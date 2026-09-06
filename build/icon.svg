@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#14191f"/>
+      <stop offset="1" stop-color="#080a0d"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" y1="1" x2="0" y2="0">
+      <stop offset="0" stop-color="#9fcb45"/>
+      <stop offset="1" stop-color="#e2ff91"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-40%" width="260%" height="180%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+  </defs>
+  <rect x="44" y="44" width="936" height="936" rx="218" fill="url(#surface)"/>
+  <rect x="48" y="48" width="928" height="928" rx="214" fill="none" stroke="#2c343c" stroke-width="8"/>
+  <g opacity=".24" fill="#d6ff73" filter="url(#glow)">
+    <rect x="257" y="430" width="112" height="320" rx="45"/>
+    <rect x="456" y="240" width="112" height="510" rx="45"/>
+    <rect x="655" y="345" width="112" height="405" rx="45"/>
+  </g>
+  <g fill="url(#signal)">
+    <rect x="257" y="430" width="112" height="320" rx="45"/>
+    <rect x="456" y="240" width="112" height="510" rx="45"/>
+    <rect x="655" y="345" width="112" height="405" rx="45"/>
+  </g>
+  <g fill="#0a0d10" opacity=".72">
+    <rect x="279" y="454" width="68" height="9" rx="4.5"/>
+    <rect x="478" y="264" width="68" height="9" rx="4.5"/>
+    <rect x="677" y="369" width="68" height="9" rx="4.5"/>
+  </g>
+</svg>

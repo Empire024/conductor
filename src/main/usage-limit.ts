@@ -1,0 +1,59 @@
+const LIMIT_LANGUAGE = /\b(?:(?:usage|rate)[\s-]*)?limit\b|\bquota\b/i
+const RESET_LANGUAGE = /\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)\b/i
+const DURATION_PART = String.raw`\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b`
+
+const parseDuration = (value: string): number => {
+  let milliseconds = 0
+  for (const match of value.matchAll(/(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/gi)) {
+    const amount = Number(match[1])
+    const unit = match[2]!.toLowerCase()[0]
+    milliseconds += amount * (unit === 'd' ? 86_400_000 : unit === 'h' ? 3_600_000 : unit === 'm' ? 60_000 : 1000)
+  }
+  return milliseconds
+}
+
+/**
+ * Extract the next usable time from the short limit messages emitted by coding
+ * agent CLIs. Clock-only values intentionally use the machine's local timezone,
+ * matching the timezone in which the desktop UI and provider process run.
+ */
+export const parseUsageLimitReset = (text: string, from = new Date()): Date | null => {
+  if (!LIMIT_LANGUAGE.test(text) || !RESET_LANGUAGE.test(text)) return null
+
+  const durationPattern = new RegExp(
+    String.raw`\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)[^.\r\n]{0,80}?\b(?:in|after)\s+((?:${DURATION_PART})(?:[\s,]*(?:and\s+)?(?:${DURATION_PART}))*)`,
+    'i'
+  )
+  const durationText = durationPattern.exec(text)?.[1]
+  const duration = durationText ? parseDuration(durationText) : 0
+  if (duration > 0) return new Date(from.getTime() + duration)
+
+  const iso = text.match(/\b20\d\d-\d\d-\d\d(?:[T ][0-2]\d:[0-5]\d(?::[0-5]\d(?:\.\d{1,3})?)?(?:Z|[+-]\d\d:?\d\d)?)?\b/)?.[0]
+  if (iso) {
+    const parsed = new Date(iso)
+    if (!Number.isNaN(parsed.getTime())) return parsed
+  }
+
+  const clock = text.match(
+    /\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)[^0-9\r\n]{0,20}(?:at\s*)?([0-2]?\d(?::[0-5]\d)?\s*(?:am|pm)?)\b/i
+  )?.[1]
+  if (!clock) return null
+
+  const parts = clock.trim().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i)
+  if (!parts) return null
+  let hour = Number(parts[1])
+  const minute = Number(parts[2] ?? 0)
+  const meridiem = parts[3]?.toLowerCase()
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return null
+    if (meridiem === 'pm' && hour < 12) hour += 12
+    if (meridiem === 'am' && hour === 12) hour = 0
+  } else if (hour > 23) {
+    return null
+  }
+
+  const result = new Date(from)
+  result.setHours(hour, minute, 0, 0)
+  if (result.getTime() <= from.getTime() + 30_000) result.setDate(result.getDate() + 1)
+  return result
+}

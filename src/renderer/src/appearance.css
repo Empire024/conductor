@@ -1,0 +1,158 @@
+/* Theme families only define tokens. Existing component rules consume them, so
+   each family can switch between day and night without duplicating layout CSS. */
+:root[data-theme-id="night-owl"][data-theme-variant="night"] {
+  --bg: #01111f;
+  --surface-0: #011627;
+  --surface-1: #071d2e;
+  --surface-2: #0b2942;
+  --surface-3: #133a57;
+  --border: #1d3b53;
+  --border-soft: #102f46;
+  --text: #d6deeb;
+  --text-2: #b2ccd6;
+  --text-3: #637777;
+  --accent: #82aaff;
+  --accent-muted: #7fdbca;
+  --accent-bg: #82aaff18;
+  --danger: #ef5350;
+  --blue: #82aaff;
+}
+
+:root[data-theme-id="night-owl"][data-theme-variant="day"] {
+  --bg: #dce7f2;
+  --surface-0: #e9f0f7;
+  --surface-1: #f2f6fa;
+  --surface-2: #d5e2ee;
+  --surface-3: #c5d6e5;
+  --border: #b7c9d9;
+  --border-soft: #cedce8;
+  --text: #29384d;
+  --text-2: #4c6178;
+  --text-3: #71869a;
+  --accent: #3b6fc4;
+  --accent-muted: #208f88;
+  --accent-bg: #208f8817;
+  --danger: #c43d45;
+  --blue: #3b6fc4;
+}
+
+:root[data-theme-id="obsidian"][data-theme-variant="night"] {
+  --bg: #050607;
+  --surface-0: #080a0c;
+  --surface-1: #0d1013;
+  --surface-2: #15191d;
+  --surface-3: #1d2329;
+  --border: #282f36;
+  --border-soft: #191e23;
+  --text: #eceff2;
+  --text-2: #adb4bc;
+  --text-3: #6b747e;
+  --accent: #d6ff73;
+  --accent-muted: #a9d157;
+  --accent-bg: #d6ff7315;
+  --danger: #ff6672;
+  --blue: #75adff;
+}
+
+:root[data-theme-id="obsidian"][data-theme-variant="day"] {
+  --bg: #dbe0df;
+  --surface-0: #e7ebea;
+  --surface-1: #f0f3f1;
+  --surface-2: #d2d9d6;
+  --surface-3: #c2ccc8;
+  --border: #b2bdb9;
+  --border-soft: #ccd4d1;
+  --text: #26302d;
+  --text-2: #4e5d58;
+  --text-3: #74817c;
+  --accent: #527b1e;
+  --accent-muted: #4b7727;
+  --accent-bg: #527b1e17;
+  --danger: #b53e49;
+  --blue: #3c6f9e;
+}
+
+:root[data-theme-id="nord"][data-theme-variant="night"] {
+  --bg: #242933;
+  --surface-0: #2b303b;
+  --surface-1: #303743;
+  --surface-2: #3b4351;
+  --surface-3: #465163;
+  --border: #4c586b;
+  --border-soft: #3a4351;
+  --text: #eceff4;
+  --text-2: #d8dee9;
+  --text-3: #8e9aae;
+  --accent: #88c0d0;
+  --accent-muted: #8fbcbb;
+  --accent-bg: #88c0d019;
+  --danger: #bf616a;
+  --blue: #81a1c1;
+}
+
+:root[data-theme-id="nord"][data-theme-variant="day"] {
+  --bg: #d7e0e8;
+  --surface-0: #e3eaf0;
+  --surface-1: #edf2f5;
+  --surface-2: #cfdbe4;
+  --surface-3: #bfceda;
+  --border: #afc0cd;
+  --border-soft: #c8d5df;
+  --text: #2e3440;
+  --text-2: #4c566a;
+  --text-3: #718095;
+  --accent: #477e9a;
+  --accent-muted: #397d7b;
+  --accent-bg: #397d7b17;
+  --danger: #a94450;
+  --blue: #4c6f91;
+}
+
+/* Day variants stay cool-toned instead of falling back to pure white overlays. */
+:root[data-theme-variant="day"] .launcher-grid,
+:root[data-theme-variant="day"] .launcher-grid button,
+:root[data-theme-variant="day"] .layout-popover,
+:root[data-theme-variant="day"] .cursor-context-menu,
+:root[data-theme-variant="day"] .settings-panel,
+:root[data-theme-variant="day"] .agent-activity {
+  color: var(--text);
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--surface-1) 96%, transparent);
+}
+
+.theme-controls { display: flex; flex-direction: column; gap: 9px; margin-top: 12px; }
+.theme-family-select { display: flex; flex-direction: column; gap: 6px; color: var(--text-3); font-size: 8px; text-transform: uppercase; letter-spacing: .08em; }
+.theme-family-select select {
+  width: 100%; height: 38px; padding: 0 10px; border: 1px solid var(--border);
+  border-radius: 9px; color: var(--text); background: var(--surface-0); font: inherit; font-size: 9px;
+}
+.theme-variant-setting { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+.theme-variant-setting button { height: 36px; display: flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid var(--border); border-radius: 9px; color: var(--text-2); background: var(--surface-0); font-size: 9px; }
+.theme-variant-setting button.active { border-color: var(--accent-muted); color: var(--text); background: var(--accent-bg); }
+.theme-variant-setting button:disabled { opacity: .42; }
+.theme-auto-setting { min-height: 43px; padding: 0 9px 0 11px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-0); cursor: pointer; }
+.theme-auto-setting > span { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.theme-auto-setting strong { color: var(--text); font-size: 9px; }
+.theme-auto-setting small { color: var(--text-3); font-size: 7.5px; }
+.theme-auto-setting input { position: absolute; opacity: 0; pointer-events: none; }
+.theme-auto-setting > i { width: 31px; height: 17px; padding: 2px; border-radius: 10px; background: var(--surface-3); transition: background 140ms ease; }
+.theme-auto-setting > i::before { content: ''; display: block; width: 13px; height: 13px; border-radius: 50%; background: var(--text-2); transition: transform 140ms ease, background 140ms ease; }
+.theme-auto-setting input:checked + i { background: var(--accent-muted); }
+.theme-auto-setting input:checked + i::before { transform: translateX(14px); background: var(--surface-0); }
+.theme-auto-setting input:focus-visible + i { outline: 1px solid var(--accent); outline-offset: 2px; }
+
+.debug-setting { margin-top: 12px; display: flex; align-items: center; gap: 8px; }
+.debug-setting > label { min-height: 43px; min-width: 0; flex: 1; padding: 0 9px 0 11px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-0); cursor: pointer; }
+.debug-setting label > span { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.debug-setting label strong { color: var(--text); font-size: 9px; }
+.debug-setting label small { color: var(--text-3); font-size: 7.5px; }
+.debug-setting label input { position: absolute; opacity: 0; pointer-events: none; }
+.debug-setting label > i { width: 31px; height: 17px; padding: 2px; flex: 0 0 auto; border-radius: 10px; background: var(--surface-3); transition: background 140ms ease; }
+.debug-setting label > i::before { content: ''; display: block; width: 13px; height: 13px; border-radius: 50%; background: var(--text-2); transition: transform 140ms ease, background 140ms ease; }
+.debug-setting label input:checked + i { background: var(--accent-muted); }
+.debug-setting label input:checked + i::before { transform: translateX(14px); background: var(--surface-0); }
+.debug-setting label input:focus-visible + i { outline: 1px solid var(--accent); outline-offset: 2px; }
+.debug-setting > button { height: 43px; padding: 0 11px; border: 1px solid var(--border); border-radius: 10px; color: var(--accent-muted); background: var(--accent-bg); font-size: 8px; }
+.debug-setting > button:disabled { opacity: .35; }
+
+.session-tab-rename { min-width: 0; flex: 1; height: 24px; padding: 0 5px; border: 1px solid var(--accent-muted); border-radius: 6px; color: var(--text); background: var(--surface-0); font-size: inherit; font-weight: inherit; outline: none; user-select: text; }
