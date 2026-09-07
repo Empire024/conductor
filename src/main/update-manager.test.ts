@@ -106,3 +106,11 @@ describe('installed updater source ownership — mocked transport, no installati
     finish(); await first
   })
 })
+
+it('keeps a downloaded update ready when the owner cancels closing dirty editors', async () => {
+  const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: 'fixture', beforeInstall: () => { throw Object.assign(new Error('Cancelled'), { code: 'UPDATE_CANCELLED' }) } })
+  managers.push(m); m.configure('')
+  await m.check(); await m.download(); await m.install()
+  expect(m.getState().phase).toBe('ready')
+  expect(f.instances.every((instance) => instance.quitAndInstall.mock.calls.length === 0)).toBe(true)
+})

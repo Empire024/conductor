@@ -71,6 +71,16 @@ export class JsonLineTransport {
     if (Buffer.byteLength(line) > 8 * 1024 * 1024 || this.child.stdin.writableLength > 8 * 1024 * 1024) throw new Error('Provider input queue exceeded limit')
     this.child.stdin.write(line)
   }
+  async closeAndWait(): Promise<void> {
+    const child = this.child
+    if (!child || this.exited) return
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => { child.removeListener('close', closed); reject(new Error('The previous provider process has not exited. Try switching again.')) }, 5000)
+      const closed = (): void => { clearTimeout(timer); resolve() }
+      child.once('close', closed)
+      this.close()
+    })
+  }
   close(): void {
     const child = this.child
     if (!child || this.exited || child.killed) return

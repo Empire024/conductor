@@ -75,6 +75,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return
   }
   if (!initialized || !acknowledged) throw new Error('request before initialization handshake completed')
+  if (message.method === 'thread/read') { send({ id: message.id, result: { thread: defaults().thread } }); return }
   if (message.method === 'thread/start' || message.method === 'thread/resume') {
     send({ id: message.id, result: defaults() })
     return
@@ -100,6 +101,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const scenario = message.params.input[0].text
   notify('turn/started', { threadId, turn: { id: currentTurn, status: 'inProgress', items: [], error: null } })
   send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } })
+  if (scenario.startsWith('synthetic:backlog')) {
+    itemEvent('item/completed', { type: 'agentMessage', id: 'backlog-result', text: 'SYNTHETIC backlog fixture. [Open alpha](alpha.ts)\n\n' + 'long_unbroken_text_'.repeat(180) + '\n\n' + String.fromCharCode(96).repeat(3) + 'text\n' + 'wide code '.repeat(180) + '\n' + String.fromCharCode(96).repeat(3), phase: null, memoryCitation: null, delivery: null, questions: null })
+    return // Deliberately wait for an explicit interrupt; no live provider runs.
+  }
   if (scenario === 'synthetic:large') {
     let index = 0
     let barrierStarted

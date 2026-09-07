@@ -1,0 +1,114 @@
+import { useEffect, useRef, useState } from 'react'
+import { Eye, FileCode2, Globe2, Plus, X } from 'lucide-react'
+import type { ProjectRecord } from '../../../shared/models'
+import { CodePane } from '../panes/CodePane'
+import { FilePreviewPane } from '../panes/FilePreviewPane'
+import { BrowserPane } from '../panes/BrowserPane'
+import { AgentDialog } from '../panes/StructuredAgentRenderers'
+import { FilePicker } from './FilePicker'
+import { loadWorkspaceFiles, openWorkspaceFile, type OpenWorkspaceFile, type WorkspaceFile } from './workspace-files-state'
+
+function FileBrowser({ project, file }: { project: ProjectRecord; file: WorkspaceFile }): React.JSX.Element {
+  const [url, setUrl] = useState(''), [error, setError] = useState('')
+  useEffect(() => { let live = true; void window.conductor.files.browserUrl(project.id, file.path).then((value) => { if (live) setUrl(value) }).catch((reason: unknown) => { if (live) setError(String(reason)) }); return () => { live = false } }, [project.id, file.path])
+  return url ? <BrowserPane key={url} initialUrl={url} compact performanceTabId={file.id} /> : <p className="editor-loading">{error || 'Opening browser…'}</p>
+}
+export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects: ProjectRecord[]; projectId: string; workspaceId: string }): React.JSX.Element | null {
+  const [state, setState] = useState(() => loadWorkspaceFiles(workspaceId))
+  const [width, setWidth] = useState(() => Number(localStorage.getItem('conductor.documentWidth')) || 620)
+  const [picker, setPicker] = useState(false), [creating, setCreating] = useState(false), [name, setName] = useState(''), [error, setError] = useState('')
+  const [dirtyIds, setDirtyIds] = useState<Set<string>>(new Set())
+  const host = useRef<HTMLElement>(null)
+  const stateRef = useRef(state); stateRef.current = state
+  const active = state.files.find((file) => file.id === state.activeId) ?? state.files[0]
+  const open = (file: OpenWorkspaceFile): void => {
+    setState((current) => {
+      const existing = current.files.find((item) => item.projectId === file.projectId && item.path === file.path)
+      const next = { ...file, id: existing?.id ?? 'document:' + workspaceId + ':' + crypto.randomUUID() }
+      return { files: existing ? current.files.map((item) => item.id === existing.id ? { ...item, ...next } : item) : [...current.files, next], activeId: next.id }
+    })
+  }
+  const close = async (id: string): Promise<void> => {
+    window.dispatchEvent(new Event('conductor:flush-editors'))
+    if (!await window.conductor.files.confirmClose([id])) return
+    setState((current) => {
+      const index = current.files.findIndex((file) => file.id === id)
+      const files = current.files.filter((file) => file.id !== id)
+      return { files, activeId: current.activeId === id ? files[Math.min(index, files.length - 1)]?.id ?? null : current.activeId }
+    })
+  }
+  useEffect(() => {
+    localStorage.setItem('conductor.workspaceFiles.' + workspaceId, JSON.stringify(state))
+    window.dispatchEvent(new CustomEvent('conductor:browser-files', { detail: state.files.filter((file) => file.mode === 'browser') }))
+  }, [state, workspaceId])
+  useEffect(() => {
+    const receive = (event: Event): void => open((event as CustomEvent<OpenWorkspaceFile>).detail)
+    const pathChanged = (): void => setState(loadWorkspaceFiles(workspaceId))
+    const agentFile = (event: Event): void => {
+      const detail = (event as CustomEvent<{ cwd: string; path: string; mode: 'browser' | 'external'; line?: number }>).detail
+      const project = projects.find((item) => item.path.replaceAll('\\', '/').toLowerCase() === detail.cwd.replaceAll('\\', '/').replace(/\/$/, '').toLowerCase())
+      if (!project) return
+      if (detail.mode === 'external') void window.conductor.files.openInBrowser(project.id, detail.path).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: String(reason) })))
+      else open({ projectId: project.id, path: detail.path, mode: 'browser', line: detail.line })
+    }
+    const key = (event: KeyboardEvent): void => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return
+      if (event.key.toLowerCase() === 'e') { event.preventDefault(); event.stopImmediatePropagation(); setPicker((current) => !current) }
+      if (event.key.toLowerCase() === 'w' && host.current?.contains(document.activeElement) && stateRef.current.activeId) { event.preventDefault(); event.stopImmediatePropagation(); void close(stateRef.current.activeId) }
+    }
+    const dirty = (event: Event): void => { const detail = (event as CustomEvent<{ id: string; dirty: boolean }>).detail; setDirtyIds((current) => { const next = new Set(current); if (detail.dirty) next.add(detail.id); else next.delete(detail.id); return next }) }
+    const offShortcut = window.conductor.files.onOpenShortcut(() => setPicker((current) => !current))
+    const storageChanged = (event: StorageEvent): void => { if (event.key === 'conductor.workspaceFiles.' + workspaceId) pathChanged() }
+    window.addEventListener('storage', storageChanged)
+    const offResolved = window.conductor.files.onDraftResolved(({ tabId }) => setDirtyIds((current) => { const next = new Set(current); next.delete(tabId); return next }))
+    window.addEventListener('conductor:open-file', receive)
+    window.addEventListener('conductor:agent-file', agentFile)
+    window.addEventListener('conductor:files-path-changed', pathChanged)
+    window.addEventListener('conductor:editor-dirty', dirty)
+    window.addEventListener('keydown', key, true)
+    return () => {
+      offResolved(); offShortcut(); window.removeEventListener('storage', storageChanged)
+      window.removeEventListener('conductor:open-file', receive); window.removeEventListener('conductor:agent-file', agentFile)
+      window.removeEventListener('conductor:files-path-changed', pathChanged); window.removeEventListener('conductor:editor-dirty', dirty); window.removeEventListener('keydown', key, true)
+    }
+  }, [projects, workspaceId])
+  const resize = (event: React.PointerEvent<HTMLButtonElement>): void => {
+    if (event.button !== 0) return
+    event.preventDefault(); event.currentTarget.setPointerCapture(event.pointerId)
+    const x = event.clientX, initial = width, element = event.currentTarget
+    const move = (next: PointerEvent): void => { const size = Math.max(320, Math.min(window.innerWidth - 300, initial + x - next.clientX)); setWidth(size); localStorage.setItem('conductor.documentWidth', String(size)) }
+    const stop = (): void => { element.removeEventListener('pointermove', move); element.removeEventListener('pointerup', stop); element.removeEventListener('lostpointercapture', stop) }
+    element.addEventListener('pointermove', move); element.addEventListener('pointerup', stop); element.addEventListener('lostpointercapture', stop)
+  }
+  return <>
+    {active && <aside ref={host} className="workspace-document workspace-files" style={{ width }} aria-label="Open files">
+      <button className="workspace-document-resizer" onPointerDown={resize} aria-label="Resize editor" />
+      <div className="file-tabs" role="tablist" aria-label="File tabs">
+        {state.files.map((file) => <div className={'file-tab' + (file.id === active.id ? ' active' : '')} key={file.id}>
+          <button role="tab" aria-selected={file.id === active.id} title={projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
+            onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }}>
+            {file.mode === 'browser' ? <Globe2 size={13} /> : <FileCode2 size={13} />}<span>{file.path.split('/').pop()}</span>{dirtyIds.has(file.id) && <i className="file-dirty-dot" aria-label="Unsaved changes" />}
+          </button><button className="file-tab-close" aria-label={'Close ' + file.path} onClick={() => void close(file.id)}><X size={12} /></button>
+        </div>)}
+        <button className="file-new" title="New file" aria-label="New file" onClick={() => { setName(''); setError(''); setCreating(true) }}><Plus size={15} /></button>
+      </div>
+      <div className="file-view-toolbar"><span title={active.path}>{active.path}</span>
+        {([['editor', FileCode2, 'Edit'], ['preview', Eye, 'Preview'], ['browser', Globe2, 'Open in browser']] as const).map(([mode, Icon, label]) => <button key={mode} title={label} aria-label={label} aria-pressed={active.mode === mode} onClick={() => open({ ...active, mode })}><Icon size={14} /></button>)}
+      </div>
+      <div className="workspace-document-body">
+        {state.files.map((file) => {
+          const project = projects.find((item) => item.id === file.projectId)
+          if (!project) return file.id === active.id ? <p key={file.id}>This project is no longer loaded.</p> : null
+          return <div className="file-tab-content" key={file.id} hidden={file.id !== active.id}>
+            {file.mode === 'editor' ? <CodePane project={project} tabId={file.id} path={file.path} line={file.line} /> : file.mode === 'browser' ? <FileBrowser project={project} file={file} /> : <FilePreviewPane project={project} path={file.path} onOpenEditor={(path) => open({ projectId: project.id, path, mode: 'editor' })} />}
+          </div>
+        })}
+      </div>
+    </aside>}
+    {picker && <FilePicker projects={projects} onClose={() => setPicker(false)} onPick={(file) => openWorkspaceFile(file.projectId, file.path)} />}
+    {creating && <AgentDialog title="New file" onClose={() => setCreating(false)}><form className="new-file-form" onSubmit={(event) => {
+      event.preventDefault(); const owner = active?.projectId ?? projectId
+      void window.conductor.files.create(owner, active?.path.includes('/') ? active.path.slice(0, active.path.lastIndexOf('/')) : '', name, 'file').then((file) => { open({ projectId: owner, path: file.relativePath, mode: 'editor' }); setCreating(false); window.dispatchEvent(new Event('conductor:refresh-files')) }).catch((reason: unknown) => setError(String(reason)))
+    }}><label>File name<input autoFocus required value={name} placeholder="untitled.ts" onChange={(event) => setName(event.target.value)} /></label>{error && <p role="alert">{error}</p>}<footer><button type="button" onClick={() => setCreating(false)}>Cancel</button><button className="primary" type="submit">Create file</button></footer></form></AgentDialog>}
+  </>
+}

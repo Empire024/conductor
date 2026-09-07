@@ -1,3 +1,4 @@
+import { ProviderIcon } from '../components/ProviderIcon'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal, flushSync } from 'react-dom'
 import {
@@ -216,7 +217,7 @@ function PaneGroup({
 
   useEffect(() => {
     if (!menuPosition) return
-    const closeMenu = (): void => setMenuPosition(null)
+    const closeMenu = (event?: Event): void => { if (event?.target instanceof Element && event.target.closest('.pane-menu-button') && groupRef.current?.contains(event.target)) return; setMenuPosition(null) }
     const closeOnEscape = (event: KeyboardEvent): void => { if (event.key === 'Escape') closeMenu() }
     window.addEventListener('mousedown', closeMenu)
     window.addEventListener('resize', closeMenu)
@@ -296,6 +297,7 @@ function PaneGroup({
     event.preventDefault()
     event.stopPropagation()
     workspace.onFocus(group.id)
+    if (event.type === 'click' && menuPosition) { setMenuPosition(null); return }
     setMenuPosition({
       x: Math.min(event.clientX, window.innerWidth - 205),
       y: Math.min(event.clientY, window.innerHeight - 315)
@@ -435,7 +437,7 @@ function PaneGroup({
                 onDragStart={(event) => beginDrag(event, tab)}
                 onDragEnd={(event) => finishDrag(event, tab)}
               >
-                <Icon size={13} strokeWidth={1.8} />
+                {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
                 <span>{tab.title}</span>
                 {tab.kind === 'agent' && <small className="tab-model">{(tab.state?.model as string) || 'default'}</small>}
                 {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (

@@ -2,6 +2,10 @@
 
 Recorded 2026-09-07. **Owner-authorized testing delivery; full parity is not claimed.** Offline validation and the explicitly authorized replacement Codex A/B suite pass. Claude live testing is blocked by the owner's reported exhausted allowance. The owner explicitly requested updater delivery of local/testing builds without waiting for full extension parity. Publication is verified separately against the release workflow and assets, not inferred from these tests.
 
+## Completed feature list — 2026-09-07
+
+All current feature-list items are implemented. See the [backlog delivery record](conductor-backlog-delivery.md) for the final 304-test run, production build, 20 Electron backlog checks and eight draft checks per provider. It also records native CLI, clipboard and dependency-cancellation validation boundaries. Earlier sections below describe their respective deliveries.
+
 ## Composer draft recovery — 2026-09-07
 
 Backlog bug 11 is implemented for structured Codex and Claude conversations. Text and captured attachments are saved per project/conversation in local storage directly when edited. Project/workspace switching, history navigation, reload, pane close/retrieve, detached-window edits, and a full application restart preserve the appropriate draft without submitting it. Successful sends clear only the submitted revision; failed sends and newer typing retain their drafts. Image previews are regenerated on inspection rather than persisting image data URLs.

@@ -1,3 +1,4 @@
+import { ProviderIcon } from '../components/ProviderIcon'
 import {
   Bot,
   ChevronRight,
@@ -32,7 +33,7 @@ export function LauncherPane({ onOpen }: LauncherPaneProps): React.JSX.Element {
       <div className="launcher-grid" aria-label="Open runtime">
         {choices.map(({ kind, provider, icon: Icon, title, tone, key }) => (
           <button key={`${kind}-${provider ?? ''}`} onClick={() => onOpen(kind, provider)}>
-            <span className={`launch-icon ${tone}`}><Icon size={19} /></span>
+            <span className={`launch-icon ${tone}`}>{provider ? <ProviderIcon provider={provider} size={21} /> : <Icon size={19} />}</span>
             <span><strong>{title}</strong></span>
             <kbd>{key}</kbd>
             <ChevronRight className="launch-arrow" size={15} />

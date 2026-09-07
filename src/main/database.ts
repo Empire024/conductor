@@ -187,10 +187,30 @@ export class ConductorDatabase {
     }
   }
 
+  private applyOrder<T extends { id: string }>(key: string, records: T[]): T[] {
+    let order: string[] = []
+    try { const saved: unknown = JSON.parse(this.getSetting(key) ?? '[]'); if (Array.isArray(saved)) order = saved.filter((id): id is string => typeof id === 'string') } catch { /* stale UI order */ }
+    const rank = new Map(order.map((id, index) => [id, index]))
+    return records.sort((a, b) => (rank.get(a.id) ?? Infinity) - (rank.get(b.id) ?? Infinity))
+  }
+
+  reorderProjects(ids: string[]): ProjectRecord[] {
+    this.saveOrder('projectOrder', ids, this.listProjects())
+    return this.listProjects()
+  }
+
+  reorderSessions(projectId: string, ids: string[]): SessionRecord[] {
+    this.saveOrder('sessionOrder:' + projectId, ids, this.listSessions(projectId))
+    return this.listSessions(projectId)
+  }
+
+  private saveOrder(key: string, ids: string[], records: Array<{ id: string }>): void {
+    if (!Array.isArray(ids) || ids.length !== records.length || new Set(ids).size !== ids.length || ids.some((id) => !records.some((record) => record.id === id))) throw new Error('The list changed. Refresh and try reordering again.')
+    this.setSetting(key, JSON.stringify(ids))
+  }
+
   listProjects(): ProjectRecord[] {
-    return (this.db.prepare('SELECT * FROM projects ORDER BY updated_at DESC').all() as DbRow[]).map(
-      this.mapProject
-    )
+    return this.applyOrder('projectOrder', (this.db.prepare('SELECT * FROM projects ORDER BY updated_at DESC').all() as DbRow[]).map(this.mapProject))
   }
 
   getProject(id: string): ProjectRecord | null {
@@ -276,6 +296,8 @@ export class ConductorDatabase {
     return this.getProject(projectId)!
   }
 
+  removeSetting(key: string): void { this.db.prepare('DELETE FROM settings WHERE key = ?').run(key) }
+
   getSetting(key: string): string | null {
     const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as DbRow | undefined
     return (row?.value as string | undefined) ?? null
@@ -291,11 +313,7 @@ export class ConductorDatabase {
   }
 
   listSessions(projectId: string): SessionRecord[] {
-    return (
-      this.db
-        .prepare('SELECT * FROM sessions WHERE project_id = ? ORDER BY created_at ASC')
-        .all(projectId) as DbRow[]
-    ).map(this.mapSession)
+    return this.applyOrder('sessionOrder:' + projectId, (this.db.prepare('SELECT * FROM sessions WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as DbRow[]).map(this.mapSession))
   }
 
   getSession(id: string): SessionRecord | null {
@@ -407,6 +425,17 @@ export class ConductorDatabase {
       this.db.exec('ROLLBACK')
       throw error
     }
+  }
+
+  remapEditorDrafts(projectId: string, previousPath: string, nextPath: string, directory: boolean): void {
+    const drafts = this.listEditorDrafts().filter((draft) => draft.projectId === projectId && (draft.path === previousPath || directory && draft.path.startsWith(previousPath + '/')))
+    this.db.exec('BEGIN IMMEDIATE')
+    try { for (const draft of drafts) this.db.prepare('UPDATE editor_drafts SET path = ?, updated_at = ? WHERE tab_id = ?').run(nextPath + draft.path.slice(previousPath.length), now(), draft.tabId); this.db.exec('COMMIT') } catch (reason) { this.db.exec('ROLLBACK'); throw reason }
+  }
+
+  listEditorDrafts(): EditorDraft[] {
+    const rows = this.db.prepare('SELECT tab_id, project_id, path FROM editor_drafts ORDER BY updated_at ASC').all() as DbRow[]
+    return rows.map((row) => this.getEditorDraft(row.tab_id as string, row.project_id as string, row.path as string)!).filter(Boolean)
   }
 
   getEditorDraft(tabId: string, projectId: string, path: string): EditorDraft | null {

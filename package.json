@@ -25,7 +25,8 @@
     "test:agent-ui": "npm run build && node scripts/smoke-structured-agents.mjs && node scripts/smoke-structured-agents.mjs --provider=claude",
     "test:composer-drafts": "npm run build && node scripts/smoke-composer-drafts.mjs && node scripts/smoke-composer-drafts.mjs --provider=claude",
     "test:agent-live": "node scripts/live-structured-codex.mjs",
-    "smoke:ui": "node scripts/smoke-ui.mjs"
+    "smoke:ui": "node scripts/smoke-ui.mjs",
+    "test:backlog": "npm run build && node scripts/smoke-backlog.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
@@ -101,6 +102,12 @@
       "runAfterFinish": true,
       "deleteAppDataOnUninstall": false,
       "artifactName": "Conductor-Setup-${version}.${ext}"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "src/renderer/src/assets/providers/LICENSE",
+        "to": "provider-icons-LICENSE.txt"
+      }
+    ]
   }
 }

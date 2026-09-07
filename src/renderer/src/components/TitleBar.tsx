@@ -14,13 +14,17 @@ import {
   Sun,
   X
 } from 'lucide-react'
-import type { AppUpdateState, ThemeVariant } from '../../../shared/models'
+import type { AppUpdateState, ThemeVariant, ThemeId } from '../../../shared/models'
+import { THEME_OPTIONS } from '../../../shared/models'
 import { useWindowMaximized } from '../use-window-maximized'
 
 interface TitleBarProps {
   projectName?: string
   themeVariant: ThemeVariant
   themeAuto: boolean
+  themeId?: ThemeId
+  onTheme?(id: ThemeId): void
+  onThemeAuto?(enabled: boolean): void
   onThemeVariant(variant: ThemeVariant): void
   onNewProject?(): void
   onOpenProject?(): void
@@ -34,6 +38,15 @@ interface TitleBarProps {
 
 export function TitleBar(props: TitleBarProps): React.JSX.Element {
   const [fileMenuOpen, setFileMenuOpen] = useState(false)
+  const [themeMenuOpen, setThemeMenuOpen] = useState(false)
+  const themeMenuRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!themeMenuOpen) return
+    const close = (event: MouseEvent): void => { if (!themeMenuRef.current?.contains(event.target as Node)) setThemeMenuOpen(false) }
+    const escape = (event: KeyboardEvent): void => { if (event.key === 'Escape') { event.stopPropagation(); setThemeMenuOpen(false) } }
+    window.addEventListener('mousedown', close); window.addEventListener('keydown', escape, true)
+    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('keydown', escape, true) }
+  }, [themeMenuOpen])
   const menuRef = useRef<HTMLDivElement>(null)
   const ThemeIcon = props.themeAuto ? Laptop : props.themeVariant === 'night' ? MoonStar : Sun
   const nextVariant: ThemeVariant = props.themeVariant === 'night' ? 'day' : 'night'
@@ -87,9 +100,16 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
       <div className="titlebar-drag">
         {props.projectName ? <span className="titlebar-project">{props.projectName} <span>/</span> Local workspace</span> : <span className="titlebar-project">Local agent workspace</span>}
       </div>
-      <button className="quick-theme-toggle" onClick={() => props.onThemeVariant(nextVariant)} title={props.themeAuto ? `Theme follows local time. Click to use ${nextVariant} manually.` : `Theme: ${props.themeVariant}. Click for ${nextVariant}.`}>
+      <div className="quick-theme-menu-host" ref={themeMenuRef}>
+      <button onContextMenu={(event) => { event.preventDefault(); setThemeMenuOpen((open) => !open) }} className="quick-theme-toggle" onClick={() => props.onThemeVariant(nextVariant)} title={props.themeAuto ? `Theme follows local time. Click to use ${nextVariant} manually.` : `Theme: ${props.themeVariant}. Click for ${nextVariant}.`}>
         <ThemeIcon size={17} /> <span>{label}</span>
       </button>
+      {themeMenuOpen && <div className="theme-menu" role="menu" aria-label="Theme">
+        {THEME_OPTIONS.map((theme) => <button key={theme.id} role="menuitemradio" aria-checked={props.themeId === theme.id} onClick={() => { props.onTheme?.(theme.id); setThemeMenuOpen(false) }}><span className={'theme-swatch ' + theme.id} />{theme.label}{props.themeId === theme.id && <span className="theme-selected">✓</span>}</button>)}
+        <hr />
+        <button role="menuitemcheckbox" aria-checked={props.themeAuto} onClick={() => { props.onThemeAuto?.(!props.themeAuto); setThemeMenuOpen(false) }}><Laptop size={14} /> Follow local time{props.themeAuto && <span className="theme-selected">✓</span>}</button>
+      </div>}
+      </div>
       <div className="window-controls">
         <button onClick={() => window.conductor.window.minimize()} aria-label="Minimize"><Minus size={14} /></button>
         <button onClick={() => window.conductor.window.toggleMaximize()} aria-label={maximized ? 'Restore window' : 'Maximize window'} title={maximized ? 'Restore window' : 'Maximize window'}>

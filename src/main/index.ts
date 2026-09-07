@@ -33,9 +33,12 @@ import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-pa
 import { AgentCollaborationStore } from './agent-collaboration-store'
 import { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { registerAgentCollaborationIpc } from './agent-collaboration-ipc'
+import { ProjectPreviewServer } from './project-preview'
+import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { UpdateManager } from './update-manager'
 import { normalizeUpdateFeedUrl } from './update-config'
 
+const projectPreview = new ProjectPreviewServer()
 let database: ConductorDatabase
 let terminals: TerminalManager
 let agents: AgentManager
@@ -122,7 +125,26 @@ const createWindow = (
       webviewTag: true
     }
   })
+  // Browser guests do not bubble keyboard events into the workspace renderer.
+  window.webContents.on('did-attach-webview', (_event, guest) => {
+    guest.on('before-input-event', (event, input) => {
+      if (input.type === 'keyDown' && (input.control || input.meta) && !input.alt && input.key.toLowerCase() === 'e') {
+        event.preventDefault()
+        window.webContents.focus()
+        window.webContents.send('files:open-shortcut')
+      }
+    })
+  })
   installWindowStateEvents(window)
+  let closeApproved = false
+  let decidingClose = false
+  window.on('close', (event) => {
+    if (closeApproved || isQuitting) return
+    event.preventDefault()
+    if (decidingClose) return
+    decidingClose = true
+    void resolveUnsavedEditors(window).then((approved) => { decidingClose = false; if (approved && !window.isDestroyed()) { closeApproved = true; window.close() } })
+  })
 
   window.once('ready-to-show', () => {
     if (visibleSavedPlacement?.maximized) window.maximize()
@@ -324,13 +346,79 @@ const disposeRuntimeServices = (): void => {
   }
 }
 
-const prepareForUpdateInstall = (): void => {
+const prepareForUpdateInstall = async (): Promise<void> => {
+  if (!await resolveUnsavedEditors(mainWindow)) throw Object.assign(new Error('Update restart cancelled. Your edits are still open.'), { code: 'UPDATE_CANCELLED' })
   database.setSetting(UPDATE_WINDOW_LAYOUT_KEY, JSON.stringify(captureWindowLayout()))
   database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'true')
   // electron-updater closes windows before Electron emits before-quit. Mark the
   // close as intentional now so detached tabs remain detached for the relaunch.
   isQuitting = true
   disposeRuntimeServices()
+}
+
+
+let resolvingEditors: Promise<boolean> | null = null
+const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): Promise<boolean> => {
+  // Serialize decisions across windows. A caller with another scope checks again afterwards.
+  if (resolvingEditors) return resolvingEditors.then((ok) => ok && resolveUnsavedEditors(owner, tabIds))
+  const task = (async (): Promise<boolean> => {
+    const windows = BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed())
+    await Promise.all(windows.map(async (window) => {
+      if (window.webContents.isDestroyed()) return
+      let timeout: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          window.webContents.executeJavaScript("window.dispatchEvent(new Event('conductor:flush-editors'))"),
+          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('An editor window did not respond. Try again after it recovers.')), 5000) })
+        ])
+      } finally { clearTimeout(timeout) }
+    }))
+    const drafts = database.listEditorDrafts().filter((draft) => !tabIds || tabIds.includes(draft.tabId))
+    const dirty: Array<{ draft: typeof drafts[number]; disk: string; target: string }> = []
+    for (const draft of drafts) {
+      if (!database.getProject(draft.projectId)) continue
+      const target = resolveProjectPath(draft.projectId, draft.path)
+      await resolveExistingProjectPath(draft.projectId, dirname(draft.path))
+      let disk = ''
+      try { disk = await fs.readFile(await resolveExistingProjectPath(draft.projectId, draft.path), 'utf8') } catch (reason) { if ((reason as NodeJS.ErrnoException).code !== 'ENOENT') throw reason }
+      if (disk === draft.content) { database.removeEditorDraft(draft.tabId); continue }
+      dirty.push({ draft, disk, target })
+    }
+    if (!dirty.length) return true
+    const options: Electron.MessageBoxOptions = {
+      type: 'question', title: 'Save changes?', message: 'Save changes before closing?',
+      detail: dirty.map(({ draft }) => (database.getProject(draft.projectId)?.name ?? '') + ' / ' + draft.path).join('\n'),
+      buttons: ['Save', "Don't Save", 'Cancel'], defaultId: 0, cancelId: 2, noLink: true
+    }
+    const { response } = owner && !owner.isDestroyed() ? await dialog.showMessageBox(owner, options) : await dialog.showMessageBox(options)
+    if (response === 2) return false
+    if (response === 0) {
+      const versions = new Map<string, string>()
+      for (const { draft, target } of dirty) {
+        if (versions.has(target) && versions.get(target) !== draft.content) throw new Error('This file has different edits in multiple workspaces: ' + draft.path + '. Save the version you want in its editor first.')
+        versions.set(target, draft.content)
+      }
+    }
+    for (const { draft, disk, target } of dirty) {
+      if (response === 0) {
+        const destination = await folderExists(target) ? await resolveExistingProjectPath(draft.projectId, draft.path) : (await resolveExistingProjectPath(draft.projectId, dirname(draft.path)), target)
+        await fs.writeFile(destination, draft.content, 'utf8')
+      }
+      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path)
+      if (current?.content === draft.content) database.removeEditorDraft(draft.tabId)
+      for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-resolved', { tabId: draft.tabId, submitted: draft.content, content: response === 0 ? draft.content : disk })
+    }
+    // Edits made in a different window while a native decision dialog was open stay protected.
+    return !database.listEditorDrafts().some((draft) => (!tabIds || tabIds.includes(draft.tabId)) && dirty.some((item) => item.draft.tabId === draft.tabId && item.draft.content !== draft.content))
+  })().catch(async (reason: unknown) => {
+    const options: Electron.MessageBoxOptions = { type: 'error', title: 'Could not close editor', message: reason instanceof Error ? reason.message : String(reason) }
+    if (owner && !owner.isDestroyed()) await dialog.showMessageBox(owner, options)
+    else await dialog.showMessageBox(options)
+    return false
+  })
+  resolvingEditors = task
+  void task.finally(() => { if (resolvingEditors === task) resolvingEditors = null })
+  return task
 }
 
 const folderExists = async (path: string): Promise<boolean> => {
@@ -382,6 +470,12 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:snapshot', (event, id) => { trustedStructured(event); return database.structured.snapshot(structuredId(id)) })
   ipcMain.handle('structured:connect', (event, id) => { trustedStructured(event); return agents.structured.connectSession(structuredId(id)) })
   ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
+  ipcMain.handle('structured:queue', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.queue(structuredId(id), text, settings, attachments) })
+  ipcMain.handle('structured:cancel-queued', (event, id) => { trustedStructured(event); return agents.structured.cancelQueued(structuredId(id)) })
+  ipcMain.handle('native-cli:ensure', (event, id) => { trustedStructured(event); return agents.nativeCli.ensure(structuredId(id)) })
+  ipcMain.handle('native-cli:chat', (event, id) => { trustedStructured(event); return agents.nativeCli.switchToChat(structuredId(id)) })
+  ipcMain.on('native-cli:write', (event, id, data) => { try { trustedStructured(event); agents.nativeCli.write(structuredId(id), data) } catch { /* reject untrusted/invalid input */ } })
+  ipcMain.on('native-cli:resize', (event, id, cols, rows) => { try { trustedStructured(event); agents.nativeCli.resize(structuredId(id), cols, rows) } catch { /* reject untrusted/invalid input */ } })
   ipcMain.handle('structured:submit', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.submit(structuredId(id), text, settings, attachments) })
   ipcMain.handle('structured:respond', (event, response) => { trustedStructured(event); return agents.structured.respond(response) })
   ipcMain.handle('structured:interrupt', (event, id) => { trustedStructured(event); return agents.structured.interrupt(structuredId(id)) })
@@ -617,6 +711,16 @@ const registerIpc = (): void => {
     }
   })
 
+  ipcMain.handle('files:confirm-close', (event, tabIds: string[]) => { trustedStructured(event); if (!Array.isArray(tabIds) || tabIds.some((id) => typeof id !== 'string')) throw new Error('Invalid editor tabs'); return resolveUnsavedEditors(BrowserWindow.fromWebContents(event.sender), tabIds) })
+  ipcMain.handle('projects:reorder', (event, ids: string[]) => { trustedStructured(event); return database.reorderProjects(ids) })
+  ipcMain.handle('sessions:reorder', (event, projectId: string, ids: string[]) => { trustedStructured(event); return database.reorderSessions(projectId, ids) })
+  ipcMain.handle('files:search', async (event, projectIds: string[], query: string) => {
+    trustedStructured(event)
+    if (!Array.isArray(projectIds) || projectIds.length > 200 || typeof query !== 'string' || query.length > 512) throw new Error('Invalid file search')
+    return searchProjectFiles(database.listProjects().filter((project) => projectIds.includes(project.id)), query)
+  })
+  ipcMain.handle('files:browser-url', async (event, projectId: string, requested: string) => { trustedStructured(event); const project = database.getProject(projectId); if (!project) throw new Error('Project not found'); return projectPreview.url(project, requested) })
+  ipcMain.handle('files:open-in-browser', async (event, projectId: string, requested: string) => { trustedStructured(event); const project = database.getProject(projectId); if (!project) throw new Error('Project not found'); await shell.openExternal(await projectPreview.url(project, requested)) })
   ipcMain.handle('files:list', async (_event, projectId: string, requested = '') => {
     const root = database.getProject(projectId)
     if (!root) throw new Error('Project not found')
@@ -700,6 +804,7 @@ const registerIpc = (): void => {
         throw reason
       }
 
+      invalidateProjectFiles(project.path)
       return {
         name,
         path: target,
@@ -726,6 +831,8 @@ const registerIpc = (): void => {
         await fs.rename(source, target)
       }
       const stat = await fs.lstat(target)
+      invalidateProjectFiles(project.path)
+      database.remapEditorDrafts(projectId, requested.replaceAll('\\', '/'), relative(project.path, target).replaceAll('\\', '/'), stat.isDirectory())
       return {
         name,
         path: target,
@@ -764,6 +871,8 @@ const registerIpc = (): void => {
         if (await folderExists(target)) throw new Error(`An item named ${basename(source)} already exists`)
         await fs.rename(source, target)
       }
+      invalidateProjectFiles(project.path)
+      database.remapEditorDrafts(projectId, requested.replaceAll('\\', '/'), relative(project.path, target).replaceAll('\\', '/'), sourceStat.isDirectory())
       return {
         name: basename(target),
         path: target,
@@ -777,6 +886,7 @@ const registerIpc = (): void => {
     if (!project) throw new Error('Project not found')
     if (isProjectRoot(project.path, requested)) throw new Error('The project root cannot be deleted')
     await shell.trashItem(await resolveExistingProjectPath(projectId, requested))
+    invalidateProjectFiles(project.path)
   })
   ipcMain.handle('files:reveal', async (_event, projectId: string, requested = '') => {
     const target = await resolveExistingProjectPath(projectId, requested)
@@ -1063,11 +1173,14 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
 })
 
-app.on('before-quit', () => {
-  isQuitting = true
+app.on('before-quit', (event) => {
+  if (isQuitting) return
+  event.preventDefault()
+  void resolveUnsavedEditors(mainWindow).then((approved) => { if (approved) { isQuitting = true; app.quit() } })
 })
 
 app.on('will-quit', () => {
+  projectPreview.close()
   updates?.dispose()
   disposeRuntimeServices()
 })

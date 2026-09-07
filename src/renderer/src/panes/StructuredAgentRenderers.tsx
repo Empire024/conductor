@@ -29,6 +29,12 @@ export const toolRendererRegistry: Array<{ kind: ToolRendererKind; matches: (nam
 export function rendererKind(name: string): ToolRendererKind {
   return toolRendererRegistry.find((renderer) => renderer.matches(name))?.kind ?? 'custom'
 }
+function openAgentFile(event: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }, cwd: string, path: string, open: (path: string, line?: number) => void): void {
+  const target = safeFileTarget(path, cwd)
+  if (!target) return
+  if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, ...target, mode: event.shiftKey ? 'external' : 'browser' } }))
+  else open(target.path, target.line)
+}
 function record(value: Json | undefined): Record<string, Json> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
 }
@@ -83,7 +89,7 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
       if (!href) return <span>{children}</span>
       const external = safeExternalLink(href)
       const target = external ? null : safeFileTarget(href, cwd)
-      return <a href={external ? href : '#'} onClick={(event) => { event.preventDefault(); if (external) void window.conductor.system.openExternal(href); else if (target) onOpenFile(target.path, target.line) }}>{children}</a>
+      return <a href={external ? href : '#'} onClick={(event) => { event.preventDefault(); if (external) void window.conductor.system.openExternal(href); else if (target) { if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, path: target.path, line: target.line, mode: event.shiftKey ? 'external' : 'browser' } })); else onOpenFile(target.path, target.line) } }}>{children}</a>
     },
     img: ({ alt }) => <span className="sa-muted">{alt ? '[Image: ' + alt + ']' : '[Image omitted]'}</span>,
     pre: ({ children }) => <MarkdownCodeBlock>{children}</MarkdownCodeBlock>
@@ -102,9 +108,10 @@ export function AgentDialog({ title, children, onClose }: { title: string; child
   useEffect(() => {
     const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null
     ref.current?.showModal()
+    ref.current?.querySelector<HTMLInputElement>('input:not([type="checkbox"]):not([disabled]), textarea:not([disabled])')?.focus()
     return () => { ref.current?.close(); focused?.focus() }
   }, [])
-  return <dialog ref={ref} className="sa-dialog" aria-label={title} onCancel={(event) => { event.preventDefault(); onClose() }}><header><strong>{title}</strong><button aria-label={'Close ' + title} onClick={onClose}><X size={16} /></button></header>{children}</dialog>
+  return <dialog ref={ref} className="sa-dialog" aria-label={title} onMouseDown={(event) => { if (event.target !== event.currentTarget) return; const rect = event.currentTarget.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) onClose() }} onCancel={(event) => { event.preventDefault(); onClose() }}><header><strong>{title}</strong><button aria-label={'Close ' + title} onClick={onClose}><X size={16} /></button></header>{children}</dialog>
 }
 
 export function ImmutableDiff({ sessionId, change, onClose, onOpenFile }: { sessionId: string; change: FileChange; onClose(): void; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
@@ -182,7 +189,7 @@ interface ActivityProps {
   onDiff(change: FileChange): void
   onRespond(item: TimelineItem, decision?: string, answers?: Record<string, string[]>): Promise<void>
 }
-function ToolCard({ item, expanded, onExpand, onOpenFile, sessionId }: ActivityProps): React.JSX.Element | null {
+function ToolCard({ item, expanded, onExpand, onOpenFile, sessionId, cwd }: ActivityProps): React.JSX.Element | null {
   if (item.data.type !== 'tool') return null
   const tool = item.data
   const presentation = toolPresentation(tool)
@@ -194,7 +201,7 @@ function ToolCard({ item, expanded, onExpand, onOpenFile, sessionId }: ActivityP
   return <section className={'sa-tool sa-tool-' + presentation.kind} aria-label={tool.name + ': ' + status}>
     <header><button className="sa-tool-heading" aria-expanded={expanded} onClick={() => onExpand(item.id)}>{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}<strong>{tool.name}</strong><span>{presentation.title !== tool.name ? presentation.title : ''}</span></button><small className={'sa-status status-' + status}>{status.replaceAll('_', ' ')}</small></header>
     {expanded && <>
-      <div className="sa-io"><span>IN</span><div>{presentation.cwd && <small className="sa-cwd">{presentation.cwd}</small>}{presentation.kind === 'custom' || presentation.kind === 'edit' ? <details><summary>Inspect tool input</summary>{input}</details> : input}{presentation.path && <button className="sa-file-link" onClick={() => onOpenFile(presentation.path!)}>{presentation.path}</button>}</div></div>
+      <div className="sa-io"><span>IN</span><div>{presentation.cwd && <small className="sa-cwd">{presentation.cwd}</small>}{presentation.kind === 'custom' || presentation.kind === 'edit' ? <details><summary>Inspect tool input</summary>{input}</details> : input}{presentation.path && <button className="sa-file-link" onClick={(event) => openAgentFile(event, cwd, presentation.path!, onOpenFile)}>{presentation.path}</button>}</div></div>
       <div className="sa-io sa-output"><span>OUT</span><div>{tool.output !== undefined ? <OutputPreview value={tool.output} artifactId={tool.outputArtifactId} sessionId={sessionId} language={outputLanguage} /> : <span className="sa-muted">{status === 'preparing' ? 'Preparing…' : status === 'awaiting_approval' ? 'Awaiting approval.' : status === 'running' ? 'Running…' : 'No output.'}</span>}{tool.stderr && <><small className="sa-stream-name">stderr</small><OutputPreview value={tool.stderr} sessionId={sessionId} /></>}</div></div>
       {(tool.exitCode !== undefined || tool.durationMs !== undefined) && <footer>{tool.exitCode !== undefined && <span>Exit {tool.exitCode}</span>}{tool.durationMs !== undefined && <span>{(tool.durationMs / 1000).toFixed(2)} s</span>}</footer>}
     </>}
@@ -241,7 +248,7 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
     case 'tool': body = <ToolCard {...props} />; break
     case 'interaction': body = <InteractionCard {...props} />; break
     case 'changes': body = <section className="sa-changes" aria-label="File changes">{data.changes.map((change, index) => <div className="sa-file-change" key={change.path + '-' + index}>
-      <header><button className="sa-file-link" onClick={() => props.onOpenFile(change.path)}><FileCode2 size={13} /><code>{change.oldPath ? change.oldPath + ' → ' : ''}{change.path}</code></button><span className="sa-diff-count">{change.additions !== undefined && <b>+{change.additions}</b>}{change.deletions !== undefined && <em>−{change.deletions}</em>}</span><small>{change.status}</small></header>
+      <header><button className="sa-file-link" onClick={(event) => openAgentFile(event, props.cwd, change.path, props.onOpenFile)}><FileCode2 size={13} /><code>{change.oldPath ? change.oldPath + ' → ' : ''}{change.path}</code></button><span className="sa-diff-count">{change.additions !== undefined && <b>+{change.additions}</b>}{change.deletions !== undefined && <em>−{change.deletions}</em>}</span><small>{change.status}</small></header>
       {change.patch && <PatchPreview change={change} />}
       {(change.patch || change.artifactId) ? <button className="sa-expand-diff" onClick={() => props.onDiff(change)}><Maximize2 size={12} /> Click to expand diff</button> : change.limitation && <details className="sa-change-limitation"><summary>Diff unavailable</summary><p>{change.limitation}</p></details>}
     </div>)}</section>; break

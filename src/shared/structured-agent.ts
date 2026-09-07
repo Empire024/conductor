@@ -72,8 +72,10 @@ export interface FileChange {
   status: 'proposed' | 'applied' | 'failed' | 'rejected' | 'reverted'
   limitation?: string
 }
+export interface QueuedPrompt { id: string; text: string; settings: SessionSettings; attachments: ContextAttachment[] }
 export type AgentEventData =
-  | { type: 'session'; phase: SessionPhase; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings }
+  | { type: 'queue'; prompt: QueuedPrompt | null }
+  | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings }
   | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot' }
   | { type: 'tool'; name: string; description?: string; input?: Json; inputDelta?: string; status: ActivityStatus; output?: string; outputMode?: 'delta' | 'snapshot'; stderr?: string; exitCode?: number; durationMs?: number; outputArtifactId?: string }
   | { type: 'changes'; changes: FileChange[] }
@@ -116,6 +118,8 @@ export interface TimelineItem {
   data: AgentEventData
 }
 export interface SessionProjection {
+  view?: 'visual' | 'cli'
+  queued?: QueuedPrompt | null
   sessionId: string
   runtimeId: string
   nativeSessionId?: string
@@ -149,6 +153,8 @@ export interface InteractionResponse {
   answers?: Record<string, string[]>
 }
 export interface StructuredAgentBridge {
+  queue(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
+  cancelQueued(id: string): Promise<QueuedPrompt | null>
   connect(id: string): Promise<void>
   snapshot(id: string): Promise<SessionProjection | null>
   events(id: string, after?: number): Promise<AgentEvent[]>

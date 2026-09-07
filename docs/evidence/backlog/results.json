@@ -1,0 +1,40 @@
+{
+  "synthetic": true,
+  "checks": [
+    "Ctrl+E searches and opens another loaded project without changing the active workspace",
+    "File tabs show dirty state and Cancel/Save preserve exact editor bytes",
+    "Browser file tab has a visual cue and a sandboxed browser view",
+    "New file tab creates a file in its owning project",
+    "Don't Save discards the editor draft without modifying the file",
+    "Explorer shows all roots, collapses them, and dismisses inline rename on outside click",
+    "Right-click theme menu selects and toggles closed",
+    "Attach focuses autocomplete and the composer has no heavy focus outline",
+    "Clicking outside a native modal dismisses it",
+    "CLI switch uses the same native ID and returns to Chat",
+    "Send becomes Stop or Queue while running; Escape stops and queued text returns intact to the draft",
+    "Long prose and code stay inside the conversation width",
+    "Agent file clicks select editor, embedded browser, or external browser; Ctrl+E works from the browser guest",
+    "Project drag ordering persists in the database",
+    "Workspaces can be dragged, persisted, and closed from the sidebar",
+    "Repeating the project and tab menu triggers closes their dropdowns",
+    "App close asks about dirty files and Cancel keeps the window and edits open",
+    "Version number checks for updates and confirms the installed version is current",
+    "Download progress uses a thin progress indicator with readable status",
+    "Ctrl+E still opens files when every workspace is closed"
+  ],
+  "errors": [],
+  "monacoCancellations": [
+    "Canceled: Canceled\n    at Delayer.cancel (<renderer-bundle>:24489:23)\n    at Delayer.dispose (<renderer-bundle>:24498:10)\n    at dispose (<renderer-bundle>:17445:13)\n    at DisposableStore.clear (<renderer-bundle>:17508:7)\n    at DisposableStore.dispose (<renderer-bundle>:17492:10)\n    at WordHighlighter2.dispose (<renderer-bundle>:177519:19)\n    at UniqueContainer.value (<renderer-bundle>:177545:31)\n    at Emitter._deliver (<renderer-bundle>:18325:16)\n    at Emitter._deliverQueue (<renderer-bundle>:18334:12)\n    at Emitter.fire (<renderer-bundle>:18354:12)",
+    "Canceled: Canceled\n    at Delayer.cancel (<renderer-bundle>:24489:23)\n    at Delayer.dispose (<renderer-bundle>:24498:10)\n    at dispose (<renderer-bundle>:17445:13)\n    at DisposableStore.clear (<renderer-bundle>:17508:7)\n    at DisposableStore.dispose (<renderer-bundle>:17492:10)\n    at WordHighlighter2.dispose (<renderer-bundle>:177519:19)\n    at UniqueContainer.value (<renderer-bundle>:177545:31)\n    at Emitter._deliver (<renderer-bundle>:18325:16)\n    at Emitter._deliverQueue (<renderer-bundle>:18334:12)\n    at Emitter.fire (<renderer-bundle>:18354:12)",
+    "Canceled: Canceled\n    at Delayer.cancel (<renderer-bundle>:24489:23)\n    at Delayer.dispose (<renderer-bundle>:24498:10)\n    at dispose (<renderer-bundle>:17445:13)\n    at DisposableStore.clear (<renderer-bundle>:17508:7)\n    at DisposableStore.dispose (<renderer-bundle>:17492:10)\n    at WordHighlighter2.dispose (<renderer-bundle>:177519:19)\n    at UniqueContainer.value (<renderer-bundle>:177545:31)\n    at Emitter._deliver (<renderer-bundle>:18325:16)\n    at Emitter._deliverQueue (<renderer-bundle>:18334:12)\n    at Emitter.fire (<renderer-bundle>:18354:12)"
+  ],
+  "validation": {
+    "vitestFiles": 45,
+    "vitestTests": 291,
+    "nodeTests": 13,
+    "build": "passed",
+    "nativeProviderInference": false,
+    "externalBrowserLaunch": "stubbed and URL verified",
+    "nativeClipboard": "not verified in the isolated Windows test desktop"
+  }
+}

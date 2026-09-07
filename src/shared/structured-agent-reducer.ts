@@ -29,8 +29,10 @@ function bound(data: AgentEventData): AgentEventData {
 export function projectAgentEvent(state: SessionProjection, event: AgentEvent): SessionProjection {
   if (event.sessionId !== state.sessionId || event.sequence <= state.sequence) return state
   let next = { ...state, sequence: event.sequence, runtimeId: event.runtimeId, nativeSessionId: state.nativeSessionId ?? event.nativeSessionId }
+  if (event.data.type === 'queue') return { ...next, queued: event.data.prompt }
   if (event.data.type === 'session') {
     next.phase = event.data.phase
+    next.view = event.data.view ?? next.view
     next.nativeSessionId = event.data.nativeSessionId ?? next.nativeSessionId
     next.capabilities = event.data.capabilities ?? next.capabilities
     next.title = event.data.title ?? next.title

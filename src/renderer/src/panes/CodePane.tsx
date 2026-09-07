@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Editor, { type BeforeMount, type OnMount } from '@monaco-editor/react'
-import { Check, FilePlus2, LoaderCircle, Save } from 'lucide-react'
+import { Check, FilePlus2, LoaderCircle, Save, WrapText } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
 import { dispatchAgentContext } from './StructuredAgentPane'
 
@@ -16,6 +16,8 @@ const languageFor = (path: string): string => {
 }
 
 export function CodePane({ project, tabId, path, line }: { project: ProjectRecord; tabId: string; path: string; line?: number }): React.JSX.Element {
+  const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('conductor.editorWordWrap') !== 'off')
+  const toggleWrap = (): void => setWordWrap((current) => { localStorage.setItem('conductor.editorWordWrap', current ? 'off' : 'on'); return !current })
   const [value, setValue] = useState('')
   const [savedValue, setSavedValue] = useState('')
   const [loading, setLoading] = useState(true)
@@ -23,6 +25,7 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
   const [recovered, setRecovered] = useState(false)
   const [error, setError] = useState('')
   const [theme, setTheme] = useState(document.documentElement.dataset.theme === 'light' ? 'conductor-light' : 'conductor-dark')
+  const loadedRef = useRef(false)
   const valueRef = useRef(value)
   const savedValueRef = useRef(savedValue)
   const pathRef = useRef(path)
@@ -38,7 +41,7 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
   const language = useMemo(() => languageFor(path), [path])
 
   const flushDraft = (): void => {
-    if (valueRef.current === savedValueRef.current) return
+    if (!loadedRef.current) return
     if (draftTimerRef.current !== null) {
       window.clearTimeout(draftTimerRef.current)
       draftTimerRef.current = null
@@ -61,6 +64,7 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
 
   useEffect(() => {
     let cancelled = false
+    loadedRef.current = false
     setLoading(true)
     setRecovered(false)
     setError('')
@@ -75,6 +79,7 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
       viewStateRef.current = draft?.viewState ?? null
       setValue(recoveredContent)
       setSavedValue(content)
+      loadedRef.current = true
       setRecovered(Boolean(draft && draft.content !== content))
     }).catch((reason: unknown) => {
       if (!cancelled) setError(reason instanceof Error ? reason.message : `Could not open ${path}`)
@@ -91,10 +96,12 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
     const onVisibility = (): void => {
       if (document.visibilityState === 'hidden') flushDraft()
     }
+    window.addEventListener('conductor:flush-editors', flushDraft)
     window.addEventListener('pagehide', flushDraft)
     window.addEventListener('beforeunload', flushDraft)
     document.addEventListener('visibilitychange', onVisibility)
     return () => {
+      window.removeEventListener('conductor:flush-editors', flushDraft)
       window.removeEventListener('pagehide', flushDraft)
       window.removeEventListener('beforeunload', flushDraft)
       document.removeEventListener('visibilitychange', onVisibility)
@@ -109,15 +116,30 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
     return () => observer.disconnect()
   }, [])
 
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('conductor:editor-dirty', { detail: { id: tabId, dirty: !loading && dirty } }))
+  }, [tabId, dirty, loading])
+
+  useEffect(() => window.conductor.files.onDraftResolved((result) => {
+    if (result.tabId !== tabId) return
+    savedValueRef.current = result.content
+    setSavedValue(result.content)
+    if (valueRef.current === result.submitted) { valueRef.current = result.content; setValue(result.content); setRecovered(false) }
+    else flushDraft()
+    queueMicrotask(() => window.dispatchEvent(new CustomEvent('conductor:editor-dirty', { detail: { id: tabId, dirty: valueRef.current !== savedValueRef.current } })))
+  }), [tabId])
+
   const save = async (): Promise<void> => {
     setSaving(true)
     setError('')
     try {
-      await window.conductor.files.write(project.id, path, valueRef.current)
-      savedValueRef.current = valueRef.current
-      setSavedValue(valueRef.current)
+      const submittedValue = valueRef.current
+      await window.conductor.files.write(project.id, path, submittedValue)
+      savedValueRef.current = submittedValue
+      setSavedValue(submittedValue)
       setRecovered(false)
-      await window.conductor.files.removeDraft(tabId)
+      if (valueRef.current === submittedValue) await window.conductor.files.removeDraft(tabId)
+      else flushDraft()
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : `Could not save ${path}`
       setError(message)
@@ -126,6 +148,10 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
       setSaving(false)
     }
   }
+
+  useEffect(() => {
+    if (line && editorRef.current) { editorRef.current.setPosition({ lineNumber: line, column: 1 }); editorRef.current.revealLineInCenter(line); editorRef.current.focus() }
+  }, [line])
 
   const beforeMount: BeforeMount = (monaco) => {
     monaco.editor.defineTheme('conductor-dark', {
@@ -195,23 +221,12 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
         dispatchAgentContext(project.id, { id: crypto.randomUUID(), kind: 'diagnostics', name: pathRef.current, path: pathRef.current, content: markers.map((marker) => pathRef.current + ':' + marker.startLineNumber + ':' + marker.startColumn + ' ' + marker.message).join('\n') })
       }
     })
+    _editor.addAction({ id: 'conductor-word-wrap', label: 'Toggle word wrap', keybindings: [monaco.KeyMod.Alt | monaco.KeyCode.KeyZ], run: toggleWrap })
     _editor.addAction({
       id: 'conductor-save',
       label: 'Save',
       keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
       run: () => save()
-    })
-    let copyTimer = 0
-    _editor.onDidChangeCursorSelection(({ selection }) => {
-      window.clearTimeout(copyTimer)
-      if (selection.isEmpty()) return
-      copyTimer = window.setTimeout(() => {
-        const text = _editor.getModel()?.getValueInRange(selection) ?? ''
-        if (!text) return
-        void navigator.clipboard.writeText(text).then(() => {
-          window.dispatchEvent(new CustomEvent('conductor:toast', { detail: `Copied ${text.length.toLocaleString()} characters` }))
-        })
-      }, 220)
     })
     if (viewStateRef.current) {
       _editor.restoreViewState(viewStateRef.current as Parameters<typeof _editor.restoreViewState>[0])
@@ -250,6 +265,7 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
         <span className="code-path">{path}</span>
         {recovered && <span className="code-recovered">Recovered draft</span>}
         <span className="code-language">{language}</span>
+        <button aria-pressed={wordWrap} onClick={toggleWrap} title="Toggle word wrap (Alt+Z)" aria-label="Toggle word wrap"><WrapText size={14} /></button>
         <button onClick={attachContext} disabled={loading} title="Attach selected range, or current editor content, to the last focused agent"><FilePlus2 size={13} /> Attach context</button>
         <button className={dirty ? 'dirty' : ''} disabled={!dirty || saving} onClick={() => void save()}>
           {saving ? <LoaderCircle className="spin" size={13} /> : dirty ? <Save size={13} /> : <Check size={13} />}
@@ -275,6 +291,9 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
           }}
           options={{
             automaticLayout: true,
+            wordWrap: wordWrap ? 'on' : 'off',
+            wrappingIndent: 'same',
+            scrollbar: { alwaysConsumeMouseWheel: false },
             fontFamily: 'Cascadia Code, Cascadia Mono, Consolas, monospace',
             fontSize: 12.5,
             lineHeight: 20,

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, renameSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, dirname } from 'node:path'
+import { claudeHistoryPath } from './native-history'
 import { ConductorDatabase } from './database'
 import { StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
@@ -440,5 +441,94 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(resumed.submissions).toEqual([{ text: 'Pending effort-selected turn', settings: selected, attachments: [] }])
     expect(original.submissions).toHaveLength(1)
     expect(f.database.structured.snapshot(f.spec.id)?.items.filter((item) => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(userItemsBefore + 1)
+  })
+})
+
+describe('queued messages and native CLI handoff', () => {
+  it('restores an interrupted queue after restart without submitting it', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'active', settings)
+    await f.manager.queue(f.spec.id, 'durable queued text', settings)
+    f.manager.dispose()
+    const restarted = new StructuredSessions(f.database, () => 'synthetic-executable', f.broadcast, f.factory)
+    managers.push(restarted); restarted.ensure(f.spec)
+    expect(f.database.structured.snapshot(f.spec.id)?.queued?.text).toBe('durable queued text')
+    expect(f.adapters.reduce((count, adapter) => count + adapter.submissions.length, 0)).toBe(1)
+    expect(restarted.cancelQueued(f.spec.id)?.text).toBe('durable queued text')
+  })
+  it('imports only the CLI portion of Claude history after returning to Chat', async () => {
+    const f = fixture('claude')
+    vi.stubEnv('CLAUDE_CONFIG_DIR', join(f.root, 'claude-profile'))
+    await f.manager.submit(f.spec.id, 'existing conversation', settings); f.current.finish()
+    const nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId!
+    const log = claudeHistoryPath(f.workspace, nativeId)
+    mkdirSync(dirname(log), { recursive: true })
+    const row = (uuid: string, type: string, content: unknown) => JSON.stringify({ uuid, type, sessionId: nativeId, message: { content } }) + '\n'
+    const original = row('before', 'user', 'existing conversation')
+    writeFileSync(log, original)
+    await f.manager.prepareCli(f.spec.id)
+    writeFileSync(log, original + row('cli-user', 'user', 'native CLI question') + row('cli-answer', 'assistant', [{ type: 'text', text: 'native CLI answer' }]) + row('cli-tool', 'assistant', [{ type: 'tool_use', id: 'tool-1', name: 'Read', input: { file_path: 'file.ts' } }]) + row('cli-result', 'user', [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'file content' }]))
+    await f.manager.finishCli(f.spec.id)
+    await f.manager.finishCli(f.spec.id)
+    const state = f.database.structured.snapshot(f.spec.id)!
+    const texts = state.items.flatMap(item => item.data.type === 'text' ? [item.data.text] : [])
+    expect(texts.filter(text => text === 'existing conversation')).toHaveLength(1)
+    expect(texts.filter(text => text === 'native CLI answer')).toHaveLength(1)
+    expect(texts).toContain('native CLI question')
+    expect(state.items.some(item => item.data.type === 'tool' && item.data.status === 'completed' && item.data.output === 'file content')).toBe(true)
+    expect(state.nativeSessionId).toBe(nativeId)
+  })
+  it('owns a queued message across views and dispatches it exactly once after completion', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'first', settings)
+    await f.manager.queue(f.spec.id, 'second', settings)
+    expect(f.database.structured.snapshot(f.spec.id)?.queued?.text).toBe('second')
+    await expect(f.manager.queue(f.spec.id, 'duplicate', settings)).rejects.toThrow('already queued')
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    expect(f.current.submissions.map((item) => item.text)).toEqual(['first', 'second'])
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+  })
+  it('keeps a queued message through interruption and returns its exact context when removed', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'first', settings)
+    await f.manager.queue(f.spec.id, 'queued', settings, [{ id: 'context', kind: 'selection', name: 'selection', content: 'exact text' }])
+    await f.manager.interrupt(f.spec.id)
+    expect(f.current.submissions).toHaveLength(1)
+    const queued = f.manager.cancelQueued(f.spec.id)!
+    expect(queued.text).toBe('queued')
+    expect(queued.attachments[0]?.content).toBe('exact text')
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+  })
+  it('does not replace conversation identity when moving between Chat and CLI', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'existing conversation', settings); f.current.finish()
+    const original = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
+    const previous = f.current
+    const handoff = await f.manager.prepareCli(f.spec.id)
+    expect(handoff.nativeSessionId).toBe(original)
+    expect(previous.disposed).toBe(true)
+    expect(f.database.structured.snapshot(f.spec.id)?.view).toBe('cli')
+    await expect(f.manager.submit(f.spec.id, 'wrong view', settings)).rejects.toThrow('CLI')
+    await expect(f.manager.connectSession(f.spec.id)).rejects.toThrow('CLI')
+    await f.manager.finishCli(f.spec.id)
+    expect(f.current.options.nativeSessionId).toBe(original)
+    expect(f.database.structured.snapshot(f.spec.id)?.view).toBe('visual')
+    expect(f.database.structured.snapshot(f.spec.id)?.items.filter((item) => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(1)
+  })
+  it('rejects CLI handoff while a turn or queued prompt owns execution', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'active', settings)
+    await expect(f.manager.prepareCli(f.spec.id)).rejects.toThrow('Finish or stop')
+    expect(f.current.disposed).toBe(false)
+  })
+  it('allocates one Claude native ID before a new CLI conversation and reuses it in Chat', async () => {
+    const f = fixture('claude', false)
+    const handoff = await f.manager.prepareCli(f.spec.id)
+    expect(handoff.fresh).toBe(true)
+    expect(handoff.nativeSessionId).toMatch(/^[a-f0-9-]{36}$/)
+    await f.manager.finishCli(f.spec.id)
+    expect(f.current.options.nativeSessionId).toBe(handoff.nativeSessionId)
+    expect(f.current.options.newNativeSession).toBe(true)
   })
 })

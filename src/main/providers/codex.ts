@@ -23,7 +23,7 @@ import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetRe
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 
 export const CODEX_PROTOCOL_BASELINE = '0.153.4'
-type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'>
+type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait'>>
 /** Injectable only in backend contract tests; no renderer can supply a transport. */
 export interface CodexAdapterDependencies {
   transport?: (options: TransportOptions) => WireTransport
@@ -387,6 +387,20 @@ export class CodexAdapter implements ProviderAdapter {
     return json(Object.fromEntries(results.map((result, index) => [requests[index]!.label, result.status === 'fulfilled' ? { status: 'available', payload: result.value } : { status: 'unavailable', message: result.reason instanceof Error ? result.reason.message : 'Provider discovery failed' }])))
   }
 
+  async history(): Promise<import('../native-history').NativeHistoryItem[]> {
+    if (!this.threadId) return []
+    const result = await this.request<import('./generated/codex/v2/ThreadReadResponse').ThreadReadResponse>('thread/read', { threadId: this.threadId, includeTurns: true })
+    const items: import('../native-history').NativeHistoryItem[] = []
+    for (const turn of result.thread.turns ?? []) for (const item of turn.items) {
+      const base = { id: turn.id + ':' + item.id, turnId: turn.id }
+      if (item.type === 'userMessage') items.push({ ...base, data: { type: 'text', role: 'user', mode: 'snapshot', text: item.content.flatMap((part) => part.type === 'text' ? [part.text] : []).join('\n') } })
+      else if (item.type === 'agentMessage') items.push({ ...base, data: { type: 'text', role: 'assistant', mode: 'snapshot', text: item.text } })
+      else if (item.type === 'commandExecution') items.push({ ...base, data: { type: 'tool', name: 'Command', input: { command: item.command, cwd: item.cwd }, status: item.exitCode ? 'failed' : item.status === 'completed' ? 'completed' : 'interrupted', output: item.aggregatedOutput ?? undefined, exitCode: item.exitCode ?? undefined } })
+      else if (item.type === 'fileChange') items.push({ ...base, data: { type: 'changes', changes: codexChanges(item.changes, item.status === 'completed' ? 'applied' : 'failed') } })
+    }
+    return items.slice(-2000)
+  }
+  async stop(): Promise<void> { this.dispose(); await this.transport?.closeAndWait?.() }
   dispose(): void {
     if (this.disposed) return
     this.disposed = true

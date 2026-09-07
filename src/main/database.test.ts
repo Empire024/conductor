@@ -179,3 +179,40 @@ describe('ConductorDatabase persistence', () => {
     })
   })
 })
+
+describe('workspace navigation and file draft persistence', () => {
+  it('preserves project and workspace drag order across restart and metadata updates', () => {
+    withDatabasePath((path, root) => {
+      let db = new ConductorDatabase(path)
+      try {
+        const a = db.upsertProject(join(root, 'a'), 'A'), b = db.upsertProject(join(root, 'b'), 'B')
+        db.reorderProjects([a.id, b.id])
+        const first = db.listSessions(a.id)[0]!, second = db.createSession(a.id, 'Second')
+        db.reorderSessions(a.id, [second.id, first.id])
+        db.close(); db = new ConductorDatabase(path)
+        expect(db.listProjects().map((item) => item.id)).toEqual([a.id, b.id])
+        expect(db.listSessions(a.id).map((item) => item.id)).toEqual([second.id, first.id])
+        expect(() => db.reorderProjects([a.id, a.id])).toThrow('list changed')
+        const c = db.upsertProject(join(root, 'c'), 'C')
+        expect(db.listProjects().map((item) => item.id)).toEqual([a.id, b.id, c.id])
+      } finally { db.close() }
+    })
+  })
+  it('moves every hidden draft in a renamed directory without affecting another project or sibling', () => {
+    withDatabasePath((path, root) => {
+      const db = new ConductorDatabase(path)
+      try {
+        const a = db.upsertProject(join(root, 'a'), 'A'), b = db.upsertProject(join(root, 'b'), 'B')
+        db.saveEditorDraft('hidden-a', a.id, 'src/file.ts', 'unsaved a', null)
+        db.saveEditorDraft('hidden-b', a.id, 'src/nested/file.ts', 'unsaved b', null)
+        db.saveEditorDraft('other', b.id, 'src/file.ts', 'other project', null)
+        db.saveEditorDraft('sibling', a.id, 'src-more/file.ts', 'sibling', null)
+        db.remapEditorDrafts(a.id, 'src', 'renamed', true)
+        expect(db.getEditorDraft('hidden-a', a.id, 'renamed/file.ts')?.content).toBe('unsaved a')
+        expect(db.getEditorDraft('hidden-b', a.id, 'renamed/nested/file.ts')?.content).toBe('unsaved b')
+        expect(db.getEditorDraft('other', b.id, 'src/file.ts')?.content).toBe('other project')
+        expect(db.getEditorDraft('sibling', a.id, 'src-more/file.ts')?.content).toBe('sibling')
+      } finally { db.close() }
+    })
+  })
+})

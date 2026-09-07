@@ -1,3 +1,4 @@
+import { ProviderIcon } from '../components/ProviderIcon'
 import { useEffect, useId, useRef, useState } from 'react'
 import { Check, ChevronDown, LoaderCircle, Search } from 'lucide-react'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
@@ -46,7 +47,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
 
   return <>
     <div className="sa-model-control" ref={host}>
-      <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title="Choose model" onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><span>{label}</span><ChevronDown size={12} /></button>
+      <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title="Choose model" onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><ProviderIcon provider={capabilities?.provider} model={model} size={14} /><span>{label}</span><ChevronDown size={12} /></button>
       {open && <div className="sa-model-menu" onKeyDown={event => {
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close() }
         if (event.key === 'Enter' && event.target instanceof HTMLInputElement) {
@@ -65,7 +66,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
         <label className="sa-model-search"><Search size={13} /><input autoFocus aria-label="Search models" placeholder="Search models" value={query} onChange={event => setQuery(event.target.value)} /></label>
         {loading && <p className="sa-model-loading" role="status"><LoaderCircle size={13} className="spin" /> Loading models…</p>}
         {error && <p role="alert" className="sa-error">{error}</p>}
-        <div id={listId} role="listbox" aria-label="Models">{choices.map(option => <button type="button" role="option" aria-selected={option.id === model} key={option.id} onClick={() => { onChange({ model: option.id || undefined }); close() }}><span>{option.label}</span>{option.id === model && <Check size={13} />}</button>)}</div>
+        <div id={listId} role="listbox" aria-label="Models">{choices.map(option => <button type="button" role="option" aria-selected={option.id === model} key={option.id} onClick={() => { onChange({ model: option.id || undefined }); close() }}><ProviderIcon provider={capabilities?.provider} model={option.id} size={14} /><span>{option.label}</span>{option.id === model && <Check size={13} />}</button>)}</div>
         {!loading && !error && !choices.length && <p className="sa-model-loading">No matching models</p>}
       </div>}
     </div>

@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { CheckCircle2, Download, RefreshCw, RotateCcw, X } from 'lucide-react'
 import type { AppUpdateState } from '../../../shared/models'
 
@@ -14,13 +15,14 @@ export function UpdatePrompt({
   onAction(): void
   onDismiss(): void
 }): React.JSX.Element {
+  useEffect(() => { const escape = (event: KeyboardEvent): void => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onDismiss() } }; window.addEventListener('keydown', escape, true); return () => window.removeEventListener('keydown', escape, true) }, [onDismiss])
   const downloading = state.phase === 'downloading'
   const installing = state.phase === 'installing'
   const busy = downloading || installing
   const progress = typeof state.progress === 'number' && Number.isFinite(state.progress) ? Math.round(Math.max(0, Math.min(100, state.progress))) : undefined
   const ready = state.phase === 'ready'
   const failed = state.phase === 'error'
-  const Icon = ready ? CheckCircle2 : busy || failed ? RefreshCw : Download
+  const Icon = ready ? CheckCircle2 : failed ? RefreshCw : Download
   const title = installing ? 'Preparing to restart Conductor' : ready
     ? 'Update ready to install'
     : failed
@@ -36,10 +38,10 @@ export function UpdatePrompt({
   const action = installing ? 'Preparing restart…' : ready ? 'Restart to update' : failed ? 'Retry update' : 'Download update'
 
   return (
-    <div className="update-prompt-backdrop" role="presentation">
+    <div className="update-prompt-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onDismiss() }}>
       <section className="update-prompt" role="dialog" aria-modal="true" aria-labelledby="update-prompt-title">
         <header>
-          <span className={`update-prompt-icon ${ready ? 'ready' : ''}`}><Icon className={busy ? 'spin' : ''} size={20} /></span>
+          <span className={`update-prompt-icon ${ready ? 'ready' : ''}`}><Icon size={20} /></span>
           <div>
             <strong id="update-prompt-title">{title}</strong>
             <span>{state.source === 'local' ? 'Local test build' : 'Installed-app update'} · {state.currentVersion} → {state.availableVersion}</span>
@@ -47,7 +49,7 @@ export function UpdatePrompt({
           <button title="Not now" aria-label="Not now" onClick={onDismiss}><X size={15} /></button>
         </header>
         <p role={failed ? 'alert' : 'status'} aria-live="polite">{detail}</p>
-        {downloading && progress !== undefined && <progress aria-label="Update download progress" value={progress} max={100} />}
+        {downloading && <progress aria-label="Update download progress" value={progress} max={100} />}
         {state.source === 'local' && <p>This build was published locally on this PC for testing. It may contain unfinished features.</p>}
         <label className="update-auto-choice">
           <input type="checkbox" checked={autoDownload} onChange={(event) => onAutoDownload(event.target.checked)} />
@@ -56,7 +58,7 @@ export function UpdatePrompt({
         <footer>
           <button onClick={onDismiss}>Not now</button>
           <button className="primary" disabled={busy} aria-busy={busy} onClick={onAction}>
-            {busy ? <RefreshCw className="spin" size={13} /> : ready ? <RotateCcw size={13} /> : <Download size={13} />}
+            {ready ? <RotateCcw size={13} /> : <Download size={13} />}
             {downloading ? progress === undefined ? 'Preparing download…' : `Downloading ${progress}%` : action}
           </button>
         </footer>

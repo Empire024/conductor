@@ -15,6 +15,7 @@ import type { ConductorDatabase } from './database'
 import { parseUsageLimitReset } from './usage-limit'
 import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSignalAgentOutput } from './agent-activity'
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
+import { NativeCliManager } from './native-cli-manager'
 import { StructuredSessions } from './structured-sessions'
 
 export { parseUsageLimitReset } from './usage-limit'
@@ -198,6 +199,7 @@ const stripAnsi = (value: string): string =>
 
 export class AgentManager {
   readonly structured: StructuredSessions
+  readonly nativeCli: NativeCliManager
   private readonly agents = new Map<string, LiveAgent>()
   private readonly continuationTimers = new Map<string, NodeJS.Timeout>()
   private disposing = false
@@ -217,6 +219,7 @@ export class AgentManager {
         if (event.data.type !== 'tool' && event.data.type !== 'changes') return
         try { collaboration?.observeEvent(spec, { id: event.id, agentSessionId: spec.id, type: event.data.type === 'changes' ? 'file_change' : 'tool_call', message: event.data.type === 'tool' ? event.data.name : event.data.changes.map(change => change.path).join(', '), metadata: { structured: true, itemId: event.itemId, input: event.data.type === 'tool' ? event.data.input : undefined }, createdAt: event.timestamp }) } catch { /* Coordination remains advisory. */ }
       })
+    this.nativeCli = new NativeCliManager(this.structured, database, (provider) => providers[provider].resolveExecutable(), broadcast)
   }
 
   listProviders(): AgentProviderInfo[] {
@@ -516,6 +519,7 @@ export class AgentManager {
   }
 
   killProject(projectId: string): void {
+    this.nativeCli.killWhere((spec) => spec.projectId === projectId)
     this.structured.killWhere(spec => spec.projectId === projectId)
     for (const [id, agent] of this.agents) {
       if (agent.spec.projectId === projectId) this.kill(id)
@@ -523,6 +527,7 @@ export class AgentManager {
   }
 
   killSession(sessionId: string): void {
+    this.nativeCli.killWhere((spec) => spec.sessionId === sessionId)
     this.structured.killWhere(spec => spec.sessionId === sessionId)
     for (const [id, agent] of this.agents) {
       if (agent.spec.sessionId === sessionId) this.kill(id)
@@ -530,6 +535,7 @@ export class AgentManager {
   }
 
   dispose(): void {
+    this.nativeCli.dispose()
     this.structured.dispose()
     this.disposing = true
     for (const id of [...this.agents.keys()]) this.kill(id, false)

@@ -1,3 +1,6 @@
+import { AppVersionButton } from './components/AppVersionButton'
+import { WorkspaceFiles } from './components/WorkspaceFiles'
+import { openWorkspaceFile } from './components/workspace-files-state'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { Bot, Braces, ExternalLink, FolderGit2, Gauge, LayoutGrid, MemoryStick, PanelLeft, PanelLeftOpen, PanelRight, Workflow, X } from 'lucide-react'
@@ -23,6 +26,8 @@ interface DetachedBundle {
 }
 
 export function DetachedWindowApp({ detachedId }: { detachedId: string }): React.JSX.Element {
+  const [loadedProjects, setLoadedProjects] = useState<ProjectRecord[]>([])
+  useEffect(() => { const refresh = (): void => { void window.conductor.projects.list().then(setLoadedProjects) }; refresh(); window.addEventListener('focus', refresh); return () => window.removeEventListener('focus', refresh) }, [])
   const [bundle, setBundle] = useState<DetachedBundle | null>(null)
   const [layout, setLayout] = useState<WorkspaceLayout | null>(null)
   const [maximizedGroupId, setMaximizedGroupId] = useState<string | null>(null)
@@ -39,7 +44,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
   const layoutRef = useRef<WorkspaceLayout | null>(layout)
   const maximizedGroupIdRef = useRef<string | null>(maximizedGroupId)
   const checkpointTimerRef = useRef<number | null>(null)
-  const { updateState, runUpdateAction } = useAppUpdates()
+  const { updateState, runUpdateAction, checkForUpdates } = useAppUpdates()
   layoutRef.current = layout
   maximizedGroupIdRef.current = maximizedGroupId
 
@@ -146,6 +151,9 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
         projectName={bundle.project.name}
         themeVariant={resolveThemeVariant(settings)}
         themeAuto={settings.themeAuto}
+        themeId={settings.themeId}
+        onTheme={(id) => void window.conductor.settings.setTheme(id).then(setSettings)}
+        onThemeAuto={(enabled) => void window.conductor.settings.setThemeAuto(enabled).then(setSettings)}
         onThemeVariant={(themeVariant) => {
           setSettings((current) => ({ ...current, themeAuto: false, themeVariant }))
           void (async () => {
@@ -194,7 +202,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
           </aside>
         )}
         <main className={`detached-stage workspace-content-shell utility-${utilitySide} ${utilityPanel ? 'has-utility' : ''} ${utilityDragging ? 'utility-is-dragging' : ''}`}>
-          <div className="workspace-content-main">
+          <div className="workspace-content-main runtime-document-stage">
             <PaneWorkspace
               layout={layout}
               project={bundle.project}
@@ -206,6 +214,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               onMaximize={setMaximizedGroupId}
               onClosed={(tab) => setClosedTabs((current) => [...current, tab].slice(-20))}
               onDetach={detachAgain}
+              onOpenFile={(path, line) => openWorkspaceFile(bundle.project.id, path, 'editor', line)}
               canReopen={closedTabs.length > 0}
               onReopen={(groupId) => {
                 const tab = closedTabs.at(-1)
@@ -215,6 +224,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
                 setClosedTabs((current) => current.slice(0, -1))
               }}
             />
+            <WorkspaceFiles key={detachedId} projects={loadedProjects} projectId={bundle.project.id} workspaceId={'detached:' + detachedId} />
           </div>
           {utilityPanel && (
             <aside className={`workspace-utility-drawer detached-utility-drawer utility-${utilitySide} ${['agents', 'tasks', 'routines'].includes(utilityPanel) ? 'orchestration-drawer' : ''}`}>
@@ -278,11 +288,11 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
           ))}
         </main>
       </div>
-      {isUpdateActionVisible(updateState) && (
+      {(isUpdateActionVisible(updateState) || updateState.currentVersion) && (
         <footer className="statusbar detached-statusbar">
           <span className="status-spacer" />
           <AppUpdateButton state={updateState} onAction={() => void runUpdateAction()} />
-          {updateState.currentVersion && <span className="status-version">v{updateState.currentVersion}</span>}
+          {updateState.currentVersion && <AppVersionButton state={updateState} onCheck={checkForUpdates} />}
         </footer>
       )}
     </div>

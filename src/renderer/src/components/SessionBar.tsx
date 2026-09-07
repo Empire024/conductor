@@ -9,7 +9,7 @@ interface SessionBarProps {
   templates: LayoutTemplateRecord[]
   onSelect(id: string): void
   onNew(): void
-  onClose(id: string): void
+  onClose(id: string): void | Promise<void>
   onRename(id: string, name: string): void
   onReopen(): void
   onPalette(): void
@@ -27,6 +27,14 @@ const TAB_ANIMATION_MS = 110
 
 export function SessionBar(props: SessionBarProps): React.JSX.Element {
   const [layoutsOpen, setLayoutsOpen] = useState(false)
+  const layoutsRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!layoutsOpen) return
+    const outside = (event: PointerEvent): void => { if (!layoutsRef.current?.contains(event.target as Node)) setLayoutsOpen(false) }
+    const escape = (event: KeyboardEvent): void => { if (event.key === 'Escape') { event.stopPropagation(); setLayoutsOpen(false) } }
+    window.addEventListener('pointerdown', outside); window.addEventListener('keydown', escape, true)
+    return () => { window.removeEventListener('pointerdown', outside); window.removeEventListener('keydown', escape, true) }
+  }, [layoutsOpen])
   const [layoutName, setLayoutName] = useState('')
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
@@ -92,7 +100,7 @@ export function SessionBar(props: SessionBarProps): React.JSX.Element {
   const requestClose = (id: string): void => {
     if (closingIds.has(id)) return
     setClosingIds((current) => new Set(current).add(id))
-    window.setTimeout(() => props.onClose(id), TAB_ANIMATION_MS)
+    window.setTimeout(() => { void Promise.resolve(props.onClose(id)).finally(() => setClosingIds((current) => { const next = new Set(current); next.delete(id); return next })) }, TAB_ANIMATION_MS)
   }
   return (
     <div className="session-bar">
@@ -160,12 +168,12 @@ export function SessionBar(props: SessionBarProps): React.JSX.Element {
         </button>
       </div>
       <div className="session-actions">
-        <div className="layout-selector">
+        <div className="layout-selector" ref={layoutsRef}>
           <button onClick={() => setLayoutsOpen((value) => !value)} title="Named layouts">
             <LayoutTemplate size={13} /> Layouts
           </button>
           {layoutsOpen && (
-            <div className="layout-popover" onMouseLeave={() => setLayoutsOpen(false)}>
+            <div className="layout-popover">
               <strong>Named layouts</strong>
               <div className="layout-save-row">
                 <input

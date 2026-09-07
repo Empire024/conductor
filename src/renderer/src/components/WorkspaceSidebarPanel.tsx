@@ -7,11 +7,12 @@ import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar
 interface WorkspaceSidebarPanelProps {
   mode: WorkspaceSidebarMode
   project: ProjectRecord | null
+  projects?: ProjectRecord[]
   workspace: ReactNode
-  onOpenFile?(relativePath: string, mode: ExplorerOpenMode): void
+  onOpenFile?(relativePath: string, mode: ExplorerOpenMode, projectId?: string): void
   onProjectRenamed?(project: ProjectRecord): void
-  onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind']): void
-  onPathRemoved?(relativePath: string, kind: FileEntry['kind']): void
+  onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind'], projectId?: string): void
+  onPathRemoved?(relativePath: string, kind: FileEntry['kind'], projectId?: string): void
 }
 
 /**
@@ -21,6 +22,7 @@ interface WorkspaceSidebarPanelProps {
 export function WorkspaceSidebarPanel({
   mode,
   project,
+  projects,
   workspace,
   onOpenFile,
   onProjectRenamed,
@@ -29,16 +31,14 @@ export function WorkspaceSidebarPanel({
 }: WorkspaceSidebarPanelProps): React.JSX.Element {
   if (mode === 'workspace') return <>{workspace}</>
   if (mode === 'browser') return <BrowserSidebar projectId={project?.id} />
-  if (project) {
-    return (
-      <ExplorerSidebar
-        project={project}
-        onOpenFile={onOpenFile}
+  if (projects?.length || project) {
+    return <div className="all-project-explorer" aria-label="Explorer">
+      {(projects ?? (project ? [project] : [])).map((item) => <ExplorerSidebar key={item.id} project={item} defaultCollapsed={item.id !== project?.id}
+        onOpenFile={(path, mode) => onOpenFile?.(path, mode, item.id)}
         onProjectRenamed={onProjectRenamed}
-        onPathChanged={onPathChanged}
-        onPathRemoved={onPathRemoved}
-      />
-    )
+        onPathChanged={(previous, next, kind) => onPathChanged?.(previous, next, kind, item.id)}
+        onPathRemoved={(path, kind) => onPathRemoved?.(path, kind, item.id)} />)}
+    </div>
   }
   return (
     <section className="workspace-sidebar-pane" aria-label="Explorer">

@@ -1,5 +1,6 @@
+import { ProviderIcon } from '../components/ProviderIcon'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Archive, ArrowDown, ArrowLeft, CircleStop, FilePlus2, History, ListTree, Send, Settings2, X } from 'lucide-react'
+import { Archive, ArrowDown, ArrowLeft, CircleStop, FilePlus2, History, ListTree, Send, Play, Square, Settings2, TerminalSquare, MessagesSquare, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase } from '../../../shared/models'
 import type { AgentEvent, ContextAttachment, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../../../shared/structured-agent-reducer'
@@ -7,6 +8,7 @@ import type { RuntimeTerminalProps } from './RuntimeTerminal'
 import { AgentDialog, ImmutableDiff, isConversationActivity, safeFileTarget, StructuredActivity } from './StructuredAgentRenderers'
 import { StructuredComposerControls } from './StructuredComposerControls'
 import { StructuredUsageDetails } from './StructuredUsageDetails'
+import { FileAttachmentInput } from '../components/FileAttachmentInput'
 import { useComposerDraft } from './use-composer-draft'
 import './StructuredAgentPane.css'
 
@@ -26,13 +28,18 @@ const activePhases = new Set(['starting', 'running', 'waiting_approval', 'waitin
 const displayPhase = (phase: string): string => phase === 'waiting_approval' ? 'Waiting for approval' : phase === 'waiting_input' ? 'Waiting for your answer' : phase.replaceAll('_', ' ')
 
 export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Element {
-  const [activeId, setActiveId] = useState(props.resourceId)
+  const [activeId, setActiveId] = useState(props.conversationId ?? props.resourceId)
   const [historical, setHistorical] = useState(false)
   const [projection, setProjection] = useState<SessionProjection>(() => emptyProjection(props.resourceId))
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
   const { draft, setMessage, setAttachments, clearSubmitted } = useComposerDraft(props.project.id, activeId)
   const { message, attachments } = draft
+  const draftRef = useRef(draft); draftRef.current = draft
+  const composer = useRef<HTMLTextAreaElement>(null)
+  const pane = useRef<HTMLElement>(null)
+  const [workingWord, setWorkingWord] = useState(0)
+  useEffect(() => { if (projection.phase !== 'running') return; const timer = window.setInterval(() => setWorkingWord((current) => (current + 1) % 4), 7000); return () => window.clearInterval(timer) }, [projection.phase])
   const [submitting, setSubmitting] = useState(false)
   const [settings, setSettings] = useState<SessionSettings>({ permission: 'default', plan: false, model: props.model, effort: props.effort === 'auto' ? undefined : props.effort })
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -205,7 +212,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const submit = async (): Promise<void> => {
     const text = message.trim()
     const connectingMetadata = projection.phase === 'starting' && metadataConnectionId.current === activeId
-    if (!text || submitLock.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata) || projection.archived) return
+    const queuing = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase)
+    if (!text || submitLock.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived || (queuing && projection.queued)) return
     submitLock.current = true
     setSubmitting(true)
     setError('')
@@ -214,7 +222,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       // owned handshake once; do not drop the click or dispatch a duplicate turn.
       if (connection.current?.sessionId === activeId) await connection.current.promise
       if (activeIdRef.current !== activeId) return
-      await window.conductor.structured.submit(activeId, text, settings, attachments)
+      if (queuing) await window.conductor.structured.queue(activeId, text, settings, attachments)
+      else await window.conductor.structured.submit(activeId, text, settings, attachments)
       clearSubmitted(draft.revision)
       if (activeIdRef.current === activeId) {
         setImagePreviews({})
@@ -251,8 +260,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     try { setDiscovery(await window.conductor.structured.discover(activeId)) }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
-  const addFile = async (): Promise<void> => {
-    const target = safeFileTarget(filePath.trim(), props.project.path)
+  const addFile = async (requested = filePath): Promise<void> => {
+    const target = safeFileTarget(requested.trim(), props.project.path)
     if (!target) { setError('Choose a file within this workspace.'); return }
     try {
       if (/\.(png|jpe?g|gif|webp)$/i.test(target.path)) {
@@ -263,6 +272,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         setImagePreviews((current) => Object.fromEntries([...Object.entries(current), [id, image.dataUrl]].slice(-20)))
         setFilePath('')
         setAddFileOpen(false)
+        composer.current?.focus()
         return
       }
       const content = await window.conductor.files.read(props.project.id, target.path)
@@ -270,9 +280,23 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       setAttachments((current) => [...current, { id: crypto.randomUUID(), kind: 'file' as const, name: target.path, path: target.path, content }].slice(-20))
       setFilePath('')
       setAddFileOpen(false)
+      composer.current?.focus()
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
-  const canSubmit = ready && !historical && (!activePhases.has(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
+
+  const stop = (): void => { void window.conductor.structured.interrupt(activeId).catch((reason: unknown) => setError(String(reason))) }
+  const needsResume = !historical && Boolean(projection.nativeSessionId) && ['interrupted', 'disconnected'].includes(projection.phase)
+  useEffect(() => {
+    const escape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape' || event.defaultPrevented || document.querySelector('dialog[open], [aria-modal="true"], .settings-scrim, .palette-backdrop') || addFileOpen) return
+      if (!pane.current?.contains(document.activeElement) || !activePhases.has(projection.phase) || historical) return
+      event.preventDefault(); event.stopPropagation(); stop()
+    }
+    window.addEventListener('keydown', escape)
+    return () => window.removeEventListener('keydown', escape)
+  }, [activeId, projection.phase, historical, addFileOpen])
+
+  const canSubmit = ready && !historical && (!activePhases.has(projection.phase) || (['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && !projection.queued) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
   const capabilities = projection.capabilities
   const pending = projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length
   const conversationItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
@@ -303,10 +327,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const parentLabels = useMemo(() => new Map(projection.items.flatMap(item => item.nativeItemId && (item.data.type === 'tool' || item.data.type === 'subagent') ? [[item.runtimeId + ':' + item.nativeItemId, item.data.name] as const] : [])), [projection.items])
   const updateSettings = (change: Partial<SessionSettings>): void => setSettings((current) => ({ ...current, ...change }))
 
-  return <section className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
+  return <section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
     <header className="sa-session-bar">
+      <ProviderIcon provider={provider} size={15} />
+      {props.onRequestCli && <div className="agent-view-switch"><button className="active" aria-pressed title="Chat"><MessagesSquare size={13} /> Chat</button><button title="Continue the same conversation in the native CLI" disabled={!ready || historical || activePhases.has(projection.phase) || Boolean(projection.queued)} onClick={() => props.onRequestCli?.(activeId)}><TerminalSquare size={13} /> CLI</button></div>}
       <strong title={projection.title || name}>{projection.title || 'New conversation'}</strong>
-      {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? 'Working' : displayPhase(projection.phase)}</span>}
+      {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? ['Thinking', 'Spelunking', 'Working', 'Considering'][workingWord] : displayPhase(projection.phase)}</span>}
       {pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}
       <span className="sa-spacer" />
       <button aria-label="Conversation history" title="History" onClick={() => setHistoryOpen(true)}><History size={15} /></button>
@@ -341,7 +367,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     </AgentDialog>}
     {error && <div className="sa-error-bar" role="alert"><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
     {historical && <div className="sa-history-banner"><span>Viewing saved history</span><button onClick={() => { setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button onClick={() => void resume()}>Resume this conversation</button>}</div>}
-    {(projection.phase === 'disconnected' && !unstartedConversation || projection.phase === 'interrupted') && !historical && <div className="sa-history-banner"><span>{projection.phase === 'disconnected' ? 'Runtime disconnected. The last operation may be incomplete.' : 'Runtime interrupted.'}</span>{capabilities?.resume && projection.nativeSessionId && <button onClick={() => void resume()}>Resume conversation</button>}</div>}
+    {(projection.phase === 'disconnected' && !unstartedConversation || projection.phase === 'interrupted') && !historical && <div className="sa-history-banner"><span>{projection.phase === 'disconnected' ? 'Runtime disconnected. The last operation may be incomplete.' : 'Runtime interrupted.'}</span></div>}
     <div className="sa-timeline-wrap"><div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onScroll={() => {
       const el = timeline.current
       nearBottom.current = Boolean(el && el.scrollHeight - el.scrollTop - el.clientHeight < 80)
@@ -352,18 +378,21 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
       {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
       {visibleItems.map((item) => <StructuredActivity key={item.id} item={item} sessionId={activeId} cwd={props.project.path} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} parentLabel={item.parentId ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />)}
-      {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : 'Working…'}</div>}
+      {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}</div>}
     </div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }}>
+      {projection.queued && <div className="sa-queue"><strong>Queued</strong><span title={projection.queued.text}>{projection.queued.text}</span><button type="button" title="Return queued message to draft" aria-label="Remove queued message" onClick={() => {
+        void window.conductor.structured.cancelQueued(activeId).then((queued) => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments((current) => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch((reason: unknown) => setError(String(reason)))
+      }}><X size={12} /></button></div>}
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title="Inspect attached context" onClick={() => setInspectAttachment(attachment)}>{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button><button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => setAttachments(current => current.filter(item => item.id !== attachment.id))}><X size={11} /></button></span>)}</div>}
-      <textarea aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : 'Message ' + name} value={message} disabled={!ready || historical || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onChange={event => setMessage(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} />
+      <textarea ref={composer} aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : 'Message ' + name} value={message} disabled={!ready || historical || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onChange={event => setMessage(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} />
       <footer className="agent-prompt-controls">
         <button type="button" aria-label="Attach file context" title="Attach context" disabled={historical} onClick={() => setAddFileOpen(open => !open)}><FilePlus2 size={15} /></button>
         <StructuredComposerControls key={activeId} settings={settings} capabilities={capabilities} disabled={historical || !ready} onChange={updateSettings} onDiscover={connect} />
         <span className="sa-spacer" />
-        <button className="sa-send agent-send-button" type="submit" aria-label="Send message" title="Send message · Enter" disabled={!canSubmit || !message.trim() || submitting}><Send size={15} /></button>
+        {activePhases.has(projection.phase) && !message.trim() ? <button className="sa-send sa-stop agent-send-button" type="button" aria-label="Stop" title="Stop · Esc" disabled={projection.phase === 'interrupting' || historical} onClick={stop}><Square size={13} fill="currentColor" /></button> : needsResume ? <button className="sa-send agent-send-button" type="button" aria-label="Resume conversation" title="Resume the same conversation" onClick={() => void resume()}><Play size={15} /></button> : <button className="sa-send agent-send-button" type="submit" aria-label={activePhases.has(projection.phase) ? 'Queue message' : 'Send message'} title={activePhases.has(projection.phase) ? 'Queue message after this turn · Enter' : 'Send message · Enter'} disabled={!canSubmit || !message.trim() || submitting}><Send size={15} /></button>}
       </footer>
-      {addFileOpen && <div className="sa-file-attach"><input aria-label="Context file path" placeholder="Workspace-relative file path" value={filePath} onChange={event => setFilePath(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void addFile() } }} /><button type="button" onClick={() => void addFile()}>Attach</button></div>}
+      {addFileOpen && <FileAttachmentInput projectId={props.project.id} value={filePath} onChange={setFilePath} onAttach={(path) => void addFile(path)} onClose={() => { setAddFileOpen(false); composer.current?.focus() }} />}
     </form>
     {diff && <ImmutableDiff sessionId={activeId} change={diff} onOpenFile={onOpenFile} onClose={() => setDiff(null)} />}
     {inspectAttachment && <AgentDialog title={'Context · ' + inspectAttachment.name} onClose={() => setInspectAttachment(null)}><p className="sa-notice">{inspectAttachment.kind === 'image' ? 'This workspace image path will be submitted using the native image attachment mechanism. The provider reads the file when the turn is submitted.' : 'This content will be submitted with your message. File content is captured when attached.'}</p>{inspectAttachment.kind === 'image' && imagePreviews[inspectAttachment.id] && <img className="sa-context-image" alt={inspectAttachment.name} src={imagePreviews[inspectAttachment.id]} />}<pre className="sa-expanded-output">{inspectAttachment.content ?? inspectAttachment.path ?? 'No content'}</pre></AgentDialog>}

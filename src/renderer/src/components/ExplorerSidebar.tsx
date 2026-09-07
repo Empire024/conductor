@@ -35,6 +35,7 @@ import './ExplorerSidebar.css'
 
 interface ExplorerSidebarProps {
   project: ProjectRecord
+  defaultCollapsed?: boolean
   onOpenFile?(relativePath: string, mode: ExplorerOpenMode): void
   onProjectRenamed?(project: ProjectRecord): void
   onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind']): void
@@ -208,12 +209,15 @@ function ExplorerRows({
 
 export function ExplorerSidebar({
   project,
+  defaultCollapsed = false,
   onOpenFile,
   onProjectRenamed,
   onPathChanged,
   onPathRemoved,
   refreshIntervalMs = 5000
 }: ExplorerSidebarProps): React.JSX.Element {
+  const [rootCollapsed, setRootCollapsed] = useState(defaultCollapsed)
+  useEffect(() => { if (!defaultCollapsed) setRootCollapsed(false) }, [defaultCollapsed])
   const [entriesByDirectory, setEntriesByDirectory] = useState<Record<string, FileEntry[]>>({})
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
   const [query, setQuery] = useState('')
@@ -293,11 +297,13 @@ export function ExplorerSidebar({
     }, Math.max(2000, refreshIntervalMs))
     const onFocus = (): void => { void refresh() }
     const onVisibility = (): void => { if (!document.hidden) void refresh() }
+    window.addEventListener('conductor:refresh-files', onFocus)
     window.addEventListener('focus', onFocus)
     document.addEventListener('visibilitychange', onVisibility)
     return () => {
       window.clearInterval(interval)
       window.clearTimeout(completeTimerRef.current)
+      window.removeEventListener('conductor:refresh-files', onFocus)
       window.removeEventListener('focus', onFocus)
       document.removeEventListener('visibilitychange', onVisibility)
     }
@@ -310,7 +316,7 @@ export function ExplorerSidebar({
 
   useEffect(() => {
     if (!menu) return
-    const close = (): void => setMenu(null)
+    const close = (event?: Event): void => { if (event?.target instanceof Element && event.target.closest('[data-explorer-menu-trigger]')) return; setMenu(null) }
     const onEscape = (event: KeyboardEvent): void => { if (event.key === 'Escape') close() }
     window.addEventListener('mousedown', close)
     window.addEventListener('resize', close)
@@ -580,7 +586,7 @@ export function ExplorerSidebar({
   const lastRefreshText = refreshedLabel(lastRefreshed, clock)
 
   return (
-    <section className="workspace-sidebar-pane explorer-sidebar" aria-label="Explorer">
+    <section data-project-id={project.id} className={'workspace-sidebar-pane explorer-sidebar explorer-root' + (rootCollapsed ? ' root-collapsed' : '')} aria-label="Explorer">
       <header className="workspace-sidebar-title">
         <span>Explorer</span>
         <div>
@@ -598,17 +604,19 @@ export function ExplorerSidebar({
           >
             {phase === 'complete' ? <Check size={13} /> : <RefreshCw className={phase === 'refreshing' ? 'spin' : ''} size={13} />}
           </button>
-          <button title="Project actions" aria-label="Project actions" onClick={(event) => showMenu(event, { kind: 'project' })}>
+          <button data-explorer-menu-trigger title="Project actions" aria-label="Project actions" onClick={(event) => { if (menu?.target.kind === 'project') setMenu(null); else showMenu(event, { kind: 'project' }) }}>
             <MoreHorizontal size={14} />
           </button>
         </div>
       </header>
-      <button
+      <div role="button" tabIndex={0} aria-expanded={!rootCollapsed}
+        onClick={() => setRootCollapsed((current) => !current)}
         className={`explorer-project${dropTarget === '' ? ' drop-target' : ''}`}
         title={project.path}
         onDoubleClick={() => { setCreateTarget(null); setRenameTarget({ kind: 'project', value: project.name }) }}
         onContextMenu={(event) => showMenu(event, { kind: 'project' })}
         onKeyDown={(event) => {
+          if ((event.key === 'Enter' || event.key === ' ') && event.target === event.currentTarget) { event.preventDefault(); setRootCollapsed((current) => !current) }
           if (event.ctrlKey && event.key.toLocaleLowerCase() === 'v') { event.preventDefault(); moveHere('') }
         }}
         onDragOver={(event) => dragOver(event, '')}
@@ -617,10 +625,16 @@ export function ExplorerSidebar({
         }}
         onDrop={(event) => drop(event, '')}
       >
-        <ChevronDown size={12} />
+        {rootCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
         <FolderOpen size={14} />
-        <strong className="ellipsis">{project.name}</strong>
-      </button>
+        {renameTarget?.kind === 'project' ? <form className="explorer-project-rename" onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()}
+          onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setRenameTarget(null) }}
+          onSubmit={(event) => { event.preventDefault(); void finishRename() }}>
+          <input autoFocus aria-label="Rename project" value={renameTarget.value} onFocus={(event) => event.currentTarget.select()}
+            onChange={(event) => setRenameTarget({ kind: 'project', value: event.target.value })}
+            onKeyDown={(event) => { event.stopPropagation(); if (event.key === 'Escape') setRenameTarget(null) }} />
+        </form> : <strong className="ellipsis">{project.name}</strong>}
+      </div>
       <div className="explorer-filter">
         <Search size={12} />
         <input aria-label="Filter files" placeholder="Filter files" value={query} onChange={(event) => setQuery(event.target.value)} />
@@ -646,11 +660,11 @@ export function ExplorerSidebar({
           <button type="button" title="Cancel" onClick={() => setCreateTarget(null)}><X size={13} /></button>
         </form>
       )}
-      {renameTarget && (
-        <form className="explorer-rename-bar" onSubmit={(event) => { event.preventDefault(); void finishRename() }}>
+      {renameTarget?.kind === 'entry' && (
+        <form className="explorer-rename-bar" onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setRenameTarget(null) }} onSubmit={(event) => { event.preventDefault(); void finishRename() }}>
           <FilePenLine size={13} />
           <label>
-            <span>Rename {renameTarget.kind === 'project' ? 'project' : renameTarget.entry.kind}</span>
+            <span>Rename {renameTarget.entry.kind}</span>
             <input
               autoFocus
               value={renameTarget.value}

@@ -19,7 +19,17 @@ const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => v
 }
 
 const bridge: ConductorBridge = {
+  nativeCli: {
+    ensure: (id) => ipcRenderer.invoke('native-cli:ensure', id),
+    chat: (id) => ipcRenderer.invoke('native-cli:chat', id),
+    write: (id, data) => ipcRenderer.send('native-cli:write', id, data),
+    resize: (id, cols, rows) => ipcRenderer.send('native-cli:resize', id, cols, rows),
+    onData: (callback) => subscribe('native-cli:data', callback),
+    onStatus: (callback) => subscribe('native-cli:status', callback)
+  },
   structured: {
+    queue: (id, text, settings, attachments) => ipcRenderer.invoke('structured:queue', id, text, settings, attachments),
+    cancelQueued: (id) => ipcRenderer.invoke('structured:cancel-queued', id),
     connect: (id) => ipcRenderer.invoke('structured:connect', id),
     snapshot: (id) => ipcRenderer.invoke('structured:snapshot', id),
     events: (id, after) => ipcRenderer.invoke('structured:events', id, after),
@@ -40,6 +50,7 @@ const bridge: ConductorBridge = {
   orchestration: orchestrationBridge,
   collaboration: agentCollaborationBridge,
   projects: {
+    reorder: (ids) => ipcRenderer.invoke('projects:reorder', ids),
     list: () => ipcRenderer.invoke('projects:list'),
     openFolder: () => ipcRenderer.invoke('projects:open-folder'),
     create: (name) => ipcRenderer.invoke('projects:create', name),
@@ -72,6 +83,7 @@ const bridge: ConductorBridge = {
     onPrepareInstall: (callback) => subscribe('updates:prepare-install', callback)
   },
   sessions: {
+    reorder: (projectId, ids) => ipcRenderer.invoke('sessions:reorder', projectId, ids),
     list: (projectId) => ipcRenderer.invoke('sessions:list', projectId),
     create: (projectId, name) => ipcRenderer.invoke('sessions:create', projectId, name),
     delete: (sessionId) => ipcRenderer.invoke('sessions:delete', sessionId),
@@ -93,6 +105,12 @@ const bridge: ConductorBridge = {
     flush: (snapshot: WorkspaceRecoveryCheckpoint) => ipcRenderer.sendSync('recovery:flush', snapshot) === true
   },
   files: {
+    onOpenShortcut: (callback) => subscribe('files:open-shortcut', callback),
+    browserUrl: (projectId, path) => ipcRenderer.invoke('files:browser-url', projectId, path),
+    openInBrowser: (projectId, path) => ipcRenderer.invoke('files:open-in-browser', projectId, path),
+    confirmClose: (tabIds) => ipcRenderer.invoke('files:confirm-close', tabIds),
+    onDraftResolved: (callback) => subscribe('files:draft-resolved', callback),
+    search: (projectIds, query) => ipcRenderer.invoke('files:search', projectIds, query),
     list: (projectId, relativePath) => ipcRenderer.invoke('files:list', projectId, relativePath),
     read: (projectId, relativePath) => ipcRenderer.invoke('files:read', projectId, relativePath),
     readDataUrl: (projectId, relativePath) => ipcRenderer.invoke('files:read-data-url', projectId, relativePath),

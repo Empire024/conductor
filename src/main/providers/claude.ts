@@ -14,7 +14,7 @@ const string = (value: Json | undefined): string | undefined => typeof value ===
 const number = (value: Json | undefined): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined
 const array = (value: Json | undefined): Json[] => Array.isArray(value) ? value : []
 const display = (value: Json | undefined): string => typeof value === 'string' ? value : value === undefined ? '' : JSON.stringify(value, null, 2)
-interface Transport { start(): void; send(message: Json): void; close(): void; readonly connected: boolean }
+interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean }
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; captured?: boolean }
 interface Block { id: string; kind: string; input: string }
@@ -79,7 +79,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       '--forward-subagent-text', '--permission-mode', this.permissionMode(this.settings)]
     if (this.settings.model) args.push('--model', this.settings.model)
     if (this.settings.effort) args.push('--effort', this.settings.effort)
-    if (this.nativeSessionId) args.push('--resume', this.nativeSessionId)
+    if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // No --bare, --system-prompt, --setting-sources, or environment auth mutation:
     // CLI defaults retain the coding-agent prompt, user/project/local configuration and policy.
     this.transport = (this.dependencies.createTransport ?? ((options) => new JsonLineTransport(options)))({
@@ -185,6 +185,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     await this.control({ subtype: 'interrupt', cancel_queued: true })
   }
 
+  async stop(): Promise<void> { this.dispose(); await this.transport?.closeAndWait?.() }
   dispose(): void {
     if (this.disposed) return
     this.disposed = true

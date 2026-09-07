@@ -1,3 +1,4 @@
+import { NativeCliPane } from './NativeCliPane'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
@@ -36,6 +37,8 @@ export interface RuntimeTerminalProps {
   onModelChange?(model: string): void
   onEffortChange?(effort: AgentEffort): void
   onViewModeChange?(viewMode: 'visual' | 'cli'): void
+  onRequestCli?(id: string): void
+  conversationId?: string
 }
 
 const terminalTheme = {
@@ -76,9 +79,28 @@ const lightTerminalTheme = {
 
 export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element {
   if (props.mode === 'agent' && (props.provider === 'codex' || props.provider === 'claude' || !props.provider)) {
-    return <StructuredAgentPane {...props} />
+    return <StructuredRuntime {...props} />
   }
   return <TerminalRuntimePane {...props} />
+}
+
+function StructuredRuntime(props: RuntimeTerminalProps): React.JSX.Element {
+  const [view, setView] = useState(props.viewMode ?? 'visual')
+  const [conversation, setConversation] = useState(props.resourceId)
+  const changeView = (next: 'visual' | 'cli'): void => { setView(next); props.onViewModeChange?.(next) }
+  useEffect(() => {
+    const off = window.conductor.structured.onEvents((events) => {
+      const event = events.filter((item) => item.sessionId === conversation && item.data.type === 'session' && item.data.view).at(-1)
+      if (event?.data.type === 'session' && event.data.view) changeView(event.data.view)
+    })
+    void window.conductor.structured.snapshot(conversation).then((state) => { if (state?.view) changeView(state.view) })
+    return off
+  }, [conversation])
+  return view === 'cli' ? <NativeCliPane {...props} resourceId={conversation} onChat={async () => { await window.conductor.nativeCli.chat(conversation); changeView('visual') }} />
+    : <StructuredAgentPane {...props} conversationId={conversation} onRequestCli={(id) => {
+      setConversation(id)
+      void window.conductor.nativeCli.ensure(id).then(() => changeView('cli')).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: String(reason) })))
+    }} />
 }
 
 function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {

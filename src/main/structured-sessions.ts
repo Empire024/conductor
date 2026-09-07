@@ -1,3 +1,4 @@
+import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-history'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentSpec, RuntimeEnsureResult } from '../shared/models'
@@ -16,6 +17,8 @@ interface LiveSession {
   runtimeId: string
   adapter?: ProviderAdapter
   starting?: Promise<void>
+  handoff?: boolean
+  dispatchingQueue?: boolean
   submitting: boolean
   closed: boolean
   responses: Set<string>
@@ -89,6 +92,7 @@ export class StructuredSessions {
     return {
       executable: live.executable, cwd: live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
       settings: state.settings,
+      newNativeSession: live.spec.provider === 'claude' && Boolean(state.nativeSessionId) && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!),
       emit: event => { if (live.runtimeId === runtimeId && !live.closed) this.emit(live, event) },
       beforeTool: async (itemId, paths) => {
         if (live.runtimeId !== runtimeId || live.closed) return
@@ -118,8 +122,66 @@ export class StructuredSessions {
     }).finally(() => { live.starting = undefined })
     return live.starting
   }
+
+  cliSpec(id: string): AgentSpec { return this.get(id).spec }
+  private cliOwned(id: string): boolean { return this.database.getSetting('cliHandoff:' + id) !== null }
+  async prepareCli(id: string): Promise<{ spec: AgentSpec; nativeSessionId: string; settings: SessionSettings; fresh: boolean }> {
+    const live = this.get(id), store = this.database.structured
+    let state = store.snapshot(id)!
+    if (live.handoff || live.submitting || live.dispatchingQueue || state.queued || active.has(state.phase)) throw new Error('Finish or stop this turn and remove queued messages before switching to CLI.')
+    live.handoff = true
+    try {
+      if (!this.cliOwned(id)) {
+        if (live.spec.provider === 'codex') await this.connect(live)
+        state = store.snapshot(id)!
+        if (active.has(state.phase)) throw new Error('The native conversation is still running. Stop it before switching.')
+        let nativeSessionId = state.nativeSessionId
+        if (!nativeSessionId) {
+          nativeSessionId = randomUUID()
+          this.database.setSetting('newNative:' + id, 'true')
+          this.emit(live, { data: { type: 'session', phase: 'idle', nativeSessionId } })
+        }
+        const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, nativeSessionId) : await live.adapter?.history?.() ?? []
+        const handoff = { id: randomUUID(), known: history.map((item) => item.id) }
+        // Persist ownership before releasing the structured process.
+        this.database.setSetting('cliHandoff:' + id, JSON.stringify(handoff))
+      }
+      const previous = live.adapter
+      live.closed = true
+      try { if (previous?.stop) await previous.stop(); else previous?.dispose() } catch (reason) { live.closed = false; throw reason }
+      live.adapter = undefined; live.closed = false
+      state = store.snapshot(id)!
+      this.emit(live, { data: { type: 'session', phase: 'idle', view: 'cli' } })
+      return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings: state.settings, fresh: live.spec.provider === 'claude' && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) }
+    } finally { live.handoff = false }
+  }
+  async finishCli(id: string): Promise<void> {
+    const live = this.get(id)
+    if (live.handoff) throw new Error('A view switch is already in progress')
+    const serialized = this.database.getSetting('cliHandoff:' + id)
+    if (!serialized) return
+    live.handoff = true
+    try {
+      const handoff = JSON.parse(serialized) as { id: string; known: string[] }
+      // A previous switch may have timed out while stopping its process.
+      if (live.adapter) {
+        live.closed = true
+        try { if (live.adapter.stop) await live.adapter.stop(); else live.adapter.dispose(); live.adapter = undefined } finally { live.closed = false }
+      }
+      await this.connect(live)
+      const state = this.database.structured.snapshot(id)!
+      const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, state.nativeSessionId!) : await this.get(id).adapter?.history?.() ?? []
+      const known = new Set(handoff.known)
+      // A failed/retried import reuses the handoff identity, so journal replay reconciles each item.
+      for (const item of history) if (!known.has(item.id)) this.emit(live, historyEvent(item, handoff.id))
+      this.database.removeSetting('cliHandoff:' + id)
+      this.emit(live, { data: { type: 'session', phase: state.phase, view: 'visual' } })
+    } finally { live.handoff = false }
+  }
+
   async resume(id: string, settings?: SessionSettings): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
     if (active.has(state.phase)) throw new Error('Session still has active work')
     if (!state.nativeSessionId) throw new Error('This history has no native conversation to resume')
     if (settings) { this.validateSettings(settings, state.capabilities); this.database.structured.update(id, { settings }) }
@@ -127,6 +189,7 @@ export class StructuredSessions {
     await this.connect(live)
   }
   async connectSession(id: string): Promise<void> {
+    if (this.get(id).handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
     const live = this.get(id), state = this.database.structured.snapshot(id)!
     if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Resume this disconnected native conversation explicitly')
     await this.connect(live)
@@ -167,8 +230,44 @@ export class StructuredSessions {
     this.flush()
     return forkId
   }
+
+  async queue(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
+    const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (!['running', 'waiting_input', 'waiting_approval'].includes(state.phase) || !live.adapter) throw new Error('There is no active turn to queue behind')
+    if (state.queued) throw new Error('A message is already queued. Remove it before queuing another.')
+    if (typeof text !== 'string' || !text.trim() || text.length > 60000) throw new Error('Prompt must contain 1–60000 characters')
+    this.validateSettings(settings, state.capabilities)
+    const captured = structuredClone(attachments)
+    await this.attachments(live, captured)
+    // The current turn can finish while paths are being checked. Dispatch once if it did.
+    const latest = this.database.structured.snapshot(id)!
+    if (latest.queued) throw new Error('A message was queued in another window')
+    if (latest.phase === 'completed' || latest.phase === 'idle') return this.submit(id, text, settings, captured)
+    if (!['running', 'waiting_input', 'waiting_approval'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
+    this.emit(live, { data: { type: 'queue', prompt: { id: randomUUID(), text, settings, attachments: captured } } })
+  }
+  cancelQueued(id: string): import('../shared/structured-agent').QueuedPrompt | null {
+    const live = this.get(id), queued = this.database.structured.snapshot(id)?.queued ?? null
+    if (live.dispatchingQueue) throw new Error('The queued message is already being sent')
+    if (queued) this.emit(live, { data: { type: 'queue', prompt: null } })
+    return queued
+  }
+  private async drainQueue(live: LiveSession): Promise<void> {
+    const state = this.database.structured.snapshot(live.spec.id)
+    if (!state?.queued || state.phase !== 'completed' || live.closed || live.submitting || live.dispatchingQueue || !live.adapter) return
+    const queued = state.queued
+    live.dispatchingQueue = true
+    try {
+      await this.submit(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments))
+      if (this.database.structured.snapshot(live.spec.id)?.queued?.id === queued.id) this.emit(live, { data: { type: 'queue', prompt: null } })
+    } catch (reason) {
+      this.emit(live, { data: { type: 'notice', message: 'Queued message was not sent. It is still available above the composer: ' + (reason instanceof Error ? reason.message : String(reason)) } })
+    } finally { live.dispatchingQueue = false }
+  }
+
   async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
     const live = this.get(id), store = this.database.structured, state = store.snapshot(id)!
+    if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
     if (live.submitting || active.has(state.phase)) throw new Error('A turn or request is already active in this session')
     if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Execution became uncertain. Resume the native conversation explicitly before sending another turn.')
     if (typeof text !== 'string' || !text.trim() || text.length > 60_000) throw new Error('Prompt must contain 1–60000 characters')
@@ -215,7 +314,7 @@ export class StructuredSessions {
         this.emit(live, { data: { type: 'session', phase: 'failed' } })
       }
       throw error
-    } finally { live.submitting = false }
+    } finally { live.submitting = false; void this.drainQueue(live) }
   }
   private validateSettings(settings: SessionSettings, capabilities: import('../shared/structured-agent').ProviderCapabilities | undefined): void {
     if (!settings || !['default', 'read-only', 'accept-edits'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
@@ -328,6 +427,7 @@ export class StructuredSessions {
     this.pending.push(event)
     this.observe?.(live.spec, event)
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), 32)
+    if (data.type === 'session' && data.phase === 'completed') queueMicrotask(() => { void this.drainQueue(live) })
     if (data.type === 'session') {
       const phase = data.phase === 'running' || data.phase === 'starting' || data.phase === 'interrupting' ? 'working' : data.phase.startsWith('waiting') ? 'waiting_input' : data.phase === 'completed' ? 'complete' : ['failed', 'disconnected'].includes(data.phase) ? 'error' : 'idle'
       const status = phase === 'working' || phase === 'idle' ? 'running' : phase

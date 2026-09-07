@@ -44,7 +44,7 @@ try {
   const firstText = '  Unsent project A\nKeep whitespace, café, and 🧪.  '
   await composer().fill(firstText)
   await page.getByRole('button', { name: 'Attach file context', exact: true }).click()
-  await page.getByRole('textbox', { name: 'Context file path', exact: true }).fill('context.txt')
+  await page.getByRole('combobox', { name: 'Context file path', exact: true }).fill('context.txt')
   await page.getByRole('button', { name: 'Attach', exact: true }).click()
   await expect(page.locator('.sa-context-chips')).toContainText('context.txt')
   await selectProject('Draft project B')
@@ -87,7 +87,7 @@ try {
   if (provider === 'codex') {
   await expect.poll(async () => Boolean((await page.evaluate(id => window.conductor.structured.snapshot(id), firstId)).capabilities?.imageAttachments)).toBe(true)
   await page.getByRole('button', { name: 'Attach file context', exact: true }).click()
-  await page.getByRole('textbox', { name: 'Context file path', exact: true }).fill('pixel.png')
+  await page.getByRole('combobox', { name: 'Context file path', exact: true }).fill('pixel.png')
   await page.getByRole('button', { name: 'Attach', exact: true }).click()
   await expect(page.locator('.sa-context-chips')).toContainText('pixel.png')
   }
@@ -112,6 +112,12 @@ try {
   const detached = await nextWindow
   detached.on('pageerror', error => errors.push(error.message))
   await expect(detached.getByRole('textbox', { name: /^Message / })).toHaveValue(firstText)
+  await detached.keyboard.press('Control+e')
+  await expect(detached.getByRole('combobox', { name: 'Search files', exact: true })).toBeFocused()
+  await expect(detached.locator('.file-picker-results').getByRole('option').first()).toBeVisible()
+  await detached.keyboard.press('Escape')
+  await expect(detached.locator('.status-version-button')).toBeVisible()
+  results.checks.push('Detached windows support Ctrl+E and show a clickable installed version')
   const detachedText = 'Draft edited in a detached window'
   await detached.getByRole('textbox', { name: /^Message / }).fill(detachedText)
   await detached.getByRole('button', { name: 'Close', exact: true }).click()

@@ -137,7 +137,7 @@ export class UpdateManager {
   async download(): Promise<AppUpdateState> {
     const updater = this.updater
     if (!updater || !(this.state.phase === 'available' || this.state.phase === 'error' && this.state.availableVersion)) return this.getState()
-    this.setState({ ...this.state, phase: 'downloading', progress: 0, message: 'Downloading Conductor ' + this.state.availableVersion + '…' })
+    this.setState({ ...this.state, phase: 'downloading', progress: undefined, message: 'Downloading Conductor ' + this.state.availableVersion + '…' })
     try { await updater.downloadUpdate() }
     catch (reason) { if (this.updater === updater) this.setState({ ...this.state, phase: 'error', message: errorMessage(reason) }) }
     return this.getState()
@@ -150,6 +150,7 @@ export class UpdateManager {
       await this.options.beforeInstall()
       this.updater.quitAndInstall(true, true)
     } catch (reason) {
+      if (reason && typeof reason === 'object' && 'code' in reason && reason.code === 'UPDATE_CANCELLED') { this.setState({ ...this.state, phase: 'ready', message: 'Update ready. Restart whenever you are ready.' }); return }
       this.setState({ ...this.state, phase: 'error', message: 'Could not prepare the update: ' + errorMessage(reason) })
       throw reason
     }

@@ -25,7 +25,7 @@ export function AppUpdateButton({
         : state.phase === 'installing'
           ? 'Preparing restart…'
           : 'Retry update'
-  const Icon = state.phase === 'available' ? Download : state.phase === 'ready' ? RotateCcw : RefreshCw
+  const Icon = ['available', 'downloading'].includes(state.phase) ? Download : state.phase === 'ready' ? RotateCcw : RefreshCw
 
   return (
     <button
@@ -35,8 +35,9 @@ export function AppUpdateButton({
       aria-busy={busy}
       title={state.message ?? (state.availableVersion ? `${label}: Conductor ${state.availableVersion}` : label)}
     >
-      <Icon className={busy ? 'spin' : ''} size={11} />
+      <Icon size={11} />
       <span aria-live="polite">{label}</span>
+      {state.phase === 'downloading' && <progress aria-label="Update download progress" value={progress} max={100} />}
     </button>
   )
 }

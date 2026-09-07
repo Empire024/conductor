@@ -5,6 +5,7 @@ export interface AdapterOptions {
   cwd: string
   runtimeId: string
   nativeSessionId?: string
+  newNativeSession?: boolean
   settings: SessionSettings
   emit(event: AdapterEvent): void
   /** Host-owned artifact capture hook: provider must call only on real lifecycle events. */
@@ -23,5 +24,7 @@ export interface ProviderAdapter {
   archive?(archived: boolean): Promise<void>
   rename?(title: string): Promise<void>
   discover?(): Promise<Json>
+  stop?(): Promise<void>
+  history?(): Promise<import('../native-history').NativeHistoryItem[]>
   dispose(): void
 }

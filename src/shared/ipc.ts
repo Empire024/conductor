@@ -34,11 +34,20 @@ import type { AgentCollaborationBridge } from './agent-collaboration'
 import type { StructuredAgentBridge } from './structured-agent'
 
 export interface ConductorBridge {
+  nativeCli: {
+    ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }>
+    chat(id: string): Promise<void>
+    write(id: string, data: string): void
+    resize(id: string, cols: number, rows: number): void
+    onData(callback: (data: { id: string; data: string; sequence: number }) => void): () => void
+    onStatus(callback: (state: { id: string; status: string; exitCode?: number }) => void): () => void
+  }
   structured: StructuredAgentBridge
   orchestration: OrchestrationBridge
   collaboration: AgentCollaborationBridge
   projects: {
     list(): Promise<ProjectRecord[]>
+    reorder(ids: string[]): Promise<ProjectRecord[]>
     openFolder(): Promise<ProjectRecord | null>
     create(name: string): Promise<ProjectRecord>
     remove(projectId: string): Promise<void>
@@ -71,6 +80,7 @@ export interface ConductorBridge {
   }
   sessions: {
     list(projectId: string): Promise<SessionRecord[]>
+    reorder(projectId: string, ids: string[]): Promise<SessionRecord[]>
     create(projectId: string, name?: string): Promise<SessionRecord>
     delete(sessionId: string): Promise<void>
     rename(sessionId: string, name: string): Promise<void>
@@ -90,6 +100,12 @@ export interface ConductorBridge {
     flush(snapshot: WorkspaceRecoveryCheckpoint): boolean
   }
   files: {
+    onOpenShortcut(callback: () => void): () => void
+    browserUrl(projectId: string, path: string): Promise<string>
+    openInBrowser(projectId: string, path: string): Promise<void>
+    confirmClose(tabIds: string[]): Promise<boolean>
+    onDraftResolved(callback: (result: { tabId: string; submitted: string; content: string }) => void): () => void
+    search(projectIds: string[], query: string): Promise<Array<{ projectId: string; path: string }>>
     list(projectId: string, relativePath?: string): Promise<FileEntry[]>
     read(projectId: string, relativePath: string): Promise<string>
     readDataUrl(projectId: string, relativePath: string): Promise<FileDataResource>

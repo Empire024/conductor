@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
+  X,
   Bot,
   ChevronDown,
   ChevronRight,
@@ -43,16 +44,19 @@ interface SidebarProps {
   onMoveProject(id: string): void
   onRemoveProject(id: string): void
   onRevealProject(path: string): void
+  onCloseSession(id: string): void
+  onReorderProjects(ids: string[]): void
+  onReorderSessions(ids: string[]): void
   onNewSession(): void
   onOpenPalette(): void
   onOpenSettings(): void
   collapsed: boolean
   onToggleCollapsed(): void
   onOpenTab(kind: PaneKind): void
-  onOpenFile?(relativePath: string, mode: ExplorerOpenMode): void
+  onOpenFile?(relativePath: string, mode: ExplorerOpenMode, projectId?: string): void
   onProjectRenamed?(project: ProjectRecord): void
-  onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind']): void
-  onPathRemoved?(relativePath: string, kind: FileEntry['kind']): void
+  onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind'], projectId?: string): void
+  onPathRemoved?(relativePath: string, kind: FileEntry['kind'], projectId?: string): void
   utilityPanel: WorkspacePanel | null
   onUtilityPanel(panel: WorkspacePanel | null): void
 }
@@ -151,7 +155,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
 
   useEffect(() => {
     if (!menu) return
-    const close = (): void => setMenu(null)
+    const close = (event?: Event): void => { if (event?.target instanceof Element && event.target.closest('.project-more, [data-project-menu-trigger]')) return; setMenu(null) }
     const escape = (event: KeyboardEvent): void => { if (event.key === 'Escape') close() }
     window.addEventListener('mousedown', close)
     window.addEventListener('resize', close)
@@ -167,6 +171,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     event.preventDefault()
     event.stopPropagation()
     setConfirmingRemoval(null)
+    if (menu?.kind === 'project' && menu.project.id === project.id && event.type === 'click') { setMenu(null); return }
     setMenu({
       kind: 'project',
       project,
@@ -215,6 +220,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
       {!props.collapsed && <aside className="sidebar">
         <WorkspaceSidebarPanel
           mode={sidebarMode}
+          projects={props.projects}
           project={props.projects.find((project) => project.id === props.activeProjectId) ?? null}
           onOpenFile={props.onOpenFile}
           onPathChanged={props.onPathChanged}
@@ -236,11 +242,12 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
             <div className="heading-actions">
               <button onClick={props.onCreateProject} title="Create new project"><Plus size={14} /></button>
               <button
+                data-project-menu-trigger
                 title="More project actions"
                 onClick={(event) => {
                   event.stopPropagation()
                   const rect = event.currentTarget.getBoundingClientRect()
-                  setMenu({ kind: 'projects', x: Math.min(rect.right - 8, window.innerWidth - 210), y: rect.bottom + 3 })
+                  setMenu((current) => current?.kind === 'projects' ? null : { kind: 'projects', x: Math.min(rect.right - 8, window.innerWidth - 210), y: rect.bottom + 3 })
                 }}
               ><MoreHorizontal size={14} /></button>
             </div>
@@ -251,7 +258,11 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
               const expanded = active && !collapsedProjectIds.has(project.id)
               return (
                 <div key={project.id} onContextMenu={(event) => showProjectMenu(event, project)}>
-                  <div className={`project-row-wrap ${active ? 'active' : ''}`}>
+                  <div className={`project-row-wrap ${active ? 'active' : ''}`} draggable={editingProjectId !== project.id}
+                    onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-conductor-project', project.id) }}
+                    onDragOver={(event) => { if (event.dataTransfer.types.includes('application/x-conductor-project')) { event.preventDefault(); event.currentTarget.classList.add('reorder-target') } }}
+                    onDragLeave={(event) => event.currentTarget.classList.remove('reorder-target')}
+                    onDrop={(event) => { event.preventDefault(); event.currentTarget.classList.remove('reorder-target'); const dragged = event.dataTransfer.getData('application/x-conductor-project'); if (!dragged || dragged === project.id) return; const ids = props.projects.map((item) => item.id).filter((id) => id !== dragged); ids.splice(ids.indexOf(project.id) + (event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.clientHeight / 2 ? 1 : 0), 0, dragged); props.onReorderProjects(ids) }}>
                     {editingProjectId === project.id ? (
                       <div className={`project-row project-row-editing ${active ? 'active' : ''}`}>
                         {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
@@ -299,8 +310,12 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                   {expanded && (
                     <div className="session-tree">
                       {props.sessions.map((session, index) => (
+                        <div key={session.id} className="sidebar-session-row" draggable
+                          onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-conductor-session', session.id) }}
+                          onDragOver={(event) => { if (event.dataTransfer.types.includes('application/x-conductor-session')) { event.preventDefault(); event.currentTarget.classList.add('reorder-target') } }}
+                          onDragLeave={(event) => event.currentTarget.classList.remove('reorder-target')}
+                          onDrop={(event) => { event.preventDefault(); event.currentTarget.classList.remove('reorder-target'); const dragged = event.dataTransfer.getData('application/x-conductor-session'); if (!dragged || dragged === session.id) return; const ids = props.sessions.map((item) => item.id).filter((id) => id !== dragged); ids.splice(ids.indexOf(session.id) + (event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.clientHeight / 2 ? 1 : 0), 0, dragged); props.onReorderSessions(ids) }}>
                         <button
-                          key={session.id}
                           className={session.id === props.activeSessionId ? 'active' : ''}
                           onClick={() => props.onSelectSession(session.id)}
                         >
@@ -308,6 +323,8 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                           <span className="ellipsis">{session.name}</span>
                           {session.id === props.activeSessionId && <i className="live-dot" />}
                         </button>
+                        <button className="sidebar-session-close" aria-label={'Close ' + session.name} title={'Close ' + session.name} onClick={() => props.onCloseSession(session.id)}><X size={11} /></button>
+                        </div>
                       ))}
                       <button className="new-session" onClick={props.onNewSession}>
                         <Plus size={12} /> New workspace

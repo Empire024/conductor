@@ -5,6 +5,7 @@
     "Project switching restores exact unsent text and attached context without leaking another project draft",
     "Workspaces and historical conversations have separate drafts; returning to current restores the right composer",
     "Reload and close/reopen preserve captured file context",
+    "Detached windows support Ctrl+E and show a clickable installed version",
     "Detaching and retrieving a pane preserve text, attached context, and edits made in the other window",
     "Full application restart restores drafts; all navigation and restoration submitted zero provider prompts",
     "Rejected sends keep text and attachments; a successful synthetic provider send clears them durably",

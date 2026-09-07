@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import { Bot, Brain, Eye, FileCode2, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
+import { Bot, Brain, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
 import type {
   AgentProviderId,
   AgentSoundProfile,
@@ -39,8 +39,9 @@ import { createPaneTab } from './panes/pane-factory'
 import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
-import { CodePane } from './panes/CodePane'
-import { FilePreviewPane } from './panes/FilePreviewPane'
+import { WorkspaceFiles } from './components/WorkspaceFiles'
+import { openWorkspaceFile, changeWorkspacePath, workspaceFileIds } from './components/workspace-files-state'
+import { AppVersionButton } from './components/AppVersionButton'
 import { applyAppTheme, resolveThemeVariant } from './appearance'
 import { DebugConsole } from './components/DebugConsole'
 import {
@@ -60,7 +61,6 @@ import { AppUpdateButton } from './components/AppUpdateButton'
 import { UpdatePrompt } from './components/UpdatePrompt'
 
 export function App(): React.JSX.Element {
-  type WorkspaceDocument = { projectId: string; sessionId: string; path: string; mode: 'editor' | 'preview'; line?: number }
   const [projects, setProjects] = useState<ProjectRecord[]>([])
   const [sessions, setSessions] = useState<SessionRecord[]>([])
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null)
@@ -94,8 +94,6 @@ export function App(): React.JSX.Element {
   const [toast, setToast] = useState('')
   const [loading, setLoading] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('conductor.sidebarCollapsed') === 'true')
-  const [workspaceDocument, setWorkspaceDocument] = useState<WorkspaceDocument | null>(null)
-  const [documentWidth, setDocumentWidth] = useState(() => Number(localStorage.getItem('conductor.documentWidth')) || 620)
   const [attentionResourceIds, setAttentionResourceIds] = useState<Set<string>>(() => new Set())
   const [debugConsoleOpen, setDebugConsoleOpen] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved' | 'error'>('saved')
@@ -158,19 +156,6 @@ export function App(): React.JSX.Element {
   activeSessionIdRef.current = activeSessionId
   soundProfileRef.current = appSettings.agentSoundProfile
   if (activeSessionId && focusedGroupId) focusedGroupIdsRef.current[activeSessionId] = focusedGroupId
-
-  useEffect(() => {
-    if (!activeProjectId || !activeSessionId) {
-      setWorkspaceDocument(null)
-      return
-    }
-    try {
-      const saved = JSON.parse(localStorage.getItem(`conductor.workspaceDocument.${activeSessionId}`) ?? 'null') as WorkspaceDocument | null
-      setWorkspaceDocument(saved?.projectId === activeProjectId ? saved : null)
-    } catch {
-      setWorkspaceDocument(null)
-    }
-  }, [activeProjectId, activeSessionId])
 
   const recoveryCheckpoint = useCallback((): WorkspaceRecoveryCheckpoint => ({
     activeProjectId: activeProjectIdRef.current,
@@ -334,30 +319,9 @@ export function App(): React.JSX.Element {
   }, [appSettings.themeAuto, appSettings.themeId, appSettings.themeVariant])
 
   useEffect(() => {
-    let lastCopied = ''
-    let lastCopiedAt = 0
-    const announce = (text: string): void => {
-      if (!text || (text === lastCopied && Date.now() - lastCopiedAt < 1200)) return
-      lastCopied = text
-      lastCopiedAt = Date.now()
-      void navigator.clipboard.writeText(text).then(() => setToast(`Copied ${text.length.toLocaleString()} characters`))
-    }
-    const copySelection = (): void => {
-      const active = document.activeElement
-      if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
-        const start = active.selectionStart ?? 0
-        const end = active.selectionEnd ?? 0
-        if (end > start) announce(active.value.slice(start, end))
-        return
-      }
-      const selected = window.getSelection()?.toString() ?? ''
-      if (selected) announce(selected)
-    }
     const onToast = (event: Event): void => setToast((event as CustomEvent<string>).detail)
-    window.addEventListener('mouseup', copySelection)
     window.addEventListener('conductor:toast', onToast)
     return () => {
-      window.removeEventListener('mouseup', copySelection)
       window.removeEventListener('conductor:toast', onToast)
     }
   }, [])
@@ -509,6 +473,8 @@ export function App(): React.JSX.Element {
     const project = projects.find((item) => item.id === projectId)
     if (!project) return
     try {
+      window.dispatchEvent(new Event('conductor:flush-editors'))
+      if (!await window.conductor.files.confirmClose(workspaceFileIds(projectId))) return
       await window.conductor.projects.remove(projectId)
       const remaining = projects.filter((item) => item.id !== projectId)
       setProjects(remaining)
@@ -633,6 +599,8 @@ export function App(): React.JSX.Element {
     debugLog('workspace', 'Workspace close requested', { sessionId }, 'info')
     const remaining = sessions.filter((session) => session.id !== sessionId)
     const fallback = remaining[Math.min(closingIndex, remaining.length - 1)]
+    window.dispatchEvent(new Event('conductor:flush-editors'))
+    if (!await window.conductor.files.confirmClose(workspaceFileIds(undefined, sessionId))) return
     await window.conductor.sessions.delete(sessionId)
     const apply = (): void => {
       setSessions(remaining)
@@ -709,84 +677,20 @@ export function App(): React.JSX.Element {
     setFocusedGroupId(group.id)
   }, [activeSession, focusedGroupId, setLayout])
 
-  const openExplorerFile = useCallback((relativePath: string, mode: 'editor' | 'preview'): void => {
-    if (!activeProject || !activeSession) return
-    const document: WorkspaceDocument = { projectId: activeProject.id, sessionId: activeSession.id, path: relativePath, mode }
-    setWorkspaceDocument(document)
-    localStorage.setItem(`conductor.workspaceDocument.${activeSession.id}`, JSON.stringify(document))
-  }, [activeProject, activeSession])
-
-  const handleExplorerPathChanged = useCallback((previousPath: string, nextPath: string, kind: 'file' | 'directory'): void => {
-    const isAffected = (path: string): boolean =>
-      path === previousPath || (kind === 'directory' && path.startsWith(`${previousPath}/`))
-    const projectId = activeProjectIdRef.current
-    for (const session of sessionsRef.current) {
-      if (session.projectId !== projectId) continue
-      const key = `conductor.workspaceDocument.${session.id}`
-      try {
-        const saved = JSON.parse(localStorage.getItem(key) ?? 'null') as WorkspaceDocument | null
-        if (saved && isAffected(saved.path)) {
-          localStorage.setItem(key, JSON.stringify({ ...saved, path: `${nextPath}${saved.path.slice(previousPath.length)}` }))
-        }
-      } catch {
-        // A malformed stale document record should not block the filesystem action.
-      }
-    }
-    setWorkspaceDocument((current) => {
-      if (!current) return current
-      if (!isAffected(current.path)) return current
-      const updated = { ...current, path: `${nextPath}${current.path.slice(previousPath.length)}` }
-      localStorage.setItem(`conductor.workspaceDocument.${current.sessionId}`, JSON.stringify(updated))
-      return updated
-    })
+  const openExplorerFile = useCallback((relativePath: string, mode: 'editor' | 'preview', projectId?: string): void => {
+    const owner = projectId ?? activeProjectIdRef.current
+    if (owner) openWorkspaceFile(owner, relativePath, mode)
   }, [])
 
-  const handleExplorerPathRemoved = useCallback((relativePath: string, kind: 'file' | 'directory'): void => {
-    const isAffected = (path: string): boolean =>
-      path === relativePath || (kind === 'directory' && path.startsWith(`${relativePath}/`))
-    const projectId = activeProjectIdRef.current
-    for (const session of sessionsRef.current) {
-      if (session.projectId !== projectId) continue
-      const key = `conductor.workspaceDocument.${session.id}`
-      try {
-        const saved = JSON.parse(localStorage.getItem(key) ?? 'null') as WorkspaceDocument | null
-        if (saved && isAffected(saved.path)) localStorage.removeItem(key)
-      } catch {
-        localStorage.removeItem(key)
-      }
-    }
-    setWorkspaceDocument((current) => {
-      if (!current) return current
-      if (!isAffected(current.path)) return current
-      localStorage.removeItem(`conductor.workspaceDocument.${current.sessionId}`)
-      return null
-    })
+  const handleExplorerPathChanged = useCallback((previousPath: string, nextPath: string, kind: 'file' | 'directory', projectId?: string): void => {
+    const owner = projectId ?? activeProjectIdRef.current
+    if (owner) changeWorkspacePath(owner, previousPath, nextPath, kind)
   }, [])
 
-  const closeWorkspaceDocument = (): void => {
-    if (activeSessionId) localStorage.removeItem(`conductor.workspaceDocument.${activeSessionId}`)
-    setWorkspaceDocument(null)
-  }
-
-  const startDocumentResize = (event: React.PointerEvent): void => {
-    if (event.button !== 0) return
-    event.preventDefault()
-    const startX = event.clientX
-    const startWidth = documentWidth
-    const move = (moveEvent: PointerEvent): void => {
-      const width = Math.min(Math.max(360, startWidth + startX - moveEvent.clientX), Math.max(420, window.innerWidth - 420))
-      setDocumentWidth(width)
-      localStorage.setItem('conductor.documentWidth', String(width))
-    }
-    const stop = (): void => {
-      window.removeEventListener('pointermove', move)
-      window.removeEventListener('pointerup', stop)
-      document.body.classList.remove('resizing-horizontal')
-    }
-    document.body.classList.add('resizing-horizontal')
-    window.addEventListener('pointermove', move)
-    window.addEventListener('pointerup', stop)
-  }
+  const handleExplorerPathRemoved = useCallback((path: string, kind: 'file' | 'directory', projectId?: string): void => {
+    const owner = projectId ?? activeProjectIdRef.current
+    if (owner) changeWorkspacePath(owner, path, null, kind)
+  }, [])
 
   const splitFocused = useCallback((edge: Exclude<DockEdge, 'center'>, tab?: PaneTab): void => {
     if (!activeSession) return
@@ -944,6 +848,9 @@ export function App(): React.JSX.Element {
         projectName={activeProject?.name}
         themeVariant={resolvedThemeVariant}
         themeAuto={appSettings.themeAuto}
+        themeId={appSettings.themeId}
+        onTheme={(id) => void window.conductor.settings.setTheme(id).then(setAppSettings)}
+        onThemeAuto={(enabled) => void window.conductor.settings.setThemeAuto(enabled).then(setAppSettings)}
         onThemeVariant={(variant) => void chooseManualThemeVariant(variant)}
         onNewProject={() => void createManagedProject()}
         onOpenProject={() => void openExistingProject()}
@@ -971,6 +878,9 @@ export function App(): React.JSX.Element {
           onRemoveProject={(id) => void removeProject(id)}
           onRevealProject={(path) => void window.conductor.projects.reveal(path)}
           onNewSession={() => void newSession()}
+          onCloseSession={(id) => void closeSession(id)}
+          onReorderProjects={(ids) => { void window.conductor.projects.reorder(ids).then(setProjects).catch((reason: unknown) => setToast(String(reason))) }}
+          onReorderSessions={(ids) => { if (activeProjectId) { const projectId = activeProjectId; void window.conductor.sessions.reorder(projectId, ids).then((ordered) => { if (activeProjectIdRef.current === projectId) setSessions((current) => ordered.map((item) => current.find((existing) => existing.id === item.id) ?? item)) }).catch((reason: unknown) => setToast(String(reason))) } }}
           onOpenPalette={() => setPaletteOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           collapsed={sidebarCollapsed}
@@ -996,7 +906,7 @@ export function App(): React.JSX.Element {
                 templates={templates}
                 onSelect={(id) => { const session = sessions.find((item) => item.id === id); if (session) selectSession(session) }}
                 onNew={() => void newSession()}
-                onClose={(id) => void closeSession(id)}
+                onClose={(id) => closeSession(id)}
                 onRename={(id, name) => void renameSession(id, name)}
                 onReopen={reopenClosed}
                 onPalette={() => setPaletteOpen(true)}
@@ -1032,38 +942,17 @@ export function App(): React.JSX.Element {
                           onDetach={detachTab}
                           canReopen={activeSession.closedTabs.length > 0}
                           onReopen={reopenClosed}
-                          onOpenFile={(path, line) => {
-                            const document: WorkspaceDocument = { projectId: activeProject.id, sessionId: activeSession.id, path, mode: 'editor', line }
-                            setWorkspaceDocument(document)
-                            localStorage.setItem(`conductor.workspaceDocument.${activeSession.id}`, JSON.stringify(document))
-                          }}
+                          onOpenFile={(path, line) => openWorkspaceFile(activeProject.id, path, 'editor', line)}
                         />
-                        {workspaceDocument?.projectId === activeProject.id && workspaceDocument.sessionId === activeSession.id && (
-                          <aside className="workspace-document" style={{ width: documentWidth }}>
-                            <button className="workspace-document-resizer" onPointerDown={startDocumentResize} aria-label="Resize editor" />
-                            <header>
-                              <div><FileCode2 size={16} /><span><strong>{workspaceDocument.path.split('/').pop()}</strong><small>{workspaceDocument.path}</small></span></div>
-                              <div>
-                                <button className={workspaceDocument.mode === 'editor' ? 'active' : ''} title="Edit" onClick={() => openExplorerFile(workspaceDocument.path, 'editor')}><FileCode2 size={15} /></button>
-                                <button className={workspaceDocument.mode === 'preview' ? 'active' : ''} title="Preview" onClick={() => openExplorerFile(workspaceDocument.path, 'preview')}><Eye size={15} /></button>
-                                <button title="Close editor" onClick={closeWorkspaceDocument}><X size={17} /></button>
-                              </div>
-                            </header>
-                            <div className="workspace-document-body">
-                              {workspaceDocument.mode === 'editor'
-                                ? <CodePane project={activeProject} tabId={`document:${activeSession.id}:${workspaceDocument.path}`} path={workspaceDocument.path} line={workspaceDocument.line} />
-                                : <FilePreviewPane project={activeProject} path={workspaceDocument.path} onOpenEditor={(path) => openExplorerFile(path, 'editor')} />}
-                            </div>
-                          </aside>
-                        )}
+                        <WorkspaceFiles key={'files:' + activeSession.id} projects={projects} projectId={activeProject.id} workspaceId={activeSession.id} />
                       </div>
                     </>
                   ) : (
-                    <div className="no-workspace-state">
+                    <div className="runtime-document-stage"><div className="no-workspace-state">
                       <div className="empty-orbit"><LayoutPanelTop size={30} /></div>
                       <strong>No workspace open</strong>
                       <button onClick={() => void newSession()}><Plus size={17} /> New workspace</button>
-                    </div>
+                    </div><WorkspaceFiles key={'files:project:' + activeProject.id} projects={projects} projectId={activeProject.id} workspaceId={'project:' + activeProject.id} /></div>
                   )}
                 </div>
                 {utilityPanel && (
@@ -1173,7 +1062,7 @@ export function App(): React.JSX.Element {
           <span><HardDrive size={12} /> SQLite</span>
           <span className="accent-status"><Zap size={11} /> ready</span>
         </>}
-        {updateState.currentVersion && <span className="status-version">v{updateState.currentVersion}</span>}
+        {updateState.currentVersion && <AppVersionButton state={updateState} onCheck={checkForUpdates} />}
       </footer>
       {paletteOpen && activeSession && <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />}
       {settingsOpen && (
