@@ -12,6 +12,11 @@ Bug list:
 10. [Implemented] Projects need to be able to be ordered (dragged) around in the view vertically
 11. [Implemented] Going from one project to another removes what we had written in our Message Codex textbox - fix
 12. [Implemented] Workspaces need to be able to be closed from the left menu as well as dragged and ordered like projects.
+13. [Implemented] CTRL+E arrow keys don't work properly, they should be able to immidiately list through list of files.
+14. [Implemented] For models that don't have Effort, don't even display it
+15. [Implemented] Trying to change into CLI view shows error
+16. [Implemented] Clicking Browser then clicking it again should close it.
+17. [Implemented] I dislike the '+ Add agent' button design still, text is too large compared to all other parts of the theme, make it uppercase and smaller font style at least..
 
 Feature list:
 0. [Implemented] Beautify the 'send' button.

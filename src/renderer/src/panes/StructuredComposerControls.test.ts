@@ -9,7 +9,7 @@ const capabilities: ProviderCapabilities = {
   provider: 'codex', runtimeVersion: 'synthetic-offline', adapterVersion: 1, authentication: 'cli',
   textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true, approvals: true,
   questions: true, resume: true, fork: true, plans: true,
-  models: [{ id: 'model-one', label: 'Model One' }, { id: 'model-two', label: 'Model Two' }],
+  models: [{ id: 'model-one', label: 'Model One', isDefault: true, effort: ['minimal', 'low', 'medium', 'high'] }, { id: 'model-two', label: 'Model Two', effort: [] }],
   effort: ['minimal', 'low', 'medium', 'high'], limitations: []
 }
 function render(options: { settings?: SessionSettings; capabilities?: ProviderCapabilities; disabled?: boolean } = {}): { html: string; onDiscover: ReturnType<typeof vi.fn>; onChange: ReturnType<typeof vi.fn> } {
@@ -40,8 +40,8 @@ describe('compact composer controls (synthetic, zero inference)', () => {
   })
   it('hides the effort slider unless supported effort choices are available', () => {
     expect(render().html).not.toContain('type="range"')
-    expect(render({ capabilities: { ...capabilities, effort: [] } }).html).not.toContain('type="range"')
-    expect(render({ capabilities: { ...capabilities, effort: ['', 'auto'] } }).html).not.toContain('type="range"')
+    expect(render({ capabilities: { ...capabilities, models: [] } }).html).not.toContain('type="range"')
+    expect(render({ capabilities, settings: { ...settings, model: 'model-two', effort: 'high' } }).html).not.toContain('type="range"')
   })
   it('places supported effort values and Auto at their real slider positions', () => {
     const html = render({ capabilities, settings: { ...settings, effort: 'medium' } }).html
@@ -52,7 +52,7 @@ describe('compact composer controls (synthetic, zero inference)', () => {
     expect(html).toContain('--effort-progress:75%')
     expect(render({ capabilities }).html).toContain('aria-valuetext="Auto"')
     expect(render({ capabilities, settings: { ...settings, effort: 'auto' } }).html).toContain('aria-valuetext="Auto"')
-    const filtered = render({ capabilities: { ...capabilities, effort: ['', 'auto', 'low', 'high'] }, settings: { ...settings, effort: 'high' } }).html
+    const filtered = render({ capabilities: { ...capabilities, models: [{ id: 'model-one', label: 'Model One', isDefault: true, effort: ['', 'auto', 'low', 'high'] }] }, settings: { ...settings, effort: 'high' } }).html
     expect(filtered).toContain('max="2"')
     expect(filtered).toContain('aria-valuetext="High"')
   })
@@ -78,4 +78,20 @@ describe('compact composer controls (synthetic, zero inference)', () => {
     expect(html).not.toContain('<img')
     expect(html).not.toContain('<script')
   })
+})
+
+it('resolves the default effort capability from the effective model instead of the provider union', () => {
+  const html = render({ capabilities: { ...capabilities, effectiveSettings: { model: 'model-two' } } }).html
+  expect(html).not.toContain('Reasoning effort')
+  expect(html).not.toContain('Unavailable:')
+  const known = render({ capabilities: { ...capabilities, effectiveSettings: { model: 'model-two' } }, settings: { ...settings, model: 'model-one' } }).html
+  expect(known).toContain('Reasoning effort')
+})
+
+it('uses Claude default alias metadata while hiding effort for a non-reasoning model', () => {
+  const claude: ProviderCapabilities = { ...capabilities, provider: 'claude', models: [{ id: 'default', label: 'Default (recommended)', effort: ['low', 'high'] }, { id: 'haiku', label: 'Haiku', effort: [] }] }
+  expect(render({ capabilities: claude }).html).toContain('Reasoning effort')
+  const html = render({ capabilities: claude, settings: { ...settings, model: 'haiku', effort: 'high' } }).html
+  expect(html).not.toContain('Reasoning effort')
+  expect(html).not.toContain('Unavailable:')
 })

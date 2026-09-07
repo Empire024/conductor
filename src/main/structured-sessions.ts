@@ -132,7 +132,15 @@ export class StructuredSessions {
     live.handoff = true
     try {
       if (!this.cliOwned(id)) {
-        if (live.spec.provider === 'codex') await this.connect(live)
+        if (live.spec.provider === 'codex') {
+          await this.connect(live)
+          const connected = store.snapshot(id)!
+          // An empty native thread has no durable history until metadata is saved.
+          // Persist its existing Conductor title before reading/resuming that exact ID.
+          if (!connected.truncated && !connected.items.some(item => item.data.type === 'text' && item.data.role !== 'status')) {
+            await live.adapter?.rename?.(connected.title || live.spec.title)
+          }
+        }
         state = store.snapshot(id)!
         if (active.has(state.phase)) throw new Error('The native conversation is still running. Stop it before switching.')
         let nativeSessionId = state.nativeSessionId
@@ -154,6 +162,11 @@ export class StructuredSessions {
       this.emit(live, { data: { type: 'session', phase: 'idle', view: 'cli' } })
       return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings: state.settings, fresh: live.spec.provider === 'claude' && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) }
     } finally { live.handoff = false }
+  }
+  cancelCli(id: string): void {
+    const live = this.get(id)
+    this.database.removeSetting('cliHandoff:' + id)
+    this.emit(live, { data: { type: 'session', phase: live.adapter ? 'idle' : 'disconnected', view: 'visual' } })
   }
   async finishCli(id: string): Promise<void> {
     const live = this.get(id)

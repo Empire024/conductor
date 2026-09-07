@@ -8,15 +8,15 @@ import type { ConductorDatabase } from './database'
 
 export function nativeCliArgs(provider: StructuredProvider, nativeId: string, settings: SessionSettings, fresh = false): string[] {
   if (!/^[a-zA-Z0-9_-]{1,160}$/.test(nativeId)) throw new Error('Invalid native conversation ID')
-  const model = settings.model ? ['--model', settings.model] : []
+  const model = settings.model && settings.model !== 'default' ? ['--model', settings.model] : []
   if (provider === 'codex') return [
     'resume', nativeId, ...model,
-    ...(settings.effort ? ['-c', 'model_reasoning_effort=' + JSON.stringify(settings.effort)] : []),
-    ...(settings.sandbox ? ['--sandbox', settings.sandbox] : settings.permission === 'read-only' ? ['--sandbox', 'read-only'] : []),
-    ...(settings.approvalPolicy && settings.approvalPolicy !== 'inherit' ? ['--ask-for-approval', settings.approvalPolicy] : [])
+    ...(settings.effort && settings.effort !== 'auto' ? ['-c', 'model_reasoning_effort=' + JSON.stringify(settings.effort)] : []),
+    ...(settings.sandbox && settings.sandbox !== 'inherit' ? ['--sandbox', settings.sandbox] : settings.permission === 'read-only' ? ['--sandbox', 'read-only'] : []),
+    ...(settings.approvalPolicy && settings.approvalPolicy !== 'inherit' ? ['-c', 'approval_policy=' + JSON.stringify(settings.approvalPolicy)] : [])
   ]
   return [fresh ? '--session-id' : '--resume', nativeId, ...model,
-    ...(settings.effort ? ['--effort', settings.effort] : []),
+    ...(settings.effort && settings.effort !== 'auto' ? ['--effort', settings.effort] : []),
     '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'plan' : 'default']
 }
 interface LiveCli { spec: AgentSpec; process: IPty; exited: boolean; transcript: string; sequence: number; stopped: Promise<void>; resolveStopped(): void }
@@ -41,26 +41,31 @@ export class NativeCliManager {
     if (!executable) throw new Error('The provider CLI is unavailable')
     if (this.database.structured.snapshot(id)?.settings.plan && spec.provider === 'codex') throw new Error('Turn off Plan mode before switching to the Codex CLI.')
     const handoff = await this.sessions.prepareCli(id)
-    const args = nativeCliArgs(handoff.spec.provider as StructuredProvider, handoff.nativeSessionId, handoff.settings, handoff.fresh)
-    const child = pty.spawn(executable, offline ? [join(process.cwd(), 'scripts/fixtures/native-cli.cjs'), handoff.nativeSessionId] : args, {
-      name: 'xterm-256color', cols: 100, rows: 30, cwd: handoff.spec.cwd, useConptyDll: process.platform === 'win32',
-      env: { ...process.env, ...(offline ? { ELECTRON_RUN_AS_NODE: '1' } : {}), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
-    })
-    let resolveStopped!: () => void
-    const stopped = new Promise<void>((resolve) => { resolveStopped = resolve })
-    const live: LiveCli = { spec: handoff.spec, process: child, exited: false, transcript: '', sequence: 0, stopped, resolveStopped }
-    this.live.set(id, live)
-    child.onData((data) => {
-      if (this.live.get(id) !== live) return
-      live.transcript = (live.transcript + data).slice(-256000)
-      this.broadcast('native-cli:data', { id, data, sequence: ++live.sequence })
-    })
-    child.onExit(({ exitCode }) => {
-      live.exited = true; live.resolveStopped()
-      if (this.live.get(id) !== live) return
-      this.broadcast('native-cli:status', { id, status: 'exited', exitCode })
-    })
-    return { id, available: true, status: 'running', transcript: live.transcript, sequence: live.sequence, executable }
+    try {
+      const args = nativeCliArgs(handoff.spec.provider as StructuredProvider, handoff.nativeSessionId, handoff.settings, handoff.fresh)
+      const child = pty.spawn(executable, offline ? [join(process.cwd(), 'scripts/fixtures/native-cli.cjs'), handoff.nativeSessionId] : args, {
+        name: 'xterm-256color', cols: 100, rows: 30, cwd: handoff.spec.cwd, useConptyDll: process.platform === 'win32',
+        env: { ...process.env, ...(offline ? { ELECTRON_RUN_AS_NODE: '1' } : {}), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
+      })
+      let resolveStopped!: () => void
+      const stopped = new Promise<void>((resolve) => { resolveStopped = resolve })
+      const live: LiveCli = { spec: handoff.spec, process: child, exited: false, transcript: '', sequence: 0, stopped, resolveStopped }
+      this.live.set(id, live)
+      child.onData((data) => {
+        if (this.live.get(id) !== live) return
+        live.transcript = (live.transcript + data).slice(-256000)
+        this.broadcast('native-cli:data', { id, data, sequence: ++live.sequence })
+      })
+      child.onExit(({ exitCode }) => {
+        live.exited = true; live.resolveStopped()
+        if (this.live.get(id) !== live) return
+        this.broadcast('native-cli:status', { id, status: 'exited', exitCode })
+      })
+      return { id, available: true, status: 'running', transcript: live.transcript, sequence: live.sequence, executable }
+    } catch (error) {
+      this.sessions.cancelCli(id)
+      throw error
+    }
   }
   write(id: string, data: string): void { const live = this.live.get(id); if (live && !live.exited && typeof data === 'string' && data.length <= 1000000) live.process.write(data) }
   resize(id: string, cols: number, rows: number): void { const live = this.live.get(id); if (live && !live.exited && Number.isInteger(cols) && Number.isInteger(rows)) live.process.resize(Math.max(2, Math.min(500, cols)), Math.max(2, Math.min(300, rows))) }

@@ -214,7 +214,7 @@ export function OrchestrationHub({
             <div className="orchestration-section">
               <div className="orchestration-section-heading">
                 <span><strong>Agent roster</strong><small>Reusable identities and operating instructions</small></span>
-                <button className="orchestration-primary" onClick={() => setAgentDraft(blankAgent())}><Plus size={14} /> Add agent</button>
+                <button className="orchestration-primary orchestration-add-agent" onClick={() => setAgentDraft(blankAgent())}><Plus size={14} /> Add agent</button>
               </div>
               {agentDraft && (
                 <div className="orchestration-editor">

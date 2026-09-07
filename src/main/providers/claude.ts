@@ -100,7 +100,10 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.capabilities.models = array(initialized.models).flatMap((entry) => {
         const model = object(entry)
         const id = string(model.value) ?? string(model.id)
-        return id ? [{ id, label: string(model.displayName) ?? string(model.name) ?? id }] : []
+        const effort = model.supportsEffort === false ? [] : Array.isArray(model.supportedEffortLevels)
+          ? model.supportedEffortLevels.filter((value): value is string => typeof value === 'string' && this.capabilities.effort.includes(value))
+          : model.supportsEffort === true ? this.capabilities.effort : []
+        return id ? [{ id, label: string(model.displayName) ?? string(model.name) ?? id, ...(effort ? { effort } : {}) }] : []
       })
       this.ready = true
       this.initializedMetadata = initialized
@@ -330,6 +333,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     if (type === 'system' && message.subtype === 'init') {
       this.configurationMetadata = message
+      if (typeof message.model === 'string') this.capabilities.effectiveSettings = { model: message.model }
       if (typeof message.claude_code_version === 'string') this.capabilities.runtimeVersion = message.claude_code_version
       this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', nativeSessionId: this.nativeSessionId, capabilities: this.capabilities }, native: { method: 'system/init', payload: message } })
       return

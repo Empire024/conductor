@@ -1,0 +1,12 @@
+{
+  "native": true,
+  "provider": "codex",
+  "messages": 0,
+  "checks": [
+    "Empty native conversation starts CLI",
+    "PTY stays running",
+    "Chat resumes exact native identity",
+    "No user prompt submitted"
+  ],
+  "errors": []
+}

@@ -1046,8 +1046,8 @@ export function App(): React.JSX.Element {
           <span><Radio size={11} /> local</span>
           <button
             className="statusbar-link"
-            onClick={() => window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'browser' }))}
-            title="Open responsive browser"
+            onClick={() => window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: { mode: 'browser', toggle: true } }))}
+            title="Toggle responsive browser"
           ><Globe2 size={11} /> Browser</button>
         </>}
         <span className="status-spacer" />

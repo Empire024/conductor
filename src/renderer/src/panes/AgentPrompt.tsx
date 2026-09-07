@@ -155,7 +155,7 @@ export function AgentPrompt(props: AgentPromptProps): React.JSX.Element {
               {props.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
             </select>
           </label>
-          <label className="agent-prompt-effort" title={`Reasoning effort: ${selectedEffort.label}. Changing it restarts this provider session.`}>
+          {effortOptions.some(option => option.id !== 'auto') && <label className="agent-prompt-effort" title={`Reasoning effort: ${selectedEffort.label}. Changing it restarts this provider session.`}>
             <span className="agent-effort-heading"><span>Effort</span><output>{selectedEffort.label}</output></span>
             <span
               className="agent-effort-slider"
@@ -181,7 +181,7 @@ export function AgentPrompt(props: AgentPromptProps): React.JSX.Element {
                 onBlur={commitEffort}
               />
             </span>
-          </label>
+          </label>}
           <span className="agent-prompt-spacer" />
           <button className="agent-voice-button" disabled={!props.onVoiceInput} onClick={props.onVoiceInput} title={props.onVoiceInput ? 'Dictate message' : 'Voice input unavailable'}><Mic size={17} /></button>
           <button className="agent-send-button" disabled={!message.trim() || props.disabled || submitting} onClick={() => void submit()} title="Send message (Enter)"><Send size={17} /></button>

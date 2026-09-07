@@ -12,6 +12,8 @@ let acknowledged = false
 let currentTurn
 let turnNumber = 0
 let approval
+const materializedPath = join(process.cwd(), '.synthetic-codex-materialized')
+let materialized = existsSync(materializedPath)
 const threadId = 'synthetic-thread-1'
 const send = message => process.stdout.write(`${JSON.stringify(message)}\n`)
 const notify = (method, params) => send({ method, params })
@@ -75,13 +77,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return
   }
   if (!initialized || !acknowledged) throw new Error('request before initialization handshake completed')
+  if (message.method === 'thread/name/set') { materialized = true; if (process.env.CONDUCTOR_TEST_EMPTY_HISTORY === '1') writeFileSync(materializedPath, 'Synthetic empty history metadata') }
+  if (message.method === 'thread/read' && !materialized && process.env.CONDUCTOR_TEST_EMPTY_HISTORY === '1') { send({ id: message.id, error: { code: -32603, message: 'list_turns is not supported yet' } }); return }
   if (message.method === 'thread/read') { send({ id: message.id, result: { thread: defaults().thread } }); return }
   if (message.method === 'thread/start' || message.method === 'thread/resume') {
     send({ id: message.id, result: defaults() })
     return
   }
   if (message.method === 'model/list') {
-    send({ id: message.id, result: { data: [{ id: 'synthetic-model-id', model: 'synthetic-model', displayName: 'Synthetic model', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Synthetic' }] }], nextCursor: null } })
+    send({ id: message.id, result: { data: [{ id: 'synthetic-model-id', model: 'synthetic-model', displayName: 'Synthetic model', isDefault: true, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Synthetic' }] }, ...(process.env.CONDUCTOR_TEST_MODEL_CATALOG === '1' ? [{ id: 'plain', model: 'plain-model', displayName: 'No effort model', isDefault: false, defaultReasoningEffort: 'none', supportedReasoningEfforts: [] }] : [])], nextCursor: null } })
     return
   }
   if (message.method === 'thread/goal/get') { send({ id: message.id, result: { goal: null } }); return }

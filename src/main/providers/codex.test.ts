@@ -44,7 +44,7 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     const { adapter, sent } = create()
     await Promise.all([adapter.start(), adapter.start()])
     expect(sent.map(message => (message as { method: string }).method)).toEqual(['initialize', 'initialized', 'thread/start', 'model/list'])
-    expect(adapter.capabilities.models).toEqual([{ id: 'synthetic-model', label: 'Synthetic model' }])
+    expect(adapter.capabilities.models).toEqual([{ id: 'synthetic-model', label: 'Synthetic model', effort: ['low'], isDefault: true }])
     expect(adapter.capabilities.plans).toBe(false)
     expect(adapter.capabilities.runtimeVersion).toBe('0.153.4')
   })
@@ -242,5 +242,22 @@ describe('Codex deterministic mapping', () => {
     expect(() => codexLiveSkillOverrides({ data: [] }, config)).toThrow('incomplete')
     discovered.data[0]!.skills[0]!.scope = 'unknown' as never
     expect(() => codexLiveSkillOverrides(discovered, config)).toThrow('Unknown skill scope')
+  })
+})
+
+describe('model and empty-history regression contracts', () => {
+  it('materializes empty history by saving its title before a CLI handoff', async () => {
+    const { adapter } = create({ CONDUCTOR_TEST_EMPTY_HISTORY: '1' })
+    await adapter.start()
+    await expect(adapter.history()).rejects.toThrow('list_turns is not supported yet')
+    await adapter.rename('Existing pane title')
+    await expect(adapter.history()).resolves.toEqual([])
+  })
+  it('does not carry default reasoning effort into a model without effort', async () => {
+    const { adapter, sent } = create({ CONDUCTOR_TEST_MODEL_CATALOG: '1' })
+    await adapter.start()
+    expect(adapter.capabilities.models.find(model => model.id === 'plain-model')?.effort).toEqual([])
+    await adapter.submit('synthetic:stream', { ...settings, model: 'plain-model' })
+    expect(sent.find(message => (message as { method?: string }).method === 'turn/start')).toMatchObject({ params: { model: 'plain-model', effort: null } })
   })
 })

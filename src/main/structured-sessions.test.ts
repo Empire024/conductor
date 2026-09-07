@@ -532,3 +532,19 @@ describe('queued messages and native CLI handoff', () => {
     expect(f.current.options.newNativeSession).toBe(true)
   })
 })
+
+describe('empty native conversation handoff', () => {
+  it('saves the existing title before reading an empty Codex history', async () => {
+    const f = fixture('codex')
+    await f.manager.connectSession(f.spec.id)
+    const rename = vi.spyOn(f.current, 'rename')
+    const history = vi.fn(async () => { expect(rename).toHaveBeenCalledWith(f.spec.title); return [] })
+    Object.assign(f.current, { history })
+    const original = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
+    await expect(f.manager.prepareCli(f.spec.id)).resolves.toMatchObject({ nativeSessionId: original })
+    expect(history).toHaveBeenCalledOnce()
+    f.manager.cancelCli(f.spec.id)
+    expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ view: 'visual', nativeSessionId: original, phase: 'disconnected' })
+    expect(f.database.getSetting('cliHandoff:' + f.spec.id)).toBeNull()
+  })
+})

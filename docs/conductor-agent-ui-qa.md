@@ -4,7 +4,7 @@ Recorded 2026-09-07. **Owner-authorized testing delivery; full parity is not cla
 
 ## Completed feature list — 2026-09-07
 
-All current feature-list items are implemented. See the [backlog delivery record](conductor-backlog-delivery.md) for the final 304-test run, production build, 20 Electron backlog checks and eight draft checks per provider. It also records native CLI, clipboard and dependency-cancellation validation boundaries. Earlier sections below describe their respective deliveries.
+The original feature-list delivery and the follow-up fixes for bugs 13?17 are implemented. See the [backlog delivery record](conductor-backlog-delivery.md) for the latest 312-test run, production build, 24 Electron backlog checks, native CLI metadata checks and the earlier draft checks per provider. Later backlog additions remain pending. It also records native CLI, clipboard and dependency-cancellation validation boundaries. Earlier sections below describe their respective deliveries.
 
 ## Composer draft recovery — 2026-09-07
 

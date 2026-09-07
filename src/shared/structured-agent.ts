@@ -22,7 +22,7 @@ export interface ProviderCapabilities {
   approvalPolicies?: NonNullable<SessionSettings['approvalPolicy']>[]
   effectiveSettings?: Json
   effort: string[]
-  models: Array<{ id: string; label: string }>
+  models: Array<{ id: string; label: string; effort?: string[]; isDefault?: boolean }>
   limitations: string[]
 }
 export interface SessionSettings {

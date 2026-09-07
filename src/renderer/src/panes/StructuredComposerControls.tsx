@@ -1,3 +1,4 @@
+import { modelEfforts } from '../../../shared/model-effort'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { useEffect, useId, useRef, useState } from 'react'
 import { Check, ChevronDown, LoaderCircle, Search } from 'lucide-react'
@@ -23,11 +24,20 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const label = models.find(option => option.id === model)?.label ?? (model || 'Default')
   const choices = [{ id: '', label: 'Default' }, ...models.filter(option => option.id !== 'default')]
     .filter(option => (option.label + ' ' + option.id).toLowerCase().includes(query.toLowerCase()))
-  const efforts = ['', ...(capabilities?.effort ?? []).filter(value => value && value !== 'auto')]
+  const supportedEfforts = modelEfforts(capabilities, settings.model)
+  const efforts = ['', ...(supportedEfforts ?? []).filter(value => value && value !== 'auto')]
   const unavailableEffort = Boolean(capabilities && settings.effort && settings.effort !== 'auto' && !efforts.includes(settings.effort))
   const effortIndex = Math.max(0, efforts.indexOf(settings.effort ?? ''))
   const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : (efforts[effortIndex] || 'Auto').replace(/^./, char => char.toUpperCase())
   const close = (): void => { setOpen(false); setQuery(''); trigger.current?.focus() }
+  const chooseModel = (id: string): void => {
+    const supported = modelEfforts(capabilities, id)
+    onChange({ model: id || undefined, ...(supported && settings.effort && !supported.includes(settings.effort) ? { effort: undefined } : {}) })
+    close()
+  }
+  useEffect(() => {
+    if (supportedEfforts?.length === 0 && settings.effort) onChange({ effort: undefined })
+  }, [supportedEfforts, settings.effort, onChange])
 
   useEffect(() => {
     if (!open) return
@@ -53,7 +63,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
         if (event.key === 'Enter' && event.target instanceof HTMLInputElement) {
           event.preventDefault(); event.stopPropagation()
           const option = choices[0]
-          if (option) { onChange({ model: option.id || undefined }); close() }
+          if (option) { chooseModel(option.id) }
         }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
           event.preventDefault()
@@ -66,11 +76,11 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
         <label className="sa-model-search"><Search size={13} /><input autoFocus aria-label="Search models" placeholder="Search models" value={query} onChange={event => setQuery(event.target.value)} /></label>
         {loading && <p className="sa-model-loading" role="status"><LoaderCircle size={13} className="spin" /> Loading models…</p>}
         {error && <p role="alert" className="sa-error">{error}</p>}
-        <div id={listId} role="listbox" aria-label="Models">{choices.map(option => <button type="button" role="option" aria-selected={option.id === model} key={option.id} onClick={() => { onChange({ model: option.id || undefined }); close() }}><ProviderIcon provider={capabilities?.provider} model={option.id} size={14} /><span>{option.label}</span>{option.id === model && <Check size={13} />}</button>)}</div>
+        <div id={listId} role="listbox" aria-label="Models">{choices.map(option => <button type="button" role="option" aria-selected={option.id === model} key={option.id} onClick={() => { chooseModel(option.id) }}><ProviderIcon provider={capabilities?.provider} model={option.id} size={14} /><span>{option.label}</span>{option.id === model && <Check size={13} />}</button>)}</div>
         {!loading && !error && !choices.length && <p className="sa-model-loading">No matching models</p>}
       </div>}
     </div>
-    {unavailableEffort && <button className="sa-effort-unavailable" type="button" disabled={disabled} title="This saved effort is not in the current model catalog. Click to reset to Auto." onClick={() => onChange({ effort: undefined })}>{effortLabel}</button>}
+    {efforts.length > 1 && unavailableEffort && <button className="sa-effort-unavailable" type="button" disabled={disabled} title="This saved effort is not in the current model catalog. Click to reset to Auto." onClick={() => onChange({ effort: undefined })}>{effortLabel}</button>}
     {efforts.length > 1 && !unavailableEffort && <label className="agent-prompt-effort sa-effort-control" title="Reasoning effort for your next message">
       <span className="agent-effort-heading"><span>Effort</span><output>{effortLabel}</output></span>
       <span className="agent-effort-slider" style={{ '--effort-progress': `${effortIndex / (efforts.length - 1) * 100}%` } as React.CSSProperties}>

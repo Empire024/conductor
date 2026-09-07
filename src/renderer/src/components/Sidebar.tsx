@@ -142,16 +142,18 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
 
   useEffect(() => {
     const requestMode = (event: Event): void => {
-      const mode = (event as CustomEvent<WorkspaceSidebarMode>).detail
+      const detail = (event as CustomEvent<WorkspaceSidebarMode | { mode: WorkspaceSidebarMode; toggle?: boolean }>).detail
+      const mode = typeof detail === 'string' ? detail : detail.mode
       if (!['workspace', 'explorer', 'browser'].includes(mode)) return
       props.onUtilityPanel(null)
+      if (typeof detail !== 'string' && detail.toggle && sidebarMode === mode && !props.collapsed) { props.onToggleCollapsed(); return }
       setSidebarMode(mode)
       localStorage.setItem('conductor.sidebarMode', mode)
       if (props.collapsed) props.onToggleCollapsed()
     }
     window.addEventListener('conductor:sidebar-mode', requestMode)
     return () => window.removeEventListener('conductor:sidebar-mode', requestMode)
-  }, [props.collapsed, props.onToggleCollapsed, props.onUtilityPanel])
+  }, [sidebarMode, props.collapsed, props.onToggleCollapsed, props.onUtilityPanel])
 
   useEffect(() => {
     if (!menu) return

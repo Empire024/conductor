@@ -12,6 +12,8 @@ export function FilePicker({ projects, onPick, onClose }: { projects: ProjectRec
   const [error, setError] = useState('')
   const listId = useId()
   const list = useRef<HTMLDivElement>(null)
+  const keyboardNavigation = useRef(false)
+  const pendingSelection = useRef(0)
   const ids = projects.map((project) => project.id).join(',')
   useEffect(() => {
     let live = true
@@ -19,23 +21,28 @@ export function FilePicker({ projects, onPick, onClose }: { projects: ProjectRec
     const timer = window.setTimeout(() => {
       void window.conductor.files.search(ids.split(',').filter(Boolean), query).then((files) => {
         if (!live) return
-        setResults(files); setSelected(0); setError('')
+        setResults(files); setSelected(Math.max(0, Math.min(files.length - 1, pendingSelection.current))); setError('')
       }).catch((reason: unknown) => { if (live) { setError(String(reason)); setResults([]) } }).finally(() => { if (live) setBusy(false) })
-    }, 100)
+    }, query ? 100 : 0)
     return () => { live = false; window.clearTimeout(timer) }
   }, [ids, query])
-  useEffect(() => { list.current?.children[selected]?.scrollIntoView({ block: 'nearest' }) }, [selected])
+  useEffect(() => { list.current?.children[selected]?.scrollIntoView({ block: 'nearest' }) }, [selected, results])
   return <AgentDialog title="Open file" onClose={onClose}>
-    <div className="file-picker">
+    <div className="file-picker" onKeyDown={(event) => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault(); event.stopPropagation(); keyboardNavigation.current = true
+        const next = Math.max(0, (busy && !results.length ? pendingSelection.current : selected) + (event.key === 'ArrowDown' ? 1 : -1))
+        pendingSelection.current = busy && !results.length ? next : Math.min(Math.max(0, results.length - 1), next)
+        setSelected(pendingSelection.current)
+      }
+      if (event.key === 'Enter' && results[selected]) { event.preventDefault(); event.stopPropagation(); onPick(results[selected]!); onClose() }
+    }}>
       <label className="file-picker-input"><Search size={17} /><input autoFocus placeholder="Search files in loaded projects…" aria-label="Search files"
         role="combobox" aria-expanded aria-autocomplete="list" aria-controls={listId} aria-activedescendant={results[selected] ? listId + '-' + selected : undefined}
-        value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
-          if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); setSelected((current) => Math.max(0, Math.min(results.length - 1, current + (event.key === 'ArrowDown' ? 1 : -1)))) }
-          if (event.key === 'Enter' && results[selected]) { event.preventDefault(); onPick(results[selected]!); onClose() }
-        }} /><kbd>Ctrl E</kbd></label>
+        value={query} onChange={(event) => { setQuery(event.target.value); setResults([]); setSelected(0); setBusy(true); pendingSelection.current = 0 }} /><kbd>Ctrl E</kbd></label>
       <div className="file-picker-results" id={listId} role="listbox" aria-label="Files" ref={list} aria-busy={busy}>
-        {results.map((file, index) => <button key={file.projectId + ':' + file.path} id={listId + '-' + index} role="option" aria-selected={selected === index}
-          className={selected === index ? 'active' : ''} onMouseMove={() => setSelected(index)} onClick={() => { onPick(file); onClose() }}>
+        {results.map((file, index) => <button key={file.projectId + ':' + file.path} id={listId + '-' + index} role="option" tabIndex={-1} aria-selected={selected === index}
+          className={selected === index ? 'active' : ''} onMouseDown={(event) => event.preventDefault()} onMouseMove={(event) => { if (event.movementX || event.movementY) keyboardNavigation.current = false; if (!keyboardNavigation.current) { pendingSelection.current = index; setSelected(index) } }} onClick={() => { onPick(file); onClose() }}>
           <File size={16} /><span><strong>{file.path.split('/').pop()}</strong><small>{file.path}</small></span><small>{projects.find((project) => project.id === file.projectId)?.name}</small>
         </button>)}
         {!results.length && <p role="status">{error || (busy ? 'Finding files…' : projects.length ? 'No matching files.' : 'Add a project to browse its files.')}</p>}

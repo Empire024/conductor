@@ -247,7 +247,7 @@ export class CodexAdapter implements ProviderAdapter {
       try {
         const catalog = await this.request<ModelListResponse>('model/list', { limit: 100, includeHidden: false })
         this.models = Array.isArray(catalog.data) ? catalog.data : []
-        this.capabilities.models = this.models.map(model => ({ id: model.model, label: model.displayName }))
+        this.capabilities.models = this.models.map(model => ({ id: model.model, label: model.displayName, effort: model.supportedReasoningEfforts.map(option => option.reasoningEffort), isDefault: model.isDefault }))
         this.capabilities.effort = [...new Set(this.models.flatMap(model => model.supportedReasoningEfforts.map(option => option.reasoningEffort)))]
       } catch { this.capabilities.limitations.push('Model discovery failed; model and effort availability are unknown until the runtime accepts a turn.') }
       this.emit({ data: { type: 'session', phase: this.turnId ? 'running' : 'idle', nativeSessionId: this.threadId, capabilities: this.capabilities } })
@@ -272,7 +272,7 @@ export class CodexAdapter implements ProviderAdapter {
     if (!this.capabilities.sandboxModes!.includes(sandbox) || !this.capabilities.approvalPolicies!.includes(approvalPolicy)) throw new Error('Unsupported Codex sandbox or approval policy')
     const params: TurnStartParams = {
       threadId: this.threadId, input: codexInput(text, attachments), cwd: this.options.cwd, model,
-      effort: (settings.effort as ReasoningEffort | undefined) ?? this.defaults.reasoningEffort,
+      effort: (settings.effort as ReasoningEffort | undefined) ?? (modelInfo ? modelInfo.supportedReasoningEfforts.length ? modelInfo.defaultReasoningEffort : null : model === this.defaults.model ? this.defaults.reasoningEffort : null),
       approvalPolicy: approvalPolicy === 'inherit' ? this.defaults.approvalPolicy : approvalPolicy,
       sandboxPolicy: sandbox === 'inherit' ? this.defaults.sandbox : sandbox === 'read-only'
         ? { type: 'readOnly', networkAccess: false }

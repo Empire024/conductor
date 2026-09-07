@@ -1,6 +1,6 @@
 # Feature-list delivery
 
-Recorded 2026-09-07. All items in `feature-list.md`, plus Ctrl+E and the download-loader request, are implemented and validated. The source version stays unchanged; pushing this tested state to main lets the release workflow choose the next patch. Publication must be verified after the push.
+Recorded 2026-09-07. The original bug items 1?12 and feature items 0?11 are implemented and validated. The follow-up delivery for bugs 13?17 is recorded below; later backlog additions remain pending. The source version stays unchanged; pushing this tested state to main lets the release workflow choose the next patch. Publication must be verified after the push.
 
 ## Behavior
 
@@ -29,3 +29,15 @@ Native provider inference was not run and no live allowance was reset. Provider 
 Monaco 0.52.2 can reject its pending word-highlighter delay with `Canceled` when an editor closes. The smoke record retains that exact dependency teardown stack separately and fails for every other renderer exception. No global application error suppression was added.
 
 The broader native-extension parity work and future roadmap in the existing handoffs are separate from this feature list. Their earlier live-validation limits still apply.
+
+## Bug items 13?17 ? 2026-09-07
+
+- **13:** Ctrl+E starts its initial search immediately, retains arrow presses received while results load, scrolls the selected file into view, and prevents a stationary pointer from resetting keyboard selection. Enter opens the selected file while search retains focus.
+- **14:** Codex and Claude retain the selected model's effort metadata. The control disappears for models without effort; changing models clears an incompatible setting. Claude's default alias remains supported, and Codex no longer carries another model's default effort into a model without reasoning. Claude metadata fields follow the [official ModelInfo contract](https://code.claude.com/docs/en/agent-sdk/typescript#modelinfo).
+- **15:** A native Codex metadata probe reproduced `list_turns is not supported yet` on a fresh paginated conversation. Saving its existing Conductor title materializes that exact thread before handoff. Native CLI arguments omit inherited/default placeholder values and preserve approval policies via config. A PTY startup failure releases CLI ownership and restores Chat for recovery.
+- **16:** The Browser footer button toggles its sidebar open, closed and open again. Explicit Open Browser commands still open it.
+- **17:** Add agent uses 8px uppercase type and a smaller plus icon. Its selector now takes precedence over the hub's inherited button font rule.
+
+Validation for this delivery: `npm.cmd test` passed 299 Vitest tests plus 13 Node tests (312 total); `npm.cmd run build` passed. The production Electron backlog smoke passed 24 check groups, including all five fixes. [Results](evidence/backlog-13-17/results.json). [Add agent screenshot](evidence/backlog-13-17/add-agent.png) was visually inspected.
+
+Both installed native CLIs also passed an isolated empty-conversation Chat ? CLI ? Chat check with the same native ID and zero user prompts or inference submissions: [Codex](evidence/backlog-13-17/native-codex.json), [Claude](evidence/backlog-13-17/native-claude.json). The offline fixture now reproduces Codex's unmaterialized-history error and persists metadata across its process restart. No live allowance was reset. Release publication is verified after pushing the tested commit to main.

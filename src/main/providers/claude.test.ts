@@ -287,3 +287,21 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(f.transport.sent).toHaveLength(sent)
   })
 })
+
+it('preserves model-specific effort capability metadata from Claude initialization', async () => {
+  const f = fixture({}, false)
+  const starting = f.adapter.start()
+  await flush()
+  const first = f.transport.sent[0] as { request_id: string }
+  f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: first.request_id, response: { models: [
+    { value: 'reasoner', displayName: 'Reasoner', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+    { value: 'plain', displayName: 'Plain', supportsEffort: false },
+    { value: 'unknown', displayName: 'Unknown' }
+  ] } } })
+  await starting
+  expect(f.adapter.capabilities.models).toEqual([
+    { id: 'reasoner', label: 'Reasoner', effort: ['low', 'high'] },
+    { id: 'plain', label: 'Plain', effort: [] },
+    { id: 'unknown', label: 'Unknown', effort: [] }
+  ])
+})
