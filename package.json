@@ -13,7 +13,7 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
-    "dist:win": "npm run build && electron-builder --win nsis --x64 && node scripts/generate-update-manifest.mjs",
+    "dist:win": "npm run build && electron-builder --win nsis --x64 --publish never && node scripts/generate-update-manifest.mjs",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
