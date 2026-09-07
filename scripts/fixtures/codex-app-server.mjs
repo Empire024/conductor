@@ -94,6 +94,16 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (message.method === 'skills/list') { send({ id: message.id, result: { data: [{ cwd: process.cwd(), skills: [], errors: [] }] } }); return }
   if (message.method === 'mcpServerStatus/list') { send({ id: message.id, result: { data: [], nextCursor: null } }); return }
   if (message.method === 'plugin/list') { send({ id: message.id, result: { marketplaces: [] } }); return }
+  if (message.method === 'turn/steer') {
+    const behavior = process.env.CONDUCTOR_TEST_STEER
+    if (behavior === 'timeout') return
+    if (behavior === 'disconnect') { process.exit(7); return }
+    if (behavior === 'stale' || message.params.expectedTurnId !== currentTurn) { send({ id: message.id, error: { code: -32600, message: 'expectedTurnId does not match the active turn' } }); return }
+    if (behavior === 'review' || behavior === 'compact') { send({ id: message.id, error: { code: -32600, message: 'Active turn is not steerable', data: { codexErrorInfo: { activeTurnNotSteerable: { turnKind: behavior } } } } }); return }
+    send({ id: message.id, result: { turnId: behavior === 'malformed' ? 'wrong-turn' : currentTurn } })
+    if (behavior !== 'malformed') itemEvent('item/completed', { type: 'userMessage', id: 'steer-' + message.id, content: message.params.input })
+    return
+  }
   if (message.method === 'turn/interrupt') {
     send({ id: message.id, result: {} })
     if (approval) { notify('serverRequest/resolved', { threadId, requestId: approval.id }); approval = undefined }
@@ -104,7 +114,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   currentTurn = `synthetic-turn-${++turnNumber}`
   const scenario = message.params.input[0].text
   notify('turn/started', { threadId, turn: { id: currentTurn, status: 'inProgress', items: [], error: null } })
-  send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } })
+  if (process.env.CONDUCTOR_TEST_TURN_ACK_DELAY === '1') setTimeout(() => send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } }), 150)
+  else send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } })
+  if (scenario.startsWith('synthetic:steer')) {
+    if (scenario === 'synthetic:steer-review') itemEvent('item/started', { type: 'enteredReviewMode', id: 'review', review: 'Synthetic review' })
+    if (scenario === 'synthetic:steer-compact') itemEvent('item/started', { type: 'contextCompaction', id: 'compact' })
+    return
+  }
   if (scenario === 'synthetic:activity-groups') {
     itemEvent('item/completed', { type: 'agentMessage', id: 'activity-intro', text: 'I will inspect the files and preserve useful results.', phase: null, memoryCitation: null, delivery: null, questions: null })
     for (let index = 1; index <= 8; index++) {

@@ -29,6 +29,7 @@ const bridge: ConductorBridge = {
   },
   structured: {
     queue: (id, text, settings, attachments) => ipcRenderer.invoke('structured:queue', id, text, settings, attachments),
+    steer: (id, text, settings, attachments) => ipcRenderer.invoke('structured:steer', id, text, settings, attachments),
     cancelQueued: (id, promptId) => ipcRenderer.invoke('structured:cancel-queued', id, promptId),
     connect: (id) => ipcRenderer.invoke('structured:connect', id),
     snapshot: (id) => ipcRenderer.invoke('structured:snapshot', id),

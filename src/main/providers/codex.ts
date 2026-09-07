@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import type { AdapterOptions, ProviderAdapter } from './adapter'
+import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import type { ClientRequest } from './generated/codex/ClientRequest'
@@ -13,6 +13,8 @@ import type { ThreadItem } from './generated/codex/v2/ThreadItem'
 import type { ThreadStartResponse } from './generated/codex/v2/ThreadStartResponse'
 import type { TurnStartParams } from './generated/codex/v2/TurnStartParams'
 import type { TurnStartResponse } from './generated/codex/v2/TurnStartResponse'
+import type { TurnSteerResponse } from './generated/codex/v2/TurnSteerResponse'
+import type { NonSteerableTurnKind } from './generated/codex/v2/NonSteerableTurnKind'
 import type { FileUpdateChange } from './generated/codex/v2/FileUpdateChange'
 import type { UserInput } from './generated/codex/v2/UserInput'
 import type { ConfigReadResponse } from './generated/codex/v2/ConfigReadResponse'
@@ -30,6 +32,10 @@ export interface CodexAdapterDependencies {
   version?: () => Promise<string>
   requestTimeoutMs?: number
 }
+class CodexRpcError extends Error {
+  constructor(readonly code: unknown, readonly data: unknown, message: string) { super(`Codex request failed (${String(code ?? 'unknown')}): ${message}`) }
+}
+
 type PendingRpc = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
 type PendingRequest = { request: ServerRequest; interaction: PendingInteraction; blocking: boolean }
 type Correlation = Pick<AdapterEvent, 'nativeSessionId' | 'turnId' | 'itemId' | 'parentId'>
@@ -145,9 +151,9 @@ export function codexInput(text: string, attachments: ContextAttachment[] = []):
 /** One App Server process per backend-owned session; views never construct this class. */
 export class CodexAdapter implements ProviderAdapter {
   readonly provider = 'codex' as const
-  readonly capabilities: ProviderCapabilities = {
+  private readonly providerCapabilities: ProviderCapabilities = {
     provider: 'codex', runtimeVersion: 'unknown', adapterVersion: 1, authentication: 'cli',
-    textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true,
+    steering: false, textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true,
     approvals: true, questions: true, resume: true, fork: true, plans: false, imageAttachments: true, effort: ['minimal', 'low', 'medium', 'high', 'xhigh'], models: [], permissions: ['default', 'read-only', 'accept-edits'],
     sandboxModes: ['inherit', 'read-only', 'workspace-write'], approvalPolicies: ['inherit', 'untrusted', 'on-request', 'never'],
     limitations: [
@@ -169,6 +175,7 @@ export class CodexAdapter implements ProviderAdapter {
   private childParents = new Map<string, string>()
   private threadId?: string
   private turnId?: string
+  private turnKind?: NonSteerableTurnKind
   private dispatching = false
   private interrupted = false
   private liveRetryStopped = false
@@ -179,6 +186,11 @@ export class CodexAdapter implements ProviderAdapter {
   private experimental = false
 
   constructor(private options: AdapterOptions, private dependencies: CodexAdapterDependencies = {}) {}
+
+  get capabilities(): ProviderCapabilities {
+    this.providerCapabilities.steering = Boolean(this.turnId && !this.turnKind && !this.dispatching && !this.interrupted && !this.failed && !this.disposed && this.transport?.connected)
+    return this.providerCapabilities
+  }
 
   start(): Promise<void> {
     if (this.disposed) return Promise.reject(new Error('Codex adapter has been disposed'))
@@ -239,7 +251,11 @@ export class CodexAdapter implements ProviderAdapter {
       this.capabilities.effectiveSettings = json({ model: result.model, effort: result.reasoningEffort, approvalPolicy: result.approvalPolicy, sandbox: result.sandbox })
       // Historical hydration belongs to durable local replay. Never replay old items as new work.
       const active = result.thread.turns?.find(turn => turn.status === 'inProgress')
-      if (active) this.turnId = active.id
+      if (active) {
+        this.turnId = active.id
+        if (active.items.some(item => item.type === 'enteredReviewMode')) this.turnKind = 'review'
+        else if (active.items.some(item => item.type === 'contextCompaction')) this.turnKind = 'compact'
+      }
       else if (record(result.thread.status) && result.thread.status.type === 'active') {
         throw new Error('The resumed Codex thread is active but its turn identity is unavailable. No prompt was sent; reconnect explicitly after it stops.')
       }
@@ -284,6 +300,7 @@ export class CodexAdapter implements ProviderAdapter {
       mode: settings.plan ? 'plan' : 'default',
       settings: { model, reasoning_effort: params.effort ?? null, developer_instructions: null }
     }
+    this.turnKind = undefined
     this.dispatching = true
     this.interrupted = false
     this.liveRetryStopped = false
@@ -301,7 +318,32 @@ export class CodexAdapter implements ProviderAdapter {
       // A lost acknowledgement is not permission to retry or claim that nothing executed.
       this.disconnect(error instanceof Error ? error.message : 'Codex turn dispatch failed')
       throw error
-    } finally { this.dispatching = false }
+    } finally { this.dispatching = false; if (this.turnId) this.emitPhase(true) }
+  }
+
+  async steer(text: string, _settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> {
+    if (this.disposed || this.failed || !this.threadId || !this.transport?.connected) throw new SteeringUnavailableError('Codex runtime is disconnected')
+    if (this.dispatching) throw new SteeringUnavailableError('Codex turn acknowledgement is pending; steering is not yet addressable')
+    if (!this.turnId) throw new SteeringUnavailableError('There is no active Codex turn to steer')
+    if (this.turnKind || this.interrupted) throw new SteeringUnavailableError('Codex ' + (this.turnKind ?? 'interrupting') + ' turns cannot be steered')
+    const turnId = this.turnId
+    try {
+      const result = await this.request<TurnSteerResponse>('turn/steer', { threadId: this.threadId, input: codexInput(text, attachments), expectedTurnId: turnId })
+      if (result?.turnId !== turnId) throw new Error('Malformed Codex steer response; delivery is uncertain')
+    } catch (error) {
+      if (error instanceof CodexRpcError) {
+        const info = record(error.data) ? error.data.codexErrorInfo : undefined
+        const refusal = record(info) && record(info.activeTurnNotSteerable) ? info.activeTurnNotSteerable : undefined
+        if (refusal?.turnKind === 'review' || refusal?.turnKind === 'compact') {
+          if (this.turnId === turnId) { this.turnKind = refusal.turnKind; this.emitPhase(true) }
+          throw new SteeringUnavailableError(error.message)
+        }
+        if ([-32600, -32601, -32602].includes(Number(error.code))) throw new SteeringUnavailableError(error.message)
+      }
+      // A lost acknowledgement cannot authorize a second delivery through the queue.
+      this.disconnect(error instanceof Error ? error.message : 'Codex steering delivery is uncertain')
+      throw error
+    }
   }
 
   async respond(response: InteractionResponse): Promise<void> {
@@ -430,7 +472,7 @@ export class CodexAdapter implements ProviderAdapter {
       if (!pending) return this.unknown('rpc/unmatched', message)
       clearTimeout(pending.timer)
       this.rpc.delete(requestKey(message.id))
-      if (record(message.error)) pending.reject(new Error(`Codex request failed (${String(message.error.code ?? 'unknown')}): ${String(message.error.message ?? 'Unknown provider error')}`))
+      if (record(message.error)) pending.reject(new CodexRpcError(message.error.code, message.error.data, String(message.error.message ?? 'Unknown provider error')))
       else if ('result' in message) pending.resolve(message.result)
       else pending.reject(new Error('Malformed Codex RPC response'))
       return
@@ -471,6 +513,7 @@ export class CodexAdapter implements ProviderAdapter {
         return
       case 'turn/started':
         if (params.threadId === this.threadId) {
+          if (this.turnId !== params.turn.id) this.turnKind = undefined
           this.turnId = params.turn.id
           send({ type: 'session', phase: 'running' }, { turnId: params.turn.id })
         }
@@ -570,6 +613,10 @@ export class CodexAdapter implements ProviderAdapter {
 
   private item(item: ThreadItem, context: Correlation, complete: boolean, native: AdapterEvent['native']): void {
     if (!record(item) || typeof item.id !== 'string' || typeof item.type !== 'string') throw new Error('Malformed Codex item')
+    if (context.nativeSessionId === this.threadId && context.turnId === this.turnId) {
+      if (item.type === 'enteredReviewMode') { this.turnKind = 'review'; this.emitPhase(true) }
+      if (item.type === 'contextCompaction') { this.turnKind = complete ? undefined : 'compact'; this.emitPhase(true) }
+    }
     const correlation = { ...context, itemId: item.id }
     if (complete) {
       if (this.completedItems.size >= 2048) this.completedItems.delete(this.completedItems.values().next().value!)
@@ -698,7 +745,7 @@ export class CodexAdapter implements ProviderAdapter {
   }
 
   private itemKey(context: Correlation): string { return JSON.stringify([context.nativeSessionId, context.turnId, context.itemId]) }
-  private emit(event: AdapterEvent): void { this.options.emit({ nativeSessionId: this.threadId, turnId: this.turnId, ...event }) }
+  private emit(event: AdapterEvent): void { this.options.emit({ nativeSessionId: this.threadId, turnId: this.turnId, ...event, data: event.data.type === 'session' ? { ...event.data, capabilities: { ...this.capabilities } } : event.data }) }
   private unknown(method: string, payload: unknown, message = `Codex event: ${method}`): void {
     this.emit({ ...this.correlation(payload), data: { type: 'notice', message, payload: json(payload) }, native: { method, payload: json(payload) } })
   }

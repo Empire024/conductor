@@ -7,7 +7,7 @@ import { StructuredComposerControls } from './StructuredComposerControls'
 const settings: SessionSettings = { permission: 'default', plan: false }
 const capabilities: ProviderCapabilities = {
   provider: 'codex', runtimeVersion: 'synthetic-offline', adapterVersion: 1, authentication: 'cli',
-  textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true, approvals: true,
+  steering: false, textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true, approvals: true,
   questions: true, resume: true, fork: true, plans: true,
   models: [{ id: 'model-one', label: 'Model One', isDefault: true, effort: ['minimal', 'low', 'medium', 'high'] }, { id: 'model-two', label: 'Model Two', effort: [] }],
   effort: ['minimal', 'low', 'medium', 'high'], limitations: []

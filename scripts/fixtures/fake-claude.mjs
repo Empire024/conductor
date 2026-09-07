@@ -50,7 +50,9 @@ for await (const line of input) {
     if (!initialized) throw new Error('User message before initialization')
     const prompt = message.message.content
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
+    if (prompt.startsWith('SYNTHETIC STEER DATA')) { text('Synthetic steering input received during the active turn.'); continue }
     turn++
+    if (prompt.startsWith('SYNTHETIC STEER START')) { emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' }); continue }
     emit({ type: 'system', subtype: 'init', claude_code_version: '2.1.263', tools: ['Edit', 'Bash'], mcp_servers: [], permissionMode: 'default' })
     if (prompt.startsWith('SYNTHETIC QUESTION')) {
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', effort: 'high', claude_code_version: '2.1.263' })

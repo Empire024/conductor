@@ -9,6 +9,7 @@ export interface ProviderCapabilities {
   adapterVersion: 1
   authentication: 'cli' | 'api' | 'unknown'
   textStreaming: boolean
+  steering: boolean
   toolInputStreaming: boolean
   toolOutputStreaming: boolean
   approvals: boolean
@@ -155,6 +156,7 @@ export interface InteractionResponse {
   answers?: Record<string, string[]>
 }
 export interface StructuredAgentBridge {
+  steer(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
   queue(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
   cancelQueued(id: string, promptId?: string): Promise<QueuedPrompt | null>
   connect(id: string): Promise<void>

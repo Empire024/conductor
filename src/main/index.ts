@@ -511,6 +511,7 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:connect', (event, id) => { trustedStructured(event); return agents.structured.connectSession(structuredId(id)) })
   ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
   ipcMain.handle('structured:queue', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.queue(structuredId(id), text, settings, attachments) })
+  ipcMain.handle('structured:steer', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.steer(structuredId(id), text, settings, attachments) })
   ipcMain.handle('structured:cancel-queued', (event, id, promptId?: string) => { trustedStructured(event); if (promptId !== undefined && typeof promptId !== 'string') throw new Error('Invalid queued prompt'); return agents.structured.cancelQueued(structuredId(id), promptId) })
   ipcMain.handle('native-cli:ensure', (event, id) => { trustedStructured(event); return agents.nativeCli.ensure(structuredId(id)) })
   ipcMain.handle('native-cli:chat', (event, id) => { trustedStructured(event); return agents.nativeCli.switchToChat(structuredId(id)) })

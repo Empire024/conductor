@@ -5,7 +5,7 @@ import type { AgentSpec, RuntimeEnsureResult } from '../shared/models'
 import type { AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
-import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
+import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import { createProviderAdapter } from './providers/factory'
 import { validateLiveTurn } from './live-test-policy'
 import { LiveRuntimeBudget } from './live-runtime-budget'
@@ -20,6 +20,8 @@ interface LiveSession {
   handoff?: boolean
   dispatchingQueue?: boolean
   queueing?: Promise<void>
+  steering?: boolean
+  turnId?: string
   submitting: boolean
   closed: boolean
   responses: Set<string>
@@ -196,7 +198,7 @@ export class StructuredSessions {
   async resume(id: string, settings?: SessionSettings): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
-    if (active.has(state.phase)) throw new Error('Session still has active work')
+    if (active.has(state.phase) || live.queueing) throw new Error('Session still has active work')
     if (!state.nativeSessionId) throw new Error('This history has no native conversation to resume')
     if (settings) { this.validateSettings(settings, state.capabilities); this.database.structured.update(id, { settings }) }
     live.closed = true; live.adapter?.dispose(); live.adapter = undefined; live.closed = false
@@ -246,7 +248,15 @@ export class StructuredSessions {
   }
 
   async queue(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
-    const live = this.get(id)
+    return this.followup(id, text, settings, attachments, false)
+  }
+  async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
+    return this.followup(id, text, settings, attachments, true)
+  }
+  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean): Promise<void> {
+    const live = this.get(id), adapter = live.adapter, runtimeId = live.runtimeId, turnId = live.turnId
+    const captured = structuredClone(attachments)
+    settings = structuredClone(settings)
     // Serialize validation as well as insertion so slow file reads cannot reorder messages.
     const previous = live.queueing
     const queued = (async () => {
@@ -256,17 +266,33 @@ export class StructuredSessions {
       if (!live.adapter || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(state.phase)) throw new Error('There is no active turn to queue behind')
       if (typeof text !== 'string' || !text.trim() || text.length > 60000) throw new Error('Prompt must contain 1-60000 characters')
       this.validateSettings(settings, state.capabilities)
-      const captured = structuredClone(attachments)
-      await this.attachments(live, captured)
-      const latest = this.database.structured.snapshot(id)!
-      if (live.closed || live.handoff || this.cliOwned(id) || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
+      const context = await this.attachments(live, captured)
+      let latest = this.database.structured.snapshot(id)!
+      if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
+      let refusal = 'The current turn does not support steering'
+      if (steer && live.turnId === turnId && adapter?.steer && adapter.capabilities.steering && ['running', 'waiting_input', 'waiting_approval'].includes(latest.phase)) {
+        this.reserveLive(live, latest.settings, text.trim() + context)
+        live.steering = true
+        try {
+          await adapter.steer(text.trim() + context, settings, captured.filter(item => item.kind === 'image'))
+          if (live.closed || this.live.get(id) !== live || live.runtimeId !== runtimeId) throw new Error('The runtime changed after steering was sent. Check the conversation before resending; your draft was kept.')
+          this.emit(live, { turnId, itemId: randomUUID(), data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(captured.length ? { attachments: captured.map(({ content: _content, ...metadata }) => metadata) } : {}) } })
+          return
+        } catch (error) {
+          if (!(error instanceof SteeringUnavailableError)) throw new Error((error instanceof Error ? error.message : String(error)) + '. Steering was not confirmed; your draft was kept. Check the conversation before resending.')
+          refusal = error.message
+        } finally { live.steering = false }
+        latest = this.database.structured.snapshot(id)!
+        if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
+      }
       const prompts = latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])
       if (prompts.length >= 100) throw new Error('The queue is full (100 messages)')
       this.setQueue(live, [...prompts, { id: randomUUID(), text, settings: structuredClone(settings), attachments: captured }])
+      if (steer) this.emit(live, { data: { type: 'notice', message: 'Message queued instead of steered: ' + refusal } })
       void this.drainQueue(live)
     })()
     live.queueing = queued
-    try { await queued } finally { if (live.queueing === queued) live.queueing = undefined }
+    try { await queued } finally { if (live.queueing === queued) live.queueing = undefined; void this.drainQueue(live) }
   }
   private setQueue(live: LiveSession, prompts: import('../shared/structured-agent').QueuedPrompt[]): void {
     this.emit(live, { data: { type: 'queue', prompt: prompts[0] ?? null, prompts } })
@@ -281,7 +307,7 @@ export class StructuredSessions {
   }
   private async drainQueue(live: LiveSession): Promise<void> {
     const state = this.database.structured.snapshot(live.spec.id)
-    if (!state?.queued || !['completed', 'idle'].includes(state.phase) || live.closed || live.submitting || live.dispatchingQueue || !live.adapter) return
+    if (!state?.queued || !['completed', 'idle'].includes(state.phase) || live.closed || live.submitting || live.steering || live.dispatchingQueue || !live.adapter) return
     const queued = state.queued
     live.dispatchingQueue = true
     let sent = false
@@ -302,7 +328,7 @@ export class StructuredSessions {
   async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
     const live = this.get(id), store = this.database.structured, state = store.snapshot(id)!
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
-    if (live.submitting || active.has(state.phase)) throw new Error('A turn or request is already active in this session')
+    if (live.submitting || live.steering || active.has(state.phase)) throw new Error('A turn or request is already active in this session')
     if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Execution became uncertain. Resume the native conversation explicitly before sending another turn.')
     if (typeof text !== 'string' || !text.trim() || text.length > 60_000) throw new Error('Prompt must contain 1–60000 characters')
     this.validateSettings(settings, state.capabilities)
@@ -429,6 +455,7 @@ export class StructuredSessions {
       const correlated = state.items.filter(item => item.runtimeId === live.runtimeId && item.nativeItemId === source.itemId).at(-1)
       if (correlated?.turnId) source = { ...source, turnId: correlated.turnId }
     }
+    if (source.data.type === 'session' && source.turnId) live.turnId = source.turnId
     let data = source.data
     if (data.type === 'changes') data = { ...data, changes: data.changes.map(change => this.artifacts.fromPatch(live.spec.id, change, live.spec.cwd)) }
     if (data.type === 'tool' && data.output && data.output.length > 32_000) {

@@ -3,7 +3,7 @@ import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shar
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
 import { ClaudeAdapter } from './claude'
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
-import type { AdapterOptions } from './adapter'
+import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import { resolve, join } from 'node:path'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -400,4 +400,74 @@ it('matches VS Code context accounting, reserves output and compaction space, an
   expect(latest()).toMatchObject({ limits: { contextUsedTokens: 2030, contextCapacityTokens: 155000 } })
   f.transport.receive({ type: 'assistant', message: { id: 'new-model', model: 'claude-other', usage: { input_tokens: 1000, output_tokens: 20 }, content: [] } })
   expect(latest()).toMatchObject({ limits: { contextUsedTokens: 1020, contextCapacityTokens: null } })
+})
+
+
+describe('Claude mid-turn steering (synthetic, zero inference)', () => {
+  it('writes another user message immediately without resetting turn identity, pending tools, or settings', async () => {
+    const f = fixture({ nativeSessionId: 'native-steering' })
+    await f.adapter.start(); await f.adapter.submit('Original prompt', settings)
+    f.transport.receive(toolUse('still-running', 'Read', { path: 'context.txt' }))
+    const turnId = f.events.at(-1)?.turnId
+    const count = f.transport.sent.length
+    await f.adapter.steer('More data', { ...settings, effort: 'low' }, [{ id: 'selection', kind: 'selection', name: 'Selected lines', content: 'Exact context' }])
+    expect(f.transport.sent).toHaveLength(count + 1)
+    expect(f.transport.sent.at(-1)).toMatchObject({ type: 'user', session_id: 'native-steering', uuid: expect.any(String), message: { role: 'user', content: expect.stringContaining('More data') } })
+    expect(f.transport.sent.at(-1)).toMatchObject({ message: { content: expect.stringContaining('Exact context') } })
+    expect((f.transport.sent.at(-1) as { uuid: string }).uuid).not.toBe(turnId)
+    expect(f.projection().phase).toBe('running')
+    expect(f.adapter.capabilities.steering).toBe(true)
+    f.transport.receive(toolUse('after-steer', 'Read', {}))
+    expect(f.events.at(-1)?.turnId).toBe(turnId)
+    expect(f.projection().items.find(item => item.nativeItemId === 'still-running')).toBeDefined()
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ effort: null })
+  })
+
+  it.each(['idle', 'completed', 'disconnected', 'disposed', 'interrupting'])('refuses a %s runtime before writing input', async state => {
+    const f = fixture()
+    await f.adapter.start()
+    if (state !== 'idle') await f.adapter.submit('Original prompt', settings)
+    if (state === 'completed') f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+    if (state === 'disconnected') f.transport.options.onExit?.(1, null)
+    if (state === 'disposed') f.adapter.dispose()
+    if (state === 'interrupting') await f.adapter.interrupt()
+    const count = f.transport.sent.length
+    expect(f.adapter.capabilities.steering).toBe(false)
+    await expect(f.adapter.steer('Keep my text', settings)).rejects.toThrow(SteeringUnavailableError)
+    expect(f.transport.sent).toHaveLength(count)
+  })
+
+  it('uses the same image encoder for submit and steer', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-steer-image-')); imageRoots.push(root)
+    writeFileSync(join(root, 'image.png'), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]))
+    const f = fixture({ cwd: root })
+    const attachments = [{ id: 'image', kind: 'image' as const, name: 'image.png', path: 'image.png' }]
+    await f.adapter.start(); await f.adapter.submit('Same text', settings, attachments)
+    const original = f.transport.sent.at(-1) as { message: Json }
+    await f.adapter.steer('Same text', settings, attachments)
+    expect(f.transport.sent.at(-1)).toMatchObject({ message: original.message })
+  })
+
+  it('rechecks the active turn after asynchronous image capture', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-steer-image-race-')); imageRoots.push(root)
+    writeFileSync(join(root, 'image.png'), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1]))
+    const f = fixture({ cwd: root })
+    await f.adapter.start(); await f.adapter.submit('Original prompt', settings)
+    const count = f.transport.sent.length
+    const steering = f.adapter.steer('Keep my image', settings, [{ id: 'image', kind: 'image', name: 'image.png', path: 'image.png' }])
+    f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+    await expect(steering).rejects.toThrow(SteeringUnavailableError)
+    expect(f.transport.sent).toHaveLength(count)
+  })
+
+  it('surfaces a failed stdin write without claiming delivery or permitting automatic retry', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Original prompt', settings)
+    const count = f.transport.sent.length
+    vi.spyOn(f.transport, 'send').mockImplementationOnce(() => { throw new Error('stdin write failed') })
+    const reason: unknown = await f.adapter.steer('Keep my text', settings).catch(error => error)
+    expect(reason).toBeInstanceOf(Error)
+    expect(reason).not.toBeInstanceOf(SteeringUnavailableError)
+    expect(f.transport.sent).toHaveLength(count)
+  })
 })

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexDiffCounts, codexInput, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
 import { JsonLineTransport } from './transport'
+import { SteeringUnavailableError } from './adapter'
 import type { AdapterEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import type { ConfigReadResponse } from './generated/codex/v2/ConfigReadResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
@@ -14,14 +15,14 @@ const settings: SessionSettings = { permission: 'default', plan: false }
 const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const clean of cleanup.splice(0)) await clean() })
 
-function create(extraEnvironment: NodeJS.ProcessEnv = {}, nativeSessionId?: string) {
+function create(extraEnvironment: NodeJS.ProcessEnv = {}, nativeSessionId?: string, requestTimeoutMs = 3000) {
   const cwd = mkdtempSync(path.join(tmpdir(), 'conductor-codex-'))
   const events: AdapterEvent[] = []
   const sent: Json[] = []
   let closed = true
   const adapter = new CodexAdapter({ executable: 'not-a-real-provider', cwd, runtimeId: 'runtime-1', settings, nativeSessionId, environment: { ...process.env, ...extraEnvironment }, emit: event => events.push(event) }, {
     version: async () => `codex-cli ${CODEX_PROTOCOL_BASELINE}`,
-    requestTimeoutMs: 3000,
+    requestTimeoutMs,
     transport: options => {
       closed = false
       const transport = new JsonLineTransport({ ...options, executable: process.execPath, args: [fixture], onExit: (code, signal) => { closed = true; options.onExit?.(code, signal) } })
@@ -280,4 +281,77 @@ it('keeps latest context and response output separate from cumulative Codex tota
   const usage = events.filter(event => event.data.type === 'usage' && event.data.scope === 'session').map(event => event.data)
   expect(usage).toHaveLength(3)
   for (const [index, used] of [140000, 190000, 24000].entries()) expect(usage[index]).toMatchObject({ totalTokens: 9004000, outputTokens: 4000, limits: { contextUsedTokens: used, contextCapacityTokens: 200000, workingOutputTokens: 42 } })
+})
+
+
+describe('Codex mid-turn steering (synthetic, zero inference)', () => {
+  it('dispatches to the active turn immediately with native image input and no new turn', async () => {
+    const { adapter, sent, events } = create()
+    await adapter.submit('synthetic:steer', settings)
+    expect(adapter.capabilities.steering).toBe(true)
+    await adapter.steer('More data', settings, [{ id: 'image', kind: 'image', name: 'context.png', path: 'context.png' }])
+    expect(sent.filter(message => (message as { method?: string }).method === 'turn/steer')).toEqual([{ id: expect.any(Number), method: 'turn/steer', params: { threadId: 'synthetic-thread-1', expectedTurnId: 'synthetic-turn-1', input: codexInput('More data', [{ id: 'image', kind: 'image', name: 'context.png', path: 'context.png' }]) } }])
+    expect(sent.filter(message => (message as { method?: string }).method === 'turn/start')).toHaveLength(1)
+    expect(completed(events)).toBe(false)
+    expect(adapter.capabilities.steering).toBe(true)
+    await adapter.interrupt()
+    expect(adapter.capabilities.steering).toBe(false)
+  })
+
+  it('rejects an idle or disposed runtime without sending input', async () => {
+    const { adapter, sent } = create()
+    await adapter.start()
+    expect(adapter.capabilities.steering).toBe(false)
+    await expect(adapter.steer('Keep my text', settings)).rejects.toThrow('no active Codex turn')
+    adapter.dispose()
+    await expect(adapter.steer('Keep my text', settings)).rejects.toThrow('disconnected')
+    expect(sent.some(message => (message as { method?: string }).method === 'turn/steer')).toBe(false)
+  })
+
+  it('rejects steering until turn/start is acknowledged even after turn/started', async () => {
+    const { adapter, sent, events } = create({ CONDUCTOR_TEST_TURN_ACK_DELAY: '1' })
+    const starting = adapter.submit('synthetic:steer', settings)
+    await waitFor(() => events.some(event => event.data.type === 'session' && event.data.phase === 'running'))
+    expect(adapter.capabilities.steering).toBe(false)
+    await expect(adapter.steer('Keep my text', settings)).rejects.toThrow('not yet addressable')
+    expect(sent.some(message => (message as { method?: string }).method === 'turn/steer')).toBe(false)
+    await starting
+    expect(adapter.capabilities.steering).toBe(true)
+    expect(events.at(-1)?.data).toMatchObject({ capabilities: { steering: true } })
+  })
+
+  it('surfaces a stale expectedTurnId as a definite refusal without disconnecting', async () => {
+    const { adapter, events } = create({ CONDUCTOR_TEST_STEER: 'stale' })
+    await adapter.submit('synthetic:steer', settings)
+    await expect(adapter.steer('Keep my text', settings)).rejects.toThrow(SteeringUnavailableError)
+    expect(events.some(event => event.data.type === 'session' && event.data.phase === 'disconnected')).toBe(false)
+  })
+
+  it.each(['review', 'compact'])('disables steering for native %s turns before dispatch', async kind => {
+    const { adapter, sent } = create()
+    await adapter.submit('synthetic:steer-' + kind, settings)
+    await waitFor(() => !adapter.capabilities.steering)
+    await expect(adapter.steer('Keep my text', settings)).rejects.toThrow('cannot be steered')
+    expect(sent.some(message => (message as { method?: string }).method === 'turn/steer')).toBe(false)
+  })
+
+  it.each(['review', 'compact'])('learns an unreported %s turn kind from its refusal', async kind => {
+    const { adapter, sent } = create({ CONDUCTOR_TEST_STEER: kind })
+    await adapter.submit('synthetic:steer', settings)
+    await expect(adapter.steer('Keep my text', settings)).rejects.toThrow(SteeringUnavailableError)
+    expect(adapter.capabilities.steering).toBe(false)
+    await expect(adapter.steer('More text', settings)).rejects.toThrow('cannot be steered')
+    expect(sent.filter(message => (message as { method?: string }).method === 'turn/steer')).toHaveLength(1)
+  })
+
+  it.each(['timeout', 'malformed', 'disconnect'])('never authorizes a retry after a %s acknowledgement', async behavior => {
+    const { adapter, sent, events } = create({ CONDUCTOR_TEST_STEER: behavior }, undefined, 500)
+    await adapter.submit('synthetic:steer', settings)
+    const error: unknown = await adapter.steer('Keep my text', settings).catch(reason => reason)
+    expect(error).toBeInstanceOf(Error)
+    expect(error).not.toBeInstanceOf(SteeringUnavailableError)
+    expect(adapter.capabilities.steering).toBe(false)
+    expect(events.at(-1)?.data).toMatchObject({ phase: 'disconnected' })
+    expect(sent.filter(message => (message as { method?: string }).method === 'turn/steer')).toHaveLength(1)
+  })
 })

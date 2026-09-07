@@ -6,7 +6,7 @@ import { claudeHistoryPath } from './native-history'
 import { ConductorDatabase } from './database'
 import { StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
-import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
+import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
@@ -19,11 +19,14 @@ afterEach(() => {
 })
 class FakeProvider implements ProviderAdapter {
   readonly provider = 'claude' as const
-  readonly capabilities: ProviderCapabilities = { provider: 'claude', runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, toolInputStreaming: true, toolOutputStreaming: false, approvals: true, questions: true, resume: true, fork: true, plans: true, permissions: ['default', 'accept-edits'], effort: ['low'], models: [], limitations: ['SYNTHETIC zero-inference fixture'] }
+  readonly capabilities: ProviderCapabilities = { provider: 'claude', runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', steering: false, textStreaming: true, toolInputStreaming: true, toolOutputStreaming: false, approvals: true, questions: true, resume: true, fork: true, plans: true, permissions: ['default', 'accept-edits'], effort: ['low'], models: [], limitations: ['SYNTHETIC zero-inference fixture'] }
   starts = 0
   nativeIdentityOnStart = true
   disposed = false
   submissions: Array<{ text: string; settings: SessionSettings; attachments?: ContextAttachment[] }> = []
+  steers: Array<{ text: string; settings: SessionSettings; attachments?: ContextAttachment[] }> = []
+  onSteer?: () => Promise<void>
+  async steer(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> { this.steers.push({ text, settings, attachments }); await this.onSteer?.() }
   responses: InteractionResponse[] = []
   startGate?: Promise<void>
   responseGate?: Promise<void>
@@ -515,5 +518,129 @@ describe('empty native conversation handoff', () => {
     f.manager.cancelCli(f.spec.id)
     expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ view: 'visual', nativeSessionId: original, phase: 'disconnected' })
     expect(f.database.getSetting('cliHandoff:' + f.spec.id)).toBeNull()
+  })
+})
+
+
+describe('mid-turn steering and input retention', () => {
+  it.each(['running', 'waiting_input', 'waiting_approval'] as const)('dispatches immediately inside a %s turn, keeping explicit queue entries intact', async phase => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = true
+    f.current.emit({ turnId: 'active-turn', data: { type: 'session', phase, capabilities: f.current.capabilities } })
+    await f.manager.queue(f.spec.id, 'Explicitly queued', settings)
+    await f.manager.steer(f.spec.id, 'More data', settings, [{ id: 'selection', kind: 'selection', name: 'Selected lines', content: 'Exact context' }])
+    expect(f.current.steers).toEqual([{ text: expect.stringContaining('More data'), settings, attachments: [] }])
+    expect(f.current.steers[0]?.text).toContain('Exact context')
+    expect(f.current.submissions).toHaveLength(1)
+    const state = f.database.structured.snapshot(f.spec.id)
+    expect(state?.phase).toBe(phase)
+    expect(state?.queuedPrompts?.map(prompt => prompt.text)).toEqual(['Explicitly queued'])
+    expect(state?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(2)
+    expect(state?.items.at(-1)).toMatchObject({ turnId: 'active-turn', data: { type: 'text', role: 'user', text: 'More data', attachments: [{ id: 'selection' }] } })
+    expect(JSON.stringify(state?.items.at(-1))).not.toContain('Exact context')
+  })
+
+  it.each(['unsupported', 'stale expectedTurnId', 'review', 'compact'])('queues a definite %s refusal without losing text or captured attachments', async refusal => {
+    const f = fixture()
+    writeFileSync(join(f.workspace, 'context.txt'), 'Captured bytes')
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = refusal !== 'unsupported'
+    f.current.onSteer = async () => { writeFileSync(join(f.workspace, 'context.txt'), 'Later bytes'); throw new SteeringUnavailableError(refusal) }
+    const attachments: ContextAttachment[] = [{ id: 'file', kind: 'file', name: 'context.txt', path: 'context.txt' }]
+    await f.manager.steer(f.spec.id, 'Keep my text', settings, attachments)
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toMatchObject({ text: 'Keep my text', attachments: [{ content: 'Captured bytes' }] })
+    expect(attachments[0]?.content).toBeUndefined()
+    expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(1)
+    expect(f.database.structured.snapshot(f.spec.id)?.items.at(-1)?.data).toMatchObject({ type: 'notice', message: expect.stringContaining('queued instead of steered') })
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    expect(f.current.submissions[1]?.text).toContain('Captured bytes')
+    expect(f.current.submissions[1]?.text).not.toContain('Later bytes')
+  })
+
+  it('queues when a turn completes during attachment capture and dispatches once as the next turn', async () => {
+    const f = fixture()
+    writeFileSync(join(f.workspace, 'context.txt'), 'Captured bytes')
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = true
+    const steering = f.manager.steer(f.spec.id, 'Next turn', settings, [{ id: 'file', kind: 'file', name: 'context.txt', path: 'context.txt' }])
+    f.current.finish()
+    await steering
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    expect(f.current.steers).toHaveLength(0)
+    expect(f.current.submissions[1]?.text).toContain('Next turn')
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+  })
+
+  it('retains ordering across a pending steer and explicit queue insertion', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = true
+    let release = () => {}
+    f.current.onSteer = () => new Promise<void>((_resolve, reject) => { release = () => reject(new SteeringUnavailableError('stale expectedTurnId')) })
+    const first = f.manager.steer(f.spec.id, 'First', settings)
+    await vi.waitFor(() => expect(f.current.steers).toHaveLength(1))
+    const second = f.manager.queue(f.spec.id, 'Second', settings)
+    release(); await Promise.all([first, second])
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.map(prompt => prompt.text)).toEqual(['First', 'Second'])
+  })
+
+  it('never claims delivery while the provider acknowledgement is pending', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = true
+    f.current.emit({ turnId: 'original-turn', data: { type: 'session', phase: 'running' } })
+    let release = () => {}
+    f.current.onSteer = () => new Promise<void>(resolve => { release = resolve })
+    const steering = f.manager.steer(f.spec.id, 'Delayed acknowledgement', settings)
+    await vi.waitFor(() => expect(f.current.steers).toHaveLength(1))
+    expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(1)
+    f.current.finish()
+    await expect(f.manager.resume(f.spec.id)).rejects.toThrow('active work')
+    release(); await steering
+    expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('completed')
+    expect(f.database.structured.snapshot(f.spec.id)?.items.at(-1)).toMatchObject({ turnId: 'original-turn', data: { text: 'Delayed acknowledgement' } })
+  })
+
+  it.each(['acknowledgement timed out', 'stdin write failed'])('returns a %s error to the composer without queueing or recording success', async message => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = true
+    f.current.onSteer = async () => { throw new Error(message) }
+    await expect(f.manager.steer(f.spec.id, 'Keep my draft', settings)).rejects.toThrow('your draft was kept')
+    expect(f.current.steers).toHaveLength(1)
+    expect(f.current.submissions).toHaveLength(1)
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeFalsy()
+    expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(1)
+  })
+
+  it.each(['closed', 'cli', 'interrupted', 'swap'])('preserves the draft when %s wins the attachment capture race', async race => {
+    const f = fixture()
+    writeFileSync(join(f.workspace, 'context.txt'), 'Captured bytes')
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    const original = f.current
+    original.capabilities.steering = true
+    const steering = f.manager.steer(f.spec.id, 'Keep my draft', settings, [{ id: 'file', kind: 'file', name: 'context.txt', path: 'context.txt' }])
+    const rejected = expect(steering).rejects.toThrow('draft was kept')
+    if (race === 'closed' || race === 'swap') f.manager.killWhere(spec => spec.id === f.spec.id)
+    if (race === 'cli') f.database.setSetting('cliHandoff:' + f.spec.id, '{}')
+    if (race === 'interrupted') await f.manager.interrupt(f.spec.id)
+    if (race === 'swap') await f.manager.resume(f.spec.id)
+    await rejected
+    expect(original.steers).toHaveLength(0)
+    expect(f.current.steers).toHaveLength(0)
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeFalsy()
+  })
+
+  it('rejects invalid input and queue overflow so the composer keeps the original draft', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    await expect(f.manager.steer(f.spec.id, '', settings)).rejects.toThrow('Prompt must contain')
+    await expect(f.manager.steer(f.spec.id, 'Keep my draft', settings, [{ id: 'file', kind: 'file', name: 'missing.txt', path: 'missing.txt' }])).rejects.toThrow()
+    for (let index = 0; index < 100; index++) await f.manager.queue(f.spec.id, 'Queued ' + index, settings)
+    await expect(f.manager.steer(f.spec.id, 'Keep my draft', settings)).rejects.toThrow('queue is full')
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toHaveLength(100)
+    expect(f.current.steers).toHaveLength(0)
   })
 })

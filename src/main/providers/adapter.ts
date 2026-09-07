@@ -18,6 +18,7 @@ export interface ProviderAdapter {
   readonly capabilities: ProviderCapabilities
   start(): Promise<void>
   submit(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
+  steer?(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
   respond(response: InteractionResponse): Promise<void>
   interrupt(): Promise<void>
   fork?(): Promise<string>
@@ -28,3 +29,6 @@ export interface ProviderAdapter {
   history?(): Promise<import('../native-history').NativeHistoryItem[]>
   dispose(): void
 }
+
+/** Only a definite refusal permits automatically queueing the same input. */
+export class SteeringUnavailableError extends Error {}

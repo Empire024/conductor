@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { workspacePath } from '../agent-artifacts'
-import type { AdapterOptions, ProviderAdapter } from './adapter'
+import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
@@ -30,9 +30,9 @@ function readVersion(executable: string): Promise<string> {
 /** Preserves native Claude Code authentication/configuration; never creates an API client. */
 export class ClaudeAdapter implements ProviderAdapter {
   readonly provider = 'claude' as const
-  readonly capabilities: ProviderCapabilities = {
+  private readonly providerCapabilities: ProviderCapabilities = {
     provider: 'claude', runtimeVersion: 'unknown', adapterVersion: 1, authentication: 'cli',
-    textStreaming: true, toolInputStreaming: true, toolOutputStreaming: false,
+    steering: false, textStreaming: true, toolInputStreaming: true, toolOutputStreaming: false,
     approvals: true, questions: true, resume: true, fork: false, plans: true, permissions: ['default', 'accept-edits', 'auto'],
     effort: ['low', 'medium', 'high', 'xhigh', 'max'], models: [],
     limitations: [
@@ -71,6 +71,11 @@ export class ClaudeAdapter implements ProviderAdapter {
   constructor(private options: AdapterOptions, private dependencies: Dependencies = {}) {
     this.nativeSessionId = options.nativeSessionId
     this.settings = { ...options.settings }
+  }
+
+  get capabilities(): ProviderCapabilities {
+    this.providerCapabilities.steering = Boolean(this.ready && this.active && !this.stopRequested && !this.disposed && this.transport?.connected)
+    return this.providerCapabilities
   }
 
   async start(): Promise<void> {
@@ -125,8 +130,26 @@ export class ClaudeAdapter implements ProviderAdapter {
   async submit(text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
     if (!this.ready || !this.transport?.connected || this.disposed) throw new Error('Claude runtime is disconnected')
     if (this.active || this.requests.size) throw new Error('Claude is already processing a turn')
-    if (/^\/(clear|reset|new)(?:\s|$)/i.test(text.trim())) throw new Error('Conversation reset requires a new Conductor session; the existing native conversation is preserved')
     this.validateSettings(settings)
+    const messageId = randomUUID()
+    const message = await this.userMessage(text, attachments, messageId)
+    if (settings.effort !== this.settings.effort) await this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: settings.effort ?? null } })
+    if (settings.model !== this.settings.model) await this.control({ subtype: 'set_model', model: settings.model ?? null })
+    if (this.permissionMode(settings) !== this.permissionMode(this.settings)) await this.control({ subtype: 'set_permission_mode', mode: this.permissionMode(settings) })
+    this.settings = { ...settings }
+    this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), ...(settings.model ? { model: settings.model } : {}), effort: settings.effort ?? null, permissionMode: this.permissionMode(settings) }
+    this.turnId = messageId
+    this.hasAssistantText = false
+    this.stopRequested = false
+    this.active = true
+    try {
+      this.transport.send(message)
+      this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
+    } catch (error) { this.active = false; throw error }
+  }
+
+  private async userMessage(text: string, attachments: ContextAttachment[], messageId: string): Promise<Json> {
+    if (/^\/(clear|reset|new)(?:\s|$)/i.test(text.trim())) throw new Error('Conversation reset requires a new Conductor session; the existing native conversation is preserved')
     const imageBlocks: Json[] = []
     let encodedImageBytes = 0
     for (const image of attachments.filter((item) => item.kind === 'image')) {
@@ -135,24 +158,21 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (encodedImageBytes > 4 * 1024 * 1024) throw new Error('Claude image attachments exceed the 4 MiB combined message limit')
       imageBlocks.push(block)
     }
-    if (settings.effort !== this.settings.effort) await this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: settings.effort ?? null } })
-    if (settings.model !== this.settings.model) await this.control({ subtype: 'set_model', model: settings.model ?? null })
-    if (this.permissionMode(settings) !== this.permissionMode(this.settings)) await this.control({ subtype: 'set_permission_mode', mode: this.permissionMode(settings) })
-    this.settings = { ...settings }
-    this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), ...(settings.model ? { model: settings.model } : {}), effort: settings.effort ?? null, permissionMode: this.permissionMode(settings) }
-    this.turnId = randomUUID()
-    this.hasAssistantText = false
-    this.stopRequested = false
-    this.active = true
     // Only explicitly selected context is included. The host validates/loads file bytes.
     const context = attachments.filter((item) => item.kind !== 'image').map((item) => `\n\n--- Attached ${item.kind}: ${item.name}${item.path ? ` (${item.path})` : ''}${item.startLine ? ` lines ${item.startLine}-${item.endLine ?? item.startLine}` : ''} ---\n${item.content ?? ''}`)
-    try {
-      const content: Json = imageBlocks.length ? [...imageBlocks, { type: 'text', text: text + context.join('') }] : text + context.join('')
-      const message: Json = { type: 'user', uuid: this.turnId, session_id: this.nativeSessionId ?? '', parent_tool_use_id: null, message: { role: 'user', content } }
-      if (imageBlocks.length && Buffer.byteLength(JSON.stringify(message)) > 4 * 1024 * 1024) throw new Error('Claude image attachments exceed the 4 MiB combined message limit')
-      this.transport.send(message)
-      this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
-    } catch (error) { this.active = false; throw error }
+    const content: Json = imageBlocks.length ? [...imageBlocks, { type: 'text', text: text + context.join('') }] : text + context.join('')
+    const message: Json = { type: 'user', uuid: messageId, session_id: this.nativeSessionId ?? '', parent_tool_use_id: null, message: { role: 'user', content } }
+    if (imageBlocks.length && Buffer.byteLength(JSON.stringify(message)) > 4 * 1024 * 1024) throw new Error('Claude image attachments exceed the 4 MiB combined message limit')
+    return message
+  }
+
+  async steer(text: string, _settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
+    if (!this.ready || !this.transport?.connected || this.disposed) throw new SteeringUnavailableError('Claude runtime is disconnected')
+    if (!this.active || this.stopRequested) throw new SteeringUnavailableError('There is no active Claude turn to steer')
+    const turnId = this.turnId
+    const message = await this.userMessage(text, attachments, randomUUID())
+    if (!this.capabilities.steering || this.turnId !== turnId) throw new SteeringUnavailableError('The Claude turn stopped before steering could be sent')
+    this.transport.send(message)
   }
 
   async respond(response: InteractionResponse): Promise<void> {
@@ -209,7 +229,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
 
   private emit(event: AdapterEvent): void {
-    this.options.emit({ nativeSessionId: this.nativeSessionId, turnId: this.turnId, ...event })
+    this.options.emit({ nativeSessionId: this.nativeSessionId, turnId: this.turnId, ...event, data: event.data.type === 'session' ? { ...event.data, capabilities: { ...this.capabilities } } : event.data })
   }
   private validateSettings(settings: SessionSettings): void {
     if (settings.permission === 'read-only') throw new Error('Claude CLI has no Conductor read-only sandbox; use explicit permissions or plan mode')
