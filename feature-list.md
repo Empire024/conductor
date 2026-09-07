@@ -10,7 +10,7 @@ Bug list:
 9. a - In explorer, clicking on down arrow on project name does nothing - should open/close it. Double clicking it opens a rename menu, which should go away when clicking away, and should be where the conductor title is, not where it's currently mispossitioned.
 9. b - Explorer needs to also show other projects files currently loaded in session (but closed by default) 
 10. Projects need to be able to be ordered (dragged) around in the view vertically
-11. Going from one project to another removes what we had written in our Message Codex textbox - fix
+11. [Implemented] Going from one project to another removes what we had written in our Message Codex textbox - fix
 12. Workspaces need to be able to be closed from the left menu as well as dragged and ordered like projects.
 
 Feature list:

@@ -7,6 +7,7 @@ import type { RuntimeTerminalProps } from './RuntimeTerminal'
 import { AgentDialog, ImmutableDiff, isConversationActivity, safeFileTarget, StructuredActivity } from './StructuredAgentRenderers'
 import { StructuredComposerControls } from './StructuredComposerControls'
 import { StructuredUsageDetails } from './StructuredUsageDetails'
+import { useComposerDraft } from './use-composer-draft'
 import './StructuredAgentPane.css'
 
 let focusedAgent: { sessionId: string; projectId: string } | null = null
@@ -30,12 +31,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [projection, setProjection] = useState<SessionProjection>(() => emptyProjection(props.resourceId))
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
+  const { draft, setMessage, setAttachments, clearSubmitted } = useComposerDraft(props.project.id, activeId)
+  const { message, attachments } = draft
   const [submitting, setSubmitting] = useState(false)
   const [settings, setSettings] = useState<SessionSettings>({ permission: 'default', plan: false, model: props.model, effort: props.effort === 'auto' ? undefined : props.effort })
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [expansion, setExpansion] = useState<Record<string, boolean>>(() => storedExpansion(props.resourceId))
-  const [attachments, setAttachments] = useState<ContextAttachment[]>([])
   const [imagePreviews, setImagePreviews] = useState<Record<string, string>>({})
   const [inspectAttachment, setInspectAttachment] = useState<ContextAttachment | null>(null)
   const [addFileOpen, setAddFileOpen] = useState(false)
@@ -63,6 +64,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const lastConversationItems = useRef<TimelineItem[]>([])
   const provider = props.provider === 'claude' ? 'claude' : 'codex'
   const name = (projection.capabilities?.provider ?? provider) === 'claude' ? 'Claude Code' : 'Codex'
+  const unstartedConversation = !projection.nativeSessionId && !projection.truncated && projection.items.every(item => item.data.type === 'notice' && !item.turnId)
   const propsRef = useRef(props)
   propsRef.current = props
 
@@ -165,6 +167,23 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200))).catch((reason: unknown) => setError(String(reason)))
   }, [activeId, eventsOpen, projection.phase])
 
+  useEffect(() => {
+    setInspectAttachment(null)
+    setImagePreviews({})
+    setFilePath('')
+    setAddFileOpen(false)
+  }, [activeId])
+
+  useEffect(() => {
+    if (inspectAttachment?.kind !== 'image' || !inspectAttachment.path || imagePreviews[inspectAttachment.id]) return
+    let disposed = false
+    const attachment = inspectAttachment
+    void window.conductor.files.readDataUrl(props.project.id, attachment.path!).then(image => {
+      if (!disposed) setImagePreviews(current => ({ ...current, [attachment.id]: image.dataUrl }))
+    }).catch((reason: unknown) => { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) })
+    return () => { disposed = true }
+  }, [inspectAttachment, imagePreviews, props.project.id])
+
   const onOpenFile = useCallback((raw: string, line?: number): void => {
     const current = propsRef.current
     const target = safeFileTarget(raw, current.project.path)
@@ -196,11 +215,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       if (connection.current?.sessionId === activeId) await connection.current.promise
       if (activeIdRef.current !== activeId) return
       await window.conductor.structured.submit(activeId, text, settings, attachments)
-      setMessage('')
-      setAttachments([])
-      setImagePreviews({})
-      setReadingWindow(null)
-      nearBottom.current = true
+      clearSubmitted(draft.revision)
+      if (activeIdRef.current === activeId) {
+        setImagePreviews({})
+        setReadingWindow(null)
+        nearBottom.current = true
+      }
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
     finally { submitLock.current = false; setSubmitting(false) }
   }
@@ -211,7 +231,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }
   const connect = async (): Promise<void> => {
     if (projection.capabilities?.models.length) return
-    if (historical || projection.phase === 'disconnected') throw new Error('Resume this conversation to load models.')
+    if (historical || projection.phase === 'disconnected' && !unstartedConversation) throw new Error('Resume this conversation to load models.')
     if (connection.current?.sessionId === activeId) return connection.current.promise
     metadataConnectionId.current = activeId
     const pending = window.conductor.structured.connect(activeId).then(async () => {
@@ -252,7 +272,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       setAddFileOpen(false)
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
-  const canSubmit = ready && !historical && (!activePhases.has(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && projection.phase !== 'disconnected'
+  const canSubmit = ready && !historical && (!activePhases.has(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
   const capabilities = projection.capabilities
   const pending = projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length
   const conversationItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
@@ -321,7 +341,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     </AgentDialog>}
     {error && <div className="sa-error-bar" role="alert"><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
     {historical && <div className="sa-history-banner"><span>Viewing saved history</span><button onClick={() => { setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button onClick={() => void resume()}>Resume this conversation</button>}</div>}
-    {(projection.phase === 'disconnected' || projection.phase === 'interrupted') && !historical && <div className="sa-history-banner"><span>{projection.phase === 'disconnected' ? 'Runtime disconnected. The last operation may be incomplete.' : 'Runtime interrupted.'}</span>{capabilities?.resume && projection.nativeSessionId && <button onClick={() => void resume()}>Resume conversation</button>}</div>}
+    {(projection.phase === 'disconnected' && !unstartedConversation || projection.phase === 'interrupted') && !historical && <div className="sa-history-banner"><span>{projection.phase === 'disconnected' ? 'Runtime disconnected. The last operation may be incomplete.' : 'Runtime interrupted.'}</span>{capabilities?.resume && projection.nativeSessionId && <button onClick={() => void resume()}>Resume conversation</button>}</div>}
     <div className="sa-timeline-wrap"><div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onScroll={() => {
       const el = timeline.current
       nearBottom.current = Boolean(el && el.scrollHeight - el.scrollTop - el.clientHeight < 80)

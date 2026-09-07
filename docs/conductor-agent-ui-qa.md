@@ -2,6 +2,22 @@
 
 Recorded 2026-09-07. **Owner-authorized testing delivery; full parity is not claimed.** Offline validation and the explicitly authorized replacement Codex A/B suite pass. Claude live testing is blocked by the owner's reported exhausted allowance. The owner explicitly requested updater delivery of local/testing builds without waiting for full extension parity. Publication is verified separately against the release workflow and assets, not inferred from these tests.
 
+## Composer draft recovery — 2026-09-07
+
+Backlog bug 11 is implemented for structured Codex and Claude conversations. Text and captured attachments are saved per project/conversation in local storage directly when edited. Project/workspace switching, history navigation, reload, pane close/retrieve, detached-window edits, and a full application restart preserve the appropriate draft without submitting it. Successful sends clear only the submitted revision; failed sends and newer typing retain their drafts. Image previews are regenerated on inspection rather than persisting image data URLs.
+
+The previous production build failed the new Electron regression at the first return to project A: expected the exact unsent message, received an empty string. Final validation:
+
+- `npm.cmd test`: 42 Vitest files / 276 tests, plus 13 Node tests; zero failures.
+- `npm.cmd run build`: passed TypeScript and all production bundles.
+- `node scripts/smoke-composer-drafts.mjs`: seven actual Electron check groups passed. [Codex results](evidence/composer-drafts/codex.json).
+- `node scripts/smoke-composer-drafts.mjs --provider=claude`: seven actual Electron check groups passed. [Claude results](evidence/composer-drafts/claude.json).
+- `npm.cmd run test:composer-drafts` builds and runs both regression suites. The final acknowledgement-race case deliberately holds submit IPC in that isolated test app; successful provider submission is checked separately through each raw synthetic process. These tests do not use the clipboard or live inference.
+
+An unused Claude metadata connection can return disconnected without a native conversation ID after restart. Its restored draft can now be sent when its complete history contains only notices with no turns. Existing conversations and uncertain histories keep the explicit resume requirement. Codex image draft recovery is covered; Claude currently does not advertise image attachment capability, so its run covers text/file context. This corrects the scope of the older image-parity claim below, without adding image support in this change.
+
+If local storage refuses a write, the latest draft remains in memory for project switches and a visible warning asks the owner to keep the window open; restart recovery cannot be promised until a write succeeds. No previous live-test allowance was reset or consumed. Remaining immediate backlog priorities are Escape/stop/resume controls and modal dismissal; the prior full-parity gaps remain open.
+
 ## UX correction verification — 2026-09-07
 
 This follow-up fixes conversation clutter and delayed update feedback. It does not claim new live-provider parity. Models/effort moved beside the composer; usage and technical metadata moved to expandable settings. Raw events are retained. Tool bodies and resolved approvals start collapsed. Syntax colors use the existing local Monaco grammars, bounded at 16,000 highlighted characters / 2,000 spans, with inert React text and exact copying. Duplicate wrapper/card classes no longer apply borders and padding twice.
