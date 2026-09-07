@@ -1190,6 +1190,7 @@ export function App(): React.JSX.Element {
           onSetAgentSoundProfile={(profile) => void setAgentSoundProfile(profile)}
           onSetDebugLogging={(enabled) => void setDebugLogging(enabled)}
           updateState={updateState}
+          onSetLocalUpdates={(enabled) => void window.conductor.settings.setLocalUpdates(enabled).then(setAppSettings).catch((error: unknown) => setToast(String(error)))}
           onCheckForUpdates={() => void checkForUpdates()}
           onOpenDebugConsole={() => {
             setDebugConsoleOpen(true)

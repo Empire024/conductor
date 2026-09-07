@@ -58,9 +58,11 @@ const bridge: ConductorBridge = {
     setThemeAuto: (enabled) => ipcRenderer.invoke('settings:set-theme-auto', enabled),
     setDebugLogging: (enabled) => ipcRenderer.invoke('settings:set-debug-logging', enabled),
     setAgentSoundProfile: (profile) => ipcRenderer.invoke('settings:set-agent-sound-profile', profile),
-    setUpdateFeedUrl: (url) => ipcRenderer.invoke('settings:set-update-feed-url', url)
+    setUpdateFeedUrl: (url) => ipcRenderer.invoke('settings:set-update-feed-url', url),
+    setLocalUpdates: (enabled) => ipcRenderer.invoke('settings:set-local-updates', enabled)
   },
   updates: {
+    openLocalFolder: () => ipcRenderer.invoke('updates:open-local-folder'),
     getState: () => ipcRenderer.invoke('updates:get-state'),
     check: () => ipcRenderer.invoke('updates:check'),
     download: () => ipcRenderer.invoke('updates:download'),

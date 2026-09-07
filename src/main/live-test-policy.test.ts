@@ -2,10 +2,20 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import { LIVE_PROMPT_A, LIVE_PROMPT_B, validateLiveTurn } from './live-test-policy'
+import { LIVE_PROMPT_A, LIVE_PROMPT_B, validateLiveTurn, liveReplacementAuthorization, liveCostLimits } from './live-test-policy'
 import { ConductorDatabase } from './database'
 
 describe('host live acceptance policy (zero inference)', () => {
+  it('requires a suite-exact explicit replacement authorization and leaves cost thresholds unchanged', () => {
+    const env = { CONDUCTOR_LIVE_TESTS: '1', CONDUCTOR_LIVE_REPLACEMENT_A_SUITE_ID: 'original-suite' }
+    expect(liveReplacementAuthorization('original-suite', 'codex', {})).toBe(false)
+    expect(liveReplacementAuthorization('original-suite', 'codex', env)).toBe(true)
+    expect(() => liveReplacementAuthorization('new-suite', 'codex', env)).toThrow('exactly')
+    expect(() => liveReplacementAuthorization('original-suite', 'claude', env)).toThrow('Codex')
+    expect(() => liveReplacementAuthorization('original-suite', 'codex', { ...env, CONDUCTOR_LIVE_TESTS: '0' })).toThrow('enabled')
+    expect(liveCostLimits('codex', env)).toEqual({ provider: .25, suite: .50 })
+    expect(liveCostLimits('codex', { ...env, CONDUCTOR_LIVE_MAX_USD_CODEX: '99', CONDUCTOR_LIVE_MAX_USD_TOTAL: '99' })).toEqual({ provider: .25, suite: .50 })
+  })
   it('defaults off and requires explicit model/auth/effort plus a matching isolated fixture marker', () => {
     const root = mkdtempSync(join(tmpdir(), 'conductor-live-policy-'))
     try {

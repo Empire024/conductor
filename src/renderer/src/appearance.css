@@ -134,7 +134,8 @@
 .theme-auto-setting > span { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .theme-auto-setting strong { color: var(--text); font-size: 9px; }
 .theme-auto-setting small { color: var(--text-3); font-size: 7.5px; }
-.theme-auto-setting input { position: absolute; opacity: 0; pointer-events: none; }
+.theme-auto-setting { position: relative; }
+.theme-auto-setting input { position: absolute; right: 9px; width: 31px; height: 17px; opacity: 0; pointer-events: none; }
 .theme-auto-setting > i { width: 31px; height: 17px; padding: 2px; border-radius: 10px; background: var(--surface-3); transition: background 140ms ease; }
 .theme-auto-setting > i::before { content: ''; display: block; width: 13px; height: 13px; border-radius: 50%; background: var(--text-2); transition: transform 140ms ease, background 140ms ease; }
 .theme-auto-setting input:checked + i { background: var(--accent-muted); }

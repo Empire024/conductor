@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import type { AgentEvent, DiffArtifact, SessionProjection, StructuredProvider } from '../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
-import { liveCostLimits } from './live-test-policy'
+import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
 
 export function sanitizeDiagnostic(value: unknown): unknown {
   if (typeof value === 'string') return value
@@ -45,6 +45,12 @@ export class StructuredAgentStore {
       CREATE TABLE IF NOT EXISTS live_suite_limits (
         suite_id TEXT NOT NULL, provider TEXT NOT NULL, provider_usd REAL NOT NULL,
         suite_usd REAL NOT NULL, PRIMARY KEY(suite_id, provider)
+      );
+      CREATE TABLE IF NOT EXISTS live_suite_amendments (
+        suite_id TEXT PRIMARY KEY, provider TEXT NOT NULL CHECK(provider='codex'),
+        kind TEXT NOT NULL CHECK(kind='one-replacement-A'),
+        prior_submissions INTEGER NOT NULL CHECK(prior_submissions=1),
+        authorized_at TEXT NOT NULL
       );
     `)
     // Historical projection is independent of reconnect. Never retry uncertain execution.
@@ -154,8 +160,18 @@ export class StructuredAgentStore {
       this.db.prepare('INSERT INTO live_suite_limits(suite_id,provider,provider_usd,suite_usd) VALUES(?,?,?,?) ON CONFLICT(suite_id,provider) DO UPDATE SET provider_usd=MIN(provider_usd,excluded.provider_usd),suite_usd=MIN(suite_usd,excluded.suite_usd)').run(suiteId, provider, limits.provider, limits.suite)
       const rows = this.db.prepare('SELECT provider,submissions,cost_usd FROM live_suite_budget WHERE suite_id=?').all(suiteId) as Array<{ provider: string; submissions: number; cost_usd: number }>
       const own = rows.find(row => row.provider === provider)
-      if (prompt && (own?.submissions ?? 0) !== (prompt === 'A' ? 0 : 1)) throw new Error('Live acceptance prompts may run only once, in A then B order')
-      if ((own?.submissions ?? 0) >= providerLimit || rows.reduce((sum, row) => sum + row.submissions, 0) >= totalLimit) throw new Error('Live suite submission allowance exhausted')
+      const count = own?.submissions ?? 0
+      let amendment = provider === 'codex' && Boolean(this.db.prepare('SELECT suite_id FROM live_suite_amendments WHERE suite_id=?').get(suiteId))
+      if (liveReplacementAuthorization(suiteId, provider) && !amendment) {
+        if (count !== 1 || prompt !== 'A') throw new Error('A replacement can only amend one already-reserved A; it cannot expand a fresh or completed suite')
+        this.db.prepare('INSERT INTO live_suite_amendments(suite_id,provider,kind,prior_submissions,authorized_at) VALUES(?,?,?,?,?)').run(suiteId, provider, 'one-replacement-A', 1, new Date().toISOString())
+        amendment = true
+      }
+      const expectedCount = amendment ? (prompt === 'A' ? 1 : 2) : (prompt === 'A' ? 0 : 1)
+      if (prompt && count !== expectedCount) throw new Error('Live acceptance prompts may run only once, in A then B order; an authorized replacement A is also single-use')
+      // Callers cannot enlarge defaults. The only expansion is the single durable owner amendment above.
+      const effectiveProviderLimit = Math.min(providerLimit, 2) + (amendment ? 1 : 0)
+      if (count >= effectiveProviderLimit || rows.reduce((sum, row) => sum + row.submissions, 0) >= Math.min(totalLimit, 4)) throw new Error('Live suite submission allowance exhausted')
       if (this.liveCostExceeded(suiteId, provider)) throw new Error('Live suite observed cost threshold reached')
       this.db.prepare('INSERT INTO live_suite_budget(suite_id,provider,submissions) VALUES(?,?,1) ON CONFLICT(suite_id,provider) DO UPDATE SET submissions=submissions+1').run(suiteId, provider)
       this.db.exec('COMMIT')

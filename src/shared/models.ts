@@ -87,6 +87,8 @@ export interface AppSettings {
   debugLogging: boolean
   agentSoundProfile: AgentSoundProfile
   updateFeedUrl: string
+  includeLocalUpdates?: boolean
+  localUpdateDirectory?: string
 }
 
 export type AppUpdatePhase =
@@ -107,6 +109,8 @@ export interface AppUpdateState {
   message?: string
   configured: boolean
   lastCheckedAt?: string
+  source?: 'local' | 'release'
+  localBuildWarning?: string
 }
 
 export interface AppDiagnostics {

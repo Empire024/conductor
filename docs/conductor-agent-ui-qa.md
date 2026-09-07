@@ -1,6 +1,6 @@
 # Structured agent UI QA
 
-Recorded 2026-09-07. **Not delivered; core parity release gate remains open.** The integrated implementation and offline checks pass. The capped Codex live acceptance failed at its first approval; no successful live edit/test or continuation is claimed. Claude live testing is blocked by the owner's reported exhausted allowance.
+Recorded 2026-09-07. **Owner-authorized testing delivery; full parity is not claimed.** Offline validation and the explicitly authorized replacement Codex A/B suite pass. Claude live testing is blocked by the owner's reported exhausted allowance. The owner explicitly requested updater delivery of local/testing builds without waiting for full extension parity. Publication is verified separately against the release workflow and assets, not inferred from these tests.
 
 ## Environment and reference baseline
 
@@ -17,7 +17,7 @@ All ordinary tests below use synthetic processes or injected SDK/adapter boundar
 
 | Exact command | Actual result |
 | --- | --- |
-| `npm.cmd test` | **Passed:** 35 Vitest files / 214 tests, followed by 5 Node approval-guard tests. |
+| `npm.cmd test` | **Passed:** 37 Vitest files / 230 tests, followed by 13 Node approval-guard/packaging tests. |
 | `npm.cmd run test:agent-contracts` | **Passed:** 10 files / 100 tests, followed by 5 Node guard tests. |
 | `npm.cmd run build` | **Passed:** TypeScript no-emit check and production Electron/Vite build. |
 | `npm.cmd run test:agent-ui` | **Passed:** production build, actual Electron Codex and Claude suites; zero inference. |
@@ -28,7 +28,9 @@ All ordinary tests below use synthetic processes or injected SDK/adapter boundar
 | `node scripts/inspect-codex-isolation.mjs` | Metadata-only installed-runtime check passed after the MCP override correction: two optional MCP servers disabled, six optional skill overrides prepared; zero threads/turns. |
 | `node scripts/inspect-codex-baseline.mjs --usage-only` | Native rate-limit metadata read without a turn; no API-dollar telemetry. |
 | `$env:CONDUCTOR_LIVE_TESTS = '0'; npm.cmd run test:agent-live` | **Skipped as designed:** no provider connection or inference. |
-| Explicitly opted-in `npm.cmd run test:agent-live` with model/auth below | **Failed acceptance:** one Codex A submission, no B. See live chronology. |
+| Explicitly opted-in `npm.cmd run test:agent-live` with model/auth below | Original A failed; **owner-authorized replacement A and B passed**. Three aggregate Codex submissions, no Claude submissions. See chronology and amendment. |
+| `npm.cmd run test:update-ui` | **Passed:** production build plus actual Electron/native NsisUpdater automatic local-feed discovery, Update pending, mouse/keyboard controls, opt-out persistence and opt-in rediscovery. Synthetic non-executable artifacts; no install. |
+| `npm.cmd run update:local` | **Passed:** real NSIS package, executable and blockmap hashes, atomic publication to the owner's private local feed. First package `0.1.5-local.1788788132715`; source package version/tags unchanged. This is packaging evidence, not an installed-app restart claim. |
 
 The final production renderer bundle is approximately 8.25 MB before packaging, including existing Monaco; its large worker chunks remain. This build result is not a rendering benchmark or an updater delivery.
 
@@ -64,7 +66,7 @@ The local fixture preparation verified the exact original baseline fails with `c
 5. **Offline correction:** preserve the native captured request in [quoted-rg regression](../scripts/fixtures/captured/codex-0.153.4-quoted-rg-approval.json). Accept only that exact fixture search/body; reject unquoted pipelines, added commands, other files/cwds, broader grants and mismatched wrappers. The harness still chooses only **Allow once**, never a proposed persistent exec-policy amendment.
 6. **B skipped:** A never removed the identifiers or ran the test. No silent A replay, replacement session, helper prompt or allowance reset was used. No further live run occurred after the offline fix.
 
-Actual counts: **Codex A 1, Codex B 0; Claude A 0, Claude B 0**. Live verification: connection/native IDs/text streaming/receipt of a real pending approval and truthful shutdown observed. Live approval response round trip, execution, two-line edit, test result, immutable live diff, completed turn and context recall remain **unverified/blocked after failed acceptance**.
+Counts at the end of the original attempt: **Codex A 1, Codex B 0; Claude A 0, Claude B 0**. That attempt did not establish edit/test or recall success. The separately authorized amendment below supersedes the aggregate counts, without erasing this failure.
 
 The opted-in invocation used:
 
@@ -75,7 +77,21 @@ $env:CONDUCTOR_LIVE_AUTH_CODEX = 'cli'
 npm.cmd run test:agent-live
 ```
 
-**Do not rerun this command to reset/retry the suite.** The retained `artifacts/live-codex/allowance.json` and separate SQLite suite rows remain at one reservation. The script refuses a rerun once any submission is reserved. A replacement A plus the unused B needs explicit additional owner authorization and a recorded amended aggregate allowance, not deletion of the old records.
+**Do not rerun this command to reset/retry the suite.** The original failed reservation was retained. The owner's explicit authorization for exactly one replacement A plus the unused B was recorded in both the external allowance and the additive SQLite `live_suite_amendments` table. The amended Codex limit is three, total suite limit remains four, and all other caps are unchanged. That allowance is now exhausted for Codex; another invocation refuses rather than spending more turns.
+
+### Authorized replacement, 2026-09-07 13:41 UTC
+
+The same fixture root/profile/suite and existing CLI authentication were retained. A new disposable smoke repository started from the original verified failing baseline. The exact invocation added only:
+
+```powershell
+$env:CONDUCTOR_LIVE_REPLACEMENT_A_SUITE_ID = 'conductor-codex-1788745961011'
+```
+
+A was submitted at 13:41:34.991Z and B at 13:41:53.519Z; both completed inside their host time bounds. **Live-verified:** actual approval response through Allow once; only the two declaration lines removed; real `node --test panel.test.mjs` command exactly once with exit 0 and passing output; native two-deletion activity and expanded immutable diff; pane close/reopen and reload without another A; explicit native resume with unchanged conversation identity; B names both identifiers and the passing test without tools. After inference ended, local checks preserved the immutable artifact and later conflicting bytes during Undo.
+
+Aggregate actual submissions: **Codex A 2 (one failed, one passed), B 1 (passed); Claude A/B 0**. No automatic retry, helper inference, account switch or API billing route was used. Reported replacement usage: A 32,293 input / 454 output / 21,760 cached; B 8,443 input / 20 output / 7,936 cached. The provider reported a weekly bucket at 10%; this is not attributable suite cost. Authoritative USD cost and original failed-A tokens remain unknown.
+
+Evidence: [Live A](evidence/agent-ui/live-codex-replacement/live-a.png), [expanded live diff](evidence/agent-ui/live-codex-replacement/live-diff.png), [sanitized events/result](evidence/agent-ui/live-codex-replacement/results.json). Updater: [actual Electron prompt with synthetic update metadata](evidence/local-updates/local-update-pending.png), [result](evidence/local-updates/results.json). `node scripts/export-agent-ui-evidence.mjs` exports only these explicit local runs, redacts diagnostic secrets and owner paths, and never invokes a provider. Original failure evidence remains separate.
 
 Default caps are two submissions/provider and four/suite. Reserve before dispatch; never auto-retry. Host active runtime is 90 seconds/prompt plus a separate 30-second cumulative approval wait; the UI harness has a 120-second outer bound. Stable App Server exposes no hard internal-model-step limit, so six/two-step limits cannot be guaranteed. Native retry notifications trigger interruption, but in-flight work may have begun.
 
@@ -91,6 +107,6 @@ Offline reproduction uses `npm.cmd test` and `npm.cmd run test:agent-ui`. It cre
 
 ## Outstanding gates and delivery status
 
-Core live acceptance is not passed. Full local extension parity also remains partial: command/skill execution picker and configuration/MCP/plugin management; provider checkpoints/context rollback and combined restore; Claude immediate fork; richer plan-feedback/execute controls; cross-session background steering; externally authorized file attachment paths; provider-specific hosted/browser delegation. Claude's documented Bash/subagent snapshot limitations and rename/binary/oversized restore limitations remain explicit. OS-wide atomic compare-and-swap against unrelated writers is not provided; Undo uses expected-byte checks, host locks and immediate recheck.
+Codex's capped live acceptance passed; Claude remains live-blocked by quota. Full local extension parity remains partial: command/skill execution picker and configuration/MCP/plugin management; provider checkpoints/context rollback and combined restore; Claude immediate fork; richer plan-feedback/execute controls; cross-session background steering; externally authorized file attachment paths; provider-specific hosted/browser delegation. Claude's documented Bash/subagent snapshot limitations and rename/binary/oversized restore limitations remain explicit. OS-wide atomic compare-and-swap against unrelated writers is not provided; Undo uses expected-byte checks, host locks and immediate recheck.
 
-No push to `main` or release was performed for this unfinished state. Consequently no new workflow run, installer, blockmap or `latest.yml` can be claimed verified, and the installed updater has not received this change. Publishing requires clearing the core release gate; a local commit/build is not delivery. No package version or tag was manually changed.
+The owner explicitly authorized an installed-updater testing release despite those gaps. The delivery workflow commits the tested integrated state, pushes `main`, and checks the automatic release workflow plus installer, blockmap and `latest.yml`. Publication success must be verified after the push; it is not implied by this pre-publication QA record. No source package version or release tag is manually changed. Older installed versions receive the local-feed support in a normal GitHub bootstrap update; subsequent locally packaged builds use the same Download / Restart to update flow, with the default-enabled Settings option. See [local update delivery](conductor-local-updates.md).

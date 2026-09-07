@@ -57,8 +57,10 @@ export interface ConductorBridge {
     setDebugLogging(enabled: boolean): Promise<AppSettings>
     setAgentSoundProfile(profile: AgentSoundProfile): Promise<AppSettings>
     setUpdateFeedUrl(url: string): Promise<AppSettings>
+    setLocalUpdates(enabled: boolean): Promise<AppSettings>
   }
   updates: {
+    openLocalFolder(): Promise<void>
     getState(): Promise<AppUpdateState>
     check(): Promise<AppUpdateState>
     download(): Promise<AppUpdateState>

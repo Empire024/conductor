@@ -16,6 +16,7 @@ export function SettingsPanel({
   onSetDebugLogging,
   onOpenDebugConsole,
   updateState,
+  onSetLocalUpdates,
   onCheckForUpdates
 }: {
   settings: AppSettings
@@ -29,6 +30,7 @@ export function SettingsPanel({
   onSetDebugLogging(enabled: boolean): void
   onOpenDebugConsole(): void
   updateState: AppUpdateState
+  onSetLocalUpdates(enabled: boolean): void
   onCheckForUpdates(): void
 }): React.JSX.Element {
   const percent = Math.round(settings.zoomFactor * 100)
@@ -138,8 +140,16 @@ export function SettingsPanel({
         </section>
 
         <section>
-          <div className="settings-section-title"><RefreshCw size={14} /><div><strong>Updates</strong><span>GitHub Releases</span></div></div>
+          <div className="settings-section-title"><RefreshCw size={14} /><div><strong>Updates</strong><span>GitHub Releases and local test builds</span></div></div>
           <div className="update-source-setting"><strong>Installed-app updates</strong><small>Automatic checks at startup and every 2 minutes</small></div>
+          <label className="theme-auto-setting">
+            <span><strong>Include local test builds</strong><small>Offer builds published on this PC through the normal updater.</small></span>
+            <input type="checkbox" checked={settings.includeLocalUpdates !== false} disabled={['downloading', 'ready', 'installing'].includes(updateState.phase)} onChange={(event) => onSetLocalUpdates(event.target.checked)} />
+            <i aria-hidden="true" />
+          </label>
+          <div className="folder-setting"><code title={settings.localUpdateDirectory}>{settings.localUpdateDirectory}</code><button onClick={() => void window.conductor.updates.openLocalFolder()}>Open local builds folder</button></div>
+          <p>Local builds are testing versions, not claims of completed provider parity. Newer published releases remain available automatically.</p>
+          {updateState.localBuildWarning && <p role="alert">{updateState.localBuildWarning}</p>}
           <div className="update-status-setting">
             <span>
               <strong>Conductor {updateState.currentVersion || '—'}</strong>

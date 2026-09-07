@@ -25,7 +25,7 @@ export const normalizeUpdateFeedUrl = (requested: string): string => {
 }
 
 export type ConductorUpdateProvider =
-  | { provider: 'generic'; url: string }
+  | { provider: 'generic'; url: string; useMultipleRangeRequest?: boolean }
   | { provider: 'github'; owner: string; repo: string; releaseType: 'release' }
 
 export const resolveUpdateProvider = (requestedUrl: string): ConductorUpdateProvider => {

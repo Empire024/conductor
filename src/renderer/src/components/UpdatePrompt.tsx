@@ -39,11 +39,12 @@ export function UpdatePrompt({
           <span className={`update-prompt-icon ${ready ? 'ready' : ''}`}><Icon className={downloading ? 'spin' : ''} size={20} /></span>
           <div>
             <strong id="update-prompt-title">{title}</strong>
-            <span>Installed-app update · {state.currentVersion} → {state.availableVersion}</span>
+            <span>{state.source === 'local' ? 'Local test build' : 'Installed-app update'} · {state.currentVersion} → {state.availableVersion}</span>
           </div>
           <button title="Not now" aria-label="Not now" onClick={onDismiss}><X size={15} /></button>
         </header>
         <p>{detail}</p>
+        {state.source === 'local' && <p>This build was published locally on this PC for testing. It may contain unfinished features.</p>}
         <label className="update-auto-choice">
           <input type="checkbox" checked={autoDownload} onChange={(event) => onAutoDownload(event.target.checked)} />
           <span><strong>Download future updates automatically</strong><small>They install when you exit normally; active work is never interrupted.</small></span>

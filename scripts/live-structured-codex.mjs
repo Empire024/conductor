@@ -13,19 +13,30 @@ if (process.env.CONDUCTOR_LIVE_TESTS !== '1') {
 const model = process.env.CONDUCTOR_LIVE_MODEL_CODEX
 const auth = process.env.CONDUCTOR_LIVE_AUTH_CODEX
 assert.ok(model && auth === 'cli', 'Explicit allowed model and existing CLI auth are required; this harness does not enable API billing')
-const evidence = resolve('artifacts/live-codex')
-await mkdir(evidence, { recursive: true })
-const allowancePath = join(evidence, 'allowance.json')
+const evidenceRoot = resolve('artifacts/live-codex')
+await mkdir(evidenceRoot, { recursive: true })
+const allowancePath = join(evidenceRoot, 'allowance.json')
 let prior
 try { prior = JSON.parse(await readFile(allowancePath, 'utf8')) } catch (error) { if (error.code !== 'ENOENT') throw error }
-if (prior?.submissions > 0) throw new Error('This capped suite already submitted a prompt. Automatic retries are prohibited; inspect the retained evidence.')
+const replacementSuite = process.env.CONDUCTOR_LIVE_REPLACEMENT_A_SUITE_ID
+const replacement = Boolean(replacementSuite)
+if (replacement) {
+  assert.ok(prior && replacementSuite === prior.suiteId, 'Replacement A must explicitly name the original persisted suite; creating a new suite cannot reset the allowance')
+  assert.equal(prior.submissions, 1, 'The single replacement A allowance is only available after the original A; no additional retries are authorized')
+  assert.equal(prior.model, model, 'A replacement cannot silently change the approved model')
+  assert.equal(prior.auth, auth, 'A replacement cannot silently change authentication or billing routes')
+} else if (prior?.submissions > 0) throw new Error('This capped suite already submitted a prompt. Automatic retries are prohibited; inspect the retained evidence.')
 const root = prior?.root ?? await mkdtemp(join(tmpdir(), 'conductor-live-codex-'))
 const suiteId = prior?.suiteId ?? `conductor-codex-${Date.now()}`
-const allowance = { suiteId, root, model, auth, submissions: 0, preflightAttempts: (prior?.preflightAttempts ?? 1) + (prior ? 1 : 0) }
+const allowance = { ...prior, suiteId, root, model, auth, submissions: prior?.submissions ?? 0, preflightAttempts: (prior?.preflightAttempts ?? 1) + (prior ? 1 : 0) }
+if (replacement && !allowance.amendment) allowance.amendment = { kind: 'one-replacement-A', suiteId, priorSubmissions: 1, providerSubmissionLimit: 3, totalSubmissionLimit: 4, authorizedAt: new Date().toISOString() }
+if (replacement) assert.deepEqual({ kind: allowance.amendment.kind, suiteId: allowance.amendment.suiteId, priorSubmissions: allowance.amendment.priorSubmissions, providerSubmissionLimit: allowance.amendment.providerSubmissionLimit, totalSubmissionLimit: allowance.amendment.totalSubmissionLimit }, { kind: 'one-replacement-A', suiteId, priorSubmissions: 1, providerSubmissionLimit: 3, totalSubmissionLimit: 4 })
+const evidence = replacement ? join(evidenceRoot, `replacement-a-preflight-${allowance.preflightAttempts}`) : evidenceRoot
+await mkdir(evidence, { recursive: true })
 await writeFile(allowancePath, JSON.stringify(allowance, null, 2))
 const promptA = 'In panel.mjs, remove only the two unused declarations wasOpen and wasPinned. Change nothing else. Run node --test panel.test.mjs once. Do not browse, inspect unrelated files, install packages, or delegate. Report the test result and changed file in no more than 35 words.'
 const promptB = 'Without using tools, name the two identifiers you removed and say whether the test passed. One sentence.'
-const results = { status: 'running', suiteId, model, effort: 'low', authentication: 'existing CLI ChatGPT authentication', prompts: [], checks: [], limitations: ['Native Codex internal model-step limits are not exposed; host time and submission allowance are enforced.', 'Subscription cost telemetry is not an authoritative USD charge.'], screenshots: [], failures: [] }
+const results = { status: 'running', suiteId, model, effort: 'low', authentication: 'existing CLI ChatGPT authentication', priorSubmissions: allowance.submissions, amendment: allowance.amendment, prompts: [], checks: [], limitations: ['Native Codex internal model-step limits are not exposed; host time and submission allowance are enforced.', 'Subscription cost telemetry is not an authoritative USD charge.'], screenshots: [], failures: [] }
 const env = { ...process.env, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_LIVE_FIXTURE_ROOT: root, CONDUCTOR_LIVE_SUITE_ID: suiteId, CONDUCTOR_LIVE_MODEL_CODEX: model, CONDUCTOR_LIVE_AUTH_CODEX: auth, CONDUCTOR_LIVE_OPTIONAL_MCP: JSON.stringify(['chrome-devtools', 'node_repl']) }
 delete env.ELECTRON_RUN_AS_NODE
 delete env.CONDUCTOR_OFFLINE_TESTS
@@ -34,7 +45,7 @@ let page, sessionId
 try {
   page = await app.firstWindow()
   await page.waitForFunction(() => Boolean(window.conductor?.structured))
-  const projectName = allowance.preflightAttempts === 1 ? 'Codex live acceptance' : `Codex live acceptance preflight ${allowance.preflightAttempts}`
+  const projectName = replacement ? `Codex replacement A preflight ${allowance.preflightAttempts}` : allowance.preflightAttempts === 1 ? 'Codex live acceptance' : `Codex live acceptance preflight ${allowance.preflightAttempts}`
   const project = await page.evaluate(name => window.conductor.projects.create(name), projectName)
   await copyFile(resolve('scripts/fixtures/panel.mjs'), join(project.path, 'panel.mjs'))
   await copyFile(resolve('scripts/fixtures/panel.test.mjs'), join(project.path, 'panel.test.mjs'))
@@ -68,6 +79,8 @@ try {
   await page.getByLabel('Approval policy', { exact: true }).selectOption('untrusted')
   await page.getByRole('button', { name: 'Session settings', exact: true }).click()
   const submit = async (prompt, label) => {
+    assert.equal(allowance.submissions, (replacement ? 1 : 0) + (label === 'A' ? 0 : 1), 'No retries or helper submissions are authorized')
+    assert.ok(allowance.submissions < (replacement ? 3 : 2), 'The persisted provider allowance is exhausted')
     allowance.submissions++
     await writeFile(allowancePath, JSON.stringify(allowance, null, 2)) // reserve outside a session before UI dispatch
     results.prompts.push({ label, submittedAt: new Date().toISOString(), text: prompt })
@@ -78,7 +91,7 @@ try {
     while (Date.now() < until) {
       const state = await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)
       const submitted = state.items.filter(item => item.data.type === 'text' && item.data.role === 'user').length
-      if (submitted >= allowance.submissions) observedActive = true
+      if (submitted >= results.prompts.length) observedActive = true
       if (observedActive && ['completed', 'failed', 'disconnected', 'interrupted'].includes(state.phase)) return { state, approvals }
       if (state.phase === 'waiting_approval') {
         const requests = state.items.filter(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending')
@@ -109,10 +122,10 @@ try {
   results.checks.push('Live A changed only two declarations; native edit event and successful test command verified')
   results.liveApproval = a.approvals ? 'live-verified through UI' : 'unverified: runtime emitted no approval'
   results.nativeSessionId = a.state.nativeSessionId
-  await page.screenshot({ path: join(evidence, 'live-a.png'), fullPage: true }); results.screenshots.push('artifacts/live-codex/live-a.png')
+  await page.screenshot({ path: join(evidence, 'live-a.png'), fullPage: true }); results.screenshots.push(join(evidence, 'live-a.png'))
   await page.getByRole('button', { name: /Click to expand diff/ }).last().click()
   await page.getByRole('dialog').waitFor()
-  await page.screenshot({ path: join(evidence, 'live-diff.png'), fullPage: true }); results.screenshots.push('artifacts/live-codex/live-diff.png')
+  await page.screenshot({ path: join(evidence, 'live-diff.png'), fullPage: true }); results.screenshots.push(join(evidence, 'live-diff.png'))
   await page.keyboard.press('Escape')
   await page.locator('.pane-close-button').first().click()
   await expect(page.locator('.structured-agent-pane')).toHaveCount(0)
@@ -158,6 +171,7 @@ try {
   }
 }
 finally {
+  results.aggregateSubmissions = allowance.submissions
   if (page && sessionId) {
     try { results.events = await page.evaluate(id => window.conductor.structured.events(id), sessionId) } catch {}
   }

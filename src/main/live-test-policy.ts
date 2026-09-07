@@ -6,6 +6,14 @@ export const LIVE_PROMPT_A = 'In panel.mjs, remove only the two unused declarati
 export const LIVE_PROMPT_B = 'Without using tools, name the two identifiers you removed and say whether the test passed. One sentence.'
 const normalized = (value: string): string => value.replace(/\s+/g, ' ').trim()
 
+/** An owner-authorized replacement is scoped to one existing suite, never a general cap override. */
+export function liveReplacementAuthorization(suiteId: string, provider: StructuredProvider, env: NodeJS.ProcessEnv = process.env): boolean {
+  const authorizedSuite = env.CONDUCTOR_LIVE_REPLACEMENT_A_SUITE_ID
+  if (!authorizedSuite) return false
+  if (env.CONDUCTOR_LIVE_TESTS !== '1' || authorizedSuite !== suiteId || provider !== 'codex') throw new Error('Replacement A authorization must name this enabled Codex suite exactly')
+  return true
+}
+
 /** Configured thresholds can tighten, never expand, the default suite allowance. */
 export function liveCostLimits(provider: StructuredProvider, env: NodeJS.ProcessEnv = process.env): { provider: number; suite: number } {
   const limit = (value: string | undefined, fallback: number): number => {

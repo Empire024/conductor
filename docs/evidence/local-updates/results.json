@@ -1,0 +1,13 @@
+{
+  "synthetic": true,
+  "actualElectron": true,
+  "checks": [
+    "Native NsisUpdater discovers the verified local generic feed automatically and the real UI shows Update pending / Local test build",
+    "Opt-out persists across renderer reload; enabling the local feed discovers the build without replacing the release feed",
+    "No synthetic installer was downloaded or executed; fixture bytes unchanged"
+  ],
+  "failures": [],
+  "screenshots": [
+    "local-update-pending.png"
+  ]
+}

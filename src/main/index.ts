@@ -280,7 +280,9 @@ const getAppSettings = (): AppSettings => {
     agentSoundProfile: AGENT_SOUND_PROFILES.includes(database.getSetting('agentSoundProfile') as AgentSoundProfile)
       ? database.getSetting('agentSoundProfile') as AgentSoundProfile
       : 'soft',
-    updateFeedUrl: database.getSetting('updateFeedUrl') || process.env.CONDUCTOR_UPDATE_URL || ''
+    updateFeedUrl: database.getSetting('updateFeedUrl') || process.env.CONDUCTOR_UPDATE_URL || '',
+    includeLocalUpdates: database.getSetting('includeLocalUpdates') !== 'false',
+    localUpdateDirectory: join(app.getPath('userData'), 'local-updates')
   }
 }
 
@@ -534,19 +536,36 @@ const registerIpc = (): void => {
     database.setSetting('agentSoundProfile', profile)
     return getAppSettings()
   })
-  ipcMain.handle('settings:set-update-feed-url', (_event, requestedUrl: string) => {
+  ipcMain.handle('settings:set-update-feed-url', (event, requestedUrl: unknown) => {
+    trustedStructured(event)
+    if (typeof requestedUrl !== 'string') throw new Error('Invalid update feed URL')
     const updateFeedUrl = normalizeUpdateFeedUrl(requestedUrl)
-    database.setSetting('updateFeedUrl', updateFeedUrl)
     const effectiveUrl = updateFeedUrl || process.env.CONDUCTOR_UPDATE_URL || ''
-    updates.configure(effectiveUrl)
-    if (effectiveUrl) void updates.check()
+    updates.configure(effectiveUrl, getAppSettings().includeLocalUpdates)
+    database.setSetting('updateFeedUrl', updateFeedUrl)
+    void updates.check()
     return getAppSettings()
   })
 
-  ipcMain.handle('updates:get-state', () => updates.getState())
-  ipcMain.handle('updates:check', () => updates.check())
-  ipcMain.handle('updates:download', () => updates.download())
-  ipcMain.handle('updates:install', () => updates.install())
+  ipcMain.handle('settings:set-local-updates', (event, enabled: unknown) => {
+    trustedStructured(event)
+    if (typeof enabled !== 'boolean') throw new Error('Invalid local update setting')
+    updates.configure(getAppSettings().updateFeedUrl, enabled)
+    database.setSetting('includeLocalUpdates', String(enabled))
+    void updates.check()
+    return getAppSettings()
+  })
+  ipcMain.handle('updates:open-local-folder', async (event) => {
+    trustedStructured(event)
+    const path = join(app.getPath('userData'), 'local-updates')
+    await fs.mkdir(path, { recursive: true })
+    const error = await shell.openPath(path)
+    if (error) throw new Error(error)
+  })
+  ipcMain.handle('updates:get-state', (event) => { trustedStructured(event); return updates.getState() })
+  ipcMain.handle('updates:check', (event) => { trustedStructured(event); return updates.check() })
+  ipcMain.handle('updates:download', (event) => { trustedStructured(event); return updates.download() })
+  ipcMain.handle('updates:install', (event) => { trustedStructured(event); return updates.install() })
   ipcMain.on('updates:prepare-ack', (event, requestId: string) => {
     updates.acknowledgePrepare(event.sender.id, requestId)
   })
@@ -1012,10 +1031,11 @@ app.whenReady().then(() => {
     currentVersion: app.getVersion(),
     isPackaged: app.isPackaged,
     allowDevelopmentUpdates: process.env.CONDUCTOR_UPDATE_DEV === '1',
+    localBuildDirectory: join(app.getPath('userData'), 'local-updates'),
     beforeInstall: prepareForUpdateInstall
   })
   try {
-    updates.configure(getAppSettings().updateFeedUrl)
+    updates.configure(getAppSettings().updateFeedUrl, getAppSettings().includeLocalUpdates)
   } catch (error) {
     console.error('Ignoring invalid update feed configuration', error)
     updates.configure('')
