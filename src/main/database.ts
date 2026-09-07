@@ -1,6 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import { StructuredAgentStore } from './structured-store'
 import type {
   AgentSpec,
   AgentMemory,
@@ -33,12 +34,14 @@ const now = (): string => new Date().toISOString()
 
 export class ConductorDatabase {
   private readonly db: DatabaseSync
+  readonly structured: StructuredAgentStore
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000;')
     this.migrate()
+    this.structured = new StructuredAgentStore(this.db, dirname(path))
   }
 
   private migrate(): void {
@@ -226,6 +229,7 @@ export class ConductorDatabase {
       this.db
         .prepare('UPDATE agent_sessions SET cwd = ?, updated_at = ? WHERE project_id = ?')
         .run(path, timestamp, projectId)
+      this.structured.rebindProject(projectId, path)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -263,6 +267,7 @@ export class ConductorDatabase {
       this.db
         .prepare('UPDATE agent_sessions SET cwd = ?, updated_at = ? WHERE project_id = ?')
         .run(path, timestamp, projectId)
+      this.structured.rebindProject(projectId, path)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -872,6 +877,7 @@ export class ConductorDatabase {
   }
 
   close(): void {
+    this.structured.flush()
     this.db.close()
   }
 

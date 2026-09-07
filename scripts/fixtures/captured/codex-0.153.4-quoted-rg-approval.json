@@ -1,0 +1,52 @@
+{
+  "fixtureType": "sanitized-captured-failure",
+  "provider": "codex",
+  "runtimeVersion": "0.153.4",
+  "capturedAt": "2026-09-07T12:44:39.103Z",
+  "source": "Conductor production adapter during live prompt A; harness rejected this request before answering it",
+  "model": "gpt-5.6-luna",
+  "authentication": "existing CLI ChatGPT authentication",
+  "userTurnSubmissions": 1,
+  "redactions": "Disposable workspace path and native IDs replaced. Command, available decisions and scope fields preserved exactly.",
+  "request": {
+    "id": 0,
+    "method": "item/commandExecution/requestApproval",
+    "params": {
+      "kind": "command",
+      "threadId": "captured-thread-A",
+      "turnId": "captured-turn-A",
+      "itemId": "captured-command-A",
+      "startedAtMs": 1788785079097,
+      "environmentId": "local",
+      "command": "\"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe\" -Command 'rg -n \"wasOpen|wasPinned\" panel.mjs'",
+      "cwd": "C:\\Conductor fixtures\\Codex live acceptance",
+      "commandActions": [
+        {
+          "type": "unknown",
+          "command": "rg -n \"wasOpen|wasPinned\" panel.mjs"
+        }
+      ],
+      "proposedExecpolicyAmendment": [
+        "rg",
+        "-n",
+        "wasOpen|wasPinned",
+        "panel.mjs"
+      ],
+      "availableDecisions": [
+        "accept",
+        {
+          "acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": [
+              "rg",
+              "-n",
+              "wasOpen|wasPinned",
+              "panel.mjs"
+            ]
+          }
+        },
+        "cancel"
+      ]
+    }
+  },
+  "expectedHarnessDecision": "accept once only; never acceptWithExecpolicyAmendment"
+}

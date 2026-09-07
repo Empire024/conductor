@@ -1,0 +1,17 @@
+{
+  "fixtureType": "sanitized-captured-metadata",
+  "capturedDate": "2026-09-07",
+  "source": "scripts/inspect-codex-isolation.mjs using production launch and validation functions",
+  "status": "metadata-verified",
+  "runtimeVersion": "codex-cli 0.153.4",
+  "methods": ["initialize", "configRequirements/read", "config/read", "skills/list"],
+  "threadsStarted": 0,
+  "userTurnSubmissions": 0,
+  "mcpServers": [
+    { "name": "chrome-devtools", "enabled": false },
+    { "name": "node_repl", "enabled": false }
+  ],
+  "optionalSkillDisableOverridesPrepared": 6,
+  "preservedAdministratorSkills": 0,
+  "limitation": "Per-thread skill overrides were prepared but not applied by this metadata-only check; no thread or model turn was started."
+}

@@ -19,6 +19,24 @@ const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => v
 }
 
 const bridge: ConductorBridge = {
+  structured: {
+    connect: (id) => ipcRenderer.invoke('structured:connect', id),
+    snapshot: (id) => ipcRenderer.invoke('structured:snapshot', id),
+    events: (id, after) => ipcRenderer.invoke('structured:events', id, after),
+    submit: (id, text, settings, attachments) => ipcRenderer.invoke('structured:submit', id, text, settings, attachments),
+    respond: (response) => ipcRenderer.invoke('structured:respond', response),
+    interrupt: (id) => ipcRenderer.invoke('structured:interrupt', id),
+    resume: (id, settings) => ipcRenderer.invoke('structured:resume', id, settings),
+    fork: (id) => ipcRenderer.invoke('structured:fork', id),
+    discover: (id) => ipcRenderer.invoke('structured:discover', id),
+    rename: (id, title) => ipcRenderer.invoke('structured:rename', id, title),
+    archive: (id, archived) => ipcRenderer.invoke('structured:archive', id, archived),
+    history: (projectId, query) => ipcRenderer.invoke('structured:history', projectId, query),
+    artifact: (id, artifactId) => ipcRenderer.invoke('structured:artifact', id, artifactId),
+    output: (id, artifactId) => ipcRenderer.invoke('structured:output', id, artifactId),
+    review: (id, artifactId, action) => ipcRenderer.invoke('structured:review', id, artifactId, action),
+    onEvents: (callback) => subscribe('structured:events', callback)
+  },
   orchestration: orchestrationBridge,
   collaboration: agentCollaborationBridge,
   projects: {

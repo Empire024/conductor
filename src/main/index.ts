@@ -1,5 +1,7 @@
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs } from 'node:fs'
+import { pathToFileURL } from 'node:url'
+import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell, webContents } from 'electron'
 import type {
   AgentSpec,
@@ -57,6 +59,9 @@ const USAGE_LIMIT_DETECTION_VERSION_KEY = 'usageLimitDetectionVersion'
 const RESTORE_WINDOWS_AFTER_UPDATE_KEY = 'restoreWindowsAfterUpdate'
 
 app.setName('Conductor')
+// Isolated automation profile is chosen before the single-instance lock.
+if (!app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA) app.setPath('userData', resolve(process.env.CONDUCTOR_TEST_USER_DATA))
+if (app.isPackaged) delete process.env.CONDUCTOR_OFFLINE_TESTS
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) app.quit()
@@ -362,6 +367,31 @@ const resolveExistingProjectPath = async (projectId: string, requested = ''): Pr
 }
 
 const registerIpc = (): void => {
+  const structuredId = (value: unknown): string => {
+    if (typeof value !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(value)) throw new Error('Invalid session identifier')
+    return value
+  }
+  const trustedStructured = (event: Pick<Electron.IpcMainInvokeEvent, 'sender' | 'senderFrame'>): void => {
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    const known = owner && (owner === mainWindow || owner === debugWindow || [...detachedWindows.values()].includes(owner))
+    const rendererUrl = process.env.ELECTRON_RENDERER_URL ?? pathToFileURL(join(__dirname, '../renderer/index.html')).href
+    if (!known || owner.webContents !== event.sender || event.senderFrame !== event.sender.mainFrame || !isStructuredRendererUrl(event.senderFrame.url, rendererUrl)) throw new Error('Structured controls require the trusted Conductor document')
+  }
+  ipcMain.handle('structured:snapshot', (event, id) => { trustedStructured(event); return database.structured.snapshot(structuredId(id)) })
+  ipcMain.handle('structured:connect', (event, id) => { trustedStructured(event); return agents.structured.connectSession(structuredId(id)) })
+  ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
+  ipcMain.handle('structured:submit', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.submit(structuredId(id), text, settings, attachments) })
+  ipcMain.handle('structured:respond', (event, response) => { trustedStructured(event); return agents.structured.respond(response) })
+  ipcMain.handle('structured:interrupt', (event, id) => { trustedStructured(event); return agents.structured.interrupt(structuredId(id)) })
+  ipcMain.handle('structured:resume', (event, id, settings) => { trustedStructured(event); return agents.structured.resume(structuredId(id), settings) })
+  ipcMain.handle('structured:fork', (event, id) => { trustedStructured(event); return agents.structured.fork(structuredId(id)) })
+  ipcMain.handle('structured:discover', (event, id) => { trustedStructured(event); return agents.structured.discover(structuredId(id)) })
+  ipcMain.handle('structured:rename', (event, id, title) => { trustedStructured(event); if (typeof title !== 'string' || !title.trim() || title.length > 160) throw new Error('Invalid title'); return agents.structured.rename(structuredId(id), title.trim()) })
+  ipcMain.handle('structured:archive', (event, id, archived) => { trustedStructured(event); if (typeof archived !== 'boolean') throw new Error('Invalid archive setting'); return agents.structured.archive(structuredId(id), archived) })
+  ipcMain.handle('structured:history', (event, projectId, query) => { trustedStructured(event); if (query !== undefined && (typeof query !== 'string' || query.length > 500)) throw new Error('Invalid search'); return database.structured.history(structuredId(projectId), query) })
+  ipcMain.handle('structured:artifact', (event, id, artifactId) => { trustedStructured(event); return database.structured.artifact(structuredId(id), structuredId(artifactId)) })
+  ipcMain.handle('structured:output', (event, id, artifactId) => { trustedStructured(event); return database.structured.output(structuredId(id), structuredId(artifactId)) })
+  ipcMain.handle('structured:review', (event, id, artifactId, action) => { trustedStructured(event); return agents.structured.review(structuredId(id), structuredId(artifactId), action) })
   ipcMain.on('settings:get-startup', (event) => {
     event.returnValue = getAppSettings()
   })
@@ -772,24 +802,36 @@ const registerIpc = (): void => {
     terminals.resize(id, cols, rows)
   )
 
-  ipcMain.handle('agent:ensure', (_event, spec: AgentSpec) => agents.ensure(spec))
-  ipcMain.handle('agent:restart', (_event, spec: AgentSpec) => agents.restart(spec))
-  ipcMain.handle('agent:submit', (_event, id: string, message: string, mode?: 'manual' | 'edit' | 'plan' | 'auto') =>
-    agents.submit(id, message, mode)
-  )
+  // Legacy entry points also reach the structured owner. Apply the same document
+  // boundary here so an embedded or navigated web page cannot bypass its IPC.
+  ipcMain.handle('agent:ensure', (event, spec: AgentSpec) => { trustedStructured(event); return agents.ensure(spec) })
+  ipcMain.handle('agent:restart', (event, spec: AgentSpec) => { trustedStructured(event); return agents.restart(spec) })
+  ipcMain.handle('agent:submit', (event, id: string, message: string, mode?: 'manual' | 'edit' | 'plan' | 'auto') => {
+    trustedStructured(event)
+    return agents.submit(id, message, mode)
+  })
   ipcMain.on('agent:capture-visual', (_event, id: string, body: string, active: boolean, settled: boolean) =>
     agents.captureVisual(id, body, active, settled)
   )
   ipcMain.handle('agent:list-events', (_event, id: string) => database.listAgentEvents(id))
   ipcMain.handle('agent:list-providers', () => agents.listProviders())
   ipcMain.handle('runtime:list-processes', (_event, projectId?: string) => database.listProcesses(projectId))
-  ipcMain.on('agent:write', (_event, id: string, data: string) => agents.write(id, data))
-  ipcMain.on('agent:respond', (_event, id: string, data: string) => agents.respond(id, data))
+  ipcMain.on('agent:write', (event, id: string, data: string) => {
+    try { trustedStructured(event) } catch { return }
+    agents.write(id, data)
+  })
+  ipcMain.on('agent:respond', (event, id: string, data: string) => {
+    try { trustedStructured(event) } catch { return }
+    agents.respond(id, data)
+  })
   ipcMain.on('agent:report-interaction', (_event, id: string, kind: 'directory_trust') => agents.reportInteraction(id, kind))
   ipcMain.on('agent:resize', (_event, id: string, cols: number, rows: number) =>
     agents.resize(id, cols, rows)
   )
-  ipcMain.on('agent:interrupt', (_event, id: string) => agents.interrupt(id))
+  ipcMain.on('agent:interrupt', (event, id: string) => {
+    try { trustedStructured(event) } catch { return }
+    agents.interrupt(id)
+  })
 
   ipcMain.handle('memory:list', (_event, projectId: string, agentKey?: string) =>
     database.listMemories(projectId, agentKey)

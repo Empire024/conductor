@@ -1,0 +1,12 @@
+{
+  "fixtureType": "sanitized-captured-failure",
+  "provider": "codex",
+  "runtimeVersion": "0.153.4",
+  "capturedAt": "2026-09-07T01:52:42Z",
+  "source": "Conductor live UI preflight process/stderr event; artifacts/live-codex/results.json",
+  "userTurnSubmissions": 0,
+  "nativeThreadStarts": 0,
+  "failingArgument": "mcp_servers.\"chrome-devtools\".enabled=false",
+  "stderr": "Error: error loading default config after config error: invalid transport\nin `mcp_servers.\"chrome-devtools\"`\n\n",
+  "correction": "Use mcp_servers.chrome-devtools.enabled=false for validated simple names. Codex's dotted override parser preserves quote characters as part of the name."
+}

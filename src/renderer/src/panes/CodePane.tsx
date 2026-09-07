@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Editor, { type BeforeMount, type OnMount } from '@monaco-editor/react'
-import { Check, LoaderCircle, Save } from 'lucide-react'
+import { Check, FilePlus2, LoaderCircle, Save } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
+import { dispatchAgentContext } from './StructuredAgentPane'
 
 const languageFor = (path: string): string => {
   const ext = path.split('.').pop()?.toLowerCase()
@@ -172,6 +173,29 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
   const onMount: OnMount = (_editor, monaco) => {
     editorRef.current = _editor
     _editor.addAction({
+      id: 'conductor-attach-selection',
+      label: 'Attach selection to focused agent',
+      contextMenuGroupId: 'navigation',
+      contextMenuOrder: 2,
+      run: () => attachContext()
+    })
+    _editor.addAction({
+      id: 'conductor-attach-diagnostics',
+      label: 'Attach file diagnostics to focused agent',
+      contextMenuGroupId: 'navigation',
+      contextMenuOrder: 3,
+      run: () => {
+        const model = _editor.getModel()
+        if (!model) return
+        const markers = monaco.editor.getModelMarkers({ resource: model.uri })
+        if (!markers.length) {
+          window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'This file has no editor diagnostics.' }))
+          return
+        }
+        dispatchAgentContext(project.id, { id: crypto.randomUUID(), kind: 'diagnostics', name: pathRef.current, path: pathRef.current, content: markers.map((marker) => pathRef.current + ':' + marker.startLineNumber + ':' + marker.startColumn + ' ' + marker.message).join('\n') })
+      }
+    })
+    _editor.addAction({
       id: 'conductor-save',
       label: 'Save',
       keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
@@ -200,12 +224,33 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
     _editor.focus()
   }
 
+  const attachContext = (): void => {
+    const selected = editorRef.current?.getSelection()
+    const model = editorRef.current?.getModel()
+    const hasSelection = Boolean(selected && !selected.isEmpty())
+    const content = hasSelection && selected && model ? model.getValueInRange(selected) : valueRef.current
+    if (content.length > 160_000) {
+      window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Select a smaller range to attach (maximum 160,000 characters).' }))
+      return
+    }
+    dispatchAgentContext(project.id, {
+      id: crypto.randomUUID(),
+      kind: hasSelection ? 'selection' : valueRef.current !== savedValueRef.current ? 'editor' : 'file',
+      name: pathRef.current + (!hasSelection && valueRef.current !== savedValueRef.current ? ' (unsaved)' : ''),
+      path: pathRef.current,
+      content,
+      startLine: hasSelection ? selected?.startLineNumber : undefined,
+      endLine: hasSelection ? selected?.endLineNumber : undefined
+    })
+  }
+
   return (
     <div className="code-pane">
       <div className="code-toolbar">
         <span className="code-path">{path}</span>
         {recovered && <span className="code-recovered">Recovered draft</span>}
         <span className="code-language">{language}</span>
+        <button onClick={attachContext} disabled={loading} title="Attach selected range, or current editor content, to the last focused agent"><FilePlus2 size={13} /> Attach context</button>
         <button className={dirty ? 'dirty' : ''} disabled={!dirty || saving} onClick={() => void save()}>
           {saving ? <LoaderCircle className="spin" size={13} /> : dirty ? <Save size={13} /> : <Check size={13} />}
           {dirty ? 'Save' : 'Saved'}

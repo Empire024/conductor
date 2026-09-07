@@ -16,10 +16,11 @@ import type {
 } from '../../../shared/models'
 import { AgentPrompt, type AgentPromptMode } from './AgentPrompt'
 import { AgentConversation } from './AgentConversation'
+import { dispatchAgentContext, StructuredAgentPane } from './StructuredAgentPane'
 import { extractAgentScreenSnapshot, joinWrappedTerminalRows } from './agent-screen'
 import './AgentPrompt.css'
 
-interface RuntimeTerminalProps {
+export interface RuntimeTerminalProps {
   mode: 'terminal' | 'agent'
   resourceId: string
   title: string
@@ -74,6 +75,13 @@ const lightTerminalTheme = {
 }
 
 export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element {
+  if (props.mode === 'agent' && (props.provider === 'codex' || props.provider === 'claude' || !props.provider)) {
+    return <StructuredAgentPane {...props} />
+  }
+  return <TerminalRuntimePane {...props} />
+}
+
+function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
@@ -540,7 +548,12 @@ export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element 
               </div>
             </>
           )}
-          {props.mode === 'terminal' && <button className="runtime-menu-button" onClick={() => void restart()} title="Restart runtime"><RefreshCw size={17} /></button>}
+          {props.mode === 'terminal' && <><button className="runtime-menu-button" onClick={() => {
+            const content = terminalRef.current?.getSelection()
+            if (!content) { window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Select terminal output to attach to an agent.' })); return }
+            if (content.length > 160_000) { window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Select a smaller output range (maximum 160,000 characters).' })); return }
+            dispatchAgentContext(props.project.id, { id: crypto.randomUUID(), kind: 'terminal', name: props.title, content })
+          }} title="Attach selected terminal output to the last focused agent"><MessagesSquare size={15} /></button><button className="runtime-menu-button" onClick={() => void restart()} title="Restart runtime"><RefreshCw size={17} /></button></>}
         </div>
       </div>
       <div className={`xterm-host ${props.mode === 'agent' && viewMode === 'visual' ? 'agent-terminal-hidden' : ''}`} ref={hostRef} onClick={() => terminalRef.current?.focus()} />

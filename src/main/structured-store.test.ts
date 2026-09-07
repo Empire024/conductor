@@ -1,0 +1,102 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { DatabaseSync } from 'node:sqlite'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { StructuredAgentStore, sanitizeDiagnostic } from './structured-store'
+import type { AgentEvent, AgentEventData } from '../shared/structured-agent'
+
+const roots: string[] = [], databases: DatabaseSync[] = []
+afterEach(() => { for (const db of databases.splice(0)) { try { db.close() } catch {} } for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 }); vi.unstubAllEnvs() })
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), 'conductor-store-fixture-')); roots.push(root)
+  const path = join(root, 'events.sqlite')
+  const db = new DatabaseSync(path); databases.push(db)
+  db.exec('CREATE TABLE agent_sessions(id TEXT PRIMARY KEY); INSERT INTO agent_sessions(id) VALUES(\'one\'),(\'two\')')
+  const store = new StructuredAgentStore(db, root)
+  store.register('one', 'project', 'claude', { cwd: 'synthetic' }); store.register('two', 'project', 'codex', {})
+  return { root, path, db, store }
+}
+const event = (sequence: number, data: AgentEventData, overrides: Partial<AgentEvent> = {}): AgentEvent => ({ schemaVersion: 1, id: `event-${sequence}`, sequence, sessionId: 'one', runtimeId: 'runtime', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: 'fixture', timestamp: '2026-09-07T00:00:00.000Z', data, ...overrides })
+
+describe('structured SQLite journal and immutable artifacts', () => {
+  it('restores uncheckpointed events without resending work and marks lost runtime state disconnected', () => {
+    const f = fixture()
+    f.store.append(event(1, { type: 'text', role: 'user', text: 'Synthetic first prompt', mode: 'snapshot' }))
+    f.store.checkpoint('one')
+    f.store.append(event(2, { type: 'session', phase: 'running', nativeSessionId: 'native' }))
+    f.store.append(event(3, { type: 'tool', name: 'Bash', status: 'running' }, { itemId: 'tool' }))
+    f.store.append(event(4, { type: 'interaction', interaction: { id: 'approval', kind: 'approval', title: 'Allow?', input: {}, choices: [], status: 'pending' } }, { requestId: 'approval' }))
+    f.db.close()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const restored = new StructuredAgentStore(reopened, f.root)
+    expect(restored.snapshot('one')).toMatchObject({ phase: 'disconnected', nativeSessionId: 'native', sequence: 4, title: 'Synthetic first prompt' })
+    expect(restored.snapshot('one')?.items.find((item) => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'expired' } })
+    expect(restored.snapshot('one')?.items.find((item) => item.data.type === 'tool')?.data).toMatchObject({ status: 'interrupted' })
+    expect(restored.events('one')).toHaveLength(4)
+  })
+  it('rejects non-contiguous events and isolates each session journal', () => {
+    const { store } = fixture()
+    expect(() => store.append(event(2, { type: 'notice', message: 'gap' }))).toThrow('Non-contiguous')
+    store.append(event(1, { type: 'notice', message: 'one' }))
+    expect(() => store.append(event(1, { type: 'notice', message: 'duplicate' }))).toThrow('Non-contiguous')
+    store.append(event(1, { type: 'notice', message: 'two' }, { sessionId: 'two', provider: 'codex' }))
+    expect(store.events('one').map((entry) => entry.data)).toEqual([{ type: 'notice', message: 'one' }])
+    expect(store.events('two').map((entry) => entry.data)).toEqual([{ type: 'notice', message: 'two' }])
+  })
+  it('redacts diagnostics while preserving private immutable bytes and session authorization', () => {
+    const { store } = fixture()
+    const secret = 'sk-ant-' + 'SYNTHETIC'.repeat(4)
+    const safe = store.append(event(1, { type: 'notice', message: `Bearer ${secret}`, payload: { environment: { PRIVATE: secret }, authorization: secret } }))
+    expect(JSON.stringify(safe)).not.toContain(secret)
+    const artifact = store.putArtifact('one', { sessionId: 'one', path: 'file.txt', before: secret, after: 'new', patch: 'synthetic patch', additions: 1, deletions: 1, canUndo: true })
+    expect(store.artifact('one', artifact.id).before).toBe(secret)
+    expect(() => store.artifact('two', artifact.id)).toThrow('not found in this session')
+    expect(() => store.artifact('one', '../file')).toThrow('not found')
+    const outputId = store.putOutput('one', `Bearer ${secret}`)
+    expect(store.output('one', outputId)).toBe('Bearer [REDACTED]')
+    expect(store.artifact('one', artifact.id)).toEqual(artifact)
+    expect(sanitizeDiagnostic({ password: 'synthetic', note: 'safe' })).toEqual({ password: '[REDACTED]', note: 'safe' })
+  })
+  it('persists rename/archive/search independently of a process or pane', () => {
+    const f = fixture()
+    f.store.append(event(1, { type: 'text', role: 'assistant', text: 'Find searchable Unicode: 日本語', mode: 'snapshot' }))
+    f.store.update('one', { title: 'Renamed', archived: true, settings: { permission: 'accept-edits', plan: false } })
+    expect(f.store.history('project', '日本語')).toEqual([{ id: 'one', title: 'Renamed', archived: true, provider: 'claude', phase: 'idle' }])
+    expect(f.store.history('another-project')).toEqual([])
+    f.db.close()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const store = new StructuredAgentStore(reopened, f.root)
+    expect(store.snapshot('one')).toMatchObject({ title: 'Renamed', archived: true, settings: { permission: 'accept-edits' } })
+  })
+  it('reserves suite allowance durably before dispatch and does not reset it on reopen', () => {
+    const f = fixture()
+    f.store.reserveLive('suite', 'claude', 2, 4); f.store.reserveLive('suite', 'claude', 2, 4)
+    expect(() => f.store.reserveLive('suite', 'claude', 2, 4)).toThrow('allowance exhausted')
+    f.db.close()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const store = new StructuredAgentStore(reopened, f.root)
+    expect(() => store.reserveLive('suite', 'claude', 2, 4)).toThrow('allowance exhausted')
+    store.reserveLive('suite', 'codex', 2, 4)
+    store.addLiveCost('suite', 'codex', 0.25)
+    expect(() => store.reserveLive('suite', 'codex', 2, 4)).toThrow('cost threshold')
+  })
+
+  it('retains stricter provider and total cost thresholds after database restart and removed environment settings', () => {
+    vi.stubEnv('CONDUCTOR_LIVE_MAX_USD_CLAUDE', '0.05')
+    vi.stubEnv('CONDUCTOR_LIVE_MAX_USD_TOTAL', '0.08')
+    const f = fixture()
+    f.store.reserveLive('strict-suite', 'claude', 2, 4, 'A')
+    f.store.addLiveCost('strict-suite', 'claude', 0.05)
+    f.db.close()
+    vi.unstubAllEnvs()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const store = new StructuredAgentStore(reopened, f.root)
+    expect(store.liveCostExceeded('strict-suite', 'claude')).toBe(true)
+    expect(() => store.reserveLive('strict-suite', 'claude', 2, 4, 'B')).toThrow('cost threshold')
+    store.reserveLive('strict-suite', 'codex', 2, 4, 'A')
+    store.addLiveCost('strict-suite', 'codex', 0.031)
+    expect(store.liveCostExceeded('strict-suite', 'codex')).toBe(true)
+    expect(() => store.reserveLive('strict-suite', 'codex', 2, 4, 'B')).toThrow('cost threshold')
+  })
+})

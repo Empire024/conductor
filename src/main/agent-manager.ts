@@ -15,6 +15,7 @@ import type { ConductorDatabase } from './database'
 import { parseUsageLimitReset } from './usage-limit'
 import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSignalAgentOutput } from './agent-activity'
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
+import { StructuredSessions } from './structured-sessions'
 
 export { parseUsageLimitReset } from './usage-limit'
 
@@ -196,6 +197,7 @@ const stripAnsi = (value: string): string =>
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
 
 export class AgentManager {
+  readonly structured: StructuredSessions
   private readonly agents = new Map<string, LiveAgent>()
   private readonly continuationTimers = new Map<string, NodeJS.Timeout>()
   private disposing = false
@@ -203,7 +205,19 @@ export class AgentManager {
   constructor(
     private readonly database: ConductorDatabase,
     private readonly collaboration?: AgentCollaborationRuntime
-  ) {}
+  ) {
+    this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
+      undefined,
+      (spec, prompt) => {
+        const memories = database.recall(spec.projectId, prompt, spec.provider, 8)
+        const memoryContext = memories.length ? `Conductor project memory (current project evidence takes precedence):\n${memories.map(memory => `- [${memory.kind}] ${memory.gist.slice(0, 520)}`).join('\n')}` : ''
+        return [memoryContext, collaboration?.briefingFor(spec.id) ?? ''].filter(Boolean).join('\n\n')
+      },
+      (spec, event) => {
+        if (event.data.type !== 'tool' && event.data.type !== 'changes') return
+        try { collaboration?.observeEvent(spec, { id: event.id, agentSessionId: spec.id, type: event.data.type === 'changes' ? 'file_change' : 'tool_call', message: event.data.type === 'tool' ? event.data.name : event.data.changes.map(change => change.path).join(', '), metadata: { structured: true, itemId: event.itemId, input: event.data.type === 'tool' ? event.data.input : undefined }, createdAt: event.timestamp }) } catch { /* Coordination remains advisory. */ }
+      })
+  }
 
   listProviders(): AgentProviderInfo[] {
     return Object.values(providers).map((provider) => {
@@ -221,6 +235,7 @@ export class AgentManager {
   }
 
   ensure(spec: AgentSpec): RuntimeEnsureResult {
+    if (spec.provider === 'codex' || spec.provider === 'claude') return this.structured.ensure(spec)
     const continuation = this.database.getContinuation(spec.id)
     const parsedContinuation = continuation?.status === 'pending' ? new Date(continuation.resumeAt) : null
     const resumeAt = parsedContinuation && !Number.isNaN(parsedContinuation.getTime())
@@ -283,6 +298,9 @@ export class AgentManager {
   }
 
   restart(spec: AgentSpec): RuntimeEnsureResult {
+    if (spec.provider === 'codex' || spec.provider === 'claude') {
+      throw new Error('Use Resume for a native structured conversation; restarting must not silently replace context')
+    }
     this.kill(spec.id)
     return this.spawn(spec)
   }
@@ -343,7 +361,9 @@ export class AgentManager {
     broadcast('agent:status', { id, status: 'waiting_input', phase: 'waiting_input', model: agent.spec.model ?? 'default' })
   }
 
-  submit(id: string, message: string, mode: 'manual' | 'edit' | 'plan' | 'auto' = 'edit'): void {
+  submit(id: string, message: string, mode: 'manual' | 'edit' | 'plan' | 'auto' = 'edit'): void | Promise<void> {
+    const structured = this.database.structured.snapshot(id)
+    if (structured) return this.structured.submit(id, message, { ...structured.settings, permission: mode === 'edit' ? 'accept-edits' : 'default', plan: mode === 'plan' })
     const agent = this.agents.get(id)
     if (!agent) throw new Error('Agent session is not running')
     const normalized = message.trim().slice(0, 60_000)
@@ -479,6 +499,7 @@ export class AgentManager {
   }
 
   interrupt(id: string): void {
+    if (this.database.structured.snapshot(id)) { void this.structured.interrupt(id).catch(() => {}); return }
     const live = this.agents.get(id)
     if (!live) return
     live.process.write('\u0003')
@@ -495,18 +516,21 @@ export class AgentManager {
   }
 
   killProject(projectId: string): void {
+    this.structured.killWhere(spec => spec.projectId === projectId)
     for (const [id, agent] of this.agents) {
       if (agent.spec.projectId === projectId) this.kill(id)
     }
   }
 
   killSession(sessionId: string): void {
+    this.structured.killWhere(spec => spec.sessionId === sessionId)
     for (const [id, agent] of this.agents) {
       if (agent.spec.sessionId === sessionId) this.kill(id)
     }
   }
 
   dispose(): void {
+    this.structured.dispose()
     this.disposing = true
     for (const id of [...this.agents.keys()]) this.kill(id, false)
     for (const timer of this.continuationTimers.values()) clearTimeout(timer)

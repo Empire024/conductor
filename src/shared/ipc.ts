@@ -31,8 +31,10 @@ import type {
 } from './models'
 import type { OrchestrationBridge } from './orchestration'
 import type { AgentCollaborationBridge } from './agent-collaboration'
+import type { StructuredAgentBridge } from './structured-agent'
 
 export interface ConductorBridge {
+  structured: StructuredAgentBridge
   orchestration: OrchestrationBridge
   collaboration: AgentCollaborationBridge
   projects: {
