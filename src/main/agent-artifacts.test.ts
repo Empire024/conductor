@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, unlinkSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createTwoFilesPatch } from 'diff'
@@ -186,7 +186,8 @@ describe('immutable diff artifacts and conflict-safe snapshot restore', () => {
     const f = fixture(), target = join(f.workspace, 'target'); mkdirSync(target)
     writeFileSync(join(target, 'file.txt'), 'canonical fixture')
     symlinkSync(target, join(f.workspace, 'alias'), process.platform === 'win32' ? 'junction' : 'dir')
-    expect(await workspacePath(f.workspace, 'alias/file.txt')).toBe(join(target, 'file.txt'))
-    expect(await workspacePath(f.workspace, 'alias/new.txt', true)).toBe(join(target, 'new.txt'))
+    expect(await workspacePath(f.workspace, 'alias/file.txt')).toBe(join(realpathSync.native(target), 'file.txt'))
+    expect(await workspacePath(f.workspace, join(f.workspace, 'alias', 'file.txt'))).toBe(join(realpathSync.native(target), 'file.txt'))
+    expect(await workspacePath(f.workspace, 'alias/new.txt', true)).toBe(join(realpathSync.native(target), 'new.txt'))
   })
 })

@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
-import { open, realpath } from 'node:fs/promises'
+import { open, realpath, lstat } from 'node:fs/promises'
 import type { FileHandle } from 'node:fs/promises'
-import { basename, join, relative, isAbsolute, resolve, sep } from 'node:path'
+import { basename, dirname, join, relative, isAbsolute, resolve, sep } from 'node:path'
 import { valid } from 'semver'
 
 export interface LocalBuild {
@@ -89,7 +89,12 @@ export class LocalUpdateFeed {
     let descriptorRead = false
     try {
       const root = await realpath(this.directory)
-      if (root.toLocaleLowerCase() !== resolve(this.directory).toLocaleLowerCase()) throw new Error('Local build feed folder is redirected')
+      // realpath also expands legitimate Windows 8.3 aliases. Inspect reparse
+      // points instead of treating every spelling difference as a redirect.
+      for (let ancestor = resolve(this.directory); ; ancestor = dirname(ancestor)) {
+        if ((await lstat(ancestor)).isSymbolicLink()) throw new Error('Local build feed folder is redirected')
+        if (dirname(ancestor) === ancestor) break
+      }
       const path = await realpath(join(this.directory, 'conductor-local-build.json'))
       if (!inside(root, path)) throw new Error('Local build descriptor escapes the feed folder')
       info = parseLocalBuild(await boundedJson(path))

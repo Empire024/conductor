@@ -107,6 +107,22 @@ Offline reproduction uses `npm.cmd test` and `npm.cmd run test:agent-ui`. It cre
 
 ## Outstanding gates and delivery status
 
+### Release runner regression and correction
+
+The first publication attempt, [run 34129306942](https://github.com/Empire024/conductor/actions/runs/34129306942), failed its tests and published no release. The Windows runner uses a `RUNNER~1` temporary directory alias. Comparing its lexical name to expanded canonical paths falsely rejected the local feed and generated an incorrect relative hook-artifact path. This was reproduced locally with a real 8.3 path, corrected without allowing junction escapes, and the full **230 Vitest + 13 Node** tests then passed under that alias. Native synchronous canonicalization is now consistent with asynchronous `realpath`; immutable hook paths remain relative to the canonical workspace. Existing traversal/junction tests still pass.
+
+Exact local reproduction, in a task-scoped shell (no persistent environment changes):
+
+```powershell
+New-Item -ItemType Directory -Force -Path 'C:\claude\conductor\artifacts\ci-short-path' | Out-Null
+$fsProbe = New-Object -ComObject Scripting.FileSystemObject
+$env:TEMP = $fsProbe.GetFolder('C:\claude\conductor\artifacts\ci-short-path').ShortPath
+$env:TMP = $env:TEMP
+npm.cmd test
+```
+
+`npm.cmd run test:update-ui` rebuilds and retests the native updater after this correction. No provider turn is repeated for the path fix; the live allowance remains three Codex submissions.
+
 Codex's capped live acceptance passed; Claude remains live-blocked by quota. Full local extension parity remains partial: command/skill execution picker and configuration/MCP/plugin management; provider checkpoints/context rollback and combined restore; Claude immediate fork; richer plan-feedback/execute controls; cross-session background steering; externally authorized file attachment paths; provider-specific hosted/browser delegation. Claude's documented Bash/subagent snapshot limitations and rename/binary/oversized restore limitations remain explicit. OS-wide atomic compare-and-swap against unrelated writers is not provided; Undo uses expected-byte checks, host locks and immediate recheck.
 
 The owner explicitly authorized an installed-updater testing release despite those gaps. The delivery workflow commits the tested integrated state, pushes `main`, and checks the automatic release workflow plus installer, blockmap and `latest.yml`. Publication success must be verified after the push; it is not implied by this pre-publication QA record. No source package version or release tag is manually changed. Older installed versions receive the local-feed support in a normal GitHub bootstrap update; subsequent locally packaged builds use the same Download / Restart to update flow, with the default-enabled Settings option. See [local update delivery](conductor-local-updates.md).

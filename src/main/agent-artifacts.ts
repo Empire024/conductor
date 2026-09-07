@@ -16,9 +16,16 @@ export function patchCounts(patch: string): { additions: number; deletions: numb
 }
 
 /** Lexical + canonical path check, including existing parent for new/deleted files. */
+function lexicalWorkspaceTarget(cwd: string, root: string, requested: string): string {
+  const lexicalRoot = resolve(cwd), target = resolve(lexicalRoot, requested)
+  const inside = (base: string): boolean => { const part = relative(base, target); return part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part) }
+  if (inside(lexicalRoot)) return resolve(root, relative(lexicalRoot, target))
+  if (inside(root)) return target
+  throw new Error('File is outside the session workspace')
+}
 export async function workspacePath(cwd: string, requested: string, allowMissing = false): Promise<string> {
   if (!requested || requested.includes('\0') || (process.platform === 'win32' && /^(?:\/|[a-z]:[^\\/])/i.test(requested))) throw new Error('Invalid workspace path; WSL paths require an explicit mapping')
-  const root = await realpath(cwd), target = resolve(root, requested)
+  const root = await realpath(cwd), target = lexicalWorkspaceTarget(cwd, root, requested)
   const inside = (candidate: string): boolean => { const part = relative(root, candidate); return part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part) }
   if (!inside(target)) throw new Error('File is outside the session workspace')
   try {
@@ -123,7 +130,7 @@ export class AgentArtifacts {
         const before = capture.versions.get(path)!, after = await textVersion(path)
         if (this.before.get(key) !== capture) return []
         if (before === after) continue
-        const name = relative(cwd, path).replace(/\\/g, '/')
+        const name = relative(await realpath(cwd), path).replace(/\\/g, '/')
         if (snapshots.some(snapshot => snapshot.path === name)) continue
         const patch = createTwoFilesPatch(before === null ? '/dev/null' : name, after === null ? '/dev/null' : name, before ?? '', after ?? '')
         snapshots.push({ sessionId, path: name, before, after, patch, ...patchCounts(patch), canUndo: true, limitation: 'Hook-scoped snapshot. External filesystem writes are not serialized with the provider.' })
@@ -146,12 +153,12 @@ export class AgentArtifacts {
       let limitation = 'Authoritative provider patch; complete before/after bytes were not supplied. Snapshot undo is unavailable.'
       if (cwd && change.status === 'applied' && parsed.length === 1) {
         try {
-          const root = realpathSync(cwd), target = resolve(root, change.path)
+          const root = realpathSync.native(cwd), target = lexicalWorkspaceTarget(cwd, root, change.path)
           const assertInside = (value: string): void => { const part = relative(root, value); if (part === '..' || part.startsWith(`..${sep}`) || isAbsolute(part)) throw new Error('Path outside workspace') }
           assertInside(target)
           let bytes: Buffer | null = null
-          try { assertInside(realpathSync(target)); const stat = lstatSync(target); if (!stat.isFile() || stat.size > 2 * 1024 * 1024) throw new Error('Unsupported snapshot'); bytes = readFileSync(target) }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; assertInside(realpathSync(dirname(target))) }
+          try { assertInside(realpathSync.native(target)); const stat = lstatSync(target); if (!stat.isFile() || stat.size > 2 * 1024 * 1024) throw new Error('Unsupported snapshot'); bytes = readFileSync(target) }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; assertInside(realpathSync.native(dirname(target))) }
           if (bytes && (bytes.includes(0) || !Buffer.from(bytes.toString('utf8')).equals(bytes))) throw new Error('Non-UTF-8 snapshot')
           const observed = bytes?.toString('utf8') ?? ''
           const reversed = applyPatch(observed, reversePatch(parsed[0]!))
@@ -163,7 +170,8 @@ export class AgentArtifacts {
           limitation = 'Versions reconstructed from the authoritative patch and verified against bytes at completion. Undo refuses later changes; external writers are not locked.'
         } catch { /* Preserve the immutable patch when complete versions cannot be established. */ }
       }
-      const displayedPath = cwd ? relative(cwd, resolve(cwd, change.path)).replace(/\\/g, '/') : change.path
+      const root = cwd ? realpathSync.native(cwd) : undefined
+      const displayedPath = cwd && root ? relative(root, lexicalWorkspaceTarget(cwd, root, change.path)).replace(/\\/g, '/') : change.path
       const artifact = this.store.putArtifact(sessionId, { sessionId, path: displayedPath, oldPath: change.oldPath, before, after, patch: change.patch, ...counts, canUndo, limitation })
       return { ...change, path: displayedPath, ...counts, artifactId: artifact.id, limitation: artifact.limitation }
     } catch { return { ...change, limitation: 'Provider diff is not a supported unified patch; inspect the raw event.' } }
