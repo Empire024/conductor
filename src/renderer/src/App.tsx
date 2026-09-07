@@ -1198,7 +1198,7 @@ export function App(): React.JSX.Element {
           }}
         />
       )}
-      {updateState.availableVersion !== dismissedUpdateVersion && ['available', 'downloading', 'ready'].includes(updateState.phase) && (
+      {updateState.availableVersion && updateState.availableVersion !== dismissedUpdateVersion && ['available', 'downloading', 'ready', 'installing', 'error'].includes(updateState.phase) && (
         <UpdatePrompt
           state={updateState}
           autoDownload={autoDownload}

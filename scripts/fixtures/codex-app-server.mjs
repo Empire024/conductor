@@ -51,7 +51,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       catch (error) { output = String(error.stdout ?? '') + String(error.stderr ?? ''); exitCode = typeof error.status === 'number' ? error.status : 1 }
       notify('item/commandExecution/outputDelta', { threadId, turnId: currentTurn, itemId: 'test-1', delta: output })
       itemEvent('item/completed', { ...running, status: exitCode ? 'failed' : 'completed', aggregatedOutput: output, exitCode, durationMs: Date.now() - started })
-      itemEvent('item/completed', { type: 'agentMessage', id: 'ui-result', text: '**Synthetic fixture:** removed two declarations from `panel.mjs`. The actual local Node test ' + (exitCode ? 'failed' : 'passed') + '.', phase: null, memoryCitation: null, delivery: null, questions: null })
+      itemEvent('item/completed', { type: 'agentMessage', id: 'ui-result', text: '**Synthetic fixture:** removed two declarations from `panel.mjs`. The actual local Node test ' + (exitCode ? 'failed' : 'passed') + '.\n\n```js\nconst label = "<img src=x onerror=alert(1)>";\n```', phase: null, memoryCitation: null, delivery: null, questions: null })
+      notify('thread/status/changed', { threadId, status: { type: 'idle' } })
+      notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens: 1200, outputTokens: 80, cachedInputTokens: 600 }, modelContextWindow: 128000 } })
+      notify('account/rateLimits/updated', { rateLimits: { primary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: 1789344000 }, secondary: null } })
       finish(exitCode ? 'failed' : 'completed')
       return
     }

@@ -2,6 +2,36 @@
 
 Recorded 2026-09-07. **Owner-authorized testing delivery; full parity is not claimed.** Offline validation and the explicitly authorized replacement Codex A/B suite pass. Claude live testing is blocked by the owner's reported exhausted allowance. The owner explicitly requested updater delivery of local/testing builds without waiting for full extension parity. Publication is verified separately against the release workflow and assets, not inferred from these tests.
 
+## UX correction verification — 2026-09-07
+
+This follow-up fixes conversation clutter and delayed update feedback. It does not claim new live-provider parity. Models/effort moved beside the composer; usage and technical metadata moved to expandable settings. Raw events are retained. Tool bodies and resolved approvals start collapsed. Syntax colors use the existing local Monaco grammars, bounded at 16,000 highlighted characters / 2,000 spans, with inert React text and exact copying. Duplicate wrapper/card classes no longer apply borders and padding twice.
+
+Exact final commands and results:
+
+| Command | Actual result |
+| --- | --- |
+| `npm.cmd test` | Passed: 41 Vitest files / 268 tests, plus 13 Node tests; zero failures. |
+| `npm.cmd run build` | Passed: TypeScript, main/preload and production renderer build. |
+| `node scripts/smoke-structured-agents.mjs` | Passed: 13 actual Electron Codex checks, zero failures. Raw synthetic process → production adapter/controller → SQLite → renderer, and UI responses back to the process. |
+| `node scripts/smoke-structured-agents.mjs --provider=claude` | Passed: 11 actual Electron checks, zero failures. Synthetic CLI only, no Claude usage. |
+| `node scripts/smoke-local-updates.mjs` | Passed: 8 actual Electron checks, zero failures. Real local-feed discovery; controlled download/install IPC, no installer execution. |
+| `npm.cmd run test:agent-live` | Skipped as required: CONDUCTOR_LIVE_TESTS off; no connection or inference. |
+| `node scripts/export-agent-ui-evidence.mjs --ux` | Exported the explicitly selected offline runs with diagnostic/path sanitization; older live evidence unchanged. |
+
+Regression details:
+
+- No redundant provider/Connect selection after opening Codex. Search and Enter choose the native-discovered model and restore focus without sending a prompt. The effort slider, sandbox and approval controls update backend settings independently.
+- Typing starts only metadata discovery. The first Send now waits for its owned handshake once. An initial offline Claude UI run exposed a dropped click during initialization; an 800 ms synthetic delay now reproduces this deterministically and passes. Selecting effort before the first Claude prompt safely replaces only an unused idle metadata connection. Existing/uncertain native conversations still require explicit resume.
+- Native usage, account limits and protocol events remain stored and inspectable, but do not add rows or new-output badges to chat. Separate cost-only events are retained; later context-window metadata cannot erase account limits. Missing usage is not zero; unsupported saved effort is not falsely labeled Auto.
+- Actual browser assertions verify colored keyword spans, inert HTML-like code, exact clipboard text, collapsed requests, command completion/output, exactly two deleted lines, immutable Monaco versions, file navigation, Keep without writes and conflict-safe Undo.
+- Reload, close/reopen, split and actual detached-window retrieval preserve identity, prompts and expansion. Long paths, 110% zoom, narrow panes, selection and Jump to latest are exercised. No renderer exceptions.
+- Final large-history sample: 2,200 raw synthetic activities; 2,000 retained projection items; initially 250 DOM activities. Completion/render was 4,380 ms, including the explicit selection barrier; 3,578 ms after releasing it. This is one Windows end-to-end observation, not an isolated rendering benchmark.
+- Update click immediately enters Preparing download, with disabled controls and no fabricated percentage. Tests hold IPC unresolved, attempt repeated clicks, broadcast 37% then ready, begin restart before the stale download reply, and verify rejected-request recovery. No automatic failed-download retry.
+
+Captures, inspected directly (no model-based screenshot evaluator): [Codex conversation](evidence/agent-ui/ux-codex/normal.png), [narrow Codex pane](evidence/agent-ui/ux-codex/narrow.png), [model picker](evidence/agent-ui/ux-codex/model-picker.png), [expanded diff](evidence/agent-ui/ux-codex/diff.png), [narrow Claude pane](evidence/agent-ui/ux-claude/narrow.png), [immediate download feedback](evidence/agent-ui/ux-updater/local-update-preparing.png). Machine-readable results sit beside the captures.
+
+Runtime schema baselines remain Codex CLI 0.153.4 and Claude Code 2.1.263. This revision used synthetic models and no authentication. No additional live A/B or helper inference ran; the previously recorded three Codex submissions remain exhausted, and Claude live remains quota-blocked. Existing full-parity gaps below remain unchanged. This is an updater-delivered UX correction, not a claim that mocks establish live parity.
+
 ## Environment and reference baseline
 
 Windows, Node 24.18.1, Electron 37.10.3, React 19.2.8, TypeScript 5.9.3, Playwright 1.63.0, Vitest 3.2.7. Existing Node SQLite/WAL, Monaco, xterm/node-pty, Git and Electron/Vite were reused; this is not a replacement application.

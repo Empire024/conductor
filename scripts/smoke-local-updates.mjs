@@ -7,7 +7,8 @@ import { createServer } from 'node:http'
 import assert from 'node:assert/strict'
 
 // Synthetic, non-executable artifacts test native updater discovery only.
-// No download/install action, provider process, or inference is permitted.
+// Download/install IPC is replaced by explicitly controlled promises below;
+// no real artifact download/install, provider process, or inference is permitted.
 const root = await mkdtemp(join(tmpdir(), 'conductor-update-ui-'))
 const profile = join(root, 'profile')
 const feed = join(profile, 'local-updates')
@@ -55,8 +56,62 @@ try {
   await expect(page.getByRole('checkbox', { name: /Include local test builds/ })).toBeChecked()
   await expect.poll(() => page.evaluate(() => window.conductor.updates.getState())).toMatchObject({ phase: 'available', source: 'local' })
   result.checks.push('Opt-out persists across renderer reload; enabling the local feed discovers the build without replacing the release feed')
+  // Exercise the real hook and rendered controls through delayed IPC, never an installer.
+  await app.evaluate(({ ipcMain }) => {
+    const control = { downloads: 0, installs: 0 }
+    globalThis.conductorSyntheticUpdateControl = control
+    ipcMain.removeHandler('updates:download')
+    ipcMain.removeHandler('updates:install')
+    ipcMain.handle('updates:download', () => {
+      control.downloads++
+      return new Promise((resolveRequest, rejectRequest) => { control.resolveDownload = resolveRequest; control.rejectDownload = rejectRequest })
+    })
+    ipcMain.handle('updates:install', () => {
+      control.installs++
+      return new Promise((resolveRequest, rejectRequest) => { control.resolveInstall = resolveRequest; control.rejectInstall = rejectRequest })
+    })
+  })
+  const prompt = page.locator('.update-prompt')
+  await expect(prompt).toBeVisible()
+  await prompt.getByRole('button', { name: 'Download update', exact: true }).evaluate(element => { element.click(); element.click() })
+  await expect(prompt.getByRole('button', { name: 'Preparing download…', exact: true })).toBeDisabled()
+  await expect(page.locator('.statusbar-update')).toHaveText('Preparing download…')
+  await expect.poll(() => app.evaluate(() => globalThis.conductorSyntheticUpdateControl.downloads)).toBe(1)
+  await expect(prompt).not.toContainText('0%')
+  await page.screenshot({ path: join(output, 'local-update-preparing.png'), fullPage: true })
+  result.screenshots.push('artifacts/local-update-ui/local-update-preparing.png')
+  result.checks.push('Download click shows immediate disabled preparing feedback before its IPC reply; rapid repeated click submits once and does not fabricate 0%')
+  const available = { phase: 'available', currentVersion: '0.1.4', availableVersion: version, configured: true, source: 'local' }
+  await app.evaluate(({ BrowserWindow }, state) => BrowserWindow.getAllWindows()[0].webContents.send('updates:state', state), { ...available, phase: 'downloading', progress: 37.4 })
+  await expect(prompt.getByRole('progressbar', { name: 'Update download progress' })).toHaveAttribute('value', '37')
+  await expect(page.locator('.statusbar-update')).toHaveText('Downloading 37%')
+  await app.evaluate(({ BrowserWindow }, state) => BrowserWindow.getAllWindows()[0].webContents.send('updates:state', state), { ...available, phase: 'ready', progress: 100 })
+  await expect(prompt.getByRole('button', { name: 'Restart to update', exact: true })).toBeEnabled()
+  await expect(page.locator('.statusbar-update')).toHaveText('Restart to update')
+  result.checks.push('Authoritative progress reaches the actual controls and ready is actionable before the original download IPC has replied')
+  await prompt.getByRole('button', { name: 'Restart to update', exact: true }).evaluate(element => { element.click(); element.click() })
+  await expect(prompt.getByRole('button', { name: 'Preparing restart…', exact: true })).toBeDisabled()
+  await expect(page.locator('.statusbar-update')).toHaveText('Preparing restart…')
+  await expect.poll(() => app.evaluate(() => globalThis.conductorSyntheticUpdateControl.installs)).toBe(1)
+  // The old download resolves after a newer install request has already begun.
+  await app.evaluate((_electron, state) => globalThis.conductorSyntheticUpdateControl.resolveDownload(state), available)
+  await expect(prompt.getByRole('button', { name: 'Preparing restart…', exact: true })).toBeDisabled()
+  await expect(page.locator('.statusbar-update')).toHaveText('Preparing restart…')
+  result.checks.push('A stale download reply cannot overwrite or unlock a newer restart-preparation request')
+  await app.evaluate(() => globalThis.conductorSyntheticUpdateControl.rejectInstall(new Error('SYNTHETIC restart preparation failed; no installer was called')))
+  await expect(prompt.getByRole('alert')).toContainText('SYNTHETIC restart preparation failed')
+  await expect(prompt.getByRole('button', { name: 'Retry update', exact: true })).toBeEnabled()
+  result.checks.push('Restart preparation shows immediate busy feedback, suppresses duplicate submission, and exposes a rejected IPC request without claiming installation succeeded')
+  await prompt.getByRole('button', { name: 'Retry update', exact: true }).click()
+  await expect(prompt.getByRole('button', { name: 'Preparing download…', exact: true })).toBeDisabled()
+  await expect.poll(() => app.evaluate(() => globalThis.conductorSyntheticUpdateControl.downloads)).toBe(2)
+  await app.evaluate(() => globalThis.conductorSyntheticUpdateControl.rejectDownload(new Error('SYNTHETIC download transport failed')))
+  await expect(prompt.getByRole('alert')).toContainText('SYNTHETIC download transport failed')
+  await expect(prompt.getByRole('button', { name: 'Retry update', exact: true })).toBeEnabled()
+  await expect(page.locator('.statusbar-update')).toBeEnabled()
+  result.checks.push('A rejected download IPC restores an enabled explicit retry and accessible failure details; no automatic retry is submitted')
   assert.equal(await readFile(join(feed, descriptor.installer), 'utf8'), bytes.toString())
-  result.checks.push('No synthetic installer was downloaded or executed; fixture bytes unchanged')
+  result.checks.push('Controlled IPC was synthetic; no installer was downloaded or executed, no provider ran, and fixture bytes remained unchanged')
 } catch (error) {
   result.failures.push(String(error.stack ?? error))
   process.exitCode = 1

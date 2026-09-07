@@ -173,14 +173,35 @@ export class StructuredSessions {
     if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Execution became uncertain. Resume the native conversation explicitly before sending another turn.')
     if (typeof text !== 'string' || !text.trim() || text.length > 60_000) throw new Error('Prompt must contain 1–60000 characters')
     this.validateSettings(settings, state.capabilities)
-    if (live.adapter && live.spec.provider === 'claude' && settings.effort !== state.settings.effort) throw new Error('Resume the Claude connection with the selected effort before sending this message')
+    const reconfigureInitialClaude = Boolean(live.adapter && live.spec.provider === 'claude' && settings.effort !== state.settings.effort)
+    const metadataOnly = (): boolean => {
+      const current = store.snapshot(id)!
+      // Absence of a native ID alone is not proof of a new conversation: a turn
+      // may have disconnected before reporting one, or history may be compacted.
+      return !live.closed && this.live.get(id) === live && current.phase === 'idle' && !current.nativeSessionId &&
+        !current.truncated && current.items.every(item => item.data.type === 'notice' && !item.turnId)
+    }
+    if (reconfigureInitialClaude && !metadataOnly()) throw new Error('Resume the Claude connection with the selected effort before sending this message')
     live.submitting = true
     try {
       const context = await this.attachments(live, attachments)
       const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text) ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
-      store.update(id, { settings, title: state.title || text.trim().replace(/\s+/g, ' ').slice(0, 80) })
+      if (reconfigureInitialClaude) {
+        // start() may have just emitted idle but still be finishing its promise.
+        if (live.starting) await live.starting
+        if (!metadataOnly()) throw new Error('The Claude connection changed during preparation. Resume it explicitly before changing effort.')
+      }
+      // A rejected allowance must not persist settings that the still-running
+      // metadata connection never received.
       this.reserveLive(live, settings, submitted)
+      store.update(id, { settings, title: state.title || text.trim().replace(/\s+/g, ' ').slice(0, 80) })
+      if (reconfigureInitialClaude) {
+        const previous = live.adapter!
+        live.closed = true
+        live.adapter = undefined
+        try { previous.dispose() } finally { live.closed = false }
+      }
       await this.connect(live)
       if (live.closed || this.live.get(id) !== live || !live.adapter) throw new Error('Session closed during initialization; no prompt was sent')
       // User-visible text is exactly the submitted context; provider adapters must not emit a duplicate user item.

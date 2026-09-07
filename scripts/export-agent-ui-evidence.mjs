@@ -12,7 +12,11 @@ function sanitize(value) {
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, /^(authorization|api_?key|access_?token|refresh_?token|password|secret|env|environment)$/i.test(key) ? '[REDACTED]' : sanitize(item)]))
   return value
 }
-const sources = [
+const sources = process.argv.includes('--ux') ? [
+  { source: 'artifacts/structured-agent-ui/codex', target: 'docs/evidence/agent-ui/ux-codex', images: ['normal.png', 'narrow.png', 'model-picker.png', 'diff.png'] },
+  { source: 'artifacts/structured-agent-ui/claude', target: 'docs/evidence/agent-ui/ux-claude', images: ['normal.png', 'narrow.png'] },
+  { source: 'artifacts/local-update-ui', target: 'docs/evidence/agent-ui/ux-updater', images: ['local-update-pending.png', 'local-update-preparing.png'] }
+] : [
   { source: 'artifacts/local-update-ui', target: 'docs/evidence/local-updates', images: ['local-update-pending.png'] },
   { source: 'artifacts/local-update-ui', resultName: 'real-download-results.json', target: 'docs/evidence/local-update-download', images: ['real-download-ready.png'] },
   { source: 'artifacts/live-codex/replacement-a-preflight-4', target: 'docs/evidence/agent-ui/live-codex-replacement', images: ['live-a.png', 'live-diff.png'] }

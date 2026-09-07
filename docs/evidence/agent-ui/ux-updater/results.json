@@ -1,0 +1,19 @@
+{
+  "synthetic": true,
+  "actualElectron": true,
+  "checks": [
+    "Native NsisUpdater discovers the verified local generic feed automatically and the real UI shows Update pending / Local test build",
+    "Opt-out persists across renderer reload; enabling the local feed discovers the build without replacing the release feed",
+    "Download click shows immediate disabled preparing feedback before its IPC reply; rapid repeated click submits once and does not fabricate 0%",
+    "Authoritative progress reaches the actual controls and ready is actionable before the original download IPC has replied",
+    "A stale download reply cannot overwrite or unlock a newer restart-preparation request",
+    "Restart preparation shows immediate busy feedback, suppresses duplicate submission, and exposes a rejected IPC request without claiming installation succeeded",
+    "A rejected download IPC restores an enabled explicit retry and accessible failure details; no automatic retry is submitted",
+    "Controlled IPC was synthetic; no installer was downloaded or executed, no provider ran, and fixture bytes remained unchanged"
+  ],
+  "failures": [],
+  "screenshots": [
+    "local-update-pending.png",
+    "local-update-preparing.png"
+  ]
+}

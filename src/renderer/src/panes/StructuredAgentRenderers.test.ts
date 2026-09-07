@@ -2,7 +2,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolPresentation } from './StructuredAgentRenderers'
+import { commandSummary, interactionOutcome, isConversationActivity, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolPresentation } from './StructuredAgentRenderers'
 
 const cwd = 'C:\\work\\My project'
 function renderActivity(data: AgentEventData): string {
@@ -26,11 +26,21 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
   })
   it('retains partial tool JSON without pretending execution ran', () => {
     const html = renderActivity({ type: 'tool', name: 'Bash', status: 'preparing', inputDelta: '{"command":"git' })
-    expect(html).toContain('execution is not yet confirmed')
+    expect(html).toContain('Preparing…')
     expect(html).not.toContain('Exit 0')
     expect(html).toContain('IN')
     expect(html).toContain('OUT')
     expect(toolPresentation({ type: 'tool', name: 'Bash', status: 'preparing', input: {}, inputDelta: '{"command":"git' }).input).toBe('{"command":"git')
+  })
+  it('keeps Windows launcher noise out of collapsed titles without changing exact input', () => {
+    const command = '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command \'node --test "résumé panel.test.mjs"\''
+    expect(commandSummary(command)).toBe('node --test "résumé panel.test.mjs"')
+    const tool = { type: 'tool' as const, name: 'PowerShell', status: 'completed' as const, input: { command } }
+    expect(toolPresentation(tool)).toMatchObject({ title: 'Run node --test "résumé panel.test.mjs"', input: command })
+    expect(toolPresentation({ ...tool, description: 'Run ' + command.slice(0, 120) }).title).toBe('Run node --test "résumé panel.test.mjs"')
+    expect(toolPresentation({ ...tool, description: 'Verify the exact two-line removal' }).title).toBe('Verify the exact two-line removal')
+    expect(commandSummary('node --test; Write-Host "done"')).toBe('node --test; Write-Host "done"')
+    expect(commandSummary('unknown.exe -Command "body"')).toBe('unknown.exe -Command "body"')
   })
   it('renders nonzero exit status as failed and escapes executable output', () => {
     const html = renderActivity({ type: 'tool', name: 'Command', status: 'completed', input: { command: 'node --test' }, output: '<script>alert(1)</script>', stderr: 'assertion failed', exitCode: 1, durationMs: 2500 })
@@ -84,5 +94,90 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
     const html = renderActivity({ type: 'tool', name: 'Command', status: 'completed', output: 'x'.repeat(100_000), outputArtifactId: 'output', input: { command: 'emit' } })
     expect(html.length).toBeLessThan(15_000)
     expect(html).toContain('Expand output')
+  })
+  it('keeps usage, limits and technical protocol events out of the conversation without altering data', () => {
+    const hidden: AgentEventData[] = [
+      { type: 'usage', source: 'provider', inputTokens: 123, limits: { remaining: 42 } },
+      { type: 'session', phase: 'running' },
+      { type: 'notice', message: 'Codex event: future/event', payload: { exact: 'native payload retained' } },
+      { type: 'notice', message: 'Codex effective thread settings', payload: { model: 'actual-model' } },
+      { type: 'notice', message: 'Native Codex settings updated' },
+      { type: 'notice', message: 'Claude system / init', payload: { type: 'system' } }
+    ]
+    for (const data of hidden) {
+      const before = JSON.stringify(data)
+      const item: TimelineItem = { id: 'item', runtimeId: 'runtime', sequence: 1, timestamp: '', data }
+      expect(isConversationActivity(item)).toBe(false)
+      expect(renderActivity(data)).toBe('')
+      expect(JSON.stringify(data)).toBe(before)
+    }
+    expect(renderActivity({ type: 'error', message: 'Turn failed' })).toContain('role="alert"')
+    expect(renderActivity({ type: 'notice', message: 'Snapshot unavailable: file is too large' })).toContain('Snapshot unavailable')
+    expect(renderActivity({ type: 'notice', message: 'Unsupported Claude control request: new_permission', payload: {} })).toContain('Unsupported Claude control request')
+    expect(renderActivity({ type: 'notice', message: 'Saved terminal history', outputArtifactId: 'legacy-output' })).toContain('Expand output')
+  })
+  it('collapses answered and expired requests while keeping real pending choices actionable', () => {
+    const request = { id: 'request', kind: 'approval' as const, title: 'Run tests?', input: { command: 'node --test' }, choices: [{ id: 'accept', label: 'Allow once' }] }
+    const resolved = renderActivity({ type: 'interaction', interaction: { ...request, status: 'resolved', outcome: 'Allowed once' } })
+    expect(resolved).toContain('<details class="sa-interaction sa-interaction-resolved"')
+    expect(resolved).toContain('<summary><span>Run tests?</span><small>Allowed once</small></summary>')
+    expect(resolved).not.toContain('<details open')
+    expect(resolved).not.toContain('Allow once</button>')
+    expect(resolved).not.toContain('Your response is required')
+    const pending = renderActivity({ type: 'interaction', interaction: { ...request, status: 'pending' } })
+    expect(pending).toContain('needs-attention')
+    expect(pending).toContain('Allow once</button>')
+  })
+  it('omits repetitive assistant labels, native subagent IDs and edit boilerplate', () => {
+    expect(renderActivity({ type: 'text', role: 'assistant', text: 'Here is the fix.', mode: 'snapshot' })).not.toContain('sa-role')
+    const child = renderActivity({ type: 'subagent', name: 'Review', status: 'completed', nativeSessionId: 'private-native-identity' })
+    expect(child).toContain('Review')
+    expect(child).not.toContain('private-native-identity')
+    const changes = renderActivity({ type: 'changes', changes: [{ path: 'panel.mjs', kind: 'update', status: 'applied', artifactId: 'saved', patch: '@@ -1 +1 @@\n-var n = 1\n+const n = 1', additions: 1, deletions: 1, limitation: 'Immutable historical warning belongs in expanded review.' }] })
+    expect(changes).toContain('data-language="javascript"')
+    expect(changes).not.toContain('Immutable historical warning')
+    expect(changes).toContain('Click to expand diff')
+  })
+  it('renders fenced code through safe, language-aware spans and keeps inline code simple', () => {
+    const fence = String.fromCharCode(96).repeat(3)
+    const text = fence + 'js\nconst message = "<script>";\n' + fence + '\n\n' + String.fromCharCode(96) + 'inline' + String.fromCharCode(96)
+    const html = renderToStaticMarkup(createElement(StructuredMarkdown, { cwd, onOpenFile: vi.fn(), text }))
+    expect(html).toContain('data-language="javascript"')
+    expect(html).toContain('const message = &quot;&lt;script&gt;&quot;;')
+    expect(html).toContain('aria-label="Copy code"')
+    expect(html).toContain('<code>inline</code>')
+    expect(html).not.toContain('<script>')
+    const read = renderActivity({ type: 'tool', name: 'Read', status: 'completed', input: { file_path: 'component.ts' }, output: 'const count = 1;' })
+    expect(read).toContain('data-language="typescript"')
+    const unknownActions = renderActivity({ type: 'tool', name: 'custom', status: 'completed', input: { actions: 'not an array' } })
+    expect(unknownActions).toContain('custom')
+  })
+  it('keeps timeline wrapper classes separate from inner card styles and preserves role classes', () => {
+    const cases: AgentEventData[] = [
+      { type: 'tool', name: 'Command', status: 'completed', input: { command: 'node --test' } },
+      { type: 'interaction', interaction: { id: 'id', kind: 'approval', title: 'Run?', status: 'pending', input: {}, choices: [] } },
+      { type: 'plan', steps: [] },
+      { type: 'subagent', name: 'Review', status: 'completed' },
+      { type: 'changes', changes: [] }
+    ]
+    for (const data of cases) {
+      const html = renderActivity(data)
+      expect(html).toContain('<article class="sa-activity sa-kind-' + data.type + '"')
+      expect(html).not.toContain('<article class="sa-activity sa-' + data.type + '"')
+      expect(html).toContain('class="sa-marker"')
+    }
+    expect(renderActivity({ type: 'text', role: 'user', text: 'Hello', mode: 'snapshot' })).toContain('sa-activity sa-kind-text sa-user')
+  })
+  it('uses friendly known approval outcomes without hiding unknown decisions', () => {
+    expect(interactionOutcome('accept')).toBe('Accepted')
+    expect(interactionOutcome('decline')).toBe('Declined')
+    expect(interactionOutcome('cancel')).toBe('Cancelled')
+    expect(interactionOutcome('acceptForSession')).toBe('Accepted for session')
+    expect(interactionOutcome('answered')).toBe('Answered')
+    expect(interactionOutcome('A future native outcome')).toBe('A future native outcome')
+    const html = renderActivity({ type: 'interaction', interaction: { id: 'id', kind: 'approval', title: 'Run?', status: 'resolved', outcome: 'accept', input: {}, choices: [] } })
+    expect(html).toContain('<small>Accepted</small>')
+    const expired = renderActivity({ type: 'interaction', interaction: { id: 'id', kind: 'approval', title: 'Run?', status: 'expired', outcome: 'Delivery uncertain after disconnect', input: {}, choices: [] } })
+    expect(expired).toContain('Delivery uncertain after disconnect')
   })
 })

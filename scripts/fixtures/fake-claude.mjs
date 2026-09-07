@@ -37,6 +37,8 @@ for await (const line of input) {
   if (message.type === 'control_request') {
     const kind = message.request.subtype
     if (kind === 'initialize') {
+      // Delayed metadata response exercises pressing Send during initialization.
+      await new Promise(resolve => setTimeout(resolve, 800))
       initialized = true
       success(message.request_id, { models: [{ value: 'synthetic-claude', displayName: 'Synthetic Claude fixture' }], commands: [{ name: 'fixture', description: 'Synthetic discovery only' }] })
     } else if (kind === 'interrupt') {

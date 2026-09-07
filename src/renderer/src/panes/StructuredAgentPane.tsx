@@ -4,7 +4,9 @@ import type { AgentSpec, AgentActivityPhase } from '../../../shared/models'
 import type { AgentEvent, ContextAttachment, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../../../shared/structured-agent-reducer'
 import type { RuntimeTerminalProps } from './RuntimeTerminal'
-import { AgentDialog, ImmutableDiff, safeFileTarget, StructuredActivity } from './StructuredAgentRenderers'
+import { AgentDialog, ImmutableDiff, isConversationActivity, safeFileTarget, StructuredActivity } from './StructuredAgentRenderers'
+import { StructuredComposerControls } from './StructuredComposerControls'
+import { StructuredUsageDetails } from './StructuredUsageDetails'
 import './StructuredAgentPane.css'
 
 let focusedAgent: { sessionId: string; projectId: string } | null = null
@@ -54,6 +56,11 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const nearBottom = useRef(true)
   const priorSequence = useRef(0)
   const submitLock = useRef(false)
+  const connection = useRef<{ sessionId: string; promise: Promise<void> } | null>(null)
+  const metadataConnectionId = useRef<string | null>(null)
+  const activeIdRef = useRef(activeId)
+  activeIdRef.current = activeId
+  const lastConversationItems = useRef<TimelineItem[]>([])
   const provider = props.provider === 'claude' ? 'claude' : 'codex'
   const name = (projection.capabilities?.provider ?? provider) === 'claude' ? 'Claude Code' : 'Codex'
   const propsRef = useRef(props)
@@ -72,6 +79,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setReadingWindow(null)
     lastVisibleItems.current = []
     priorSequence.current = 0
+    lastConversationItems.current = []
     nearBottom.current = true
     const flush = (): void => {
       frame = 0
@@ -111,6 +119,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [activeId, projection.phase])
 
   useLayoutEffect(() => {
+    const next = projection.items.filter(isConversationActivity)
+    if (next.length === lastConversationItems.current.length && next.every((item, index) => item === lastConversationItems.current[index])) return
+    lastConversationItems.current = next
     const selection = window.getSelection()
     if (selection?.toString() && !readingWindow && lastVisibleItems.current.length) {
       // Pin the committed window before a new batch can evict selected DOM nodes.
@@ -162,7 +173,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [])
   const onExpand = useCallback((id: string): void => {
     setExpansion((current) => {
-      const next = { ...current, [id]: current[id] === false }
+      const next = { ...current, [id]: !current[id] }
       const retained = Object.fromEntries(Object.entries(next).slice(-500))
       localStorage.setItem('conductor.structured.expansion.' + activeId, JSON.stringify(retained))
       return retained
@@ -174,11 +185,16 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [activeId])
   const submit = async (): Promise<void> => {
     const text = message.trim()
-    if (!text || submitLock.current || !ready || historical || activePhases.has(projection.phase) || projection.archived) return
+    const connectingMetadata = projection.phase === 'starting' && metadataConnectionId.current === activeId
+    if (!text || submitLock.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata) || projection.archived) return
     submitLock.current = true
     setSubmitting(true)
     setError('')
     try {
+      // A user can press Send while the model catalog is loading. Await that
+      // owned handshake once; do not drop the click or dispatch a duplicate turn.
+      if (connection.current?.sessionId === activeId) await connection.current.promise
+      if (activeIdRef.current !== activeId) return
       await window.conductor.structured.submit(activeId, text, settings, attachments)
       setMessage('')
       setAttachments([])
@@ -194,9 +210,16 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
   const connect = async (): Promise<void> => {
-    setError('')
-    try { await window.conductor.structured.connect(activeId) }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+    if (projection.capabilities?.models.length) return
+    if (historical || projection.phase === 'disconnected') throw new Error('Resume this conversation to load models.')
+    if (connection.current?.sessionId === activeId) return connection.current.promise
+    metadataConnectionId.current = activeId
+    const pending = window.conductor.structured.connect(activeId).then(async () => {
+      const snapshot = await window.conductor.structured.snapshot(activeId)
+      if (snapshot && activeIdRef.current === activeId) setProjection(current => current.sessionId === snapshot.sessionId && snapshot.sequence >= current.sequence ? snapshot : current)
+    })
+    connection.current = { sessionId: activeId, promise: pending }
+    try { await pending } finally { if (connection.current?.promise === pending) connection.current = null }
   }
   const fork = async (): Promise<void> => {
     setError('')
@@ -229,22 +252,23 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       setAddFileOpen(false)
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
-  const canSubmit = ready && !historical && !activePhases.has(projection.phase) && !projection.archived && projection.phase !== 'disconnected'
+  const canSubmit = ready && !historical && (!activePhases.has(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && projection.phase !== 'disconnected'
   const capabilities = projection.capabilities
   const pending = projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length
+  const conversationItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
   const visibleItems = useMemo(() => {
-    if (!readingWindow) return projection.items.slice(-visibleCount)
+    if (!readingWindow) return conversationItems.slice(-visibleCount)
     const latest = new Map(projection.items.map((item) => [item.id, item]))
     // Keep a bounded reading window; reconcile existing statuses without adding rows.
     return readingWindow.map((item) => latest.get(item.id) ?? item)
-  }, [projection.items, visibleCount, readingWindow])
+  }, [projection.items, conversationItems, visibleCount, readingWindow])
   useLayoutEffect(() => { lastVisibleItems.current = visibleItems }, [visibleItems])
-  const earlierCount = readingWindow ? projection.items.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).length : Math.max(0, projection.items.length - visibleCount)
+  const earlierCount = readingWindow ? conversationItems.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).length : Math.max(0, conversationItems.length - visibleCount)
   const showEarlier = (): void => {
     const el = timeline.current
     const height = el?.scrollHeight ?? 0
     if (readingWindow) {
-      const earlier = projection.items.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).slice(-250)
+      const earlier = conversationItems.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).slice(-250)
       setReadingWindow([...earlier, ...readingWindow].slice(-2000))
       setVisibleCount((count) => Math.min(2000, count + earlier.length))
     } else setVisibleCount((count) => Math.min(2000, count + 250))
@@ -256,14 +280,45 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setNewOutput(false)
     requestAnimationFrame(() => { if (timeline.current) timeline.current.scrollTop = timeline.current.scrollHeight })
   }
-  const parentLabels = useMemo(() => new Map(projection.items.filter((item) => item.nativeItemId).map((item) => [item.runtimeId + ':' + item.nativeItemId, item.data.type === 'tool' || item.data.type === 'subagent' ? item.data.name : item.nativeItemId!])), [projection.items])
+  const parentLabels = useMemo(() => new Map(projection.items.flatMap(item => item.nativeItemId && (item.data.type === 'tool' || item.data.type === 'subagent') ? [[item.runtimeId + ':' + item.nativeItemId, item.data.name] as const] : [])), [projection.items])
   const updateSettings = (change: Partial<SessionSettings>): void => setSettings((current) => ({ ...current, ...change }))
 
   return <section className="structured-agent-pane" data-structured-session={activeId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
-    <header className="sa-session-bar"><span className={'sa-session-dot status-' + projection.phase} /><strong title={projection.title || name}>{projection.title || name}</strong><span className="sa-provider-label">{name}</span><span className="sa-session-phase" role="status">{displayPhase(projection.phase)}</span>{pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}<span className="sa-spacer" /><button aria-label="Conversation history" title="Conversation history" onClick={() => setHistoryOpen(true)}><History size={15} /></button><button aria-label="Inspect provider events" title="Inspect provider events (not a terminal)" onClick={() => setEventsOpen(true)}><ListTree size={15} /></button><button aria-label="Session settings" title="Session settings" aria-expanded={settingsOpen} onClick={() => setSettingsOpen((open) => !open)}><Settings2 size={15} /></button>{activePhases.has(projection.phase) && !historical && <button aria-label="Stop agent" title="Stop agent" disabled={projection.phase === 'interrupting'} onClick={() => void window.conductor.structured.interrupt(activeId).catch((reason: unknown) => setError(String(reason)))}><CircleStop size={15} /></button>}</header>
-    {settingsOpen && <section className="sa-settings"><div><strong>{name}</strong><small>{capabilities ? 'Runtime ' + capabilities.runtimeVersion + ' · adapter v' + capabilities.adapterVersion + ' · ' + capabilities.authentication + ' authentication' : 'Capabilities will be detected by the backend.'}</small></div><p>{capabilities?.provider === 'claude' && projection.nativeSessionId ? 'Settings apply to the next turn. Apply a changed reasoning effort with Resume connection first.' : 'Settings below apply to the next submitted turn.'}</p><label>Model{capabilities?.models.length ? <select aria-label="Model" value={settings.model ?? ''} onChange={(event) => updateSettings({ model: event.target.value || undefined })}><option value="">Provider default</option>{capabilities.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select> : <input aria-label="Model" value={settings.model ?? ''} placeholder="Provider default" onChange={(event) => updateSettings({ model: event.target.value || undefined })} />}</label>{Boolean(capabilities?.effort.length) && <label>Reasoning effort<select aria-label="Reasoning effort" value={settings.effort ?? ''} onChange={(event) => updateSettings({ effort: event.target.value || undefined })}><option value="">Provider default</option>{capabilities?.effort.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>}{capabilities?.provider !== 'codex' && (capabilities?.permissions?.length ? <label>Permission policy<select aria-label="Permission policy" value={settings.permission} onChange={(event) => updateSettings({ permission: event.target.value as SessionSettings['permission'] })}>{capabilities.permissions.map((permission) => <option value={permission} key={permission}>{permission}</option>)}</select></label> : <small>Permission policy: {settings.permission}</small>)}{capabilities?.plans && <label><input type="checkbox" checked={settings.plan} onChange={(event) => updateSettings({ plan: event.target.checked })} /> Planning mode</label>}<details><summary>Session identity and capability limits</summary><p>Conductor: <code>{activeId}</code></p><p>Native conversation: <code>{projection.nativeSessionId ?? 'Not started'}</code></p><p>Workspace: <code>{props.project.path}</code></p><ul>{capabilities?.limitations.map((limitation) => <li key={limitation}>{limitation}</li>)}</ul><p>Hidden panes continue receiving events while the application is running. Exiting the application interrupts owned runtimes.</p></details><div><button onClick={() => setRename(projection.title || props.title)}>Rename</button><button onClick={() => void window.conductor.structured.archive(activeId, !projection.archived).catch((reason: unknown) => setError(String(reason)))}><Archive size={13} />{projection.archived ? 'Unarchive' : 'Archive'}</button></div></section>}
-    {settingsOpen && <section className="sa-settings">{Boolean(capabilities?.sandboxModes?.length) && <label>Execution sandbox<select aria-label="Execution sandbox" value={settings.sandbox ?? 'inherit'} onChange={(event) => updateSettings({ sandbox: event.target.value as SessionSettings['sandbox'] })}>{capabilities?.sandboxModes?.map((mode) => <option key={mode} value={mode}>{mode === 'inherit' ? 'Inherit provider configuration' : mode}</option>)}</select></label>}{Boolean(capabilities?.approvalPolicies?.length) && <label>Approval policy<select aria-label="Approval policy" value={settings.approvalPolicy ?? 'inherit'} onChange={(event) => updateSettings({ approvalPolicy: event.target.value as SessionSettings['approvalPolicy'] })}>{capabilities?.approvalPolicies?.map((policy) => <option key={policy} value={policy}>{policy === 'inherit' ? 'Inherit provider configuration' : policy}</option>)}</select></label>}{capabilities?.effectiveSettings && <details><summary>Effective provider settings</summary><pre>{JSON.stringify(capabilities.effectiveSettings, null, 2)}</pre></details>}</section>}
-    {settingsOpen && <div className="sa-connection-actions"><button onClick={() => void discover()}>Provider commands and configuration</button>{!activePhases.has(projection.phase) && (!projection.nativeSessionId ? <button onClick={() => void connect()}>Connect provider · discover models</button> : <>{capabilities?.resume && <button onClick={() => void resume()}>Resume connection</button>}{capabilities?.fork && <button onClick={() => void fork()}>Fork conversation</button>}</>)}</div>}
+    <header className="sa-session-bar">
+      <strong title={projection.title || name}>{projection.title || 'New conversation'}</strong>
+      {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? 'Working' : displayPhase(projection.phase)}</span>}
+      {pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}
+      <span className="sa-spacer" />
+      <button aria-label="Conversation history" title="History" onClick={() => setHistoryOpen(true)}><History size={15} /></button>
+      <button aria-label="Session settings" title="Conversation settings" aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)}><Settings2 size={15} /></button>
+      {activePhases.has(projection.phase) && !historical && <button aria-label="Stop agent" title="Stop" disabled={projection.phase === 'interrupting'} onClick={() => void window.conductor.structured.interrupt(activeId).catch((reason: unknown) => setError(String(reason)))}><CircleStop size={15} /></button>}
+    </header>
+    {settingsOpen && <AgentDialog title="Conversation settings" onClose={() => setSettingsOpen(false)}>
+      <div className="sa-settings">
+        <p className="sa-detail-hint">Changes apply to your next message.</p>
+        <section className="sa-settings-section"><h3>Permissions</h3>
+          {capabilities?.provider !== 'codex' && Boolean(capabilities?.permissions?.length) && <label>Edits<select aria-label="Permission policy" value={settings.permission} onChange={event => updateSettings({ permission: event.target.value as SessionSettings['permission'] })}>{capabilities?.permissions?.map(permission => <option key={permission} value={permission}>{permission === 'default' ? 'Ask before editing' : permission === 'accept-edits' ? 'Allow edits' : 'Read only'}</option>)}</select></label>}
+          {Boolean(capabilities?.sandboxModes?.length) && <label>Workspace access<select aria-label="Execution sandbox" value={settings.sandbox ?? 'inherit'} onChange={event => updateSettings({ sandbox: event.target.value as SessionSettings['sandbox'] })}>{capabilities?.sandboxModes?.map(mode => <option key={mode} value={mode}>{mode === 'inherit' ? 'Use saved settings' : mode === 'workspace-write' ? 'Workspace files' : 'Read only'}</option>)}</select></label>}
+          {Boolean(capabilities?.approvalPolicies?.length) && <label>Approvals<select aria-label="Approval policy" value={settings.approvalPolicy ?? 'inherit'} onChange={event => updateSettings({ approvalPolicy: event.target.value as SessionSettings['approvalPolicy'] })}>{capabilities?.approvalPolicies?.map(policy => <option key={policy} value={policy}>{policy === 'inherit' ? 'Use saved settings' : policy === 'untrusted' ? 'Ask before commands' : policy === 'on-request' ? 'Ask when needed' : 'Never ask'}</option>)}</select></label>}
+          {capabilities?.plans && <label>Plan before making changes<input type="checkbox" checked={settings.plan} onChange={event => updateSettings({ plan: event.target.checked })} /></label>}
+          {!capabilities && <p className="sa-detail-hint">Choose a model or start typing to load available settings.</p>}
+          {provider === 'claude' && projection.nativeSessionId && settings.effort !== projection.settings.effort && <p className="sa-detail-hint">Reconnect below to apply the changed effort.</p>}
+        </section>
+        <section className="sa-settings-section"><h3>Conversation</h3><div className="sa-detail-actions">
+          <button onClick={() => { setSettingsOpen(false); setRename(projection.title || props.title) }}>Rename</button>
+          {capabilities?.fork && <button disabled={activePhases.has(projection.phase)} onClick={() => void fork()}>Fork conversation</button>}
+          <button onClick={() => void window.conductor.structured.archive(activeId, !projection.archived).catch((reason: unknown) => setError(String(reason)))}><Archive size={13} />{projection.archived ? 'Unarchive' : 'Archive'}</button>
+          {capabilities?.resume && projection.nativeSessionId && <button disabled={activePhases.has(projection.phase)} onClick={() => void resume()}>Resume connection</button>}
+        </div></section>
+        <StructuredUsageDetails items={projection.items} />
+        <details className="sa-diagnostics"><summary>Advanced & diagnostics</summary>
+          <dl><dt>Connection</dt><dd>{name} {capabilities?.runtimeVersion ?? ''}</dd><dt>Sign-in</dt><dd>{capabilities?.authentication === 'cli' ? 'Existing local sign-in' : capabilities?.authentication ?? 'Not connected'}</dd></dl>
+          <div className="sa-detail-actions"><button aria-label="Inspect provider events" onClick={() => { setSettingsOpen(false); setEventsOpen(true) }}><ListTree size={13} /> Event log</button><button onClick={() => { setSettingsOpen(false); void discover() }}>Skills & connections</button></div>
+          <details><summary>Connection details</summary><p>Conversation: <code>{activeId}</code></p><p>Session: <code>{projection.nativeSessionId ?? 'Not started'}</code></p><p>Workspace: <code>{props.project.path}</code></p>{Boolean(capabilities?.limitations.length) && <ul>{capabilities?.limitations.map(limitation => <li key={limitation}>{limitation}</li>)}</ul>}<p>Work continues while panes are hidden. Closing the app disconnects the session.</p></details>
+          {capabilities?.effectiveSettings && <details><summary>Effective settings</summary><pre>{JSON.stringify(capabilities.effectiveSettings, null, 2)}</pre></details>}
+        </details>
+      </div>
+    </AgentDialog>}
     {error && <div className="sa-error-bar" role="alert"><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
     {historical && <div className="sa-history-banner"><span>Viewing saved history</span><button onClick={() => { setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button onClick={() => void resume()}>Resume this conversation</button>}</div>}
     {(projection.phase === 'disconnected' || projection.phase === 'interrupted') && !historical && <div className="sa-history-banner"><span>{projection.phase === 'disconnected' ? 'Runtime disconnected. The last operation may be incomplete.' : 'Runtime interrupted.'}</span>{capabilities?.resume && projection.nativeSessionId && <button onClick={() => void resume()}>Resume conversation</button>}</div>}
@@ -273,18 +328,28 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       if (!nearBottom.current) setReadingWindow((current) => current ?? lastVisibleItems.current)
       else if (!newOutput && !window.getSelection()?.toString()) { setReadingWindow(null); setNewOutput(false) }
     }}>
-      {!projection.items.length && <div className="sa-empty"><strong>{ready ? 'Start a conversation' : 'Opening saved conversation…'}</strong><p>{ready ? 'Send a message to start ' + name + ' in this workspace.' : 'Reading history does not start an agent.'}</p><code>{props.project.path}</code>{ready && !projection.nativeSessionId && !activePhases.has(projection.phase) && <button onClick={() => void connect()}>Connect provider · discover models</button>}{projection.nativeSessionId && <small>Connected · no prompt has been submitted.</small>}</div>}
+      {!conversationItems.length && <div className="sa-empty"><strong>{ready ? 'What are we working on?' : 'Opening conversation…'}</strong>{ready && <p>Ask {name} about your code, or describe a change.</p>}</div>}
       {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
-      {projection.truncated && <p className="sa-muted">Older events remain in durable history; this view shows a bounded activity window.</p>}
-      {visibleItems.map((item) => <StructuredActivity key={item.id} item={item} sessionId={activeId} cwd={props.project.path} expanded={expansion[item.id] !== false} interactive={!historical && item.runtimeId === projection.runtimeId} parentLabel={item.parentId ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />)}
-      {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Starting runtime…' : 'Working…'}</div>}
+      {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
+      {visibleItems.map((item) => <StructuredActivity key={item.id} item={item} sessionId={activeId} cwd={props.project.path} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} parentLabel={item.parentId ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />)}
+      {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : 'Working…'}</div>}
     </div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>
-    <form className="sa-composer" onSubmit={(event) => { event.preventDefault(); void submit() }}><div className="sa-context-chips">{attachments.map((attachment) => <span key={attachment.id}><button type="button" title="Inspect submitted context" onClick={() => setInspectAttachment(attachment)}>{attachment.kind} · {attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button><button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => setAttachments((current) => current.filter((item) => item.id !== attachment.id))}><X size={11} /></button></span>)}</div><textarea aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : 'Message ' + name} value={message} disabled={!canSubmit || submitting} rows={2} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} /><footer><button type="button" aria-label="Attach file context" title="Attach a file (select editor text to attach a range)" disabled={historical} onClick={() => setAddFileOpen((open) => !open)}><FilePlus2 size={15} /></button><button type="button" className="sa-setting-summary" onClick={() => setSettingsOpen((open) => !open)}>{settings.model || 'Provider default'}{settings.effort && ' · ' + settings.effort}<span>{settings.permission}{settings.plan ? ' · plan' : ''}</span></button><span className="sa-spacer" /><small>Enter to send · Shift+Enter for newline</small><button className="sa-send" type="submit" aria-label="Send message" disabled={!canSubmit || !message.trim() || submitting}><Send size={15} /></button></footer>{addFileOpen && <div className="sa-file-attach"><input aria-label="Context file path" placeholder="Workspace-relative file path" value={filePath} onChange={(event) => setFilePath(event.target.value)} /><button type="button" onClick={() => void addFile()}>Attach</button></div>}</form>
+    <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }}>
+      {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title="Inspect attached context" onClick={() => setInspectAttachment(attachment)}>{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button><button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => setAttachments(current => current.filter(item => item.id !== attachment.id))}><X size={11} /></button></span>)}</div>}
+      <textarea aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : 'Message ' + name} value={message} disabled={!ready || historical || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onChange={event => setMessage(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void submit() } }} />
+      <footer className="agent-prompt-controls">
+        <button type="button" aria-label="Attach file context" title="Attach context" disabled={historical} onClick={() => setAddFileOpen(open => !open)}><FilePlus2 size={15} /></button>
+        <StructuredComposerControls key={activeId} settings={settings} capabilities={capabilities} disabled={historical || !ready} onChange={updateSettings} onDiscover={connect} />
+        <span className="sa-spacer" />
+        <button className="sa-send agent-send-button" type="submit" aria-label="Send message" title="Send message · Enter" disabled={!canSubmit || !message.trim() || submitting}><Send size={15} /></button>
+      </footer>
+      {addFileOpen && <div className="sa-file-attach"><input aria-label="Context file path" placeholder="Workspace-relative file path" value={filePath} onChange={event => setFilePath(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); void addFile() } }} /><button type="button" onClick={() => void addFile()}>Attach</button></div>}
+    </form>
     {diff && <ImmutableDiff sessionId={activeId} change={diff} onOpenFile={onOpenFile} onClose={() => setDiff(null)} />}
     {inspectAttachment && <AgentDialog title={'Context · ' + inspectAttachment.name} onClose={() => setInspectAttachment(null)}><p className="sa-notice">{inspectAttachment.kind === 'image' ? 'This workspace image path will be submitted using the native image attachment mechanism. The provider reads the file when the turn is submitted.' : 'This content will be submitted with your message. File content is captured when attached.'}</p>{inspectAttachment.kind === 'image' && imagePreviews[inspectAttachment.id] && <img className="sa-context-image" alt={inspectAttachment.name} src={imagePreviews[inspectAttachment.id]} />}<pre className="sa-expanded-output">{inspectAttachment.content ?? inspectAttachment.path ?? 'No content'}</pre></AgentDialog>}
-    {eventsOpen && <AgentDialog title="Provider events" onClose={() => setEventsOpen(false)}><p className="sa-notice">Sanitized protocol events. This is an inspection view, not an interactive terminal. Showing the latest {rawEvents.length} events.</p><div className="sa-diff-toolbar"><button onClick={() => void navigator.clipboard.writeText(JSON.stringify(rawEvents, null, 2))}>Copy events</button><button onClick={() => void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200)))}>Refresh</button></div><div className="sa-event-list">{rawEvents.map((event) => <details key={event.id}><summary>#{event.sequence} · {event.data.type} · {event.native?.method ?? event.itemId ?? event.requestId ?? ''}</summary><pre>{JSON.stringify(event, null, 2)}</pre></details>)}</div></AgentDialog>}
+    {eventsOpen && <AgentDialog title="Event log" onClose={() => setEventsOpen(false)}><p className="sa-notice">Diagnostics only. Showing the latest {rawEvents.length} events.</p><div className="sa-diff-toolbar"><button onClick={() => void navigator.clipboard.writeText(JSON.stringify(rawEvents, null, 2))}>Copy events</button><button onClick={() => void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200)))}>Refresh</button></div><div className="sa-event-list">{rawEvents.map((event) => <details key={event.id}><summary>#{event.sequence} · {event.data.type} · {event.native?.method ?? event.itemId ?? event.requestId ?? ''}</summary><pre>{JSON.stringify(event, null, 2)}</pre></details>)}</div></AgentDialog>}
     {historyOpen && <AgentDialog title="Conversation history" onClose={() => setHistoryOpen(false)}><input className="sa-history-search" aria-label="Search conversation history" placeholder="Search conversations" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} /><div className="sa-history-list">{historyItems.map((item) => <button key={item.id} onClick={() => { setActiveId(item.id); setHistorical(item.id !== props.resourceId); setHistoryOpen(false) }}><strong>{item.title || 'Untitled conversation'}</strong><small>{item.provider} · {displayPhase(item.phase)}{item.archived ? ' · archived' : ''}</small></button>)}{!historyItems.length && <p>No saved conversations match.</p>}</div></AgentDialog>}
-    {discovery !== undefined && <AgentDialog title="Provider commands and configuration" onClose={() => setDiscovery(undefined)}><p className="sa-notice">Native provider discovery. Expand a category to inspect available commands, skills, configuration and integration status at their reported scopes. This inspector does not execute a command or alter configuration.</p><div className="sa-event-list">{discovery && typeof discovery === 'object' && !Array.isArray(discovery) ? Object.entries(discovery).map(([category, value]) => <details key={category}><summary>{category.replaceAll('_', ' ')}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>) : <pre>{JSON.stringify(discovery, null, 2)}</pre>}</div></AgentDialog>}
+    {discovery !== undefined && <AgentDialog title={name + ' configuration'} onClose={() => setDiscovery(undefined)}><p className="sa-notice">Read-only details of configured skills, commands and connections. Nothing here runs a command or changes your configuration.</p><div className="sa-event-list">{discovery && typeof discovery === 'object' && !Array.isArray(discovery) ? Object.entries(discovery).map(([category, value]) => <details key={category}><summary>{category.replaceAll('_', ' ')}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>) : <pre>{JSON.stringify(discovery, null, 2)}</pre>}</div></AgentDialog>}
     {rename !== null && <AgentDialog title="Rename conversation" onClose={() => setRename(null)}><form className="sa-rename" onSubmit={(event) => { event.preventDefault(); const title = rename.trim(); if (!title) return; void window.conductor.structured.rename(activeId, title).then(() => { setProjection((current) => ({ ...current, title })); setRename(null) }).catch((reason: unknown) => setError(String(reason))) }}><input autoFocus aria-label="Conversation title" maxLength={160} value={rename} onChange={(event) => setRename(event.target.value)} /><button type="submit">Save name</button></form></AgentDialog>}
   </section>
 }
