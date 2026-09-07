@@ -87,12 +87,41 @@ export function summarizeUsage(items: TimelineItem[]): UsageSummary {
 }
 
 export function liveTokenLabel(summary: UsageSummary): string {
-  const tokens = summary.tokens
-  const prefix = summary.estimated ? '~' : ''
-  if (tokens?.totalTokens !== undefined) return `${prefix}${tokens.totalTokens.toLocaleString()} tokens`
-  if (tokens?.outputTokens !== undefined) return `${prefix}${tokens.outputTokens.toLocaleString()} output tokens`
-  if (tokens?.inputTokens !== undefined) return `${prefix}${tokens.inputTokens.toLocaleString()} input tokens`
-  return 'Tokens pending'
+  const count = summary.tokens?.outputTokens
+  return count === undefined ? 'Output tokens pending' : `${summary.estimated ? '~' : ''}${count.toLocaleString()} output tokens`
+}
+
+/** Working text describes the current response, never its input context or session total. */
+export function summarizeWorkingUsage(items: TimelineItem[]): UsageSummary {
+  const root = items.filter(item => !item.parentId)
+  const latestUser = root.filter(item => item.data.type === 'text' && item.data.role === 'user').at(-1)
+  const runtime = root.at(-1)?.runtimeId
+  const usage = root.filter((item): item is UsageItem => item.runtimeId === runtime && item.data.type === 'usage' && updatedSequence(item) > (latestUser?.sequence ?? 0))
+    .sort((a, b) => updatedSequence(a) - updatedSequence(b))
+  for (const item of usage.reverse()) {
+    const latestOutput = number(object(item.data.limits).workingOutputTokens)
+    const output = latestOutput ?? (item.data.scope !== 'session' ? number(item.data.outputTokens) : undefined)
+    if (output !== undefined) return { tokens: { outputTokens: output }, scope: 'latest', estimated: item.data.source === 'estimate', costEstimated: false, costScope: 'latest' }
+  }
+  return { scope: 'latest', estimated: false, costEstimated: false, costScope: 'latest' }
+}
+
+export interface ContextSummary { used: number; capacity: number; window?: number; percent: number; level: 'normal' | 'warning' | 'critical' }
+export function summarizeContext(items: TimelineItem[], runtimeId?: string): ContextSummary | undefined {
+  const root = items.filter(item => !item.parentId)
+  const runtime = runtimeId ?? root.at(-1)?.runtimeId
+  const usage = root.filter(item => item.runtimeId === runtime && item.data.type === 'usage').sort((a, b) => updatedSequence(a) - updatedSequence(b))
+  let used: number | undefined, capacity: number | undefined, window: number | undefined
+  for (const item of usage) {
+    if (item.data.type !== 'usage') continue
+    const limits = object(item.data.limits)
+    if ('contextUsedTokens' in limits) used = number(limits.contextUsedTokens)
+    if ('contextCapacityTokens' in limits) capacity = number(limits.contextCapacityTokens)
+    if ('modelContextWindow' in limits) window = number(limits.modelContextWindow)
+  }
+  if (used === undefined || capacity === undefined || capacity <= 0) return undefined
+  const percent = Math.min(100, used / capacity * 100)
+  return { used, capacity, window, percent, level: percent >= 90 ? 'critical' : percent >= 70 ? 'warning' : 'normal' }
 }
 
 export interface SubagentSummary {

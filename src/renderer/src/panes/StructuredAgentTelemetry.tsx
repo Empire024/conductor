@@ -3,21 +3,25 @@ import { ChevronDown, Search, Users } from 'lucide-react'
 import type { SessionPhase, TimelineItem } from '../../../shared/structured-agent'
 import { AgentDialog } from './StructuredAgentRenderers'
 import { StructuredUsageContent } from './StructuredUsageDetails'
-import { liveTokenLabel, subagentCountLabel, subagentStatusLabels, summarizeSubagents, summarizeUsage } from './usage-summary'
+import { liveTokenLabel, subagentCountLabel, subagentStatusLabels, summarizeSubagents, summarizeWorkingUsage, summarizeContext } from './usage-summary'
 import './StructuredAgentTelemetry.css'
 import type { SubagentSummary } from './usage-summary'
 
 export function StructuredLiveTokens({ items }: { items: TimelineItem[] }): React.JSX.Element {
-  const summary = useMemo(() => summarizeUsage(items), [items])
-  return <span className="sa-live-tokens" title={summary.tokens ? 'Available conversation token usage. Updates with provider reports; reasoning tokens are included when reported.' : 'Waiting for the provider to report token usage.'}>{liveTokenLabel(summary)}</span>
+  const summary = useMemo(() => summarizeWorkingUsage(items), [items])
+  return <span className="sa-live-tokens" title={summary.tokens ? 'Output tokens reported for the current response, including reasoning when reported. Input and cached context are shown separately.' : 'Waiting for the provider to report output tokens for this response.'}>{liveTokenLabel(summary)}</span>
 }
 
 export function StructuredAgentTelemetry({ items, runtimeId, phase, truncated = false }: { items: TimelineItem[]; runtimeId: string; phase: SessionPhase; truncated?: boolean }): React.JSX.Element {
   const [panel, setPanel] = useState<'usage' | 'agents' | null>(null)
   const agents = useMemo(() => summarizeSubagents(items, runtimeId, phase, panel === 'agents'), [items, runtimeId, phase, panel])
   const countLabel = subagentCountLabel(agents)
+  const context = useMemo(() => summarizeContext(items, runtimeId), [items, runtimeId])
   return <div className="sa-telemetry">
     {agents.length > 0 && <button type="button" className="sa-subagent-summary" aria-label={countLabel} title={countLabel} aria-expanded={panel === 'agents'} onClick={() => setPanel(current => current === 'agents' ? null : 'agents')}><Users size={12} /><span>{countLabel}</span></button>}
+    {context && context.percent >= 40 && <button type="button" className={'sa-context-circle level-' + context.level} aria-label={`Context ${Math.floor(context.percent)}% used`} title={`${Math.floor(context.percent)}% context used (${context.used.toLocaleString()} / ${context.capacity.toLocaleString()} tokens). ${context.percent >= 90 ? 'Context nearly full. Use /compact to make room.' : 'View context details.'}`} aria-expanded={panel === 'usage'} onClick={() => setPanel(current => current === 'usage' ? null : 'usage')}>
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle className="sa-context-track" cx="12" cy="12" r="9" /><circle className="sa-context-fill" cx="12" cy="12" r="9" pathLength="100" strokeDasharray={`${context.percent} 100`} transform="rotate(-90 12 12)" /></svg><span>{Math.floor(context.percent)}%</span>
+    </button>}
     <button type="button" className="sa-usage-link" aria-expanded={panel === 'usage'} onClick={() => setPanel(current => current === 'usage' ? null : 'usage')}>View usage</button>
     {panel === 'usage' && <AgentDialog title="Usage" onClose={() => setPanel(null)}><StructuredUsageContent items={items} truncated={truncated} /></AgentDialog>}
     {panel === 'agents' && <AgentDialog title="Subagents" onClose={() => setPanel(null)}>

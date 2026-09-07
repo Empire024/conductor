@@ -57,3 +57,20 @@
 .sa-agent-body pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; padding: 9px; border-radius: 5px; background: var(--surface-0); color: var(--text-2); font: 11px/1.6 'Cascadia Code', monospace; user-select: text; }
 .sa-agent-activity > summary { cursor: pointer; font-size: 11px; color: var(--text-2); margin: 12px 0; }
 .sa-agent-activity > div { border-top: 1px solid var(--border-soft); padding-top: 8px; }
+
+.sa-telemetry .sa-context-circle { flex: 0 0 auto; display: inline-flex; gap: 4px; align-items: center; color: var(--text-2); padding: 2px 4px; font-size: 10px; font-variant-numeric: tabular-nums; }
+.sa-context-circle svg { flex-shrink: 0; overflow: visible; }
+.sa-context-circle circle { fill: none; stroke-width: 2; }
+.sa-context-track { stroke: var(--border); }
+.sa-context-fill { stroke: currentColor; stroke-linecap: round; transition: stroke-dasharray 300ms ease, stroke-width 300ms ease; }
+.sa-telemetry .sa-context-circle.level-warning { color: #df9a49; }
+.sa-telemetry .sa-context-circle.level-critical { color: #ed6d72; font-weight: 650; }
+.sa-context-circle.level-critical .sa-context-fill { stroke-width: 3; animation: sa-context-pulse 3s ease-in-out infinite; }
+.sa-context-circle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 5px; }
+.sa-context-details { margin-bottom: 15px; padding-bottom: 12px; border-bottom: 1px solid var(--border-soft); }
+.sa-context-details h4 { margin: 4px 0 8px; font-size: 12px; }
+.sa-context-details p { font-size: 11px; line-height: 1.5; }
+.sa-context-details > progress { width: 100%; height: 4px; accent-color: var(--accent); }
+.sa-context-guidance { color: #ed6d72; }
+@keyframes sa-context-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .78; } }
+@media (prefers-reduced-motion: reduce) { .sa-context-circle.level-critical .sa-context-fill { animation: none; } .sa-context-fill { transition: none; } }

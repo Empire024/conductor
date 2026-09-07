@@ -523,7 +523,7 @@ export class CodexAdapter implements ProviderAdapter {
         send({ type: 'plan', steps: params.plan.map(step => ({ text: step.step, status: step.status === 'inProgress' ? 'in_progress' : step.status })), ...(params.explanation ? { explanation: params.explanation } : {}) }, { itemId: `plan:${params.turnId}` })
         return
       case 'thread/tokenUsage/updated':
-        send({ type: 'usage', scope: 'session', inputTokens: params.tokenUsage.total.inputTokens, outputTokens: params.tokenUsage.total.outputTokens, cachedTokens: params.tokenUsage.total.cachedInputTokens, cacheCreationTokens: params.tokenUsage.total.cacheWriteInputTokens, totalTokens: params.tokenUsage.total.totalTokens, reasoningTokens: params.tokenUsage.total.reasoningOutputTokens, source: 'provider', limits: json({ modelContextWindow: params.tokenUsage.modelContextWindow }) }, { itemId: `usage:${params.threadId}`, turnId: undefined })
+        send({ type: 'usage', scope: 'session', inputTokens: params.tokenUsage.total.inputTokens, outputTokens: params.tokenUsage.total.outputTokens, cachedTokens: params.tokenUsage.total.cachedInputTokens, cacheCreationTokens: params.tokenUsage.total.cacheWriteInputTokens, totalTokens: params.tokenUsage.total.totalTokens, reasoningTokens: params.tokenUsage.total.reasoningOutputTokens, source: 'provider', limits: json({ modelContextWindow: params.tokenUsage.modelContextWindow, contextCapacityTokens: params.tokenUsage.modelContextWindow, contextUsedTokens: params.tokenUsage.last?.totalTokens ?? null, workingOutputTokens: params.tokenUsage.last?.outputTokens ?? null }) }, { itemId: `usage:${params.threadId}`, turnId: undefined })
         return
       case 'thread/settings/updated':
         if (params.threadId === this.threadId) {

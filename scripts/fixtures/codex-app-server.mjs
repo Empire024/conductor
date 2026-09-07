@@ -117,6 +117,14 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     finish()
     return
   }
+  if (scenario === 'synthetic:context') {
+    for (const totalTokens of [140000, 190000, 24000]) notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: {
+      total: { inputTokens: 9000000, outputTokens: 4000, totalTokens: 9004000, cachedInputTokens: 8000000, reasoningOutputTokens: 1000 },
+      last: { inputTokens: totalTokens - 42, outputTokens: 42, totalTokens, cachedInputTokens: 20000, reasoningOutputTokens: 20 }, modelContextWindow: 200000
+    } })
+    finish()
+    return
+  }
   if (scenario === 'synthetic:telemetry') {
     const telemetry = (inputTokens, outputTokens, reasoningOutputTokens) => notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, cachedInputTokens: 400, reasoningOutputTokens }, modelContextWindow: 200000 } })
     const agents = (first, second) => itemEvent('item/completed', { type: 'collabAgentToolCall', id: 'telemetry-parent', tool: 'spawnAgent', status: 'completed', senderThreadId: threadId, receiverThreadIds: ['telemetry-research', 'telemetry-tests'], prompt: 'Synthetic telemetry validation only. No agents are actually launched.', model: null, reasoningEffort: null, agentsStates: { 'telemetry-research': { status: first, message: null }, 'telemetry-tests': { status: second, message: null } } })

@@ -8,13 +8,13 @@ import { resolve } from 'node:path'
 const fixture = `import React, {useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import {StructuredComposerControls} from '/src/renderer/src/panes/StructuredComposerControls';
-import {StructuredAgentTelemetry} from '/src/renderer/src/panes/StructuredAgentTelemetry';
+import {StructuredAgentTelemetry,StructuredLiveTokens} from '/src/renderer/src/panes/StructuredAgentTelemetry';
 import '/src/renderer/src/styles.css';
 import '/src/renderer/src/panes/StructuredAgentPane.css';
 const caps = {provider:'claude',models:[{id:'default',label:'Default (Opus)',effort:['low','high','xhigh']},{id:'opus',label:'Opus',effort:['low','high','xhigh']}],effectiveSettings:{model:'opus',effort:'xhigh'},permissions:['default','accept-edits','auto'],plans:true};
 const item=(sequence,data,extra={})=>({id:String(sequence),runtimeId:'r',sequence,timestamp:'2026-09-07T12:00:00Z',data,...extra});
 const items=[item(1,{type:'tool',name:'Agent',status:'completed',input:{prompt:'Review permission changes'}},{nativeItemId:'launch'}),item(2,{type:'subagent',name:'Permission reviewer',status:'completed',nativeSessionId:'review-thread'},{parentId:'launch',nativeItemId:'child'}),item(3,{type:'tool',name:'Read',status:'completed',output:'Permission menu inspected'},{parentId:'launch'}),item(4,{type:'text',role:'assistant',text:'Keyboard navigation and permission settings verified.',mode:'snapshot'},{parentId:'launch'}),item(5,{type:'subagent',name:'Test runner',status:'running'},{nativeItemId:'test-child'}),item(6,{type:'subagent',name:'Failed check',status:'failed'},{nativeItemId:'failed-child'})];
-function App(){const [settings,setSettings]=useState({permission:'default',plan:false});return <main className="structured-agent-pane" style={{height:'100vh',padding:24}}><h2>Session controls</h2><StructuredAgentTelemetry items={items} runtimeId="r" phase="running"/><div className="sa-composer" style={{marginTop:'auto'}}><div style={{display:'flex',gap:10,alignItems:'center'}}><StructuredComposerControls settings={settings} capabilities={caps} disabled={false} onChange={change=>setSettings(s=>({...s,...change}))} onDiscover={async()=>{}}/></div></div></main>};createRoot(document.getElementById('root')).render(<App/>);`
+function App(){const [used,setUsed]=useState(35000);window.setContextUsed=setUsed;const usage=item(10,{type:'usage',source:'provider',scope:'session',totalTokens:9000000,outputTokens:4000,limits:{contextUsedTokens:used,contextCapacityTokens:100000,modelContextWindow:128000,workingOutputTokens:42}});const [settings,setSettings]=useState({permission:'default',plan:false});return <main className="structured-agent-pane" style={{height:'100vh',padding:24}}><h2>Session controls</h2><StructuredAgentTelemetry items={[...items,usage]} runtimeId="r" phase="running"/><div className="sa-working">Spelunking<StructuredLiveTokens items={[...items,usage]}/></div><div className="sa-composer" style={{marginTop:'auto'}}><div style={{display:'flex',gap:10,alignItems:'center'}}><StructuredComposerControls settings={settings} capabilities={caps} disabled={false} onChange={change=>setSettings(s=>({...s,...change}))} onDiscover={async()=>{}}/></div></div></main>};createRoot(document.getElementById('root')).render(<App/>);`
 const server = await createServer({ configFile: false, root: process.cwd(), plugins: [react(), {
   name: 'session-controls-fixture',
   resolveId(id) { if (id === '/__session-controls.tsx') return id },
@@ -67,6 +67,35 @@ try {
   await page.screenshot({path:resolve(output,'subagents-narrow.png')})
   await expect(page.getByRole('dialog')).toBeVisible()
   const overflow=await page.getByRole('dialog').evaluate(el=>el.scrollWidth>el.clientWidth); if(overflow) throw Error('Dialog overflows horizontally')
+  await page.getByRole('button',{name:'Close Subagents',exact:true}).click()
+  await page.setViewportSize({width:1000,height:760})
+  await expect(page.locator('.sa-live-tokens')).toHaveText('42 output tokens')
+  await expect(page.locator('.sa-context-circle')).toHaveCount(0)
+  for (const [used,level] of [[40000,'normal'],[70000,'warning'],[95000,'critical']]) {
+    await page.evaluate(used=>window.setContextUsed(used),used)
+    const circle=page.getByRole('button',{name:`Context ${used/1000}% used`,exact:true})
+    await expect(circle).toHaveClass('sa-context-circle level-'+level)
+    await expect.poll(()=>circle.locator('.sa-context-fill').evaluate(el=>parseFloat(getComputedStyle(el).strokeDasharray))).toBeCloseTo(used/1000, 1)
+    await page.screenshot({path:resolve(output,'context-'+level+'.png')})
+  }
+  await expect.poll(()=>page.locator('.sa-context-fill').evaluate(el=>getComputedStyle(el).animationName)).toBe('sa-context-pulse')
+  await page.setViewportSize({width:390,height:740})
+  await page.screenshot({path:resolve(output,'context-narrow.png')})
+  await expect(page.locator('.sa-context-circle')).toBeVisible()
+  await page.setViewportSize({width:1000,height:760})
+  await page.emulateMedia({reducedMotion:'reduce'})
+  await expect.poll(()=>page.locator('.sa-context-fill').evaluate(el=>getComputedStyle(el).animationName)).toBe('none')
+  await page.getByRole('button',{name:'Context 95% used',exact:true}).click()
+  await expect(page.getByRole('dialog')).toContainText('95,000 / 100,000 usable tokens')
+  await expect(page.getByRole('dialog')).toContainText('/compact')
+  await page.getByRole('button',{name:'Close Usage',exact:true}).click()
+  await page.evaluate(()=>window.setContextUsed(100000))
+  await page.getByRole('button',{name:'Context 100% used',exact:true}).click()
+  await expect(page.getByRole('dialog')).toContainText('Context is full.')
+  await page.screenshot({path:resolve(output,'context-full-details.png')})
+  await page.getByRole('button',{name:'Close Usage',exact:true}).click()
+  await page.evaluate(()=>window.setContextUsed(15000))
+  await expect(page.locator('.sa-context-circle')).toHaveCount(0)
   if(errors.length) throw Error(errors.join('\n'))
-  console.log('Passed: effective effort position, permission keyboard selection, focus restoration, subagent details, search, filters, expand/collapse, narrow layout.')
+  console.log('Passed: effective effort position, permission keyboard selection, focus restoration, subagent details, search, filters, expand/collapse, narrow layout, context thresholds, pulse, reduced motion, context details, compaction reset, output-only working tokens.')
 } finally { await browser.close(); await server.close() }

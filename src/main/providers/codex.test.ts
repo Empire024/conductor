@@ -271,3 +271,13 @@ describe('model and empty-history regression contracts', () => {
     expect(sent.find(message => (message as { method?: string }).method === 'turn/start')).toMatchObject({ params: { model: 'plain-model', effort: null } })
   })
 })
+
+
+it('keeps latest context and response output separate from cumulative Codex totals across compaction', async () => {
+  const { adapter, events } = create()
+  await adapter.submit('synthetic:context', settings)
+  await waitFor(() => completed(events))
+  const usage = events.filter(event => event.data.type === 'usage' && event.data.scope === 'session').map(event => event.data)
+  expect(usage).toHaveLength(3)
+  for (const [index, used] of [140000, 190000, 24000].entries()) expect(usage[index]).toMatchObject({ totalTokens: 9004000, outputTokens: 4000, limits: { contextUsedTokens: used, contextCapacityTokens: 200000, workingOutputTokens: 42 } })
+})

@@ -2,7 +2,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { liveTokenLabel, subagentCountLabel, summarizeSubagents, summarizeUsage } from './usage-summary'
+import { liveTokenLabel, subagentCountLabel, summarizeSubagents, summarizeUsage, summarizeContext, summarizeWorkingUsage } from './usage-summary'
 import { StructuredAgentTelemetry, StructuredLiveTokens } from './StructuredAgentTelemetry'
 
 function item(sequence: number, data: AgentEventData, extra: Partial<TimelineItem> = {}): TimelineItem {
@@ -17,7 +17,7 @@ describe('reported live usage', () => {
       item(3, { type: 'usage', source: 'provider', scope: 'session', inputTokens: 1000, outputTokens: 800 }, { parentId: 'child-tool' })
     ])
     expect(summary).toMatchObject({ scope: 'session', tokens: { inputTokens: 200, outputTokens: 50, totalTokens: 250, reasoningTokens: 30 } })
-    expect(liveTokenLabel(summary)).toBe('250 tokens')
+    expect(liveTokenLabel(summary)).toBe('50 output tokens')
   })
 
   it('uses reconciled update order rather than the original timeline position', () => {
@@ -54,8 +54,8 @@ describe('reported live usage', () => {
     const summary = summarizeUsage([item(1, { type: 'usage', source: 'provider', outputTokens: 14, inputTokens: Number.NaN, cachedTokens: -1 })])
     expect(summary.tokens).toEqual({ outputTokens: 14 })
     expect(liveTokenLabel(summary)).toBe('14 output tokens')
-    expect(liveTokenLabel(summarizeUsage([]))).toBe('Tokens pending')
-    expect(liveTokenLabel(summarizeUsage([item(1, { type: 'usage', source: 'provider', inputTokens: 0, outputTokens: 0 })]))).toBe('0 tokens')
+    expect(liveTokenLabel(summarizeUsage([]))).toBe('Output tokens pending')
+    expect(liveTokenLabel(summarizeUsage([item(1, { type: 'usage', source: 'provider', inputTokens: 0, outputTokens: 0 })]))).toBe('0 output tokens')
   })
 
   it('does not imply complete totals when a streamed message lacks input usage', () => {
@@ -69,7 +69,8 @@ describe('reported live usage', () => {
 
   it('renders the provider token count beside working status and exposes usage before any report', () => {
     const html = renderToStaticMarkup(createElement(StructuredLiveTokens, { items: [item(1, { type: 'usage', source: 'provider', inputTokens: 1000, outputTokens: 50 })] }))
-    expect(html).toContain('1,050 tokens')
+    expect(html).toContain('50 output tokens')
+    expect(html).not.toContain('1,050')
     const empty = renderToStaticMarkup(createElement(StructuredAgentTelemetry, { items: [], runtimeId: 'runtime', phase: 'idle' }))
     expect(empty).toContain('View usage')
     expect(empty).toContain('aria-expanded="false"')
@@ -129,4 +130,36 @@ it('correlates child task, nested tools and response without mixing runtime or s
   expect(agent.activity.map(value => value.sequence)).toEqual([3, 4])
   const shared = summarizeSubagents([...facts, item(7, { type: 'subagent', name: 'Sibling', status: 'running' }, { parentId: 'launch', nativeItemId: 'task:2' })], 'runtime', 'running')
   expect(shared.every(value => value.activity.length === 0 && !value.task)).toBe(true)
+})
+
+
+describe('context and working output are separate', () => {
+  const context = (used: number, capacity = 1000) => item(1, { type: 'usage', source: 'provider', scope: 'session', totalTokens: 9_000_000, outputTokens: 4000, limits: { contextUsedTokens: used, contextCapacityTokens: capacity, workingOutputTokens: 25 } })
+  it('uses the current context snapshot, never cumulative usage, and respects thresholds', () => {
+    for (const [used, level] of [[400, 'normal'], [699, 'normal'], [700, 'warning'], [899, 'warning'], [900, 'critical'], [1000, 'critical']] as const) {
+      expect(summarizeContext([context(used)])).toMatchObject({ level })
+      expect(summarizeContext([context(used)])?.percent).toBeCloseTo(used / 10)
+      const html = renderToStaticMarkup(createElement(StructuredAgentTelemetry, { items: [context(used)], runtimeId: 'runtime', phase: 'idle' }))
+      expect(html).toContain('sa-context-circle level-' + level)
+    }
+    const hidden = renderToStaticMarkup(createElement(StructuredAgentTelemetry, { items: [context(399)], runtimeId: 'runtime', phase: 'idle' }))
+    expect(hidden).not.toContain('sa-context-circle')
+    expect(summarizeContext([context(2000)])?.percent).toBe(100)
+    expect(liveTokenLabel(summarizeWorkingUsage([context(900)]))).toBe('25 output tokens')
+  })
+  it('clears stale context on compaction, invalid reports, or a runtime change', () => {
+    expect(summarizeContext([context(900), item(2, { type: 'usage', source: 'provider', limits: { contextUsedTokens: null } })])).toBeUndefined()
+    expect(summarizeContext([context(900)], 'new-runtime')).toBeUndefined()
+    expect(summarizeContext([context(900, 0)])).toBeUndefined()
+    expect(summarizeContext([context(Number.NaN)])).toBeUndefined()
+    expect(summarizeContext([context(900), item(2, { type: 'usage', source: 'provider', limits: { contextUsedTokens: 150 } })])?.percent).toBe(15)
+  })
+  it('ignores child context and does not carry working counts into a new prompt', () => {
+    const child = { ...context(990), parentId: 'child' }
+    expect(summarizeContext([child])).toBeUndefined()
+    const prompt = item(2, { type: 'text', role: 'user', text: 'Next', mode: 'snapshot' })
+    expect(liveTokenLabel(summarizeWorkingUsage([context(700), prompt]))).toBe('Output tokens pending')
+    const response = item(3, { type: 'usage', source: 'provider', scope: 'message', inputTokens: 8000, cachedTokens: 7000, outputTokens: 19 })
+    expect(liveTokenLabel(summarizeWorkingUsage([context(700), prompt, response]))).toBe('19 output tokens')
+  })
 })

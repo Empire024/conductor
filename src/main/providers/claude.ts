@@ -64,6 +64,9 @@ export class ClaudeAdapter implements ProviderAdapter {
   private initializedMetadata: Json = {}
   private configurationMetadata: Json = {}
   private cumulativeCostUsd = 0
+  private contextTokens?: number
+  private contextWindow?: number
+  private maxOutputTokens?: number
 
   constructor(private options: AdapterOptions, private dependencies: Dependencies = {}) {
     this.nativeSessionId = options.nativeSessionId
@@ -291,9 +294,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (type === 'assistant' || type === 'user') {
       const body = object(message.message), messageId = string(body.id) ?? uuid
       if (type === 'assistant' && !parentId && typeof body.model === 'string') {
+        this.resetContextForModel(body.model)
         this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: body.model }
         this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
       }
+      if (type === 'assistant' && messageId) this.usage(object(body.usage), `usage:message:${messageId}`, 'message', parentId)
       for (const [index, content] of array(body.content).entries()) {
         const block = object(content)
         if (block.type === 'text' && type === 'assistant' && messageId) {
@@ -333,6 +338,14 @@ export class ClaudeAdapter implements ProviderAdapter {
       }
       const usage = object(message.usage)
       this.usage(usage, `usage:turn:${this.turnId ?? uuid ?? randomUUID()}`, 'turn', parentId)
+      if (!parentId) {
+        const model = string(object(this.capabilities.effectiveSettings).model)
+        const models = object(message.modelUsage)
+        const metadata = object(model ? models[model] : Object.keys(models).length === 1 ? Object.values(models)[0] : undefined)
+        this.contextWindow = number(metadata.contextWindow) ?? this.contextWindow
+        this.maxOutputTokens = number(metadata.maxOutputTokens) ?? this.maxOutputTokens
+        this.emitContext()
+      }
       const cumulativeCost = number(message.total_cost_usd)
       // CLI stream-input results contain per-turn tokens but runtime-cumulative estimated cost.
       // Cost is computed from the CLI price table, not authoritative account billing/quota.
@@ -349,8 +362,14 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupted' : failure ? 'failed' : 'completed', nativeSessionId: this.nativeSessionId }, native: { method: 'result', payload: message } })
       return
     }
+    if (type === 'system' && message.subtype === 'compact_boundary' && !parentId) {
+      this.contextTokens = undefined
+      this.emitContext()
+      return
+    }
     if (type === 'system' && message.subtype === 'init') {
       this.configurationMetadata = message
+      if (typeof message.model === 'string') this.resetContextForModel(message.model)
       if (typeof message.model === 'string') this.capabilities.effectiveSettings = { model: message.model, effort: this.settings.effort ?? string(message.effort) ?? null, permissionMode: string(message.permissionMode) ?? this.permissionMode(this.settings) }
       if (typeof message.claude_code_version === 'string') this.capabilities.runtimeVersion = message.claude_code_version
       this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', nativeSessionId: this.nativeSessionId, capabilities: this.capabilities }, native: { method: 'system/init', payload: message } })
@@ -371,11 +390,12 @@ export class ClaudeAdapter implements ProviderAdapter {
       const body = object(event.message), id = string(body.id)
       if (id) {
         this.streams.set(key, { messageId: id, blocks: new Map() })
-        this.usage(object(body.usage), `usage:message:${id}`, 'message', parentId)
         if (!parentId && typeof body.model === 'string') {
+          this.resetContextForModel(body.model)
           this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: body.model, ...(this.settings.effort ? { effort: this.settings.effort } : {}) }
           this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
         }
+        this.usage(object(body.usage), `usage:message:${id}`, 'message', parentId)
       }
       return
     }
@@ -425,13 +445,30 @@ export class ClaudeAdapter implements ProviderAdapter {
     }).join('\n')
   }
   private usage(update: ObjectValue, itemId: string, scope: 'message' | 'turn', parentId?: string): void {
-    const previous = this.messageUsage.get(itemId) ?? {}, usage = { ...previous, ...update }
+    const previous = this.messageUsage.get(itemId) ?? {}, usage = { ...previous, ...Object.fromEntries(Object.entries(update).filter(([, value]) => value !== null)) }
     this.messageUsage.set(itemId, usage)
     if (this.messageUsage.size > 4096) this.messageUsage.delete(this.messageUsage.keys().next().value!)
     const uncached = number(usage.input_tokens), cachedTokens = number(usage.cache_read_input_tokens), cacheCreationTokens = number(usage.cache_creation_input_tokens), outputTokens = number(usage.output_tokens)
     const inputTokens = uncached === undefined ? undefined : uncached + (cachedTokens ?? 0) + (cacheCreationTokens ?? 0)
     if ([inputTokens, cachedTokens, cacheCreationTokens, outputTokens].every(value => value === undefined)) return
+    if (scope === 'message' && !parentId && inputTokens !== undefined && outputTokens !== undefined) { this.contextTokens = inputTokens + outputTokens; this.emitContext() }
     this.emit({ itemId, parentId, data: { type: 'usage', scope, source: 'provider', inputTokens, cachedTokens, cacheCreationTokens, outputTokens, ...(inputTokens !== undefined && outputTokens !== undefined ? { totalTokens: inputTokens + outputTokens } : {}) } })
+  }
+
+  private resetContextForModel(model: string): void {
+    const previous = string(object(this.capabilities.effectiveSettings).model)
+    if (!previous || previous === model) return
+    this.contextTokens = undefined; this.contextWindow = undefined; this.maxOutputTokens = undefined
+    this.emitContext()
+  }
+
+  private emitContext(): void {
+    // Claude VS Code 2.1.263 reserves maximum output plus 13k for compaction.
+    const capacity = this.contextWindow !== undefined && this.maxOutputTokens !== undefined ? this.contextWindow - this.maxOutputTokens - 13_000 : undefined
+    this.emit({ itemId: 'usage:context', data: { type: 'usage', source: 'provider', limits: {
+      contextUsedTokens: this.contextTokens ?? null, modelContextWindow: this.contextWindow ?? null,
+      contextCapacityTokens: capacity !== undefined && capacity > 0 ? capacity : null
+    } } })
   }
 
   private declareTool(id: string, name: string, input: Json, parentId?: string): void {

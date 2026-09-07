@@ -1,0 +1,11 @@
+# Context and working tokens
+
+Checked against the installed Claude Code VS Code extension 2.1.263 on 2026-09-07 (`webview/index.js`). Its `updateUsage` replaces context with the latest assistant usage: input + cache read + cache creation + output. It does not add prior requests. Its composer passes model context window minus maximum output tokens minus 13,000 tokens to its context gauge. Model limits come from the result's `modelUsage` entry for the active model. A compact boundary clears the prior context snapshot.
+
+Conductor follows that accounting and waits for reported model limits rather than guessing model capacities. Codex uses `thread/tokenUsage/updated.tokenUsage.last.totalTokens` and the runtime's `modelContextWindow`, preserving `total` exclusively for cumulative usage. The upstream [Codex token usage implementation](https://github.com/openai/codex/blob/main/codex-rs/tui/src/token_usage.rs) explicitly distinguishes active context (`last`) from accumulated session usage (`total`). Its TUI has a separate baseline adjustment; Conductor uses the app-server capacity as reported.
+
+The working indicator shows only reported generated output for the current response (including reasoning where the provider includes it). It does not add input, cached input, or reasoning a second time. A new user prompt clears the previous working count until another output report arrives. No hidden reasoning text is read or displayed.
+
+The context circle appears at 40% of usable capacity, turns orange at 70%, and becomes red with a thicker ring and a subtle three-second opacity pulse at 90%. Reduced-motion preferences disable the pulse. Clicking opens context details and shows `/compact` guidance near/full capacity. This control does not submit a prompt or compact automatically. Missing/invalid context reports stay unknown, child usage is excluded, and reports after compaction can decrease the percentage. Conversation totals remain available in View usage.
+
+Validation: provider protocol tests cover cached input, output reserves, independent cumulative/current usage, compaction and model resets; summary tests cover thresholds and missing data; `node scripts/smoke-session-controls.mjs` checks interaction, visual states, output separation, pulse and reduced motion without inference.
