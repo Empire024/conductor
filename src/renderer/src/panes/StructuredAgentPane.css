@@ -177,6 +177,11 @@
 .sa-activity { padding-bottom: 10px; padding-left: 13px; border-left-color: var(--border-soft); }
 .sa-assistant { padding-top: 3px; padding-bottom: 15px; }
 .sa-user { margin: 5px 0 15px; }
+/* Compact Codex turns while retaining readable text and distinct user bubbles. */
+.structured-agent-pane[data-provider="codex"] .sa-timeline { padding-block: 10px 12px; }
+.structured-agent-pane[data-provider="codex"] .sa-activity { padding-bottom: 6px; }
+.structured-agent-pane[data-provider="codex"] .sa-assistant { padding-top: 2px; padding-bottom: 9px; }
+.structured-agent-pane[data-provider="codex"] .sa-user { margin: 3px 0 6px; }
 .sa-tool { background: transparent; border-color: var(--border-soft); }
 .sa-tool > header { min-height: 29px; }
 .sa-empty { align-items: center; justify-content: center; min-height: 160px; padding: 25px 12px; text-align: center; }

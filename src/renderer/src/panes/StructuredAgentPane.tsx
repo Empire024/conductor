@@ -283,7 +283,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const parentLabels = useMemo(() => new Map(projection.items.flatMap(item => item.nativeItemId && (item.data.type === 'tool' || item.data.type === 'subagent') ? [[item.runtimeId + ':' + item.nativeItemId, item.data.name] as const] : [])), [projection.items])
   const updateSettings = (change: Partial<SessionSettings>): void => setSettings((current) => ({ ...current, ...change }))
 
-  return <section className="structured-agent-pane" data-structured-session={activeId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
+  return <section className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
     <header className="sa-session-bar">
       <strong title={projection.title || name}>{projection.title || 'New conversation'}</strong>
       {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? 'Working' : displayPhase(projection.phase)}</span>}
