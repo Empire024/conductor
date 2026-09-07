@@ -100,6 +100,8 @@ it('shows the effective model and effort in place of ambiguous saved aliases', (
   const html = render({ capabilities: { ...capabilities, effectiveSettings: { model: 'gpt-6-astra', effort: 'xhigh' }, models: [{ id: 'gpt-6-astra', label: 'gpt-6-astra', effort: ['high', 'xhigh'], defaultEffort: 'high' }] }, settings: { ...settings, model: 'default', effort: 'auto' } }).html
   expect(html).toContain('GPT 6 Astra</span>')
   expect(html).toContain('aria-valuetext="Xhigh"')
+  expect(html).toContain('value="2"')
+  expect(html).toContain('--effort-progress:100%')
   expect(html).toContain('title="GPT 6 Astra · xhigh"')
   expect(html).not.toContain('Default</span>')
   expect(html).not.toContain('Auto</output>')
@@ -113,6 +115,23 @@ it('uses the new model default effort instead of carrying the running model effo
 it('offers only modes reported by the provider in the bottom controls', () => {
   const claude = render({ capabilities: { ...capabilities, provider: 'claude', permissions: ['default', 'auto', 'accept-edits'], plans: true } }).html
   expect(claude).toContain('aria-label="Conversation mode"')
-  for (const mode of ['Ask', 'Auto', 'Edit', 'Plan']) expect(claude).toContain('>' + mode + '</option>')
+  expect(claude).toContain('aria-haspopup="menu"')
+  expect(claude).toContain('Ask</span>')
+  expect(claude).not.toContain('<select')
   expect(render({ capabilities: { ...capabilities, plans: false } }).html).not.toContain('Conversation mode')
+})
+
+
+it('shows Claude configured default metadata until the runtime reports the model', () => {
+  const claude: ProviderCapabilities = { ...capabilities, provider: 'claude', models: [{ id: 'default', label: 'Default (Opus)', effort: ['high'] }] }
+  expect(render({ capabilities: claude }).html).toContain('Default (Opus)</span>')
+  expect(render({ capabilities: { ...claude, models: [] } }).html).toContain('Claude configured model</span>')
+  expect(render({ capabilities: { ...claude, effectiveSettings: { model: 'claude-opus-runtime' } } }).html).toContain('claude-opus-runtime</span>')
+})
+
+
+it('keeps default alias effort metadata when Claude reports a concrete runtime model ID', () => {
+  const html = render({ capabilities: { ...capabilities, provider: 'claude', effectiveSettings: { model: 'claude-opus-runtime', effort: 'high' }, models: [{ id: 'default', label: 'Default (Opus)', effort: ['low', 'high'] }] } }).html
+  expect(html).toContain('aria-valuetext="High"')
+  expect(html).toContain('value="2"')
 })

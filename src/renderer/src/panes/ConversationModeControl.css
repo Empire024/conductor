@@ -1,0 +1,10 @@
+.sa-mode-picker { position: relative; flex: 0 0 auto; }
+.sa-mode-trigger { gap: 5px; height: 29px; padding: 3px 7px !important; border: 1px solid var(--border-soft) !important; border-radius: 7px !important; font-size: 10px !important; }
+.sa-mode-trigger[aria-expanded="true"] { color: var(--accent); background: var(--accent-bg); }
+.sa-mode-menu { position: absolute; bottom: calc(100% + 10px); left: 0; z-index: 21; width: min(285px, calc(100cqw - 24px)); padding: 5px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-1); box-shadow: 0 10px 35px #0005; }
+.sa-mode-menu > p { margin: 6px 8px 9px; color: var(--text-3); font-size: 10px; }
+.sa-mode-menu > button { width: 100%; padding: 8px !important; text-align: left; justify-content: space-between; gap: 10px; border-radius: 5px; }
+.sa-mode-menu strong { display: block; font-size: 11px; font-weight: 500; }
+.sa-mode-menu small { display: block; margin-top: 3px; color: var(--text-2); font-size: 10px; line-height: 1.5; }
+.sa-mode-menu > button[aria-checked="true"] { color: var(--accent); background: var(--accent-bg); }
+.sa-mode-menu > button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }

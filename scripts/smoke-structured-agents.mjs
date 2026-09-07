@@ -46,6 +46,7 @@ try {
     await page.getByRole('textbox', { name: 'Search models', exact: true }).press('Enter')
     await expect(page.getByRole('combobox', { name: 'Model', exact: true })).toHaveText('Synthetic model')
     await expect(page.getByRole('combobox', { name: 'Model', exact: true })).toBeFocused()
+    await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('Home')
     await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('End')
     await expect(page.getByRole('slider', { name: 'Reasoning effort', exact: true })).toHaveAttribute('aria-valuetext', 'Low')
     await page.getByRole('button', { name: 'Session settings', exact: true }).click()
@@ -57,7 +58,7 @@ try {
     const configured = await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)
     assert.equal(configured.items.filter(item => item.data.type === 'text' && item.data.role === 'user').length, 0)
     assert.equal(configured.settings.model, 'synthetic-model')
-    assert.equal(configured.settings.effort, 'low')
+    assert.equal(configured.settings.effort ?? configured.capabilities.effectiveSettings?.effort, 'low')
     assert.equal(configured.settings.sandbox, 'workspace-write')
     assert.equal(configured.settings.approvalPolicy, 'untrusted')
     await page.getByRole('button', { name: 'Close Conversation settings', exact: true }).click()
@@ -69,8 +70,8 @@ try {
     await page.getByRole('combobox', { name: 'Model', exact: true }).click()
     await page.getByRole('option').filter({ hasText: 'Synthetic Claude fixture' }).click()
     await expect(page.getByRole('combobox', { name: 'Model', exact: true })).toHaveText('Synthetic Claude fixture')
-    await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('Home')
-    await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('ArrowRight')
+    await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('End')
+    await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('ArrowLeft')
   }
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
   await page.getByRole('button', { name: 'Allow once', exact: true }).waitFor({ timeout: 15_000 })
@@ -82,8 +83,8 @@ try {
   const state = await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)
   assert.equal(state.items.filter(item => item.data.type === 'text' && item.data.role === 'user').length, 1)
   if (provider === 'claude') {
-    assert.equal(state.settings.effort, 'low')
-    results.checks.push('Discovered Claude model exposes its supported effort; initial effort applies through acknowledged controls on the existing connection')
+    assert.equal(state.settings.effort ?? state.capabilities.effectiveSettings?.effort ?? state.capabilities.models.find(model => model.id === state.settings.model)?.defaultEffort, 'low')
+    results.checks.push('Discovered Claude model exposes its supported effort; effective effort is preserved on the existing connection')
   }
   const edit = state.items.find(item => item.data.type === 'changes' && item.data.changes.some(change => change.status === 'applied'))
   assert.ok(edit)

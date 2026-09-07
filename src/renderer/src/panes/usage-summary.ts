@@ -99,6 +99,12 @@ export interface SubagentSummary {
   id: string
   name: string
   nativeSessionId?: string
+  runtimeId: string
+  startedAt: string
+  updatedAt: string
+  parentIds: string[]
+  task?: string
+  activity: TimelineItem[]
   status: ActivityStatus | 'unknown'
   sequence: number
 }
@@ -108,7 +114,7 @@ export const subagentStatusLabels: Record<SubagentSummary['status'], string> = {
   preparing: 'Starting', running: 'Running', awaiting_approval: 'Needs approval', completed: 'Completed', failed: 'Failed', rejected: 'Declined', interrupted: 'Stopped', unknown: 'Status unavailable'
 }
 
-export function summarizeSubagents(items: TimelineItem[], runtimeId: string, phase: SessionPhase): SubagentSummary[] {
+export function summarizeSubagents(items: TimelineItem[], runtimeId: string, phase: SessionPhase, includeActivity = true): SubagentSummary[] {
   const agents = new Map<string, SubagentSummary>()
   for (const item of [...items].sort((a, b) => updatedSequence(a) - updatedSequence(b))) {
     if (item.data.type !== 'subagent') continue
@@ -117,7 +123,38 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
     const genericName = ['Codex agent', 'Background activity', 'Agent'].includes(item.data.name)
     const name = genericName && previous ? previous.name : item.data.name
     const status = activeStatuses.has(item.data.status) && (item.runtimeId !== runtimeId || inactivePhases.has(phase)) ? 'unknown' : item.data.status
-    agents.set(id, { id, name, nativeSessionId: item.data.nativeSessionId, status, sequence: previous?.sequence ?? item.sequence })
+    agents.set(id, { id, name, nativeSessionId: item.data.nativeSessionId, runtimeId: item.runtimeId,
+      startedAt: previous?.startedAt ?? item.timestamp, updatedAt: item.timestamp,
+      parentIds: [...new Set([...(previous?.runtimeId === item.runtimeId ? previous.parentIds : []), item.parentId, item.nativeItemId].filter((value): value is string => Boolean(value)))],
+      activity: [], status, sequence: previous?.sequence ?? item.sequence })
+  }
+  if (!includeActivity) return [...agents.values()].sort((a, b) => a.sequence - b.sequence)
+  // A shared launch/wait tool is not evidence that every child produced its output.
+  const owners = new Map<string, Set<string>>()
+  for (const agent of agents.values()) for (const parent of agent.parentIds) {
+    const key = JSON.stringify([agent.runtimeId, parent])
+    const ids = owners.get(key) ?? new Set<string>()
+    ids.add(agent.id); owners.set(key, ids)
+  }
+  for (const agent of agents.values()) {
+    const parents = new Set(agent.parentIds.filter(parent => owners.get(JSON.stringify([agent.runtimeId, parent]))?.size === 1))
+    const scoped = items.filter(item => item.runtimeId === agent.runtimeId)
+    const launch = scoped.find(item => item.nativeItemId && parents.has(item.nativeItemId) && item.data.type === 'tool')
+    if (launch?.data.type === 'tool') {
+      const input = object(launch.data.input)
+      agent.task = typeof input.prompt === 'string' ? input.prompt : typeof input.message === 'string' ? input.message : launch.data.description
+    }
+    // Follow nested tool parents, independent of arrival order.
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const item of scoped) if (item.parentId && parents.has(item.parentId) && item.nativeItemId && !parents.has(item.nativeItemId) && item.data.type !== 'subagent') {
+        parents.add(item.nativeItemId); changed = true
+      }
+    }
+    agent.activity = scoped.filter(item => item.parentId && parents.has(item.parentId) && ['text', 'tool', 'error', 'changes'].includes(item.data.type)).sort((a, b) => updatedSequence(a) - updatedSequence(b))
+    const latest = agent.activity.at(-1)
+    if (latest && latest.timestamp > agent.updatedAt) agent.updatedAt = latest.timestamp
   }
   return [...agents.values()].sort((a, b) => a.sequence - b.sequence)
 }

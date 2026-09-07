@@ -5,6 +5,7 @@ import { useEffect, useId, useRef, useState } from 'react'
 import { Check, ChevronDown, LoaderCircle, Search } from 'lucide-react'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 import './AgentPrompt.css'
+import { ConversationModeControl } from './ConversationModeControl'
 
 export function StructuredComposerControls({ settings, capabilities, disabled, onChange, onDiscover }: {
   settings: SessionSettings
@@ -30,7 +31,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const supportedEfforts = modelEfforts(capabilities, settings.model)
   const efforts = ['', ...(supportedEfforts ?? []).filter(value => value && value !== 'auto')]
   const unavailableEffort = Boolean(capabilities && settings.effort && settings.effort !== 'auto' && !efforts.includes(settings.effort))
-  const effortIndex = Math.max(0, efforts.indexOf(settings.effort ?? ''))
+  const effortIndex = Math.max(0, efforts.indexOf(resolved.effort ?? ''))
   const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : (efforts[effortIndex] || resolved.effort || 'Not reported').replace(/^./, char => char.toUpperCase())
   const close = (): void => { setOpen(false); setQuery(''); trigger.current?.focus() }
   const chooseModel = (id: string): void => {
@@ -59,7 +60,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   }
 
   return <>
-    {modes.length > 1 && <select className="sa-mode-control" aria-label="Conversation mode" title="Mode for your next message" value={mode} disabled={disabled} onChange={event => { const choice = modes.find(option => option.id === event.target.value); if (choice) onChange(choice.change) }}>{modes.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}</select>}
+    {modes.length > 1 && <ConversationModeControl modes={modes} value={mode} disabled={disabled} onChange={onChange} />}
     <div className="sa-model-control" ref={host}>
       <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title={label + (resolved.effort ? ' · ' + resolved.effort : '')} onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><ProviderIcon provider={capabilities?.provider} model={model} size={14} /><span>{label}</span><ChevronDown size={12} /></button>
       {open && <div className="sa-model-menu" onKeyDown={event => {

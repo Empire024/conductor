@@ -290,6 +290,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (type === 'stream_event') return this.stream(message, parentId)
     if (type === 'assistant' || type === 'user') {
       const body = object(message.message), messageId = string(body.id) ?? uuid
+      if (type === 'assistant' && !parentId && typeof body.model === 'string') {
+        this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: body.model }
+        this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
+      }
       for (const [index, content] of array(body.content).entries()) {
         const block = object(content)
         if (block.type === 'text' && type === 'assistant' && messageId) {

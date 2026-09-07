@@ -31,3 +31,29 @@
 .sa-subagent-state.status-awaiting_approval { color: #e2b872; }
 .sa-subagent-state.status-failed { color: var(--danger); }
 .sa-dialog:has(> .sa-usage-content), .sa-dialog:has(> .sa-subagent-details) { width: min(460px, calc(100vw - 32px)); }
+
+.sa-dialog:has(> .sa-subagent-details) { width: min(680px, calc(100vw - 32px)); }
+.sa-agent-search { display: flex; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; color: var(--text-3); }
+.sa-agent-search input { min-width: 0; width: 100%; border: 0; background: transparent; color: var(--text); outline: none; font-size: 12px; }
+.sa-agent-search:focus-within { border-color: var(--accent); }
+.sa-agent-filters { display: flex; flex-wrap: wrap; gap: 5px; margin: 10px 0; }
+.sa-agent-filters button { padding: 4px 8px; border-radius: 5px; font-size: 11px; border: 1px solid var(--border-soft); }
+.sa-agent-filters button[aria-pressed="true"] { color: var(--accent); background: var(--accent-bg); border-color: var(--accent); }
+.sa-agent-list-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 10px; color: var(--text-3); }
+.sa-agent-list-actions > span { margin-right: auto; }
+.sa-agent-list-actions > button { font-size: 10px; }
+.sa-subagent-roster > li { padding: 7px 0; }
+.sa-agent-card { width: 100%; min-width: 0; }
+.sa-agent-card-heading { display: flex; width: 100%; gap: 9px; padding: 7px !important; text-align: left; border-radius: 6px; }
+.sa-agent-card-heading > span:nth-child(2) { min-width: 0; flex: 1; }
+.sa-agent-card-heading > svg { flex-shrink: 0; transition: transform 120ms; }
+.sa-agent-card-heading > svg.expanded { transform: rotate(180deg); }
+.sa-agent-card-heading:focus-visible { outline: 2px solid var(--accent); }
+.sa-agent-preview { margin: 0 7px 5px 22px; font-size: 11px; line-height: 1.5; color: var(--text-2); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
+.sa-agent-body { padding: 0 9px 9px 22px; }
+.sa-agent-body dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 12px; font-size: 10px; color: var(--text-2); }
+.sa-agent-body dd { margin: 0; overflow-wrap: anywhere; }
+.sa-agent-body h4 { margin: 12px 0 5px; color: var(--text); font-size: 11px; font-weight: 500; }
+.sa-agent-body pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 260px; overflow: auto; padding: 9px; border-radius: 5px; background: var(--surface-0); color: var(--text-2); font: 11px/1.6 'Cascadia Code', monospace; user-select: text; }
+.sa-agent-activity > summary { cursor: pointer; font-size: 11px; color: var(--text-2); margin: 12px 0; }
+.sa-agent-activity > div { border-top: 1px solid var(--border-soft); padding-top: 8px; }

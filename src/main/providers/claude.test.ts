@@ -373,3 +373,13 @@ describe('Claude conversation reliability', () => {
     expect(f.projection().items.filter(item => item.data.type === 'text')).toEqual([])
   })
 })
+
+
+it('reports the model from complete assistant messages without letting child models replace it', async () => {
+  const f = fixture()
+  await f.adapter.start()
+  f.transport.receive({ type: 'assistant', message: { id: 'main-model', model: 'claude-main', content: [] } })
+  expect(f.projection().capabilities?.effectiveSettings).toMatchObject({ model: 'claude-main' })
+  f.transport.receive({ type: 'assistant', parent_tool_use_id: 'child', message: { id: 'child-model', model: 'claude-child', content: [] } })
+  expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ model: 'claude-main' })
+})

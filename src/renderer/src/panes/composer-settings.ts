@@ -12,7 +12,8 @@ export function resolvedComposerSettings(settings: SessionSettings, capabilities
   const catalogDefault = capabilities?.models.find(model => model.isDefault && reported(model.id))
   const model = configured ?? (reported(values.model) ? values.model : catalogDefault?.id) ?? ''
   const info = capabilities?.models.find(option => option.id === model)
-  const label = info && !/^default\b/i.test(info.label) ? modelDisplayName(info.label) : model ? modelDisplayName(model) : capabilities ? 'Model not reported' : 'Choose model'
+  const defaultLabel = capabilities?.provider === 'claude' ? capabilities.models.find(option => option.id === 'default')?.label : undefined
+  const label = info && !/^default\b/i.test(info.label) ? modelDisplayName(info.label) : model ? modelDisplayName(model) : defaultLabel ?? (capabilities?.provider === 'claude' ? 'Claude configured model' : capabilities ? 'Model not reported' : 'Choose model')
   const effort = reported(settings.effort) ? settings.effort : (!configured || configured === values.model) && reported(values.effort) ? values.effort : info?.defaultEffort
   return { model, label, effort }
 }

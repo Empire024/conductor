@@ -113,3 +113,20 @@ describe('subagent roster', () => {
     expect(html).not.toContain('<script>')
   })
 })
+
+
+it('correlates child task, nested tools and response without mixing runtime or sibling output', () => {
+  const facts = [
+    item(1, { type: 'tool', name: 'Agent', input: { prompt: 'Review permissions' }, status: 'completed' }, { nativeItemId: 'launch' }),
+    item(2, { type: 'subagent', name: 'Reviewer', status: 'completed' }, { nativeItemId: 'task:1', parentId: 'launch' }),
+    item(3, { type: 'tool', name: 'Read', status: 'completed' }, { parentId: 'launch', nativeItemId: 'read' }),
+    item(4, { type: 'text', role: 'assistant', text: 'Reviewed', mode: 'snapshot' }, { parentId: 'read' }),
+    item(5, { type: 'text', role: 'assistant', text: 'Other runtime', mode: 'snapshot' }, { runtimeId: 'other', parentId: 'launch' }),
+    item(6, { type: 'text', role: 'assistant', text: 'Other child', mode: 'snapshot' }, { parentId: 'other-launch' })
+  ]
+  const agent = summarizeSubagents(facts, 'runtime', 'running')[0]!
+  expect(agent.task).toBe('Review permissions')
+  expect(agent.activity.map(value => value.sequence)).toEqual([3, 4])
+  const shared = summarizeSubagents([...facts, item(7, { type: 'subagent', name: 'Sibling', status: 'running' }, { parentId: 'launch', nativeItemId: 'task:2' })], 'runtime', 'running')
+  expect(shared.every(value => value.activity.length === 0 && !value.task)).toBe(true)
+})
