@@ -80,6 +80,7 @@ export interface ProjectRecord {
 
 export interface AppSettings {
   projectsRoot: string
+  defaultNewFileExtension: string
   zoomFactor: number
   themeId: ThemeId
   themeVariant: ThemeVariant
@@ -237,9 +238,13 @@ export interface EditorDraft {
   projectId: string
   path: string
   content: string
+  /** Disk contents before editing. Undefined means an older draft has no baseline. */
+  baseContent?: string | null
   viewState: unknown | null
   updatedAt: string
 }
+
+export type EditorFileWriteResult = { status: 'saved' } | { status: 'conflict'; message: string }
 
 export interface TerminalSpec {
   id: string

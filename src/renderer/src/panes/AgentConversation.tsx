@@ -180,7 +180,7 @@ export function AgentConversation(props: AgentConversationProps): React.JSX.Elem
             <div className="agent-conversation-empty">
               <span><Sparkles size={24} /></span>
               <strong>{props.providerName} is ready</strong>
-              <small>{props.model === 'default' ? 'Account default model' : props.model}</small>
+              <small>{['default', 'auto'].includes(props.model) ? 'Model not reported' : props.model}</small>
             </div>
           )}
           {visibleBlocks.map((block) => {

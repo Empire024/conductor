@@ -1,0 +1,44 @@
+{
+  "checkedAt": "2026-09-07T20:36:27.039805+00:00",
+  "version": "2.1.263 (Claude Code)",
+  "userMessagesSent": 0,
+  "inferenceRequested": false,
+  "controls": [
+    {
+      "name": "initialize",
+      "request": {
+        "subtype": "initialize"
+      },
+      "responseSubtype": "success"
+    },
+    {
+      "name": "effort-high",
+      "request": {
+        "subtype": "apply_flag_settings",
+        "settings": {
+          "effortLevel": "high"
+        }
+      },
+      "responseSubtype": "success"
+    },
+    {
+      "name": "auto",
+      "request": {
+        "subtype": "set_permission_mode",
+        "mode": "auto"
+      },
+      "responseSubtype": "success"
+    },
+    {
+      "name": "reset-effort",
+      "request": {
+        "subtype": "apply_flag_settings",
+        "settings": {
+          "effortLevel": null
+        }
+      },
+      "responseSubtype": "success"
+    }
+  ],
+  "passed": true
+}

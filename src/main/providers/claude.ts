@@ -17,8 +17,8 @@ const display = (value: Json | undefined): string => typeof value === 'string' ?
 interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean }
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; captured?: boolean }
-interface Block { id: string; kind: string; input: string }
-interface Request { interaction: PendingInteraction; input: ObjectValue; toolId?: string; submitting: boolean }
+interface Block { id: string; kind: string; input: string; text: string }
+interface Request { interaction: PendingInteraction; input: ObjectValue; toolId?: string; submitting: boolean; permissionUpdates?: Json[] }
 
 function readVersion(executable: string): Promise<string> {
   return new Promise((resolve, reject) => execFile(executable, ['--version'], { windowsHide: true, timeout: 10_000, maxBuffer: 4096 }, (error, stdout) => {
@@ -33,14 +33,14 @@ export class ClaudeAdapter implements ProviderAdapter {
   readonly capabilities: ProviderCapabilities = {
     provider: 'claude', runtimeVersion: 'unknown', adapterVersion: 1, authentication: 'cli',
     textStreaming: true, toolInputStreaming: true, toolOutputStreaming: false,
-    approvals: true, questions: true, resume: true, fork: false, plans: true, permissions: ['default', 'accept-edits'],
+    approvals: true, questions: true, resume: true, fork: false, plans: true, permissions: ['default', 'accept-edits', 'auto'],
     effort: ['low', 'medium', 'high', 'xhigh', 'max'], models: [],
     limitations: [
       'CLI authentication is inherited; subscription quota and API billing are not inferred from cost telemetry.',
       'Command output arrives with the tool result; token streaming does not imply command-output streaming.',
       'Read-only sandbox, native checkpoint/fork controls, cloud delegation and extension-only dialogs are not exposed.',
       'Conductor snapshots cover observed Edit/Write/NotebookEdit hooks only; shell edits and concurrent external changes cannot be attributed.',
-      'Effort changes require an explicit resumed runtime; available effort levels depend on the selected model.'
+      'Effort changes apply to the next turn through the native settings control; available levels depend on the selected model.'
     ]
   }
   private transport?: Transport
@@ -58,6 +58,9 @@ export class ClaudeAdapter implements ProviderAdapter {
   private streams = new Map<string, { messageId: string; blocks: Map<number, Block> }>()
   private seen = new Set<string>()
   private hookRequests = new Set<string>()
+  private completedBlocks = new Set<string>()
+  private replies = new Map<string, ObjectValue>()
+  private messageUsage = new Map<string, ObjectValue>()
   private initializedMetadata: Json = {}
   private configurationMetadata: Json = {}
   private cumulativeCostUsd = 0
@@ -103,7 +106,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         const effort = model.supportsEffort === false ? [] : Array.isArray(model.supportedEffortLevels)
           ? model.supportedEffortLevels.filter((value): value is string => typeof value === 'string' && this.capabilities.effort.includes(value))
           : model.supportsEffort === true ? this.capabilities.effort : []
-        return id ? [{ id, label: string(model.displayName) ?? string(model.name) ?? id, ...(effort ? { effort } : {}) }] : []
+        return id ? [{ id, label: string(model.displayName) ?? string(model.name) ?? id, effort, ...(string(model.defaultEffort) ? { defaultEffort: string(model.defaultEffort) } : {}), ...(model.isDefault === true ? { isDefault: true } : {}) }] : []
       })
       this.ready = true
       this.initializedMetadata = initialized
@@ -121,7 +124,6 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.active || this.requests.size) throw new Error('Claude is already processing a turn')
     if (/^\/(clear|reset|new)(?:\s|$)/i.test(text.trim())) throw new Error('Conversation reset requires a new Conductor session; the existing native conversation is preserved')
     this.validateSettings(settings)
-    if (settings.effort !== this.settings.effort) throw new Error('Changing Claude effort requires an explicit resume before the next turn')
     const imageBlocks: Json[] = []
     let encodedImageBytes = 0
     for (const image of attachments.filter((item) => item.kind === 'image')) {
@@ -130,9 +132,11 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (encodedImageBytes > 4 * 1024 * 1024) throw new Error('Claude image attachments exceed the 4 MiB combined message limit')
       imageBlocks.push(block)
     }
+    if (settings.effort !== this.settings.effort) await this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: settings.effort ?? null } })
     if (settings.model !== this.settings.model) await this.control({ subtype: 'set_model', model: settings.model ?? null })
     if (this.permissionMode(settings) !== this.permissionMode(this.settings)) await this.control({ subtype: 'set_permission_mode', mode: this.permissionMode(settings) })
     this.settings = { ...settings }
+    this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), ...(settings.model ? { model: settings.model } : {}), effort: settings.effort ?? null, permissionMode: this.permissionMode(settings) }
     this.turnId = randomUUID()
     this.hasAssistantText = false
     this.stopRequested = false
@@ -144,7 +148,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       const message: Json = { type: 'user', uuid: this.turnId, session_id: this.nativeSessionId ?? '', parent_tool_use_id: null, message: { role: 'user', content } }
       if (imageBlocks.length && Buffer.byteLength(JSON.stringify(message)) > 4 * 1024 * 1024) throw new Error('Claude image attachments exceed the 4 MiB combined message limit')
       this.transport.send(message)
-      this.emit({ data: { type: 'session', phase: 'running' } })
+      this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
     } catch (error) { this.active = false; throw error }
   }
 
@@ -153,7 +157,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     const pending = this.requests.get(response.requestId)
     if (!pending || pending.submitting || !this.transport?.connected) throw new Error('Approval is stale, disconnected, or already resolved')
     const decision = response.decision ?? (response.answers ? 'allow' : '')
-    if (!['allow', 'deny', 'abort'].includes(decision)) throw new Error('Unsupported Claude permission decision')
+    if (!pending.interaction.choices.some(choice => choice.id === decision)) throw new Error('Unsupported Claude permission decision')
+    const allowed = decision === 'allow' || decision === 'allow-session'
     let input: Json = pending.input
     if (pending.interaction.kind === 'question' && decision === 'allow') {
       const answers: ObjectValue = {}
@@ -167,12 +172,12 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     pending.submitting = true // claim synchronously across every pane before sending
     try {
-      this.reply(response.requestId, decision === 'allow'
-        ? { behavior: 'allow', updatedInput: input, ...(pending.toolId ? { toolUseID: pending.toolId } : {}) }
+      this.reply(response.requestId, allowed
+        ? { behavior: 'allow', updatedInput: input, ...(decision === 'allow-session' ? { updatedPermissions: pending.permissionUpdates ?? [] } : {}), ...(pending.toolId ? { toolUseID: pending.toolId } : {}) }
         : { behavior: 'deny', message: decision === 'abort' ? 'User cancelled this turn' : 'User denied this operation', interrupt: decision === 'abort', ...(pending.toolId ? { toolUseID: pending.toolId } : {}) })
       this.requests.delete(response.requestId)
       this.emit({ requestId: response.requestId, itemId: pending.toolId, data: { type: 'interaction', interaction: { ...pending.interaction, status: 'resolved', outcome: decision } } })
-      if (pending.toolId) this.updateTool(pending.toolId, { status: decision === 'allow' ? 'preparing' : decision === 'abort' ? 'interrupted' : 'rejected' })
+      if (pending.toolId) this.updateTool(pending.toolId, { status: allowed ? 'preparing' : decision === 'abort' ? 'interrupted' : 'rejected' })
       if (decision === 'abort') this.stopRequested = true
       this.emitWaiting()
     } catch (error) { pending.submitting = false; throw error }
@@ -207,7 +212,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (settings.permission === 'read-only') throw new Error('Claude CLI has no Conductor read-only sandbox; use explicit permissions or plan mode')
     if (settings.effort && !this.capabilities.effort.includes(settings.effort)) throw new Error('Unsupported Claude effort level')
   }
-  private permissionMode(settings: SessionSettings): string { return settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : 'default' }
+  private permissionMode(settings: SessionSettings): string { return settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
   private async imageInput(attachment: ContextAttachment): Promise<Json> {
     if (!attachment.path) throw new Error('Claude image attachment requires a local workspace path')
     const path = await workspacePath(this.options.cwd, attachment.path)
@@ -244,6 +249,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
   private reply(requestId: string, response: ObjectValue): void {
     this.transport!.send({ type: 'control_response', response: { subtype: 'success', request_id: requestId, response } })
+    this.replies.set(requestId, response)
+    if (this.replies.size > 2048) this.replies.delete(this.replies.keys().next().value!)
   }
   private replyError(requestId: string, error: string): void {
     this.transport!.send({ type: 'control_response', response: { subtype: 'error', request_id: requestId, error } })
@@ -286,8 +293,11 @@ export class ClaudeAdapter implements ProviderAdapter {
       for (const [index, content] of array(body.content).entries()) {
         const block = object(content)
         if (block.type === 'text' && type === 'assistant' && messageId) {
-          this.hasAssistantText = true
-          this.emit({ itemId: `${messageId}:${index}`, parentId, data: { type: 'text', role: 'assistant', text: string(block.text) ?? '', mode: 'snapshot' } })
+          const id = `${messageId}:${index}`, text = this.visibleText(string(block.text) ?? '')
+          this.completedBlocks.add(id)
+          if (this.completedBlocks.size > 8192) this.completedBlocks.delete(this.completedBlocks.values().next().value!)
+          if (text && !parentId) this.hasAssistantText = true
+          this.emit({ itemId: id, parentId, data: { type: 'text', role: 'assistant', text, mode: 'snapshot' } })
         } else if (block.type === 'tool_use' && typeof block.id === 'string') {
           this.declareTool(block.id, string(block.name) ?? 'Unknown tool', block.input ?? {}, parentId)
         } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
@@ -312,34 +322,38 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     if (type === 'result') {
       const failure = message.is_error === true || (typeof message.subtype === 'string' && message.subtype !== 'success')
-      if (!this.hasAssistantText && typeof message.result === 'string' && !failure) this.emit({ itemId: uuid ?? `result:${this.turnId}`, data: { type: 'text', role: 'assistant', mode: 'snapshot', text: message.result } })
+      const resultText = this.visibleText(string(message.result) ?? '')
+      if (!this.hasAssistantText && resultText && !failure && !this.stopRequested) {
+        this.hasAssistantText = true
+        this.emit({ itemId: `result:${this.turnId ?? uuid}`, data: { type: 'text', role: 'assistant', mode: 'snapshot', text: resultText } })
+      }
       const usage = object(message.usage)
-      this.emit({ data: { type: 'usage', source: 'provider', inputTokens: number(usage.input_tokens), outputTokens: number(usage.output_tokens), cachedTokens: number(usage.cache_read_input_tokens) } })
+      this.usage(usage, `usage:turn:${this.turnId ?? uuid ?? randomUUID()}`, 'turn', parentId)
       const cumulativeCost = number(message.total_cost_usd)
       // CLI stream-input results contain per-turn tokens but runtime-cumulative estimated cost.
       // Cost is computed from the CLI price table, not authoritative account billing/quota.
       if (cumulativeCost !== undefined && cumulativeCost >= this.cumulativeCostUsd) {
-        this.emit({ data: { type: 'usage', source: 'estimate', costUsd: cumulativeCost - this.cumulativeCostUsd }, native: { method: 'result/estimated_cost', payload: { total_cost_usd: cumulativeCost, scope: 'runtime_cumulative' } } })
+        if (cumulativeCost > this.cumulativeCostUsd || cumulativeCost === 0) this.emit({ itemId: `usage:cost:${this.turnId ?? uuid ?? randomUUID()}`, parentId, data: { type: 'usage', scope: 'turn', source: 'estimate', costUsd: cumulativeCost - this.cumulativeCostUsd }, native: { method: 'result/estimated_cost', payload: { total_cost_usd: cumulativeCost, scope: 'runtime_cumulative' } } })
         this.cumulativeCostUsd = cumulativeCost
       } else if (cumulativeCost !== undefined) {
         this.emit({ data: { type: 'notice', message: 'Claude reported a lower cumulative cost; this turn cost estimate is unknown', payload: { total_cost_usd: cumulativeCost } } })
       }
       this.active = false
       this.expireRequests('Turn ended')
-      if (failure) this.emit({ data: { type: 'error', message: array(message.errors).map(display).join('\n') || string(message.result) || string(message.subtype) || 'Claude turn failed' } })
+      if (failure && !this.stopRequested) this.emit({ data: { type: 'error', message: this.visibleText(array(message.errors).map(display).join('\n')) || resultText || string(message.subtype) || 'Claude turn failed' } })
       for (const [id, tool] of this.tools) if (['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: this.stopRequested ? 'interrupted' : 'failed' })
       this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupted' : failure ? 'failed' : 'completed', nativeSessionId: this.nativeSessionId }, native: { method: 'result', payload: message } })
       return
     }
     if (type === 'system' && message.subtype === 'init') {
       this.configurationMetadata = message
-      if (typeof message.model === 'string') this.capabilities.effectiveSettings = { model: message.model }
+      if (typeof message.model === 'string') this.capabilities.effectiveSettings = { model: message.model, effort: this.settings.effort ?? string(message.effort) ?? null, permissionMode: string(message.permissionMode) ?? this.permissionMode(this.settings) }
       if (typeof message.claude_code_version === 'string') this.capabilities.runtimeVersion = message.claude_code_version
       this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', nativeSessionId: this.nativeSessionId, capabilities: this.capabilities }, native: { method: 'system/init', payload: message } })
       return
     }
     if (type === 'system' && ['task_started', 'task_progress', 'task_notification'].includes(string(message.subtype) ?? '')) {
-      const id = string(message.tool_use_id) ?? string(message.task_id)
+      const id = string(message.task_id) ?? string(message.tool_use_id)
       const status = message.status === 'failed' ? 'failed' : message.status === 'stopped' ? 'interrupted' : message.status === 'completed' ? 'completed' : 'running'
       this.emit({ itemId: id ? `task:${id}` : undefined, parentId: string(message.tool_use_id) ?? parentId, data: { type: 'subagent', name: string(message.description) ?? string(message.summary) ?? 'Background activity', status }, native: { method: `system/${String(message.subtype)}`, payload: message } })
       return
@@ -350,30 +364,44 @@ export class ClaudeAdapter implements ProviderAdapter {
   private stream(message: ObjectValue, parentId?: string): void {
     const event = object(message.event), key = parentId ?? 'main'
     if (event.type === 'message_start') {
-      const id = string(object(event.message).id)
-      if (id) this.streams.set(key, { messageId: id, blocks: new Map() })
+      const body = object(event.message), id = string(body.id)
+      if (id) {
+        this.streams.set(key, { messageId: id, blocks: new Map() })
+        this.usage(object(body.usage), `usage:message:${id}`, 'message', parentId)
+        if (!parentId && typeof body.model === 'string') {
+          this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: body.model, ...(this.settings.effort ? { effort: this.settings.effort } : {}) }
+          this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
+        }
+      }
       return
     }
     const stream = this.streams.get(key), index = number(event.index)
     if (!stream) return
     if (event.type === 'message_stop') { this.streams.delete(key); return }
+    if (event.type === 'message_delta') { this.usage(object(event.usage), `usage:message:${stream.messageId}`, 'message', parentId); return }
     if (index === undefined) return
     if (event.type === 'content_block_start') {
       const block = object(event.content_block), kind = string(block.type) ?? 'unknown'
       const id = kind === 'tool_use' ? string(block.id) : `${stream.messageId}:${index}`
       if (!id) return
-      stream.blocks.set(index, { id, kind, input: '' })
+      stream.blocks.set(index, { id, kind, input: '', text: string(block.text) ?? '' })
       if (kind === 'tool_use') this.declareTool(id, string(block.name) ?? 'Unknown tool', block.input ?? {}, parentId)
-      else if (kind === 'text' && typeof block.text === 'string' && block.text) this.emit({ itemId: id, parentId, data: { type: 'text', role: 'assistant', mode: 'delta', text: block.text } })
+      else if (kind === 'text' && typeof block.text === 'string' && block.text && !this.completedBlocks.has(id)) {
+        const text = this.visibleText(block.text, true)
+        if (text) { if (!parentId) this.hasAssistantText = true; this.emit({ itemId: id, parentId, data: { type: 'text', role: 'assistant', mode: 'snapshot', text } }) }
+      }
       return
     }
     const block = stream.blocks.get(index)
-    if (!block) return
+    if (!block || this.completedBlocks.has(block.id)) return
     if (event.type === 'content_block_delta') {
       const delta = object(event.delta)
       if (delta.type === 'text_delta' && typeof delta.text === 'string') {
-        this.hasAssistantText = true
-        this.emit({ itemId: block.id, parentId, data: { type: 'text', role: 'assistant', mode: 'delta', text: delta.text } })
+        const previous = this.visibleText(block.text, true)
+        block.text += delta.text
+        const text = this.visibleText(block.text, true)
+        if (text && !parentId) this.hasAssistantText = true
+        if (text !== previous) this.emit({ itemId: block.id, parentId, data: { type: 'text', role: 'assistant', ...(text.startsWith(previous) ? { mode: 'delta' as const, text: text.slice(previous.length) } : { mode: 'snapshot' as const, text }) } })
       } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
         block.input += delta.partial_json
         if (Buffer.byteLength(block.input) > 1024 * 1024) throw new Error('Claude tool input exceeds 1 MiB preview limit')
@@ -384,6 +412,22 @@ export class ClaudeAdapter implements ProviderAdapter {
       catch { this.emit({ itemId: block.id, data: { type: 'notice', message: 'Incomplete tool input JSON; awaiting the authoritative complete message' } }) }
       // Tool declaration completed, not execution. Only native progress/result proves execution.
     }
+  }
+
+  private visibleText(text: string, partial = false): string {
+    return text.split('\n').filter(line => !/^\s*\[ede_diagnostic\]/.test(line)).filter((line, index, lines) => {
+      const candidate = line.trimStart()
+      return !(partial && index === lines.length - 1 && candidate.length > 0 && '[ede_diagnostic]'.startsWith(candidate))
+    }).join('\n')
+  }
+  private usage(update: ObjectValue, itemId: string, scope: 'message' | 'turn', parentId?: string): void {
+    const previous = this.messageUsage.get(itemId) ?? {}, usage = { ...previous, ...update }
+    this.messageUsage.set(itemId, usage)
+    if (this.messageUsage.size > 4096) this.messageUsage.delete(this.messageUsage.keys().next().value!)
+    const uncached = number(usage.input_tokens), cachedTokens = number(usage.cache_read_input_tokens), cacheCreationTokens = number(usage.cache_creation_input_tokens), outputTokens = number(usage.output_tokens)
+    const inputTokens = uncached === undefined ? undefined : uncached + (cachedTokens ?? 0) + (cacheCreationTokens ?? 0)
+    if ([inputTokens, cachedTokens, cacheCreationTokens, outputTokens].every(value => value === undefined)) return
+    this.emit({ itemId, parentId, data: { type: 'usage', scope, source: 'provider', inputTokens, cachedTokens, cacheCreationTokens, outputTokens, ...(inputTokens !== undefined && outputTokens !== undefined ? { totalTokens: inputTokens + outputTokens } : {}) } })
   }
 
   private declareTool(id: string, name: string, input: Json, parentId?: string): void {
@@ -404,6 +448,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private async runtimeRequest(message: ObjectValue): Promise<void> {
     const id = string(message.request_id), request = object(message.request)
     if (!id) throw new Error('Malformed Claude control request without identity')
+    const replied = this.replies.get(id)
+    if (replied) { this.reply(id, replied); return }
     if (this.requests.has(id) || this.hookRequests.has(id)) return
     if (request.subtype === 'hook_callback') {
       this.hookRequests.add(id)
@@ -423,16 +469,22 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.updateTool(toolId, { status: 'awaiting_approval' })
     }
     const question = name === 'AskUserQuestion'
+    // Use only native, tool-specific allow suggestions; keep the grant inside this session.
+    const permissionUpdates = array(request.permission_suggestions ?? request.permissionSuggestions ?? request.suggestions).flatMap(value => {
+      const update = object(value), rules = array(update.rules)
+      return update.type === 'addRules' && update.behavior === 'allow' && rules.length && rules.every(rule => string(object(rule).toolName) === name)
+        ? [{ ...update, destination: 'session' }] : []
+    })
     const interaction: PendingInteraction = {
       id, kind: question ? 'question' : 'approval', status: 'pending', title: string(request.title) ?? (question ? 'Claude needs your input' : `Allow ${name}?`),
-      input, choices: [{ id: 'allow', label: question ? 'Submit answers' : 'Allow once' }, { id: 'deny', label: 'Deny' }, { id: 'abort', label: 'Cancel turn' }],
+      input, choices: [{ id: 'allow', label: question ? 'Submit answers' : 'Allow once' }, ...(!question && permissionUpdates.length ? [{ id: 'allow-session', label: 'Allow for this session' }] : []), { id: 'deny', label: 'Deny' }, { id: 'abort', label: 'Cancel turn' }],
       ...(question ? { questions: array(input.questions).map((value, index) => {
         const entry = object(value)
         return { id: `question:${index}`, question: string(entry.question) ?? '', header: string(entry.header), multiSelect: entry.multiSelect === true,
           options: array(entry.options).map((option) => ({ label: string(object(option).label) ?? '', description: string(object(option).description) })) }
       }) } : {})
     }
-    this.requests.set(id, { interaction, input, toolId, submitting: false })
+    this.requests.set(id, { interaction, input, toolId, submitting: false, permissionUpdates })
     this.emit({ requestId: id, itemId: toolId, data: { type: 'interaction', interaction }, native: { method: 'can_use_tool', payload: request } })
     this.emitWaiting()
   }

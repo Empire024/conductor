@@ -26,6 +26,14 @@ interface DetachedBundle {
 }
 
 export function DetachedWindowApp({ detachedId }: { detachedId: string }): React.JSX.Element {
+  useEffect(() => {
+    const restore = (event: KeyboardEvent): void => {
+      if (!(event.ctrlKey || event.metaKey) || !event.shiftKey || event.altKey || event.key.toLowerCase() !== 'z') return
+      event.preventDefault(); event.stopPropagation(); void window.conductor.sessions.restore().catch((error: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: String(error) })))
+    }
+    window.addEventListener('keydown', restore, true)
+    return () => window.removeEventListener('keydown', restore, true)
+  }, [])
   const [loadedProjects, setLoadedProjects] = useState<ProjectRecord[]>([])
   useEffect(() => { const refresh = (): void => { void window.conductor.projects.list().then(setLoadedProjects) }; refresh(); window.addEventListener('focus', refresh); return () => window.removeEventListener('focus', refresh) }, [])
   const [bundle, setBundle] = useState<DetachedBundle | null>(null)

@@ -40,11 +40,11 @@ for await (const line of input) {
       // Delayed metadata response exercises pressing Send during initialization.
       await new Promise(resolve => setTimeout(resolve, 800))
       initialized = true
-      success(message.request_id, { models: [{ value: 'synthetic-claude', displayName: 'Synthetic Claude fixture' }], commands: [{ name: 'fixture', description: 'Synthetic discovery only' }] })
+      success(message.request_id, { models: [{ value: 'synthetic-claude', displayName: 'Synthetic Claude fixture', supportsEffort: true, supportedEffortLevels: ['low', 'high'], defaultEffort: 'high' }], commands: [{ name: 'fixture', description: 'Synthetic discovery only' }] })
     } else if (kind === 'interrupt') {
       if (pending) send({ type: 'control_cancel_request', request_id: pending })
-      pending = undefined; success(message.request_id); finish()
-    } else if (kind === 'set_model' || kind === 'set_permission_mode') success(message.request_id)
+      pending = undefined; success(message.request_id); emit({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use', usage: {} })
+    } else if (kind === 'set_model' || kind === 'set_permission_mode' || kind === 'apply_flag_settings') success(message.request_id)
     else send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Unsupported synthetic control' } })
   } else if (message.type === 'user') {
     if (!initialized) throw new Error('User message before initialization')
@@ -52,6 +52,14 @@ for await (const line of input) {
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
     turn++
     emit({ type: 'system', subtype: 'init', claude_code_version: '2.1.263', tools: ['Edit', 'Bash'], mcp_servers: [], permissionMode: 'default' })
+    if (prompt.startsWith('SYNTHETIC QUESTION')) {
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', effort: 'high', claude_code_version: '2.1.263' })
+      const answerText = 'I have one question before continuing.'
+      text(answerText)
+      pending = 'question-' + turn
+      send({ type: 'control_request', request_id: pending, request: { subtype: 'can_use_tool', tool_name: 'AskUserQuestion', tool_use_id: pending, input: { questions: [{ header: 'Appearance', question: 'Which theme should this workspace use?', multiSelect: false, options: [{ label: 'Night', description: 'A quiet, dark workspace.' }, { label: 'Day', description: 'A bright workspace for daytime.' }] }] } } })
+      continue
+    }
     if (prompt.startsWith('SYNTHETIC B')) {
       text('**Synthetic fixture continuation:** `wasOpen` and `wasPinned` were removed; the local Node test passed. This is offline fixture behavior, not live-provider context evidence.')
       finish(); continue
@@ -63,6 +71,15 @@ for await (const line of input) {
   } else if (message.type === 'control_response') {
     const { request_id: id, response } = message.response
     if (id !== pending) throw new Error('Response does not match the outstanding synthetic request')
+    if (id === 'question-' + turn) {
+      if (response.updatedInput.answers['Which theme should this workspace use?'] !== 'Night') throw new Error('Synthetic question answer changed')
+      result(pending, 'Answer received')
+      const summary = 'Night was selected.'
+      text(summary)
+      emit({ type: 'result', subtype: 'success', is_error: false, result: summary, usage: { input_tokens: 100, output_tokens: 20 } })
+      pending = undefined
+      continue
+    }
     if (id === `pre-${turn}`) {
       pending = `approval-${turn}`
       send({ type: 'control_request', request_id: pending, request: { subtype: 'can_use_tool', tool_use_id: `edit-${turn}`, tool_name: 'Edit', input: editInput, title: 'Allow synthetic two-line edit?' } })

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeThemeSettings } from './app-settings'
+import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 
 describe('theme settings migration', () => {
   it.each([
@@ -22,5 +22,13 @@ describe('theme settings migration', () => {
       themeAuto: 'false',
       legacyThemeMode: 'auto'
     })).toEqual({ themeId: 'obsidian', themeVariant: 'day', themeAuto: false })
+  })
+})
+
+describe('new file extension settings', () => {
+  it('normalizes conventional extensions and rejects paths or invalid suffixes', () => {
+    expect(normalizeNewFileExtension(' .MD ')).toBe('md')
+    expect(normalizeNewFileExtension('test.ts')).toBe('test.ts')
+    for (const value of ['../ts', 'a/b', 'a\\b', '', '.', 'md.', '..md', 'a'.repeat(33), null]) expect(normalizeNewFileExtension(value)).toBeNull()
   })
 })

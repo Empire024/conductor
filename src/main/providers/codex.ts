@@ -247,7 +247,7 @@ export class CodexAdapter implements ProviderAdapter {
       try {
         const catalog = await this.request<ModelListResponse>('model/list', { limit: 100, includeHidden: false })
         this.models = Array.isArray(catalog.data) ? catalog.data : []
-        this.capabilities.models = this.models.map(model => ({ id: model.model, label: model.displayName, effort: model.supportedReasoningEfforts.map(option => option.reasoningEffort), isDefault: model.isDefault }))
+        this.capabilities.models = this.models.map(model => ({ id: model.model, label: model.displayName, effort: model.supportedReasoningEfforts.map(option => option.reasoningEffort), defaultEffort: model.defaultReasoningEffort, isDefault: model.isDefault }))
         this.capabilities.effort = [...new Set(this.models.flatMap(model => model.supportedReasoningEfforts.map(option => option.reasoningEffort)))]
       } catch { this.capabilities.limitations.push('Model discovery failed; model and effort availability are unknown until the runtime accepts a turn.') }
       this.emit({ data: { type: 'session', phase: this.turnId ? 'running' : 'idle', nativeSessionId: this.threadId, capabilities: this.capabilities } })
@@ -523,7 +523,7 @@ export class CodexAdapter implements ProviderAdapter {
         send({ type: 'plan', steps: params.plan.map(step => ({ text: step.step, status: step.status === 'inProgress' ? 'in_progress' : step.status })), ...(params.explanation ? { explanation: params.explanation } : {}) }, { itemId: `plan:${params.turnId}` })
         return
       case 'thread/tokenUsage/updated':
-        send({ type: 'usage', inputTokens: params.tokenUsage.total.inputTokens, outputTokens: params.tokenUsage.total.outputTokens, cachedTokens: params.tokenUsage.total.cachedInputTokens, source: 'provider', limits: json({ modelContextWindow: params.tokenUsage.modelContextWindow }) }, { itemId: `usage:${params.threadId}` })
+        send({ type: 'usage', scope: 'session', inputTokens: params.tokenUsage.total.inputTokens, outputTokens: params.tokenUsage.total.outputTokens, cachedTokens: params.tokenUsage.total.cachedInputTokens, cacheCreationTokens: params.tokenUsage.total.cacheWriteInputTokens, totalTokens: params.tokenUsage.total.totalTokens, reasoningTokens: params.tokenUsage.total.reasoningOutputTokens, source: 'provider', limits: json({ modelContextWindow: params.tokenUsage.modelContextWindow }) }, { itemId: `usage:${params.threadId}`, turnId: undefined })
         return
       case 'thread/settings/updated':
         if (params.threadId === this.threadId) {
@@ -617,10 +617,11 @@ export class CodexAdapter implements ProviderAdapter {
           if (this.childParents.size >= 2048) this.childParents.delete(this.childParents.keys().next().value!)
           this.childParents.set(child, item.id)
           const state = item.agentsStates[child]
-          send({ type: 'subagent', name: 'Codex agent', nativeSessionId: child, status: state?.status === 'completed' ? 'completed' : state?.status === 'errored' ? 'failed' : 'running' }, { itemId: `thread:${child}`, parentId: item.id })
+          send({ type: 'subagent', name: 'Codex agent', nativeSessionId: child, status: state?.status === 'completed' ? 'completed' : state?.status === 'errored' || state?.status === 'notFound' ? 'failed' : state?.status === 'interrupted' || state?.status === 'shutdown' ? 'interrupted' : state?.status === 'pendingInit' ? 'preparing' : 'running' }, { itemId: `thread:${child}`, parentId: item.id })
         }
         return
       case 'subAgentActivity':
+        if (item.agentThreadId === this.threadId) return // Root activity is already represented by the session status.
         send({ type: 'subagent', name: item.agentPath, nativeSessionId: item.agentThreadId, status: item.kind === 'completed' ? 'completed' : item.kind === 'interrupted' ? 'interrupted' : 'running' }, { parentId: this.childParents.get(item.agentThreadId) })
         return
       default:

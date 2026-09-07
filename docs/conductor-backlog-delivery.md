@@ -1,6 +1,6 @@
 # Feature-list delivery
 
-Recorded 2026-09-07. The original bug items 1?12 and feature items 0?11 are implemented and validated. The follow-up delivery for bugs 13?17 is recorded below; later backlog additions remain pending. The source version stays unchanged; pushing this tested state to main lets the release workflow choose the next patch. Publication must be verified after the push.
+Recorded 2026-09-07. The original bug items 1-12 and feature items 0-11 are implemented and validated. Follow-up deliveries for bugs 13-33 and features 12-13 are recorded below; every item in feature-list.md is implemented. The source version stays unchanged; pushing this tested state to main lets the release workflow choose the next patch. Publication must be verified after the push.
 
 ## Behavior
 
@@ -30,7 +30,7 @@ Monaco 0.52.2 can reject its pending word-highlighter delay with `Canceled` when
 
 The broader native-extension parity work and future roadmap in the existing handoffs are separate from this feature list. Their earlier live-validation limits still apply.
 
-## Bug items 13?17 ? 2026-09-07
+## Bug items 13-17 - 2026-09-07
 
 - **13:** Ctrl+E starts its initial search immediately, retains arrow presses received while results load, scrolls the selected file into view, and prevents a stationary pointer from resetting keyboard selection. Enter opens the selected file while search retains focus.
 - **14:** Codex and Claude retain the selected model's effort metadata. The control disappears for models without effort; changing models clears an incompatible setting. Claude's default alias remains supported, and Codex no longer carries another model's default effort into a model without reasoning. Claude metadata fields follow the [official ModelInfo contract](https://code.claude.com/docs/en/agent-sdk/typescript#modelinfo).
@@ -40,4 +40,33 @@ The broader native-extension parity work and future roadmap in the existing hand
 
 Validation for this delivery: `npm.cmd test` passed 299 Vitest tests plus 13 Node tests (312 total); `npm.cmd run build` passed. The production Electron backlog smoke passed 24 check groups, including all five fixes. [Results](evidence/backlog-13-17/results.json). [Add agent screenshot](evidence/backlog-13-17/add-agent.png) was visually inspected.
 
-Both installed native CLIs also passed an isolated empty-conversation Chat ? CLI ? Chat check with the same native ID and zero user prompts or inference submissions: [Codex](evidence/backlog-13-17/native-codex.json), [Claude](evidence/backlog-13-17/native-claude.json). The offline fixture now reproduces Codex's unmaterialized-history error and persists metadata across its process restart. No live allowance was reset. Release publication is verified after pushing the tested commit to main.
+Both installed native CLIs also passed an isolated empty-conversation Chat -> CLI -> Chat check with the same native ID and zero user prompts or inference submissions: [Codex](evidence/backlog-13-17/native-codex.json), [Claude](evidence/backlog-13-17/native-claude.json). The offline fixture now reproduces Codex's unmaterialized-history error and persists metadata across its process restart. No live allowance was reset. Release publication is verified after pushing the tested commit to main.
+
+## Remaining backlog and additions 18-33 / features 12-13 - 2026-09-07
+
+This delivery includes the later additions made to feature-list.md during implementation (28-33), and the display examples in session.md.
+
+- **18:** New user messages retain only the typed prompt and attachment names in the conversation; providers still receive the captured file bytes. Older Conductor attachment suffixes remain accessible in a collapsed context disclosure.
+- **19:** Up to 100 messages can be queued, removed individually, recovered into the composer, and dispatched in order. Each entry captures its settings and attachment bytes. Completion/acknowledgement races cannot strand the next entry. Model labels resolve the actual configured/runtime model and reported effort; unknown metadata is explicit.
+- **20-21:** Claude reconciles streamed and final messages by native identity, reuses responses to duplicate permission requests, and supports native session-scoped permission grants. Auto, Ask, Edit, and Plan appear in the composer when supported. Effort updates use the acknowledged native control channel, preserving the runtime and session grants.
+- **22-25:** Following the bottom survives streamed content and layout changes; returning to the bottom resumes the latest output automatically. Selections in another pane no longer pause this conversation. Compact tab/action rows remove the duplicate title and stop control. Questions use full-card native inputs; optional request details follow the actions. Split dividers take no layout space and retain pointer and keyboard resizing.
+- **26:** Stop diagnostics remain available as native events without appearing as assistant prose. Interrupted conversations retain their native identity.
+- **27:** Editor drafts record the disk baseline. Clean checkpoints are removed rather than treated as edits. Explicit saves and close/update saves compare the current file with that baseline before atomic replacement, reject stale or conflicting versions, serialize repeated saves, and preserve newer edits arriving during save/close. Conflicts retain the draft and offer Save a copy or Reload from disk. Legacy drafts without a known baseline cannot overwrite differing disk contents.
+- **28:** Ctrl+E retains results during debounced searches and keeps the result area stable. Enter during a pending search waits for that query rather than opening a stale match.
+- **29, 31:** Workspace closing is reversible and keeps layout, tab IDs, conversation history and detached pane records. Ctrl+Shift+Z and Bring back workspace restore the last closed workspace. Sidebar double-click renames inline. Sidebar and workspace-tab context menus share the same actions.
+- **30:** Restart to update retains readable foreground/background contrast on hover.
+- **32:** New file immediately creates a unique untitled.md, opens its editor and selects the inline tab name. Escape keeps the default name; Enter or blur commits a collision-safe rename. Settings stores the default extension for subsequent files.
+- **33:** Adjacent completed tool calls collapse into expandable activity groups. Failures, running operations, pending requests and substantive messages remain visible. Exact input/output stays accessible; inline scripts have readable labels. Repeated child statuses move to the subagent roster, and root self-status is ignored.
+- **Features 12-13:** Every conversation offers View usage. The running status shows reported token counts as updates arrive, with reasoning, cache, context, cost and account limits where supplied. Missing data is not invented. Cumulative session snapshots are not added together; final Claude turn totals replace partial reports; child usage is not double-counted. The subagent roster shows counts, names and latest reported states, with unavailable states explicit.
+
+Validation for the integrated delivery:
+
+- `npm.cmd test`: **351 Vitest tests across 50 files + 13 Node tests (364 total)** passed.
+- `npm.cmd run build`: TypeScript and production main/preload/renderer bundles passed.
+- Production Electron smoke checks: backlog **26**, editor safety/new files **10**, workspace recovery **5**, conversation controls **3**, activity grouping **2**, telemetry **6**, structured provider UI **14 Codex / 12 Claude**, composer drafts **8 per provider** (**94 check groups** total).
+- Evidence: [backlog](evidence/backlog-followup/backlog-results.json), [editor safety](evidence/backlog-followup/editor-safety-results.json), [workspace recovery](evidence/backlog-followup/workspace-restore-results.json), [conversation controls](evidence/backlog-followup/conversation-results.json), [activity grouping](evidence/backlog-followup/conversation-declutter-results.json), [telemetry](evidence/backlog-followup/telemetry-results.json), [Codex UI](evidence/backlog-followup/structured-codex-results.json), [Claude UI](evidence/backlog-followup/structured-claude-results.json), [Codex drafts](evidence/backlog-followup/drafts-codex-results.json), [Claude drafts](evidence/backlog-followup/drafts-claude-results.json).
+- Screenshots were inspected for the [question and queue](evidence/backlog-followup/claude-question-queue.png), [collapsed actions](evidence/backlog-followup/conversation-declutter-collapsed.png), [usage details](evidence/backlog-followup/telemetry-usage.png), [subagent roster](evidence/backlog-followup/telemetry-subagents.png), [workspace menu](evidence/backlog-followup/workspace-restore-menu.png), [inline new file](evidence/backlog-followup/editor-inline-new-file.png), and [conflict recovery](evidence/backlog-followup/editor-conflict-recovery.png).
+
+These checks used isolated profiles and offline protocol fixtures with the actual production renderer, IPC, SQLite, Monaco and provider adapters. They verified exact disk bytes and controlled asynchronous save/send races. Native clipboard checks passed in this run. The exact synthetic edit fixture is normalized to LF before copying on Windows; its baseline failure and post-edit Node test both execute. No provider inference was submitted and no usage allowance was reset. The installed Claude 2.1.263 control channel also acknowledged effort high, effort reset, and Auto mode without a user turn ([native acknowledgements](evidence/backlog-followup/claude-native-controls.json)).
+
+Unrelated in-progress memory changes and the owner's recovery/transcript files are preserved in the shared working tree. The delivery was built and tested in an isolated checkout excluding that unfinished work. Package version and tags are left to the automatic release workflow. Completion requires the pushed commit's workflow to succeed and publish the installer, blockmap and latest.yml; the release is checked after the push.

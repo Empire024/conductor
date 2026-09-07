@@ -1,0 +1,27 @@
+import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
+
+const reported = (value: unknown): value is string => typeof value === 'string' && Boolean(value) && !['default', 'auto'].includes(value)
+export function modelDisplayName(id: string): string {
+  if (/^gpt-\d/i.test(id)) return id.split('-').map((part, index) => index === 0 ? 'GPT' : /^\d/.test(part) ? part : part[0]!.toUpperCase() + part.slice(1)).join(' ')
+  return id
+}
+export function resolvedComposerSettings(settings: SessionSettings, capabilities?: ProviderCapabilities): { model: string; label: string; effort?: string } {
+  const effective = capabilities?.effectiveSettings
+  const values = effective && typeof effective === 'object' && !Array.isArray(effective) ? effective : {}
+  const configured = reported(settings.model) ? settings.model : undefined
+  const catalogDefault = capabilities?.models.find(model => model.isDefault && reported(model.id))
+  const model = configured ?? (reported(values.model) ? values.model : catalogDefault?.id) ?? ''
+  const info = capabilities?.models.find(option => option.id === model)
+  const label = info && !/^default\b/i.test(info.label) ? modelDisplayName(info.label) : model ? modelDisplayName(model) : capabilities ? 'Model not reported' : 'Choose model'
+  const effort = reported(settings.effort) ? settings.effort : (!configured || configured === values.model) && reported(values.effort) ? values.effort : info?.defaultEffort
+  return { model, label, effort }
+}
+
+export function conversationModes(capabilities?: ProviderCapabilities): Array<{ id: string; label: string; change: Partial<SessionSettings> }> {
+  if (!capabilities) return []
+  if (capabilities.provider === 'codex') return capabilities.plans ? [{ id: 'edit', label: 'Edit', change: { plan: false } }, { id: 'plan', label: 'Plan', change: { plan: true } }] : []
+  const labels: Record<SessionSettings['permission'], string> = { default: 'Ask', auto: 'Auto', 'accept-edits': 'Edit', 'read-only': 'Read only' }
+  const modes = (capabilities.permissions ?? []).map(permission => ({ id: permission as string, label: labels[permission], change: { permission, plan: false } as Partial<SessionSettings> }))
+  if (capabilities.plans) modes.push({ id: 'plan', label: 'Plan', change: { plan: true } })
+  return modes
+}

@@ -3,6 +3,9 @@ import Editor, { type BeforeMount, type OnMount } from '@monaco-editor/react'
 import { Check, FilePlus2, LoaderCircle, Save, WrapText } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
 import { dispatchAgentContext } from './StructuredAgentPane'
+import { AgentDialog } from './StructuredAgentRenderers'
+import { recoverEditorDraft } from './editor-draft-state'
+import './CodePane.css'
 
 const languageFor = (path: string): string => {
   const ext = path.split('.').pop()?.toLowerCase()
@@ -15,7 +18,7 @@ const languageFor = (path: string): string => {
   )
 }
 
-export function CodePane({ project, tabId, path, line }: { project: ProjectRecord; tabId: string; path: string; line?: number }): React.JSX.Element {
+export function CodePane({ project, tabId, path, line, autoFocus = true }: { project: ProjectRecord; tabId: string; path: string; line?: number; autoFocus?: boolean }): React.JSX.Element {
   const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('conductor.editorWordWrap') !== 'off')
   const toggleWrap = (): void => setWordWrap((current) => { localStorage.setItem('conductor.editorWordWrap', current ? 'off' : 'on'); return !current })
   const [value, setValue] = useState('')
@@ -24,63 +27,85 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
   const [saving, setSaving] = useState(false)
   const [recovered, setRecovered] = useState(false)
   const [error, setError] = useState('')
+  const [conflict, setConflict] = useState(false)
+  const [reloadOpen, setReloadOpen] = useState(false)
   const [theme, setTheme] = useState(document.documentElement.dataset.theme === 'light' ? 'conductor-light' : 'conductor-dark')
   const loadedRef = useRef(false)
   const valueRef = useRef(value)
   const savedValueRef = useRef(savedValue)
+  const baseContentRef = useRef<string | null | undefined>(undefined)
   const pathRef = useRef(path)
   const tabIdRef = useRef(tabId)
+  const projectIdRef = useRef(project.id)
+  const generationRef = useRef(0)
   const viewStateRef = useRef<unknown | null>(null)
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null)
   const draftTimerRef = useRef<number | null>(null)
+  const saveTaskRef = useRef<Promise<void> | null>(null)
+  const saveAgainRef = useRef(false)
+  const reloadingRef = useRef(false)
   valueRef.current = value
   savedValueRef.current = savedValue
   pathRef.current = path
   tabIdRef.current = tabId
+  projectIdRef.current = project.id
   const dirty = value !== savedValue
   const language = useMemo(() => languageFor(path), [path])
 
-  const flushDraft = (): void => {
+  const flushDraft = (event?: Event): void => {
     if (!loadedRef.current) return
     if (draftTimerRef.current !== null) {
       window.clearTimeout(draftTimerRef.current)
       draftTimerRef.current = null
     }
     viewStateRef.current = editorRef.current?.saveViewState() ?? viewStateRef.current
-    // A file can be renamed or moved from Explorer while it is open. Refs let
-    // the outgoing effect checkpoint its unsaved content under the new path.
-    window.conductor.files.flushDraft(tabIdRef.current, project.id, pathRef.current, valueRef.current, viewStateRef.current)
+    const ok = window.conductor.files.flushDraft(tabIdRef.current, projectIdRef.current, pathRef.current, valueRef.current, viewStateRef.current, baseContentRef.current)
+    if (!ok) {
+      if (event instanceof CustomEvent && event.detail) event.detail.failed = true
+      setError('Could not preserve your editor draft. Keep this window open and try saving again.')
+    }
   }
 
-  const checkpointDraft = (): void => {
-    if (valueRef.current === savedValueRef.current) return
+  const checkpointDraft = (contentChanged = false): void => {
+    if (!loadedRef.current || !contentChanged && valueRef.current === savedValueRef.current) return
     if (draftTimerRef.current !== null) window.clearTimeout(draftTimerRef.current)
+    // Also checkpoint an undo back to the saved text to remove an older draft.
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null
       viewStateRef.current = editorRef.current?.saveViewState() ?? viewStateRef.current
-      window.conductor.files.checkpointDraft(tabId, project.id, path, valueRef.current, viewStateRef.current)
+      window.conductor.files.checkpointDraft(tabIdRef.current, projectIdRef.current, pathRef.current, valueRef.current, viewStateRef.current, baseContentRef.current)
     }, 100)
   }
 
   useEffect(() => {
     let cancelled = false
+    generationRef.current++
     loadedRef.current = false
     setLoading(true)
+    setSaving(false)
     setRecovered(false)
+    setConflict(false)
+    setReloadOpen(false)
     setError('')
     void Promise.all([
-      window.conductor.files.read(project.id, path),
+      window.conductor.files.readForEditor(project.id, path),
       window.conductor.files.getDraft(tabId, project.id, path)
     ]).then(([content, draft]) => {
       if (cancelled) return
-      const recoveredContent = draft?.content ?? content
-      valueRef.current = recoveredContent
-      savedValueRef.current = content
+      const state = recoverEditorDraft(content, draft)
+      valueRef.current = state.content
+      savedValueRef.current = state.savedContent
+      baseContentRef.current = state.baseContent
       viewStateRef.current = draft?.viewState ?? null
-      setValue(recoveredContent)
-      setSavedValue(content)
+      setValue(state.content)
+      setSavedValue(state.savedContent)
       loadedRef.current = true
-      setRecovered(Boolean(draft && draft.content !== content))
+      setRecovered(state.recovered)
+      setConflict(state.conflict)
+      if (state.conflict) setError('The file on disk differs from this recovered draft. Both versions are preserved; save a copy or reload the file.')
+      else if (content === null && !draft) setError('This file no longer exists on disk.')
+      // Remove historical clean checkpoints, without writing anything to disk.
+      flushDraft()
     }).catch((reason: unknown) => {
       if (!cancelled) setError(reason instanceof Error ? reason.message : `Could not open ${path}`)
     }).finally(() => {
@@ -89,6 +114,8 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
     return () => {
       cancelled = true
       flushDraft()
+      loadedRef.current = false
+      generationRef.current++
     }
   }, [path, project.id, tabId])
 
@@ -120,33 +147,107 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
     window.dispatchEvent(new CustomEvent('conductor:editor-dirty', { detail: { id: tabId, dirty: !loading && dirty } }))
   }, [tabId, dirty, loading])
 
+  useEffect(() => window.conductor.files.onDraftConflict((result) => {
+    if (result.tabId === tabId) { setConflict(true); setError(result.message) }
+  }), [tabId])
+
   useEffect(() => window.conductor.files.onDraftResolved((result) => {
     if (result.tabId !== tabId) return
-    savedValueRef.current = result.content
-    setSavedValue(result.content)
-    if (valueRef.current === result.submitted) { valueRef.current = result.content; setValue(result.content); setRecovered(false) }
-    else flushDraft()
+    const unchanged = valueRef.current === result.submitted
+    // A discarded old draft must not authorize overwriting newer disk bytes
+    // with edits that arrived while another window was deciding to close.
+    if (unchanged || result.saved) {
+      baseContentRef.current = result.content
+      savedValueRef.current = result.content ?? ''
+      setSavedValue(savedValueRef.current)
+    }
+    if (unchanged) {
+      valueRef.current = result.content ?? ''
+      setValue(valueRef.current)
+      setRecovered(false)
+      setConflict(false)
+      setError('')
+    } else {
+      if (!result.saved && baseContentRef.current !== result.content) { setConflict(true); setError('The file changed while closing. Your newer edits are preserved; save a copy or reload the file.') }
+      flushDraft()
+    }
     queueMicrotask(() => window.dispatchEvent(new CustomEvent('conductor:editor-dirty', { detail: { id: tabId, dirty: valueRef.current !== savedValueRef.current } })))
   }), [tabId])
 
-  const save = async (): Promise<void> => {
+  const save = (): Promise<void> => {
+    if (!loadedRef.current || reloadingRef.current) return Promise.resolve()
+    if (saveTaskRef.current) { saveAgainRef.current = true; return saveTaskRef.current }
+    if (valueRef.current === savedValueRef.current && baseContentRef.current !== undefined) return Promise.resolve()
+    const generation = generationRef.current
+    const owner = { projectId: projectIdRef.current, path: pathRef.current, tabId: tabIdRef.current }
+    const isCurrent = (): boolean => generationRef.current === generation && owner.path === pathRef.current && owner.tabId === tabIdRef.current && owner.projectId === projectIdRef.current
+    editorRef.current?.pushUndoStop()
     setSaving(true)
     setError('')
+    const task = (async (): Promise<void> => {
+      try {
+        do {
+          saveAgainRef.current = false
+          const submittedValue = valueRef.current
+          flushDraft()
+          const result = await window.conductor.files.write(owner.projectId, owner.path, submittedValue, baseContentRef.current)
+          if (!isCurrent()) return
+          if (result.status === 'conflict') { setConflict(true); setError(result.message); return }
+          editorRef.current?.pushUndoStop()
+          baseContentRef.current = submittedValue
+          savedValueRef.current = submittedValue
+          setSavedValue(submittedValue)
+          setRecovered(false)
+          setConflict(false)
+          // A synchronous checkpoint preserves edits typed while saving, or
+          // removes the draft if the exact submitted buffer is still current.
+          flushDraft()
+        } while (saveAgainRef.current && valueRef.current !== savedValueRef.current)
+      } catch (reason) {
+        if (isCurrent()) {
+          const message = reason instanceof Error ? reason.message : `Could not save ${owner.path}`
+          setError(message)
+          window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message }))
+        }
+      } finally {
+        if (isCurrent()) setSaving(false)
+      }
+    })()
+    saveTaskRef.current = task
+    void task.finally(() => { if (saveTaskRef.current === task) saveTaskRef.current = null })
+    return task
+  }
+
+  const saveCopy = async (): Promise<void> => {
     try {
-      const submittedValue = valueRef.current
-      await window.conductor.files.write(project.id, path, submittedValue)
-      savedValueRef.current = submittedValue
-      setSavedValue(submittedValue)
+      const copy = await window.conductor.files.saveCopy(projectIdRef.current, pathRef.current, valueRef.current)
+      window.dispatchEvent(new Event('conductor:refresh-files'))
+      window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Your edits were saved to ' + copy }))
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+  }
+
+  const reload = async (): Promise<void> => {
+    if (reloadingRef.current || saveTaskRef.current) return
+    reloadingRef.current = true
+    const generation = generationRef.current
+    const submitted = valueRef.current
+    try {
+      const content = await window.conductor.files.readForEditor(projectIdRef.current, pathRef.current)
+      if (generation !== generationRef.current) return
+      if (submitted !== valueRef.current) { setError('Your edits changed while reloading. Try again when ready.'); return }
+      if (content === null) { setError('The file no longer exists. Save a copy to preserve your edits.'); return }
+      valueRef.current = content
+      savedValueRef.current = content
+      baseContentRef.current = content
+      setValue(content)
+      setSavedValue(content)
       setRecovered(false)
-      if (valueRef.current === submittedValue) await window.conductor.files.removeDraft(tabId)
-      else flushDraft()
-    } catch (reason) {
-      const message = reason instanceof Error ? reason.message : `Could not save ${path}`
-      setError(message)
-      window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message }))
-    } finally {
-      setSaving(false)
-    }
+      setConflict(false)
+      setError('')
+      setReloadOpen(false)
+      flushDraft()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+    finally { reloadingRef.current = false }
   }
 
   useEffect(() => {
@@ -234,9 +335,9 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
       _editor.setPosition({ lineNumber: line, column: 1 })
       _editor.revealLineInCenter(line)
     }
-    _editor.onDidScrollChange(checkpointDraft)
-    _editor.onDidChangeCursorPosition(checkpointDraft)
-    _editor.focus()
+    _editor.onDidScrollChange(() => checkpointDraft())
+    _editor.onDidChangeCursorPosition(() => checkpointDraft())
+    if (autoFocus) _editor.focus()
   }
 
   const attachContext = (): void => {
@@ -272,13 +373,15 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
           {dirty ? 'Save' : 'Saved'}
         </button>
       </div>
+      {error && loadedRef.current && <div className="code-save-error" role="alert"><span>{error}</span>{conflict && <div><button onClick={() => void saveCopy()}>Save a copy</button><button disabled={saving} onClick={() => setReloadOpen(true)}>Reload from disk</button></div>}</div>}
+      {reloadOpen && <AgentDialog title="Reload from disk?" onClose={() => setReloadOpen(false)}><div className="code-reload-dialog"><p>Reloading replaces your unsaved edits with the current file. Save a copy first if you want to keep both versions.</p><footer><button onClick={() => setReloadOpen(false)}>Cancel</button><button onClick={() => void reload()}>Reload from disk</button></footer></div></AgentDialog>}
       {loading ? (
         <div className="editor-loading"><LoaderCircle className="spin" size={18} /> Opening {path}</div>
-      ) : error && !value ? (
+      ) : error && !loadedRef.current ? (
         <div className="editor-loading">{error}</div>
       ) : (
         <Editor
-          path={`${project.id}/${path}`}
+          path={`${project.id}/${encodeURIComponent(tabId)}/${path}`}
           value={value}
           language={language}
           theme={theme}
@@ -287,7 +390,7 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
           onChange={(next) => {
             valueRef.current = next ?? ''
             setValue(valueRef.current)
-            checkpointDraft()
+            checkpointDraft(true)
           }}
           options={{
             automaticLayout: true,

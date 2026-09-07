@@ -65,3 +65,24 @@ describe('durable agent projection — synthetic events', () => {
     expect(initial?.type === 'tool' ? initial.output?.length : 0).toBeLessThanOrEqual(MAX_PREVIEW_CHARS)
   })
 })
+
+
+describe('queue and live usage projection', () => {
+  it('replays old single-message queues and new multiple-message queues', () => {
+    const prompt = { id: 'one', text: 'first', settings: { permission: 'default' as const, plan: false }, attachments: [] }
+    const old = replayAgentEvents('session', [event(1, { type: 'queue', prompt })])
+    expect(old.queuedPrompts).toEqual([prompt])
+    const prompts = [prompt, { ...prompt, id: 'two', text: 'second' }]
+    const next = projectAgentEvent(old, event(2, { type: 'queue', prompt, prompts }))
+    expect(next.queued?.id).toBe('one')
+    expect(next.queuedPrompts).toEqual(prompts)
+  })
+  it('preserves known usage fields and tracks latest snapshot sequence', () => {
+    const state = replayAgentEvents('session', [
+      event(1, { type: 'usage', source: 'provider', scope: 'message', inputTokens: 30, outputTokens: 1 }, { itemId: 'usage' }),
+      event(2, { type: 'usage', source: 'provider', scope: 'message', inputTokens: undefined, outputTokens: 8 }, { itemId: 'usage' })
+    ])
+    expect(state.items).toHaveLength(1)
+    expect(state.items[0]).toMatchObject({ sequence: 1, updatedSequence: 2, data: { inputTokens: 30, outputTokens: 8 } })
+  })
+})

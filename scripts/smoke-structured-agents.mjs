@@ -23,7 +23,8 @@ try {
   await page.waitForFunction(() => Boolean(window.conductor?.structured))
   await page.evaluate(async () => { await window.conductor.settings.setZoom(1); await window.conductor.settings.setThemeAuto(false); await window.conductor.settings.setThemeVariant('night') })
   const project = await page.evaluate(() => window.conductor.projects.create('Structured fixture'))
-  await copyFile(resolve('scripts/fixtures/panel.mjs'), join(project.path, 'panel.mjs'))
+  // The raw synthetic Edit request deliberately matches exact LF fixture bytes.
+  await writeFile(join(project.path, 'panel.mjs'), (await readFile(resolve('scripts/fixtures/panel.mjs'), 'utf8')).replace(/\r\n/g, '\n'))
   await copyFile(resolve('scripts/fixtures/panel.test.mjs'), join(project.path, 'panel.test.mjs'))
   const baseline = await readFile(join(project.path, 'panel.mjs'), 'utf8')
   try { execFileSync(process.execPath, ['--test', 'panel.test.mjs'], { cwd: project.path, stdio: 'pipe' }); throw new Error('Baseline unexpectedly passed') } catch (error) { assert.match(String(error.stdout), /contains must not be called/) }
@@ -65,7 +66,9 @@ try {
   const composer = page.getByRole('textbox', { name: /message|prompt/i }).last()
   await composer.fill('SYNTHETIC A: remove the two unused declarations, then run node --test panel.test.mjs once.')
   if (provider === 'claude') {
-    await expect.poll(async () => (await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)).phase).toBe('starting')
+    await page.getByRole('combobox', { name: 'Model', exact: true }).click()
+    await page.getByRole('option').filter({ hasText: 'Synthetic Claude fixture' }).click()
+    await expect(page.getByRole('combobox', { name: 'Model', exact: true })).toHaveText('Synthetic Claude fixture')
     await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('Home')
     await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('ArrowRight')
   }
@@ -80,7 +83,7 @@ try {
   assert.equal(state.items.filter(item => item.data.type === 'text' && item.data.role === 'user').length, 1)
   if (provider === 'claude') {
     assert.equal(state.settings.effort, 'low')
-    results.checks.push('Send during delayed metadata handshake is retained once; initial Claude effort change reconfigures only the unused connection')
+    results.checks.push('Discovered Claude model exposes its supported effort; initial effort applies through acknowledged controls on the existing connection')
   }
   const edit = state.items.find(item => item.data.type === 'changes' && item.data.changes.some(change => change.status === 'applied'))
   assert.ok(edit)
@@ -100,9 +103,10 @@ try {
     await expect(page.locator('.sa-code-block img, .sa-code-block script')).toHaveCount(0)
     await page.getByRole('button', { name: 'Copy code', exact: true }).click()
     await expect.poll(async () => await app.evaluate(({ clipboard }) => clipboard.readText())).toContain('const label = "<img src=x onerror=alert(1)>";')
+    await page.getByRole('button', { name: 'View usage', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: 'Usage', exact: true })).toContainText('1,200')
+    await page.getByRole('button', { name: 'Close Usage', exact: true }).click()
     await page.getByRole('button', { name: 'Session settings', exact: true }).click()
-    await page.locator('.sa-usage-details > summary').click()
-    await expect(page.locator('.sa-usage-details')).toContainText('1,200')
     await page.locator('.sa-diagnostics > summary').click()
     await page.getByRole('button', { name: 'Inspect provider events', exact: true }).click()
     await expect(page.getByRole('dialog', { name: 'Event log', exact: true })).toContainText('thread/status/changed')
@@ -192,11 +196,26 @@ try {
   await page.keyboard.press('Escape')
   await page.getByRole('button', { name: 'Remove context panel.mjs', exact: true }).click()
   await expect(page.locator('.sa-context-chips > span')).toHaveCount(0)
-  await page.getByRole('button', { name: 'Close editor', exact: true }).click()
+  await page.getByRole('button', { name: 'Close panel.mjs', exact: true }).click()
   results.checks.push('File link opens actual Monaco code pane without writes; explicit editor context is inspectable and removable')
   await page.locator('.pane-menu-button').first().click()
   await page.getByRole('button', { name: 'Split right', exact: true }).click()
   await expect(page.locator('.pane-group')).toHaveCount(2)
+  const separator = page.getByRole('separator', { name: 'Resize tab areas' })
+  assert.equal(await separator.evaluate(el => getComputedStyle(el).flexBasis), '0px')
+  assert.equal(await separator.locator('i').evaluate(el => getComputedStyle(el).display), 'none')
+  await separator.focus()
+  const initialRatio = Number(await separator.getAttribute('aria-valuenow'))
+  await separator.press('ArrowRight')
+  await expect(separator).toHaveAttribute('aria-valuenow', String(initialRatio + 2))
+  const handle = await separator.boundingBox()
+  await page.mouse.move(handle.x, handle.y + handle.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(handle.x + 30, handle.y + handle.height / 2, { steps: 4 })
+  await page.mouse.up()
+  assert.ok(Number(await separator.getAttribute('aria-valuenow')) > initialRatio + 2)
+  results.checks.push('Invisible zero-space split handle remains draggable and keyboard-resizable')
+
   // The file-navigation editor was verified above; now exercise two ordinary split panes.
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setSize(1200, 820))
   await expect.poll(async () => {
@@ -278,13 +297,15 @@ try {
     assert.ok(renderedActivities <= 250)
     const durationMs = Date.now() - started
     await page.evaluate(() => window.getSelection().removeAllRanges())
-    await page.getByRole('button', { name: /New output · Jump to latest/ }).click()
+    // Clearing the selection at the bottom now resumes following output automatically.
+    await expect(page.getByRole('button', { name: /New output · Jump to latest/ })).toHaveCount(0)
+    await expect(page.locator('.sa-markdown p').last()).toContainText('Synthetic activity 2200')
     await page.getByRole('button', { name: /Show earlier activities/ }).click()
     await expect(page.locator('.sa-activity')).toHaveCount(500)
     await expect(page.locator('.sa-parent-label').first()).toBeAttached()
     await expect(page.getByRole('button', { name: /New output · Jump to latest/ })).toHaveCount(0)
     results.performance = { rawSyntheticActivities: 2200, retainedProjectionItems: large.items.length, initialRenderedActivities: renderedActivities, completionAndRenderMs: durationMs, postSelectionReleaseMs: Date.now() - releasedAt, syntheticBarrier: 'Raw fixture intentionally pauses after 500 rows until the UI selection is committed.', observed: 'One local Windows sample, including the intentional fixture barrier, raw process delivery, SQLite projection, polling, and React rendering; not a benchmark.' }
-    results.checks.push('2,200 raw synthetic activities retain 2,000 projected items and initially 250 DOM activities; selected text and its DOM identity remain while new rows arrive; new-output/Jump, earlier history and nested parent label verified')
+    results.checks.push('2,200 raw synthetic activities retain 2,000 projected items and initially 250 DOM activities; selected text and its DOM identity remain while new rows arrive; new-output indication, automatic following after selection clears, earlier history and nested parent label verified')
     await page.screenshot({ path: join(output, 'large-history.png'), fullPage: true })
     results.screenshots.push('artifacts/structured-agent-ui/' + provider + '/large-history.png')
   }

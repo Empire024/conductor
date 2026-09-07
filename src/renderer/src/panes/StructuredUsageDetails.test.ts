@@ -21,7 +21,7 @@ describe('opt-in usage details (synthetic, zero inference)', () => {
   })
   it('shows authoritative zero values when they actually are reported', () => {
     const html = render([{ type: 'usage', source: 'provider', inputTokens: 0, outputTokens: 0, cachedTokens: 0, costUsd: 0, limits: { rateLimits: { primary: { usedPercent: 0, windowDurationMins: 300 } } } }])
-    expect(html.match(/<dd>0<\/dd>/g)).toHaveLength(3)
+    expect(html.match(/<dd>0<\/dd>/g)).toHaveLength(4)
     expect(html).toContain('$0.0000')
     expect(html).toContain('0% used')
     expect(html).not.toContain('Token usage has not been reported.')
@@ -47,6 +47,7 @@ describe('opt-in usage details (synthetic, zero inference)', () => {
     expect(html).toContain('$0.0123')
     expect(html).toMatch(/[Ee]stimat/)
     expect(html).toContain('not a subscription charge')
+    expect(html).toContain('Estimated cost (latest report)')
   })
   it('can show a cost-only report while token counts remain unknown', () => {
     const html = render([{ type: 'usage', source: 'estimate', costUsd: 0 }])

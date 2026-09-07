@@ -10,6 +10,7 @@ import type {
   AgentProviderInfo,
   AgentSpec,
   EditorDraft,
+  EditorFileWriteResult,
   FileEntry,
   FileDataResource,
   DetachedWindowRecord,
@@ -65,6 +66,7 @@ export interface ConductorBridge {
     setThemeAuto(enabled: boolean): Promise<AppSettings>
     setDebugLogging(enabled: boolean): Promise<AppSettings>
     setAgentSoundProfile(profile: AgentSoundProfile): Promise<AppSettings>
+    setDefaultNewFileExtension(extension: string): Promise<AppSettings>
     setUpdateFeedUrl(url: string): Promise<AppSettings>
     setLocalUpdates(enabled: boolean): Promise<AppSettings>
   }
@@ -79,6 +81,9 @@ export interface ConductorBridge {
     onPrepareInstall(callback: (payload: { requestId: string }) => void): () => void
   }
   sessions: {
+    onRestored(callback: (session: SessionRecord) => void): () => void
+    closed(): Promise<SessionRecord[]>
+    restore(sessionId?: string): Promise<SessionRecord | null>
     list(projectId: string): Promise<SessionRecord[]>
     reorder(projectId: string, ids: string[]): Promise<SessionRecord[]>
     create(projectId: string, name?: string): Promise<SessionRecord>
@@ -104,21 +109,25 @@ export interface ConductorBridge {
     browserUrl(projectId: string, path: string): Promise<string>
     openInBrowser(projectId: string, path: string): Promise<void>
     confirmClose(tabIds: string[]): Promise<boolean>
-    onDraftResolved(callback: (result: { tabId: string; submitted: string; content: string }) => void): () => void
+    onDraftResolved(callback: (result: { tabId: string; submitted: string; content: string | null; saved: boolean }) => void): () => void
+    onDraftConflict(callback: (result: { tabId: string; message: string }) => void): () => void
     search(projectIds: string[], query: string): Promise<Array<{ projectId: string; path: string }>>
     list(projectId: string, relativePath?: string): Promise<FileEntry[]>
     read(projectId: string, relativePath: string): Promise<string>
+    readForEditor(projectId: string, relativePath: string): Promise<string | null>
     readDataUrl(projectId: string, relativePath: string): Promise<FileDataResource>
-    write(projectId: string, relativePath: string, content: string): Promise<void>
+    write(projectId: string, relativePath: string, content: string, expectedContent?: string | null): Promise<EditorFileWriteResult>
+    saveCopy(projectId: string, relativePath: string, content: string): Promise<string>
     create(projectId: string, directory: string, name: string, kind: FileEntry['kind']): Promise<FileEntry>
+    createUntitled(projectId: string, directory: string): Promise<FileEntry>
     rename(projectId: string, relativePath: string, name: string): Promise<FileEntry>
     move(projectId: string, relativePath: string, destinationDirectory: string): Promise<FileEntry>
     trash(projectId: string, relativePath: string): Promise<void>
     reveal(projectId: string, relativePath?: string): Promise<void>
     openExternal(projectId: string, relativePath: string): Promise<void>
     getDraft(tabId: string, projectId: string, relativePath: string): Promise<EditorDraft | null>
-    checkpointDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown): void
-    flushDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown): void
+    checkpointDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown, baseContent?: string | null): void
+    flushDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown, baseContent?: string | null): boolean
     removeDraft(tabId: string): Promise<void>
   }
   terminals: {

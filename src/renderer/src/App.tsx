@@ -63,6 +63,14 @@ import { UpdatePrompt } from './components/UpdatePrompt'
 export function App(): React.JSX.Element {
   const [projects, setProjects] = useState<ProjectRecord[]>([])
   const [sessions, setSessions] = useState<SessionRecord[]>([])
+  const [closedWorkspaces, setClosedWorkspaces] = useState<SessionRecord[]>([])
+  const workspaceRestoreBusy = useRef(false)
+  const workspaceCloseBusy = useRef(new Set<string>())
+  useEffect(() => {
+    const refresh = (): void => { void window.conductor.sessions.closed().then(setClosedWorkspaces).catch(() => {}) }
+    refresh(); window.addEventListener('focus', refresh)
+    return () => window.removeEventListener('focus', refresh)
+  }, [])
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null)
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
   const [focusedGroupId, setFocusedGroupId] = useState('')
@@ -593,31 +601,63 @@ export function App(): React.JSX.Element {
   }
 
   const closeSession = useCallback(async (sessionId: string): Promise<void> => {
-    const closingIndex = sessions.findIndex((session) => session.id === sessionId)
-    if (closingIndex < 0 || !activeProject) return
-
-    debugLog('workspace', 'Workspace close requested', { sessionId }, 'info')
-    const remaining = sessions.filter((session) => session.id !== sessionId)
-    const fallback = remaining[Math.min(closingIndex, remaining.length - 1)]
-    window.dispatchEvent(new Event('conductor:flush-editors'))
-    if (!await window.conductor.files.confirmClose(workspaceFileIds(undefined, sessionId))) return
-    await window.conductor.sessions.delete(sessionId)
-    const apply = (): void => {
-      setSessions(remaining)
-      if (activeSessionId === sessionId) {
-        if (fallback) selectSession(fallback)
-        else {
-          setActiveSessionId(null)
-          setFocusedGroupId('')
+    const closing = sessionsRef.current.find(session => session.id === sessionId)
+    if (!closing || workspaceCloseBusy.current.has(sessionId)) return
+    workspaceCloseBusy.current.add(sessionId)
+    try {
+      window.dispatchEvent(new Event('conductor:flush-editors'))
+      if (!await window.conductor.files.confirmClose(workspaceFileIds(undefined, sessionId))) return
+      // Commit the exact current layout before hiding the workspace, retaining its IDs and drafts.
+      const latest = sessionsRef.current.find(session => session.id === sessionId) ?? closing
+      await window.conductor.sessions.save(sessionId, latest.layout, latest.maximizedGroupId, latest.closedTabs)
+      await window.conductor.sessions.delete(sessionId)
+      setClosedWorkspaces(await window.conductor.sessions.closed())
+      if (activeProjectIdRef.current === closing.projectId) {
+        const current = sessionsRef.current
+        const remaining = current.filter(session => session.id !== sessionId)
+        const fallback = remaining[Math.min(current.findIndex(session => session.id === sessionId), remaining.length - 1)]
+        setSessions(remaining)
+        if (activeSessionIdRef.current === sessionId) {
+          if (fallback) selectSession(fallback)
+          else { setActiveSessionId(null); setFocusedGroupId('') }
         }
       }
-    }
-    const transitionDocument = document as Document & { startViewTransition?: (update: () => void) => unknown }
-    if (transitionDocument.startViewTransition) transitionDocument.startViewTransition(() => flushSync(apply))
-    else apply()
-    debugLog('workspace', 'Workspace closed', { sessionId }, 'info')
-  }, [activeProject, activeSessionId, selectSession, sessions])
+      debugLog('workspace', 'Workspace closed and available to restore', { sessionId }, 'info')
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'Could not close workspace')
+    } finally { workspaceCloseBusy.current.delete(sessionId) }
+  }, [selectSession])
 
+  const showRestoredWorkspace = useCallback(async (restored: SessionRecord): Promise<void> => {
+    setClosedWorkspaces(await window.conductor.sessions.closed())
+    if (activeProjectIdRef.current === restored.projectId) {
+      const ordered = await window.conductor.sessions.list(restored.projectId)
+      setSessions(current => ordered.map(session => session.id === restored.id ? restored : current.find(existing => existing.id === session.id) ?? session))
+      selectSession(restored)
+    } else await loadProject(restored.projectId, restored.id)
+    setToast(`Brought back ${restored.name}`)
+  }, [loadProject, selectSession])
+
+  const restoreWorkspace = useCallback(async (): Promise<void> => {
+    if (workspaceRestoreBusy.current) return
+    workspaceRestoreBusy.current = true
+    try {
+      const restored = await window.conductor.sessions.restore()
+      if (restored) await showRestoredWorkspace(restored)
+      else { setClosedWorkspaces([]); setToast('No closed workspace to bring back') }
+    } catch (error) { setToast(error instanceof Error ? error.message : 'Could not bring back workspace') }
+    finally { workspaceRestoreBusy.current = false }
+  }, [showRestoredWorkspace])
+
+  useEffect(() => window.conductor.sessions.onRestored(session => { void showRestoredWorkspace(session) }), [showRestoredWorkspace])
+  useEffect(() => {
+    const shortcut = (event: KeyboardEvent): void => {
+      if (!(event.ctrlKey || event.metaKey) || !event.shiftKey || event.altKey || event.key.toLowerCase() !== 'z') return
+      event.preventDefault(); event.stopPropagation(); void restoreWorkspace()
+    }
+    window.addEventListener('keydown', shortcut, true)
+    return () => window.removeEventListener('keydown', shortcut, true)
+  }, [restoreWorkspace])
   const renameSession = useCallback(async (sessionId: string, name: string): Promise<void> => {
     const normalized = name.trim()
     if (!normalized) return
@@ -879,6 +919,9 @@ export function App(): React.JSX.Element {
           onRevealProject={(path) => void window.conductor.projects.reveal(path)}
           onNewSession={() => void newSession()}
           onCloseSession={(id) => void closeSession(id)}
+          onRenameSession={(id, name) => void renameSession(id, name)}
+          canRestoreWorkspace={closedWorkspaces.length > 0}
+          onRestoreWorkspace={() => void restoreWorkspace()}
           onReorderProjects={(ids) => { void window.conductor.projects.reorder(ids).then(setProjects).catch((reason: unknown) => setToast(String(reason))) }}
           onReorderSessions={(ids) => { if (activeProjectId) { const projectId = activeProjectId; void window.conductor.sessions.reorder(projectId, ids).then((ordered) => { if (activeProjectIdRef.current === projectId) setSessions((current) => ordered.map((item) => current.find((existing) => existing.id === item.id) ?? item)) }).catch((reason: unknown) => setToast(String(reason))) } }}
           onOpenPalette={() => setPaletteOpen(true)}
@@ -903,6 +946,8 @@ export function App(): React.JSX.Element {
                 sessions={sessions}
                 activeId={activeSession?.id ?? ''}
                 canReopen={Boolean(activeSession?.closedTabs.length)}
+                canRestoreWorkspace={closedWorkspaces.length > 0}
+                onRestoreWorkspace={() => void restoreWorkspace()}
                 templates={templates}
                 onSelect={(id) => { const session = sessions.find((item) => item.id === id); if (session) selectSession(session) }}
                 onNew={() => void newSession()}
@@ -1078,6 +1123,7 @@ export function App(): React.JSX.Element {
           onSetThemeAuto={(enabled) => void setThemeAuto(enabled)}
           onSetAgentSoundProfile={(profile) => void setAgentSoundProfile(profile)}
           onSetDebugLogging={(enabled) => void setDebugLogging(enabled)}
+          onSetDefaultNewFileExtension={(extension) => window.conductor.settings.setDefaultNewFileExtension(extension).then((saved) => { setAppSettings(saved); return saved })}
           updateState={updateState}
           onSetLocalUpdates={(enabled) => void window.conductor.settings.setLocalUpdates(enabled).then(setAppSettings).catch((error: unknown) => setToast(String(error)))}
           onCheckForUpdates={() => void checkForUpdates()}

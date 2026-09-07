@@ -10,11 +10,24 @@ import { languageForPath, SyntaxCode } from './SyntaxCode'
 export function isConversationActivity(item: TimelineItem): boolean {
   const data = item.data
   if (data.type === 'session' || data.type === 'usage') return false
+  if (data.type === 'subagent') return ['failed', 'interrupted', 'rejected'].includes(data.status)
   if (data.type !== 'notice') return true
   if (data.outputArtifactId) return true
   if (/^(?:Snapshot unavailable:|Unsupported .*control request:|Live retry stopped:|Incomplete tool input JSON;)/.test(data.message) || data.message.includes('Interruption requested;')) return true
   if (/^(?:Codex event:|Codex process diagnostic|Claude process diagnostic|Codex effective thread settings|Native Codex settings updated|Current turn diff \(provider aggregate\)|Codex live fixture isolation|Claude runtime capabilities|Claude reported a lower cumulative cost)/.test(data.message)) return false
   return data.payload === undefined
+}
+
+/** Preserve the timeline order while collecting only adjacent, successful tool results. */
+export function groupConversationActivities(items: TimelineItem[]): TimelineItem[][] {
+  const groups: TimelineItem[][] = []
+  const completed = (item: TimelineItem): boolean => item.data.type === 'tool' && item.data.status === 'completed' && (item.data.exitCode === undefined || item.data.exitCode === 0)
+  for (const item of items) {
+    const previous = groups.at(-1)
+    if (previous && completed(item) && completed(previous[0]!)) previous.push(item)
+    else groups.push([item])
+  }
+  return groups
 }
 
 type ToolData = Extract<AgentEventData, { type: 'tool' }>
@@ -51,6 +64,7 @@ export function commandSummary(command: string): string {
     display = display.slice(1, -1)
     if (singleQuoted) display = display.replaceAll("''", "'")
   }
+  if (/^@['"]\r?\n/.test(display)) return /['"]@\s*\|\s*python(?:\s|$)/i.test(display) ? 'Python script' : 'PowerShell script'
   return display.split(/\r?\n/)[0]!.trim().slice(0, 110)
 }
 export function toolPresentation(tool: ToolData): { kind: ToolRendererKind; title: string; input: string; path?: string; cwd?: string } {
@@ -217,7 +231,7 @@ function OutputPreview({ value, sessionId, artifactId, language }: { value: stri
 }
 export function interactionOutcome(outcome?: string): string {
   if (!outcome) return 'Resolved'
-  return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
+  return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', 'allow-session': 'Allowed for session', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
 }
 function InteractionCard({ item, interactive, onRespond }: ActivityProps): React.JSX.Element | null {
   const [answers, setAnswers] = useState<Record<string, string[]>>({})
@@ -237,14 +251,48 @@ function InteractionCard({ item, interactive, onRespond }: ActivityProps): React
     <summary><span>{request.title}</span><small>{request.status === 'resolved' ? interactionOutcome(request.outcome) : request.status === 'expired' ? 'Expired' : 'Unavailable'}</small></summary>
     <div className="sa-interaction-detail">{request.status === 'expired' && request.outcome && <p>{request.outcome}</p>}<pre><SyntaxCode value={JSON.stringify(request.input, null, 2)} language="json" /></pre>{request.questions?.map((question) => <p key={question.id}>{question.question}</p>)}</div>
   </details>
-  return <section className={'sa-interaction ' + (pending ? 'needs-attention' : '')} aria-label={request.kind + ': ' + request.title}><header><strong>{request.title}</strong><small>{request.status === 'resolved' ? request.outcome ?? 'Resolved' : pending ? 'Your response is required' : request.status === 'expired' ? 'Expired' : 'Historical request'}</small></header><details><summary>Inspect exact request and scope</summary><pre>{JSON.stringify(request.input, null, 2)}</pre></details>{request.questions?.map((question) => <fieldset key={question.id} disabled={!pending || busy}><legend>{question.header && <small>{question.header} · </small>}{question.question}</legend>{question.options.map((option) => <label className="sa-question-option" key={option.label}><input type={question.multiSelect ? 'checkbox' : 'radio'} name={item.id + '-' + question.id} checked={(answers[question.id] ?? []).includes(option.label)} onChange={(event) => { setCustom((value) => ({ ...value, [question.id]: '' })); setAnswers((value) => ({ ...value, [question.id]: question.multiSelect ? event.target.checked ? [...(value[question.id] ?? []), option.label] : (value[question.id] ?? []).filter((label) => label !== option.label) : [option.label] })) }} /><span>{option.label}{option.description && <small>{option.description}</small>}</span></label>)}{question.allowCustom !== false && <label className="sa-custom-answer"><span>{question.options.length ? 'Or type an answer' : 'Your answer'}</span><input type={question.isSecret ? 'password' : 'text'} value={custom[question.id] ?? ''} onChange={(event) => setCustom((value) => ({ ...value, [question.id]: event.target.value }))} /></label>}</fieldset>)}{pending && <div className="sa-interaction-actions">{request.kind === 'question' ? <button disabled={busy || (request.questions ?? []).some((question) => !(answers[question.id]?.length || custom[question.id]?.trim()))} onClick={() => void respond()}>Submit answers</button> : request.choices.map((choice) => <button key={choice.id} disabled={busy} onClick={() => void respond(choice.id)}>{choice.label}</button>)}</div>}{error && <p role="alert" className="sa-error">{error}</p>}</section>
+  return <section className="sa-interaction needs-attention" aria-label={request.kind + ': ' + request.title}>
+    <header><strong>{request.title}</strong><small>{request.kind === 'question' ? 'Choose an answer' : 'Review and continue'}</small></header>
+    {request.kind === 'approval' && <p className="sa-request-summary">{typeof record(request.input).description === 'string' ? String(record(request.input).description) : typeof record(request.input).command === 'string' ? commandSummary(String(record(request.input).command)) : typeof record(request.input).file_path === 'string' ? String(record(request.input).file_path) : ''}</p>}
+    {request.questions?.map((question) => <fieldset key={question.id} disabled={busy}>
+      <legend>{question.header && <small>{question.header}</small>}{question.question}</legend>
+      <div className="sa-question-options">{question.options.map((option) => {
+        const checked = !custom[question.id]?.trim() && (answers[question.id] ?? []).includes(option.label)
+        return <label className={'sa-question-option' + (checked ? ' selected' : '')} key={option.label}>
+          <input type={question.multiSelect ? 'checkbox' : 'radio'} name={item.id + '-' + question.id} checked={checked} onChange={(event) => {
+            setCustom((value) => ({ ...value, [question.id]: '' }))
+            setAnswers((value) => ({ ...value, [question.id]: question.multiSelect ? event.target.checked ? [...(value[question.id] ?? []), option.label] : (value[question.id] ?? []).filter((label) => label !== option.label) : [option.label] }))
+          }} />
+          <span className="sa-choice-indicator" aria-hidden="true">{checked && <Check size={12} />}</span>
+          <span><strong>{option.label}</strong>{option.description && <small>{option.description}</small>}</span>
+        </label>
+      })}</div>
+      {question.allowCustom !== false && <label className="sa-custom-answer"><span>{question.options.length ? 'Or type an answer' : 'Your answer'}</span><input type={question.isSecret ? 'password' : 'text'} value={custom[question.id] ?? ''} onChange={(event) => setCustom((value) => ({ ...value, [question.id]: event.target.value }))} /></label>}
+    </fieldset>)}
+    <div className="sa-interaction-actions">{request.kind === 'question'
+      ? <button disabled={busy || (request.questions ?? []).some((question) => !(answers[question.id]?.length || custom[question.id]?.trim()))} onClick={() => void respond()}>Submit answers</button>
+      : request.choices.map((choice) => <button key={choice.id} disabled={busy} onClick={() => void respond(choice.id)}>{choice.label}</button>)}</div>
+    <details className="sa-request-details"><summary title="Inspect exact request and scope">Request details</summary><pre>{JSON.stringify(request.input, null, 2)}</pre></details>
+    {error && <p role="alert" className="sa-error">{error}</p>}
+  </section>
 }
+/** Legacy journals included expanded attachments in the user text. Collapse, never discard, that suffix. */
+export function legacyAttachedContext(text: string): { prompt: string; context: string } | null {
+  const match = /\r?\n\r?\n\[Attached (?:file|selection|editor|terminal|diagnostics|image): [^\]\r\n]+\]/.exec(text)
+  if (!match || !text.slice(0, match.index).trim()) return null
+  return { prompt: text.slice(0, match.index), context: text.slice(match.index).trimStart() }
+}
+function MessageText({ data, cwd, onOpenFile }: { data: Extract<AgentEventData, { type: 'text' }>; cwd: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
+  const legacy = data.role === 'user' && !data.attachments?.length ? legacyAttachedContext(data.text) : null
+  return <><StructuredMarkdown text={legacy?.prompt ?? data.text} cwd={cwd} onOpenFile={onOpenFile} />{legacy && <details className="sa-legacy-context"><summary>Attached context</summary><StructuredMarkdown text={legacy.context} cwd={cwd} onOpenFile={onOpenFile} /></details>}</>
+}
+
 export const StructuredActivity = memo(function StructuredActivity(props: ActivityProps): React.JSX.Element | null {
   if (!isConversationActivity(props.item)) return null
   const { data } = props.item
   let body: ReactNode
   switch (data.type) {
-    case 'text': body = <>{data.role === 'user' && <span className="sa-role">You</span>}<StructuredMarkdown text={data.text} cwd={props.cwd} onOpenFile={props.onOpenFile} /></>; break
+    case 'text': body = <>{data.role === 'user' && <span className="sa-role">You</span>}<MessageText data={data} cwd={props.cwd} onOpenFile={props.onOpenFile} />{Boolean(data.attachments?.length) && <div className="sa-message-attachments" aria-label="Attached context">{data.attachments?.map(attachment => attachment.path ? <button key={attachment.id} className="sa-file-link" title={attachment.name} onClick={event => openAgentFile(event, props.cwd, attachment.path!, props.onOpenFile)}><FileCode2 size={12} />{attachment.name}{attachment.startLine ? ':' + attachment.startLine : ''}</button> : <span key={attachment.id}><FileCode2 size={12} />{attachment.name}</span>)}</div>}</>; break
     case 'tool': body = <ToolCard {...props} />; break
     case 'interaction': body = <InteractionCard {...props} />; break
     case 'changes': body = <section className="sa-changes" aria-label="File changes">{data.changes.map((change, index) => <div className="sa-file-change" key={change.path + '-' + index}>

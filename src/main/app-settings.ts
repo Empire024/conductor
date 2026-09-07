@@ -26,3 +26,10 @@ export function normalizeThemeSettings(stored: StoredThemeSettings): ThemeSettin
   )
   return { themeId, themeVariant, themeAuto }
 }
+
+/** A filename suffix, never a path. Multiple suffixes such as test.ts are valid. */
+export function normalizeNewFileExtension(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const extension = value.trim().replace(/^\./, '').toLowerCase()
+  return extension.length <= 32 && /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(extension) ? extension : null
+}

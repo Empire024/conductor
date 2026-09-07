@@ -13,6 +13,7 @@ interface AgentPromptProps {
   disabledReason?: string
   limitedUntil?: string
   model: string
+  modelLabel?: string
   models: Array<{ id: string; label: string }>
   effort: AgentEffort
   efforts: Array<{ id: AgentEffort; label: string }>
@@ -151,8 +152,8 @@ export function AgentPrompt(props: AgentPromptProps): React.JSX.Element {
           <label className="agent-prompt-model" title="Changing model restarts this provider session">
             <span>Model</span>
             <select disabled={props.settingsDisabled} value={props.model} onChange={(event) => void props.onModel(event.target.value)}>
-              {!props.models.some((model) => model.id === props.model) && <option value={props.model}>{props.model}</option>}
-              {props.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
+              {!props.models.some((model) => model.id === props.model) && <option value={props.model}>{props.modelLabel ?? (['default', 'auto'].includes(props.model) ? 'Model not reported' : props.model)}</option>}
+              {props.models.map((model) => <option key={model.id} value={model.id}>{['default', 'auto'].includes(model.id) ? props.model === model.id ? props.modelLabel ?? 'Model not reported' : 'Use saved model' : model.label}</option>)}
             </select>
           </label>
           {effortOptions.some(option => option.id !== 'auto') && <label className="agent-prompt-effort" title={`Reasoning effort: ${selectedEffort.label}. Changing it restarts this provider session.`}>

@@ -1,0 +1,6 @@
+.file-tab-naming { display: flex; align-items: center; gap: 6px; padding: 0 4px 0 9px; min-width: 0; }
+.file-tab-name { width: 135px; min-width: 55px; height: 24px; border: 1px solid var(--accent-muted); border-radius: 4px; padding: 2px 5px; background: var(--surface-0); color: var(--text); font-size: 10px; }
+.file-create-error { flex: 0 0 auto; padding: 7px 10px; margin: 0; color: var(--danger); background: var(--surface-1); font-size: 10px; overflow-wrap: anywhere; }
+.default-file-extension { display: grid; grid-template-columns: 1fr 100px; align-items: center; gap: 8px; font-size: 11px; color: var(--text-2); }
+.default-file-extension input { width: 100%; padding: 6px 8px; background: var(--surface-0); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
+.default-file-extension small { grid-column: 1 / -1; color: var(--text-3); }

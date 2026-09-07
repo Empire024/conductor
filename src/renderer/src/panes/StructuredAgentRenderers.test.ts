@@ -2,7 +2,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { commandSummary, interactionOutcome, isConversationActivity, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolPresentation } from './StructuredAgentRenderers'
+import { commandSummary, groupConversationActivities, interactionOutcome, isConversationActivity, legacyAttachedContext, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolPresentation } from './StructuredAgentRenderers'
 
 const cwd = 'C:\\work\\My project'
 function renderActivity(data: AgentEventData): string {
@@ -131,7 +131,7 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
   it('omits repetitive assistant labels, native subagent IDs and edit boilerplate', () => {
     expect(renderActivity({ type: 'text', role: 'assistant', text: 'Here is the fix.', mode: 'snapshot' })).not.toContain('sa-role')
     const child = renderActivity({ type: 'subagent', name: 'Review', status: 'completed', nativeSessionId: 'private-native-identity' })
-    expect(child).toContain('Review')
+    expect(child).toBe('')
     expect(child).not.toContain('private-native-identity')
     const changes = renderActivity({ type: 'changes', changes: [{ path: 'panel.mjs', kind: 'update', status: 'applied', artifactId: 'saved', patch: '@@ -1 +1 @@\n-var n = 1\n+const n = 1', additions: 1, deletions: 1, limitation: 'Immutable historical warning belongs in expanded review.' }] })
     expect(changes).toContain('data-language="javascript"')
@@ -157,7 +157,7 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
       { type: 'tool', name: 'Command', status: 'completed', input: { command: 'node --test' } },
       { type: 'interaction', interaction: { id: 'id', kind: 'approval', title: 'Run?', status: 'pending', input: {}, choices: [] } },
       { type: 'plan', steps: [] },
-      { type: 'subagent', name: 'Review', status: 'completed' },
+      { type: 'subagent', name: 'Review', status: 'failed' },
       { type: 'changes', changes: [] }
     ]
     for (const data of cases) {
@@ -180,4 +180,66 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
     const expired = renderActivity({ type: 'interaction', interaction: { id: 'id', kind: 'approval', title: 'Run?', status: 'expired', outcome: 'Delivery uncertain after disconnect', input: {}, choices: [] } })
     expect(expired).toContain('Delivery uncertain after disconnect')
   })
+})
+
+it('shows attachment names below a user message without embedding file content', () => {
+  const html = renderActivity({ type: 'text', role: 'user', text: 'Review this file', mode: 'snapshot', attachments: [{ id: 'a', kind: 'file', name: 'panel.mjs', path: 'panel.mjs' }] })
+  expect(html).toContain('Review this file')
+  expect(html).toContain('panel.mjs')
+  expect(html).toContain('aria-label="Attached context"')
+})
+
+it('places optional request details after the answer choices and retains native accessible inputs', () => {
+  const html = renderActivity({ type: 'interaction', interaction: { id: 'q', kind: 'question', title: 'Claude needs your input', input: { question: 'Pick a color' }, status: 'pending', choices: [], questions: [{ id: 'color', question: 'Pick a color', options: [{ label: 'Blue', description: 'Calm' }, { label: 'Green' }], multiSelect: false }] } })
+  expect(html.indexOf('Submit answers')).toBeLessThan(html.indexOf('Request details'))
+  expect(html).toContain('type="radio"')
+  expect(html).toContain('sa-choice-indicator')
+  expect(html).toContain('disabled=""')
+})
+
+
+it('groups only adjacent successful tools and retains failures and substantive messages', () => {
+  const item = (id: string, data: AgentEventData): TimelineItem => ({ id, data, runtimeId: 'runtime', timestamp: '', sequence: Number(id) })
+  const command = { type: 'tool' as const, name: 'PowerShell', status: 'completed' as const }
+  const items = [
+    item('1', command), item('2', { ...command, output: 'exact output' }),
+    item('3', { ...command, status: 'running' }), item('4', command),
+    item('5', { ...command, exitCode: 1 }), item('6', command),
+    item('7', { type: 'text', role: 'assistant', text: 'Meaningful update', mode: 'snapshot' }),
+    item('8', command), item('9', command)
+  ]
+  const before = JSON.stringify(items)
+  const groups = groupConversationActivities(items)
+  expect(groups.map(group => group.map(item => item.id))).toEqual([['1', '2'], ['3'], ['4'], ['5'], ['6'], ['7'], ['8', '9']])
+  expect(groups.flat()).toEqual(items)
+  expect(JSON.stringify(items)).toBe(before)
+})
+
+it('summarizes inline scripts without losing their original source', () => {
+  const script = "@'\nfrom pathlib import Path\nprint('example')\n'@ | python -X utf8 -"
+  expect(commandSummary(script)).toBe('Python script')
+  expect(toolPresentation({ type: 'tool', name: 'PowerShell', status: 'completed', input: { command: script }, description: "Run @'" })).toMatchObject({ title: 'Run Python script', input: script })
+  expect(commandSummary("@'\nWrite-Output example\n'@")).toBe('PowerShell script')
+})
+
+it('keeps routine subagent status in its roster while surfacing failures', () => {
+  expect(renderActivity({ type: 'subagent', name: '/root/reviewer', status: 'running' })).toBe('')
+  expect(renderActivity({ type: 'subagent', name: '/root/reviewer', status: 'completed' })).toBe('')
+  expect(renderActivity({ type: 'subagent', name: 'Reviewer', status: 'failed' })).toContain('Reviewer')
+  expect(renderActivity({ type: 'text', role: 'assistant', text: 'A child found a defect.', mode: 'snapshot' })).toContain('A child found a defect.')
+  expect(interactionOutcome('allow-session')).toBe('Allowed for session')
+})
+
+
+it('collapses old expanded attachment suffixes without dropping any original text', () => {
+  const text = 'Implement the task.\n\n[Attached file: feature-list.md]\nFull original file contents.'
+  const original = legacyAttachedContext(text)
+  expect(original).toEqual({ prompt: 'Implement the task.', context: '[Attached file: feature-list.md]\nFull original file contents.' })
+  expect(legacyAttachedContext('Please explain the phrase [Attached file: sample.md].')).toBeNull()
+  expect(legacyAttachedContext('[Attached file: sample.md]\nThis entire prompt is user content.')).toBeNull()
+  const html = renderActivity({ type: 'text', role: 'user', text, mode: 'snapshot' })
+  expect(html).toContain('Implement the task.')
+  expect(html).toContain('<details class="sa-legacy-context"><summary>Attached context</summary>')
+  expect(html).toContain('Full original file contents.')
+  expect(html).not.toContain('<details open')
 })

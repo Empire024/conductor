@@ -28,3 +28,11 @@ export const migrateLegacyCodexModels = (layout: WorkspaceLayout): WorkspaceLayo
   const root = visit(layout.root)
   return changed ? { ...layout, root } : layout
 }
+
+/** Saved provider defaults are not a factual model identity. Prefer a reported ID. */
+export function runtimeModelLabel(configuredModel?: string, models: Array<{ id: string; label: string }> = [], reportedModel?: string): string {
+  const explicit = (value?: string): value is string => Boolean(value?.trim() && !['default', 'auto'].includes(value.trim().toLowerCase()))
+  const model = explicit(reportedModel) ? reportedModel : explicit(configuredModel) ? configuredModel : undefined
+  if (!model) return 'Model not reported'
+  return models.find(option => option.id === model)?.label || model
+}

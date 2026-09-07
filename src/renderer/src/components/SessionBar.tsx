@@ -1,11 +1,14 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Bell, Check, Command, LayoutPanelTop, LayoutTemplate, Plus, Save, TimerReset, Undo2, X } from 'lucide-react'
 import type { LayoutTemplateRecord, SessionRecord } from '../../../shared/models'
+import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
 
 interface SessionBarProps {
   sessions: SessionRecord[]
   activeId: string
   canReopen: boolean
+  canRestoreWorkspace: boolean
+  onRestoreWorkspace(): void
   templates: LayoutTemplateRecord[]
   onSelect(id: string): void
   onNew(): void
@@ -26,6 +29,7 @@ interface SessionBarProps {
 const TAB_ANIMATION_MS = 110
 
 export function SessionBar(props: SessionBarProps): React.JSX.Element {
+  const [workspaceMenu, setWorkspaceMenu] = useState<{ session?: SessionRecord; x: number; y: number } | null>(null)
   const [layoutsOpen, setLayoutsOpen] = useState(false)
   const layoutsRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -103,12 +107,13 @@ export function SessionBar(props: SessionBarProps): React.JSX.Element {
     window.setTimeout(() => { void Promise.resolve(props.onClose(id)).finally(() => setClosingIds((current) => { const next = new Set(current); next.delete(id); return next })) }, TAB_ANIMATION_MS)
   }
   return (
-    <div className="session-bar">
-      <div className="session-tabs">
+    <div className="session-bar">{workspaceMenu && <WorkspaceSessionMenu x={workspaceMenu.x} y={workspaceMenu.y} canRestore={props.canRestoreWorkspace} onRename={workspaceMenu.session ? () => startRename(workspaceMenu.session!) : undefined} onNew={props.onNew} onRestore={props.onRestoreWorkspace} onCloseWorkspace={workspaceMenu.session ? () => requestClose(workspaceMenu.session!.id) : undefined} onDismiss={() => setWorkspaceMenu(null)} />}
+      <div className="session-tabs" onContextMenu={event => { event.preventDefault(); setWorkspaceMenu({ x: event.clientX, y: event.clientY }) }}>
         {props.sessions.map((session) => (
           <button
             key={session.id}
             className={`session-tab ${session.id === props.activeId ? 'active' : ''} ${props.attentionIds.has(session.id) ? 'needs-attention' : ''} ${session.continueOnLimit ? 'limit-active' : ''} ${openingIds.has(session.id) ? 'opening' : ''} ${closingIds.has(session.id) ? 'closing' : ''}`}
+            onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
             onClick={() => props.onSelect(session.id)}
             onDoubleClick={(event) => {
               event.preventDefault()

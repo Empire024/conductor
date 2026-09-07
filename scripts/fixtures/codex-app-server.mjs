@@ -105,6 +105,50 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const scenario = message.params.input[0].text
   notify('turn/started', { threadId, turn: { id: currentTurn, status: 'inProgress', items: [], error: null } })
   send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } })
+  if (scenario === 'synthetic:activity-groups') {
+    itemEvent('item/completed', { type: 'agentMessage', id: 'activity-intro', text: 'I will inspect the files and preserve useful results.', phase: null, memoryCitation: null, delivery: null, questions: null })
+    for (let index = 1; index <= 8; index++) {
+      itemEvent('item/completed', command(`activity-command-${index}`, 'completed', `EXACT OUTPUT ${index}`, 0))
+      itemEvent('item/completed', { type: 'subAgentActivity', id: `activity-status-${index}`, kind: 'started', agentThreadId: 'activity-child', agentPath: '/root/reviewer' })
+    }
+    itemEvent('item/completed', { type: 'subAgentActivity', id: 'activity-self', kind: 'started', agentThreadId: threadId, agentPath: '/root' })
+    itemEvent('item/completed', command('activity-failure', 'failed', 'An actionable command failure remains visible.', 2))
+    itemEvent('item/completed', { type: 'agentMessage', id: 'activity-result', text: 'Inspection is complete. The failed check needs attention.', phase: null, memoryCitation: null, delivery: null, questions: null })
+    finish()
+    return
+  }
+  if (scenario === 'synthetic:telemetry') {
+    const telemetry = (inputTokens, outputTokens, reasoningOutputTokens) => notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, cachedInputTokens: 400, reasoningOutputTokens }, modelContextWindow: 200000 } })
+    const agents = (first, second) => itemEvent('item/completed', { type: 'collabAgentToolCall', id: 'telemetry-parent', tool: 'spawnAgent', status: 'completed', senderThreadId: threadId, receiverThreadIds: ['telemetry-research', 'telemetry-tests'], prompt: 'Synthetic telemetry validation only. No agents are actually launched.', model: null, reasoningEffort: null, agentsStates: { 'telemetry-research': { status: first, message: null }, 'telemetry-tests': { status: second, message: null } } })
+    const paragraph = index => `Synthetic telemetry paragraph ${index}. This raw protocol fixture validates scrolling and accounting without model inference.`
+    const message = (id, title) => itemEvent('item/completed', { type: 'agentMessage', id, text: `**${title}**\n\n` + Array.from({ length: 22 }, (_, index) => paragraph(index + 1)).join('\n\n'), phase: null, memoryCitation: null, delivery: null, questions: null })
+    const waitForFile = (file, next) => {
+      const started = Date.now()
+      const poll = () => {
+        if (existsSync(join(process.cwd(), file))) next()
+        else if (Date.now() - started < 30000) setTimeout(poll, 20)
+        else { process.stderr.write('Synthetic telemetry barrier timed out.\n'); finish('failed') }
+      }
+      poll()
+    }
+    agents('running', 'running')
+    telemetry(1000, 20, 10)
+    notify('thread/tokenUsage/updated', { threadId: 'telemetry-research', turnId: 'telemetry-child-turn', tokenUsage: { total: { inputTokens: 9000, outputTokens: 500, totalTokens: 9500, cachedInputTokens: 0, reasoningOutputTokens: 300 }, modelContextWindow: 200000 } })
+    notify('account/rateLimits/updated', { rateLimits: { primary: { usedPercent: 24, windowDurationMins: 300, resetsAt: 1789416000 }, secondary: { usedPercent: 10, windowDurationMins: 10080, resetsAt: 1789941600 } } })
+    message('telemetry-first', 'Synthetic telemetry started')
+    waitForFile('.synthetic-telemetry-next', () => {
+      agents('completed', 'running')
+      telemetry(1000, 100, 60)
+      message('telemetry-next', 'Synthetic telemetry updated')
+      waitForFile('.synthetic-telemetry-finish', () => {
+        agents('completed', 'errored')
+        telemetry(1500, 200, 100)
+        message('telemetry-final', 'Synthetic telemetry complete')
+        finish()
+      })
+    })
+    return
+  }
   if (scenario.startsWith('synthetic:backlog')) {
     itemEvent('item/completed', { type: 'agentMessage', id: 'backlog-result', text: 'SYNTHETIC backlog fixture. [Open alpha](alpha.ts)\n\n' + 'long_unbroken_text_'.repeat(180) + '\n\n' + String.fromCharCode(96).repeat(3) + 'text\n' + 'wide code '.repeat(180) + '\n' + String.fromCharCode(96).repeat(3), phase: null, memoryCitation: null, delivery: null, questions: null })
     return // Deliberately wait for an explicit interrupt; no live provider runs.

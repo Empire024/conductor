@@ -27,6 +27,7 @@ import {
 } from 'lucide-react'
 import type { FileEntry, PaneKind, ProjectRecord, SessionRecord } from '../../../shared/models'
 import { WorkspaceSidebarPanel } from './WorkspaceSidebarPanel'
+import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
 
 interface SidebarProps {
@@ -45,6 +46,9 @@ interface SidebarProps {
   onRemoveProject(id: string): void
   onRevealProject(path: string): void
   onCloseSession(id: string): void
+  onRenameSession(id: string, name: string): void
+  canRestoreWorkspace: boolean
+  onRestoreWorkspace(): void
   onReorderProjects(ids: string[]): void
   onReorderSessions(ids: string[]): void
   onNewSession(): void
@@ -89,6 +93,11 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     | { kind: 'projects'; x: number; y: number }
     | null
   >(null)
+  const [workspaceMenu, setWorkspaceMenu] = useState<{ session: SessionRecord; x: number; y: number } | null>(null)
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
+  const [sessionName, setSessionName] = useState('')
+  const renameSession = (session: SessionRecord): void => { setEditingSessionId(session.id); setSessionName(session.name) }
+  const finishSessionRename = (save: boolean): void => { const id = editingSessionId; setEditingSessionId(null); if (save && id && sessionName.trim()) props.onRenameSession(id, sessionName.trim()) }
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null)
   const [projectName, setProjectName] = useState('')
   const [confirmingRemoval, setConfirmingRemoval] = useState<string | null>(null)
@@ -184,7 +193,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
 
   return (
     <div className={`left-shell ${props.collapsed ? 'rail-only' : ''}`}>
-      <nav className="activity-rail" aria-label="Activity">
+      {workspaceMenu && <WorkspaceSessionMenu x={workspaceMenu.x} y={workspaceMenu.y} canRestore={props.canRestoreWorkspace} onRename={() => renameSession(workspaceMenu.session)} onNew={props.onNewSession} onRestore={props.onRestoreWorkspace} onCloseWorkspace={() => props.onCloseSession(workspaceMenu.session.id)} onDismiss={() => setWorkspaceMenu(null)} />}<nav className="activity-rail" aria-label="Activity">
         <div className="rail-primary">
           {railItems.map(({ icon: Icon, label, kind, sidebar, utility }) => {
             const active = sidebar
@@ -312,7 +321,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                   {expanded && (
                     <div className="session-tree">
                       {props.sessions.map((session, index) => (
-                        <div key={session.id} className="sidebar-session-row" draggable
+                        <div key={session.id} className="sidebar-session-row" draggable={editingSessionId !== session.id} onContextMenu={event => { if (editingSessionId === session.id) return; event.preventDefault(); event.stopPropagation(); setMenu(null); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
                           onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-conductor-session', session.id) }}
                           onDragOver={(event) => { if (event.dataTransfer.types.includes('application/x-conductor-session')) { event.preventDefault(); event.currentTarget.classList.add('reorder-target') } }}
                           onDragLeave={(event) => event.currentTarget.classList.remove('reorder-target')}
@@ -320,9 +329,11 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                         <button
                           className={session.id === props.activeSessionId ? 'active' : ''}
                           onClick={() => props.onSelectSession(session.id)}
+                          onDoubleClick={event => { event.preventDefault(); renameSession(session) }}
+                          onKeyDown={event => { if (event.key === 'F2') { event.preventDefault(); event.stopPropagation(); renameSession(session) } }}
                         >
                           <span className="session-number">{String(index + 1).padStart(2, '0')}</span>
-                          <span className="ellipsis">{session.name}</span>
+                          <span className="ellipsis">{editingSessionId === session.id ? <input className="sidebar-session-rename" aria-label="Workspace name" autoFocus value={sessionName} onFocus={event => event.currentTarget.select()} onClick={event => event.stopPropagation()} onDoubleClick={event => event.stopPropagation()} onChange={event => setSessionName(event.target.value)} onBlur={() => finishSessionRename(true)} onKeyDown={event => { event.stopPropagation(); if (event.key === 'Enter') { event.preventDefault(); finishSessionRename(true) }; if (event.key === 'Escape') { event.preventDefault(); finishSessionRename(false) } }} /> : session.name}</span>
                           {session.id === props.activeSessionId && <i className="live-dot" />}
                         </button>
                         <button className="sidebar-session-close" aria-label={'Close ' + session.name} title={'Close ' + session.name} onClick={() => props.onCloseSession(session.id)}><X size={11} /></button>

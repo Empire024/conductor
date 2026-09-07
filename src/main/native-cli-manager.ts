@@ -17,7 +17,7 @@ export function nativeCliArgs(provider: StructuredProvider, nativeId: string, se
   ]
   return [fresh ? '--session-id' : '--resume', nativeId, ...model,
     ...(settings.effort && settings.effort !== 'auto' ? ['--effort', settings.effort] : []),
-    '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'plan' : 'default']
+    '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'plan' : settings.permission === 'auto' ? 'auto' : 'manual']
 }
 interface LiveCli { spec: AgentSpec; process: IPty; exited: boolean; transcript: string; sequence: number; stopped: Promise<void>; resolveStopped(): void }
 export class NativeCliManager {

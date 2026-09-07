@@ -1,3 +1,4 @@
+import { conversationModes, modelDisplayName, resolvedComposerSettings } from './composer-settings'
 import { modelEfforts } from '../../../shared/model-effort'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { useEffect, useId, useRef, useState } from 'react'
@@ -20,15 +21,17 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const trigger = useRef<HTMLButtonElement>(null)
   const listId = useId()
   const models = capabilities?.models ?? []
-  const model = settings.model && settings.model !== 'default' ? settings.model : ''
-  const label = models.find(option => option.id === model)?.label ?? (model || 'Default')
-  const choices = [{ id: '', label: 'Default' }, ...models.filter(option => option.id !== 'default')]
+  const resolved = resolvedComposerSettings(settings, capabilities)
+  const { model, label } = resolved
+  const choices = models.filter(option => option.id !== 'default').map(option => ({ ...option, label: modelDisplayName(option.label) }))
     .filter(option => (option.label + ' ' + option.id).toLowerCase().includes(query.toLowerCase()))
+  const modes = conversationModes(capabilities)
+  const mode = settings.plan ? 'plan' : capabilities?.provider === 'codex' ? 'edit' : settings.permission
   const supportedEfforts = modelEfforts(capabilities, settings.model)
   const efforts = ['', ...(supportedEfforts ?? []).filter(value => value && value !== 'auto')]
   const unavailableEffort = Boolean(capabilities && settings.effort && settings.effort !== 'auto' && !efforts.includes(settings.effort))
   const effortIndex = Math.max(0, efforts.indexOf(settings.effort ?? ''))
-  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : (efforts[effortIndex] || 'Auto').replace(/^./, char => char.toUpperCase())
+  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : (efforts[effortIndex] || resolved.effort || 'Not reported').replace(/^./, char => char.toUpperCase())
   const close = (): void => { setOpen(false); setQuery(''); trigger.current?.focus() }
   const chooseModel = (id: string): void => {
     const supported = modelEfforts(capabilities, id)
@@ -56,8 +59,9 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   }
 
   return <>
+    {modes.length > 1 && <select className="sa-mode-control" aria-label="Conversation mode" title="Mode for your next message" value={mode} disabled={disabled} onChange={event => { const choice = modes.find(option => option.id === event.target.value); if (choice) onChange(choice.change) }}>{modes.map(option => <option key={option.id} value={option.id}>{option.label}</option>)}</select>}
     <div className="sa-model-control" ref={host}>
-      <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title="Choose model" onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><ProviderIcon provider={capabilities?.provider} model={model} size={14} /><span>{label}</span><ChevronDown size={12} /></button>
+      <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title={label + (resolved.effort ? ' · ' + resolved.effort : '')} onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><ProviderIcon provider={capabilities?.provider} model={model} size={14} /><span>{label}</span><ChevronDown size={12} /></button>
       {open && <div className="sa-model-menu" onKeyDown={event => {
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close() }
         if (event.key === 'Enter' && event.target instanceof HTMLInputElement) {
@@ -80,7 +84,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
         {!loading && !error && !choices.length && <p className="sa-model-loading">No matching models</p>}
       </div>}
     </div>
-    {efforts.length > 1 && unavailableEffort && <button className="sa-effort-unavailable" type="button" disabled={disabled} title="This saved effort is not in the current model catalog. Click to reset to Auto." onClick={() => onChange({ effort: undefined })}>{effortLabel}</button>}
+    {efforts.length > 1 && unavailableEffort && <button className="sa-effort-unavailable" type="button" disabled={disabled} title="This saved effort is not in the current model catalog. Click to use the configured effort." onClick={() => onChange({ effort: undefined })}>{effortLabel}</button>}
     {efforts.length > 1 && !unavailableEffort && <label className="agent-prompt-effort sa-effort-control" title="Reasoning effort for your next message">
       <span className="agent-effort-heading"><span>Effort</span><output>{effortLabel}</output></span>
       <span className="agent-effort-slider" style={{ '--effort-progress': `${effortIndex / (efforts.length - 1) * 100}%` } as React.CSSProperties}>

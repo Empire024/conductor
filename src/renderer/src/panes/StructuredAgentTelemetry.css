@@ -1,0 +1,33 @@
+.sa-telemetry { display: flex; align-items: center; gap: 10px; min-width: 0; min-height: 23px; flex: 0 0 auto; padding: 0 13px 3px; color: var(--text-2); }
+.structured-agent-pane .sa-telemetry > button { min-height: 20px; padding: 0; font-size: 10px; }
+.structured-agent-pane .sa-telemetry > button:hover { background: transparent; }
+.sa-telemetry .sa-subagent-summary { min-width: 0; justify-content: flex-start; }
+.sa-subagent-summary > svg { flex: 0 0 auto; color: var(--accent); }
+.sa-subagent-summary > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-telemetry .sa-usage-link { flex: 0 0 auto; margin-left: auto; color: var(--text-2); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 3px; }
+.sa-telemetry .sa-usage-link:hover { color: var(--accent); text-decoration-color: currentColor; }
+.sa-live-tokens { padding-left: 8px; border-left: 1px solid var(--border-soft); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--text-2); }
+.sa-working { flex-wrap: wrap; }
+.sa-dialog > .sa-usage-content, .sa-subagent-details { padding: 4px 15px 15px; }
+.sa-usage-content dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 18px; margin: 10px 0; }
+.sa-usage-content dt { color: var(--text-2); }
+.sa-usage-content dd { margin: 0; color: var(--text); font-variant-numeric: tabular-nums; text-align: right; }
+.sa-usage-content .sa-limit-detail { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; margin: 12px 0; }
+.sa-usage-content .sa-limit-detail > progress { appearance: none; grid-column: 1 / -1; width: 100%; height: 3px; border: 0; border-radius: 3px; overflow: hidden; }
+.sa-usage-content progress::-webkit-progress-bar { background: var(--surface-2); }
+.sa-usage-content progress::-webkit-progress-value { background: var(--accent); }
+.sa-usage-content .sa-limit-detail > small { grid-column: 1 / -1; color: var(--text-2); }
+.sa-subagent-roster { list-style: none; padding: 0; margin: 10px 0 0; }
+.sa-subagent-roster > li { display: flex; align-items: center; gap: 9px; padding: 9px 0; border-top: 1px solid var(--border-soft); }
+.sa-subagent-roster > li > div { min-width: 0; flex: 1; }
+.sa-subagent-roster strong { display: block; overflow-wrap: anywhere; font-size: 12px; font-weight: 500; color: var(--text); }
+.sa-subagent-roster small { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font: 10px/1.5 'Cascadia Code', monospace; }
+.sa-subagent-state { flex: 0 0 auto; color: var(--text-2); font-size: 10px; }
+.sa-subagent-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); flex: 0 0 auto; }
+.sa-subagent-dot.status-running, .sa-subagent-dot.status-preparing { background: var(--accent); }
+.sa-subagent-dot.status-awaiting_approval { background: #e2b872; }
+.sa-subagent-dot.status-completed { background: #85b866; }
+.sa-subagent-dot.status-failed { background: var(--danger); }
+.sa-subagent-state.status-awaiting_approval { color: #e2b872; }
+.sa-subagent-state.status-failed { color: var(--danger); }
+.sa-dialog:has(> .sa-usage-content), .sa-dialog:has(> .sa-subagent-details) { width: min(460px, calc(100vw - 32px)); }

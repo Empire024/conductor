@@ -5,6 +5,7 @@ export const MAX_PREVIEW_CHARS = 64_000
 export const emptyProjection = (sessionId: string): SessionProjection => ({ sessionId, runtimeId: '', phase: 'idle', sequence: 0, items: [], settings: { permission: 'default', plan: false }, title: '', archived: false, truncated: false })
 
 function reconcile(previous: AgentEventData, next: AgentEventData): AgentEventData {
+  if (previous.type === 'usage' && next.type === 'usage') return { ...previous, ...Object.fromEntries(Object.entries(next).filter(([, value]) => value !== undefined)) } as AgentEventData
   if (previous.type === 'text' && next.type === 'text') return { ...next, text: (next.mode === 'delta' ? previous.text + next.text : next.text).slice(-MAX_PREVIEW_CHARS) }
   if (previous.type === 'tool' && next.type === 'tool') return {
     ...previous, ...next,
@@ -29,7 +30,10 @@ function bound(data: AgentEventData): AgentEventData {
 export function projectAgentEvent(state: SessionProjection, event: AgentEvent): SessionProjection {
   if (event.sessionId !== state.sessionId || event.sequence <= state.sequence) return state
   let next = { ...state, sequence: event.sequence, runtimeId: event.runtimeId, nativeSessionId: state.nativeSessionId ?? event.nativeSessionId }
-  if (event.data.type === 'queue') return { ...next, queued: event.data.prompt }
+  if (event.data.type === 'queue') {
+    const queuedPrompts = event.data.prompts ?? (event.data.prompt ? [event.data.prompt] : [])
+    return { ...next, queued: queuedPrompts[0] ?? null, queuedPrompts }
+  }
   if (event.data.type === 'session') {
     next.phase = event.data.phase
     next.view = event.data.view ?? next.view
@@ -50,12 +54,18 @@ export function projectAgentEvent(state: SessionProjection, event: AgentEvent): 
   const identity = event.data.type === 'interaction' ? event.requestId : event.itemId
   const id = identity ? JSON.stringify(event.data.type === 'interaction'
     ? [event.runtimeId, identity, event.data.type]
-    : [event.runtimeId, event.nativeSessionId ?? '', event.turnId ?? '', identity, event.data.type]) : event.id
-  const index = next.items.findIndex(item => item.id === id)
+    : [event.runtimeId, event.nativeSessionId ?? state.nativeSessionId ?? '', event.turnId ?? '', identity, event.data.type]) : event.id
+  let index = next.items.findIndex(item => item.id === id)
+  // Claude can reveal its root session ID only after text has begun streaming.
+  // Reconcile that initial item without merging explicitly identified child conversations.
+  if (index < 0 && identity && event.provider === 'claude' && event.nativeSessionId && (!state.nativeSessionId || event.nativeSessionId === state.nativeSessionId)) {
+    const initialId = JSON.stringify([event.runtimeId, '', event.turnId ?? '', identity, event.data.type])
+    index = next.items.findIndex(item => item.id === initialId && item.parentId === event.parentId)
+  }
   const existing = next.items[index]
   const item: TimelineItem = {
     id, runtimeId: event.runtimeId, turnId: event.turnId, nativeItemId: event.itemId, parentId: event.parentId,
-    sequence: existing?.sequence ?? event.sequence, timestamp: existing?.timestamp ?? event.timestamp,
+    sequence: existing?.sequence ?? event.sequence, updatedSequence: event.sequence, timestamp: existing?.timestamp ?? event.timestamp,
     data: bound(existing ? reconcile(existing.data, event.data) : event.data)
   }
   next.items = index < 0 ? [...next.items, item] : next.items.map((entry, i) => i === index ? item : entry)

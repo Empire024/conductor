@@ -1,3 +1,4 @@
+import { runtimeModelLabel } from '../agent-models'
 import { useEffect, useMemo, useState } from 'react'
 import { Bot, Check, CircleDot, Clock3, Gauge, RefreshCw, TerminalSquare, UserRound } from 'lucide-react'
 import type { ProjectRecord, RuntimeProcessSummary } from '../../../shared/models'
@@ -79,7 +80,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
                   onDoubleClick={() => window.dispatchEvent(new CustomEvent('conductor:focus-process', { detail: process }))}
                 >
                   <span className={`process-icon ${process.status}`}><Icon size={17} /></span>
-                  <div><strong>{process.title}</strong><small>{process.provider ? `${process.provider} · ${process.model ?? 'default'}` : 'PowerShell'} · {relativeTime(process.updatedAt)}</small>
+                  <div><strong>{process.title}</strong><small>{process.provider ? `${process.provider} · ${runtimeModelLabel(process.model)}` : 'PowerShell'} · {relativeTime(process.updatedAt)}</small>
                     {section === 'running' && <div className="process-progress"><i /></div>}
                   </div>
                   <span className={`process-status ${process.status}`}>{process.status === 'limited' && process.resumeAt ? <><Clock3 size={12} /> {Math.ceil(eta / 60000)}m</> : section === 'ready' ? 'ready' : process.status.replace('_', ' ')}</span>

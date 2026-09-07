@@ -1,0 +1,16 @@
+{
+  "synthetic": true,
+  "checks": [
+    "Closing an untouched stale editor never prompts or overwrites newer disk content",
+    "Explicit save refuses a newer disk version and preserves the exact local draft",
+    "Save a copy preserves both versions; reload requires a decision and resets the baseline",
+    "Save on close rechecks disk after the dialog and keeps conflicting edits open",
+    "Repeated Ctrl+S while saving serializes the latest buffer without losing intervening edits",
+    "Undoing back to the saved text removes the recovery draft",
+    "Two workspaces keep independent editor models and cannot overwrite each other with an older baseline",
+    "New file opens its editor immediately with inline naming; Escape keeps a usable untitled.md",
+    "Inline naming chooses unique defaults, rejects existing names, and commits a new name without a popup",
+    "Settings persists the default new-file extension and applies it to the next editor tab"
+  ],
+  "errors": []
+}

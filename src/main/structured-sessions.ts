@@ -19,6 +19,7 @@ interface LiveSession {
   starting?: Promise<void>
   handoff?: boolean
   dispatchingQueue?: boolean
+  queueing?: Promise<void>
   submitting: boolean
   closed: boolean
   responses: Set<string>
@@ -128,7 +129,7 @@ export class StructuredSessions {
   async prepareCli(id: string): Promise<{ spec: AgentSpec; nativeSessionId: string; settings: SessionSettings; fresh: boolean }> {
     const live = this.get(id), store = this.database.structured
     let state = store.snapshot(id)!
-    if (live.handoff || live.submitting || live.dispatchingQueue || state.queued || active.has(state.phase)) throw new Error('Finish or stop this turn and remove queued messages before switching to CLI.')
+    if (live.handoff || live.submitting || live.dispatchingQueue || live.queueing || state.queued || active.has(state.phase)) throw new Error('Finish or stop this turn and remove queued messages before switching to CLI.')
     live.handoff = true
     try {
       if (!this.cliOwned(id)) {
@@ -245,37 +246,57 @@ export class StructuredSessions {
   }
 
   async queue(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
-    const live = this.get(id), state = this.database.structured.snapshot(id)!
-    if (!['running', 'waiting_input', 'waiting_approval'].includes(state.phase) || !live.adapter) throw new Error('There is no active turn to queue behind')
-    if (state.queued) throw new Error('A message is already queued. Remove it before queuing another.')
-    if (typeof text !== 'string' || !text.trim() || text.length > 60000) throw new Error('Prompt must contain 1–60000 characters')
-    this.validateSettings(settings, state.capabilities)
-    const captured = structuredClone(attachments)
-    await this.attachments(live, captured)
-    // The current turn can finish while paths are being checked. Dispatch once if it did.
-    const latest = this.database.structured.snapshot(id)!
-    if (latest.queued) throw new Error('A message was queued in another window')
-    if (latest.phase === 'completed' || latest.phase === 'idle') return this.submit(id, text, settings, captured)
-    if (!['running', 'waiting_input', 'waiting_approval'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
-    this.emit(live, { data: { type: 'queue', prompt: { id: randomUUID(), text, settings, attachments: captured } } })
+    const live = this.get(id)
+    // Serialize validation as well as insertion so slow file reads cannot reorder messages.
+    const previous = live.queueing
+    const queued = (async () => {
+      if (previous) await previous.catch(() => undefined)
+      const state = this.database.structured.snapshot(id)!
+      if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
+      if (!live.adapter || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(state.phase)) throw new Error('There is no active turn to queue behind')
+      if (typeof text !== 'string' || !text.trim() || text.length > 60000) throw new Error('Prompt must contain 1-60000 characters')
+      this.validateSettings(settings, state.capabilities)
+      const captured = structuredClone(attachments)
+      await this.attachments(live, captured)
+      const latest = this.database.structured.snapshot(id)!
+      if (live.closed || live.handoff || this.cliOwned(id) || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
+      const prompts = latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])
+      if (prompts.length >= 100) throw new Error('The queue is full (100 messages)')
+      this.setQueue(live, [...prompts, { id: randomUUID(), text, settings: structuredClone(settings), attachments: captured }])
+      void this.drainQueue(live)
+    })()
+    live.queueing = queued
+    try { await queued } finally { if (live.queueing === queued) live.queueing = undefined }
   }
-  cancelQueued(id: string): import('../shared/structured-agent').QueuedPrompt | null {
-    const live = this.get(id), queued = this.database.structured.snapshot(id)?.queued ?? null
-    if (live.dispatchingQueue) throw new Error('The queued message is already being sent')
-    if (queued) this.emit(live, { data: { type: 'queue', prompt: null } })
+  private setQueue(live: LiveSession, prompts: import('../shared/structured-agent').QueuedPrompt[]): void {
+    this.emit(live, { data: { type: 'queue', prompt: prompts[0] ?? null, prompts } })
+  }
+  cancelQueued(id: string, promptId?: string): import('../shared/structured-agent').QueuedPrompt | null {
+    const live = this.get(id), state = this.database.structured.snapshot(id)!
+    const prompts = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
+    const queued = promptId ? prompts.find(prompt => prompt.id === promptId) ?? null : prompts[0] ?? null
+    if (live.dispatchingQueue && queued?.id === prompts[0]?.id) throw new Error('The queued message is already being sent')
+    if (queued) this.setQueue(live, prompts.filter(prompt => prompt.id !== queued.id))
     return queued
   }
   private async drainQueue(live: LiveSession): Promise<void> {
     const state = this.database.structured.snapshot(live.spec.id)
-    if (!state?.queued || state.phase !== 'completed' || live.closed || live.submitting || live.dispatchingQueue || !live.adapter) return
+    if (!state?.queued || !['completed', 'idle'].includes(state.phase) || live.closed || live.submitting || live.dispatchingQueue || !live.adapter) return
     const queued = state.queued
     live.dispatchingQueue = true
+    let sent = false
     try {
       await this.submit(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments))
-      if (this.database.structured.snapshot(live.spec.id)?.queued?.id === queued.id) this.emit(live, { data: { type: 'queue', prompt: null } })
+      const latest = this.database.structured.snapshot(live.spec.id)!
+      this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(prompt => prompt.id !== queued.id))
+      sent = true
     } catch (reason) {
       this.emit(live, { data: { type: 'notice', message: 'Queued message was not sent. It is still available above the composer: ' + (reason instanceof Error ? reason.message : String(reason)) } })
-    } finally { live.dispatchingQueue = false }
+    } finally {
+      live.dispatchingQueue = false
+      // Some runtimes finish before submit resolves; that completion still drains the next item.
+      if (sent) queueMicrotask(() => { void this.drainQueue(live) })
+    }
   }
 
   async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
@@ -285,39 +306,17 @@ export class StructuredSessions {
     if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Execution became uncertain. Resume the native conversation explicitly before sending another turn.')
     if (typeof text !== 'string' || !text.trim() || text.length > 60_000) throw new Error('Prompt must contain 1–60000 characters')
     this.validateSettings(settings, state.capabilities)
-    const reconfigureInitialClaude = Boolean(live.adapter && live.spec.provider === 'claude' && settings.effort !== state.settings.effort)
-    const metadataOnly = (): boolean => {
-      const current = store.snapshot(id)!
-      // Absence of a native ID alone is not proof of a new conversation: a turn
-      // may have disconnected before reporting one, or history may be compacted.
-      return !live.closed && this.live.get(id) === live && current.phase === 'idle' && !current.nativeSessionId &&
-        !current.truncated && current.items.every(item => item.data.type === 'notice' && !item.turnId)
-    }
-    if (reconfigureInitialClaude && !metadataOnly()) throw new Error('Resume the Claude connection with the selected effort before sending this message')
     live.submitting = true
     try {
       const context = await this.attachments(live, attachments)
       const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text) ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
-      if (reconfigureInitialClaude) {
-        // start() may have just emitted idle but still be finishing its promise.
-        if (live.starting) await live.starting
-        if (!metadataOnly()) throw new Error('The Claude connection changed during preparation. Resume it explicitly before changing effort.')
-      }
-      // A rejected allowance must not persist settings that the still-running
-      // metadata connection never received.
       this.reserveLive(live, settings, submitted)
       store.update(id, { settings, title: state.title || text.trim().replace(/\s+/g, ' ').slice(0, 80) })
-      if (reconfigureInitialClaude) {
-        const previous = live.adapter!
-        live.closed = true
-        live.adapter = undefined
-        try { previous.dispose() } finally { live.closed = false }
-      }
       await this.connect(live)
       if (live.closed || this.live.get(id) !== live || !live.adapter) throw new Error('Session closed during initialization; no prompt was sent')
-      // User-visible text is exactly the submitted context; provider adapters must not emit a duplicate user item.
-      this.emit(live, { itemId: randomUUID(), data: { type: 'text', role: 'user', text: submitted, mode: 'snapshot' } })
+      // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
+      this.emit(live, { itemId: randomUUID(), data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}) } })
       this.emit(live, { data: { type: 'session', phase: 'running' } })
       if (process.env.CONDUCTOR_LIVE_TESTS === '1') live.budget = new LiveRuntimeBudget(boundary => this.stopLive(live, boundary === 'active-runtime' ? 'Live prompt reached its 90 second active runtime allowance' : 'Live prompt reached its 30 second cumulative human-input wait allowance'))
       await live.adapter!.submit(submitted, settings, attachments.filter(item => item.kind === 'image'))
@@ -330,7 +329,7 @@ export class StructuredSessions {
     } finally { live.submitting = false; void this.drainQueue(live) }
   }
   private validateSettings(settings: SessionSettings, capabilities: import('../shared/structured-agent').ProviderCapabilities | undefined): void {
-    if (!settings || !['default', 'read-only', 'accept-edits'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
+    if (!settings || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
     if (settings.plan && !capabilities?.plans) throw new Error('Planning is unavailable on this adapter baseline')
     if (capabilities?.permissions && !capabilities.permissions.includes(settings.permission)) throw new Error('Permission policy unsupported by this provider')
     if (settings.sandbox && !capabilities?.sandboxModes?.includes(settings.sandbox)) throw new Error('Execution sandbox unsupported by this provider')
@@ -364,6 +363,7 @@ export class StructuredSessions {
         content = await readFile(path, 'utf8')
       } else if (item.path) await workspacePath(live.spec.cwd, item.path)
       if (typeof content !== 'string' || content.length > 128_000) throw new Error('Attachment content is unavailable or oversized')
+      item.content = content
       context += `\n\n[Attached ${item.kind}: ${item.name}${item.startLine ? ` lines ${item.startLine}-${item.endLine ?? item.startLine}` : ''}]\n${content}`
       if (context.length > 250_000) throw new Error('Total attached context exceeds 250 KB')
     }

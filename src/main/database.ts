@@ -173,7 +173,9 @@ export class ConductorDatabase {
 
       CREATE INDEX IF NOT EXISTS editor_drafts_project_idx ON editor_drafts(project_id, updated_at DESC);
     `)
+    this.ensureColumn('editor_drafts', 'base_content_json', 'TEXT')
     this.ensureColumn('sessions', 'continue_on_limit', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('sessions', 'closed_at', 'INTEGER')
     this.ensureColumn('agent_sessions', 'model', 'TEXT')
     this.ensureColumn('agent_sessions', 'effort', 'TEXT')
     this.ensureColumn('agent_sessions', 'continue_on_limit', 'INTEGER NOT NULL DEFAULT 0')
@@ -313,7 +315,7 @@ export class ConductorDatabase {
   }
 
   listSessions(projectId: string): SessionRecord[] {
-    return this.applyOrder('sessionOrder:' + projectId, (this.db.prepare('SELECT * FROM sessions WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as DbRow[]).map(this.mapSession))
+    return this.applyOrder('sessionOrder:' + projectId, (this.db.prepare('SELECT * FROM sessions WHERE project_id = ? AND closed_at IS NULL ORDER BY created_at ASC').all(projectId) as DbRow[]).map(this.mapSession))
   }
 
   getSession(id: string): SessionRecord | null {
@@ -334,6 +336,26 @@ export class ConductorDatabase {
     return this.listSessions(projectId).find((session) => session.id === id)!
   }
 
+  /** Closing is reversible; keep pane IDs, conversation history and drafts in place. */
+  closeSession(sessionId: string): void {
+    const latest = this.db.prepare('SELECT MAX(closed_at) AS latest FROM sessions').get() as DbRow
+    const closedAt = Math.max(Date.now(), Number(latest.latest ?? 0) + 1)
+    this.db.prepare('UPDATE sessions SET closed_at = ?, updated_at = ? WHERE id = ? AND closed_at IS NULL').run(closedAt, now(), sessionId)
+    if (this.getSetting('activeSessionId') === sessionId) this.setSetting('activeSessionId', '')
+  }
+
+  listClosedSessions(): SessionRecord[] {
+    return (this.db.prepare('SELECT * FROM sessions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC').all() as DbRow[]).map(this.mapSession)
+  }
+
+  restoreSession(sessionId?: string): SessionRecord | null {
+    const row = (sessionId
+      ? this.db.prepare('SELECT * FROM sessions WHERE id = ? AND closed_at IS NOT NULL').get(sessionId)
+      : this.db.prepare('SELECT * FROM sessions WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 1').get()) as DbRow | undefined
+    if (!row) return null
+    this.db.prepare('UPDATE sessions SET closed_at = NULL, updated_at = ? WHERE id = ?').run(now(), row.id as string)
+    return this.getSession(row.id as string)
+  }
   deleteSession(sessionId: string): void {
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -367,7 +389,7 @@ export class ConductorDatabase {
       .prepare(
         `UPDATE sessions
          SET layout_json = ?, maximized_group_id = ?, closed_tabs_json = ?, updated_at = ?
-         WHERE id = ?`
+         WHERE id = ? AND closed_at IS NULL`
       )
       .run(JSON.stringify(layout), maximizedGroupId, JSON.stringify(closedTabs.slice(-20)), now(), sessionId)
   }
@@ -376,7 +398,7 @@ export class ConductorDatabase {
     const activeProjectId = this.getSetting('activeProjectId') || null
     const activeSessionId = this.getSetting('activeSessionId') || null
     const project = activeProjectId ? this.getProject(activeProjectId) : null
-    const session = activeSessionId ? this.getSession(activeSessionId) : null
+    const session = activeSessionId && activeProjectId ? this.listSessions(activeProjectId).find(item => item.id === activeSessionId) : null
     let focusedGroupIds: Record<string, string> = {}
     try {
       const parsed = JSON.parse(this.getSetting('focusedGroupIds') || '{}') as unknown
@@ -400,7 +422,7 @@ export class ConductorDatabase {
     const saveSession = this.db.prepare(
       `UPDATE sessions
        SET layout_json = ?, maximized_group_id = ?, closed_tabs_json = ?, updated_at = ?
-       WHERE id = ?`
+       WHERE id = ? AND closed_at IS NULL`
     )
     const saveSetting = this.db.prepare(
       `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
@@ -418,7 +440,7 @@ export class ConductorDatabase {
         )
       }
       saveSetting.run('activeProjectId', checkpoint.activeProjectId ?? '', timestamp)
-      saveSetting.run('activeSessionId', checkpoint.activeSessionId ?? '', timestamp)
+      saveSetting.run('activeSessionId', checkpoint.activeSessionId && this.db.prepare('SELECT id FROM sessions WHERE id = ? AND closed_at IS NULL').get(checkpoint.activeSessionId) ? checkpoint.activeSessionId : '', timestamp)
       saveSetting.run('focusedGroupIds', JSON.stringify(checkpoint.focusedGroupIds), timestamp)
       this.db.exec('COMMIT')
     } catch (error) {
@@ -454,19 +476,23 @@ export class ConductorDatabase {
       projectId: row.project_id as string,
       path: row.path as string,
       content: row.content as string,
+      baseContent: row.base_content_json == null ? undefined : JSON.parse(row.base_content_json as string) as string | null,
       viewState,
       updatedAt: row.updated_at as string
     }
   }
 
-  saveEditorDraft(tabId: string, projectId: string, path: string, content: string, viewState: unknown): void {
+  saveEditorDraft(tabId: string, projectId: string, path: string, content: string, viewState: unknown, baseContent?: string | null): void {
+    // Clean buffers can be older than disk without containing any user edits.
+    if (content === baseContent || baseContent === null && content === '') { this.removeEditorDraft(tabId); return }
     this.db.prepare(
-      `INSERT INTO editor_drafts (tab_id, project_id, path, content, view_state_json, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO editor_drafts (tab_id, project_id, path, content, view_state_json, updated_at, base_content_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tab_id) DO UPDATE SET
          project_id = excluded.project_id, path = excluded.path, content = excluded.content,
-         view_state_json = excluded.view_state_json, updated_at = excluded.updated_at`
-    ).run(tabId, projectId, path, content, viewState ? JSON.stringify(viewState) : null, now())
+         view_state_json = excluded.view_state_json, updated_at = excluded.updated_at,
+         base_content_json = excluded.base_content_json`
+    ).run(tabId, projectId, path, content, viewState ? JSON.stringify(viewState) : null, now(), baseContent === undefined ? null : JSON.stringify(baseContent))
   }
 
   removeEditorDraft(tabId: string): void {
@@ -566,7 +592,7 @@ export class ConductorDatabase {
   listDetachedWindows(): DetachedWindowRecord[] {
     return (
       this.db
-        .prepare('SELECT * FROM detached_windows ORDER BY created_at ASC')
+        .prepare('SELECT * FROM detached_windows WHERE session_id IN (SELECT id FROM sessions WHERE closed_at IS NULL) ORDER BY created_at ASC')
         .all() as DbRow[]
     ).map(this.mapDetachedWindow)
   }

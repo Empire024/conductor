@@ -1,0 +1,28 @@
+{
+  "synthetic": true,
+  "provider": "claude",
+  "root": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-offline-6Tao1d",
+  "checks": [
+    "Opening an empty pane registers history without starting a provider",
+    "Discovered Claude model exposes its supported effort; initial effort applies through acknowledged controls on the existing connection",
+    "Real request answered in UI; fake runtime executes one edit after approval; exact two-line deletion and actual node:test output",
+    "Default 110% zoom keeps the pane within the viewport and transcript free of horizontal overflow",
+    "Expanded immutable Monaco versions; next change and side-by-side; clipboard patch; Keep does not reapply; undo preserves a later user edit",
+    "Renderer reload preserves native identity and does not resend prompt",
+    "Closing/retrieving the agent pane preserves transcript, native session and card expansion; no resubmission",
+    "File link opens actual Monaco code pane without writes; explicit editor context is inspectable and removable",
+    "Invisible zero-space split handle remains draggable and keyboard-resizable",
+    "Explicit runtime resume and second synthetic turn preserve native conversation ID and history; labeled fixture continuation, not live-context proof",
+    "Detach to an actual Electron window, close, and retrieve preserve runtime incarnation, native conversation and exactly two submitted prompts",
+    "Normal and narrow screenshots captured; no renderer exceptions"
+  ],
+  "failures": [],
+  "screenshots": [
+    "artifacts/structured-agent-ui/claude/model-picker.png",
+    "artifacts/structured-agent-ui/claude/normal.png",
+    "artifacts/structured-agent-ui/claude/zoom-110.png",
+    "artifacts/structured-agent-ui/claude/diff.png",
+    "artifacts/structured-agent-ui/claude/narrow.png",
+    "artifacts/structured-agent-ui/claude/detached.png"
+  ]
+}

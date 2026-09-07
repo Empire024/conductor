@@ -1,0 +1,15 @@
+{
+  "synthetic": true,
+  "checks": [
+    "Workspace sidebar double-click renames inline; Escape cancels without saving",
+    "Top workspace tabs and sidebar share the same context-menu actions",
+    "Ctrl Shift Z restores the same workspace, agent resource, native conversation, and unsent draft; closing stops the runtime",
+    "Closed workspace recovery survives renderer restart and works through the context menu",
+    "Rapidly closing every workspace leaves no stale tabs, and Ctrl Shift Z restores from an empty workspace bar"
+  ],
+  "failures": [],
+  "screenshots": [
+    "artifacts/backlog-followup/workspace-restore-menu.png",
+    "artifacts/backlog-followup/workspace-restored.png"
+  ]
+}

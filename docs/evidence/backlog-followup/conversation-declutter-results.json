@@ -1,0 +1,8 @@
+{
+  "synthetic": true,
+  "checks": [
+    "Eight successful operations collapse to one row; failure and assistant messages remain visible; subagent/root status noise is removed",
+    "Expanding the group and an action reveals its exact command and output"
+  ],
+  "failures": []
+}

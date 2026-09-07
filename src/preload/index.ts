@@ -29,7 +29,7 @@ const bridge: ConductorBridge = {
   },
   structured: {
     queue: (id, text, settings, attachments) => ipcRenderer.invoke('structured:queue', id, text, settings, attachments),
-    cancelQueued: (id) => ipcRenderer.invoke('structured:cancel-queued', id),
+    cancelQueued: (id, promptId) => ipcRenderer.invoke('structured:cancel-queued', id, promptId),
     connect: (id) => ipcRenderer.invoke('structured:connect', id),
     snapshot: (id) => ipcRenderer.invoke('structured:snapshot', id),
     events: (id, after) => ipcRenderer.invoke('structured:events', id, after),
@@ -69,6 +69,7 @@ const bridge: ConductorBridge = {
     setThemeAuto: (enabled) => ipcRenderer.invoke('settings:set-theme-auto', enabled),
     setDebugLogging: (enabled) => ipcRenderer.invoke('settings:set-debug-logging', enabled),
     setAgentSoundProfile: (profile) => ipcRenderer.invoke('settings:set-agent-sound-profile', profile),
+    setDefaultNewFileExtension: (extension) => ipcRenderer.invoke('settings:set-default-file-extension', extension),
     setUpdateFeedUrl: (url) => ipcRenderer.invoke('settings:set-update-feed-url', url),
     setLocalUpdates: (enabled) => ipcRenderer.invoke('settings:set-local-updates', enabled)
   },
@@ -83,6 +84,9 @@ const bridge: ConductorBridge = {
     onPrepareInstall: (callback) => subscribe('updates:prepare-install', callback)
   },
   sessions: {
+    closed: () => ipcRenderer.invoke('sessions:closed'),
+    onRestored: (callback) => subscribe('sessions:restored', callback),
+    restore: (sessionId) => ipcRenderer.invoke('sessions:restore', sessionId),
     reorder: (projectId, ids) => ipcRenderer.invoke('sessions:reorder', projectId, ids),
     list: (projectId) => ipcRenderer.invoke('sessions:list', projectId),
     create: (projectId, name) => ipcRenderer.invoke('sessions:create', projectId, name),
@@ -110,12 +114,16 @@ const bridge: ConductorBridge = {
     openInBrowser: (projectId, path) => ipcRenderer.invoke('files:open-in-browser', projectId, path),
     confirmClose: (tabIds) => ipcRenderer.invoke('files:confirm-close', tabIds),
     onDraftResolved: (callback) => subscribe('files:draft-resolved', callback),
+    onDraftConflict: (callback) => subscribe('files:draft-conflict', callback),
     search: (projectIds, query) => ipcRenderer.invoke('files:search', projectIds, query),
     list: (projectId, relativePath) => ipcRenderer.invoke('files:list', projectId, relativePath),
     read: (projectId, relativePath) => ipcRenderer.invoke('files:read', projectId, relativePath),
+    readForEditor: (projectId, relativePath) => ipcRenderer.invoke('files:read-for-editor', projectId, relativePath),
     readDataUrl: (projectId, relativePath) => ipcRenderer.invoke('files:read-data-url', projectId, relativePath),
-    write: (projectId, relativePath, content) =>
-      ipcRenderer.invoke('files:write', projectId, relativePath, content),
+    write: (projectId, relativePath, content, expectedContent) =>
+      ipcRenderer.invoke('files:write', projectId, relativePath, content, expectedContent),
+    saveCopy: (projectId, relativePath, content) => ipcRenderer.invoke('files:save-copy', projectId, relativePath, content),
+    createUntitled: (projectId, directory) => ipcRenderer.invoke('files:create-untitled', projectId, directory),
     create: (projectId, directory, name, kind) =>
       ipcRenderer.invoke('files:create', projectId, directory, name, kind),
     rename: (projectId, relativePath, name) =>
@@ -128,11 +136,10 @@ const bridge: ConductorBridge = {
       ipcRenderer.invoke('files:open-external', projectId, relativePath),
     getDraft: (tabId, projectId, relativePath) =>
       ipcRenderer.invoke('files:get-draft', tabId, projectId, relativePath),
-    checkpointDraft: (tabId, projectId, relativePath, content, viewState) =>
-      ipcRenderer.send('files:checkpoint-draft', tabId, projectId, relativePath, content, viewState),
-    flushDraft: (tabId, projectId, relativePath, content, viewState) => {
-      ipcRenderer.sendSync('files:flush-draft', tabId, projectId, relativePath, content, viewState)
-    },
+    checkpointDraft: (tabId, projectId, relativePath, content, viewState, baseContent) =>
+      ipcRenderer.send('files:checkpoint-draft', tabId, projectId, relativePath, content, viewState, baseContent),
+    flushDraft: (tabId, projectId, relativePath, content, viewState, baseContent) =>
+      ipcRenderer.sendSync('files:flush-draft', tabId, projectId, relativePath, content, viewState, baseContent),
     removeDraft: (tabId) => ipcRenderer.invoke('files:remove-draft', tabId)
   },
   terminals: {

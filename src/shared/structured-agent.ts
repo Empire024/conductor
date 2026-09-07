@@ -22,13 +22,13 @@ export interface ProviderCapabilities {
   approvalPolicies?: NonNullable<SessionSettings['approvalPolicy']>[]
   effectiveSettings?: Json
   effort: string[]
-  models: Array<{ id: string; label: string; effort?: string[]; isDefault?: boolean }>
+  models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }>
   limitations: string[]
 }
 export interface SessionSettings {
   model?: string
   effort?: string
-  permission: 'default' | 'read-only' | 'accept-edits'
+  permission: 'default' | 'read-only' | 'accept-edits' | 'auto'
   sandbox?: 'inherit' | 'read-only' | 'workspace-write'
   approvalPolicy?: 'inherit' | 'untrusted' | 'on-request' | 'never'
   plan: boolean
@@ -74,14 +74,14 @@ export interface FileChange {
 }
 export interface QueuedPrompt { id: string; text: string; settings: SessionSettings; attachments: ContextAttachment[] }
 export type AgentEventData =
-  | { type: 'queue'; prompt: QueuedPrompt | null }
+  | { type: 'queue'; prompt: QueuedPrompt | null; prompts?: QueuedPrompt[] }
   | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings }
-  | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot' }
+  | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[] }
   | { type: 'tool'; name: string; description?: string; input?: Json; inputDelta?: string; status: ActivityStatus; output?: string; outputMode?: 'delta' | 'snapshot'; stderr?: string; exitCode?: number; durationMs?: number; outputArtifactId?: string }
   | { type: 'changes'; changes: FileChange[] }
   | { type: 'interaction'; interaction: PendingInteraction }
   | { type: 'plan'; steps: Array<{ text: string; status: 'pending' | 'in_progress' | 'completed' }>; explanation?: string }
-  | { type: 'usage'; inputTokens?: number; outputTokens?: number; cachedTokens?: number; costUsd?: number; source: 'provider' | 'estimate'; limits?: Json }
+  | { type: 'usage'; inputTokens?: number; outputTokens?: number; cachedTokens?: number; cacheCreationTokens?: number; reasoningTokens?: number; totalTokens?: number; costUsd?: number; scope?: 'session' | 'turn' | 'message'; source: 'provider' | 'estimate'; limits?: Json }
   | { type: 'error'; message: string; code?: string }
   | { type: 'notice'; message: string; payload?: Json; outputArtifactId?: string }
   | { type: 'subagent'; name: string; nativeSessionId?: string; status: ActivityStatus }
@@ -108,6 +108,7 @@ export interface AgentEvent {
 /** Adapter emits only provider facts; the backend assigns durable envelope fields. */
 export type AdapterEvent = Pick<AgentEvent, 'data'> & Partial<Pick<AgentEvent, 'nativeSessionId' | 'turnId' | 'itemId' | 'parentId' | 'requestId' | 'native'>>
 export interface TimelineItem {
+  updatedSequence?: number
   id: string
   runtimeId: string
   turnId?: string
@@ -120,6 +121,7 @@ export interface TimelineItem {
 export interface SessionProjection {
   view?: 'visual' | 'cli'
   queued?: QueuedPrompt | null
+  queuedPrompts?: QueuedPrompt[]
   sessionId: string
   runtimeId: string
   nativeSessionId?: string
@@ -154,7 +156,7 @@ export interface InteractionResponse {
 }
 export interface StructuredAgentBridge {
   queue(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
-  cancelQueued(id: string): Promise<QueuedPrompt | null>
+  cancelQueued(id: string, promptId?: string): Promise<QueuedPrompt | null>
   connect(id: string): Promise<void>
   snapshot(id: string): Promise<SessionProjection | null>
   events(id: string, after?: number): Promise<AgentEvent[]>

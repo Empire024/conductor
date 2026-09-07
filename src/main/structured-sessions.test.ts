@@ -255,7 +255,7 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     await expect(f.manager.submit(f.spec.id, 'unsupported', { ...settings, permission: 'read-only' })).rejects.toThrow('unsupported')
   })
 
-  it('stores the actual selected and unsaved context that is submitted', async () => {
+  it('submits exact selected context while keeping expanded file bytes outside the visible message', async () => {
     const f = fixture()
     writeFileSync(join(f.workspace, 'context.txt'), 'saved content\n')
     await f.manager.submit(f.spec.id, 'Inspect selected context', settings, [
@@ -266,7 +266,9 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     const submitted = f.current.submissions[0]!.text
     expect(submitted).toContain('saved content'); expect(submitted).toContain('unsaved content'); expect(submitted).toContain('lines 2-3')
     const user = f.database.structured.snapshot(f.spec.id)?.items.find((item) => item.data.type === 'text' && item.data.role === 'user')
-    expect(user?.data).toMatchObject({ text: submitted })
+    expect(user?.data).toMatchObject({ text: 'Inspect selected context', attachments: [{ id: 'file', name: 'context.txt' }, { id: 'editor', name: 'context.txt (unsaved)' }, { id: 'selection', startLine: 2, endLine: 3 }] })
+    expect(JSON.stringify(user?.data)).not.toContain('saved content')
+    expect(JSON.stringify(user?.data)).not.toContain('[Attached')
   })
 
   it('forks native context and copies immutable historical artifacts without an inference submission', async () => {
@@ -334,114 +336,57 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(0)
   })
 
-  it('reconfigures only an untouched Claude metadata connection so the first selected effort reaches the runtime once', async () => {
+  it('applies first-turn effort through the existing initialized Claude connection', async () => {
     const f = fixture('claude', false)
     await f.manager.connectSession(f.spec.id)
-    const metadata = f.current
-    metadata.emit({ data: { type: 'notice', message: 'SYNTHETIC initialized model metadata', payload: { models: [] } } })
-    expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ phase: 'idle' })
-    expect(f.database.structured.snapshot(f.spec.id)?.nativeSessionId).toBeUndefined()
-    expect(metadata.options.settings.effort).toBeUndefined()
-    const selected: SessionSettings = { ...settings, effort: 'low' }
-
+    const original = f.current, selected = { ...settings, effort: 'low' }
     await f.manager.submit(f.spec.id, 'First effort-selected synthetic turn', selected)
-    const connected = f.current
-    expect(metadata.disposed).toBe(true)
-    expect(metadata.submissions).toEqual([])
-    expect(connected).not.toBe(metadata)
-    expect(connected.options.nativeSessionId).toBeUndefined()
-    expect(connected.options.runtimeId).not.toBe(metadata.options.runtimeId)
-    expect(connected.options).toMatchObject({ cwd: f.workspace, settings: selected })
-    expect(connected.submissions).toEqual([{ text: 'First effort-selected synthetic turn', settings: selected, attachments: [] }])
-    expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(2)
-    expect(f.adapters.reduce((sum, adapter) => sum + adapter.submissions.length, 0)).toBe(1)
-    expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(1)
-    const sequence = f.database.structured.snapshot(f.spec.id)!.sequence
-    metadata.emit({ data: { type: 'session', phase: 'disconnected' } })
-    expect(f.database.structured.snapshot(f.spec.id)!.sequence).toBe(sequence)
+    expect(f.current).toBe(original)
+    expect(original.disposed).toBe(false)
+    expect(original.submissions).toEqual([{ text: 'First effort-selected synthetic turn', settings: selected, attachments: [] }])
+    expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(1)
   })
-
-  it('does not dispose or change metadata settings when first-turn context validation fails', async () => {
+  it('does not change runtime settings when context validation fails', async () => {
     const f = fixture('claude', false)
     await f.manager.connectSession(f.spec.id)
-    const metadata = f.current
+    const original = f.current
     await expect(f.manager.submit(f.spec.id, 'Invalid context', { ...settings, effort: 'low' }, [
       { id: 'outside', kind: 'file', name: 'outside', path: '../conductor.db' }
     ])).rejects.toThrow('outside')
-    expect(metadata.disposed).toBe(false)
-    expect(metadata.submissions).toEqual([])
+    expect(original.disposed).toBe(false)
+    expect(original.submissions).toEqual([])
     expect(f.database.structured.snapshot(f.spec.id)?.settings.effort).toBeUndefined()
-    expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(1)
   })
-
-  it('rechecks metadata identity after asynchronous context preparation before disposing a connection', async () => {
+  it('keeps native identity arriving during context preparation when changing effort', async () => {
     const f = fixture('claude', false)
     writeFileSync(join(f.workspace, 'context.txt'), 'Synthetic context')
     await f.manager.connectSession(f.spec.id)
-    const metadata = f.current
-    const submitted = f.manager.submit(f.spec.id, 'Do not restart newly established context', { ...settings, effort: 'low' }, [
-      { id: 'context', kind: 'file', name: 'context.txt', path: 'context.txt' }
-    ])
-    metadata.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: 'native-arrived-during-context-read' } })
-    await expect(submitted).rejects.toThrow('changed during preparation')
-    expect(metadata.disposed).toBe(false)
-    expect(metadata.submissions).toEqual([])
-    expect(f.database.structured.snapshot(f.spec.id)?.settings.effort).toBeUndefined()
-    expect(f.database.structured.snapshot(f.spec.id)?.nativeSessionId).toBe('native-arrived-during-context-read')
-    expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(1)
-  })
-
-  it.each(['disconnected', 'failed', 'interrupted'] as const)('does not treat a %s Claude connection without a native ID as idle metadata', async phase => {
-    const f = fixture('claude', false)
-    await f.manager.connectSession(f.spec.id)
-    const metadata = f.current
-    metadata.emit({ data: { type: 'session', phase } })
-    await expect(f.manager.submit(f.spec.id, 'No uncertain restart', { ...settings, effort: 'low' })).rejects.toThrow('Resume the Claude connection')
-    expect(metadata.disposed).toBe(false)
-    expect(metadata.submissions).toEqual([])
-    expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(1)
-  })
-
-  it('requires explicit recovery when a prior user turn has not reported a native identity', async () => {
-    const f = fixture('claude', false)
-    await f.manager.submit(f.spec.id, 'Prior synthetic turn without native identity', settings)
     const original = f.current
-    original.emit({ data: { type: 'session', phase: 'idle' } })
-    await expect(f.manager.submit(f.spec.id, 'Do not rebuild prior context', { ...settings, effort: 'low' })).rejects.toThrow('Resume the Claude connection')
+    const submitted = f.manager.submit(f.spec.id, 'Preserve current context', { ...settings, effort: 'low' }, [{ id: 'context', kind: 'file', name: 'context.txt', path: 'context.txt' }])
+    original.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: 'native-arrived-during-context-read' } })
+    await submitted
+    expect(f.current).toBe(original)
     expect(original.disposed).toBe(false)
     expect(original.submissions).toHaveLength(1)
-    expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(1)
+    expect(f.database.structured.snapshot(f.spec.id)?.nativeSessionId).toBe('native-arrived-during-context-read')
   })
-
-  it('rejects connected Claude effort changes before recording a prompt and applies them only through explicit native resume', async () => {
+  it('applies each queued effort to the same native Claude conversation', async () => {
     const f = fixture()
-    await f.manager.submit(f.spec.id, 'Original synthetic turn', settings)
-    const original = f.current
+    await f.manager.submit(f.spec.id, 'Original turn', settings)
+    const original = f.current, nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
+    await f.manager.queue(f.spec.id, 'Low effort followup', { ...settings, effort: 'low' })
+    await f.manager.queue(f.spec.id, 'Inherited effort followup', settings)
     original.finish()
-    const previous = f.database.structured.snapshot(f.spec.id)!
-    const nativeId = previous.nativeSessionId
-    const selected: SessionSettings = { ...settings, effort: 'low' }
-    const userItemsBefore = previous.items.filter((item) => item.data.type === 'text' && item.data.role === 'user').length
-
-    await expect(f.manager.submit(f.spec.id, 'Pending effort-selected turn', selected)).rejects.toThrow('Resume the Claude connection with the selected effort')
-    expect(f.database.structured.snapshot(f.spec.id)?.sequence).toBe(previous.sequence)
-    expect(f.database.structured.snapshot(f.spec.id)?.settings.effort).toBeUndefined()
-    expect(original.submissions).toHaveLength(1)
-    expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(1)
-
-    await f.manager.resume(f.spec.id, selected)
-    const resumed = f.current
-    expect(original.disposed).toBe(true)
-    expect(resumed).not.toBe(original)
-    expect(resumed.options).toMatchObject({ nativeSessionId: nativeId, settings: { effort: 'low' } })
-    expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ nativeSessionId: nativeId, settings: { effort: 'low' } })
-    expect(resumed.submissions).toEqual([])
-
-    await f.manager.submit(f.spec.id, 'Pending effort-selected turn', selected)
-    expect(resumed.submissions).toEqual([{ text: 'Pending effort-selected turn', settings: selected, attachments: [] }])
-    expect(original.submissions).toHaveLength(1)
-    expect(f.database.structured.snapshot(f.spec.id)?.items.filter((item) => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(userItemsBefore + 1)
+    await vi.waitFor(() => expect(original.submissions).toHaveLength(2))
+    original.finish()
+    await vi.waitFor(() => expect(original.submissions).toHaveLength(3))
+    expect(original.submissions.map(submission => submission.settings.effort)).toEqual([undefined, 'low', undefined])
+    expect(f.current).toBe(original)
+    expect(original.disposed).toBe(false)
+    expect(f.database.structured.snapshot(f.spec.id)?.nativeSessionId).toBe(nativeId)
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toEqual([])
   })
+
 })
 
 describe('queued messages and native CLI handoff', () => {
@@ -483,11 +428,35 @@ describe('queued messages and native CLI handoff', () => {
     await f.manager.submit(f.spec.id, 'first', settings)
     await f.manager.queue(f.spec.id, 'second', settings)
     expect(f.database.structured.snapshot(f.spec.id)?.queued?.text).toBe('second')
-    await expect(f.manager.queue(f.spec.id, 'duplicate', settings)).rejects.toThrow('already queued')
+    await f.manager.queue(f.spec.id, 'third', settings)
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.map(prompt => prompt.text)).toEqual(['second', 'third'])
     f.current.finish()
     await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
     expect(f.current.submissions.map((item) => item.text)).toEqual(['first', 'second'])
+    expect(f.database.structured.snapshot(f.spec.id)?.queued?.text).toBe('third')
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(3))
+    expect(f.current.submissions.map(item => item.text)).toEqual(['first', 'second', 'third'])
     expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+  })
+  it('captures file contents when queued and removes a selected message without dropping its neighbors', async () => {
+    const f = fixture(), path = join(f.workspace, 'queued.txt')
+    writeFileSync(path, 'original queued bytes')
+    await f.manager.submit(f.spec.id, 'active', settings)
+    await Promise.all([
+      f.manager.queue(f.spec.id, 'first followup', settings, [{ id: 'file', kind: 'file', name: 'queued.txt', path: 'queued.txt' }]),
+      f.manager.queue(f.spec.id, 'remove this', settings),
+      f.manager.queue(f.spec.id, 'last followup', settings)
+    ])
+    const prompts = f.database.structured.snapshot(f.spec.id)!.queuedPrompts!
+    expect(prompts.map(prompt => prompt.text)).toEqual(['first followup', 'remove this', 'last followup'])
+    expect(f.manager.cancelQueued(f.spec.id, prompts[1]!.id)?.text).toBe('remove this')
+    expect(f.database.structured.snapshot(f.spec.id)!.queuedPrompts!.map(prompt => prompt.text)).toEqual(['first followup', 'last followup'])
+    writeFileSync(path, 'changed disk bytes')
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    expect(f.current.submissions[1]!.text).toContain('original queued bytes')
+    expect(f.current.submissions[1]!.text).not.toContain('changed disk bytes')
   })
   it('keeps a queued message through interruption and returns its exact context when removed', async () => {
     const f = fixture()

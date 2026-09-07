@@ -4,9 +4,9 @@ import type { ProjectRecord } from '../../../shared/models'
 import { CodePane } from '../panes/CodePane'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { BrowserPane } from '../panes/BrowserPane'
-import { AgentDialog } from '../panes/StructuredAgentRenderers'
 import { FilePicker } from './FilePicker'
-import { loadWorkspaceFiles, openWorkspaceFile, type OpenWorkspaceFile, type WorkspaceFile } from './workspace-files-state'
+import { changeWorkspacePath, loadWorkspaceFiles, openWorkspaceFile, type OpenWorkspaceFile, type WorkspaceFile } from './workspace-files-state'
+import './WorkspaceFiles.css'
 
 function FileBrowser({ project, file }: { project: ProjectRecord; file: WorkspaceFile }): React.JSX.Element {
   const [url, setUrl] = useState(''), [error, setError] = useState('')
@@ -16,7 +16,14 @@ function FileBrowser({ project, file }: { project: ProjectRecord; file: Workspac
 export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects: ProjectRecord[]; projectId: string; workspaceId: string }): React.JSX.Element | null {
   const [state, setState] = useState(() => loadWorkspaceFiles(workspaceId))
   const [width, setWidth] = useState(() => Number(localStorage.getItem('conductor.documentWidth')) || 620)
-  const [picker, setPicker] = useState(false), [creating, setCreating] = useState(false), [name, setName] = useState(''), [error, setError] = useState('')
+  const [picker, setPicker] = useState(false), [creating, setCreating] = useState(false), [error, setError] = useState('')
+  const [naming, setNaming] = useState<{ file: WorkspaceFile; value: string } | null>(null)
+  const [renaming, setRenaming] = useState(false)
+  const namingRef = useRef(naming); namingRef.current = naming
+  const namingInput = useRef<HTMLInputElement>(null)
+  const creatingRef = useRef(false), renamingRef = useRef(false)
+  const mounted = useRef(true)
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false } }, [])
   const [dirtyIds, setDirtyIds] = useState<Set<string>>(new Set())
   const host = useRef<HTMLElement>(null)
   const stateRef = useRef(state); stateRef.current = state
@@ -28,6 +35,50 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
       return { files: existing ? current.files.map((item) => item.id === existing.id ? { ...item, ...next } : item) : [...current.files, next], activeId: next.id }
     })
   }
+  const focusEditor = (): void => { requestAnimationFrame(() => { host.current?.querySelector<HTMLTextAreaElement>('.file-tab-content:not([hidden]) .monaco-editor textarea')?.focus() }) }
+  const stopNaming = (): void => { namingRef.current = null; setNaming(null); setError('') }
+  const finishNaming = async (): Promise<void> => {
+    const entry = namingRef.current
+    if (!entry || renamingRef.current) return
+    const name = entry.value.trim()
+    if (!name || name === entry.file.path.split('/').pop()) { stopNaming(); return }
+    renamingRef.current = true; setRenaming(true); setError('')
+    try {
+      window.dispatchEvent(new Event('conductor:flush-editors'))
+      const renamed = await window.conductor.files.rename(entry.file.projectId, entry.file.path, name)
+      changeWorkspacePath(entry.file.projectId, entry.file.path, renamed.relativePath, 'file')
+      window.dispatchEvent(new Event('conductor:refresh-files'))
+      if (namingRef.current?.file.id === entry.file.id) stopNaming()
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+    finally { renamingRef.current = false; setRenaming(false) }
+  }
+  const createFile = async (): Promise<void> => {
+    if (creatingRef.current) return
+    creatingRef.current = true; setCreating(true); setError('')
+    try {
+      const owner = active?.projectId ?? projectId
+      const directory = active?.path.includes('/') ? active.path.slice(0, active.path.lastIndexOf('/')) : ''
+      const created = await window.conductor.files.createUntitled(owner, directory)
+      const file: WorkspaceFile = { id: 'document:' + workspaceId + ':' + crypto.randomUUID(), projectId: owner, path: created.relativePath, mode: 'editor' }
+      // A workspace may change while the file is being created. Persist its
+      // new tab under the original workspace even if this view was unmounted.
+      const current = mounted.current ? stateRef.current : loadWorkspaceFiles(workspaceId)
+      const next = { files: [...current.files, file], activeId: file.id }
+      localStorage.setItem('conductor.workspaceFiles.' + workspaceId, JSON.stringify(next))
+      if (mounted.current) { stateRef.current = next; setState(next); setNaming({ file, value: created.name }) }
+      window.dispatchEvent(new Event('conductor:refresh-files'))
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
+    finally { creatingRef.current = false; setCreating(false) }
+  }
+  useEffect(() => {
+    if (!naming) return
+    const frame = requestAnimationFrame(() => {
+      const input = namingInput.current
+      input?.focus()
+      input?.setSelectionRange(0, Math.max(0, naming.value.lastIndexOf('.')) || naming.value.length)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [naming?.file.id])
   const close = async (id: string): Promise<void> => {
     window.dispatchEvent(new Event('conductor:flush-editors'))
     if (!await window.conductor.files.confirmClose([id])) return
@@ -85,13 +136,17 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
       <button className="workspace-document-resizer" onPointerDown={resize} aria-label="Resize editor" />
       <div className="file-tabs" role="tablist" aria-label="File tabs">
         {state.files.map((file) => <div className={'file-tab' + (file.id === active.id ? ' active' : '')} key={file.id}>
-          <button role="tab" aria-selected={file.id === active.id} title={projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
+          {naming?.file.id === file.id ? <div className="file-tab-naming"><FileCode2 size={13} /><input ref={namingInput} className="file-tab-name" aria-label="New file name" value={naming.value} disabled={renaming} onChange={(event) => { const next = { ...naming, value: event.target.value }; namingRef.current = next; setNaming(next) }} onBlur={() => void finishNaming()} onKeyDown={(event) => {
+            if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); stopNaming(); focusEditor() }
+            if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); void finishNaming().then(focusEditor) }
+          }} /></div> : <button role="tab" aria-selected={file.id === active.id} title={projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
             onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }}>
             {file.mode === 'browser' ? <Globe2 size={13} /> : <FileCode2 size={13} />}<span>{file.path.split('/').pop()}</span>{dirtyIds.has(file.id) && <i className="file-dirty-dot" aria-label="Unsaved changes" />}
-          </button><button className="file-tab-close" aria-label={'Close ' + file.path} onClick={() => void close(file.id)}><X size={12} /></button>
+          </button>}<button className="file-tab-close" aria-label={'Close ' + file.path} onMouseDown={() => { if (namingRef.current?.file.id === file.id) stopNaming() }} onClick={() => void close(file.id)}><X size={12} /></button>
         </div>)}
-        <button className="file-new" title="New file" aria-label="New file" onClick={() => { setName(''); setError(''); setCreating(true) }}><Plus size={15} /></button>
+        <button className="file-new" title="New file" aria-label="New file" disabled={creating || renaming} onClick={() => void createFile()}><Plus size={15} /></button>
       </div>
+      {error && <p className="file-create-error" role="alert">{error}</p>}
       <div className="file-view-toolbar"><span title={active.path}>{active.path}</span>
         {([['editor', FileCode2, 'Edit'], ['preview', Eye, 'Preview'], ['browser', Globe2, 'Open in browser']] as const).map(([mode, Icon, label]) => <button key={mode} title={label} aria-label={label} aria-pressed={active.mode === mode} onClick={() => open({ ...active, mode })}><Icon size={14} /></button>)}
       </div>
@@ -100,15 +155,12 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
           const project = projects.find((item) => item.id === file.projectId)
           if (!project) return file.id === active.id ? <p key={file.id}>This project is no longer loaded.</p> : null
           return <div className="file-tab-content" key={file.id} hidden={file.id !== active.id}>
-            {file.mode === 'editor' ? <CodePane project={project} tabId={file.id} path={file.path} line={file.line} /> : file.mode === 'browser' ? <FileBrowser project={project} file={file} /> : <FilePreviewPane project={project} path={file.path} onOpenEditor={(path) => open({ projectId: project.id, path, mode: 'editor' })} />}
+            {file.mode === 'editor' ? <CodePane project={project} tabId={file.id} path={file.path} line={file.line} autoFocus={naming?.file.id !== file.id} /> : file.mode === 'browser' ? <FileBrowser project={project} file={file} /> : <FilePreviewPane project={project} path={file.path} onOpenEditor={(path) => open({ projectId: project.id, path, mode: 'editor' })} />}
           </div>
         })}
       </div>
     </aside>}
     {picker && <FilePicker projects={projects} onClose={() => setPicker(false)} onPick={(file) => openWorkspaceFile(file.projectId, file.path)} />}
-    {creating && <AgentDialog title="New file" onClose={() => setCreating(false)}><form className="new-file-form" onSubmit={(event) => {
-      event.preventDefault(); const owner = active?.projectId ?? projectId
-      void window.conductor.files.create(owner, active?.path.includes('/') ? active.path.slice(0, active.path.lastIndexOf('/')) : '', name, 'file').then((file) => { open({ projectId: owner, path: file.relativePath, mode: 'editor' }); setCreating(false); window.dispatchEvent(new Event('conductor:refresh-files')) }).catch((reason: unknown) => setError(String(reason)))
-    }}><label>File name<input autoFocus required value={name} placeholder="untitled.ts" onChange={(event) => setName(event.target.value)} /></label>{error && <p role="alert">{error}</p>}<footer><button type="button" onClick={() => setCreating(false)}>Cancel</button><button className="primary" type="submit">Create file</button></footer></form></AgentDialog>}
+
   </>
 }

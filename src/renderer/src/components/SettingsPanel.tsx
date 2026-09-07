@@ -13,6 +13,7 @@ export function SettingsPanel({
   onSetThemeVariant,
   onSetThemeAuto,
   onSetAgentSoundProfile,
+  onSetDefaultNewFileExtension,
   onSetDebugLogging,
   onOpenDebugConsole,
   updateState,
@@ -27,6 +28,7 @@ export function SettingsPanel({
   onSetThemeVariant(value: ThemeVariant): void
   onSetThemeAuto(enabled: boolean): void
   onSetAgentSoundProfile(profile: AgentSoundProfile): void
+  onSetDefaultNewFileExtension(extension: string): Promise<AppSettings>
   onSetDebugLogging(enabled: boolean): void
   onOpenDebugConsole(): void
   updateState: AppUpdateState
@@ -34,6 +36,12 @@ export function SettingsPanel({
   onCheckForUpdates(): void
 }): React.JSX.Element {
   const percent = Math.round(settings.zoomFactor * 100)
+  const [fileExtension, setFileExtension] = useState(settings.defaultNewFileExtension)
+  const [extensionError, setExtensionError] = useState('')
+  const saveExtension = async (): Promise<void> => {
+    try { const saved = await onSetDefaultNewFileExtension(fileExtension); setFileExtension(saved.defaultNewFileExtension); setExtensionError('') }
+    catch (reason) { setExtensionError(reason instanceof Error ? reason.message : String(reason)) }
+  }
   const [providers, setProviders] = useState<AgentProviderInfo[]>([])
   useEffect(() => { void window.conductor.agents.listProviders().then(setProviders) }, [])
   const previewSound = (cue: AgentSoundCue): void => playAgentSound(settings.agentSoundProfile, cue)
@@ -81,6 +89,12 @@ export function SettingsPanel({
           <div className="settings-section-title"><FolderCog size={14} /><div><strong>Managed projects</strong><span>New projects are created in this folder.</span></div></div>
           <div className="folder-setting"><code title={settings.projectsRoot}>{settings.projectsRoot}</code><button onClick={onChooseProjectsRoot}>Change…</button></div>
           <p>Moving this location does not move existing projects. Use a project's context menu for that.</p>
+        </section>
+
+        <section>
+          <div className="settings-section-title"><FolderCog size={14} /><div><strong>New files</strong><span>Choose the extension used when you add a file tab.</span></div></div>
+          <label className="default-file-extension"><span>Default file extension</span><input aria-label="Default file extension" value={fileExtension} placeholder="md" maxLength={33} onChange={(event) => setFileExtension(event.target.value)} onBlur={() => void saveExtension()} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); event.currentTarget.blur() } }} /><small>New files start as untitled.{settings.defaultNewFileExtension}.</small></label>
+          {extensionError && <p role="alert">{extensionError}</p>}
         </section>
 
         <section>

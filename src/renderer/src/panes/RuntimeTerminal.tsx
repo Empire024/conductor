@@ -17,6 +17,7 @@ import type {
 } from '../../../shared/models'
 import { AgentPrompt, type AgentPromptMode } from './AgentPrompt'
 import { AgentConversation } from './AgentConversation'
+import { runtimeModelLabel } from '../agent-models'
 import { dispatchAgentContext, StructuredAgentPane } from './StructuredAgentPane'
 import { extractAgentScreenSnapshot, joinWrappedTerminalRows } from './agent-screen'
 import './AgentPrompt.css'
@@ -520,6 +521,7 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
   }
 
   const providerInfo = providers.find((item) => item.id === props.provider)
+  const modelLabel = runtimeModelLabel(modelDraft, providerInfo?.models, runtime?.model)
   const viewMode = props.mode === 'agent' ? props.viewMode ?? 'visual' : 'cli'
 
   const switchView = (next: 'visual' | 'cli'): void => {
@@ -537,7 +539,7 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
       <div className="runtime-strip">
         <div className="runtime-state">
           <i className={`runtime-dot ${runtime?.status ?? 'starting'}`} />
-          {props.mode === 'agent' ? <><strong>{providerInfo?.displayName ?? props.title}</strong><small>{modelDraft}</small><span>{phase === 'working' ? 'working' : runtime?.status === 'running' ? 'ready' : runtime?.status ?? 'connecting'}</span></> : <span>{runtime?.status ?? 'connecting'}</span>}
+          {props.mode === 'agent' ? <><strong>{providerInfo?.displayName ?? props.title}</strong><small>{modelLabel}</small><span>{phase === 'working' ? 'working' : runtime?.status === 'running' ? 'ready' : runtime?.status ?? 'connecting'}</span></> : <span>{runtime?.status ?? 'connecting'}</span>}
           {props.mode === 'terminal' && runtime?.executable && <small>{runtime.executable}</small>}
           {runtime?.resumeAt && <small className="limit-time"><TimerReset size={11} /> resumes {new Date(runtime.resumeAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>}
         </div>
@@ -583,7 +585,7 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
         <div className={`agent-visual-surface ${viewMode === 'visual' ? 'active' : 'hidden'}`} aria-hidden={viewMode !== 'visual'}>
           <AgentConversation
           providerName={providerInfo?.displayName ?? props.title}
-          model={modelDraft}
+          model={modelLabel}
           projectPath={props.project.path}
           events={events}
           transcript={runtime?.transcript ?? ''}
@@ -617,6 +619,7 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
           disabledReason={blockingInteraction === 'directory_trust' ? 'Resolve directory trust above' : undefined}
           limitedUntil={runtime?.status === 'limited' ? runtime.resumeAt : undefined}
           model={modelDraft}
+          modelLabel={modelLabel}
           models={providerInfo?.models ?? []}
           effort={props.effort ?? 'auto'}
           efforts={providerInfo?.efforts ?? [{ id: 'auto', label: 'Provider default' }]}

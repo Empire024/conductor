@@ -1,0 +1,9 @@
+{
+  "synthetic": true,
+  "checks": [
+    "Auto/Plan/Edit live in the composer; actual model is explicit; attachment bytes stay out of displayed prompt; headers are compact",
+    "Three messages queue; removing the middle preserves FIFO; choices submit once; streamed/final Claude response is not repeated",
+    "Escape interrupts the same Claude session cleanly without exposing stop diagnostics"
+  ],
+  "failures": []
+}

@@ -128,8 +128,8 @@ if (managedSettings.result.value.projectsRoot.includes('.managed-project-smoke')
     return true
   })()`)
   if (!selectedOriginal.result.value) {
-    await evaluate(`window.conductor.files.write(${JSON.stringify(created.id)}, 'package.json', ${JSON.stringify('{\n  "name": "conductor-smoke-fixture"\n}\n')})`)
-    await evaluate(`window.conductor.files.write(${JSON.stringify(created.id)}, 'README.md', ${JSON.stringify('# Smoke project\n\nMarkdown preview fixture.\n')})`)
+    await evaluate(`window.conductor.files.readForEditor(${JSON.stringify(created.id)}, 'package.json').then(base => window.conductor.files.write(${JSON.stringify(created.id)}, 'package.json', ${JSON.stringify('{\n  "name": "conductor-smoke-fixture"\n}\n')}, base))`)
+    await evaluate(`window.conductor.files.readForEditor(${JSON.stringify(created.id)}, 'README.md').then(base => window.conductor.files.write(${JSON.stringify(created.id)}, 'README.md', ${JSON.stringify('# Smoke project\n\nMarkdown preview fixture.\n')}, base))`)
   }
   await delay(500)
 }
@@ -191,8 +191,8 @@ await evaluate(`(async () => {
   const projects = await window.conductor.projects.list()
   const project = projects.find((item) => item.name === 'Workspace smoke') ?? projects[0]
   if (!project) return
-  await window.conductor.files.write(project.id, 'package.json', ${JSON.stringify('{\n  "name": "conductor-smoke-fixture"\n}\n')})
-  await window.conductor.files.write(project.id, 'README.md', ${JSON.stringify('# Workspace smoke\n')})
+  await window.conductor.files.write(project.id, 'package.json', ${JSON.stringify('{\n  "name": "conductor-smoke-fixture"\n}\n')}, await window.conductor.files.readForEditor(project.id, 'package.json'))
+  await window.conductor.files.write(project.id, 'README.md', ${JSON.stringify('# Workspace smoke\n')}, await window.conductor.files.readForEditor(project.id, 'README.md'))
 })()`)
 
 const activeWorkspaceAtStart = await evaluate(`Boolean(document.querySelector('.session-tab.active'))`)

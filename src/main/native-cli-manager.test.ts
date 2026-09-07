@@ -12,6 +12,12 @@ describe('native conversation launch arguments', () => {
     expect(args).not.toContain('--last')
     expect(args).not.toContain('--dangerously-bypass-approvals-and-sandbox')
   })
+  it('preserves Claude Auto, Edit, Plan and manual policies during CLI handoff', () => {
+    expect(nativeCliArgs('claude', 'same-id', { permission: 'auto', plan: false })).toContain('auto')
+    expect(nativeCliArgs('claude', 'same-id', { permission: 'accept-edits', plan: false })).toContain('acceptEdits')
+    expect(nativeCliArgs('claude', 'same-id', { permission: 'auto', plan: true })).toContain('plan')
+    expect(nativeCliArgs('claude', 'same-id', { permission: 'default', plan: false })).toContain('manual')
+  })
   it('uses an exact Claude identity for both a new session and a resume', () => {
     const settings = { permission: 'default', plan: false } as const
     expect(nativeCliArgs('claude', 'same-id', settings).slice(0, 2)).toEqual(['--resume', 'same-id'])

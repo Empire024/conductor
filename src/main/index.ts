@@ -28,7 +28,7 @@ import {
 } from './window-geometry'
 import { OrchestrationStore } from './orchestration-store'
 import { registerOrchestrationIpc } from './orchestration-ipc'
-import { normalizeThemeSettings } from './app-settings'
+import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
 import { AgentCollaborationStore } from './agent-collaboration-store'
 import { AgentCollaborationRuntime } from './agent-collaboration-runtime'
@@ -37,6 +37,7 @@ import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { UpdateManager } from './update-manager'
 import { normalizeUpdateFeedUrl } from './update-config'
+import { createUntitledEditorFile, EDITOR_CONFLICT_MESSAGE, readEditorFile, saveEditorCopy, writeEditorFile } from './editor-files'
 
 const projectPreview = new ProjectPreviewServer()
 let database: ConductorDatabase
@@ -299,6 +300,7 @@ const getAppSettings = (): AppSettings => {
     themeVariant,
     themeAuto,
     debugLogging: database.getSetting('debugLogging') === 'true',
+    defaultNewFileExtension: normalizeNewFileExtension(database.getSetting('defaultNewFileExtension')) ?? 'md',
     agentSoundProfile: AGENT_SOUND_PROFILES.includes(database.getSetting('agentSoundProfile') as AgentSoundProfile)
       ? database.getSetting('agentSoundProfile') as AgentSoundProfile
       : 'soft',
@@ -357,32 +359,38 @@ const prepareForUpdateInstall = async (): Promise<void> => {
 }
 
 
+const flushEditorWindows = async (windows: BrowserWindow[]): Promise<void> => {
+  await Promise.all(windows.map(async (window) => {
+    if (window.webContents.isDestroyed()) return
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        window.webContents.executeJavaScript("(() => { const event = new CustomEvent('conductor:flush-editors', { detail: { failed: false } }); window.dispatchEvent(event); if (event.detail.failed) throw new Error('An editor draft could not be preserved. Keep the window open and try again.'); })()"),
+        new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('An editor window did not respond. Try again after it recovers.')), 5000) })
+      ])
+    } finally { clearTimeout(timeout) }
+  }))
+}
+
 let resolvingEditors: Promise<boolean> | null = null
 const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): Promise<boolean> => {
   // Serialize decisions across windows. A caller with another scope checks again afterwards.
   if (resolvingEditors) return resolvingEditors.then((ok) => ok && resolveUnsavedEditors(owner, tabIds))
   const task = (async (): Promise<boolean> => {
     const windows = BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed())
-    await Promise.all(windows.map(async (window) => {
-      if (window.webContents.isDestroyed()) return
-      let timeout: ReturnType<typeof setTimeout> | undefined
-      try {
-        await Promise.race([
-          window.webContents.executeJavaScript("window.dispatchEvent(new Event('conductor:flush-editors'))"),
-          new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('An editor window did not respond. Try again after it recovers.')), 5000) })
-        ])
-      } finally { clearTimeout(timeout) }
-    }))
+    await flushEditorWindows(windows)
     const drafts = database.listEditorDrafts().filter((draft) => !tabIds || tabIds.includes(draft.tabId))
-    const dirty: Array<{ draft: typeof drafts[number]; disk: string; target: string }> = []
+    const dirty: Array<{ draft: typeof drafts[number]; target: string }> = []
     for (const draft of drafts) {
       if (!database.getProject(draft.projectId)) continue
-      const target = resolveProjectPath(draft.projectId, draft.path)
-      await resolveExistingProjectPath(draft.projectId, dirname(draft.path))
-      let disk = ''
-      try { disk = await fs.readFile(await resolveExistingProjectPath(draft.projectId, draft.path), 'utf8') } catch (reason) { if ((reason as NodeJS.ErrnoException).code !== 'ENOENT') throw reason }
+      // Old clean buffers must not be mistaken for user edits when disk changed.
+      if (draft.content === draft.baseContent) { database.removeEditorDraft(draft.tabId); continue }
+      const target = await resolveEditorPath(draft.projectId, draft.path)
+      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path)
+      if (current?.content !== draft.content || current?.baseContent !== draft.baseContent) return false
+      const disk = readEditorFile(target)
       if (disk === draft.content) { database.removeEditorDraft(draft.tabId); continue }
-      dirty.push({ draft, disk, target })
+      dirty.push({ draft, target })
     }
     if (!dirty.length) return true
     const options: Electron.MessageBoxOptions = {
@@ -392,24 +400,44 @@ const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): 
     }
     const { response } = owner && !owner.isDestroyed() ? await dialog.showMessageBox(owner, options) : await dialog.showMessageBox(options)
     if (response === 2) return false
+    // Resolve again after the dialog: a file may have moved, changed or been
+    // deleted while the owner was deciding. Validate all drafts before writing.
+    for (const item of dirty) item.target = await resolveEditorPath(item.draft.projectId, item.draft.path)
+    for (const { draft } of dirty) {
+      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path)
+      if (current?.content !== draft.content || current?.baseContent !== draft.baseContent) return false
+    }
     if (response === 0) {
       const versions = new Map<string, string>()
       for (const { draft, target } of dirty) {
-        if (versions.has(target) && versions.get(target) !== draft.content) throw new Error('This file has different edits in multiple workspaces: ' + draft.path + '. Save the version you want in its editor first.')
-        versions.set(target, draft.content)
+        const key = process.platform === 'win32' ? target.toLowerCase() : target
+        if (versions.has(key) && versions.get(key) !== draft.content) throw new Error('This file has different edits in multiple workspaces: ' + draft.path + '. Save a copy from each editor to preserve both versions.')
+        versions.set(key, draft.content)
+        const disk = readEditorFile(target)
+        if (disk !== draft.content && (draft.baseContent === undefined || disk !== draft.baseContent)) {
+          for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-conflict', { tabId: draft.tabId, message: EDITOR_CONFLICT_MESSAGE })
+          throw new Error(draft.path + ': ' + EDITOR_CONFLICT_MESSAGE)
+        }
       }
     }
-    for (const { draft, disk, target } of dirty) {
+    for (const { draft, target } of dirty) {
       if (response === 0) {
-        const destination = await folderExists(target) ? await resolveExistingProjectPath(draft.projectId, draft.path) : (await resolveExistingProjectPath(draft.projectId, dirname(draft.path)), target)
-        await fs.writeFile(destination, draft.content, 'utf8')
+        const result = writeEditorFile(target, draft.content, draft.baseContent)
+        if (result.status === 'conflict') {
+          for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-conflict', { tabId: draft.tabId, message: result.message })
+          throw new Error(draft.path + ': ' + result.message)
+        }
       }
-      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path)
-      if (current?.content === draft.content) database.removeEditorDraft(draft.tabId)
-      for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-resolved', { tabId: draft.tabId, submitted: draft.content, content: response === 0 ? draft.content : disk })
+      // No awaited work between validation and commit; another editor cannot
+      // replace this draft during the decision's final main-process turn.
+      database.removeEditorDraft(draft.tabId)
+      const content = response === 0 ? draft.content : readEditorFile(target)
+      for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-resolved', { tabId: draft.tabId, submitted: draft.content, content, saved: response === 0 })
     }
-    // Edits made in a different window while a native decision dialog was open stay protected.
-    return !database.listEditorDrafts().some((draft) => (!tabIds || tabIds.includes(draft.tabId)) && dirty.some((item) => item.draft.tabId === draft.tabId && item.draft.content !== draft.content))
+    // Let renderer resolution handlers preserve any last edits before granting
+    // close. A newer draft cancels this close without losing its original base.
+    await flushEditorWindows(windows)
+    return !database.listEditorDrafts().some((draft) => !tabIds || tabIds.includes(draft.tabId))
   })().catch(async (reason: unknown) => {
     const options: Electron.MessageBoxOptions = { type: 'error', title: 'Could not close editor', message: reason instanceof Error ? reason.message : String(reason) }
     if (owner && !owner.isDestroyed()) await dialog.showMessageBox(owner, options)
@@ -456,6 +484,18 @@ const resolveExistingProjectPath = async (projectId: string, requested = ''): Pr
   return target
 }
 
+const resolveEditorPath = async (projectId: string, requested: string): Promise<string> => {
+  const target = resolveProjectPath(projectId, requested)
+  try {
+    await resolveExistingProjectPath(projectId, requested)
+    return await fs.realpath(target)
+  } catch (reason) {
+    if ((reason as NodeJS.ErrnoException).code !== 'ENOENT') throw reason
+    const parent = await resolveExistingProjectPath(projectId, dirname(requested))
+    return join(await fs.realpath(parent), basename(target))
+  }
+}
+
 const registerIpc = (): void => {
   const structuredId = (value: unknown): string => {
     if (typeof value !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(value)) throw new Error('Invalid session identifier')
@@ -471,7 +511,7 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:connect', (event, id) => { trustedStructured(event); return agents.structured.connectSession(structuredId(id)) })
   ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
   ipcMain.handle('structured:queue', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.queue(structuredId(id), text, settings, attachments) })
-  ipcMain.handle('structured:cancel-queued', (event, id) => { trustedStructured(event); return agents.structured.cancelQueued(structuredId(id)) })
+  ipcMain.handle('structured:cancel-queued', (event, id, promptId?: string) => { trustedStructured(event); if (promptId !== undefined && typeof promptId !== 'string') throw new Error('Invalid queued prompt'); return agents.structured.cancelQueued(structuredId(id), promptId) })
   ipcMain.handle('native-cli:ensure', (event, id) => { trustedStructured(event); return agents.nativeCli.ensure(structuredId(id)) })
   ipcMain.handle('native-cli:chat', (event, id) => { trustedStructured(event); return agents.nativeCli.switchToChat(structuredId(id)) })
   ipcMain.on('native-cli:write', (event, id, data) => { try { trustedStructured(event); agents.nativeCli.write(structuredId(id), data) } catch { /* reject untrusted/invalid input */ } })
@@ -625,6 +665,13 @@ const registerIpc = (): void => {
     database.setSetting('debugLogging', String(Boolean(enabled)))
     return getAppSettings()
   })
+  ipcMain.handle('settings:set-default-file-extension', (event, requested: string) => {
+    trustedStructured(event)
+    const extension = normalizeNewFileExtension(requested)
+    if (!extension) throw new Error('Enter a file extension such as md, txt or ts.')
+    database.setSetting('defaultNewFileExtension', extension)
+    return getAppSettings()
+  })
   ipcMain.handle('settings:set-agent-sound-profile', (_event, requestedProfile: AgentSoundProfile) => {
     const profile: AgentSoundProfile = AGENT_SOUND_PROFILES.includes(requestedProfile) ? requestedProfile : 'soft'
     database.setSetting('agentSoundProfile', profile)
@@ -665,13 +712,28 @@ const registerIpc = (): void => {
   })
 
   ipcMain.handle('sessions:list', (_event, projectId: string) => database.listSessions(projectId))
+  ipcMain.handle('sessions:closed', (event) => { trustedStructured(event); return database.listClosedSessions() })
+  ipcMain.handle('sessions:restore', (event, sessionId?: string) => {
+    trustedStructured(event)
+    if (sessionId !== undefined && typeof sessionId !== 'string') throw new Error('Invalid workspace ID')
+    const restored = database.restoreSession(sessionId)
+    if (restored) {
+      for (const record of database.listDetachedWindows()) if (record.sessionId === restored.id) openDetachedWindow(record.id)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (event.sender.id !== mainWindow.webContents.id) mainWindow.webContents.send('sessions:restored', restored)
+        mainWindow.show(); mainWindow.focus()
+      }
+    }
+    return restored
+  })
   ipcMain.handle('sessions:create', (_event, projectId: string, name?: string) =>
     database.createSession(projectId, name)
   )
   ipcMain.handle('sessions:delete', (_event, sessionId: string) => {
     terminals.killSession(sessionId)
     agents.killSession(sessionId)
-    database.deleteSession(sessionId)
+    for (const record of database.listDetachedWindows()) if (record.sessionId === sessionId) detachedWindows.get(record.id)?.hide()
+    database.closeSession(sessionId)
   })
   ipcMain.handle('sessions:rename', (_event, sessionId: string, name: string) =>
     database.renameSession(sessionId, name)
@@ -745,6 +807,10 @@ const registerIpc = (): void => {
   ipcMain.handle('files:read', async (_event, projectId: string, requested: string) =>
     fs.readFile(await resolveExistingProjectPath(projectId, requested), 'utf8')
   )
+  ipcMain.handle('files:read-for-editor', async (event, projectId: string, requested: string) => {
+    trustedStructured(event)
+    return readEditorFile(await resolveEditorPath(projectId, requested))
+  })
   ipcMain.handle('files:read-data-url', async (_event, projectId: string, requested: string) => {
     const target = await resolveExistingProjectPath(projectId, requested)
     const stat = await fs.stat(target)
@@ -768,13 +834,31 @@ const registerIpc = (): void => {
   })
   ipcMain.handle(
     'files:write',
-    async (_event, projectId: string, requested: string, content: string) => {
-      const target = resolveProjectPath(projectId, requested)
-      if (await folderExists(target)) await resolveExistingProjectPath(projectId, requested)
-      else await resolveExistingProjectPath(projectId, dirname(requested))
-      await fs.writeFile(target, content, 'utf8')
+    async (event, projectId: string, requested: string, content: string, expectedContent?: string | null) => {
+      trustedStructured(event)
+      if (typeof content !== 'string' || expectedContent !== undefined && expectedContent !== null && typeof expectedContent !== 'string') throw new Error('Invalid editor content')
+      return writeEditorFile(await resolveEditorPath(projectId, requested), content, expectedContent)
     }
   )
+  ipcMain.handle('files:save-copy', async (event, projectId: string, requested: string, content: string) => {
+    trustedStructured(event)
+    if (typeof content !== 'string') throw new Error('Invalid editor content')
+    const target = await resolveEditorPath(projectId, requested)
+    const copy = saveEditorCopy(target, content)
+    const root = await fs.realpath(database.getProject(projectId)!.path)
+    invalidateProjectFiles(root)
+    return relative(root, copy).replaceAll('\\', '/')
+  })
+  ipcMain.handle('files:create-untitled', async (event, projectId: string, requestedDirectory: string) => {
+    trustedStructured(event)
+    const project = database.getProject(projectId)
+    if (!project) throw new Error('Project not found')
+    const directory = await resolveExistingProjectPath(projectId, requestedDirectory)
+    if (!(await fs.stat(directory)).isDirectory()) throw new Error('Choose a destination folder')
+    const target = createUntitledEditorFile(directory, getAppSettings().defaultNewFileExtension)
+    invalidateProjectFiles(project.path)
+    return { name: basename(target), path: target, relativePath: relative(project.path, target).replaceAll('\\', '/'), kind: 'file' as const }
+  })
   ipcMain.handle(
     'files:create',
     async (
@@ -903,17 +987,19 @@ const registerIpc = (): void => {
   })
   ipcMain.on(
     'files:checkpoint-draft',
-    (_event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown) => {
+    (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null) => {
+      trustedStructured(event)
       resolveProjectPath(projectId, requested)
-      database.saveEditorDraft(tabId, projectId, requested, content, viewState)
+      database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent)
     }
   )
   ipcMain.on(
     'files:flush-draft',
-    (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown) => {
+    (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null) => {
       try {
+        trustedStructured(event)
         resolveProjectPath(projectId, requested)
-        database.saveEditorDraft(tabId, projectId, requested, content, viewState)
+        database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent)
         event.returnValue = true
       } catch (error) {
         console.error(`Failed to flush editor draft ${tabId}`, error)

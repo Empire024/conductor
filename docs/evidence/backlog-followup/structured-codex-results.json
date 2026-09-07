@@ -1,0 +1,40 @@
+{
+  "synthetic": true,
+  "provider": "codex",
+  "root": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-offline-mG0eGj",
+  "checks": [
+    "Opening an empty pane registers history without starting a provider",
+    "Searchable model picker with keyboard focus restoration and effort slider update backend settings; sandbox/approvals remain separate; metadata discovery and resume submit no prompt",
+    "Protocol/quota noise hidden from chat but retained in settings/event log; actual colored code spans, inert markup and exact clipboard text verified",
+    "Real request answered in UI; fake runtime executes one edit after approval; exact two-line deletion and actual node:test output",
+    "Default 110% zoom keeps the pane within the viewport and transcript free of horizontal overflow",
+    "Expanded immutable Monaco versions; next change and side-by-side; clipboard patch; Keep does not reapply; undo preserves a later user edit",
+    "Renderer reload preserves native identity and does not resend prompt",
+    "Closing/retrieving the agent pane preserves transcript, native session and card expansion; no resubmission",
+    "File link opens actual Monaco code pane without writes; explicit editor context is inspectable and removable",
+    "Invisible zero-space split handle remains draggable and keyboard-resizable",
+    "Explicit runtime resume and second synthetic turn preserve native conversation ID and history; labeled fixture continuation, not live-context proof",
+    "Detach to an actual Electron window, close, and retrieve preserve runtime incarnation, native conversation and exactly two submitted prompts",
+    "2,200 raw synthetic activities retain 2,000 projected items and initially 250 DOM activities; selected text and its DOM identity remain while new rows arrive; new-output indication, automatic following after selection clears, earlier history and nested parent label verified",
+    "Normal and narrow screenshots captured; no renderer exceptions"
+  ],
+  "failures": [],
+  "screenshots": [
+    "artifacts/structured-agent-ui/codex/model-picker.png",
+    "artifacts/structured-agent-ui/codex/normal.png",
+    "artifacts/structured-agent-ui/codex/zoom-110.png",
+    "artifacts/structured-agent-ui/codex/diff.png",
+    "artifacts/structured-agent-ui/codex/narrow.png",
+    "artifacts/structured-agent-ui/codex/detached.png",
+    "artifacts/structured-agent-ui/codex/large-history.png"
+  ],
+  "performance": {
+    "rawSyntheticActivities": 2200,
+    "retainedProjectionItems": 2000,
+    "initialRenderedActivities": 250,
+    "completionAndRenderMs": 4380,
+    "postSelectionReleaseMs": 3566,
+    "syntheticBarrier": "Raw fixture intentionally pauses after 500 rows until the UI selection is committed.",
+    "observed": "One local Windows sample, including the intentional fixture barrier, raw process delivery, SQLite projection, polling, and React rendering; not a benchmark."
+  }
+}

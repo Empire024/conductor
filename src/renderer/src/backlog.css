@@ -103,3 +103,20 @@
 .agent-view-switch button { display: inline-flex; align-items: center; justify-content: center; gap: 4px; padding: 3px 6px; border: 0; border-radius: 4px; font-size: 10px; background: transparent; color: var(--text-3); }
 .agent-view-switch button.active { background: var(--surface-3); color: var(--text); }
 .sa-session-bar > strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The hit target straddles adjoining panes without consuming layout space. */
+.split-gutter { flex-basis: 0; min-width: 0; min-height: 0; }
+.split-gutter i { display: none; }
+.split-node.horizontal > .split-gutter::before { left: -4px; right: -4px; }
+.split-node.vertical > .split-gutter::before { top: -4px; bottom: -4px; }
+.split-gutter:focus-visible::before { outline: 1px solid var(--accent-muted); outline-offset: -3px; }
+.pane-header { height: 29px; min-height: 29px; }
+.pane-header .pane-tab { height: 28px; }
+.pane-tab > .pane-tab-title { flex: 1 1 auto; min-width: 0; }
+.pane-tab > .provider-logo, .pane-tab > .tab-close { flex: 0 0 auto; }
+.pane-group.focused .pane-header::before { top: 12px; }
+
+.file-picker-results { height: min(440px, 55vh); }
+/* Keep the ready action's foreground/background paired across pointer states. */
+.statusbar-update.ready:hover:not(:disabled), .statusbar-update.ready:focus-visible { color: var(--surface-0); background: color-mix(in srgb, var(--accent) 85%, var(--text)); border-color: var(--accent); }
+.statusbar-update.ready:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }

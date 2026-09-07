@@ -438,8 +438,7 @@ function PaneGroup({
                 onDragEnd={(event) => finishDrag(event, tab)}
               >
                 {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
-                <span>{tab.title}</span>
-                {tab.kind === 'agent' && <small className="tab-model">{(tab.state?.model as string) || 'default'}</small>}
+                <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
                 {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (
                   <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
                 )}
@@ -630,6 +629,9 @@ function SplitView({
         onKeyDown={nudgeResize}
         role="separator"
         aria-label="Resize tab areas"
+        aria-orientation={node.direction === 'horizontal' ? 'vertical' : 'horizontal'}
+        aria-valuemin={10}
+        aria-valuemax={90}
         aria-valuenow={Math.round(node.sizes[0])}
       >
         <i />
