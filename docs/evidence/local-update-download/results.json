@@ -1,0 +1,17 @@
+{
+  "actualElectron": true,
+  "actualNativeDownload": true,
+  "actualInstallerBytes": true,
+  "installedVersionMetadata": "simulated 0.1.4",
+  "installation": "forbidden by test-only boundary",
+  "version": "0.1.5-local.1788788132715",
+  "checks": [
+    "Real UI Download update reached ready through native NsisUpdater and production loopback feed",
+    "Isolated cached installer SHA-512 and byte size match the actual packaged executable",
+    "No installer was executed or installed profile/cache modified"
+  ],
+  "failures": [],
+  "screenshots": [
+    "real-download-ready.png"
+  ]
+}

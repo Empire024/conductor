@@ -14,10 +14,11 @@ function sanitize(value) {
 }
 const sources = [
   { source: 'artifacts/local-update-ui', target: 'docs/evidence/local-updates', images: ['local-update-pending.png'] },
+  { source: 'artifacts/local-update-ui', resultName: 'real-download-results.json', target: 'docs/evidence/local-update-download', images: ['real-download-ready.png'] },
   { source: 'artifacts/live-codex/replacement-a-preflight-4', target: 'docs/evidence/agent-ui/live-codex-replacement', images: ['live-a.png', 'live-diff.png'] }
 ]
 for (const entry of sources) {
-  const result = sanitize(JSON.parse(await readFile(resolve(entry.source, 'results.json'), 'utf8')))
+  const result = sanitize(JSON.parse(await readFile(resolve(entry.source, entry.resultName ?? 'results.json'), 'utf8')))
   result.screenshots = entry.images
   await mkdir(resolve(entry.target), { recursive: true })
   await writeFile(resolve(entry.target, 'results.json'), JSON.stringify(result, null, 2) + '\n')

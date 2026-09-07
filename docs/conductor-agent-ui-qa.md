@@ -109,6 +109,8 @@ Offline reproduction uses `npm.cmd test` and `npm.cmd run test:agent-ui`. It cre
 
 ### Release runner regression and correction
 
+Real installer download also passed through the actual Electron UI and native NsisUpdater: [ready state](evidence/local-update-download/real-download-ready.png), [result](evidence/local-update-download/results.json). The cached executable's SHA-512 and byte size match the real NSIS package. `node scripts/smoke-local-update-download.mjs` reproduces this after a local package exists; `npm.cmd run test:update-download` builds first. The isolated test simulates old installed-version metadata, overrides the cache/config location, and forbids installer execution/quit installation. Discovery and downloading are real; an installed-app replacement/restart is **not** claimed. The probe initially reset its source while overriding test config; correcting that probe-only setup made it pass without changing the production updater.
+
 The first publication attempt, [run 34129306942](https://github.com/Empire024/conductor/actions/runs/34129306942), failed its tests and published no release. The Windows runner uses a `RUNNER~1` temporary directory alias. Comparing its lexical name to expanded canonical paths falsely rejected the local feed and generated an incorrect relative hook-artifact path. This was reproduced locally with a real 8.3 path, corrected without allowing junction escapes, and the full **230 Vitest + 13 Node** tests then passed under that alias. Native synchronous canonicalization is now consistent with asynchronous `realpath`; immutable hook paths remain relative to the canonical workspace. Existing traversal/junction tests still pass.
 
 Exact local reproduction, in a task-scoped shell (no persistent environment changes):
@@ -122,6 +124,8 @@ npm.cmd test
 ```
 
 `npm.cmd run test:update-ui` rebuilds and retests the native updater after this correction. No provider turn is repeated for the path fix; the live allowance remains three Codex submissions.
+
+[Run 34129820642](https://github.com/Empire024/conductor/actions/runs/34129820642) passed the path cases but hit the default five-second deadline in three disk-backed SQLite tests under unrestricted parallel workers. CI now uses two workers and a bounded 15-second offline-test deadline, with zero retries. The same CI configuration is verified locally with `$env:CI='1'; npm.cmd test`. This changes no provider/live allowance, deadline or production behavior.
 
 Codex's capped live acceptance passed; Claude remains live-blocked by quota. Full local extension parity remains partial: command/skill execution picker and configuration/MCP/plugin management; provider checkpoints/context rollback and combined restore; Claude immediate fork; richer plan-feedback/execute controls; cross-session background steering; externally authorized file attachment paths; provider-specific hosted/browser delegation. Claude's documented Bash/subagent snapshot limitations and rename/binary/oversized restore limitations remain explicit. OS-wide atomic compare-and-swap against unrelated writers is not provided; Undo uses expected-byte checks, host locks and immediate recheck.
 

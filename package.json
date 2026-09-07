@@ -20,6 +20,7 @@
     "update:local": "node scripts/build-local-update.mjs",
     "test:local-update-package": "node --test scripts/local-update-package.test.mjs",
     "test:update-ui": "npm run build && node scripts/smoke-local-updates.mjs",
+    "test:update-download": "npm run build && node scripts/smoke-local-update-download.mjs",
     "test:agent-contracts": "vitest run src/main/providers src/main/structured-sessions.test.ts src/main/structured-store.test.ts src/main/agent-artifacts.test.ts src/main/live-test-policy.test.ts src/main/live-runtime-budget.test.ts src/shared/structured-agent-reducer.test.ts && node --test scripts/live-acceptance-guard.test.mjs",
     "test:agent-ui": "npm run build && node scripts/smoke-structured-agents.mjs && node scripts/smoke-structured-agents.mjs --provider=claude",
     "test:agent-live": "node scripts/live-structured-codex.mjs",

@@ -16,6 +16,8 @@ The developer command supports `--feed-dir <absolute-path>` for isolated testing
 
 ## Offline packaging verification
 
+After a real local package exists, `npm.cmd run test:update-download` verifies the real Electron Download update action and native NsisUpdater cached bytes in a disposable profile. It simulates an old installed version and explicitly disables installation; it does not replace or close the owner's installed app. `npm.cmd run test:update-ui` needs no real package and tests discovery/settings with synthetic non-executable metadata. Neither command invokes a coding provider.
+
 ```powershell
 node --test scripts/local-update-package.test.mjs
 ```
