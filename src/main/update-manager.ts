@@ -17,7 +17,7 @@ interface PendingPrepare {
   finish(): void
 }
 
-const CHECK_INTERVAL_MS = 30 * 60 * 1000
+const CHECK_INTERVAL_MS = 2 * 60 * 1000
 const PREPARE_TIMEOUT_MS = 2_000
 
 const errorMessage = (reason: unknown): string => {
@@ -62,7 +62,7 @@ export class UpdateManager {
 
     const updater = new NsisUpdater(resolveUpdateProvider(feedUrl))
     updater.autoDownload = false
-    updater.autoInstallOnAppQuit = false
+    updater.autoInstallOnAppQuit = true
     updater.autoRunAppAfterInstall = true
     updater.disableWebInstaller = true
     updater.logger = console
@@ -84,7 +84,7 @@ export class UpdateManager {
         currentVersion: this.options.currentVersion,
         availableVersion: info.version,
         configured: true,
-        message: `Conductor ${info.version} is available.`,
+        message: `Update pending: Conductor ${info.version}.`,
         lastCheckedAt: new Date().toISOString()
       })
     })

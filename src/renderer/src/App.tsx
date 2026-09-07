@@ -57,6 +57,7 @@ import { useAppUpdates } from './use-app-updates'
 import { TabPerformancePopover } from './components/TabPerformancePopover'
 import { playAgentSound } from './agent-sounds'
 import { AppUpdateButton } from './components/AppUpdateButton'
+import { UpdatePrompt } from './components/UpdatePrompt'
 
 export function App(): React.JSX.Element {
   type WorkspaceDocument = { projectId: string; sessionId: string; path: string; mode: 'editor' | 'preview'; line?: number }
@@ -99,7 +100,8 @@ export function App(): React.JSX.Element {
   const [debugConsoleOpen, setDebugConsoleOpen] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved' | 'error'>('saved')
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null)
-  const { updateState, runUpdateAction, checkForUpdates } = useAppUpdates()
+  const { updateState, autoDownload, setAutoDownload, runUpdateAction, checkForUpdates } = useAppUpdates()
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null)
 
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? null
   const activeSession = sessions.find((session) => session.id === activeSessionId) ?? null
@@ -714,6 +716,53 @@ export function App(): React.JSX.Element {
     localStorage.setItem(`conductor.workspaceDocument.${activeSession.id}`, JSON.stringify(document))
   }, [activeProject, activeSession])
 
+  const handleExplorerPathChanged = useCallback((previousPath: string, nextPath: string, kind: 'file' | 'directory'): void => {
+    const isAffected = (path: string): boolean =>
+      path === previousPath || (kind === 'directory' && path.startsWith(`${previousPath}/`))
+    const projectId = activeProjectIdRef.current
+    for (const session of sessionsRef.current) {
+      if (session.projectId !== projectId) continue
+      const key = `conductor.workspaceDocument.${session.id}`
+      try {
+        const saved = JSON.parse(localStorage.getItem(key) ?? 'null') as WorkspaceDocument | null
+        if (saved && isAffected(saved.path)) {
+          localStorage.setItem(key, JSON.stringify({ ...saved, path: `${nextPath}${saved.path.slice(previousPath.length)}` }))
+        }
+      } catch {
+        // A malformed stale document record should not block the filesystem action.
+      }
+    }
+    setWorkspaceDocument((current) => {
+      if (!current) return current
+      if (!isAffected(current.path)) return current
+      const updated = { ...current, path: `${nextPath}${current.path.slice(previousPath.length)}` }
+      localStorage.setItem(`conductor.workspaceDocument.${current.sessionId}`, JSON.stringify(updated))
+      return updated
+    })
+  }, [])
+
+  const handleExplorerPathRemoved = useCallback((relativePath: string, kind: 'file' | 'directory'): void => {
+    const isAffected = (path: string): boolean =>
+      path === relativePath || (kind === 'directory' && path.startsWith(`${relativePath}/`))
+    const projectId = activeProjectIdRef.current
+    for (const session of sessionsRef.current) {
+      if (session.projectId !== projectId) continue
+      const key = `conductor.workspaceDocument.${session.id}`
+      try {
+        const saved = JSON.parse(localStorage.getItem(key) ?? 'null') as WorkspaceDocument | null
+        if (saved && isAffected(saved.path)) localStorage.removeItem(key)
+      } catch {
+        localStorage.removeItem(key)
+      }
+    }
+    setWorkspaceDocument((current) => {
+      if (!current) return current
+      if (!isAffected(current.path)) return current
+      localStorage.removeItem(`conductor.workspaceDocument.${current.sessionId}`)
+      return null
+    })
+  }, [])
+
   const closeWorkspaceDocument = (): void => {
     if (activeSessionId) localStorage.removeItem(`conductor.workspaceDocument.${activeSessionId}`)
     setWorkspaceDocument(null)
@@ -931,6 +980,8 @@ export function App(): React.JSX.Element {
           })}
           onOpenTab={(kind) => openInFocused(kind)}
           onOpenFile={openExplorerFile}
+          onPathChanged={handleExplorerPathChanged}
+          onPathRemoved={handleExplorerPathRemoved}
           onProjectRenamed={(project) => setProjects((current) => current.map((item) => item.id === project.id ? project : item))}
           utilityPanel={utilityPanel}
           onUtilityPanel={setUtilityPanel}
@@ -1144,6 +1195,15 @@ export function App(): React.JSX.Element {
             setDebugConsoleOpen(true)
             setSettingsOpen(false)
           }}
+        />
+      )}
+      {updateState.availableVersion !== dismissedUpdateVersion && ['available', 'downloading', 'ready'].includes(updateState.phase) && (
+        <UpdatePrompt
+          state={updateState}
+          autoDownload={autoDownload}
+          onAutoDownload={setAutoDownload}
+          onAction={() => void runUpdateAction()}
+          onDismiss={() => setDismissedUpdateVersion(updateState.availableVersion ?? null)}
         />
       )}
       {appSettings.debugLogging && debugConsoleOpen && (

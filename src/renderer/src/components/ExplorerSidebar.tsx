@@ -11,14 +11,18 @@ import {
   FileCode2,
   FileJson,
   FilePenLine,
+  FilePlus2,
   FileText,
   Folder,
+  FolderPlus,
   FolderOpen,
   Image,
   MoreHorizontal,
   Pencil,
   RefreshCw,
   Search,
+  Scissors,
+  Trash2,
   X
 } from 'lucide-react'
 import type { FileEntry, ProjectRecord } from '../../../shared/models'
@@ -33,6 +37,8 @@ interface ExplorerSidebarProps {
   project: ProjectRecord
   onOpenFile?(relativePath: string, mode: ExplorerOpenMode): void
   onProjectRenamed?(project: ProjectRecord): void
+  onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind']): void
+  onPathRemoved?(relativePath: string, kind: FileEntry['kind']): void
   refreshIntervalMs?: number
 }
 
@@ -63,6 +69,18 @@ const parentPath = (relativePath: string): string => {
   return separator < 0 ? '' : relativePath.slice(0, separator)
 }
 
+const isSameOrChildPath = (path: string, parent: string): boolean =>
+  path === parent || path.startsWith(`${parent}/`)
+
+const canMoveTo = (entry: FileEntry, directory: string): boolean =>
+  parentPath(entry.relativePath) !== directory &&
+  !(entry.kind === 'directory' && isSameOrChildPath(directory, entry.relativePath))
+
+const sortEntries = (entries: FileEntry[]): FileEntry[] => [...entries].sort((a, b) => {
+  if (a.kind !== b.kind) return a.kind === 'directory' ? -1 : 1
+  return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
+})
+
 const refreshedLabel = (lastRefreshed: Date | null, now: number): string => {
   if (!lastRefreshed) return 'Not refreshed yet'
   const seconds = Math.max(0, Math.floor((now - lastRefreshed.getTime()) / 1000))
@@ -78,18 +96,44 @@ function ExplorerRows({
   entriesByDirectory,
   expanded,
   query,
+  selectedPath,
+  movingPath,
+  draggingPath,
+  dropTarget,
   onToggle,
   onOpen,
-  onContextMenu
+  onContextMenu,
+  onSelect,
+  onRename,
+  onRemove,
+  onStartMove,
+  onMoveHere,
+  onDragStart,
+  onDragEnd,
+  onDragOver,
+  onDrop
 }: {
   directory: string
   depth: number
   entriesByDirectory: Record<string, FileEntry[]>
   expanded: Set<string>
   query: string
+  selectedPath: string | null
+  movingPath: string | null
+  draggingPath: string | null
+  dropTarget: string | null
   onToggle(entry: FileEntry): void
   onOpen(entry: FileEntry): void
   onContextMenu(event: React.MouseEvent, entry: FileEntry): void
+  onSelect(entry: FileEntry): void
+  onRename(entry: FileEntry): void
+  onRemove(entry: FileEntry): void
+  onStartMove(entry: FileEntry): void
+  onMoveHere(directory: string): void
+  onDragStart(event: React.DragEvent, entry: FileEntry): void
+  onDragEnd(): void
+  onDragOver(event: React.DragEvent, directory: string): void
+  onDrop(event: React.DragEvent, directory: string): void
 }): React.JSX.Element {
   const normalizedQuery = query.trim().toLocaleLowerCase()
   const entries = (entriesByDirectory[directory] ?? []).filter((entry) =>
@@ -104,11 +148,25 @@ function ExplorerRows({
         return (
           <div key={entry.relativePath}>
             <button
-              className={`explorer-row ${entry.kind}`}
+              className={`explorer-row ${entry.kind}${selectedPath === entry.relativePath ? ' selected' : ''}${movingPath === entry.relativePath ? ' moving' : ''}${draggingPath === entry.relativePath ? ' dragging' : ''}${entry.kind === 'directory' && dropTarget === entry.relativePath ? ' drop-target' : ''}`}
               style={{ paddingLeft: 7 + depth * 13 }}
               title={entry.relativePath}
-              onClick={() => entry.kind === 'directory' ? onToggle(entry) : onOpen(entry)}
+              draggable
+              onClick={() => { onSelect(entry); entry.kind === 'directory' ? onToggle(entry) : onOpen(entry) }}
               onContextMenu={(event) => onContextMenu(event, entry)}
+              onKeyDown={(event) => {
+                if (event.key === 'F2') { event.preventDefault(); onRename(entry) }
+                if (event.key === 'Delete') { event.preventDefault(); onRemove(entry) }
+                if (event.ctrlKey && event.key.toLocaleLowerCase() === 'x') { event.preventDefault(); onStartMove(entry) }
+                if (event.ctrlKey && event.key.toLocaleLowerCase() === 'v' && entry.kind === 'directory') { event.preventDefault(); onMoveHere(entry.relativePath) }
+              }}
+              onDragStart={(event) => onDragStart(event, entry)}
+              onDragEnd={onDragEnd}
+              onDragOver={(event) => {
+                event.stopPropagation()
+                onDragOver(event, entry.kind === 'directory' ? entry.relativePath : directory)
+              }}
+              onDrop={(event) => onDrop(event, entry.kind === 'directory' ? entry.relativePath : directory)}
             >
               {entry.kind === 'directory'
                 ? open ? <ChevronDown className="explorer-chevron" size={12} /> : <ChevronRight className="explorer-chevron" size={12} />
@@ -123,9 +181,22 @@ function ExplorerRows({
                 entriesByDirectory={entriesByDirectory}
                 expanded={expanded}
                 query={query}
+                selectedPath={selectedPath}
+                movingPath={movingPath}
+                draggingPath={draggingPath}
+                dropTarget={dropTarget}
                 onToggle={onToggle}
                 onOpen={onOpen}
                 onContextMenu={onContextMenu}
+                onSelect={onSelect}
+                onRename={onRename}
+                onRemove={onRemove}
+                onStartMove={onStartMove}
+                onMoveHere={onMoveHere}
+                onDragStart={onDragStart}
+                onDragEnd={onDragEnd}
+                onDragOver={onDragOver}
+                onDrop={onDrop}
               />
             )}
           </div>
@@ -139,6 +210,8 @@ export function ExplorerSidebar({
   project,
   onOpenFile,
   onProjectRenamed,
+  onPathChanged,
+  onPathRemoved,
   refreshIntervalMs = 5000
 }: ExplorerSidebarProps): React.JSX.Element {
   const [entriesByDirectory, setEntriesByDirectory] = useState<Record<string, FileEntry[]>>({})
@@ -149,20 +222,27 @@ export function ExplorerSidebar({
   const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null)
   const [clock, setClock] = useState(Date.now())
   const [menu, setMenu] = useState<{ target: ContextTarget; x: number; y: number } | null>(null)
+  const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const [movingEntry, setMovingEntry] = useState<FileEntry | null>(null)
+  const [draggingEntry, setDraggingEntry] = useState<FileEntry | null>(null)
+  const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const [createTarget, setCreateTarget] = useState<{
+    directory: string
+    kind: FileEntry['kind']
+    value: string
+  } | null>(null)
   const [renameTarget, setRenameTarget] = useState<
     | { kind: 'project'; value: string }
     | { kind: 'entry'; entry: FileEntry; value: string }
     | null
   >(null)
   const expandedRef = useRef(expanded)
-  const refreshingRef = useRef(false)
   const refreshRequestRef = useRef(0)
   const completeTimerRef = useRef<number | undefined>(undefined)
+  const draggingEntryRef = useRef<FileEntry | null>(null)
   expandedRef.current = expanded
 
   const refresh = useCallback(async (): Promise<void> => {
-    if (refreshingRef.current) return
-    refreshingRef.current = true
     const requestId = ++refreshRequestRef.current
     window.clearTimeout(completeTimerRef.current)
     setPhase('refreshing')
@@ -187,17 +267,22 @@ export function ExplorerSidebar({
     setLastRefreshed(new Date())
     setClock(Date.now())
     setPhase('complete')
-    refreshingRef.current = false
     completeTimerRef.current = window.setTimeout(() => setPhase('idle'), 900)
   }, [project.id])
 
   useEffect(() => {
     refreshRequestRef.current += 1
-    refreshingRef.current = false
     setEntriesByDirectory({})
     setExpanded(new Set())
     expandedRef.current = new Set()
     setQuery('')
+    setSelectedPath(null)
+    setMovingEntry(null)
+    setDraggingEntry(null)
+    draggingEntryRef.current = null
+    setDropTarget(null)
+    setCreateTarget(null)
+    setRenameTarget(null)
     setLastRefreshed(null)
     void refresh()
   }, [project.id, refresh])
@@ -269,17 +354,186 @@ export function ExplorerSidebar({
     }
   }
 
-  const renameEntry = async (entry: FileEntry, name: string): Promise<void> => {
-    if (!name || name === entry.name) return
+  const beginCreate = (directory: string, kind: FileEntry['kind']): void => {
+    setMenu(null)
+    setRenameTarget(null)
+    setQuery('')
+    setCreateTarget({ directory, kind, value: kind === 'file' ? 'untitled.txt' : 'new-folder' })
+    if (!directory) return
+    setExpanded((current) => {
+      const next = new Set(current).add(directory)
+      expandedRef.current = next
+      return next
+    })
+    if (!entriesByDirectory[directory]) {
+      const requestId = refreshRequestRef.current
+      void window.conductor.files.list(project.id, directory)
+        .then((entries) => {
+          if (requestId === refreshRequestRef.current) {
+            setEntriesByDirectory((current) => ({ ...current, [directory]: entries }))
+          }
+        })
+        .catch((reason) => notify(cleanIpcError(reason)))
+    }
+  }
+
+  const finishCreate = async (): Promise<void> => {
+    if (!createTarget) return
+    const target = createTarget
+    const name = target.value.trim()
+    if (!name) return
     try {
-      await window.conductor.files.rename(project.id, entry.relativePath, name)
-      setExpanded(new Set())
-      expandedRef.current = new Set()
+      const created = await window.conductor.files.create(project.id, target.directory, name, target.kind)
+      setCreateTarget(null)
+      setEntriesByDirectory((current) => ({
+        ...current,
+        [target.directory]: sortEntries([...(current[target.directory] ?? []), created])
+      }))
+      setSelectedPath(created.relativePath)
       await refresh()
-      notify(`Renamed ${entry.name} to ${name}`)
+      notify(`Created ${created.kind} ${created.name}`)
+      if (created.kind === 'file') open(created, 'editor')
     } catch (reason) {
       notify(cleanIpcError(reason))
     }
+  }
+
+  const remapExpandedPaths = (previousPath: string, nextPath: string): void => {
+    setExpanded((current) => {
+      const next = new Set([...current].map((path) =>
+        isSameOrChildPath(path, previousPath) ? `${nextPath}${path.slice(previousPath.length)}` : path
+      ))
+      expandedRef.current = next
+      return next
+    })
+  }
+
+  const remapCachedPaths = (previousPath: string, moved: FileEntry): void => {
+    const nextPath = moved.relativePath
+    const previousParent = parentPath(previousPath)
+    const nextParent = parentPath(nextPath)
+    setEntriesByDirectory((current) => {
+      const next: Record<string, FileEntry[]> = {}
+      for (const [directory, entries] of Object.entries(current)) {
+        const mappedDirectory = isSameOrChildPath(directory, previousPath)
+          ? `${nextPath}${directory.slice(previousPath.length)}`
+          : directory
+        next[mappedDirectory] = entries
+          .filter((entry) => entry.relativePath !== previousPath || directory !== previousParent)
+          .map((entry) => {
+            if (!isSameOrChildPath(entry.relativePath, previousPath)) return entry
+            if (entry.relativePath === previousPath) return moved
+            return { ...entry, relativePath: `${nextPath}${entry.relativePath.slice(previousPath.length)}` }
+          })
+      }
+      if (next[nextParent]) {
+        next[nextParent] = sortEntries([
+          ...next[nextParent].filter((entry) => entry.relativePath !== nextPath),
+          moved
+        ])
+      }
+      return next
+    })
+  }
+
+  const renameEntry = async (entry: FileEntry, name: string): Promise<void> => {
+    if (!name || name === entry.name) return
+    try {
+      const renamed = await window.conductor.files.rename(project.id, entry.relativePath, name)
+      remapExpandedPaths(entry.relativePath, renamed.relativePath)
+      remapCachedPaths(entry.relativePath, renamed)
+      setSelectedPath(renamed.relativePath)
+      onPathChanged?.(entry.relativePath, renamed.relativePath, entry.kind)
+      await refresh()
+      notify(`Renamed ${entry.name} to ${renamed.name}`)
+    } catch (reason) {
+      notify(cleanIpcError(reason))
+    }
+  }
+
+  const moveEntry = async (entry: FileEntry, directory: string): Promise<void> => {
+    if (!canMoveTo(entry, directory)) return
+    try {
+      const moved = await window.conductor.files.move(project.id, entry.relativePath, directory)
+      remapExpandedPaths(entry.relativePath, moved.relativePath)
+      remapCachedPaths(entry.relativePath, moved)
+      setMovingEntry(null)
+      setDraggingEntry(null)
+      draggingEntryRef.current = null
+      setDropTarget(null)
+      setSelectedPath(moved.relativePath)
+      onPathChanged?.(entry.relativePath, moved.relativePath, entry.kind)
+      await refresh()
+      notify(`Moved ${entry.name} to ${directory || project.name}`)
+    } catch (reason) {
+      setDraggingEntry(null)
+      draggingEntryRef.current = null
+      setDropTarget(null)
+      notify(cleanIpcError(reason))
+    }
+  }
+
+  const removeEntry = async (entry: FileEntry): Promise<void> => {
+    const confirmed = window.confirm(`Move “${entry.name}” to the Recycle Bin?`)
+    if (!confirmed) return
+    try {
+      await window.conductor.files.trash(project.id, entry.relativePath)
+      setEntriesByDirectory((current) => {
+        const next: Record<string, FileEntry[]> = {}
+        for (const [directory, entries] of Object.entries(current)) {
+          if (isSameOrChildPath(directory, entry.relativePath)) continue
+          next[directory] = entries.filter((item) => !isSameOrChildPath(item.relativePath, entry.relativePath))
+        }
+        return next
+      })
+      setExpanded((current) => {
+        const next = new Set([...current].filter((path) => !isSameOrChildPath(path, entry.relativePath)))
+        expandedRef.current = next
+        return next
+      })
+      if (movingEntry && isSameOrChildPath(movingEntry.relativePath, entry.relativePath)) setMovingEntry(null)
+      setSelectedPath(null)
+      onPathRemoved?.(entry.relativePath, entry.kind)
+      await refresh()
+      notify(`Moved ${entry.name} to the Recycle Bin`)
+    } catch (reason) {
+      notify(cleanIpcError(reason))
+    }
+  }
+
+  const beginMove = (entry: FileEntry): void => {
+    setMenu(null)
+    setMovingEntry(entry)
+    setSelectedPath(entry.relativePath)
+    notify(`Choose a destination for ${entry.name}`)
+  }
+
+  const moveHere = (directory: string): void => {
+    if (movingEntry && canMoveTo(movingEntry, directory)) void moveEntry(movingEntry, directory)
+  }
+
+  const startDrag = (event: React.DragEvent, entry: FileEntry): void => {
+    setDraggingEntry(entry)
+    draggingEntryRef.current = entry
+    setSelectedPath(entry.relativePath)
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', entry.relativePath)
+  }
+
+  const dragOver = (event: React.DragEvent, directory: string): void => {
+    const entry = draggingEntryRef.current
+    if (!entry || !canMoveTo(entry, directory)) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.dataTransfer.dropEffect = 'move'
+    setDropTarget(directory)
+  }
+
+  const drop = (event: React.DragEvent, directory: string): void => {
+    event.preventDefault()
+    event.stopPropagation()
+    const entry = draggingEntryRef.current
+    if (entry && canMoveTo(entry, directory)) void moveEntry(entry, directory)
   }
 
   const renameProject = async (name: string): Promise<void> => {
@@ -318,8 +572,9 @@ export function ExplorerSidebar({
     setMenu({
       target,
       x: Math.min(event.clientX, window.innerWidth - 224),
-      y: Math.min(event.clientY, window.innerHeight - 250)
+      y: Math.max(6, Math.min(event.clientY, window.innerHeight - 410))
     })
+    if (target.kind === 'entry') setSelectedPath(target.entry.relativePath)
   }
 
   const lastRefreshText = refreshedLabel(lastRefreshed, clock)
@@ -329,6 +584,12 @@ export function ExplorerSidebar({
       <header className="workspace-sidebar-title">
         <span>Explorer</span>
         <div>
+          <button title="New file" aria-label="New file" onClick={() => beginCreate('', 'file')}>
+            <FilePlus2 size={13} />
+          </button>
+          <button title="New folder" aria-label="New folder" onClick={() => beginCreate('', 'directory')}>
+            <FolderPlus size={13} />
+          </button>
           <button
             className={`explorer-refresh ${phase}`}
             title={`${lastRefreshText}. Refresh now`}
@@ -342,7 +603,20 @@ export function ExplorerSidebar({
           </button>
         </div>
       </header>
-      <button className="explorer-project" title={project.path} onDoubleClick={() => setRenameTarget({ kind: 'project', value: project.name })} onContextMenu={(event) => showMenu(event, { kind: 'project' })}>
+      <button
+        className={`explorer-project${dropTarget === '' ? ' drop-target' : ''}`}
+        title={project.path}
+        onDoubleClick={() => { setCreateTarget(null); setRenameTarget({ kind: 'project', value: project.name }) }}
+        onContextMenu={(event) => showMenu(event, { kind: 'project' })}
+        onKeyDown={(event) => {
+          if (event.ctrlKey && event.key.toLocaleLowerCase() === 'v') { event.preventDefault(); moveHere('') }
+        }}
+        onDragOver={(event) => dragOver(event, '')}
+        onDragLeave={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDropTarget(null)
+        }}
+        onDrop={(event) => drop(event, '')}
+      >
         <ChevronDown size={12} />
         <FolderOpen size={14} />
         <strong className="ellipsis">{project.name}</strong>
@@ -352,6 +626,26 @@ export function ExplorerSidebar({
         <input aria-label="Filter files" placeholder="Filter files" value={query} onChange={(event) => setQuery(event.target.value)} />
         {query && <button title="Clear filter" onClick={() => setQuery('')}><X size={11} /></button>}
       </div>
+      {createTarget && (
+        <form className="explorer-rename-bar explorer-create-bar" onSubmit={(event) => { event.preventDefault(); void finishCreate() }}>
+          {createTarget.kind === 'file' ? <FilePlus2 size={13} /> : <FolderPlus size={13} />}
+          <label>
+            <span>New {createTarget.kind} in {createTarget.directory || project.name}</span>
+            <input
+              autoFocus
+              value={createTarget.value}
+              onFocus={(event) => {
+                const dot = createTarget.kind === 'file' ? event.currentTarget.value.lastIndexOf('.') : -1
+                event.currentTarget.setSelectionRange(0, dot > 0 ? dot : event.currentTarget.value.length)
+              }}
+              onChange={(event) => setCreateTarget({ ...createTarget, value: event.target.value })}
+              onKeyDown={(event) => { if (event.key === 'Escape') { event.preventDefault(); setCreateTarget(null) } }}
+            />
+          </label>
+          <button type="submit" title={`Create ${createTarget.kind}`}><Check size={13} /></button>
+          <button type="button" title="Cancel" onClick={() => setCreateTarget(null)}><X size={13} /></button>
+        </form>
+      )}
       {renameTarget && (
         <form className="explorer-rename-bar" onSubmit={(event) => { event.preventDefault(); void finishRename() }}>
           <FilePenLine size={13} />
@@ -372,7 +666,12 @@ export function ExplorerSidebar({
           <button type="button" title="Cancel rename" onClick={() => setRenameTarget(null)}><X size={13} /></button>
         </form>
       )}
-      <div className="explorer-tree">
+      <div
+        className="explorer-tree"
+        onContextMenu={(event) => showMenu(event, { kind: 'project' })}
+        onDragOver={(event) => dragOver(event, '')}
+        onDrop={(event) => drop(event, '')}
+      >
         {error && <div className="explorer-error">{error}</div>}
         {!error && phase !== 'refreshing' && (entriesByDirectory['']?.length ?? 0) === 0 && (
           <div className="explorer-empty">This project is empty.</div>
@@ -383,11 +682,31 @@ export function ExplorerSidebar({
           entriesByDirectory={entriesByDirectory}
           expanded={expanded}
           query={query}
+          selectedPath={selectedPath}
+          movingPath={movingEntry?.relativePath ?? null}
+          draggingPath={draggingEntry?.relativePath ?? null}
+          dropTarget={dropTarget}
           onToggle={(entry) => void toggle(entry)}
           onOpen={open}
           onContextMenu={(event, entry) => showMenu(event, { kind: 'entry', entry })}
+          onSelect={(entry) => setSelectedPath(entry.relativePath)}
+          onRename={(entry) => { setCreateTarget(null); setRenameTarget({ kind: 'entry', entry, value: entry.name }) }}
+          onRemove={(entry) => void removeEntry(entry)}
+          onStartMove={beginMove}
+          onMoveHere={moveHere}
+          onDragStart={startDrag}
+          onDragEnd={() => { setDraggingEntry(null); draggingEntryRef.current = null; setDropTarget(null) }}
+          onDragOver={dragOver}
+          onDrop={drop}
         />
       </div>
+      {movingEntry && (
+        <div className="explorer-move-bar">
+          <Scissors size={12} />
+          <span className="ellipsis"><strong>{movingEntry.name}</strong><small>Drag it, or right-click a folder → Move here</small></span>
+          <button title="Cancel move" aria-label="Cancel move" onClick={() => setMovingEntry(null)}><X size={12} /></button>
+        </div>
+      )}
       <footer className="explorer-footer" title={lastRefreshed?.toLocaleString()}>
         <span>{entriesByDirectory['']?.length ?? 0} root items</span>
         <span>{lastRefreshText}</span>
@@ -402,7 +721,13 @@ export function ExplorerSidebar({
           {menu.target.kind === 'project' ? (
             <>
               <div className="context-menu-label">{project.name}</div>
-              <button onClick={() => { setMenu(null); setRenameTarget({ kind: 'project', value: project.name }) }}><Pencil size={14} /> Rename project…</button>
+              <button onClick={() => beginCreate('', 'file')}><FilePlus2 size={14} /> New file…</button>
+              <button onClick={() => beginCreate('', 'directory')}><FolderPlus size={14} /> New folder…</button>
+              {movingEntry && (
+                <button disabled={!canMoveTo(movingEntry, '')} onClick={() => { setMenu(null); moveHere('') }}><Scissors size={14} /> Move {movingEntry.name} here</button>
+              )}
+              <div />
+              <button onClick={() => { setMenu(null); setCreateTarget(null); setRenameTarget({ kind: 'project', value: project.name }) }}><Pencil size={14} /> Rename project…</button>
               <button onClick={() => { setMenu(null); void window.conductor.files.reveal(project.id).catch((reason) => notify(cleanIpcError(reason))) }}><FolderOpen size={14} /> Reveal in File Explorer</button>
             </>
           ) : (() => {
@@ -411,6 +736,16 @@ export function ExplorerSidebar({
             return (
               <>
                 <div className="context-menu-label">{entry.name}</div>
+                {entry.kind === 'directory' && (
+                  <>
+                    <button onClick={() => beginCreate(entry.relativePath, 'file')}><FilePlus2 size={14} /> New file…</button>
+                    <button onClick={() => beginCreate(entry.relativePath, 'directory')}><FolderPlus size={14} /> New folder…</button>
+                    {movingEntry && movingEntry.relativePath !== entry.relativePath && (
+                      <button disabled={!canMoveTo(movingEntry, entry.relativePath)} onClick={() => { setMenu(null); moveHere(entry.relativePath) }}><Scissors size={14} /> Move {movingEntry.name} here</button>
+                    )}
+                    <div />
+                  </>
+                )}
                 {entry.kind === 'file' && ['markdown', 'image', 'media', 'pdf'].includes(kind) && (
                   <button onClick={() => { setMenu(null); open(entry, 'preview') }}><Eye size={14} /> Preview</button>
                 )}
@@ -421,9 +756,12 @@ export function ExplorerSidebar({
                   <button onClick={() => { setMenu(null); void window.conductor.files.openExternal(project.id, entry.relativePath).catch((reason) => notify(cleanIpcError(reason))) }}><ExternalLink size={14} /> Open with default app</button>
                 )}
                 <div />
-                <button onClick={() => { setMenu(null); setRenameTarget({ kind: 'entry', entry, value: entry.name }) }}><Pencil size={14} /> Rename…</button>
+                <button onClick={() => { setMenu(null); setCreateTarget(null); setRenameTarget({ kind: 'entry', entry, value: entry.name }) }}><Pencil size={14} /> Rename… <span className="context-shortcut">F2</span></button>
+                <button onClick={() => beginMove(entry)}><Scissors size={14} /> Move… <span className="context-shortcut">Ctrl+X</span></button>
                 <button onClick={() => { setMenu(null); void window.conductor.files.reveal(project.id, entry.relativePath).catch((reason) => notify(cleanIpcError(reason))) }}><FolderOpen size={14} /> Reveal in File Explorer</button>
                 <button onClick={() => { setMenu(null); void copyPath(entry.relativePath) }}><Copy size={14} /> Copy relative path</button>
+                <div />
+                <button className="danger" onClick={() => { setMenu(null); void removeEntry(entry) }}><Trash2 size={14} /> Move to Recycle Bin <span className="context-shortcut">Del</span></button>
               </>
             )
           })()}

@@ -25,7 +25,7 @@ npm.cmd run dist:win
 
 ### Publishing updates
 
-Installed builds check the public [Empire024/conductor](https://github.com/Empire024/conductor) GitHub Releases feed at startup and every 30 minutes. A highlighted **Update available** action appears in the bottom bar; it downloads on click and becomes **Restart to update** when ready. Restarting saves the window layout, stops runtime processes, installs, and reopens Conductor. Push a version tag such as `v0.1.3` to run the release workflow and publish the installer, blockmap, and `latest.yml` automatically. `CONDUCTOR_UPDATE_URL` remains available as a development-only feed override.
+Installed builds use GitHub Releases only as their update transport. They check shortly after startup and every two minutes. A highlighted **Update pending** action appears in the bottom bar, and the startup prompt can enable automatic downloads. Downloaded updates install on normal app exit or immediately through **Restart to update**. Every tested push to `main` is automatically assigned the next patch version and published with its installer, blockmap, and `latest.yml`; that release is the definition of done for an agent task. `CONDUCTOR_UPDATE_URL` remains available as a development-only feed override.
 
 Before installing, Conductor asks every window to synchronously checkpoint its layout, saves the normal bounds and maximized state of the main and detached windows, and stops all terminal and agent processes. The silent NSIS installer relaunches Conductor and restores those windows in place.
 
@@ -59,7 +59,7 @@ Conductor discovers `codex`, `claude`, `qwen`, `kimi`, and `gemini` on `PATH`. O
 - A SQLite-backed coworker channel tracks per-file read/edit/create/delete intent across every agent on a project. Agents receive current ownership and recent teammate activity before acting, conflicting writes are surfaced, and leases are released or expire safely.
 - Persistent agents, task queues, and linear routines are available in the orchestration dock. Routine steps retain state and unlock in order across restarts.
 - Runtime tabs are deliberately limited to agents and PowerShell. Explorer files, Monaco documents, previews, and Browser remain dedicated workspace surfaces instead of becoming disposable chat-style tabs.
-- The Explorer activity-bar view replaces the project sidebar when selected. It auto-refreshes, preserves expanded folders, filters files, supports inline rename and context actions, and opens text, Markdown, images, PDF, audio, and video as an editor or purpose-built preview.
+- The Explorer activity-bar view replaces the project sidebar when selected. It auto-refreshes, preserves expanded folders, filters files, creates files and folders inline, supports F2 rename, drag/drop and contextual moves, and sends deletions to the Recycle Bin. Text, Markdown, images, PDF, audio, and video open in an editor or purpose-built preview.
 - Monaco editing includes save, language detection, and clickable file/line references from agent terminals.
 - Browser views use Electron's sandboxed Chromium `webview`, with persistent cookies, native navigation, reload, failure state, DevTools, and a mobile-first responsive frame with one-click phone, tablet, laptop, desktop, custom-size, and rotation controls.
 - The Conductor logo opens a familiar File menu for creating/opening projects and workspaces, opening runtime tabs, closing the active workspace, and entering Settings. Removing a project from Conductor deletes only its local orchestration metadata; its folder and files remain untouched.

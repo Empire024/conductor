@@ -9,6 +9,7 @@ interface AgentPromptProps {
   providerId: string
   providerName: string
   disabled?: boolean
+  settingsDisabled?: boolean
   disabledReason?: string
   limitedUntil?: string
   model: string
@@ -90,8 +91,14 @@ export function AgentPrompt(props: AgentPromptProps): React.JSX.Element {
   const commitEffort = (): void => {
     const option = effortOptions[effortIndexRef.current]
     if (option && option.id !== committedEffortRef.current) {
+      const previousEffort = committedEffortRef.current
       committedEffortRef.current = option.id
-      void props.onEffort(option.id)
+      void Promise.resolve(props.onEffort(option.id)).catch(() => {
+        const previousIndex = Math.max(0, effortOptions.findIndex((item) => item.id === previousEffort))
+        committedEffortRef.current = previousEffort
+        effortIndexRef.current = previousIndex
+        setEffortIndex(previousIndex)
+      })
     }
   }
 
@@ -143,7 +150,7 @@ export function AgentPrompt(props: AgentPromptProps): React.JSX.Element {
           </div>
           <label className="agent-prompt-model" title="Changing model restarts this provider session">
             <span>Model</span>
-            <select value={props.model} onChange={(event) => void props.onModel(event.target.value)}>
+            <select disabled={props.settingsDisabled} value={props.model} onChange={(event) => void props.onModel(event.target.value)}>
               {!props.models.some((model) => model.id === props.model) && <option value={props.model}>{props.model}</option>}
               {props.models.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
             </select>
@@ -163,7 +170,7 @@ export function AgentPrompt(props: AgentPromptProps): React.JSX.Element {
                 max={Math.max(0, effortOptions.length - 1)}
                 step={1}
                 value={effortIndex}
-                disabled={effortOptions.length < 2}
+                disabled={props.settingsDisabled || effortOptions.length < 2}
                 aria-label="Reasoning effort"
                 aria-valuetext={selectedEffort.label}
                 onChange={(event) => previewEffort(Number(event.target.value))}

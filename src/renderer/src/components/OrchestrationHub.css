@@ -53,11 +53,38 @@
 
 .orchestration-primary,
 .orchestration-run,
-.routine-add-step { min-height: 30px; padding: 0 10px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-2); background: var(--surface-1); font-size: 8.5px; }
-.orchestration-primary { border-color: var(--accent-muted); color: var(--text); background: var(--accent-bg); }
+.routine-add-step {
+  min-height: 28px;
+  padding: 0 8px 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  color: var(--text-2);
+  background: transparent;
+  box-shadow: inset 0 1px color-mix(in srgb, var(--text) 3%, transparent);
+  font-size: 8.25px;
+  font-weight: 550;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease, transform 90ms ease;
+}
+.orchestration-primary svg,
+.orchestration-run svg,
+.routine-add-step svg {
+  width: 18px;
+  height: 18px;
+  padding: 3px;
+  border-radius: 5px;
+  color: var(--accent-muted);
+  background: var(--accent-bg);
+}
 .orchestration-primary:hover:not(:disabled),
 .orchestration-run:hover:not(:disabled),
-.routine-add-step:hover:not(:disabled) { border-color: var(--accent-muted); color: var(--accent); }
+.routine-add-step:hover:not(:disabled) { border-color: var(--border); color: var(--text); background: var(--surface-hover); }
+.orchestration-primary:active:not(:disabled),
+.orchestration-run:active:not(:disabled),
+.routine-add-step:active:not(:disabled) { transform: translateY(1px); }
 .orchestration-hub button:disabled { opacity: .45; cursor: default; }
 
 .orchestration-card-list { display: flex; flex-direction: column; gap: 6px; }
@@ -123,7 +150,7 @@
 .routine-step-actions { display: flex; flex-direction: column; gap: 2px; }
 .routine-step-actions button { width: 25px; height: 22px; display: grid; place-items: center; border: 0; border-radius: 5px; color: var(--text-3); background: transparent; }
 .routine-step-actions button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
-.routine-add-step { align-self: flex-start; background: transparent; }
+.routine-add-step { align-self: flex-start; }
 
 .orchestration-empty { min-height: 190px; padding: 25px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; color: var(--text-3); text-align: center; }
 .orchestration-empty strong { color: var(--text-2); font-size: 10.5px; }

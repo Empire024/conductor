@@ -2,8 +2,13 @@ name: Release Conductor
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: conductor-installed-update
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -18,13 +23,24 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - name: Verify tag and package version
+      - name: Test
+        run: npm test
+      - name: Select next installed-app version
+        id: version
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $version = node -p "require('./package.json').version"
-          if ($env:GITHUB_REF_NAME -ne "v$version") {
-            throw "Tag $env:GITHUB_REF_NAME does not match package version $version"
+          $latestTag = gh release view --json tagName --jq .tagName 2>$null
+          if ($LASTEXITCODE -eq 0 -and $latestTag -match '^v(\d+)\.(\d+)\.(\d+)$') {
+            $version = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+          } else {
+            $packageVersion = node -p "require('./package.json').version"
+            if ($packageVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$') { throw "Invalid package version $packageVersion" }
+            $version = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
           }
+          npm version $version --no-git-tag-version
+          "version=$version" >> $env:GITHUB_OUTPUT
       - name: Build Windows release
         run: npm run dist:win
       - name: Publish GitHub release
@@ -32,12 +48,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = node -p "require('./package.json').version"
-          gh release create $env:GITHUB_REF_NAME `
+          $version = '${{ steps.version.outputs.version }}'
+          gh release create "v$version" `
             "release/Conductor-Setup-$version.exe" `
             "release/Conductor-Setup-$version.exe.blockmap" `
             "release/latest.yml" `
-            --verify-tag `
+            --target $env:GITHUB_SHA `
             --generate-notes `
             --latest `
             --title "Conductor $version"

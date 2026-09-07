@@ -97,6 +97,8 @@ export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element 
   const [providers, setProviders] = useState<Awaited<ReturnType<typeof window.conductor.agents.listProviders>>>([])
   const [modelDraft, setModelDraft] = useState(props.model ?? 'default')
   const [liveResponse, setLiveResponse] = useState('')
+  const [reconfiguring, setReconfiguring] = useState(false)
+  const reconfiguringRef = useRef(false)
   phaseRef.current = phase
 
   const makeSpec = useCallback((): TerminalSpec | AgentSpec => {
@@ -430,31 +432,61 @@ export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element 
   }
 
   const changeModel = async (requestedModel = modelDraft): Promise<void> => {
-    if (props.mode !== 'agent') return
+    if (props.mode !== 'agent' || reconfiguringRef.current) return
     const model = requestedModel.trim() || 'default'
-    setModelDraft(model)
     const currentSpec = specRef.current as AgentSpec | null
     if (model === (currentSpec?.model ?? props.model ?? 'default')) return
-    props.onModelChange?.(model)
     const spec = { ...(currentSpec ?? makeSpec()), model } as AgentSpec
-    specRef.current = spec
-    autoTrustRespondedRef.current = false
-    terminalRef.current?.clear()
-    setPhase('idle')
-    setRuntime(await window.conductor.agents.restart(spec))
+    reconfiguringRef.current = true
+    setReconfiguring(true)
+    setModelDraft(model)
+    try {
+      const result = await window.conductor.agents.restart(spec)
+      if (!result.available || result.status === 'error' || result.status === 'exited') {
+        throw new Error(result.message ?? `Could not switch to ${model}`)
+      }
+      specRef.current = spec
+      autoTrustRespondedRef.current = false
+      setPhase('idle')
+      setRuntime(result)
+      props.onModelChange?.(model)
+    } catch (error) {
+      setModelDraft(currentSpec?.model ?? props.model ?? 'default')
+      window.dispatchEvent(new CustomEvent('conductor:toast', {
+        detail: error instanceof Error ? error.message : 'The model could not be changed'
+      }))
+    } finally {
+      reconfiguringRef.current = false
+      setReconfiguring(false)
+    }
   }
 
   const changeEffort = async (effort: AgentEffort): Promise<void> => {
-    if (props.mode !== 'agent') return
+    if (props.mode !== 'agent' || reconfiguringRef.current) return
     const currentSpec = specRef.current as AgentSpec | null
     if (effort === (currentSpec?.effort ?? props.effort ?? 'auto')) return
-    props.onEffortChange?.(effort)
     const spec = { ...(currentSpec ?? makeSpec()), effort } as AgentSpec
-    specRef.current = spec
-    autoTrustRespondedRef.current = false
-    terminalRef.current?.clear()
-    setPhase('idle')
-    setRuntime(await window.conductor.agents.restart(spec))
+    reconfiguringRef.current = true
+    setReconfiguring(true)
+    try {
+      const result = await window.conductor.agents.restart(spec)
+      if (!result.available || result.status === 'error' || result.status === 'exited') {
+        throw new Error(result.message ?? 'The reasoning effort could not be changed')
+      }
+      specRef.current = spec
+      autoTrustRespondedRef.current = false
+      setPhase('idle')
+      setRuntime(result)
+      props.onEffortChange?.(effort)
+    } catch (error) {
+      window.dispatchEvent(new CustomEvent('conductor:toast', {
+        detail: error instanceof Error ? error.message : 'The reasoning effort could not be changed'
+      }))
+      throw error
+    } finally {
+      reconfiguringRef.current = false
+      setReconfiguring(false)
+    }
   }
 
   const providerInfo = providers.find((item) => item.id === props.provider)
@@ -546,6 +578,7 @@ export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element 
           providerId={props.provider ?? 'codex'}
           providerName={providerInfo?.displayName ?? props.title}
           disabled={Boolean(blockingInteraction) || !runtime?.available || ['starting', 'exited', 'unavailable', 'error'].includes(runtime.status)}
+          settingsDisabled={reconfiguring}
           disabledReason={blockingInteraction === 'directory_trust' ? 'Resolve directory trust above' : undefined}
           limitedUntil={runtime?.status === 'limited' ? runtime.resumeAt : undefined}
           model={modelDraft}

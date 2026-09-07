@@ -1,6 +1,6 @@
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs } from 'node:fs'
-import { app, BrowserWindow, dialog, ipcMain, screen, shell, webContents } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell, webContents } from 'electron'
 import type {
   AgentSpec,
   AgentSoundProfile,
@@ -53,6 +53,7 @@ let servicesDisposed = false
 
 const DEFAULT_ZOOM = 1.1
 const UPDATE_WINDOW_LAYOUT_KEY = 'updateWindowLayout'
+const USAGE_LIMIT_DETECTION_VERSION_KEY = 'usageLimitDetectionVersion'
 const RESTORE_WINDOWS_AFTER_UPDATE_KEY = 'restoreWindowsAfterUpdate'
 
 app.setName('Conductor')
@@ -622,6 +623,43 @@ const registerIpc = (): void => {
     }
   )
   ipcMain.handle(
+    'files:create',
+    async (
+      _event,
+      projectId: string,
+      requestedDirectory: string,
+      requestedName: string,
+      kind: 'file' | 'directory'
+    ) => {
+      const project = database.getProject(projectId)
+      if (!project) throw new Error('Project not found')
+      if (kind !== 'file' && kind !== 'directory') throw new Error('Unsupported item type')
+
+      const name = safeEntryName(requestedName)
+      const directory = await resolveExistingProjectPath(projectId, requestedDirectory)
+      if (!(await fs.stat(directory)).isDirectory()) throw new Error('Choose a destination folder')
+      const target = resolveWithinProject(project.path, join(requestedDirectory, name))
+      if (await folderExists(target)) throw new Error(`An item named ${name} already exists`)
+
+      try {
+        if (kind === 'directory') await fs.mkdir(target)
+        else await fs.writeFile(target, '', { encoding: 'utf8', flag: 'wx' })
+      } catch (reason) {
+        if ((reason as NodeJS.ErrnoException).code === 'EEXIST') {
+          throw new Error(`An item named ${name} already exists`)
+        }
+        throw reason
+      }
+
+      return {
+        name,
+        path: target,
+        relativePath: relative(project.path, target).replaceAll('\\', '/'),
+        kind
+      }
+    }
+  )
+  ipcMain.handle(
     'files:rename',
     async (_event, projectId: string, requested: string, requestedName: string) => {
       const project = database.getProject(projectId)
@@ -647,6 +685,50 @@ const registerIpc = (): void => {
       }
     }
   )
+  ipcMain.handle(
+    'files:move',
+    async (_event, projectId: string, requested: string, requestedDirectory: string) => {
+      const project = database.getProject(projectId)
+      if (!project) throw new Error('Project not found')
+      if (isProjectRoot(project.path, requested)) throw new Error('The project root cannot be moved')
+
+      const source = await resolveExistingProjectPath(projectId, requested)
+      const destination = await resolveExistingProjectPath(projectId, requestedDirectory)
+      if (!(await fs.stat(destination)).isDirectory()) throw new Error('Choose a destination folder')
+
+      const sourceStat = await fs.lstat(source)
+      const destinationRelation = relative(
+        sourceStat.isDirectory() ? await fs.realpath(source) : source,
+        await fs.realpath(destination)
+      )
+      const destinationIsInsideSource = destinationRelation === '' || (
+        !isAbsolute(destinationRelation) &&
+        destinationRelation !== '..' &&
+        !destinationRelation.startsWith(`..${sep}`)
+      )
+      if (sourceStat.isDirectory() && destinationIsInsideSource) {
+        throw new Error('A folder cannot be moved inside itself')
+      }
+
+      const target = resolveWithinProject(project.path, join(requestedDirectory, basename(source)))
+      if (target !== source) {
+        if (await folderExists(target)) throw new Error(`An item named ${basename(source)} already exists`)
+        await fs.rename(source, target)
+      }
+      return {
+        name: basename(target),
+        path: target,
+        relativePath: relative(project.path, target).replaceAll('\\', '/'),
+        kind: sourceStat.isDirectory() ? ('directory' as const) : ('file' as const)
+      }
+    }
+  )
+  ipcMain.handle('files:trash', async (_event, projectId: string, requested: string) => {
+    const project = database.getProject(projectId)
+    if (!project) throw new Error('Project not found')
+    if (isProjectRoot(project.path, requested)) throw new Error('The project root cannot be deleted')
+    await shell.trashItem(await resolveExistingProjectPath(projectId, requested))
+  })
   ipcMain.handle('files:reveal', async (_event, projectId: string, requested = '') => {
     const target = await resolveExistingProjectPath(projectId, requested)
     shell.showItemInFolder(target)
@@ -774,19 +856,18 @@ const registerIpc = (): void => {
       capturedAt: new Date().toISOString()
     }
   })
-  ipcMain.handle('debug:save-screenshot', async (event) => {
-    if (!lastDebugScreenshot) return null
-    const owner = BrowserWindow.fromWebContents(event.sender)
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-    const options: Electron.SaveDialogOptions = {
-      title: 'Save debug screenshot',
-      defaultPath: join(app.getPath('pictures'), `Conductor-debug-${timestamp}.png`),
-      filters: [{ name: 'PNG image', extensions: ['png'] }]
+  ipcMain.handle('debug:open-issue', async (_event, url: string) => {
+    const issueUrl = new URL(url)
+    if (
+      issueUrl.protocol !== 'https:' ||
+      issueUrl.hostname !== 'github.com' ||
+      issueUrl.pathname !== '/Empire024/conductor/issues/new'
+    ) {
+      throw new Error('Issue reports can only be sent to the Conductor GitHub repository')
     }
-    const result = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options)
-    if (result.canceled || !result.filePath) return null
-    await fs.writeFile(result.filePath, lastDebugScreenshot.toPNG())
-    return result.filePath
+    if (lastDebugScreenshot) clipboard.writeImage(lastDebugScreenshot)
+    await shell.openExternal(issueUrl.toString())
+    return { screenshotCopied: Boolean(lastDebugScreenshot) }
   })
   ipcMain.on('debug:publish-snapshot', (event, snapshot: DebugConsoleSnapshot) => {
     if (BrowserWindow.fromWebContents(event.sender) === debugWindow) return
@@ -869,6 +950,13 @@ app.whenReady().then(() => {
   const databasePath = join(app.getPath('userData'), 'conductor.db')
   database = new ConductorDatabase(databasePath)
   database.reconcileInterruptedRuntimes()
+  // v1 could mistake Codex's "usage limit resets available" credit notice for
+  // an exhausted quota. Clear those persisted waits once; a genuinely limited
+  // CLI will immediately report its real reset time again.
+  if (database.getSetting(USAGE_LIMIT_DETECTION_VERSION_KEY) !== '2') {
+    database.clearPendingContinuations()
+    database.setSetting(USAGE_LIMIT_DETECTION_VERSION_KEY, '2')
+  }
   orchestration = new OrchestrationStore(databasePath)
   collaboration = new AgentCollaborationStore(databasePath)
   const projectArgument = process.argv.find((argument) => argument.startsWith('--project-path='))

@@ -749,6 +749,10 @@ export class ConductorDatabase {
     this.db.prepare('DELETE FROM agent_continuations WHERE agent_id = ?').run(agentId)
   }
 
+  clearPendingContinuations(): void {
+    this.db.prepare("DELETE FROM agent_continuations WHERE status = 'pending'").run()
+  }
+
   listProcesses(projectId?: string): RuntimeProcessSummary[] {
     const filter = projectId ? ' WHERE project_id = ?' : ''
     const params = projectId ? [projectId] : []

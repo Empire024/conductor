@@ -1,5 +1,8 @@
 const LIMIT_LANGUAGE = /\b(?:(?:usage|rate)[\s-]*)?limit\b|\bquota\b/i
 const RESET_LANGUAGE = /\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)\b/i
+const AVAILABLE_RESET_CREDITS = /\b(?:you\s+have\s+)?\d+\s+(?:usage[\s-]+)?limit\s+resets?\s+available\b/i
+const BLOCKED_LIMIT_LANGUAGE = /\b(?:hit|reached|exceeded|exhausted|blocked)\b|\btoo many requests\b/i
+const PUNCTUATED_LIMIT_RESET = /(?:\b(?:(?:usage|rate)[\s-]*)?limit\b|\bquota\b)\s*[,;:.\u2013\u2014-]\s*(?:reset|try again|retry|available again|continue)/i
 const DURATION_PART = String.raw`\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b`
 
 const parseDuration = (value: string): number => {
@@ -18,7 +21,16 @@ const parseDuration = (value: string): number => {
  * matching the timezone in which the desktop UI and provider process run.
  */
 export const parseUsageLimitReset = (text: string, from = new Date()): Date | null => {
-  if (!LIMIT_LANGUAGE.test(text) || !RESET_LANGUAGE.test(text)) return null
+  // Codex offers a limited number of manual usage-window reset credits. That
+  // notice contains all of the generic words below (usage, limit, reset and a
+  // number), but it means the user can continue now -- not that they are
+  // blocked until a future time.
+  if (AVAILABLE_RESET_CREDITS.test(text)) return null
+  if (
+    !LIMIT_LANGUAGE.test(text) ||
+    !RESET_LANGUAGE.test(text) ||
+    (!BLOCKED_LIMIT_LANGUAGE.test(text) && !PUNCTUATED_LIMIT_RESET.test(text))
+  ) return null
 
   const durationPattern = new RegExp(
     String.raw`\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)[^.\r\n]{0,80}?\b(?:in|after)\s+((?:${DURATION_PART})(?:[\s,]*(?:and\s+)?(?:${DURATION_PART}))*)`,

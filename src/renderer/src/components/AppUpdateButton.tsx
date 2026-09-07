@@ -16,7 +16,7 @@ export function AppUpdateButton({
 
   const busy = state.phase === 'downloading' || state.phase === 'installing'
   const label = state.phase === 'available'
-    ? 'Update available'
+    ? 'Update pending'
     : state.phase === 'downloading'
       ? `Downloading ${Math.round(state.progress ?? 0)}%`
       : state.phase === 'ready'

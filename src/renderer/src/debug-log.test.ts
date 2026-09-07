@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildIssueReport } from './debug-log'
+import { buildIssueDraftUrl, buildIssueReport } from './debug-log'
 
 describe('debug issue reports', () => {
   it('includes useful diagnostics without project paths', () => {
@@ -24,7 +24,7 @@ describe('debug issue reports', () => {
     expect(report).not.toContain('C:\\')
   })
 
-  it('includes local screenshot context and its optional description', () => {
+  it('includes screenshot context, description, and GitHub attachment instructions', () => {
     const report = buildIssueReport(
       { appVersion: '0.1.2', electronVersion: '37', chromeVersion: '138', nodeVersion: '22', platform: 'win32', arch: 'x64' },
       {
@@ -37,5 +37,14 @@ describe('debug issue reports', () => {
     expect(report).toContain('## Screenshot')
     expect(report).toContain('1200 × 800')
     expect(report).toContain('The tab bar overlaps the editor.')
+    expect(report).toContain('GitHub will turn it into a permanent link')
+    expect(report).not.toContain('save and attach')
+  })
+
+  it('builds a bounded prefilled Conductor issue URL', () => {
+    const url = new URL(buildIssueDraftUrl('x'.repeat(20_000), 'Effort slider breaks the pane'))
+    expect(`${url.origin}${url.pathname}`).toBe('https://github.com/Empire024/conductor/issues/new')
+    expect(url.searchParams.get('title')).toBe('Effort slider breaks the pane')
+    expect(url.searchParams.get('body')?.length).toBeLessThanOrEqual(6_000)
   })
 })

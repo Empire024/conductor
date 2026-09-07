@@ -37,12 +37,16 @@ const modelArg = (spec: AgentSpec): string[] => spec.model && spec.model !== 'de
   ? ['--model', spec.model]
   : []
 
-const standardEfforts: Array<{ id: AgentEffort; label: string }> = [
+export const CODEX_EFFORTS: Array<{ id: AgentEffort; label: string }> = [
   { id: 'auto', label: 'Automatic' },
   { id: 'low', label: 'Low' },
   { id: 'medium', label: 'Medium' },
   { id: 'high', label: 'High' },
-  { id: 'xhigh', label: 'Extra high' },
+  { id: 'xhigh', label: 'Extra high' }
+]
+
+const standardEfforts: Array<{ id: AgentEffort; label: string }> = [
+  ...CODEX_EFFORTS,
   { id: 'max', label: 'Maximum' }
 ]
 
@@ -74,12 +78,17 @@ const providers: Record<AgentProviderId, AgentProvider> = {
     resolveExecutable: () => findOnPath('codex', process.env.CONDUCTOR_CODEX_PATH),
     installUrl: 'https://developers.openai.com/codex/cli/',
     models: CODEX_MODELS,
-    efforts: standardEfforts,
+    // Codex config currently accepts minimal/low/medium/high/xhigh. `max` is
+    // intentionally not offered here: passing it as model_reasoning_effort
+    // makes the CLI exit and leaves its pane looking broken.
+    efforts: CODEX_EFFORTS,
     launch: (spec, executable) => ({
       executable,
       args: [
         ...modelArg(spec),
-        ...(spec.effort && spec.effort !== 'auto' ? ['-c', `model_reasoning_effort="${spec.effort}"`] : []),
+        ...(CODEX_EFFORTS.some(({ id }) => id === spec.effort) && spec.effort !== 'auto'
+          ? ['-c', `model_reasoning_effort="${spec.effort}"`]
+          : []),
         ...(spec.resume ? ['resume', '--last'] : [])
       ]
     })

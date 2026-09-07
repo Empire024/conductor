@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { Bug, Camera, Copy, Download, Maximize2, Minimize2, Minus, PictureInPicture2, Trash2, X } from 'lucide-react'
+import { Bug, Camera, Copy, Maximize2, Minimize2, Minus, PictureInPicture2, Send, Trash2, X } from 'lucide-react'
 import type { DebugScreenshot, IssueReportContext } from '../../../shared/models'
 import {
   buildIssueReport,
+  buildIssueDraftUrl,
   clearDebugEntries,
   getDebugEntries,
   subscribeToDebugEntries,
@@ -56,6 +57,32 @@ export function DebugConsole({
     onCopied()
   }
 
+  const openIssue = async (): Promise<void> => {
+    if (!screenshot) return
+    const description = screenshotDescription.trim()
+    if (!description) {
+      setCaptureStatus('Describe what is wrong first')
+      descriptionRef.current?.focus()
+      return
+    }
+    setCaptureStatus('Opening issue...')
+    try {
+      const diagnostics = await window.conductor.system.getDiagnostics()
+      const report = buildIssueReport(
+        diagnostics,
+        context,
+        entries,
+        { ...screenshot, description }
+      )
+      const { screenshotCopied } = await window.conductor.debug.openIssue(buildIssueDraftUrl(report, description))
+      setCaptureStatus(screenshotCopied
+        ? 'Issue draft opened - paste the copied screenshot'
+        : 'Issue draft opened')
+    } catch (reason) {
+      setCaptureStatus(reason instanceof Error ? reason.message : 'Could not open the issue')
+    }
+  }
+
   const takeScreenshot = async (): Promise<void> => {
     setCaptureStatus('Capturing…')
     document.documentElement.dataset.debugCapturing = 'true'
@@ -63,19 +90,15 @@ export function DebugConsole({
     try {
       const captured = await window.conductor.debug.captureScreenshot()
       setScreenshot(captured)
+      setScreenshotDescription('')
       setMinimized(false)
-      setCaptureStatus('Screenshot ready')
+      setCaptureStatus('Describe it, then press Enter')
       requestAnimationFrame(() => requestAnimationFrame(() => descriptionRef.current?.focus()))
     } catch (reason) {
       setCaptureStatus(reason instanceof Error ? reason.message : 'Capture failed')
     } finally {
       delete document.documentElement.dataset.debugCapturing
     }
-  }
-
-  const saveScreenshot = async (): Promise<void> => {
-    const path = await window.conductor.debug.saveScreenshot()
-    setCaptureStatus(path ? `Saved ${path}` : 'Save cancelled')
   }
 
   const clear = (): void => {
@@ -132,16 +155,22 @@ export function DebugConsole({
         <div className="debug-screenshot">
           <img src={screenshot.dataUrl} alt="Captured Conductor window" />
           <label>
-            <span><strong>Screenshot</strong><small>{screenshot.width} × {screenshot.height} · optional description</small></span>
+            <span><strong>What is wrong here?</strong><small>{screenshot.width} × {screenshot.height} · Enter to report</small></span>
             <textarea
               ref={descriptionRef}
               rows={2}
               value={screenshotDescription}
               onChange={(event) => setScreenshotDescription(event.target.value)}
-              placeholder="Describe what looks wrong so it is included in the issue report…"
+              placeholder="Briefly describe what should have happened…"
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault()
+                  void openIssue()
+                }
+              }}
             />
           </label>
-          <button onClick={() => void saveScreenshot()} title="Save screenshot as PNG" aria-label="Save screenshot"><Download size={14} /></button>
+          <button onClick={() => void openIssue()} title="Open GitHub issue draft (Enter)" aria-label="Open GitHub issue draft"><Send size={14} /></button>
           <button onClick={() => { setScreenshot(null); setCaptureStatus('') }} title="Remove screenshot" aria-label="Remove screenshot"><X size={14} /></button>
         </div>
       )}
@@ -158,7 +187,7 @@ export function DebugConsole({
               </div>
             ))}
           </div>
-          <footer>Local only. Screenshots exclude this inline console; save the PNG separately and copy the matching report.</footer>
+          <footer>Capture, describe, press Enter. The issue draft opens with diagnostics and the screenshot ready to paste as a GitHub link.</footer>
         </>
       )}
     </aside>

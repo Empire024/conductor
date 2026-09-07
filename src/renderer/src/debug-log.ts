@@ -8,6 +8,18 @@ export interface IssueScreenshotContext {
   description?: string
 }
 
+const GITHUB_ISSUE_URL = 'https://github.com/Empire024/conductor/issues/new'
+const MAX_ISSUE_DRAFT_LENGTH = 6_000
+
+export const buildIssueDraftUrl = (report: string, description = ''): string => {
+  const normalizedDescription = description.trim().replace(/\s+/g, ' ')
+  const title = normalizedDescription ? normalizedDescription.slice(0, 90) : 'Conductor issue'
+  const body = report.length <= MAX_ISSUE_DRAFT_LENGTH
+    ? report
+    : `${report.slice(0, 4_200)}\n\n<!-- Long report shortened for the GitHub draft. Copy the full report from Conductor if needed. -->\n\n${report.slice(-1_500)}`
+  return `${GITHUB_ISSUE_URL}?${new URLSearchParams({ title, body }).toString()}`
+}
+
 const MAX_ENTRIES = 300
 const listeners = new Set<(entries: DebugLogEntry[]) => void>()
 let entries: DebugLogEntry[] = []
@@ -136,9 +148,11 @@ export const buildIssueReport = (
       '## Screenshot',
       `- Captured: ${screenshot.capturedAt}`,
       `- Size: ${screenshot.width} × ${screenshot.height}`,
-      '- Attachment: save and attach the PNG from the debug console.',
+      '- Attachment: paste the screenshot from your clipboard here. GitHub will turn it into a permanent link.',
       '',
       screenshot.description?.trim() || '<!-- Describe what is visibly wrong in the screenshot. -->',
+      '',
+      '<!-- Paste screenshot here -->',
       ''
     ] : []),
     '## Recent debug log',

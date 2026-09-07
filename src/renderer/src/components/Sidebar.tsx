@@ -24,7 +24,7 @@ import {
   Settings2,
   Trash2
 } from 'lucide-react'
-import type { PaneKind, ProjectRecord, SessionRecord } from '../../../shared/models'
+import type { FileEntry, PaneKind, ProjectRecord, SessionRecord } from '../../../shared/models'
 import { WorkspaceSidebarPanel } from './WorkspaceSidebarPanel'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
 
@@ -51,6 +51,8 @@ interface SidebarProps {
   onOpenTab(kind: PaneKind): void
   onOpenFile?(relativePath: string, mode: ExplorerOpenMode): void
   onProjectRenamed?(project: ProjectRecord): void
+  onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind']): void
+  onPathRemoved?(relativePath: string, kind: FileEntry['kind']): void
   utilityPanel: WorkspacePanel | null
   onUtilityPanel(panel: WorkspacePanel | null): void
 }
@@ -215,6 +217,8 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
           mode={sidebarMode}
           project={props.projects.find((project) => project.id === props.activeProjectId) ?? null}
           onOpenFile={props.onOpenFile}
+          onPathChanged={props.onPathChanged}
+          onPathRemoved={props.onPathRemoved}
           onProjectRenamed={(project) => {
             props.onProjectRenamed?.(project)
             window.dispatchEvent(new CustomEvent('conductor:project-renamed', { detail: project }))

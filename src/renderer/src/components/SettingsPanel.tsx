@@ -139,7 +139,7 @@ export function SettingsPanel({
 
         <section>
           <div className="settings-section-title"><RefreshCw size={14} /><div><strong>Updates</strong><span>GitHub Releases</span></div></div>
-          <div className="update-source-setting"><strong>Empire024/conductor</strong><small>Automatic checks at startup and every 30 minutes</small></div>
+          <div className="update-source-setting"><strong>Installed-app updates</strong><small>Automatic checks at startup and every 2 minutes</small></div>
           <div className="update-status-setting">
             <span>
               <strong>Conductor {updateState.currentVersion || '—'}</strong>

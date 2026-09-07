@@ -30,5 +30,7 @@ describe('parseUsageLimitReset', () => {
     expect(parseUsageLimitReset('The layout resize limit was changed.', from)).toBeNull()
     expect(parseUsageLimitReset('Usage limit reached.', from)).toBeNull()
     expect(parseUsageLimitReset('Try again in 30 minutes.', from)).toBeNull()
+    expect(parseUsageLimitReset('You have 2 usage limit resets available. Run /usage to use one.', from)).toBeNull()
+    expect(parseUsageLimitReset('You have 2 usage limit resets available. Run /usage to use one. Next window resets at 2 AM.', from)).toBeNull()
   })
 })

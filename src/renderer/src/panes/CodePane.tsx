@@ -24,11 +24,15 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
   const [theme, setTheme] = useState(document.documentElement.dataset.theme === 'light' ? 'conductor-light' : 'conductor-dark')
   const valueRef = useRef(value)
   const savedValueRef = useRef(savedValue)
+  const pathRef = useRef(path)
+  const tabIdRef = useRef(tabId)
   const viewStateRef = useRef<unknown | null>(null)
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null)
   const draftTimerRef = useRef<number | null>(null)
   valueRef.current = value
   savedValueRef.current = savedValue
+  pathRef.current = path
+  tabIdRef.current = tabId
   const dirty = value !== savedValue
   const language = useMemo(() => languageFor(path), [path])
 
@@ -39,7 +43,9 @@ export function CodePane({ project, tabId, path, line }: { project: ProjectRecor
       draftTimerRef.current = null
     }
     viewStateRef.current = editorRef.current?.saveViewState() ?? viewStateRef.current
-    window.conductor.files.flushDraft(tabId, project.id, path, valueRef.current, viewStateRef.current)
+    // A file can be renamed or moved from Explorer while it is open. Refs let
+    // the outgoing effect checkpoint its unsaved content under the new path.
+    window.conductor.files.flushDraft(tabIdRef.current, project.id, pathRef.current, valueRef.current, viewStateRef.current)
   }
 
   const checkpointDraft = (): void => {

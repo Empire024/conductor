@@ -78,8 +78,13 @@ const bridge: ConductorBridge = {
     readDataUrl: (projectId, relativePath) => ipcRenderer.invoke('files:read-data-url', projectId, relativePath),
     write: (projectId, relativePath, content) =>
       ipcRenderer.invoke('files:write', projectId, relativePath, content),
+    create: (projectId, directory, name, kind) =>
+      ipcRenderer.invoke('files:create', projectId, directory, name, kind),
     rename: (projectId, relativePath, name) =>
       ipcRenderer.invoke('files:rename', projectId, relativePath, name),
+    move: (projectId, relativePath, destinationDirectory) =>
+      ipcRenderer.invoke('files:move', projectId, relativePath, destinationDirectory),
+    trash: (projectId, relativePath) => ipcRenderer.invoke('files:trash', projectId, relativePath),
     reveal: (projectId, relativePath) => ipcRenderer.invoke('files:reveal', projectId, relativePath),
     openExternal: (projectId, relativePath) =>
       ipcRenderer.invoke('files:open-external', projectId, relativePath),
@@ -133,7 +138,7 @@ const bridge: ConductorBridge = {
   debug: {
     openWindow: (placeAtCursor) => ipcRenderer.invoke('debug:open-window', placeAtCursor),
     captureScreenshot: () => ipcRenderer.invoke('debug:capture-screenshot'),
-    saveScreenshot: () => ipcRenderer.invoke('debug:save-screenshot'),
+    openIssue: (url) => ipcRenderer.invoke('debug:open-issue', url),
     publishSnapshot: (snapshot) => ipcRenderer.send('debug:publish-snapshot', snapshot),
     getSnapshot: () => ipcRenderer.invoke('debug:get-snapshot'),
     clearSource: () => ipcRenderer.send('debug:clear-source'),

@@ -44,10 +44,10 @@ for (let attempt = 0; attempt < 60; attempt += 1) {
     const style = getComputedStyle(button)
     return { label: button.textContent.trim(), className: button.className, borderColor: style.borderColor, boxShadow: style.boxShadow }
   })()`)
-  if (update?.label === 'Update available') break
+  if (update?.label === 'Update pending') break
   await delay(200)
 }
-if (update?.label !== 'Update available' || !update.className.includes('available') || update.boxShadow === 'none') {
+if (update?.label !== 'Update pending' || !update.className.includes('available') || update.boxShadow === 'none') {
   const state = await evaluate('window.conductor.updates.getState()')
   socket.close()
   throw new Error(`Bottom-bar update highlight was missing: ${JSON.stringify({ update, state })}`)

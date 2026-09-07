@@ -701,6 +701,27 @@ kbd {
 /* Settings and project creation */
 .dialog-backdrop, .settings-scrim { position: fixed; inset: 39px 0 0; z-index: 1300; background: #05070a99; backdrop-filter: blur(2px); }
 .dialog-backdrop { display: grid; place-items: center; }
+.update-prompt-backdrop { position: fixed; inset: 39px 0 0; z-index: 1350; display: grid; place-items: center; padding: 24px; background: #05070aaa; backdrop-filter: blur(3px); }
+.update-prompt { width: min(460px, calc(100vw - 32px)); overflow: hidden; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface-1); box-shadow: 0 26px 90px #000c; }
+.update-prompt > header { min-height: 72px; padding: 13px 14px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid var(--border-soft); }
+.update-prompt-icon { width: 39px; height: 39px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--accent) 38%, var(--border)); border-radius: 9px; color: var(--accent); background: var(--accent-bg); }
+.update-prompt-icon.ready { color: var(--accent-muted); border-color: color-mix(in srgb, var(--accent-muted) 38%, var(--border)); background: color-mix(in srgb, var(--accent-muted) 9%, var(--surface-1)); }
+.update-prompt > header > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
+.update-prompt > header strong { color: var(--text); font-size: 12px; font-weight: 650; }
+.update-prompt > header span { color: var(--text-3); font-size: 8px; }
+.update-prompt > header > button { width: 27px; height: 27px; display: grid; place-items: center; border: 0; border-radius: 5px; color: var(--text-3); background: transparent; }
+.update-prompt > header > button:hover { color: var(--text); background: var(--surface-hover); }
+.update-prompt > p { margin: 0; padding: 16px 16px 10px; color: var(--text-2); font-size: 10px; line-height: 1.55; }
+.update-auto-choice { margin: 3px 16px 17px; padding: 10px 11px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-0); cursor: pointer; }
+.update-auto-choice input { width: 14px; height: 14px; accent-color: var(--accent); }
+.update-auto-choice span { display: flex; flex-direction: column; gap: 2px; }
+.update-auto-choice strong { color: var(--text-2); font-size: 9px; }
+.update-auto-choice small { color: var(--text-3); font-size: 7.5px; }
+.update-prompt > footer { min-height: 53px; padding: 0 14px; display: flex; align-items: center; justify-content: flex-end; gap: 7px; border-top: 1px solid var(--border-soft); }
+.update-prompt > footer button { height: 30px; padding: 0 11px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-2); background: var(--surface-2); font-size: 9px; }
+.update-prompt > footer button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
+.update-prompt > footer button.primary { border-color: var(--accent); color: #10140c; background: var(--accent); font-weight: 650; }
+.update-prompt > footer button:disabled { opacity: .55; }
 .create-project-dialog { width: 440px; overflow: hidden; border: 1px solid #3a434d; border-radius: 8px; background: #14191f; box-shadow: 0 24px 80px #000b; }
 .create-project-dialog > header { min-height: 68px; padding: 12px 13px; display: flex; align-items: center; gap: 11px; border-bottom: 1px solid #292f37; }
 .dialog-icon { width: 36px; height: 36px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #46552e; border-radius: 7px; color: var(--accent); background: #1b2314; }
@@ -1340,9 +1361,49 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 .debug-screenshot textarea:focus { border-color: var(--accent-muted); }
 .debug-screenshot > button { width: 25px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 5px; color: var(--text-3); background: transparent; }
 .debug-screenshot > button:hover { color: var(--text); background: var(--surface-2); }
+.debug-screenshot > button:first-of-type { color: var(--accent-muted); background: var(--accent-bg); }
 .debug-window-shell { position: relative; width: 100%; height: 100%; background: var(--surface-0); }
 .debug-window-notice { position: fixed; z-index: 20; right: 10px; bottom: 9px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 5px; color: var(--accent-muted); background: var(--surface-1); font-size: 8px; }
 :root[data-debug-capturing="true"] .debug-console { visibility: hidden; }
+
+/* Creation controls stay quiet and tool-like across empty workspaces. */
+.primary-action,
+.no-workspace-state > button,
+.empty-pane-workspace button {
+  min-height: 28px;
+  height: 28px;
+  margin-top: 0;
+  padding: 0 8px 0 5px;
+  gap: 6px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  color: var(--text-2);
+  background: transparent;
+  box-shadow: none;
+  font-size: 8.5px;
+  font-weight: 550;
+  transition: border-color 120ms ease, color 120ms ease, background 120ms ease, transform 90ms ease;
+}
+.primary-action svg,
+.no-workspace-state > button svg,
+.empty-pane-workspace button svg {
+  width: 18px;
+  height: 18px;
+  padding: 3px;
+  border-radius: 5px;
+  color: var(--accent-muted);
+  background: var(--accent-bg);
+}
+.primary-action:hover,
+.no-workspace-state > button:hover:not(:disabled),
+.empty-pane-workspace button:hover:not(:disabled) {
+  border-color: var(--border);
+  color: var(--text);
+  background: var(--surface-hover);
+}
+.primary-action:active,
+.no-workspace-state > button:active,
+.empty-pane-workspace button:active:not(:disabled) { transform: translateY(1px); }
 
 /* Utility docks remember their side and expose magnetic targets only while
    their header is being dragged. */

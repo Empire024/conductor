@@ -90,7 +90,10 @@ export interface ConductorBridge {
     read(projectId: string, relativePath: string): Promise<string>
     readDataUrl(projectId: string, relativePath: string): Promise<FileDataResource>
     write(projectId: string, relativePath: string, content: string): Promise<void>
+    create(projectId: string, directory: string, name: string, kind: FileEntry['kind']): Promise<FileEntry>
     rename(projectId: string, relativePath: string, name: string): Promise<FileEntry>
+    move(projectId: string, relativePath: string, destinationDirectory: string): Promise<FileEntry>
+    trash(projectId: string, relativePath: string): Promise<void>
     reveal(projectId: string, relativePath?: string): Promise<void>
     openExternal(projectId: string, relativePath: string): Promise<void>
     getDraft(tabId: string, projectId: string, relativePath: string): Promise<EditorDraft | null>
@@ -138,7 +141,7 @@ export interface ConductorBridge {
   debug: {
     openWindow(placeAtCursor?: boolean): Promise<void>
     captureScreenshot(): Promise<DebugScreenshot>
-    saveScreenshot(): Promise<string | null>
+    openIssue(url: string): Promise<{ screenshotCopied: boolean }>
     publishSnapshot(snapshot: DebugConsoleSnapshot): void
     getSnapshot(): Promise<DebugConsoleSnapshot | null>
     clearSource(): void

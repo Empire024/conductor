@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react'
-import type { ProjectRecord } from '../../../shared/models'
+import type { FileEntry, ProjectRecord } from '../../../shared/models'
 import { BrowserSidebar } from './BrowserSidebar'
 import { ExplorerSidebar } from './ExplorerSidebar'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
@@ -10,6 +10,8 @@ interface WorkspaceSidebarPanelProps {
   workspace: ReactNode
   onOpenFile?(relativePath: string, mode: ExplorerOpenMode): void
   onProjectRenamed?(project: ProjectRecord): void
+  onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind']): void
+  onPathRemoved?(relativePath: string, kind: FileEntry['kind']): void
 }
 
 /**
@@ -21,7 +23,9 @@ export function WorkspaceSidebarPanel({
   project,
   workspace,
   onOpenFile,
-  onProjectRenamed
+  onProjectRenamed,
+  onPathChanged,
+  onPathRemoved
 }: WorkspaceSidebarPanelProps): React.JSX.Element {
   if (mode === 'workspace') return <>{workspace}</>
   if (mode === 'browser') return <BrowserSidebar projectId={project?.id} />
@@ -31,6 +35,8 @@ export function WorkspaceSidebarPanel({
         project={project}
         onOpenFile={onOpenFile}
         onProjectRenamed={onProjectRenamed}
+        onPathChanged={onPathChanged}
+        onPathRemoved={onPathRemoved}
       />
     )
   }
