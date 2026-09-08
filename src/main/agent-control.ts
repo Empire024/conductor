@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
-import { realpathSync, statSync } from 'node:fs'
+import { statSync } from 'node:fs'
+import { realpath } from 'node:fs/promises'
 import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
@@ -129,7 +130,7 @@ export class AgentControl {
     if (!workspace) throw new Error('This linked workspace is no longer open')
     const scope = { projectId, sessionId: workspace.id, agentSessionId: '' }
     if (kind === 'workspace') await this.ui(scope, 'workspace.focus', {})
-    else if (kind === 'file') await this.ui(scope, 'files.open', { path: relative(realpathSync(project.path), await workspacePath(project.path, id)).replaceAll('\\', '/') })
+    else if (kind === 'file') await this.ui(scope, 'files.open', { path: relative(await realpath(project.path), await workspacePath(project.path, id)).replaceAll('\\', '/') })
     else throw new Error('Unsupported Conductor link')
   }
 
@@ -287,8 +288,9 @@ export class AgentControl {
     if (['files.read', 'files.write', 'files.open'].includes(method)) {
       const path = await workspacePath(source.cwd, text(args, 'path', 4000), method === 'files.write')
       if (method !== 'files.write' && (!statSync(path).isFile() || statSync(path).size > 1024 * 1024)) throw new Error('Only text files up to 1 MiB are supported')
+      // Match workspacePath's native resolver, including Windows 8.3 folder aliases.
+      const relativePath = relative(await realpath(source.cwd), path).replaceAll('\\', '/')
       this.authorize(scope)
-      const relativePath = relative(realpathSync(source.cwd), path).replaceAll('\\', '/')
       if (method === 'files.open') return this.ui(scope, 'files.open', { path: relativePath })
       if (method === 'files.read') return { path: relativePath, content: readEditorFile(path), uri: conductorUri(scope.projectId, 'file', relativePath) }
       if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
