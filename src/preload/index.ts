@@ -19,6 +19,10 @@ const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => v
 }
 
 const bridge: ConductorBridge = {
+  projectTasks: {
+    get: (projectId) => ipcRenderer.invoke('project-tasks:get', projectId),
+    edit: (projectId, revision, edit) => ipcRenderer.invoke('project-tasks:edit', projectId, revision, edit)
+  },
   nativeCli: {
     ensure: (id) => ipcRenderer.invoke('native-cli:ensure', id),
     chat: (id) => ipcRenderer.invoke('native-cli:chat', id),
@@ -110,6 +114,7 @@ const bridge: ConductorBridge = {
     flush: (snapshot: WorkspaceRecoveryCheckpoint) => ipcRenderer.sendSync('recovery:flush', snapshot) === true
   },
   files: {
+    importImage: (projectId, name, bytes) => ipcRenderer.invoke('files:import-image', projectId, name, bytes),
     onOpenShortcut: (callback) => subscribe('files:open-shortcut', callback),
     browserUrl: (projectId, path) => ipcRenderer.invoke('files:browser-url', projectId, path),
     openInBrowser: (projectId, path) => ipcRenderer.invoke('files:open-in-browser', projectId, path),

@@ -116,6 +116,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   notify('turn/started', { threadId, turn: { id: currentTurn, status: 'inProgress', items: [], error: null } })
   if (process.env.CONDUCTOR_TEST_TURN_ACK_DELAY === '1') setTimeout(() => send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } }), 150)
   else send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } })
+  if (scenario.startsWith('synthetic:images')) {
+    const images = message.params.input.filter(item => item.type === 'localImage')
+    if (!images.length || images.some(item => readFileSync(item.path).subarray(0,8).toString('hex') !== '89504e470d0a1a0a')) throw new Error('Synthetic image bytes did not reach Codex')
+    itemEvent('item/completed', { type: 'agentMessage', id: 'images-' + turnNumber, text: 'Synthetic native images received: ' + images.length, phase: null, memoryCitation: null, delivery: null, questions: null })
+    finish(); return
+  }
   if (scenario.startsWith('synthetic:steer')) {
     if (scenario === 'synthetic:steer-review') itemEvent('item/started', { type: 'enteredReviewMode', id: 'review', review: 'Synthetic review' })
     if (scenario === 'synthetic:steer-compact') itemEvent('item/started', { type: 'contextCompaction', id: 'compact' })

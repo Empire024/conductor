@@ -33,7 +33,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   private readonly providerCapabilities: ProviderCapabilities = {
     provider: 'claude', runtimeVersion: 'unknown', adapterVersion: 1, authentication: 'cli',
     steering: false, textStreaming: true, toolInputStreaming: true, toolOutputStreaming: false,
-    approvals: true, questions: true, resume: true, fork: false, plans: true, permissions: ['default', 'accept-edits', 'auto'],
+    approvals: true, questions: true, resume: true, fork: false, plans: true, imageAttachments: true, permissions: ['default', 'accept-edits', 'auto'],
     effort: ['low', 'medium', 'high', 'xhigh', 'max'], models: [],
     limitations: [
       'CLI authentication is inherited; subscription quota and API billing are not inferred from cost telemetry.',

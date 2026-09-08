@@ -1,9 +1,10 @@
+import { PromptImageThumbnail } from '../components/PromptImageUpload'
 import { Children, isValidElement, memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DiffEditor, type DiffOnMount } from '@monaco-editor/react'
 import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, Copy, FileCode2, Maximize2, X } from 'lucide-react'
-import type { AgentEventData, DiffArtifact, FileChange, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
+import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
 import { languageForPath, SyntaxCode } from './SyntaxCode'
 
 /** Diagnostics remain in the event inspector, not the conversation timeline. */
@@ -192,6 +193,8 @@ function PatchPreview({ change }: { change: FileChange }): React.JSX.Element {
 }
 
 interface ActivityProps {
+  projectId?: string
+  onInspectAttachment?(attachment: ContextAttachment): void
   item: TimelineItem
   sessionId: string
   cwd: string
@@ -292,7 +295,7 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
   const { data } = props.item
   let body: ReactNode
   switch (data.type) {
-    case 'text': body = <>{data.role === 'user' && <span className="sa-role">You</span>}<MessageText data={data} cwd={props.cwd} onOpenFile={props.onOpenFile} />{Boolean(data.attachments?.length) && <div className="sa-message-attachments" aria-label="Attached context">{data.attachments?.map(attachment => attachment.path ? <button key={attachment.id} className="sa-file-link" title={attachment.name} onClick={event => openAgentFile(event, props.cwd, attachment.path!, props.onOpenFile)}><FileCode2 size={12} />{attachment.name}{attachment.startLine ? ':' + attachment.startLine : ''}</button> : <span key={attachment.id}><FileCode2 size={12} />{attachment.name}</span>)}</div>}</>; break
+    case 'text': body = <>{data.role === 'user' && <span className="sa-role">You</span>}<MessageText data={data} cwd={props.cwd} onOpenFile={props.onOpenFile} />{Boolean(data.attachments?.length) && <div className="sa-message-attachments" aria-label="Attached context">{data.attachments?.map(attachment => attachment.kind === 'image' && props.projectId && props.onInspectAttachment ? <button key={attachment.id} className="sa-sent-image" aria-label={'View image ' + attachment.name} title={'View ' + attachment.name} onClick={() => props.onInspectAttachment?.(attachment)}><PromptImageThumbnail projectId={props.projectId} attachment={attachment} /><span>{attachment.name}</span></button> : attachment.path ? <button key={attachment.id} className="sa-file-link" title={attachment.name} onClick={event => openAgentFile(event, props.cwd, attachment.path!, props.onOpenFile)}><FileCode2 size={12} />{attachment.name}{attachment.startLine ? ':' + attachment.startLine : ''}</button> : <span key={attachment.id}><FileCode2 size={12} />{attachment.name}</span>)}</div>}</>; break
     case 'tool': body = <ToolCard {...props} />; break
     case 'interaction': body = <InteractionCard {...props} />; break
     case 'changes': body = <section className="sa-changes" aria-label="File changes">{data.changes.map((change, index) => <div className="sa-file-change" key={change.path + '-' + index}>

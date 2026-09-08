@@ -48,7 +48,14 @@ for await (const line of input) {
     else send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Unsupported synthetic control' } })
   } else if (message.type === 'user') {
     if (!initialized) throw new Error('User message before initialization')
-    const prompt = message.message.content
+    const blocks = message.message.content
+    const prompt = Array.isArray(blocks) ? blocks.filter(item => item.type === 'text').map(item => item.text).join('') : blocks
+    if (typeof prompt === 'string' && prompt.startsWith('SYNTHETIC IMAGES')) {
+      const images = blocks.filter(item => item.type === 'image')
+      if (!images.length || images.some(item => item.source.type !== 'base64' || item.source.media_type !== 'image/png' || Buffer.from(item.source.data, 'base64').subarray(0,8).toString('hex') !== '89504e470d0a1a0a')) throw new Error('Synthetic image bytes did not reach Claude')
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
+      text('Synthetic native images received: ' + images.length); finish(); continue
+    }
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
     if (prompt.startsWith('SYNTHETIC STEER DATA')) { text('Synthetic steering input received during the active turn.'); continue }
     turn++

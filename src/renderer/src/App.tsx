@@ -1,3 +1,4 @@
+import { ListTodo } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { Bot, Brain, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
@@ -41,6 +42,7 @@ import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile, changeWorkspacePath, workspaceFileIds } from './components/workspace-files-state'
+import { ProjectBacklogPane } from './components/ProjectBacklogPane'
 import { AppVersionButton } from './components/AppVersionButton'
 import { applyAppTheme, resolveThemeVariant } from './appearance'
 import { DebugConsole } from './components/DebugConsole'
@@ -80,7 +82,7 @@ export function App(): React.JSX.Element {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [utilityPanel, setUtilityPanel] = useState<WorkspacePanel | null>(() => {
     const saved = localStorage.getItem('conductor.utilityPanel')
-    return ['agents', 'tasks', 'routines', 'memory', 'processes'].includes(saved ?? '')
+    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog'].includes(saved ?? '')
       ? saved as WorkspacePanel
       : null
   })
@@ -176,7 +178,9 @@ export function App(): React.JSX.Element {
       closedTabs: session.closedTabs
     }))
   }), [])
-  const utilityMeta = utilityPanel === 'memory'
+  const utilityMeta = utilityPanel === 'backlog'
+    ? { label: 'Project tasks', aria: 'Project bugs and features', icon: ListTodo }
+    : utilityPanel === 'memory'
     ? { label: 'Project memory', aria: 'Project memory', icon: Brain }
     : utilityPanel === 'processes'
       ? { label: 'Processes', aria: 'Process dashboard', icon: Gauge }
@@ -1040,7 +1044,9 @@ export function App(): React.JSX.Element {
                       </div>
                     </header>
                     <div className="workspace-utility-content">
-                      {utilityPanel === 'memory'
+                      {utilityPanel === 'backlog'
+                        ? <ProjectBacklogPane key={activeProject.id} project={activeProject} />
+                        : utilityPanel === 'memory'
                         ? <MemoryPane project={activeProject} />
                         : utilityPanel === 'processes'
                           ? <ProcessDashboardPane project={activeProject} />

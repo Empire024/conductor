@@ -1,6 +1,8 @@
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs } from 'node:fs'
 import { pathToFileURL } from 'node:url'
+import { importPromptImage } from './prompt-images'
+import { ProjectBacklogs } from './project-backlog'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell, webContents } from 'electron'
 import type {
@@ -47,6 +49,7 @@ let orchestration: OrchestrationStore
 let disposeOrchestrationIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
+let projectBacklogs: ProjectBacklogs
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
 const detachedWindows = new Map<string, BrowserWindow>()
@@ -510,6 +513,14 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:snapshot', (event, id) => { trustedStructured(event); return database.structured.snapshot(structuredId(id)) })
   ipcMain.handle('structured:connect', (event, id) => { trustedStructured(event); return agents.structured.connectSession(structuredId(id)) })
   ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
+  ipcMain.handle('files:import-image', async (event, projectId: string, name: unknown, bytes: unknown) => {
+    trustedStructured(event)
+    const project = database.getProject(projectId)
+    if (!project) throw new Error('Project not found')
+    const attachment = await importPromptImage(project.path, name, bytes)
+    invalidateProjectFiles(project.path)
+    return attachment
+  })
   ipcMain.handle('structured:queue', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.queue(structuredId(id), text, settings, attachments) })
   ipcMain.handle('structured:steer', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.steer(structuredId(id), text, settings, attachments) })
   ipcMain.handle('structured:cancel-queued', (event, id, promptId?: string) => { trustedStructured(event); if (promptId !== undefined && typeof promptId !== 'string') throw new Error('Invalid queued prompt'); return agents.structured.cancelQueued(structuredId(id), promptId) })
@@ -532,6 +543,8 @@ const registerIpc = (): void => {
   ipcMain.on('settings:get-startup', (event) => {
     event.returnValue = getAppSettings()
   })
+  ipcMain.handle('project-tasks:get', (event, projectId: string) => { trustedStructured(event); return projectBacklogs.get(projectId) })
+  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const result = await projectBacklogs.edit(projectId, revision, edit); const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); return result })
   ipcMain.handle('projects:list', () => database.listProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await dialog.showOpenDialog({
@@ -540,7 +553,9 @@ const registerIpc = (): void => {
     })
     if (result.canceled || !result.filePaths[0]) return null
     const path = resolve(result.filePaths[0])
-    return database.upsertProject(path, basename(path))
+    const project = database.upsertProject(path, basename(path))
+    await projectBacklogs.ensure(project.id)
+    return project
   })
   ipcMain.handle('projects:create', async (_event, name: string) => {
     const settings = getAppSettings()
@@ -553,7 +568,9 @@ const registerIpc = (): void => {
       suffix += 1
     }
     await fs.mkdir(target)
-    return database.upsertProject(target, basename(target))
+    const project = database.upsertProject(target, basename(target))
+    await projectBacklogs.ensure(project.id)
+    return project
   })
   ipcMain.handle('projects:remove', (_event, projectId: string) => {
     const project = database.getProject(projectId)
@@ -1222,6 +1239,8 @@ app.whenReady().then(() => {
     const projectPath = resolve(projectArgument.slice('--project-path='.length))
     database.upsertProject(projectPath, basename(projectPath))
   }
+  projectBacklogs = new ProjectBacklogs(database)
+  for (const project of database.listProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
   terminals = new TerminalManager(database)
   agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration))
   updates = new UpdateManager({

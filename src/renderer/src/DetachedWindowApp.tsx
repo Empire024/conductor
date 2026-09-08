@@ -1,3 +1,5 @@
+import { ProjectBacklogPane } from './components/ProjectBacklogPane'
+import { ListTodo } from 'lucide-react'
 import { AppVersionButton } from './components/AppVersionButton'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile } from './components/workspace-files-state'
@@ -8,7 +10,7 @@ import type { AppSettings, DetachedWindowRecord, PaneKind, PaneTab, ProjectRecor
 import { makeLauncherTab } from '../../shared/models'
 import { TitleBar } from './components/TitleBar'
 import { PaneWorkspace } from './layout/PaneWorkspace'
-import { addTab, closeTab, findGroup, listGroups, stripWorkspaceUtilityTabs } from './layout/layout-operations'
+import { activateTab, addTab, closeTab, findGroup, listGroups, stripWorkspaceUtilityTabs } from './layout/layout-operations'
 import { createPaneTab } from './panes/pane-factory'
 import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
@@ -79,6 +81,19 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     const timer = window.setInterval(apply, 60_000)
     return () => window.clearInterval(timer)
   }, [settings.themeAuto, settings.themeId, settings.themeVariant])
+
+  useEffect(() => {
+    const focus = (event: Event): void => {
+      const detail = (event as CustomEvent<{ id: string; sessionId: string }>).detail
+      const current = layoutRef.current
+      const group = current && listGroups(current.root).find(group => group.tabs.some(tab => tab.resourceId === detail.id))
+      const tab = group?.tabs.find(tab => tab.resourceId === detail.id)
+      if (current && group && tab) { setLayout(activateTab(current, group.id, tab.id)); setFocusedGroupId(group.id); setUtilityPanel(null) }
+      else window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'This agent is in another workspace window.' }))
+    }
+    window.addEventListener('conductor:focus-process', focus)
+    return () => window.removeEventListener('conductor:focus-process', focus)
+  }, [])
 
   useEffect(() => {
     if (!layout) return
@@ -185,6 +200,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               }}
             ><LayoutGrid size={18} /></button>
             <button title="New agent or tool tab" aria-label="New agent or tool tab" onClick={() => openTab('launcher')}><Bot size={18} /></button>
+            <button title="Project tasks" aria-label="Project tasks" className={utilityPanel === 'backlog' ? 'active' : ''} onClick={() => setUtilityPanel(current => current === 'backlog' ? null : 'backlog')}><ListTodo size={18} /></button>
             <button className={utilityPanel === 'memory' ? 'active' : ''} title="Memory" aria-label="Memory" onClick={() => setUtilityPanel((current) => current === 'memory' ? null : 'memory')}><MemoryStick size={18} /></button>
             <button className={utilityPanel === 'processes' ? 'active' : ''} title="Processes" aria-label="Processes" onClick={() => setUtilityPanel((current) => current === 'processes' ? null : 'processes')}><Gauge size={18} /></button>
           </div>
@@ -252,7 +268,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               >
                 <div>
                   {utilityPanel === 'memory' ? <MemoryStick size={19} /> : utilityPanel === 'processes' ? <Gauge size={19} /> : utilityPanel === 'routines' ? <Workflow size={19} /> : <Bot size={19} />}
-                  <span><strong>{utilityPanel === 'memory' ? 'Project memory' : utilityPanel === 'processes' ? 'Processes' : utilityPanel === 'routines' ? 'Routines' : 'Agents & tasks'}</strong><small>Drag this header to dock left or right</small></span>
+                  <span><strong>{utilityPanel === 'backlog' ? 'Project tasks' : utilityPanel === 'memory' ? 'Project memory' : utilityPanel === 'processes' ? 'Processes' : utilityPanel === 'routines' ? 'Routines' : 'Agents & tasks'}</strong><small>Drag this header to dock left or right</small></span>
                 </div>
                 <div className="utility-header-actions">
                   <button onClick={() => moveUtility(utilitySide === 'right' ? 'left' : 'right')} title={`Move to ${utilitySide === 'right' ? 'left' : 'right'} side`}>
@@ -262,7 +278,9 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
                 </div>
               </header>
               <div className="workspace-utility-content">
-                {utilityPanel === 'memory'
+                {utilityPanel === 'backlog'
+                  ? <ProjectBacklogPane key={bundle.project.id} project={bundle.project} />
+                  : utilityPanel === 'memory'
                   ? <MemoryPane project={bundle.project} />
                   : utilityPanel === 'processes'
                     ? <ProcessDashboardPane project={bundle.project} />

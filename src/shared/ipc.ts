@@ -35,6 +35,7 @@ import type { AgentCollaborationBridge } from './agent-collaboration'
 import type { StructuredAgentBridge } from './structured-agent'
 
 export interface ConductorBridge {
+  projectTasks: import('./project-backlog').ProjectBacklogBridge
   nativeCli: {
     ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }>
     chat(id: string): Promise<void>
@@ -105,6 +106,7 @@ export interface ConductorBridge {
     flush(snapshot: WorkspaceRecoveryCheckpoint): boolean
   }
   files: {
+    importImage(projectId: string, name: string, bytes: Uint8Array): Promise<import('./structured-agent').ContextAttachment>
     onOpenShortcut(callback: () => void): () => void
     browserUrl(projectId: string, path: string): Promise<string>
     openInBrowser(projectId: string, path: string): Promise<void>

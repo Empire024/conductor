@@ -17,6 +17,7 @@ import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSign
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { NativeCliManager } from './native-cli-manager'
 import { StructuredSessions } from './structured-sessions'
+import { projectTaskBriefing } from './project-backlog'
 
 export { parseUsageLimitReset } from './usage-limit'
 
@@ -213,7 +214,7 @@ export class AgentManager {
       (spec, prompt) => {
         const memories = database.recall(spec.projectId, prompt, spec.provider, 8)
         const memoryContext = memories.length ? `Conductor project memory (current project evidence takes precedence):\n${memories.map(memory => `- [${memory.kind}] ${memory.gist.slice(0, 520)}`).join('\n')}` : ''
-        return [memoryContext, collaboration?.briefingFor(spec.id) ?? ''].filter(Boolean).join('\n\n')
+        return [memoryContext, collaboration?.briefingFor(spec.id) ?? '', projectTaskBriefing(spec)].filter(Boolean).join('\n\n')
       },
       (spec, event) => {
         if (event.data.type !== 'tool' && event.data.type !== 'changes') return

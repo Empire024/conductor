@@ -1,0 +1,15 @@
+{
+  "provider": "codex",
+  "actualElectron": true,
+  "syntheticProviders": true,
+  "checks": [
+    "Project file is automatic, legacy items import, done items collapse, UI edits preserve surrounding file content",
+    "Task ownership names the actual conversation; external agent completion updates the UI and its link focuses the tab",
+    "File upload, clipboard paste, and drag/drop attach previews; images and prompt survive project switches and reload without modifying originals",
+    "Production provider adapter delivers all three native image blocks to the synthetic codex process",
+    "Non-image bytes are rejected before becoming an attachment",
+    "Queued image files survive application restart and return to the draft with their preview; no automatic replay",
+    "Every project has an isolated task file; detached and main windows share live task updates"
+  ],
+  "errors": []
+}

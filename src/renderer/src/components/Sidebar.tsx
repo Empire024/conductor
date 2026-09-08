@@ -14,6 +14,7 @@ import {
   GitBranch,
   Gauge,
   LayoutGrid,
+  ListTodo,
   MemoryStick,
   MoreHorizontal,
   MoveRight,
@@ -65,7 +66,7 @@ interface SidebarProps {
   onUtilityPanel(panel: WorkspacePanel | null): void
 }
 
-export type WorkspacePanel = 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
+export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
 
 const railItems: Array<{
   icon: typeof LayoutGrid
@@ -76,6 +77,7 @@ const railItems: Array<{
 }> = [
   { icon: LayoutGrid, label: 'Workspace', sidebar: 'workspace' },
   { icon: FolderTree, label: 'Explorer', sidebar: 'explorer' },
+  { icon: ListTodo, label: 'Project tasks', utility: 'backlog' },
   { icon: GitBranch, label: 'Source control' },
   { icon: Bot, label: 'Automation', utility: 'agents' },
   { icon: MemoryStick, label: 'Memory', utility: 'memory' },

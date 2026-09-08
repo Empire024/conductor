@@ -45,7 +45,7 @@ export class NativeCliManager {
       const args = nativeCliArgs(handoff.spec.provider as StructuredProvider, handoff.nativeSessionId, handoff.settings, handoff.fresh)
       const child = pty.spawn(executable, offline ? [join(process.cwd(), 'scripts/fixtures/native-cli.cjs'), handoff.nativeSessionId] : args, {
         name: 'xterm-256color', cols: 100, rows: 30, cwd: handoff.spec.cwd, useConptyDll: process.platform === 'win32',
-        env: { ...process.env, ...(offline ? { ELECTRON_RUN_AS_NODE: '1' } : {}), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
+        env: { ...process.env, CONDUCTOR_AGENT_ID: id, CONDUCTOR_TASK_FILE: 'feature-list.md', ...(offline ? { ELECTRON_RUN_AS_NODE: '1' } : {}), TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
       })
       let resolveStopped!: () => void
       const stopped = new Promise<void>((resolve) => { resolveStopped = resolve })
