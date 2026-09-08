@@ -16,10 +16,12 @@ import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs() })
-function fixture() {
+function fixture(aliasedRoot = false) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0'); vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
-  const root = mkdtempSync(join(tmpdir(), 'conductor-control-')), projectPath = join(root, 'project')
-  mkdirSync(projectPath)
+  const root = mkdtempSync(join(tmpdir(), 'conductor-control-')), canonicalProjectPath = join(root, 'project')
+  mkdirSync(canonicalProjectPath)
+  const projectPath = aliasedRoot ? join(root, 'project-alias') : canonicalProjectPath
+  if (aliasedRoot) symlinkSync(canonicalProjectPath, projectPath, 'junction')
   dispose.push(() => rmSync(root, { recursive: true, force: true, maxRetries: 5 }))
   const path = join(root, 'conductor.db'), database = new ConductorDatabase(path)
   dispose.push(() => database.close())
@@ -107,8 +109,8 @@ describe('authorized native app control', () => {
     expect(f.requests.filter(request => request.action === 'tabs.close')).toHaveLength(1)
   })
 
-  it('compares file versions, announces live changes and rejects escapes and competing leases', async () => {
-    const f = fixture(), file = join(f.project.path, 'notes.md')
+  it.each([false, true])('compares file versions, announces live changes and rejects escapes and competing leases (aliased root: %s)', async aliasedRoot => {
+    const f = fixture(aliasedRoot), file = join(f.project.path, 'notes.md')
     writeFileSync(file, 'original')
     const read = await f.control.call(f.scope, 'files.read', { path: 'notes.md' }) as { content: string; uri: string }
     expect(read.content).toBe('original')

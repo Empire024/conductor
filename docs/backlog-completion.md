@@ -24,7 +24,7 @@ This delivery covers all unfinished items present in feature-list.md: bugs 34?45
 
 ## Validation
 
-The integrated delivery passed **457 Vitest tests across 61 files and 13 Node tests (470 total)** and the production build. It also passed **28 Electron acceptance groups**: 9 composer (6 Codex, 3 Claude), 7 navigation, 6 telemetry, and 6 Claude-to-Codex control/live-file checks. Commands:
+The integrated delivery passed **458 Vitest tests across 61 files and 13 Node tests (471 total)** and the production build. It also passed **28 Electron acceptance groups**: 9 composer (6 Codex, 3 Claude), 7 navigation, 6 telemetry, and 6 Claude-to-Codex control/live-file checks. Commands:
 
 - npm.cmd test
 - npm.cmd run build
