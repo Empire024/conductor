@@ -207,14 +207,15 @@ export class AgentManager {
 
   constructor(
     private readonly database: ConductorDatabase,
-    private readonly collaboration?: AgentCollaborationRuntime
+    private readonly collaboration?: AgentCollaborationRuntime,
+    private readonly controlBriefing?: (spec: AgentSpec) => string
   ) {
     this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
       undefined,
       (spec, prompt) => {
         const memories = database.recall(spec.projectId, prompt, spec.provider, 8)
         const memoryContext = memories.length ? `Conductor project memory (current project evidence takes precedence):\n${memories.map(memory => `- [${memory.kind}] ${memory.gist.slice(0, 520)}`).join('\n')}` : ''
-        return [memoryContext, collaboration?.briefingFor(spec.id) ?? '', projectTaskBriefing(spec)].filter(Boolean).join('\n\n')
+        return [memoryContext, collaboration?.briefingFor(spec.id) ?? '', projectTaskBriefing(spec), this.controlBriefing?.(spec) ?? ''].filter(Boolean).join('\n\n')
       },
       (spec, event) => {
         if (event.data.type !== 'tool' && event.data.type !== 'changes') return
@@ -240,6 +241,8 @@ export class AgentManager {
 
   ensure(spec: AgentSpec): RuntimeEnsureResult {
     if (spec.provider === 'codex' || spec.provider === 'claude') return this.structured.ensure(spec)
+    // Choose and launch the same concrete catalog model shown in this tab.
+    if (!spec.model || ['default', 'auto'].includes(spec.model)) spec = { ...spec, model: this.agents.get(spec.id)?.spec.model ?? providers[spec.provider].models.find(model => !['default', 'auto'].includes(model.id))?.id }
     const continuation = this.database.getContinuation(spec.id)
     const parsedContinuation = continuation?.status === 'pending' ? new Date(continuation.resumeAt) : null
     const resumeAt = parsedContinuation && !Number.isNaN(parsedContinuation.getTime())
@@ -412,7 +415,7 @@ export class AgentManager {
     } catch {
       // Collaboration context should never prevent a user message from sending.
     }
-    const collaborationContext = coworkerBriefing ? `\n\n${coworkerBriefing}` : ''
+    const collaborationContext = [coworkerBriefing, this.controlBriefing?.(agent.spec) ?? ''].filter(Boolean).map(context => '\n\n' + context).join('')
     const submitted = `[Conductor ${mode} mode: ${modeInstruction}]${collaborationContext}${context}\n\n${normalized}`
     this.emitEvent(agent.spec, 'text', normalized, {
       role: 'user',

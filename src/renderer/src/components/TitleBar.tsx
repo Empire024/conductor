@@ -101,12 +101,14 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
         {props.projectName ? <span className="titlebar-project">{props.projectName} <span>/</span> Local workspace</span> : <span className="titlebar-project">Local agent workspace</span>}
       </div>
       <div className="quick-theme-menu-host" ref={themeMenuRef}>
-      <button onContextMenu={(event) => { event.preventDefault(); setThemeMenuOpen((open) => !open) }} className="quick-theme-toggle" onClick={() => props.onThemeVariant(nextVariant)} title={props.themeAuto ? `Theme follows local time. Click to use ${nextVariant} manually.` : `Theme: ${props.themeVariant}. Click for ${nextVariant}.`}>
+      <button onContextMenu={(event) => { event.preventDefault(); setThemeMenuOpen((open) => !open) }} className="quick-theme-toggle" aria-label={`Switch to ${nextVariant} theme`} onClick={() => { setThemeMenuOpen(false); props.onThemeVariant(nextVariant) }} title={props.themeAuto ? `Theme follows local time. Click to use ${nextVariant} manually.` : `Theme: ${props.themeVariant}. Click for ${nextVariant}.`}>
         <ThemeIcon size={17} /> <span>{label}</span>
       </button>
       {themeMenuOpen && <div className="theme-menu" role="menu" aria-label="Theme">
         {THEME_OPTIONS.map((theme) => <button key={theme.id} role="menuitemradio" aria-checked={props.themeId === theme.id} onClick={() => { props.onTheme?.(theme.id); setThemeMenuOpen(false) }}><span className={'theme-swatch ' + theme.id} />{theme.label}{props.themeId === theme.id && <span className="theme-selected">✓</span>}</button>)}
         <hr />
+        <button role="menuitemradio" aria-checked={!props.themeAuto && props.themeVariant === 'day'} onClick={() => { props.onThemeVariant('day'); setThemeMenuOpen(false) }}><Sun size={14} /> Day</button>
+        <button role="menuitemradio" aria-checked={!props.themeAuto && props.themeVariant === 'night'} onClick={() => { props.onThemeVariant('night'); setThemeMenuOpen(false) }}><MoonStar size={14} /> Night</button>
         <button role="menuitemcheckbox" aria-checked={props.themeAuto} onClick={() => { props.onThemeAuto?.(!props.themeAuto); setThemeMenuOpen(false) }}><Laptop size={14} /> Follow local time{props.themeAuto && <span className="theme-selected">✓</span>}</button>
       </div>}
       </div>

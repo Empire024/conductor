@@ -3,6 +3,10 @@ import { promises as fs } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { importPromptImage } from './prompt-images'
 import { ProjectBacklogs } from './project-backlog'
+import { AgentControl } from './agent-control'
+import { AgentControlServer } from './agent-control-server'
+import { AgentControlUi } from './agent-control-ui'
+import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell, webContents } from 'electron'
 import type {
@@ -50,9 +54,16 @@ let disposeOrchestrationIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
 let projectBacklogs: ProjectBacklogs
+let agentControlServer: AgentControlServer | undefined
+let agentControlUi: AgentControlUi | undefined
+let projectFileChanges: ProjectFileChanges | undefined
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
 const detachedWindows = new Map<string, BrowserWindow>()
+const floatingDetachedIds = (): string[] => {
+  try { const value: unknown = JSON.parse(database.getSetting('floatingDetachedWindows') ?? '[]'); return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : [] }
+  catch { return [] }
+}
 let debugWindow: BrowserWindow | null = null
 let debugSourceWindow: BrowserWindow | null = null
 let latestDebugSnapshot: DebugConsoleSnapshot | null = null
@@ -173,7 +184,9 @@ const createWindow = (
     detachedWindows.delete(detachedId)
     if (isQuitting) return
     try {
-      const closed = database.closeDetachedWindow(detachedId)
+      const floatingIds = floatingDetachedIds()
+      const closed = database.closeDetachedWindow(detachedId, floatingIds.includes(detachedId))
+      if (floatingIds.includes(detachedId)) database.setSetting('floatingDetachedWindows', JSON.stringify(floatingIds.filter(id => id !== detachedId)))
       if (!closed) return
       for (const recipient of BrowserWindow.getAllWindows()) {
         if (!recipient.isDestroyed()) {
@@ -214,6 +227,7 @@ const openDetachedWindow = (
   }
   if (!database.getDetachedWindow(id)) return null
   const window = createWindow(id, placeAtCursor, savedPlacement)
+  if (floatingDetachedIds().includes(id)) window.setAlwaysOnTop(true)
   detachedWindows.set(id, window)
   return window
 }
@@ -334,6 +348,7 @@ const disposeRuntimeServices = (): void => {
   if (servicesDisposed) return
   servicesDisposed = true
   const disposals: Array<[string, () => void]> = [
+    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
@@ -531,6 +546,7 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:submit', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.submit(structuredId(id), text, settings, attachments) })
   ipcMain.handle('structured:respond', (event, response) => { trustedStructured(event); return agents.structured.respond(response) })
   ipcMain.handle('structured:interrupt', (event, id) => { trustedStructured(event); return agents.structured.interrupt(structuredId(id)) })
+  ipcMain.handle('structured:bind-workspace', (event, id, sessionId) => { trustedStructured(event); if (typeof sessionId !== 'string' || sessionId.length > 160) throw new Error('Invalid workspace'); return agents.structured.bindWorkspace(structuredId(id), sessionId) })
   ipcMain.handle('structured:resume', (event, id, settings) => { trustedStructured(event); return agents.structured.resume(structuredId(id), settings) })
   ipcMain.handle('structured:fork', (event, id) => { trustedStructured(event); return agents.structured.fork(structuredId(id)) })
   ipcMain.handle('structured:discover', (event, id) => { trustedStructured(event); return agents.structured.discover(structuredId(id)) })
@@ -555,6 +571,7 @@ const registerIpc = (): void => {
     const path = resolve(result.filePaths[0])
     const project = database.upsertProject(path, basename(path))
     await projectBacklogs.ensure(project.id)
+    projectFileChanges?.watch(project)
     return project
   })
   ipcMain.handle('projects:create', async (_event, name: string) => {
@@ -570,6 +587,7 @@ const registerIpc = (): void => {
     await fs.mkdir(target)
     const project = database.upsertProject(target, basename(target))
     await projectBacklogs.ensure(project.id)
+    projectFileChanges?.watch(project)
     return project
   })
   ipcMain.handle('projects:remove', (_event, projectId: string) => {
@@ -1183,9 +1201,13 @@ const registerIpc = (): void => {
   })
   ipcMain.handle(
     'window:detach',
-    (_event, projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout) => {
+    (_event, projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout, options?: { alwaysOnTop?: boolean }) => {
       const record = database.createDetachedWindow(projectId, sessionId, tab, sourceLayout)
-      openDetachedWindow(record.id, true)
+      const window = openDetachedWindow(record.id, true)
+      if (options?.alwaysOnTop) {
+        database.setSetting('floatingDetachedWindows', JSON.stringify([...new Set([...floatingDetachedIds(), record.id])]))
+        window?.setAlwaysOnTop(true)
+      }
       return record
     }
   )
@@ -1219,7 +1241,7 @@ const registerIpc = (): void => {
   )
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
   app.setAppUserModelId('io.conductor.desktop')
   const databasePath = join(app.getPath('userData'), 'conductor.db')
@@ -1242,7 +1264,33 @@ app.whenReady().then(() => {
   projectBacklogs = new ProjectBacklogs(database)
   for (const project of database.listProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
   terminals = new TerminalManager(database)
-  agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration))
+  agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '')
+  const publish = (channel: string, payload: unknown): void => {
+    for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload)
+  }
+  projectFileChanges = new ProjectFileChanges(change => publish('files:changed', change))
+  for (const project of database.listProjects()) projectFileChanges.watch(project)
+  agentControlUi = new AgentControlUi(join(__dirname, '../renderer/index.html'), request => {
+    const tabs = control.tabs(request)
+    const target = typeof request.params.tabId === 'string' ? tabs.find(tab => tab.id === request.params.tabId) : undefined
+    if (target?.detachedId) return detachedWindows.get(target.detachedId) ?? null
+    if (mainWindow && !mainWindow.isDestroyed()) return mainWindow
+    const source = tabs.find(tab => tab.resourceId === request.agentSessionId)
+    return source?.detachedId ? detachedWindows.get(source.detachedId) ?? null : null
+  })
+  const control = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
+    providers: () => agents.listProviders(), ui: agentControlUi.request,
+    confirm: async (_scope, message) => {
+      const options: Electron.MessageBoxOptions = { type: 'question', title: 'Agent request', message, buttons: ['Cancel', 'Allow'], defaultId: 0, cancelId: 0, noLink: true }
+      const result = mainWindow && !mainWindow.isDestroyed() ? await dialog.showMessageBox(mainWindow, options) : await dialog.showMessageBox(options)
+      return result.response === 1
+    },
+    fileChanged: change => projectFileChanges?.changed(change),
+    linksChanged: scope => publish('agent-control:links-changed', { projectId: scope.projectId, sessionId: scope.sessionId })
+  })
+  agentControlUi.register(control)
+  agentControlServer = new AgentControlServer(control)
+  await agentControlServer.start()
   updates = new UpdateManager({
     currentVersion: app.getVersion(),
     isPackaged: app.isPackaged,

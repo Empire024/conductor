@@ -16,6 +16,7 @@ const app = await electron.launch({ args: [resolve('out/main/index.js')], env, t
 const results = { synthetic: true, checks: [], failures: [], screenshots: [] }
 try {
   const page = await app.firstWindow()
+  await page.emulateMedia({ reducedMotion: 'no-preference' })
   const errors = []
   page.on('pageerror', error => errors.push(error.message))
   await page.waitForFunction(() => Boolean(window.conductor?.structured))
@@ -39,15 +40,19 @@ try {
 
   await page.getByRole('textbox', { name: 'Message Codex', exact: true }).fill('synthetic:telemetry')
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
-  await expect(page.locator('.sa-live-tokens')).toHaveText('1,020 tokens', { timeout: 15000 })
+  await expect(page.locator('.sa-live-tokens')).toHaveText('20 output tokens', { timeout: 15000 })
   await expect(page.locator('.sa-subagent-summary')).toContainText('2 subagents · 2 running')
   await expect.poll(async () => (await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)).phase).toBe('running')
   results.checks.push('Running status displays live reported tokens; child usage does not inflate main totals')
 
   const timeline = page.locator('.sa-timeline')
   await expect.poll(() => timeline.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(5)
+  await page.evaluate(() => { globalThis.__tokenFrames = []; const target = document.querySelector('.sa-live-tokens'); globalThis.__tokenObserver = new MutationObserver(() => globalThis.__tokenFrames.push(Number(target.textContent.replace(/[^0-9]/g, '')))); globalThis.__tokenObserver.observe(target, { childList: true, subtree: true, characterData: true }); })
   await writeFile(join(project.path, '.synthetic-telemetry-next'), 'Release second synthetic telemetry report.\n')
-  await expect(page.locator('.sa-live-tokens')).toHaveText('1,100 tokens')
+  await expect(page.locator('.sa-live-tokens')).toHaveText('100 output tokens')
+  const tokenFrames = await page.evaluate(() => { globalThis.__tokenObserver.disconnect(); return globalThis.__tokenFrames })
+  assert.ok(tokenFrames.some(count => count > 20 && count < 100), 'Count animates between actual reports')
+  assert.ok(tokenFrames.every(count => count >= 20 && count <= 100), 'Count never invents usage beyond the report')
   await expect(page.locator('.sa-subagent-summary')).toContainText('2 subagents · 1 running · 1 completed')
   await expect.poll(() => timeline.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(5)
   await expect(page.locator('.sa-jump')).toHaveCount(0)
@@ -66,6 +71,7 @@ try {
 
   await page.getByRole('button', { name: 'View usage', exact: true }).click()
   await expect(usage).toBeVisible()
+  await expect(usage).toContainText('Conversation model')
   await expect(usage).toContainText('Total tokens')
   await expect(usage).toContainText('1,100')
   await expect(usage).toContainText('Reasoning tokens')
@@ -82,12 +88,16 @@ try {
   await expect(usage).toHaveCount(0)
   results.checks.push('View usage exposes reasoning, cache, context and account windows; Escape closes details')
 
+  await timeline.hover()
+  await page.mouse.wheel(0, -100000)
   await timeline.evaluate(el => { el.scrollTop = 0; el.dispatchEvent(new Event('scroll', { bubbles: true })) })
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   await writeFile(join(project.path, '.synthetic-telemetry-finish'), 'Release final synthetic telemetry report.\n')
   await expect.poll(async () => (await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)).phase).toBe('completed')
   await expect(page.locator('.sa-subagent-summary')).toContainText('2 subagents · 1 completed · 1 failed')
   await expect(page.locator('.sa-jump')).toBeVisible()
+  await timeline.hover()
+  await page.mouse.wheel(0, 100000)
   await timeline.evaluate(el => { el.scrollTop = el.scrollHeight; el.dispatchEvent(new Event('scroll', { bubbles: true })) })
   await expect(page.locator('.sa-jump')).toHaveCount(0)
   await expect(timeline).toContainText('Synthetic telemetry complete')

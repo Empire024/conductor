@@ -1,0 +1,14 @@
+{
+  "checks": [
+    "Native provider receives scoped app-control briefing and discovers project/workspace state",
+    "Router uses persisted agent/routine/task state and dispatches a visible native coworker turn with control links",
+    "Detached control links keep both identities and stable tab URIs focus the correct native window",
+    "Protocol writes and external atomic saves update the visible editor immediately",
+    "External edits preserve dirty user buffers and flag a conflict instead of authorizing stale overwrites",
+    "Owner can release a control relationship while native work remains intact"
+  ],
+  "errors": [],
+  "sourceProvider": "claude",
+  "inference": "none",
+  "providerBoundary": "synthetic raw process"
+}

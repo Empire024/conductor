@@ -136,6 +136,40 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
   }, [path, project.id, tabId])
 
   useEffect(() => {
+    let disposed = false, sequence = 0
+    const normalize = (value: string): string => value.replaceAll('\\', '/').replace(/\/$/, '').toLocaleLowerCase()
+    const refresh = async (): Promise<void> => {
+      if (!loadedRef.current || disposed) return
+      if (saveTaskRef.current) { await saveTaskRef.current; if (disposed) return }
+      const version = ++sequence, generation = generationRef.current
+      try {
+        const content = await window.conductor.files.readForEditor(project.id, path)
+        if (disposed || version !== sequence || generation !== generationRef.current || content === baseContentRef.current) return
+        if (valueRef.current !== savedValueRef.current) {
+          setConflict(true)
+          setError('This file changed on disk. Your unsaved edits are preserved; save a copy or reload the current file.')
+          return
+        }
+        if (content === null) { setConflict(true); setError('This file was removed on disk. Save a copy to preserve its contents.'); return }
+        const view = editorRef.current?.saveViewState()
+        baseContentRef.current = content
+        savedValueRef.current = content
+        valueRef.current = content
+        setSavedValue(content); setValue(content); setRecovered(false); setConflict(false); setError('')
+        flushDraft()
+        requestAnimationFrame(() => { if (!disposed && generation === generationRef.current && view) editorRef.current?.restoreViewState(view) })
+      } catch (reason) { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) }
+    }
+    const unsubscribe = window.conductor.files.onChanged(change => {
+      if (change.projectId !== project.id) return
+      const current = normalize(path), changed = normalize(change.path)
+      if (current === changed || current === normalize(project.path) + '/' + changed) void refresh()
+    })
+    window.addEventListener('focus', refresh)
+    return () => { disposed = true; sequence++; unsubscribe(); window.removeEventListener('focus', refresh) }
+  }, [project.id, project.path, path, tabId])
+
+  useEffect(() => {
     const observer = new MutationObserver(() => {
       setTheme(document.documentElement.dataset.theme === 'light' ? 'conductor-light' : 'conductor-dark')
     })

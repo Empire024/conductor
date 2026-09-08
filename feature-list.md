@@ -43,6 +43,38 @@ Bug list:
 
 33. [Implemented] Check out session.md, it contains the ouput of your session and shows the amounts of unnecessary and weirdly displayed info.
 
+00 urgent. [Implemented] Steering still queues it for waaaay too long! Should steer same as in VScode... FIX THIS. currently I CANT STEER MODELS I CANT ADD MORE DATA TO MY ORIGINAL PROMPT
+
+
+34. [x] resuming a tab from history feels like something is broken till I understood what's going on, make it a bit more nicer on the UX. <!-- conductor-task:bug-34 agent=agent_mtsnb9sd_pe77gi7 -->
+35. [x] Ask/auto -> why are the titles moved left / right but no icons are visible? Also, why is the default on Codex Model not <!-- conductor-task:bug-35 agent=agent_mtsnb9sd_pe77gi7 -->
+36. [x] Usage model etc., never do not reported. based on some logic, always choose a model for that window. obviously subagents can call whichever cheaper or more expensive  <!-- conductor-task:bug-36 agent=agent_mtsnb9sd_pe77gi7 -->
+models they want
+37. [x] the files with . are visible the same as other files. think if that should be the case, maybe they should be separated? <!-- conductor-task:bug-37 agent=agent_mtsnb9sd_pe77gi7 -->
+38. [x] adding files as context is terrible, moves content around (autocomplete should be as a over-content dropdown) - spend a bit of time on it, make it like VScode (feel free to launch vscode and test how it works there) <!-- conductor-task:bug-38 agent=agent_mtsnb9sd_pe77gi7 -->
+39. [x] remove cyan border around entire selected window, only cyan around textbox. <!-- conductor-task:bug-39 agent=agent_mtsnb9sd_pe77gi7 -->
+40. [x] When a tab uses another tab, a visual link should be active between those tabs (unless detached, then another simple way of displaying which tab it's attached/being controlled by needs to be shown) (like a cable) - that's for when for example Codex is using Claude in another tab or so. <!-- conductor-task:bug-40 agent=agent_mtsnb9sd_pe77gi7 -->
+
+41. [x] when claude is using codex in a tab, it all should be visual as if a user was using it. <!-- conductor-task:bug-41 agent=agent_mtsnb9sd_pe77gi7 -->
+
+42. [x] Claude messages are still doubled.. <!-- conductor-task:bug-42 agent=agent_mtsnb9sd_pe77gi7 -->
+
+43. [x] scrolling broken when questions appear and sometimes when new output is still going on. <!-- conductor-task:bug-43 agent=agent_mtsnb9sd_pe77gi7 -->
+
+44. [x] removing project is broken - files stay on disk part is broken visually and we cant actually delete an item.. sometimes it appears, but its bugged <!-- conductor-task:bug-44 agent=agent_mtsnb9sd_pe77gi7 -->
+
+45. [x] make tokens going up smooth, currently it looks laggy <!-- conductor-task:bug-45 agent=agent_mtsnb9sd_pe77gi7 -->
+
+46. [Implemented] design the effort slider a bit more nice, to where it feels like charging something up and full effort will make it fully designed/backgrouned (you get me)
+
+47. [x] add hover effects to tab headers everywhere (even currently active tab) and workspace, fix night/day selector atop page, make changing of colors a smooth transition somehow (currently a flashbang) <!-- conductor-task:bug-47 agent=agent_mtsnb9sd_pe77gi7 -->
+
+49. [x] Enter does not submit an agent question/answer form - the Submit answers button has to be clicked manually. <!-- conductor-task:bug-49 agent=agent_mtsnb9sd_pe77gi7 -->
+
+50. [Implemented] Subagent roster reported ordinary foreground tool calls as subagents. Claude sends system/task_* for every Bash call with is_backgrounded false; only backgrounded work is listed now, foreground lifecycle stays in the event inspector. Background tasks keep their launch description instead of being renamed to 'Background command ... (exit code 0)', report real status past the end of the turn, show their command, and link to the runtime's tab.
+
+51. [x] Subagent roster still shows '0 tools / 0 activity items' for a backgrounded shell task. Its real output lives in the task's output_file, which is not surfaced anywhere - decide whether to read and attach it. <!-- conductor-task:bug-51 agent=agent_mtsnb9sd_pe77gi7 -->
+
 Feature list:
 
 0. [Implemented] Beautify the 'send' button.
@@ -62,4 +94,12 @@ Feature list:
 12. [Implemented] We need a way to see subagents -> How many are called, whats their status, etc.
 13. [Implemented] We need to see how many tokens Working & Spelunking is taking up in real time, also add available usage breakdown findable in each tab under View usage text link
 
+14. [Implemented] Make tabs easy to controll with keyboard like in chrome (ctrl+t, ctrl tab etc), add easy resizing of window like with windows + arrow for tabs - so ctrl+t, X will open codex, etc.
+
+15. [x] add autocomplete of commands in chat <!-- conductor-task:feature-15 agent=agent_mtsnb9sd_pe77gi7 -->
+16. [x] in workspaces, workspace should show tabs, right clicking on tab should give us all options we have till now for tabs + a new one, 'Show tab' which will show the tab detached over other content <!-- conductor-task:feature-16 agent=agent_mtsnb9sd_pe77gi7 -->
+17. [x] the entire app needs to be controllable via models via mcp or other internal protocol and the models need to know about it so that links and all work beautifully and we can refer to stuff without the models having to endlessly search stuff that doesn't matter, also for memory, and internal agents, etc. - think of when we have an agent that'll pick the best model for each task when we prompt him, spawn a couple tabs and work on our task at hand. Why not create that agent via that MCP when you build it to test it out also? <!-- conductor-task:feature-17 agent=agent_mtsnb9sd_pe77gi7 -->
+18. [x] to add on to 17 for example with this feature list, the agent will edit it, so the user immidiately sees edits happen in real time. It doesn't have to be MCP, but just a communication for agents with conductor that won't churn extra tokens for no reason. <!-- conductor-task:feature-18 agent=agent_mtsnb9sd_pe77gi7 -->
 Implementation and validation: [backlog delivery record](docs/conductor-backlog-delivery.md).
+
+Latest completion and validation: [remaining checklist delivery](docs/backlog-completion.md).

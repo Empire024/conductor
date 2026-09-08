@@ -5,7 +5,7 @@ function object(value: Json | undefined): Record<string, Json> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
 }
 
-export function StructuredUsageContent({ items, truncated = false }: { items: TimelineItem[]; truncated?: boolean }): React.JSX.Element {
+export function StructuredUsageContent({ items, truncated = false, modelLabel }: { items: TimelineItem[]; truncated?: boolean; modelLabel?: string }): React.JSX.Element {
   const usage = summarizeUsage(items)
   const tokens = usage.tokens
   const context = summarizeContext(items)
@@ -19,6 +19,7 @@ export function StructuredUsageContent({ items, truncated = false }: { items: Ti
     return [{ label, used: limit.usedPercent, reset: reset && !Number.isNaN(reset.getTime()) ? reset.toLocaleString() : undefined }]
   })
   return <div className="sa-usage-content">
+    {modelLabel && <dl><dt>Conversation model</dt><dd>{modelLabel}</dd></dl>}
     {context && <section className="sa-context-details"><h4>Context window</h4><p><strong>{Math.floor(context.percent)}% used</strong> &middot; {context.used.toLocaleString()} / {context.capacity.toLocaleString()} usable tokens</p><progress max={100} value={context.percent} aria-label="Context used" /><p className="sa-detail-hint">Latest context snapshot, including cached input. This is separate from cumulative token usage. The usable budget reflects the provider's reserved space.</p>{context.percent >= 90 && <p className="sa-context-guidance">{context.percent >= 100 ? 'Context is full.' : 'Context is nearly full.'} Use <code>/compact</code> to make room before continuing.</p>}</section>}
     <p className="sa-detail-hint">{usage.scope === 'session' ? 'Conversation totals' : usage.scope === 'reported' ? 'Reported turn totals' : 'Latest reported figures'}{usage.estimated ? ' · estimated' : ''}. Updates when the provider reports usage.</p>
     {truncated && usage.scope === 'reported' && <p className="sa-detail-hint">Earlier turns are outside the loaded history; these totals cover the available reports.</p>}

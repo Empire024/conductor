@@ -112,7 +112,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   }
   if (message.method !== 'turn/start') { send({ id: message.id, error: { code: -32601, message: 'unsupported synthetic request' } }); return }
   currentTurn = `synthetic-turn-${++turnNumber}`
-  const scenario = message.params.input[0].text
+  const promptText = message.params.input[0].text
+  if (process.env.CONDUCTOR_TEST_CONTROL_CAPTURE) writeFileSync(process.env.CONDUCTOR_TEST_CONTROL_CAPTURE, promptText)
+  // App briefing context follows the explicit synthetic scenario on later lines.
+  const scenario = promptText.startsWith('synthetic:') ? promptText.split(/\r?\n/, 1)[0] : promptText
   notify('turn/started', { threadId, turn: { id: currentTurn, status: 'inProgress', items: [], error: null } })
   if (process.env.CONDUCTOR_TEST_TURN_ACK_DELAY === '1') setTimeout(() => send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } }), 150)
   else send({ id: message.id, result: { turn: { id: currentTurn, status: 'inProgress', items: [], error: null } } })
@@ -148,7 +151,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return
   }
   if (scenario === 'synthetic:telemetry') {
-    const telemetry = (inputTokens, outputTokens, reasoningOutputTokens) => notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, cachedInputTokens: 400, reasoningOutputTokens }, modelContextWindow: 200000 } })
+    const telemetry = (inputTokens, outputTokens, reasoningOutputTokens) => notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, cachedInputTokens: 400, reasoningOutputTokens }, last: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, cachedInputTokens: 400, reasoningOutputTokens }, modelContextWindow: 200000 } })
     const agents = (first, second) => itemEvent('item/completed', { type: 'collabAgentToolCall', id: 'telemetry-parent', tool: 'spawnAgent', status: 'completed', senderThreadId: threadId, receiverThreadIds: ['telemetry-research', 'telemetry-tests'], prompt: 'Synthetic telemetry validation only. No agents are actually launched.', model: null, reasoningEffort: null, agentsStates: { 'telemetry-research': { status: first, message: null }, 'telemetry-tests': { status: second, message: null } } })
     const paragraph = index => `Synthetic telemetry paragraph ${index}. This raw protocol fixture validates scrolling and accounting without model inference.`
     const message = (id, title) => itemEvent('item/completed', { type: 'agentMessage', id, text: `**${title}**\n\n` + Array.from({ length: 22 }, (_, index) => paragraph(index + 1)).join('\n\n'), phase: null, memoryCitation: null, delivery: null, questions: null })

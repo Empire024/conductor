@@ -22,6 +22,7 @@ import type {
 import { createDefaultLayout, makeId } from '../shared/models'
 import {
   clampMemoryWeight,
+  memorySourceOf,
   memoryTokens,
   normalizeMemoryCues,
   scoreMemory,
@@ -180,6 +181,9 @@ export class ConductorDatabase {
     this.ensureColumn('agent_sessions', 'effort', 'TEXT')
     this.ensureColumn('agent_sessions', 'continue_on_limit', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('agent_sessions', 'activity_phase', "TEXT NOT NULL DEFAULT 'idle'")
+    // Agents could not write memory before this column existed, so every
+    // pre-existing row came from a person and must never be auto-forgotten.
+    this.ensureColumn('memories', 'source', "TEXT NOT NULL DEFAULT 'human'")
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -611,7 +615,7 @@ export class ConductorDatabase {
       .run(JSON.stringify(layout), maximizedGroupId, now(), id)
   }
 
-  closeDetachedWindow(id: string): { sessionId: string; tabs: PaneTab[] } | null {
+  closeDetachedWindow(id: string, restoreToWorkspace = false): { sessionId: string; tabs: PaneTab[] } | null {
     const record = this.getDetachedWindow(id)
     if (!record) return null
 
@@ -619,18 +623,27 @@ export class ConductorDatabase {
     this.db.exec('BEGIN IMMEDIATE')
     try {
       const source = this.db
-        .prepare('SELECT closed_tabs_json FROM sessions WHERE id = ?')
+        .prepare('SELECT layout_json, closed_tabs_json FROM sessions WHERE id = ?')
         .get(record.sessionId) as DbRow | undefined
       if (source) {
         const closedTabs = JSON.parse((source.closed_tabs_json as string) || '[]') as PaneTab[]
         const returnedIds = new Set(tabs.map((tab) => tab.id))
-        const nextClosedTabs = [
-          ...closedTabs.filter((tab) => !returnedIds.has(tab.id)),
-          ...tabs
-        ].slice(-20)
-        this.db
-          .prepare('UPDATE sessions SET closed_tabs_json = ?, updated_at = ? WHERE id = ?')
-          .run(JSON.stringify(nextClosedTabs), now(), record.sessionId)
+        const retainedClosedTabs = closedTabs.filter((tab) => !returnedIds.has(tab.id))
+        if (restoreToWorkspace && tabs.length) {
+          const layout = JSON.parse(source.layout_json as string) as WorkspaceLayout
+          let group = layout.root
+          while (group.type === 'split') group = group.children[0]
+          const existing = new Set(this.collectLayoutTabs(layout).map(tab => tab.id))
+          const returning = tabs.filter(tab => !existing.has(tab.id))
+          group.tabs.push(...returning)
+          if (returning.length) group.activeTabId = returning.at(-1)!.id
+          this.db.prepare('UPDATE sessions SET layout_json = ?, maximized_group_id = NULL, closed_tabs_json = ?, updated_at = ? WHERE id = ?')
+            .run(JSON.stringify(layout), JSON.stringify(retainedClosedTabs), now(), record.sessionId)
+        } else {
+          const nextClosedTabs = [...retainedClosedTabs, ...tabs].slice(-20)
+          this.db.prepare('UPDATE sessions SET closed_tabs_json = ?, updated_at = ? WHERE id = ?')
+            .run(JSON.stringify(nextClosedTabs), now(), record.sessionId)
+        }
       }
       this.db.prepare('DELETE FROM detached_windows WHERE id = ?').run(id)
       this.db.exec('COMMIT')
@@ -862,8 +875,9 @@ export class ConductorDatabase {
     if (!gist) throw new Error('Memory needs a concise gist')
     const cues = normalizeMemoryCues(input.cues?.length ? input.cues : memoryTokens(gist).slice(0, 10))
     const memoryScope = input.agentKey ?? null
+    const source = memorySourceOf(input.source)
     const existing = this.listMemories(input.projectId).find((memory) =>
-      memory.agentKey === memoryScope &&
+      memory.agentKey === memoryScope && memory.source === source &&
       shouldConsolidateMemory(memory.kind, memory.cues, input.kind, cues)
     )
     const timestamp = now()
@@ -887,13 +901,13 @@ export class ConductorDatabase {
     this.db.prepare(
       `INSERT INTO memories
        (id, project_id, agent_key, kind, gist, cues_json, salience, strength, confidence,
-        occurred_at, last_recalled_at, recall_count, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, 0, ?, ?)`
+        occurred_at, last_recalled_at, recall_count, created_at, updated_at, source)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, 0, ?, ?, ?)`
     ).run(
       id, input.projectId, input.agentKey ?? null, input.kind, gist, JSON.stringify(cues),
       clampMemoryWeight(input.salience ?? 0.5),
       clampMemoryWeight(input.confidence ?? 0.75),
-      timestamp, timestamp, timestamp
+      timestamp, timestamp, timestamp, source
     )
     return this.getMemory(id)!
   }
@@ -1023,6 +1037,7 @@ export class ConductorDatabase {
     projectId: row.project_id as string,
     agentKey: (row.agent_key as string | null) ?? null,
     kind: row.kind as AgentMemory['kind'],
+    source: memorySourceOf(row.source),
     gist: row.gist as string,
     cues: JSON.parse((row.cues_json as string) || '[]') as string[],
     salience: Number(row.salience),

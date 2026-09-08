@@ -196,7 +196,7 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     const frame = Buffer.from(JSON.stringify({ type: 'assistant', uuid: 'unicode-msg', message: { id: 'unicode', content: [{ type: 'text', text: 'Árvíz 日本語 😀' }] } }) + '\r\n')
     for (const byte of frame) decoder.push(Buffer.from([byte]))
     expect(errors).toEqual([])
-    expect(f.projection().items.find((item) => item.nativeItemId === 'unicode:0')?.data).toMatchObject({ text: 'Árvíz 日本語 😀' })
+    expect(f.projection().items.find((item) => item.nativeItemId === 'unicode:text:0')?.data).toMatchObject({ text: 'Árvíz 日本語 😀' })
   })
 
   it('drives an actual fake process through handshake, approval, hook and result round trips', async () => {
@@ -470,4 +470,78 @@ describe('Claude mid-turn steering (synthetic, zero inference)', () => {
     expect(reason).not.toBeInstanceOf(SteeringUnavailableError)
     expect(f.transport.sent).toHaveLength(count)
   })
+})
+
+describe('Claude background task reporting (payloads captured from a real session)', () => {
+  const subagents = (f: ReturnType<typeof fixture>) =>
+    f.events.filter(event => event.data.type === 'subagent').map(event => event.data as Extract<AdapterEvent['data'], { type: 'subagent' }>)
+
+  it('does not report a foreground tool call as a subagent', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'bu8bk69bg', tool_use_id: 'toolu_A', description: 'Typecheck the renderer changes', is_backgrounded: false, task_type: 'local_bash' })
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'bu8bk69bg', tool_use_id: 'toolu_A', status: 'completed', output_file: '', summary: 'Typecheck the renderer changes' })
+    expect(subagents(f)).toHaveLength(0)
+    // The native record is retained for the inspector without entering the conversation.
+    expect(f.events.some(event => event.data.type === 'notice' && event.native?.method === 'system/task_started')).toBe(true)
+  })
+
+  it('reports a backgrounded task and keeps its launch description as the name', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'b90gny9dq', tool_use_id: 'toolu_B', description: 'Run Codex on the steering implementation', is_backgrounded: true, task_type: 'local_bash' })
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'b90gny9dq', tool_use_id: 'toolu_B', status: 'completed', output_file: 'C:/tmp/b90gny9dq.output', summary: 'Background command "Run Codex on the steering implementation" completed (exit code 0)' })
+    const reported = subagents(f)
+    expect(reported).toHaveLength(2)
+    expect(reported[0]).toMatchObject({ name: 'Run Codex on the steering implementation', status: 'running', detached: true })
+    expect(reported[1]).toMatchObject({ name: 'Run Codex on the steering implementation', status: 'completed' })
+    expect(reported[1]?.name).not.toContain('exit code')
+  })
+
+  it('still reports a completion that names an output file after its start was missed', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'orphan', tool_use_id: 'toolu_C', status: 'completed', output_file: 'C:/tmp/orphan.output', summary: 'Background command "Deploy" completed (exit code 0)' })
+    expect(subagents(f)).toHaveLength(1)
+  })
+
+  it('keeps two concurrent background runs distinct', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    for (const [task, tool] of [['one', 'toolu_D'], ['two', 'toolu_E']] as const) {
+      f.transport.receive({ type: 'system', subtype: 'task_started', task_id: task, tool_use_id: tool, description: 'Run ' + task, is_backgrounded: true, task_type: 'local_bash' })
+    }
+    expect(new Set(subagents(f).map(agent => agent.name)).size).toBe(2)
+  })
+})
+
+
+describe('Claude visible text identity', () => {
+  it('reconciles text after hidden thinking when final blocks are renumbered, including multiple identical visible blocks', async () => {
+    const f = fixture(); await f.adapter.start(); await f.adapter.submit('Prompt', settings)
+    const stream = (event: Json) => f.transport.receive({ type: 'stream_event', session_id: 'native-1', event })
+    stream({ type: 'message_start', message: { id: 'thinking-message' } })
+    stream({ type: 'content_block_start', index: 0, content_block: { type: 'thinking' } })
+    for (const index of [1, 2]) {
+      stream({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } })
+      stream({ type: 'content_block_delta', index, delta: { type: 'text_delta', text: 'Repeated intentionally.' } })
+    }
+    stream({ type: 'message_stop' })
+    f.transport.receive({ type: 'assistant', uuid: 'final', message: { id: 'thinking-message', content: [{ type: 'text', text: 'Repeated intentionally.' }, { type: 'text', text: 'Repeated intentionally.' }] } })
+    const text = f.projection().items.filter(item => item.data.type === 'text')
+    expect(text).toHaveLength(2)
+    expect(text.map(item => item.nativeItemId)).toEqual(['thinking-message:text:0', 'thinking-message:text:1'])
+  })
+})
+
+
+it('attaches actual bounded background command output to its task record', async () => {
+  const base = join(tmpdir(), 'claude'); mkdirSync(base, { recursive: true })
+  const root = mkdtempSync(join(base, 'conductor-adapter-output-')); imageRoots.push(root)
+  const taskDirectory = join(root, 'native-output-session', 'tasks'); mkdirSync(taskDirectory, { recursive: true })
+  const outputFile = join(taskDirectory, 'background-1.output'); writeFileSync(outputFile, 'Native background command completed successfully')
+  const f = fixture({ nativeSessionId: 'native-output-session' }); await f.adapter.start()
+  f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'background-1', is_backgrounded: true, description: 'Run checks' })
+  f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'background-1', status: 'completed', output_file: outputFile })
+  await vi.waitFor(() => expect(f.projection().items.find(item => item.data.type === 'subagent')?.data).toMatchObject({ name: 'Run checks', status: 'completed', detached: true, outputFile, output: 'Native background command completed successfully', outputTruncated: false }))
 })

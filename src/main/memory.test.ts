@@ -12,6 +12,7 @@ const memory = (patch: Partial<AgentMemory> = {}): AgentMemory => ({
   projectId: 'project-1',
   agentKey: null,
   kind: 'episodic',
+  source: 'agent',
   gist: 'Checkout tax discrepancy was caused by stale totals',
   cues: ['checkout', 'tax', 'totals'],
   salience: 0.5,

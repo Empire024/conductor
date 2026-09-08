@@ -1,3 +1,4 @@
+import type { ConversationIdentity } from './conversation-tab'
 import { NativeCliPane } from './NativeCliPane'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
@@ -40,6 +41,7 @@ export interface RuntimeTerminalProps {
   onViewModeChange?(viewMode: 'visual' | 'cli'): void
   onRequestCli?(id: string): void
   conversationId?: string
+  onConversationChange?(conversation: ConversationIdentity): Promise<void>
 }
 
 const terminalTheme = {
@@ -98,7 +100,10 @@ function StructuredRuntime(props: RuntimeTerminalProps): React.JSX.Element {
     return off
   }, [conversation])
   return view === 'cli' ? <NativeCliPane {...props} resourceId={conversation} onChat={async () => { await window.conductor.nativeCli.chat(conversation); changeView('visual') }} />
-    : <StructuredAgentPane {...props} conversationId={conversation} onRequestCli={(id) => {
+    : <StructuredAgentPane {...props} conversationId={conversation} onConversationChange={async identity => {
+      await props.onConversationChange?.(identity)
+      setConversation(identity.id)
+    }} onRequestCli={(id) => {
       setConversation(id)
       void window.conductor.nativeCli.ensure(id).then(() => changeView('cli')).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: String(reason) })))
     }} />

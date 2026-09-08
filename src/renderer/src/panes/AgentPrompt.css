@@ -27,16 +27,29 @@
 .agent-effort-heading { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 7px; line-height: 10px; }
 .agent-effort-heading > span { letter-spacing: .03em; text-transform: uppercase; }
 .agent-effort-heading output { min-width: 0; overflow: hidden; color: var(--text-2); font-size: 7.5px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
-.agent-effort-slider { --effort-progress: 0%; position: relative; height: 9px; display: block; }
+/* Effort reads as a charge meter: the track fills, each passed step lights up, and a
+   full charge settles the control onto its own glowing surface. The charged state is a
+   style query on --effort-progress, so the markup only has to publish that one value. */
+.agent-effort-slider { --effort-progress: 0%; --effort-charge: color-mix(in srgb, var(--accent-muted) 74%, #8ef2ff); position: relative; height: 9px; display: block; }
 .agent-effort-slider input { position: relative; z-index: 2; width: 100%; height: 9px; margin: 0; padding: 0; appearance: none; -webkit-appearance: none; outline: none; background: transparent; cursor: pointer; }
-.agent-effort-slider input::-webkit-slider-runnable-track { height: 3px; border-radius: 999px; background: linear-gradient(90deg, var(--accent-muted) 0 var(--effort-progress), var(--border) var(--effort-progress) 100%); box-shadow: 0 1px 0 #0004 inset; }
-.agent-effort-slider input::-webkit-slider-thumb { width: 11px; height: 11px; margin-top: -4px; appearance: none; -webkit-appearance: none; border: 2px solid var(--surface-1); border-radius: 50%; background: var(--accent-muted); box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-muted) 70%, var(--border)), 0 2px 6px #0008; transition: transform 100ms ease, box-shadow 100ms ease; }
-.agent-effort-slider input:hover::-webkit-slider-thumb { transform: scale(1.08); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-muted) 20%, transparent), 0 2px 7px #0009; }
-.agent-effort-slider input:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-muted) 28%, transparent), 0 2px 7px #0009; }
+.agent-effort-slider input::-webkit-slider-runnable-track { height: 3px; border-radius: 999px; background: linear-gradient(90deg, color-mix(in srgb, var(--accent-muted) 58%, transparent) 0, var(--effort-charge) var(--effort-progress), var(--border) var(--effort-progress), var(--border) 100%); box-shadow: 0 1px 0 #0004 inset; }
+.agent-effort-slider input::-webkit-slider-thumb { width: 11px; height: 11px; margin-top: -4px; appearance: none; -webkit-appearance: none; border: 2px solid var(--surface-1); border-radius: 50%; background: var(--effort-charge); box-shadow: 0 0 0 1px color-mix(in srgb, var(--effort-charge) 70%, var(--border)), 0 2px 6px #0008; transition: transform 120ms ease, box-shadow 160ms ease, background 160ms ease; }
+.agent-effort-slider input:hover::-webkit-slider-thumb { transform: scale(1.08); box-shadow: 0 0 0 2px color-mix(in srgb, var(--effort-charge) 20%, transparent), 0 2px 7px #0009; }
+.agent-effort-slider input:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px color-mix(in srgb, var(--effort-charge) 28%, transparent), 0 2px 7px #0009; }
 .agent-effort-slider input:disabled { cursor: default; opacity: .5; }
 .agent-effort-ticks { position: absolute; z-index: 1; left: 4px; right: 4px; top: 3px; display: flex; justify-content: space-between; pointer-events: none; }
-.agent-effort-ticks i { width: 3px; height: 3px; border-radius: 50%; background: var(--border-strong); box-shadow: 0 0 0 1px var(--surface-1); }
-.agent-effort-ticks i.active { background: color-mix(in srgb, var(--accent-muted) 84%, white); }
+/* The wash grows with the charge, so raising effort visibly fills the control. */
+.agent-effort-ticks::before { content: ''; position: absolute; z-index: -1; inset: -8px -9px -10px; border-radius: 10px; background: linear-gradient(90deg, color-mix(in srgb, var(--effort-charge) 17%, transparent) 0, color-mix(in srgb, var(--effort-charge) 9%, transparent) var(--effort-progress), transparent var(--effort-progress), transparent 100%); transition: background 200ms ease, box-shadow 240ms ease; }
+.agent-effort-ticks i { width: 3px; height: 3px; border-radius: 50%; background: var(--border-strong); box-shadow: 0 0 0 1px var(--surface-1); transition: background 160ms ease, box-shadow 160ms ease, transform 160ms ease; }
+.agent-effort-ticks i.active { background: color-mix(in srgb, var(--effort-charge) 84%, white); box-shadow: 0 0 0 1px var(--surface-1), 0 0 6px color-mix(in srgb, var(--effort-charge) 60%, transparent); transform: scale(1.18); }
+@container style(--effort-progress: 100%) {
+  .agent-effort-ticks::before { background: linear-gradient(90deg, color-mix(in srgb, var(--effort-charge) 26%, transparent), color-mix(in srgb, var(--effort-charge) 13%, transparent)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--effort-charge) 32%, transparent), 0 0 16px color-mix(in srgb, var(--effort-charge) 24%, transparent); }
+  .agent-effort-ticks i.active { animation: agent-effort-charged 2.6s ease-in-out infinite; }
+}
+@keyframes agent-effort-charged { 50% { box-shadow: 0 0 0 1px var(--surface-1), 0 0 9px color-mix(in srgb, var(--effort-charge) 85%, transparent); } }
+@media (prefers-reduced-motion: reduce) {
+  .agent-effort-ticks i.active { animation: none; }
+}
 .agent-prompt-spacer { flex: 1; }
 .agent-voice-button, .agent-send-button { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 9px; color: var(--text-3); background: transparent; }
 .agent-voice-button:not(:disabled):hover { color: var(--text); background: var(--surface-hover); }

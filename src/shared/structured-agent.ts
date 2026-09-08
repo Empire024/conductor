@@ -85,7 +85,8 @@ export type AgentEventData =
   | { type: 'usage'; inputTokens?: number; outputTokens?: number; cachedTokens?: number; cacheCreationTokens?: number; reasoningTokens?: number; totalTokens?: number; costUsd?: number; scope?: 'session' | 'turn' | 'message'; source: 'provider' | 'estimate'; limits?: Json }
   | { type: 'error'; message: string; code?: string }
   | { type: 'notice'; message: string; payload?: Json; outputArtifactId?: string }
-  | { type: 'subagent'; name: string; nativeSessionId?: string; status: ActivityStatus }
+  /** `detached` marks background work that deliberately outlives the turn that started it. */
+  | { type: 'subagent'; name: string; nativeSessionId?: string; status: ActivityStatus; detached?: boolean; outputFile?: string; output?: string; outputTruncated?: boolean; outputError?: string }
   | { type: 'review'; artifactId: string; outcome: 'kept' | 'reverted' }
 export interface AgentEvent {
   schemaVersion: 1
@@ -156,6 +157,7 @@ export interface InteractionResponse {
   answers?: Record<string, string[]>
 }
 export interface StructuredAgentBridge {
+  bindWorkspace(id: string, sessionId: string): Promise<void>
   steer(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
   queue(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
   cancelQueued(id: string, promptId?: string): Promise<QueuedPrompt | null>

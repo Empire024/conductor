@@ -194,6 +194,8 @@ it('places optional request details after the answer choices and retains native 
   expect(html.indexOf('Submit answers')).toBeLessThan(html.indexOf('Request details'))
   expect(html).toContain('type="radio"')
   expect(html).toContain('sa-choice-indicator')
+  expect(html).toContain('<form class="sa-interaction needs-attention"')
+  expect(html).toContain('type="submit"')
   expect(html).toContain('disabled=""')
 })
 

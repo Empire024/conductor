@@ -28,7 +28,7 @@ describe('Codex model migration', () => {
 
 describe('runtime model identity', () => {
   it('does not turn saved defaults into a claimed model', () => {
-    for (const model of [undefined, '', 'default', 'auto']) expect(runtimeModelLabel(model)).toBe('Model not reported')
+    for (const model of [undefined, '', 'default', 'auto']) expect(runtimeModelLabel(model)).toBe('Choose model')
   })
   it('uses an explicit runtime report before a configured alias', () => {
     const models = [{ id: 'model-current', label: 'Current model' }]

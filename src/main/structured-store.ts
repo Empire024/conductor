@@ -1,3 +1,4 @@
+import { recoverClaudeMessageDuplicates } from '../shared/claude-message-recovery'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
@@ -54,7 +55,7 @@ export class StructuredAgentStore {
       );
     `)
     // Historical projection is independent of reconnect. Never retry uncertain execution.
-    const rows = db.prepare('SELECT id, projection_json FROM structured_sessions').all() as Array<{ id: string; projection_json: string }>
+    const rows = db.prepare('SELECT id, provider, projection_json FROM structured_sessions').all() as Array<{ id: string; provider: string; projection_json: string }>
     for (const row of rows) {
       const state = JSON.parse(row.projection_json) as SessionProjection
       const events = this.events(row.id, state.sequence)
@@ -62,6 +63,7 @@ export class StructuredAgentStore {
       if (['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(restored.phase)) restored = { ...restored, phase: 'disconnected' }
       restored.items = restored.items.map(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' ? { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' } } } : item)
       restored.items = restored.items.map(item => item.data.type === 'tool' && ['running', 'preparing', 'awaiting_approval'].includes(item.data.status) ? { ...item, data: { ...item.data, status: 'interrupted' } } : item)
+      if (row.provider === 'claude') restored.items = recoverClaudeMessageDuplicates(restored.items)
       this.projections.set(row.id, restored)
     }
   }
@@ -76,6 +78,11 @@ export class StructuredAgentStore {
   spec<T>(id: string): T | null {
     const row = this.db.prepare('SELECT spec_json FROM structured_sessions WHERE id=?').get(id) as { spec_json: string } | undefined
     return row ? JSON.parse(row.spec_json) as T : null
+  }
+  rebindWorkspace(id: string, sessionId: string): void {
+    const spec = this.spec<Record<string, unknown>>(id)
+    if (!spec) throw new Error('Session not found')
+    this.db.prepare('UPDATE structured_sessions SET spec_json=? WHERE id=?').run(JSON.stringify({ ...spec, sessionId }), id)
   }
   rebindProject(projectId: string, cwd: string): void {
     for (const row of this.db.prepare('SELECT id,spec_json FROM structured_sessions WHERE project_id=?').all(projectId) as Array<{ id: string; spec_json: string }>) {

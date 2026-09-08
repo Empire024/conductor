@@ -1,3 +1,4 @@
+import { useAgentControl } from './use-agent-control'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
 import { ListTodo } from 'lucide-react'
 import { AppVersionButton } from './components/AppVersionButton'
@@ -132,12 +133,12 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     }
   }, [detachedId])
 
-  const detachAgain = useCallback((groupId: string, tab: PaneTab): void => {
+  const detachAgain = useCallback((groupId: string, tab: PaneTab, options?: { alwaysOnTop?: boolean }): void => {
     if (!bundle || !layout) return
     const result = closeTab(layout, groupId, tab.id)
     if (!result.closed) return
     setLayout(result.layout)
-    void window.conductor.window.detach(bundle.project.id, bundle.session.id, result.closed)
+    void window.conductor.window.saveDetached(detachedId, result.layout, null).then(() => window.conductor.window.detach(bundle.project.id, bundle.session.id, result.closed!, undefined, options))
   }, [bundle, layout])
 
   const openTab = useCallback((kind: PaneKind): void => {
@@ -163,6 +164,26 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
       transitionDocument.startViewTransition(() => flushSync(apply))
     } else apply()
   }, [])
+
+  useAgentControl({
+    detachedId,
+    resolve: async request => {
+      if (!bundle || !layoutRef.current || bundle.session.id !== request.sessionId || bundle.project.id !== request.projectId) throw new Error('This detached workspace is no longer open.')
+      return { ...bundle.session, layout: layoutRef.current, maximizedGroupId: maximizedGroupIdRef.current, closedTabs }
+    },
+    commit: async (session, groupId, reveal) => {
+      layoutRef.current = session.layout
+      maximizedGroupIdRef.current = session.maximizedGroupId
+      flushSync(() => { setLayout(session.layout); setMaximizedGroupId(session.maximizedGroupId); setClosedTabs(session.closedTabs); setBundle(current => current ? { ...current, session } : current) })
+      await window.conductor.window.saveDetached(detachedId, session.layout, session.maximizedGroupId)
+      if (reveal) { setFocusedGroupId(groupId); setUtilityPanel(null) }
+    },
+    detach: async (session, tab, nextLayout) => {
+      await window.conductor.window.saveDetached(detachedId, nextLayout, null)
+      return window.conductor.window.detach(session.projectId, session.id, tab)
+    },
+    openFile: (projectId, path) => openWorkspaceFile(projectId, path)
+  })
 
   if (!bundle || !layout) {
     return <div className="detached-loading"><ExternalLink size={24} /><span>Restoring window…</span></div>
@@ -234,6 +255,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               focusedGroupId={focusedGroupId}
               maximizedGroupId={maximizedGroupId}
               onLayout={setLayout}
+              onPersistLayout={layout => window.conductor.window.saveDetached(detachedId, layout, maximizedGroupId)}
               onFocus={setFocusedGroupId}
               onMaximize={setMaximizedGroupId}
               onClosed={(tab) => setClosedTabs((current) => [...current, tab].slice(-20))}

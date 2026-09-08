@@ -1,0 +1,17 @@
+{
+  "synthetic": true,
+  "checks": [
+    "View usage is available in an empty tab and missing telemetry remains unknown",
+    "Running status displays live reported tokens; child usage does not inflate main totals",
+    "Live token count increments while running and existing bottom position follows new messages",
+    "Subagent roster shows each child once with its latest status",
+    "View usage exposes reasoning, cache, context and account windows; Escape closes details",
+    "Completed and failed child statuses remain visible; scrolling back to bottom resumes latest messages without an extra click"
+  ],
+  "failures": [],
+  "screenshots": [
+    "artifacts/backlog-followup/telemetry-running.png",
+    "artifacts/backlog-followup/telemetry-subagents.png",
+    "artifacts/backlog-followup/telemetry-usage.png"
+  ]
+}

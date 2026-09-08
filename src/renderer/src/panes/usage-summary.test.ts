@@ -2,7 +2,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { liveTokenLabel, subagentCountLabel, summarizeSubagents, summarizeUsage, summarizeContext, summarizeWorkingUsage } from './usage-summary'
+import { liveTokenLabel, providerOfCommand, subagentCountLabel, summarizeSubagents, summarizeUsage, summarizeContext, summarizeWorkingUsage } from './usage-summary'
 import { StructuredAgentTelemetry, StructuredLiveTokens } from './StructuredAgentTelemetry'
 
 function item(sequence: number, data: AgentEventData, extra: Partial<TimelineItem> = {}): TimelineItem {
@@ -161,5 +161,41 @@ describe('context and working output are separate', () => {
     expect(liveTokenLabel(summarizeWorkingUsage([context(700), prompt]))).toBe('Output tokens pending')
     const response = item(3, { type: 'usage', source: 'provider', scope: 'message', inputTokens: 8000, cachedTokens: 7000, outputTokens: 19 })
     expect(liveTokenLabel(summarizeWorkingUsage([context(700), prompt, response]))).toBe('19 output tokens')
+  })
+})
+
+describe('detached background tasks', () => {
+  const task = (status: 'running' | 'completed' = 'running'): TimelineItem =>
+    item(1, { type: 'subagent', name: 'Run Codex on the steering implementation', status, detached: true }, { nativeItemId: 'task:a' })
+
+  it('keeps reporting a background task that outlives the turn that started it', () => {
+    expect(summarizeSubagents([task()], 'runtime', 'completed')[0]?.status).toBe('running')
+    expect(summarizeSubagents([task()], 'runtime', 'idle')[0]?.status).toBe('running')
+  })
+
+  it('still refuses to vouch for a background task from a different runtime', () => {
+    expect(summarizeSubagents([task()], 'new-runtime', 'running')[0]?.status).toBe('unknown')
+  })
+
+  it('leaves ordinary subagents downgraded once their turn ends', () => {
+    const child = item(1, { type: 'subagent', name: 'Research', status: 'running' }, { nativeItemId: 'task:a' })
+    expect(summarizeSubagents([child], 'runtime', 'completed')[0]?.status).toBe('unknown')
+  })
+
+  it('describes a backgrounded shell task by its command and links its runtime', () => {
+    const agents = summarizeSubagents([
+      item(1, { type: 'tool', name: 'Bash', status: 'running', input: { command: 'codex exec --approve-for-me steer' } }, { nativeItemId: 'launch' }),
+      item(2, { type: 'subagent', name: 'Run Codex', status: 'running', detached: true }, { parentId: 'launch', nativeItemId: 'task:a' })
+    ], 'runtime', 'running')
+    expect(agents[0]?.task).toContain('codex exec')
+    expect(agents[0]?.linkedProvider).toBe('codex')
+    expect(agents[0]?.detached).toBe(true)
+  })
+
+  it('matches the executable rather than a passing mention of a runtime', () => {
+    expect(providerOfCommand('codex exec --json')).toBe('codex')
+    expect(providerOfCommand('C:/tools/claude.exe --print')).toBe('claude')
+    expect(providerOfCommand('echo "ask codexional about it"')).toBeUndefined()
+    expect(providerOfCommand('npm run build')).toBeUndefined()
   })
 })

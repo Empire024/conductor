@@ -1,3 +1,4 @@
+import { readClaudeTaskOutput } from './claude-task-output'
 import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
@@ -55,7 +56,10 @@ export class ClaudeAdapter implements ProviderAdapter {
   private requests = new Map<string, Request>()
   private controls = new Map<string, { resolve(value: ObjectValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
   private tools = new Map<string, Tool>()
-  private streams = new Map<string, { messageId: string; blocks: Map<number, Block> }>()
+  private streams = new Map<string, { messageId: string; blocks: Map<number, Block>; textBlocks: number }>()
+  /** Backgrounded task id to its launch description; later events omit both facts. */
+  private backgroundTasks = new Map<string, string>()
+  private taskOutputRevision = new Map<string, number>()
   private seen = new Set<string>()
   private hookRequests = new Set<string>()
   private completedBlocks = new Set<string>()
@@ -319,10 +323,11 @@ export class ClaudeAdapter implements ProviderAdapter {
         this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', capabilities: this.capabilities } })
       }
       if (type === 'assistant' && messageId) this.usage(object(body.usage), `usage:message:${messageId}`, 'message', parentId)
-      for (const [index, content] of array(body.content).entries()) {
+      let textIndex = 0
+      for (const content of array(body.content)) {
         const block = object(content)
         if (block.type === 'text' && type === 'assistant' && messageId) {
-          const id = `${messageId}:${index}`, text = this.visibleText(string(block.text) ?? '')
+          const id = `${messageId}:text:${textIndex++}`, text = this.visibleText(string(block.text) ?? '')
           this.completedBlocks.add(id)
           if (this.completedBlocks.size > 8192) this.completedBlocks.delete(this.completedBlocks.values().next().value!)
           if (text && !parentId) this.hasAssistantText = true
@@ -397,8 +402,36 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     if (type === 'system' && ['task_started', 'task_progress', 'task_notification'].includes(string(message.subtype) ?? '')) {
       const id = string(message.task_id) ?? string(message.tool_use_id)
-      const status = message.status === 'failed' ? 'failed' : message.status === 'stopped' ? 'interrupted' : message.status === 'completed' ? 'completed' : 'running'
-      this.emit({ itemId: id ? `task:${id}` : undefined, parentId: string(message.tool_use_id) ?? parentId, data: { type: 'subagent', name: string(message.description) ?? string(message.summary) ?? 'Background activity', status }, native: { method: `system/${String(message.subtype)}`, payload: message } })
+      const status: Extract<import('../../shared/structured-agent').AgentEventData, { type: 'subagent' }>['status'] = message.status === 'failed' ? 'failed' : message.status === 'stopped' ? 'interrupted' : message.status === 'completed' ? 'completed' : 'running'
+      const native = { method: `system/${String(message.subtype)}`, payload: message }
+      const description = string(message.description)
+      // Only task_started carries is_backgrounded; later events for the same task are
+      // matched by id, and a completion naming an output file is backgrounded by itself.
+      if (message.is_backgrounded === true && id) this.backgroundTasks.set(id, description ?? '')
+      const backgrounded = Boolean(id && this.backgroundTasks.has(id)) || Boolean(string(message.output_file))
+      // A foreground task is the lifecycle of a tool call that is already on the timeline.
+      // Repeating it as a subagent invents children that never existed.
+      if (!backgrounded) {
+        this.emit({ parentId: string(message.tool_use_id) ?? parentId, data: { type: 'notice', message: 'Claude task lifecycle', payload: message }, native })
+        return
+      }
+      // Completions carry only a summary ("... completed (exit code 0)"), so the launch
+      // description is kept as the name rather than being overwritten by it.
+      const name = (id ? this.backgroundTasks.get(id) : '') || description || string(message.summary) || 'Background activity'
+      if (id && status !== 'running') this.backgroundTasks.delete(id)
+      // Backgrounded work keeps running after the turn ends, so the roster must not
+      // treat a finished parent turn as evidence that its status went stale.
+      const outputFile = string(message.output_file) || undefined
+      const task = { itemId: id ? `task:${id}` : undefined, parentId: string(message.tool_use_id) ?? parentId, data: { type: 'subagent' as const, name, status, detached: true, outputFile }, native }
+      this.emit(task)
+      if (id) {
+        const revision = (this.taskOutputRevision.get(id) ?? 0) + 1
+        this.taskOutputRevision.set(id, revision)
+        if (outputFile) {
+          const output = await readClaudeTaskOutput(outputFile, id, this.nativeSessionId)
+          if (!this.disposed && this.taskOutputRevision.get(id) === revision) this.emit({ ...task, data: { ...task.data, ...output } })
+        }
+      }
       return
     }
     this.emit({ parentId, data: { type: 'notice', message: `Claude ${type ?? 'unknown'}${message.subtype ? ` / ${String(message.subtype)}` : ''}`, payload: message }, native: { method: type ?? 'unknown', payload: message } })
@@ -409,7 +442,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (event.type === 'message_start') {
       const body = object(event.message), id = string(body.id)
       if (id) {
-        this.streams.set(key, { messageId: id, blocks: new Map() })
+        this.streams.set(key, { messageId: id, blocks: new Map(), textBlocks: 0 })
         if (!parentId && typeof body.model === 'string') {
           this.resetContextForModel(body.model)
           this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: body.model, ...(this.settings.effort ? { effort: this.settings.effort } : {}) }
@@ -426,7 +459,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (index === undefined) return
     if (event.type === 'content_block_start') {
       const block = object(event.content_block), kind = string(block.type) ?? 'unknown'
-      const id = kind === 'tool_use' ? string(block.id) : `${stream.messageId}:${index}`
+      const id = kind === 'tool_use' ? string(block.id) : kind === 'text' ? `${stream.messageId}:text:${stream.textBlocks++}` : `${stream.messageId}:${index}`
       if (!id) return
       stream.blocks.set(index, { id, kind, input: '', text: string(block.text) ?? '' })
       if (kind === 'tool_use') this.declareTool(id, string(block.name) ?? 'Unknown tool', block.input ?? {}, parentId)

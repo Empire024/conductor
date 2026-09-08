@@ -1,3 +1,4 @@
+import { useAgentControl } from './use-agent-control'
 import { ListTodo } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
@@ -24,6 +25,7 @@ import { EmptyState } from './components/EmptyState'
 import { CommandPalette, type PaletteCommand } from './components/CommandPalette'
 import { SettingsPanel } from './components/SettingsPanel'
 import { PaneWorkspace } from './layout/PaneWorkspace'
+import { applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
 import {
   activateTab,
   addTab,
@@ -36,6 +38,16 @@ import {
   stripWorkspaceUtilityTabs,
   type DockEdge
 } from './layout/layout-operations'
+import {
+  CHORD_TIMEOUT_MS,
+  TAB_CHORD,
+  isEditingTarget,
+  resizeFocusedGroup,
+  snapFocusedGroup,
+  tabIdAtChromeIndex,
+  tabIdByOffset,
+  type ResizeDirection
+} from './layout/tab-keyboard'
 import { createPaneTab } from './panes/pane-factory'
 import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
@@ -504,6 +516,7 @@ export function App(): React.JSX.Element {
       setToast(`Removed ${project.name} from Conductor. Its files remain at ${project.path}`)
     } catch (reason) {
       setToast(reason instanceof Error ? reason.message : 'Could not remove project')
+      throw reason
     }
   }
 
@@ -752,6 +765,22 @@ export function App(): React.JSX.Element {
     if (created) setFocusedGroupId(created.id)
   }, [activeSession, focusedGroupId, setLayout])
 
+  const cycleFocusedTab = useCallback((offset: number): void => {
+    if (!activeSession) return
+    const group = findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0]
+    if (!group) return
+    const next = tabIdByOffset(group, offset)
+    if (!next) return
+    setLayout(activateTab(activeSession.layout, group.id, next))
+    setFocusedGroupId(group.id)
+  }, [activeSession, focusedGroupId, setLayout])
+
+  const nudgeFocusedGroup = useCallback((direction: ResizeDirection, snap = false): void => {
+    if (!activeSession) return
+    const next = (snap ? snapFocusedGroup : resizeFocusedGroup)(activeSession.layout, focusedGroupId, direction)
+    if (next !== activeSession.layout) setLayout(next)
+  }, [activeSession, focusedGroupId, setLayout])
+
   const reopenClosed = useCallback((targetGroupId?: string) => {
     if (!activeSession || activeSession.closedTabs.length === 0) return
     const tab = activeSession.closedTabs.at(-1)!
@@ -764,13 +793,49 @@ export function App(): React.JSX.Element {
     }))
   }, [activeSession, focusedGroupId, patchActiveSession])
 
-  const detachTab = useCallback((groupId: string, tab: PaneTab): void => {
+  const detachTab = useCallback((groupId: string, tab: PaneTab, options?: { alwaysOnTop?: boolean }): void => {
     if (!activeProject || !activeSession) return
     const result = closeTab(activeSession.layout, groupId, tab.id)
     if (!result.closed) return
     setLayout(result.layout)
-    void window.conductor.window.detach(activeProject.id, activeSession.id, result.closed, result.layout)
+    void window.conductor.window.detach(activeProject.id, activeSession.id, result.closed, result.layout, options)
   }, [activeProject, activeSession, setLayout])
+
+  const sidebarTabAction = useCallback(async (sessionId: string, groupId: string, tabId: string, action: WorkspaceTabAction): Promise<void> => {
+    const session = sessions.find(item => item.id === sessionId)
+    if (!session) return
+    const tab = findGroup(session.layout.root, groupId)?.tabs.find(item => item.id === tabId)
+    if (!tab) return
+    try {
+      const result = applyWorkspaceTabAction(session, groupId, tabId, action)
+      if (action === 'detach' || action === 'show') await window.conductor.window.detach(session.projectId, session.id, tab, result.session.layout, { alwaysOnTop: action === 'show' })
+      setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
+      if (action !== 'detach' && action !== 'show') { selectSession(result.session); setFocusedGroupId(result.focusedGroupId); setUtilityPanel(null) }
+      if (action === 'show') setToast(`${tab.title} is shown in a floating window. Close it to return the tab to its workspace.`)
+    } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
+  }, [sessions, selectSession])
+
+  useAgentControl({
+    resolve: async request => {
+      const available = activeProjectIdRef.current === request.projectId ? sessionsRef.current : await window.conductor.sessions.list(request.projectId)
+      const session = available.find(item => item.id === request.sessionId)
+      if (!session) throw new Error('This workspace is no longer open.')
+      return session
+    },
+    commit: async (session, groupId, reveal) => {
+      if (activeProjectIdRef.current === session.projectId) {
+        sessionsRef.current = sessionsRef.current.map(item => item.id === session.id ? session : item)
+        flushSync(() => setSessions(sessionsRef.current))
+      }
+      await window.conductor.sessions.save(session.id, session.layout, session.maximizedGroupId, session.closedTabs)
+      if (reveal) {
+        if (activeProjectIdRef.current !== session.projectId) await loadProject(session.projectId, session.id)
+        flushSync(() => { selectSession(session); setFocusedGroupId(groupId); setUtilityPanel(null) })
+      }
+    },
+    detach: async (session, tab, layout) => window.conductor.window.detach(session.projectId, session.id, tab, layout),
+    openFile: (projectId, path) => openWorkspaceFile(projectId, path)
+  })
 
   useEffect(() => window.conductor.window.onDetachedClosed(({ sessionId }) => {
     if (!activeProjectId || !sessions.some((session) => session.id === sessionId)) return
@@ -778,12 +843,12 @@ export function App(): React.JSX.Element {
   }), [activeProjectId, sessions])
 
   const commands = useMemo<PaletteCommand[]>(() => [
-    { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', run: () => openInFocused('agent', 'claude') },
-    { id: 'open-codex', label: 'Open Codex', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', run: () => openInFocused('agent', 'codex') },
-    { id: 'open-qwen', label: 'Open Qwen Code', detail: 'Open the real local Qwen runtime', category: 'Agents', icon: 'agent', run: () => openInFocused('agent', 'qwen') },
-    { id: 'open-kimi', label: 'Open Kimi Code', detail: 'Open the real local Moonshot runtime', category: 'Agents', icon: 'agent', run: () => openInFocused('agent', 'kimi') },
-    { id: 'open-gemini', label: 'Open Gemini CLI', detail: 'Open the real local Google runtime', category: 'Agents', icon: 'agent', run: () => openInFocused('agent', 'gemini') },
-    { id: 'open-terminal', label: 'Open PowerShell', detail: 'Create a persistent PTY', category: 'Tools', icon: 'terminal', shortcut: 'Ctrl `', run: () => openInFocused('terminal') },
+    { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then C', run: () => openInFocused('agent', 'claude') },
+    { id: 'open-codex', label: 'Open Codex', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then X', run: () => openInFocused('agent', 'codex') },
+    { id: 'open-qwen', label: 'Open Qwen Code', detail: 'Open the real local Qwen runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then Q', run: () => openInFocused('agent', 'qwen') },
+    { id: 'open-kimi', label: 'Open Kimi Code', detail: 'Open the real local Moonshot runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then K', run: () => openInFocused('agent', 'kimi') },
+    { id: 'open-gemini', label: 'Open Gemini CLI', detail: 'Open the real local Google runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then G', run: () => openInFocused('agent', 'gemini') },
+    { id: 'open-terminal', label: 'Open PowerShell', detail: 'Create a persistent PTY', category: 'Tools', icon: 'terminal', shortcut: 'Ctrl T then T', run: () => openInFocused('terminal') },
     { id: 'open-files', label: 'Open Explorer', detail: 'Browse the active project', category: 'Workspace', icon: 'file', run: () => window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'explorer' })) },
     { id: 'open-browser', label: 'Open responsive browser', detail: 'Mobile-first Chromium preview', category: 'Workspace', icon: 'browser', run: () => window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'browser' })) },
     { id: 'open-memory', label: 'Open project memory', detail: 'Open the workspace memory drawer', category: 'Workspace', icon: 'file', run: () => setUtilityPanel('memory') },
@@ -793,8 +858,35 @@ export function App(): React.JSX.Element {
     { id: 'split-claude', label: 'Split Claude Code right', detail: 'Create and launch in one action', category: 'Agents', icon: 'agent', run: () => splitFocused('right', makeTab('agent', 'claude')) },
     { id: 'split-codex', label: 'Split Codex right', detail: 'Create and launch in one action', category: 'Agents', icon: 'agent', run: () => splitFocused('right', makeTab('agent', 'codex')) },
     { id: 'split-terminal', label: 'Split PowerShell below', detail: 'Create and launch in one action', category: 'Tools', icon: 'terminal', run: () => splitFocused('below', makeTab('terminal')) },
-    { id: 'reopen', label: 'Reopen closed tab', category: 'Layout', icon: 'layout', run: reopenClosed }
-  ], [openInFocused, reopenClosed, splitFocused])
+    { id: 'reopen', label: 'Reopen closed tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift T', run: reopenClosed },
+    { id: 'next-tab', label: 'Next tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Tab', run: () => cycleFocusedTab(1) },
+    { id: 'previous-tab', label: 'Previous tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Tab', run: () => cycleFocusedTab(-1) },
+    { id: 'grow-tab', label: 'Grow tab area', detail: 'Snap with Ctrl Alt Shift arrows', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift →', run: () => nudgeFocusedGroup('right') },
+    { id: 'shrink-tab', label: 'Shrink tab area', detail: 'Snap with Ctrl Alt Shift arrows', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift ←', run: () => nudgeFocusedGroup('left') }
+  ], [cycleFocusedTab, nudgeFocusedGroup, openInFocused, reopenClosed, splitFocused])
+
+  // The subagent roster links a background task back to the runtime it is driving.
+  useEffect(() => {
+    const openRuntime = (event: Event): void => {
+      const provider = (event as CustomEvent<AgentProviderId>).detail
+      if (provider) openInFocused('agent', provider)
+    }
+    window.addEventListener('conductor:open-runtime', openRuntime)
+    return () => window.removeEventListener('conductor:open-runtime', openRuntime)
+  }, [openInFocused])
+
+  const chordArmed = useRef(false)
+  const chordTimer = useRef(0)
+  const disarmChord = useCallback((): void => {
+    chordArmed.current = false
+    if (chordTimer.current) { window.clearTimeout(chordTimer.current); chordTimer.current = 0 }
+  }, [])
+  const armChord = useCallback((): void => {
+    disarmChord()
+    chordArmed.current = true
+    chordTimer.current = window.setTimeout(disarmChord, CHORD_TIMEOUT_MS)
+  }, [disarmChord])
+  useEffect(() => disarmChord, [disarmChord])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent): void => {
@@ -825,15 +917,67 @@ export function App(): React.JSX.Element {
         setPaletteOpen((value) => !value)
         return
       }
-      if (event.ctrlKey && event.altKey && ['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key)) {
+      if (event.ctrlKey && event.altKey && !event.shiftKey && ['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key)) {
         event.preventDefault()
         const edge = ({ arrowleft: 'left', arrowright: 'right', arrowup: 'above', arrowdown: 'below' } as const)[key as 'arrowleft']
         splitFocused(edge)
         return
       }
-      if (event.ctrlKey && !event.altKey && !event.shiftKey && /^[1-9]$/.test(event.key)) {
-        const target = sessions[Number(event.key) - 1]
-        if (target) { event.preventDefault(); selectSession(target) }
+      // Ctrl+T opens the launcher immediately; a follow-up key swaps that launcher for
+      // the chosen runtime, so the chord never leaves the user staring at a dead shortcut.
+      if (event.ctrlKey && !event.altKey && !event.shiftKey && key === 't') {
+        event.preventDefault()
+        openInFocused('launcher')
+        armChord()
+        return
+      }
+      if (chordArmed.current && !event.ctrlKey && !event.altKey && !event.metaKey) {
+        const target = TAB_CHORD[key]
+        disarmChord()
+        if (target) {
+          event.preventDefault()
+          openInFocused(target.kind, target.provider)
+          return
+        }
+        if (key === 'escape') { event.preventDefault(); return }
+      }
+      if (event.ctrlKey && event.shiftKey && !event.altKey && key === 't') {
+        event.preventDefault()
+        reopenClosed()
+        return
+      }
+      const group = activeSession ? findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0] : null
+      if (event.ctrlKey && !event.altKey && key === 'tab' && group) {
+        event.preventDefault()
+        event.stopPropagation()
+        cycleFocusedTab(event.shiftKey ? -1 : 1)
+        return
+      }
+      if (event.ctrlKey && !event.altKey && !event.shiftKey && (key === 'pageup' || key === 'pagedown')) {
+        event.preventDefault()
+        cycleFocusedTab(key === 'pagedown' ? 1 : -1)
+        return
+      }
+      // Chrome semantics: plain Ctrl+digit picks a tab, so workspaces move to Ctrl+Shift+digit.
+      if (event.ctrlKey && !event.altKey && !event.shiftKey && /^[1-9]$/.test(event.key) && group && activeSession) {
+        const next = tabIdAtChromeIndex(group, Number(event.key))
+        if (next) {
+          event.preventDefault()
+          setLayout(activateTab(activeSession.layout, group.id, next))
+          setFocusedGroupId(group.id)
+          return
+        }
+      }
+      if (event.ctrlKey && event.shiftKey && !event.altKey && /^[1-9]$/.test(event.code.replace('Digit', ''))) {
+        const target = sessions[Number(event.code.replace('Digit', '')) - 1]
+        if (target) { event.preventDefault(); selectSession(target); return }
+      }
+      // Ctrl+Shift+Arrow collides with word selection, so it stays out of text surfaces.
+      if (event.ctrlKey && event.shiftKey && ['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key) && !isEditingTarget(event.target)) {
+        event.preventDefault()
+        const direction = ({ arrowleft: 'left', arrowright: 'right', arrowup: 'up', arrowdown: 'down' } as const)[key as 'arrowleft']
+        nudgeFocusedGroup(direction, event.altKey)
+        return
       }
       if (event.ctrlKey && event.shiftKey && event.key === 'Enter' && activeSession) {
         event.preventDefault()
@@ -842,7 +986,7 @@ export function App(): React.JSX.Element {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeSession, appSettings.zoomFactor, closeFocusedTab, closeSession, focusedGroupId, selectSession, sessions, setMaximized, setZoom, splitFocused])
+  }, [activeSession, appSettings.zoomFactor, armChord, closeFocusedTab, closeSession, cycleFocusedTab, disarmChord, focusedGroupId, nudgeFocusedGroup, openInFocused, reopenClosed, selectSession, sessions, setLayout, setMaximized, setZoom, splitFocused])
 
   useEffect(() => {
     if (!toast) return
@@ -919,7 +1063,8 @@ export function App(): React.JSX.Element {
           onProjectRenameComplete={() => setRenameProjectId(null)}
           onOpenExistingProject={() => void openExistingProject()}
           onMoveProject={(id) => void moveProject(id)}
-          onRemoveProject={(id) => void removeProject(id)}
+          onRemoveProject={removeProject}
+          onTabAction={(sessionId, groupId, tabId, action) => void sidebarTabAction(sessionId, groupId, tabId, action)}
           onRevealProject={(path) => void window.conductor.projects.reveal(path)}
           onNewSession={() => void newSession()}
           onCloseSession={(id) => void closeSession(id)}
@@ -985,6 +1130,7 @@ export function App(): React.JSX.Element {
                           focusedGroupId={focusedGroupId}
                           maximizedGroupId={activeSession.maximizedGroupId}
                           onLayout={setLayout}
+                          onPersistLayout={layout => window.conductor.sessions.save(activeSession.id, layout, activeSession.maximizedGroupId, activeSession.closedTabs)}
                           onFocus={setFocusedGroupId}
                           onMaximize={setMaximized}
                           onClosed={rememberClosed}

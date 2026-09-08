@@ -1,0 +1,10 @@
+.agent-control-cables { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 45; pointer-events: none; overflow: visible; }
+.agent-control-cables path { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: .65; }
+.agent-control-cables circle { fill: var(--accent); }
+.agent-control-links { position: fixed; bottom: 30px; right: 14px; z-index: 44; display: grid; gap: 4px; max-width: calc(100vw - 32px); color: var(--text-2); }
+.agent-control-link { display: flex; align-items: center; gap: 5px; padding: 3px 6px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 2px 9px #0002; font-size: 10px; }
+.agent-control-link > svg { color: var(--accent); flex-shrink: 0; }
+.agent-control-link button { min-width: 0; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px; border: 0; border-radius: 3px; background: transparent; color: var(--text); font: inherit; cursor: pointer; }
+.agent-control-link button:hover { background: var(--surface-hover); color: var(--accent); }
+.agent-control-link button:focus-visible { outline: 1px solid var(--accent); }
+.agent-control-link .agent-control-release { flex-shrink: 0; display: flex; margin-left: 3px; }

@@ -1,4 +1,4 @@
-import type { AgentMemory, MemoryKind } from '../shared/models'
+import type { AgentMemory, MemoryKind, MemorySource } from '../shared/models'
 
 const STOP_WORDS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'are', 'was', 'were', 'will', 'have', 'has'
@@ -68,3 +68,5 @@ export const scoreMemory = (
       rehearsal * 0.06
   }
 }
+
+export const memorySourceOf = (value: unknown): MemorySource => (value === 'agent' ? 'agent' : 'human')

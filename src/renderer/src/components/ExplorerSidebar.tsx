@@ -1,3 +1,4 @@
+import { isDotEntry, orderExplorerEntries } from './explorer-order'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -77,10 +78,7 @@ const canMoveTo = (entry: FileEntry, directory: string): boolean =>
   parentPath(entry.relativePath) !== directory &&
   !(entry.kind === 'directory' && isSameOrChildPath(directory, entry.relativePath))
 
-const sortEntries = (entries: FileEntry[]): FileEntry[] => [...entries].sort((a, b) => {
-  if (a.kind !== b.kind) return a.kind === 'directory' ? -1 : 1
-  return a.name.localeCompare(b.name, undefined, { sensitivity: 'base' })
-})
+const sortEntries = orderExplorerEntries
 
 const refreshedLabel = (lastRefreshed: Date | null, now: number): string => {
   if (!lastRefreshed) return 'Not refreshed yet'
@@ -137,19 +135,20 @@ function ExplorerRows({
   onDrop(event: React.DragEvent, directory: string): void
 }): React.JSX.Element {
   const normalizedQuery = query.trim().toLocaleLowerCase()
-  const entries = (entriesByDirectory[directory] ?? []).filter((entry) =>
+  const entries = orderExplorerEntries(entriesByDirectory[directory] ?? []).filter((entry) =>
     !normalizedQuery || entry.kind === 'directory' || entry.name.toLocaleLowerCase().includes(normalizedQuery)
   )
 
   return (
     <>
-      {entries.map((entry) => {
+      {entries.map((entry, index) => {
         const open = entry.kind === 'directory' && expanded.has(entry.relativePath)
         const Icon = entry.kind === 'directory' && open ? FolderOpen : iconFor(entry)
         return (
           <div key={entry.relativePath}>
+            {isDotEntry(entry) && (index === 0 || !isDotEntry(entries[index - 1]!)) && <div className="explorer-dotfile-heading" style={{ paddingLeft: 20 + depth * 13 }} title="Dotfiles and folders hold project configuration and hidden content">Configuration &amp; hidden</div>}
             <button
-              className={`explorer-row ${entry.kind}${selectedPath === entry.relativePath ? ' selected' : ''}${movingPath === entry.relativePath ? ' moving' : ''}${draggingPath === entry.relativePath ? ' dragging' : ''}${entry.kind === 'directory' && dropTarget === entry.relativePath ? ' drop-target' : ''}`}
+              className={`explorer-row ${entry.kind}${isDotEntry(entry) ? ' dot-entry' : ''}${selectedPath === entry.relativePath ? ' selected' : ''}${movingPath === entry.relativePath ? ' moving' : ''}${draggingPath === entry.relativePath ? ' dragging' : ''}${entry.kind === 'directory' && dropTarget === entry.relativePath ? ' drop-target' : ''}`}
               style={{ paddingLeft: 7 + depth * 13 }}
               title={entry.relativePath}
               draggable

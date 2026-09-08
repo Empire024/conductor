@@ -1,4 +1,7 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
+import { WorkspaceTabList } from './WorkspaceTabList'
+import { RemoveProjectDialog } from './RemoveProjectDialog'
+import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
 import { createPortal } from 'react-dom'
 import {
   X,
@@ -44,7 +47,8 @@ interface SidebarProps {
   onProjectRenameComplete(): void
   onOpenExistingProject(): void
   onMoveProject(id: string): void
-  onRemoveProject(id: string): void
+  onRemoveProject(id: string): Promise<void>
+  onTabAction(sessionId: string, groupId: string, tabId: string, action: WorkspaceTabAction): void
   onRevealProject(path: string): void
   onCloseSession(id: string): void
   onRenameSession(id: string, name: string): void
@@ -102,7 +106,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
   const finishSessionRename = (save: boolean): void => { const id = editingSessionId; setEditingSessionId(null); if (save && id && sessionName.trim()) props.onRenameSession(id, sessionName.trim()) }
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null)
   const [projectName, setProjectName] = useState('')
-  const [confirmingRemoval, setConfirmingRemoval] = useState<string | null>(null)
+  const [confirmingRemoval, setConfirmingRemoval] = useState<ProjectRecord | null>(null)
   const [collapsedProjectIds, setCollapsedProjectIds] = useState<Set<string>>(() => {
     try {
       return new Set(JSON.parse(localStorage.getItem('conductor.collapsedProjects') ?? '[]') as string[])
@@ -323,7 +327,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                   {expanded && (
                     <div className="session-tree">
                       {props.sessions.map((session, index) => (
-                        <div key={session.id} className="sidebar-session-row" draggable={editingSessionId !== session.id} onContextMenu={event => { if (editingSessionId === session.id) return; event.preventDefault(); event.stopPropagation(); setMenu(null); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
+                        <Fragment key={session.id}><div className="sidebar-session-row" draggable={editingSessionId !== session.id} onContextMenu={event => { if (editingSessionId === session.id) return; event.preventDefault(); event.stopPropagation(); setMenu(null); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
                           onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-conductor-session', session.id) }}
                           onDragOver={(event) => { if (event.dataTransfer.types.includes('application/x-conductor-session')) { event.preventDefault(); event.currentTarget.classList.add('reorder-target') } }}
                           onDragLeave={(event) => event.currentTarget.classList.remove('reorder-target')}
@@ -340,6 +344,8 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                         </button>
                         <button className="sidebar-session-close" aria-label={'Close ' + session.name} title={'Close ' + session.name} onClick={() => props.onCloseSession(session.id)}><X size={11} /></button>
                         </div>
+                        <WorkspaceTabList session={session} active={session.id === props.activeSessionId} onAction={(groupId, tabId, action) => props.onTabAction(session.id, groupId, tabId, action)} />
+                        </Fragment>
                       ))}
                       <button className="new-session" onClick={props.onNewSession}>
                         <Plus size={12} /> New workspace
@@ -371,6 +377,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
           </>}
         />
       </aside>}
+      {confirmingRemoval && <RemoveProjectDialog project={confirmingRemoval} onRemove={() => props.onRemoveProject(confirmingRemoval.id)} onDismiss={() => setConfirmingRemoval(null)} />}
       {menu && createPortal(
         <div
           className="cursor-context-menu project-context-menu"
@@ -391,17 +398,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
               <button onClick={() => { setMenu(null); props.onRevealProject(menu.project.path) }}><FolderOpen size={14} /> Show in File Explorer</button>
               <button onClick={() => { const id = menu.project.id; setMenu(null); props.onMoveProject(id) }}><MoveRight size={14} /> Move project…</button>
               <div />
-              {confirmingRemoval === menu.project.id ? (
-                <div className="project-remove-confirm">
-                  <span>Remove from Conductor? Files stay on disk.</span>
-                  <div>
-                    <button onClick={() => setConfirmingRemoval(null)}>Cancel</button>
-                    <button className="danger" onClick={() => { const id = menu.project.id; setMenu(null); setConfirmingRemoval(null); props.onRemoveProject(id) }}><Trash2 size={13} /> Remove</button>
-                  </div>
-                </div>
-              ) : (
-                <button className="danger" onClick={() => setConfirmingRemoval(menu.project.id)}><Trash2 size={14} /> Remove from Conductor</button>
-              )}
+              <button className="danger" onClick={() => { setConfirmingRemoval(menu.project); setMenu(null) }}><Trash2 size={14} /> Remove from Conductor</button>
             </>
           )}
         </div>,

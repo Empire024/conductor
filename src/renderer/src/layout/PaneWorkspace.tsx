@@ -1,18 +1,21 @@
+import { bindConversationTab, type ConversationIdentity } from '../panes/conversation-tab'
+import { AgentControlLinks } from '../components/AgentControlLinks'
+import '../navigation.css'
 import { ProviderIcon } from '../components/ProviderIcon'
+import { PaneTabMenu } from '../components/PaneTabMenu'
+import { applyWorkspaceTabAction } from './workspace-tab-actions'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal, flushSync } from 'react-dom'
 import {
   Bell,
   Bot,
   Braces,
-  Copy,
   ExternalLink,
   FileText,
   FileSearch,
   FolderTree,
   Globe2,
   GripVertical,
-  Maximize2,
   MoreHorizontal,
   PanelBottom,
   PanelLeft,
@@ -41,11 +44,9 @@ import {
   addTab,
   closeTab,
   dockTab,
-  duplicateTab,
   findGroup,
   listGroups,
   resizeSplit,
-  splitGroup,
   type DockEdge,
   replaceTab,
   updateTab
@@ -66,10 +67,11 @@ interface PaneWorkspaceProps {
   focusedGroupId: string
   maximizedGroupId: string | null
   onLayout(layout: WorkspaceLayout): void
+  onPersistLayout(layout: WorkspaceLayout): Promise<void>
   onFocus(groupId: string): void
   onMaximize(groupId: string | null): void
   onClosed(tab: PaneTab): void
-  onDetach(groupId: string, tab: PaneTab): void
+  onDetach(groupId: string, tab: PaneTab, options?: { alwaysOnTop?: boolean }): void
   canReopen: boolean
   onReopen(groupId: string): void
   onOpenFile?(path: string, line?: number): void
@@ -118,7 +120,8 @@ const PaneBody = ({
   session,
   onOpen,
   onOpenFile,
-  onUpdateTab
+  onUpdateTab,
+  onConversationChange
 }: {
   tab: PaneTab
   groupId: string
@@ -127,6 +130,7 @@ const PaneBody = ({
   onOpen(kind: PaneKind, provider?: AgentProviderId): void
   onOpenFile(path: string, line?: number): void
   onUpdateTab(tabId: string, state: Record<string, unknown>): void
+  onConversationChange(tabId: string, conversation: ConversationIdentity): Promise<void>
 }): React.JSX.Element => {
   if (tab.kind === 'launcher') return <LauncherPane onOpen={onOpen} />
   if (tab.kind === 'terminal') {
@@ -156,6 +160,7 @@ const PaneBody = ({
         project={project}
         session={session}
         onOpenFile={onOpenFile}
+        onConversationChange={conversation => onConversationChange(tab.id, conversation)}
         onModelChange={(model) => onUpdateTab(tab.id, { ...tab.state, model })}
         onEffortChange={(effort) => onUpdateTab(tab.id, { ...tab.state, effort })}
         onViewModeChange={(viewMode) => onUpdateTab(tab.id, { ...tab.state, viewMode })}
@@ -192,7 +197,7 @@ function PaneGroup({
   dragSourceTabId: string | null
 }): React.JSX.Element {
   const groupRef = useRef<HTMLElement>(null)
-  const [menuPosition, setMenuPosition] = useState<{ x: number; y: number } | null>(null)
+  const [menuPosition, setMenuPosition] = useState<{ x: number; y: number; tabId: string } | null>(null)
   const [activity, setActivity] = useState<Record<string, AgentActivityPhase>>({})
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(() => new Set())
   const [openingTabIds, setOpeningTabIds] = useState<Set<string>>(() => new Set())
@@ -201,6 +206,7 @@ function PaneGroup({
   const workspaceRef = useRef(workspace)
   workspaceRef.current = workspace
   const activeTab = group.tabs.find((tab) => tab.id === group.activeTabId) ?? group.tabs[0]!
+  const menuTab = group.tabs.find(tab => tab.id === menuPosition?.tabId) ?? activeTab
   const focused = workspace.focusedGroupId === group.id
   const sourceGroup = dragSourceGroupId ? findGroup(workspace.layout.root, dragSourceGroupId) : null
   const possibleEdges: DockEdge[] = !sourceGroup
@@ -293,14 +299,15 @@ function PaneGroup({
     if (rect) dragActions.preview(group.id, edge, rect)
   }
 
-  const showContextMenu = (event: React.MouseEvent): void => {
+  const showContextMenu = (event: React.MouseEvent, tab: PaneTab = activeTab): void => {
     event.preventDefault()
     event.stopPropagation()
     workspace.onFocus(group.id)
     if (event.type === 'click' && menuPosition) { setMenuPosition(null); return }
     setMenuPosition({
       x: Math.min(event.clientX, window.innerWidth - 205),
-      y: Math.min(event.clientY, window.innerHeight - 315)
+      y: event.clientY,
+      tabId: tab.id
     })
   }
 
@@ -318,16 +325,17 @@ function PaneGroup({
     workspace.onLayout(updateTab(workspace.layout, group.id, tabId, (tab) => ({ ...tab, state })))
   }
 
-  const split = (edge: Exclude<DockEdge, 'center'>): void => {
-    const launcher = makeLauncherTab()
-    const next = splitGroup(workspace.layout, group.id, edge, launcher)
-    workspace.onLayout(next)
-    const created = findGroup(next.root, group.id)
-    const locateNew = (node: LayoutNode): string | null => {
-      if (node.type === 'group') return node.tabs.some((tab) => tab.id === launcher.id) ? node.id : null
-      return locateNew(node.children[0]) ?? locateNew(node.children[1])
-    }
-    workspace.onFocus(locateNew(next.root) ?? created?.id ?? group.id)
+
+  const changeConversation = async (tabId: string, conversation: ConversationIdentity): Promise<void> => {
+    const current = workspaceRef.current
+    const currentGroup = findGroup(current.layout.root, group.id)
+    if (current.session.id !== workspace.session.id || !currentGroup?.tabs.some(tab => tab.id === tabId)) throw new Error('This conversation tab is no longer open.')
+    await window.conductor.structured.bindWorkspace(conversation.id, current.session.id)
+    const latest = workspaceRef.current
+    if (latest.session.id !== current.session.id || !findGroup(latest.layout.root, group.id)?.tabs.some(tab => tab.id === tabId)) throw new Error('This conversation tab is no longer open.')
+    const layout = updateTab(latest.layout, group.id, tabId, tab => bindConversationTab(tab, conversation))
+    flushSync(() => latest.onLayout(layout))
+    await latest.onPersistLayout(layout)
   }
 
   const close = (tab: PaneTab): void => {
@@ -352,6 +360,7 @@ function PaneGroup({
       const apply = (): void => {
         const result = closeTab(currentWorkspace.layout, requestedGroupId, tab.id)
         currentWorkspace.onLayout(result.layout)
+        setClosingTabIds(current => { const next = new Set(current); next.delete(tab.id); return next })
         if (result.closed) {
           currentWorkspace.onClosed(result.closed)
           debugLog('tabs', 'Tab closed', { sessionId: requestedSessionId, groupId: requestedGroupId, tabId: tab.id }, 'info')
@@ -409,7 +418,7 @@ function PaneGroup({
           if ((event.target as HTMLElement).closest('button')) return
           workspace.onMaximize(workspace.maximizedGroupId === group.id ? null : group.id)
         }}
-        onContextMenu={showContextMenu}
+        onContextMenu={event => showContextMenu(event)}
         onPointerDown={(event) => {
           if (event.button !== 1 || (event.target as HTMLElement).closest('.pane-controls')) return
           event.preventDefault()
@@ -424,8 +433,11 @@ function PaneGroup({
             return (
               <button
                 key={tab.id}
+                data-control-tab-id={tab.id}
+                data-control-agent-id={tab.resourceId}
                 className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''}`}
                 onClick={() => workspace.onLayout(activateTab(workspace.layout, group.id, tab.id))}
+                onContextMenu={event => showContextMenu(event, tab)}
                 onPointerDown={(event) => {
                   if (event.button !== 1) return
                   event.preventDefault()
@@ -476,7 +488,7 @@ function PaneGroup({
       <div className="pane-content">
         {group.tabs.map((tab) => (
           <div key={tab.id} className="pane-tab-content" data-performance-tab-id={tab.id} style={{ display: tab.id === activeTab.id ? 'flex' : 'none' }}>
-            <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={openFile} onUpdateTab={setTabState} />
+            <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={openFile} onUpdateTab={setTabState} onConversationChange={changeConversation} />
           </div>
         ))}
       </div>
@@ -489,36 +501,19 @@ function PaneGroup({
         {validEdges.length === 0 && <div className="dock-detach-hint"><ExternalLink size={19} /><span>Drag outside Conductor for a separate window</span></div>}
       </div>
     </section>
-    {menuPosition && createPortal(
-      <div
-        className="conductor-menu cursor-context-menu pane-context-menu"
-        style={{ left: menuPosition.x, top: menuPosition.y }}
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <div className="context-menu-label">{activeTab.title}</div>
-        <button onClick={() => { split('left'); setMenuPosition(null) }}><PanelLeft size={13} /> Split left</button>
-        <button onClick={() => { split('right'); setMenuPosition(null) }}><PanelRight size={13} /> Split right</button>
-        <button onClick={() => { split('above'); setMenuPosition(null) }}><PanelTop size={13} /> Split above</button>
-        <button onClick={() => { split('below'); setMenuPosition(null) }}><PanelBottom size={13} /> Split below</button>
-        <div />
-        <button onClick={() => { workspace.onLayout(addTab(workspace.layout, group.id, duplicateTab(activeTab))); setMenuPosition(null) }}><Copy size={13} /> Duplicate tab</button>
-        <button onClick={() => { workspace.onDetach(group.id, activeTab); setMenuPosition(null) }}><ExternalLink size={13} /> Open as window</button>
-        <button onClick={() => { workspace.onMaximize(workspace.maximizedGroupId === group.id ? null : group.id); setMenuPosition(null) }}><Maximize2 size={13} /> {workspace.maximizedGroupId === group.id ? 'Restore layout' : 'Maximize tab'}</button>
-        {activeTab.kind === 'agent' && (
-          <button onClick={() => {
-            const effective = activeTab.state?.continueOnLimit === undefined
-              ? workspace.session.continueOnLimit
-              : Boolean(activeTab.state.continueOnLimit)
-            setTabState(activeTab.id, { ...activeTab.state, continueOnLimit: !effective })
-            setMenuPosition(null)
-          }}><TimerReset size={13} /> {(activeTab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(activeTab.state.continueOnLimit)) ? 'Disable limit continuation' : 'Enable limit continuation'}</button>
-        )}
-        <button disabled={!workspace.canReopen} onClick={() => { workspace.onReopen(group.id); setMenuPosition(null) }}><Undo2 size={13} /> Retrieve closed tab</button>
-        <div />
-        <button className="danger" onClick={() => { close(activeTab); setMenuPosition(null) }}><X size={13} /> Close tab</button>
-      </div>,
-      document.body
-    )}
+    {menuPosition && <PaneTabMenu x={menuPosition.x} y={menuPosition.y} tab={menuTab}
+      maximized={workspace.maximizedGroupId === group.id}
+      continuation={menuTab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(menuTab.state.continueOnLimit)}
+      canReopen={workspace.canReopen} onDismiss={() => setMenuPosition(null)} onAction={action => {
+        if (action === 'close') { close(menuTab); return }
+        if (action === 'detach' || action === 'show') { workspace.onDetach(group.id, menuTab, { alwaysOnTop: action === 'show' }); return }
+        if (action === 'reopen') { workspace.onReopen(group.id); return }
+        const result = applyWorkspaceTabAction({ ...workspace.session, layout: workspace.layout, maximizedGroupId: workspace.maximizedGroupId }, group.id, menuTab.id, action)
+        workspace.onLayout(result.session.layout)
+        workspace.onMaximize(result.session.maximizedGroupId)
+        workspace.onFocus(result.focusedGroupId)
+      }} />}
+
     </>
   )
 }
@@ -720,6 +715,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   const DragIcon = dragging ? iconFor(dragging.tab) : FileText
   return (
     <div className={`pane-workspace ${dragging ? 'dragging' : ''}`}>
+      <AgentControlLinks projectId={props.project.id} sessionId={props.session.id} layout={props.layout} />
       {emptyGroup ? (
         <div className="empty-pane-workspace">
           <div>

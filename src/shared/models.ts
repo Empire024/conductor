@@ -308,11 +308,15 @@ export interface RuntimeProcessSummary {
 
 export type MemoryKind = 'episodic' | 'semantic' | 'procedural'
 
+/** Who committed a memory. Only agent-written episodes are ever auto-forgotten. */
+export type MemorySource = 'human' | 'agent'
+
 export interface AgentMemory {
   id: string
   projectId: string
   agentKey: string | null
   kind: MemoryKind
+  source: MemorySource
   gist: string
   cues: string[]
   salience: number
@@ -329,6 +333,7 @@ export interface RememberMemoryInput {
   projectId: string
   agentKey?: string
   kind: MemoryKind
+  source?: MemorySource
   gist: string
   cues?: string[]
   salience?: number

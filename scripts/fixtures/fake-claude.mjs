@@ -50,6 +50,7 @@ for await (const line of input) {
     if (!initialized) throw new Error('User message before initialization')
     const blocks = message.message.content
     const prompt = Array.isArray(blocks) ? blocks.filter(item => item.type === 'text').map(item => item.text).join('') : blocks
+    if (process.env.CONDUCTOR_TEST_CONTROL_CAPTURE && typeof prompt === 'string') writeFileSync(process.env.CONDUCTOR_TEST_CONTROL_CAPTURE, prompt)
     if (typeof prompt === 'string' && prompt.startsWith('SYNTHETIC IMAGES')) {
       const images = blocks.filter(item => item.type === 'image')
       if (!images.length || images.some(item => item.source.type !== 'base64' || item.source.media_type !== 'image/png' || Buffer.from(item.source.data, 'base64').subarray(0,8).toString('hex') !== '89504e470d0a1a0a')) throw new Error('Synthetic image bytes did not reach Claude')

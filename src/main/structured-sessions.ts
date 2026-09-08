@@ -1,7 +1,8 @@
+import { concreteModel } from '../shared/agent-model-selection'
 import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-history'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
-import type { AgentSpec, RuntimeEnsureResult } from '../shared/models'
+import type { AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import type { AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
@@ -53,7 +54,7 @@ export class StructuredSessions {
     const executable = process.env.CONDUCTOR_OFFLINE_TESTS === '1' ? process.execPath : this.resolveExecutable(spec.provider as StructuredProvider)
     if (!store.snapshot(spec.id)) this.database.upsertAgent(spec, 'running', 'idle')
     const state = store.register(spec.id, spec.projectId, spec.provider as StructuredProvider, spec)
-    if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: spec.model && spec.model !== 'default' ? spec.model : undefined, effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined } })
+    if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: concreteModel(spec.provider, spec.model, state.capabilities), effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined } })
     // Registration constructs no process. Views subscribe to this backend resource.
     if (!this.live.has(spec.id)) this.live.set(spec.id, { spec: previousSpec ?? spec, executable: executable ?? '', runtimeId: '', submitting: false, closed: false, responses: new Set() })
     const live = this.live.get(spec.id)!
@@ -195,6 +196,21 @@ export class StructuredSessions {
     } finally { live.handoff = false }
   }
 
+  bindWorkspace(id: string, sessionId: string): void {
+    const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (live.spec.sessionId === sessionId) return
+    const workspace = this.database.getSession(sessionId)
+    if (!workspace || workspace.projectId !== live.spec.projectId || !this.database.listSessions(live.spec.projectId).some(item => item.id === sessionId)) throw new Error('A native conversation can move only to an open workspace in its project')
+    if (active.has(state.phase) || live.submitting || live.handoff || live.queueing || state.queued || this.cliOwned(id)) throw new Error('Finish active work before moving this conversation')
+    const contains = (node: LayoutNode): boolean => node.type === 'split' ? node.children.some(contains) : node.tabs.some(tab => tab.kind === 'agent' && tab.resourceId === id)
+    if (this.database.listSessions(live.spec.projectId).some(item => item.id !== sessionId && contains(item.layout.root)) || this.database.listDetachedWindows().some(item => item.projectId === live.spec.projectId && item.sessionId !== sessionId && contains(item.layout.root))) throw new Error('This conversation is already open in another workspace. Show its existing tab first.')
+    const process = this.database.listProcesses(live.spec.projectId).find(process => process.id === id)
+    live.spec = { ...live.spec, sessionId }
+    this.database.structured.rebindWorkspace(id, sessionId)
+    this.database.upsertAgent(live.spec, process?.status ?? 'running', process?.activityPhase ?? 'idle')
+    this.database.removeSetting('agentControlParent:' + id)
+  }
+
   async resume(id: string, settings?: SessionSettings): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
@@ -242,7 +258,7 @@ export class StructuredSessions {
     fork.runtimeId = randomUUID()
     // Saved history is copied for presentation; native context is provided only by thread/fork.
     this.database.structured.cloneHistory(id, forkId)
-    this.emit(fork, { data: { type: 'session', phase: 'idle', nativeSessionId }, nativeSessionId })
+    this.emit(fork, { data: { type: 'session', phase: 'idle', nativeSessionId, title: spec.title }, nativeSessionId })
     this.flush()
     return forkId
   }

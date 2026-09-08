@@ -1,0 +1,12 @@
+{
+  "checks": [
+    "Header context menu closes the right-clicked inactive tab",
+    "Workspace sidebar lists real tabs and restores closed tabs",
+    "Show tab opens a floating window above content and closing it restores the original tab",
+    "Active tabs have hover feedback and focused panes have no cyan ring",
+    "Dotfiles and folders remain usable in a separate configuration group",
+    "Day/night control has visible icons, a full-height click target, and smooth color transitions",
+    "Project removal dialog supports Cancel and removes the registered project while preserving disk files"
+  ],
+  "errors": []
+}

@@ -33,6 +33,6 @@ export const migrateLegacyCodexModels = (layout: WorkspaceLayout): WorkspaceLayo
 export function runtimeModelLabel(configuredModel?: string, models: Array<{ id: string; label: string }> = [], reportedModel?: string): string {
   const explicit = (value?: string): value is string => Boolean(value?.trim() && !['default', 'auto'].includes(value.trim().toLowerCase()))
   const model = explicit(reportedModel) ? reportedModel : explicit(configuredModel) ? configuredModel : undefined
-  if (!model) return 'Model not reported'
+  if (!model) return models.find(option => explicit(option.id))?.label ?? 'Choose model'
   return models.find(option => option.id === model)?.label || model
 }

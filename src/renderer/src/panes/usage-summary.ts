@@ -1,4 +1,5 @@
 import type { ActivityStatus, AgentEventData, Json, SessionPhase, TimelineItem } from '../../../shared/structured-agent'
+import type { AgentProviderId } from '../../../shared/models'
 
 type Usage = Extract<AgentEventData, { type: 'usage' }>
 type UsageItem = TimelineItem & { data: Usage }
@@ -133,10 +134,30 @@ export interface SubagentSummary {
   updatedAt: string
   parentIds: string[]
   task?: string
+  outputFile?: string
+  output?: string
+  outputTruncated?: boolean
+  outputError?: string
   activity: TimelineItem[]
   status: ActivityStatus | 'unknown'
+  /** Background work that keeps running after the turn that launched it ends. */
+  detached: boolean
+  /** Set when this task is itself running one of Conductor's own agent runtimes. */
+  linkedProvider?: AgentProviderId
   sequence: number
 }
+/** Match the executable, not a passing mention, so a prompt about Codex is not a Codex run. */
+const providerCommands: Array<{ provider: AgentProviderId; pattern: RegExp }> = [
+  { provider: 'codex', pattern: /(^|[\\/\s"'])codex(\.\w+)?(\s|$)/i },
+  { provider: 'claude', pattern: /(^|[\\/\s"'])claude(\.\w+)?(\s|$)/i },
+  { provider: 'gemini', pattern: /(^|[\\/\s"'])gemini(\.\w+)?(\s|$)/i },
+  { provider: 'qwen', pattern: /(^|[\\/\s"'])qwen(\.\w+)?(\s|$)/i },
+  { provider: 'kimi', pattern: /(^|[\\/\s"'])kimi(\.\w+)?(\s|$)/i }
+]
+
+export const providerOfCommand = (command: string): AgentProviderId | undefined =>
+  providerCommands.find(candidate => candidate.pattern.test(command))?.provider
+
 const activeStatuses = new Set<ActivityStatus>(['preparing', 'running', 'awaiting_approval'])
 const inactivePhases = new Set<SessionPhase>(['idle', 'completed', 'failed', 'disconnected', 'interrupted'])
 export const subagentStatusLabels: Record<SubagentSummary['status'], string> = {
@@ -151,11 +172,15 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
     const previous = agents.get(id)
     const genericName = ['Codex agent', 'Background activity', 'Agent'].includes(item.data.name)
     const name = genericName && previous ? previous.name : item.data.name
-    const status = activeStatuses.has(item.data.status) && (item.runtimeId !== runtimeId || inactivePhases.has(phase)) ? 'unknown' : item.data.status
-    agents.set(id, { id, name, nativeSessionId: item.data.nativeSessionId, runtimeId: item.runtimeId,
+    // A finished turn cannot vouch for a child that still claims to be running, but
+    // detached background work is defined to outlive its turn. Only a genuinely
+    // different runtime makes a detached task's reported status unverifiable.
+    const stale = item.data.detached ? item.runtimeId !== runtimeId : item.runtimeId !== runtimeId || inactivePhases.has(phase)
+    const status = activeStatuses.has(item.data.status) && stale ? 'unknown' : item.data.status
+    agents.set(id, { id, name, nativeSessionId: item.data.nativeSessionId, runtimeId: item.runtimeId, detached: item.data.detached ?? false,
       startedAt: previous?.startedAt ?? item.timestamp, updatedAt: item.timestamp,
       parentIds: [...new Set([...(previous?.runtimeId === item.runtimeId ? previous.parentIds : []), item.parentId, item.nativeItemId].filter((value): value is string => Boolean(value)))],
-      activity: [], status, sequence: previous?.sequence ?? item.sequence })
+      activity: [], outputFile: item.data.outputFile ?? previous?.outputFile, output: item.data.output ?? previous?.output, outputTruncated: item.data.outputTruncated ?? previous?.outputTruncated, outputError: item.data.outputError, status, sequence: previous?.sequence ?? item.sequence })
   }
   if (!includeActivity) return [...agents.values()].sort((a, b) => a.sequence - b.sequence)
   // A shared launch/wait tool is not evidence that every child produced its output.
@@ -171,7 +196,11 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
     const launch = scoped.find(item => item.nativeItemId && parents.has(item.nativeItemId) && item.data.type === 'tool')
     if (launch?.data.type === 'tool') {
       const input = object(launch.data.input)
-      agent.task = typeof input.prompt === 'string' ? input.prompt : typeof input.message === 'string' ? input.message : launch.data.description
+      // Backgrounded shell work carries a command rather than a prompt; without it these
+      // tasks render with no description at all.
+      const command = typeof input.command === 'string' ? input.command : undefined
+      agent.task = typeof input.prompt === 'string' ? input.prompt : typeof input.message === 'string' ? input.message : command ?? launch.data.description
+      agent.linkedProvider = command ? providerOfCommand(command) : undefined
     }
     // Follow nested tool parents, independent of arrival order.
     let changed = true

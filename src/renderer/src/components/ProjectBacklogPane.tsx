@@ -18,6 +18,7 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
     catch(reason){if(mounted.current)setError(String(reason))}
   },[project.id])
   useEffect(()=>{mounted.current=true;void refresh();const timer=setInterval(()=>{if(!writing.current)void refresh()},1500);window.addEventListener('focus',refresh);return()=>{mounted.current=false;revision.current++;clearInterval(timer);window.removeEventListener('focus',refresh)}},[refresh])
+  useEffect(()=>window.conductor.files.onChanged(change=>{if(change.projectId===project.id && change.path.replaceAll('\\','/').toLowerCase()==='feature-list.md' && !writing.current)void refresh()}),[project.id,refresh])
   const edit=async(change:ProjectTaskEdit):Promise<boolean>=> {
     if(!board || writing.current)return false
     writing.current=true;setBusy(true);setError('');revision.current++

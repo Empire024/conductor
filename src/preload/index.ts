@@ -19,6 +19,15 @@ const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => v
 }
 
 const bridge: ConductorBridge = {
+  agentControl: {
+    openUri: uri => ipcRenderer.invoke('agent-control:open-uri', uri),
+    focusTab: (projectId, sessionId, tabId) => ipcRenderer.invoke('agent-control:focus-tab', projectId, sessionId, tabId),
+    links: (projectId, sessionId) => ipcRenderer.invoke('agent-control:links', projectId, sessionId),
+    release: agentSessionId => ipcRenderer.invoke('agent-control:release', agentSessionId),
+    onLinksChanged: callback => subscribe('agent-control:links-changed', callback),
+    onRequest: callback => subscribe('agent-control:request', callback),
+    respond: response => ipcRenderer.send('agent-control:response', response)
+  },
   projectTasks: {
     get: (projectId) => ipcRenderer.invoke('project-tasks:get', projectId),
     edit: (projectId, revision, edit) => ipcRenderer.invoke('project-tasks:edit', projectId, revision, edit)
@@ -32,6 +41,7 @@ const bridge: ConductorBridge = {
     onStatus: (callback) => subscribe('native-cli:status', callback)
   },
   structured: {
+    bindWorkspace: (id, sessionId) => ipcRenderer.invoke('structured:bind-workspace', id, sessionId),
     queue: (id, text, settings, attachments) => ipcRenderer.invoke('structured:queue', id, text, settings, attachments),
     steer: (id, text, settings, attachments) => ipcRenderer.invoke('structured:steer', id, text, settings, attachments),
     cancelQueued: (id, promptId) => ipcRenderer.invoke('structured:cancel-queued', id, promptId),
@@ -114,6 +124,7 @@ const bridge: ConductorBridge = {
     flush: (snapshot: WorkspaceRecoveryCheckpoint) => ipcRenderer.sendSync('recovery:flush', snapshot) === true
   },
   files: {
+    onChanged: callback => subscribe('files:changed', callback),
     importImage: (projectId, name, bytes) => ipcRenderer.invoke('files:import-image', projectId, name, bytes),
     onOpenShortcut: (callback) => subscribe('files:open-shortcut', callback),
     browserUrl: (projectId, path) => ipcRenderer.invoke('files:browser-url', projectId, path),
@@ -203,8 +214,8 @@ const bridge: ConductorBridge = {
     isMaximized: () => ipcRenderer.invoke('window:is-maximized'),
     onMaximizedChange: (callback) => subscribe('window:maximized-changed', callback),
     isCursorOutside: () => ipcRenderer.invoke('window:is-cursor-outside'),
-    detach: (projectId, sessionId, tab, sourceLayout) =>
-      ipcRenderer.invoke('window:detach', projectId, sessionId, tab, sourceLayout),
+    detach: (projectId, sessionId, tab, sourceLayout, options) =>
+      ipcRenderer.invoke('window:detach', projectId, sessionId, tab, sourceLayout, options),
     getDetached: (id) => ipcRenderer.invoke('window:get-detached', id),
     saveDetached: (id, layout, maximizedGroupId) =>
       ipcRenderer.invoke('window:save-detached', id, layout, maximizedGroupId),

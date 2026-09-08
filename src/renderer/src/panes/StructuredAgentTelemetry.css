@@ -74,3 +74,9 @@
 .sa-context-guidance { color: #ed6d72; }
 @keyframes sa-context-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .78; } }
 @media (prefers-reduced-motion: reduce) { .sa-context-circle.level-critical .sa-context-fill { animation: none; } .sa-context-fill { transition: none; } }
+
+/* Background tasks outlive their turn, so the roster labels them and, when the task is
+   driving one of our own runtimes, offers a direct route to that runtime's tab. */
+.sa-subagent-detached { margin-right: 6px; padding: 1px 5px; border-radius: 999px; color: var(--text-2); font-size: 8px; font-style: normal; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; background: var(--surface-hover); }
+.sa-subagent-link { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 6px 22px; padding: 3px 8px; border: 1px solid color-mix(in srgb, var(--accent-muted) 34%, var(--border)); border-radius: 7px; color: var(--text-2); font-size: 9.5px; letter-spacing: .03em; text-transform: uppercase; background: color-mix(in srgb, var(--accent-muted) 10%, transparent); transition: color 120ms ease, background 120ms ease, border-color 120ms ease; }
+.sa-subagent-link:hover { color: var(--text); border-color: var(--accent-muted); background: color-mix(in srgb, var(--accent-muted) 18%, transparent); }

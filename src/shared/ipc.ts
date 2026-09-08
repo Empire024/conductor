@@ -35,6 +35,7 @@ import type { AgentCollaborationBridge } from './agent-collaboration'
 import type { StructuredAgentBridge } from './structured-agent'
 
 export interface ConductorBridge {
+  agentControl: import('./agent-control').AgentControlBridge
   projectTasks: import('./project-backlog').ProjectBacklogBridge
   nativeCli: {
     ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }>
@@ -106,6 +107,7 @@ export interface ConductorBridge {
     flush(snapshot: WorkspaceRecoveryCheckpoint): boolean
   }
   files: {
+    onChanged(callback: (event: import('./agent-control').AgentFileChange) => void): () => void
     importImage(projectId: string, name: string, bytes: Uint8Array): Promise<import('./structured-agent').ContextAttachment>
     onOpenShortcut(callback: () => void): () => void
     browserUrl(projectId: string, path: string): Promise<string>
@@ -186,7 +188,7 @@ export interface ConductorBridge {
     isMaximized(): Promise<boolean>
     onMaximizedChange(callback: (maximized: boolean) => void): () => void
     isCursorOutside(): Promise<boolean>
-    detach(projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout): Promise<DetachedWindowRecord>
+    detach(projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout, options?: { alwaysOnTop?: boolean }): Promise<DetachedWindowRecord>
     getDetached(id: string): Promise<{ record: DetachedWindowRecord; project: ProjectRecord; session: SessionRecord } | null>
     saveDetached(id: string, layout: WorkspaceLayout, maximizedGroupId: string | null): Promise<void>
     flushDetached(id: string, layout: WorkspaceLayout, maximizedGroupId: string | null): void

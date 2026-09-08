@@ -24,7 +24,7 @@ describe('compact composer controls (synthetic, zero inference)', () => {
     expect(html).toContain('role="combobox"')
     expect(html).toContain('aria-label="Model"')
     expect(html).toContain('aria-expanded="false"')
-    expect(html).toContain('Choose model</span>')
+    expect(html).toContain('GPT 6 Astra</span>')
     expect(html).not.toContain('role="listbox"')
     expect(html).not.toContain('Search models')
     expect(html).not.toContain('Provider')
@@ -122,10 +122,10 @@ it('offers only modes reported by the provider in the bottom controls', () => {
 })
 
 
-it('shows Claude configured default metadata until the runtime reports the model', () => {
+it('chooses Claude Opus explicitly until native model metadata is available', () => {
   const claude: ProviderCapabilities = { ...capabilities, provider: 'claude', models: [{ id: 'default', label: 'Default (Opus)', effort: ['high'] }] }
-  expect(render({ capabilities: claude }).html).toContain('Default (Opus)</span>')
-  expect(render({ capabilities: { ...claude, models: [] } }).html).toContain('Claude configured model</span>')
+  expect(render({ capabilities: claude }).html).toContain('Claude Opus</span>')
+  expect(render({ capabilities: { ...claude, models: [] } }).html).toContain('Claude Opus</span>')
   expect(render({ capabilities: { ...claude, effectiveSettings: { model: 'claude-opus-runtime' } } }).html).toContain('claude-opus-runtime</span>')
 })
 

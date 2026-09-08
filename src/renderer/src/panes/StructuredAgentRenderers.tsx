@@ -98,17 +98,22 @@ export function safeFileTarget(raw: string, cwd: string): { path: string; line?:
 export function safeExternalLink(href: string): boolean {
   try { const url = new URL(href); return (url.protocol === 'https:' || url.protocol === 'http:') && !url.username && !url.password } catch { return false }
 }
+export function safeConductorLink(href: string): boolean {
+  try { const url = new URL(href); return url.protocol === 'conductor:' && Boolean(url.hostname) && !url.search && !url.hash && !url.port && !url.username && !url.password && /^\/(tab|file|workspace)\/[^/]+$/.test(url.pathname) } catch { return false }
+}
 export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, onOpenFile }: { text: string; cwd: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
-  return <div className="sa-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={(url) => safeExternalLink(url) || safeFileTarget(url, cwd) ? url : ''} components={{
+  const [linkError, setLinkError] = useState('')
+  return <div className="sa-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={(url) => safeConductorLink(url) || safeExternalLink(url) || safeFileTarget(url, cwd) ? url : ''} components={{
     a: ({ href, children }) => {
       if (!href) return <span>{children}</span>
+      const internal = safeConductorLink(href)
       const external = safeExternalLink(href)
-      const target = external ? null : safeFileTarget(href, cwd)
-      return <a href={external ? href : '#'} onClick={(event) => { event.preventDefault(); if (external) void window.conductor.system.openExternal(href); else if (target) { if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, path: target.path, line: target.line, mode: event.shiftKey ? 'external' : 'browser' } })); else onOpenFile(target.path, target.line) } }}>{children}</a>
+      const target = external || internal ? null : safeFileTarget(href, cwd)
+      return <a href={external ? href : '#'} onClick={(event) => { event.preventDefault(); if (internal) void window.conductor.agentControl.openUri(href).catch(reason => setLinkError(reason instanceof Error ? reason.message : String(reason))); else if (external) void window.conductor.system.openExternal(href); else if (target) { if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, path: target.path, line: target.line, mode: event.shiftKey ? 'external' : 'browser' } })); else onOpenFile(target.path, target.line) } }}>{children}</a>
     },
     img: ({ alt }) => <span className="sa-muted">{alt ? '[Image: ' + alt + ']' : '[Image omitted]'}</span>,
     pre: ({ children }) => <MarkdownCodeBlock>{children}</MarkdownCodeBlock>
-  }}>{text}</ReactMarkdown></div>
+  }}>{text}</ReactMarkdown>{linkError && <span className="sa-error" role="alert">{linkError}</span>}</div>
 })
 function MarkdownCodeBlock({ children }: { children: ReactNode }): React.JSX.Element {
   const child = Children.toArray(children)[0]
@@ -244,8 +249,9 @@ function InteractionCard({ item, interactive, onRespond }: ActivityProps): React
   if (item.data.type !== 'interaction') return null
   const request: PendingInteraction = item.data.interaction
   const pending = request.status === 'pending' && interactive
+  const unanswered = (request.questions ?? []).some(question => !(answers[question.id]?.length || custom[question.id]?.trim()))
   const respond = async (decision?: string): Promise<void> => {
-    if (busy || !pending) return
+    if (busy || !pending || request.kind === 'question' && unanswered) return
     setBusy(true)
     try { await onRespond(item, decision, request.kind === 'question' ? Object.fromEntries((request.questions ?? []).map((question) => [question.id, custom[question.id]?.trim() ? [custom[question.id]!.trim()] : answers[question.id] ?? []])) : undefined) }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false) }
@@ -254,7 +260,10 @@ function InteractionCard({ item, interactive, onRespond }: ActivityProps): React
     <summary><span>{request.title}</span><small>{request.status === 'resolved' ? interactionOutcome(request.outcome) : request.status === 'expired' ? 'Expired' : 'Unavailable'}</small></summary>
     <div className="sa-interaction-detail">{request.status === 'expired' && request.outcome && <p>{request.outcome}</p>}<pre><SyntaxCode value={JSON.stringify(request.input, null, 2)} language="json" /></pre>{request.questions?.map((question) => <p key={question.id}>{question.question}</p>)}</div>
   </details>
-  return <section className="sa-interaction needs-attention" aria-label={request.kind + ': ' + request.title}>
+  return <form className="sa-interaction needs-attention" aria-label={request.kind + ': ' + request.title} onSubmit={event => { event.preventDefault(); void respond() }} onKeyDown={event => {
+    if (request.kind !== 'question' || event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing || !(event.target instanceof HTMLInputElement)) return
+    event.preventDefault(); event.stopPropagation(); void respond()
+  }}>
     <header><strong>{request.title}</strong><small>{request.kind === 'question' ? 'Choose an answer' : 'Review and continue'}</small></header>
     {request.kind === 'approval' && <p className="sa-request-summary">{typeof record(request.input).description === 'string' ? String(record(request.input).description) : typeof record(request.input).command === 'string' ? commandSummary(String(record(request.input).command)) : typeof record(request.input).file_path === 'string' ? String(record(request.input).file_path) : ''}</p>}
     {request.questions?.map((question) => <fieldset key={question.id} disabled={busy}>
@@ -273,11 +282,11 @@ function InteractionCard({ item, interactive, onRespond }: ActivityProps): React
       {question.allowCustom !== false && <label className="sa-custom-answer"><span>{question.options.length ? 'Or type an answer' : 'Your answer'}</span><input type={question.isSecret ? 'password' : 'text'} value={custom[question.id] ?? ''} onChange={(event) => setCustom((value) => ({ ...value, [question.id]: event.target.value }))} /></label>}
     </fieldset>)}
     <div className="sa-interaction-actions">{request.kind === 'question'
-      ? <button disabled={busy || (request.questions ?? []).some((question) => !(answers[question.id]?.length || custom[question.id]?.trim()))} onClick={() => void respond()}>Submit answers</button>
-      : request.choices.map((choice) => <button key={choice.id} disabled={busy} onClick={() => void respond(choice.id)}>{choice.label}</button>)}</div>
+      ? <button type="submit" disabled={busy || unanswered}>Submit answers</button>
+      : request.choices.map((choice) => <button type="button" key={choice.id} disabled={busy} onClick={() => void respond(choice.id)}>{choice.label}</button>)}</div>
     <details className="sa-request-details"><summary title="Inspect exact request and scope">Request details</summary><pre>{JSON.stringify(request.input, null, 2)}</pre></details>
     {error && <p role="alert" className="sa-error">{error}</p>}
-  </section>
+  </form>
 }
 /** Legacy journals included expanded attachments in the user text. Collapse, never discard, that suffix. */
 export function legacyAttachedContext(text: string): { prompt: string; context: string } | null {

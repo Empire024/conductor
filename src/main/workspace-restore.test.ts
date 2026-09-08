@@ -77,6 +77,21 @@ describe('reversible workspace closure', () => {
     expect(database.listDetachedWindows().map(item => item.id)).toEqual([detached.id])
   })
 
+  it('returns a floating tab to the visible layout while ordinary detached tabs stay retrievable', () => {
+    const { database, project, session } = setup()
+    const floating: PaneTab = { id: 'floating', kind: 'agent', title: 'Floating', resourceId: 'same-runtime' }
+    const detached = database.createDetachedWindow(project.id, session.id, floating)
+    database.closeDetachedWindow(detached.id, true)
+    const restored = database.getSession(session.id)!
+    expect(restored.layout.root.type === 'group' && restored.layout.root.tabs).toContainEqual(floating)
+    expect(restored.layout.root.type === 'group' && restored.layout.root.activeTabId).toBe(floating.id)
+    expect(restored.closedTabs).not.toContainEqual(floating)
+    const normal: PaneTab = { id: 'normal-window', kind: 'launcher', title: 'Normal' }
+    const window = database.createDetachedWindow(project.id, session.id, normal)
+    database.closeDetachedWindow(window.id)
+    expect(database.getSession(session.id)!.closedTabs).toContainEqual(normal)
+  })
+
   it('preserves workspace order and never duplicates an already open or unknown workspace', () => {
     const { database, project, session } = setup()
     const second = database.createSession(project.id, 'Second')

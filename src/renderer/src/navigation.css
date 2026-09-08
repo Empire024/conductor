@@ -1,0 +1,38 @@
+/* Shared workspace navigation, including detached windows. */
+.pane-group.focused { border-color: var(--border); box-shadow: 0 2px 10px #0000002e; }
+.pane-group.focused .pane-header::before { display: none; }
+.pane-tab, .session-tabs > button.session-tab, .session-tree button, .file-tab, .project-row-wrap { transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease; }
+.pane-tab:hover, .pane-tab.active:hover, .session-tabs > button.session-tab:hover, .session-tabs > button.session-tab.active:hover,
+.session-tree button:hover, .session-tree button.active:hover, .file-tab:hover, .file-tab.active:hover, .project-row-wrap:hover { color: var(--text); background-color: var(--surface-hover); }
+.pane-tab.active:hover::after { background: var(--surface-hover); }
+.pane-tab:focus-visible, .session-tree button:focus-visible, .session-tabs > button:focus-visible { outline: 1px solid var(--accent-muted); outline-offset: -2px; }
+.quick-theme-menu-host { display: flex; align-items: stretch; flex: 0 0 auto; }
+.quick-theme-toggle { height: 100%; min-height: 32px; }
+.quick-theme-toggle > svg { flex: 0 0 17px; }
+.quick-theme-toggle > span { width: 30px; text-align: left; }
+:root.theme-changing, :root.theme-changing * { transition-property: background-color, color, border-color, box-shadow, fill, stroke !important; transition-duration: 400ms !important; transition-timing-function: ease !important; }
+.workspace-tab-tree { margin: 0 0 4px 17px; min-width: 0; }
+.session-tree .workspace-tab-toggle { height: 21px; min-height: 21px; padding: 0 5px; gap: 5px; color: var(--text-3); font-size: 9px; }
+.workspace-tab-row { display: flex; min-width: 0; border-radius: 4px; }
+.workspace-tab-row.selected { background: color-mix(in srgb, var(--surface-hover) 60%, transparent); }
+.session-tree .workspace-tab-select { flex: 1; min-width: 0; height: 25px; padding: 0 5px; gap: 6px; font-size: 10px; }
+.workspace-tab-select > svg, .workspace-tab-select > .provider-logo { flex-shrink: 0; }
+.session-tree .workspace-tab-more { flex: 0 0 23px; width: 23px; height: 25px; padding: 0; justify-content: center; opacity: 0; }
+.workspace-tab-row:hover .workspace-tab-more, .workspace-tab-row:focus-within .workspace-tab-more { opacity: 1; }
+.explorer-dotfile-heading { margin: 7px 6px 3px; padding-top: 6px; border-top: 1px solid var(--border-soft); color: var(--text-3); font-size: 8px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
+.explorer-row.dot-entry { color: var(--text-3); }
+.explorer-row.dot-entry:hover, .explorer-row.dot-entry.selected { color: var(--text); }
+.project-remove-backdrop { z-index: 1600; }
+.project-remove-dialog { width: min(420px, calc(100vw - 32px)); overflow: hidden; border: 1px solid var(--border); border-radius: 10px; color: var(--text); background: var(--surface-1); box-shadow: 0 24px 70px #0007; }
+.project-remove-dialog header { display: flex; align-items: center; gap: 9px; padding: 16px; border-bottom: 1px solid var(--border-soft); }
+.project-remove-dialog header strong { flex: 1; min-width: 0; overflow-wrap: anywhere; font-size: 13px; }
+.project-remove-dialog button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; padding: 7px 10px; color: var(--text-2); background: var(--surface-2); font-size: 11px; }
+.project-remove-dialog button:hover:not(:disabled) { background: var(--surface-hover); color: var(--text); }
+.project-remove-dialog button:disabled { opacity: .55; }
+.project-remove-dialog header button { padding: 4px; border: 0; background: transparent; }
+.project-remove-dialog p { margin: 0; padding: 16px; color: var(--text-2); line-height: 1.65; font-size: 12px; }
+.project-remove-dialog code { display: block; margin: 0 16px 16px; padding: 10px; border-radius: 5px; background: var(--surface-0); color: var(--text-3); overflow-wrap: anywhere; font-size: 10px; user-select: text; }
+.project-remove-dialog footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border-soft); }
+.project-remove-dialog button.danger { color: var(--danger); }
+.project-remove-dialog button.danger:hover:not(:disabled) { color: #fff; background: #8e343b; }
+@media (prefers-reduced-motion: reduce) { :root.theme-changing, :root.theme-changing *, .pane-tab, .session-tabs > button.session-tab, .session-tree button, .file-tab { transition: none !important; } }

@@ -1,3 +1,4 @@
+import { concreteModel } from '../../../shared/agent-model-selection'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 
 const reported = (value: unknown): value is string => typeof value === 'string' && Boolean(value) && !['default', 'auto'].includes(value)
@@ -9,12 +10,11 @@ export function resolvedComposerSettings(settings: SessionSettings, capabilities
   const effective = capabilities?.effectiveSettings
   const values = effective && typeof effective === 'object' && !Array.isArray(effective) ? effective : {}
   const configured = reported(settings.model) ? settings.model : undefined
-  const catalogDefault = capabilities?.models.find(model => model.isDefault && reported(model.id))
-  const model = configured ?? (reported(values.model) ? values.model : catalogDefault?.id) ?? ''
-  const info = capabilities?.models.find(option => option.id === model)
-  const defaultLabel = capabilities?.provider === 'claude' ? capabilities.models.find(option => option.id === 'default')?.label : undefined
-  const label = info && !/^default\b/i.test(info.label) ? modelDisplayName(info.label) : model ? modelDisplayName(model) : defaultLabel ?? (capabilities?.provider === 'claude' ? 'Claude configured model' : capabilities ? 'Model not reported' : 'Choose model')
-  const effort = reported(settings.effort) ? settings.effort : (!configured || configured === values.model) && reported(values.effort) ? values.effort : info?.defaultEffort
+  const model = concreteModel(capabilities?.provider ?? 'codex', settings.model, capabilities)
+  const actual = reported(values.model) && ['opus', 'sonnet', 'haiku', 'fable'].includes(model) && values.model.includes(model) ? values.model : model
+  const info = capabilities?.models.find(option => option.id === actual)
+  const label = info && !/^default\b/i.test(info.label) ? modelDisplayName(info.label) : modelDisplayName(actual === 'opus' ? 'Claude Opus' : actual)
+  const effort = reported(settings.effort) ? settings.effort : (!configured || configured === values.model || actual === values.model) && reported(values.effort) ? values.effort : info?.defaultEffort
   return { model, label, effort }
 }
 
