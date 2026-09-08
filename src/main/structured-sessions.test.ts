@@ -6,7 +6,7 @@ import { claudeHistoryPath } from './native-history'
 import { ConductorDatabase } from './database'
 import { StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
-import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
+import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
@@ -26,7 +26,9 @@ class FakeProvider implements ProviderAdapter {
   submissions: Array<{ text: string; settings: SessionSettings; attachments?: ContextAttachment[] }> = []
   steers: Array<{ text: string; settings: SessionSettings; attachments?: ContextAttachment[] }> = []
   onSteer?: () => Promise<void>
-  async steer(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> { this.steers.push({ text, settings, attachments }); await this.onSteer?.() }
+  autoDeliver = true
+  steerIds: string[] = []
+  async steer(text: string, settings: SessionSettings, attachments?: ContextAttachment[], inputId = 'fixture-input'): Promise<void> { this.steers.push({ text, settings, attachments }); this.steerIds.push(inputId); await this.onSteer?.(); if (this.autoDeliver) this.emit({ data: { type: 'input_delivery', inputId, status: 'delivered' } }) }
   responses: InteractionResponse[] = []
   startGate?: Promise<void>
   responseGate?: Promise<void>
@@ -643,4 +645,234 @@ describe('mid-turn steering and input retention', () => {
     expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toHaveLength(100)
     expect(f.current.steers).toHaveLength(0)
   })
+})
+
+
+describe('permission response acknowledgment and mode persistence', () => {
+  it('retains a definitively rejected approval so another action can resolve it', async () => {
+    const f = fixture(); await f.manager.submit(f.spec.id, 'Synthetic', settings)
+    f.current.approval()
+    f.current.onResponse = async () => { throw new InteractionResponseRejectedError('Native policy rejected auto mode before answering') }
+    const response = { sessionId: f.spec.id, runtimeId: f.current.options.runtimeId, requestId: 'request', decision: 'allow' }
+    await expect(f.manager.respond(response)).rejects.toThrow('Native policy rejected')
+    expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'pending' } })
+    f.current.onResponse = undefined
+    await f.manager.respond({ ...response, decision: 'deny' })
+    expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'resolved', outcome: 'deny' } })
+  })
+  it('persists confirmed provider mode while preserving cancellation during its acknowledgment', async () => {
+    const f = fixture(); await f.manager.submit(f.spec.id, 'Synthetic', settings)
+    f.current.approval()
+    f.current.onResponse = async () => {
+      f.current.emit({ requestId: 'request', data: { type: 'interaction', interaction: { id: 'request', kind: 'approval', title: 'Expired', input: {}, choices: [], status: 'expired', outcome: 'Provider cancelled request' } } })
+      f.current.emit({ data: { type: 'session', phase: 'running', settings: { ...settings, permission: 'auto', plan: false } } })
+    }
+    await f.manager.respond({ sessionId: f.spec.id, runtimeId: f.current.options.runtimeId, requestId: 'request', decision: 'allow' })
+    expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ settings: { permission: 'auto', plan: false }, phase: 'running' })
+    expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'expired', outcome: 'Provider cancelled request' } })
+    f.current.finish(); await f.manager.resume(f.spec.id)
+    expect(f.current.options.settings.permission).toBe('auto')
+  })
+  it('rejects disabled scopes before transport dispatch and keeps uncertain delivery nonretryable', async () => {
+    const f = fixture(); await f.manager.submit(f.spec.id, 'Synthetic', settings)
+    f.current.emit({ requestId: 'request', data: { type: 'interaction', interaction: { id: 'request', kind: 'approval', title: 'Permission', input: {}, choices: [{ id: 'allow-session', label: 'Allow for this session', disabled: true }, { id: 'allow', label: 'Allow once' }], status: 'pending' } } })
+    const response = { sessionId: f.spec.id, runtimeId: f.current.options.runtimeId, requestId: 'request', decision: 'allow-session' }
+    await expect(f.manager.respond(response)).rejects.toThrow('Unsupported approval scope')
+    expect(f.current.responses).toHaveLength(0)
+    f.current.onResponse = async () => { throw new Error('Transport disconnected') }
+    await expect(f.manager.respond({ ...response, decision: 'allow' })).rejects.toThrow('Transport disconnected')
+    expect(f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'interaction')?.data).toMatchObject({ interaction: { status: 'expired', outcome: 'Response delivery uncertain' } })
+    await expect(f.manager.respond({ ...response, decision: 'allow' })).rejects.toThrow('already submitted')
+  })
+})
+
+
+it.each(['resume', 'handoff', 'restore'] as const)('expires a provider session Edit grant on %s', async transition => {
+  const f = fixture(); await f.manager.submit(f.spec.id, 'Synthetic', settings)
+  const current = f.current
+  current.emit({ data: { type: 'session', phase: 'completed', settings: { ...settings, permission: 'accept-edits', temporaryPermission: { runtimeId: current.options.runtimeId, restore: 'default' } } } })
+  const grant = f.database.structured.snapshot(f.spec.id)!.settings
+  await f.manager.submit(f.spec.id, 'Same runtime retains Edit', grant)
+  expect(current.submissions.at(-1)?.settings.permission).toBe('accept-edits')
+  current.finish()
+  if (transition === 'handoff') {
+    const cli = await f.manager.prepareCli(f.spec.id)
+    expect(cli.settings).toMatchObject({ permission: 'default' })
+    expect(cli.settings.temporaryPermission).toBeUndefined()
+  } else if (transition === 'restore') {
+    f.manager.dispose()
+    const recovered = new StructuredSessions(f.database, () => 'synthetic-executable', f.broadcast, f.factory); managers.push(recovered)
+    await recovered.resume(f.spec.id)
+    expect(f.current.options.settings.permission).toBe('default')
+    expect(f.current.options.settings.temporaryPermission).toBeUndefined()
+  } else {
+    await f.manager.resume(f.spec.id, grant)
+    expect(f.current.options.settings.permission).toBe('default')
+    expect(f.current.options.settings.temporaryPermission).toBeUndefined()
+  }
+  expect(f.database.structured.snapshot(f.spec.id)?.settings.permission).toBe('default')
+  expect(f.database.structured.snapshot(f.spec.id)?.settings.temporaryPermission).toBeUndefined()
+})
+
+
+describe('steering receipts and Escape delivery', () => {
+  async function pendingFixture() {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.capabilities.steering = true; f.current.autoDeliver = false
+    f.current.emit({ turnId: 'original-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+    await f.manager.steer(f.spec.id, 'Already submitted', settings)
+    const id = f.current.steerIds[0]!
+    return { ...f, inputId: id, receipt: (status: 'accepted' | 'delivered' | 'cancelled' | 'uncertain') => f.current.emit({ data: { type: 'input_delivery', inputId: id, status } }) }
+  }
+  it('keeps input pending across a tool result until the native consumption receipt, and ignores duplicate receipts', async () => {
+    const f = await pendingFixture()
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering?.[0]).toMatchObject({ text: 'Already submitted', status: 'sending' })
+    f.receipt('accepted')
+    f.current.emit({ itemId: 'tool', data: { type: 'tool', name: 'Read', status: 'completed', output: 'Synthetic result' } })
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering?.[0]?.status).toBe('accepted')
+    expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(1)
+    f.receipt('delivered'); f.receipt('delivered'); f.receipt('accepted')
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toEqual([])
+    expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(2)
+    expect(f.current.submissions).toHaveLength(1)
+  })
+  it.each(['receipt-first', 'completion-first'])('Escape submits the exact cancelled pending input once after both confirmations (%s)', async order => {
+    const f = await pendingFixture()
+    f.receipt('accepted')
+    let finishInterrupt = () => {}
+    f.current.interrupt = () => new Promise<void>(resolve => { finishInterrupt = resolve })
+    const stopping = f.manager.interrupt(f.spec.id, true)
+    const secondStop = f.manager.interrupt(f.spec.id, true)
+    if (order === 'receipt-first') f.receipt('cancelled')
+    f.current.emit({ data: { type: 'session', phase: 'interrupted' } })
+    await Promise.resolve()
+    expect(f.current.submissions).toHaveLength(1)
+    if (order === 'completion-first') f.receipt('cancelled')
+    finishInterrupt(); await Promise.all([stopping, secondStop])
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    expect(f.current.submissions[1]?.text).toBe('Already submitted')
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toEqual([])
+  })
+  it('does not replay input absorbed during interruption, or interrupt without submitted input', async () => {
+    const f = await pendingFixture()
+    f.current.interrupt = async () => { f.receipt('delivered'); f.current.emit({ data: { type: 'session', phase: 'interrupted' } }) }
+    await f.manager.interrupt(f.spec.id, true)
+    expect(f.current.submissions).toHaveLength(1)
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toEqual([])
+    f.current.emit({ data: { type: 'session', phase: 'running' } })
+    await f.manager.interrupt(f.spec.id, true)
+    expect(f.current.submissions).toHaveLength(1)
+  })
+  it('does not replay a cancellation without proof, or replay from a budget stop', async () => {
+    const f = await pendingFixture()
+    await f.manager.interrupt(f.spec.id, true)
+    expect(f.current.submissions).toHaveLength(1)
+    f.current.emit({ data: { type: 'session', phase: 'running' } })
+    f.current.interrupt = async () => { f.receipt('cancelled'); f.current.emit({ data: { type: 'session', phase: 'interrupted' } }) }
+    await f.manager.interrupt(f.spec.id)
+    expect(f.current.submissions).toHaveLength(1)
+    expect(f.manager.cancelQueued(f.spec.id, f.inputId)?.text).toBe('Already submitted')
+  })
+  it('promotes a message queued during native startup into the active turn once steering becomes available', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    f.current.emit({ data: { type: 'session', phase: 'running' } })
+    await f.manager.steer(f.spec.id, 'After next tool', settings)
+    expect(f.current.steers).toHaveLength(0)
+    f.current.capabilities.steering = true
+    f.current.emit({ turnId: 'ready-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+    await vi.waitFor(() => expect(f.current.steers).toHaveLength(1))
+    expect(f.current.submissions).toHaveLength(1)
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toEqual([])
+  })
+})
+
+
+it('steers startup-held input past an explicitly after-turn queued message', async () => {
+  const f = fixture()
+  await f.manager.submit(f.spec.id, 'Original', settings)
+  f.current.emit({ data: { type: 'session', phase: 'running' } })
+  await f.manager.queue(f.spec.id, 'After the whole turn', settings)
+  await f.manager.steer(f.spec.id, 'Next tool please', settings)
+  f.current.capabilities.steering = true
+  f.current.emit({ turnId: 'ready-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+  await vi.waitFor(() => expect(f.current.steers).toHaveLength(1))
+  expect(f.current.steers[0]?.text).toBe('Next tool please')
+  expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.map(input => input.text)).toEqual(['After the whole turn'])
+  expect(f.current.submissions).toHaveLength(1)
+})
+
+it('Escape expedites a host-held steering message after native interruption', async () => {
+  const f = fixture()
+  await f.manager.submit(f.spec.id, 'Original', settings)
+  f.current.emit({ data: { type: 'session', phase: 'running' } })
+  await f.manager.steer(f.spec.id, 'Held during startup', settings)
+  await f.manager.interrupt(f.spec.id, true)
+  await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+  expect(f.current.submissions[1]?.text).toBe('Held during startup')
+  expect(f.current.steers).toHaveLength(0)
+})
+
+
+it('transfers a promoted queue entry to native pending ownership even when delivery becomes uncertain', async () => {
+  const f = fixture()
+  await f.manager.submit(f.spec.id, 'Original', settings)
+  f.current.emit({ data: { type: 'session', phase: 'running' } })
+  await f.manager.queue(f.spec.id, 'Unrelated after turn', settings)
+  await f.manager.steer(f.spec.id, 'Do not deliver twice', settings)
+  f.current.capabilities.steering = true
+  f.current.onSteer = async () => { throw new Error('Native acknowledgment lost') }
+  f.current.emit({ turnId: 'ready-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+  await vi.waitFor(() => expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering?.[0]?.status).toBe('uncertain'))
+  expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.map(input => input.text)).toEqual(['Unrelated after turn'])
+  expect(f.current.steers).toHaveLength(1)
+  f.current.emit({ data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+  f.current.finish()
+  await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+  expect(f.current.steers).toHaveLength(1)
+  expect(f.current.submissions[1]?.text).toBe('Unrelated after turn')
+  f.current.finish()
+  await new Promise(resolve => setImmediate(resolve))
+  await f.manager.resume(f.spec.id)
+  expect(f.current.submissions).toHaveLength(0)
+  expect(f.current.steers).toHaveLength(0)
+  expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toEqual([])
+  expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toMatchObject([{ text: 'Do not deliver twice', status: 'uncertain' }])
+})
+
+
+it('retains transferred input when a definite native refusal races with Stop', async () => {
+  const f = fixture()
+  await f.manager.submit(f.spec.id, 'Original', settings)
+  f.current.emit({ data: { type: 'session', phase: 'running' } })
+  await f.manager.steer(f.spec.id, 'Recover after Stop', settings, [{ id: 'context', kind: 'selection', name: 'Selected text', content: 'Exact captured bytes' }])
+  let refuse = () => {}
+  f.current.onSteer = () => new Promise<void>((_resolve, reject) => { refuse = () => reject(new SteeringUnavailableError('The active turn stopped')) })
+  f.current.capabilities.steering = true
+  f.current.emit({ turnId: 'ready-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+  await vi.waitFor(() => expect(f.current.steers).toHaveLength(1))
+  await f.manager.interrupt(f.spec.id)
+  refuse()
+  await vi.waitFor(() => expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering?.[0]?.status).toBe('cancelled'))
+  expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('interrupted')
+  expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toEqual([])
+  expect(f.current.submissions).toHaveLength(1)
+  expect(f.manager.cancelQueued(f.spec.id, f.current.steerIds[0])).toMatchObject({ text: 'Recover after Stop', attachments: [{ content: 'Exact captured bytes' }] })
+  expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toEqual([])
+})
+
+
+it.each([false, true])('retains explicitly queued unsupported-turn input after interrupt(expedite=%s)', async expedite => {
+  const f = fixture()
+  await f.manager.submit(f.spec.id, 'Original', settings)
+  f.current.capabilities.steering = false
+  f.current.emit({ turnId: 'non-steerable-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+  await f.manager.queue(f.spec.id, 'Explicit after-turn queue', settings)
+  await f.manager.interrupt(f.spec.id, expedite)
+  expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('interrupted')
+  expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toMatchObject([{ text: 'Explicit after-turn queue' }])
+  expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.[0]?.steer).toBeUndefined()
+  expect(f.current.steers).toHaveLength(0)
+  expect(f.current.submissions).toHaveLength(1)
 })

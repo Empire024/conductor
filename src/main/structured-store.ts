@@ -61,6 +61,7 @@ export class StructuredAgentStore {
       const events = this.events(row.id, state.sequence)
       let restored = events.reduce(projectAgentEvent, state)
       if (['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(restored.phase)) restored = { ...restored, phase: 'disconnected' }
+      restored.pendingSteering = restored.pendingSteering?.map(input => ['sending', 'accepted'].includes(input.status) ? { ...input, status: 'uncertain' as const } : input)
       restored.items = restored.items.map(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' ? { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' } } } : item)
       restored.items = restored.items.map(item => item.data.type === 'tool' && ['running', 'preparing', 'awaiting_approval'].includes(item.data.status) ? { ...item, data: { ...item.data, status: 'interrupted' } } : item)
       if (row.provider === 'claude') restored.items = recoverClaudeMessageDuplicates(restored.items)

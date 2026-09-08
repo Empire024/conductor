@@ -1,3 +1,4 @@
+import { settingsForRuntime } from '../../../shared/structured-agent'
 import { conversationIdentity } from './conversation-tab'
 import { PromptImageUpload, PromptImageThumbnail } from '../components/PromptImageUpload'
 import { ProviderIcon } from '../components/ProviderIcon'
@@ -122,6 +123,13 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       const events = queue
       queue = []
       setProjection((current) => events.reduce(projectAgentEvent, current))
+      // A permission action changes the running provider mode in every pane.
+      // Preserve any locally selected model/effort for the next message.
+      const modeUpdate = events.filter(event => event.data.type === 'session' && event.data.settings).at(-1)
+      if (modeUpdate?.data.type === 'session' && modeUpdate.data.settings) {
+        const confirmed = modeUpdate.data.settings
+        setSettings(current => ({ ...current, permission: confirmed.permission, plan: confirmed.plan, temporaryPermission: confirmed.temporaryPermission }))
+      }
     }
     // Subscribe first, then merge events received while reading the durable snapshot.
     const off = window.conductor.structured.onEvents((events) => {
@@ -141,7 +149,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       queue = []
       initialized = true
       setProjection(state)
-      if (snapshot) setSettings({ ...snapshot.settings, model: concreteModel(snapshot.capabilities?.provider ?? provider, snapshot.settings.model, snapshot.capabilities) })
+      if (snapshot) setSettings({ ...state.settings, model: concreteModel(state.capabilities?.provider ?? provider, state.settings.model, state.capabilities) })
       setReady(true)
     }
     void initialize().catch((reason: unknown) => { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) })
@@ -345,13 +353,13 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     void connect().then(() => window.conductor.structured.discover(activeId)).then(result => { if (activeIdRef.current === activeId) setCommandDiscovery(result) }).catch(() => { /* Local commands remain available if provider discovery fails. */ }).finally(() => { if (activeIdRef.current === activeId) setCommandLoading(false) })
   }, [commandsOpen, activeId, ready, historical])
 
-  const stop = (): void => { void window.conductor.structured.interrupt(activeId).catch((reason: unknown) => setError(String(reason))) }
+  const stop = (expediteSubmittedInput = false): void => { void window.conductor.structured.interrupt(activeId, expediteSubmittedInput).catch((reason: unknown) => setError(String(reason))) }
   const needsResume = !historical && Boolean(projection.nativeSessionId) && ['interrupted', 'disconnected'].includes(projection.phase)
   useEffect(() => {
     const escape = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape' || event.defaultPrevented || document.querySelector('dialog[open], [aria-modal="true"], .settings-scrim, .palette-backdrop') || addFileOpen) return
       if (!pane.current?.contains(document.activeElement) || !activePhases.has(projection.phase) || historical) return
-      event.preventDefault(); event.stopPropagation(); stop()
+      event.preventDefault(); event.stopPropagation(); stop(true)
     }
     window.addEventListener('keydown', escape)
     return () => window.removeEventListener('keydown', escape)
@@ -359,6 +367,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
 
   const canSubmit = ready && !historical && !resuming && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
   const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
+  const pendingSteering = projection.pendingSteering ?? []
   const queuedPrompts = projection.queuedPrompts ?? (projection.queued ? [projection.queued] : [])
   const capabilities = projection.capabilities
   const pending = projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length
@@ -418,7 +427,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }
   const parentLabels = useMemo(() => new Map(projection.items.flatMap(item => item.nativeItemId && (item.data.type === 'tool' || item.data.type === 'subagent') ? [[item.runtimeId + ':' + item.nativeItemId, item.data.name] as const] : [])), [projection.items])
   const activityGroups = useMemo(() => groupConversationActivities(visibleItems), [visibleItems])
-  const updateSettings = (change: Partial<SessionSettings>): void => setSettings((current) => ({ ...current, ...change }))
+  const updateSettings = (change: Partial<SessionSettings>): void => setSettings((current) => ({ ...(change.permission !== undefined || change.plan !== undefined ? settingsForRuntime(current) : current), ...change }))
   const chooseCommand = (command: ComposerCommand): void => {
     setCommandDismissed(true); setCommandIndex(0)
     setMessage(command.insert ?? '')
@@ -489,12 +498,20 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>
     <StructuredAgentTelemetry key={activeId} modelLabel={resolvedComposerSettings(settings, capabilities).label} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} />
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }}>
+      {pendingSteering.length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{pendingSteering.map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>
+        <strong>{input.status === 'sending' ? 'Sending' : input.status === 'accepted' ? 'Received' : input.status === 'cancelled' ? 'Not sent' : 'Delivery uncertain'}</strong>
+        <span title={input.text}>{input.text}</span>
+        <small role="status">{input.status === 'sending' ? 'Waiting for the agent to acknowledge this message' : input.status === 'accepted' ? 'Message will be sent after the next tool use. Esc interrupts and sends now.' : input.status === 'cancelled' ? 'The agent cancelled this message before receiving it' : 'Check the conversation before resending'}</small>
+        {['cancelled', 'uncertain'].includes(input.status) && <button type="button" aria-label="Return steering message to draft" title="Return this message to the composer" onClick={() => {
+          void window.conductor.structured.cancelQueued(activeId, input.id).then(queued => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments(current => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch(reason => setError(String(reason)))
+        }}><X size={12} /></button>}
+      </div>)}</div>}
       {queuedPrompts.length > 0 && <div className="sa-queue-list" aria-label="Queued messages">{queuedPrompts.map((prompt, index) => <div className="sa-queue" key={prompt.id}><strong>Queued {index + 1}</strong><span title={prompt.text}>{prompt.text}</span>{prompt.attachments.length > 0 && <small>{prompt.attachments.length} attached</small>}<button type="button" title="Return queued message to draft" aria-label={'Remove queued message ' + (index + 1)} onClick={() => {
         void window.conductor.structured.cancelQueued(activeId, prompt.id).then((queued) => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments((current) => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch((reason: unknown) => setError(String(reason)))
       }}><X size={12} /></button></div>)}</div>}
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title="Inspect attached context" onClick={() => setInspectAttachment(attachment)}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button><button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => setAttachments(current => current.filter(item => item.id !== attachment.id))}><X size={11} /></button></span>)}</div>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
-      <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? 'Send to running turn' : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => setCommandDismissed(true)} onChange={event => { setMessage(event.target.value); setCommandDismissed(false); setCommandIndex(0) }} onKeyDown={event => {
+      <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? 'Message after the next tool use' : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => setCommandDismissed(true)} onChange={event => { setMessage(event.target.value); setCommandDismissed(false); setCommandIndex(0) }} onKeyDown={event => {
         if (event.nativeEvent.isComposing) return
         if (commandsOpen) {
           if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); setCommandDismissed(true); return }
@@ -508,7 +525,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         <button type="button" aria-label="Attach file context" title="Attach context" disabled={historical} onClick={() => setAddFileOpen(open => !open)}><FilePlus2 size={15} /></button>
         <StructuredComposerControls key={activeId} settings={settings} capabilities={capabilities} disabled={historical || !ready} onChange={updateSettings} onDiscover={connect} />
         <span className="sa-spacer" />
-        {activePhases.has(projection.phase) && !message.trim() ? <button className="sa-send sa-stop agent-send-button" type="button" aria-label="Stop" title="Stop · Esc" disabled={projection.phase === 'interrupting' || historical} onClick={stop}><Square size={13} fill="currentColor" /></button> : needsResume ? <button className="sa-send agent-send-button" type="button" aria-label="Resume conversation" title="Resume the same conversation" onClick={() => void resume()}><Play size={15} /></button> : <button className="sa-send agent-send-button" type="submit" aria-label={steering ? 'Steer' : activePhases.has(projection.phase) ? 'Queue message' : 'Send message'} title={steering ? 'Send to running turn · Enter' : activePhases.has(projection.phase) ? 'Queue message after this turn · Enter' : 'Send message · Enter'} disabled={!canSubmit || !message.trim() || submitting}><Send size={15} /></button>}
+        {activePhases.has(projection.phase) && !message.trim() ? <button className="sa-send sa-stop agent-send-button" type="button" aria-label="Stop" title="Stop · Esc" disabled={projection.phase === 'interrupting' || historical} onClick={() => stop()}><Square size={13} fill="currentColor" /></button> : needsResume ? <button className="sa-send agent-send-button" type="button" aria-label="Resume conversation" title="Resume the same conversation" onClick={() => void resume()}><Play size={15} /></button> : <button className="sa-send agent-send-button" type="submit" aria-label={steering ? 'Steer' : activePhases.has(projection.phase) ? 'Queue message' : 'Send message'} title={steering ? 'Send to running turn · Enter' : activePhases.has(projection.phase) ? 'Queue message after this turn · Enter' : 'Send message · Enter'} disabled={!canSubmit || !message.trim() || submitting}><Send size={15} /></button>}
       </footer>
       {addFileOpen && <FileAttachmentInput projectId={props.project.id} value={filePath} onChange={setFilePath} onAttach={(path) => void addFile(path)} onClose={() => { setAddFileOpen(false); composer.current?.focus() }} />}
     </form>

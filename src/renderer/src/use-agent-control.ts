@@ -60,9 +60,15 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
     const created = request.params.tab as PaneTab | undefined
     if (!created?.id || !created.kind) throw new Error('A prepared tab is required.')
     const existing = groups.find(candidate => candidate.tabs.some(item => item.id === created.id))
-    if (existing) { group = existing; next = { ...session, layout: activateTab(session.layout, existing.id, created.id), maximizedGroupId: null } }
-    else next = { ...session, layout: addTab(session.layout, group.id, created), maximizedGroupId: null }
-    focusedGroupId = group.id; tab = created; reveal = true; result = serialize(created, group.id)
+    const focus = request.params.focus !== false
+    if (existing) { group = existing; if (focus) next = { ...session, layout: activateTab(session.layout, existing.id, created.id), maximizedGroupId: null } }
+    else {
+      const added = addTab(session.layout, group.id, created)
+      // Owner task assignment keeps its dialog alive until native submission
+      // returns, including when Project tasks is itself the active pane tab.
+      next = { ...session, layout: focus ? added : activateTab(added, group.id, group.activeTabId), maximizedGroupId: focus ? null : session.maximizedGroupId }
+    }
+    focusedGroupId = group.id; tab = created; reveal = focus; result = serialize(created, group.id)
   } else {
     if (!tab) throw new Error('The requested tab is no longer open.')
     if (request.action === 'tabs.rename') {

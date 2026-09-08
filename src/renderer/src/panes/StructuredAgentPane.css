@@ -308,3 +308,6 @@
 .sa-history-banner small { font-size: 10px; color: var(--text-3); }
 .sa-history-help, .sa-history-loading { color: var(--text-2); padding: 0 16px; font-size: 11px; }
 .sa-history-loading { display: flex; align-items: center; gap: 7px; }
+
+.sa-steering-prompt { flex-wrap: wrap; }
+.sa-steering-prompt small { order: 1; flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; font-size: 11px; }

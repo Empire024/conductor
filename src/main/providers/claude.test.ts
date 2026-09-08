@@ -12,6 +12,7 @@ const settings: SessionSettings = { permission: 'default', plan: false }
 const flush = async (): Promise<void> => { await new Promise<void>((resolve) => setImmediate(resolve)) }
 class FakeTransport {
   connected = false
+  autoControlResponses = true
   sent: Json[] = []
   constructor(readonly options: TransportOptions, private autoInitialize = true) {}
   start(): void { this.connected = true }
@@ -20,7 +21,7 @@ class FakeTransport {
     if (!this.connected) throw new Error('Disconnected')
     this.sent.push(value)
     const message = value as { type?: string; request_id?: string; request?: { subtype?: string } }
-    if (message.type === 'control_request' && (message.request?.subtype !== 'initialize' || this.autoInitialize)) queueMicrotask(() => this.receive({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id!, response: { models: [{ value: 'fixture-model', displayName: 'Synthetic model' }] } } }))
+    if (this.autoControlResponses && message.type === 'control_request' && (message.request?.subtype !== 'initialize' || this.autoInitialize)) queueMicrotask(() => this.receive({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id!, response: { models: [{ value: 'fixture-model', displayName: 'Synthetic model' }] } } }))
   }
   receive(value: Json): void { this.options.onMessage(value) }
 }
@@ -544,4 +545,214 @@ it('attaches actual bounded background command output to its task record', async
   f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'background-1', is_backgrounded: true, description: 'Run checks' })
   f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'background-1', status: 'completed', output_file: outputFile })
   await vi.waitFor(() => expect(f.projection().items.find(item => item.data.type === 'subagent')?.data).toMatchObject({ name: 'Run checks', status: 'completed', detached: true, outputFile, output: 'Native background command completed successfully', outputTruncated: false }))
+})
+
+
+describe('Claude permission actions and native approval boundaries', () => {
+  function request(f: ReturnType<typeof fixture>, id = 'approval') {
+    const item = f.projection().items.find(item => item.data.type === 'interaction' && item.data.interaction.id === id)
+    if (item?.data.type !== 'interaction') throw new Error('Missing permission request')
+    return item.data.interaction
+  }
+  function answer(id: string, decision: string) { return { sessionId: 'session', runtimeId: 'incarnation-A', requestId: id, decision } }
+  function modeAck(f: ReturnType<typeof fixture>, error?: string) {
+    const sent = f.transport.sent.at(-1) as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: error ? 'error' : 'success', request_id: sent.request_id, ...(error ? { error } : { response: {} }) } })
+  }
+  it('shows distinct session and auto actions without inventing a reusable grant', async () => {
+    const f = fixture(); await f.adapter.start()
+    f.transport.receive(permission('approval', 'shell', 'Bash', { command: 'npm test' }))
+    expect(request(f).choices).toContainEqual(expect.objectContaining({ id: 'allow-session', label: 'Allow for this session', disabled: true, description: expect.stringContaining('did not offer') }))
+    expect(request(f).choices).toContainEqual(expect.objectContaining({ id: 'auto-mode', label: 'Switch to auto-mode', disabled: false }))
+    await expect(f.adapter.respond(answer('approval', 'allow-session'))).rejects.toThrow('Unsupported')
+    expect(request(f).status).toBe('pending')
+    await f.adapter.respond(answer('approval', 'allow'))
+    expect(f.transport.sent.at(-1)).toMatchObject({ response: { response: { behavior: 'allow', updatedInput: { command: 'npm test' } } } })
+    expect(JSON.stringify(f.transport.sent.at(-1))).not.toContain('updatedPermissions')
+  })
+  it('limits native suggestions to the permitted tool and session, including provider Edit rules for Write', async () => {
+    const f = fixture(); await f.adapter.start()
+    f.transport.receive({ type: 'control_request', request_id: 'approval', request: {
+      subtype: 'can_use_tool', tool_use_id: 'write', tool_name: 'Write', input: { file_path: 'report.txt', content: 'data' },
+      permission_suggestions: [
+        { type: 'addRules', behavior: 'allow', destination: 'userSettings', rules: [{ toolName: 'Edit', ruleContent: '/report.txt' }] },
+        { type: 'addRules', behavior: 'allow', destination: 'projectSettings', rules: [{ toolName: 'Bash' }] },
+        { type: 'setMode', mode: 'bypassPermissions', destination: 'session' },
+        { type: 'addDirectories', directories: ['C:/'], destination: 'session' }
+      ]
+    } })
+    expect(request(f).choices.find(choice => choice.id === 'allow-session')).toMatchObject({ disabled: false, description: expect.stringContaining('Edit(/report.txt)') })
+    await f.adapter.respond(answer('approval', 'allow-session'))
+    expect(f.transport.sent.at(-1)).toMatchObject({ response: { response: { updatedPermissions: [{ type: 'addRules', behavior: 'allow', destination: 'session', rules: [{ toolName: 'Edit', ruleContent: '/report.txt' }] }] } } })
+    // If Claude still requests a matching permission, host grants must never skip it:
+    // native ask rules and required-interaction tools outrank native allow rules.
+    f.transport.receive(permission('required-again', 'write-again', 'Write', { file_path: 'report.txt', content: 'data' }))
+    expect(request(f, 'required-again').status).toBe('pending')
+    expect(f.projection().settings.permission).toBe('default')
+    f.adapter.dispose()
+    const fresh = fixture(); await fresh.adapter.start()
+    fresh.transport.receive(permission('approval', 'write', 'Write', { file_path: 'report.txt', content: 'data' }))
+    expect(request(fresh).status).toBe('pending')
+    expect(JSON.stringify(fresh.transport.sent)).not.toContain('updatedPermissions')
+  })
+  it.each<Record<string, Json>>([
+    { matched_ask_rule: { source: 'policySettings', tool_name: 'Bash' } },
+    { decision_reason: 'Your organization requires approval for this tool' }
+  ])('does not offer a reusable grant over a mandatory approval: %j', async boundary => {
+    const f = fixture(); await f.adapter.start()
+    f.transport.receive({ type: 'control_request', request_id: 'approval', request: {
+      subtype: 'can_use_tool', tool_name: 'Bash', input: { command: 'npm test' }, ...boundary,
+      permission_suggestions: [{ type: 'addRules', behavior: 'allow', rules: [{ toolName: 'Bash', ruleContent: 'npm test' }], destination: 'session' }]
+    } })
+    expect(request(f).choices.find(choice => choice.id === 'allow-session')).toMatchObject({ disabled: true, description: expect.stringContaining('individual approval') })
+  })
+  it('awaits native auto-mode confirmation, allows the selected request once, and preserves other pending requests', async () => {
+    const f = fixture({ settings: { ...settings, plan: true } }); await f.adapter.start(); await f.adapter.submit('Synthetic', { ...settings, plan: true })
+    f.transport.receive(permission('approval', 'one', 'Bash', { command: 'npm test' }))
+    f.transport.receive(permission('second', 'two', 'Bash', { command: 'git status' }))
+    f.transport.autoControlResponses = false
+    const switching = f.adapter.respond(answer('approval', 'auto-mode'))
+    expect(f.transport.sent.at(-1)).toMatchObject({ type: 'control_request', request: { subtype: 'set_permission_mode', mode: 'auto' } })
+    expect(request(f).status).toBe('pending')
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ permissionMode: 'plan' })
+    await expect(f.adapter.respond(answer('approval', 'auto-mode'))).rejects.toThrow('already resolved')
+    modeAck(f); await switching
+    expect(f.projection()).toMatchObject({ phase: 'waiting_approval', settings: { permission: 'auto', plan: false }, capabilities: { effectiveSettings: { permissionMode: 'auto' } } })
+    expect(request(f)).toMatchObject({ status: 'resolved', outcome: 'auto-mode' })
+    expect(request(f, 'second').status).toBe('pending')
+    expect(f.transport.sent.at(-1)).toMatchObject({ response: { request_id: 'approval', response: { behavior: 'allow', updatedInput: { command: 'npm test' } } } })
+    expect(JSON.stringify(f.transport.sent.at(-1))).not.toContain('updatedPermissions')
+    await f.adapter.respond(answer('second', 'deny'))
+    f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+    f.transport.autoControlResponses = true
+    await f.adapter.submit('Keep Auto', { ...settings, permission: 'auto' })
+    expect(f.transport.sent.filter(value => JSON.stringify(value).includes('set_permission_mode'))).toHaveLength(1)
+    f.transport.receive(permission('mandatory-in-auto', 'three', 'Bash', { command: 'npm test' }))
+    expect(request(f, 'mandatory-in-auto').choices.find(choice => choice.id === 'auto-mode')).toMatchObject({ disabled: true, description: expect.stringContaining('already active') })
+    expect(request(f, 'mandatory-in-auto').status).toBe('pending')
+  })
+  it('leaves a rejected native auto switch pending and lets the owner deny the operation', async () => {
+    const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    f.transport.receive(permission('approval', 'one', 'Bash', { command: 'npm test' }))
+    f.transport.autoControlResponses = false
+    const switching = f.adapter.respond(answer('approval', 'auto-mode'))
+    modeAck(f, 'Auto mode is disabled by managed policy')
+    await expect(switching).rejects.toThrow('disabled by managed policy')
+    expect(request(f).status).toBe('pending')
+    expect(f.projection()).toMatchObject({ settings: { permission: 'default' }, phase: 'waiting_approval' })
+    expect(f.transport.sent.filter(value => JSON.stringify(value).includes('"behavior":"allow"'))).toHaveLength(0)
+    await f.adapter.respond(answer('approval', 'deny'))
+    expect(request(f)).toMatchObject({ status: 'resolved', outcome: 'deny' })
+  })
+  it.each(['cancel', 'complete'] as const)('never answers a request that the provider %s event expired during mode switching', async ending => {
+    const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    f.transport.receive(permission('approval', 'one', 'Bash', { command: 'npm test' }))
+    f.transport.autoControlResponses = false
+    const switching = f.adapter.respond(answer('approval', 'auto-mode'))
+    const modeRequest = f.transport.sent.at(-1)
+    if (ending === 'cancel') f.transport.receive({ type: 'control_cancel_request', request_id: 'approval' })
+    else f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+    modeAck(f); await switching
+    expect(request(f).status).toBe('expired')
+    expect(f.transport.sent.at(-1)).toEqual(modeRequest)
+    expect(f.projection()).toMatchObject({ phase: ending === 'cancel' ? 'running' : 'completed', settings: { permission: 'auto', plan: false } })
+  })
+  it('keeps questions separate from permission mode actions', async () => {
+    const f = fixture(); await f.adapter.start()
+    f.transport.receive(permission('approval', 'question', 'AskUserQuestion', { questions: [{ question: 'Pick one', options: [{ label: 'One' }] }] }))
+    expect(request(f).choices.map(choice => choice.id)).toEqual(['allow', 'deny', 'abort'])
+  })
+})
+
+
+it('honors the native offered session Edit mode, keeps it across turns, and expires it for another runtime', async () => {
+  const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+  f.transport.receive({ type: 'control_request', request_id: 'session-edit', request: {
+    subtype: 'can_use_tool', tool_use_id: 'write', tool_name: 'Write', input: { file_path: 'proof.txt', content: 'first' },
+    permission_suggestions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }]
+  } })
+  const interaction = f.projection().items.find(item => item.data.type === 'interaction')
+  expect(interaction?.data).toMatchObject({ interaction: { choices: expect.arrayContaining([expect.objectContaining({ id: 'allow-session', disabled: false, description: expect.stringContaining('all file edits') })]) } })
+  await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'session-edit', decision: 'allow-session' })
+  expect(f.transport.sent).toContainEqual(expect.objectContaining({ request: { subtype: 'set_permission_mode', mode: 'acceptEdits' } }))
+  expect(f.transport.sent.at(-1)).toMatchObject({ response: { response: { behavior: 'allow', updatedPermissions: [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }] } } })
+  expect(f.projection()).toMatchObject({ settings: { permission: 'accept-edits', temporaryPermission: { runtimeId: 'incarnation-A', restore: 'default' } }, capabilities: { effectiveSettings: { permissionMode: 'acceptEdits' } } })
+  f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+  await f.adapter.submit('Another turn', f.projection().settings)
+  expect(f.transport.sent.filter(value => JSON.stringify(value).includes('set_permission_mode'))).toHaveLength(1)
+  const resumed = fixture({ settings: f.projection().settings, runtimeId: 'incarnation-B' })
+  await resumed.adapter.start()
+  expect(resumed.transport.options.args[resumed.transport.options.args.indexOf('--permission-mode') + 1]).toBe('manual')
+  await resumed.adapter.submit('Stale queued settings', f.projection().settings)
+  expect(resumed.transport.sent.filter(value => JSON.stringify(value).includes('set_permission_mode'))).toHaveLength(0)
+})
+
+it.each([
+  { tool_name: 'Bash', update: { type: 'setMode', mode: 'acceptEdits', destination: 'session' } },
+  { tool_name: 'Write', update: { type: 'setMode', mode: 'acceptEdits', destination: 'userSettings' } },
+  { tool_name: 'Write', update: { type: 'setMode', mode: 'bypassPermissions', destination: 'session' } }
+])('does not invent a session mode grant for an unrelated tool or permanent/dangerous mode: %j', async row => {
+  const f = fixture(); await f.adapter.start()
+  f.transport.receive({ type: 'control_request', request_id: 'unoffered', request: { subtype: 'can_use_tool', tool_name: row.tool_name, input: {}, permission_suggestions: [row.update] } })
+  await expect(f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'unoffered', decision: 'allow-session' })).rejects.toThrow('Unsupported')
+})
+
+
+it.each(['deny', 'abort', 'interrupt'] as const)('preserves explicit %s outcome through native failure hooks and error echoes', async action => {
+  const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+  const input = { command: 'node --version' }
+  f.transport.receive(permission('decision', 'shell', 'Bash', input))
+  if (action === 'interrupt') await f.adapter.interrupt()
+  else await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'decision', decision: action })
+  f.transport.receive(hook('failure-hook', 'conductor_failed', 'shell', 'Bash', input, { exitCode: 1, stderr: 'Native request did not run' }))
+  await flush()
+  f.transport.receive({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'shell', content: 'Native request did not run', is_error: true }] } })
+  expect(f.projection().items.find(item => item.data.type === 'tool' && item.nativeItemId === 'shell')?.data).toMatchObject({ status: action === 'deny' ? 'rejected' : 'interrupted' })
+  f.transport.receive(toolUse('ordinary-error', 'Bash', { command: 'node missing-file.js' }))
+  f.transport.receive(hook('ordinary-failure-hook', 'conductor_failed', 'ordinary-error', 'Bash', { command: 'node missing-file.js' }, { exitCode: 1 }))
+  await flush()
+  expect(f.projection().items.find(item => item.data.type === 'tool' && item.nativeItemId === 'ordinary-error')?.data).toMatchObject({ status: 'failed' })
+})
+
+
+describe('Claude native steering command lifecycle', () => {
+  it('uses next priority and only reports consumption on the matching native started frame', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Original', settings)
+    await f.adapter.steer('Followup', settings, [], 'steering-1')
+    expect(f.transport.sent.at(-1)).toMatchObject({ type: 'user', uuid: 'steering-1', priority: 'next' })
+    expect(f.events.some(event => event.data.type === 'input_delivery')).toBe(false)
+    const lifecycle = (id: string, state: string) => f.transport.receive({ type: 'command_lifecycle', uuid: id + state, command_uuid: id, state })
+    lifecycle('other-input', 'started'); lifecycle('steering-1', 'queued')
+    f.transport.receive(toolUse('next-tool', 'Read', { file_path: 'panel.mjs' }))
+    expect(f.events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([{ type: 'input_delivery', inputId: 'steering-1', status: 'accepted' }])
+    lifecycle('steering-1', 'started'); lifecycle('steering-1', 'started'); lifecycle('steering-1', 'cancelled')
+    expect(f.events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([{ type: 'input_delivery', inputId: 'steering-1', status: 'accepted' }, { type: 'input_delivery', inputId: 'steering-1', status: 'delivered' }])
+    expect(f.adapter.capabilities.steering).toBe(true)
+  })
+  it('uses the interrupt cancellation receipt, never an ambiguous cancelled lifecycle, to authorize replay', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Original', settings)
+    await f.adapter.steer('Pending', settings, [], 'pending-input')
+    f.transport.autoControlResponses = false
+    const stopping = f.adapter.interrupt()
+    const request = f.transport.sent.at(-1) as { request_id: string }
+    f.transport.receive({ type: 'command_lifecycle', command_uuid: 'pending-input', state: 'cancelled' })
+    f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+    expect(f.events.some(event => event.data.type === 'input_delivery')).toBe(false)
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: request.request_id, response: { still_queued: [], cancelled: ['pending-input'] } } })
+    await stopping
+    expect(f.events.at(-1)?.data).toEqual({ type: 'input_delivery', inputId: 'pending-input', status: 'cancelled' })
+  })
+  it('marks pending input uncertain on disconnect and tracks a native next command after a result', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Original', settings)
+    await f.adapter.steer('Next', settings, [], 'next-input')
+    f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+    f.transport.receive({ type: 'command_lifecycle', command_uuid: 'next-input', state: 'started' })
+    expect(f.adapter.capabilities.steering).toBe(true)
+    await f.adapter.steer('Unconfirmed', settings, [], 'unconfirmed-input')
+    f.adapter.dispose()
+    expect(f.events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([{ type: 'input_delivery', inputId: 'next-input', status: 'delivered' }, { type: 'input_delivery', inputId: 'unconfirmed-input', status: 'uncertain' }])
+  })
 })

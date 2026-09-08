@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 import { StructuredComposerControls } from './StructuredComposerControls'
+import { resolveEffortChoice, supportedEffortChoices } from '../../../shared/model-effort'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
 const capabilities: ProviderCapabilities = {
@@ -43,17 +44,19 @@ describe('compact composer controls (synthetic, zero inference)', () => {
     expect(render({ capabilities: { ...capabilities, models: [] } }).html).not.toContain('type="range"')
     expect(render({ capabilities, settings: { ...settings, model: 'model-two', effort: 'high' } }).html).not.toContain('type="range"')
   })
-  it('places supported effort values at their real slider positions and labels missing defaults', () => {
+  it('places supported effort values at their real slider positions and always shows a concrete effort', () => {
     const html = render({ capabilities, settings: { ...settings, effort: 'medium' } }).html
     expect(html).toContain('aria-label="Reasoning effort"')
     expect(html).toContain('aria-valuetext="Medium"')
-    expect(html).toContain('type="range" min="0" max="4" step="1"')
-    expect(html).toContain('value="3"')
-    expect(html).toContain('--effort-progress:75%')
-    expect(render({ capabilities }).html).toContain('aria-valuetext="Not reported"')
-    expect(render({ capabilities, settings: { ...settings, effort: 'auto' } }).html).toContain('aria-valuetext="Not reported"')
+    expect(html).toContain('type="range" min="0" max="3" step="1"')
+    expect(html).toContain('value="2"')
+    expect(html).toContain('--effort-progress:67%')
+    for (const missing of [render({ capabilities }).html, render({ capabilities, settings: { ...settings, effort: 'auto' } }).html]) {
+      expect(missing).toContain('aria-valuetext="Medium"')
+      expect(missing).not.toContain('Not reported')
+    }
     const filtered = render({ capabilities: { ...capabilities, models: [{ id: 'model-one', label: 'Model One', isDefault: true, effort: ['', 'auto', 'low', 'high'] }] }, settings: { ...settings, effort: 'high' } }).html
-    expect(filtered).toContain('max="2"')
+    expect(filtered).toContain('max="1"')
     expect(filtered).toContain('aria-valuetext="High"')
   })
   it('disables both controls when a session cannot accept settings changes', () => {
@@ -66,7 +69,7 @@ describe('compact composer controls (synthetic, zero inference)', () => {
     expect(html).toContain('Unavailable: future-effort')
     expect(html).toContain('Click to use the configured effort.')
     expect(html).not.toContain('type="range"')
-    expect(html).not.toContain('aria-valuetext="Not reported"')
+    expect(html).not.toContain('Not reported')
     expect(saved.effort).toBe('future-effort')
     expect(onChange).not.toHaveBeenCalled()
     const disabled = render({ capabilities, settings: saved, disabled: true }).html
@@ -100,7 +103,7 @@ it('shows the effective model and effort in place of ambiguous saved aliases', (
   const html = render({ capabilities: { ...capabilities, effectiveSettings: { model: 'gpt-6-astra', effort: 'xhigh' }, models: [{ id: 'gpt-6-astra', label: 'gpt-6-astra', effort: ['high', 'xhigh'], defaultEffort: 'high' }] }, settings: { ...settings, model: 'default', effort: 'auto' } }).html
   expect(html).toContain('GPT 6 Astra</span>')
   expect(html).toContain('aria-valuetext="Xhigh"')
-  expect(html).toContain('value="2"')
+  expect(html).toContain('value="1"')
   expect(html).toContain('--effort-progress:100%')
   expect(html).toContain('title="GPT 6 Astra · xhigh"')
   expect(html).not.toContain('Default</span>')
@@ -133,5 +136,16 @@ it('chooses Claude Opus explicitly until native model metadata is available', ()
 it('keeps default alias effort metadata when Claude reports a concrete runtime model ID', () => {
   const html = render({ capabilities: { ...capabilities, provider: 'claude', effectiveSettings: { model: 'claude-opus-runtime', effort: 'high' }, models: [{ id: 'default', label: 'Default (Opus)', effort: ['low', 'high'] }] } }).html
   expect(html).toContain('aria-valuetext="High"')
-  expect(html).toContain('value="2"')
+  expect(html).toContain('value="1"')
+})
+
+it('always resolves a concrete effort for models that report one', () => {
+  expect(supportedEffortChoices(capabilities)).toEqual(['minimal', 'low', 'medium', 'high'])
+  expect(supportedEffortChoices(capabilities, 'model-two')).toEqual([])
+  expect(resolveEffortChoice(['minimal', 'low', 'medium', 'high'])).toBe('medium')
+  expect(resolveEffortChoice(['minimal', 'low', 'medium', 'high'], 'low')).toBe('low')
+  expect(resolveEffortChoice(['minimal', 'low', 'medium', 'high'], 'unsupported')).toBe('medium')
+  expect(resolveEffortChoice(['low', 'high'])).toBe('low')
+  expect(resolveEffortChoice(['high'])).toBe('high')
+  expect(resolveEffortChoice([])).toBeUndefined()
 })

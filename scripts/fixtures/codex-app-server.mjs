@@ -101,7 +101,11 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     if (behavior === 'stale' || message.params.expectedTurnId !== currentTurn) { send({ id: message.id, error: { code: -32600, message: 'expectedTurnId does not match the active turn' } }); return }
     if (behavior === 'review' || behavior === 'compact') { send({ id: message.id, error: { code: -32600, message: 'Active turn is not steerable', data: { codexErrorInfo: { activeTurnNotSteerable: { turnKind: behavior } } } } }); return }
     send({ id: message.id, result: { turnId: behavior === 'malformed' ? 'wrong-turn' : currentTurn } })
-    if (behavior !== 'malformed') itemEvent('item/completed', { type: 'userMessage', id: 'steer-' + message.id, content: message.params.input })
+    if (!['malformed', 'pending'].includes(behavior)) {
+      const deliver = () => itemEvent('item/completed', { type: 'userMessage', id: 'steer-' + message.id, clientId: message.params.clientUserMessageId, content: message.params.input })
+      if (behavior === 'delayed') setTimeout(deliver, 150)
+      else deliver()
+    }
     return
   }
   if (message.method === 'turn/interrupt') {

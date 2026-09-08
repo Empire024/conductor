@@ -9,11 +9,13 @@ import { App } from './App'
 import { DetachedWindowApp } from './DetachedWindowApp'
 import { DebugWindowApp } from './DebugWindowApp'
 import { applyAppTheme } from './appearance'
+import { installAutoscroll } from './autoscroll'
 
 const parameters = new URLSearchParams(window.location.search)
 const detachedId = parameters.get('detached')
 const debugConsole = parameters.get('debug-console') === '1'
 applyAppTheme(window.conductor.settings.getStartup())
+installAutoscroll(document)
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>

@@ -5,7 +5,7 @@ import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
 import { makeId, type AgentProviderInfo, type AgentSpec, type LayoutNode, type PaneKind, type PaneTab } from '../shared/models'
-import type { SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
 import type { StructuredSessions } from './structured-sessions'
@@ -38,8 +38,8 @@ const toolSignatures = {
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
   'tabs.detach': '({tabId})',
   'tabs.close': '({tabId}) — asks the owner to confirm; never closes the caller or its ancestors',
-  'agents.list': '() — visible native sessions',
-  'agents.snapshot': '({agentSessionId}) — recent native turn output and state',
+  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt',
+  'agents.snapshot': '({agentSessionId}) — observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
   'agents.steer': '({agentSessionId,prompt}) — same steering/queue behavior as the user composer',
@@ -51,7 +51,7 @@ const toolSignatures = {
   'files.read': '({path}) — UTF-8 text up to 1 MiB',
   'files.write': '({path,content,expectedContent}) — atomic compare-and-save; expectedContent:null creates a file; live views refresh',
   'files.open': '({path}) — open the file in a visible editor',
-  'tasks.list': '() — feature-list.md tasks and revision',
+  'tasks.list': '() — feature-list.md bug/feature/idea tasks, their recorded owners and revision',
   'tasks.update': '({revision,id,status?:"todo"|"doing"|"done",title?}) — optimistic update preserving markers and other agents’ claims',
   'memory.recall': '({query?})',
   'memory.remember': '({gist,kind?:"episodic"|"semantic"|"procedural",cues?:string[]}) — writes agent-owned memory',
@@ -62,7 +62,7 @@ const toolSignatures = {
   'orchestration.routines.save': '({id?,name,description?,steps:[{title,instructions?,assignedAgentId?}]})',
   'workspace.rename': '({title})',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?}]}) — one to four explicit assignments; choose actual catalog models per task; visible tabs and persisted orchestration tasks'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,projectTaskIds?:string[]}]}) - one to four visible coworkers with actual models/efforts; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance'
 } as const
 
 export interface AgentControlDependencies {
@@ -132,6 +132,20 @@ export class AgentControl {
     if (kind === 'workspace') await this.ui(scope, 'workspace.focus', {})
     else if (kind === 'file') await this.ui(scope, 'files.open', { path: relative(await realpath(project.path), await workspacePath(project.path, id)).replaceAll('\\', '/') })
     else throw new Error('Unsupported Conductor link')
+  }
+
+  private observation(scope: AgentControlScope, tab: AgentControlTab, state: SessionProjection | null, observedAt: string) {
+    const lastEvent = state?.sequence ? this.deps.database.structured.events(tab.resourceId!, state.sequence - 1)[0] : undefined
+    return {
+      observedAt, source: 'native-session' as const, projectId: scope.projectId, workspaceId: scope.sessionId,
+      tabId: tab.id, agentSessionId: tab.resourceId, groupId: tab.groupId, detachedId: tab.detachedId,
+      title: tab.title, provider: tab.state?.provider, uri: tab.uri, phase: state?.phase ?? null,
+      lastActivityAt: lastEvent?.timestamp ?? null, sequence: state?.sequence ?? 0,
+      lastEvent: lastEvent ? {
+        sequence: lastEvent.sequence, timestamp: lastEvent.timestamp, type: lastEvent.data.type,
+        ...(lastEvent.data.type === 'tool' ? { name: lastEvent.data.name, status: lastEvent.data.status, exitCode: lastEvent.data.exitCode } : {})
+      } : null
+    }
   }
 
   private target(scope: AgentControlScope, id: string, mutate = false): AgentControlTab {
@@ -228,7 +242,7 @@ export class AgentControl {
       const settings: SessionSettings = { ...this.deps.database.structured.snapshot(spec.id)!.settings, model: model.id, effort, permission: restricted(sourceSettings) && provider === 'codex' ? 'read-only' : 'default', ...(restricted(sourceSettings) && provider === 'codex' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude' }
       this.deps.database.structured.update(spec.id, { settings })
     } else if (kind === 'terminal') tab.resourceId = makeId('terminal')
-    await this.ui(scope, 'tabs.open', { tab })
+    await this.ui(scope, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
     const opened = this.tab(scope, tab.id)
     if (kind === 'agent') this.relationship(scope, opened, 'attached')
     return opened
@@ -239,7 +253,7 @@ export class AgentControl {
     if (process.env.CONDUCTOR_LIVE_TESTS === '1') throw new Error('App control is disabled during isolated live acceptance tests')
     if (args.projectId !== undefined && args.projectId !== scope.projectId || args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
     if (method === 'tools.list') return toolSignatures
-    if (method === 'app.state') return { project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: [...this.links(scope)].map(([agentSessionId, controllerAgentSessionId]) => ({ agentSessionId, controllerAgentSessionId })) }
+    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: [...this.links(scope)].map(([agentSessionId, controllerAgentSessionId]) => ({ agentSessionId, controllerAgentSessionId })) }
     if (method === 'models.list') return this.catalog(scope)
     if (method === 'tabs.list') return this.tabs(scope)
     if (method === 'tabs.open') return this.open(scope, args)
@@ -255,11 +269,18 @@ export class AgentControl {
       if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, tab, 'detached')
       return result
     }
-    if (method === 'agents.list') return this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => ({ tabId: tab.id, agentSessionId: tab.resourceId, title: tab.title, provider: tab.state?.provider, phase: database.structured.snapshot(tab.resourceId!)?.phase, uri: tab.uri }))
+    if (method === 'agents.list') {
+      const observedAt = new Date().toISOString()
+      return this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
+    }
     if (method.startsWith('agents.')) {
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history'].includes(method)
       const tab = this.target(scope, id, mutate), state = database.structured.snapshot(id)!
-      if (method === 'agents.snapshot') return { ...state, items: state.items.slice(-60) }
+      if (method === 'agents.snapshot') {
+        const recent = [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence)).slice(0, 60)
+        const activeTools = state.items.filter(item => item.data.type === 'tool' && ['preparing', 'running', 'awaiting_approval'].includes(item.data.status))
+        return { ...this.observation(scope, tab, state, new Date().toISOString()), ...state, activeTools, items: recent.sort((a, b) => a.sequence - b.sequence), truncated: state.truncated || state.items.length > recent.length }
+      }
       if (method === 'agents.history') return database.structured.events(id, typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0).slice(0, 100)
       if (method === 'agents.resume' || method === 'agents.fork') {
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot resume or fork a writable conversation')
@@ -309,7 +330,7 @@ export class AgentControl {
       if (task.agentId && task.agentId !== scope.agentSessionId && task.status === 'doing') throw new Error('Another agent owns this task')
       const status = args.status === undefined ? task.status : args.status
       if (!['todo', 'doing', 'done'].includes(String(status))) throw new Error('Invalid task status')
-      const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', 8000) }), agentId: scope.agentSessionId })
+      const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', 8000) }), agentId: scope.agentSessionId }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
       this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
       return updated
     }
@@ -365,18 +386,53 @@ export class AgentControl {
 
   private async dispatchRouter(scope: AgentControlScope, args: Args): Promise<unknown> {
     if (!Array.isArray(args.tasks) || !args.tasks.length || args.tasks.length > 4) throw new Error('Route one to four bounded tasks per call')
-    const requests = args.tasks.map(value => { const task = object(value); text(task, 'title', 120); text(task, 'prompt'); return task })
+    const seen = new Set<string>()
+    const requests: Array<Args & { projectTaskIds: string[] }> = args.tasks.map(value => {
+      const request = object(value); text(request, 'title', 120); text(request, 'prompt')
+      const ids = request.projectTaskIds ?? []
+      if (!Array.isArray(ids) || ids.length > 50 || ids.some(id => typeof id !== 'string' || !id || id.length > 160 || seen.has(id) || !seen.add(id))) throw new Error('Provide distinct exact project task IDs across this dispatch')
+      return { ...request, projectTaskIds: ids as string[] }
+    })
+    if (seen.size && restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('A read-only or planning controller cannot assign project tasks')
+    const board = seen.size ? await this.deps.backlogs.get(scope.projectId) : undefined
+    const selected = new Map((board?.tasks ?? []).filter(task => seen.has(task.id)).map(task => [task.id, task]))
+    const claimable = (task: NonNullable<typeof board>['tasks'][number] | undefined): boolean => Boolean(task && task.status !== 'done' && (task.agentId === scope.agentSessionId || task.status === 'todo'))
+    for (const id of seen) if (!claimable(selected.get(id))) throw new Error('A selected project task is missing, finished, or owned by another active agent')
     const results: unknown[] = []
     for (const request of requests) {
-      const tab = await this.open(scope, { ...request, kind: 'agent' })
+      const tab = await this.open(scope, { ...request, kind: 'agent', ...(request.projectTaskIds.length ? { focus: false } : {}) })
       const assigned = this.deps.orchestration.saveAgent({ projectId: scope.projectId, name: tab.title, provider: tab.state!.provider as StructuredProvider, model: String(tab.state!.model), role: 'Routed coworker', instructions: String(request.prompt) })
       const task = this.deps.orchestration.createTask({ projectId: scope.projectId, title: String(request.title), description: String(request.prompt), status: 'in_progress', assignedAgentId: assigned.id })
+      let accepted = false
       try {
-        await this.call(scope, 'agents.submit', { agentSessionId: tab.resourceId, prompt: String(request.prompt) + '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol.' })
-        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, provider: tab.state!.provider, model: tab.state!.model, uri: tab.uri })
+        await this.deps.sessions.connectSession(tab.resourceId!)
+        const state = this.deps.database.structured.snapshot(tab.resourceId!)!
+        const model = state.capabilities?.models.find(model => model.id === tab.state!.model)
+        if (!model || state.settings.effort && !model.effort?.includes(state.settings.effort)) throw new Error('The native runtime did not advertise the selected model and effort; no worker prompt was sent')
+        if (request.projectTaskIds.length) {
+          const current = await this.deps.backlogs.get(scope.projectId)
+          for (const id of request.projectTaskIds) {
+            const before = selected.get(id)!, latest = current.tasks.find(task => task.id === id)
+            if (!claimable(latest) || latest?.title !== before.title || latest?.status !== before.status || latest?.agentId !== before.agentId) throw new Error('A selected task changed before native dispatch; review its current owner before retrying')
+          }
+        }
+        const ownership = request.projectTaskIds.length ? '\n\nExact Project tasks assigned to this worker: ' + request.projectTaskIds.join(', ') + '. Read tasks.list before updating these IDs. Ownership is transferred immediately after prompt acceptance; wait for the handoff if it is not visible yet. Do not seize unrelated claims.' : ''
+        await this.call(scope, 'agents.submit', { agentSessionId: tab.resourceId, prompt: String(request.prompt) + ownership + '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol.' })
+        accepted = true
+        if (request.projectTaskIds.length) {
+          let current = await this.deps.backlogs.get(scope.projectId)
+          for (const id of request.projectTaskIds) {
+            const latest = current.tasks.find(task => task.id === id)
+            if (latest?.agentId === tab.resourceId) continue
+            if (!claimable(latest)) throw new Error('Worker prompt accepted, but task ownership changed. Inspect the worker; do not submit the task again.')
+            current = await this.deps.backlogs.edit(scope.projectId, current.revision, { type: 'update', id, status: 'doing', agentId: tab.resourceId! }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
+          }
+          this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
+        }
+        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, provider: tab.state!.provider, model: tab.state!.model, effort: state.settings.effort, uri: tab.uri, accepted })
       } catch (error) {
         this.deps.orchestration.updateTask(task.id, { status: 'blocked' })
-        results.push({ tabId: tab.id, taskId: task.id, error: error instanceof Error ? error.message : String(error) })
+        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, accepted, error: error instanceof Error ? error.message : String(error) })
       }
     }
     return results

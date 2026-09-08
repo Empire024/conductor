@@ -245,3 +245,21 @@ it('collapses old expanded attachment suffixes without dropping any original tex
   expect(html).toContain('Full original file contents.')
   expect(html).not.toContain('<details open')
 })
+
+
+it('renders separate Claude permission actions with the exact scope and disabled boundary explanation', () => {
+  const html = renderActivity({ type: 'interaction', interaction: {
+    id: 'permission', kind: 'approval', title: 'Allow Bash?', input: { command: 'npm test' }, status: 'pending', choices: [
+      { id: 'allow', label: 'Allow once' },
+      { id: 'allow-session', label: 'Allow for this session', description: 'Scope: Bash(npm test). Only this running Claude session.' },
+      { id: 'auto-mode', label: 'Switch to auto-mode', description: 'Auto-mode is already active. Claude still requires approval for this request.', disabled: true },
+      { id: 'deny', label: 'Deny' }
+    ]
+  } })
+  expect(html).toContain('>Allow for this session</button>')
+  expect(html).toContain('>Switch to auto-mode</button>')
+  expect(html).toContain('Scope: Bash(npm test). Only this running Claude session.')
+  expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Switch to auto-mode<\/button>/)
+  expect(html).toContain('Claude still requires approval for this request.')
+  expect(interactionOutcome('auto-mode')).toBe('Auto-mode enabled')
+})

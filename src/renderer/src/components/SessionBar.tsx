@@ -127,6 +127,7 @@ export function SessionBar(props: SessionBarProps): React.JSX.Element {
               requestClose(session.id)
             }}
             onAuxClick={(event) => event.preventDefault()}
+            data-autoscroll="off"
           >
             <span className="session-tab-glyph"><LayoutPanelTop size={14} strokeWidth={1.8} /></span>
             {editingId === session.id ? (

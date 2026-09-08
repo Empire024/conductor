@@ -52,4 +52,22 @@ describe('visible agent control', () => {
     release(); await promise
     expect(done).toBe(true)
   })
+  it('keeps the current task pane and utility panel open until the owner explicitly focuses an assigned tab', async () => {
+    const { host, request, current } = fixture()
+    const initial = listGroups(current().layout.root)[0]!
+    const activeTabId = initial.activeTabId
+    current().maximizedGroupId = initial.id
+    const tab = { id: 'assigned', kind: 'agent', title: 'Task worker', resourceId: 'assigned-worker' }
+    const opened = await handleAgentControlRequest(request('tabs.open', { tab, focus: false }), host)
+    expect(opened).toMatchObject({ id: tab.id, uri: 'conductor://project/tab/assigned' })
+    expect(listGroups(current().layout.root)[0]!.tabs.some(item => item.id === tab.id)).toBe(true)
+    expect(listGroups(current().layout.root)[0]!.activeTabId).toBe(activeTabId)
+    expect(current().maximizedGroupId).toBe(initial.id)
+    expect(host.commit).toHaveBeenLastCalledWith(current(), initial.id, false)
+    await handleAgentControlRequest(request('tabs.open', { tab, focus: false }), host)
+    expect(listGroups(current().layout.root)[0]!.activeTabId).toBe(activeTabId)
+    await handleAgentControlRequest(request('tabs.focus', { tabId: tab.id }), host)
+    expect(listGroups(current().layout.root)[0]!.activeTabId).toBe(tab.id)
+    expect(host.commit).toHaveBeenLastCalledWith(current(), initial.id, true)
+  })
 })

@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentSpec } from '../shared/models'
 import { ConductorDatabase } from './database'
 import {
@@ -10,7 +10,10 @@ import {
   normalizeCollaborationPath
 } from './agent-collaboration-store'
 
+afterEach(() => vi.useRealTimers())
+
 interface CollaborationFixture {
+  database: ConductorDatabase
   store: AgentCollaborationStore
   path: string
   projectId: string
@@ -47,7 +50,7 @@ const withCollaboration = (run: (fixture: CollaborationFixture) => void): void =
   database.upsertAgent(outsider, 'running')
   const store = new AgentCollaborationStore(path)
   try {
-    run({ store, path, projectId: project.id, projectRoot, first, second, outsider })
+    run({ database, store, path, projectId: project.id, projectRoot, first, second, outsider })
   } finally {
     store.close()
     database.close()
@@ -125,6 +128,33 @@ describe('AgentCollaborationStore', () => {
         path: 'src/index.ts',
         intent: 'edit'
       })).toThrow('does not belong to this project')
+    })
+  })
+
+  it('labels historical intents and expiring leases with observation times and exact detached tab/workspace IDs', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-08T10:00:00.000Z'))
+    withCollaboration(({ database, store, projectId, first, second }) => {
+      const tab = { id: 'coworker-tab', kind: 'agent' as const, title: 'Builder', resourceId: first.id }
+      database.saveSession(first.sessionId, { version: 1, root: { type: 'group', id: 'coworker-group', activeTabId: tab.id, tabs: [tab] } }, null, [])
+      database.createDetachedWindow(projectId, first.sessionId, tab)
+      store.announcePresence({ projectId, sessionId: first.sessionId, agentSessionId: first.id, path: 'src/old.ts', intent: 'edit', ttlSeconds: 90 })
+      store.postMessage({ projectId, sessionId: first.sessionId, agentSessionId: first.id, kind: 'intent', body: 'Older planned edit', paths: ['src/old.ts'] })
+      const leased = store.buildBriefing(second.id)
+      expect(leased).toContain('generated 2026-09-08T10:00:00.000Z')
+      expect(leased).toContain('Active edit lease')
+      expect(leased).toContain('heartbeat=2026-09-08T10:00:00.000Z; expires=2026-09-08T10:01:30.000Z')
+      expect(leased).toContain('another workspace=' + first.sessionId + '; agent=' + first.id + '; tab=coworker-tab')
+      expect(leased).toContain('Recorded intent at 2026-09-08T10:00:00.000Z')
+      expect(leased).toContain('not live execution evidence')
+      expect(leased).toContain('agents.snapshot')
+      vi.setSystemTime(new Date('2026-09-08T10:02:00.000Z'))
+      store.postMessage({ projectId, sessionId: first.sessionId, agentSessionId: first.id, kind: 'completion', body: 'Latest result is ready' })
+      const expired = store.buildBriefing(second.id)
+      expect(expired).not.toContain('Active edit lease')
+      expect(expired).toContain('old intents may be stale')
+      expect(expired.indexOf('Latest result is ready')).toBeLessThan(expired.indexOf('Older planned edit'))
+      expect(store.buildBriefing(second.id, 700)).toContain('Latest result is ready')
     })
   })
 

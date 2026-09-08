@@ -3,10 +3,11 @@ import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-hist
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
+import { settingsForRuntime } from '../shared/structured-agent'
 import type { AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
-import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
+import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import { createProviderAdapter } from './providers/factory'
 import { validateLiveTurn } from './live-test-policy'
 import { LiveRuntimeBudget } from './live-runtime-budget'
@@ -20,8 +21,14 @@ interface LiveSession {
   starting?: Promise<void>
   handoff?: boolean
   dispatchingQueue?: boolean
+  dispatchingPromptId?: string
   queueing?: Promise<void>
   steering?: boolean
+  interrupting?: Promise<void>
+  expediteInput?: Set<string>
+  expediteQueued?: Set<string>
+  expediteReady?: boolean
+  sendAfterInterrupt?: boolean
   turnId?: string
   submitting: boolean
   closed: boolean
@@ -95,7 +102,7 @@ export class StructuredSessions {
     const id = live.spec.id, state = this.database.structured.snapshot(id)!
     return {
       executable: live.executable, cwd: live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
-      settings: state.settings,
+      settings: settingsForRuntime(state.settings, runtimeId),
       newNativeSession: live.spec.provider === 'claude' && Boolean(state.nativeSessionId) && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!),
       emit: event => { if (live.runtimeId === runtimeId && !live.closed) this.emit(live, event) },
       beforeTool: async (itemId, paths) => {
@@ -116,8 +123,9 @@ export class StructuredSessions {
     this.validateSpec(live.spec)
     if (!live.executable) throw new Error('Provider executable unavailable')
     live.runtimeId = randomUUID(); live.closed = false; live.responses.clear()
-    live.adapter = this.factory(live.spec.provider as StructuredProvider, this.options(live, live.runtimeId))
-    this.emit(live, { data: { type: 'session', phase: 'starting', capabilities: live.adapter.capabilities } })
+    const options = this.options(live, live.runtimeId)
+    live.adapter = this.factory(live.spec.provider as StructuredProvider, options)
+    this.emit(live, { data: { type: 'session', phase: 'starting', capabilities: live.adapter.capabilities, settings: options.settings } })
     live.starting = live.adapter.start().catch(error => {
       this.emit(live, { data: { type: 'error', message: error instanceof Error ? error.message : 'Provider initialization failed' } })
       this.emit(live, { data: { type: 'session', phase: 'disconnected' } })
@@ -163,8 +171,9 @@ export class StructuredSessions {
       try { if (previous?.stop) await previous.stop(); else previous?.dispose() } catch (reason) { live.closed = false; throw reason }
       live.adapter = undefined; live.closed = false
       state = store.snapshot(id)!
-      this.emit(live, { data: { type: 'session', phase: 'idle', view: 'cli' } })
-      return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings: state.settings, fresh: live.spec.provider === 'claude' && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) }
+      const settings = settingsForRuntime(state.settings)
+      this.emit(live, { data: { type: 'session', phase: 'idle', view: 'cli', settings } })
+      return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings, fresh: live.spec.provider === 'claude' && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) }
     } finally { live.handoff = false }
   }
   cancelCli(id: string): void {
@@ -269,7 +278,7 @@ export class StructuredSessions {
   async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
     return this.followup(id, text, settings, attachments, true)
   }
-  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean): Promise<void> {
+  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptId?: string): Promise<void> {
     const live = this.get(id), adapter = live.adapter, runtimeId = live.runtimeId, turnId = live.turnId
     const captured = structuredClone(attachments)
     settings = structuredClone(settings)
@@ -286,56 +295,121 @@ export class StructuredSessions {
       let latest = this.database.structured.snapshot(id)!
       if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
       let refusal = 'The current turn does not support steering'
+      let maySteer = steer
+      let refusedInputId: string | undefined
       if (steer && live.turnId === turnId && adapter?.steer && adapter.capabilities.steering && ['running', 'waiting_input', 'waiting_approval'].includes(latest.phase)) {
         this.reserveLive(live, latest.settings, text.trim() + context)
+        if ((latest.pendingSteering?.length ?? 0) >= 100) throw new Error('There are already 100 pending steering messages')
         live.steering = true
+        const inputId = randomUUID()
+        this.setSteering(live, [...latest.pendingSteering ?? [], { id: inputId, text: text.trim(), settings: structuredClone(latest.settings), attachments: captured, runtimeId, turnId, status: 'sending' }])
+        // Transfer ownership before the native attempt. An uncertain response must
+        // leave only the pending record, never an automatically drainable copy.
+        if (queuedPromptId) this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(input => input.id !== queuedPromptId))
         try {
-          await adapter.steer(text.trim() + context, settings, captured.filter(item => item.kind === 'image'))
+          await adapter.steer(text.trim() + context, settings, captured.filter(item => item.kind === 'image'), inputId)
           if (live.closed || this.live.get(id) !== live || live.runtimeId !== runtimeId) throw new Error('The runtime changed after steering was sent. Check the conversation before resending; your draft was kept.')
-          this.emit(live, { turnId, itemId: randomUUID(), data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(captured.length ? { attachments: captured.map(({ content: _content, ...metadata }) => metadata) } : {}) } })
           return
         } catch (error) {
-          if (!(error instanceof SteeringUnavailableError)) throw new Error((error instanceof Error ? error.message : String(error)) + '. Steering was not confirmed; your draft was kept. Check the conversation before resending.')
+          if (!(error instanceof SteeringUnavailableError)) {
+            this.reconcileInput(live, { data: { type: 'input_delivery', inputId, status: 'uncertain' } })
+            throw new Error((error instanceof Error ? error.message : String(error)) + (queuedPromptId ? '. Steering was not confirmed; the pending input was retained. Check the conversation before resending.' : '. Steering was not confirmed; your draft was kept. Check the conversation before resending.'))
+          }
+          // A transferred queue entry has no composer draft to fall back to.
+          // Retain a recoverable cancelled record until fallback queueing is safe.
+          if (queuedPromptId) this.reconcileInput(live, { data: { type: 'input_delivery', inputId, status: 'cancelled' } })
+          else this.setSteering(live, (this.database.structured.snapshot(id)?.pendingSteering ?? []).filter(input => input.id !== inputId))
+          maySteer = false
           refusal = error.message
         } finally { live.steering = false }
         latest = this.database.structured.snapshot(id)!
         if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
+        if (queuedPromptId) refusedInputId = inputId
       }
       const prompts = latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])
       if (prompts.length >= 100) throw new Error('The queue is full (100 messages)')
-      this.setQueue(live, [...prompts, { id: randomUUID(), text, settings: structuredClone(settings), attachments: captured }])
+      this.setQueue(live, [...prompts, { id: randomUUID(), text, settings: structuredClone(settings), attachments: captured, ...(maySteer ? { steer: true } : {}) }])
+      if (refusedInputId) this.setSteering(live, (this.database.structured.snapshot(id)?.pendingSteering ?? []).filter(input => input.id !== refusedInputId))
       if (steer) this.emit(live, { data: { type: 'notice', message: 'Message queued instead of steered: ' + refusal } })
       void this.drainQueue(live)
     })()
     live.queueing = queued
     try { await queued } finally { if (live.queueing === queued) live.queueing = undefined; void this.drainQueue(live) }
   }
+  private setSteering(live: LiveSession, prompts: import('../shared/structured-agent').PendingSteering[], native?: AdapterEvent['native']): void {
+    this.emit(live, { data: { type: 'steering', prompts }, native })
+  }
+  private reconcileInput(live: LiveSession, source: AdapterEvent): void {
+    if (source.data.type !== 'input_delivery') return
+    const { inputId, status } = source.data
+    const state = this.database.structured.snapshot(live.spec.id)!
+    const prompts = state.pendingSteering ?? []
+    const input = prompts.find(prompt => prompt.id === inputId && prompt.runtimeId === live.runtimeId)
+    if (!input) return
+    if (status === 'delivered') {
+      this.setSteering(live, prompts.filter(prompt => prompt.id !== inputId), source.native)
+      live.expediteInput?.delete(inputId)
+      this.emit(live, { turnId: input.turnId, itemId: inputId, data: { type: 'text', role: 'user', text: input.text, mode: 'snapshot', ...(input.attachments.length ? { attachments: input.attachments.map(({ content: _content, ...metadata }) => metadata) } : {}) }, native: source.native })
+    } else {
+      // A delayed ACK cannot downgrade a terminal/uncertain outcome.
+      if (status === 'accepted' && input.status !== 'sending') return
+      this.setSteering(live, prompts.map(prompt => prompt.id === inputId ? { ...prompt, status } : prompt), source.native)
+    }
+    queueMicrotask(() => { void this.drainQueue(live) })
+  }
   private setQueue(live: LiveSession, prompts: import('../shared/structured-agent').QueuedPrompt[]): void {
     this.emit(live, { data: { type: 'queue', prompt: prompts[0] ?? null, prompts } })
   }
   cancelQueued(id: string, promptId?: string): import('../shared/structured-agent').QueuedPrompt | null {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
+    const pending = promptId ? state.pendingSteering?.find(input => input.id === promptId) : undefined
+    if (pending) {
+      if (!['cancelled', 'uncertain'].includes(pending.status)) throw new Error('The provider still owns this pending message')
+      this.setSteering(live, state.pendingSteering!.filter(input => input.id !== pending.id))
+      return pending
+    }
     const prompts = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
     const queued = promptId ? prompts.find(prompt => prompt.id === promptId) ?? null : prompts[0] ?? null
-    if (live.dispatchingQueue && queued?.id === prompts[0]?.id) throw new Error('The queued message is already being sent')
+    if (live.dispatchingQueue && queued?.id === live.dispatchingPromptId) throw new Error('The queued message is already being sent')
     if (queued) this.setQueue(live, prompts.filter(prompt => prompt.id !== queued.id))
     return queued
   }
   private async drainQueue(live: LiveSession): Promise<void> {
-    const state = this.database.structured.snapshot(live.spec.id)
-    if (!state?.queued || !['completed', 'idle'].includes(state.phase) || live.closed || live.submitting || live.steering || live.dispatchingQueue || !live.adapter) return
-    const queued = state.queued
+    let state = this.database.structured.snapshot(live.spec.id)
+    if (!state || live.closed || live.submitting || live.steering || live.dispatchingQueue || !live.adapter) return
+    if (live.expediteReady && ['interrupted', 'completed'].includes(state.phase)) {
+      const recovered = (state.pendingSteering ?? []).filter(input => live.expediteInput?.has(input.id) && input.status === 'cancelled')
+      const queued = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
+      const held = queued.filter(input => live.expediteQueued?.has(input.id))
+      live.expediteReady = false; live.expediteInput = undefined; live.expediteQueued = undefined
+      if (recovered.length || held.length) {
+        const ids = new Set(recovered.map(input => input.id))
+        this.setSteering(live, (state.pendingSteering ?? []).filter(input => !ids.has(input.id)))
+        this.setQueue(live, [...recovered.map(({ runtimeId: _runtime, turnId: _turn, status: _status, ...input }) => ({ ...input, steer: true })), ...held, ...queued.filter(input => !held.includes(input))])
+        live.sendAfterInterrupt = true
+        state = this.database.structured.snapshot(live.spec.id)!
+      }
+    }
+    if (!state.queued) return
+    const steerable = live.adapter.capabilities.steering && ['running', 'waiting_input', 'waiting_approval'].includes(state.phase)
+    const queued = (steerable && state.queuedPrompts?.find(input => input.steer)) || state.queued
+    const canSteer = queued.steer && steerable
+    if (!canSteer && !['completed', 'idle'].includes(state.phase) && !(state.phase === 'interrupted' && live.sendAfterInterrupt)) return
     live.dispatchingQueue = true
+    live.dispatchingPromptId = queued.id
     let sent = false
     try {
-      await this.submit(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments))
+      if (canSteer) await this.followup(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments), true, queued.id)
+      else { live.sendAfterInterrupt = false; await this.submit(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments)) }
       const latest = this.database.structured.snapshot(live.spec.id)!
       this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(prompt => prompt.id !== queued.id))
       sent = true
     } catch (reason) {
-      this.emit(live, { data: { type: 'notice', message: 'Queued message was not sent. It is still available above the composer: ' + (reason instanceof Error ? reason.message : String(reason)) } })
+      const retained = this.database.structured.snapshot(live.spec.id)?.queuedPrompts?.some(input => input.id === queued.id)
+      this.emit(live, { data: { type: 'notice', message: (retained ? 'Queued message was not sent. It is still available above the composer: ' : 'Steering delivery was not confirmed. Check the retained pending message above the composer: ') + (reason instanceof Error ? reason.message : String(reason)) } })
     } finally {
       live.dispatchingQueue = false
+      live.dispatchingPromptId = undefined
       // Some runtimes finish before submit resolves; that completion still drains the next item.
       if (sent) queueMicrotask(() => { void this.drainQueue(live) })
     }
@@ -347,6 +421,7 @@ export class StructuredSessions {
     if (live.submitting || live.steering || active.has(state.phase)) throw new Error('A turn or request is already active in this session')
     if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Execution became uncertain. Resume the native conversation explicitly before sending another turn.')
     if (typeof text !== 'string' || !text.trim() || text.length > 60_000) throw new Error('Prompt must contain 1–60000 characters')
+    settings = settingsForRuntime(settings, live.adapter ? live.runtimeId : undefined)
     this.validateSettings(settings, state.capabilities)
     live.submitting = true
     try {
@@ -372,6 +447,7 @@ export class StructuredSessions {
   }
   private validateSettings(settings: SessionSettings, capabilities: import('../shared/structured-agent').ProviderCapabilities | undefined): void {
     if (!settings || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
+    if (settings.temporaryPermission && (typeof settings.temporaryPermission.runtimeId !== 'string' || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.temporaryPermission.restore))) throw new Error('Invalid temporary permission scope')
     if (settings.plan && !capabilities?.plans) throw new Error('Planning is unavailable on this adapter baseline')
     if (capabilities?.permissions && !capabilities.permissions.includes(settings.permission)) throw new Error('Permission policy unsupported by this provider')
     if (settings.sandbox && !capabilities?.sandboxModes?.includes(settings.sandbox)) throw new Error('Execution sandbox unsupported by this provider')
@@ -423,7 +499,7 @@ export class StructuredSessions {
     const item = state.items.find(item => item.runtimeId === response.runtimeId && item.data.type === 'interaction' && item.data.interaction.id === response.requestId && item.data.interaction.status === 'pending')
     if (!item || item.data.type !== 'interaction') throw new Error('Request is no longer pending')
     const interaction = item.data.interaction
-    if (interaction.kind === 'approval' && !interaction.choices.some(choice => choice.id === response.decision)) throw new Error('Unsupported approval scope')
+    if (interaction.kind === 'approval' && !interaction.choices.some(choice => choice.id === response.decision && !choice.disabled)) throw new Error('Unsupported approval scope')
     if (interaction.kind === 'question') {
       if (!response.answers || Object.keys(response.answers).some(key => !interaction.questions?.some(question => question.id === key))) throw new Error('Invalid question answers')
       for (const question of interaction.questions ?? []) {
@@ -436,25 +512,39 @@ export class StructuredSessions {
     live.responses.add(response.requestId)
     try {
       await live.adapter.respond(response)
-      this.emit(live, { requestId: response.requestId, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...interaction, status: 'resolved', outcome: response.decision ?? 'answered' } } })
+      const current = this.database.structured.snapshot(response.sessionId)?.items.find(entry => entry.runtimeId === response.runtimeId && entry.data.type === 'interaction' && entry.data.interaction.id === response.requestId)
+      if (current?.data.type === 'interaction' && current.data.interaction.status === 'pending') this.emit(live, { requestId: response.requestId, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...interaction, status: 'resolved', outcome: response.decision ?? 'answered' } } })
     } catch (error) {
+      if (error instanceof InteractionResponseRejectedError) {
+        live.responses.delete(response.requestId)
+        throw error
+      }
       // Uncertain transport delivery cannot be retried automatically or double submitted.
       this.emit(live, { requestId: response.requestId, data: { type: 'interaction', interaction: { ...interaction, status: 'expired', outcome: 'Response delivery uncertain' } } })
       throw error
     }
   }
-  async interrupt(id: string): Promise<void> {
+  async interrupt(id: string, expediteSubmittedInput = false): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (live.interrupting) return live.interrupting
     if (!live.adapter || !active.has(state.phase)) return
+    // Escape expedites only already-submitted input; composer drafts never reach here.
+    const pending = (state.pendingSteering ?? []).filter(input => input.runtimeId === live.runtimeId && ['sending', 'accepted'].includes(input.status))
+    live.expediteInput = expediteSubmittedInput && pending.length ? new Set(pending.map(input => input.id)) : undefined
+    live.expediteQueued = expediteSubmittedInput ? new Set((state.queuedPrompts ?? []).filter(input => input.steer && input.id !== live.dispatchingPromptId).map(input => input.id)) : undefined
     this.emit(live, { data: { type: 'session', phase: 'interrupting' } })
-    await live.adapter.interrupt()
+    const interrupted = live.adapter.interrupt()
+    live.interrupting = interrupted
+    try { await interrupted; live.expediteReady = Boolean(live.expediteInput?.size || live.expediteQueued?.size) }
+    catch (error) { live.expediteInput = undefined; live.expediteQueued = undefined; live.expediteReady = false; throw error }
+    finally { live.interrupting = undefined; void this.drainQueue(live) }
   }
   private stopLive(live: LiveSession, message: string): void {
     if (!active.has(this.database.structured.snapshot(live.spec.id)!.phase) || live.shutdownTimer) return
     live.budget?.dispose(); live.budget = undefined
     const runtimeId = live.runtimeId
     this.emit(live, { data: { type: 'notice', message: `${message}. Interruption requested; in-flight work and delayed cost reporting may overshoot.` } })
-    void this.interrupt(live.spec.id).catch(() => { /* Owned process cleanup is bounded independently of protocol acknowledgement. */ })
+    void this.interrupt(live.spec.id, false).catch(() => { /* Owned process cleanup is bounded independently of protocol acknowledgement. */ })
     live.shutdownTimer = setTimeout(() => {
       live.shutdownTimer = undefined
       if (live.runtimeId !== runtimeId || live.closed || !active.has(this.database.structured.snapshot(live.spec.id)!.phase)) return
@@ -465,6 +555,7 @@ export class StructuredSessions {
   private emit(live: LiveSession, source: AdapterEvent): void {
     const store = this.database.structured, state = store.snapshot(live.spec.id)
     if (!state || live.closed) return
+    if (source.data.type === 'input_delivery') { this.reconcileInput(live, source); return }
     // Host lifecycle hooks retain the exact tool identity; recover its recorded turn,
     // never associate output with a tool by its displayed name or position alone.
     if (source.itemId && !source.turnId) {
@@ -483,7 +574,7 @@ export class StructuredSessions {
     this.pending.push(event)
     this.observe?.(live.spec, event)
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), 32)
-    if (data.type === 'session' && data.phase === 'completed') queueMicrotask(() => { void this.drainQueue(live) })
+    if (data.type === 'session') queueMicrotask(() => { void this.drainQueue(live) })
     if (data.type === 'session') {
       const phase = data.phase === 'running' || data.phase === 'starting' || data.phase === 'interrupting' ? 'working' : data.phase.startsWith('waiting') ? 'waiting_input' : data.phase === 'completed' ? 'complete' : ['failed', 'disconnected'].includes(data.phase) ? 'error' : 'idle'
       const status = phase === 'working' || phase === 'idle' ? 'running' : phase

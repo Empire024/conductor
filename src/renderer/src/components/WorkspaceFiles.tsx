@@ -140,7 +140,7 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
             if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); stopNaming(); focusEditor() }
             if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); void finishNaming().then(focusEditor) }
           }} /></div> : <button role="tab" aria-selected={file.id === active.id} title={projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
-            onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }}>
+            onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }} data-autoscroll="off">
             {file.mode === 'browser' ? <Globe2 size={13} /> : <FileCode2 size={13} />}<span>{file.path.split('/').pop()}</span>{dirtyIds.has(file.id) && <i className="file-dirty-dot" aria-label="Unsaved changes" />}
           </button>}<button className="file-tab-close" aria-label={'Close ' + file.path} onMouseDown={() => { if (namingRef.current?.file.id === file.id) stopNaming() }} onClick={() => void close(file.id)}><X size={12} /></button>
         </div>)}

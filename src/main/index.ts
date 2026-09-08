@@ -3,6 +3,8 @@ import { promises as fs } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { importPromptImage } from './prompt-images'
 import { ProjectBacklogs } from './project-backlog'
+import { ProjectTaskDispatcher } from './project-task-dispatch'
+import { SourceControl } from './source-control'
 import { AgentControl } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
 import { AgentControlUi } from './agent-control-ui'
@@ -54,6 +56,8 @@ let disposeOrchestrationIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
 let projectBacklogs: ProjectBacklogs
+let projectTaskDispatcher: ProjectTaskDispatcher
+let sourceControl: SourceControl
 let agentControlServer: AgentControlServer | undefined
 let agentControlUi: AgentControlUi | undefined
 let projectFileChanges: ProjectFileChanges | undefined
@@ -545,7 +549,7 @@ const registerIpc = (): void => {
   ipcMain.on('native-cli:resize', (event, id, cols, rows) => { try { trustedStructured(event); agents.nativeCli.resize(structuredId(id), cols, rows) } catch { /* reject untrusted/invalid input */ } })
   ipcMain.handle('structured:submit', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.submit(structuredId(id), text, settings, attachments) })
   ipcMain.handle('structured:respond', (event, response) => { trustedStructured(event); return agents.structured.respond(response) })
-  ipcMain.handle('structured:interrupt', (event, id) => { trustedStructured(event); return agents.structured.interrupt(structuredId(id)) })
+  ipcMain.handle('structured:interrupt', (event, id, expediteSubmittedInput?: boolean) => { trustedStructured(event); if (expediteSubmittedInput !== undefined && typeof expediteSubmittedInput !== 'boolean') throw new Error('Invalid interrupt option'); return agents.structured.interrupt(structuredId(id), expediteSubmittedInput === true) })
   ipcMain.handle('structured:bind-workspace', (event, id, sessionId) => { trustedStructured(event); if (typeof sessionId !== 'string' || sessionId.length > 160) throw new Error('Invalid workspace'); return agents.structured.bindWorkspace(structuredId(id), sessionId) })
   ipcMain.handle('structured:resume', (event, id, settings) => { trustedStructured(event); return agents.structured.resume(structuredId(id), settings) })
   ipcMain.handle('structured:fork', (event, id) => { trustedStructured(event); return agents.structured.fork(structuredId(id)) })
@@ -559,8 +563,12 @@ const registerIpc = (): void => {
   ipcMain.on('settings:get-startup', (event) => {
     event.returnValue = getAppSettings()
   })
+  ipcMain.handle('project-tasks:dispatch-options', (event, projectId) => { trustedStructured(event); return projectTaskDispatcher.options(projectId) })
+  ipcMain.handle('project-tasks:dispatch', (event, projectId, revision, request) => { trustedStructured(event); return projectTaskDispatcher.dispatch(projectId, revision, request) })
   ipcMain.handle('project-tasks:get', (event, projectId: string) => { trustedStructured(event); return projectBacklogs.get(projectId) })
-  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const result = await projectBacklogs.edit(projectId, revision, edit); const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); return result })
+  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }); const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); return result })
+  ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
+  ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); return projectBacklogs.changes(projectId, taskId) })
   ipcMain.handle('projects:list', () => database.listProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await dialog.showOpenDialog({
@@ -1261,7 +1269,8 @@ app.whenReady().then(async () => {
     const projectPath = resolve(projectArgument.slice('--project-path='.length))
     database.upsertProject(projectPath, basename(projectPath))
   }
-  projectBacklogs = new ProjectBacklogs(database)
+  sourceControl = new SourceControl(database)
+  projectBacklogs = new ProjectBacklogs(database, sourceControl)
   for (const project of database.listProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
   terminals = new TerminalManager(database)
   agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '')
@@ -1288,6 +1297,7 @@ app.whenReady().then(async () => {
     fileChanged: change => projectFileChanges?.changed(change),
     linksChanged: scope => publish('agent-control:links-changed', { projectId: scope.projectId, sessionId: scope.sessionId })
   })
+  projectTaskDispatcher = new ProjectTaskDispatcher({ database, backlogs: projectBacklogs, sessions: agents.structured, control, providers: () => agents.listProviders(), ui: agentControlUi.request, changed: projectId => { const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId, path: 'feature-list.md' }) } })
   agentControlUi.register(control)
   agentControlServer = new AgentControlServer(control)
   await agentControlServer.start()

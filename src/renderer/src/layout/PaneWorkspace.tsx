@@ -1,5 +1,6 @@
 import { bindConversationTab, type ConversationIdentity } from '../panes/conversation-tab'
 import { AgentControlLinks } from '../components/AgentControlLinks'
+import { ProjectBacklogPane } from '../components/ProjectBacklogPane'
 import '../navigation.css'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { PaneTabMenu } from '../components/PaneTabMenu'
@@ -168,6 +169,7 @@ const PaneBody = ({
     )
   }
   if (tab.kind === 'file-tree') return <FileTreePane project={project} onOpenFile={onOpenFile} />
+  if (tab.kind === 'tasks') return <ProjectBacklogPane project={project} />
   if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} />
   if (tab.kind === 'preview') return <FilePreviewPane project={project} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} onOpenEditor={onOpenFile} />
   if (tab.kind === 'browser') return <BrowserPane performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { ...tab.state, url })} />
@@ -445,6 +447,7 @@ function PaneGroup({
                   close(tab)
                 }}
                 onAuxClick={(event) => event.preventDefault()}
+                data-autoscroll="off"
                 draggable
                 onDragStart={(event) => beginDrag(event, tab)}
                 onDragEnd={(event) => finishDrag(event, tab)}

@@ -30,7 +30,11 @@ const bridge: ConductorBridge = {
   },
   projectTasks: {
     get: (projectId) => ipcRenderer.invoke('project-tasks:get', projectId),
-    edit: (projectId, revision, edit) => ipcRenderer.invoke('project-tasks:edit', projectId, revision, edit)
+    edit: (projectId, revision, edit) => ipcRenderer.invoke('project-tasks:edit', projectId, revision, edit),
+    setSourceControl: (projectId, enabled) => ipcRenderer.invoke('project-tasks:set-source-control', projectId, enabled),
+    changes: (projectId, taskId) => ipcRenderer.invoke('project-tasks:changes', projectId, taskId),
+    dispatchOptions: projectId => ipcRenderer.invoke('project-tasks:dispatch-options', projectId),
+    dispatch: (projectId, revision, request) => ipcRenderer.invoke('project-tasks:dispatch', projectId, revision, request)
   },
   nativeCli: {
     ensure: (id) => ipcRenderer.invoke('native-cli:ensure', id),
@@ -50,7 +54,7 @@ const bridge: ConductorBridge = {
     events: (id, after) => ipcRenderer.invoke('structured:events', id, after),
     submit: (id, text, settings, attachments) => ipcRenderer.invoke('structured:submit', id, text, settings, attachments),
     respond: (response) => ipcRenderer.invoke('structured:respond', response),
-    interrupt: (id) => ipcRenderer.invoke('structured:interrupt', id),
+    interrupt: (id, expediteSubmittedInput) => ipcRenderer.invoke('structured:interrupt', id, expediteSubmittedInput),
     resume: (id, settings) => ipcRenderer.invoke('structured:resume', id, settings),
     fork: (id) => ipcRenderer.invoke('structured:fork', id),
     discover: (id) => ipcRenderer.invoke('structured:discover', id),

@@ -290,7 +290,7 @@ describe('Codex mid-turn steering (synthetic, zero inference)', () => {
     await adapter.submit('synthetic:steer', settings)
     expect(adapter.capabilities.steering).toBe(true)
     await adapter.steer('More data', settings, [{ id: 'image', kind: 'image', name: 'context.png', path: 'context.png' }])
-    expect(sent.filter(message => (message as { method?: string }).method === 'turn/steer')).toEqual([{ id: expect.any(Number), method: 'turn/steer', params: { threadId: 'synthetic-thread-1', expectedTurnId: 'synthetic-turn-1', input: codexInput('More data', [{ id: 'image', kind: 'image', name: 'context.png', path: 'context.png' }]) } }])
+    expect(sent.filter(message => (message as { method?: string }).method === 'turn/steer')).toEqual([{ id: expect.any(Number), method: 'turn/steer', params: { threadId: 'synthetic-thread-1', clientUserMessageId: expect.any(String), expectedTurnId: 'synthetic-turn-1', input: codexInput('More data', [{ id: 'image', kind: 'image', name: 'context.png', path: 'context.png' }]) } }])
     expect(sent.filter(message => (message as { method?: string }).method === 'turn/start')).toHaveLength(1)
     expect(completed(events)).toBe(false)
     expect(adapter.capabilities.steering).toBe(true)
@@ -353,5 +353,29 @@ describe('Codex mid-turn steering (synthetic, zero inference)', () => {
     expect(adapter.capabilities.steering).toBe(false)
     expect(events.at(-1)?.data).toMatchObject({ phase: 'disconnected' })
     expect(sent.filter(message => (message as { method?: string }).method === 'turn/steer')).toHaveLength(1)
+  })
+})
+
+
+describe('native steering delivery receipts', () => {
+  it('distinguishes acceptance from consumption while the original turn keeps working', async () => {
+    const { adapter, events } = create({ CONDUCTOR_TEST_STEER: 'delayed' })
+    await adapter.submit('synthetic:steer', settings)
+    await adapter.steer('More data', settings, [], 'client-input')
+    expect(events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([{ type: 'input_delivery', inputId: 'client-input', status: 'accepted' }])
+    await waitFor(() => events.some(event => event.data.type === 'input_delivery' && event.data.status === 'delivered'))
+    expect(completed(events)).toBe(false)
+    await adapter.interrupt()
+    await waitFor(() => events.some(event => event.data.type === 'session' && event.data.phase === 'interrupted'))
+    expect(events.some(event => event.data.type === 'input_delivery' && event.data.status === 'cancelled')).toBe(false)
+  })
+  it('only confirms unconsumed input cancellation after native interrupted completion', async () => {
+    const { adapter, events } = create({ CONDUCTOR_TEST_STEER: 'pending' })
+    await adapter.submit('synthetic:steer', settings)
+    await adapter.steer('More data', settings, [], 'client-pending')
+    await adapter.interrupt()
+    expect(events.some(event => event.data.type === 'input_delivery' && event.data.status === 'cancelled')).toBe(false)
+    await waitFor(() => events.some(event => event.data.type === 'session' && event.data.phase === 'interrupted'))
+    expect(events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([{ type: 'input_delivery', inputId: 'client-pending', status: 'accepted' }, { type: 'input_delivery', inputId: 'client-pending', status: 'cancelled' }])
   })
 })

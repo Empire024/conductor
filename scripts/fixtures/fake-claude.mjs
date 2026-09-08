@@ -31,6 +31,11 @@ let initialized = false
 let turn = 0
 let pending
 let testResult
+let permissionScenario
+let permissionMode = process.argv[process.argv.indexOf('--permission-mode') + 1]
+const sessionRules = new Set()
+const steeringHeld = new Map()
+const steeringTimers = new Set()
 
 for await (const line of input) {
   const message = JSON.parse(line)
@@ -43,8 +48,13 @@ for await (const line of input) {
       success(message.request_id, { models: [{ value: 'synthetic-claude', displayName: 'Synthetic Claude fixture', supportsEffort: true, supportedEffortLevels: ['low', 'high'], defaultEffort: 'high' }], commands: [{ name: 'fixture', description: 'Synthetic discovery only' }] })
     } else if (kind === 'interrupt') {
       if (pending) send({ type: 'control_cancel_request', request_id: pending })
-      pending = undefined; success(message.request_id); emit({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use', usage: {} })
-    } else if (kind === 'set_model' || kind === 'set_permission_mode' || kind === 'apply_flag_settings') success(message.request_id)
+      const cancelled = [...steeringHeld.keys()]
+      steeringHeld.clear(); for (const timer of steeringTimers) clearTimeout(timer); steeringTimers.clear()
+      pending = undefined; success(message.request_id, { cancelled, still_queued: [] }); emit({ type: 'result', subtype: 'error_during_execution', is_error: true, result: '[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use', usage: {} })
+    } else if (kind === 'set_permission_mode') {
+      if (permissionScenario === 'REJECT' && message.request.mode === 'auto') send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Synthetic managed policy disables auto-mode' } })
+      else { permissionMode = message.request.mode; success(message.request_id) }
+    } else if (kind === 'set_model' || kind === 'apply_flag_settings') success(message.request_id)
     else send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Unsupported synthetic control' } })
   } else if (message.type === 'user') {
     if (!initialized) throw new Error('User message before initialization')
@@ -58,8 +68,55 @@ for await (const line of input) {
       text('Synthetic native images received: ' + images.length); finish(); continue
     }
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
-    if (prompt.startsWith('SYNTHETIC STEER DATA')) { text('Synthetic steering input received during the active turn.'); continue }
+    if (prompt.startsWith('SYNTHETIC STEERING ')) {
+      const scenario = prompt.split(/\s+/)[2]
+      if (message.priority === 'next') {
+        steeringHeld.set(message.uuid, prompt)
+        emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'queued' })
+        if (scenario === 'NEXT') {
+          const timer = setTimeout(() => {
+            steeringTimers.delete(timer)
+            if (!steeringHeld.delete(message.uuid)) return
+            result('steering-tool', 'Synthetic tool boundary reached')
+            emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'started' })
+            text('Synthetic steering consumed while the original turn continues.')
+          }, 1800)
+          steeringTimers.add(timer)
+        }
+      } else {
+        emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
+        if (scenario === 'WAIT') { declare('steering-tool', 'Read', { file_path: 'synthetic.txt' }); text('Synthetic tool remains active.') }
+        else { text('Synthetic expedited input received.'); finish() }
+      }
+      continue
+    }
+    if (prompt.startsWith('SYNTHETIC STEER DATA')) { emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'queued' }); emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'started' }); text('Synthetic steering input received during the active turn.'); continue }
     turn++
+    if (prompt.startsWith('SYNTHETIC PERMISSION ')) {
+      permissionScenario = /^SYNTHETIC PERMISSION (SCOPED|REPEAT|AUTO|REJECT|ONCE|DENY|REQUIRED|SESSION_EDIT|REPEAT_EDIT)\b/.exec(prompt)?.[1]
+      if (!permissionScenario) throw new Error('Unknown synthetic permission scenario')
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      const command = permissionScenario === 'SCOPED' || permissionScenario === 'REPEAT' ? 'echo conductor-session-scope' : 'echo conductor-' + permissionScenario.toLowerCase()
+      const editPermission = ['SESSION_EDIT', 'REPEAT_EDIT'].includes(permissionScenario)
+      const toolName = editPermission ? 'Write' : 'Bash'
+      const toolInput = editPermission ? { file_path: 'synthetic-permission.txt', content: 'proof' } : { command }
+      declare(`permission-tool-${turn}`, toolName, toolInput)
+      if (permissionScenario === 'REPEAT_EDIT' && permissionMode === 'acceptEdits') {
+        result(`permission-tool-${turn}`, 'SYNTHETIC native Edit-mode session grant covered repeat; no file was changed.')
+        text('SYNTHETIC native session Edit mode reused.'); finish(); continue
+      }
+      if (permissionScenario === 'REPEAT' && sessionRules.has(command)) {
+        result(`permission-tool-${turn}`, 'SYNTHETIC native session rule covered repeat; no command was executed.')
+        text('SYNTHETIC native session grant reused.'); finish(); continue
+      }
+      pending = `permission-${turn}`
+      send({ type: 'control_request', request_id: pending, request: {
+        subtype: 'can_use_tool', tool_use_id: `permission-tool-${turn}`, tool_name: toolName, input: toolInput,
+        ...(permissionScenario === 'REQUIRED' ? { matched_ask_rule: { source: 'policySettings', tool_name: 'Bash' }, decision_reason: 'Synthetic policy requires approval' } : {}),
+        permission_suggestions: editPermission ? [{ type: 'setMode', mode: 'acceptEdits', destination: 'session' }] : [{ type: 'addRules', behavior: 'allow', destination: 'localSettings', rules: [{ toolName: 'Bash', ruleContent: command }] }]
+      } })
+      continue
+    }
     if (prompt.startsWith('SYNTHETIC STEER START')) { emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' }); continue }
     emit({ type: 'system', subtype: 'init', claude_code_version: '2.1.263', tools: ['Edit', 'Bash'], mcp_servers: [], permissionMode: 'default' })
     if (prompt.startsWith('SYNTHETIC QUESTION')) {
@@ -81,6 +138,19 @@ for await (const line of input) {
   } else if (message.type === 'control_response') {
     const { request_id: id, response } = message.response
     if (id !== pending) throw new Error('Response does not match the outstanding synthetic request')
+    if (id === `permission-${turn}`) {
+      for (const update of response.updatedPermissions ?? []) {
+        if (update.type === 'setMode' && update.mode === 'acceptEdits' && update.destination === 'session' && ['SESSION_EDIT', 'REPEAT_EDIT'].includes(permissionScenario)) { permissionMode = 'acceptEdits'; continue }
+        if (update.type !== 'addRules' || update.behavior !== 'allow' || update.destination !== 'session') throw new Error('Synthetic session grant escaped its scope')
+        for (const rule of update.rules) {
+          if (rule.toolName !== 'Bash' || rule.ruleContent !== 'echo conductor-session-scope') throw new Error('Synthetic grant was broader than the offered action')
+          sessionRules.add(rule.ruleContent)
+        }
+      }
+      result(`permission-tool-${turn}`, `SYNTHETIC ${response.behavior}; no command was executed.`, response.behavior !== 'allow')
+      text(`SYNTHETIC permission result: ${response.behavior}; native mode: ${permissionMode}.`)
+      pending = undefined; permissionScenario = undefined; finish(); continue
+    }
     if (id === 'question-' + turn) {
       if (response.updatedInput.answers['Which theme should this workspace use?'] !== 'Night') throw new Error('Synthetic question answer changed')
       result(pending, 'Answer received')

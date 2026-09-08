@@ -4,82 +4,95 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
 
-// Isolated synthetic processes exercise real IPC without provider inference.
-const provider = process.argv.includes('--provider=claude') ? 'claude' : 'codex'
-const behavior = process.argv.find(arg => arg.startsWith('--behavior='))?.split('=')[1] ?? 'accepted'
-const root = await mkdtemp(join(tmpdir(), 'conductor-steering-'))
-const output = resolve('artifacts/steering', provider + '-' + behavior)
+// Offline raw Claude protocol -> real adapter/session IPC -> actual React/Escape.
+// No model or native tool execution; the fixture emits deterministic lifecycle frames.
+const root = await mkdtemp(join(tmpdir(), 'conductor-steering-ui-'))
+const output = resolve('artifacts/steering-ui')
 await mkdir(output, { recursive: true })
-const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_TEST_STEER: behavior }
-delete env.ELECTRON_RUN_AS_NODE
-delete env.CONDUCTOR_LIVE_TESTS
-const app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 30_000 })
-const page = await app.firstWindow()
-const errors = []
-page.on('pageerror', error => errors.push(error.message))
-const results = { synthetic: true, provider, behavior, checks: [], failures: [] }
+const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
+delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS
+const app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 30000 })
+const results = { synthetic: true, checks: [], failures: [], root }
+let page
 try {
+  page = await app.firstWindow()
+  const errors = []; page.on('pageerror', error => errors.push(error.message))
   await page.waitForFunction(() => Boolean(window.conductor?.structured))
-  const project = await page.evaluate(() => window.conductor.projects.create('Steering fixture'))
-  await writeFile(join(project.path, 'context.txt'), 'Exact added context')
+  await page.evaluate(() => window.conductor.projects.create('Steering fixture'))
   await page.reload()
-  await page.locator('.project-row').filter({ hasText: 'Steering fixture' }).click()
-  await page.locator('.launcher-grid:visible button').filter({ hasText: provider === 'claude' ? 'Claude' : 'Codex' }).click()
-  const pane = page.locator('.structured-agent-pane:visible')
+  await page.getByText('Steering fixture', { exact: true }).first().click()
+  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  const pane = page.locator('.structured-agent-pane').first()
+  await pane.waitFor()
   const id = await pane.getAttribute('data-structured-session')
-  const composer = pane.getByRole('textbox', { name: /^Message / })
   const snapshot = () => page.evaluate(id => window.conductor.structured.snapshot(id), id)
-  await expect(composer).toBeEnabled()
-  await composer.fill(provider === 'claude' ? 'SYNTHETIC STEER START' : 'synthetic:steer')
-  await pane.getByRole('button', { name: 'Send message', exact: true }).click()
-  await expect(composer).toHaveValue('')
-  await expect.poll(async () => (await snapshot()).capabilities.steering).toBe(true)
-  await expect(composer).toHaveAttribute('placeholder', 'Send to running turn')
-  await composer.fill('SYNTHETIC STEER DATA: keep this text')
-  await pane.getByRole('button', { name: 'Attach file context', exact: true }).click()
-  await pane.getByRole('combobox', { name: 'Context file path', exact: true }).fill('context.txt')
-  await pane.getByRole('button', { name: 'Attach', exact: true }).click()
-  const before = await snapshot()
-  const turnId = (await page.evaluate(id => window.conductor.structured.events(id), id)).filter(event => event.data.type === 'session' && event.turnId).at(-1).turnId
-  await pane.getByRole('button', { name: 'Steer', exact: true }).click()
-  if (behavior === 'malformed') {
-    await expect(pane.getByRole('alert')).toContainText('your draft was kept')
-    await expect(composer).toHaveValue('SYNTHETIC STEER DATA: keep this text')
-    await expect(pane.locator('.sa-context-chips')).toContainText('context.txt')
-    assert.equal((await snapshot()).items.filter(item => item.data.type === 'text' && item.data.role === 'user').length, 1)
-    assert.ok(!(await snapshot()).queued)
-    results.checks.push('Uncertain RPC delivery retains composer text and attachments without queueing or claiming success')
-  } else if (behavior === 'stale') {
-    await expect(composer).toHaveValue('')
-    await expect(pane.getByLabel('Queued messages')).toContainText('SYNTHETIC STEER DATA: keep this text')
-    assert.equal((await snapshot()).queued.attachments[0].content, 'Exact added context')
-    await pane.getByRole('button', { name: 'Remove queued message 1', exact: true }).click()
-    await expect(composer).toHaveValue('SYNTHETIC STEER DATA: keep this text')
-    await expect(pane.locator('.sa-context-chips')).toContainText('context.txt')
-    results.checks.push('Stale expectedTurnId queues captured input and cancellation restores its exact draft')
-  } else {
-    await expect(composer).toHaveValue('')
-    await expect(pane.getByLabel('Queued messages')).toHaveCount(0)
-    const after = await snapshot()
-    assert.equal(after.runtimeId, before.runtimeId)
-    assert.equal(after.phase, 'running')
-    const users = after.items.filter(item => item.data.type === 'text' && item.data.role === 'user')
-    assert.equal(users.length, 2)
-    assert.equal(users.at(-1).turnId, turnId)
-    assert.equal(users.at(-1).data.text, 'SYNTHETIC STEER DATA: keep this text')
-    assert.equal(users.at(-1).data.attachments[0].name, 'context.txt')
-    await expect(pane.getByText('SYNTHETIC STEER DATA: keep this text', { exact: true })).toBeVisible()
-    await expect(pane.locator('.sa-context-chips')).toHaveCount(0)
-    results.checks.push('Steer affordance routes through real IPC into the running turn, adds one transcript message, and clears only delivered input')
+  const input = () => pane.getByRole('textbox', { name: /^Message / })
+  const send = async (text, action = 'Send message') => {
+    await input().fill(text)
+    // Backend snapshots can lead the batched renderer event by 32 ms.
+    // Exercise Enter only once the intended action is actually offered by the UI.
+    await expect(pane.getByRole('button', { name: action, exact: true })).toBeEnabled()
+    await input().press('Enter')
   }
-  await page.screenshot({ path: join(output, 'steering.png'), fullPage: true })
+  const users = async text => (await snapshot()).items.filter(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text === text)
+  await send('SYNTHETIC STEERING WAIT')
+  await expect.poll(async () => (await snapshot()).capabilities?.steering).toBe(true)
+  await send('SYNTHETIC STEERING NEXT', 'Steer')
+  const pending = pane.getByLabel('Pending steering messages')
+  await expect(pending).toContainText('Message will be sent after the next tool use. Esc interrupts and sends now.')
+  assert.equal((await users('SYNTHETIC STEERING NEXT')).length, 0)
+  await expect(pending).toHaveCount(0)
+  assert.equal((await snapshot()).phase, 'running')
+  assert.equal((await users('SYNTHETIC STEERING NEXT')).length, 1)
+  results.checks.push('Accepted input remains pending until the native next-tool receipt, then appears exactly once while the original turn continues')
+
+  await send('SYNTHETIC STEERING HOLD', 'Steer')
+  await expect(pending).toContainText('Received')
+  await page.reload()
+  await expect(pending).toContainText('SYNTHETIC STEERING HOLD')
+  results.checks.push('Pending native delivery survives renderer reload without sending another input')
+  const hintFits = await pending.locator('small').evaluate(element => element.getBoundingClientRect().right <= window.innerWidth && getComputedStyle(element).whiteSpace === 'normal')
+  assert.equal(hintFits, true, 'Delivery hint must wrap inside the visible pane')
+  await input().fill('Unsent draft stays here')
+  await expect(pane.getByRole('button', { name: 'Steer', exact: true })).toBeEnabled()
+  await page.screenshot({ path: join(output, 'pending-steering.png'), fullPage: true })
+  await input().press('Escape')
+  await expect.poll(async () => (await snapshot()).phase).toBe('completed')
+  await expect(input()).toHaveValue('Unsent draft stays here')
+  assert.equal((await users('SYNTHETIC STEERING HOLD')).length, 1)
+  assert.equal((await users('Unsent draft stays here')).length, 0)
+  await expect(pending).toHaveCount(0)
+  results.checks.push('Escape interrupts and expedites only the confirmed unconsumed submitted input, preserving the unsent draft')
+
+  await send('SYNTHETIC STEERING WAIT')
+  await expect.poll(async () => (await snapshot()).phase).toBe('running')
+  await input().fill('Another unsent draft')
+  await expect(pane.getByRole('button', { name: 'Steer', exact: true })).toBeEnabled()
+  await input().press('Escape')
+  await expect.poll(async () => (await snapshot()).phase).toBe('interrupted')
+  await expect(input()).toHaveValue('Another unsent draft')
+  assert.equal((await users('Another unsent draft')).length, 0)
+  results.checks.push('Escape with no submitted pending input remains a plain stop and never submits the composer draft')
+  await pane.getByRole('button', { name: 'Resume conversation', exact: true }).click()
+  await expect.poll(async () => (await snapshot()).phase).toBe('idle')
+  await send('SYNTHETIC STEERING WAIT')
+  await expect.poll(async () => (await snapshot()).phase).toBe('running')
+  await send('SYNTHETIC STEERING HOLD', 'Steer')
+  await expect(pending).toContainText('Received')
+  await pane.getByRole('button', { name: 'Stop', exact: true }).click()
+  await expect.poll(async () => (await snapshot()).phase).toBe('interrupted')
+  await expect(pending).toContainText('Not sent')
+  assert.equal((await users('SYNTHETIC STEERING HOLD')).length, 1)
+  await pending.getByRole('button', { name: 'Return steering message to draft' }).click()
+  await expect(input()).toHaveValue('SYNTHETIC STEERING HOLD')
+  results.checks.push('Stop cancels without expediting, and the unsent pending message can be restored to the composer')
   assert.deepEqual(errors, [])
+  console.log(JSON.stringify(results, null, 2))
 } catch (error) {
   results.failures.push(error.stack ?? String(error))
-  await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => {})
+  if (page) await page.screenshot({ path: join(output, 'failure.png'), fullPage: true }).catch(() => undefined)
   throw error
 } finally {
-  await writeFile(join(output, 'results.json'), JSON.stringify(results, null, 2))
+  await writeFile(join(output, 'report.json'), JSON.stringify(results, null, 2) + '\n')
   await app.close()
 }
-console.log(JSON.stringify(results, null, 2))

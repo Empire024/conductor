@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 const root = await mkdtemp(join(tmpdir(), 'conductor-backlog-'))
 const output = resolve('artifacts/backlog')
 await mkdir(output, { recursive: true })
-const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_MODEL_CATALOG: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
+const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_MODEL_CATALOG: '1', CONDUCTOR_TEST_STEER: 'review', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
 delete env.ELECTRON_RUN_AS_NODE
 delete env.CONDUCTOR_LIVE_TESTS
 const app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 30000 })
@@ -30,6 +30,8 @@ const chooseDialog = async (response) => app.evaluate(({ dialog }, choice) => {
 const activeEditor = () => page.locator('.file-tab-content:not([hidden]) .monaco-editor textarea')
 try {
   await page.waitForFunction(() => Boolean(window.conductor?.nativeCli))
+  // Keep the Nord day contrast check independent of the local clock.
+  await page.evaluate(async () => { await window.conductor.settings.setThemeAuto(false); await window.conductor.settings.setThemeVariant('day') })
   const projects = await page.evaluate(async () => [await window.conductor.projects.create('Backlog Alpha'), await window.conductor.projects.create('Backlog Beta')])
   await writeFile(join(projects[0].path, 'alpha.ts'), 'export const alpha = 1;\n')
   await writeFile(join(projects[0].path, 'context.txt'), 'Context for attachment autocomplete.\n')
@@ -42,14 +44,31 @@ try {
   await expect(composer).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await composer.fill('Unsent draft survives file navigation.')
+  // Hold the first index response to exercise pending keyboard navigation without
+  // racing an already selected result or a pointer left over the opening dialog.
+  await page.mouse.move(8, 70)
+  await app.evaluate(({ ipcMain }) => {
+    const original = ipcMain._invokeHandlers.get('files:search')
+    globalThis.__initialPickerOriginal = original
+    ipcMain.removeHandler('files:search')
+    ipcMain.handle('files:search', (...args) => new Promise(resolve => { globalThis.__releaseInitialPicker = () => resolve(original(...args)) }))
+  })
   await composer.press('Control+e')
   const search = page.getByRole('combobox', { name: 'Search files', exact: true })
   await expect(search).toBeFocused()
+  await expect.poll(() => app.evaluate(() => typeof globalThis.__releaseInitialPicker)).toBe('function')
+  await expect(page.locator('.file-picker-results')).toHaveAttribute('aria-busy', 'true')
   await search.press('ArrowDown')
+  await app.evaluate(({ ipcMain }) => {
+    globalThis.__releaseInitialPicker()
+    ipcMain.removeHandler('files:search'); ipcMain.handle('files:search', globalThis.__initialPickerOriginal)
+  })
   const fileOptions = page.locator('.file-picker-results [role=option]')
   await expect(fileOptions.nth(1)).toHaveAttribute('aria-selected', 'true')
   await search.fill('picker-')
   await search.press('ArrowDown')
+  await expect(page.locator('.file-picker-results')).toHaveAttribute('aria-busy', 'false')
+  await expect(fileOptions).toHaveCount(35)
   await expect(fileOptions.nth(1)).toHaveAttribute('aria-selected', 'true')
   await fileOptions.nth(1).hover()
   for (let index = 0; index < 27; index++) await search.press('ArrowDown')
@@ -165,9 +184,17 @@ try {
   check('Clicking outside a native modal dismisses it')
   await composer.fill('')
   await expect.poll(async () => (await page.evaluate((id) => window.conductor.structured.snapshot(id), id)).phase).toBe('idle')
+  // Select a model that the synthetic runtime actually advertises; the app's
+  // configured default can be absent from this deliberately small test catalog.
+  await page.getByRole('combobox', { name: 'Model', exact: true }).click()
+  const modelSearch = page.getByRole('textbox', { name: 'Search models', exact: true })
+  await modelSearch.fill('synthetic-model')
+  await expect(page.getByRole('option')).toHaveCount(1)
+  await modelSearch.press('Enter')
   const effort = page.getByRole('slider', { name: 'Reasoning effort' })
   await expect(effort).toBeVisible()
-  await effort.fill('1')
+  await effort.press('Home')
+  await expect(effort).toHaveAttribute('aria-valuetext', 'Low')
   await page.getByRole('combobox', { name: 'Model', exact: true }).click()
   await page.getByRole('option').filter({ hasText: 'No effort model' }).click()
   await expect(effort).toHaveCount(0)
@@ -207,7 +234,9 @@ try {
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
   await expect(page.locator('.sa-composer').getByRole('button', { name: 'Stop', exact: true })).toBeVisible()
   await composer.fill('Queued follow-up survives interruption.')
-  await page.getByRole('button', { name: 'Queue message', exact: true }).click()
+  // Native review turns decline steering, so the first follow-up safely enters
+  // the queue and later messages use the resulting Queue affordance.
+  await page.getByRole('button', { name: 'Steer', exact: true }).click()
   await expect(page.locator('.sa-queue')).toContainText('Queued follow-up survives interruption.')
   await composer.fill('Second queued message.')
   await page.getByRole('button', { name: 'Queue message', exact: true }).click()

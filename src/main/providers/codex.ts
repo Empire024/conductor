@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
@@ -321,17 +322,29 @@ export class CodexAdapter implements ProviderAdapter {
     } finally { this.dispatching = false; if (this.turnId) this.emitPhase(true) }
   }
 
-  async steer(text: string, _settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> {
+  private steeringInputs = new Map<string, string>()
+
+  private inputDelivery(inputId: string, status: 'accepted' | 'delivered' | 'cancelled' | 'uncertain', native?: AdapterEvent['native']): void {
+    const turnId = this.steeringInputs.get(inputId)
+    if (!turnId) return
+    if (status !== 'accepted') this.steeringInputs.delete(inputId)
+    this.emit({ turnId, data: { type: 'input_delivery', inputId, status }, native })
+  }
+
+  async steer(text: string, _settings: SessionSettings, attachments?: ContextAttachment[], inputId: string = randomUUID()): Promise<void> {
     if (this.disposed || this.failed || !this.threadId || !this.transport?.connected) throw new SteeringUnavailableError('Codex runtime is disconnected')
     if (this.dispatching) throw new SteeringUnavailableError('Codex turn acknowledgement is pending; steering is not yet addressable')
     if (!this.turnId) throw new SteeringUnavailableError('There is no active Codex turn to steer')
     if (this.turnKind || this.interrupted) throw new SteeringUnavailableError('Codex ' + (this.turnKind ?? 'interrupting') + ' turns cannot be steered')
     const turnId = this.turnId
+    this.steeringInputs.set(inputId, turnId)
     try {
-      const result = await this.request<TurnSteerResponse>('turn/steer', { threadId: this.threadId, input: codexInput(text, attachments), expectedTurnId: turnId })
+      const result = await this.request<TurnSteerResponse>('turn/steer', { threadId: this.threadId, clientUserMessageId: inputId, input: codexInput(text, attachments), expectedTurnId: turnId })
       if (result?.turnId !== turnId) throw new Error('Malformed Codex steer response; delivery is uncertain')
+      this.inputDelivery(inputId, 'accepted', { method: 'turn/steer', payload: json(result) })
     } catch (error) {
       if (error instanceof CodexRpcError) {
+        this.steeringInputs.delete(inputId)
         const info = record(error.data) ? error.data.codexErrorInfo : undefined
         const refusal = record(info) && record(info.activeTurnNotSteerable) ? info.activeTurnNotSteerable : undefined
         if (refusal?.turnKind === 'review' || refusal?.turnKind === 'compact') {
@@ -525,6 +538,9 @@ export class CodexAdapter implements ProviderAdapter {
         for (const item of params.turn.items ?? []) this.item(item, { ...context, turnId: params.turn.id }, true, native)
         this.expireRequests('Turn completed', params.threadId, params.turn.id)
         if (params.threadId === this.threadId && (!this.turnId || this.turnId === params.turn.id)) {
+          // Interrupted turns discard their remaining turn-local input queue. Item
+          // snapshots above reconcile any input already consumed before cancellation.
+          for (const [id, turnId] of this.steeringInputs) if (turnId === params.turn.id) this.inputDelivery(id, params.turn.status === 'interrupted' ? 'cancelled' : 'uncertain', native)
           this.turnId = undefined
           if (params.turn.error) send({ type: 'error', message: params.turn.error.message })
           send({ type: 'session', phase: params.turn.status === 'failed' ? 'failed' : params.turn.status === 'interrupted' ? 'interrupted' : 'completed' }, { turnId: params.turn.id })
@@ -629,7 +645,9 @@ export class CodexAdapter implements ProviderAdapter {
       send({ type: 'tool', name, ...data })
     }
     switch (item.type) {
-      case 'userMessage': return // Host already persisted the exact submitted input once.
+      case 'userMessage':
+        if (correlation.nativeSessionId === this.threadId && item.clientId) this.inputDelivery(item.clientId, 'delivered', native)
+        return // Host persists its captured input only after the matching native receipt.
       case 'agentMessage':
         send({ type: 'text', role: 'assistant', text: item.text, mode: 'snapshot' })
         return
@@ -736,6 +754,7 @@ export class CodexAdapter implements ProviderAdapter {
   }
 
   private disconnect(message: string): void {
+    for (const id of this.steeringInputs.keys()) this.inputDelivery(id, 'uncertain')
     if (this.failed) return
     this.failed = true
     for (const pending of this.rpc.values()) { clearTimeout(pending.timer); pending.reject(new Error(message)) }

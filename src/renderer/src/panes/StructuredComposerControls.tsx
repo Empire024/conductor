@@ -1,5 +1,5 @@
 import { conversationModes, modelDisplayName, resolvedComposerSettings } from './composer-settings'
-import { modelEfforts } from '../../../shared/model-effort'
+import { modelEfforts, resolveEffortChoice, supportedEffortChoices } from '../../../shared/model-effort'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { useEffect, useId, useRef, useState } from 'react'
 import { Check, ChevronDown, LoaderCircle, Search } from 'lucide-react'
@@ -29,19 +29,23 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const modes = conversationModes(capabilities)
   const mode = settings.plan ? 'plan' : capabilities?.provider === 'codex' ? 'edit' : settings.permission
   const supportedEfforts = modelEfforts(capabilities, settings.model)
-  const efforts = ['', ...(supportedEfforts ?? []).filter(value => value && value !== 'auto')]
+  const efforts = supportedEffortChoices(capabilities, settings.model)
   const unavailableEffort = Boolean(capabilities && settings.effort && settings.effort !== 'auto' && !efforts.includes(settings.effort))
-  const effortIndex = Math.max(0, efforts.indexOf(resolved.effort ?? ''))
-  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : (efforts[effortIndex] || resolved.effort || 'Not reported').replace(/^./, char => char.toUpperCase())
+  const effort = resolveEffortChoice(efforts, resolved.effort)
+  const effortIndex = Math.max(0, efforts.indexOf(effort ?? ''))
+  const effortProgress = efforts.length > 1 ? Math.round(effortIndex / (efforts.length - 1) * 100) : 100
+  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : (effort ?? '').replace(/^./, char => char.toUpperCase())
   const close = (): void => { setOpen(false); setQuery(''); trigger.current?.focus() }
   const chooseModel = (id: string): void => {
     const supported = modelEfforts(capabilities, id)
     onChange({ model: id || undefined, ...(supported && settings.effort && !supported.includes(settings.effort) ? { effort: undefined } : {}) })
     close()
   }
+  // The composer commits the effort it is showing, so the runtime is never guessing.
   useEffect(() => {
-    if (supportedEfforts?.length === 0 && settings.effort) onChange({ effort: undefined })
-  }, [supportedEfforts, settings.effort, onChange])
+    if (supportedEfforts?.length === 0) { if (settings.effort) onChange({ effort: undefined }); return }
+    if (!unavailableEffort && effort && settings.effort !== effort) onChange({ effort })
+  }, [supportedEfforts, settings.effort, effort, unavailableEffort, onChange])
 
   useEffect(() => {
     if (!open) return
@@ -85,12 +89,12 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
         {!loading && !error && !choices.length && <p className="sa-model-loading">No matching models</p>}
       </div>}
     </div>
-    {efforts.length > 1 && unavailableEffort && <button className="sa-effort-unavailable" type="button" disabled={disabled} title="This saved effort is not in the current model catalog. Click to use the configured effort." onClick={() => onChange({ effort: undefined })}>{effortLabel}</button>}
-    {efforts.length > 1 && !unavailableEffort && <label className="agent-prompt-effort sa-effort-control" title="Reasoning effort for your next message">
+    {efforts.length > 0 && unavailableEffort && <button className="sa-effort-unavailable" type="button" disabled={disabled} title="This saved effort is not in the current model catalog. Click to use the configured effort." onClick={() => onChange({ effort: undefined })}>{effortLabel}</button>}
+    {efforts.length > 0 && !unavailableEffort && <label className="agent-prompt-effort sa-effort-control" title="Reasoning effort for your next message">
       <span className="agent-effort-heading"><span>Effort</span><output>{effortLabel}</output></span>
-      <span className="agent-effort-slider" style={{ '--effort-progress': `${effortIndex / (efforts.length - 1) * 100}%` } as React.CSSProperties}>
+      <span className="agent-effort-slider" style={{ '--effort-progress': `${effortProgress}%` } as React.CSSProperties}>
         <span className="agent-effort-ticks" aria-hidden="true">{efforts.map((effort, index) => <i key={effort} className={index <= effortIndex ? 'active' : ''} />)}</span>
-        <input type="range" min={0} max={efforts.length - 1} step={1} value={effortIndex} disabled={disabled} aria-label="Reasoning effort" aria-valuetext={effortLabel} onChange={event => onChange({ effort: efforts[Number(event.target.value)] || undefined })} />
+        <input type="range" min={0} max={efforts.length - 1} step={1} value={effortIndex} disabled={disabled} aria-label="Reasoning effort" aria-valuetext={effortLabel} onChange={event => onChange({ effort: efforts[Number(event.target.value)] ?? effort })} />
       </span>
     </label>}
   </>

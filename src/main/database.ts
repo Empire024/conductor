@@ -20,6 +20,7 @@ import type {
   WorkspaceLayout
 } from '../shared/models'
 import { createDefaultLayout, makeId } from '../shared/models'
+import type { ProjectTaskActivity, ProjectTaskStatus } from '../shared/project-backlog'
 import {
   clampMemoryWeight,
   memorySourceOf,
@@ -30,6 +31,21 @@ import {
 } from './memory'
 
 type DbRow = Record<string, unknown>
+
+const mapTaskActivity = (row: DbRow): ProjectTaskActivity => ({
+  id: row.id as string,
+  status: row.status as ProjectTaskStatus,
+  actor: row.actor as 'agent' | 'you' | 'file',
+  at: row.created_at as string,
+  // NULL is an older row whose agent_id also represented its assignee. New unassigned rows store ''.
+  assignedAgentId: ((row.assigned_agent_id == null ? row.agent_id : row.assigned_agent_id) as string | null) || undefined,
+  agentId: (row.agent_id as string | null) ?? undefined,
+  agentTitle: (row.agent_title as string | null) ?? undefined,
+  provider: (row.provider as string | null) ?? undefined,
+  sessionId: (row.session_id as string | null) ?? undefined,
+  workspace: (row.workspace as string | null) ?? undefined,
+  commit: (row.commit_sha as string | null) ?? undefined
+})
 
 const now = (): string => new Date().toISOString()
 
@@ -173,7 +189,26 @@ export class ConductorDatabase {
       );
 
       CREATE INDEX IF NOT EXISTS editor_drafts_project_idx ON editor_drafts(project_id, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS project_task_activity (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        task_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        actor TEXT NOT NULL,
+        agent_id TEXT,
+        agent_title TEXT,
+        provider TEXT,
+        session_id TEXT,
+        workspace TEXT,
+        commit_sha TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS project_task_activity_idx
+        ON project_task_activity(project_id, task_id, created_at DESC);
     `)
+    this.ensureColumn('project_task_activity', 'assigned_agent_id', 'TEXT')
     this.ensureColumn('editor_drafts', 'base_content_json', 'TEXT')
     this.ensureColumn('sessions', 'continue_on_limit', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('sessions', 'closed_at', 'INTEGER')
@@ -316,6 +351,56 @@ export class ConductorDatabase {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
       )
       .run(key, value, now())
+  }
+
+  /** Task provenance: which agent, in which workspace, against which commit. */
+  recordProjectTaskActivity(entry: {
+    projectId: string
+    taskId: string
+    status: ProjectTaskStatus
+    actor: 'agent' | 'you' | 'file'
+    assignedAgentId?: string
+    agentId?: string
+    agentTitle?: string
+    provider?: string
+    sessionId?: string
+    workspace?: string
+    commit?: string
+  }): ProjectTaskActivity {
+    const id = makeId('task-activity')
+    const at = now()
+    this.db
+      .prepare(
+        `INSERT INTO project_task_activity
+           (id, project_id, task_id, status, actor, agent_id, agent_title, provider, session_id, workspace, commit_sha, created_at, assigned_agent_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, entry.projectId, entry.taskId, entry.status, entry.actor, entry.agentId ?? null, entry.agentTitle ?? null, entry.provider ?? null, entry.sessionId ?? null, entry.workspace ?? null, entry.commit ?? null, at, entry.assignedAgentId ?? '')
+    return { id, at, status: entry.status, actor: entry.actor, assignedAgentId: entry.assignedAgentId, agentId: entry.agentId, agentTitle: entry.agentTitle, provider: entry.provider, sessionId: entry.sessionId, workspace: entry.workspace, commit: entry.commit }
+  }
+
+  /** Newest first, so a task can show who last moved it without another query. */
+  listProjectTaskActivity(projectId: string, perTask = 12): Map<string, ProjectTaskActivity[]> {
+    const rows = this.db
+      .prepare('SELECT * FROM project_task_activity WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 2000')
+      .all(projectId) as DbRow[]
+    const activity = new Map<string, ProjectTaskActivity[]>()
+    for (const row of rows) {
+      const taskId = row.task_id as string
+      const list = activity.get(taskId) ?? []
+      if (list.length < perTask) list.push(mapTaskActivity(row))
+      activity.set(taskId, list)
+    }
+    return activity
+  }
+
+  /** The commits a task was opened against and last moved against, in that order. */
+  projectTaskCommitRange(projectId: string, taskId: string): { base?: string; head?: string } {
+    const rows = this.db
+      .prepare('SELECT commit_sha FROM project_task_activity WHERE project_id = ? AND task_id = ? AND commit_sha IS NOT NULL ORDER BY created_at ASC, rowid ASC')
+      .all(projectId, taskId) as DbRow[]
+    const commits = rows.map((row) => row.commit_sha as string)
+    return { base: commits[0], head: commits.at(-1) }
   }
 
   listSessions(projectId: string): SessionRecord[] {

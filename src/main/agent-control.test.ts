@@ -1,4 +1,4 @@
-﻿import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -11,11 +11,11 @@ import { AgentCollaborationStore } from './agent-collaboration-store'
 import { ProjectBacklogs } from './project-backlog'
 import type { AgentControlScope, AgentControlTab, AgentControlUiRequest } from '../shared/agent-control'
 import type { AgentProviderInfo, AgentSpec, PaneTab } from '../shared/models'
-import type { ProviderCapabilities, StructuredProvider } from '../shared/structured-agent'
+import type { AgentEventData, ProviderCapabilities, SessionProjection, StructuredProvider } from '../shared/structured-agent'
 import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
 
 const dispose: Array<() => void> = []
-afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs() })
+afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
 function fixture(aliasedRoot = false) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0'); vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
   const root = mkdtempSync(join(tmpdir(), 'conductor-control-')), canonicalProjectPath = join(root, 'project')
@@ -73,6 +73,37 @@ describe('authorized native app control', () => {
     await expect(f.control.call(f.scope, 'agents.submit', { agentSessionId: f.spec.id, prompt: 'Loop' })).rejects.toThrow('itself')
     f.database.closeSession(f.workspace.id)
     await expect(f.control.call(f.scope, 'models.list')).rejects.toThrow('scope')
+    expect(f.submissions).toHaveLength(0)
+  })
+
+  it('observes coworker identity and fresh native execution results, including detached and older updated tools', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-08T10:00:00.000Z'))
+    const f = fixture(), child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude' }) as AgentControlTab
+    const detached = f.database.createDetachedWindow(f.project.id, f.workspace.id, child)
+    const append = (data: AgentEventData, itemId?: string): void => {
+      const sequence = f.database.structured.snapshot(child.resourceId!)!.sequence + 1
+      f.database.structured.append({ schemaVersion: 1, id: 'event-' + sequence, sequence, sessionId: child.resourceId!, runtimeId: 'runtime-coworker', provider: 'claude', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), itemId, data })
+    }
+    append({ type: 'session', phase: 'running' })
+    append({ type: 'tool', name: 'Bash', status: 'running', input: { command: 'test fixture' } }, 'long-tool')
+    const startedAt = new Date().toISOString()
+    for (let index = 0; index < 65; index++) append({ type: 'text', role: 'status', text: 'Concurrent activity ' + index, mode: 'snapshot' })
+    const active = await f.control.call(f.scope, 'agents.snapshot', { agentSessionId: child.resourceId }) as SessionProjection & { activeTools: SessionProjection['items'] }
+    expect(active.activeTools).toEqual([expect.objectContaining({ nativeItemId: 'long-tool', data: expect.objectContaining({ status: 'running' }) })])
+    vi.setSystemTime(new Date('2026-09-08T10:01:00.000Z'))
+    append({ type: 'tool', name: 'Bash', status: 'failed', output: 'Fixture failed', exitCode: 7 }, 'long-tool')
+    const lastActivityAt = new Date().toISOString()
+    vi.setSystemTime(new Date('2026-09-08T10:02:00.000Z'))
+    const observedAt = new Date().toISOString()
+    expect(await f.control.call(f.scope, 'app.state')).toMatchObject({ observedAt, projectId: f.project.id, workspaceId: f.workspace.id })
+    expect(await f.control.call(f.scope, 'agents.list')).toEqual(expect.arrayContaining([expect.objectContaining({ observedAt, source: 'native-session', projectId: f.project.id, workspaceId: f.workspace.id, tabId: child.id, detachedId: detached.id, agentSessionId: child.resourceId, provider: 'claude', phase: 'running', lastActivityAt, lastEvent: expect.objectContaining({ type: 'tool', status: 'failed', exitCode: 7 }) })]))
+    const snapshot = await f.control.call(f.scope, 'agents.snapshot', { agentSessionId: child.resourceId }) as SessionProjection & { observedAt: string; lastActivityAt: string; activeTools: SessionProjection['items'] }
+    expect(snapshot).toMatchObject({ observedAt, lastActivityAt, phase: 'running', truncated: true, activeTools: [] })
+    expect(snapshot.items).toHaveLength(60)
+    expect(snapshot.items.find(item => item.nativeItemId === 'long-tool')).toMatchObject({ timestamp: startedAt, data: { type: 'tool', status: 'failed', output: 'Fixture failed', exitCode: 7 } })
+    append({ type: 'session', phase: 'idle' })
+    expect(await f.control.call(f.scope, 'agents.list')).toEqual(expect.arrayContaining([expect.objectContaining({ agentSessionId: child.resourceId, phase: 'idle', lastActivityAt: observedAt })]))
     expect(f.submissions).toHaveLength(0)
   })
 
@@ -215,5 +246,43 @@ describe('local protocol boundary', () => {
     await server.start(); expect(server.briefing(f.spec)).toBe('')
     await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Forbidden', prompt: 'Outside live fixture' }] })).rejects.toThrow('disabled')
     server.close()
+  })
+})
+
+describe('Project task handoff through native router dispatch', () => {
+  it('transfers only accepted exact task claims to a visible worker with the selected effort', async () => {
+    const f = fixture()
+    writeFileSync(join(f.root, 'project', 'feature-list.md'), '- [~] Selected task <!-- conductor-task:selected agent=controller -->\n- [~] Coworker task <!-- conductor-task:other agent=coworker -->\n')
+    const result = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Selected work', prompt: 'Complete the selected task', provider: 'claude', model: 'claude-synthetic', effort: 'low', projectTaskIds: ['selected'] }] }) as Array<{ accepted: boolean; agentSessionId: string; projectTaskIds: string[]; effort: string }>
+    expect(result[0]).toMatchObject({ accepted: true, projectTaskIds: ['selected'], effort: 'low' })
+    expect(f.requests.find(request => request.action === 'tabs.open')?.params.focus).toBe(false)
+    expect(f.submissions).toHaveLength(1)
+    expect(f.submissions[0]?.prompt).toContain('Exact Project tasks assigned to this worker: selected')
+    const board = await f.deps.backlogs.get(f.project.id)
+    expect(board.tasks.find(task => task.id === 'selected')).toMatchObject({ status: 'doing', agentId: result[0]!.agentSessionId })
+    expect(board.tasks.find(task => task.id === 'selected')!.activity[0]).toMatchObject({ actor: 'agent', agentId: 'controller', agentTitle: 'Controller', assignedAgentId: result[0]!.agentSessionId })
+    expect((await f.deps.backlogs.get(f.project.id)).tasks.find(task => task.id === 'selected')!.activity).toEqual(board.tasks.find(task => task.id === 'selected')!.activity)
+    expect(board.tasks.find(task => task.id === 'other')).toMatchObject({ status: 'doing', agentId: 'coworker' })
+    const finished = await f.control.call({ ...f.scope, agentSessionId: result[0]!.agentSessionId }, 'tasks.update', { revision: board.revision, id: 'selected', status: 'done' }) as { tasks: Array<{ id: string; status: string }> }
+    expect(finished.tasks.find(task => task.id === 'selected')?.status).toBe('done')
+  })
+  it('rejects missing, finished, competing active, and duplicate task IDs before any new tab or prompt', async () => {
+    const f = fixture()
+    writeFileSync(join(f.root, 'project', 'feature-list.md'), '- [~] Mine <!-- conductor-task:mine agent=controller -->\n- [~] Other <!-- conductor-task:other agent=coworker -->\n- [x] Done <!-- conductor-task:done -->\n')
+    const worker = { title: 'Worker', prompt: 'Selected work', provider: 'claude', model: 'claude-synthetic', effort: 'low' }
+    for (const id of ['absent', 'other', 'done']) await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ ...worker, projectTaskIds: [id] }] })).rejects.toThrow('missing, finished, or owned')
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ ...worker, projectTaskIds: ['mine'] }, { ...worker, projectTaskIds: ['mine'] }] })).rejects.toThrow('distinct')
+    expect(f.control.tabs(f.scope)).toHaveLength(1)
+    expect(f.submissions).toHaveLength(0)
+  })
+  it('retains the original task claim and visible worker after a native dispatch refusal without retrying', async () => {
+    const f = fixture()
+    writeFileSync(join(f.root, 'project', 'feature-list.md'), '- [~] Mine <!-- conductor-task:mine agent=controller -->\n')
+    const submit = vi.spyOn(f.sessions, 'submit').mockRejectedValueOnce(new Error('Synthetic dispatch refusal'))
+    const result = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Worker', prompt: 'Selected work', provider: 'claude', model: 'claude-synthetic', effort: 'low', projectTaskIds: ['mine'] }] }) as Array<{ accepted: boolean; error: string }>
+    expect(result[0]).toMatchObject({ accepted: false, error: 'Synthetic dispatch refusal' })
+    expect(submit).toHaveBeenCalledOnce()
+    expect((await f.deps.backlogs.get(f.project.id)).tasks[0]).toMatchObject({ agentId: 'controller', status: 'doing' })
+    expect(f.control.tabs(f.scope)).toHaveLength(2)
   })
 })

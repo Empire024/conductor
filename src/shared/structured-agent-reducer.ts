@@ -30,11 +30,14 @@ function bound(data: AgentEventData): AgentEventData {
 export function projectAgentEvent(state: SessionProjection, event: AgentEvent): SessionProjection {
   if (event.sessionId !== state.sessionId || event.sequence <= state.sequence) return state
   let next = { ...state, sequence: event.sequence, runtimeId: event.runtimeId, nativeSessionId: state.nativeSessionId ?? event.nativeSessionId }
+  if (event.data.type === 'steering') return { ...next, pendingSteering: event.data.prompts }
+  if (event.data.type === 'input_delivery') return next // The host reconciles receipts with its captured input.
   if (event.data.type === 'queue') {
     const queuedPrompts = event.data.prompts ?? (event.data.prompt ? [event.data.prompt] : [])
     return { ...next, queued: queuedPrompts[0] ?? null, queuedPrompts }
   }
   if (event.data.type === 'session') {
+    if (event.data.phase === 'disconnected' || event.runtimeId !== state.runtimeId) next.pendingSteering = next.pendingSteering?.map(input => ['sending', 'accepted'].includes(input.status) ? { ...input, status: 'uncertain' as const } : input)
     next.phase = event.data.phase
     next.view = event.data.view ?? next.view
     next.nativeSessionId = event.data.nativeSessionId ?? next.nativeSessionId

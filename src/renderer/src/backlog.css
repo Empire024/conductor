@@ -120,7 +120,7 @@
 
 .file-picker-results { height: min(440px, 55vh); }
 /* Keep the ready action's foreground/background paired across pointer states. */
-.statusbar-update.ready:hover:not(:disabled), .statusbar-update.ready:focus-visible { color: var(--surface-0); background: color-mix(in srgb, var(--accent) 85%, var(--text)); border-color: var(--accent); }
+.statusbar-update.ready:hover:not(:disabled), .statusbar-update.ready:focus-visible { color: var(--surface-0); background: color-mix(in srgb, var(--accent) 75%, var(--text)); border-color: var(--accent); }
 .statusbar-update.ready:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
 
 .sa-image-upload { display: inline-flex; }

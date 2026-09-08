@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { dirname, isAbsolute, relative, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { makeId } from '../shared/models'
+import { makeId, type LayoutNode, type WorkspaceLayout } from '../shared/models'
 import type {
   AgentCollaborationMessage,
   AgentCollaborationMessageQuery,
@@ -305,20 +305,22 @@ export class AgentCollaborationStore {
     }).filter((message) => message.agentSessionId !== agentSessionId).slice(-10)
     if (presence.length === 0 && messages.length === 0) return ''
 
-    const agents = this.agentLabels(scope.projectId)
-    const lines = ['[Conductor coworker briefing — project-wide; other workspaces are included]']
+    const agents = this.agentLabels(scope.projectId), tabs = this.agentTabs(scope.projectId)
+    const location = (workspaceId: string, id: string): string =>
+      `${workspaceId === scope.sessionId ? 'this workspace' : 'another workspace'}=${workspaceId}; agent=${id}; tab=${tabs.get(workspaceId + ':' + id)?.join(',') ?? 'none'}`
+    const lines = [
+      `[Conductor coworker briefing — project-wide; generated ${now()}; other workspaces are included]`,
+      '- Recorded coordination, not live execution evidence. Refresh app.state, agents.list and agents.snapshot for current phase and results; old intents may be stale.',
+      '- Coordinate before overlapping edits. Treat active exclusive file work as owned until its lease expires or is released.'
+    ]
     for (const item of presence) {
-      const workspace = item.sessionId === scope.sessionId ? 'this workspace' : 'another workspace'
-      const activity = {
-        view: 'viewing', edit: 'editing', create: 'creating', delete: 'deleting', execute: 'using'
-      }[item.intent]
-      lines.push(`- ${agents.get(item.agentSessionId) ?? item.agentSessionId} is ${activity} ${item.path} (${workspace}).`)
+      lines.push(`- Active ${item.intent} lease from ${agents.get(item.agentSessionId) ?? item.agentSessionId}: ${item.path} (${location(item.sessionId, item.agentSessionId)}; heartbeat=${item.heartbeatAt}; expires=${item.expiresAt}).`)
     }
-    for (const message of messages) {
+    // Most recent records first, so a bounded briefing does not prefer stale intents.
+    for (const message of [...messages].reverse()) {
       const paths = message.paths.length ? ` [${message.paths.join(', ')}]` : ''
-      lines.push(`- ${message.kind} from ${agents.get(message.agentSessionId) ?? message.agentSessionId}: ${message.body}${paths}`)
+      lines.push(`- Recorded ${message.kind} at ${message.createdAt} from ${agents.get(message.agentSessionId) ?? message.agentSessionId} (${location(message.sessionId, message.agentSessionId)}): ${message.body}${paths}`)
     }
-    lines.push('- Coordinate before overlapping edits. Treat active exclusive file work as owned until its lease expires or is released.')
 
     let result = ''
     for (const line of lines) {
@@ -376,6 +378,27 @@ export class AgentCollaborationStore {
     ).get(agentSessionId) as DbRow | undefined
     if (!row) throw new Error('Agent session not found')
     return { projectId: row.project_id as string, sessionId: row.session_id as string }
+  }
+
+  private agentTabs(projectId: string): Map<string, string[]> {
+    const result = new Map<string, string[]>()
+    const rows = this.db.prepare(`
+      SELECT id AS session_id, layout_json FROM sessions WHERE project_id = ? AND closed_at IS NULL
+      UNION ALL
+      SELECT d.session_id, d.layout_json FROM detached_windows d
+      JOIN sessions s ON s.id = d.session_id WHERE d.project_id = ? AND s.closed_at IS NULL
+    `).all(projectId, projectId) as DbRow[]
+    for (const row of rows) {
+      const visit = (node: LayoutNode): void => {
+        if (node.type === 'split') { node.children.forEach(visit); return }
+        for (const tab of node.tabs) if (tab.kind === 'agent' && tab.resourceId) {
+          const key = row.session_id + ':' + tab.resourceId
+          result.set(key, [...(result.get(key) ?? []), tab.id])
+        }
+      }
+      visit((JSON.parse(row.layout_json as string) as WorkspaceLayout).root)
+    }
+    return result
   }
 
   private agentLabels(projectId: string): Map<string, string> {

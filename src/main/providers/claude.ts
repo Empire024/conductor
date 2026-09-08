@@ -3,8 +3,9 @@ import { execFile } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { workspacePath } from '../agent-artifacts'
-import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
+import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
+import { settingsForRuntime } from '../../shared/structured-agent'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.263. */
@@ -19,6 +20,7 @@ interface Transport { start(): void; send(message: Json): void; close(): void; c
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; captured?: boolean }
 interface Block { id: string; kind: string; input: string; text: string }
+class ClaudeControlRejectedError extends Error {}
 interface Request { interaction: PendingInteraction; input: ObjectValue; toolId?: string; submitting: boolean; permissionUpdates?: Json[] }
 
 function readVersion(executable: string): Promise<string> {
@@ -48,6 +50,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   private nativeSessionId?: string
   private turnId?: string
   private settings: SessionSettings
+  private phase: Extract<AdapterEvent['data'], { type: 'session' }>['phase'] = 'idle'
   private ready = false
   private disposed = false
   private active = false
@@ -74,7 +77,7 @@ export class ClaudeAdapter implements ProviderAdapter {
 
   constructor(private options: AdapterOptions, private dependencies: Dependencies = {}) {
     this.nativeSessionId = options.nativeSessionId
-    this.settings = { ...options.settings }
+    this.settings = { ...settingsForRuntime(options.settings, options.runtimeId) }
   }
 
   get capabilities(): ProviderCapabilities {
@@ -134,6 +137,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   async submit(text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
     if (!this.ready || !this.transport?.connected || this.disposed) throw new Error('Claude runtime is disconnected')
     if (this.active || this.requests.size) throw new Error('Claude is already processing a turn')
+    settings = settingsForRuntime(settings, this.options.runtimeId)
     this.validateSettings(settings)
     const messageId = randomUUID()
     const message = await this.userMessage(text, attachments, messageId)
@@ -170,13 +174,25 @@ export class ClaudeAdapter implements ProviderAdapter {
     return message
   }
 
-  async steer(text: string, _settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
+  private steeringInputs = new Map<string, string | undefined>()
+
+  async steer(text: string, _settings: SessionSettings, attachments: ContextAttachment[] = [], inputId: string = randomUUID()): Promise<void> {
     if (!this.ready || !this.transport?.connected || this.disposed) throw new SteeringUnavailableError('Claude runtime is disconnected')
     if (!this.active || this.stopRequested) throw new SteeringUnavailableError('There is no active Claude turn to steer')
     const turnId = this.turnId
-    const message = await this.userMessage(text, attachments, randomUUID())
+    const message = await this.userMessage(text, attachments, inputId)
     if (!this.capabilities.steering || this.turnId !== turnId) throw new SteeringUnavailableError('The Claude turn stopped before steering could be sent')
-    this.transport.send(message)
+    // Native 'next' priority folds the input alongside the next tool result.
+    this.steeringInputs.set(inputId, turnId)
+    try { this.transport.send({ ...object(message), priority: 'next' }) }
+    catch (error) { this.steeringInputs.delete(inputId); throw error }
+  }
+
+  private inputDelivery(inputId: string, status: 'accepted' | 'delivered' | 'cancelled' | 'uncertain', native?: AdapterEvent['native']): void {
+    if (!this.steeringInputs.has(inputId)) return
+    const turnId = this.steeringInputs.get(inputId)
+    if (status !== 'accepted') this.steeringInputs.delete(inputId)
+    this.emit({ turnId, data: { type: 'input_delivery', inputId, status }, native })
   }
 
   async respond(response: InteractionResponse): Promise<void> {
@@ -184,8 +200,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     const pending = this.requests.get(response.requestId)
     if (!pending || pending.submitting || !this.transport?.connected) throw new Error('Approval is stale, disconnected, or already resolved')
     const decision = response.decision ?? (response.answers ? 'allow' : '')
-    if (!pending.interaction.choices.some(choice => choice.id === decision)) throw new Error('Unsupported Claude permission decision')
-    const allowed = decision === 'allow' || decision === 'allow-session'
+    if (!pending.interaction.choices.some(choice => choice.id === decision && !choice.disabled)) throw new Error('Unsupported Claude permission decision')
+    const allowed = decision === 'allow' || decision === 'allow-session' || decision === 'auto-mode'
     let input: Json = pending.input
     if (pending.interaction.kind === 'question' && decision === 'allow') {
       const answers: ObjectValue = {}
@@ -199,13 +215,38 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     pending.submitting = true // claim synchronously across every pane before sending
     try {
+      const sessionEditMode = decision === 'allow-session' && pending.permissionUpdates?.some(update => object(update).type === 'setMode' && object(update).mode === 'acceptEdits')
+      if (decision === 'auto-mode' || sessionEditMode) {
+        const mode = sessionEditMode ? 'acceptEdits' : 'auto'
+        // Change the real provider mode first. A managed-policy refusal must leave
+        // the request unanswered so the owner can still allow once or deny it.
+        try { await this.control({ subtype: 'set_permission_mode', mode }) }
+        catch (error) {
+          if (error instanceof ClaudeControlRejectedError) throw new InteractionResponseRejectedError(`Claude could not switch to ${sessionEditMode ? 'session Edit mode' : 'auto-mode'}: ${error.message}`)
+          throw error
+        }
+        if (this.disposed || !this.transport?.connected) throw new Error('Claude disconnected while switching permission mode')
+        const { temporaryPermission, ...current } = this.settings
+        this.settings = sessionEditMode
+          ? { ...current, permission: 'accept-edits', plan: false, temporaryPermission: { runtimeId: this.options.runtimeId, restore: temporaryPermission?.restore ?? current.permission } }
+          : { ...current, permission: 'auto', plan: false }
+        this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), permissionMode: mode }
+        this.emit({ data: { type: 'session', phase: this.phase, settings: { ...this.settings } } })
+        // The provider may cancel/reissue permission requests while changing mode.
+        // Never send a stale allow or resurrect a cancelled/finished request.
+        if (this.requests.get(response.requestId) !== pending) return
+      }
       this.reply(response.requestId, allowed
         ? { behavior: 'allow', updatedInput: input, ...(decision === 'allow-session' ? { updatedPermissions: pending.permissionUpdates ?? [] } : {}), ...(pending.toolId ? { toolUseID: pending.toolId } : {}) }
         : { behavior: 'deny', message: decision === 'abort' ? 'User cancelled this turn' : 'User denied this operation', interrupt: decision === 'abort', ...(pending.toolId ? { toolUseID: pending.toolId } : {}) })
       this.requests.delete(response.requestId)
       this.emit({ requestId: response.requestId, itemId: pending.toolId, data: { type: 'interaction', interaction: { ...pending.interaction, status: 'resolved', outcome: decision } } })
       if (pending.toolId) this.updateTool(pending.toolId, { status: allowed ? 'preparing' : decision === 'abort' ? 'interrupted' : 'rejected' })
-      if (decision === 'abort') this.stopRequested = true
+      if (decision === 'abort') {
+        this.stopRequested = true
+        this.interruptWaitingTools()
+        this.expireRequests('Cancelled turn')
+      }
       this.emitWaiting()
     } catch (error) { pending.submitting = false; throw error }
   }
@@ -213,11 +254,14 @@ export class ClaudeAdapter implements ProviderAdapter {
   async interrupt(): Promise<void> {
     if (!this.active || !this.transport?.connected) return
     this.stopRequested = true
+    this.interruptWaitingTools()
     this.expireRequests('Interrupted by user')
     this.emit({ data: { type: 'session', phase: 'interrupting' } })
     // Cancellation goes through the supported full-duplex control channel.
     // An ACK is not a completion event; await the final result or disconnect.
-    await this.control({ subtype: 'interrupt', cancel_queued: true })
+    const receipt = await this.control({ subtype: 'interrupt', cancel_queued: true })
+    // Only the exact native cancellation receipt authorizes replay after Escape.
+    for (const id of array(receipt.cancelled)) if (typeof id === 'string') this.inputDelivery(id, 'cancelled', { method: 'interrupt', payload: receipt })
   }
 
   async stop(): Promise<void> { this.dispose(); await this.transport?.closeAndWait?.() }
@@ -233,6 +277,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
 
   private emit(event: AdapterEvent): void {
+    if (event.data.type === 'session') this.phase = event.data.phase
     this.options.emit({ nativeSessionId: this.nativeSessionId, turnId: this.turnId, ...event, data: event.data.type === 'session' ? { ...event.data, capabilities: { ...this.capabilities } } : event.data })
   }
   private validateSettings(settings: SessionSettings): void {
@@ -293,7 +338,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       if (!pending || !id) return
       clearTimeout(pending.timer); this.controls.delete(id)
       if (response.subtype === 'success') pending.resolve(object(response.response))
-      else pending.reject(new Error(string(response.error) ?? 'Claude control request failed'))
+      else pending.reject(new ClaudeControlRejectedError(string(response.error) ?? 'Claude control request failed'))
       return
     }
     if (type === 'control_request') return this.runtimeRequest(message)
@@ -313,6 +358,21 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (sessionId && !parentId) {
       if (this.nativeSessionId && sessionId !== this.nativeSessionId) throw new Error('Claude changed native conversation identity unexpectedly')
       this.nativeSessionId = sessionId
+    }
+    if (type === 'command_lifecycle' && !parentId) {
+      const inputId = string(message.command_uuid)
+      if (!inputId || !this.steeringInputs.has(inputId)) return
+      const native = { method: 'command_lifecycle', payload: message }
+      if (message.state === 'queued') this.inputDelivery(inputId, 'accepted', native)
+      else if (message.state === 'started') {
+        // A command may start a fresh native turn after the preceding result.
+        if (!this.active) { this.turnId = inputId; this.active = true; this.stopRequested = false; this.hasAssistantText = false; this.emit({ data: { type: 'session', phase: 'running' } }) }
+        this.inputDelivery(inputId, 'delivered', native)
+      } else if (message.state === 'discarded' || message.state === 'refused') this.inputDelivery(inputId, 'cancelled', native)
+      // 'cancelled' also describes an already absorbed message in an aborted turn.
+      // Interrupt's per-uuid receipt, rather than that ambiguous frame, permits replay.
+      else if (message.state === 'completed' || message.state === 'cancelled' && !this.stopRequested) this.inputDelivery(inputId, 'uncertain', native)
+      return
     }
     if (type === 'stream_event') return this.stream(message, parentId)
     if (type === 'assistant' || type === 'user') {
@@ -563,15 +623,36 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.updateTool(toolId, { status: 'awaiting_approval' })
     }
     const question = name === 'AskUserQuestion'
-    // Use only native, tool-specific allow suggestions; keep the grant inside this session.
-    const permissionUpdates = array(request.permission_suggestions ?? request.permissionSuggestions ?? request.suggestions).flatMap(value => {
+    // Only native tool-specific suggestions may become reusable grants. Claude
+    // evaluates these rules itself, preserving ask rules and mandatory approvals.
+    // Edit rules also govern Write/NotebookEdit in the provider permission engine.
+    const ruleNames = new Set([name, ...(['Write', 'NotebookEdit', 'MultiEdit'].includes(name) ? ['Edit'] : [])])
+    const requiredApproval = request.matched_ask_rule != null || /requires? (?:user )?approval|requires? user interaction/i.test(string(request.decision_reason) ?? '')
+    const permissionUpdates: ObjectValue[] = requiredApproval || this.settings.plan ? [] : array(request.permission_suggestions ?? request.permissionSuggestions ?? request.suggestions).flatMap(value => {
       const update = object(value), rules = array(update.rules)
-      return update.type === 'addRules' && update.behavior === 'allow' && rules.length && rules.every(rule => string(object(rule).toolName) === name)
+      // The CLI offers its native session Edit mode on Write/Edit requests.
+      // It covers all edits, so describe that explicitly and restore on resume.
+      if (update.type === 'setMode' && update.mode === 'acceptEdits' && update.destination === 'session' && ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'].includes(name)) return [update]
+      return update.type === 'addRules' && update.behavior === 'allow' && rules.length && rules.every(rule => ruleNames.has(string(object(rule).toolName) ?? ''))
         ? [{ ...update, destination: 'session' }] : []
     })
+    const sessionScope = permissionUpdates.flatMap(update => update.type === 'setMode' ? ['all file edits and filesystem operations Claude permits in Edit mode'] : array(update.rules).map(value => {
+      const rule = object(value)
+      return `${string(rule.toolName)}${string(rule.ruleContent) ? `(${string(rule.ruleContent)})` : ' (all inputs)'}`
+    })).join(', ')
+    const sessionDescription = sessionScope
+      ? `Scope: ${sessionScope}. Only this running Claude session; cleared when it restarts or resumes. Required approvals still apply.`
+      : requiredApproval ? 'Claude requires an individual approval for this request; a session grant cannot replace it.'
+        : this.settings.plan ? 'Plan mode requires individual approval for writes. Switch modes to change that behavior.'
+          : 'Claude did not offer a reusable permission scope for this request. You can allow it once.'
+    const autoMode = this.settings.permission === 'auto' && !this.settings.plan
     const interaction: PendingInteraction = {
       id, kind: question ? 'question' : 'approval', status: 'pending', title: string(request.title) ?? (question ? 'Claude needs your input' : `Allow ${name}?`),
-      input, choices: [{ id: 'allow', label: question ? 'Submit answers' : 'Allow once' }, ...(!question && permissionUpdates.length ? [{ id: 'allow-session', label: 'Allow for this session' }] : []), { id: 'deny', label: 'Deny' }, { id: 'abort', label: 'Cancel turn' }],
+      input, choices: [{ id: 'allow', label: question ? 'Submit answers' : 'Allow once' }, ...(!question ? [
+        { id: 'allow-session', label: 'Allow for this session', description: sessionDescription, disabled: !permissionUpdates.length },
+        { id: 'auto-mode', label: 'Switch to auto-mode', disabled: autoMode,
+          description: autoMode ? 'Auto-mode is already active. Claude still requires approval for this request.' : 'Allow this request once, then let Claude review future actions automatically. Required approvals still apply.' }
+      ] : []), { id: 'deny', label: 'Deny' }, { id: 'abort', label: 'Cancel turn' }],
       ...(question ? { questions: array(input.questions).map((value, index) => {
         const entry = object(value)
         return { id: `question:${index}`, question: string(entry.question) ?? '', header: string(entry.header), multiSelect: entry.multiSelect === true,
@@ -601,7 +682,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     const response = object(input.tool_response), success = callback === 'conductor_after' && response.interrupted !== true && (number(response.exitCode) ?? 0) === 0
     if (paths.length) await this.options.afterTool?.(id, paths, success)
     const stdout = string(response.stdout), stderr = string(response.stderr)
-    this.updateTool(id, { status: success ? 'completed' : input.is_interrupt === true || response.interrupted === true ? 'interrupted' : 'failed' }, {
+    const priorStatus = this.tools.get(id)?.status
+    this.updateTool(id, { status: priorStatus === 'rejected' || priorStatus === 'interrupted' ? priorStatus : success ? 'completed' : input.is_interrupt === true || response.interrupted === true ? 'interrupted' : 'failed' }, {
       ...(stdout !== undefined ? { output: stdout, outputMode: 'snapshot' as const } : {}), ...(stderr !== undefined ? { stderr } : {}),
       ...(number(response.exitCode) !== undefined ? { exitCode: number(response.exitCode) } : {})
     })
@@ -609,6 +691,9 @@ export class ClaudeAdapter implements ProviderAdapter {
       const todo = object(value)
       return { text: string(todo.content) ?? '', status: todo.status === 'completed' ? 'completed' : todo.status === 'in_progress' ? 'in_progress' : 'pending' }
     }) } })
+  }
+  private interruptWaitingTools(): void {
+    for (const request of this.requests.values()) if (request.toolId) this.updateTool(request.toolId, { status: 'interrupted' })
   }
   private emitWaiting(): void {
     const pending = [...this.requests.values()]
@@ -622,6 +707,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   }
   private expireRequests(reason: string): void { for (const id of this.requests.keys()) this.expireRequest(id, reason) }
   private disconnected(message: string): void {
+    for (const id of this.steeringInputs.keys()) this.inputDelivery(id, 'uncertain')
     this.ready = false
     this.expireRequests(message)
     for (const request of this.controls.values()) { clearTimeout(request.timer); request.reject(new Error(message)) }

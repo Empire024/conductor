@@ -239,7 +239,7 @@ function OutputPreview({ value, sessionId, artifactId, language }: { value: stri
 }
 export function interactionOutcome(outcome?: string): string {
   if (!outcome) return 'Resolved'
-  return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', 'allow-session': 'Allowed for session', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
+  return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', 'allow-session': 'Allowed for session', 'auto-mode': 'Auto-mode enabled', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
 }
 function InteractionCard({ item, interactive, onRespond }: ActivityProps): React.JSX.Element | null {
   const [answers, setAnswers] = useState<Record<string, string[]>>({})
@@ -283,7 +283,8 @@ function InteractionCard({ item, interactive, onRespond }: ActivityProps): React
     </fieldset>)}
     <div className="sa-interaction-actions">{request.kind === 'question'
       ? <button type="submit" disabled={busy || unanswered}>Submit answers</button>
-      : request.choices.map((choice) => <button type="button" key={choice.id} disabled={busy} onClick={() => void respond(choice.id)}>{choice.label}</button>)}</div>
+      : request.choices.map((choice) => <button type="button" key={choice.id} disabled={busy || choice.disabled} title={choice.description} onClick={() => void respond(choice.id)}>{choice.label}</button>)}</div>
+    {request.choices.filter(choice => choice.description).map(choice => <p className="sa-request-summary" key={choice.id}><strong>{choice.label}:</strong> {choice.description}</p>)}
     <details className="sa-request-details"><summary title="Inspect exact request and scope">Request details</summary><pre>{JSON.stringify(request.input, null, 2)}</pre></details>
     {error && <p role="alert" className="sa-error">{error}</p>}
   </form>

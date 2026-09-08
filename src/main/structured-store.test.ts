@@ -160,3 +160,16 @@ describe('structured SQLite journal and immutable artifacts', () => {
     expect(reopened.prepare('SELECT provider_usd,suite_usd FROM live_suite_limits').get()).toMatchObject({ provider_usd: .01, suite_usd: .50 })
   })
 })
+
+
+it('retains pending native input after a backend restart as uncertain, without replaying it', () => {
+  const f = fixture()
+  f.store.append(event(1, { type: 'session', phase: 'running', nativeSessionId: 'native' }))
+  f.store.append(event(2, { type: 'steering', prompts: [{ id: 'input', text: 'Keep selected context', settings: { permission: 'default', plan: false }, attachments: [{ id: 'selection', kind: 'selection', name: 'Selection', content: 'Captured bytes' }], runtimeId: 'runtime', status: 'accepted' }] }))
+  f.store.checkpoint('one'); f.db.close()
+  const reopened = new DatabaseSync(f.path); databases.push(reopened)
+  const restored = new StructuredAgentStore(reopened, f.root)
+  expect(restored.snapshot('one')).toMatchObject({ phase: 'disconnected', pendingSteering: [{ id: 'input', status: 'uncertain', attachments: [{ content: 'Captured bytes' }] }] })
+  expect(restored.snapshot('one')?.items).toEqual([])
+  expect(restored.events('one')).toHaveLength(2)
+})

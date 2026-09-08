@@ -30,9 +30,19 @@ export interface SessionSettings {
   model?: string
   effort?: string
   permission: 'default' | 'read-only' | 'accept-edits' | 'auto'
+  /** A provider-offered Edit-mode grant lasts only for this runtime, never a resume. */
+  temporaryPermission?: { runtimeId: string; restore: SessionSettings['permission'] }
   sandbox?: 'inherit' | 'read-only' | 'workspace-write'
   approvalPolicy?: 'inherit' | 'untrusted' | 'on-request' | 'never'
   plan: boolean
+}
+/** Expire a session approval whenever a new provider process takes ownership. */
+export function settingsForRuntime(settings: SessionSettings, runtimeId?: string): SessionSettings {
+  const { temporaryPermission, ...permanent } = settings
+  if (!temporaryPermission) return settings
+  if (settings.permission !== 'accept-edits') return permanent
+  if (temporaryPermission.runtimeId === runtimeId) return settings
+  return { ...permanent, permission: temporaryPermission.restore }
 }
 export interface ContextAttachment {
   id: string
@@ -57,7 +67,7 @@ export interface PendingInteraction {
   kind: 'approval' | 'question'
   title: string
   input: Json
-  choices: Array<{ id: string; label: string }>
+  choices: Array<{ id: string; label: string; description?: string; disabled?: boolean }>
   questions?: InputQuestion[]
   status: 'pending' | 'resolved' | 'expired'
   outcome?: string
@@ -73,8 +83,11 @@ export interface FileChange {
   status: 'proposed' | 'applied' | 'failed' | 'rejected' | 'reverted'
   limitation?: string
 }
-export interface QueuedPrompt { id: string; text: string; settings: SessionSettings; attachments: ContextAttachment[] }
+export interface QueuedPrompt { id: string; text: string; settings: SessionSettings; attachments: ContextAttachment[]; steer?: boolean }
+export interface PendingSteering extends QueuedPrompt { runtimeId: string; turnId?: string; status: 'sending' | 'accepted' | 'cancelled' | 'uncertain' }
 export type AgentEventData =
+  | { type: 'steering'; prompts: PendingSteering[] }
+  | { type: 'input_delivery'; inputId: string; status: 'accepted' | 'delivered' | 'cancelled' | 'uncertain' }
   | { type: 'queue'; prompt: QueuedPrompt | null; prompts?: QueuedPrompt[] }
   | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings }
   | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[] }
@@ -124,6 +137,7 @@ export interface SessionProjection {
   view?: 'visual' | 'cli'
   queued?: QueuedPrompt | null
   queuedPrompts?: QueuedPrompt[]
+  pendingSteering?: PendingSteering[]
   sessionId: string
   runtimeId: string
   nativeSessionId?: string
@@ -166,7 +180,7 @@ export interface StructuredAgentBridge {
   events(id: string, after?: number): Promise<AgentEvent[]>
   submit(id: string, text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void>
   respond(response: InteractionResponse): Promise<void>
-  interrupt(id: string): Promise<void>
+  interrupt(id: string, expediteSubmittedInput?: boolean): Promise<void>
   resume(id: string, settings?: SessionSettings): Promise<void>
   fork(id: string): Promise<string>
   discover(id: string): Promise<Json>
