@@ -25,7 +25,9 @@
 .update-prompt progress:indeterminate::-webkit-progress-bar, .statusbar-update progress:indeterminate::-webkit-progress-bar { background: transparent; }
 .statusbar-update { position: relative; overflow: hidden; }
 .statusbar-update progress { appearance: none; position: absolute; left: 0; bottom: 0; width: 100%; height: 2px; border: 0; background: var(--surface-3); }
-.status-version-button { display: inline-flex; gap: 5px; align-items: center; border: 0; background: transparent; cursor: pointer; color: var(--text-3); padding: 3px 5px; font: inherit; }
+.status-version-button { display: inline-flex; flex: 0 0 auto; gap: 6px; align-items: center; border: 0; border-radius: 4px; background: transparent; cursor: pointer; color: var(--text-2); padding: 3px 5px; font: inherit; font-size: 10px; white-space: nowrap; }
+.status-version-number { font-family: "Cascadia Mono", Consolas, monospace; font-variant-numeric: tabular-nums; }
+.status-version-feedback { font-size: 9px; }
 .status-version-button:hover { color: var(--text); background: var(--surface-hover); }
 @keyframes download-progress { to { background-position: -200% 0; } }
 .quick-theme-menu-host { position: relative; -webkit-app-region: no-drag; }

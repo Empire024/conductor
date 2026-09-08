@@ -1,0 +1,33 @@
+{
+  "realGitHubProvider": true,
+  "actualElectron": true,
+  "latest": "0.1.15",
+  "release": "https://github.com/Empire024/conductor/releases/tag/v0.1.15",
+  "checks": [
+    {
+      "currentVersion": "0.1.5",
+      "state": {
+        "phase": "available",
+        "currentVersion": "0.1.5",
+        "availableVersion": "0.1.15",
+        "source": "release",
+        "configured": true,
+        "message": "Update pending: Conductor 0.1.15.",
+        "lastCheckedAt": "2026-09-08T07:33:13.015Z"
+      },
+      "downloadOrInstallCalls": 0
+    },
+    {
+      "currentVersion": "0.1.15",
+      "state": {
+        "phase": "idle",
+        "currentVersion": "0.1.15",
+        "configured": true,
+        "message": "Conductor is up to date.",
+        "lastCheckedAt": "2026-09-08T07:33:16.667Z"
+      },
+      "downloadOrInstallCalls": 0
+    }
+  ],
+  "errors": []
+}

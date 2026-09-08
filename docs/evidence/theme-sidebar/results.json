@@ -1,0 +1,1006 @@
+{
+  "actualElectron": true,
+  "providerTurns": 0,
+  "checks": [
+    "night-owl day: readable surfaces and text in normal, selected and hover states",
+    "night-owl night: readable surfaces and text in normal, selected and hover states",
+    "obsidian day: readable surfaces and text in normal, selected and hover states",
+    "obsidian night: readable surfaces and text in normal, selected and hover states",
+    "nord day: readable surfaces and text in normal, selected and hover states",
+    "nord night: readable surfaces and text in normal, selected and hover states",
+    "Full version remains readable during and after a manual update check"
+  ],
+  "colors": [
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "Jump to",
+      "color": "rgb(76, 97, 120)",
+      "background": "rgb(233, 240, 247)",
+      "foreground": [
+        76,
+        97,
+        120
+      ],
+      "surface": [
+        233,
+        240,
+        247
+      ],
+      "contrast": 5.556469473894973
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "title-bar version",
+      "color": "rgb(76, 97, 120)",
+      "background": "rgb(242, 246, 250)",
+      "foreground": [
+        76,
+        97,
+        120
+      ],
+      "surface": [
+        242,
+        246,
+        250
+      ],
+      "contrast": 5.880743134128215
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "selected project",
+      "color": "rgb(41, 56, 77)",
+      "background": "rgb(213, 226, 238)",
+      "foreground": [
+        41,
+        56,
+        77
+      ],
+      "surface": [
+        213,
+        226,
+        238
+      ],
+      "contrast": 9.021687714283145
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "other project",
+      "color": "rgb(76, 97, 120)",
+      "background": "rgb(242, 246, 250)",
+      "foreground": [
+        76,
+        97,
+        120
+      ],
+      "surface": [
+        242,
+        246,
+        250
+      ],
+      "contrast": 5.880743134128215
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "selected workspace",
+      "color": "rgb(41, 56, 77)",
+      "background": "rgb(213, 226, 238)",
+      "foreground": [
+        41,
+        56,
+        77
+      ],
+      "surface": [
+        213,
+        226,
+        238
+      ],
+      "contrast": 9.021687714283145
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "other workspace",
+      "color": "rgb(76, 97, 120)",
+      "background": "rgb(242, 246, 250)",
+      "foreground": [
+        76,
+        97,
+        120
+      ],
+      "surface": [
+        242,
+        246,
+        250
+      ],
+      "contrast": 5.880743134128215
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "hovered Jump to",
+      "color": "rgb(41, 56, 77)",
+      "background": "rgb(233, 240, 247)",
+      "foreground": [
+        41,
+        56,
+        77
+      ],
+      "surface": [
+        233,
+        240,
+        247
+      ],
+      "contrast": 10.339916338692587
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "hovered project",
+      "color": "rgb(41, 56, 77)",
+      "background": "rgb(213, 226, 238)",
+      "foreground": [
+        41,
+        56,
+        77
+      ],
+      "surface": [
+        213,
+        226,
+        238
+      ],
+      "contrast": 9.021687714283145
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "hovered workspace",
+      "color": "rgb(41, 56, 77)",
+      "background": "rgb(242, 246, 250)",
+      "foreground": [
+        41,
+        56,
+        77
+      ],
+      "surface": [
+        242,
+        246,
+        250
+      ],
+      "contrast": 10.943350323780782
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "Jump to",
+      "color": "rgb(178, 204, 214)",
+      "background": "rgb(1, 22, 39)",
+      "foreground": [
+        178,
+        204,
+        214
+      ],
+      "surface": [
+        1,
+        22,
+        39
+      ],
+      "contrast": 10.91468840458498
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "title-bar version",
+      "color": "rgb(178, 204, 214)",
+      "background": "rgb(7, 29, 46)",
+      "foreground": [
+        178,
+        204,
+        214
+      ],
+      "surface": [
+        7,
+        29,
+        46
+      ],
+      "contrast": 10.21142644750023
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "selected project",
+      "color": "rgb(214, 222, 235)",
+      "background": "rgb(11, 41, 66)",
+      "foreground": [
+        214,
+        222,
+        235
+      ],
+      "surface": [
+        11,
+        41,
+        66
+      ],
+      "contrast": 10.997556030100233
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "other project",
+      "color": "rgb(178, 204, 214)",
+      "background": "rgb(7, 29, 46)",
+      "foreground": [
+        178,
+        204,
+        214
+      ],
+      "surface": [
+        7,
+        29,
+        46
+      ],
+      "contrast": 10.21142644750023
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "selected workspace",
+      "color": "rgb(214, 222, 235)",
+      "background": "rgb(11, 41, 66)",
+      "foreground": [
+        214,
+        222,
+        235
+      ],
+      "surface": [
+        11,
+        41,
+        66
+      ],
+      "contrast": 10.997556030100233
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "other workspace",
+      "color": "rgb(178, 204, 214)",
+      "background": "rgb(7, 29, 46)",
+      "foreground": [
+        178,
+        204,
+        214
+      ],
+      "surface": [
+        7,
+        29,
+        46
+      ],
+      "contrast": 10.21142644750023
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "hovered Jump to",
+      "color": "rgb(214, 222, 235)",
+      "background": "rgb(1, 22, 39)",
+      "foreground": [
+        214,
+        222,
+        235
+      ],
+      "surface": [
+        1,
+        22,
+        39
+      ],
+      "contrast": 13.53940404990579
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "hovered project",
+      "color": "rgb(214, 222, 235)",
+      "background": "rgb(11, 41, 66)",
+      "foreground": [
+        214,
+        222,
+        235
+      ],
+      "surface": [
+        11,
+        41,
+        66
+      ],
+      "contrast": 10.997556030100233
+    },
+    {
+      "theme": "night-owl",
+      "variant": "night",
+      "name": "hovered workspace",
+      "color": "rgb(214, 222, 235)",
+      "background": "rgb(7, 29, 46)",
+      "foreground": [
+        214,
+        222,
+        235
+      ],
+      "surface": [
+        7,
+        29,
+        46
+      ],
+      "contrast": 12.667024790237864
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "Jump to",
+      "color": "rgb(78, 93, 88)",
+      "background": "rgb(231, 235, 234)",
+      "foreground": [
+        78,
+        93,
+        88
+      ],
+      "surface": [
+        231,
+        235,
+        234
+      ],
+      "contrast": 5.764283941434366
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "title-bar version",
+      "color": "rgb(78, 93, 88)",
+      "background": "rgb(240, 243, 241)",
+      "foreground": [
+        78,
+        93,
+        88
+      ],
+      "surface": [
+        240,
+        243,
+        241
+      ],
+      "contrast": 6.201902309321682
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "selected project",
+      "color": "rgb(38, 48, 45)",
+      "background": "rgb(210, 217, 214)",
+      "foreground": [
+        38,
+        48,
+        45
+      ],
+      "surface": [
+        210,
+        217,
+        214
+      ],
+      "contrast": 9.485191964291438
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "other project",
+      "color": "rgb(78, 93, 88)",
+      "background": "rgb(240, 243, 241)",
+      "foreground": [
+        78,
+        93,
+        88
+      ],
+      "surface": [
+        240,
+        243,
+        241
+      ],
+      "contrast": 6.201902309321682
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "selected workspace",
+      "color": "rgb(38, 48, 45)",
+      "background": "rgb(210, 217, 214)",
+      "foreground": [
+        38,
+        48,
+        45
+      ],
+      "surface": [
+        210,
+        217,
+        214
+      ],
+      "contrast": 9.485191964291438
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "other workspace",
+      "color": "rgb(78, 93, 88)",
+      "background": "rgb(240, 243, 241)",
+      "foreground": [
+        78,
+        93,
+        88
+      ],
+      "surface": [
+        240,
+        243,
+        241
+      ],
+      "contrast": 6.201902309321682
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "hovered Jump to",
+      "color": "rgb(38, 48, 45)",
+      "background": "rgb(231, 235, 234)",
+      "foreground": [
+        38,
+        48,
+        45
+      ],
+      "surface": [
+        231,
+        235,
+        234
+      ],
+      "contrast": 11.320955233950892
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "hovered project",
+      "color": "rgb(38, 48, 45)",
+      "background": "rgb(210, 217, 214)",
+      "foreground": [
+        38,
+        48,
+        45
+      ],
+      "surface": [
+        210,
+        217,
+        214
+      ],
+      "contrast": 9.485191964291438
+    },
+    {
+      "theme": "obsidian",
+      "variant": "day",
+      "name": "hovered workspace",
+      "color": "rgb(38, 48, 45)",
+      "background": "rgb(240, 243, 241)",
+      "foreground": [
+        38,
+        48,
+        45
+      ],
+      "surface": [
+        240,
+        243,
+        241
+      ],
+      "contrast": 12.18043023600538
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "Jump to",
+      "color": "rgb(173, 180, 188)",
+      "background": "rgb(8, 10, 12)",
+      "foreground": [
+        173,
+        180,
+        188
+      ],
+      "surface": [
+        8,
+        10,
+        12
+      ],
+      "contrast": 9.472184712460301
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "title-bar version",
+      "color": "rgb(173, 180, 188)",
+      "background": "rgb(13, 16, 19)",
+      "foreground": [
+        173,
+        180,
+        188
+      ],
+      "surface": [
+        13,
+        16,
+        19
+      ],
+      "contrast": 9.114317768558521
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "selected project",
+      "color": "rgb(236, 239, 242)",
+      "background": "rgb(21, 25, 29)",
+      "foreground": [
+        236,
+        239,
+        242
+      ],
+      "surface": [
+        21,
+        25,
+        29
+      ],
+      "contrast": 15.307178730019496
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "other project",
+      "color": "rgb(173, 180, 188)",
+      "background": "rgb(13, 16, 19)",
+      "foreground": [
+        173,
+        180,
+        188
+      ],
+      "surface": [
+        13,
+        16,
+        19
+      ],
+      "contrast": 9.114317768558521
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "selected workspace",
+      "color": "rgb(236, 239, 242)",
+      "background": "rgb(21, 25, 29)",
+      "foreground": [
+        236,
+        239,
+        242
+      ],
+      "surface": [
+        21,
+        25,
+        29
+      ],
+      "contrast": 15.307178730019496
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "other workspace",
+      "color": "rgb(173, 180, 188)",
+      "background": "rgb(13, 16, 19)",
+      "foreground": [
+        173,
+        180,
+        188
+      ],
+      "surface": [
+        13,
+        16,
+        19
+      ],
+      "contrast": 9.114317768558521
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "hovered Jump to",
+      "color": "rgb(236, 239, 242)",
+      "background": "rgb(8, 10, 12)",
+      "foreground": [
+        236,
+        239,
+        242
+      ],
+      "surface": [
+        8,
+        10,
+        12
+      ],
+      "contrast": 17.180805987687634
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "hovered project",
+      "color": "rgb(236, 239, 242)",
+      "background": "rgb(21, 25, 29)",
+      "foreground": [
+        236,
+        239,
+        242
+      ],
+      "surface": [
+        21,
+        25,
+        29
+      ],
+      "contrast": 15.307178730019496
+    },
+    {
+      "theme": "obsidian",
+      "variant": "night",
+      "name": "hovered workspace",
+      "color": "rgb(236, 239, 242)",
+      "background": "rgb(13, 16, 19)",
+      "foreground": [
+        236,
+        239,
+        242
+      ],
+      "surface": [
+        13,
+        16,
+        19
+      ],
+      "contrast": 16.531700979790656
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "Jump to",
+      "color": "rgb(76, 86, 106)",
+      "background": "rgb(227, 234, 240)",
+      "foreground": [
+        76,
+        86,
+        106
+      ],
+      "surface": [
+        227,
+        234,
+        240
+      ],
+      "contrast": 6.07529826198004
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "title-bar version",
+      "color": "rgb(76, 86, 106)",
+      "background": "rgb(237, 242, 245)",
+      "foreground": [
+        76,
+        86,
+        106
+      ],
+      "surface": [
+        237,
+        242,
+        245
+      ],
+      "contrast": 6.541377418493105
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "selected project",
+      "color": "rgb(46, 52, 64)",
+      "background": "rgb(207, 219, 228)",
+      "foreground": [
+        46,
+        52,
+        64
+      ],
+      "surface": [
+        207,
+        219,
+        228
+      ],
+      "contrast": 8.86522578804859
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "other project",
+      "color": "rgb(76, 86, 106)",
+      "background": "rgb(237, 242, 245)",
+      "foreground": [
+        76,
+        86,
+        106
+      ],
+      "surface": [
+        237,
+        242,
+        245
+      ],
+      "contrast": 6.541377418493105
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "selected workspace",
+      "color": "rgb(46, 52, 64)",
+      "background": "rgb(207, 219, 228)",
+      "foreground": [
+        46,
+        52,
+        64
+      ],
+      "surface": [
+        207,
+        219,
+        228
+      ],
+      "contrast": 8.86522578804859
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "other workspace",
+      "color": "rgb(76, 86, 106)",
+      "background": "rgb(237, 242, 245)",
+      "foreground": [
+        76,
+        86,
+        106
+      ],
+      "surface": [
+        237,
+        242,
+        245
+      ],
+      "contrast": 6.541377418493105
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "hovered Jump to",
+      "color": "rgb(46, 52, 64)",
+      "background": "rgb(227, 234, 240)",
+      "foreground": [
+        46,
+        52,
+        64
+      ],
+      "surface": [
+        227,
+        234,
+        240
+      ],
+      "contrast": 10.285226303298229
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "hovered project",
+      "color": "rgb(46, 52, 64)",
+      "background": "rgb(207, 219, 228)",
+      "foreground": [
+        46,
+        52,
+        64
+      ],
+      "surface": [
+        207,
+        219,
+        228
+      ],
+      "contrast": 8.86522578804859
+    },
+    {
+      "theme": "nord",
+      "variant": "day",
+      "name": "hovered workspace",
+      "color": "rgb(46, 52, 64)",
+      "background": "rgb(237, 242, 245)",
+      "foreground": [
+        46,
+        52,
+        64
+      ],
+      "surface": [
+        237,
+        242,
+        245
+      ],
+      "contrast": 11.074278855662113
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "Jump to",
+      "color": "rgb(216, 222, 233)",
+      "background": "rgb(43, 48, 59)",
+      "foreground": [
+        216,
+        222,
+        233
+      ],
+      "surface": [
+        43,
+        48,
+        59
+      ],
+      "contrast": 9.78498060042428
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "title-bar version",
+      "color": "rgb(216, 222, 233)",
+      "background": "rgb(48, 55, 67)",
+      "foreground": [
+        216,
+        222,
+        233
+      ],
+      "surface": [
+        48,
+        55,
+        67
+      ],
+      "contrast": 8.866603991094173
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "selected project",
+      "color": "rgb(236, 239, 244)",
+      "background": "rgb(59, 67, 81)",
+      "foreground": [
+        236,
+        239,
+        244
+      ],
+      "surface": [
+        59,
+        67,
+        81
+      ],
+      "contrast": 8.644507258846248
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "other project",
+      "color": "rgb(216, 222, 233)",
+      "background": "rgb(48, 55, 67)",
+      "foreground": [
+        216,
+        222,
+        233
+      ],
+      "surface": [
+        48,
+        55,
+        67
+      ],
+      "contrast": 8.866603991094173
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "selected workspace",
+      "color": "rgb(236, 239, 244)",
+      "background": "rgb(59, 67, 81)",
+      "foreground": [
+        236,
+        239,
+        244
+      ],
+      "surface": [
+        59,
+        67,
+        81
+      ],
+      "contrast": 8.644507258846248
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "other workspace",
+      "color": "rgb(216, 222, 233)",
+      "background": "rgb(48, 55, 67)",
+      "foreground": [
+        216,
+        222,
+        233
+      ],
+      "surface": [
+        48,
+        55,
+        67
+      ],
+      "contrast": 8.866603991094173
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "hovered Jump to",
+      "color": "rgb(236, 239, 244)",
+      "background": "rgb(43, 48, 59)",
+      "foreground": [
+        236,
+        239,
+        244
+      ],
+      "surface": [
+        43,
+        48,
+        59
+      ],
+      "contrast": 11.468526832014307
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "hovered project",
+      "color": "rgb(236, 239, 244)",
+      "background": "rgb(59, 67, 81)",
+      "foreground": [
+        236,
+        239,
+        244
+      ],
+      "surface": [
+        59,
+        67,
+        81
+      ],
+      "contrast": 8.644507258846248
+    },
+    {
+      "theme": "nord",
+      "variant": "night",
+      "name": "hovered workspace",
+      "color": "rgb(236, 239, 244)",
+      "background": "rgb(48, 55, 67)",
+      "foreground": [
+        236,
+        239,
+        244
+      ],
+      "surface": [
+        48,
+        55,
+        67
+      ],
+      "contrast": 10.392139742852375
+    },
+    {
+      "theme": "night-owl",
+      "variant": "day",
+      "name": "installed version",
+      "color": "rgb(41, 56, 77)",
+      "background": "rgb(213, 226, 238)",
+      "foreground": [
+        41,
+        56,
+        77
+      ],
+      "surface": [
+        213,
+        226,
+        238
+      ],
+      "contrast": 9.021687714283145
+    }
+  ],
+  "errors": []
+}
