@@ -1,23 +1,31 @@
-import { settingsForRuntime } from '../../../shared/structured-agent'
 import { conversationIdentity } from './conversation-tab'
 import { PromptImageUpload, PromptImageThumbnail } from '../components/PromptImageUpload'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Archive, ArrowDown, ArrowLeft, FilePlus2, History, ListTree, Send, Play, Square, Settings2, TerminalSquare, MessagesSquare, LoaderCircle, X } from 'lucide-react'
-import type { AgentSpec, AgentActivityPhase } from '../../../shared/models'
+import { Archive, ArrowDown, ArrowLeft, FileDiff, FilePlus2, History, ListTree, Pin, Play, PlugZap, Settings2, TerminalSquare, MessagesSquare, LoaderCircle, X } from 'lucide-react'
+import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import type { AgentEvent, ContextAttachment, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../../../shared/structured-agent-reducer'
+import { coalesceTextDeltas } from './coalesce-stream-events'
 import type { RuntimeTerminalProps } from './RuntimeTerminal'
-import { AgentDialog, ImmutableDiff, groupConversationActivities, isConversationActivity, safeFileTarget, StructuredActivity } from './StructuredAgentRenderers'
+import { AgentDialog, ImmutableDiff, coalescedEditLabel, coalescedEditSummary, groupConversationActivities, isConversationActivity, parentLabelAnchors, safeFileTarget, StructuredActivity, toolPresentation } from './StructuredAgentRenderers'
+import { MemoryRecallStrip, recallsByItem } from './MemoryRecallStrip'
+import { AgentChangeHistoryView } from './AgentChangeHistory'
 import { StructuredComposerControls } from './StructuredComposerControls'
-import { StructuredAgentTelemetry, StructuredLiveTokens } from './StructuredAgentTelemetry'
-import { hasTimelineSelection, isAtConversationBottom } from './conversation-scroll'
+import { StructuredSendButton, sendButtonIntent } from './StructuredSendButton'
+import { StructuredAgentTelemetry, StructuredLiveTokens, StructuredUsageSummary } from './StructuredAgentTelemetry'
+import { distinguishSubagentLabels, subagentColorIndex, subagentIdentityId, summarizeSubagents } from './usage-summary'
+import { followsBottomAfterScroll, hasTimelineSelection, latestOwnerPrompt, truncatePromptPreview } from './conversation-scroll'
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
-import { resolvedComposerSettings } from './composer-settings'
+import { composerChildKey, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
 import { CommandAutocomplete } from './CommandAutocomplete'
 import { composerCommands, matchingComposerCommands, type ComposerCommand } from './composer-commands'
 import { concreteModel } from '../../../shared/agent-model-selection'
 import { useComposerDraft } from './use-composer-draft'
+import { initialPermission, rememberPermission } from './permission-memory'
+import { bannerAbsorbsError, runtimeBanner } from './runtime-banner'
+import { cleanIpcError } from '../ipc-errors'
+import { copyText } from '../clipboard'
 import './StructuredAgentPane.css'
 
 let focusedAgent: { sessionId: string; projectId: string } | null = null
@@ -46,10 +54,20 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const draftRef = useRef(draft); draftRef.current = draft
   const composer = useRef<HTMLTextAreaElement>(null)
   const pane = useRef<HTMLElement>(null)
+  // Recall silently edits the prompt, so the ledger of what it injected is loaded alongside
+  // the timeline and shown against the message it rode with.
+  const [turnRecalls, setTurnRecalls] = useState<TurnMemoryRecall[]>([])
+  const loadTurnRecalls = useCallback((): void => {
+    void window.conductor.memory.turnRecalls(activeId).then(setTurnRecalls).catch(() => setTurnRecalls([]))
+  }, [activeId])
+  useEffect(loadTurnRecalls, [loadTurnRecalls, projection.sequence])
+  const recallByItem = useMemo(() => recallsByItem(turnRecalls), [turnRecalls])
   const [workingWord, setWorkingWord] = useState(0)
   useEffect(() => { if (projection.phase !== 'running') return; const timer = window.setInterval(() => setWorkingWord((current) => (current + 1) % 4), 7000); return () => window.clearInterval(timer) }, [projection.phase])
   const [submitting, setSubmitting] = useState(false)
-  const [settings, setSettings] = useState<SessionSettings>({ permission: 'default', plan: false, model: concreteModel(props.provider === 'claude' ? 'claude' : 'codex', props.model), effort: props.effort === 'auto' ? undefined : props.effort })
+  const [settings, setSettings] = useState<SessionSettings>({ permission: initialPermission(props.provider === 'claude' ? 'claude' : 'codex'), plan: false, model: concreteModel(props.provider === 'claude' ? 'claude' : 'codex', props.model), effort: props.effort === 'auto' ? undefined : props.effort })
+  const settingsRef = useRef(settings)
+  settingsRef.current = settings
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [expansion, setExpansion] = useState<Record<string, boolean>>(() => storedExpansion(props.resourceId))
   const [imagePreviews, setImagePreviews] = useState<Record<string, string>>({})
@@ -57,6 +75,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [addFileOpen, setAddFileOpen] = useState(false)
   const [filePath, setFilePath] = useState('')
   const [diff, setDiff] = useState<FileChange | null>(null)
+  const [changesOpen, setChangesOpen] = useState(false)
   const [eventsOpen, setEventsOpen] = useState(false)
   const [rawEvents, setRawEvents] = useState<AgentEvent[]>([])
   const [historyOpen, setHistoryOpen] = useState(false)
@@ -78,6 +97,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [newOutput, setNewOutput] = useState(false)
   const [visibleCount, setVisibleCount] = useState(250)
   const [readingWindow, setReadingWindow] = useState<TimelineItem[] | null>(null)
+  const [pendingPromptScroll, setPendingPromptScroll] = useState<string | null>(null)
+  const promptFlashTimer = useRef(0)
   const lastVisibleItems = useRef<TimelineItem[]>([])
   const timeline = useRef<HTMLDivElement>(null)
   const timelineContent = useRef<HTMLDivElement>(null)
@@ -93,7 +114,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const lastConversationItems = useRef<TimelineItem[]>([])
   const provider = props.provider === 'claude' ? 'claude' : 'codex'
   const name = (projection.capabilities?.provider ?? provider) === 'claude' ? 'Claude Code' : 'Codex'
-  const unstartedConversation = !projection.nativeSessionId && !projection.truncated && projection.items.every(item => item.data.type === 'notice' && !item.turnId)
+  // A runtime that never reached a native session exchanged nothing: startup notices and the
+  // failure itself must not lock the composer, or a failed connect leaves no way to retry.
+  const unstartedConversation = !projection.nativeSessionId && !projection.truncated && projection.items.every(item => (item.data.type === 'notice' || item.data.type === 'error') && !item.turnId)
   const propsRef = useRef(props)
   propsRef.current = props
 
@@ -108,6 +131,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setExpansion(storedExpansion(activeId))
     setVisibleCount(250)
     setReadingWindow(null)
+    setPendingPromptScroll(null)
+    window.clearTimeout(promptFlashTimer.current)
     lastVisibleItems.current = []
     priorSequence.current = 0
     lastConversationItems.current = []
@@ -122,7 +147,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       if (!initialized || disposed) return
       const events = queue
       queue = []
-      setProjection((current) => events.reduce(projectAgentEvent, current))
+      // A fast reply can queue many deltas for the same message before one frame; merging
+      // them first keeps this a single O(items) reduce instead of one per delta.
+      setProjection((current) => coalesceTextDeltas(events).reduce(projectAgentEvent, current))
       // A permission action changes the running provider mode in every pane.
       // Preserve any locally selected model/effort for the next message.
       const modeUpdate = events.filter(event => event.data.type === 'session' && event.data.settings).at(-1)
@@ -157,7 +184,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [activeId, provider])
 
   useEffect(() => {
-    const phase: AgentActivityPhase = projection.phase === 'waiting_approval' || projection.phase === 'waiting_input' ? 'waiting_input' : projection.phase === 'running' || projection.phase === 'starting' || projection.phase === 'interrupting' ? 'working' : projection.phase === 'failed' || projection.phase === 'disconnected' ? 'error' : projection.phase === 'completed' ? 'complete' : 'idle'
+    const phase: AgentActivityPhase = projection.phase === 'waiting_approval' || projection.phase === 'waiting_input' ? 'waiting_input' : projection.phase === 'running' || projection.phase === 'starting' || projection.phase === 'interrupting' ? 'working' : projection.phase === 'failed' ? 'failed' : projection.phase === 'disconnected' ? 'disconnected' : projection.phase === 'interrupted' ? 'stopped' : projection.phase === 'completed' ? 'complete' : 'idle'
     window.dispatchEvent(new CustomEvent('conductor:agent-activity', { detail: { id: activeId, phase } }))
   }, [activeId, projection.phase])
 
@@ -230,7 +257,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     const current = propsRef.current
     const target = safeFileTarget(raw, current.project.path)
     if (!target) { setError('The file link is outside this workspace or has an invalid path.'); return }
-    void window.conductor.files.read(current.project.id, target.path).then(() => current.onOpenFile?.(target.path, line ?? target.line)).catch((reason: unknown) => setError('Cannot open current file: ' + (reason instanceof Error ? reason.message : String(reason))))
+    // Confirming the path exists must not read the bytes: an agent can link a
+    // video or a database dump, and loading one to answer "is it there?" stalls
+    // the window before the file tab has decided how to show it.
+    void window.conductor.files.stat(current.project.id, target.path).then(() => current.onOpenFile?.(target.path, line ?? target.line)).catch((reason: unknown) => setError('Cannot open current file: ' + (reason instanceof Error ? reason.message : String(reason))))
   }, [])
   const onExpand = useCallback((id: string): void => {
     setExpansion((current) => {
@@ -367,11 +397,17 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
 
   const canSubmit = ready && !historical && !resuming && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
   const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
+  const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: Boolean(message.trim()), needsResume, steering, historical, canSubmit, submitting })
   const pendingSteering = projection.pendingSteering ?? []
   const queuedPrompts = projection.queuedPrompts ?? (projection.queued ? [projection.queued] : [])
   const capabilities = projection.capabilities
+  const banner = runtimeBanner({ phase: projection.phase, historical, unstarted: unstartedConversation, archived: projection.archived, ready, resuming, canResume: Boolean(capabilities?.resume && projection.nativeSessionId) })
+  const shownError = bannerAbsorbsError(banner, error) ? '' : cleanIpcError(error)
   const pending = projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length
   const conversationItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
+  // Independent of the windowed/reading-view slice below: the pin must reflect the true latest
+  // prompt even while the visible window only covers older or newer activity.
+  const pinnedPrompt = useMemo(() => latestOwnerPrompt(conversationItems), [conversationItems])
   const visibleItems = useMemo(() => {
     if (!readingWindow) return conversationItems.slice(-visibleCount)
     const latest = new Map(projection.items.map((item) => [item.id, item]))
@@ -379,6 +415,30 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return readingWindow.map((item) => latest.get(item.id) ?? item)
   }, [projection.items, conversationItems, visibleCount, readingWindow])
   useLayoutEffect(() => { lastVisibleItems.current = visibleItems }, [visibleItems])
+  // The scroll-to-pinned-prompt jump goes through the same reading-window pin as a deliberate
+  // scroll up, rather than a raw scrollTop write, so it does not fight autoscroll afterwards.
+  const scrollToPinnedPrompt = (): void => {
+    if (!pinnedPrompt) return
+    userScrollUntil.current = Date.now() + 800
+    nearBottom.current = false
+    setReadingWindow((current) => {
+      if (current?.some((item) => item.id === pinnedPrompt.id)) return current
+      const index = conversationItems.findIndex((item) => item.id === pinnedPrompt.id)
+      return index === -1 ? (current ?? lastVisibleItems.current) : conversationItems.slice(Math.max(0, index - 5))
+    })
+    setPendingPromptScroll(pinnedPrompt.id)
+  }
+  useLayoutEffect(() => {
+    if (!pendingPromptScroll) return
+    const element = timeline.current
+    const card = element?.querySelector<HTMLElement>('[data-item-id="' + CSS.escape(pendingPromptScroll) + '"]')
+    if (!element || !card) return
+    element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
+    card.classList.add('sa-activity-flash')
+    window.clearTimeout(promptFlashTimer.current)
+    promptFlashTimer.current = window.setTimeout(() => card.classList.remove('sa-activity-flash'), 1400)
+    setPendingPromptScroll(null)
+  }, [pendingPromptScroll, visibleItems])
   useLayoutEffect(() => {
     if (nearBottom.current && !readingWindow && !hasTimelineSelection(timeline.current, window.getSelection()) && timeline.current) {
       timeline.current.scrollTop = timeline.current.scrollHeight
@@ -425,9 +485,30 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setNewOutput(false)
     requestAnimationFrame(() => { if (timeline.current) timeline.current.scrollTop = timeline.current.scrollHeight })
   }
-  const parentLabels = useMemo(() => new Map(projection.items.flatMap(item => item.nativeItemId && (item.data.type === 'tool' || item.data.type === 'subagent') ? [[item.runtimeId + ':' + item.nativeItemId, item.data.name] as const] : [])), [projection.items])
+  // Same identity notion the subagent roster counts by: same color and disambiguated name
+  // everywhere a given subagent shows up, not a second, independent labeling scheme.
+  const subagentRoster = useMemo(() => summarizeSubagents(projection.items, projection.runtimeId, projection.phase, false), [projection.items, projection.runtimeId, projection.phase])
+  const subagentLabels = useMemo(() => distinguishSubagentLabels(subagentRoster), [subagentRoster])
+  const parentLabels = useMemo(() => new Map(projection.items.flatMap(item => {
+    if (!item.nativeItemId) return []
+    const key = item.runtimeId + ':' + item.nativeItemId
+    if (item.data.type === 'subagent') { const id = subagentIdentityId(item.data, item.runtimeId, item.nativeItemId, item.id); return [[key, { name: subagentLabels.get(id) ?? item.data.name, colorIndex: subagentColorIndex(id) }] as const] }
+    if (item.data.type === 'tool') { const title = toolPresentation(item.data).title; return [[key, { name: title === item.data.name ? item.data.name : item.data.name + ': ' + title }] as const] }
+    return []
+  })), [projection.items, subagentLabels])
+  const labelAnchors = useMemo(() => parentLabelAnchors(visibleItems), [visibleItems])
   const activityGroups = useMemo(() => groupConversationActivities(visibleItems), [visibleItems])
-  const updateSettings = (change: Partial<SessionSettings>): void => setSettings((current) => ({ ...(change.permission !== undefined || change.plan !== undefined ? settingsForRuntime(current) : current), ...change }))
+  // A composer choice belongs to the conversation, not to this mounting of the pane: switching
+  // project or restarting must reopen on the model and effort the user picked, so the change is
+  // saved with the conversation instead of waiting for a message that may never be sent.
+  const updateSettings = (change: Partial<SessionSettings>): void => {
+    rememberPermission(provider, change.permission, capabilities)
+    const next = nextComposerSettings(settingsRef.current, change)
+    settingsRef.current = next
+    setSettings(next)
+    if (historical) return
+    void window.conductor.structured.saveSettings(activeId, next).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))
+  }
   const chooseCommand = (command: ComposerCommand): void => {
     setCommandDismissed(true); setCommandIndex(0)
     setMessage(command.insert ?? '')
@@ -450,6 +531,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? ['Thinking', 'Spelunking', 'Working', 'Considering'][workingWord] : displayPhase(projection.phase)}</span>}
       {pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}
       <span className="sa-spacer" />
+      <button aria-label="Local change history" title="Files this conversation changed, with revert" onClick={() => setChangesOpen(true)}><FileDiff size={15} /></button>
       <button aria-label="Conversation history" title="History" onClick={() => setHistoryOpen(true)}><History size={15} /></button>
       <button aria-label="Session settings" title="Conversation settings" aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)}><Settings2 size={15} /></button>
     </header>
@@ -475,28 +557,34 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         </details>
       </div>
     </AgentDialog>}
-    {error && <div className="sa-error-bar" role="alert"><span>{error}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
+    {shownError && <div className="sa-error-bar" role="alert"><span>{shownError}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
     {historical && <div className="sa-history-banner" role="status"><span><strong>{resuming ? 'Reconnecting conversation...' : 'Previewing saved conversation'}</strong><small>{projection.title || 'Saved messages'} ? Resume to continue from here.</small></span><button disabled={resuming} onClick={() => { setReady(false); setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button disabled={!ready || resuming || projection.archived} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume this conversation'}</button>}</div>}
-    {(projection.phase === 'disconnected' && !unstartedConversation || projection.phase === 'interrupted') && !historical && <div className="sa-history-banner"><span>{projection.phase === 'disconnected' ? 'Runtime disconnected. The last operation may be incomplete.' : 'Runtime interrupted.'}</span></div>}
+    {banner && <div className="sa-runtime-banner" role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
     <div className="sa-timeline-wrap"><div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
       const el = timeline.current
       // Layout and content growth can emit scroll events too. Only user input
       // should release automatic following while the view is pinned to the end.
       if (nearBottom.current && Date.now() > userScrollUntil.current) return
-      nearBottom.current = Boolean(el && isAtConversationBottom(el))
+      nearBottom.current = Boolean(el && followsBottomAfterScroll(nearBottom.current, el))
       if (!nearBottom.current) setReadingWindow((current) => current ?? lastVisibleItems.current)
       else if (!hasTimelineSelection(el, window.getSelection())) { setReadingWindow(null); setNewOutput(false) }
     }}><div ref={timelineContent} className="sa-timeline-content">
+      {pinnedPrompt && <button type="button" className="sa-pinned-prompt" title={pinnedPrompt.text} aria-label={'Scroll to your last message: ' + pinnedPrompt.text} onClick={scrollToPinnedPrompt}><Pin size={11} aria-hidden="true" /><span>{truncatePromptPreview(pinnedPrompt.text)}</span></button>}
       {(!ready || !conversationItems.length) && <div className="sa-empty"><strong>{ready ? 'What are we working on?' : 'Opening conversation…'}</strong>{ready && <p>Ask {name} about your code, or describe a change.</p>}</div>}
       {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
       {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
       {ready && activityGroups.map(group => {
-        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={props.project.path} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} parentLabel={item.parentId ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />)
-        return group.length === 1 ? activities[0] : <details className="sa-completed-group" key={group[0]!.id}><summary>{group.length} completed actions</summary><div>{activities}</div></details>
+        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={props.project.path} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />)
+        // A recall belongs to the message it was injected with, so it renders directly under it.
+        const recall = group.length === 1 && group[0]!.nativeItemId ? recallByItem.get(group[0]!.nativeItemId) : undefined
+        if (recall) return <div className="sa-turn" key={group[0]!.id}>{activities[0]}<MemoryRecallStrip recall={recall} onChanged={loadTurnRecalls} /></div>
+        if (group.length === 1) return activities[0]
+        const coalesced = coalescedEditSummary(group)
+        return <details className="sa-completed-group" key={group[0]!.id}><summary>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</summary><div>{activities}</div></details>
       })}
       {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
     </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>
-    <StructuredAgentTelemetry key={activeId} modelLabel={resolvedComposerSettings(settings, capabilities).label} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} />
+    <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={props.project.path} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }}>
       {pendingSteering.length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{pendingSteering.map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>
         <strong>{input.status === 'sending' ? 'Sending' : input.status === 'accepted' ? 'Received' : input.status === 'cancelled' ? 'Not sent' : 'Delivery uncertain'}</strong>
@@ -521,17 +609,19 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submit() }
       }} />
       <footer className="agent-prompt-controls">
-        <PromptImageUpload key={activeId} projectId={props.project.id} disabled={historical || !capabilities?.imageAttachments} onError={setError} onAttach={(images) => setAttachments(current => { if (current.length + images.length > 20) { setError('A prompt can have up to 20 attachments. Remove some and attach these images again.'); return current }; return [...current, ...images] })} />
+        <PromptImageUpload key={composerChildKey('images', activeId)} projectId={props.project.id} disabled={historical || !capabilities?.imageAttachments} onError={setError} onAttach={(images) => setAttachments(current => { if (current.length + images.length > 20) { setError('A prompt can have up to 20 attachments. Remove some and attach these images again.'); return current }; return [...current, ...images] })} />
         <button type="button" aria-label="Attach file context" title="Attach context" disabled={historical} onClick={() => setAddFileOpen(open => !open)}><FilePlus2 size={15} /></button>
-        <StructuredComposerControls key={activeId} settings={settings} capabilities={capabilities} disabled={historical || !ready} onChange={updateSettings} onDiscover={connect} />
+        <StructuredComposerControls key={composerChildKey('controls', activeId)} settings={settings} capabilities={capabilities} disabled={historical || !ready} onChange={updateSettings} onDiscover={connect} />
+        <StructuredUsageSummary key={composerChildKey('usage', activeId)} items={projection.items} runtimeId={projection.runtimeId} truncated={projection.truncated} modelLabel={resolvedComposerSettings(settings, capabilities).label} agentSessionId={activeId} workspaceId={props.session.id} />
         <span className="sa-spacer" />
-        {activePhases.has(projection.phase) && !message.trim() ? <button className="sa-send sa-stop agent-send-button" type="button" aria-label="Stop" title="Stop · Esc" disabled={projection.phase === 'interrupting' || historical} onClick={() => stop()}><Square size={13} fill="currentColor" /></button> : needsResume ? <button className="sa-send agent-send-button" type="button" aria-label="Resume conversation" title="Resume the same conversation" onClick={() => void resume()}><Play size={15} /></button> : <button className="sa-send agent-send-button" type="submit" aria-label={steering ? 'Steer' : activePhases.has(projection.phase) ? 'Queue message' : 'Send message'} title={steering ? 'Send to running turn · Enter' : activePhases.has(projection.phase) ? 'Queue message after this turn · Enter' : 'Send message · Enter'} disabled={!canSubmit || !message.trim() || submitting}><Send size={15} /></button>}
+        <StructuredSendButton {...sendIntent} busy={activePhases.has(projection.phase)} onActivate={() => { if (sendIntent.state === 'stop') stop(); else void resume() }} />
       </footer>
       {addFileOpen && <FileAttachmentInput projectId={props.project.id} value={filePath} onChange={setFilePath} onAttach={(path) => void addFile(path)} onClose={() => { setAddFileOpen(false); composer.current?.focus() }} />}
     </form>
     {diff && <ImmutableDiff sessionId={activeId} change={diff} onOpenFile={onOpenFile} onClose={() => setDiff(null)} />}
+    {changesOpen && <AgentChangeHistoryView sessionId={activeId} title={projection.title || props.title} busy={activePhases.has(projection.phase)} onOpenFile={onOpenFile} onClose={() => setChangesOpen(false)} />}
     {inspectAttachment && <AgentDialog title={'Context · ' + inspectAttachment.name} onClose={() => setInspectAttachment(null)}><p className="sa-notice">{inspectAttachment.kind === 'image' ? 'This attached image stays available when you switch projects or reopen the conversation.' : 'This content will be submitted with your message. File content is captured when attached.'}</p>{inspectAttachment.kind === 'image' && imagePreviews[inspectAttachment.id] && <img className="sa-context-image" alt={inspectAttachment.name} src={imagePreviews[inspectAttachment.id]} />}{inspectAttachment.kind !== 'image' && <pre className="sa-expanded-output">{inspectAttachment.content ?? inspectAttachment.path ?? 'No content'}</pre>}</AgentDialog>}
-    {eventsOpen && <AgentDialog title="Event log" onClose={() => setEventsOpen(false)}><p className="sa-notice">Diagnostics only. Showing the latest {rawEvents.length} events.</p><div className="sa-diff-toolbar"><button onClick={() => void navigator.clipboard.writeText(JSON.stringify(rawEvents, null, 2))}>Copy events</button><button onClick={() => void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200)))}>Refresh</button></div><div className="sa-event-list">{rawEvents.map((event) => <details key={event.id}><summary>#{event.sequence} · {event.data.type} · {event.native?.method ?? event.itemId ?? event.requestId ?? ''}</summary><pre>{JSON.stringify(event, null, 2)}</pre></details>)}</div></AgentDialog>}
+    {eventsOpen && <AgentDialog title="Event log" onClose={() => setEventsOpen(false)}><p className="sa-notice">Diagnostics only. Showing the latest {rawEvents.length} events.</p><div className="sa-diff-toolbar"><button onClick={() => void copyText(JSON.stringify(rawEvents, null, 2))}>Copy events</button><button onClick={() => void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200)))}>Refresh</button></div><div className="sa-event-list">{rawEvents.map((event) => <details key={event.id}><summary>#{event.sequence} · {event.data.type} · {event.native?.method ?? event.itemId ?? event.requestId ?? ''}</summary><pre>{JSON.stringify(event, null, 2)}</pre></details>)}</div></AgentDialog>}
     {historyOpen && <AgentDialog title="Conversation history" onClose={() => setHistoryOpen(false)}><input className="sa-history-search" aria-label="Search conversation history" placeholder="Search conversations" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} /><p className="sa-history-help">Choose a conversation to preview its messages, then resume when you are ready to continue.</p>{historyLoading && <p className="sa-history-loading" role="status"><LoaderCircle size={13} className="spin" /> Loading conversations...</p>}<div className="sa-history-list" aria-busy={historyLoading}>{historyItems.map((item) => <button key={item.id} title="Preview saved conversation" onClick={() => { if (item.id !== activeId) setReady(false); setActiveId(item.id); setHistorical(item.id !== props.resourceId); setHistoryOpen(false) }}><strong>{item.title || 'Untitled conversation'}</strong><small>{item.provider} · {displayPhase(item.phase)}{item.archived ? ' · archived' : ''}</small></button>)}{!historyLoading && !historyItems.length && <p>No saved conversations match.</p>}</div></AgentDialog>}
     {discovery !== undefined && <AgentDialog title={name + ' configuration'} onClose={() => setDiscovery(undefined)}><p className="sa-notice">Read-only details of configured skills, commands and connections. Nothing here runs a command or changes your configuration.</p><div className="sa-event-list">{discovery && typeof discovery === 'object' && !Array.isArray(discovery) ? Object.entries(discovery).map(([category, value]) => <details key={category}><summary>{category.replaceAll('_', ' ')}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>) : <pre>{JSON.stringify(discovery, null, 2)}</pre>}</div></AgentDialog>}
     {rename !== null && <AgentDialog title="Rename conversation" onClose={() => setRename(null)}><form className="sa-rename" onSubmit={(event) => { event.preventDefault(); const title = rename.trim(); if (!title) return; void window.conductor.structured.rename(activeId, title).then(() => { setProjection((current) => ({ ...current, title })); setRename(null) }).catch((reason: unknown) => setError(String(reason))) }}><input autoFocus aria-label="Conversation title" maxLength={160} value={rename} onChange={(event) => setRename(event.target.value)} /><button type="submit">Save name</button></form></AgentDialog>}

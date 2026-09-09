@@ -3,31 +3,25 @@ import { AgentControlLinks } from '../components/AgentControlLinks'
 import { ProjectBacklogPane } from '../components/ProjectBacklogPane'
 import '../navigation.css'
 import { ProviderIcon } from '../components/ProviderIcon'
-import { PaneTabMenu } from '../components/PaneTabMenu'
-import { applyWorkspaceTabAction } from './workspace-tab-actions'
+import { PaneTabMenu, TabGroupMenu } from '../components/PaneTabMenu'
+import { TabActivityIndicator } from '../components/TabActivityIndicator'
+import { applyTabGroupAction, applyWorkspaceTabAction } from './workspace-tab-actions'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal, flushSync } from 'react-dom'
 import {
-  Bell,
   Bot,
-  Braces,
-  ExternalLink,
   FileText,
-  FileSearch,
   FolderTree,
   Globe2,
   GripVertical,
   MoreHorizontal,
-  PanelBottom,
-  PanelLeft,
-  PanelRight,
-  PanelTop,
   Plus,
   TerminalSquare,
   TimerReset,
   Undo2,
   X
 } from 'lucide-react'
+import { fileTypeIcon } from '../file-types'
 import type {
   AgentActivityPhase,
   AgentProviderId,
@@ -43,15 +37,19 @@ import { makeLauncherTab } from '../../../shared/models'
 import {
   activateTab,
   addTab,
+  applyTabDrop,
   closeTab,
-  dockTab,
+  collapseTabGroup,
   findGroup,
-  listGroups,
   resizeSplit,
-  type DockEdge,
+  tabDropLands,
+  type TabDropTarget,
   replaceTab,
   updateTab
 } from './layout-operations'
+import { tabGroupsOf, tabStripSlots, type TabGroupAction } from './tab-groups'
+import { dropTargetAt, gapAnchorId, type CanvasEdge, type PaneGeometry, type TabRect } from './tab-drag'
+import { ChevronRight } from 'lucide-react'
 import { createPaneTab } from '../panes/pane-factory'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { RuntimeTerminal } from '../panes/RuntimeTerminal'
@@ -75,44 +73,31 @@ interface PaneWorkspaceProps {
   onDetach(groupId: string, tab: PaneTab, options?: { alwaysOnTop?: boolean }): void
   canReopen: boolean
   onReopen(groupId: string): void
-  onOpenFile?(path: string, line?: number): void
+  onOpenFile?(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
+  /** App.tsx's phase map, already downgraded away from 'complete' while a tab still owns active
+   *  subagent work (see resolveActivityPhases in attention.ts). Falls back to this pane's own raw
+   *  per-tab listener when absent, e.g. in a detached window that doesn't thread this prop. */
+  correctedActivityPhases?: ReadonlyMap<string, AgentActivityPhase>
 }
+
+interface TabDragState { sourceGroupId: string; tab: PaneTab; width: number; x: number; y: number }
 
 interface PaneDragActions {
-  start(groupId: string, tab: PaneTab, point: { x: number; y: number }): void
-  end(): void
-  preview(groupId: string, edge: DockEdge, rect: DOMRect): void
-  arrive(groupId: string, edge: DockEdge): void
-}
-
-interface DockPreviewState {
-  groupId: string
-  edge: DockEdge
-  title: string
-  left: number
-  top: number
-  width: number
-  height: number
+  start(groupId: string, tab: PaneTab, width: number, point: { x: number; y: number }): void
 }
 
 const iconFor = (tab: PaneTab): typeof Bot => {
   if (tab.kind === 'agent') return Bot
   if (tab.kind === 'terminal') return TerminalSquare
   if (tab.kind === 'file-tree') return FolderTree
-  if (tab.kind === 'code') return Braces
-  if (tab.kind === 'preview') return FileSearch
+  // Same mapping the explorer, file tabs and Ctrl+E picker use, so a .tsx tab's icon matches everywhere.
+  if (tab.kind === 'code' || tab.kind === 'preview') return fileTypeIcon((tab.state?.path as string) ?? tab.resourceId ?? '')
   if (tab.kind === 'browser') return Globe2
   return FileText
 }
 
 const TAB_ANIMATION_MS = 110
-
-const layoutShape = (layout: WorkspaceLayout): string => {
-  const shape = (node: LayoutNode): unknown => node.type === 'group'
-    ? { type: 'group', tabs: node.tabs.map((tab) => tab.id), active: node.activeTabId }
-    : { type: 'split', direction: node.direction, sizes: node.sizes.map(Math.round), children: node.children.map(shape) }
-  return JSON.stringify(shape(layout.root))
-}
+const TAB_SPOTLIGHT_MS = 1600
 
 const PaneBody = ({
   tab,
@@ -129,7 +114,7 @@ const PaneBody = ({
   project: ProjectRecord
   session: SessionRecord
   onOpen(kind: PaneKind, provider?: AgentProviderId): void
-  onOpenFile(path: string, line?: number): void
+  onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   onUpdateTab(tabId: string, state: Record<string, unknown>): void
   onConversationChange(tabId: string, conversation: ConversationIdentity): Promise<void>
 }): React.JSX.Element => {
@@ -171,7 +156,7 @@ const PaneBody = ({
   if (tab.kind === 'file-tree') return <FileTreePane project={project} onOpenFile={onOpenFile} />
   if (tab.kind === 'tasks') return <ProjectBacklogPane project={project} />
   if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} />
-  if (tab.kind === 'preview') return <FilePreviewPane project={project} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} onOpenEditor={onOpenFile} />
+  if (tab.kind === 'preview') return <FilePreviewPane project={project} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} onOpenEditor={(path, allowBinary) => onOpenFile(path, undefined, 'editor', allowBinary)} />
   if (tab.kind === 'browser') return <BrowserPane performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { ...tab.state, url })} />
   return (
     <div className="coming-pane">
@@ -185,43 +170,42 @@ function PaneGroup({
   group,
   workspace,
   dragActions,
-  arrivalEdge,
-  hoverEdge,
-  dragSourceGroupId,
-  dragSourceTabId
+  dragging,
+  dropTarget,
+  snapArrival
 }: {
   group: PaneGroupNode
   workspace: PaneWorkspaceProps
   dragActions: PaneDragActions
-  arrivalEdge: DockEdge | null
-  hoverEdge: DockEdge | null
-  dragSourceGroupId: string | null
-  dragSourceTabId: string | null
+  dragging: TabDragState | null
+  dropTarget: TabDropTarget | null
+  snapArrival: { groupId: string; edge: CanvasEdge } | null
 }): React.JSX.Element {
   const groupRef = useRef<HTMLElement>(null)
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number; tabId: string } | null>(null)
+  const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; tabGroupId: string } | null>(null)
+  /** A group created from the tab menu opens its name editor as soon as the chip exists,
+   * the way Chrome drops you straight into naming a new group. */
+  const [pendingRename, setPendingRename] = useState<string | null>(null)
   const [activity, setActivity] = useState<Record<string, AgentActivityPhase>>({})
+  // One clock reading per group, shared by every spinner it renders, anchors them all to the
+  // same epoch so a tab mounting later still lands in step with tabs already spinning.
+  const spinEpoch = useRef(Date.now()).current
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(() => new Set())
   const [openingTabIds, setOpeningTabIds] = useState<Set<string>>(() => new Set())
+  const [spotlight, setSpotlight] = useState<{ tabId: string; key: number } | null>(null)
   const knownTabIdsRef = useRef(new Set(group.tabs.map((tab) => tab.id)))
   const closeTimersRef = useRef(new Map<string, number>())
   const workspaceRef = useRef(workspace)
   workspaceRef.current = workspace
   const activeTab = group.tabs.find((tab) => tab.id === group.activeTabId) ?? group.tabs[0]!
   const menuTab = group.tabs.find(tab => tab.id === menuPosition?.tabId) ?? activeTab
+  const menuGroup = tabGroupsOf(group).find(item => item.id === groupMenu?.tabGroupId)
   const focused = workspace.focusedGroupId === group.id
-  const sourceGroup = dragSourceGroupId ? findGroup(workspace.layout.root, dragSourceGroupId) : null
-  const possibleEdges: DockEdge[] = !sourceGroup
-    ? []
-    : sourceGroup.id !== group.id
-      ? ['left', 'right', 'above', 'below', 'center']
-      : sourceGroup.tabs.length > 1
-        ? ['left', 'right', 'above', 'below']
-        : []
-  const currentShape = layoutShape(workspace.layout)
-  const validEdges = possibleEdges.filter((edge) =>
-    layoutShape(dockTab(workspace.layout, sourceGroup!.id, dragSourceTabId ?? '', group.id, edge)) !== currentShape
-  )
+  const isSourceGroup = dragging?.sourceGroupId === group.id
+  const barIndex = dropTarget?.kind === 'bar' && dropTarget.groupId === group.id ? dropTarget.index : null
+  const canvasEdge = dropTarget?.kind === 'canvas' && dropTarget.groupId === group.id ? dropTarget.edge : null
+  const gapBeforeId = barIndex === null ? undefined : gapAnchorId(group.tabs.map((tab) => tab.id), isSourceGroup ? dragging!.tab.id : null, barIndex)
 
   useEffect(() => {
     if (!menuPosition) return
@@ -246,6 +230,30 @@ function PaneGroup({
     window.addEventListener('conductor:agent-activity', onActivity)
     return () => window.removeEventListener('conductor:agent-activity', onActivity)
   }, [group.tabs])
+
+  useEffect(() => {
+    const onSpotlight = (event: Event): void => {
+      const tabId = (event as CustomEvent<{ tabId?: string }>).detail?.tabId
+      if (tabId) setSpotlight({ tabId, key: Date.now() })
+    }
+    window.addEventListener('conductor:spotlight-tab', onSpotlight)
+    return () => window.removeEventListener('conductor:spotlight-tab', onSpotlight)
+  }, [])
+
+  useLayoutEffect(() => {
+    if (!pendingRename) return
+    setPendingRename(null)
+    const chip = groupRef.current?.querySelector<HTMLElement>(`.tab-group-chip[data-tab-group-id="${CSS.escape(pendingRename)}"]`)
+    if (!chip) return
+    const rect = chip.getBoundingClientRect()
+    setGroupMenu({ x: Math.min(rect.left, window.innerWidth - 235), y: rect.bottom + 2, tabGroupId: pendingRename })
+  }, [pendingRename])
+
+  useEffect(() => {
+    if (!spotlight) return
+    const timer = window.setTimeout(() => setSpotlight(null), TAB_SPOTLIGHT_MS)
+    return () => window.clearTimeout(timer)
+  }, [spotlight])
 
   useLayoutEffect(() => {
     const nextIds = new Set(group.tabs.map((tab) => tab.id))
@@ -279,26 +287,18 @@ function PaneGroup({
     transparentImage.width = 1
     transparentImage.height = 1
     event.dataTransfer.setDragImage(transparentImage, 0, 0)
-    dragActions.start(group.id, tab, { x: event.clientX, y: event.clientY })
+    dragActions.start(group.id, tab, event.currentTarget.getBoundingClientRect().width, { x: event.clientX, y: event.clientY })
   }
 
   const finishDrag = (event: React.DragEvent, tab: PaneTab): void => {
-    const wasNotDocked = event.dataTransfer.dropEffect === 'none'
-    dragActions.end()
-    if (!wasNotDocked) return
-
+    if (event.dataTransfer.dropEffect !== 'none') return
     // Native applications often zero out DragEvent screen coordinates when they
-    // accept the drop. Electron's cursor position remains reliable across apps.
+    // accept the drop. Electron's cursor position remains reliable across apps, and the
+    // top-level drag effect already preventDefaults every dragover inside the window, so
+    // dropEffect only stays 'none' here when the drag ended outside it entirely.
     void window.conductor.window.isCursorOutside().then((outsideWindow) => {
       if (outsideWindow) workspace.onDetach(group.id, tab)
     })
-  }
-
-  const previewDock = (edge: DockEdge, event: React.DragEvent): void => {
-    event.preventDefault()
-    event.dataTransfer.dropEffect = 'move'
-    const rect = groupRef.current?.getBoundingClientRect()
-    if (rect) dragActions.preview(group.id, edge, rect)
   }
 
   const showContextMenu = (event: React.MouseEvent, tab: PaneTab = activeTab): void => {
@@ -313,14 +313,29 @@ function PaneGroup({
     })
   }
 
+  const showGroupMenu = (event: React.MouseEvent, tabGroupId: string): void => {
+    event.preventDefault()
+    event.stopPropagation()
+    workspace.onFocus(group.id)
+    setMenuPosition(null)
+    setGroupMenu({ x: Math.min(event.clientX, window.innerWidth - 235), y: event.clientY, tabGroupId })
+  }
+
+  const runGroupAction = (action: TabGroupAction, tab: PaneTab): void => {
+    const result = applyTabGroupAction({ ...workspace.session, layout: workspace.layout }, group.id, tab.id, action)
+    workspace.onLayout(result.session.layout)
+    for (const closed of result.session.closedTabs.slice(workspace.session.closedTabs.length)) workspace.onClosed(closed)
+    if (result.tabGroupId) setPendingRename(result.tabGroupId)
+  }
+
   const open = (kind: PaneKind, provider?: AgentProviderId): void => {
     if (kind !== 'agent' && kind !== 'terminal') return
     const tab = createPaneTab(kind, { provider })
     workspace.onLayout(replaceTab(workspace.layout, group.id, activeTab.id, tab))
   }
 
-  const openFile = (path: string, line?: number): void => {
-    workspace.onOpenFile?.(path, line)
+  const openFile = (path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void => {
+    workspace.onOpenFile?.(path, line, mode, allowBinary)
   }
 
   const setTabState = (tabId: string, state: Record<string, unknown>): void => {
@@ -368,49 +383,64 @@ function PaneGroup({
           debugLog('tabs', 'Tab closed', { sessionId: requestedSessionId, groupId: requestedGroupId, tabId: tab.id }, 'info')
         }
       }
-      const transitionDocument = document as Document & { startViewTransition?: (update: () => void) => unknown }
-      if (transitionDocument.startViewTransition) transitionDocument.startViewTransition(() => flushSync(apply))
-      else apply()
+      // The surviving neighbour must not remount when a split collapses into it, so this
+      // relies on SplitView's own flex-basis transition instead of a view-transition snapshot.
+      apply()
     }, TAB_ANIMATION_MS)
     closeTimersRef.current.set(tab.id, timer)
   }
 
-  const drop = (edge: DockEdge, event: React.DragEvent): void => {
-    event.preventDefault()
-    event.stopPropagation()
-    try {
-      const data = JSON.parse(event.dataTransfer.getData('application/x-conductor-pane')) as {
-        groupId: string
-        tabId: string
-      }
-      const next = dockTab(workspace.layout, data.groupId, data.tabId, group.id, edge)
-      const destination = listGroups(next.root).find((candidate) =>
-        candidate.tabs.some((tab) => tab.id === data.tabId)
-      )
-      const destinationId = destination?.id ?? group.id
-      const applySnap = (): void => {
-        workspace.onLayout(next)
-        workspace.onFocus(destinationId)
-        dragActions.arrive(destinationId, edge)
-      }
-      const transitionDocument = document as Document & {
-        startViewTransition?: (update: () => void) => { finished: Promise<void> }
-      }
-      if (transitionDocument.startViewTransition) {
-        transitionDocument.startViewTransition(() => flushSync(applySnap))
-      } else {
-        flushSync(applySnap)
-      }
-    } finally {
-      dragActions.end()
-    }
+  /** One tab button. `gapHere` opens the drag insertion gap in front of it; for the first tab
+   * of a group the gap belongs on the group wrapper instead, so the tab never detaches from
+   * its own chip mid-drag. */
+  const renderTab = (tab: PaneTab, gapHere: boolean): React.JSX.Element => {
+    const Icon = iconFor(tab)
+    const rawPhase = activity[tab.id] ?? 'idle'
+    const correctedPhase = tab.resourceId ? workspace.correctedActivityPhases?.get(tab.resourceId) : undefined
+    const tabPhase = correctedPhase ?? rawPhase
+    return (
+      <button
+        key={tab.id}
+        data-control-tab-id={tab.id}
+        data-control-agent-id={tab.resourceId}
+        data-drop-slot-id={tab.id}
+        className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
+        style={{ marginLeft: gapHere ? dragging!.width : undefined }}
+        onClick={() => workspace.onLayout(activateTab(workspace.layout, group.id, tab.id))}
+        onContextMenu={event => showContextMenu(event, tab)}
+        onPointerDown={(event) => {
+          if (event.button !== 1) return
+          event.preventDefault()
+          event.stopPropagation()
+          close(tab)
+        }}
+        onAuxClick={(event) => event.preventDefault()}
+        data-autoscroll="off"
+        draggable
+        onDragStart={(event) => beginDrag(event, tab)}
+        onDragEnd={(event) => finishDrag(event, tab)}
+      >
+        {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
+        <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
+        {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (
+          <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
+        )}
+        {tab.kind === 'agent' && <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />}
+        <i
+          className="tab-close"
+          role="button"
+          onClick={(event) => { event.stopPropagation(); close(tab) }}
+        ><X size={11} /></i>
+      </button>
+    )
   }
 
   return (
     <>
     <section
       ref={groupRef}
-      className={`pane-group ${focused ? 'focused' : ''} ${group.tabs.length === 1 && closingTabIds.has(activeTab.id) ? 'closing' : ''} ${arrivalEdge ? `snap-arrival snap-${arrivalEdge}` : ''} ${hoverEdge ? `dock-hover dock-hover-${hoverEdge}` : ''}`}
+      data-group-id={group.id}
+      className={`pane-group ${focused ? 'focused' : ''} ${group.tabs.length === 1 && closingTabIds.has(activeTab.id) ? 'closing' : ''} ${snapArrival?.groupId === group.id ? `snap-arrival snap-${snapArrival.edge}` : ''} ${canvasEdge ? `dock-hover dock-hover-${canvasEdge}` : ''}`}
       style={{ viewTransitionName: `pane-${group.id.replace(/[^a-zA-Z0-9_-]/g, '-')}` }}
       onMouseDown={() => workspace.onFocus(group.id)}
     >
@@ -429,50 +459,39 @@ function PaneGroup({
         }}
       >
         <div className="pane-tabs">
-          {group.tabs.map((tab) => {
-            const Icon = iconFor(tab)
-            const tabPhase = activity[tab.id] ?? 'idle'
+          {tabStripSlots(group).map((slot) => {
+            if (slot.kind === 'tab') return renderTab(slot.tab, gapBeforeId === slot.tab.id)
+            // The gap in front of a group's first tab opens before its chip, so a tab dropped
+            // at the head of a run lands outside the group's outline rather than inside it.
+            const runFirstId = slot.tabs[0]!.id
+            const count = slot.tabs.length
             return (
-              <button
-                key={tab.id}
-                data-control-tab-id={tab.id}
-                data-control-agent-id={tab.resourceId}
-                className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''}`}
-                onClick={() => workspace.onLayout(activateTab(workspace.layout, group.id, tab.id))}
-                onContextMenu={event => showContextMenu(event, tab)}
-                onPointerDown={(event) => {
-                  if (event.button !== 1) return
-                  event.preventDefault()
-                  event.stopPropagation()
-                  close(tab)
-                }}
-                onAuxClick={(event) => event.preventDefault()}
-                data-autoscroll="off"
-                draggable
-                onDragStart={(event) => beginDrag(event, tab)}
-                onDragEnd={(event) => finishDrag(event, tab)}
+              <div
+                key={slot.group.id}
+                className={`tab-group ${slot.collapsed ? 'collapsed' : ''} ${slot.tabs.some((tab) => tab.id === activeTab.id) ? 'has-active' : ''}`}
+                data-tab-group-id={slot.group.id}
+                data-tab-group-color={slot.group.color}
+                style={{ marginLeft: gapBeforeId === runFirstId ? dragging!.width : undefined }}
+                {...(slot.collapsed ? { 'data-drop-slot-id': slot.group.id, 'data-drop-span': count } : {})}
               >
-                {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
-                <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
-                {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (
-                  <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
-                )}
-                {tab.kind === 'agent' && (
-                  <span className={`tab-activity ${tabPhase}`} aria-label={tabPhase === 'waiting_input' ? `${tab.title} needs your attention` : tabPhase} title={tabPhase === 'waiting_input' ? 'Needs your attention' : undefined}>
-                    {tabPhase === 'waiting_input'
-                      ? <Bell className="tab-attention-bell" aria-hidden="true" />
-                      : <svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="6" /><path d="M5.7 9.2 8 11.4l4.5-5" /></svg>}
-                  </span>
-                )}
-                <i
-                  className="tab-close"
-                  role="button"
-                  onClick={(event) => { event.stopPropagation(); close(tab) }}
-                ><X size={11} /></i>
-              </button>
+                <button
+                  className="tab-group-chip"
+                  data-tab-group-id={slot.group.id}
+                  aria-expanded={!slot.collapsed}
+                  title={`${slot.group.title || 'Unnamed group'} - ${count} tab${count === 1 ? '' : 's'}`}
+                  onClick={() => workspace.onLayout(collapseTabGroup(workspace.layout, group.id, slot.group.id, !slot.collapsed))}
+                  onContextMenu={(event) => showGroupMenu(event, slot.group.id)}
+                >
+                  <i className="tab-group-dot" data-tab-group-color={slot.group.color} />
+                  {slot.group.title && <span className="tab-group-name">{slot.group.title}</span>}
+                  {slot.collapsed && <span className="tab-group-count">{count}</span>}
+                  {slot.collapsed && <ChevronRight size={11} className="tab-group-caret" />}
+                </button>
+                {!slot.collapsed && slot.tabs.map((tab) => renderTab(tab, gapBeforeId === tab.id && tab.id !== runFirstId))}
+              </div>
             )
           })}
-          <button className="pane-add-tab" title="New tab" onClick={() => workspace.onLayout(addTab(workspace.layout, group.id, makeLauncherTab()))}>
+          <button className="pane-add-tab" style={{ marginLeft: barIndex !== null && gapBeforeId === null ? dragging!.width : undefined }} title="New tab" onClick={() => workspace.onLayout(addTab(workspace.layout, group.id, makeLauncherTab()))}>
             <Plus size={13} />
           </button>
         </div>
@@ -495,18 +514,12 @@ function PaneGroup({
           </div>
         ))}
       </div>
-      <div className="dock-overlay" aria-hidden="true">
-        {validEdges.includes('left') && <button className="dock-zone dock-left" onDragEnter={(event) => previewDock('left', event)} onDragOver={(event) => previewDock('left', event)} onDrop={(event) => drop('left', event)}><PanelLeft size={20} /><span>Place left</span></button>}
-        {validEdges.includes('right') && <button className="dock-zone dock-right" onDragEnter={(event) => previewDock('right', event)} onDragOver={(event) => previewDock('right', event)} onDrop={(event) => drop('right', event)}><PanelRight size={20} /><span>Place right</span></button>}
-        {validEdges.includes('above') && <button className="dock-zone dock-top" onDragEnter={(event) => previewDock('above', event)} onDragOver={(event) => previewDock('above', event)} onDrop={(event) => drop('above', event)}><PanelTop size={20} /><span>Place above</span></button>}
-        {validEdges.includes('below') && <button className="dock-zone dock-bottom" onDragEnter={(event) => previewDock('below', event)} onDragOver={(event) => previewDock('below', event)} onDrop={(event) => drop('below', event)}><PanelBottom size={20} /><span>Place below</span></button>}
-        {validEdges.includes('center') && <button className="dock-zone dock-center" onDragEnter={(event) => previewDock('center', event)} onDragOver={(event) => previewDock('center', event)} onDrop={(event) => drop('center', event)}><Plus size={22} /><span>Join as tabs</span></button>}
-        {validEdges.length === 0 && <div className="dock-detach-hint"><ExternalLink size={19} /><span>Drag outside Conductor for a separate window</span></div>}
-      </div>
     </section>
     {menuPosition && <PaneTabMenu x={menuPosition.x} y={menuPosition.y} tab={menuTab}
       maximized={workspace.maximizedGroupId === group.id}
       continuation={menuTab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(menuTab.state.continueOnLimit)}
+      groups={tabGroupsOf(group)}
+      onGroupAction={action => runGroupAction(action, menuTab)}
       canReopen={workspace.canReopen} onDismiss={() => setMenuPosition(null)} onAction={action => {
         if (action === 'close') { close(menuTab); return }
         if (action === 'detach' || action === 'show') { workspace.onDetach(group.id, menuTab, { alwaysOnTop: action === 'show' }); return }
@@ -516,6 +529,10 @@ function PaneGroup({
         workspace.onMaximize(result.session.maximizedGroupId)
         workspace.onFocus(result.focusedGroupId)
       }} />}
+    {groupMenu && menuGroup && <TabGroupMenu x={groupMenu.x} y={groupMenu.y} group={menuGroup}
+      tabCount={group.tabs.filter(tab => tab.tabGroupId === menuGroup.id).length}
+      onDismiss={() => setGroupMenu(null)}
+      onAction={action => runGroupAction(action, activeTab)} />}
 
     </>
   )
@@ -525,56 +542,74 @@ function SplitView({
   node,
   workspace,
   dragActions,
-  snapArrival,
-  dockHover,
-  dragSourceGroupId,
-  dragSourceTabId
+  dragging,
+  dropTarget,
+  snapArrival
 }: {
   node: LayoutNode
   workspace: PaneWorkspaceProps
   dragActions: PaneDragActions
-  snapArrival: { groupId: string; edge: DockEdge } | null
-  dockHover: { groupId: string; edge: DockEdge } | null
-  dragSourceGroupId: string | null
-  dragSourceTabId: string | null
+  dragging: TabDragState | null
+  dropTarget: TabDropTarget | null
+  snapArrival: { groupId: string; edge: CanvasEdge } | null
 }): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const [resizing, setResizing] = useState(false)
-  if (node.type === 'group') {
+  const [ready, setReady] = useState(false)
+  useEffect(() => setReady(true), [])
+  // When a group's last tab closes, its parent split collapses and this same slot is handed
+  // the surviving child directly (see removeFromNode in layout-operations.ts). Remembering the
+  // split shape here lets us keep rendering that child through the same wrapper/position instead
+  // of switching this component's return type from <div className="split-node"> to <PaneGroup>,
+  // which is what was remounting (and flashing) the surviving pane.
+  const prevNodeRef = useRef<LayoutNode>(node)
+  const remnantRef = useRef<{ direction: 'horizontal' | 'vertical'; survivorSide: 0 | 1 } | null>(null)
+  const prevNode = prevNodeRef.current
+  if (node.type === 'split') remnantRef.current = null
+  else if (prevNode.type === 'split' && (prevNode.children[0].id === node.id || prevNode.children[1].id === node.id)) {
+    remnantRef.current = { direction: prevNode.direction, survivorSide: prevNode.children[0].id === node.id ? 0 : 1 }
+  }
+  prevNodeRef.current = node
+  const remnant = remnantRef.current
+
+  if (node.type === 'group' && !remnant) {
     return (
       <PaneGroup
         key={`${workspace.session.id}:${node.id}`}
         group={node}
         workspace={workspace}
         dragActions={dragActions}
-        arrivalEdge={snapArrival?.groupId === node.id ? snapArrival.edge : null}
-        hoverEdge={dockHover?.groupId === node.id ? dockHover.edge : null}
-        dragSourceGroupId={dragSourceGroupId}
-        dragSourceTabId={dragSourceTabId}
+        dragging={dragging}
+        dropTarget={dropTarget}
+        snapArrival={snapArrival}
       />
     )
   }
 
+  const split = node.type === 'split' ? node : null
+  const direction = split ? split.direction : remnant!.direction
+  const sizes: [number, number] = split ? split.sizes : remnant!.survivorSide === 0 ? [100, 0] : [0, 100]
+
   const startResize = (event: React.PointerEvent): void => {
-    if (event.button !== 0) return
+    if (!split || event.button !== 0) return
     event.preventDefault()
     const rect = containerRef.current?.getBoundingClientRect()
     if (!rect) return
     const gutter = event.currentTarget
     gutter.setPointerCapture(event.pointerId)
-    const axisSize = node.direction === 'horizontal' ? rect.width : rect.height
+    const axisSize = split.direction === 'horizontal' ? rect.width : rect.height
     const minimumPixels = Math.min(190, axisSize * 0.38)
     const minimumPercent = Math.max(8, (minimumPixels / axisSize) * 100)
     let animationFrame = 0
-    let pendingFirst = node.sizes[0]
+    let pendingFirst = split.sizes[0]
     let finished = false
 
     const commit = (): void => {
       animationFrame = 0
-      workspace.onLayout(resizeSplit(workspace.layout, node.id, [pendingFirst, 100 - pendingFirst]))
+      workspace.onLayout(resizeSplit(workspace.layout, split.id, [pendingFirst, 100 - pendingFirst]))
     }
     const move = (moveEvent: PointerEvent): void => {
-      const raw = node.direction === 'horizontal'
+      const raw = split.direction === 'horizontal'
         ? ((moveEvent.clientX - rect.left) / rect.width) * 100
         : ((moveEvent.clientY - rect.top) / rect.height) * 100
       pendingFirst = Math.min(100 - minimumPercent, Math.max(minimumPercent, raw))
@@ -596,7 +631,7 @@ function SplitView({
       setResizing(false)
     }
     const lostCapture = (lostEvent: Event): void => stop(lostEvent as PointerEvent)
-    document.body.classList.add(`resizing-${node.direction}`)
+    document.body.classList.add(`resizing-${split.direction}`)
     setResizing(true)
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', stop)
@@ -605,70 +640,145 @@ function SplitView({
   }
 
   const nudgeResize = (event: React.KeyboardEvent): void => {
-    const relevant = node.direction === 'horizontal'
+    if (!split) return
+    const relevant = split.direction === 'horizontal'
       ? ['ArrowLeft', 'ArrowRight']
       : ['ArrowUp', 'ArrowDown']
     if (!relevant.includes(event.key)) return
     event.preventDefault()
     const decreasing = event.key === 'ArrowLeft' || event.key === 'ArrowUp'
-    const first = Math.min(90, Math.max(10, node.sizes[0] + (decreasing ? -2 : 2)))
-    workspace.onLayout(resizeSplit(workspace.layout, node.id, [first, 100 - first]))
+    const first = Math.min(90, Math.max(10, split.sizes[0] + (decreasing ? -2 : 2)))
+    workspace.onLayout(resizeSplit(workspace.layout, split.id, [first, 100 - first]))
+  }
+
+  const renderChild = (side: 0 | 1): React.JSX.Element | null => {
+    if (split) return <SplitView node={split.children[side]} workspace={workspace} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
+    if (side === remnant!.survivorSide) return <SplitView node={node} workspace={workspace} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
+    return null
   }
 
   return (
-    <div ref={containerRef} className={`split-node ${node.direction}`}>
-      <div className="split-child" style={{ flexBasis: `${node.sizes[0]}%` }}>
-        <SplitView node={node.children[0]} workspace={workspace} dragActions={dragActions} snapArrival={snapArrival} dockHover={dockHover} dragSourceGroupId={dragSourceGroupId} dragSourceTabId={dragSourceTabId} />
-      </div>
+    <div ref={containerRef} className={`split-node ${direction} ${ready && !resizing ? 'animate-resize' : ''}`}>
+      <div className="split-child" style={{ flexBasis: `${sizes[0]}%` }}>{renderChild(0)}</div>
       <button
         className={`split-gutter ${resizing ? 'active' : ''}`}
+        style={{ display: split ? undefined : 'none' }}
         onPointerDown={startResize}
-        onDoubleClick={() => workspace.onLayout(resizeSplit(workspace.layout, node.id, [50, 50]))}
+        onDoubleClick={() => split && workspace.onLayout(resizeSplit(workspace.layout, split.id, [50, 50]))}
         onKeyDown={nudgeResize}
         role="separator"
+        aria-hidden={!split}
+        tabIndex={split ? 0 : -1}
         aria-label="Resize tab areas"
-        aria-orientation={node.direction === 'horizontal' ? 'vertical' : 'horizontal'}
+        aria-orientation={direction === 'horizontal' ? 'vertical' : 'horizontal'}
         aria-valuemin={10}
         aria-valuemax={90}
-        aria-valuenow={Math.round(node.sizes[0])}
+        aria-valuenow={Math.round(sizes[0])}
       >
         <i />
-        {resizing && <span>{Math.round(node.sizes[0])} / {Math.round(node.sizes[1])}</span>}
+        {resizing && <span>{Math.round(sizes[0])} / {Math.round(sizes[1])}</span>}
       </button>
-      <div className="split-child" style={{ flexBasis: `${node.sizes[1]}%` }}>
-        <SplitView node={node.children[1]} workspace={workspace} dragActions={dragActions} snapArrival={snapArrival} dockHover={dockHover} dragSourceGroupId={dragSourceGroupId} dragSourceTabId={dragSourceTabId} />
-      </div>
+      <div className="split-child" style={{ flexBasis: `${sizes[1]}%` }}>{renderChild(1)}</div>
     </div>
   )
 }
 
+/** Measures the pane under the pointer (falling back to the drag's own pane so a drop always
+ * lands somewhere). Only `.pane-group` and `.pane-header` are read: the dock preview squeezes
+ * `.pane-content`, so its box lies about where the pane really is mid-drag. */
+const measurePaneAt = (x: number, y: number, fallbackGroupId: string): PaneGeometry | null => {
+  const el = document.elementFromPoint(x, y)
+  const groupEl = (el?.closest('.pane-group') as HTMLElement | null) ?? (document.querySelector(`.pane-group[data-group-id="${CSS.escape(fallbackGroupId)}"]`) as HTMLElement | null)
+  const groupId = groupEl?.dataset.groupId
+  if (!groupEl || !groupId) return null
+  const rect = groupEl.getBoundingClientRect()
+  const header = groupEl.querySelector<HTMLElement>('.pane-header')
+  const tabs: TabRect[] = Array.from(groupEl.querySelectorAll<HTMLElement>('.pane-tabs [data-drop-slot-id]')).map((slotEl) => {
+    const slotRect = slotEl.getBoundingClientRect()
+    return {
+      id: slotEl.dataset.dropSlotId!,
+      left: slotRect.left,
+      right: slotRect.right,
+      span: slotEl.dataset.dropSpan ? Number(slotEl.dataset.dropSpan) : 1
+    }
+  })
+  return {
+    groupId,
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height,
+    headerBottom: header ? header.getBoundingClientRect().bottom : rect.top,
+    tabs
+  }
+}
+
+/** Chrome-exact drop resolution for a pointer position: over a tab bar it's an insertion
+ * index into that bar, anywhere else it's the nearest edge of whatever pane sits under the
+ * pointer, so a drop always lands somewhere. */
+const resolveDropTarget = (x: number, y: number, sourceGroupId: string, draggedTabId: string): TabDropTarget | null => {
+  const pane = measurePaneAt(x, y, sourceGroupId)
+  return pane ? dropTargetAt({ x, y }, pane, draggedTabId) : null
+}
+
+const sameDropTarget = (a: TabDropTarget | null, b: TabDropTarget | null): boolean => JSON.stringify(a) === JSON.stringify(b)
+
 export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
-  const [dragging, setDragging] = useState<{ sourceGroupId: string; tab: PaneTab; x: number; y: number } | null>(null)
-  const [dockPreview, setDockPreview] = useState<DockPreviewState | null>(null)
-  const [snapArrival, setSnapArrival] = useState<{ groupId: string; edge: DockEdge } | null>(null)
+  const [dragging, setDragging] = useState<TabDragState | null>(null)
+  const [dropTarget, setDropTarget] = useState<TabDropTarget | null>(null)
+  const [snapArrival, setSnapArrival] = useState<{ groupId: string; edge: CanvasEdge } | null>(null)
   const dragGhostRef = useRef<HTMLDivElement>(null)
+  const latestTargetRef = useRef<TabDropTarget | null>(null)
+  // Mirrors `dragging` synchronously from the dragstart handler. The listeners below are
+  // registered once for the lifetime of the workspace rather than by an effect keyed on
+  // `dragging`, so they cannot miss the first dragover while React is still committing.
+  const draggingRef = useRef<TabDragState | null>(null)
+  const propsRef = useRef(props)
+  propsRef.current = props
   const maximized = props.maximizedGroupId ? findGroup(props.layout.root, props.maximizedGroupId) : null
   const emptyGroup = props.layout.root.type === 'group' && props.layout.root.tabs.length === 0
 
   useEffect(() => {
-    if (!dragging) return
-    const trackPointer = (event: DragEvent): void => {
-      if (!event.clientX && !event.clientY) return
-      if (dragGhostRef.current) {
-        dragGhostRef.current.style.transform = `translate3d(${event.clientX + 16}px, ${event.clientY + 16}px, 0)`
-      }
-    }
-    const cancel = (): void => {
+    const endDrag = (): void => {
+      latestTargetRef.current = null
+      draggingRef.current = null
       setDragging(null)
-      setDockPreview(null)
+      setDropTarget(null)
+    }
+    const trackPointer = (event: DragEvent): void => {
+      const drag = draggingRef.current
+      if (!drag) return
+      if (!event.clientX && !event.clientY) return
+      event.preventDefault()
+      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+      if (dragGhostRef.current) dragGhostRef.current.style.transform = `translate3d(${event.clientX + 14}px, ${event.clientY + 14}px, 0)`
+      const found = resolveDropTarget(event.clientX, event.clientY, drag.sourceGroupId, drag.tab.id)
+      const resolved = found && tabDropLands(propsRef.current.layout, drag.sourceGroupId, drag.tab.id, found) ? found : null
+      latestTargetRef.current = resolved
+      setDropTarget((current) => sameDropTarget(current, resolved) ? current : resolved)
+    }
+    const commitDrop = (event: DragEvent): void => {
+      const drag = draggingRef.current
+      if (!drag) return
+      event.preventDefault()
+      const target = latestTargetRef.current
+      if (target) {
+        const current = propsRef.current
+        current.onLayout(applyTabDrop(current.layout, drag.sourceGroupId, drag.tab.id, target))
+        current.onFocus(target.groupId)
+        if (target.kind === 'canvas') setSnapArrival({ groupId: target.groupId, edge: target.edge })
+      }
+      endDrag()
     }
     document.addEventListener('dragover', trackPointer, true)
-    document.addEventListener('dragend', cancel, true)
+    document.addEventListener('drop', commitDrop, true)
+    document.addEventListener('dragend', endDrag, true)
     return () => {
       document.removeEventListener('dragover', trackPointer, true)
-      document.removeEventListener('dragend', cancel, true)
+      document.removeEventListener('drop', commitDrop, true)
+      document.removeEventListener('dragend', endDrag, true)
     }
-  }, [dragging])
+  }, [])
 
   useEffect(() => {
     if (!snapArrival) return
@@ -677,9 +787,9 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   }, [snapArrival])
 
   const dragActions: PaneDragActions = {
-    start: (sourceGroupId, tab, point) => {
-      setDockPreview(null)
-      setDragging({ sourceGroupId, tab, ...point })
+    start: (sourceGroupId, tab, width, point) => {
+      draggingRef.current = { sourceGroupId, tab, width, ...point }
+      setDragging(draggingRef.current)
       if (props.maximizedGroupId) {
         window.setTimeout(() => {
           const transitionDocument = document as Document & {
@@ -692,27 +802,6 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
           }
         }, 0)
       }
-    },
-    end: () => {
-      setDragging(null)
-      setDockPreview(null)
-    },
-    arrive: (groupId, edge) => setSnapArrival({ groupId, edge }),
-    preview: (groupId, edge, rect) => {
-      const inset = 5
-      const availableWidth = Math.max(0, rect.width - inset * 2)
-      const availableHeight = Math.max(0, rect.height - inset * 2)
-      const halfWidth = availableWidth / 2
-      const halfHeight = availableHeight / 2
-      setDockPreview({
-        groupId,
-        edge,
-        title: dragging?.tab.title ?? 'Tab',
-        left: rect.left + inset + (edge === 'right' ? halfWidth : 0),
-        top: rect.top + inset + (edge === 'below' ? halfHeight : 0),
-        width: edge === 'left' || edge === 'right' ? halfWidth : availableWidth,
-        height: edge === 'above' || edge === 'below' ? halfHeight : availableHeight
-      })
     }
   }
   const DragIcon = dragging ? iconFor(dragging.tab) : FileText
@@ -728,26 +817,16 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
           <button disabled={!props.canReopen} onClick={() => props.onReopen(props.layout.root.id)}><Undo2 size={14} /> Reopen</button>
         </div>
       ) : (
-        <SplitView node={maximized ?? props.layout.root} workspace={props} dragActions={dragActions} snapArrival={snapArrival} dockHover={dockPreview ? { groupId: dockPreview.groupId, edge: dockPreview.edge } : null} dragSourceGroupId={dragging?.sourceGroupId ?? null} dragSourceTabId={dragging?.tab.id ?? null} />
+        <SplitView node={maximized ?? props.layout.root} workspace={props} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
       )}
       {maximized && <div className="maximized-badge">MAXIMIZED</div>}
-      {dockPreview && (
-        <div
-          className={`dock-snap-preview ${dockPreview.edge}`}
-          style={{ left: dockPreview.left, top: dockPreview.top, width: dockPreview.width, height: dockPreview.height }}
-        >
-          <span>{dockPreview.edge === 'center' ? 'Join tab group' : `Snap ${dockPreview.edge}`}</span>
-        </div>
-      )}
       {dragging && createPortal(
         <div
           ref={dragGhostRef}
           className="pane-drag-ghost"
-          style={{ transform: `translate3d(${dragging.x + 16}px, ${dragging.y + 16}px, 0)` }}
+          style={{ transform: `translate3d(${dragging.x + 14}px, ${dragging.y + 14}px, 0)` }}
         >
-          <header><DragIcon size={14} /><strong>{dragging.tab.title}</strong></header>
-          <div><i /><i /><i /></div>
-          <small>Move tab</small>
+          <DragIcon size={13} strokeWidth={1.8} /><span>{dragging.tab.title}</span>
         </div>,
         document.body
       )}

@@ -9,25 +9,32 @@ import type {
   EditorDraft,
   LayoutTemplateRecord,
   NormalizedAgentEvent,
+  MemoryOrigin,
+  MemoryPruneCandidate,
   PaneTab,
   ProjectRecord,
   SessionRecord,
   RememberMemoryInput,
   RuntimeProcessSummary,
+  TurnMemoryRecall,
+  UpdateMemoryInput,
   TerminalSpec,
   WorkspaceRecoveryCheckpoint,
   WorkspaceRecoveryState,
   WorkspaceLayout
 } from '../shared/models'
-import { createDefaultLayout, makeId } from '../shared/models'
+import { createDefaultLayout, isMemoryKind, makeId, readActivityPhase } from '../shared/models'
 import type { ProjectTaskActivity, ProjectTaskStatus } from '../shared/project-backlog'
+import type { AgentActivityRow } from './project-activity'
 import {
   clampMemoryWeight,
   memorySourceOf,
   memoryTokens,
   normalizeMemoryCues,
+  rankMemoriesForPrune,
   scoreMemory,
-  shouldConsolidateMemory
+  shouldConsolidateMemory,
+  shouldForgetMemory
 } from './memory'
 
 type DbRow = Record<string, unknown>
@@ -48,6 +55,34 @@ const mapTaskActivity = (row: DbRow): ProjectTaskActivity => ({
 })
 
 const now = (): string => new Date().toISOString()
+
+/** Provenance is advisory: a malformed or absent record must read as "unknown", never throw
+ *  while listing memories. */
+const parseMemoryOrigin = (value: unknown): MemoryOrigin | null => {
+  if (typeof value !== 'string' || !value) return null
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (!parsed || typeof parsed !== 'object') return null
+    const record = parsed as Record<string, unknown>
+    if (typeof record.agentSessionId !== 'string' || !record.agentSessionId) return null
+    return {
+      agentSessionId: record.agentSessionId,
+      ...(typeof record.workspaceId === 'string' ? { workspaceId: record.workspaceId } : {}),
+      ...(typeof record.title === 'string' ? { title: record.title.slice(0, 200) } : {}),
+      ...(typeof record.provider === 'string' ? { provider: record.provider as MemoryOrigin['provider'] } : {})
+    }
+  } catch { return null }
+}
+
+const serializeMemoryOrigin = (origin: MemoryOrigin | undefined): string | null =>
+  origin && typeof origin.agentSessionId === 'string' && origin.agentSessionId
+    ? JSON.stringify({
+        agentSessionId: origin.agentSessionId,
+        ...(origin.workspaceId ? { workspaceId: origin.workspaceId } : {}),
+        ...(origin.title ? { title: origin.title.replace(/\s+/g, ' ').trim().slice(0, 200) } : {}),
+        ...(origin.provider ? { provider: origin.provider } : {})
+      })
+    : null
 
 export class ConductorDatabase {
   private readonly db: DatabaseSync
@@ -179,6 +214,19 @@ export class ConductorDatabase {
 
       CREATE INDEX IF NOT EXISTS memories_project_idx ON memories(project_id, updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS memory_recalls (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        agent_session_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        memory_ids_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS memory_recalls_session_idx
+        ON memory_recalls(agent_session_id, created_at DESC);
+
       CREATE TABLE IF NOT EXISTS editor_drafts (
         tab_id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -219,6 +267,10 @@ export class ConductorDatabase {
     // Agents could not write memory before this column existed, so every
     // pre-existing row came from a person and must never be auto-forgotten.
     this.ensureColumn('memories', 'source', "TEXT NOT NULL DEFAULT 'human'")
+    // Memories written before provenance was recorded cannot be attributed to a conversation;
+    // a null origin reads as "unknown" in the pane rather than pretending to a source.
+    this.ensureColumn('memories', 'origin_json', 'TEXT')
+    this.ensureColumn('memories', 'corrected_at', 'TEXT')
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -911,6 +963,19 @@ export class ConductorDatabase {
     this.db.prepare("DELETE FROM agent_continuations WHERE status = 'pending'").run()
   }
 
+  /** Every agent's last recorded phase, for every project. The renderer only holds the active
+   *  project's workspaces, so cross-project activity has to be answered from here. */
+  listAgentActivity(): AgentActivityRow[] {
+    return (this.db.prepare(
+      'SELECT id, project_id, session_id, activity_phase FROM agent_sessions'
+    ).all() as DbRow[]).map((row) => ({
+      id: row.id as string,
+      projectId: row.project_id as string,
+      sessionId: row.session_id as string,
+      activityPhase: row.activity_phase ? readActivityPhase(row.activity_phase as string) : 'idle'
+    }))
+  }
+
   listProcesses(projectId?: string): RuntimeProcessSummary[] {
     const filter = projectId ? ' WHERE project_id = ?' : ''
     const params = projectId ? [projectId] : []
@@ -932,7 +997,7 @@ export class ConductorDatabase {
         kind: 'terminal' as const,
         title: row.title as string,
         status: row.status as RuntimeProcessSummary['status'],
-        activityPhase: (row.activity_phase as RuntimeProcessSummary['activityPhase']) ?? 'idle',
+        activityPhase: row.activity_phase ? readActivityPhase(row.activity_phase as string) : 'idle',
         needsInput: false,
         progress: null,
         updatedAt: row.updated_at as string
@@ -946,7 +1011,7 @@ export class ConductorDatabase {
         provider: row.provider as RuntimeProcessSummary['provider'],
         model: (row.model as string | null) ?? undefined,
         status: row.status as RuntimeProcessSummary['status'],
-        activityPhase: (row.activity_phase as RuntimeProcessSummary['activityPhase']) ?? 'idle',
+        activityPhase: row.activity_phase ? readActivityPhase(row.activity_phase as string) : 'idle',
         needsInput: row.status === 'waiting_input',
         progress: null,
         resumeAt: (row.resume_at as string | null) ?? undefined,
@@ -966,10 +1031,11 @@ export class ConductorDatabase {
       shouldConsolidateMemory(memory.kind, memory.cues, input.kind, cues)
     )
     const timestamp = now()
+    const origin = serializeMemoryOrigin(input.origin)
     if (existing) {
       this.db.prepare(
         `UPDATE memories SET gist = ?, cues_json = ?, salience = ?, strength = ?, confidence = ?,
-         occurred_at = ?, updated_at = ? WHERE id = ?`
+         occurred_at = ?, updated_at = ?, origin_json = COALESCE(?, origin_json) WHERE id = ?`
       ).run(
         gist.length <= existing.gist.length * 1.4 ? gist : existing.gist,
         JSON.stringify([...new Set([...existing.cues, ...cues])].slice(0, 20)),
@@ -978,6 +1044,9 @@ export class ConductorDatabase {
         clampMemoryWeight(Math.max(existing.confidence, input.confidence ?? 0.75)),
         timestamp,
         timestamp,
+        // Consolidation re-attributes the memory to the conversation that last reinforced it,
+        // which is the one worth opening when the claim turns out to be wrong.
+        origin,
         existing.id
       )
       return this.getMemory(existing.id)!
@@ -986,15 +1055,100 @@ export class ConductorDatabase {
     this.db.prepare(
       `INSERT INTO memories
        (id, project_id, agent_key, kind, gist, cues_json, salience, strength, confidence,
-        occurred_at, last_recalled_at, recall_count, created_at, updated_at, source)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, 0, ?, ?, ?)`
+        occurred_at, last_recalled_at, recall_count, created_at, updated_at, source, origin_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, 0, ?, ?, ?, ?)`
     ).run(
       id, input.projectId, input.agentKey ?? null, input.kind, gist, JSON.stringify(cues),
       clampMemoryWeight(input.salience ?? 0.5),
       clampMemoryWeight(input.confidence ?? 0.75),
-      timestamp, timestamp, timestamp, source
+      timestamp, timestamp, timestamp, source, origin
     )
     return this.getMemory(id)!
+  }
+
+  /**
+   * A hand correction. Editing an agent-written memory does not rewrite its provenance —
+   * who first claimed it stays visible — but it does mark the memory as vouched for, which
+   * takes it out of reach of the automatic forgetting pass.
+   */
+  updateMemory(input: UpdateMemoryInput): AgentMemory {
+    const existing = this.getMemory(input.id)
+    if (!existing) throw new Error('That memory no longer exists')
+    if (input.kind !== undefined && !isMemoryKind(input.kind)) throw new Error('Unknown memory kind')
+    const gist = input.gist === undefined ? existing.gist : input.gist.replace(/\s+/g, ' ').trim().slice(0, 4000)
+    if (!gist) throw new Error('Memory needs a concise gist')
+    const cues = input.cues === undefined
+      ? existing.cues
+      : normalizeMemoryCues(input.cues.length ? input.cues : memoryTokens(gist).slice(0, 10))
+    const timestamp = now()
+    this.db.prepare(
+      `UPDATE memories SET kind = ?, gist = ?, cues_json = ?, salience = ?, confidence = ?,
+       strength = ?, corrected_at = ?, updated_at = ? WHERE id = ?`
+    ).run(
+      input.kind ?? existing.kind,
+      gist,
+      JSON.stringify(cues),
+      clampMemoryWeight(input.salience ?? existing.salience),
+      clampMemoryWeight(input.confidence ?? existing.confidence),
+      // Re-weighting rehearsal is how a person says "this matters more than its history
+      // suggests"; it is bounded so one slider cannot make a memory permanent.
+      Math.min(50, Math.max(0, input.strength ?? existing.strength)),
+      timestamp,
+      timestamp,
+      existing.id
+    )
+    return this.getMemory(existing.id)!
+  }
+
+  /** The visible prune: everything ranked weakest-first, with the reason it is fading.
+   *  Nothing is deleted here — the owner decides, which is the point of it being visible. */
+  memoryPruneCandidates(projectId: string, limit = 25, currentTime = Date.now()): MemoryPruneCandidate[] {
+    return rankMemoriesForPrune(this.listMemories(projectId), currentTime)
+      .slice(0, Math.min(200, Math.max(1, limit)))
+      .map(({ memory, standing, retrievability, reason }) => ({ memory, standing, retrievability, reason }))
+  }
+
+  /** Records what recall actually handed to a turn, keyed by the user message it rode along
+   *  with, so the conversation can say which memories steered it. */
+  recordMemoryRecall(entry: {
+    projectId: string
+    agentSessionId: string
+    itemId: string
+    prompt: string
+    memoryIds: string[]
+  }): void {
+    if (!entry.itemId || !entry.memoryIds.length) return
+    this.db.prepare(
+      `INSERT INTO memory_recalls (id, project_id, agent_session_id, item_id, prompt, memory_ids_json, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      makeId('recall'), entry.projectId, entry.agentSessionId, entry.itemId,
+      entry.prompt.replace(/\s+/g, ' ').trim().slice(0, 500),
+      JSON.stringify(entry.memoryIds.slice(0, 50)), now()
+    )
+  }
+
+  /** Resolves a conversation's recall ledger against memory as it stands now, so a memory
+   *  that was since corrected shows its corrected text and a deleted one is counted, not faked. */
+  listMemoryRecalls(agentSessionId: string): TurnMemoryRecall[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM memory_recalls WHERE agent_session_id = ? ORDER BY created_at ASC LIMIT 500'
+    ).all(agentSessionId) as DbRow[]
+    if (!rows.length) return []
+    const byId = new Map(this.listMemories(rows[0]!.project_id as string).map((memory) => [memory.id, memory]))
+    return rows.map((row) => {
+      let ids: string[] = []
+      try { const parsed: unknown = JSON.parse((row.memory_ids_json as string) || '[]'); if (Array.isArray(parsed)) ids = parsed.filter((id): id is string => typeof id === 'string') } catch { /* a corrupt ledger row still lists nothing rather than failing the pane */ }
+      const memories = ids.map((id) => byId.get(id)).filter((memory): memory is AgentMemory => Boolean(memory))
+      return {
+        itemId: row.item_id as string,
+        agentSessionId: row.agent_session_id as string,
+        prompt: row.prompt as string,
+        createdAt: row.created_at as string,
+        memories,
+        forgotten: ids.length - memories.length
+      }
+    })
   }
 
   listMemories(projectId: string, agentKey?: string): AgentMemory[] {
@@ -1019,6 +1173,14 @@ export class ConductorDatabase {
     )
     for (const { memory } of ranked) statement.run(recalledAt, recalledAt, memory.id)
     return ranked.map(({ memory }) => ({ ...memory, recallCount: memory.recallCount + 1, lastRecalledAt: recalledAt }))
+  }
+
+  /** Only unrehearsed, low-stakes episodes decay out; knowledge, policy and anything a human
+   *  wrote are what the project is expected to retain. Returns how many were dropped. */
+  forgetStaleMemories(projectId: string, currentTime = Date.now()): number {
+    const stale = this.listMemories(projectId).filter((memory) => shouldForgetMemory(memory, currentTime))
+    for (const memory of stale) this.removeMemory(memory.id)
+    return stale.length
   }
 
   removeMemory(id: string): void {
@@ -1123,6 +1285,7 @@ export class ConductorDatabase {
     agentKey: (row.agent_key as string | null) ?? null,
     kind: row.kind as AgentMemory['kind'],
     source: memorySourceOf(row.source),
+    origin: parseMemoryOrigin(row.origin_json),
     gist: row.gist as string,
     cues: JSON.parse((row.cues_json as string) || '[]') as string[],
     salience: Number(row.salience),
@@ -1131,6 +1294,7 @@ export class ConductorDatabase {
     occurredAt: row.occurred_at as string,
     lastRecalledAt: (row.last_recalled_at as string | null) ?? null,
     recallCount: Number(row.recall_count),
+    correctedAt: (row.corrected_at as string | null) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string
   })

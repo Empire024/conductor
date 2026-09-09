@@ -126,4 +126,42 @@ describe('buildAgentVisualTimeline', () => {
     expect(timeline.blocks[0]).toMatchObject({ label: 'You', title: 'You' })
     expect(timeline.blocks[1]).toMatchObject({ label: 'Response' })
   })
+
+  it('coalesces four small successive edits to the same file into one inflated row instead of four near-identical ones', () => {
+    const timeline = buildAgentVisualTimeline([
+      makeEvent('edit-1', 'file_change', 'Updated src/app.ts', '2026-09-06T12:00:00.000Z', { path: 'src/app.ts', operation: 'updated' }),
+      makeEvent('edit-2', 'file_change', 'Updated src/app.ts', '2026-09-06T12:00:00.500Z', { path: 'src/app.ts', operation: 'updated' }),
+      makeEvent('edit-3', 'file_change', 'Updated src/app.ts', '2026-09-06T12:00:01.000Z', { path: 'src/app.ts', operation: 'updated' }),
+      makeEvent('edit-4', 'file_change', 'Renamed a variable in src/app.ts', '2026-09-06T12:00:01.500Z', { path: 'src/app.ts', operation: 'updated' })
+    ])
+    expect(timeline.blocks).toHaveLength(1)
+    expect(timeline.blocks[0]).toMatchObject({
+      kind: 'file', occurrences: 4, body: 'Renamed a variable in src/app.ts',
+      sourceEventIds: ['edit-1', 'edit-2', 'edit-3', 'edit-4']
+    })
+  })
+
+  it('does not coalesce edits once agent commentary interrupts the run, and keeps different files separate', () => {
+    const interrupted = buildAgentVisualTimeline([
+      makeEvent('edit-1', 'file_change', 'Updated src/app.ts', '2026-09-06T12:00:00.000Z', { path: 'src/app.ts' }),
+      makeEvent('note', 'text', 'Now checking the other file.', '2026-09-06T12:00:00.500Z'),
+      makeEvent('edit-2', 'file_change', 'Updated src/app.ts', '2026-09-06T12:00:01.000Z', { path: 'src/app.ts' })
+    ])
+    expect(interrupted.blocks.map(block => block.kind)).toEqual(['file', 'message', 'file'])
+
+    const differentFiles = buildAgentVisualTimeline([
+      makeEvent('edit-1', 'file_change', 'Updated src/app.ts', '2026-09-06T12:00:00.000Z', { path: 'src/app.ts' }),
+      makeEvent('edit-2', 'file_change', 'Updated src/other.ts', '2026-09-06T12:00:00.500Z', { path: 'src/other.ts' })
+    ])
+    expect(differentFiles.blocks).toHaveLength(2)
+  })
+  it('never merges two unrelated tool calls, whose only shared key is the tool name', () => {
+    const timeline = buildAgentVisualTimeline([
+      makeEvent('grep-1', 'tool_call', 'Grep for parsePriority', '2026-09-06T12:00:00.000Z', { tool: 'Grep' }),
+      makeEvent('grep-2', 'tool_call', 'Grep for runtimeBanner', '2026-09-06T12:00:00.500Z', { tool: 'Grep' })
+    ])
+    // Merging these would silently replace the first search's title and body with the second's.
+    expect(timeline.blocks).toHaveLength(2)
+    expect(timeline.blocks.map(block => block.body)).toEqual(['Grep for parsePriority', 'Grep for runtimeBanner'])
+  })
 })

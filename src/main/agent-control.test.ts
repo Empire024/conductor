@@ -61,6 +61,14 @@ function fixture(aliasedRoot = false) {
   return { root, project, workspace, database, sessions, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, control, deps }
 }
 
+/** Give an agent session a visible tab, so its checklist claims count as live. */
+const openAgentTab = (f: ReturnType<typeof fixture>, resourceId: string, tabId: string): void => {
+  const current = f.database.getSession(f.workspace.id)!
+  if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+  current.layout.root.tabs.push({ id: tabId, kind: 'agent', resourceId, title: resourceId, state: { provider: 'codex', model: 'codex-synthetic' } })
+  f.database.saveSession(f.workspace.id, current.layout, null, [])
+}
+
 describe('authorized native app control', () => {
   it('refuses foreign projects/workspaces, hidden sessions and closed callers', async () => {
     const f = fixture()
@@ -173,6 +181,19 @@ describe('authorized native app control', () => {
     expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'read-only', sandbox: 'read-only' })
   })
 
+  it('opens controlled tabs with the controller autonomy rather than leaving every one of them on ask', async () => {
+    const f = fixture()
+    f.database.structured.update(f.spec.id, { settings: { permission: 'auto', plan: false } })
+    const inherited = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const settings = f.database.structured.snapshot(inherited.resourceId!)!.settings
+    // The fixture provider stops at accept-edits, so a controller on auto is clamped there, not dropped to ask.
+    expect(settings).toMatchObject({ permission: 'accept-edits', plan: false })
+    expect(settings.sandbox).toBeUndefined()
+    f.database.structured.update(f.spec.id, { settings: { permission: 'accept-edits', plan: false, temporaryPermission: { runtimeId: 'earlier-runtime', restore: 'default' } } })
+    const guarded = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    expect(f.database.structured.snapshot(guarded.resourceId!)?.settings).toMatchObject({ permission: 'default' })
+  })
+
   it('preserves human memories and checklist ownership during agent writes', async () => {
     const f = fixture()
     const human = f.database.remember({ projectId: f.project.id, kind: 'semantic', gist: 'Keep project conventions', cues: ['project', 'conventions'] })
@@ -180,10 +201,31 @@ describe('authorized native app control', () => {
     expect(memory.source).toBe('agent'); expect(memory.id).not.toBe(human.id)
     await expect(f.control.call(f.scope, 'memory.forget', { id: human.id })).rejects.toThrow('agent-authored')
     writeFileSync(join(f.project.path, 'feature-list.md'), '## Features\n1. [ ] One <!-- conductor-task:one -->\n2. [~] Two <!-- conductor-task:two agent=another -->\n')
+    openAgentTab(f, 'another', 'another-tab')
     const board = await f.deps.backlogs.get(f.project.id)
     await f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'one', status: 'doing' })
     expect(readFileSync(join(f.project.path, 'feature-list.md'), 'utf8')).toContain('conductor-task:one agent=controller')
     await expect(f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'two', status: 'done' })).rejects.toThrow('owns')
+  })
+
+  it('releases a claim whose owning conversation is no longer open anywhere in the project', async () => {
+    const f = fixture()
+    writeFileSync(join(f.project.path, 'feature-list.md'), '## Features\n1. [~] Stalled <!-- conductor-task:stalled agent=departed -->\n')
+    const board = await f.deps.backlogs.get(f.project.id)
+    const updated = await f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'stalled', status: 'done' }) as { tasks: Array<{ id: string; status: string }> }
+    expect(updated.tasks.find(task => task.id === 'stalled')?.status).toBe('done')
+    expect(readFileSync(join(f.project.path, 'feature-list.md'), 'utf8')).toContain('conductor-task:stalled agent=controller')
+  })
+
+  it('lets an agent set task priority, and refuses a value the backlog would silently discard', async () => {
+    const f = fixture()
+    writeFileSync(join(f.project.path, 'feature-list.md'), '## Bugs\n1. [ ] Sortable <!-- conductor-task:sortable -->\n')
+    const board = await f.deps.backlogs.get(f.project.id)
+    await expect(f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'sortable', priority: 'urgent' })).rejects.toThrow('priority')
+    expect(readFileSync(join(f.project.path, 'feature-list.md'), 'utf8')).not.toContain('priority=')
+    const updated = await f.control.call(f.scope, 'tasks.update', { revision: board.revision, id: 'sortable', priority: 'high' }) as { tasks: Array<{ id: string; priority: string }> }
+    expect(updated.tasks.find(task => task.id === 'sortable')?.priority).toBe('high')
+    expect(readFileSync(join(f.project.path, 'feature-list.md'), 'utf8')).toContain('priority=high')
   })
 
   it('moves resumed hidden history to its visible workspace without losing native identity, settings or protocol authority', async () => {
@@ -284,5 +326,105 @@ describe('Project task handoff through native router dispatch', () => {
     expect(submit).toHaveBeenCalledOnce()
     expect((await f.deps.backlogs.get(f.project.id)).tasks[0]).toMatchObject({ agentId: 'controller', status: 'doing' })
     expect(f.control.tabs(f.scope)).toHaveLength(2)
+  })
+})
+
+
+/** Puts the controlling tab on a named machine, the way a remotely placed tab would be. */
+const placeControllerOn = (f: ReturnType<typeof fixture>, machineId: string): void => {
+  const current = f.database.getSession(f.workspace.id)!
+  if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+  const tab = current.layout.root.tabs.find(candidate => candidate.resourceId === f.scope.agentSessionId)!
+  tab.state = { ...tab.state, machineId }
+  f.database.saveSession(f.workspace.id, current.layout, null, [])
+}
+
+describe('which machine a controlled tab runs on', () => {
+  const MACHINES = [
+    { id: 'local', name: 'This Laptop', kind: 'local' as const, status: 'online' as const, accountLogin: null, grantedProjectIds: [] },
+    { id: 'render-desktop', name: 'Render Desktop', kind: 'peer' as const, status: 'online' as const, accountLogin: 'Empire024', grantedProjectIds: [] },
+    { id: 'studio', name: 'Studio', kind: 'peer' as const, status: 'revoked' as const, accountLogin: 'Empire024', grantedProjectIds: [] }
+  ]
+  const withMachines = (f: ReturnType<typeof fixture>) => {
+    const openRemote = vi.fn(async (machineId: string) => ({ tabId: 'remote-tab', agentSessionId: 'remote-agent', machineName: machineId === 'render-desktop' ? 'Render Desktop' : machineId }))
+    const machines = MACHINES.map(machine => ({ ...machine, grantedProjectIds: machine.kind === 'peer' ? [f.project.id] : [] }))
+    return { openRemote, control: new AgentControl({ ...f.deps, machines: () => machines, openRemote }) }
+  }
+
+  it('records this machine on a tab a local controller opens', async () => {
+    const f = fixture()
+    const { control, openRemote } = withMachines(f)
+    const tab = await control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic' }) as AgentControlTab
+    expect(tab.state?.machineId).toBe('local')
+    expect(openRemote).not.toHaveBeenCalled()
+  })
+
+  it('keeps a child tab on the same machine as the controller that opened it', async () => {
+    const f = fixture()
+    placeControllerOn(f, 'render-desktop')
+    const { control, openRemote } = withMachines(f)
+    const result = await control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic' }) as { machineId: string; remote: boolean }
+    expect(result).toMatchObject({ machineId: 'render-desktop', remote: true, machineName: 'Render Desktop' })
+    expect(openRemote).toHaveBeenCalledWith('render-desktop', expect.objectContaining({ projectId: f.project.id, sessionId: f.workspace.id }))
+    // The inherited placement never creates a second local agent tab.
+    expect(control.tabs(f.scope)).toHaveLength(1)
+  })
+
+  it('moves a child tab only when the caller names a machine explicitly', async () => {
+    const f = fixture()
+    placeControllerOn(f, 'render-desktop')
+    const { control, openRemote } = withMachines(f)
+    const tab = await control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', machineId: 'local' }) as AgentControlTab
+    expect(tab.state?.machineId).toBe('local')
+    expect(openRemote).not.toHaveBeenCalled()
+  })
+
+  it('refuses an unknown or revoked machine instead of quietly running the work here', async () => {
+    const f = fixture()
+    const { control, openRemote } = withMachines(f)
+    await expect(control.call(f.scope, 'tabs.open', { machineId: 'nowhere' })).rejects.toThrow(/machines.list/)
+    await expect(control.call(f.scope, 'tabs.open', { machineId: 'studio' })).rejects.toThrow(/revoked|not paired/)
+    expect(openRemote).not.toHaveBeenCalled()
+    expect(control.tabs(f.scope)).toHaveLength(1)
+  })
+
+  it('falls back to this machine when the controller machine is no longer paired', async () => {
+    const f = fixture()
+    placeControllerOn(f, 'a-machine-that-vanished')
+    const { control } = withMachines(f)
+    const tab = await control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic' }) as AgentControlTab
+    expect(tab.state?.machineId).toBe('local')
+  })
+
+  it('refuses to place a tab on a machine that does not have this project shared', async () => {
+    const f = fixture()
+    const openRemote = vi.fn()
+    const control = new AgentControl({ ...f.deps, openRemote, machines: () => [
+      { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, grantedProjectIds: [] },
+      { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: 'Empire024', grantedProjectIds: ['some-other-project'] }
+    ] })
+    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/does not have this project shared/)
+    expect(openRemote).not.toHaveBeenCalled()
+  })
+
+  it('tells the caller which machine it is on and which others can run this project', async () => {
+    const f = fixture()
+    placeControllerOn(f, 'render-desktop')
+    const { control } = withMachines(f)
+    const machines = await control.call(f.scope, 'machines.list') as Array<{ id: string; current: boolean; runsThisProject: boolean }>
+    expect(machines.find(machine => machine.current)?.id).toBe('render-desktop')
+    expect(machines.find(machine => machine.id === 'local')?.runsThisProject).toBe(true)
+    const state = await control.call(f.scope, 'app.state') as { machineId: string }
+    expect(state.machineId).toBe('render-desktop')
+  })
+
+  it('reports plainly when this window cannot place tabs on other machines', async () => {
+    const f = fixture()
+    placeControllerOn(f, 'render-desktop')
+    const control = new AgentControl({ ...f.deps, machines: () => [
+      { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, grantedProjectIds: [] },
+      { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: null, grantedProjectIds: [f.project.id] }
+    ] })
+    await expect(control.call(f.scope, 'tabs.open', {})).rejects.toThrow(/Remote machine placement is unavailable/)
   })
 })

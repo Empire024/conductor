@@ -1,4 +1,7 @@
 import { isDotEntry, orderExplorerEntries } from './explorer-order'
+import { planReveal } from './explorer-reveal'
+import { copyText } from '../clipboard'
+import { cleanIpcError } from '../ipc-errors'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import {
@@ -9,15 +12,11 @@ import {
   ExternalLink,
   Eye,
   File,
-  FileCode2,
-  FileJson,
   FilePenLine,
   FilePlus2,
-  FileText,
   Folder,
   FolderPlus,
   FolderOpen,
-  Image,
   MoreHorizontal,
   Pencil,
   RefreshCw,
@@ -27,6 +26,7 @@ import {
   X
 } from 'lucide-react'
 import type { FileEntry, ProjectRecord } from '../../../shared/models'
+import { fileTypeStyle } from '../file-types'
 import {
   classifyExplorerFile,
   defaultExplorerOpenMode,
@@ -47,23 +47,14 @@ interface ExplorerSidebarProps {
 type RefreshPhase = 'idle' | 'refreshing' | 'complete'
 type ContextTarget = { kind: 'project' } | { kind: 'entry'; entry: FileEntry }
 
-const cleanIpcError = (reason: unknown): string => {
-  const message = reason instanceof Error ? reason.message : String(reason)
-  return message.replace(/^Error invoking remote method '[^']+': Error: /, '')
-}
-
 const notify = (message: string): void => {
   window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message }))
 }
 
-const iconFor = (entry: FileEntry): typeof File => {
-  if (entry.kind === 'directory') return Folder
-  const kind = classifyExplorerFile(entry.name)
-  if (kind === 'markdown') return FileText
-  if (kind === 'image') return Image
-  if (/\.(json|jsonc|ya?ml)$/i.test(entry.name)) return FileJson
-  if (kind === 'text') return FileCode2
-  return File
+const iconFor = (entry: FileEntry): { Icon: typeof File; className?: string } => {
+  if (entry.kind === 'directory') return { Icon: Folder }
+  const style = fileTypeStyle(entry.name)
+  return { Icon: style.icon, className: style.colorClass }
 }
 
 const parentPath = (relativePath: string): string => {
@@ -99,6 +90,7 @@ function ExplorerRows({
   movingPath,
   draggingPath,
   dropTarget,
+  highlightPath,
   onToggle,
   onOpen,
   onContextMenu,
@@ -121,6 +113,7 @@ function ExplorerRows({
   movingPath: string | null
   draggingPath: string | null
   dropTarget: string | null
+  highlightPath: { path: string; strong: boolean } | null
   onToggle(entry: FileEntry): void
   onOpen(entry: FileEntry): void
   onContextMenu(event: React.MouseEvent, entry: FileEntry): void
@@ -143,14 +136,15 @@ function ExplorerRows({
     <>
       {entries.map((entry, index) => {
         const open = entry.kind === 'directory' && expanded.has(entry.relativePath)
-        const Icon = entry.kind === 'directory' && open ? FolderOpen : iconFor(entry)
+        const { Icon, className: iconClassName } = entry.kind === 'directory' && open ? { Icon: FolderOpen, className: undefined } : iconFor(entry)
         return (
           <div key={entry.relativePath}>
             {isDotEntry(entry) && (index === 0 || !isDotEntry(entries[index - 1]!)) && <div className="explorer-dotfile-heading" style={{ paddingLeft: 20 + depth * 13 }} title="Dotfiles and folders hold project configuration and hidden content">Configuration &amp; hidden</div>}
             <button
-              className={`explorer-row ${entry.kind}${isDotEntry(entry) ? ' dot-entry' : ''}${selectedPath === entry.relativePath ? ' selected' : ''}${movingPath === entry.relativePath ? ' moving' : ''}${draggingPath === entry.relativePath ? ' dragging' : ''}${entry.kind === 'directory' && dropTarget === entry.relativePath ? ' drop-target' : ''}`}
+              className={`explorer-row ${entry.kind}${isDotEntry(entry) ? ' dot-entry' : ''}${selectedPath === entry.relativePath ? ' selected' : ''}${movingPath === entry.relativePath ? ' moving' : ''}${draggingPath === entry.relativePath ? ' dragging' : ''}${entry.kind === 'directory' && dropTarget === entry.relativePath ? ' drop-target' : ''}${highlightPath?.path === entry.relativePath ? (highlightPath.strong ? ' reveal-highlight-strong' : ' reveal-highlight') : ''}`}
               style={{ paddingLeft: 7 + depth * 13 }}
               title={entry.relativePath}
+              data-explorer-path={entry.relativePath}
               draggable
               onClick={() => { onSelect(entry); entry.kind === 'directory' ? onToggle(entry) : onOpen(entry) }}
               onContextMenu={(event) => onContextMenu(event, entry)}
@@ -171,7 +165,7 @@ function ExplorerRows({
               {entry.kind === 'directory'
                 ? open ? <ChevronDown className="explorer-chevron" size={12} /> : <ChevronRight className="explorer-chevron" size={12} />
                 : <span className="explorer-chevron" />}
-              <Icon size={14} />
+              <Icon size={14} className={iconClassName} />
               <span className="ellipsis">{entry.name}</span>
             </button>
             {open && (
@@ -185,6 +179,7 @@ function ExplorerRows({
                 movingPath={movingPath}
                 draggingPath={draggingPath}
                 dropTarget={dropTarget}
+                highlightPath={highlightPath}
                 onToggle={onToggle}
                 onOpen={onOpen}
                 onContextMenu={onContextMenu}
@@ -226,6 +221,8 @@ export function ExplorerSidebar({
   const [clock, setClock] = useState(Date.now())
   const [menu, setMenu] = useState<{ target: ContextTarget; x: number; y: number } | null>(null)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const [highlight, setHighlight] = useState<{ path: string; strong: boolean } | null>(null)
+  const treeRef = useRef<HTMLDivElement>(null)
   const [movingEntry, setMovingEntry] = useState<FileEntry | null>(null)
   const [draggingEntry, setDraggingEntry] = useState<FileEntry | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
@@ -327,6 +324,49 @@ export function ExplorerSidebar({
     }
   }, [menu])
 
+  // "Reveal in Conductor Explorer" from a file link elsewhere in the app: expand whatever
+  // ancestors are missing, then flash the row. A stronger flash means the row was already
+  // visible before this ran, per the checklist's ask for extra emphasis in that case.
+  useEffect(() => {
+    const onReveal = (event: Event): void => {
+      const detail = (event as CustomEvent<{ projectId: string; relativePath: string }>).detail
+      if (!detail || detail.projectId !== project.id) return
+      const plan = planReveal(expandedRef.current, detail.relativePath)
+      if (plan.parentsToExpand.length) {
+        setExpanded((current) => {
+          const next = new Set(current)
+          plan.parentsToExpand.forEach((dir) => next.add(dir))
+          expandedRef.current = next
+          return next
+        })
+        void Promise.all(plan.parentsToExpand.map(async (dir) => {
+          try {
+            const children = await window.conductor.files.list(project.id, dir)
+            setEntriesByDirectory((current) => ({ ...current, [dir]: children }))
+          } catch (reason) { setError(cleanIpcError(reason)) }
+        }))
+      }
+      // A collapsed project root hides everything below it, so the file was not actually
+      // visible yet even if its own ancestor folders happened to already be expanded.
+      const strong = plan.alreadyVisible && !rootCollapsed
+      setRootCollapsed(false)
+      setQuery('')
+      setSelectedPath(detail.relativePath)
+      setHighlight({ path: detail.relativePath, strong })
+    }
+    window.addEventListener('conductor:reveal-in-explorer', onReveal)
+    return () => window.removeEventListener('conductor:reveal-in-explorer', onReveal)
+  }, [project.id, rootCollapsed])
+
+  useEffect(() => {
+    if (!highlight) return
+    const frame = requestAnimationFrame(() => {
+      treeRef.current?.querySelector<HTMLElement>(`[data-explorer-path="${CSS.escape(highlight.path)}"]`)?.scrollIntoView({ block: 'nearest' })
+    })
+    const timer = window.setTimeout(() => setHighlight(null), highlight.strong ? 1700 : 1150)
+    return () => { cancelAnimationFrame(frame); window.clearTimeout(timer) }
+  }, [highlight])
+
   const toggle = async (entry: FileEntry): Promise<void> => {
     const opening = !expanded.has(entry.relativePath)
     setExpanded((current) => {
@@ -347,10 +387,6 @@ export function ExplorerSidebar({
 
   const open = (entry: FileEntry, requestedMode?: ExplorerOpenMode): void => {
     const mode = requestedMode ?? defaultExplorerOpenMode(entry.relativePath)
-    if (!mode) {
-      void window.conductor.files.openExternal(project.id, entry.relativePath).catch((reason) => notify(cleanIpcError(reason)))
-      return
-    }
     if (onOpenFile) onOpenFile(entry.relativePath, mode)
     else {
       window.dispatchEvent(new CustomEvent('conductor:open-resource', {
@@ -563,12 +599,7 @@ export function ExplorerSidebar({
   }
 
   const copyPath = async (path: string): Promise<void> => {
-    try {
-      await navigator.clipboard.writeText(path)
-      notify('Copied relative path')
-    } catch (reason) {
-      notify(cleanIpcError(reason))
-    }
+    notify(await copyText(path) ? 'Copied relative path' : 'Could not copy to the clipboard')
   }
 
   const showMenu = (event: React.MouseEvent, target: ContextTarget): void => {
@@ -585,9 +616,8 @@ export function ExplorerSidebar({
   const lastRefreshText = refreshedLabel(lastRefreshed, clock)
 
   return (
-    <section data-project-id={project.id} className={'workspace-sidebar-pane explorer-sidebar explorer-root' + (rootCollapsed ? ' root-collapsed' : '')} aria-label="Explorer">
-      <header className="workspace-sidebar-title">
-        <span>Explorer</span>
+    <section data-project-id={project.id} className={'workspace-sidebar-pane explorer-sidebar explorer-root' + (rootCollapsed ? ' root-collapsed' : '')} aria-label={project.name}>
+      <div className="workspace-sidebar-title explorer-project-toolbar">
         <div>
           <button title="New file" aria-label="New file" onClick={() => beginCreate('', 'file')}>
             <FilePlus2 size={13} />
@@ -607,7 +637,7 @@ export function ExplorerSidebar({
             <MoreHorizontal size={14} />
           </button>
         </div>
-      </header>
+      </div>
       <div role="button" tabIndex={0} aria-expanded={!rootCollapsed}
         onClick={() => setRootCollapsed((current) => !current)}
         className={`explorer-project${dropTarget === '' ? ' drop-target' : ''}`}
@@ -680,6 +710,7 @@ export function ExplorerSidebar({
         </form>
       )}
       <div
+        ref={treeRef}
         className="explorer-tree"
         onContextMenu={(event) => showMenu(event, { kind: 'project' })}
         onDragOver={(event) => dragOver(event, '')}
@@ -699,6 +730,7 @@ export function ExplorerSidebar({
           movingPath={movingEntry?.relativePath ?? null}
           draggingPath={draggingEntry?.relativePath ?? null}
           dropTarget={dropTarget}
+          highlightPath={highlight}
           onToggle={(entry) => void toggle(entry)}
           onOpen={open}
           onContextMenu={(event, entry) => showMenu(event, { kind: 'entry', entry })}
@@ -762,8 +794,10 @@ export function ExplorerSidebar({
                 {entry.kind === 'file' && ['markdown', 'image', 'media', 'pdf'].includes(kind) && (
                   <button onClick={() => { setMenu(null); open(entry, 'preview') }}><Eye size={14} /> Preview</button>
                 )}
-                {entry.kind === 'file' && (kind === 'markdown' || kind === 'text') && (
-                  <button onClick={() => { setMenu(null); open(entry, 'editor') }}><FilePenLine size={14} /> Open in editor</button>
+                {entry.kind === 'file' && (
+                  <button onClick={() => { setMenu(null); open(entry, 'editor') }}>
+                    <FilePenLine size={14} /> {kind === 'markdown' || kind === 'text' ? 'Open in editor' : 'Open as text'}
+                  </button>
                 )}
                 {entry.kind === 'file' && (
                   <button onClick={() => { setMenu(null); void window.conductor.files.openExternal(project.id, entry.relativePath).catch((reason) => notify(cleanIpcError(reason))) }}><ExternalLink size={14} /> Open with default app</button>

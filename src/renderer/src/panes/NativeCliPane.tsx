@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { copyText } from '../clipboard'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { MessagesSquare, TerminalSquare } from 'lucide-react'
@@ -18,10 +19,10 @@ export function NativeCliPane({ onChat, ...props }: RuntimeTerminalProps & { onC
     const offData = window.conductor.nativeCli.onData(({ id, data, sequence }) => { if (id !== props.resourceId) return; if (attached) receive({ data, sequence }); else buffered.push({ data, sequence }) })
     const offStatus = window.conductor.nativeCli.onStatus((state) => { if (state.id === props.resourceId) setExited(state.status === 'exited') })
     const input = term.onData((data) => window.conductor.nativeCli.write(props.resourceId, data))
-    const selection = term.onSelectionChange(() => { const text = term.getSelection(); if (text) void navigator.clipboard.writeText(text) })
+    const selection = term.onSelectionChange(() => { const text = term.getSelection(); if (text) void copyText(text) })
     term.attachCustomKeyEventHandler((event) => {
       if (event.type === 'keydown' && (event.ctrlKey || event.metaKey) && ['e', 'w'].includes(event.key.toLowerCase())) return false
-      if (event.type === 'keydown' && event.ctrlKey && event.key.toLowerCase() === 'c' && term.hasSelection()) { void navigator.clipboard.writeText(term.getSelection()); return false }
+      if (event.type === 'keydown' && event.ctrlKey && event.key.toLowerCase() === 'c' && term.hasSelection()) { void copyText(term.getSelection()); return false }
       if (event.type === 'keydown' && event.ctrlKey && event.key.toLowerCase() === 'v') { void navigator.clipboard.readText().then((text) => term.paste(text)); return false }
       return true
     })

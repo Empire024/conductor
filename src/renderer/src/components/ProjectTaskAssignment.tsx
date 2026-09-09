@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { ProjectRecord } from '../../../shared/models'
 import type { ProjectTask, ProjectTaskDispatchOptions, ProjectTaskDispatchResult, ProjectTaskDispatchTarget } from '../../../shared/project-backlog'
 import { AgentDialog } from '../panes/StructuredAgentRenderers'
+import { assignmentStatus } from './project-task-assignment-status'
 
 export type ProjectTaskAssignmentMode = 'existing' | 'new' | 'auto'
 
@@ -19,6 +20,7 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
   const [provider, setProvider] = useState<'codex' | 'claude'>('codex')
   const [model, setModel] = useState(''), [effort, setEffort] = useState('')
   const [result, setResult] = useState<ProjectTaskDispatchResult | null>(null)
+  const [delivered, setDelivered] = useState<string[]>([])
   const title = mode === 'existing' ? 'Assign to an open tab' : mode === 'new' ? 'Assign to a new agent' : 'Auto Fixer'
   const catalog = options?.providers.find(item => item.provider === provider)
   const chosenModel = catalog?.models.find(item => item.id === model)
@@ -66,10 +68,27 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
     const target: ProjectTaskDispatchTarget = mode === 'existing' ? { type: 'existing', agentSessionId: agent }
       : mode === 'auto' ? { type: 'auto', sessionId: workspace }
         : { type: 'new', sessionId: workspace, provider, model, ...(chosenModel?.effort?.length ? { effort } : {}) }
-    try { setResult(await onDispatch(target)) }
+    try { setDelivered([]); setResult(await onDispatch(target)) }
     catch (reason) { setError(String(reason)) }
     finally { setBusy(false) }
   }
+  // A queued prompt leaves nothing visible here until the busy tab drains it, so watch that tab
+  // and say so, rather than leaving the owner staring at a status that never changes.
+  useEffect(() => {
+    const pending = (result?.assignments ?? []).filter(item => item.status === 'queued').map(item => item.agentSessionId)
+    if (!pending.length) return
+    let disposed = false
+    const check = (): void => {
+      for (const id of pending) void window.conductor.structured.snapshot(id).then(snapshot => {
+        if (disposed || !snapshot) return
+        const queued = snapshot.queuedPrompts ?? (snapshot.queued ? [snapshot.queued] : [])
+        if (!queued.length) setDelivered(current => current.includes(id) ? current : [...current, id])
+      }).catch(() => { /* the tab may close before its queue drains */ })
+    }
+    check()
+    const off = window.conductor.structured.onEvents(events => { if (events.some(event => pending.includes(event.sessionId))) check() })
+    return () => { disposed = true; off() }
+  }, [result])
   const focus = async (assignment: ProjectTaskDispatchResult['assignments'][number]): Promise<void> => {
     try { await window.conductor.agentControl.focusTab(project.id, assignment.sessionId, assignment.tabId); onClose() }
     catch (reason) { setError(String(reason)) }
@@ -111,7 +130,7 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
       {tasks.length > 50 && <p className="project-task-error" role="alert">Select up to 50 tasks at a time.</p>}
       {hasCompleted && <p className="project-task-error" role="alert">Reopen completed tasks before assigning them.</p>}
       {result && <div className="project-task-assignment-results" role="status">{result.assignments.map((assignment, index) => <div key={assignment.agentSessionId + index}>
-        <span>{assignment.status === 'failed' ? 'Assignment failed' : assignment.status === 'queued' ? 'Queued in agent tab' : 'Sent to agent tab'}{assignment.error ? ': ' + assignment.error : ''}</span>
+        <span>{assignmentStatus(assignment, delivered.includes(assignment.agentSessionId))}</span>
         {assignment.tabId && <button type="button" onClick={() => void focus(assignment)}>Open tab</button>}
       </div>)}</div>}
       {error && <p className="project-task-error" role="alert">{error}</p>}

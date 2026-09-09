@@ -5,9 +5,13 @@ import { importPromptImage } from './prompt-images'
 import { ProjectBacklogs } from './project-backlog'
 import { ProjectTaskDispatcher } from './project-task-dispatch'
 import { SourceControl } from './source-control'
+import { pruneDiffSnapshots } from './agent-artifacts'
+import type { RevertScope } from '../shared/agent-change-history'
 import { AgentControl } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
 import { AgentControlUi } from './agent-control-ui'
+import { RemoteControlService } from './remote-control-ipc'
+import { safeStorageCipher } from './safe-storage-vault'
 import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell, webContents } from 'electron'
@@ -17,16 +21,20 @@ import type {
   AppSettings,
   DebugConsoleSnapshot,
   PaneTab,
+  RememberMemoryInput,
   TerminalSpec,
   ThemeId,
   ThemeVariant,
   WorkspaceRecoveryCheckpoint,
+  UpdateMemoryInput,
   WorkspaceLayout
 } from '../shared/models'
-import { AGENT_SOUND_PROFILES, THEME_IDS, THEME_VARIANTS } from '../shared/models'
+import { AGENT_SOUND_PROFILES, isMemoryKind, THEME_IDS, THEME_VARIANTS } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { TerminalManager } from './terminal-manager'
-import { AgentManager } from './agent-manager'
+import { AgentManager, onAgentStatusChange } from './agent-manager'
+import { aggregateProjectActivity } from './project-activity'
+import type { ProjectActivitySnapshot } from '../shared/project-activity'
 import {
   isPointOutsideBounds,
   isWindowPlacementVisible,
@@ -42,10 +50,13 @@ import { AgentCollaborationStore } from './agent-collaboration-store'
 import { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { registerAgentCollaborationIpc } from './agent-collaboration-ipc'
 import { ProjectPreviewServer } from './project-preview'
-import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
+import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
 import { normalizeUpdateFeedUrl } from './update-config'
 import { createUntitledEditorFile, EDITOR_CONFLICT_MESSAGE, readEditorFile, saveEditorCopy, writeEditorFile } from './editor-files'
+import { readExistingTextFile, readTextFile } from './text-files'
+import { resolveUsageCap, usageCapKey } from './usage-limit'
+import { parseUsageCapSetting, type UsageCapScope, type UsageCapSnapshot } from '../shared/usage-accounting'
 
 const projectPreview = new ProjectPreviewServer()
 let database: ConductorDatabase
@@ -55,10 +66,14 @@ let orchestration: OrchestrationStore
 let disposeOrchestrationIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
+let disposeProjectActivity: (() => void) | undefined
+let projectActivityTimer: NodeJS.Timeout | null = null
 let projectBacklogs: ProjectBacklogs
 let projectTaskDispatcher: ProjectTaskDispatcher
 let sourceControl: SourceControl
+let snapshotPruneTimer: NodeJS.Timeout | undefined
 let agentControlServer: AgentControlServer | undefined
+let remoteControl: RemoteControlService | undefined
 let agentControlUi: AgentControlUi | undefined
 let projectFileChanges: ProjectFileChanges | undefined
 let updates: UpdateManager
@@ -84,6 +99,30 @@ app.setName('Conductor')
 // Isolated automation profile is chosen before the single-instance lock.
 if (!app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA) app.setPath('userData', resolve(process.env.CONDUCTOR_TEST_USER_DATA))
 if (app.isPackaged) delete process.env.CONDUCTOR_OFFLINE_TESTS
+/** Smoke runs and probes drive a real window, but they must never take the desktop from whoever
+ *  is working: an automation profile (CONDUCTOR_TEST_USER_DATA) parks its windows off-screen,
+ *  out of the taskbar, and never activates or raises them. Set CONDUCTOR_BACKGROUND_WINDOWS=0 to
+ *  watch a run, or =1 to park a normal launch. */
+export const backgroundWindows = !app.isPackaged && (process.env.CONDUCTOR_BACKGROUND_WINDOWS ?? (process.env.CONDUCTOR_TEST_USER_DATA ? '1' : '0')) === '1'
+/** Far enough left of every display that no part of a parked window is ever composited over the
+ *  owner's screen, while the renderer keeps painting so CDP screenshots stay real. */
+const parkedPosition = (): { x: number; y: number } => {
+  const area = screen.getPrimaryDisplay().workArea
+  return { x: area.x - 6000, y: area.y }
+}
+/** Show without stealing activation. Used for every reveal so no code path can raise a parked window. */
+const revealWindow = (window: BrowserWindow, activate = true): void => {
+  if (window.isDestroyed()) return
+  if (backgroundWindows) {
+    window.setSkipTaskbar(true)
+    const { x, y } = parkedPosition()
+    window.setPosition(x, y)
+    window.showInactive()
+    return
+  }
+  window.show()
+  if (activate) window.focus()
+}
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) app.quit()
@@ -105,8 +144,7 @@ app.on('second-instance', () => {
   const window = mainWindow ?? detachedWindows.values().next().value
   if (!window) return
   if (window.isMinimized()) window.restore()
-  window.show()
-  window.focus()
+  revealWindow(window)
 })
 
 const createWindow = (
@@ -136,6 +174,8 @@ const createWindow = (
     backgroundColor: '#0b0d10',
     ...detachedBounds,
     ...visibleSavedPlacement?.bounds,
+    // Last so a remembered placement can never pull a parked automation window back on screen.
+    ...(backgroundWindows ? { skipTaskbar: true, ...parkedPosition() } : {}),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -166,8 +206,8 @@ const createWindow = (
   })
 
   window.once('ready-to-show', () => {
-    if (visibleSavedPlacement?.maximized) window.maximize()
-    window.show()
+    if (visibleSavedPlacement?.maximized && !backgroundWindows) window.maximize()
+    revealWindow(window, false)
   })
   window.webContents.on('did-finish-load', () => {
     window.webContents.setZoomFactor(getAppSettings().zoomFactor)
@@ -225,13 +265,12 @@ const openDetachedWindow = (
 ): BrowserWindow | null => {
   const existing = detachedWindows.get(id)
   if (existing && !existing.isDestroyed()) {
-    existing.show()
-    existing.focus()
+    revealWindow(existing)
     return existing
   }
   if (!database.getDetachedWindow(id)) return null
   const window = createWindow(id, placeAtCursor, savedPlacement)
-  if (floatingDetachedIds().includes(id)) window.setAlwaysOnTop(true)
+  if (floatingDetachedIds().includes(id) && !backgroundWindows) window.setAlwaysOnTop(true)
   detachedWindows.set(id, window)
   return window
 }
@@ -240,8 +279,7 @@ const openDebugWindow = (source: BrowserWindow, placeAtCursor = false): void => 
   debugSourceWindow = source
   if (debugWindow && !debugWindow.isDestroyed()) {
     if (debugWindow.isMinimized()) debugWindow.restore()
-    debugWindow.show()
-    debugWindow.focus()
+    revealWindow(debugWindow)
     return
   }
   const cursorBounds = placeAtCursor ? (() => {
@@ -272,7 +310,7 @@ const openDebugWindow = (source: BrowserWindow, placeAtCursor = false): void => 
   })
   installWindowStateEvents(window)
   debugWindow = window
-  window.once('ready-to-show', () => window.show())
+  window.once('ready-to-show', () => revealWindow(window, false))
   window.webContents.on('did-finish-load', () => {
     window.webContents.setZoomFactor(getAppSettings().zoomFactor)
   })
@@ -321,6 +359,7 @@ const getAppSettings = (): AppSettings => {
     themeVariant,
     themeAuto,
     debugLogging: database.getSetting('debugLogging') === 'true',
+    showHiddenFiles: database.getSetting('showHiddenFiles') === 'true',
     defaultNewFileExtension: normalizeNewFileExtension(database.getSetting('defaultNewFileExtension')) ?? 'md',
     agentSoundProfile: AGENT_SOUND_PROFILES.includes(database.getSetting('agentSoundProfile') as AgentSoundProfile)
       ? database.getSetting('agentSoundProfile') as AgentSoundProfile
@@ -348,6 +387,18 @@ const captureWindowLayout = (): SavedWindowLayout => {
   }
 }
 
+/** The authoritative cross-project view: persisted agent phases, scoped to the tabs each
+ *  workspace still shows, rolled up per project. A project whose panes were never mounted this
+ *  launch is answered from the database like any other. */
+const projectActivitySnapshot = (): ProjectActivitySnapshot => {
+  const projects = database.listProjects()
+  return aggregateProjectActivity(
+    projects.map((project) => project.id),
+    projects.flatMap((project) => database.listSessions(project.id)),
+    database.listAgentActivity()
+  )
+}
+
 const disposeRuntimeServices = (): void => {
   if (servicesDisposed) return
   servicesDisposed = true
@@ -357,6 +408,7 @@ const disposeRuntimeServices = (): void => {
     ['agents', () => agents?.dispose()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
     ['collaboration IPC', () => disposeCollaborationIpc?.()],
+    ['project activity', () => { disposeProjectActivity?.(); if (projectActivityTimer) clearTimeout(projectActivityTimer); projectActivityTimer = null }],
     ['collaboration store', () => collaboration?.close()],
     ['orchestration store', () => orchestration?.close()],
     ['workspace database', () => database?.close()]
@@ -519,6 +571,15 @@ const resolveEditorPath = async (projectId: string, requested: string): Promise<
 }
 
 const registerIpc = (): void => {
+  /** A restore names a turn, a file or one recorded edit. Nothing else reaches the disk. */
+  const revertScope = (value: unknown): RevertScope => {
+    const scope = value as Partial<RevertScope> & { kind?: string }
+    if (!scope || typeof scope !== 'object') throw new Error('Invalid revert request')
+    if (scope.kind === 'turn' && typeof (scope as { turnKey?: unknown }).turnKey === 'string') return { kind: 'turn', turnKey: (scope as { turnKey: string }).turnKey.slice(0, 200) }
+    if (scope.kind === 'file' && typeof (scope as { path?: unknown }).path === 'string') return { kind: 'file', path: (scope as { path: string }).path.slice(0, 1024) }
+    if (scope.kind === 'edit' && typeof (scope as { itemId?: unknown }).itemId === 'string' && Number.isSafeInteger((scope as { index?: unknown }).index)) return { kind: 'edit', itemId: (scope as { itemId: string }).itemId.slice(0, 200), index: (scope as { index: number }).index }
+    throw new Error('Invalid revert request')
+  }
   const structuredId = (value: unknown): string => {
     if (typeof value !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(value)) throw new Error('Invalid session identifier')
     return value
@@ -552,6 +613,7 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:interrupt', (event, id, expediteSubmittedInput?: boolean) => { trustedStructured(event); if (expediteSubmittedInput !== undefined && typeof expediteSubmittedInput !== 'boolean') throw new Error('Invalid interrupt option'); return agents.structured.interrupt(structuredId(id), expediteSubmittedInput === true) })
   ipcMain.handle('structured:bind-workspace', (event, id, sessionId) => { trustedStructured(event); if (typeof sessionId !== 'string' || sessionId.length > 160) throw new Error('Invalid workspace'); return agents.structured.bindWorkspace(structuredId(id), sessionId) })
   ipcMain.handle('structured:resume', (event, id, settings) => { trustedStructured(event); return agents.structured.resume(structuredId(id), settings) })
+  ipcMain.handle('structured:settings', (event, id, settings) => { trustedStructured(event); return agents.structured.saveSettings(structuredId(id), settings) })
   ipcMain.handle('structured:fork', (event, id) => { trustedStructured(event); return agents.structured.fork(structuredId(id)) })
   ipcMain.handle('structured:discover', (event, id) => { trustedStructured(event); return agents.structured.discover(structuredId(id)) })
   ipcMain.handle('structured:rename', (event, id, title) => { trustedStructured(event); if (typeof title !== 'string' || !title.trim() || title.length > 160) throw new Error('Invalid title'); return agents.structured.rename(structuredId(id), title.trim()) })
@@ -560,6 +622,8 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:artifact', (event, id, artifactId) => { trustedStructured(event); return database.structured.artifact(structuredId(id), structuredId(artifactId)) })
   ipcMain.handle('structured:output', (event, id, artifactId) => { trustedStructured(event); return database.structured.output(structuredId(id), structuredId(artifactId)) })
   ipcMain.handle('structured:review', (event, id, artifactId, action) => { trustedStructured(event); return agents.structured.review(structuredId(id), structuredId(artifactId), action) })
+  ipcMain.handle('structured:change-history', (event, id) => { trustedStructured(event); return agents.structured.changeHistory(structuredId(id)) })
+  ipcMain.handle('structured:revert-changes', (event, id, scope) => { trustedStructured(event); return agents.structured.revertChanges(structuredId(id), revertScope(scope)) })
   ipcMain.on('settings:get-startup', (event) => {
     event.returnValue = getAppSettings()
   })
@@ -709,6 +773,10 @@ const registerIpc = (): void => {
     database.setSetting('debugLogging', String(Boolean(enabled)))
     return getAppSettings()
   })
+  ipcMain.handle('settings:set-show-hidden-files', (_event, enabled: boolean) => {
+    database.setSetting('showHiddenFiles', String(Boolean(enabled)))
+    return getAppSettings()
+  })
   ipcMain.handle('settings:set-default-file-extension', (event, requested: string) => {
     trustedStructured(event)
     const extension = normalizeNewFileExtension(requested)
@@ -765,7 +833,7 @@ const registerIpc = (): void => {
       for (const record of database.listDetachedWindows()) if (record.sessionId === restored.id) openDetachedWindow(record.id)
       if (mainWindow && !mainWindow.isDestroyed()) {
         if (event.sender.id !== mainWindow.webContents.id) mainWindow.webContents.send('sessions:restored', restored)
-        mainWindow.show(); mainWindow.focus()
+        revealWindow(mainWindow)
       }
     }
     return restored
@@ -820,10 +888,11 @@ const registerIpc = (): void => {
   ipcMain.handle('files:confirm-close', (event, tabIds: string[]) => { trustedStructured(event); if (!Array.isArray(tabIds) || tabIds.some((id) => typeof id !== 'string')) throw new Error('Invalid editor tabs'); return resolveUnsavedEditors(BrowserWindow.fromWebContents(event.sender), tabIds) })
   ipcMain.handle('projects:reorder', (event, ids: string[]) => { trustedStructured(event); return database.reorderProjects(ids) })
   ipcMain.handle('sessions:reorder', (event, projectId: string, ids: string[]) => { trustedStructured(event); return database.reorderSessions(projectId, ids) })
-  ipcMain.handle('files:search', async (event, projectIds: string[], query: string) => {
+  ipcMain.handle('files:search', async (event, projectIds: string[], query: string, options: { showHidden?: boolean; activeProjectId?: string; recentPaths?: FileSearchResult[] } = {}) => {
     trustedStructured(event)
     if (!Array.isArray(projectIds) || projectIds.length > 200 || typeof query !== 'string' || query.length > 512) throw new Error('Invalid file search')
-    return searchProjectFiles(database.listProjects().filter((project) => projectIds.includes(project.id)), query)
+    const recentPaths = Array.isArray(options.recentPaths) ? options.recentPaths.filter((file) => file && typeof file.projectId === 'string' && typeof file.path === 'string').slice(0, 500) : undefined
+    return searchProjectFiles(database.listProjects().filter((project) => projectIds.includes(project.id)), query, { showHidden: Boolean(options.showHidden), activeProjectId: typeof options.activeProjectId === 'string' ? options.activeProjectId : undefined, recentPaths })
   })
   ipcMain.handle('files:browser-url', async (event, projectId: string, requested: string) => { trustedStructured(event); const project = database.getProject(projectId); if (!project) throw new Error('Project not found'); return projectPreview.url(project, requested) })
   ipcMain.handle('files:open-in-browser', async (event, projectId: string, requested: string) => { trustedStructured(event); const project = database.getProject(projectId); if (!project) throw new Error('Project not found'); await shell.openExternal(await projectPreview.url(project, requested)) })
@@ -849,11 +918,16 @@ const registerIpc = (): void => {
       })
   })
   ipcMain.handle('files:read', async (_event, projectId: string, requested: string) =>
-    fs.readFile(await resolveExistingProjectPath(projectId, requested), 'utf8')
+    readExistingTextFile(await resolveExistingProjectPath(projectId, requested))
   )
-  ipcMain.handle('files:read-for-editor', async (event, projectId: string, requested: string) => {
+  ipcMain.handle('files:read-for-editor', async (event, projectId: string, requested: string, allowBinary?: boolean) => {
     trustedStructured(event)
-    return readEditorFile(await resolveEditorPath(projectId, requested))
+    return readTextFile(await resolveEditorPath(projectId, requested), { allowBinary: allowBinary === true })
+  })
+  ipcMain.handle('files:stat', async (_event, projectId: string, requested: string) => {
+    const target = await resolveExistingProjectPath(projectId, requested)
+    const stat = await fs.stat(target)
+    return { size: stat.size, isFile: stat.isFile(), modifiedAt: stat.mtime.toISOString() }
   })
   ipcMain.handle('files:read-data-url', async (_event, projectId: string, requested: string) => {
     const target = await resolveExistingProjectPath(projectId, requested)
@@ -1075,6 +1149,31 @@ const registerIpc = (): void => {
   ipcMain.handle('agent:list-events', (_event, id: string) => database.listAgentEvents(id))
   ipcMain.handle('agent:list-providers', () => agents.listProviders())
   ipcMain.handle('runtime:list-processes', (_event, projectId?: string) => database.listProcesses(projectId))
+  ipcMain.handle('activity:projects', () => projectActivitySnapshot())
+  const usageCapSnapshot = (agentSessionId: string, workspaceId: string): UsageCapSnapshot => {
+    const stored = {
+      tab: database.getSetting(usageCapKey('tab', agentSessionId)),
+      workspace: database.getSetting(usageCapKey('workspace', workspaceId)),
+      default: database.getSetting(usageCapKey('default'))
+    }
+    return {
+      tab: parseUsageCapSetting(stored.tab), workspace: parseUsageCapSetting(stored.workspace), default: parseUsageCapSetting(stored.default),
+      effective: resolveUsageCap(stored)
+    }
+  }
+  ipcMain.handle('usage-cap:read', (_event, agentSessionId?: string, workspaceId?: string) => {
+    if ([agentSessionId, workspaceId].some(id => id !== undefined && typeof id !== 'string')) throw new Error('A usage cap is read for one conversation in one workspace')
+    return usageCapSnapshot(agentSessionId ?? '', workspaceId ?? '')
+  })
+  ipcMain.handle('usage-cap:write', (_event, scope: UsageCapScope, id: string | null, setting: unknown) => {
+    if (!['tab', 'workspace', 'default'].includes(scope)) throw new Error('Unknown usage cap scope')
+    if (scope !== 'default' && (typeof id !== 'string' || !id)) throw new Error('A tab or workspace cap needs its owner id')
+    // A rejected cap is never stored as "no cap": that would silently disable the owner's rule.
+    const parsed = setting === null || setting === undefined ? null : parseUsageCapSetting(setting)
+    if (setting !== null && setting !== undefined && !parsed) throw new Error('Usage cap must be a token count or a percentage between 0 and 100')
+    const key = usageCapKey(scope, id ?? undefined)
+    database.setSetting(key, parsed ? JSON.stringify(parsed) : '')
+  })
   ipcMain.on('agent:write', (event, id: string, data: string) => {
     try { trustedStructured(event) } catch { return }
     agents.write(id, data)
@@ -1095,7 +1194,22 @@ const registerIpc = (): void => {
   ipcMain.handle('memory:list', (_event, projectId: string, agentKey?: string) =>
     database.listMemories(projectId, agentKey)
   )
-  ipcMain.handle('memory:remember', (_event, input) => database.remember(input))
+  ipcMain.handle('memory:remember', (_event, input: RememberMemoryInput) => {
+    if (!input || typeof input.gist !== 'string' || !isMemoryKind(input.kind)) throw new Error('A memory needs a gist and a known kind')
+    // The pane writes on the owner's behalf; only the agent control surface may claim
+    // agent authorship, so provenance in the pane cannot be forged from the renderer.
+    return database.remember({ ...input, source: 'human', origin: undefined })
+  })
+  ipcMain.handle('memory:update', (_event, input: UpdateMemoryInput) => {
+    if (!input || typeof input.id !== 'string') throw new Error('A memory id is required')
+    return database.updateMemory(input)
+  })
+  ipcMain.handle('memory:prune-candidates', (_event, projectId: string, limit?: number) =>
+    database.memoryPruneCandidates(projectId, limit)
+  )
+  ipcMain.handle('memory:turn-recalls', (_event, agentSessionId: string) =>
+    database.listMemoryRecalls(agentSessionId)
+  )
   ipcMain.handle(
     'memory:recall',
     (_event, projectId: string, query: string, agentKey?: string, limit?: number) =>
@@ -1105,6 +1219,12 @@ const registerIpc = (): void => {
   ipcMain.handle('system:open-external', (_event, url: string) => {
     if (!/^https?:\/\//i.test(url)) throw new Error('Only web links can be opened')
     return shell.openExternal(url)
+  })
+  // Chromium refuses navigator.clipboard while the document is unfocused, which
+  // is exactly when a report is being copied out of a stuck window.
+  ipcMain.handle('system:copy-text', (_event, value: string) => {
+    if (typeof value !== 'string') throw new Error('Only text can be copied')
+    clipboard.writeText(value)
   })
   ipcMain.handle('system:get-diagnostics', () => ({
     appVersion: app.getVersion(),
@@ -1214,7 +1334,7 @@ const registerIpc = (): void => {
       const window = openDetachedWindow(record.id, true)
       if (options?.alwaysOnTop) {
         database.setSetting('floatingDetachedWindows', JSON.stringify([...new Set([...floatingDetachedIds(), record.id])]))
-        window?.setAlwaysOnTop(true)
+        if (!backgroundWindows) window?.setAlwaysOnTop(true)
       }
       return record
     }
@@ -1277,6 +1397,17 @@ app.whenReady().then(async () => {
   const publish = (channel: string, payload: unknown): void => {
     for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload)
   }
+  // A phase change can land in bursts (a turn ends, its queued follow-up starts); one coalesced
+  // snapshot per burst keeps every project row current without re-querying per event.
+  const publishProjectActivity = (): void => {
+    if (projectActivityTimer) return
+    projectActivityTimer = setTimeout(() => {
+      projectActivityTimer = null
+      try { publish('activity:projects', projectActivitySnapshot()) }
+      catch (error) { console.warn('Project activity unavailable', error) }
+    }, 120)
+  }
+  disposeProjectActivity = onAgentStatusChange(publishProjectActivity)
   projectFileChanges = new ProjectFileChanges(change => publish('files:changed', change))
   for (const project of database.listProjects()) projectFileChanges.watch(project)
   agentControlUi = new AgentControlUi(join(__dirname, '../renderer/index.html'), request => {
@@ -1287,8 +1418,17 @@ app.whenReady().then(async () => {
     const source = tabs.find(tab => tab.resourceId === request.agentSessionId)
     return source?.detachedId ? detachedWindows.get(source.detachedId) ?? null : null
   })
+  remoteControl = new RemoteControlService({
+    database, sessions: agents.structured, backlogs: projectBacklogs,
+    providers: () => agents.listProviders(), ui: agentControlUi.request,
+    fileChanged: change => projectFileChanges?.changed(change),
+    cipher: safeStorageCipher,
+    publish: (channel, payload) => publish(channel, payload)
+  })
   const control = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
     providers: () => agents.listProviders(), ui: agentControlUi.request,
+    machines: () => remoteControl!.machines(),
+    openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
     confirm: async (_scope, message) => {
       const options: Electron.MessageBoxOptions = { type: 'question', title: 'Agent request', message, buttons: ['Cancel', 'Allow'], defaultId: 0, cancelId: 0, noLink: true }
       const result = mainWindow && !mainWindow.isDestroyed() ? await dialog.showMessageBox(mainWindow, options) : await dialog.showMessageBox(options)
@@ -1299,8 +1439,10 @@ app.whenReady().then(async () => {
   })
   projectTaskDispatcher = new ProjectTaskDispatcher({ database, backlogs: projectBacklogs, sessions: agents.structured, control, providers: () => agents.listProviders(), ui: agentControlUi.request, changed: projectId => { const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId, path: 'feature-list.md' }) } })
   agentControlUi.register(control)
-  agentControlServer = new AgentControlServer(control)
+  agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '')
   await agentControlServer.start()
+  remoteControl.registerIpc()
+  await remoteControl.start()
   updates = new UpdateManager({
     currentVersion: app.getVersion(),
     isPackaged: app.isPackaged,
@@ -1315,6 +1457,12 @@ app.whenReady().then(async () => {
     updates.configure('')
   }
   registerIpc()
+  // Local snapshots are the only pre-git safety net, so they are kept generously but not
+  // forever: age them out on launch and once a day, the way the event journal is compacted.
+  const pruneSnapshots = (): void => { try { pruneDiffSnapshots(database.structured.artifactDirectory) } catch (error) { console.error('Ignoring agent snapshot prune failure', error) } }
+  pruneSnapshots()
+  snapshotPruneTimer = setInterval(pruneSnapshots, 24 * 60 * 60 * 1000)
+  snapshotPruneTimer.unref?.()
   disposeOrchestrationIpc = registerOrchestrationIpc(orchestration)
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
@@ -1344,6 +1492,8 @@ app.on('before-quit', (event) => {
 })
 
 app.on('will-quit', () => {
+  void remoteControl?.dispose().catch(error => console.warn('Remote control did not shut down cleanly', error))
+  if (snapshotPruneTimer) clearInterval(snapshotPruneTimer)
   projectPreview.close()
   updates?.dispose()
   disposeRuntimeServices()

@@ -2,8 +2,8 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { liveTokenLabel, providerOfCommand, subagentCountLabel, summarizeSubagents, summarizeUsage, summarizeContext, summarizeWorkingUsage } from './usage-summary'
-import { StructuredAgentTelemetry, StructuredLiveTokens } from './StructuredAgentTelemetry'
+import { distinguishSubagentLabels, isGenericSubagentName, liveTokenLabel, providerOfCommand, subagentColorBuckets, subagentColorIndex, subagentCountLabel, subagentIdentityId, subagentModelLabel, subagentTokenLabel, summarizeSubagents, summarizeUsage, summarizeContext, summarizeWorkingUsage } from './usage-summary'
+import { StructuredAgentTelemetry, StructuredLiveTokens, StructuredUsageSummary } from './StructuredAgentTelemetry'
 
 function item(sequence: number, data: AgentEventData, extra: Partial<TimelineItem> = {}): TimelineItem {
   return { id: String(sequence), runtimeId: 'runtime', sequence, timestamp: '2026-09-07T00:00:00Z', data, ...extra }
@@ -54,7 +54,7 @@ describe('reported live usage', () => {
     const summary = summarizeUsage([item(1, { type: 'usage', source: 'provider', outputTokens: 14, inputTokens: Number.NaN, cachedTokens: -1 })])
     expect(summary.tokens).toEqual({ outputTokens: 14 })
     expect(liveTokenLabel(summary)).toBe('14 output tokens')
-    expect(liveTokenLabel(summarizeUsage([]))).toBe('Output tokens pending')
+    expect(liveTokenLabel(summarizeUsage([]))).toBeUndefined()
     expect(liveTokenLabel(summarizeUsage([item(1, { type: 'usage', source: 'provider', inputTokens: 0, outputTokens: 0 })]))).toBe('0 output tokens')
   })
 
@@ -71,10 +71,15 @@ describe('reported live usage', () => {
     const html = renderToStaticMarkup(createElement(StructuredLiveTokens, { items: [item(1, { type: 'usage', source: 'provider', inputTokens: 1000, outputTokens: 50 })] }))
     expect(html).toContain('50 output tokens')
     expect(html).not.toContain('1,050')
+    const pending = renderToStaticMarkup(createElement(StructuredLiveTokens, { items: [] }))
+    expect(pending).toContain('role="status"')
+    expect(pending).toContain('aria-label="Output tokens pending"')
+    expect(pending).not.toContain('Output tokens pending<')
+    const usage = renderToStaticMarkup(createElement(StructuredUsageSummary, { items: [], runtimeId: 'runtime' }))
+    expect(usage).toContain('View usage')
+    expect(usage).toContain('aria-expanded="false"')
     const empty = renderToStaticMarkup(createElement(StructuredAgentTelemetry, { items: [], runtimeId: 'runtime', phase: 'idle' }))
-    expect(empty).toContain('View usage')
-    expect(empty).toContain('aria-expanded="false"')
-    expect(empty).not.toContain('0 subagents')
+    expect(empty).not.toContain('subagent')
   })
 })
 
@@ -139,10 +144,10 @@ describe('context and working output are separate', () => {
     for (const [used, level] of [[400, 'normal'], [699, 'normal'], [700, 'warning'], [899, 'warning'], [900, 'critical'], [1000, 'critical']] as const) {
       expect(summarizeContext([context(used)])).toMatchObject({ level })
       expect(summarizeContext([context(used)])?.percent).toBeCloseTo(used / 10)
-      const html = renderToStaticMarkup(createElement(StructuredAgentTelemetry, { items: [context(used)], runtimeId: 'runtime', phase: 'idle' }))
+      const html = renderToStaticMarkup(createElement(StructuredUsageSummary, { items: [context(used)], runtimeId: 'runtime' }))
       expect(html).toContain('sa-context-circle level-' + level)
     }
-    const hidden = renderToStaticMarkup(createElement(StructuredAgentTelemetry, { items: [context(399)], runtimeId: 'runtime', phase: 'idle' }))
+    const hidden = renderToStaticMarkup(createElement(StructuredUsageSummary, { items: [context(399)], runtimeId: 'runtime' }))
     expect(hidden).not.toContain('sa-context-circle')
     expect(summarizeContext([context(2000)])?.percent).toBe(100)
     expect(liveTokenLabel(summarizeWorkingUsage([context(900)]))).toBe('25 output tokens')
@@ -158,7 +163,7 @@ describe('context and working output are separate', () => {
     const child = { ...context(990), parentId: 'child' }
     expect(summarizeContext([child])).toBeUndefined()
     const prompt = item(2, { type: 'text', role: 'user', text: 'Next', mode: 'snapshot' })
-    expect(liveTokenLabel(summarizeWorkingUsage([context(700), prompt]))).toBe('Output tokens pending')
+    expect(liveTokenLabel(summarizeWorkingUsage([context(700), prompt]))).toBeUndefined()
     const response = item(3, { type: 'usage', source: 'provider', scope: 'message', inputTokens: 8000, cachedTokens: 7000, outputTokens: 19 })
     expect(liveTokenLabel(summarizeWorkingUsage([context(700), prompt, response]))).toBe('19 output tokens')
   })
@@ -197,5 +202,67 @@ describe('detached background tasks', () => {
     expect(providerOfCommand('C:/tools/claude.exe --print')).toBe('claude')
     expect(providerOfCommand('echo "ask codexional about it"')).toBeUndefined()
     expect(providerOfCommand('npm run build')).toBeUndefined()
+  })
+})
+
+describe('subagent identity and color for nested "Within X" labels', () => {
+  it('prefers the native session id, falling back to runtime and native item, matching what the roster counts by', () => {
+    const withNative = item(1, { type: 'subagent', name: 'Reviewer', nativeSessionId: 'native-1', status: 'running' })
+    expect(withNative.data.type === 'subagent' && subagentIdentityId(withNative.data, withNative.runtimeId, withNative.nativeItemId, withNative.id)).toBe('native-1')
+    const withoutNative = item(2, { type: 'subagent', name: 'Reviewer', status: 'running' }, { nativeItemId: 'task:9' })
+    expect(withoutNative.data.type === 'subagent' && subagentIdentityId(withoutNative.data, withoutNative.runtimeId, withoutNative.nativeItemId, withoutNative.id)).toBe(JSON.stringify(['runtime', 'task:9']))
+    const roster = summarizeSubagents([withNative], 'runtime', 'running')
+    expect(roster[0]?.id).toBe('native-1')
+  })
+
+  it('derives a color bucket deterministically from identity so the same agent repaints the same color', () => {
+    const first = subagentColorIndex('native-1')
+    expect(subagentColorIndex('native-1')).toBe(first)
+    expect(first).toBeGreaterThanOrEqual(0)
+    expect(first).toBeLessThan(subagentColorBuckets)
+    expect(subagentColorIndex('native-2')).not.toBe(subagentColorIndex('native-2-different-enough'))
+  })
+
+  it('numbers same-named subagents in roster order but leaves a unique name untouched', () => {
+    const labels = distinguishSubagentLabels([{ id: 'a', name: 'Codex agent' }, { id: 'b', name: 'Codex agent' }, { id: 'c', name: 'Reviewer' }])
+    expect(labels.get('a')).toBe('Codex agent #1')
+    expect(labels.get('b')).toBe('Codex agent #2')
+    expect(labels.get('c')).toBe('Reviewer')
+  })
+
+  it('recognizes the generic native names the roster collapses across lifecycle events', () => {
+    expect(isGenericSubagentName('Codex agent')).toBe(true)
+    expect(isGenericSubagentName('Background activity')).toBe(true)
+    expect(isGenericSubagentName('Reviewer')).toBe(false)
+  })
+})
+
+describe('subagent model, effort and token reporting', () => {
+  it('carries the model, effort and model provider a spawned agent thread reports, merging later confirmation', () => {
+    const spawned = item(1, { type: 'subagent', name: 'Codex agent', nativeSessionId: 'child-1', status: 'running', model: 'gpt-5-high', effort: 'high' })
+    const confirmed = item(2, { type: 'subagent', name: 'Researcher', nativeSessionId: 'child-1', status: 'running', modelProvider: 'openai' })
+    const agent = summarizeSubagents([spawned, confirmed], 'runtime', 'running')[0]
+    expect(agent).toMatchObject({ name: 'Researcher', model: 'gpt-5-high', effort: 'high', modelProvider: 'openai' })
+  })
+
+  it('leaves model, effort and provider unset for a subagent that never reported them', () => {
+    const task = item(1, { type: 'subagent', name: 'Run checks', status: 'running', detached: true }, { nativeItemId: 'task:a' })
+    const agent = summarizeSubagents([task], 'runtime', 'running')[0]
+    expect(agent?.model).toBeUndefined()
+    expect(agent?.modelProvider).toBeUndefined()
+    expect(agent?.tokens).toBeUndefined()
+  })
+
+  it('attributes token usage reported for a spawned child thread to that subagent only', () => {
+    const launch = item(1, { type: 'subagent', name: 'Researcher', status: 'running' }, { nativeItemId: 'thread:child-1' })
+    const usage = item(2, { type: 'usage', source: 'provider', scope: 'session', inputTokens: 900, outputTokens: 100, totalTokens: 1000 }, { parentId: 'thread:child-1' })
+    const agent = summarizeSubagents([launch, usage], 'runtime', 'running')[0]
+    expect(agent?.tokens).toMatchObject({ totalTokens: 1000 })
+    expect(subagentTokenLabel(agent!)).toBe('1,000 tokens')
+  })
+
+  it('formats a subagent model label using the same display convention as the composer, or nothing when unreported', () => {
+    expect(subagentModelLabel({ model: 'gpt-5-high', effort: 'high' })).toBe('GPT 5 High · high')
+    expect(subagentModelLabel({ model: undefined, effort: 'high' })).toBeUndefined()
   })
 })

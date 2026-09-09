@@ -1,23 +1,31 @@
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Eye, FileCode2, Globe2, Plus, X } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
+import { fileTypeStyle } from '../file-types'
 import { CodePane } from '../panes/CodePane'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { BrowserPane } from '../panes/BrowserPane'
 import { FilePicker } from './FilePicker'
-import { changeWorkspacePath, loadWorkspaceFiles, openWorkspaceFile, type OpenWorkspaceFile, type WorkspaceFile } from './workspace-files-state'
+import { runFileLinkAction } from './file-link-actions'
+import { buildFileLinkMenuEntries, FILE_LINK_MENU_ICONS, type FileLinkMenuAction } from './file-link-menu'
+import { changeWorkspacePath, loadWorkspaceFiles, openWorkspaceFile, recentWorkspaceFiles, type OpenWorkspaceFile, type WorkspaceFile } from './workspace-files-state'
+import { recordRecentFile } from './recent-files-store'
 import './WorkspaceFiles.css'
+
+const notify = (message: string): void => { window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })) }
 
 function FileBrowser({ project, file }: { project: ProjectRecord; file: WorkspaceFile }): React.JSX.Element {
   const [url, setUrl] = useState(''), [error, setError] = useState('')
   useEffect(() => { let live = true; void window.conductor.files.browserUrl(project.id, file.path).then((value) => { if (live) setUrl(value) }).catch((reason: unknown) => { if (live) setError(String(reason)) }); return () => { live = false } }, [project.id, file.path])
   return url ? <BrowserPane key={url} initialUrl={url} compact performanceTabId={file.id} /> : <p className="editor-loading">{error || 'Opening browser…'}</p>
 }
-export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects: ProjectRecord[]; projectId: string; workspaceId: string }): React.JSX.Element | null {
+export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFilesDefault }: { projects: ProjectRecord[]; projectId: string; workspaceId: string; showHiddenFilesDefault?: boolean }): React.JSX.Element | null {
   const [state, setState] = useState(() => loadWorkspaceFiles(workspaceId))
   const [width, setWidth] = useState(() => Number(localStorage.getItem('conductor.documentWidth')) || 620)
   const [picker, setPicker] = useState(false), [creating, setCreating] = useState(false), [error, setError] = useState('')
   const [naming, setNaming] = useState<{ file: WorkspaceFile; value: string } | null>(null)
+  const [menu, setMenu] = useState<{ file: WorkspaceFile; x: number; y: number } | null>(null)
   const [renaming, setRenaming] = useState(false)
   const namingRef = useRef(naming); namingRef.current = naming
   const namingInput = useRef<HTMLInputElement>(null)
@@ -29,6 +37,8 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
   const stateRef = useRef(state); stateRef.current = state
   const active = state.files.find((file) => file.id === state.activeId) ?? state.files[0]
   const open = (file: OpenWorkspaceFile): void => {
+    // Only a real editor open counts as "opened" — previews and browser links must not skew recency.
+    if (file.mode === 'editor') recordRecentFile(file.projectId, file.path)
     setState((current) => {
       const existing = current.files.find((item) => item.projectId === file.projectId && item.path === file.path)
       const next = { ...file, id: existing?.id ?? 'document:' + workspaceId + ':' + crypto.randomUUID() }
@@ -36,6 +46,23 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
     })
   }
   const focusEditor = (): void => { requestAnimationFrame(() => { host.current?.querySelector<HTMLTextAreaElement>('.file-tab-content:not([hidden]) .monaco-editor textarea')?.focus() }) }
+  const showFileMenu = (event: React.MouseEvent, file: WorkspaceFile): void => {
+    event.preventDefault(); event.stopPropagation()
+    setMenu({ file, x: Math.min(event.clientX, window.innerWidth - 226), y: Math.max(6, Math.min(event.clientY, window.innerHeight - 250)) })
+  }
+  const runFileMenuAction = (action: FileLinkMenuAction, file: WorkspaceFile): void => {
+    setMenu(null)
+    runFileLinkAction(action, { projectId: file.projectId, path: file.path, line: file.line }, (path, line) => open({ projectId: file.projectId, path, mode: 'editor', line, allowBinary: file.allowBinary }), notify)
+  }
+  useEffect(() => {
+    if (!menu) return
+    const close = (): void => setMenu(null)
+    const onEscape = (event: KeyboardEvent): void => { if (event.key === 'Escape') close() }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('resize', close)
+    window.addEventListener('keydown', onEscape)
+    return () => { window.removeEventListener('mousedown', close); window.removeEventListener('resize', close); window.removeEventListener('keydown', onEscape) }
+  }, [menu])
   const stopNaming = (): void => { namingRef.current = null; setNaming(null); setError('') }
   const finishNaming = async (): Promise<void> => {
     const entry = namingRef.current
@@ -99,7 +126,7 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
       const detail = (event as CustomEvent<{ cwd: string; path: string; mode: 'browser' | 'external'; line?: number }>).detail
       const project = projects.find((item) => item.path.replaceAll('\\', '/').toLowerCase() === detail.cwd.replaceAll('\\', '/').replace(/\/$/, '').toLowerCase())
       if (!project) return
-      if (detail.mode === 'external') void window.conductor.files.openInBrowser(project.id, detail.path).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: String(reason) })))
+      if (detail.mode === 'external') void window.conductor.files.openInBrowser(project.id, detail.path).catch((reason: unknown) => notify(String(reason)))
       else open({ projectId: project.id, path: detail.path, mode: 'browser', line: detail.line })
     }
     const key = (event: KeyboardEvent): void => {
@@ -136,12 +163,12 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
       <button className="workspace-document-resizer" onPointerDown={resize} aria-label="Resize editor" />
       <div className="file-tabs" role="tablist" aria-label="File tabs">
         {state.files.map((file) => <div className={'file-tab' + (file.id === active.id ? ' active' : '')} key={file.id}>
-          {naming?.file.id === file.id ? <div className="file-tab-naming"><FileCode2 size={13} /><input ref={namingInput} className="file-tab-name" aria-label="New file name" value={naming.value} disabled={renaming} onChange={(event) => { const next = { ...naming, value: event.target.value }; namingRef.current = next; setNaming(next) }} onBlur={() => void finishNaming()} onKeyDown={(event) => {
+          {naming?.file.id === file.id ? <div className="file-tab-naming">{(() => { const { icon: NamingIcon, colorClass } = fileTypeStyle(naming.value); return <NamingIcon size={13} className={colorClass} /> })()}<input ref={namingInput} className="file-tab-name" aria-label="New file name" value={naming.value} disabled={renaming} onChange={(event) => { const next = { ...naming, value: event.target.value }; namingRef.current = next; setNaming(next) }} onBlur={() => void finishNaming()} onKeyDown={(event) => {
             if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); stopNaming(); focusEditor() }
             if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); void finishNaming().then(focusEditor) }
           }} /></div> : <button role="tab" aria-selected={file.id === active.id} title={projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
-            onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }} data-autoscroll="off">
-            {file.mode === 'browser' ? <Globe2 size={13} /> : <FileCode2 size={13} />}<span>{file.path.split('/').pop()}</span>{dirtyIds.has(file.id) && <i className="file-dirty-dot" aria-label="Unsaved changes" />}
+            onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }} onContextMenu={(event) => showFileMenu(event, file)} data-autoscroll="off">
+            {file.mode === 'browser' ? <Globe2 size={13} /> : (() => { const { icon: TabIcon, colorClass } = fileTypeStyle(file.path); return <TabIcon size={13} className={colorClass} /> })()}<span>{file.path.split('/').pop()}</span>{dirtyIds.has(file.id) && <i className="file-dirty-dot" aria-label="Unsaved changes" />}
           </button>}<button className="file-tab-close" aria-label={'Close ' + file.path} onMouseDown={() => { if (namingRef.current?.file.id === file.id) stopNaming() }} onClick={() => void close(file.id)}><X size={12} /></button>
         </div>)}
         <button className="file-new" title="New file" aria-label="New file" disabled={creating || renaming} onClick={() => void createFile()}><Plus size={15} /></button>
@@ -155,12 +182,18 @@ export function WorkspaceFiles({ projects, projectId, workspaceId }: { projects:
           const project = projects.find((item) => item.id === file.projectId)
           if (!project) return file.id === active.id ? <p key={file.id}>This project is no longer loaded.</p> : null
           return <div className="file-tab-content" key={file.id} hidden={file.id !== active.id}>
-            {file.mode === 'editor' ? <CodePane project={project} tabId={file.id} path={file.path} line={file.line} autoFocus={naming?.file.id !== file.id} /> : file.mode === 'browser' ? <FileBrowser project={project} file={file} /> : <FilePreviewPane project={project} path={file.path} onOpenEditor={(path) => open({ projectId: project.id, path, mode: 'editor' })} />}
+            {file.mode === 'editor' ? <CodePane project={project} tabId={file.id} path={file.path} line={file.line} allowBinary={file.allowBinary} autoFocus={naming?.file.id !== file.id} /> : file.mode === 'browser' ? <FileBrowser project={project} file={file} /> : <FilePreviewPane project={project} path={file.path} onOpenEditor={(path, allowBinary) => open({ projectId: project.id, path, mode: 'editor', allowBinary })} />}
           </div>
         })}
       </div>
     </aside>}
-    {picker && <FilePicker projects={projects} onClose={() => setPicker(false)} onPick={(file) => openWorkspaceFile(file.projectId, file.path)} />}
-
+    {picker && <FilePicker projects={projects} activeProjectId={projectId} recentPaths={recentWorkspaceFiles()} showHiddenDefault={showHiddenFilesDefault} onClose={() => setPicker(false)} onPick={(file) => openWorkspaceFile(file.projectId, file.path)} />}
+    {menu && createPortal(
+      <div className="cursor-context-menu file-tab-context-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
+        <div className="context-menu-label">{menu.file.path.split('/').pop()}</div>
+        {buildFileLinkMenuEntries().map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} onClick={() => runFileMenuAction(entry.action, menu.file)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
+      </div>,
+      document.body
+    )}
   </>
 }

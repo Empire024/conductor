@@ -146,6 +146,14 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     finish()
     return
   }
+  if (scenario === 'synthetic:subagent-model') {
+    // Requested at spawn time through the collab tool call, then confirmed (with its provider)
+    // once the child thread itself announces. Neither call launches a real agent or model.
+    itemEvent('item/completed', { type: 'collabAgentToolCall', id: 'model-parent', tool: 'spawnAgent', status: 'completed', senderThreadId: threadId, receiverThreadIds: ['model-child'], prompt: 'Synthetic model plumbing check only.', model: 'gpt-5-high', reasoningEffort: 'high', agentsStates: { 'model-child': { status: 'running', message: null } } })
+    notify('thread/started', { thread: { id: 'model-child', status: { type: 'idle' }, turns: [], cwd: process.cwd(), parentThreadId: threadId, agentNickname: 'Researcher', agentRole: null, model: 'gpt-5-high', reasoningEffort: 'high', modelProvider: 'openai' } })
+    finish()
+    return
+  }
   if (scenario === 'synthetic:context') {
     for (const totalTokens of [140000, 190000, 24000]) notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: {
       total: { inputTokens: 9000000, outputTokens: 4000, totalTokens: 9004000, cachedInputTokens: 8000000, reasoningOutputTokens: 1000 },
@@ -218,6 +226,32 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       else finish()
     }
     batch()
+    return
+  }
+  if (scenario === 'synthetic:perf-stream') {
+    // Realistic clutter: prior completed tool activity, the way a real long-running
+    // conversation accumulates before a fresh reply starts streaming in.
+    const priorCount = Number(process.env.CONDUCTOR_PERF_STREAM_HISTORY ?? 150)
+    for (let i = 1; i <= priorCount; i++) itemEvent('item/completed', { type: 'commandExecution', id: `stream-setup-${i}`, command: `Get-Content src/file-${i}.ts`, cwd: process.cwd(), source: 'agent', status: 'completed', aggregatedOutput: `Read file ${i}: ok\n`, exitCode: 0, durationMs: 3, commandActions: [], pluginId: null, scriptPath: null, processId: null })
+    itemEvent('item/started', { type: 'agentMessage', id: 'stream-1', text: '', phase: null, memoryCitation: null, delivery: null, questions: null })
+    const paragraph = index => `Paragraph ${index}: this synthetic streaming reply exercises realistic prose with **bold**, _italic_ and \`inline code\` spans while tokens keep arriving quickly, the same way a real provider streams a long explanation back into the conversation.`
+    const code = fence => ['```ts', `export function updatePanel${fence}(el: HTMLElement, pinned: boolean): void {`, "  const wasOpen = el.classList.contains('is-open')", "  el.classList.toggle('is-pinned', pinned)", "  if (wasOpen) el.classList.add('is-loading')", `  for (let i = 0; i < ${fence}; i++) el.dataset[\`step\${i}\`] = String(i)`, '}', '```'].join('\n')
+    const table = ['| Step | File | Status |', '| --- | --- | --- |', ...Array.from({ length: 10 }, (_, i) => `| ${i + 1} | src/file-${i + 1}.ts | ok |`)].join('\n')
+    const full = [...Array.from({ length: 24 }, (_, i) => paragraph(i + 1)), code(1), table, ...Array.from({ length: 16 }, (_, i) => paragraph(i + 25)), code(2), ...Array.from({ length: 10 }, (_, i) => paragraph(i + 41))].join('\n\n')
+    const chunks = []
+    for (let i = 0; i < full.length;) { const size = 3 + (i % 5); chunks.push(full.slice(i, i + size)); i += size }
+    let index = 0
+    const stream = () => {
+      notify('item/agentMessage/delta', { threadId, turnId: currentTurn, itemId: 'stream-1', delta: chunks[index] })
+      index++
+      if (index < chunks.length) setTimeout(stream, 0)
+      else {
+        itemEvent('item/completed', { type: 'agentMessage', id: 'stream-1', text: full, phase: null, memoryCitation: null, delivery: null, questions: null })
+        notify('thread/tokenUsage/updated', { threadId, turnId: currentTurn, tokenUsage: { total: { inputTokens: 400, outputTokens: 900, cachedInputTokens: 0 }, modelContextWindow: 128000 } })
+        finish()
+      }
+    }
+    stream()
     return
   }
   if (scenario.startsWith('SYNTHETIC B')) {

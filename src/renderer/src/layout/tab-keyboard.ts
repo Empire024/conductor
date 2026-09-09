@@ -1,5 +1,5 @@
 import type { AgentProviderId, LayoutNode, PaneGroupNode, PaneKind, SplitNode, WorkspaceLayout } from '../../../shared/models'
-import { resizeSplit } from './layout-operations'
+import { dockTab, findGroup, listGroups, resizeSplit, type DockEdge } from './layout-operations'
 
 export type ResizeDirection = 'left' | 'right' | 'up' | 'down'
 
@@ -112,6 +112,49 @@ export const snapFocusedGroup = (
   const first = nextSnapStop(ancestor.split.sizes[0], towardsSecondChild(direction))
   if (first === ancestor.split.sizes[0]) return layout
   return resizeSplit(layout, ancestor.split.id, [first, 100 - first])
+}
+
+const DOCK_EDGE: Record<ResizeDirection, Exclude<DockEdge, 'center'>> = { left: 'left', right: 'right', up: 'above', down: 'below' }
+
+/** Where the tab ended up, so the caller can move the focus with it and stay repeatable. */
+export interface TabMove {
+  layout: WorkspaceLayout
+  groupId: string
+}
+
+const groupHolding = (layout: WorkspaceLayout, tabId: string): string | undefined =>
+  listGroups(layout.root).find((group) => group.tabs.some((candidate) => candidate.id === tabId))?.id
+
+/**
+ * Relocate the focused tab itself, as distinct from resizing its pane. The tab joins the
+ * neighbouring pane across the nearest divider on that axis; with no neighbour that way it
+ * peels off into a new pane, but only when the group would not be left empty. Returns the
+ * original layout when nothing can move, so the caller can leave the key unhandled, and
+ * always reports the group the tab now sits in: docking dissolves the old group and peeling
+ * mints a new one, so a caller that kept pointing at the original id would move a different
+ * tab on the next press.
+ */
+export const moveFocusedTab = (
+  layout: WorkspaceLayout,
+  groupId: string,
+  direction: ResizeDirection
+): TabMove => {
+  const group = findGroup(layout.root, groupId)
+  const tab = group?.tabs.find((candidate) => candidate.id === group.activeTabId) ?? group?.tabs[0]
+  if (!group || !tab) return { layout, groupId }
+  const forward = towardsSecondChild(direction)
+  const ancestor = splitAncestors(layout.root, groupId).find(
+    (candidate) => candidate.split.direction === axisOf(direction) && candidate.branch === (forward ? 0 : 1)
+  )
+  // Nearest pane across that divider: the one sharing the edge the tab is moving towards.
+  const neighbours = ancestor ? listGroups(ancestor.split.children[forward ? 1 : 0]) : []
+  const neighbour = forward ? neighbours[0] : neighbours.at(-1)
+  const next = neighbour
+    ? dockTab(layout, groupId, tab.id, neighbour.id, 'center')
+    : group.tabs.length < 2
+      ? layout
+      : dockTab(layout, groupId, tab.id, groupId, DOCK_EDGE[direction])
+  return { layout: next, groupId: groupHolding(next, tab.id) ?? groupId }
 }
 
 /**

@@ -77,3 +77,46 @@ describe('opt-in usage details (synthetic, zero inference)', () => {
     expect(html).not.toContain('<script>')
   })
 })
+
+describe('what a run actually cost (synthetic, zero inference)', () => {
+  it('names the account movement two reports support and says it is an upper bound', () => {
+    const html = render([
+      { type: 'session', phase: 'running', capabilities: { provider: 'codex', runtimeVersion: 'x', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: true, plans: true, effort: [], models: [], limitations: [], effectiveSettings: { model: 'gpt-6-astra' } } },
+      { type: 'usage', source: 'provider', limits: { rateLimits: { seven_day: { usedPercent: 10, windowDurationMins: 10080 } } } },
+      { type: 'usage', source: 'provider', scope: 'session', inputTokens: 120000, outputTokens: 9000, totalTokens: 129000 },
+      { type: 'usage', source: 'provider', limits: { rateLimits: { seven_day: { usedPercent: 70, windowDurationMins: 10080 } } } }
+    ])
+    expect(html).toContain('Codex')
+    expect(html).toContain('gpt-6-astra')
+    expect(html).toContain('60 points')
+    expect(html).toContain('weekly allowance while this conversation was open')
+    expect(html).toContain('10% ')
+    expect(html).toContain('70%')
+    expect(html).toContain('129,000')
+    // The provenance split is explicit rather than implied by wording alone.
+    expect(html).toContain('Where these numbers come from')
+    expect(html).toContain('upper bound')
+  })
+
+  it('shows the current level but claims no share until a second report exists', () => {
+    const html = render([
+      { type: 'usage', source: 'provider', limits: { rateLimits: { seven_day: { usedPercent: 44, windowDurationMins: 10080 } } } }
+    ])
+    expect(html).toContain('44% used')
+    expect(html).toContain('no movement can be attributed')
+    expect(html).not.toContain('points of your')
+    // A single level is a measurement, not a movement: no share is claimed anywhere.
+    expect(html).not.toContain('Share consumed here')
+    expect(html).not.toContain('upper bound')
+  })
+
+  it('refuses to attribute a share across a window rollover', () => {
+    const html = render([
+      { type: 'usage', source: 'provider', limits: { rateLimits: { seven_day: { usedPercent: 91, windowDurationMins: 10080 } } } },
+      { type: 'usage', source: 'provider', limits: { rateLimits: { seven_day: { usedPercent: 5, windowDurationMins: 10080 } } } }
+    ])
+    expect(html).toContain('5% used')
+    expect(html).toContain('cannot be attributed')
+    expect(html).not.toContain('points of your')
+  })
+})

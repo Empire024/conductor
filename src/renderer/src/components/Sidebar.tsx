@@ -1,10 +1,13 @@
 import { Fragment, useEffect, useState } from 'react'
-import { WorkspaceTabList } from './WorkspaceTabList'
+import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
 import { RemoveProjectDialog } from './RemoveProjectDialog'
+import type { TabGroupAction } from '../layout/tab-groups'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
+import type { ProjectActivityStatus, SessionActivityStatus } from '../attention'
 import { createPortal } from 'react-dom'
 import {
   X,
+  Bell,
   Bot,
   ChevronDown,
   ChevronRight,
@@ -29,7 +32,7 @@ import {
   Settings2,
   Trash2
 } from 'lucide-react'
-import type { FileEntry, PaneKind, ProjectRecord, SessionRecord } from '../../../shared/models'
+import type { AgentActivityPhase, FileEntry, PaneKind, ProjectRecord, SessionRecord } from '../../../shared/models'
 import { WorkspaceSidebarPanel } from './WorkspaceSidebarPanel'
 import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
@@ -49,6 +52,7 @@ interface SidebarProps {
   onMoveProject(id: string): void
   onRemoveProject(id: string): Promise<void>
   onTabAction(sessionId: string, groupId: string, tabId: string, action: WorkspaceTabAction): void
+  onTabGroupAction(sessionId: string, groupId: string, tabId: string, action: TabGroupAction): void
   onRevealProject(path: string): void
   onCloseSession(id: string): void
   onRenameSession(id: string, name: string): void
@@ -68,25 +72,35 @@ interface SidebarProps {
   onPathRemoved?(relativePath: string, kind: FileEntry['kind'], projectId?: string): void
   utilityPanel: WorkspacePanel | null
   onUtilityPanel(panel: WorkspacePanel | null): void
+  attentionIds: ReadonlySet<string>
+  sessionActivity: ReadonlyMap<string, SessionActivityStatus>
+  activityPhases: ReadonlyMap<string, AgentActivityPhase>
+  projectActivity: ReadonlyMap<string, ProjectActivityStatus>
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
 
+// "Workspace" and "Explorer" are the primary destinations. The rest are real, working
+// panels too, except Source control and Schedules, which have no kind/sidebar/utility
+// wired up yet - clicking them does nothing today, so they're pinned to the bottom and
+// rendered disabled rather than opening a dead button.
 const railItems: Array<{
   icon: typeof LayoutGrid
   label: string
   kind?: PaneKind
   sidebar?: WorkspaceSidebarMode
   utility?: WorkspacePanel
+  group: 'primary' | 'secondary'
+  unfinished?: boolean
 }> = [
-  { icon: LayoutGrid, label: 'Workspace', sidebar: 'workspace' },
-  { icon: FolderTree, label: 'Explorer', sidebar: 'explorer' },
-  { icon: ListTodo, label: 'Project tasks', utility: 'backlog' },
-  { icon: GitBranch, label: 'Source control' },
-  { icon: Bot, label: 'Automation', utility: 'agents' },
-  { icon: MemoryStick, label: 'Memory', utility: 'memory' },
-  { icon: Gauge, label: 'Processes', utility: 'processes' },
-  { icon: Clock3, label: 'Schedules' }
+  { icon: LayoutGrid, label: 'Workspace', sidebar: 'workspace', group: 'primary' },
+  { icon: FolderTree, label: 'Explorer', sidebar: 'explorer', group: 'primary' },
+  { icon: ListTodo, label: 'Project tasks', utility: 'backlog', group: 'secondary' },
+  { icon: Bot, label: 'Automation', utility: 'agents', group: 'secondary' },
+  { icon: MemoryStick, label: 'Memory', utility: 'memory', group: 'secondary' },
+  { icon: Gauge, label: 'Processes', utility: 'processes', group: 'secondary' },
+  { icon: GitBranch, label: 'Source control', group: 'secondary', unfinished: true },
+  { icon: Clock3, label: 'Schedules', group: 'secondary', unfinished: true }
 ]
 
 export function Sidebar(props: SidebarProps): React.JSX.Element {
@@ -94,6 +108,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     const saved = localStorage.getItem('conductor.sidebarMode')
     return saved === 'explorer' || saved === 'browser' ? saved : 'workspace'
   })
+  const [tabListOverrides, setTabListOverrides] = useState<Record<string, boolean>>({})
   const [menu, setMenu] = useState<
     | { kind: 'project'; project: ProjectRecord; x: number; y: number }
     | { kind: 'projects'; x: number; y: number }
@@ -160,7 +175,6 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
       const detail = (event as CustomEvent<WorkspaceSidebarMode | { mode: WorkspaceSidebarMode; toggle?: boolean }>).detail
       const mode = typeof detail === 'string' ? detail : detail.mode
       if (!['workspace', 'explorer', 'browser'].includes(mode)) return
-      props.onUtilityPanel(null)
       if (typeof detail !== 'string' && detail.toggle && sidebarMode === mode && !props.collapsed) { props.onToggleCollapsed(); return }
       setSidebarMode(mode)
       localStorage.setItem('conductor.sidebarMode', mode)
@@ -168,7 +182,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     }
     window.addEventListener('conductor:sidebar-mode', requestMode)
     return () => window.removeEventListener('conductor:sidebar-mode', requestMode)
-  }, [sidebarMode, props.collapsed, props.onToggleCollapsed, props.onUtilityPanel])
+  }, [sidebarMode, props.collapsed, props.onToggleCollapsed])
 
   useEffect(() => {
     if (!menu) return
@@ -197,32 +211,54 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     })
   }
 
+  // The sidebar and the dockable utility drawer are independent surfaces:
+  // picking Explorer must not close Project tasks, and neither one owns the other.
+  const renderRailItem = ({ icon: Icon, label, kind, sidebar, utility, unfinished }: (typeof railItems)[number]): React.JSX.Element => {
+    if (unfinished) {
+      return (
+        <button
+          key={label}
+          className="rail-unfinished"
+          title={`${label} — not ready yet`}
+          aria-label={`${label}, not ready yet`}
+          aria-disabled="true"
+          disabled
+        >
+          <Icon size={18} strokeWidth={1.75} />
+        </button>
+      )
+    }
+    const active = sidebar
+      ? sidebarMode === sidebar && !props.collapsed
+      : utility === props.utilityPanel
+    return (
+      <button key={label} className={active ? 'active' : ''} title={label} aria-label={label} onClick={() => {
+        if (sidebar) {
+          const wasActive = sidebarMode === sidebar && !props.collapsed
+          setSidebarMode(sidebar)
+          localStorage.setItem('conductor.sidebarMode', sidebar)
+          if (props.collapsed || wasActive) props.onToggleCollapsed()
+        } else if (kind) {
+          props.onUtilityPanel(null)
+          props.onOpenTab(kind)
+        }
+        else if (utility) props.onUtilityPanel(props.utilityPanel === utility ? null : utility)
+      }}>
+        <Icon size={18} strokeWidth={1.75} />
+      </button>
+    )
+  }
+
   return (
     <div className={`left-shell ${props.collapsed ? 'rail-only' : ''}`}>
       {workspaceMenu && <WorkspaceSessionMenu x={workspaceMenu.x} y={workspaceMenu.y} canRestore={props.canRestoreWorkspace} onRename={() => renameSession(workspaceMenu.session)} onNew={props.onNewSession} onRestore={props.onRestoreWorkspace} onCloseWorkspace={() => props.onCloseSession(workspaceMenu.session.id)} onDismiss={() => setWorkspaceMenu(null)} />}<nav className="activity-rail" aria-label="Activity">
         <div className="rail-primary">
-          {railItems.map(({ icon: Icon, label, kind, sidebar, utility }) => {
-            const active = sidebar
-              ? sidebarMode === sidebar && props.utilityPanel === null && !props.collapsed
-              : utility === props.utilityPanel
-            return (
-            <button key={label} className={active ? 'active' : ''} title={label} aria-label={label} onClick={() => {
-              if (sidebar) {
-                const wasActive = sidebarMode === sidebar && props.utilityPanel === null
-                props.onUtilityPanel(null)
-                setSidebarMode(sidebar)
-                localStorage.setItem('conductor.sidebarMode', sidebar)
-                if (props.collapsed || wasActive) props.onToggleCollapsed()
-              } else if (kind) {
-                props.onUtilityPanel(null)
-                props.onOpenTab(kind)
-              }
-              else if (utility) props.onUtilityPanel(props.utilityPanel === utility ? null : utility)
-            }}>
-              <Icon size={18} strokeWidth={1.75} />
-            </button>
-            )
-          })}
+          {railItems.filter((item) => item.group === 'primary').map(renderRailItem)}
+          <div className="rail-divider" role="separator" aria-orientation="horizontal" />
+          {railItems
+            .filter((item) => item.group === 'secondary')
+            .sort((a, b) => Number(Boolean(a.unfinished)) - Number(Boolean(b.unfinished)))
+            .map(renderRailItem)}
         </div>
         <div className="rail-bottom">
           <button
@@ -273,6 +309,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
             {props.projects.map((project) => {
               const active = project.id === props.activeProjectId
               const expanded = active && !collapsedProjectIds.has(project.id)
+              const projectStatus = props.projectActivity.get(project.id) ?? 'idle'
               return (
                 <div key={project.id} onContextMenu={(event) => showProjectMenu(event, project)}>
                   <div className={`project-row-wrap ${active ? 'active' : ''}`} draggable={editingProjectId !== project.id}
@@ -317,6 +354,8 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                       >
                         <span className="project-glyph"><FolderGit2 size={14} /></span>
                         <span className="ellipsis">{project.name}</span>
+                        {projectStatus === 'attention' && <span className="session-attention-badge" title="An agent in this project needs your attention"><Bell size={11} strokeWidth={1.7} /></span>}
+                        {projectStatus !== 'attention' && projectStatus !== 'idle' && <span className={`session-activity-dot ${projectStatus}`} title={projectStatus === 'working' ? 'Actively working' : projectStatus === 'waiting' ? 'Waiting on you' : 'Finished working'} />}
                       </button>
                       </>
                     )}
@@ -326,27 +365,32 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                   </div>
                   {expanded && (
                     <div className="session-tree">
-                      {props.sessions.map((session, index) => (
+                      {props.sessions.map((session, index) => {
+                      const attention = props.attentionIds.has(session.id)
+                      const activity = props.sessionActivity.get(session.id)
+                      return (
                         <Fragment key={session.id}><div className="sidebar-session-row" draggable={editingSessionId !== session.id} onContextMenu={event => { if (editingSessionId === session.id) return; event.preventDefault(); event.stopPropagation(); setMenu(null); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
                           onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-conductor-session', session.id) }}
                           onDragOver={(event) => { if (event.dataTransfer.types.includes('application/x-conductor-session')) { event.preventDefault(); event.currentTarget.classList.add('reorder-target') } }}
                           onDragLeave={(event) => event.currentTarget.classList.remove('reorder-target')}
                           onDrop={(event) => { event.preventDefault(); event.currentTarget.classList.remove('reorder-target'); const dragged = event.dataTransfer.getData('application/x-conductor-session'); if (!dragged || dragged === session.id) return; const ids = props.sessions.map((item) => item.id).filter((id) => id !== dragged); ids.splice(ids.indexOf(session.id) + (event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.clientHeight / 2 ? 1 : 0), 0, dragged); props.onReorderSessions(ids) }}>
+                        <WorkspaceTabToggle expanded={tabListOverrides[session.id] ?? session.id === props.activeSessionId} name={session.name} onToggle={() => setTabListOverrides(current => ({ ...current, [session.id]: !(current[session.id] ?? session.id === props.activeSessionId) }))} />
                         <button
-                          className={session.id === props.activeSessionId ? 'active' : ''}
+                          className={`sidebar-session-open ${session.id === props.activeSessionId ? 'active' : ''} ${attention ? 'needs-attention' : ''}`}
                           onClick={() => props.onSelectSession(session.id)}
                           onDoubleClick={event => { event.preventDefault(); renameSession(session) }}
                           onKeyDown={event => { if (event.key === 'F2') { event.preventDefault(); event.stopPropagation(); renameSession(session) } }}
                         >
                           <span className="session-number">{String(index + 1).padStart(2, '0')}</span>
                           <span className="ellipsis">{editingSessionId === session.id ? <input className="sidebar-session-rename" aria-label="Workspace name" autoFocus value={sessionName} onFocus={event => event.currentTarget.select()} onClick={event => event.stopPropagation()} onDoubleClick={event => event.stopPropagation()} onChange={event => setSessionName(event.target.value)} onBlur={() => finishSessionRename(true)} onKeyDown={event => { event.stopPropagation(); if (event.key === 'Enter') { event.preventDefault(); finishSessionRename(true) }; if (event.key === 'Escape') { event.preventDefault(); finishSessionRename(false) } }} /> : session.name}</span>
-                          {session.id === props.activeSessionId && <i className="live-dot" />}
+                          {attention && <span className="session-attention-badge" title="An agent in this workspace needs your attention"><Bell size={11} strokeWidth={1.7} /></span>}
+                          {!attention && activity && <span className={`session-activity-dot ${activity}`} title={activity === 'working' ? 'Actively working' : activity === 'waiting' ? 'Waiting on you' : 'Finished working'} />}
                         </button>
                         <button className="sidebar-session-close" aria-label={'Close ' + session.name} title={'Close ' + session.name} onClick={() => props.onCloseSession(session.id)}><X size={11} /></button>
                         </div>
-                        <WorkspaceTabList session={session} active={session.id === props.activeSessionId} onAction={(groupId, tabId, action) => props.onTabAction(session.id, groupId, tabId, action)} />
+                        <WorkspaceTabList session={session} active={session.id === props.activeSessionId} expanded={tabListOverrides[session.id] ?? session.id === props.activeSessionId} activityPhases={props.activityPhases} onAction={(groupId, tabId, action) => props.onTabAction(session.id, groupId, tabId, action)} onGroupAction={(groupId, tabId, action) => props.onTabGroupAction(session.id, groupId, tabId, action)} />
                         </Fragment>
-                      ))}
+                      )})}
                       <button className="new-session" onClick={props.onNewSession}>
                         <Plus size={12} /> New workspace
                       </button>

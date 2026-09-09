@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Editor, { type BeforeMount, type OnMount } from '@monaco-editor/react'
-import { Check, FilePlus2, LoaderCircle, Save, WrapText } from 'lucide-react'
+import { Check, ExternalLink, Eye, FilePlus2, FileWarning, LoaderCircle, Save, WrapText } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
 import { dispatchAgentContext } from './StructuredAgentPane'
 import { AgentDialog } from './StructuredAgentRenderers'
 import { recoverEditorDraft } from './editor-draft-state'
+import { cleanIpcError, isBinaryFileRefusal, isOverridableFileRefusal } from '../ipc-errors'
+import { openWorkspaceFile } from '../components/workspace-files-state'
 import './CodePane.css'
 
 const languageFor = (path: string): string => {
@@ -18,7 +20,7 @@ const languageFor = (path: string): string => {
   )
 }
 
-export function CodePane({ project, tabId, path, line, autoFocus = true }: { project: ProjectRecord; tabId: string; path: string; line?: number; autoFocus?: boolean }): React.JSX.Element {
+export function CodePane({ project, tabId, path, line, allowBinary = false, autoFocus = true }: { project: ProjectRecord; tabId: string; path: string; line?: number; allowBinary?: boolean; autoFocus?: boolean }): React.JSX.Element {
   const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('conductor.editorWordWrap') !== 'off')
   const toggleWrap = (): void => setWordWrap((current) => { localStorage.setItem('conductor.editorWordWrap', current ? 'off' : 'on'); return !current })
   const [value, setValue] = useState('')
@@ -28,6 +30,9 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
   const [recovered, setRecovered] = useState(false)
   const [error, setError] = useState('')
   const [conflict, setConflict] = useState(false)
+  const [blocked, setBlocked] = useState(false)
+  const [overridable, setOverridable] = useState(false)
+  const [reloadKey, setReloadKey] = useState(0)
   const [reloadOpen, setReloadOpen] = useState(false)
   const [theme, setTheme] = useState(document.documentElement.dataset.theme === 'light' ? 'conductor-light' : 'conductor-dark')
   const loadedRef = useRef(false)
@@ -44,11 +49,14 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
   const saveTaskRef = useRef<Promise<void> | null>(null)
   const saveAgainRef = useRef(false)
   const reloadingRef = useRef(false)
+  // Set only by someone deliberately choosing text, and reset per file.
+  const allowBinaryRef = useRef(allowBinary)
   valueRef.current = value
   savedValueRef.current = savedValue
   pathRef.current = path
   tabIdRef.current = tabId
   projectIdRef.current = project.id
+  useEffect(() => { allowBinaryRef.current = allowBinary; return () => { allowBinaryRef.current = allowBinary } }, [allowBinary, path, project.id, tabId])
   const dirty = value !== savedValue
   const language = useMemo(() => languageFor(path), [path])
 
@@ -85,10 +93,11 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
     setSaving(false)
     setRecovered(false)
     setConflict(false)
+    setBlocked(false)
     setReloadOpen(false)
     setError('')
     void Promise.all([
-      window.conductor.files.readForEditor(project.id, path),
+      window.conductor.files.readForEditor(project.id, path, allowBinaryRef.current),
       window.conductor.files.getDraft(tabId, project.id, path)
     ]).then(([content, draft]) => {
       if (cancelled) return
@@ -107,7 +116,10 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
       // Remove historical clean checkpoints, without writing anything to disk.
       flushDraft()
     }).catch((reason: unknown) => {
-      if (!cancelled) setError(reason instanceof Error ? reason.message : `Could not open ${path}`)
+      if (cancelled) return
+      setBlocked(isBinaryFileRefusal(reason))
+      setOverridable(isOverridableFileRefusal(reason))
+      setError(reason instanceof Error ? cleanIpcError(reason) : `Could not open ${path}`)
     }).finally(() => {
       if (!cancelled) setLoading(false)
     })
@@ -117,7 +129,7 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
       loadedRef.current = false
       generationRef.current++
     }
-  }, [path, project.id, tabId])
+  }, [path, project.id, tabId, reloadKey])
 
   useEffect(() => {
     const onVisibility = (): void => {
@@ -143,7 +155,7 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
       if (saveTaskRef.current) { await saveTaskRef.current; if (disposed) return }
       const version = ++sequence, generation = generationRef.current
       try {
-        const content = await window.conductor.files.readForEditor(project.id, path)
+        const content = await window.conductor.files.readForEditor(project.id, path, allowBinaryRef.current)
         if (disposed || version !== sequence || generation !== generationRef.current || content === baseContentRef.current) return
         if (valueRef.current !== savedValueRef.current) {
           setConflict(true)
@@ -157,7 +169,10 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
         valueRef.current = content
         setSavedValue(content); setValue(content); setRecovered(false); setConflict(false); setError('')
         flushDraft()
-        requestAnimationFrame(() => { if (!disposed && generation === generationRef.current && view) editorRef.current?.restoreViewState(view) })
+        requestAnimationFrame(() => {
+        if (disposed || generation !== generationRef.current || !view || !editorRef.current?.getModel()) return
+        try { editorRef.current.restoreViewState(view) } catch { /* the editor was replaced mid-frame */ }
+      })
       } catch (reason) { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) }
     }
     const unsubscribe = window.conductor.files.onChanged(change => {
@@ -266,7 +281,7 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
     const generation = generationRef.current
     const submitted = valueRef.current
     try {
-      const content = await window.conductor.files.readForEditor(projectIdRef.current, pathRef.current)
+      const content = await window.conductor.files.readForEditor(projectIdRef.current, pathRef.current, allowBinaryRef.current)
       if (generation !== generationRef.current) return
       if (submitted !== valueRef.current) { setError('Your edits changed while reloading. Try again when ready.'); return }
       if (content === null) { setError('The file no longer exists. Save a copy to preserve your edits.'); return }
@@ -364,7 +379,7 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
       run: () => save()
     })
     if (viewStateRef.current) {
-      _editor.restoreViewState(viewStateRef.current as Parameters<typeof _editor.restoreViewState>[0])
+      try { _editor.restoreViewState(viewStateRef.current as Parameters<typeof _editor.restoreViewState>[0]) } catch { /* a stale draft view state is not worth failing the open */ }
     } else if (line) {
       _editor.setPosition({ lineNumber: line, column: 1 })
       _editor.revealLineInCenter(line)
@@ -412,7 +427,15 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
       {loading ? (
         <div className="editor-loading"><LoaderCircle className="spin" size={18} /> Opening {path}</div>
       ) : error && !loadedRef.current ? (
-        <div className="editor-loading">{error}</div>
+        <div className="editor-blocked">
+          <strong>{blocked ? 'Not opened as text' : `Could not open ${path}`}</strong>
+          <span>{error}</span>
+          <div>
+            <button onClick={() => openWorkspaceFile(project.id, path, 'preview')}><Eye size={14} /> Preview instead</button>
+            <button onClick={() => void window.conductor.files.openExternal(project.id, path)}><ExternalLink size={14} /> Open with default app</button>
+            {blocked && overridable && <button onClick={() => { allowBinaryRef.current = true; setReloadKey((value) => value + 1) }}><FileWarning size={14} /> Show as text anyway</button>}
+          </div>
+        </div>
       ) : (
         <Editor
           path={`${project.id}/${encodeURIComponent(tabId)}/${path}`}
@@ -427,6 +450,10 @@ export function CodePane({ project, tabId, path, line, autoFocus = true }: { pro
             checkpointDraft(true)
           }}
           options={{
+            // A forced binary view is for looking only: saving would write the lossy UTF-8 decode
+            // back over the original bytes, and the conflict guard cannot see it because a re-read
+            // produces that same lossy string.
+            readOnly: allowBinaryRef.current,
             automaticLayout: true,
             wordWrap: wordWrap ? 'on' : 'off',
             wrappingIndent: 'same',

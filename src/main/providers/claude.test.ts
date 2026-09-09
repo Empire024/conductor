@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
-import { ClaudeAdapter } from './claude'
+import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility } from './claude'
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import { resolve, join } from 'node:path'
@@ -28,11 +28,11 @@ class FakeTransport {
 const adapters: ClaudeAdapter[] = []
 const imageRoots: string[] = []
 afterEach(() => { for (const adapter of adapters.splice(0)) adapter.dispose(); for (const root of imageRoots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 }) })
-function fixture(overrides: Partial<AdapterOptions> = {}, autoInitialize = true) {
+function fixture(overrides: Partial<AdapterOptions> = {}, autoInitialize = true, runtimeVersion = '2.1.263') {
   const events: AdapterEvent[] = []
   let transport!: FakeTransport
   const adapter = new ClaudeAdapter({ executable: 'synthetic-claude', cwd: process.cwd(), runtimeId: 'incarnation-A', settings, emit: (event) => events.push(event), ...overrides }, {
-    version: async () => '2.1.263', createTransport: (options) => transport = new FakeTransport(options, autoInitialize)
+    version: async () => runtimeVersion, createTransport: (options) => transport = new FakeTransport(options, autoInitialize)
   })
   adapters.push(adapter)
   return { adapter, events, get transport() { return transport }, projection: () => replayAgentEvents('session', events.map((event, i): AgentEvent => ({ schemaVersion: 1, id: `event-${i}`, sequence: i + 1, sessionId: 'session', runtimeId: 'incarnation-A', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: process.cwd(), timestamp: '2026-09-07T00:00:00.000Z', ...event }))) }
@@ -48,6 +48,24 @@ function hook(requestId: string, callback: string, toolId: string, name: string,
 }
 
 describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
+  it('connects to patch and minor releases at or above the baseline, recording the unverified gap', async () => {
+    expect(claudeCompatibility(CLAUDE_COMPATIBILITY)).toEqual({ supported: true, verified: true })
+    expect(claudeCompatibility('2.1.265')).toEqual({ supported: true, verified: false })
+    expect(claudeCompatibility('2.2.0')).toEqual({ supported: true, verified: false })
+    const f = fixture({}, true, '2.1.265')
+    await f.adapter.start()
+    expect(f.adapter.capabilities.runtimeVersion).toBe('2.1.265')
+    expect(f.adapter.capabilities.limitations.some(limitation => limitation.includes('2.1.265') && limitation.includes('fixture-verified'))).toBe(true)
+  })
+
+  it('refuses a CLI below the baseline, a different major, and an unreadable version', async () => {
+    expect(claudeCompatibility('2.1.262').supported).toBe(false)
+    expect(claudeCompatibility('2.0.999').supported).toBe(false)
+    expect(claudeCompatibility('3.0.0').supported).toBe(false)
+    expect(claudeCompatibility('unknown').supported).toBe(false)
+    await expect(fixture({}, true, '2.1.262').adapter.start()).rejects.toThrow('below the tested 2.1.263 bridge baseline')
+  })
+
   it('awaits initialize and keeps user configuration/native coding prompt and resume identity', async () => {
     const f = fixture({ nativeSessionId: 'native-session' }, false)
     const starting = f.adapter.start()
@@ -354,6 +372,35 @@ describe('Claude conversation reliability', () => {
     expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ model: 'actual-runtime-model' })
     f.transport.receive({ type: 'result', subtype: 'success', usage: { input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 5, output_tokens: 15 } })
     expect(f.projection().items.some(item => item.data.type === 'usage' && item.data.scope === 'turn' && item.data.totalTokens === 50)).toBe(true)
+  })
+  it('normalizes reported account allowance windows and records the first level of a run separately', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    // Claude's own wire shape: fractional utilization keyed by window, epoch-second resetsAt.
+    f.transport.receive({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: {
+      five_hour: { utilization: 0.24, resetsAt: 1789416000 },
+      seven_day: { utilization: 0.1 },
+      model_scoped: { utilization: null }
+    } } })
+    const first = f.projection().items.find(item => item.nativeItemId === 'usage:account-rate-limits:first')
+    const rolling = () => f.projection().items.find(item => item.nativeItemId === 'usage:account-rate-limits')
+    // Rescaled to the same 0-100 shape Codex reports, with Claude's fixed window durations.
+    expect(first?.data).toMatchObject({ type: 'usage', source: 'provider', limits: { rateLimits: {
+      five_hour: { usedPercent: 24, windowDurationMins: 300, resetsAt: 1789416000 },
+      seven_day: { usedPercent: 10, windowDurationMins: 10080 }
+    } } })
+    // An unreported utilization is dropped, never recorded as zero usage.
+    expect(JSON.stringify(first?.data)).not.toContain('model_scoped')
+
+    f.transport.receive({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: { seven_day: { utilization: 0.62 } } } })
+    // The rolling item moves; the first-observed level is retained so a share can be sourced.
+    expect(rolling()?.data).toMatchObject({ limits: { rateLimits: { seven_day: { usedPercent: 62 } } } })
+    expect(first?.data).toMatchObject({ limits: { rateLimits: { seven_day: { usedPercent: 10 } } } })
+
+    // A report with nothing measurable in it is not recorded at all.
+    const before = f.projection().items.length
+    f.transport.receive({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: { seven_day: { utilization: null } } } })
+    expect(f.projection().items).toHaveLength(before)
   })
   it('preserves an ordinary final bracket after withholding an incomplete diagnostic prefix', async () => {
     const f = fixture()

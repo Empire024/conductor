@@ -1,3 +1,7 @@
+import { isUsageCap, parseUsageCapSetting, type UsageCapScope, type UsageCapSetting } from '../shared/usage-accounting'
+
+export type { UsageCapScope } from '../shared/usage-accounting'
+
 const LIMIT_LANGUAGE = /\b(?:(?:usage|rate)[\s-]*)?limit\b|\bquota\b/i
 const RESET_LANGUAGE = /\b(?:reset(?:s|ting)?|try again|retry|available(?: again)?|continue)\b/i
 const AVAILABLE_RESET_CREDITS = /\b(?:you\s+have\s+)?\d+\s+(?:usage[\s-]+)?limit\s+resets?\s+available\b/i
@@ -68,4 +72,37 @@ export const parseUsageLimitReset = (text: string, from = new Date()): Date | nu
   result.setHours(hour, minute, 0, 0)
   if (result.getTime() <= from.getTime() + 30_000) result.setDate(result.getDate() + 1)
   return result
+}
+
+/* ------------------------------------------------------------------------- *
+ * Usage caps
+ *
+ * A cap is the owner's own stop rule, evaluated against the same provider-reported
+ * figures the usage panel shows. It is deliberately separate from `continueOnLimit`,
+ * which reacts to the provider's own limit by resuming later: a cap the owner set is
+ * never auto-resumed, because resuming is the exact thing it was configured to prevent.
+ * ------------------------------------------------------------------------- */
+
+export interface ResolvedUsageCap { setting: UsageCapSetting; scope: UsageCapScope }
+
+/** Keys in the existing settings table; no schema change and no parallel store. */
+export const usageCapKey = (scope: UsageCapScope, id?: string): string =>
+  scope === 'default' ? 'usageCap:default' : `usageCap:${scope}:${id}`
+
+/**
+ * Most specific wins, and an explicit "none" at a narrower scope opts that conversation
+ * out of a broader cap instead of silently inheriting it.
+ */
+export function resolveUsageCap(stored: Partial<Record<UsageCapScope, string | null>>): ResolvedUsageCap | null {
+  for (const scope of ['tab', 'workspace', 'default'] as const) {
+    const setting = parseUsageCapSetting(stored[scope] ?? null)
+    if (setting) return { setting, scope }
+  }
+  return null
+}
+
+/** The cap that actually stops work, or null when nothing applies. */
+export function activeUsageCap(stored: Partial<Record<UsageCapScope, string | null>>): ResolvedUsageCap | null {
+  const resolved = resolveUsageCap(stored)
+  return resolved && isUsageCap(resolved.setting) ? resolved : null
 }

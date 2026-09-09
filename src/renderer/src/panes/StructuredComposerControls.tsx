@@ -42,8 +42,11 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
     close()
   }
   // The composer commits the effort it is showing, so the runtime is never guessing.
+  // Until the real per-model catalog has been reported, the ladder shown is only the
+  // provider's static fallback: display it, but never persist a guessed value.
   useEffect(() => {
-    if (supportedEfforts?.length === 0) { if (settings.effort) onChange({ effort: undefined }); return }
+    if (supportedEfforts === undefined) return
+    if (supportedEfforts.length === 0) { if (settings.effort) onChange({ effort: undefined }); return }
     if (!unavailableEffort && effort && settings.effort !== effort) onChange({ effort })
   }, [supportedEfforts, settings.effort, effort, unavailableEffort, onChange])
 

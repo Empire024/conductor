@@ -60,6 +60,15 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(events.some(event => event.data.type === 'tool' && event.data.status === 'failed' && event.data.exitCode === 2)).toBe(true)
     expect(events.filter(event => event.data.type === 'text' && event.data.role === 'assistant')).toHaveLength(2)
   })
+  it('reports the model, effort and model provider Codex assigns to a spawned subagent thread', async () => {
+    const { adapter, events } = create()
+    await adapter.submit('synthetic:subagent-model', settings)
+    await waitFor(() => completed(events))
+    const subagents = events.filter(event => event.data.type === 'subagent').map(event => event.data)
+    expect(subagents[0]).toMatchObject({ name: 'Codex agent', status: 'running', model: 'gpt-5-high', effort: 'high' })
+    expect(subagents[1]).toMatchObject({ name: 'Researcher', status: 'running', model: 'gpt-5-high', effort: 'high', modelProvider: 'openai' })
+  })
+
   it('decodes fragmented Unicode, preserves repeated chunks, correlates concurrent tools, and uses final snapshots', async () => {
     const { adapter, events } = create()
     await adapter.submit('synthetic:stream', settings)

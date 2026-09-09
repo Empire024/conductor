@@ -1,5 +1,6 @@
 import type { ConversationIdentity } from './conversation-tab'
 import { NativeCliPane } from './NativeCliPane'
+import { copyTextWithFeedback } from '../clipboard'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
@@ -238,18 +239,14 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
       if (props.mode !== 'agent' || event.type !== 'keydown' || !event.ctrlKey || event.key.toLowerCase() !== 'c') return true
       const selection = terminal.getSelection()
       if (selection) {
-        void navigator.clipboard.writeText(selection).then(() => {
-          window.dispatchEvent(new CustomEvent('conductor:toast', { detail: `Copied ${selection.length.toLocaleString()} characters` }))
-        })
+        void copyTextWithFeedback(selection, `Copied ${selection.length.toLocaleString()} characters`)
       } else window.conductor.agents.interrupt(props.resourceId)
       return false
     })
     const selection = terminal.onSelectionChange(() => {
       const text = terminal.getSelection()
       if (!text) return
-      void navigator.clipboard.writeText(text).then(() => {
-        window.dispatchEvent(new CustomEvent('conductor:toast', { detail: `Copied ${text.length.toLocaleString()} characters` }))
-      })
+      void copyTextWithFeedback(text, `Copied ${text.length.toLocaleString()} characters`)
     })
 
     const linkRegistration = openFileRef.current
@@ -337,10 +334,10 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
         current ? { ...current, status: event.status, message: event.message, resumeAt: event.resumeAt, model: event.model ?? current.model } : current
       )
       if (props.mode === 'agent') {
-        const nextPhase = event.phase ?? (
-          event.status === 'waiting_input' || event.status === 'limited' || event.status === 'complete' || event.status === 'error'
+        const nextPhase: AgentActivityPhase = event.phase ?? (
+          event.status === 'waiting_input' || event.status === 'limited' || event.status === 'complete'
             ? event.status
-            : 'idle'
+            : event.status === 'error' ? 'failed' : 'idle'
         )
         setPhase(nextPhase)
         if (nextPhase !== 'waiting_input') setBlockingInteraction(null)
@@ -378,8 +375,9 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
     void ensure.then((result) => {
       setRuntime(result)
       if (props.mode === 'agent') {
-        const nextPhase: AgentActivityPhase = result.status === 'running' ? 'idle' :
-          result.status === 'starting' || result.status === 'exited' || result.status === 'unavailable' ? 'idle' : result.status
+        const nextPhase: AgentActivityPhase = result.status === 'running' || result.status === 'starting' || result.status === 'exited' ? 'idle' :
+          // The CLI could not be found or the run errored: both are failures to report, not idleness.
+          result.status === 'unavailable' || result.status === 'error' ? 'failed' : result.status
         setPhase(nextPhase)
         window.dispatchEvent(new CustomEvent('conductor:agent-activity', {
           detail: { id: props.resourceId, phase: nextPhase, resumeAt: result.resumeAt }
@@ -399,10 +397,11 @@ function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
       replayingTranscript = false
       const message = error instanceof Error ? error.message : 'Runtime connection failed'
       setRuntime({ id: props.resourceId, available: false, status: 'error', transcript: '', message })
-      setPhase('error')
+      // Reaching the runtime failed outright, which is a disconnection rather than a failed run.
+      setPhase('disconnected')
       if (props.mode === 'agent') {
         window.dispatchEvent(new CustomEvent('conductor:agent-activity', {
-          detail: { id: props.resourceId, phase: 'error' }
+          detail: { id: props.resourceId, phase: 'disconnected' }
         }))
       }
     })

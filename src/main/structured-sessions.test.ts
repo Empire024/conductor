@@ -876,3 +876,20 @@ it.each([false, true])('retains explicitly queued unsupported-turn input after i
   expect(f.current.steers).toHaveLength(0)
   expect(f.current.submissions).toHaveLength(1)
 })
+
+describe('composer settings persistence', () => {
+  it('keeps a chosen model and effort with the conversation, across a restart, without starting a runtime', () => {
+    const f = fixture()
+    f.manager.saveSettings(f.spec.id, { ...settings, model: 'opus', effort: 'low' })
+    expect(f.database.structured.snapshot(f.spec.id)?.settings).toMatchObject({ model: 'opus', effort: 'low' })
+    expect(f.adapters.some(adapter => adapter.starts > 0)).toBe(false)
+    f.database.close()
+    const reopened = new ConductorDatabase(f.databasePath); databases.push(reopened)
+    expect(reopened.structured.snapshot(f.spec.id)?.settings).toMatchObject({ model: 'opus', effort: 'low' })
+  })
+  it('refuses a setting the provider never offered, leaving the saved conversation settings alone', () => {
+    const f = fixture()
+    expect(() => f.manager.saveSettings(f.spec.id, { ...settings, effort: 'ultra' })).toThrow(/Effort/)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.effort).toBeUndefined()
+  })
+})

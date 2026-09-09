@@ -15,6 +15,7 @@ import type { ConductorDatabase } from './database'
 import { parseUsageLimitReset } from './usage-limit'
 import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSignalAgentOutput } from './agent-activity'
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
+import { captureMemories, capturedMemoryKey, formatRecalledMemories, MEMORY_PROTOCOL } from './memory'
 import { NativeCliManager } from './native-cli-manager'
 import { StructuredSessions } from './structured-sessions'
 import { projectTaskBriefing } from './project-backlog'
@@ -187,10 +188,21 @@ interface LiveAgent {
   status: RuntimeEnsureResult['status']
 }
 
+const statusListeners = new Set<() => void>()
+
+/** Every agent phase change - legacy terminal agents here and structured sessions through the
+ *  same broadcast - is announced on 'agent:status'. Cross-project activity is recomputed from
+ *  the database on this signal, since no renderer sees agents outside its active project. */
+export const onAgentStatusChange = (listener: () => void): (() => void) => {
+  statusListeners.add(listener)
+  return () => { statusListeners.delete(listener) }
+}
+
 const broadcast = (channel: string, payload: unknown): void => {
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) window.webContents.send(channel, payload)
   }
+  if (channel === 'agent:status') for (const listener of [...statusListeners]) listener()
 }
 
 const stripAnsi = (value: string): string =>
@@ -203,6 +215,10 @@ export class AgentManager {
   readonly nativeCli: NativeCliManager
   private readonly agents = new Map<string, LiveAgent>()
   private readonly continuationTimers = new Map<string, NodeJS.Timeout>()
+  // Per-session, not persisted: the protocol is handed over once per run, and a repeated
+  // assistant snapshot must not bank the same claim twice within that run.
+  private readonly memoryBriefed = new Set<string>()
+  private readonly memoryCaptures = new Map<string, Set<string>>()
   private disposing = false
 
   constructor(
@@ -212,16 +228,53 @@ export class AgentManager {
   ) {
     this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
       undefined,
-      (spec, prompt) => {
+      (spec, prompt, itemId) => {
+        // The write half of the contract is a once-per-session cost: it competes with the
+        // user's actual request for attention, and repeating it every turn buys nothing.
+        const first = !this.memoryBriefed.has(spec.id)
+        if (first) {
+          this.memoryBriefed.add(spec.id)
+          try { database.forgetStaleMemories(spec.projectId) } catch { /* Pruning is opportunistic; recall works without it. */ }
+        }
         const memories = database.recall(spec.projectId, prompt, spec.provider, 8)
-        const memoryContext = memories.length ? `Conductor project memory (current project evidence takes precedence):\n${memories.map(memory => `- [${memory.kind}] ${memory.gist.slice(0, 520)}`).join('\n')}` : ''
-        return [memoryContext, collaboration?.briefingFor(spec.id) ?? '', projectTaskBriefing(spec), this.controlBriefing?.(spec) ?? ''].filter(Boolean).join('\n\n')
+        const recalled = formatRecalledMemories(memories)
+        // Recall that reached the prompt is recorded against the user message it travelled
+        // with, so a memory steering the turn is visible in the conversation instead of
+        // being an invisible edit to the prompt.
+        if (recalled) {
+          try { database.recordMemoryRecall({ projectId: spec.projectId, agentSessionId: spec.id, itemId, prompt, memoryIds: memories.map(memory => memory.id) }) }
+          catch { /* The ledger explains a turn; it is never a precondition for sending one. */ }
+        }
+        const memoryContext = recalled ? `Conductor project memory (current project evidence takes precedence):\n${recalled}` : ''
+        return [memoryContext, first ? MEMORY_PROTOCOL : '', collaboration?.briefingFor(spec.id) ?? '', projectTaskBriefing(spec), this.controlBriefing?.(spec) ?? ''].filter(Boolean).join('\n\n')
       },
       (spec, event) => {
+        if (event.data.type === 'text' && event.data.role === 'assistant' && event.data.mode === 'snapshot') this.bankMemories(spec, event.itemId, event.data.text)
         if (event.data.type !== 'tool' && event.data.type !== 'changes') return
         try { collaboration?.observeEvent(spec, { id: event.id, agentSessionId: spec.id, type: event.data.type === 'changes' ? 'file_change' : 'tool_call', message: event.data.type === 'tool' ? event.data.name : event.data.changes.map(change => change.path).join(', '), metadata: { structured: true, itemId: event.itemId, input: event.data.type === 'tool' ? event.data.input : undefined }, createdAt: event.timestamp }) } catch { /* Coordination remains advisory. */ }
       })
     this.nativeCli = new NativeCliManager(this.structured, database, (provider) => providers[provider].resolveExecutable(), broadcast)
+  }
+
+  /** Reads the agent's memory-write sentinels out of its own reply and banks them as agent-source
+   *  memories. A rejected gist is dropped quietly: a bad sentinel must never fail the turn. */
+  private bankMemories(spec: AgentSpec, itemId: string | undefined, text: string): void {
+    let seen = this.memoryCaptures.get(spec.id)
+    if (!seen) { seen = new Set<string>(); this.memoryCaptures.set(spec.id, seen) }
+    for (const captured of captureMemories(text)) {
+      const key = capturedMemoryKey(itemId, captured)
+      if (seen.has(key)) continue
+      // Bounded, so a long-running session cannot grow this set without limit.
+      if (seen.size >= 500) seen.clear()
+      seen.add(key)
+      try {
+        this.database.remember({
+          projectId: spec.projectId, agentKey: spec.provider, source: 'agent', ...captured,
+          origin: { agentSessionId: spec.id, workspaceId: spec.sessionId, title: spec.title, provider: spec.provider }
+        })
+      }
+      catch { /* The agent wrote something unusable; that is not the user's problem. */ }
+    }
   }
 
   listProviders(): AgentProviderInfo[] {
@@ -553,7 +606,7 @@ export class AgentManager {
     const executable = provider.resolveExecutable()
     if (!executable) {
       const message = `${provider.displayName} CLI was not found. Add it to PATH or set CONDUCTOR_${spec.provider.toUpperCase()}_PATH.`
-      this.database.setAgentStatus(spec.id, 'unavailable', 'error')
+      this.database.setAgentStatus(spec.id, 'unavailable', 'failed')
       this.emitEvent(spec, 'error', message)
       return { id: spec.id, available: false, status: 'unavailable', transcript, message }
     }
@@ -611,22 +664,22 @@ export class AgentManager {
           live.lastOutputSignal = outputSignal
         }
         live.limitProbe = `${live.limitProbe}${plainText}`.slice(-4000)
-        for (const match of live.limitProbe.matchAll(/CONDUCTOR_MEMORY(?:\[(episodic|semantic|procedural)\])?:\s*([^\r\n|]{12,1000})(?:\|\s*cues:\s*([^\r\n]+))?/gi)) {
-          const kind = (match[1]?.toLowerCase() ?? 'semantic') as 'episodic' | 'semantic' | 'procedural'
-          const gist = match[2]!.trim()
-          const key = `${kind}:${gist.toLowerCase()}`
+        // Terminal runtimes carry the same write contract as structured ones, so they share
+        // its single parser rather than keeping a second copy of the sentinel and kind list.
+        for (const captured of captureMemories(live.limitProbe)) {
+          const key = capturedMemoryKey(undefined, captured)
           if (live.capturedMemories.has(key)) continue
           live.capturedMemories.add(key)
           const memory = this.database.remember({
             projectId: currentSpec.projectId,
             agentKey: currentSpec.provider,
-            kind,
-            gist,
-            cues: match[3]?.split(',').map((cue) => cue.trim()).filter(Boolean),
-            confidence: 0.72,
-            salience: 0.58
+            source: 'agent',
+            origin: { agentSessionId: currentSpec.id, workspaceId: currentSpec.sessionId, title: currentSpec.title, provider: currentSpec.provider },
+            ...captured,
+            confidence: captured.confidence ?? 0.72,
+            salience: captured.salience ?? 0.58
           })
-          this.emitEvent(currentSpec, 'artifact', `Stored distilled ${kind} memory: ${memory.gist}`, { memoryId: memory.id })
+          this.emitEvent(currentSpec, 'artifact', `Stored distilled ${captured.kind} memory: ${memory.gist}`, { memoryId: memory.id })
         }
         if (meaningfulOutput && !live.limitDetected && shouldSignalAgentOutput(live.workPending, live.suppressActivityUntil)) {
           live.status = 'running'

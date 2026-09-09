@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { copyTextWithFeedback } from '../clipboard'
 import {
   AlertTriangle,
   ArrowDown,
@@ -101,8 +102,7 @@ function RichText({ body }: { body: string }): React.JSX.Element {
     if (!code) return
     const codeText = code.join('\n')
     rendered.push(<pre key={`code-${rendered.length}`}><header><span>{language || 'code'}</span><button onClick={() => {
-      void navigator.clipboard.writeText(codeText)
-      window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Code copied' }))
+      void copyTextWithFeedback(codeText, 'Code copied')
     }}>Copy</button></header><code>{codeText}</code></pre>)
     code = null
     language = ''

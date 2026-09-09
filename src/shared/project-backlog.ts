@@ -3,6 +3,9 @@ import type { SourceControlChangeSet, SourceControlStatus } from './source-contr
 export type ProjectTaskStatus = 'todo' | 'doing' | 'done'
 export type ProjectTaskKind = 'bug' | 'feature' | 'idea'
 export const projectTaskKinds: ProjectTaskKind[] = ['bug', 'feature', 'idea']
+/** A small, obvious scale: no numeric ranking. Missing/unknown markers degrade to 'normal'. */
+export type ProjectTaskPriority = 'high' | 'normal' | 'low'
+export const projectTaskPriorities: ProjectTaskPriority[] = ['high', 'normal', 'low']
 /** Who moved a task, in which workspace, and what the repository looked like then. */
 export interface ProjectTaskActivity {
   id:string
@@ -19,10 +22,10 @@ export interface ProjectTaskActivity {
   workspace?:string
   commit?:string
 }
-export interface ProjectTask { id:string; title:string; kind:ProjectTaskKind; status:ProjectTaskStatus; agentId?:string; line:number; activity:ProjectTaskActivity[] }
+export interface ProjectTask { id:string; title:string; kind:ProjectTaskKind; status:ProjectTaskStatus; agentId?:string; priority:ProjectTaskPriority; line:number; activity:ProjectTaskActivity[] }
 export interface ProjectTaskOwner { id:string; sessionId:string; title:string; workspace:string; provider:string; phase:string }
 export interface ProjectBacklog { projectId:string; path:string; revision:string; tasks:ProjectTask[]; owners:ProjectTaskOwner[]; sourceControl:SourceControlStatus }
-export type ProjectTaskEdit = { type:'add'; title:string; kind:ProjectTaskKind } | { type:'update'; id:string; title?:string; status?:ProjectTaskStatus; agentId?:string|null } | {type:'remove';id:string}
+export type ProjectTaskEdit = { type:'add'; title:string; kind:ProjectTaskKind; priority?:ProjectTaskPriority } | { type:'update'; id:string; title?:string; status?:ProjectTaskStatus; agentId?:string|null; priority?:ProjectTaskPriority } | {type:'remove';id:string}
 export interface ProjectBacklogBridge {
   get(projectId:string):Promise<ProjectBacklog>
   edit(projectId:string,revision:string,edit:ProjectTaskEdit):Promise<ProjectBacklog>

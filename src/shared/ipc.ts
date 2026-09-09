@@ -1,3 +1,4 @@
+import type { UsageCapScope, UsageCapSetting, UsageCapSnapshot } from './usage-accounting'
 import type {
   AppSettings,
   AgentSoundProfile,
@@ -25,17 +26,24 @@ import type {
   TerminalSpec,
   ThemeId,
   ThemeVariant,
+  MemoryPruneCandidate,
   RememberMemoryInput,
+  TurnMemoryRecall,
+  UpdateMemoryInput,
   WorkspaceRecoveryCheckpoint,
   WorkspaceRecoveryState,
   WorkspaceLayout
 } from './models'
+import type { ProjectActivitySnapshot } from './project-activity'
 import type { OrchestrationBridge } from './orchestration'
 import type { AgentCollaborationBridge } from './agent-collaboration'
 import type { StructuredAgentBridge } from './structured-agent'
 
+export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: string; recentPaths?: Array<{ projectId: string; path: string }> }
+
 export interface ConductorBridge {
   agentControl: import('./agent-control').AgentControlBridge
+  remote: import('./remote-control').RemoteControlBridge
   projectTasks: import('./project-backlog').ProjectBacklogBridge
   nativeCli: {
     ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }>
@@ -67,6 +75,7 @@ export interface ConductorBridge {
     setThemeVariant(themeVariant: ThemeVariant): Promise<AppSettings>
     setThemeAuto(enabled: boolean): Promise<AppSettings>
     setDebugLogging(enabled: boolean): Promise<AppSettings>
+    setShowHiddenFiles(enabled: boolean): Promise<AppSettings>
     setAgentSoundProfile(profile: AgentSoundProfile): Promise<AppSettings>
     setDefaultNewFileExtension(extension: string): Promise<AppSettings>
     setUpdateFeedUrl(url: string): Promise<AppSettings>
@@ -115,10 +124,11 @@ export interface ConductorBridge {
     confirmClose(tabIds: string[]): Promise<boolean>
     onDraftResolved(callback: (result: { tabId: string; submitted: string; content: string | null; saved: boolean }) => void): () => void
     onDraftConflict(callback: (result: { tabId: string; message: string }) => void): () => void
-    search(projectIds: string[], query: string): Promise<Array<{ projectId: string; path: string }>>
+    search(projectIds: string[], query: string, options?: FileSearchOptions): Promise<Array<{ projectId: string; path: string }>>
     list(projectId: string, relativePath?: string): Promise<FileEntry[]>
     read(projectId: string, relativePath: string): Promise<string>
-    readForEditor(projectId: string, relativePath: string): Promise<string | null>
+    stat(projectId: string, relativePath: string): Promise<{ size: number; isFile: boolean; modifiedAt: string }>
+    readForEditor(projectId: string, relativePath: string, allowBinary?: boolean): Promise<string | null>
     readDataUrl(projectId: string, relativePath: string): Promise<FileDataResource>
     write(projectId: string, relativePath: string, content: string, expectedContent?: string | null): Promise<EditorFileWriteResult>
     saveCopy(projectId: string, relativePath: string, content: string): Promise<string>
@@ -160,14 +170,29 @@ export interface ConductorBridge {
     listProviders(): Promise<AgentProviderInfo[]>
     listProcesses(projectId?: string): Promise<RuntimeProcessSummary[]>
   }
+  /** Owner-set stop rules, evaluated against provider-reported usage. */
+  usageCaps: {
+    /** Omit both ids to read only the account-wide default. */
+    read(agentSessionId?: string, workspaceId?: string): Promise<UsageCapSnapshot>
+    write(scope: UsageCapScope, id: string | null, setting: UsageCapSetting | null): Promise<void>
+  }
+  /** Agent activity for every project, including those whose panes are not mounted. */
+  activity: {
+    projects(): Promise<ProjectActivitySnapshot>
+    onProjectsChanged(callback: (snapshot: ProjectActivitySnapshot) => void): () => void
+  }
   memory: {
     list(projectId: string, agentKey?: string): Promise<AgentMemory[]>
     remember(input: RememberMemoryInput): Promise<AgentMemory>
+    update(input: UpdateMemoryInput): Promise<AgentMemory>
     recall(projectId: string, query: string, agentKey?: string, limit?: number): Promise<AgentMemory[]>
     remove(id: string): Promise<void>
+    pruneCandidates(projectId: string, limit?: number): Promise<MemoryPruneCandidate[]>
+    turnRecalls(agentSessionId: string): Promise<TurnMemoryRecall[]>
   }
   system: {
     openExternal(url: string): Promise<void>
+    copyText(value: string): Promise<void>
     getDiagnostics(): Promise<AppDiagnostics>
     getPerformance(browserWebContents: Record<string, number>): Promise<AppPerformanceSnapshot>
   }

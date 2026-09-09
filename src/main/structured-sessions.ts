@@ -2,14 +2,17 @@ import { concreteModel } from '../shared/agent-model-selection'
 import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-history'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
-import type { AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
+import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import { settingsForRuntime } from '../shared/structured-agent'
-import type { AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import { createProviderAdapter } from './providers/factory'
 import { validateLiveTurn } from './live-test-policy'
+import { activeUsageCap, usageCapKey } from './usage-limit'
+import { describeUsageCap, evaluateUsageCap, summarizeUsageRun, type UsageCapStatus } from '../shared/usage-accounting'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 
@@ -35,6 +38,9 @@ interface LiveSession {
   responses: Set<string>
   budget?: LiveRuntimeBudget
   shutdownTimer?: NodeJS.Timeout
+  /** The cap decision that stopped this conversation; cleared when the owner changes the cap. */
+  capStop?: { reason: string; capKey: string }
+  capTimer?: NodeJS.Timeout
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
@@ -49,7 +55,9 @@ export class StructuredSessions {
     private resolveExecutable: (provider: StructuredProvider) => string | null,
     private broadcast: (channel: string, payload: unknown) => void,
     private factory: Factory = createProviderAdapter,
-    private context?: (spec: AgentSpec, prompt: string) => string,
+    // `itemId` is the user message this context rides along with: recall is recorded against
+    // it so the conversation can show which memories reached the turn.
+    private context?: (spec: AgentSpec, prompt: string, itemId: string) => string,
     private observe?: (spec: AgentSpec, event: AgentEvent) => void
   ) { this.artifacts = new AgentArtifacts(database.structured) }
 
@@ -220,6 +228,16 @@ export class StructuredSessions {
     this.database.removeSetting('agentControlParent:' + id)
   }
 
+  /** The composer chooses model, effort and permission for the next message, which can be long
+   *  before that message exists. Persisting the choice keeps a reopened pane on what the user
+   *  picked instead of resetting it to the registration defaults; it starts no runtime. */
+  saveSettings(id: string, settings: SessionSettings): void {
+    const state = this.database.structured.snapshot(id)
+    if (!state) throw new Error('Session not found')
+    this.validateSettings(settings, state.capabilities)
+    this.database.structured.update(id, { settings })
+  }
+
   async resume(id: string, settings?: SessionSettings): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
@@ -272,13 +290,13 @@ export class StructuredSessions {
     return forkId
   }
 
-  async queue(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
-    return this.followup(id, text, settings, attachments, false)
+  async queue(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
+    return this.followup(id, text, settings, attachments, false, undefined, origin)
   }
-  async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
-    return this.followup(id, text, settings, attachments, true)
+  async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
+    return this.followup(id, text, settings, attachments, true, undefined, origin)
   }
-  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptId?: string): Promise<void> {
+  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptId?: string, origin?: PromptOrigin): Promise<void> {
     const live = this.get(id), adapter = live.adapter, runtimeId = live.runtimeId, turnId = live.turnId
     const captured = structuredClone(attachments)
     settings = structuredClone(settings)
@@ -302,7 +320,7 @@ export class StructuredSessions {
         if ((latest.pendingSteering?.length ?? 0) >= 100) throw new Error('There are already 100 pending steering messages')
         live.steering = true
         const inputId = randomUUID()
-        this.setSteering(live, [...latest.pendingSteering ?? [], { id: inputId, text: text.trim(), settings: structuredClone(latest.settings), attachments: captured, runtimeId, turnId, status: 'sending' }])
+        this.setSteering(live, [...latest.pendingSteering ?? [], { id: inputId, text: text.trim(), settings: structuredClone(latest.settings), attachments: captured, runtimeId, turnId, status: 'sending', ...(origin ? { origin } : {}) }])
         // Transfer ownership before the native attempt. An uncertain response must
         // leave only the pending record, never an automatically drainable copy.
         if (queuedPromptId) this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(input => input.id !== queuedPromptId))
@@ -328,7 +346,7 @@ export class StructuredSessions {
       }
       const prompts = latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])
       if (prompts.length >= 100) throw new Error('The queue is full (100 messages)')
-      this.setQueue(live, [...prompts, { id: randomUUID(), text, settings: structuredClone(settings), attachments: captured, ...(maySteer ? { steer: true } : {}) }])
+      this.setQueue(live, [...prompts, { id: randomUUID(), text, settings: structuredClone(settings), attachments: captured, ...(maySteer ? { steer: true } : {}), ...(origin ? { origin } : {}) }])
       if (refusedInputId) this.setSteering(live, (this.database.structured.snapshot(id)?.pendingSteering ?? []).filter(input => input.id !== refusedInputId))
       if (steer) this.emit(live, { data: { type: 'notice', message: 'Message queued instead of steered: ' + refusal } })
       void this.drainQueue(live)
@@ -349,7 +367,7 @@ export class StructuredSessions {
     if (status === 'delivered') {
       this.setSteering(live, prompts.filter(prompt => prompt.id !== inputId), source.native)
       live.expediteInput?.delete(inputId)
-      this.emit(live, { turnId: input.turnId, itemId: inputId, data: { type: 'text', role: 'user', text: input.text, mode: 'snapshot', ...(input.attachments.length ? { attachments: input.attachments.map(({ content: _content, ...metadata }) => metadata) } : {}) }, native: source.native })
+      this.emit(live, { turnId: input.turnId, itemId: inputId, data: { type: 'text', role: 'user', text: input.text, mode: 'snapshot', ...(input.attachments.length ? { attachments: input.attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(input.origin ? { origin: input.origin } : {}) }, native: source.native })
     } else {
       // A delayed ACK cannot downgrade a terminal/uncertain outcome.
       if (status === 'accepted' && input.status !== 'sending') return
@@ -377,6 +395,7 @@ export class StructuredSessions {
   private async drainQueue(live: LiveSession): Promise<void> {
     let state = this.database.structured.snapshot(live.spec.id)
     if (!state || live.closed || live.submitting || live.steering || live.dispatchingQueue || !live.adapter) return
+    if (live.capStop && this.capSetting(live)?.key === live.capStop.capKey) return
     if (live.expediteReady && ['interrupted', 'completed'].includes(state.phase)) {
       const recovered = (state.pendingSteering ?? []).filter(input => live.expediteInput?.has(input.id) && input.status === 'cancelled')
       const queued = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
@@ -399,8 +418,8 @@ export class StructuredSessions {
     live.dispatchingPromptId = queued.id
     let sent = false
     try {
-      if (canSteer) await this.followup(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments), true, queued.id)
-      else { live.sendAfterInterrupt = false; await this.submit(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments)) }
+      if (canSteer) await this.followup(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments), true, queued.id, queued.origin)
+      else { live.sendAfterInterrupt = false; await this.submit(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments), queued.origin) }
       const latest = this.database.structured.snapshot(live.spec.id)!
       this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(prompt => prompt.id !== queued.id))
       sent = true
@@ -415,10 +434,11 @@ export class StructuredSessions {
     }
   }
 
-  async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
+  async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
     const live = this.get(id), store = this.database.structured, state = store.snapshot(id)!
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
     if (live.submitting || live.steering || active.has(state.phase)) throw new Error('A turn or request is already active in this session')
+    this.assertUnderUsageCap(live)
     if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Execution became uncertain. Resume the native conversation explicitly before sending another turn.')
     if (typeof text !== 'string' || !text.trim() || text.length > 60_000) throw new Error('Prompt must contain 1–60000 characters')
     settings = settingsForRuntime(settings, live.adapter ? live.runtimeId : undefined)
@@ -426,14 +446,15 @@ export class StructuredSessions {
     live.submitting = true
     try {
       const context = await this.attachments(live, attachments)
-      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text) ?? ''
+      const userItemId = randomUUID()
+      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId) ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.reserveLive(live, settings, submitted)
       store.update(id, { settings, title: state.title || text.trim().replace(/\s+/g, ' ').slice(0, 80) })
       await this.connect(live)
       if (live.closed || this.live.get(id) !== live || !live.adapter) throw new Error('Session closed during initialization; no prompt was sent')
       // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
-      this.emit(live, { itemId: randomUUID(), data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}) } })
+      this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(origin ? { origin } : {}) } })
       this.emit(live, { data: { type: 'session', phase: 'running' } })
       if (process.env.CONDUCTOR_LIVE_TESTS === '1') live.budget = new LiveRuntimeBudget(boundary => this.stopLive(live, boundary === 'active-runtime' ? 'Live prompt reached its 90 second active runtime allowance' : 'Live prompt reached its 30 second cumulative human-input wait allowance'))
       await live.adapter!.submit(submitted, settings, attachments.filter(item => item.kind === 'image'))
@@ -552,6 +573,66 @@ export class StructuredSessions {
       this.emit(live, { data: { type: 'session', phase: 'disconnected', message } })
     }, 2000)
   }
+
+  /* --- Usage caps ------------------------------------------------------- *
+   * The cap is the owner's own stop rule. It reads the same provider-reported
+   * figures the usage panel shows and never estimates a percentage the provider
+   * did not report; an unmeasurable cap simply does not fire. Unlike a provider
+   * usage limit, a cap is never continued automatically: `continueOnLimit`
+   * resumes work when the provider's window reopens, which is precisely what a
+   * deliberate cap exists to prevent.
+   * ---------------------------------------------------------------------- */
+
+  private capSetting(live: LiveSession): { setting: import('../shared/usage-accounting').UsageCapSetting; scope: string; key: string } | null {
+    const stored = {
+      tab: this.database.getSetting(usageCapKey('tab', live.spec.id)),
+      workspace: this.database.getSetting(usageCapKey('workspace', live.spec.sessionId)),
+      default: this.database.getSetting(usageCapKey('default'))
+    }
+    const resolved = activeUsageCap(stored)
+    // The key changes whenever the owner edits any cap, which releases a previous stop.
+    return resolved ? { setting: resolved.setting, scope: resolved.scope, key: JSON.stringify([stored.tab, stored.workspace, stored.default]) } : null
+  }
+
+  /** The cap status for this conversation, or null when no cap applies. */
+  usageCapStatus(id: string): (UsageCapStatus & { scope: string; description: string }) | null {
+    const live = this.live.get(id)
+    if (!live) return null
+    const configured = this.capSetting(live)
+    const state = this.database.structured.snapshot(id)
+    if (!configured || configured.setting.metric === 'none' || !state) return null
+    const report = summarizeUsageRun(state.items)
+    return { ...evaluateUsageCap(configured.setting, report.conversation), scope: configured.scope, description: describeUsageCap(configured.setting, report.currentWindows) }
+  }
+
+  private assertUnderUsageCap(live: LiveSession): void {
+    const configured = this.capSetting(live)
+    if (!configured) { live.capStop = undefined; return }
+    // Re-evaluated rather than remembered, so raising the cap or a window rollover releases the stop.
+    const status = this.usageCapStatus(live.spec.id)
+    if (!status?.reached) { live.capStop = undefined; return }
+    live.capStop = { reason: status.detail, capKey: configured.key }
+    throw new Error(`Usage cap reached, so this conversation is stopped. ${status.detail} Raise or clear the cap under Usage & limits to continue.`)
+  }
+
+  /** Called after every recorded usage report; stops cleanly the first time the cap is crossed. */
+  private enforceUsageCap(live: LiveSession): void {
+    const configured = this.capSetting(live)
+    if (!configured) { live.capStop = undefined; return }
+    if (live.capStop?.capKey === configured.key) return
+    const status = this.usageCapStatus(live.spec.id)
+    if (!status?.reached) return
+    live.capStop = { reason: status.detail, capKey: configured.key }
+    // Drop queued work first: a cap that stops the turn but lets the queue restart it is not a cap.
+    const state = this.database.structured.snapshot(live.spec.id)
+    if (state?.queuedPrompts?.length || state?.queued) this.setQueue(live, [])
+    this.emit(live, { data: { type: 'notice', message: `Usage cap reached (${configured.scope} cap). ${status.detail} Stopping this conversation. Automatic limit continuation does not apply to a cap you set; raise or clear it under Usage & limits to continue.`, payload: { metric: status.cap.metric, basis: status.cap.basis, limit: status.limit, value: status.value ?? null, scope: configured.scope } } })
+    const phase = this.database.structured.snapshot(live.spec.id)?.phase
+    if (phase && active.has(phase)) {
+      void this.interrupt(live.spec.id, false).catch(() => { /* The stop is recorded either way; the process is cleaned up on dispose. */ })
+    }
+  }
+
   private emit(live: LiveSession, source: AdapterEvent): void {
     const store = this.database.structured, state = store.snapshot(live.spec.id)
     if (!state || live.closed) return
@@ -573,11 +654,21 @@ export class StructuredSessions {
     const event = store.append({ ...source, data, schemaVersion: 1, id: randomUUID(), sequence: state.sequence + 1, sessionId: live.spec.id, runtimeId: live.runtimeId, provider: live.spec.provider as StructuredProvider, projectId: live.spec.projectId, workspaceId: live.spec.sessionId, cwd: live.spec.cwd, timestamp: new Date().toISOString(), nativeSessionId: source.nativeSessionId ?? state.nativeSessionId })
     this.pending.push(event)
     this.observe?.(live.spec, event)
+    // Claude reports usage per stream delta, so evaluating a cap on every event would
+    // rescan the whole timeline many times a second. A cap acting a moment late is
+    // indistinguishable to the owner; rescanning per delta is not.
+    if (data.type === 'usage' && !live.capTimer) live.capTimer = setTimeout(() => {
+      live.capTimer = undefined
+      if (live.closed) return
+      try { this.enforceUsageCap(live) } catch { /* A cap never breaks the event pipeline it observes. */ }
+    }, 250)
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), 32)
     if (data.type === 'session') queueMicrotask(() => { void this.drainQueue(live) })
     if (data.type === 'session') {
-      const phase = data.phase === 'running' || data.phase === 'starting' || data.phase === 'interrupting' ? 'working' : data.phase.startsWith('waiting') ? 'waiting_input' : data.phase === 'completed' ? 'complete' : ['failed', 'disconnected'].includes(data.phase) ? 'error' : 'idle'
-      const status = phase === 'working' || phase === 'idle' ? 'running' : phase
+      const phase: AgentActivityPhase = data.phase === 'running' || data.phase === 'starting' || data.phase === 'interrupting' ? 'working' : data.phase.startsWith('waiting') ? 'waiting_input' : data.phase === 'completed' ? 'complete' : data.phase === 'failed' ? 'failed' : data.phase === 'disconnected' ? 'disconnected' : data.phase === 'interrupted' ? 'stopped' : 'idle'
+      // AgentRecord.status is a coarser union than the phase, so the unhappy phases collapse
+      // back onto its own vocabulary here rather than leaking new values into stored rows.
+      const status = phase === 'working' || phase === 'idle' ? 'running' : phase === 'failed' || phase === 'disconnected' ? 'error' : phase === 'stopped' ? 'exited' : phase
       this.database.setAgentStatus(live.spec.id, status, phase)
       this.broadcast('agent:status', { id: live.spec.id, status, phase })
       live.budget?.setPhase(data.phase)
@@ -598,6 +689,19 @@ export class StructuredSessions {
     if (result.outcome === 'reverted') this.emit(live, { data: { type: 'review', artifactId, outcome: 'reverted' } })
     return result
   }
+  /** The conversation's own change history, independent of whether anything was committed. */
+  changeHistory(id: string): Promise<AgentChangeHistory> {
+    return this.artifacts.changeHistory(id, this.get(id).spec.cwd)
+  }
+  /** Restore files from this conversation's snapshots. Recorded in the timeline so the
+   *  conversation itself shows that the owner took the work back. */
+  async revertChanges(id: string, scope: RevertScope): Promise<RevertOutcome> {
+    const live = this.get(id)
+    if (active.has(this.database.structured.snapshot(id)!.phase)) return { reverted: [], blocked: [], message: 'Wait until the agent finishes before restoring files.' }
+    const outcome = await this.artifacts.revertChanges(id, live.spec.cwd, scope)
+    for (const entry of outcome.reverted) for (const artifactId of entry.artifactIds) this.emit(live, { data: { type: 'review', artifactId, outcome: 'reverted' } })
+    return outcome
+  }
   flush(): void {
     if (this.flushTimer) clearTimeout(this.flushTimer)
     this.flushTimer = undefined
@@ -608,7 +712,7 @@ export class StructuredSessions {
   killWhere(predicate: (spec: AgentSpec) => boolean): void {
     for (const [id, live] of this.live) if (predicate(live.spec)) {
       if (live.adapter) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Backend stopped; native resume is an explicit action' } })
-      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); live.adapter?.dispose(); this.live.delete(id)
+      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id)
     }
     this.flush()
   }

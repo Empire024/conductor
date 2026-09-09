@@ -83,6 +83,159 @@ describe('ConductorDatabase persistence', () => {
     })
   })
 
+  it('forgets only faded, unrehearsed agent episodes and keeps everything the project should retain', () => {
+    withDatabasePath((path, root) => {
+      const database = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'project'), 'Project')
+        const episode = database.remember({ projectId: project.id, kind: 'episodic', source: 'agent', gist: 'Retried the flaky deploy once', cues: ['deploy', 'retry'] })
+        const knowledge = database.remember({ projectId: project.id, kind: 'semantic', source: 'agent', gist: 'Deploys run through the release workflow', cues: ['deploy', 'release'] })
+        const owner = database.remember({ projectId: project.id, kind: 'episodic', source: 'human', gist: 'Owner watched the deploy fail live', cues: ['deploy', 'owner'] })
+        const important = database.remember({ projectId: project.id, kind: 'episodic', source: 'agent', gist: 'Deploy wiped the staging database', cues: ['deploy', 'staging'], salience: 0.9 })
+
+        // Nothing has faded yet, so a prune today must be a no-op rather than a cleanup.
+        expect(database.forgetStaleMemories(project.id)).toBe(0)
+
+        const distantFuture = Date.now() + 5 * 365 * 24 * 60 * 60 * 1000
+        expect(database.forgetStaleMemories(project.id, distantFuture)).toBe(1)
+        const remaining = database.listMemories(project.id).map((item) => item.id)
+        expect(remaining).not.toContain(episode.id)
+        expect(remaining).toEqual(expect.arrayContaining([knowledge.id, owner.id, important.id]))
+      } finally {
+        database.close()
+      }
+    })
+  })
+
+  it('records which conversation wrote a memory and re-attributes it when another reinforces it', () => {
+    withDatabasePath((path, root) => {
+      const database = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'project'), 'Project')
+        const written = database.remember({
+          projectId: project.id, agentKey: 'claude', kind: 'semantic', source: 'agent',
+          gist: 'Checkout tax totals are recalculated', cues: ['checkout', 'tax', 'totals'],
+          origin: { agentSessionId: 'agent-1', workspaceId: 'workspace-1', title: 'Tax audit', provider: 'claude' }
+        })
+        expect(written.source).toBe('agent')
+        expect(written.origin).toEqual({ agentSessionId: 'agent-1', workspaceId: 'workspace-1', title: 'Tax audit', provider: 'claude' })
+        expect(written.correctedAt).toBeNull()
+
+        // The conversation worth opening is the one that last stood behind the claim.
+        const reinforced = database.remember({
+          projectId: project.id, agentKey: 'claude', kind: 'semantic', source: 'agent',
+          gist: 'Checkout tax totals are recalculated on save', cues: ['checkout', 'tax', 'totals'],
+          origin: { agentSessionId: 'agent-2', workspaceId: 'workspace-1', title: 'Second look', provider: 'codex' }
+        })
+        expect(reinforced.id).toBe(written.id)
+        expect(reinforced.origin?.agentSessionId).toBe('agent-2')
+
+        // A memory written without provenance reads as unknown rather than borrowing someone else's.
+        const anonymous = database.remember({ projectId: project.id, kind: 'procedural', gist: 'Run npm.cmd on Windows', cues: ['windows', 'npm'] })
+        expect(anonymous.origin).toBeNull()
+        expect(anonymous.source).toBe('human')
+      } finally {
+        database.close()
+      }
+    })
+  })
+
+  it('lets a person correct and re-weight an agent memory, which then survives automatic forgetting', () => {
+    withDatabasePath((path, root) => {
+      const database = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'project'), 'Project')
+        const written = database.remember({
+          projectId: project.id, kind: 'episodic', source: 'agent', gist: 'Deploy failed becuse of stale totals',
+          cues: ['deploy', 'totals'], origin: { agentSessionId: 'agent-1', workspaceId: 'workspace-1' }
+        })
+        const corrected = database.updateMemory({
+          id: written.id, kind: 'semantic', gist: '  Deploy   failed because of stale totals  ',
+          cues: ['Deploy', 'totals', 'staleness'], salience: 5, confidence: -1, strength: 3
+        })
+        expect(corrected.gist).toBe('Deploy failed because of stale totals')
+        expect(corrected.kind).toBe('semantic')
+        expect(corrected.cues).toEqual(['deploy', 'totals', 'staleness'])
+        expect(corrected.salience).toBe(1)
+        expect(corrected.confidence).toBe(0)
+        expect(corrected.strength).toBe(3)
+        // Who first claimed it stays visible; the correction is recorded beside it, not over it.
+        expect(corrected.source).toBe('agent')
+        expect(corrected.origin?.agentSessionId).toBe('agent-1')
+        expect(corrected.correctedAt).toBeTruthy()
+
+        // Re-weighting alone must not force a rewrite of the sentence.
+        expect(database.updateMemory({ id: written.id, salience: 0.1 }).gist).toBe('Deploy failed because of stale totals')
+
+        const stale = database.remember({
+          projectId: project.id, kind: 'episodic', source: 'agent', gist: 'Retried the flaky deploy once', cues: ['flaky', 'retry']
+        })
+        expect(database.updateMemory({ id: stale.id, salience: 0.1 }).correctedAt).toBeTruthy()
+        const distantFuture = Date.now() + 5 * 365 * 24 * 60 * 60 * 1000
+        expect(database.forgetStaleMemories(project.id, distantFuture)).toBe(0)
+
+        expect(() => database.updateMemory({ id: 'missing', gist: 'nothing' })).toThrow(/no longer exists/)
+        expect(() => database.updateMemory({ id: written.id, gist: '   ' })).toThrow(/concise gist/)
+      } finally {
+        database.close()
+      }
+    })
+  })
+
+  it('ranks the visible prune weakest-first without removing anything', () => {
+    withDatabasePath((path, root) => {
+      const database = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'project'), 'Project')
+        const faded = database.remember({ projectId: project.id, kind: 'episodic', source: 'agent', gist: 'Retried the flaky deploy once', cues: ['flaky', 'retry'], salience: 0.15, confidence: 0.2 })
+        const held = database.remember({ projectId: project.id, kind: 'procedural', gist: 'Run npm.cmd on Windows', cues: ['windows', 'npm'], salience: 0.95, confidence: 0.95 })
+
+        const distantFuture = Date.now() + 5 * 365 * 24 * 60 * 60 * 1000
+        const ranked = database.memoryPruneCandidates(project.id, 10, distantFuture)
+        expect(ranked.map((candidate) => candidate.memory.id)).toEqual([faded.id, held.id])
+        expect(ranked[0]!.standing).toBeLessThan(ranked[1]!.standing)
+        expect(ranked[0]!.reason).toMatch(/Faded/)
+        // The prune is a suggestion; only the owner's action removes anything.
+        expect(database.listMemories(project.id)).toHaveLength(2)
+      } finally {
+        database.close()
+      }
+    })
+  })
+
+  it('keeps a per-turn ledger of recalled memories and stays honest about ones forgotten since', () => {
+    withDatabasePath((path, root) => {
+      const database = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'project'), 'Project')
+        const kept = database.remember({ projectId: project.id, kind: 'semantic', gist: 'Checkout tax totals are recalculated', cues: ['checkout', 'tax'] })
+        const dropped = database.remember({ projectId: project.id, kind: 'semantic', gist: 'Deploys run through the release workflow', cues: ['deploy', 'release'] })
+
+        database.recordMemoryRecall({ projectId: project.id, agentSessionId: 'agent-1', itemId: 'item-1', prompt: '  Fix   the checkout tax  ', memoryIds: [kept.id, dropped.id] })
+        // Nothing to explain, so nothing is written: an empty recall is not a turn fact.
+        database.recordMemoryRecall({ projectId: project.id, agentSessionId: 'agent-1', itemId: 'item-2', prompt: 'Anything', memoryIds: [] })
+        expect(database.listMemoryRecalls('agent-2')).toEqual([])
+
+        expect(database.listMemoryRecalls('agent-1')).toHaveLength(1)
+        const recall = database.listMemoryRecalls('agent-1')[0]!
+        expect(recall.itemId).toBe('item-1')
+        expect(recall.prompt).toBe('Fix the checkout tax')
+        expect(recall.memories.map((memory) => memory.id)).toEqual([kept.id, dropped.id])
+        expect(recall.forgotten).toBe(0)
+
+        // A memory corrected after the fact shows its corrected text, and a deleted one is
+        // counted rather than quietly vanishing from what the turn was told.
+        database.updateMemory({ id: kept.id, gist: 'Checkout tax totals are recalculated on save' })
+        database.removeMemory(dropped.id)
+        const after = database.listMemoryRecalls('agent-1')[0]!
+        expect(after.memories.map((memory) => memory.gist)).toEqual(['Checkout tax totals are recalculated on save'])
+        expect(after.forgotten).toBe(1)
+      } finally {
+        database.close()
+      }
+    })
+  })
+
   it('atomically restores the active desk, focused pane, layout, and unsaved editor draft', () => {
     withDatabasePath((path, root) => {
       let database: ConductorDatabase | null = new ConductorDatabase(path)

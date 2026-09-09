@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { Bot, Brain, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
 import type {
+  AgentActivityPhase,
   AgentProviderId,
   AgentSoundProfile,
   AppSettings,
@@ -25,7 +26,8 @@ import { EmptyState } from './components/EmptyState'
 import { CommandPalette, type PaletteCommand } from './components/CommandPalette'
 import { SettingsPanel } from './components/SettingsPanel'
 import { PaneWorkspace } from './layout/PaneWorkspace'
-import { applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
+import { applyTabGroupAction, applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
+import type { TabGroupAction } from './layout/tab-groups'
 import {
   activateTab,
   addTab,
@@ -43,6 +45,7 @@ import {
   TAB_CHORD,
   isEditingTarget,
   resizeFocusedGroup,
+  moveFocusedTab,
   snapFocusedGroup,
   tabIdAtChromeIndex,
   tabIdByOffset,
@@ -66,13 +69,16 @@ import {
   subscribeToDebugEntries,
   type IssueReportContext
 } from './debug-log'
-import { getAttentionSessionIds, retainVisibleAttentionResources } from './attention'
+import { getAttentionSessionIds, getProjectActivityStatuses, getSessionActivityStatuses, hasActiveSubagent, mergeProjectActivity, resolveActivityPhases, retainVisibleAttentionResources } from './attention'
+import type { ProjectActivitySnapshot } from '../../shared/project-activity'
 import { migrateLegacyCodexModels, migrateLegacyCodexTab } from './agent-models'
 import { useAppUpdates } from './use-app-updates'
 import { TabPerformancePopover } from './components/TabPerformancePopover'
 import { playAgentSound } from './agent-sounds'
 import { AppUpdateButton } from './components/AppUpdateButton'
 import { UpdatePrompt } from './components/UpdatePrompt'
+import { summarizeSubagents } from './panes/usage-summary'
+import { spinPhaseStyle } from './spin-sync'
 
 export function App(): React.JSX.Element {
   const [projects, setProjects] = useState<ProjectRecord[]>([])
@@ -117,6 +123,13 @@ export function App(): React.JSX.Element {
   const [loading, setLoading] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('conductor.sidebarCollapsed') === 'true')
   const [attentionResourceIds, setAttentionResourceIds] = useState<Set<string>>(() => new Set())
+  const [activityPhases, setActivityPhases] = useState<Map<string, AgentActivityPhase>>(() => new Map())
+  // Resources whose subagents (Task-tool children) are still running, preparing, or awaiting
+  // approval even though the resource's own turn already reported 'complete'.
+  const [subagentActiveIds, setSubagentActiveIds] = useState<Set<string>>(() => new Set())
+  // Agent activity for every project, computed in the main process: this renderer only holds the
+  // active project's workspaces, so no other project's row could be resolved here.
+  const [backendProjectActivity, setBackendProjectActivity] = useState<ProjectActivitySnapshot>({})
   const [debugConsoleOpen, setDebugConsoleOpen] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved' | 'error'>('saved')
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null)
@@ -140,6 +153,24 @@ export function App(): React.JSX.Element {
   const attentionSessionIds = useMemo(
     () => getAttentionSessionIds(sessions, attentionResourceIds),
     [attentionResourceIds, sessions]
+  )
+  // A tab must not show 'complete' while it still owns active subagent work; every consumer of
+  // activity phases (the top tab strip, the workspace sidebar list, session and project dots)
+  // reads this corrected map instead of the raw one dispatched by the running conversation.
+  const correctedActivityPhases = useMemo(
+    () => subagentActiveIds.size ? resolveActivityPhases(activityPhases, subagentActiveIds) : activityPhases,
+    [activityPhases, subagentActiveIds]
+  )
+  const sessionActivityStatuses = useMemo(
+    () => getSessionActivityStatuses(sessions, correctedActivityPhases),
+    [correctedActivityPhases, sessions]
+  )
+  const projectActivityStatuses = useMemo(
+    () => mergeProjectActivity(
+      backendProjectActivity,
+      getProjectActivityStatuses(sessions, attentionSessionIds, sessionActivityStatuses)
+    ),
+    [attentionSessionIds, backendProjectActivity, sessionActivityStatuses, sessions]
   )
   const debugContext = useMemo<IssueReportContext>(() => ({
     projectCount: projects.length,
@@ -313,7 +344,7 @@ export function App(): React.JSX.Element {
   useEffect(() => {
     const phases = new Map<string, string>()
     const onActivity = (event: Event): void => {
-      const detail = (event as CustomEvent<{ id: string; phase: string }>).detail
+      const detail = (event as CustomEvent<{ id: string; phase: AgentActivityPhase }>).detail
       if (phases.get(detail.id) === detail.phase) return
       phases.set(detail.id, detail.phase)
       debugLog('agent', `Activity changed to ${detail.phase}`, { resourceId: detail.id })
@@ -323,9 +354,43 @@ export function App(): React.JSX.Element {
         else next.delete(detail.id)
         return next
       })
+      setActivityPhases((current) => new Map(current).set(detail.id, detail.phase))
     }
     window.addEventListener('conductor:agent-activity', onActivity)
     return () => window.removeEventListener('conductor:agent-activity', onActivity)
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    const recheckSubagents = async (resourceId: string): Promise<void> => {
+      const projection = await window.conductor.structured.snapshot(resourceId)
+      if (disposed || !projection) return
+      const statuses = summarizeSubagents(projection.items, projection.runtimeId, projection.phase, false).map((agent) => agent.status)
+      const active = hasActiveSubagent(statuses)
+      setSubagentActiveIds((current) => {
+        if (current.has(resourceId) === active) return current
+        const next = new Set(current)
+        if (active) next.add(resourceId)
+        else next.delete(resourceId)
+        return next
+      })
+    }
+    // The exact moment a tab's own phase settles to 'complete' is when a stale subagent check
+    // matters most; every later subagent event keeps that check honest as subagents finish.
+    const onActivity = (event: Event): void => {
+      const detail = (event as CustomEvent<{ id: string; phase: AgentActivityPhase }>).detail
+      if (detail.phase === 'complete') void recheckSubagents(detail.id)
+    }
+    const offEvents = window.conductor.structured.onEvents((events) => {
+      const resourceIds = new Set(events.filter((event) => event.data.type === 'subagent').map((event) => event.sessionId))
+      for (const resourceId of resourceIds) void recheckSubagents(resourceId)
+    })
+    window.addEventListener('conductor:agent-activity', onActivity)
+    return () => {
+      disposed = true
+      offEvents()
+      window.removeEventListener('conductor:agent-activity', onActivity)
+    }
   }, [])
 
   useEffect(() => {
@@ -334,6 +399,26 @@ export function App(): React.JSX.Element {
       return next.size === current.size ? current : next
     })
   }, [sessions])
+
+  const refreshProjectActivity = useCallback((): void => {
+    void window.conductor.activity.projects().then(setBackendProjectActivity).catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    refreshProjectActivity()
+    return window.conductor.activity.onProjectsChanged(setBackendProjectActivity)
+  }, [refreshProjectActivity])
+
+  // The main process announces phase changes; opening or closing a tab, a workspace or a project
+  // changes which agents speak for a project without any phase moving, so re-ask on those too.
+  // Moving or renaming a tab does not, hence the resource key rather than the sessions array.
+  const workspaceResourceKey = useMemo(
+    () => sessions.map((session) => `${session.id}:${listGroups(session.layout.root).flatMap((group) => group.tabs.flatMap((tab) => tab.resourceId ? [tab.resourceId] : [])).sort().join(',')}`).join('|'),
+    [sessions]
+  )
+  useEffect(() => {
+    refreshProjectActivity()
+  }, [projects.length, refreshProjectActivity, workspaceResourceKey])
 
   useEffect(() => {
     const applyTheme = (): void => setResolvedThemeVariant(applyAppTheme(appSettings))
@@ -548,6 +633,11 @@ export function App(): React.JSX.Element {
     setAppSettings(await window.conductor.settings.setDebugLogging(debugLogging))
   }, [])
 
+  const setShowHiddenFiles = useCallback(async (showHiddenFiles: boolean): Promise<void> => {
+    setAppSettings((current) => ({ ...current, showHiddenFiles }))
+    setAppSettings(await window.conductor.settings.setShowHiddenFiles(showHiddenFiles))
+  }, [])
+
   const setAgentSoundProfile = useCallback(async (agentSoundProfile: AgentSoundProfile): Promise<void> => {
     setAppSettings((current) => ({ ...current, agentSoundProfile }))
     setAppSettings(await window.conductor.settings.setAgentSoundProfile(agentSoundProfile))
@@ -727,7 +817,9 @@ export function App(): React.JSX.Element {
     if (!group) return
     const tab = kind === 'launcher' ? makeLauncherTab() : makeTab(kind, provider)
     const activeTab = group.tabs.find((item) => item.id === group.activeTabId)
-    const layout = activeTab?.kind === 'launcher'
+    // A chosen runtime takes the open launcher's place; asking for another launcher must
+    // still add a tab, or Ctrl+T on a new tab would silently swap it for an identical one.
+    const layout = kind !== 'launcher' && activeTab?.kind === 'launcher'
       ? replaceTab(activeSession.layout, group.id, activeTab.id, tab)
       : addTab(activeSession.layout, group.id, tab)
     setLayout(layout)
@@ -781,6 +873,14 @@ export function App(): React.JSX.Element {
     if (next !== activeSession.layout) setLayout(next)
   }, [activeSession, focusedGroupId, setLayout])
 
+  const moveFocusedTabTo = useCallback((direction: ResizeDirection): void => {
+    if (!activeSession) return
+    const move = moveFocusedTab(activeSession.layout, focusedGroupId, direction)
+    if (move.layout === activeSession.layout) return
+    setLayout(move.layout)
+    setFocusedGroupId(move.groupId)
+  }, [activeSession, focusedGroupId, setLayout])
+
   const reopenClosed = useCallback((targetGroupId?: string) => {
     if (!activeSession || activeSession.closedTabs.length === 0) return
     const tab = activeSession.closedTabs.at(-1)!
@@ -812,6 +912,17 @@ export function App(): React.JSX.Element {
       setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
       if (action !== 'detach' && action !== 'show') { selectSession(result.session); setFocusedGroupId(result.focusedGroupId); setUtilityPanel(null) }
       if (action === 'show') setToast(`${tab.title} is shown in a floating window. Close it to return the tab to its workspace.`)
+    } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
+  }, [sessions, selectSession])
+
+  const sidebarTabGroupAction = useCallback((sessionId: string, groupId: string, tabId: string, action: TabGroupAction): void => {
+    const session = sessions.find(item => item.id === sessionId)
+    if (!session) return
+    try {
+      const result = applyTabGroupAction(session, groupId, tabId, action)
+      setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
+      selectSession(result.session)
+      void window.conductor.sessions.save(result.session.id, result.session.layout, result.session.maximizedGroupId, result.session.closedTabs)
     } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
   }, [sessions, selectSession])
 
@@ -861,9 +972,12 @@ export function App(): React.JSX.Element {
     { id: 'reopen', label: 'Reopen closed tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift T', run: reopenClosed },
     { id: 'next-tab', label: 'Next tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Tab', run: () => cycleFocusedTab(1) },
     { id: 'previous-tab', label: 'Previous tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Tab', run: () => cycleFocusedTab(-1) },
-    { id: 'grow-tab', label: 'Grow tab area', detail: 'Snap with Ctrl Alt Shift arrows', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift →', run: () => nudgeFocusedGroup('right') },
-    { id: 'shrink-tab', label: 'Shrink tab area', detail: 'Snap with Ctrl Alt Shift arrows', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift ←', run: () => nudgeFocusedGroup('left') }
-  ], [cycleFocusedTab, nudgeFocusedGroup, openInFocused, reopenClosed, splitFocused])
+    { id: 'grow-tab', label: 'Grow tab area', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift →', run: () => nudgeFocusedGroup('right') },
+    { id: 'shrink-tab', label: 'Shrink tab area', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift ←', run: () => nudgeFocusedGroup('left') },
+    { id: 'snap-tab', label: 'Snap tab area to the next stop', detail: 'Preset widths instead of a 5% nudge', category: 'Layout', icon: 'layout', run: () => nudgeFocusedGroup('right', true) },
+    { id: 'move-tab-right', label: 'Move tab right', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt →', run: () => moveFocusedTabTo('right') },
+    { id: 'move-tab-left', label: 'Move tab left', detail: 'Relocate the tab itself, not the divider', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift Alt ←', run: () => moveFocusedTabTo('left') }
+  ], [cycleFocusedTab, moveFocusedTabTo, nudgeFocusedGroup, openInFocused, reopenClosed, splitFocused])
 
   // The subagent roster links a background task back to the runtime it is driving.
   useEffect(() => {
@@ -931,15 +1045,26 @@ export function App(): React.JSX.Element {
         armChord()
         return
       }
-      if (chordArmed.current && !event.ctrlKey && !event.altKey && !event.metaKey) {
+      // The launcher prints these keys on its own buttons, so they keep working for as long
+      // as it is the focused tab; the timed chord only covers the moment right after Ctrl+T.
+      const focusedTab = activeSession
+        ? (() => {
+            const focused = findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0]
+            return focused?.tabs.find((tab) => tab.id === focused.activeTabId) ?? null
+          })()
+        : null
+      if ((chordArmed.current || focusedTab?.kind === 'launcher') && !event.ctrlKey && !event.altKey && !event.metaKey && !isEditingTarget(event.target)) {
         const target = TAB_CHORD[key]
+        const armed = chordArmed.current
         disarmChord()
         if (target) {
           event.preventDefault()
           openInFocused(target.kind, target.provider)
           return
         }
-        if (key === 'escape') { event.preventDefault(); return }
+        // Escape only cancels a chord that is actually pending; a focused launcher must not
+        // swallow the key that closes dialogs and stops runs.
+        if (armed && key === 'escape') { event.preventDefault(); return }
       }
       if (event.ctrlKey && event.shiftKey && !event.altKey && key === 't') {
         event.preventDefault()
@@ -973,10 +1098,12 @@ export function App(): React.JSX.Element {
         if (target) { event.preventDefault(); selectSession(target); return }
       }
       // Ctrl+Shift+Arrow collides with word selection, so it stays out of text surfaces.
+      // Adding Alt relocates the tab; without it the arrow resizes the pane.
       if (event.ctrlKey && event.shiftKey && ['arrowleft', 'arrowright', 'arrowup', 'arrowdown'].includes(key) && !isEditingTarget(event.target)) {
         event.preventDefault()
         const direction = ({ arrowleft: 'left', arrowright: 'right', arrowup: 'up', arrowdown: 'down' } as const)[key as 'arrowleft']
-        nudgeFocusedGroup(direction, event.altKey)
+        if (event.altKey) moveFocusedTabTo(direction)
+        else nudgeFocusedGroup(direction)
         return
       }
       if (event.ctrlKey && event.shiftKey && event.key === 'Enter' && activeSession) {
@@ -986,7 +1113,7 @@ export function App(): React.JSX.Element {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [activeSession, appSettings.zoomFactor, armChord, closeFocusedTab, closeSession, cycleFocusedTab, disarmChord, focusedGroupId, nudgeFocusedGroup, openInFocused, reopenClosed, selectSession, sessions, setLayout, setMaximized, setZoom, splitFocused])
+  }, [activeSession, appSettings.zoomFactor, armChord, closeFocusedTab, closeSession, cycleFocusedTab, disarmChord, focusedGroupId, moveFocusedTabTo, nudgeFocusedGroup, openInFocused, reopenClosed, selectSession, sessions, setLayout, setMaximized, setZoom, splitFocused])
 
   useEffect(() => {
     if (!toast) return
@@ -998,6 +1125,9 @@ export function App(): React.JSX.Element {
     const focusProcess = (event: Event): void => {
       const process = (event as CustomEvent<{ id: string; sessionId: string }>).detail
       const session = sessions.find((item) => item.id === process.sessionId)
+      // The drawer sits beside the panes, so Project tasks stays open across the jump; a
+      // short pulse is what tells you which tab just took the focus.
+      const spotlightTab = (tabId: string): void => { window.dispatchEvent(new CustomEvent('conductor:spotlight-tab', { detail: { tabId } })) }
       if (!session) {
         setToast('That runtime belongs to a workspace that is not currently available.')
         return
@@ -1011,7 +1141,7 @@ export function App(): React.JSX.Element {
         setSessions((current) => current.map((item) => item.id === session.id ? { ...item, layout } : item))
         selectSession({ ...session, layout })
         setFocusedGroupId(containingGroup.id)
-        setUtilityPanel(null)
+        spotlightTab(tab.id)
         return
       }
       const closed = [...session.closedTabs].reverse().find((tab: PaneTab) => tab.resourceId === process.id)
@@ -1022,7 +1152,7 @@ export function App(): React.JSX.Element {
         setSessions((current) => current.map((item) => item.id === session.id ? reopened : item))
         selectSession(reopened)
         setFocusedGroupId(target.id)
-        setUtilityPanel(null)
+        spotlightTab(closed.id)
         setToast(`Reopened ${closed.title}`)
       } else setToast('This process no longer has an open runtime tab.')
     }
@@ -1065,6 +1195,7 @@ export function App(): React.JSX.Element {
           onMoveProject={(id) => void moveProject(id)}
           onRemoveProject={removeProject}
           onTabAction={(sessionId, groupId, tabId, action) => void sidebarTabAction(sessionId, groupId, tabId, action)}
+          onTabGroupAction={sidebarTabGroupAction}
           onRevealProject={(path) => void window.conductor.projects.reveal(path)}
           onNewSession={() => void newSession()}
           onCloseSession={(id) => void closeSession(id)}
@@ -1087,6 +1218,10 @@ export function App(): React.JSX.Element {
           onProjectRenamed={(project) => setProjects((current) => current.map((item) => item.id === project.id ? project : item))}
           utilityPanel={utilityPanel}
           onUtilityPanel={setUtilityPanel}
+          attentionIds={attentionSessionIds}
+          sessionActivity={sessionActivityStatuses}
+          activityPhases={correctedActivityPhases}
+          projectActivity={projectActivityStatuses}
         />
         <div className="main-stage">
           {activeProject ? (
@@ -1137,9 +1272,10 @@ export function App(): React.JSX.Element {
                           onDetach={detachTab}
                           canReopen={activeSession.closedTabs.length > 0}
                           onReopen={reopenClosed}
-                          onOpenFile={(path, line) => openWorkspaceFile(activeProject.id, path, 'editor', line)}
+                          onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(activeProject.id, path, mode ?? 'auto', line, allowBinary)}
+                          correctedActivityPhases={correctedActivityPhases}
                         />
-                        <WorkspaceFiles key={'files:' + activeSession.id} projects={projects} projectId={activeProject.id} workspaceId={activeSession.id} />
+                        <WorkspaceFiles key={'files:' + activeSession.id} projects={projects} projectId={activeProject.id} workspaceId={activeSession.id} showHiddenFilesDefault={appSettings.showHiddenFiles} />
                       </div>
                     </>
                   ) : (
@@ -1147,7 +1283,7 @@ export function App(): React.JSX.Element {
                       <div className="empty-orbit"><LayoutPanelTop size={30} /></div>
                       <strong>No workspace open</strong>
                       <button onClick={() => void newSession()}><Plus size={17} /> New workspace</button>
-                    </div><WorkspaceFiles key={'files:project:' + activeProject.id} projects={projects} projectId={activeProject.id} workspaceId={'project:' + activeProject.id} /></div>
+                    </div><WorkspaceFiles key={'files:project:' + activeProject.id} projects={projects} projectId={activeProject.id} workspaceId={'project:' + activeProject.id} showHiddenFilesDefault={appSettings.showHiddenFiles} /></div>
                   )}
                 </div>
                 {utilityPanel && (
@@ -1233,7 +1369,7 @@ export function App(): React.JSX.Element {
           ) : !loading ? (
             <EmptyState onOpen={() => void createManagedProject()} />
           ) : (
-            <div className="app-loading"><i /><span>Restoring your workspace</span></div>
+            <div className="app-loading"><i style={spinPhaseStyle(Date.now())} /><span>Restoring your workspace</span></div>
           )}
         </div>
       </div>
@@ -1275,6 +1411,7 @@ export function App(): React.JSX.Element {
           onSetThemeAuto={(enabled) => void setThemeAuto(enabled)}
           onSetAgentSoundProfile={(profile) => void setAgentSoundProfile(profile)}
           onSetDebugLogging={(enabled) => void setDebugLogging(enabled)}
+          onSetShowHiddenFiles={(enabled) => void setShowHiddenFiles(enabled)}
           onSetDefaultNewFileExtension={(extension) => window.conductor.settings.setDefaultNewFileExtension(extension).then((saved) => { setAppSettings(saved); return saved })}
           updateState={updateState}
           onSetLocalUpdates={(enabled) => void window.conductor.settings.setLocalUpdates(enabled).then(setAppSettings).catch((error: unknown) => setToast(String(error)))}

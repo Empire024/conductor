@@ -1,4 +1,5 @@
 import { concreteModel } from '../../../shared/agent-model-selection'
+import { settingsForRuntime } from '../../../shared/structured-agent'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 
 const reported = (value: unknown): value is string => typeof value === 'string' && Boolean(value) && !['default', 'auto'].includes(value)
@@ -17,6 +18,17 @@ export function resolvedComposerSettings(settings: SessionSettings, capabilities
   const effort = reported(settings.effort) ? settings.effort : (!configured || configured === values.model || actual === values.model) && reported(values.effort) ? values.effort : info?.defaultEffort
   return { model, label, effort }
 }
+
+/** A mode change takes effect on the next turn, so it also drops a temporary permission that
+ *  only the current runtime was holding. Everything else is a straight overlay. */
+export function nextComposerSettings(current: SessionSettings, change: Partial<SessionSettings>): SessionSettings {
+  return { ...(change.permission !== undefined || change.plan !== undefined ? settingsForRuntime(current) : current), ...change }
+}
+
+/** The composer children remount per conversation. React drops all but the last of sibling
+ *  elements that share a key and leaves their DOM behind — a second ask/model/effort row —
+ *  so each child namespaces the conversation it belongs to. */
+export const composerChildKey = (child: string, conversationId: string): string => child + ':' + conversationId
 
 export function conversationModes(capabilities?: ProviderCapabilities): Array<{ id: string; label: string; change: Partial<SessionSettings> }> {
   if (!capabilities) return []

@@ -81,15 +81,119 @@ models they want
 
 54. [x] A "Project tasks" tab opened through the app protocol rendered "Unavailable"; the tasks pane now renders as a real workspace tab. <!-- conductor-task:bug-54 agent=agent_mtspoduk_c88in1p -->
 
-- [ ] Stop/play button in agent view is still nasty & not animated, work a bit on it to make it beautiful and fully animated - alsao, this bug report should come with easy image upload so I can visually share stuff as a bug (also CTRL+enter) should send the bug <!-- conductor-task:8d608499-2169-4667-ad20-17d85edcea36 -->
+- [x] Stop/play button in agent view is still nasty & not animated, work a bit on it to make it beautiful and fully animated - alsao, this bug report should come with easy image upload so I can visually share stuff as a bug (also CTRL+enter) should send the bug <!-- conductor-task:8d608499-2169-4667-ad20-17d85edcea36 agent=agent_mtu035p5_ezlg01o -->
 
 - [x] Messages that steer are not 'sent', but the agent is still going -> make sure this state is visually shown, i.e. we show that 'Message is sent after next tool use.' or something.. Steering should work same as in the CLI, i.e. wait for next tool use, esc to actually interupt and send immidiately, but actually next tool use, not the entire run of all tools like it used to be here ((bug))) <!-- conductor-task:aab154cf-753f-430d-9322-705aef5811e2 agent=agent_mtsqk737_52vftmy -->
 
-- [ ] Coordination cable is currently nasty - goes through content, make another visual way of connecting tabs other than that cable, or route it another way. <!-- conductor-task:1683e42e-fad9-4114-bb08-76df967f1c4c -->
+- [x] TAB + TAB Coordination cable is currently nasty - goes through content, make another visual way of connecting tabs other than that cable, or route it another way. <!-- conductor-task:1683e42e-fad9-4114-bb08-76df967f1c4c agent=agent_mttcsu1i_3zvkeu1 -->
 
-- [ ] Coordination replies are being shared the same way my messages are. They shouldn't be, my messages i.e. 'You' should really mean I sent it. <!-- conductor-task:1cf21b4b-06ff-45d9-a60d-9728358c141f -->
+- [x] Coordination replies are being shared the same way my messages are. They shouldn't be, my messages i.e. 'You' should really mean I sent it. <!-- conductor-task:1cf21b4b-06ff-45d9-a60d-9728358c141f -->
 
 - [x] Stray enter gives error when adding task & (button + add task should be just add) <!-- conductor-task:af404d03-5374-42b2-ae5e-b20ac7f62608 agent=agent_mtsqk737_52vftmy -->
+
+- [x] CTRL+T with a new tab open doesn't open another new tab, should do that <!-- conductor-task:d38cfabb-a246-4fa7-8e20-68f391a9d557 -->
+
+- [x] When CTRL+T is open and tab is focused, the C / X / Q key binds to open agent windows need to work. currently they only work if pressed immidiately after ctrl+t <!-- conductor-task:238d9c49-d5d9-480c-9b62-6ce2a677dca6 -->
+
+- [x] Make sure when ctrl+e - ing, recently opened folders, or folders in the currently opened workspace are shown first, i.e., now that i'm writing here in this project tasks feature-list.md, ctrl+e feature-list shows some . folder's feature-list, not this feature-list as first.. fix that, . files shouldn't even be ctrl+e unless we click an icon that adds this exemption in ctrl+e or set it  globally in settings <!-- conductor-task:9c001aa5-d476-4b8b-b984-dd3029d1a65b agent=agent_mtt8r78u_bfzsv3d -->
+
+- [x] Workspace and explorer should act as different menu items than ones that can be moved left & right such as project tasks. currently, clicking on files closes project tasks for no reason. <!-- conductor-task:828e9195-e5a2-4033-b1a6-655acaf7dddd -->
+
+- [x] Closing project tasks removes what we've had written there. Make sure that doesn't happen, same to other parts like project tasks <!-- conductor-task:c17c6c3c-5c82-4c03-b3d5-9bae9d1ff925 -->
+
+- [x] BREAKING BUG, TOP PRIORITY: <!-- conductor-task:1a1038af-b33f-4dd1-a708-a88eafa62c79 -->
+  
+  Can't use Claude. I get error: Claude Code 2.1.265 is outside the tested 2.1.263 bridge baseline -> it gets paused, and I can't unpause it.
+
+- [x] Explorer name needs to be atop, currently project contain the explorer tab name, that should be global. <!-- conductor-task:43792807-720b-465d-8ce4-76d97e9c1b23 agent=agent_mttzctg0_9d47sn3 -->
+
+- [x] After using ctrl shift alt downarrow on [1] over [2] verically, then up again, i can't do the same thing (repeating) there must be a bug - make this entire system just a bit nicer to use. <!-- conductor-task:e1944766-e712-4557-be92-6c1c645216da agent=agent_mtt8r78u_bfzsv3d -->
+
+- [x] Rework dragging of tabs, currently intuitive, but ugly. Make joining tabs like in chrome, i.e. if we drag it to the tab bar, it joins. <!-- conductor-task:2dc5f9b0-b091-458b-8812-979fed7209a0 agent=agent_mttcsu1i_3zvkeu1 -->
+
+- [x] If we don't do anything in a New conversation, literally nothing, just start it, don't save it in history for no reason.. <!-- conductor-task:951e6ca7-f503-4096-a572-0fe57d259fb6 agent=agent_mtt8r78u_bfzsv3d -->
+
+- [x] Animations inside the agent coding text window are slow - when agent is generating text, it's laggy, make it all really smooth & nicely animated, so it doesn't look like it's so choppy.. fast animations so we don't slow nothing down obviously, especially when the agent is giving us a reply, currently it's choppy sometimes. <!-- conductor-task:570d94d7-2dc1-46cb-a5cc-2c6cee0bbd35 agent=agent_mttcsu1i_3zvkeu1 -->
+
+- [x] I think I wrote it here already (if so merge it with other task): Workspace view workspaces need to show alert same as tab & workspace tab does.. They should also show when there is active work in them, or when they're done working, all that jazz, so we can essentially see status easily on projects from that view. <!-- conductor-task:ea118d5a-abcc-4517-9fb3-f136e6d64346 agent=agent_mttzctg0_9d47sn3 -->
+
+- [x] Usage % and 'view usage' should be in the same line as effort and all that is. <!-- conductor-task:5ffb5869-37cd-4a5a-8fa6-82562e268e3b agent=agent_mttcsu1i_3zvkeu1 -->
+
+- [x] After opening a claude tab, we're met with the model name, but not effort, we need to click on model to gain access to effort -> should automatically be there. <!-- conductor-task:f7535768-a1b8-4927-8259-7e14146c7714 agent=agent_mttcsu1i_3zvkeu1 -->
+
+- [x] Opening a file never guesses text: clicking a video, archive or other binary opened it in the editor and froze the window (no typing, no sending). Files now route by type, the main process refuses binary and oversized text reads, and "open as text" stays available from the right-click menu and the preview. Also fixed the two unhandled rejections it surfaced: clipboard copies failing with NotAllowedError when the document is unfocused, and Monaco's benign "Canceled" view-state rejection being logged as an error. <!-- conductor-task:2f1c8d64-9b3e-4c07-9a5f-1d0e7b2a4c58 agent=agent_mttdfjc1_e29wp4n -->
+
+- [x] Clicking right on a file sent to us by an agent should give all options (like ctrl click, ctrl right click etc) explained, also add another option to open the file in explorer (opens explorer and highlights the file even more if it was open [add highlightign when open]) and another one to view in Windows Explorer. <!-- conductor-task:e2bfac55-af04-4111-a9dc-6367bc14d97b agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Workspace tabs shouldnt say '3 tabs' but just show the chevron next to the workspace and let that hide all its tabs <!-- conductor-task:1e8e0059-2d59-482c-b06b-ebcad8e7d82d agent=agent_mtu035p5_ezlg01o -->
+
+- [x] When all the way to the bottom and new content is being actively generated, scrolling up stutters and doesn't let us leave bottom. <!-- conductor-task:77d9a4c4-1baf-41a5-8ff1-c091b71b1e1d agent=agent_mttz8sgn_wjeiuco -->
+
+- [x] conductor/screenshot.png shows issue -> we get a check on the tab, yet multiple subagents are running and the main thread is also running. remove screenshot after fixing task. <!-- conductor-task:7a09125f-f1fb-48c1-bd7e-cd3fcf214920 agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Dont show 'Output tokens pending', instead, show a small dots 'loader' animation <!-- conductor-task:c9cbfe5c-416d-4067-980b-e050272ca822 agent=agent_mttz8sgn_wjeiuco -->
+
+- [x] File diffs, commands, etc should at least view a bit of the 'In' and 'Out' like in VSCode Claude integration so we get at least a bit of an idea whats going on without having to click into each one. <!-- conductor-task:1117bd1d-9066-48c4-be5e-25a254357212 agent=agent_mtu035p5_ezlg01o -->
+  
+  Multiple file edits by an agent show up all the time, even small character edits - four in succession, make sure if in succession without any commentary from agent, the prev one just gets inflated to show the entire edit in one go.
+
+- [x] Getting 'Within agents' spams without any context -> show which agent it is, make it way more informative, color-code agents -> if we show info, we want it to be thorough and helpful, not clutterful and useless. <!-- conductor-task:30bc6855-f8ee-44e4-a660-d8b6f2a40946 agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Currently, resume conversation is hidden behind Conversation settings. Should be visible in the error that says the conversation has been stopped, so it's UX friendly.. <!-- conductor-task:52ae4ebf-396d-4bf3-9fe6-c406cf8899de agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Sending a task to a tab via Project tasks shows it as 'Queued' but i can't see it actually send it.. Broken! <!-- conductor-task:b54caf0b-551b-49fe-8146-e587b025e1f2 agent=agent_mtu035p5_ezlg01o -->
+
+- [x] In Project Tasks, clicking on 'completed' to see the tab that works it closes project tasks for no reason, and doesn't even highlight the tab that's working on it properly. <!-- conductor-task:f43ea848-da29-4553-b872-5eec46c1890c agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Project 'file' in Workspaces still doesn't show the project is churning, needs attention, or is done.. <!-- conductor-task:7b965f0f-36cf-40c2-8ee7-e733427dbfbf agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Fix how tasks are ordered in Project tasks (currently latest is last), also let us move them based on priority (add priority scale agents and us can set) <!-- conductor-task:71d97bf1-b4b0-4c7b-af24-c0985a5f3cea agent=agent_mtu035p5_ezlg01o -->
+
+- [x] All spinners should be synced (stop button spinner, tab spinners (top tap spinner, left side tab spinner) <!-- conductor-task:ebc30a38-8930-404d-b9c2-fdf31371e900 agent=agent_mtu035p5_ezlg01o -->
+
+- [x] This is still ugly, let's make it more UX friendly. <!-- conductor-task:8dbf1e2b-299e-4236-9ac2-45d74540e97e agent=agent_mtu035p5_ezlg01o -->
+  
+  ![image.png](.conductor/prompt-images/7e6bc8b3-6fe6-4b4e-8359-e9f47f45406b.png)
+
+- [x] Stop button is amazing, but send button is still nasty.. <!-- conductor-task:46f70c53-7942-4489-90f0-2f4a4584fdea agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Chevron to minify tabs should be next to 01 Workspace 1 not in between workspace and tabs.. <!-- conductor-task:a9dd0370-5280-4d12-9ea9-cee8c7821bf4 agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Fix this view.. that's just spam of no info for us <!-- conductor-task:d071798e-7236-49cb-b4db-763e209eaf0d agent=agent_mtu3stcq_t5batz4 -->
+  
+  ![image.png](.conductor/prompt-images/e3707b26-dcda-4df4-a331-bad0d529ff78.png)
+
+- [x] changing effort, then going to another project and back makes that effort go back.. fix, should stay where we put it <!-- conductor-task:29eb4e9b-956b-42bb-89d5-dcf01fb0605e agent=agent_mtu407kx_pn3me59 -->
+
+- [x] Resuming conversation doubles all the ask, model, effort in UI.. <!-- conductor-task:243c62d4-f853-447b-885c-99d7aec33b39 agent=agent_mtu407kx_pn3me59 -->
+
+- [x] Dragging tabs is fully broken. <!-- conductor-task:64352192-e182-4d66-8b5e-eecce2901a2c agent=agent_mtu404o5_zhiclam priority=high -->
+
+- [x] Double dot + invisible chevron bug, fix <!-- conductor-task:ea09f946-5ebd-494c-9eba-8dad432bb3c4 agent=agent_mtu406m9_t5a1uqd -->
+  
+  ![image.png](.conductor/prompt-images/57943f12-2c30-4944-b42e-c94d9c41127d.png)
+
+- [x] Redesign priority selector, currently broken (colors all red when high selected) <!-- conductor-task:a2c8c28b-8950-47a4-aa10-1b5943d1ec8b agent=agent_mtu405ms_r25z7jc priority=high -->
+  
+  ![image.png](.conductor/prompt-images/2a03e780-c2b8-4b72-b15c-50a8f68e78e7.png)
+
+- [x] Let's design this even further, having many tabs open by an agent gets cluttered now, and we don't know which tab is which.. Let's add tab groups just like in Chrome. Also, currently open tab needs to be way more visible, I can barely see which I have open when it's open (in top tab view) <!-- conductor-task:ea0c7e46-5f3c-4f18-8344-610fb1e3c628 agent=agent_mtu5dqrg_osly1zf priority=low -->
+  
+  ![image.png](.conductor/prompt-images/89582f31-d1e0-436d-94bf-fe71b95c22c5.png)
+
+- [x] Workspace projects view should also show which tabs are currently directly linked. <!-- conductor-task:7521b5cf-ed36-479b-a4f1-1b9a8421dec6 agent=agent_mtu4uptk_htoeh1o priority=low -->
+
+- [x] Let's change the weird red dot for something that really shows state - disconnected? Stopped? what happened? nasty red dot just makes me angry, it's not even round.. <!-- conductor-task:f296635e-ea63-4b7f-8650-8692acd2cbd1 agent=agent_mtu5dqrg_osly1zf -->
+
+- [x] Smoke tests are INCREDIBELY annoying. They -> appear over my screen, often taking my mouse over, and keyboard over.. That's FUCKING rampandly annoying, especialyl coming out of nowhere!!!!! <!-- conductor-task:bf25ae18-1e21-4a1e-9c94-e7742e305129 agent=agent_mtu3stcq_t5batz4 priority=high -->
+  
+  Don't destroy smoke tests, but fuck,, there must be a better way.. LIKE BRO I AM TRYING TO WORK HERE!!
+
+- [x] This is too much, let's somehow compact it, or find another way to show this control.. <!-- conductor-task:7873476c-35b8-477c-bc50-f7e320fd7d63 agent=agent_mtu3stcq_t5batz4 -->
+  
+  ![image.png](.conductor/prompt-images/bb164458-1aa4-4464-b2f0-b697f209ba36.png)
+
+- [ ] Updater should be one click -> if a user clicks it, we go all the way to restarting. BUT: if there's any tab still running, ask the user if he really wants to quit, since that tab is running still.. <!-- conductor-task:39a207c9-b656-4b36-8ea1-52627b466913 -->
 
 Feature list:
 
@@ -123,6 +227,42 @@ Implementation and validation: [backlog delivery record](docs/conductor-backlog-
 
 Latest completion and validation: [remaining checklist delivery](docs/backlog-completion.md).
 
+- [x] add real usage tracking, by real i mean: 'Codex GPT 6 Astra in this 1 session MUNCHED 60% of your weekly. Here's what happened in numbers:'. Add that for both Claude AND Codex. <!-- conductor-task:48c04f62-1f03-4bd9-827c-5a8ad5dd078e agent=agent_mtu4f3k6_yiau9kg -->
+
+- [x] When we select a permission status in a model (auto/ask/etc), remember it and set that as pre-selected default for other sessions as well. <!-- conductor-task:8f31532b-caad-43e4-8604-56e55a3da8a1 agent=agent_mttezr6c_doodr76 -->
+
+- [x] A tab an agent opens through app control still started on 'ask' permissions, so every delegated coworker stalled on approvals. A controlled tab now inherits its controller's permission mode, clamped to what the target provider supports and never above the controller's own level. <!-- conductor-task:control-tab-inherits-permission agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Add a usage cap (we can cap a tab / workspace to stop when a certain amount of weekly / daily session percentage is used, or possibly even token amount <!-- conductor-task:6c263544-4e62-442c-b65f-8b1f0b439749 agent=agent_mtu4f3k6_yiau9kg -->
+
+- [x] Maybe a local diff 'git' setup would be nice so if one agent breaks something when fixing a bug or doesn't do it justice we can revert / see his changes even before gitting stuff.. <!-- conductor-task:eced4219-15bd-4cd3-a1e1-34f946d6c79b agent=agent_mtu4iljr_5gdjfag -->
+
+- [x] Turn ask questions into multiple steps, don't just bash them 1 under the other. Place the window sticky on the bottom if tab size allows it (if not, just place it in content), so we can scroll content with it, reading stuff while reading the questions at the same time. <!-- conductor-task:b04379de-ad8c-499b-842d-6f6841515577 agent=agent_mtu3stcq_t5batz4 -->
+
+- [x] Visually separate the other menus from workspace and explorer, menus that are not finished yet go to the bottom and look disabled. <!-- conductor-task:7b979a1a-2f6a-40be-99ca-b9f2964a1f5d agent=agent_mtu4f8jp_7sy8rpg -->
+
+- [x] Just like in VScode, ctrl+e should show recently opened files (that we chose to open in conductor) <!-- conductor-task:c978a680-b006-4a86-b758-004fb427aafc agent=agent_mtu035p5_ezlg01o -->
+
+- [x] last sent prompt by me should be stuck to the top of tab, should be trunctuated after amount of characters & should scroll me to the message on click (on hover it lets me know this is possible) <!-- conductor-task:82898f2c-fc9b-4911-b02d-a42421a782e9 agent=agent_mtu4zth1_z29k4e4 -->
+
+- [x] Project row status only resolves for the project you are currently in. The Workspaces project row shows working / needs attention / done via getProjectActivityStatuses, but App's `sessions` state only ever holds the active project's workspaces, and the `conductor:agent-activity` events it rolls up are only dispatched by mounted panes. So every other project's row stays idle no matter what its agents are doing. Making it real needs activity for all projects from the backend (sessions and phases for non-active projects), not another renderer roll-up. <!-- conductor-task:feature-all-project-activity agent=agent_mtu4ioiz_385huku -->
+
+- [x] Project memory is a closed loop rather than storage alone. Recall renders through formatRecalledMemories and its token budget; agents get MEMORY_PROTOCOL once per session so they can write memories; their CONDUCTOR_MEMORY sentinels are read back out of assistant replies and banked as agent-source memories, deduplicated per message so a growing snapshot cannot inflate a memory's strength; and faded, unrehearsed agent episodes are pruned once per session by database.forgetStaleMemories, while knowledge, policy, human-written and reinforced memories are kept. <!-- conductor-task:feature-memory-loop agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Build project memory out past the loop. Three concrete gaps remain. <!-- conductor-task:feature-memory-curation agent=agent_mtu49nhv_tcg2raw -->
+  
+  1. You cannot tell your memories from an agent's. Agents can now write to project memory on their own initiative, but MemoryPane shows only gist, cues, strength and recall count - not `source`, salience or confidence. Show provenance, and show which conversation wrote a memory and when.
+  
+  2. There is no way to curate memory by hand. `database.removeMemory` exists and the `memory.forget` RPC is agent-only, so the pane can't delete, correct, or re-weight anything. Add editing and deletion for human-owned and agent-written memories, and a visible prune that uses `standingMemoryScore` (written, still no caller) to rank what is decaying, instead of only the automatic once-per-session pass.
+  
+  3. Recall is invisible. Memories are injected into a turn's prompt with no indication in the conversation of which ones were used, so a wrong memory silently steers an agent with nothing to point at. Surface what was recalled for a turn, and make it correctable from there.
+  
+  Also fold up the last loose end: `MEMORY_KINDS` is the canonical kind list and still has no caller, while MemoryPane's `kindMeta` and the `memory.remember` RPC each hardcode their own copy of the same three kinds.
+
+- [x] Add the Check icon somewhere to done tasks i.e. make a done task more visible, currently, it's not immidiately visible which are in fact done and which are not. <!-- conductor-task:663db862-e082-436a-9826-c385c232ae2d agent=agent_mtu035p5_ezlg01o -->
+
+- [x] Add logging in via github for credentials. Then, add a system which can launch a server for remote control of this machines Conductor project and Conductor filespace by another Conductor logged in with the same github credentials. Orcherstrate this via the highest, latest model available, but that model will use lower class workers for the churning. The finished integration needs to let the user select a machine that actually runs that window, that way, for example, I'll be able to run a heavy render from the comfort of my conductor window, while the render runs on a PC, I run it off my laptop. The agents need to be aware of this fact, because when they'll be creating another linked tab or something similiar, those tabs need to run on that same machine as previously selected unless prompted differently.. <!-- conductor-task:a17381dc-57e2-4232-9e3c-85bfdbb32455 agent=agent_mtu4ut5i_6fehmhy priority=low -->
+
 ## Urgent bugs and permissions - 2026-09-08
 
 Migrated from the owner-approved urgent handoff. Original evidence and acceptance criteria are preserved below; progress is tracked through Project tasks.
@@ -131,7 +271,7 @@ Migrated from the owner-approved urgent handoff. Original evidence and acceptanc
 
 ## 1. Fix agent runtime startup and filesystem access
 
-- [~] Investigate and fix `helper_unknown_error: setup refresh had errors` preventing Codex from starting its shell and accessing workspace files. <!-- conductor-task:urgent-runtime-startup agent=agent_mtsqk737_52vftmy -->
+- [x] Investigate and fix `helper_unknown_error: setup refresh had errors` preventing Codex from starting its shell and accessing workspace files. <!-- conductor-task:urgent-runtime-startup agent=agent_mtt8r78u_bfzsv3d -->
 
 Confirmed evidence: default-shell Get-Location and explicit Windows PowerShell pwd with login disabled both fail before command execution with `Failed to create unified exec process: helper_unknown_error: setup refresh had errors`. Node REPL fails with `windows sandbox failed: helper_unknown_error: setup refresh had errors`. An apply_patch update to feature-list.md fails while reading the file with the same sandbox helper error. A previous add-file call returned an empty result; creation of artifacts/bug-coworker-visibility-shell-startup.md was not verified. Do not assume that report exists.
 
@@ -167,25 +307,20 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 ## Ideas
 
-- [ ] Probe idea from the tasks pane <!-- conductor-task:ec3529fb-6ae7-45f9-b476-4efa01dfa5b0 -->
-- [ ] Probe idea from the tasks pane <!-- conductor-task:b79d0ab6-655a-41cb-87a3-8a68ee6e2507 -->
-
-- [ ] Probe idea from the tasks pane <!-- conductor-task:021d8f33-fe6d-4430-9326-311e5faffb18 -->
-
 ## Bugs
 
 - [x] Project tasks in 0.1.18 cannot add or edit reports containing line breaks. Preserve multi-line text and support Ctrl+Enter to save while Enter inserts a newline. <!-- conductor-task:task-multiline-reports agent=agent_mtsqk737_52vftmy -->
 
-- [ ] Closing a tab briefly flashes the remaining tab(s). Animate the pane resize so neighbours grow smoothly, without re-rendering or flashing their content during the transition. <!-- conductor-task:bug-tab-close-resize-flash -->
+- [x] Closing a tab briefly flashes the remaining tab(s). Animate the pane resize so neighbours grow smoothly, without re-rendering or flashing their content during the transition. <!-- conductor-task:bug-tab-close-resize-flash agent=agent_mttcsu1i_3zvkeu1 -->
 
-- [ ] Ctrl+Shift+Alt+Arrow does not move a tab/window - it resizes exactly like Ctrl+Shift+Arrow. Make the move shortcut actually relocate the tab in the layout, distinct from resizing. <!-- conductor-task:bug-move-tab-shortcut -->
+- [x] Ctrl+Shift+Alt+Arrow does not move a tab/window - it resizes exactly like Ctrl+Shift+Arrow. Make the move shortcut actually relocate the tab in the layout, distinct from resizing. <!-- conductor-task:bug-move-tab-shortcut -->
 
-- [ ] Switching the theme from day to night and back is extremely laggy. Make the theme swap fast and smooth. <!-- conductor-task:bug-theme-switch-lag -->
+- [x] Switching the theme from day to night and back is extremely laggy. Make the theme swap fast and smooth. <!-- conductor-task:bug-theme-switch-lag agent=agent_mtt8r78u_bfzsv3d -->
 
 ## Features
 
 - [x] Task circles select one or multiple tasks; completing a task uses its status selector and moves it to Done. Selected tasks can be assigned to an open native agent tab or a new tab with model and effort choices. Auto opens a main Fixer that chooses suitable models and efforts per task and delegates to visible native coworkers. <!-- conductor-task:task-selection-dispatch agent=agent_mtsqk737_52vftmy -->
 
-- [ ] Match VS Code file type colors/icons for every language and extension (.mjs, .cjs, .ts, .tsx, .json, .css, .md, .ps1, .yml, dotfiles, ...), applied consistently in the explorer, file tabs, Ctrl+E picker and agent file links. <!-- conductor-task:feature-file-type-colors -->
+- [x] Match VS Code file type colors/icons for every language and extension (.mjs, .cjs, .ts, .tsx, .json, .css, .md, .ps1, .yml, dotfiles, ...), applied consistently in the explorer, file tabs, Ctrl+E picker and agent file links. <!-- conductor-task:feature-file-type-colors agent=agent_mtu4f5v5_4ia8e4w -->
 
-- [ ] Subagents view currently shows almost nothing. Per subagent, show the model/provider it runs on (with effort), which tab and workspace it belongs to when that differs from the calling tab or is another company's model, live status, token usage, and a click-through to open it. <!-- conductor-task:feature-subagents-view-detail -->
+- [x] Subagents view currently shows almost nothing. Per subagent, show the model/provider it runs on (with effort), which tab and workspace it belongs to when that differs from the calling tab or is another company's model, live status, token usage, and a click-through to open it. It should render like the real agent view, with real designed steps rather than plain text. <!-- conductor-task:feature-subagents-view-detail agent=agent_mtu49or3_7l3m8st -->

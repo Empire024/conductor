@@ -10,15 +10,20 @@
 .quick-theme-toggle { height: 100%; min-height: 32px; }
 .quick-theme-toggle > svg { flex: 0 0 17px; }
 .quick-theme-toggle > span { width: 30px; text-align: left; }
-:root.theme-changing, :root.theme-changing * { transition-property: background-color, color, border-color, box-shadow, fill, stroke !important; transition-duration: 400ms !important; transition-timing-function: ease !important; }
 .workspace-tab-tree { margin: 0 0 4px 17px; min-width: 0; }
-.session-tree .workspace-tab-toggle { height: 21px; min-height: 21px; padding: 0 5px; gap: 5px; color: var(--text-3); font-size: 9px; }
+.session-tree .workspace-tab-toggle { flex: 0 0 15px; width: 15px; height: 21px; min-height: 21px; padding: 0; display: grid; place-items: center; border-radius: 4px; color: var(--text-2); }
+.session-tree .workspace-tab-toggle:hover { color: var(--text); background: var(--surface-hover); }
 .workspace-tab-row { display: flex; min-width: 0; border-radius: 4px; }
 .workspace-tab-row.selected { background: color-mix(in srgb, var(--surface-hover) 60%, transparent); }
 .session-tree .workspace-tab-select { flex: 1; min-width: 0; height: 25px; padding: 0 5px; gap: 6px; font-size: 10px; }
 .workspace-tab-select > svg, .workspace-tab-select > .provider-logo { flex-shrink: 0; }
 .session-tree .workspace-tab-more { flex: 0 0 23px; width: 23px; height: 25px; padding: 0; justify-content: center; opacity: 0; }
 .workspace-tab-row:hover .workspace-tab-more, .workspace-tab-row:focus-within .workspace-tab-more { opacity: 1; }
+.session-tree .workspace-tab-link { flex: 0 0 18px; width: 18px; height: 25px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 4px; background: transparent; cursor: pointer; }
+.workspace-tab-link.controlled { color: var(--blue); }
+.workspace-tab-link.controller { color: var(--accent); }
+.workspace-tab-link:hover { background: var(--surface-hover); }
+.workspace-tab-link:focus-visible { outline: 1px solid var(--accent); }
 .explorer-dotfile-heading { margin: 7px 6px 3px; padding-top: 6px; border-top: 1px solid var(--border-soft); color: var(--text-3); font-size: 8px; font-weight: 650; letter-spacing: .06em; text-transform: uppercase; }
 .explorer-row.dot-entry { color: var(--text-3); }
 .explorer-row.dot-entry:hover, .explorer-row.dot-entry.selected { color: var(--text); }
@@ -35,4 +40,10 @@
 .project-remove-dialog footer { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border-soft); }
 .project-remove-dialog button.danger { color: var(--danger); }
 .project-remove-dialog button.danger:hover:not(:disabled) { color: #fff; background: #8e343b; }
-@media (prefers-reduced-motion: reduce) { :root.theme-changing, :root.theme-changing *, .pane-tab, .session-tabs > button.session-tab, .session-tree button, .file-tab { transition: none !important; } }
+@media (prefers-reduced-motion: reduce) { .pane-tab, .session-tabs > button.session-tab, .session-tree button, .file-tab { transition: none !important; } }
+
+/* Activity rail: primary destinations (Workspace, Explorer) vs. the rest, with
+   not-yet-wired-up entries pinned below and shown as disabled. */
+.rail-divider { flex: 0 0 auto; width: 24px; height: 1px; margin: 6px 0; background: var(--border-soft, #1f242b); }
+.activity-rail button.rail-unfinished { color: #3c4148; cursor: default; }
+.activity-rail button.rail-unfinished:hover { color: #3c4148; background: transparent; }

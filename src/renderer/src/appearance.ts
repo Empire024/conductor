@@ -1,6 +1,7 @@
 import type { AppSettings, ThemeVariant } from '../../shared/models'
 
 const transitionTimers = new WeakMap<HTMLElement, ReturnType<typeof setTimeout>>()
+type TransitionDocument = Document & { startViewTransition?: (update: () => void) => { finished: Promise<void> } }
 
 export const DAY_START_HOUR = 7
 export const NIGHT_START_HOUR = 19
@@ -21,18 +22,26 @@ export function applyAppTheme(
 ): ThemeVariant {
   const variant = resolveThemeVariant(settings, at)
   const changed = root.dataset.themeId && (root.dataset.themeId !== settings.themeId || root.dataset.themeVariant !== variant)
-  if (changed && !root.ownerDocument.defaultView?.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    clearTimeout(transitionTimers.get(root))
-    root.classList.add('theme-changing')
-    // Install transitions before replacing the palette, including embedded editors.
-    void root.offsetWidth
-    transitionTimers.set(root, setTimeout(() => root.classList.remove('theme-changing'), 460))
+  const apply = (): void => {
+    root.dataset.themeId = settings.themeId
+    // Keep light/dark here for existing component selectors and Monaco integration.
+    root.dataset.theme = variant === 'day' ? 'light' : 'dark'
+    root.dataset.themeVariant = variant
+    root.dataset.themeAuto = String(settings.themeAuto)
+    root.style.colorScheme = variant === 'day' ? 'light' : 'dark'
   }
-  root.dataset.themeId = settings.themeId
-  // Keep light/dark here for existing component selectors and Monaco integration.
-  root.dataset.theme = variant === 'day' ? 'light' : 'dark'
-  root.dataset.themeVariant = variant
-  root.dataset.themeAuto = String(settings.themeAuto)
-  root.style.colorScheme = variant === 'day' ? 'light' : 'dark'
+  const transitionDoc = root.ownerDocument as TransitionDocument
+  const reducedMotion = root.ownerDocument.defaultView?.matchMedia('(prefers-reduced-motion: reduce)').matches
+  if (changed && !reducedMotion && transitionDoc.startViewTransition) {
+    clearTimeout(transitionTimers.get(root))
+    // Tag the whole page with a transient snapshot name so the swap crossfades as a
+    // single compositor layer (see styles.css ::view-transition-old/new(*)) instead of
+    // running a transition on every element, which was the source of the lag.
+    root.style.viewTransitionName = 'conductor-theme'
+    transitionDoc.startViewTransition(apply)
+    transitionTimers.set(root, setTimeout(() => { root.style.viewTransitionName = '' }, 260))
+  } else {
+    apply()
+  }
   return variant
 }

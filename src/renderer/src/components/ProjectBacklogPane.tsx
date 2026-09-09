@@ -1,11 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bug, ChevronDown, ChevronRight, Circle, CircleCheck, CircleDot, FileText, GitBranch, GitCompare, Github, Lightbulb, ListTodo, Pencil, RefreshCw, Search, Sparkles, X } from 'lucide-react'
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { Bug, Check, ChevronDown, ChevronRight, Circle, CircleCheck, CircleDot, FileText, GitBranch, GitCompare, Github, Lightbulb, ListTodo, Pencil, RefreshCw, Search, Sparkles, X } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
-import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskDispatchResult, ProjectTaskDispatchTarget, ProjectTaskEdit, ProjectTaskKind } from '../../../shared/project-backlog'
+import { projectTaskPriorities } from '../../../shared/project-backlog'
+import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskDispatchResult, ProjectTaskDispatchTarget, ProjectTaskEdit, ProjectTaskKind, ProjectTaskPriority } from '../../../shared/project-backlog'
 import type { SourceControlChangeSet } from '../../../shared/source-control'
+import type { ContextAttachment } from '../../../shared/structured-agent'
 import { AgentDialog } from '../panes/StructuredAgentRenderers'
 import { openWorkspaceFile } from './workspace-files-state'
 import { ProjectTaskAssignment, type ProjectTaskAssignmentMode } from './ProjectTaskAssignment'
+import { PromptImageThumbnail, PromptImageUpload } from './PromptImageUpload'
 import '../panes/StructuredAgentPane.css'
 import './ProjectBacklogPane.css'
 
@@ -13,10 +17,94 @@ const kindLabels:Record<ProjectTaskKind,string> = {bug:'Bug',feature:'Feature',i
 const kindIcons = {bug:Bug,feature:Sparkles,idea:Lightbulb}
 const statusVerbs:Record<ProjectTask['status'],string> = {done:'Completed by',doing:'Claimed by',todo:'Reopened by'}
 const fileVerbs:Record<ProjectTask['status'],string> = {done:'Marked done',doing:'Marked in progress',todo:'Listed'}
+const priorityLabels:Record<ProjectTaskPriority,string> = {high:'High',normal:'Normal',low:'Low'}
+const priorityRank:Record<ProjectTaskPriority,number> = {high:0,normal:1,low:2}
+const priorityColors:Record<ProjectTaskPriority,string> = {high:'var(--danger)',normal:'var(--accent-muted)',low:'var(--text-3)'}
 
-function submitTaskShortcut(event:React.KeyboardEvent<HTMLTextAreaElement>):void {
+/** A custom listbox, not a native <select>: a themed <select>'s color styles the whole
+ *  popup including every option, so tinting the trigger by priority also painted every
+ *  option in the native menu the same color. Each option here is its own node instead. */
+function PriorityPicker({value,disabled,ariaLabel,suffix,onChange,onKeyDown}:{value:ProjectTaskPriority;disabled?:boolean;ariaLabel:string;suffix?:string;onChange(next:ProjectTaskPriority):void;onKeyDown?(event:React.KeyboardEvent<HTMLButtonElement>):void}):React.JSX.Element {
+  const [open,setOpen]=useState(false)
+  const trigger=useRef<HTMLButtonElement>(null)
+  const menu=useRef<HTMLDivElement>(null)
+  const id=useId()
+  const close=():void=>{setOpen(false);trigger.current?.focus()}
+  useLayoutEffect(()=> {
+    if(!open)return
+    const anchor=trigger.current!.getBoundingClientRect()
+    const box=menu.current
+    if(box) {
+      const size=box.getBoundingClientRect()
+      box.style.left=Math.max(8,Math.min(anchor.left,window.innerWidth-size.width-8))+'px'
+      box.style.top=Math.min(anchor.bottom+4,window.innerHeight-size.height-8)+'px'
+    }
+    menu.current?.querySelector<HTMLButtonElement>('[aria-selected="true"]')?.focus()
+  },[open])
+  useEffect(()=> {
+    if(!open)return
+    const outside=(event:PointerEvent):void=>{if(!trigger.current?.contains(event.target as Node) && !menu.current?.contains(event.target as Node))setOpen(false)}
+    const dismiss=():void=>setOpen(false)
+    document.addEventListener('pointerdown',outside)
+    window.addEventListener('resize',dismiss)
+    window.addEventListener('scroll',dismiss,true)
+    return()=>{document.removeEventListener('pointerdown',outside);window.removeEventListener('resize',dismiss);window.removeEventListener('scroll',dismiss,true)}
+  },[open])
+  useEffect(()=>{if(disabled)setOpen(false)},[disabled])
+  return <>
+    <button ref={trigger} type="button" className={'project-priority-trigger priority-'+value} aria-label={ariaLabel} aria-haspopup="listbox" aria-controls={id} aria-expanded={open} disabled={disabled} onClick={()=>setOpen(o=>!o)} onKeyDown={event=> {
+      onKeyDown?.(event)
+      if(!event.defaultPrevented && event.key==='ArrowDown'){event.preventDefault();setOpen(true)}
+    }}><span className="project-priority-dot" aria-hidden="true" style={{background:priorityColors[value]}}/><span>{priorityLabels[value]}{suffix}</span><ChevronDown size={11} aria-hidden="true"/></button>
+    {open && createPortal(<div ref={menu} id={id} role="listbox" aria-label={ariaLabel} className="project-priority-menu" onKeyDown={event=> {
+      if(event.key==='Escape'){event.preventDefault();event.stopPropagation();close()}
+      if(['ArrowDown','ArrowUp','Home','End'].includes(event.key)) {
+        event.preventDefault()
+        const options=[...menu.current!.querySelectorAll<HTMLButtonElement>('[role="option"]')]
+        const index=options.indexOf(document.activeElement as HTMLButtonElement)
+        const next=event.key==='Home'?0:event.key==='End'?options.length-1:(index+(event.key==='ArrowDown'?1:options.length-1))%options.length
+        options[next]?.focus()
+      }
+    }}>{projectTaskPriorities.map(item=> <button key={item} type="button" role="option" aria-selected={value===item} className={'project-priority-option priority-'+item} onClick={()=>{onChange(item);close()}}>
+      <span className="project-priority-dot" aria-hidden="true" style={{background:priorityColors[item]}}/><span>{priorityLabels[item]}{suffix}</span>{value===item && <Check size={13} aria-hidden="true" className="project-priority-check"/>}
+    </button>)}</div>,document.body)}
+  </>
+}
+
+/** When a task was first seen (its earliest recorded activity), so "newest" tracks when it
+ *  was added rather than when it was last touched. Falls back to file position for the rare
+ *  case a task has no recorded activity yet (e.g. a freshly built fixture in tests). */
+function taskCreatedAt(task:ProjectTask):number {
+  const first=task.activity[task.activity.length-1]
+  const at=first?Date.parse(first.at):NaN
+  return Number.isFinite(at)?at:task.line
+}
+/** Priority first (high, normal, low), then newest-added first within a priority. A pure view
+ *  concern: feature-list.md keeps its own on-disk order untouched. */
+export function sortProjectTasks(tasks:ProjectTask[]):ProjectTask[] {
+  return [...tasks].sort((a,b)=>priorityRank[a.priority]-priorityRank[b.priority] || taskCreatedAt(b)-taskCreatedAt(a))
+}
+
+export function submitTaskShortcut(event:React.KeyboardEvent<HTMLTextAreaElement|HTMLSelectElement|HTMLButtonElement>):void {
   if(event.nativeEvent.isComposing || event.nativeEvent.keyCode===229)return
   if(event.key==='Enter' && (event.ctrlKey || event.metaKey)){event.preventDefault();event.currentTarget.form?.requestSubmit()}
+}
+
+/** Task titles stay valid Markdown: an attached image becomes its own continuation line so
+ *  the existing checklist parser round-trips it like any other multi-line title. */
+const taskImageLine=/^!\[([^\]]*)\]\(([^\s()]+)\)$/
+export function embedTaskImages(title:string,images:ContextAttachment[]):string {
+  const lines=images.filter(image=>image.path).map(image=>'!['+image.name.replace(/[[\]]/g,'').slice(0,160)+']('+image.path+')')
+  return lines.length?title.trim()+'\n\n'+lines.join('\n'):title
+}
+export function splitTaskImages(title:string):{text:string;images:{id:string;name:string;path:string}[]} {
+  const images:{id:string;name:string;path:string}[]=[], lines:string[]=[]
+  for(const line of title.split('\n')) {
+    const match=taskImageLine.exec(line.trim())
+    if(match)images.push({id:match[2]!,name:match[1] || 'Image',path:match[2]!})
+    else lines.push(line)
+  }
+  return {text:lines.join('\n').replace(/\n{3,}/g,'\n\n').trim(),images}
 }
 
 /** Short, honest relative time. Older entries fall back to a real date. */
@@ -35,6 +123,11 @@ export function taskAuthor(activity:ProjectTaskActivity):string {
   if(activity.actor!=='agent')return 'you'
   const name=[activity.provider,activity.agentTitle].filter(Boolean).filter((part,index,all)=>all.indexOf(part)===index).join(' · ')
   return name || activity.agentId || 'an agent'
+}
+
+/** A done task must read as done at a glance, not just once you notice the muted text. */
+export function taskTitleRow(status:ProjectTask['status'],content:React.ReactNode,onClick:()=>void):React.JSX.Element {
+  return <div className="project-task-title-row">{status==='done' && <Check size={13} className="project-task-done-check" aria-hidden="true"/>}<button className="project-task-title" onClick={onClick}>{content}</button></div>
 }
 
 function TaskChanges({project,task,onClose}:{project:ProjectRecord;task:ProjectTask;onClose():void}):React.JSX.Element {
@@ -72,17 +165,53 @@ function TaskChanges({project,task,onClose}:{project:ProjectRecord;task:ProjectT
   </AgentDialog>
 }
 
+/** The drawer unmounts whenever it is closed or the project changes, so unsubmitted task
+ *  text lives outside React state. Written from the input handlers, never from an effect,
+ *  so an unmount cannot race the save. */
+interface BacklogDraft {title:string;images:ContextAttachment[];editing:{id:string;title:string}|null}
+const emptyBacklogDraft:BacklogDraft={title:'',images:[],editing:null}
+const backlogDraftKey=(projectId:string):string=>'conductor.tasks.draft.'+projectId
+const isDraftImage=(value:unknown):value is ContextAttachment=>Boolean(value) && typeof value==='object' && (value as ContextAttachment).kind==='image' && typeof (value as ContextAttachment).id==='string' && typeof (value as ContextAttachment).path==='string' && typeof (value as ContextAttachment).name==='string'
+const readBacklogDraft=(projectId:string):BacklogDraft=> {
+  try {
+    const value=JSON.parse(localStorage.getItem(backlogDraftKey(projectId))??'null')
+    if(!value || typeof value.title!=='string')return emptyBacklogDraft
+    const editing=value.editing && typeof value.editing.id==='string' && typeof value.editing.title==='string'?{id:value.editing.id,title:value.editing.title}:null
+    const images=Array.isArray(value.images)?value.images.filter(isDraftImage):[]
+    return {title:value.title,images,editing}
+  } catch {return emptyBacklogDraft}
+}
+const writeBacklogDraft=(projectId:string,draft:BacklogDraft):void=> {
+  try {
+    if(!draft.title && !draft.images.length && !draft.editing)localStorage.removeItem(backlogDraftKey(projectId))
+    else localStorage.setItem(backlogDraftKey(projectId),JSON.stringify(draft))
+  } catch {/* A full quota must never block typing; the text stays in React state. */}
+}
+
 export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.Element {
   const [board,setBoard]=useState<ProjectBacklog|null>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false)
-  const [query,setQuery]=useState(''),[kind,setKind]=useState<'all'|ProjectTaskKind>('all'),[title,setTitle]=useState(''),[newKind,setNewKind]=useState<ProjectTaskKind>('bug')
-  const [editing,setEditing]=useState<{id:string;title:string}|null>(null),[diffTask,setDiffTask]=useState<ProjectTask|null>(null)
+  const [query,setQuery]=useState(''),[kind,setKind]=useState<'all'|ProjectTaskKind>('all'),[title,setTitle]=useState(()=>readBacklogDraft(project.id).title),[newKind,setNewKind]=useState<ProjectTaskKind>('bug')
+  const [newPriority,setNewPriority]=useState<ProjectTaskPriority>('normal')
+  const [images,setImages]=useState<ContextAttachment[]>(()=>readBacklogDraft(project.id).images)
+  const [editing,setEditing]=useState<{id:string;title:string}|null>(()=>readBacklogDraft(project.id).editing),[diffTask,setDiffTask]=useState<ProjectTask|null>(null)
   const [selected,setSelected]=useState<Set<string>>(()=>new Set())
   const [assignment,setAssignment]=useState<{mode:ProjectTaskAssignmentMode;tasks:ProjectTask[];revision:string}|null>(null)
   const key='conductor.tasks.done.'+project.id
   const [doneOpen,setDoneOpen]=useState(()=>localStorage.getItem(key)==='true')
   const revision=useRef(0),mounted=useRef(false),writing=useRef(false)
-  useEffect(()=>{setSelected(new Set());setAssignment(null)},[project.id])
+  const draft=useRef<BacklogDraft>({title,images,editing})
+  draft.current={title,images,editing}
+  const keepDraft=(next:Partial<BacklogDraft>):void=> {
+    draft.current={...draft.current,...next}
+    writeBacklogDraft(project.id,draft.current)
+  }
+  const draftTitle=(next:string):void=>{setTitle(next);keepDraft({title:next})}
+  const draftImages=(next:ContextAttachment[]):void=>{setImages(next);keepDraft({images:next})}
+  const draftEditing=(next:{id:string;title:string}|null):void=>{setEditing(next);keepDraft({editing:next})}
+  useEffect(()=>{setSelected(new Set());setAssignment(null);const saved=readBacklogDraft(project.id);draft.current=saved;setTitle(saved.title);setImages(saved.images);setEditing(saved.editing)},[project.id])
   useEffect(()=>{if(board)setSelected(current=>{const available=new Set(board.tasks.map(task=>task.id));const next=new Set([...current].filter(id=>available.has(id)));return next.size===current.size?current:next})},[board])
+  // A task deleted elsewhere must not leave an unreachable edit draft behind.
+  useEffect(()=>{if(board && editing && !board.tasks.some(task=>task.id===editing.id))draftEditing(null)},[board,editing])
   const refresh=useCallback(async()=> {
     const sequence=++revision.current
     try {const next=await window.conductor.projectTasks.get(project.id);if(mounted.current && sequence===revision.current)setBoard(next)}
@@ -122,7 +251,7 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
       await window.conductor.system.openExternal(changes.compareUrl)
     } catch(reason){setError(String(reason))}
   }
-  const visible=(board?.tasks??[]).filter(task=>(kind==='all'||task.kind===kind) && task.title.toLowerCase().includes(query.toLowerCase()))
+  const visible=sortProjectTasks((board?.tasks??[]).filter(task=>(kind==='all'||task.kind===kind) && task.title.toLowerCase().includes(query.toLowerCase())))
   const todo=visible.filter(task=>task.status==='todo'),doing=visible.filter(task=>task.status==='doing'),done=visible.filter(task=>task.status==='done')
   const row=(task:ProjectTask):React.JSX.Element=> {
     const owner=board?.owners.find(owner=>owner.id===task.agentId)
@@ -131,13 +260,16 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
     const last=task.activity[0]
     const author=last?taskAuthor(last):''
     const opened=task.activity.length===1 && last?.status==='todo'
+    const {text:taskText,images:taskImages}=splitTaskImages(task.title)
     return <article className={'project-task status-'+task.status+(selected.has(task.id)?' is-selected':'')} key={task.id} data-task-id={task.id}>
       <button type="button" role="checkbox" className="project-task-check" aria-label={'Select '+task.title} aria-checked={selected.has(task.id)} title={selected.has(task.id)?'Deselect task':'Select task'} disabled={busy} onClick={()=>setSelected(current=>{const next=new Set(current);if(next.has(task.id))next.delete(task.id);else next.add(task.id);return next})}><Selected size={16}/></button>
       <div className="project-task-body">
-        {editing?.id===task.id ? <form onSubmit={event=>{event.preventDefault();if(!editing.title.trim() || busy)return;void edit({type:'update',id:task.id,title:editing.title}).then(saved=>{if(saved)setEditing(null)})}}><textarea autoFocus aria-label="Edit task" value={editing.title} onChange={event=>setEditing({id:task.id,title:event.target.value})} onKeyDown={event=>{submitTaskShortcut(event);if(event.key==='Escape' && !event.nativeEvent.isComposing && event.nativeEvent.keyCode!==229)setEditing(null)}} title="Ctrl+Enter to save; Enter for a new line" maxLength={8000}/><div><button disabled={busy||!editing.title.trim()} type="submit">Save</button><button type="button" onClick={()=>setEditing(null)}>Cancel</button></div></form> : <button className="project-task-title" onClick={()=>setEditing({id:task.id,title:task.title})}>{task.title}</button>}
+        {editing?.id===task.id ? <form onSubmit={event=>{event.preventDefault();if(!editing.title.trim() || busy)return;void edit({type:'update',id:task.id,title:editing.title}).then(saved=>{if(saved)draftEditing(null)})}}><textarea autoFocus aria-label="Edit task" value={editing.title} onChange={event=>draftEditing({id:task.id,title:event.target.value})} onKeyDown={event=>{submitTaskShortcut(event);if(event.key==='Escape' && !event.nativeEvent.isComposing && event.nativeEvent.keyCode!==229)draftEditing(null)}} title="Ctrl+Enter to save; Enter for a new line" maxLength={8000}/><div><button disabled={busy||!editing.title.trim()} type="submit">Save</button><button type="button" onClick={()=>draftEditing(null)}>Cancel</button></div></form> : taskTitleRow(task.status,taskText || (taskImages.length?'Attached image':task.title),()=>draftEditing({id:task.id,title:task.title}))}
+        {taskImages.length>0 && <div className="project-task-images">{taskImages.map(image=><PromptImageThumbnail key={image.id} projectId={project.id} attachment={{id:image.id,kind:'image' as const,name:image.name,path:image.path}}/>)}</div>}
         <div className="project-task-meta"><span className={'project-task-kind '+task.kind}><Kind size={11}/> {kindLabels[task.kind]}</span>
           <select aria-label={'Status of '+task.title} disabled={busy} value={task.status} onChange={event=>void edit({type:'update',id:task.id,status:event.target.value as ProjectTask['status']})}><option value="todo">To do</option><option value="doing">In progress</option><option value="done">Done</option></select>
-          <button className="project-task-edit" title="Edit task" aria-label={'Edit '+task.title} onClick={()=>setEditing({id:task.id,title:task.title})}><Pencil size={11}/></button>
+          <PriorityPicker ariaLabel={'Priority of '+task.title} value={task.priority} disabled={busy} onChange={next=>void edit({type:'update',id:task.id,priority:next})}/>
+          <button className="project-task-edit" title="Edit task" aria-label={'Edit '+task.title} onClick={()=>draftEditing({id:task.id,title:task.title})}><Pencil size={11}/></button>
         </div>
         <div className="project-task-owner"><span className="project-task-owner-label" title={owner?[owner.provider,owner.title,owner.workspace].join(' / '):task.agentId??'Select this task to assign it'}>{owner?[owner.provider,owner.title,owner.workspace].join(' / '):task.agentId?'Previous agent: '+task.agentId:'Unassigned'}</span>
           {owner && <button title={'Open '+owner.title+' in '+owner.workspace} aria-label={'Open assigned agent for '+task.title} onClick={()=>window.dispatchEvent(new CustomEvent('conductor:focus-process',{detail:{id:owner.id,sessionId:owner.sessionId}}))}>{owner.phase.replaceAll('_',' ')} <ChevronRight size={12}/></button>}
@@ -166,7 +298,11 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
         {scm.enabled&&!scm.available&&<small title={scm.reason}>{scm.reason}</small>}
       </div>}
     </header>
-    <form className="project-task-add" onSubmit={event=>{event.preventDefault();if(!title.trim() || busy)return;void edit({type:'add',title,kind:newKind}).then(saved=>{if(saved)setTitle('')})}}><textarea aria-label="New project task" placeholder="Add a bug, feature, or idea…" value={title} onChange={event=>setTitle(event.target.value)} rows={2} maxLength={8000} onKeyDown={submitTaskShortcut} title="Ctrl+Enter to add; Enter for a new line"/><div><select aria-label="New task type" value={newKind} onChange={event=>setNewKind(event.target.value as ProjectTaskKind)}><option value="bug">Bug</option><option value="feature">Feature</option><option value="idea">Idea</option></select><button type="submit" disabled={busy||!board||!title.trim()}>Add task</button></div></form>
+    <form className="project-task-add" onSubmit={event=>{event.preventDefault();if(!title.trim() || busy)return;void edit({type:'add',title:embedTaskImages(title,images),kind:newKind,priority:newPriority}).then(saved=>{if(saved){draftTitle('');draftImages([])}})}}>
+      {images.length>0 && <div className="sa-context-chips">{images.map(image=><span key={image.id}><span className="project-task-image-chip" title={image.name}><PromptImageThumbnail projectId={project.id} attachment={image}/>{image.name}</span><button type="button" aria-label={'Remove attached image '+image.name} onClick={()=>draftImages(images.filter(item=>item.id!==image.id))}><X size={11}/></button></span>)}</div>}
+      <textarea aria-label="New project task" placeholder="Add a bug, feature, or idea…" value={title} onChange={event=>draftTitle(event.target.value)} rows={2} maxLength={8000} onKeyDown={submitTaskShortcut} title="Ctrl+Enter to add; Enter for a new line"/>
+      <div><span className="project-task-add-controls"><PromptImageUpload projectId={project.id} disabled={busy} onError={setError} onAttach={added=>{if(images.length+added.length>20){setError('A task can have up to 20 attached images. Remove some and attach these again.');return}draftImages([...images,...added])}}/><select aria-label="New task type" value={newKind} onChange={event=>setNewKind(event.target.value as ProjectTaskKind)} onKeyDown={submitTaskShortcut}><option value="bug">Bug</option><option value="feature">Feature</option><option value="idea">Idea</option></select><PriorityPicker ariaLabel="New task priority" value={newPriority} suffix=" priority" onChange={setNewPriority} onKeyDown={submitTaskShortcut}/></span><button type="submit" disabled={busy||!board||!title.trim()}>Add task</button></div>
+    </form>
     <div className="project-task-filters"><label><Search size={13}/><input aria-label="Search project tasks" placeholder="Search tasks" value={query} onChange={event=>setQuery(event.target.value)}/>{query&&<button title="Clear search" onClick={()=>setQuery('')}><X size={11}/></button>}</label><select aria-label="Task type filter" value={kind} onChange={event=>setKind(event.target.value as typeof kind)}><option value="all">All types</option><option value="bug">Bugs</option><option value="feature">Features</option><option value="idea">Ideas</option></select></div>
     <div className="project-task-selection">
       <div><button type="button" disabled={busy||!shown.length} onClick={()=>setSelected(current=>{const next=new Set(current);for(const task of shown){if(allShownSelected)next.delete(task.id);else next.add(task.id)}return next})}>{allShownSelected?'Deselect visible':'Select visible'}</button>

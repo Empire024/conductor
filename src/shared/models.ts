@@ -37,7 +37,53 @@ export const THEME_OPTIONS: ReadonlyArray<{
 
 /** @deprecated Persisted only for migration from versions before theme families. */
 export type ThemeMode = 'dark' | 'light' | 'auto'
-export type AgentActivityPhase = 'idle' | 'working' | 'waiting_input' | 'limited' | 'complete' | 'error'
+/** What a tab's activity indicator is reporting. The three unhappy states are kept apart
+ * because the runtime genuinely distinguishes them (see SessionPhase in structured-agent.ts)
+ * and they call for different responses: 'failed' is a run that errored, 'disconnected' is a
+ * lost runtime connection, 'stopped' is a run the user interrupted. They were once flattened
+ * into a single 'error', which told nobody anything. */
+export type AgentActivityPhase =
+  | 'idle'
+  | 'working'
+  | 'waiting_input'
+  | 'limited'
+  | 'complete'
+  | 'stopped'
+  | 'disconnected'
+  | 'failed'
+
+/** Rows persisted before the unhappy states were split still say 'error'; read them as the
+ * generic failure they meant. */
+export const readActivityPhase = (value: string): AgentActivityPhase =>
+  value === 'error' ? 'failed' : (value as AgentActivityPhase)
+
+/** Chrome's tab-group palette, in Chrome's own order. Stored by name rather than by hex so
+ * a group keeps its identity across the light and dark themes, which resolve these
+ * differently (see --tab-group-* in styles.css). */
+export const TAB_GROUP_COLORS = [
+  'grey',
+  'blue',
+  'red',
+  'yellow',
+  'green',
+  'pink',
+  'purple',
+  'cyan',
+  'orange'
+] as const
+
+export type TabGroupColor = (typeof TAB_GROUP_COLORS)[number]
+
+/** A Chrome-style tab group: a named, coloured run of tabs inside one pane's strip. Named
+ * `TabGroup` rather than `group` because `PaneGroupNode` already means a pane. Membership
+ * lives on the tabs (`PaneTab.tabGroupId`); this record only carries the presentation and
+ * the collapsed flag, so a group exists exactly as long as some tab points at it. */
+export interface TabGroup {
+  id: string
+  title: string
+  color: TabGroupColor
+  collapsed: boolean
+}
 
 export interface PaneTab {
   id: string
@@ -46,6 +92,8 @@ export interface PaneTab {
   icon?: string
   resourceId?: string
   state?: Record<string, unknown>
+  /** The TabGroup in this tab's own pane that it belongs to, if any. */
+  tabGroupId?: string
 }
 
 export interface PaneGroupNode {
@@ -53,6 +101,8 @@ export interface PaneGroupNode {
   id: string
   tabs: PaneTab[]
   activeTabId: string
+  /** Optional so layouts persisted before tab groups load unchanged. */
+  tabGroups?: TabGroup[]
 }
 
 export interface SplitNode {
@@ -86,6 +136,7 @@ export interface AppSettings {
   themeVariant: ThemeVariant
   themeAuto: boolean
   debugLogging: boolean
+  showHiddenFiles: boolean
   agentSoundProfile: AgentSoundProfile
   updateFeedUrl: string
   includeLocalUpdates?: boolean
@@ -306,10 +357,24 @@ export interface RuntimeProcessSummary {
   updatedAt: string
 }
 
-export type MemoryKind = 'episodic' | 'semantic' | 'procedural'
+/** The canonical kind list. Every menu, validator and grouping derives from this one array. */
+export const MEMORY_KINDS = ['episodic', 'semantic', 'procedural'] as const
+export type MemoryKind = (typeof MEMORY_KINDS)[number]
+export const isMemoryKind = (value: unknown): value is MemoryKind =>
+  MEMORY_KINDS.includes(value as MemoryKind)
 
 /** Who committed a memory. Only agent-written episodes are ever auto-forgotten. */
 export type MemorySource = 'human' | 'agent'
+
+/** The conversation a memory came out of, so a memory that turns out to be wrong can be
+ *  traced back to the turn that wrote it instead of standing there unattributed. */
+export interface MemoryOrigin {
+  agentSessionId: string
+  /** Workspace session that owned the conversation; needed to reopen the right tab. */
+  workspaceId?: string
+  title?: string
+  provider?: AgentProviderId
+}
 
 export interface AgentMemory {
   id: string
@@ -317,6 +382,7 @@ export interface AgentMemory {
   agentKey: string | null
   kind: MemoryKind
   source: MemorySource
+  origin: MemoryOrigin | null
   gist: string
   cues: string[]
   salience: number
@@ -325,6 +391,9 @@ export interface AgentMemory {
   occurredAt: string
   lastRecalledAt: string | null
   recallCount: number
+  /** When a person last edited or re-weighted this memory by hand. A corrected memory is
+   *  vouched for, so it stops being a candidate for automatic forgetting. */
+  correctedAt: string | null
   createdAt: string
   updatedAt: string
 }
@@ -334,10 +403,42 @@ export interface RememberMemoryInput {
   agentKey?: string
   kind: MemoryKind
   source?: MemorySource
+  origin?: MemoryOrigin
   gist: string
   cues?: string[]
   salience?: number
   confidence?: number
+}
+
+/** A hand correction. Every field is optional: re-weighting alone must not force a rewrite. */
+export interface UpdateMemoryInput {
+  id: string
+  kind?: MemoryKind
+  gist?: string
+  cues?: string[]
+  salience?: number
+  confidence?: number
+  strength?: number
+}
+
+/** One row of the visible prune, ranked by how little standing a memory still has. */
+export interface MemoryPruneCandidate {
+  memory: AgentMemory
+  standing: number
+  retrievability: number
+  reason: string
+}
+
+/** What memory actually reached the agent for one submitted turn, resolved back to the
+ *  memories themselves so a wrong one can be corrected from the conversation. */
+export interface TurnMemoryRecall {
+  itemId: string
+  agentSessionId: string
+  prompt: string
+  createdAt: string
+  memories: AgentMemory[]
+  /** Recalled memories that have since been deleted; the count keeps the record honest. */
+  forgotten: number
 }
 
 export type NormalizedAgentEventType =

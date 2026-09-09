@@ -260,7 +260,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               onMaximize={setMaximizedGroupId}
               onClosed={(tab) => setClosedTabs((current) => [...current, tab].slice(-20))}
               onDetach={detachAgain}
-              onOpenFile={(path, line) => openWorkspaceFile(bundle.project.id, path, 'editor', line)}
+              onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(bundle.project.id, path, mode ?? 'auto', line, allowBinary)}
               canReopen={closedTabs.length > 0}
               onReopen={(groupId) => {
                 const tab = closedTabs.at(-1)
@@ -270,7 +270,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
                 setClosedTabs((current) => current.slice(0, -1))
               }}
             />
-            <WorkspaceFiles key={detachedId} projects={loadedProjects} projectId={bundle.project.id} workspaceId={'detached:' + detachedId} />
+            <WorkspaceFiles key={detachedId} projects={loadedProjects} projectId={bundle.project.id} workspaceId={'detached:' + detachedId} showHiddenFilesDefault={settings.showHiddenFiles} />
           </div>
           {utilityPanel && (
             <aside className={`workspace-utility-drawer detached-utility-drawer utility-${utilitySide} ${['agents', 'tasks', 'routines'].includes(utilityPanel) ? 'orchestration-drawer' : ''}`}>

@@ -3,6 +3,7 @@ import { createDefaultLayout, makeLauncherTab } from '../../../shared/models'
 import type { PaneGroupNode, WorkspaceLayout } from '../../../shared/models'
 import { addTab, findGroup, listGroups, splitGroup } from './layout-operations'
 import {
+  moveFocusedTab,
   nextSnapStop,
   resizeFocusedGroup,
   snapFocusedGroup,
@@ -112,5 +113,75 @@ describe('keyboard pane resizing', () => {
     const { layout } = horizontal()
     expect(resizeFocusedGroup(layout, 'missing', 'right')).toBe(layout)
     expect(snapFocusedGroup(layout, 'missing', 'right')).toBe(layout)
+  })
+})
+
+describe('moving the focused tab', () => {
+  const horizontal = (): { layout: WorkspaceLayout; left: string; right: string } => {
+    const base = createDefaultLayout()
+    if (base.root.type !== 'group') throw new Error('Expected group root')
+    const layout = splitGroup(base, base.root.id, 'right', makeLauncherTab())
+    const groups = listGroups(layout.root)
+    return { layout, left: groups[0]!.id, right: groups[1]!.id }
+  }
+
+  it('relocates the tab into the neighbouring pane instead of resizing the divider', () => {
+    const { layout, left, right } = horizontal()
+    const moved = moveFocusedTab(layout, left, 'right')
+    expect(findGroup(moved.layout.root, left)).toBeNull()
+    expect(groupOf(moved.layout, right).tabs).toHaveLength(2)
+    if (moved.layout.root.type !== 'split' && layout.root.type === 'split') expect(moved.layout.root).not.toEqual(layout.root)
+  })
+
+  it('leaves the sizes alone, unlike a resize on the same arrow', () => {
+    const { layout, left } = horizontal()
+    const resized = resizeFocusedGroup(layout, left, 'right')
+    const moved = moveFocusedTab(layout, left, 'right')
+    if (layout.root.type !== 'split' || resized.root.type !== 'split') throw new Error('Expected split')
+    expect(resized.root.sizes).not.toEqual(layout.root.sizes)
+    expect(moved.layout).not.toEqual(resized)
+  })
+
+  it('peels a tab into a new pane when nothing lies that way', () => {
+    const { layout, groupId } = withTabs(2)
+    const moved = moveFocusedTab(layout, groupId, 'right')
+    expect(listGroups(moved.layout.root)).toHaveLength(2)
+    expect(listGroups(moved.layout.root).map((group) => group.tabs.length)).toEqual([1, 1])
+  })
+
+  it('refuses to empty the only pane and ignores an unknown group', () => {
+    const { layout, groupId } = withTabs(1)
+    expect(moveFocusedTab(layout, groupId, 'right').layout).toBe(layout)
+    expect(moveFocusedTab(layout, 'missing', 'left').layout).toBe(layout)
+  })
+
+  it('reports the pane the tab landed in, whether it docked or peeled', () => {
+    const { layout, left, right } = horizontal()
+    const docked = moveFocusedTab(layout, left, 'right')
+    expect(docked.groupId).toBe(right)
+    const peeled = moveFocusedTab(docked.layout, right, 'right')
+    expect(peeled.groupId).not.toBe(right)
+    expect(groupOf(peeled.layout, peeled.groupId).tabs).toHaveLength(1)
+  })
+
+  it('keeps moving the same tab down and back up however often the shortcut repeats', () => {
+    const base = createDefaultLayout()
+    if (base.root.type !== 'group') throw new Error('Expected group root')
+    const start = splitGroup(base, base.root.id, 'below', makeLauncherTab())
+    const top = listGroups(start.root)[0]!
+    const moving = top.tabs[0]!.id
+    let layout = start
+    let focused = top.id
+    for (let round = 0; round < 3; round += 1) {
+      const down = moveFocusedTab(layout, focused, 'down')
+      expect(down.layout).not.toBe(layout)
+      expect(groupOf(down.layout, down.groupId).tabs.map((tab) => tab.id)).toContain(moving)
+      const up = moveFocusedTab(down.layout, down.groupId, 'up')
+      expect(up.layout).not.toBe(down.layout)
+      expect(groupOf(up.layout, up.groupId).tabs.map((tab) => tab.id)).toContain(moving)
+      expect(listGroups(up.layout.root)).toHaveLength(2)
+      layout = up.layout
+      focused = up.groupId
+    }
   })
 })

@@ -1,0 +1,23 @@
+.ach-list { list-style: none; margin: 0; padding: 0 12px 12px; display: flex; flex-direction: column; gap: 7px; }
+.ach-group { border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); padding: 7px 9px; }
+.ach-group[data-disk="changed-since-snapshot"], .ach-group[data-disk="missing"] { border-color: color-mix(in srgb, #ed8388 45%, var(--border)); }
+.ach-group > header { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.ach-group > header > svg { flex: 0 0 auto; color: var(--text-2); }
+.ach-group > p { margin: 4px 0 0; }
+.ach-turn-label { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ach-when { color: var(--text-2); font-size: 11px; white-space: nowrap; }
+.ach-inline-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; font-size: 11px; }
+.ach-kind { color: var(--text-2); font-size: 11px; text-transform: lowercase; }
+.ach-warn { display: inline-flex; align-items: center; gap: 4px; color: #ed8388; font-size: 11px; white-space: nowrap; }
+.ach-alert { color: #ed8388; display: flex; align-items: center; gap: 6px; }
+.ach-edits { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; }
+.ach-edit { display: flex; align-items: center; gap: 8px; padding: 3px 0; border-top: 1px solid var(--border); min-width: 0; }
+.ach-blocked { list-style: none; margin: 5px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; color: var(--text-2); font-size: 11px; }
+.ach-blocked li, .ach-confirm-list li { display: flex; align-items: baseline; gap: 5px; overflow-wrap: anywhere; }
+.ach-confirm-list { list-style: none; margin: 0 0 8px; padding: 0 12px; display: flex; flex-direction: column; gap: 2px; }
+.ach-outcome { margin: 0 12px 8px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); }
+.ach-outcome p { margin: 0; }
+.ach-outcome ul { margin: 6px 0 0; padding-left: 16px; color: var(--text-2); font-size: 11px; }
+.ach-confirm-actions { display: flex; justify-content: flex-end; gap: 7px; padding: 0 12px 12px; }
+.sa-dialog button.ach-danger { border-color: color-mix(in srgb, #ed8388 55%, transparent); color: #ed8388; }
+.sa-dialog button.ach-danger:hover:not(:disabled) { color: #fff; background: #b34247; }

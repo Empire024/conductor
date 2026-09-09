@@ -32,13 +32,16 @@ export function WorkspaceSidebarPanel({
   if (mode === 'workspace') return <>{workspace}</>
   if (mode === 'browser') return <BrowserSidebar projectId={project?.id} />
   if (projects?.length || project) {
-    return <div className="all-project-explorer" aria-label="Explorer">
-      {(projects ?? (project ? [project] : [])).map((item) => <ExplorerSidebar key={item.id} project={item} defaultCollapsed={item.id !== project?.id}
-        onOpenFile={(path, mode) => onOpenFile?.(path, mode, item.id)}
-        onProjectRenamed={onProjectRenamed}
-        onPathChanged={(previous, next, kind) => onPathChanged?.(previous, next, kind, item.id)}
-        onPathRemoved={(path, kind) => onPathRemoved?.(path, kind, item.id)} />)}
-    </div>
+    return <section className="workspace-sidebar-pane" aria-label="Explorer">
+      <header className="workspace-sidebar-title"><span>Explorer</span></header>
+      <div className="all-project-explorer">
+        {(projects ?? (project ? [project] : [])).map((item) => <ExplorerSidebar key={item.id} project={item} defaultCollapsed={item.id !== project?.id}
+          onOpenFile={(path, mode) => onOpenFile?.(path, mode, item.id)}
+          onProjectRenamed={onProjectRenamed}
+          onPathChanged={(previous, next, kind) => onPathChanged?.(previous, next, kind, item.id)}
+          onPathRemoved={(path, kind) => onPathRemoved?.(path, kind, item.id)} />)}
+      </div>
+    </section>
   }
   return (
     <section className="workspace-sidebar-pane" aria-label="Explorer">

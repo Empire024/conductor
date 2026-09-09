@@ -10,7 +10,7 @@ import ts from 'typescript'
 const root = await mkdtemp(join(tmpdir(), 'conductor-autoscroll-'))
 const main = join(root, 'main.cjs')
 await writeFile(main, `const { app, BrowserWindow } = require('electron'); app.setPath('userData', ${JSON.stringify(join(root, 'profile'))}); app.whenReady().then(() => { const window = new BrowserWindow({ width: 800, height: 600 }); window.loadURL('data:text/html,<html><body></body></html>'); });`)
-const env = { ...process.env }
+const env = { CONDUCTOR_BACKGROUND_WINDOWS: '1', ...process.env }
 delete env.ELECTRON_RUN_AS_NODE
 const app = await electron.launch({ args: [main], env })
 const checks = []

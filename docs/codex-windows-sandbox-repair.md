@@ -30,6 +30,26 @@ Automatic approval review rejected refreshing inherited ACLs across the existing
 
 After any authorized inheritance repair, repeat normal sandbox read/create/edit/delete probes under the workspace root, `src`, `scripts`, and `artifacts`; verify `.git` and `.codex` writes remain denied; inspect native setup-refresh logs for `errors=[]`. Only then mark runtime access repaired.
 
+## Inheritance repair completed 2026-09-09
+
+The owner authorized the pending inheritance repair. `scripts/repair-codex-workspace-inheritance.ps1 -Repair`
+ran from an elevated PowerShell whose identity matched the workspace root owner.
+
+Read-only inventory immediately before the run: 35,526 entries, 10,867 missing the current workspace
+capability `S-1-5-21-2410288451-1089401000-3698464964-1738057620`, 80 with explicit ACEs, 0 with
+inheritance disabled, and 8 reparse points whose handle-resolved targets all stayed inside the workspace.
+
+The run reported `Missing capability after refresh: 0. Concurrently removed entries: 0`, having verified
+the root DACL was byte-identical before and after, and that no entry's owner, explicit ACEs, or protected
+ACL changed. Original ACLs were recorded to a temporary backup inventory before the single native write.
+
+Acceptance probes from the affected native Codex session, in its own sandboxed shell: `Get-Location`,
+`Get-Content package.json`, and `Get-Content src/main/project-file-search.ts` succeeded, and a
+create/read/delete cycle on `src/.probe2.tmp` returned `PASS`. The same create under `src` had failed with
+`Access to the path ... is denied` immediately before the repair, so the write path is repaired rather
+than merely untested. Native setup refresh logs report `errors=[]`; the only remaining denial in the
+sandbox log is the unrelated `hide users` attempt on the default user profile directory.
+
 ## Verification
 
 `node --test scripts/repair-codex-workspace-owner.test.mjs`: 7 passed on Windows. Coverage includes diagnostic immutability, filesystem-root refusal, workspace-junction refusal, linked `.git` refusal, and preservation of worktree pointer files, and refusal of unsafe roots or junction workspaces by the inheritance repair. The inheritance script's read-only inventory also passed against the affected workspace. Administrator ownership repair and subsequent native sandbox probes are live local evidence; the inheritance operation is still pending authorization.

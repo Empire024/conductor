@@ -58,6 +58,21 @@ describe('structured SQLite journal and immutable artifacts', () => {
     expect(store.artifact('one', artifact.id)).toEqual(artifact)
     expect(sanitizeDiagnostic({ password: 'synthetic', note: 'safe' })).toEqual({ password: '[REDACTED]', note: 'safe' })
   })
+  it('hides an untouched registered session from history yet keeps it resumable via snapshot until it is actually used', () => {
+    const { store } = fixture()
+    expect(store.snapshot('one')).toMatchObject({ items: [], title: '' })
+    expect(store.history('project')).toEqual([])
+    store.append(event(1, { type: 'text', role: 'user', text: 'First real message', mode: 'snapshot' }))
+    expect(store.history('project')).toEqual([{ id: 'one', title: 'First real message', provider: 'claude', archived: false, phase: 'idle' }])
+    expect(store.history('project').some((item) => item.id === 'two')).toBe(false)
+  })
+  it('surfaces an untouched session once it is only titled, without requiring timeline items', () => {
+    const { store } = fixture()
+    store.update('two', { title: 'Renamed before sending' })
+    expect(store.history('project')).toEqual([{ id: 'two', title: 'Renamed before sending', provider: 'codex', archived: false, phase: 'idle' }])
+    expect(store.snapshot('one')).toMatchObject({ items: [], title: '' })
+    expect(store.history('project').some((item) => item.id === 'one')).toBe(false)
+  })
   it('persists rename/archive/search independently of a process or pane', () => {
     const f = fixture()
     f.store.append(event(1, { type: 'text', role: 'assistant', text: 'Find searchable Unicode: 日本語', mode: 'snapshot' }))

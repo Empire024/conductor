@@ -85,6 +85,14 @@ const formatConsoleArgs = (args: unknown[]): { message: string; detail?: unknown
   detail: args.find((item) => item instanceof Error)
 })
 
+const named = (reason: unknown, key: 'name' | 'message'): string =>
+  typeof reason === 'object' && reason !== null && key in reason ? String((reason as Record<string, unknown>)[key]) : ''
+
+/** Cancellation is how editors and fetches unwind abandoned work; it carries no
+ * information for a bug report. */
+export const isCancellation = (reason: unknown): boolean =>
+  ['Canceled', 'Cancelled', 'AbortError'].includes(named(reason, 'name')) || named(reason, 'message') === 'Canceled'
+
 export const installDebugLogging = (): (() => void) => {
   const nativeWarn = console.warn
   const nativeError = console.error
@@ -102,6 +110,14 @@ export const installDebugLogging = (): (() => void) => {
     debugLog('window', event.message, event.error ?? { filename: event.filename, line: event.lineno, column: event.colno }, 'error')
   }
   const onRejection = (event: PromiseRejectionEvent): void => {
+    // Monaco cancels its own delayed work whenever a model or a view state is
+    // swapped, and never attaches a handler to the promise it rejects. Those
+    // are not faults, and reporting them as errors buries the real ones.
+    if (isCancellation(event.reason)) {
+      event.preventDefault()
+      debugLog('promise', 'Canceled pending work', event.reason, 'debug')
+      return
+    }
     debugLog('promise', 'Unhandled promise rejection', event.reason, 'error')
   }
   console.warn = captureWarn

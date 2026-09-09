@@ -1,13 +1,13 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
-import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { commandSummary, groupConversationActivities, interactionOutcome, isConversationActivity, legacyAttachedContext, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolPresentation } from './StructuredAgentRenderers'
+import type { AgentEventData, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
+import { activityCoalesceTarget, coalescedEditLabel, coalescedEditSummary, commandSummary, groupConversationActivities, interactionOutcome, isConversationActivity, isRuntimeHeartbeat, legacyAttachedContext, parentLabelAnchors, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
 
 const cwd = 'C:\\work\\My project'
-function renderActivity(data: AgentEventData): string {
+function renderActivity(data: AgentEventData, expanded = true): string {
   const item: TimelineItem = { id: 'item', runtimeId: 'runtime', sequence: 1, timestamp: '2026-09-07T00:00:00Z', data }
-  return renderToStaticMarkup(createElement(StructuredActivity, { item, sessionId: 'session', cwd, expanded: true, interactive: true, onExpand: vi.fn(), onOpenFile: vi.fn(), onDiff: vi.fn(), onRespond: vi.fn(async () => {}) }))
+  return renderToStaticMarkup(createElement(StructuredActivity, { item, sessionId: 'session', cwd, expanded, interactive: true, onExpand: vi.fn(), onOpenFile: vi.fn(), onDiff: vi.fn(), onRespond: vi.fn(async () => {}) }))
 }
 describe('structured renderer contracts (synthetic, zero inference)', () => {
   it('routes native command names without renaming PowerShell as Bash', () => {
@@ -262,4 +262,125 @@ it('renders separate Claude permission actions with the exact scope and disabled
   expect(html).toMatch(/<button[^>]*disabled=""[^>]*>Switch to auto-mode<\/button>/)
   expect(html).toContain('Claude still requires approval for this request.')
   expect(interactionOutcome('auto-mode')).toBe('Auto-mode enabled')
+})
+
+it('shows a short output preview on a collapsed tool row without duplicating the full IN/OUT panel', () => {
+  const html = renderActivity({ type: 'tool', name: 'Command', status: 'completed', input: { command: 'npm test' }, output: 'PASS  all 42 tests\nmore output that stays hidden' }, false)
+  expect(html).toContain('PASS  all 42 tests')
+  expect(html).not.toContain('more output that stays hidden')
+  expect(html).not.toContain('<span>IN</span>')
+  expect(html).not.toContain('<span>OUT</span>')
+  const expanded = renderActivity({ type: 'tool', name: 'Command', status: 'completed', input: { command: 'npm test' }, output: 'PASS all tests' }, true)
+  expect(expanded).not.toContain('sa-tool-preview')
+})
+
+it('truncates a long preview line and falls back to stderr when there is no stdout yet', () => {
+  expect(toolInlinePreview({ type: 'tool', name: 'Command', status: 'running' })).toBe('')
+  expect(toolInlinePreview({ type: 'tool', name: 'Command', status: 'failed', stderr: 'boom\nmore detail' })).toBe('boom')
+  const long = toolInlinePreview({ type: 'tool', name: 'Command', status: 'completed', output: 'x'.repeat(500) })
+  expect(long.length).toBeLessThan(165)
+  expect(long.endsWith('…')).toBe(true)
+})
+
+it('coalesces successive edits to the same file into one row with a visible count, unless interrupted by commentary', () => {
+  const edit = (id: string, path: string): TimelineItem => ({ id, runtimeId: 'runtime', sequence: Number(id), timestamp: '', data: { type: 'tool', name: 'Edit', status: 'completed', input: { file_path: path } } })
+  const items: TimelineItem[] = [
+    edit('1', 'src/a.ts'), edit('2', 'src/a.ts'), edit('3', 'src/a.ts'), edit('4', 'src/a.ts'),
+    { id: '5', runtimeId: 'runtime', sequence: 5, timestamp: '', data: { type: 'text', role: 'assistant', text: 'Now updating b.ts', mode: 'snapshot' } },
+    edit('6', 'src/b.ts')
+  ]
+  const groups = groupConversationActivities(items)
+  expect(groups.map(group => group.map(item => item.id))).toEqual([['1', '2', '3', '4'], ['5'], ['6']])
+  const summary = coalescedEditSummary(groups[0]!)
+  expect(summary).toMatchObject({ path: 'src/a.ts', count: 4 })
+  expect(coalescedEditLabel(summary!)).toBe('Edited src/a.ts · 4 edits')
+  expect(coalescedEditSummary(groups[2]!)).toBeNull()
+  expect(coalescedEditSummary([edit('1', 'src/a.ts')])).toBeNull()
+})
+
+it('aggregates additions and deletions across a coalesced run of file-change events, but not across different files', () => {
+  const change = (id: string, path: string, additions?: number, deletions?: number): TimelineItem => ({ id, runtimeId: 'runtime', sequence: Number(id), timestamp: '', data: { type: 'changes', changes: [{ path, kind: 'update', status: 'applied', additions, deletions }] } })
+  const groups = groupConversationActivities([change('1', 'src/a.ts', 1, 0), change('2', 'src/a.ts', 2, 1), change('3', 'src/a.ts', 0, 3)])
+  expect(groups).toHaveLength(1)
+  const summary = coalescedEditSummary(groups[0]!)
+  expect(summary).toMatchObject({ path: 'src/a.ts', count: 3, additions: 3, deletions: 4 })
+  expect(coalescedEditLabel(summary!)).toBe('Edited src/a.ts · 3 edits · +3 −4')
+  const separate = groupConversationActivities([change('1', 'a.ts'), change('2', 'b.ts')])
+  expect(separate.map(group => group.length)).toEqual([1, 1])
+  expect(activityCoalesceTarget({ id: 'x', runtimeId: 'runtime', sequence: 1, timestamp: '', data: { type: 'changes', changes: [{ path: 'a.ts', kind: 'update', status: 'applied' }, { path: 'b.ts', kind: 'update', status: 'applied' }] } })).toBeNull()
+  expect(activityCoalesceTarget({ id: 'x', runtimeId: 'runtime', sequence: 1, timestamp: '', data: { type: 'tool', name: 'Edit', status: 'completed', input: { file_path: 'a.ts' }, exitCode: 1 } })).toBeNull()
+})
+
+it('threads an optional project id through a file link without changing its default markup or click behaviour, and keeps the right-click menu absent until opened', () => {
+  const text = '[panel.mjs](panel.mjs)'
+  const withProject = renderToStaticMarkup(createElement(StructuredMarkdown, { cwd, projectId: 'project-1', onOpenFile: vi.fn(), text }))
+  expect(withProject).toContain('href="#"')
+  expect(withProject).not.toContain('cursor-context-menu')
+  expect(withProject).not.toContain('sa-file-link-menu')
+  // A project id is required for the menu (four of its six actions need one to scope the IPC/event
+  // calls), but the link itself must keep working identically either way — same markup either way.
+  const withoutProject = renderToStaticMarkup(createElement(StructuredMarkdown, { cwd, onOpenFile: vi.fn(), text }))
+  expect(withoutProject).toBe(withProject)
+})
+
+it('shows which subagent a nested row belongs to with a stable color anchor, and leaves tool parents uncolored', () => {
+  const item: TimelineItem = { id: 'child', runtimeId: 'runtime', parentId: 'parent-native', sequence: 1, timestamp: '', data: { type: 'text', role: 'assistant', text: 'Nested update', mode: 'snapshot' } }
+  const render = (parentLabel: { name: string; colorIndex?: number }): string => renderToStaticMarkup(createElement(StructuredActivity, { item, sessionId: 'session', cwd, expanded: true, interactive: true, parentLabel, onExpand: vi.fn(), onOpenFile: vi.fn(), onDiff: vi.fn(), onRespond: vi.fn(async () => {}) }))
+  const withAgent = render({ name: 'Reviewer #2', colorIndex: 3 })
+  expect(withAgent).toContain('sa-parent-label sa-agent-hue-3')
+  expect(withAgent).toContain('Within Reviewer #2')
+  const withTool = render({ name: 'Bash' })
+  expect(withTool).toContain('class="sa-parent-label"')
+  expect(withTool).not.toContain('sa-agent-hue')
+})
+
+describe('runtime heartbeats', () => {
+  const item = (nativeItemId: string, parentId?: string, data: TimelineItem['data'] = { type: 'tool', name: 'Skill', status: 'preparing', input: {} }): TimelineItem =>
+    ({ id: nativeItemId, runtimeId: 'run', nativeItemId, parentId, data } as TimelineItem)
+
+  it('hides the synthetic heartbeat clones a long tool emits under itself', () => {
+    expect(isRuntimeHeartbeat(item('toolu_1-heartbeat-0', 'toolu_1'))).toBe(true)
+    expect(isConversationActivity(item('toolu_1-heartbeat-24', 'toolu_1'))).toBe(false)
+  })
+
+  it('keeps real nested tools, including ones whose id merely looks similar', () => {
+    expect(isRuntimeHeartbeat(item('toolu_2', 'toolu_1'))).toBe(false)
+    expect(isRuntimeHeartbeat(item('toolu_1-heartbeat-x', 'toolu_1'))).toBe(false)
+    expect(isRuntimeHeartbeat(item('toolu_9-heartbeat-1', 'toolu_1'))).toBe(false)
+    expect(isConversationActivity(item('toolu_2', 'toolu_1', { type: 'tool', name: 'Bash', status: 'completed', input: { command: 'ls' } }))).toBe(true)
+  })
+
+  it('names a skill by the skill it ran instead of the bare tool name', () => {
+    expect(toolPresentation({ type: 'tool', name: 'Skill', status: 'running', input: { skill: 'code-review', args: 'high' } }).title).toBe('code-review high')
+    expect(toolPresentation({ type: 'tool', name: 'Unknown', status: 'running', input: {} }).title).toBe('Unknown')
+  })
+
+  it('heads a run of nested activity once instead of labelling every row', () => {
+    const anchors = parentLabelAnchors([item('a', 'p1'), item('b', 'p1'), item('c'), item('d', 'p1'), item('e', 'p2')])
+    expect([...anchors]).toEqual(['a', 'd', 'e'])
+  })
+})
+
+describe('stepped questions', () => {
+  const question = (id: string, label: string): NonNullable<PendingInteraction['questions']>[number] =>
+    ({ id, question: 'Pick ' + id, header: id, multiSelect: false, options: [{ label }] })
+  const ask = (...questions: NonNullable<PendingInteraction['questions']>): string =>
+    renderActivity({ type: 'interaction', interaction: { id: 'ask', kind: 'question', title: 'Choices', status: 'pending', input: {}, choices: [], questions } })
+
+  it('asks one question at a time instead of stacking them', () => {
+    const html = ask(question('one', 'First'), question('two', 'Second'), question('three', 'Third'))
+    expect(html).toContain('Question 1 of 3')
+    expect(html).toContain('Pick one')
+    expect(html).not.toContain('Pick two')
+    expect(html).toContain('Next question</button>')
+    expect(html).not.toContain('Submit answers</button>')
+    expect(html).toContain('sa-question-steps')
+  })
+
+  it('leaves a single question as a plain form that submits directly', () => {
+    const html = ask(question('only', 'Yes'))
+    expect(html).not.toContain('Question 1 of 1')
+    expect(html).not.toContain('sa-question-steps')
+    expect(html).toContain('Submit answers</button>')
+  })
 })

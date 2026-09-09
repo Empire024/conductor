@@ -131,7 +131,8 @@ export class StructuredAgentStore {
   history(projectId: string, query = ''): Array<{ id: string; title: string; provider: StructuredProvider; archived: boolean; phase: SessionProjection['phase'] }> {
     const ids = this.db.prepare('SELECT id, provider FROM structured_sessions WHERE project_id=? ORDER BY rowid DESC').all(projectId) as Array<{ id: string; provider: StructuredProvider }>
     const needle = query.toLocaleLowerCase()
-    return ids.flatMap(row => { const state = this.snapshot(row.id); return state && (!needle || JSON.stringify(state.items).toLocaleLowerCase().includes(needle) || state.title.toLocaleLowerCase().includes(needle)) ? [{ id: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, phase: state.phase }] : [] }).slice(0, 200)
+    // An untouched session (no items ever sent/received, never titled) is a bookkeeping row, not history.
+    return ids.flatMap(row => { const state = this.snapshot(row.id); return state && (state.items.length || state.title) && (!needle || JSON.stringify(state.items).toLocaleLowerCase().includes(needle) || state.title.toLocaleLowerCase().includes(needle)) ? [{ id: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, phase: state.phase }] : [] }).slice(0, 200)
   }
   putArtifact(sessionId: string, value: Omit<DiffArtifact, 'id'>): DiffArtifact {
     const id = randomUUID()

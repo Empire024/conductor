@@ -1,6 +1,7 @@
 import type { SessionRecord } from '../../../shared/models'
 import { makeLauncherTab } from '../../../shared/models'
-import { activateTab, addTab, closeTab, duplicateTab, findGroup, listGroups, splitGroup, updateTab } from './layout-operations'
+import { activateTab, addTab, assignTabsToGroup, closeTab, closeTabGroup, collapseTabGroup, duplicateTab, editTabGroup, findGroup, groupTabs, listGroups, splitGroup, ungroupTabGroup, updateTab } from './layout-operations'
+import type { TabGroupAction } from './tab-groups'
 
 export type WorkspaceTabAction = 'focus' | 'left' | 'right' | 'above' | 'below' | 'duplicate' | 'detach' | 'show' | 'maximize' | 'continuation' | 'reopen' | 'close'
 
@@ -30,4 +31,40 @@ export function applyWorkspaceTabAction(session: SessionRecord, groupId: string,
   if (action === 'continuation') layout = updateTab(layout, groupId, tabId, current => ({ ...current, state: { ...current.state, continueOnLimit: !(current.state?.continueOnLimit === undefined ? session.continueOnLimit : Boolean(current.state.continueOnLimit)) } }))
   if (action === 'reopen' && closedTabs.length) { layout = addTab(layout, groupId, closedTabs.at(-1)!); closedTabs = closedTabs.slice(0, -1) }
   return { session: { ...session, layout, closedTabs, maximizedGroupId }, focusedGroupId }
+}
+
+
+/** The group half of the tab menus, applied to a whole session so the tab strip and the
+ * sidebar's workspace list drive groups through one implementation. `tabGroupId` reports the
+ * group a 'new-group' action just minted, which the caller uses to open its name editor. */
+export function applyTabGroupAction(session: SessionRecord, groupId: string, tabId: string, action: TabGroupAction): { session: SessionRecord; tabGroupId: string } {
+  const pane = findGroup(session.layout.root, groupId)
+  const tab = pane?.tabs.find(item => item.id === tabId)
+  if (!pane || !tab) throw new Error('This tab is no longer in the workspace.')
+  let layout = session.layout
+  let closedTabs = session.closedTabs
+  let tabGroupId = ''
+  if (action.kind === 'new-group') {
+    const created = groupTabs(layout, groupId, [tabId], { title: '' })
+    layout = created.layout
+    tabGroupId = created.tabGroupId
+  }
+  if (action.kind === 'join-group') layout = assignTabsToGroup(layout, groupId, [tabId], action.tabGroupId)
+  if (action.kind === 'leave-group') layout = assignTabsToGroup(layout, groupId, [tabId], null)
+  if (action.kind === 'rename') layout = editTabGroup(layout, groupId, action.tabGroupId, { title: action.title })
+  if (action.kind === 'recolor') layout = editTabGroup(layout, groupId, action.tabGroupId, { color: action.color })
+  if (action.kind === 'collapse') layout = collapseTabGroup(layout, groupId, action.tabGroupId, action.collapsed)
+  if (action.kind === 'ungroup') layout = ungroupTabGroup(layout, groupId, action.tabGroupId)
+  if (action.kind === 'new-tab-in-group') {
+    // Straight after the group's last tab, so it joins the run rather than landing at the end
+    // of the strip and being dragged back in.
+    const after = pane.tabs.map(item => item.tabGroupId).lastIndexOf(action.tabGroupId)
+    layout = addTab(layout, groupId, { ...makeLauncherTab(), tabGroupId: action.tabGroupId }, after + 1)
+  }
+  if (action.kind === 'close-group') {
+    const result = closeTabGroup(layout, groupId, action.tabGroupId)
+    layout = result.layout
+    closedTabs = [...closedTabs, ...result.closed].slice(-20)
+  }
+  return { session: { ...session, layout, closedTabs }, tabGroupId }
 }

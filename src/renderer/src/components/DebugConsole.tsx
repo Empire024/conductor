@@ -10,6 +10,7 @@ import {
   type DebugLogEntry
 } from '../debug-log'
 import { useWindowMaximized } from '../use-window-maximized'
+import { copyText } from '../clipboard'
 
 export function DebugConsole({
   context,
@@ -47,14 +48,20 @@ export function DebugConsole({
   }, [entries])
 
   const copyReport = async (): Promise<void> => {
-    const diagnostics = await window.conductor.system.getDiagnostics()
-    await navigator.clipboard.writeText(buildIssueReport(
-      diagnostics,
-      context,
-      entries,
-      screenshot ? { ...screenshot, description: screenshotDescription } : undefined
-    ))
-    onCopied()
+    setCaptureStatus('')
+    try {
+      const diagnostics = await window.conductor.system.getDiagnostics()
+      const copied = await copyText(buildIssueReport(
+        diagnostics,
+        context,
+        entries,
+        screenshot ? { ...screenshot, description: screenshotDescription } : undefined
+      ))
+      if (copied) onCopied()
+      else setCaptureStatus('Could not reach the clipboard')
+    } catch (reason) {
+      setCaptureStatus(reason instanceof Error ? reason.message : 'Could not build the report')
+    }
   }
 
   const openIssue = async (): Promise<void> => {

@@ -4,20 +4,33 @@ import { realpath } from 'node:fs/promises'
 import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
-import { makeId, type AgentProviderInfo, type AgentSpec, type LayoutNode, type PaneKind, type PaneTab } from '../shared/models'
-import type { SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type LayoutNode, type PaneKind, type PaneTab } from '../shared/models'
+import type { PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import { settingsForRuntime } from '../shared/structured-agent'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
 import type { StructuredSessions } from './structured-sessions'
 import type { OrchestrationStore } from './orchestration-store'
 import type { AgentCollaborationStore } from './agent-collaboration-store'
 import type { ProjectBacklogs } from './project-backlog'
+import { projectTaskPriorities, type ProjectTaskPriority } from '../shared/project-backlog'
 import { workspacePath } from './agent-artifacts'
-import { readEditorFile, writeEditorFile } from './editor-files'
+import { writeEditorFile } from './editor-files'
+import { readTextFile } from './text-files'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
+import { inheritMachineId, machineRunsProject, tabMachineId } from './machines'
+import { LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
+const permissionOrder: SessionSettings['permission'][] = ['read-only', 'default', 'accept-edits', 'auto']
+/** A controlled tab inherits its controller autonomy, never more, and only what the target provider offers. */
+const inheritedPermission = (source: SessionSettings, supported?: SessionSettings['permission'][]): SessionSettings['permission'] => {
+  const ceiling = restricted(source) ? 'read-only' : source.permission
+  const offered = supported?.length ? supported : permissionOrder
+  const allowed = offered.filter(value => permissionOrder.indexOf(value) <= permissionOrder.indexOf(ceiling))
+  return allowed.sort((a, b) => permissionOrder.indexOf(b) - permissionOrder.indexOf(a))[0] ?? 'default'
+}
 const text = (args: Args, key: string, maximum = 20000): string => {
   const value = args[key]
   if (typeof value !== 'string' || !value.trim() || value.length > maximum || value.includes('\0')) throw new Error(`Invalid ${key}`)
@@ -29,10 +42,11 @@ const object = (value: unknown): Args => {
 }
 const toolSignatures = {
   'tools.list': '() — discover these methods and arguments',
-  'app.state': '() — current project, workspace, tabs and relationships',
+  'app.state': '() — current project, workspace, tabs, relationships and the machine each tab runs on',
+  'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '() — open tabs in this workspace, including detached windows',
-  'tabs.open': '({kind?,provider?,model?,effort?,title?}) — visible tab; agent default kind, provider/model must be available',
+  'tabs.open': '({kind?,provider?,model?,effort?,title?,machineId?}) — visible tab; agent default kind, provider/model must be available; a new agent tab inherits the controller permission mode, clamped to the target provider, and runs on the controller machine unless machineId names another from machines.list',
   'tabs.focus': '({tabId})',
   'tabs.rename': '({tabId,title})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
@@ -52,9 +66,9 @@ const toolSignatures = {
   'files.write': '({path,content,expectedContent}) — atomic compare-and-save; expectedContent:null creates a file; live views refresh',
   'files.open': '({path}) — open the file in a visible editor',
   'tasks.list': '() — feature-list.md bug/feature/idea tasks, their recorded owners and revision',
-  'tasks.update': '({revision,id,status?:"todo"|"doing"|"done",title?}) — optimistic update preserving markers and other agents’ claims',
+  'tasks.update': '({revision,id,status?:"todo"|"doing"|"done",title?,priority?:"high"|"normal"|"low"}) — optimistic update preserving markers and other agents’ claims',
   'memory.recall': '({query?})',
-  'memory.remember': '({gist,kind?:"episodic"|"semantic"|"procedural",cues?:string[]}) — writes agent-owned memory',
+  'memory.remember': `({gist,kind?:${MEMORY_KINDS.map(kind => JSON.stringify(kind)).join('|')},cues?:string[]}) — writes agent-owned memory`,
   'memory.forget': '({id}) — agent-owned memory only; asks the owner to confirm',
   'orchestration.snapshot': '()',
   'orchestration.tasks.create': '({title,description?,priority?,status?,assignedAgentId?})',
@@ -72,6 +86,10 @@ export interface AgentControlDependencies {
   collaboration: AgentCollaborationStore
   backlogs: ProjectBacklogs
   providers(): AgentProviderInfo[]
+  /** This machine plus any paired machines a tab may be placed on. */
+  machines?(): MachineDescriptor[]
+  /** Opens the tab on a paired machine and returns what it created there. */
+  openRemote?(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string }>
   ui(request: AgentControlUiRequest): Promise<unknown>
   confirm(scope: AgentControlScope, message: string): Promise<boolean>
   fileChanged(change: AgentFileChange): void
@@ -102,6 +120,16 @@ export class AgentControl {
     visit(workspace.layout.root)
     for (const window of this.deps.database.listDetachedWindows()) if (window.projectId === scope.projectId && window.sessionId === scope.sessionId) visit(window.layout.root, window.id)
     return tabs
+  }
+
+  /**
+   * A claim only binds while its owner still has a tab open somewhere in the project. A
+   * conversation that was closed or crashed mid-task would otherwise hold the item forever:
+   * no other agent may move it, and the owner can never come back to release it.
+   */
+  private claimHolderIsOpen(projectId: string, agentSessionId: string): boolean {
+    return this.deps.database.listSessions(projectId).some(workspace =>
+      this.tabs({ projectId, sessionId: workspace.id, agentSessionId: '' }).some(tab => tab.resourceId === agentSessionId))
   }
 
   private tab(scope: AgentControlScope, id: string): AgentControlTab {
@@ -216,10 +244,22 @@ export class AgentControl {
     })
   }
 
+  private machines(): MachineDescriptor[] {
+    return this.deps.machines?.() ?? [{ id: LOCAL_MACHINE_ID, name: 'This machine', kind: 'local', status: 'online', accountLogin: null, grantedProjectIds: [] }]
+  }
+
+  /** Where the caller itself is running; a tab it opens follows unless it says otherwise. */
+  private callerMachineId(scope: AgentControlScope): string {
+    return tabMachineId(this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId))
+  }
+
   private async open(scope: AgentControlScope, args: Args): Promise<AgentControlTab> {
     const kind = (args.kind ?? 'agent') as PaneKind
     const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs']
     if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
+    const machines = this.machines()
+    const machineId = inheritMachineId(this.callerMachineId(scope), args.machineId, machines)
+    if (machineId !== LOCAL_MACHINE_ID) return this.openOnMachine(scope, machineId, machines, args) as Promise<AgentControlTab>
     const title = args.title === undefined ? kind === 'agent' ? 'Agent' : kind : text(args, 'title', 120)
     const tab: PaneTab = { id: makeId('tab'), kind, title }
     if (kind === 'agent') {
@@ -234,18 +274,44 @@ export class AgentControl {
       if (effort && !model.effort?.includes(effort)) throw new Error('Choose an effort supported by this model')
       tab.resourceId = makeId('agent')
       tab.title = args.title === undefined ? model.label : title
-      tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual' }
+      tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual', machineId }
       const spec: AgentSpec = { id: tab.resourceId, projectId: scope.projectId, sessionId: scope.sessionId, provider, model: model.id, title: tab.title, cwd: source.cwd }
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || 'Provider unavailable')
-      const sourceSettings = this.deps.database.structured.snapshot(scope.agentSessionId)!.settings
-      const settings: SessionSettings = { ...this.deps.database.structured.snapshot(spec.id)!.settings, model: model.id, effort, permission: restricted(sourceSettings) && provider === 'codex' ? 'read-only' : 'default', ...(restricted(sourceSettings) && provider === 'codex' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude' }
+      const created = this.deps.database.structured.snapshot(spec.id)!
+      const sourceSettings = settingsForRuntime(this.deps.database.structured.snapshot(scope.agentSessionId)!.settings)
+      const permission = inheritedPermission(sourceSettings, created.capabilities?.permissions)
+      const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(permission === 'read-only' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude' }
       this.deps.database.structured.update(spec.id, { settings })
-    } else if (kind === 'terminal') tab.resourceId = makeId('terminal')
+    } else {
+      if (kind === 'terminal') tab.resourceId = makeId('terminal')
+      tab.state = { ...tab.state, machineId }
+    }
     await this.ui(scope, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
     const opened = this.tab(scope, tab.id)
     if (kind === 'agent') this.relationship(scope, opened, 'attached')
     return opened
+  }
+
+  /**
+   * Places the tab on a paired machine instead of this one. The tab is created and shown over
+   * there; what comes back identifies it so the caller can steer it through the same machine.
+   */
+  private async openOnMachine(scope: AgentControlScope, machineId: string, machines: MachineDescriptor[], args: Args): Promise<unknown> {
+    const machine = machines.find(candidate => candidate.id === machineId)!
+    if (!machineRunsProject(machine, scope.projectId)) throw new Error(`${machine.name} does not have this project shared with it; pair that project first`)
+    if (!this.deps.openRemote) throw new Error('Remote machine placement is unavailable in this window')
+    if (args.kind !== undefined && args.kind !== 'agent') throw new Error('Only agent tabs can be opened on another machine')
+    const created = await this.deps.openRemote(machineId, {
+      projectId: scope.projectId,
+      sessionId: scope.sessionId,
+      ...(typeof args.provider === 'string' ? { provider: args.provider } : {}),
+      ...(typeof args.model === 'string' ? { model: args.model } : {}),
+      ...(typeof args.effort === 'string' ? { effort: args.effort } : {}),
+      ...(args.title === undefined ? {} : { title: text(args, 'title', 120) })
+    })
+    return { machineId, machineName: created.machineName, remote: true, tabId: created.tabId, agentSessionId: created.agentSessionId,
+      note: `This tab runs on ${created.machineName}. Steer it with agents.* through that machine; it is not a local tab.` }
   }
 
   async call(scope: AgentControlScope, method: string, rawArgs: unknown = {}): Promise<unknown> {
@@ -253,7 +319,8 @@ export class AgentControl {
     if (process.env.CONDUCTOR_LIVE_TESTS === '1') throw new Error('App control is disabled during isolated live acceptance tests')
     if (args.projectId !== undefined && args.projectId !== scope.projectId || args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
     if (method === 'tools.list') return toolSignatures
-    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: [...this.links(scope)].map(([agentSessionId, controllerAgentSessionId]) => ({ agentSessionId, controllerAgentSessionId })) }
+    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: [...this.links(scope)].map(([agentSessionId, controllerAgentSessionId]) => ({ agentSessionId, controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines() }
+    if (method === 'machines.list') return this.machines().map(machine => ({ ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: machineRunsProject(machine, scope.projectId) }))
     if (method === 'models.list') return this.catalog(scope)
     if (method === 'tabs.list') return this.tabs(scope)
     if (method === 'tabs.open') return this.open(scope, args)
@@ -298,14 +365,18 @@ export class AgentControl {
         const prompt = text(args, 'prompt')
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot dispatch to a writable conversation')
         this.relationship(scope, tab, 'attached')
+        // A coordinated prompt is not the owner's message. Record the controlling tab so the
+        // conversation attributes it to that coworker instead of to "You".
+        const controller = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
+        const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: controller?.title || 'Another Conductor tab' }
         try {
-          if (method === 'agents.submit') await sessions.submit(id, prompt, state.settings)
-          else await sessions.steer(id, prompt, state.settings)
+          if (method === 'agents.submit') await sessions.submit(id, prompt, state.settings, [], origin)
+          else await sessions.steer(id, prompt, state.settings, [], origin)
         } catch (error) { this.relationship(scope, tab, 'detached'); throw error }
         return { agentSessionId: id, tabId: tab.id, uri: tab.uri, phase: database.structured.snapshot(id)?.phase }
       }
     }
-    if (method === 'files.list') return (await searchProjectFiles([database.getProject(scope.projectId)!], typeof args.query === 'string' ? args.query.slice(0, 300) : '')).map(file => ({ ...file, uri: conductorUri(scope.projectId, 'file', file.path) }))
+    if (method === 'files.list') return (await searchProjectFiles([database.getProject(scope.projectId)!], typeof args.query === 'string' ? args.query.slice(0, 300) : '', { showHidden: true })).map(file => ({ ...file, uri: conductorUri(scope.projectId, 'file', file.path) }))
     if (['files.read', 'files.write', 'files.open'].includes(method)) {
       const path = await workspacePath(source.cwd, text(args, 'path', 4000), method === 'files.write')
       if (method !== 'files.write' && (!statSync(path).isFile() || statSync(path).size > 1024 * 1024)) throw new Error('Only text files up to 1 MiB are supported')
@@ -313,7 +384,9 @@ export class AgentControl {
       const relativePath = relative(await realpath(source.cwd), path).replaceAll('\\', '/')
       this.authorize(scope)
       if (method === 'files.open') return this.ui(scope, 'files.open', { path: relativePath })
-      if (method === 'files.read') return { path: relativePath, content: readEditorFile(path), uri: conductorUri(scope.projectId, 'file', relativePath) }
+      // Same guard the editor uses: an agent asking for a binary file gets a
+      // clear refusal rather than a megabyte of mojibake it will act on.
+      if (method === 'files.read') return { path: relativePath, content: readTextFile(path), uri: conductorUri(scope.projectId, 'file', relativePath) }
       if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
       if (typeof args.content !== 'string' || Buffer.byteLength(args.content) > 1024 * 1024 || !(args.expectedContent === null || typeof args.expectedContent === 'string' && Buffer.byteLength(args.expectedContent) <= 1024 * 1024)) throw new Error('Provide content and the exact expectedContent (null for a new file), up to 1 MiB')
       const lease = this.deps.collaboration.announcePresence({ ...scope, path: relativePath, intent: args.expectedContent === null ? 'create' : 'edit', ttlSeconds: 90 })
@@ -327,19 +400,26 @@ export class AgentControl {
       if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
       const board = await backlogs.get(scope.projectId), id = text(args, 'id', 160), task = board.tasks.find(task => task.id === id)
       if (!task) throw new Error('Task not found')
-      if (task.agentId && task.agentId !== scope.agentSessionId && task.status === 'doing') throw new Error('Another agent owns this task')
+      if (task.agentId && task.agentId !== scope.agentSessionId && task.status === 'doing' && this.claimHolderIsOpen(scope.projectId, task.agentId)) throw new Error('Another agent owns this task')
       const status = args.status === undefined ? task.status : args.status
       if (!['todo', 'doing', 'done'].includes(String(status))) throw new Error('Invalid task status')
-      const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', 8000) }), agentId: scope.agentSessionId }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
+      // parsePriority would quietly degrade a typo to 'normal'; an agent deserves to hear that its edit did nothing.
+      if (args.priority !== undefined && !projectTaskPriorities.includes(args.priority as ProjectTaskPriority)) throw new Error('Invalid task priority')
+      const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', 8000) }), ...(args.priority === undefined ? {} : { priority: args.priority as ProjectTaskPriority }), agentId: scope.agentSessionId }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
       this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
       return updated
     }
     if (method === 'memory.recall') return database.recall(scope.projectId, typeof args.query === 'string' ? args.query.slice(0, 4000) : '', undefined, 12)
     if (method === 'memory.remember') {
       const kind = args.kind ?? 'semantic'
-      if (!['episodic', 'semantic', 'procedural'].includes(String(kind))) throw new Error('Invalid memory kind')
+      if (!isMemoryKind(kind)) throw new Error('Invalid memory kind')
       if (args.cues !== undefined && (!Array.isArray(args.cues) || args.cues.length > 20 || args.cues.some(cue => typeof cue !== 'string' || cue.length > 160))) throw new Error('Invalid memory cues')
-      return database.remember({ projectId: scope.projectId, kind: kind as 'semantic', source: 'agent', gist: text(args, 'gist', 4000), cues: args.cues as string[] | undefined })
+      return database.remember({
+        projectId: scope.projectId, kind, source: 'agent',
+        // Attribution comes from the authorized scope, never from the caller's arguments.
+        origin: { agentSessionId: scope.agentSessionId, workspaceId: scope.sessionId, title: source.title, provider: source.provider },
+        gist: text(args, 'gist', 4000), cues: args.cues as string[] | undefined
+      })
     }
     if (method === 'memory.forget') {
       const memory = database.listMemories(scope.projectId).find(memory => memory.id === args.id)

@@ -1,3 +1,4 @@
+import type { AgentChangeHistory, RevertOutcome, RevertScope } from './agent-change-history'
 /** Versioned, provider-neutral envelope. Native IDs never double as Conductor IDs. */
 export type StructuredProvider = 'codex' | 'claude'
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
@@ -83,14 +84,17 @@ export interface FileChange {
   status: 'proposed' | 'applied' | 'failed' | 'rejected' | 'reverted'
   limitation?: string
 }
-export interface QueuedPrompt { id: string; text: string; settings: SessionSettings; attachments: ContextAttachment[]; steer?: boolean }
+/** Who actually sent a prompt. Absent means the owner typed it in this tab's composer;
+ *  present means another Conductor tab dispatched it through the app control protocol. */
+export interface PromptOrigin { agentSessionId: string; label: string }
+export interface QueuedPrompt { id: string; text: string; settings: SessionSettings; attachments: ContextAttachment[]; steer?: boolean; origin?: PromptOrigin }
 export interface PendingSteering extends QueuedPrompt { runtimeId: string; turnId?: string; status: 'sending' | 'accepted' | 'cancelled' | 'uncertain' }
 export type AgentEventData =
   | { type: 'steering'; prompts: PendingSteering[] }
   | { type: 'input_delivery'; inputId: string; status: 'accepted' | 'delivered' | 'cancelled' | 'uncertain' }
   | { type: 'queue'; prompt: QueuedPrompt | null; prompts?: QueuedPrompt[] }
   | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings }
-  | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[] }
+  | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[]; origin?: PromptOrigin }
   | { type: 'tool'; name: string; description?: string; input?: Json; inputDelta?: string; status: ActivityStatus; output?: string; outputMode?: 'delta' | 'snapshot'; stderr?: string; exitCode?: number; durationMs?: number; outputArtifactId?: string }
   | { type: 'changes'; changes: FileChange[] }
   | { type: 'interaction'; interaction: PendingInteraction }
@@ -98,8 +102,10 @@ export type AgentEventData =
   | { type: 'usage'; inputTokens?: number; outputTokens?: number; cachedTokens?: number; cacheCreationTokens?: number; reasoningTokens?: number; totalTokens?: number; costUsd?: number; scope?: 'session' | 'turn' | 'message'; source: 'provider' | 'estimate'; limits?: Json }
   | { type: 'error'; message: string; code?: string }
   | { type: 'notice'; message: string; payload?: Json; outputArtifactId?: string }
-  /** `detached` marks background work that deliberately outlives the turn that started it. */
-  | { type: 'subagent'; name: string; nativeSessionId?: string; status: ActivityStatus; detached?: boolean; outputFile?: string; output?: string; outputTruncated?: boolean; outputError?: string }
+  /** `detached` marks background work that deliberately outlives the turn that started it.
+   *  `model`/`effort`/`modelProvider` are only present when the provider actually reports them for
+   *  this child (Codex's spawned agent threads); a bash background task has no model to report. */
+  | { type: 'subagent'; name: string; nativeSessionId?: string; status: ActivityStatus; detached?: boolean; outputFile?: string; output?: string; outputTruncated?: boolean; outputError?: string; model?: string; effort?: string; modelProvider?: string }
   | { type: 'review'; artifactId: string; outcome: 'kept' | 'reverted' }
 export interface AgentEvent {
   schemaVersion: 1
@@ -182,6 +188,7 @@ export interface StructuredAgentBridge {
   respond(response: InteractionResponse): Promise<void>
   interrupt(id: string, expediteSubmittedInput?: boolean): Promise<void>
   resume(id: string, settings?: SessionSettings): Promise<void>
+  saveSettings(id: string, settings: SessionSettings): Promise<void>
   fork(id: string): Promise<string>
   discover(id: string): Promise<Json>
   rename(id: string, title: string): Promise<void>
@@ -190,5 +197,8 @@ export interface StructuredAgentBridge {
   artifact(id: string, artifactId: string): Promise<DiffArtifact>
   output(id: string, artifactId: string): Promise<string>
   review(id: string, artifactId: string, action: 'keep' | 'undo'): Promise<{ outcome: 'kept' | 'reverted' | 'conflict'; message?: string }>
+  /** Local, pre-git change history for this conversation, and the restores it allows. */
+  changeHistory(id: string): Promise<AgentChangeHistory>
+  revertChanges(id: string, scope: RevertScope): Promise<RevertOutcome>
   onEvents(callback: (events: AgentEvent[]) => void): () => void
 }

@@ -10,7 +10,7 @@ export class AgentControlServer {
   private endpoint = ''
   private credentials = new Map<string, { token: string; scope: AgentControlScope }>()
   private busy = new Set<string>()
-  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call'>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1') {}
+  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call'>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string) {}
 
   async start(): Promise<void> {
     if (this.disabled || this.server) return
@@ -23,6 +23,9 @@ export class AgentControlServer {
       server.once('error', reject)
       server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve() })
     })
+    // After listen there is no promise left to reject into, and an 'error' event with no listener
+    // is an uncaught exception that would take the whole app down.
+    server.on('error', error => console.warn('Agent control server error', error))
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('Control server failed to bind')
     this.endpoint = `http://127.0.0.1:${address.port}/control`
@@ -35,7 +38,7 @@ export class AgentControlServer {
       credential = { token: randomBytes(32).toString('hex'), scope: { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id } }
       this.credentials.set(spec.id, credential)
     }
-    return `Conductor app control: a first-party local JSON protocol is available for this project/workspace. POST ${this.endpoint} with Authorization: Bearer ${credential.token}, Content-Type: application/json, body {"method":"tools.list","args":{}} to discover methods. Use the native shell's HTTP client (PowerShell Invoke-RestMethod or curl.exe); do not expose the authorization value or copy it to another tab. app.state gives stable tab/file URIs, models.list gives actual choices, router.start({prompt}) opens a visible router; router.dispatch({tasks:[{title,prompt,provider,model}]}) opens visible coworkers. Use these visible native tabs when delegating to another provider; do not launch nested codex or claude CLI processes. Native turns and approvals remain visible in their tabs. files.write compares expectedContent and streams disk changes to the UI; tasks.update preserves checklist markers. Your control scope is your registered project and workspace; you cannot drive yourself or your ancestors. Destructive actions ask the owner; never blindly retry a mutation after a transport timeout. Use these tools only for the user's requested work.`
+    return `Conductor app control: a first-party local JSON protocol is available for this project/workspace. POST ${this.endpoint} with Authorization: Bearer ${credential.token}, Content-Type: application/json, body {"method":"tools.list","args":{}} to discover methods. Use the native shell's HTTP client (PowerShell Invoke-RestMethod or curl.exe); do not expose the authorization value or copy it to another tab. app.state gives stable tab/file URIs, models.list gives actual choices, router.start({prompt}) opens a visible router; router.dispatch({tasks:[{title,prompt,provider,model}]}) opens visible coworkers. Use these visible native tabs when delegating to another provider; do not launch nested codex or claude CLI processes. Native turns and approvals remain visible in their tabs. files.write compares expectedContent and streams disk changes to the UI; tasks.update preserves checklist markers. Your control scope is your registered project and workspace; you cannot drive yourself or your ancestors. Destructive actions ask the owner; never blindly retry a mutation after a transport timeout. Use these tools only for the user's requested work.${this.machineNote?.(spec) ? ' ' + this.machineNote(spec) : ''}`
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {

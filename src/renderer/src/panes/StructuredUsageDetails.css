@@ -1,0 +1,63 @@
+/* Usage accounting and cap controls. Kept beside the panel that owns them so the
+   shared telemetry stylesheet stays about telemetry chrome. */
+
+.sa-usage-content .sa-usage-headline {
+  margin: 10px 0 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  line-height: 1.45;
+}
+.sa-usage-content .sa-usage-headline strong { color: var(--text); }
+
+.sa-usage-content .sa-usage-scope { margin: 14px 0; }
+.sa-usage-content .sa-usage-scope > h4,
+.sa-usage-content .sa-usage-cap > h4 {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-2);
+}
+
+.sa-usage-content .sa-usage-provenance { margin: 12px 0; }
+.sa-usage-content .sa-usage-provenance h5 { margin: 10px 0 4px; font-size: 11px; color: var(--text-2); }
+.sa-usage-content .sa-usage-provenance ul { margin: 0; padding-left: 18px; color: var(--text-2); }
+.sa-usage-content .sa-usage-provenance li { margin: 3px 0; line-height: 1.4; }
+
+.sa-usage-content .sa-usage-cap {
+  margin: 16px 0 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.sa-usage-cap-scope { display: flex; gap: 6px; margin: 8px 0; }
+.sa-usage-cap-scope > button {
+  flex: 1;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.sa-usage-cap-scope > button.active { background: var(--surface-2); color: var(--text); border-color: var(--accent); }
+.sa-usage-cap-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 160px);
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.sa-usage-cap-row > span { color: var(--text-2); }
+.sa-usage-cap-row > select,
+.sa-usage-cap-row > input {
+  width: 100%;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+}
+.sa-usage-cap-reached { margin: 8px 0 0; color: var(--danger); line-height: 1.4; }

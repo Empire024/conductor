@@ -200,3 +200,98 @@ it('does not infer an acting agent from a direct service assignment without acto
     expect((await f.service.get(f.project.id)).tasks[0]!.activity).toEqual(assigned.tasks[0]!.activity)
   }finally{f.db.close()}
 })
+
+describe('project tasks with attached images',()=> {
+  // A bug filed with a screenshot embeds the image as a Markdown continuation
+  // line rather than a separate field, so it rides the same checklist storage
+  // as any other multi-line title (see ProjectBacklogPane's embedTaskImages).
+  const withImage='Broken layout on the settings page\n\n![Pasted image](.conductor/prompt-images/abc123.png)'
+  it('keeps an embedded image link and its marker intact through add and status edits, without disturbing sibling tasks',()=>{
+    let source='# Project tasks\n\n## Bugs\n\n## Features\n'
+    source=updateProjectTaskText(source,{type:'add',kind:'bug',title:'Sibling bug filed first'})
+    source=updateProjectTaskText(source,{type:'add',kind:'bug',title:withImage})
+    source=updateProjectTaskText(source,{type:'add',kind:'bug',title:'Sibling bug filed last'})
+    const tasks=parseProjectTasks(source)
+    expect(tasks.map(task=>task.title)).toEqual(['Sibling bug filed first',withImage,'Sibling bug filed last'])
+    const imaged=tasks[1]!
+    expect(imaged.title).toContain('![Pasted image](.conductor/prompt-images/abc123.png)')
+    const markers=[...source.matchAll(/<!-- conductor-task:([a-zA-Z0-9_-]+) -->/g)].map(match=>match[1])
+    expect(markers).toHaveLength(3)
+    expect(new Set(markers).size).toBe(3)
+    const updated=updateProjectTaskText(source,{type:'update',id:imaged.id,status:'done'})
+    const reparsed=parseProjectTasks(updated)
+    expect(reparsed.find(task=>task.id===imaged.id)).toMatchObject({status:'done',title:withImage})
+    expect(reparsed.find(task=>task.title==='Sibling bug filed first')).toMatchObject({status:'todo'})
+    expect(reparsed.find(task=>task.title==='Sibling bug filed last')).toMatchObject({status:'todo'})
+    expect(updated).toMatch(/<!-- conductor-task:[a-zA-Z0-9_-]+ -->/)
+  })
+  it('persists an image-attached task through the full service write and preserves unrelated file content',async()=>{
+    const f=fixture()
+    try {
+      const path=join(f.root,'feature-list.md')
+      writeFileSync(path,'# Project tasks\n\nKeep this delivery note.\n\n## Bugs\n\n## Features\n')
+      const first=await f.service.get(f.project.id)
+      const added=await f.service.edit(f.project.id,first.revision,{type:'add',kind:'bug',title:withImage})
+      const saved=readFileSync(path,'utf8')
+      expect(saved).toContain('Keep this delivery note.')
+      expect(saved).toContain('![Pasted image](.conductor/prompt-images/abc123.png)')
+      expect(added.tasks[0]).toMatchObject({title:withImage,kind:'bug',status:'todo'})
+      expect(parseProjectTasks(saved)[0]).toMatchObject({title:withImage})
+    }finally{f.db.close()}
+  })
+})
+
+describe('project task priority',()=> {
+  it('defaults missing or unrecognized priority markers to normal without failing',()=>{
+    const source='## Bugs\n- [ ] No marker at all\n- [ ] Legacy claim <!-- conductor-task:legacy agent=agent_A -->\n- [ ] Garbled value <!-- conductor-task:odd priority=urgent -->\n- [ ] Wrong case <!-- conductor-task:cased priority=HIGH -->\n'
+    const tasks=parseProjectTasks(source)
+    expect(tasks.map(task=>task.priority)).toEqual(['normal','normal','normal','high'])
+  })
+  it('writes a high or low priority into the marker and reads it back, leaving normal unmarked',()=>{
+    let source=updateProjectTaskText('## Bugs\n',{type:'add',kind:'bug',title:'Fix now',priority:'high'})
+    source=updateProjectTaskText(source,{type:'add',kind:'bug',title:'Someday',priority:'low'})
+    source=updateProjectTaskText(source,{type:'add',kind:'bug',title:'Usual pace'})
+    expect(source).toContain('priority=high')
+    expect(source).toContain('priority=low')
+    expect(source).not.toContain('priority=normal')
+    const tasks=parseProjectTasks(source)
+    expect(tasks.map(task=>[task.title,task.priority])).toEqual([['Fix now','high'],['Someday','low'],['Usual pace','normal']])
+  })
+  it('keeps priority through a status-only update, and drops the attribute again once set back to normal',()=>{
+    let source=updateProjectTaskText('## Bugs\n',{type:'add',kind:'bug',title:'Urgent fix',priority:'high'})
+    const id=parseProjectTasks(source)[0]!.id
+    source=updateProjectTaskText(source,{type:'update',id,status:'doing'})
+    expect(parseProjectTasks(source)[0]).toMatchObject({status:'doing',priority:'high'})
+    source=updateProjectTaskText(source,{type:'update',id,priority:'normal'})
+    expect(source).not.toContain('priority=')
+    expect(parseProjectTasks(source)[0]).toMatchObject({priority:'normal'})
+  })
+  it('sets priority on one task without disturbing a sibling claim, unrelated prose, or line endings',()=>{
+    const sibling='- [ ] Keep sibling <!-- conductor-task:sibling agent=agent_B -->'
+    const source='## Bugs\r\n- [~] Target <!-- conductor-task:target agent=agent_A -->\r\n'+sibling+'\r\nUnrelated prose stays.\r\n'
+    const updated=updateProjectTaskText(source,{type:'update',id:'target',priority:'low'})
+    expect(updated).toContain('<!-- conductor-task:target agent=agent_A priority=low -->')
+    expect(updated).toContain(sibling+'\r\nUnrelated prose stays.\r\n')
+    const tasks=parseProjectTasks(updated)
+    expect(tasks[0]).toMatchObject({id:'target',agentId:'agent_A',priority:'low',status:'doing'})
+    expect(tasks[1]).toMatchObject({id:'sibling',agentId:'agent_B',priority:'normal'})
+  })
+  it('normalizes a garbage priority value from an edit instead of writing or crashing on it',()=>{
+    const source='## Bugs\n- [ ] Task <!-- conductor-task:t1 -->\n'
+    const updated=updateProjectTaskText(source,{type:'update',id:'t1',priority:'urgent' as never})
+    expect(updated).not.toContain('priority=urgent')
+    expect(parseProjectTasks(updated)[0]).toMatchObject({priority:'normal'})
+  })
+  it('saves an agent-set priority through the real service and keeps it after reloading',async()=>{
+    const f=fixture()
+    try {
+      const first=await f.service.get(f.project.id)
+      const added=await f.service.edit(f.project.id,first.revision,{type:'add',kind:'bug',title:'Ship it'})
+      const id=added.tasks[0]!.id
+      expect(added.tasks[0]).toMatchObject({priority:'normal'})
+      const prioritized=await f.service.edit(f.project.id,added.revision,{type:'update',id,priority:'high'})
+      expect(prioritized.tasks[0]).toMatchObject({priority:'high'})
+      expect((await f.service.get(f.project.id)).tasks[0]).toMatchObject({priority:'high'})
+    } finally {f.db.close()}
+  })
+})

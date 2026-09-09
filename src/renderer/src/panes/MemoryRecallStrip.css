@@ -1,0 +1,15 @@
+.sa-recall { margin: 4px 0 2px; }
+.sa-recall-summary { display: flex; align-items: center; gap: 5px; padding: 2px 7px 2px 4px; border: 1px solid var(--border-soft); border-radius: 999px; color: var(--text-3); background: transparent; font-size: 8px; }
+.sa-recall-summary:hover { color: var(--text-2); border-color: var(--border); background: var(--surface-1); }
+.sa-recall-summary > svg { flex: 0 0 auto; }
+.sa-recall-summary em { padding-left: 5px; color: var(--warning, #ecc48d); font-style: normal; }
+.sa-recall-list { margin: 5px 0 0; padding: 6px 8px; list-style: none; display: flex; flex-direction: column; gap: 4px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--surface-1); }
+.sa-recall-item { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--text-2); font-size: 9px; line-height: 1.45; }
+.sa-recall-kind { flex: 0 0 auto; padding: 1px 5px; border-radius: 5px; color: #c792ea; background: #c792ea16; font-size: 7.5px; text-transform: lowercase; }
+.sa-recall-gist { min-width: 0; flex: 1; user-select: text; }
+.sa-recall-edit { min-width: 0; flex: 1; padding: 2px 5px; border: 1px solid var(--accent-muted); border-radius: 6px; outline: 0; color: var(--text); background: var(--surface-0); font: inherit; }
+.sa-recall-meta { flex: 0 0 auto; color: var(--text-3); font-size: 7.5px; }
+.sa-recall-item button { flex: 0 0 auto; width: 19px; height: 19px; display: grid; place-items: center; border: 0; border-radius: 5px; color: var(--text-3); background: transparent; }
+.sa-recall-item button:hover:not(:disabled) { color: var(--text); background: var(--surface-2, var(--surface-0)); }
+.sa-recall-item .sa-recall-forget:hover:not(:disabled) { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.sa-recall-gone { color: var(--text-3); font-style: italic; }

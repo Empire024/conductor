@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
-import { BellRing, Bot, Bug, Check, ExternalLink, FolderCog, MessageCircleQuestion, Minus, MoonStar, Palette, Plus, RefreshCw, RotateCcw, Sun, Volume2, X, ZoomIn } from 'lucide-react'
+import { BellRing, Bot, Bug, Check, ExternalLink, EyeOff, FolderCog, MessageCircleQuestion, Minus, MoonStar, Palette, Plus, RefreshCw, RotateCcw, Sun, Volume2, X, ZoomIn } from 'lucide-react'
 import type { AgentProviderInfo, AgentSoundCue, AgentSoundProfile, AppSettings, AppUpdateState, ThemeId, ThemeVariant } from '../../../shared/models'
 import { THEME_OPTIONS } from '../../../shared/models'
 import { playAgentSound } from '../agent-sounds'
+import { UsageCapDefaultSetting } from './UsageCapDefaultSetting'
+import { RemoteControlSettings } from './RemoteControlSettings'
 
 export function SettingsPanel({
   settings,
@@ -15,6 +17,7 @@ export function SettingsPanel({
   onSetAgentSoundProfile,
   onSetDefaultNewFileExtension,
   onSetDebugLogging,
+  onSetShowHiddenFiles,
   onOpenDebugConsole,
   updateState,
   onSetLocalUpdates,
@@ -30,6 +33,7 @@ export function SettingsPanel({
   onSetAgentSoundProfile(profile: AgentSoundProfile): void
   onSetDefaultNewFileExtension(extension: string): Promise<AppSettings>
   onSetDebugLogging(enabled: boolean): void
+  onSetShowHiddenFiles(enabled: boolean): void
   onOpenDebugConsole(): void
   updateState: AppUpdateState
   onSetLocalUpdates(enabled: boolean): void
@@ -98,6 +102,19 @@ export function SettingsPanel({
         </section>
 
         <section>
+          <div className="settings-section-title"><EyeOff size={14} /><div><strong>Ctrl+E file search</strong><span>Dotfiles and folders such as .git are hidden by default.</span></div></div>
+          <label className="theme-auto-setting">
+            <span><strong>Show hidden files</strong><small>Also toggle per search from the picker itself</small></span>
+            <input
+              type="checkbox"
+              checked={settings.showHiddenFiles}
+              onChange={(event) => onSetShowHiddenFiles(event.target.checked)}
+            />
+            <i aria-hidden="true" />
+          </label>
+        </section>
+
+        <section>
           <div className="settings-section-title"><ZoomIn size={14} /><div><strong>Interface zoom</strong><span>Applies to the entire workspace.</span></div></div>
           <div className="zoom-setting">
             <button onClick={() => onSetZoom(settings.zoomFactor - 0.05)}><Minus size={14} /></button>
@@ -135,6 +152,10 @@ export function SettingsPanel({
           </div>
           <p>Final completion uses the warm rising cue.</p>
         </section>
+
+        <UsageCapDefaultSetting />
+
+        <RemoteControlSettings />
 
         <section>
           <div className="settings-section-title"><Bug size={14} /><div><strong>Debug tools</strong><span>Capture local UI events, warnings, and errors for troubleshooting.</span></div></div>

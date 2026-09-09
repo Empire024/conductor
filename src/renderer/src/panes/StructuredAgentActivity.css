@@ -1,0 +1,12 @@
+/* Additive styles for collapsed-row previews, coalesced edit runs, and per-subagent color anchors.
+   Kept in a separate file from StructuredAgentPane.css, which another agent edits concurrently. */
+.sa-tool-preview { margin: 4px 0 0; padding: 0; color: var(--text-2); font: 10.5px/1.4 "Cascadia Mono", Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.sa-parent-label { position: relative; padding-left: 12px; }
+.sa-parent-label::before { content: ''; position: absolute; left: 0; top: 50%; width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); transform: translateY(-50%); }
+.sa-agent-hue-0::before { background: var(--accent); }
+.sa-agent-hue-1::before { background: var(--blue); }
+.sa-agent-hue-2::before { background: #85b866; }
+.sa-agent-hue-3::before { background: #e2b872; }
+.sa-agent-hue-4::before { background: var(--danger); }
+.sa-agent-hue-5::before { background: var(--accent-muted); }

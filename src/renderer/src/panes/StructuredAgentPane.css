@@ -24,6 +24,8 @@
 .sa-child::before { content: "↳"; color: var(--text-3); position: absolute; left: -18px; top: 0; font-size: 12px; }
 .sa-parent-label { display: block; color: var(--text-2); margin-bottom: 4px; font-size: 10px; overflow-wrap: anywhere; }
 .sa-role { display: block; font-size: 10px; color: var(--text-2); padding: 2px 0; }
+/* A coordinated prompt must not read as the owner's own message. */
+.sa-role-coordinated { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-muted); font-weight: 600; letter-spacing: 0.02em; }
 .sa-user .sa-markdown { border: 1px solid var(--border-soft); border-radius: 7px; padding: 7px 10px; background: var(--surface-1); }
 .sa-user .sa-marker { background: var(--accent); }
 .sa-status .sa-markdown { color: var(--text-2); font-size: 11px; }
@@ -119,7 +121,6 @@
 .sa-composer textarea::placeholder { color: var(--text-2); }
 .sa-composer > footer { display: flex; align-items: center; gap: 5px; }
 .sa-composer > footer > small { color: var(--text-2); font-size: 9px; }
-.sa-send { border-color: var(--border) !important; background: var(--surface-2) !important; }
 .sa-setting-summary { flex-wrap: wrap; justify-content: flex-start !important; font-size: 10px !important; }
 .sa-setting-summary > span { color: var(--text-2); }
 .sa-context-chips { display: flex; gap: 5px; flex-wrap: wrap; }
@@ -189,9 +190,28 @@
 .sa-empty p { max-width: 300px; font-size: 11px; color: var(--text-3); }
 .sa-composer { margin: 0 10px 10px; padding: 7px 9px 5px; position: relative; z-index: 4; border-radius: 12px; }
 .sa-composer textarea { resize: none; min-height: 47px; max-height: 150px; font-size: 12px; }
-.sa-composer > footer { min-height: 32px; gap: 5px; flex-wrap: wrap; }
-.sa-composer .sa-send { flex: 0 0 29px; min-height: 29px; height: 29px; width: 29px; border: 0 !important; color: var(--surface-0); background: var(--accent-muted) !important; border-radius: 8px; }
-.sa-composer .sa-send:disabled { opacity: .35; }
+.sa-composer > footer { min-height: 32px; gap: 5px; flex-wrap: nowrap; }
+/* One send/stop/resume control: shape, fill and glyphs morph between states, and a turn in flight
+   is shown by an arc orbiting the button rather than by swapping the icon out from under the cursor. */
+.sa-composer .sa-send { position: relative; flex: 0 0 30px; min-height: 30px; height: 30px; width: 30px; padding: 0; border: 0 !important; border-radius: 10px; color: var(--surface-0); background: var(--accent-muted) !important; box-shadow: 0 1px 4px #0003, 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent) inset; transition: background-color 140ms ease, color 140ms ease, border-radius 160ms cubic-bezier(.2,.85,.25,1), box-shadow 150ms ease, transform 130ms cubic-bezier(.2,.85,.25,1), opacity 130ms ease; }
+.sa-composer .sa-send:hover:not(:disabled) { color: var(--surface-0); background: color-mix(in srgb, var(--accent) 80%, var(--accent-muted)) !important; box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--accent) 65%, white) inset; transform: translateY(-1px); }
+.sa-composer .sa-send:active:not(:disabled) { transform: translateY(0) scale(.89); box-shadow: 0 1px 3px #0005; transition-duration: 90ms; }
+.sa-composer .sa-send:disabled { opacity: .35; box-shadow: none; }
+.sa-composer .sa-send.sa-stop { border-radius: 999px; color: var(--text); background: var(--surface-2) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px var(--border) inset; }
+.sa-composer .sa-send.sa-stop:hover:not(:disabled) { color: var(--text); background: var(--surface-3) !important; box-shadow: 0 3px 10px #0005, 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border)) inset; }
+.sa-composer .sa-send.sa-stop:disabled { opacity: .6; }
+.sa-send-glyphs { display: grid; place-items: center; width: 100%; height: 100%; }
+.sa-send-glyph { grid-area: 1 / 1; transition: opacity 120ms ease, transform 170ms cubic-bezier(.2,.85,.25,1); }
+.sa-glyph-send { opacity: 0; transform: translate(7px, -7px) rotate(12deg) scale(.55); }
+.sa-glyph-stop { opacity: 0; transform: rotate(-40deg) scale(.35); }
+.sa-glyph-resume { opacity: 0; transform: translateX(-7px) scale(.55); }
+.sa-send[data-state="send"] .sa-glyph-send, .sa-send[data-state="stop"] .sa-glyph-stop { opacity: 1; transform: none; }
+.sa-send[data-state="resume"] .sa-glyph-resume { opacity: 1; transform: translateX(1px); }
+.sa-send-orbit { position: absolute; inset: -2px; border-radius: 999px; opacity: 0; pointer-events: none; background: conic-gradient(from 0turn, transparent 0 52%, color-mix(in srgb, var(--accent) 50%, transparent) 79%, color-mix(in srgb, var(--accent) 96%, white) 97%, transparent 100%); -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); transition: opacity 140ms ease; }
+.sa-send[data-busy="true"] .sa-send-orbit { opacity: 1; animation: sa-send-orbit var(--spin-duration) linear infinite; }
+@keyframes sa-send-orbit { to { transform: rotate(1turn); } }
+/* Reduced motion keeps the running indicator, as a settled ring instead of a sweep. */
+@media (prefers-reduced-motion: reduce) { .sa-send[data-busy="true"] .sa-send-orbit { background: color-mix(in srgb, var(--accent) 75%, transparent); } }
 .sa-model-control { position: relative; min-width: 0; max-width: min(230px, 46cqw); }
 .sa-model-trigger { width: 100%; min-width: 65px; height: 29px; padding: 3px 7px !important; border-radius: 7px !important; font-size: 10px !important; }
 .sa-model-trigger > span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
@@ -208,6 +228,8 @@
 .sa-effort-control .agent-effort-slider input { padding: 0; border: 0; border-radius: 0; }
 .sa-effort-control .agent-effort-heading { font-size: 8px; }
 .sa-effort-control .agent-effort-heading output { font-size: 8px; }
+.sa-composer > footer .sa-usage-summary { min-width: 0; flex-shrink: 1; margin-left: 1px; }
+.sa-composer > footer .sa-usage-summary > button { min-height: 26px; padding: 2px 6px; font-size: 10px; }
 .sa-dialog:has(> .sa-settings) { width: min(450px, calc(100vw - 32px)); }
 .sa-dialog .sa-settings { display: flex; flex-direction: column; gap: 0; padding: 10px 16px 16px; max-height: none; border: 0; background: var(--surface-0); }
 .sa-settings-section { padding: 10px 0 12px; border-bottom: 1px solid var(--border-soft); }
@@ -224,8 +246,8 @@
 .sa-limit-detail { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; margin: 9px 0; font-size: 11px; }
 .sa-limit-detail strong { font-weight: 500; }
 .sa-limit-detail small { grid-column: 1 / -1; color: var(--text-3); font-size: 10px; }
-@container (max-width: 420px) { .sa-model-control { max-width: 43cqw; } .sa-effort-control { width: 88px; padding-left: 4px; padding-right: 4px; } .sa-composer > footer { gap: 2px; } .sa-session-bar > strong { max-width: 60%; } .sa-timeline { padding-left: 13px; padding-right: 11px; } }
-@container (max-width: 300px) { .sa-model-control { max-width: 38cqw; } .sa-effort-control { width: 78px; } .sa-composer { margin: 0 5px 7px; padding: 6px; } .sa-session-phase { max-width: 65px; overflow: hidden; text-overflow: ellipsis; } }
+@container (max-width: 420px) { .sa-model-control { max-width: 43cqw; } .sa-effort-control { width: 88px; padding-left: 4px; padding-right: 4px; } .sa-composer > footer { gap: 2px; } .sa-usage-summary .sa-usage-link { max-width: 54px; } .sa-session-bar > strong { max-width: 60%; } .sa-timeline { padding-left: 13px; padding-right: 11px; } }
+@container (max-width: 300px) { .sa-model-control { max-width: 38cqw; } .sa-effort-control { width: 78px; } .sa-usage-summary .sa-usage-link { display: none; } .sa-composer { margin: 0 5px 7px; padding: 6px; } .sa-session-phase { max-width: 65px; overflow: hidden; text-overflow: ellipsis; } }
 
 /* Keep the collapsed activity rail quiet; only expanded tool bodies need a card. */
 .sa-tool:has(.sa-tool-heading[aria-expanded="false"]) { border-color: transparent; }
@@ -264,6 +286,16 @@
 .sa-question-option strong { font-weight: 500; font-size: 11px; }
 .sa-question-option small { margin-top: 2px; line-height: 1.5; }
 .sa-interaction-actions { margin-top: 12px; }
+.sa-question-steps { display: flex; gap: 4px; list-style: none; margin: 0 0 2px; padding: 0; }
+.sa-question-steps li { flex: 1; height: 3px; border-radius: 2px; background: var(--border-soft); transition: background .18s ease; }
+.sa-question-steps li.done { background: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.sa-question-steps li.current { background: var(--accent); }
+.sa-step-back { background: transparent; border-color: var(--border-soft); color: var(--text-2); }
+/* A pending question follows the conversation instead of scrolling away, so the transcript
+   behind it stays readable while it is answered. */
+.sa-activity:has(> .sa-interaction-pinned) { position: sticky; bottom: 4px; z-index: 4; }
+.sa-interaction-pinned { background: color-mix(in srgb, var(--surface-1) 93%, transparent); backdrop-filter: blur(7px); box-shadow: 0 14px 34px -16px #000c; }
+@media (prefers-reduced-motion: reduce) { .sa-question-steps li { transition: none; } }
 .sa-interaction-actions > button:first-child { color: var(--text); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 .sa-request-summary { margin: 5px 0 8px; font-size: 11px; color: var(--text-2); overflow-wrap: anywhere; }
 .sa-request-summary:empty { display: none; }
@@ -303,11 +335,36 @@
 
 /* Measured activity heights keep scroll positions stable while questions and output grow. */
 .sa-activity { content-visibility: visible; contain-intrinsic-size: none; }
+/* Each item mounts once and is memoized, so this plays a single time per new activity, never
+   per streamed token; opacity/transform only, so it costs a compositor layer, not layout. */
+.sa-activity { animation: sa-activity-in 120ms cubic-bezier(.2,.8,.2,1) both; }
+@keyframes sa-activity-in { from { opacity: 0; transform: translateY(3px); } }
 .sa-history-banner > span { min-width: 0; display: flex; flex-direction: column; }
 .sa-history-banner strong { font-size: 11px; font-weight: 600; }
 .sa-history-banner small { font-size: 10px; color: var(--text-3); }
+/* A stopped runtime is an actionable notice, not an error and not saved-history chrome: its own
+   tint, a legible second line, and the way out attached to the message rather than floated away. */
+.sa-runtime-banner { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--blue) 9%, var(--surface-1)); color: var(--text); font-size: 11px; }
+.sa-runtime-banner > svg { flex: 0 0 auto; color: var(--blue); }
+.sa-runtime-banner > span { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.sa-runtime-banner strong { font-size: 11px; font-weight: 600; }
+.sa-runtime-banner small { font-size: 10px; color: var(--text-2); overflow-wrap: anywhere; }
+.sa-runtime-resume { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border: 1px solid color-mix(in srgb, var(--blue) 45%, transparent); border-radius: 5px; background: color-mix(in srgb, var(--blue) 14%, transparent); color: var(--text); font-size: 11px; }
+.sa-runtime-resume:hover:not(:disabled) { background: color-mix(in srgb, var(--blue) 24%, transparent); border-color: var(--blue); }
+.sa-runtime-resume:disabled { opacity: .55; }
 .sa-history-help, .sa-history-loading { color: var(--text-2); padding: 0 16px; font-size: 11px; }
 .sa-history-loading { display: flex; align-items: center; gap: 7px; }
 
 .sa-steering-prompt { flex-wrap: wrap; }
 .sa-steering-prompt small { order: 1; flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
+
+/* The owner's last sent prompt stays reachable while the rest of the transcript scrolls under it. */
+.sa-pinned-prompt { position: sticky; top: -1px; z-index: 3; display: flex; width: 100%; align-items: center; justify-content: flex-start; gap: 6px; margin: 0 0 10px; padding: 5px 9px; border: 1px solid var(--border-soft); border-radius: 6px; background: color-mix(in srgb, var(--surface-1) 94%, transparent); backdrop-filter: blur(6px); box-shadow: 0 6px 16px -10px #000a; text-align: left; font-size: 11px; }
+.sa-pinned-prompt > svg { flex: 0 0 auto; color: var(--accent-muted); }
+.sa-pinned-prompt > span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-2); }
+/* A brief ring around the target activity after jumping to it from the pin, so the click has a
+   visible effect beyond the scroll itself. A transition, not a keyframe animation, so toggling
+   it never fights the unrelated mount-in animation already declared on .sa-activity above. */
+.sa-activity { transition: box-shadow 700ms ease; }
+.sa-activity-flash { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent); border-radius: 8px; }
+@media (prefers-reduced-motion: reduce) { .sa-activity { transition: none; } }

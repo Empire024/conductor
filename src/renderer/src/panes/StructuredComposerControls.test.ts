@@ -41,7 +41,7 @@ describe('compact composer controls (synthetic, zero inference)', () => {
   })
   it('hides the effort slider unless supported effort choices are available', () => {
     expect(render().html).not.toContain('type="range"')
-    expect(render({ capabilities: { ...capabilities, models: [] } }).html).not.toContain('type="range"')
+    expect(render({ capabilities: { ...capabilities, models: [] } }).html).toContain('type="range"')
     expect(render({ capabilities, settings: { ...settings, model: 'model-two', effort: 'high' } }).html).not.toContain('type="range"')
   })
   it('places supported effort values at their real slider positions and always shows a concrete effort', () => {
@@ -137,6 +137,15 @@ it('keeps default alias effort metadata when Claude reports a concrete runtime m
   const html = render({ capabilities: { ...capabilities, provider: 'claude', effectiveSettings: { model: 'claude-opus-runtime', effort: 'high' }, models: [{ id: 'default', label: 'Default (Opus)', effort: ['low', 'high'] }] } }).html
   expect(html).toContain('aria-valuetext="High"')
   expect(html).toContain('value="1"')
+})
+
+it('shows a concrete effort for a fresh Claude session before the model catalog loads, without committing a guess', () => {
+  const claude: ProviderCapabilities = { ...capabilities, provider: 'claude', models: [], effort: ['low', 'medium', 'high', 'xhigh', 'max'] }
+  const { html, onChange } = render({ capabilities: claude, settings: { permission: 'default', plan: false } })
+  expect(html).toContain('aria-label="Reasoning effort"')
+  expect(html).toContain('aria-valuetext="Medium"')
+  expect(html).toContain('type="range"')
+  expect(onChange).not.toHaveBeenCalled()
 })
 
 it('always resolves a concrete effort for models that report one', () => {

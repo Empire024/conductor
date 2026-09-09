@@ -1,7 +1,17 @@
-.agent-control-cables { position: fixed; inset: 0; width: 100vw; height: 100vh; z-index: 45; pointer-events: none; overflow: visible; }
-.agent-control-cables path { fill: none; stroke: var(--accent); stroke-width: 1.5; opacity: .65; }
-.agent-control-cables circle { fill: var(--accent); }
-.agent-control-links { position: fixed; bottom: 30px; right: 14px; z-index: 44; display: grid; gap: 4px; max-width: calc(100vw - 32px); color: var(--text-2); }
+.agent-control-markers { position: fixed; inset: 0; z-index: 45; pointer-events: none; }
+.agent-control-marker { position: absolute; display: flex; align-items: center; justify-content: center; width: 13px; height: 13px; border-radius: 50%; transform: translate(-50%, -50%); border: 1.5px solid; background: var(--surface-1); box-shadow: 0 1px 4px #0004; }
+.agent-control-marker.controller { background: currentColor; }
+.agent-control-marker.controller svg { color: var(--surface-0); }
+.agent-control-marker.controlled svg { color: currentColor; }
+.agent-control-marker b { font-size: 7px; font-weight: 700; line-height: 1; }
+.agent-control-marker.controller b { color: var(--surface-0); }
+.agent-control-links { position: fixed; bottom: 30px; right: 14px; z-index: 44; display: grid; gap: 4px; justify-items: end; max-width: calc(100vw - 32px); color: var(--text-2); }
+.agent-control-summary { display: flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); box-shadow: 0 2px 9px #0002; color: var(--text-2); font-size: 10px; cursor: pointer; }
+.agent-control-summary:hover { color: var(--text); border-color: var(--text-3); }
+.agent-control-summary:focus-visible { outline: 1px solid var(--accent); }
+.agent-control-summary > svg:first-child { color: var(--accent); }
+/* Bounded so an orchestrating tab with many coworkers can never grow this list up the screen. */
+.agent-control-link-list { display: grid; gap: 4px; justify-items: end; max-height: 38vh; overflow-y: auto; overscroll-behavior: contain; padding: 1px; }
 .agent-control-link { display: flex; align-items: center; gap: 5px; padding: 3px 6px; background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 2px 9px #0002; font-size: 10px; }
 .agent-control-link > svg { color: var(--accent); flex-shrink: 0; }
 .agent-control-link button { min-width: 0; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 3px; border: 0; border-radius: 3px; background: transparent; color: var(--text); font: inherit; cursor: pointer; }

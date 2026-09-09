@@ -169,6 +169,8 @@ export class CodexAdapter implements ProviderAdapter {
   private starting?: Promise<void>
   private disposed = false
   private failed = false
+  /** Set once the first account allowance report of this runtime has been recorded. */
+  private accountBaseline = false
   private requestId = 0
   private rpc = new Map<string, PendingRpc>()
   private pending = new Map<string, PendingRequest>()
@@ -521,7 +523,9 @@ export class CodexAdapter implements ProviderAdapter {
         if (!this.threadId && !params.thread.parentThreadId) this.threadId = params.thread.id
         if (params.thread.parentThreadId) {
           const parent = this.childParents.get(params.thread.id)
-          send({ type: 'subagent', name: params.thread.agentNickname ?? params.thread.agentRole ?? 'Codex agent', nativeSessionId: params.thread.id, status: 'running' }, { nativeSessionId: params.thread.id, itemId: `thread:${params.thread.id}`, parentId: parent })
+          send({ type: 'subagent', name: params.thread.agentNickname ?? params.thread.agentRole ?? 'Codex agent', nativeSessionId: params.thread.id, status: 'running',
+            ...(params.thread.model ? { model: params.thread.model } : {}), ...(params.thread.reasoningEffort ? { effort: params.thread.reasoningEffort } : {}), modelProvider: params.thread.modelProvider
+          }, { nativeSessionId: params.thread.id, itemId: `thread:${params.thread.id}`, parentId: parent })
         }
         return
       case 'turn/started':
@@ -593,6 +597,13 @@ export class CodexAdapter implements ProviderAdapter {
         }
         return
       case 'account/rateLimits/updated':
+        // The rolling item keeps one current level per runtime; the timeline reconciles it in
+        // place. Recording the first reported level separately is what makes "this run consumed
+        // N points" a difference between two provider reports rather than an assumption.
+        if (!this.accountBaseline) {
+          this.accountBaseline = true
+          send({ type: 'usage', source: 'provider', limits: json(params) }, { itemId: 'account-rate-limits:first' })
+        }
         send({ type: 'usage', source: 'provider', limits: json(params) }, { itemId: 'account-rate-limits' })
         return
       case 'serverRequest/resolved': {
@@ -682,7 +693,10 @@ export class CodexAdapter implements ProviderAdapter {
           if (this.childParents.size >= 2048) this.childParents.delete(this.childParents.keys().next().value!)
           this.childParents.set(child, item.id)
           const state = item.agentsStates[child]
-          send({ type: 'subagent', name: 'Codex agent', nativeSessionId: child, status: state?.status === 'completed' ? 'completed' : state?.status === 'errored' || state?.status === 'notFound' ? 'failed' : state?.status === 'interrupted' || state?.status === 'shutdown' ? 'interrupted' : state?.status === 'pendingInit' ? 'preparing' : 'running' }, { itemId: `thread:${child}`, parentId: item.id })
+          send({ type: 'subagent', name: 'Codex agent', nativeSessionId: child, status: state?.status === 'completed' ? 'completed' : state?.status === 'errored' || state?.status === 'notFound' ? 'failed' : state?.status === 'interrupted' || state?.status === 'shutdown' ? 'interrupted' : state?.status === 'pendingInit' ? 'preparing' : 'running',
+            // Requested at spawn time; the child's own thread/started (if it arrives) can refine this further.
+            ...(item.model ? { model: item.model } : {}), ...(item.reasoningEffort ? { effort: item.reasoningEffort } : {})
+          }, { itemId: `thread:${child}`, parentId: item.id })
         }
         return
       case 'subAgentActivity':

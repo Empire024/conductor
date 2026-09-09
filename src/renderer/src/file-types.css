@@ -1,0 +1,29 @@
+/* File type hues, Seti-inspired. Dark-theme values here; light-theme overrides below are
+   independently darkened/saturated for contrast against a near-white surface, matching the
+   approach already used for syntax token colors in SyntaxCode.css rather than assuming one
+   value works for both themes. */
+.file-type-blue { color: #9cdcfe; }
+.file-type-yellow { color: #dcdcaa; }
+.file-type-gold { color: #e3c07a; }
+.file-type-orange { color: #f0a05a; }
+.file-type-red { color: #ed8388; }
+.file-type-pink { color: #e582c2; }
+.file-type-purple { color: #c792ea; }
+.file-type-green { color: #85b866; }
+.file-type-teal { color: #4ec9b0; }
+.file-type-cyan { color: #6fd3e0; }
+.file-type-slate { color: #9fb1c1; }
+.file-type-gray { color: #9aa5b1; }
+
+[data-theme="light"] .file-type-blue { color: #005b87; }
+[data-theme="light"] .file-type-yellow { color: #795e26; }
+[data-theme="light"] .file-type-gold { color: #8a6d1f; }
+[data-theme="light"] .file-type-orange { color: #a15c1f; }
+[data-theme="light"] .file-type-red { color: #a02c38; }
+[data-theme="light"] .file-type-pink { color: #99396f; }
+[data-theme="light"] .file-type-purple { color: #8b2296; }
+[data-theme="light"] .file-type-green { color: #367520; }
+[data-theme="light"] .file-type-teal { color: #14776d; }
+[data-theme="light"] .file-type-cyan { color: #0b7285; }
+[data-theme="light"] .file-type-slate { color: #46647a; }
+[data-theme="light"] .file-type-gray { color: #6e7781; }

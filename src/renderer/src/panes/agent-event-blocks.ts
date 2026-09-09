@@ -184,6 +184,17 @@ const mergeFiles = (
   return [...merged.values()].slice(0, 20)
 }
 
+/** A stable target for kinds that can repeat on the same thing (a file, a command, a tool) so
+ *  successive near-duplicates coalesce; null means this kind has nothing to key a target by. */
+const coalesceTarget = (block: AgentVisualBlock): string | null => {
+  if (block.kind === 'file') return block.files[0] ? `file:${block.files[0].path.toLowerCase()}` : null
+  if (block.kind === 'command') return block.command ? `command:${block.command}` : null
+  // A bare tool name is not a target: two unrelated Grep calls would merge and the first one's
+  // title and body would be silently overwritten by the second.
+  if (block.kind === 'tool') return null
+  return null
+}
+
 export const buildAgentVisualTimeline = (
   events: NormalizedAgentEvent[],
   options: BuildAgentVisualTimelineOptions = {}
@@ -230,6 +241,24 @@ export const buildAgentVisualTimeline = (
     ) {
       previous.updatedAt = next.updatedAt
       previous.sourceEventIds.push(...next.sourceEventIds)
+      previous.occurrences += 1
+      continue
+    }
+    const target = previous ? coalesceTarget(previous) : null
+    if (
+      previous &&
+      previous.agentSessionId === next.agentSessionId &&
+      previous.kind === next.kind &&
+      target !== null && target === coalesceTarget(next) &&
+      gap >= 0 && gap <= activityWindow
+    ) {
+      // Successive edits/commands/tool calls on the same target with no intervening commentary:
+      // the row always reflects the latest, most complete state instead of stacking near-duplicates.
+      previous.title = next.title
+      previous.body = next.body
+      previous.updatedAt = next.updatedAt
+      previous.sourceEventIds.push(...next.sourceEventIds)
+      previous.files = mergeFiles(previous.files, next.files)
       previous.occurrences += 1
       continue
     }

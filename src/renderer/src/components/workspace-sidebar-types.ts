@@ -23,9 +23,17 @@ export const classifyExplorerFile = (path: string): ExplorerFileKind => {
   return 'external'
 }
 
-export const defaultExplorerOpenMode = (path: string): ExplorerOpenMode | null => {
+/** How a file tab should open a path when nobody asked for a specific view.
+ * Unlike the explorer, this never shells out and never falls back to text: an
+ * unrecognised file lands on the preview pane, which offers the default app and
+ * a deliberate "open as text" for the cases where a text read is really wanted. */
+export const defaultFileViewMode = (path: string): ExplorerOpenMode => {
   const kind = classifyExplorerFile(path)
-  if (kind === 'markdown' || kind === 'image' || kind === 'media' || kind === 'pdf') return 'preview'
-  if (kind === 'text') return 'editor'
-  return null
+  return kind === 'text' || kind === 'markdown' ? 'editor' : 'preview'
 }
+
+/** What a left click in the explorer opens. Markdown reads better than it
+ * edits here, and an unknown type lands on the preview's description of it
+ * rather than being launched by the shell from a single click. */
+export const defaultExplorerOpenMode = (path: string): ExplorerOpenMode =>
+  classifyExplorerFile(path) === 'text' ? 'editor' : 'preview'

@@ -4,9 +4,15 @@
 .sa-telemetry .sa-subagent-summary { min-width: 0; justify-content: flex-start; }
 .sa-subagent-summary > svg { flex: 0 0 auto; color: var(--accent); }
 .sa-subagent-summary > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sa-telemetry .sa-usage-link { flex: 0 0 auto; margin-left: auto; color: var(--text-2); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 3px; }
-.sa-telemetry .sa-usage-link:hover { color: var(--accent); text-decoration-color: currentColor; }
+.sa-usage-summary { display: flex; align-items: center; gap: 4px; min-width: 0; flex: 0 1 auto; color: var(--text-2); }
+.sa-usage-summary .sa-usage-link { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 3px; }
+.sa-usage-summary .sa-usage-link:hover { color: var(--accent); text-decoration-color: currentColor; }
 .sa-live-tokens { padding-left: 8px; border-left: 1px solid var(--border-soft); font-size: 10px; font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--text-2); }
+.sa-token-pending { display: inline-flex; align-items: center; gap: 3px; }
+.sa-token-pending > i { width: 3px; height: 3px; border-radius: 50%; background: var(--text-2); animation: sa-token-dot 1.1s ease-in-out infinite; }
+.sa-token-pending > i:nth-child(2) { animation-delay: .15s; }
+.sa-token-pending > i:nth-child(3) { animation-delay: .3s; }
+@keyframes sa-token-dot { 0%, 80%, 100% { opacity: .25; } 40% { opacity: 1; } }
 .sa-working { flex-wrap: wrap; }
 .sa-dialog > .sa-usage-content, .sa-subagent-details { padding: 4px 15px 15px; }
 .sa-usage-content dl { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 18px; margin: 10px 0; }
@@ -58,13 +64,24 @@
 .sa-agent-activity > summary { cursor: pointer; font-size: 11px; color: var(--text-2); margin: 12px 0; }
 .sa-agent-activity > div { border-top: 1px solid var(--border-soft); padding-top: 8px; }
 
-.sa-telemetry .sa-context-circle { flex: 0 0 auto; display: inline-flex; gap: 4px; align-items: center; color: var(--text-2); padding: 2px 4px; font-size: 10px; font-variant-numeric: tabular-nums; }
+/* Same identity color the main timeline's "Within X" labels use for this subagent, so a
+   roster row and its nested activity elsewhere read as the same colored agent. */
+.sa-subagent-identity { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--text-3); vertical-align: middle; }
+.sa-subagent-identity.sa-agent-hue-0 { background: var(--accent); }
+.sa-subagent-identity.sa-agent-hue-1 { background: var(--blue); }
+.sa-subagent-identity.sa-agent-hue-2 { background: #85b866; }
+.sa-subagent-identity.sa-agent-hue-3 { background: #e2b872; }
+.sa-subagent-identity.sa-agent-hue-4 { background: var(--danger); }
+.sa-subagent-identity.sa-agent-hue-5 { background: var(--accent-muted); }
+.sa-subagent-model, .sa-subagent-tokens { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; padding: 2px 7px; border-radius: 999px; background: var(--surface-hover); color: var(--text-2); font-size: 9.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.sa-usage-summary .sa-context-circle { flex: 0 0 auto; display: inline-flex; gap: 4px; align-items: center; color: var(--text-2); padding: 2px 4px; font-size: 10px; font-variant-numeric: tabular-nums; }
 .sa-context-circle svg { flex-shrink: 0; overflow: visible; }
 .sa-context-circle circle { fill: none; stroke-width: 2; }
 .sa-context-track { stroke: var(--border); }
 .sa-context-fill { stroke: currentColor; stroke-linecap: round; transition: stroke-dasharray 300ms ease, stroke-width 300ms ease; }
-.sa-telemetry .sa-context-circle.level-warning { color: #df9a49; }
-.sa-telemetry .sa-context-circle.level-critical { color: #ed6d72; font-weight: 650; }
+.sa-usage-summary .sa-context-circle.level-warning { color: #df9a49; }
+.sa-usage-summary .sa-context-circle.level-critical { color: #ed6d72; font-weight: 650; }
 .sa-context-circle.level-critical .sa-context-fill { stroke-width: 3; animation: sa-context-pulse 3s ease-in-out infinite; }
 .sa-context-circle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 5px; }
 .sa-context-details { margin-bottom: 15px; padding-bottom: 12px; border-bottom: 1px solid var(--border-soft); }

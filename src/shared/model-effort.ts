@@ -9,9 +9,13 @@ export function modelEfforts(capabilities: ProviderCapabilities | undefined, mod
   return info?.effort
 }
 
-/** Slider positions: real, reported efforts only. Auto is a placeholder, not a choice. */
+/** Slider positions: real, reported efforts only. Auto is a placeholder, not a choice.
+ * With no catalog at all, fall back to the provider's own declared effort ladder so the
+ * slider is not gated behind a connect the user hasn't triggered yet. */
 export function supportedEffortChoices(capabilities: ProviderCapabilities | undefined, model?: string): string[] {
-  return (modelEfforts(capabilities, model) ?? []).filter(effort => effort && effort !== 'auto')
+  if (!capabilities) return []
+  const ladder = capabilities.models.length === 0 ? capabilities.effort : modelEfforts(capabilities, model)
+  return (ladder ?? []).filter(effort => effort && effort !== 'auto')
 }
 
 /** Conductor always sends a concrete effort, so a conversation never runs on 'not reported'. */

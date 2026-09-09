@@ -10,6 +10,21 @@ import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, Pendin
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.263. */
 export const CLAUDE_COMPATIBILITY = '2.1.263'
+const parseClaudeVersion = (value: string): [number, number, number] | undefined => {
+  const parts = /^(\d+)\.(\d+)\.(\d+)$/.exec(value.trim())
+  return parts ? [Number(parts[1]), Number(parts[2]), Number(parts[3])] : undefined
+}
+/** The control protocol is additive within a major line, so a newer CLI keeps the launch flags
+ *  and control subtypes this bridge sends. Only the exact baseline is fixture-verified: a newer
+ *  patch/minor connects and records the gap, while an older or different-major CLI is refused
+ *  because it may predate flags such as --permission-prompts. */
+export function claudeCompatibility(version: string): { supported: boolean; verified: boolean } {
+  if (version === CLAUDE_COMPATIBILITY) return { supported: true, verified: true }
+  const runtime = parseClaudeVersion(version), baseline = parseClaudeVersion(CLAUDE_COMPATIBILITY)!
+  if (!runtime || runtime[0] !== baseline[0]) return { supported: false, verified: false }
+  const newer = runtime[1] > baseline[1] || (runtime[1] === baseline[1] && runtime[2] >= baseline[2])
+  return { supported: newer, verified: false }
+}
 type ObjectValue = { [key: string]: Json }
 const object = (value: Json | undefined): ObjectValue => value && typeof value === 'object' && !Array.isArray(value) ? value : {}
 const string = (value: Json | undefined): string | undefined => typeof value === 'string' ? value : undefined
@@ -71,6 +86,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private initializedMetadata: Json = {}
   private configurationMetadata: Json = {}
   private cumulativeCostUsd = 0
+  /** Set once the first account allowance report of this runtime has been recorded. */
+  private accountBaseline = false
   private contextTokens?: number
   private contextWindow?: number
   private maxOutputTokens?: number
@@ -91,7 +108,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     const version = await (this.dependencies.version ?? readVersion)(this.options.executable)
     this.capabilities.runtimeVersion = version
     // Control protocol is not promised stable across arbitrary CLI releases.
-    if (version !== CLAUDE_COMPATIBILITY) throw new Error(`Claude Code ${version} is outside the tested ${CLAUDE_COMPATIBILITY} bridge baseline`)
+    const compatibility = claudeCompatibility(version)
+    if (!compatibility.supported) throw new Error(`Claude Code ${version} is below the tested ${CLAUDE_COMPATIBILITY} bridge baseline; update Claude Code to ${CLAUDE_COMPATIBILITY} or newer`)
+    if (!compatibility.verified) this.capabilities.limitations.push(`Runtime ${version} is newer than the fixture-verified ${CLAUDE_COMPATIBILITY} baseline; protocol changes in this release are not covered by Conductor's tests.`)
     const args = ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
       '--include-partial-messages', '--permission-prompt-tool', 'stdio', '--permission-prompts', 'host',
       '--forward-subagent-text', '--permission-mode', this.permissionMode(this.settings)]
@@ -447,6 +466,10 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupted' : failure ? 'failed' : 'completed', nativeSessionId: this.nativeSessionId }, native: { method: 'result', payload: message } })
       return
     }
+    if (type === 'rate_limit_event') {
+      this.accountWindows(object(object(message.rate_limit_info).unifiedWindows), message)
+      return
+    }
     if (type === 'system' && message.subtype === 'compact_boundary' && !parentId) {
       this.contextTokens = undefined
       this.emitContext()
@@ -566,6 +589,37 @@ export class ClaudeAdapter implements ProviderAdapter {
     if ([inputTokens, cachedTokens, cacheCreationTokens, outputTokens].every(value => value === undefined)) return
     if (scope === 'message' && !parentId && inputTokens !== undefined && outputTokens !== undefined) { this.contextTokens = inputTokens + outputTokens; this.emitContext() }
     this.emit({ itemId, parentId, data: { type: 'usage', scope, source: 'provider', inputTokens, cachedTokens, cacheCreationTokens, outputTokens, ...(inputTokens !== undefined && outputTokens !== undefined ? { totalTokens: inputTokens + outputTokens } : {}) } })
+  }
+
+  /**
+   * Claude reports account allowance as `rate_limit_event.rate_limit_info.unifiedWindows`,
+   * keyed by window with `utilization` on a 0-1 scale and an epoch-second `resetsAt`.
+   * Only reported windows are forwarded, rescaled to the same 0-100 `usedPercent` shape
+   * Codex reports, so the app has one account-allowance vocabulary. Window durations are
+   * the fixed meaning of Claude's own key names, not a guess about the owner's plan.
+   */
+  private accountWindows(windows: ObjectValue, native: ObjectValue): void {
+    const durations: Record<string, number> = { five_hour: 300, seven_day: 10_080, seven_day_overage_included: 10_080 }
+    const rateLimits: ObjectValue = {}
+    for (const [key, value] of Object.entries(windows)) {
+      const utilization = number(object(value).utilization)
+      if (utilization === undefined || utilization < 0) continue
+      const resetsAt = number(object(value).resetsAt)
+      rateLimits[key] = {
+        usedPercent: utilization * 100,
+        ...(durations[key] !== undefined ? { windowDurationMins: durations[key]! } : {}),
+        ...(resetsAt !== undefined ? { resetsAt } : {})
+      }
+    }
+    if (!Object.keys(rateLimits).length) return
+    // The rolling item keeps one current level per runtime; the timeline reconciles it in
+    // place. Recording the first reported level separately is what makes "this run consumed
+    // N points" a difference between two provider reports rather than an assumption.
+    if (!this.accountBaseline) {
+      this.accountBaseline = true
+      this.emit({ itemId: 'usage:account-rate-limits:first', data: { type: 'usage', source: 'provider', limits: { rateLimits } }, native: { method: 'rate_limit_event/first', payload: native } })
+    }
+    this.emit({ itemId: 'usage:account-rate-limits', data: { type: 'usage', source: 'provider', limits: { rateLimits } }, native: { method: 'rate_limit_event', payload: native } })
   }
 
   private resetContextForModel(model: string): void {

@@ -1,129 +1,23 @@
 import type { ActivityStatus, AgentEventData, Json, SessionPhase, TimelineItem } from '../../../shared/structured-agent'
 import type { AgentProviderId } from '../../../shared/models'
-
-type Usage = Extract<AgentEventData, { type: 'usage' }>
-type UsageItem = TimelineItem & { data: Usage }
-const tokenFields = ['inputTokens', 'outputTokens', 'cachedTokens', 'reasoningTokens', 'cacheCreationTokens', 'totalTokens'] as const
-type TokenField = typeof tokenFields[number]
-export type TokenFigures = Partial<Record<TokenField, number>>
-export interface UsageSummary {
-  tokens?: TokenFigures
-  scope: 'session' | 'reported' | 'latest'
-  estimated: boolean
-  costUsd?: number
-  costEstimated: boolean
-  costScope: 'session' | 'reported' | 'latest'
-  limits?: Json
-  contextWindow?: number
-}
+import { updatedSequence, type TokenFigures } from '../../../shared/usage-accounting'
+import { modelDisplayName } from './composer-settings'
 
 function object(value: Json | undefined): Record<string, Json> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {}
 }
-function number(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
-}
-export function updatedSequence(item: TimelineItem): number { return item.updatedSequence ?? item.sequence }
-function hasTokens(value: Usage): boolean { return tokenFields.some(key => number(value[key]) !== undefined) }
-function figures(value: Usage): TokenFigures {
-  const tokens: TokenFigures = {}
-  for (const key of tokenFields) {
-    const count = number(value[key])
-    if (count !== undefined) tokens[key] = count
-  }
-  if (tokens.totalTokens === undefined && tokens.inputTokens !== undefined && tokens.outputTokens !== undefined) tokens.totalTokens = tokens.inputTokens + tokens.outputTokens
-  return tokens
-}
-function turnKey(item: TimelineItem): string { return JSON.stringify([item.runtimeId, item.turnId ?? 'unidentified']) }
 
-/** Final turn totals replace message snapshots; cumulative session snapshots are never added. */
-function scopedSnapshots(items: UsageItem[]): UsageItem[] {
-  const turns = new Map<string, { final?: UsageItem; messages: Map<string, UsageItem> }>()
-  for (const item of items) {
-    const key = turnKey(item)
-    const turn = turns.get(key) ?? { messages: new Map<string, UsageItem>() }
-    if (item.data.scope === 'turn') turn.final = item
-    if (item.data.scope === 'message') turn.messages.set(item.nativeItemId ?? item.id, item)
-    turns.set(key, turn)
-  }
-  return [...turns.values()].flatMap(turn => turn.final ? [turn.final] : [...turn.messages.values()])
-}
-function sumFigures(items: UsageItem[]): TokenFigures {
-  const snapshots = items.map(item => figures(item.data))
-  const totals: TokenFigures = {}
-  for (const key of tokenFields) {
-    // A missing count is unknown, including when only some messages report it.
-    if (snapshots.every(value => value[key] !== undefined)) totals[key] = snapshots.reduce((total, value) => total + value[key]!, 0)
-  }
-  return totals
-}
-
-export function summarizeUsage(items: TimelineItem[]): UsageSummary {
-  const usage = items.filter((item): item is UsageItem => item.data.type === 'usage' && !item.parentId).sort((a, b) => updatedSequence(a) - updatedSequence(b))
-  const tokenItems = usage.filter(item => hasTokens(item.data))
-  const session = tokenItems.filter(item => item.data.scope === 'session').at(-1)
-  const scoped = scopedSnapshots(tokenItems)
-  const fallback = tokenItems.at(-1)
-  const selected = session ? [session] : scoped.length ? scoped : fallback ? [fallback] : []
-  const costItems = usage.filter(item => number(item.data.costUsd) !== undefined)
-  const sessionCost = costItems.filter(item => item.data.scope === 'session').at(-1)
-  const scopedCosts = scopedSnapshots(costItems)
-  const costs = sessionCost ? [sessionCost] : scopedCosts.length ? scopedCosts : costItems.slice(-1)
-  let limits: Record<string, Json> | undefined
-  for (const item of usage) {
-    if (item.data.limits === undefined) continue
-    const next = object(item.data.limits)
-    limits = { ...limits, ...next, ...(next.rateLimits && typeof next.rateLimits === 'object' && !Array.isArray(next.rateLimits) ? { rateLimits: { ...object(limits?.rateLimits), ...object(next.rateLimits) } } : {}) }
-  }
-  return {
-    tokens: selected.length ? selected.length === 1 ? figures(selected[0]!.data) : sumFigures(selected) : undefined,
-    scope: session ? 'session' : scoped.length ? 'reported' : 'latest',
-    estimated: selected.some(item => item.data.source === 'estimate'),
-    costUsd: costs.length ? costs.reduce((total, item) => total + item.data.costUsd!, 0) : undefined,
-    costEstimated: costs.some(item => item.data.source === 'estimate'),
-    costScope: sessionCost ? 'session' : scopedCosts.length ? 'reported' : 'latest',
-    limits,
-    contextWindow: number(limits?.modelContextWindow)
-  }
-}
-
-export function liveTokenLabel(summary: UsageSummary): string {
-  const count = summary.tokens?.outputTokens
-  return count === undefined ? 'Output tokens pending' : `${summary.estimated ? '~' : ''}${count.toLocaleString()} output tokens`
-}
-
-/** Working text describes the current response, never its input context or session total. */
-export function summarizeWorkingUsage(items: TimelineItem[]): UsageSummary {
-  const root = items.filter(item => !item.parentId)
-  const latestUser = root.filter(item => item.data.type === 'text' && item.data.role === 'user').at(-1)
-  const runtime = root.at(-1)?.runtimeId
-  const usage = root.filter((item): item is UsageItem => item.runtimeId === runtime && item.data.type === 'usage' && updatedSequence(item) > (latestUser?.sequence ?? 0))
-    .sort((a, b) => updatedSequence(a) - updatedSequence(b))
-  for (const item of usage.reverse()) {
-    const latestOutput = number(object(item.data.limits).workingOutputTokens)
-    const output = latestOutput ?? (item.data.scope !== 'session' ? number(item.data.outputTokens) : undefined)
-    if (output !== undefined) return { tokens: { outputTokens: output }, scope: 'latest', estimated: item.data.source === 'estimate', costEstimated: false, costScope: 'latest' }
-  }
-  return { scope: 'latest', estimated: false, costEstimated: false, costScope: 'latest' }
-}
-
-export interface ContextSummary { used: number; capacity: number; window?: number; percent: number; level: 'normal' | 'warning' | 'critical' }
-export function summarizeContext(items: TimelineItem[], runtimeId?: string): ContextSummary | undefined {
-  const root = items.filter(item => !item.parentId)
-  const runtime = runtimeId ?? root.at(-1)?.runtimeId
-  const usage = root.filter(item => item.runtimeId === runtime && item.data.type === 'usage').sort((a, b) => updatedSequence(a) - updatedSequence(b))
-  let used: number | undefined, capacity: number | undefined, window: number | undefined
-  for (const item of usage) {
-    if (item.data.type !== 'usage') continue
-    const limits = object(item.data.limits)
-    if ('contextUsedTokens' in limits) used = number(limits.contextUsedTokens)
-    if ('contextCapacityTokens' in limits) capacity = number(limits.contextCapacityTokens)
-    if ('modelContextWindow' in limits) window = number(limits.modelContextWindow)
-  }
-  if (used === undefined || capacity === undefined || capacity <= 0) return undefined
-  const percent = Math.min(100, used / capacity * 100)
-  return { used, capacity, window, percent, level: percent >= 90 ? 'critical' : percent >= 70 ? 'warning' : 'normal' }
-}
+/** Account and token accounting is shared with the main process, which enforces usage caps
+ *  against the same figures the panel shows. Re-exported so panes keep one import site. */
+export {
+  accountWindowMovement, describeUsageCap, evaluateUsageCap, isUsageCap, liveTokenLabel, normalizeUsageWindows,
+  NO_USAGE_CAP, parseUsageCapSetting, shortWindow, summarizeContext, summarizeUsage, summarizeUsageRun,
+  summarizeWorkingUsage, updatedSequence, usageWindowLabel, weeklyWindow
+} from '../../../shared/usage-accounting'
+export type {
+  ContextSummary, TokenFigures, UsageCap, UsageCapBasis, UsageCapMetric, UsageCapSetting, UsageCapStatus,
+  UsageRunReport, UsageScopeReport, UsageSummary, UsageWindow, UsageWindowKind, UsageWindowMovement
+} from '../../../shared/usage-accounting'
 
 export interface SubagentSummary {
   id: string
@@ -145,6 +39,15 @@ export interface SubagentSummary {
   /** Set when this task is itself running one of Conductor's own agent runtimes. */
   linkedProvider?: AgentProviderId
   sequence: number
+  /** Only reported for a genuine spawned agent thread (Codex); a bash background task has no model. */
+  model?: string
+  effort?: string
+  /** The LLM vendor behind `model` (e.g. 'openai', 'anthropic'), which can differ from this
+   *  conversation's own provider when a collab agent is spawned on another company's model. */
+  modelProvider?: string
+  /** Token usage attributed to this subagent's own scope, when the provider reports it per child. */
+  tokens?: TokenFigures
+  tokensEstimated?: boolean
 }
 /** Match the executable, not a passing mention, so a prompt about Codex is not a Codex run. */
 const providerCommands: Array<{ provider: AgentProviderId; pattern: RegExp }> = [
@@ -158,19 +61,62 @@ const providerCommands: Array<{ provider: AgentProviderId; pattern: RegExp }> = 
 export const providerOfCommand = (command: string): AgentProviderId | undefined =>
   providerCommands.find(candidate => candidate.pattern.test(command))?.provider
 
+const tokenFields = ['inputTokens', 'outputTokens', 'cachedTokens', 'reasoningTokens', 'cacheCreationTokens', 'totalTokens'] as const
+/** A subagent's own token usage is a per-thread cumulative snapshot (Codex), not a stream of
+ *  per-message deltas to reconcile, so the latest reported snapshot is the whole answer. */
+function subagentTokenTotals(items: TimelineItem[]): { tokens?: TokenFigures; estimated: boolean } {
+  const usage = items.filter((item): item is TimelineItem & { data: Extract<AgentEventData, { type: 'usage' }> } => item.data.type === 'usage').sort((a, b) => updatedSequence(a) - updatedSequence(b)).at(-1)
+  if (!usage) return { estimated: false }
+  const tokens: TokenFigures = {}
+  for (const key of tokenFields) {
+    const value = usage.data[key]
+    if (typeof value === 'number' && Number.isFinite(value)) tokens[key] = value
+  }
+  if (tokens.totalTokens === undefined && tokens.inputTokens !== undefined && tokens.outputTokens !== undefined) tokens.totalTokens = tokens.inputTokens + tokens.outputTokens
+  return Object.keys(tokens).length ? { tokens, estimated: usage.data.source === 'estimate' } : { estimated: false }
+}
+/** Matches the "GPT 6 Astra xhigh" convention the composer uses; a subagent should never look
+ *  like it ran on an unnamed default model when the provider actually told us which one. */
+export function subagentModelLabel(agent: Pick<SubagentSummary, 'model' | 'effort'>): string | undefined {
+  return agent.model ? [modelDisplayName(agent.model), agent.effort].filter(Boolean).join(' · ') : undefined
+}
+export function subagentTokenLabel(agent: Pick<SubagentSummary, 'tokens' | 'tokensEstimated'>): string | undefined {
+  const total = agent.tokens?.totalTokens ?? (agent.tokens?.inputTokens !== undefined && agent.tokens?.outputTokens !== undefined ? agent.tokens.inputTokens + agent.tokens.outputTokens : undefined)
+  return total === undefined ? undefined : `${agent.tokensEstimated ? '~' : ''}${total.toLocaleString()} tokens`
+}
+
 const activeStatuses = new Set<ActivityStatus>(['preparing', 'running', 'awaiting_approval'])
 const inactivePhases = new Set<SessionPhase>(['idle', 'completed', 'failed', 'disconnected', 'interrupted'])
 export const subagentStatusLabels: Record<SubagentSummary['status'], string> = {
   preparing: 'Starting', running: 'Running', awaiting_approval: 'Needs approval', completed: 'Completed', failed: 'Failed', rejected: 'Declined', interrupted: 'Stopped', unknown: 'Status unavailable'
+}
+export const isGenericSubagentName = (name: string): boolean => ['Codex agent', 'Background activity', 'Agent'].includes(name)
+/** Same identity notion summarizeSubagents groups lifecycle events by, exposed so nested "Within X" labels name the same agent the subagent roster counts. */
+export const subagentIdentityId = (data: Extract<AgentEventData, { type: 'subagent' }>, runtimeId: string, nativeItemId: string | undefined, fallbackId: string): string =>
+  data.nativeSessionId ?? JSON.stringify([runtimeId, nativeItemId ?? fallbackId])
+export const subagentColorBuckets = 6
+/** A small deterministic hash keeps one subagent's color stable across re-renders and reconnects without persisting an assigned index anywhere. */
+export function subagentColorIndex(id: string): number {
+  let hash = 0
+  for (let index = 0; index < id.length; index++) hash = (hash * 31 + id.charCodeAt(index)) >>> 0
+  return hash % subagentColorBuckets
+}
+/** Same-named subagents ("Codex agent" ×3) are meaningless in a nested label unless numbered; a unique name needs no suffix. */
+export function distinguishSubagentLabels(agents: Array<{ id: string; name: string }>): Map<string, string> {
+  const groups = new Map<string, Array<{ id: string; name: string }>>()
+  for (const agent of agents) { const list = groups.get(agent.name) ?? []; list.push(agent); groups.set(agent.name, list) }
+  const labels = new Map<string, string>()
+  for (const [name, group] of groups) group.forEach((agent, index) => labels.set(agent.id, group.length > 1 ? `${name} #${index + 1}` : name))
+  return labels
 }
 
 export function summarizeSubagents(items: TimelineItem[], runtimeId: string, phase: SessionPhase, includeActivity = true): SubagentSummary[] {
   const agents = new Map<string, SubagentSummary>()
   for (const item of [...items].sort((a, b) => updatedSequence(a) - updatedSequence(b))) {
     if (item.data.type !== 'subagent') continue
-    const id = item.data.nativeSessionId ?? JSON.stringify([item.runtimeId, item.nativeItemId ?? item.id])
+    const id = subagentIdentityId(item.data, item.runtimeId, item.nativeItemId, item.id)
     const previous = agents.get(id)
-    const genericName = ['Codex agent', 'Background activity', 'Agent'].includes(item.data.name)
+    const genericName = isGenericSubagentName(item.data.name)
     const name = genericName && previous ? previous.name : item.data.name
     // A finished turn cannot vouch for a child that still claims to be running, but
     // detached background work is defined to outlive its turn. Only a genuinely
@@ -180,7 +126,8 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
     agents.set(id, { id, name, nativeSessionId: item.data.nativeSessionId, runtimeId: item.runtimeId, detached: item.data.detached ?? false,
       startedAt: previous?.startedAt ?? item.timestamp, updatedAt: item.timestamp,
       parentIds: [...new Set([...(previous?.runtimeId === item.runtimeId ? previous.parentIds : []), item.parentId, item.nativeItemId].filter((value): value is string => Boolean(value)))],
-      activity: [], outputFile: item.data.outputFile ?? previous?.outputFile, output: item.data.output ?? previous?.output, outputTruncated: item.data.outputTruncated ?? previous?.outputTruncated, outputError: item.data.outputError, status, sequence: previous?.sequence ?? item.sequence })
+      activity: [], outputFile: item.data.outputFile ?? previous?.outputFile, output: item.data.output ?? previous?.output, outputTruncated: item.data.outputTruncated ?? previous?.outputTruncated, outputError: item.data.outputError, status, sequence: previous?.sequence ?? item.sequence,
+      model: item.data.model ?? previous?.model, effort: item.data.effort ?? previous?.effort, modelProvider: item.data.modelProvider ?? previous?.modelProvider })
   }
   if (!includeActivity) return [...agents.values()].sort((a, b) => a.sequence - b.sequence)
   // A shared launch/wait tool is not evidence that every child produced its output.
@@ -211,6 +158,9 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
       }
     }
     agent.activity = scoped.filter(item => item.parentId && parents.has(item.parentId) && ['text', 'tool', 'error', 'changes'].includes(item.data.type)).sort((a, b) => updatedSequence(a) - updatedSequence(b))
+    const totals = subagentTokenTotals(scoped.filter(item => item.parentId && parents.has(item.parentId) && item.data.type === 'usage'))
+    agent.tokens = totals.tokens
+    agent.tokensEstimated = totals.estimated
     const latest = agent.activity.at(-1)
     if (latest && latest.timestamp > agent.updatedAt) agent.updatedAt = latest.timestamp
   }

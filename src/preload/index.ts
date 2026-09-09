@@ -28,6 +28,23 @@ const bridge: ConductorBridge = {
     onRequest: callback => subscribe('agent-control:request', callback),
     respond: response => ipcRenderer.send('agent-control:response', response)
   },
+  remote: {
+    githubState: () => ipcRenderer.invoke('remote:github-state'),
+    signIn: () => ipcRenderer.invoke('remote:github-sign-in'),
+    cancelSignIn: () => ipcRenderer.invoke('remote:github-cancel'),
+    signOut: () => ipcRenderer.invoke('remote:github-sign-out'),
+    onGitHubState: (callback) => subscribe('remote:github-changed', callback),
+    state: () => ipcRenderer.invoke('remote:state'),
+    setSettings: (patch) => ipcRenderer.invoke('remote:set-settings', patch),
+    createTicket: () => ipcRenderer.invoke('remote:ticket'),
+    approve: (pendingId, grantedProjectIds) => ipcRenderer.invoke('remote:approve', pendingId, grantedProjectIds),
+    deny: (pendingId) => ipcRenderer.invoke('remote:deny', pendingId),
+    revoke: (peerId) => ipcRenderer.invoke('remote:revoke', peerId),
+    connect: (ticket) => ipcRenderer.invoke('remote:connect', ticket),
+    forget: (machineId) => ipcRenderer.invoke('remote:forget', machineId),
+    machines: () => ipcRenderer.invoke('remote:machines'),
+    onState: (callback) => subscribe('remote:changed', callback)
+  },
   projectTasks: {
     get: (projectId) => ipcRenderer.invoke('project-tasks:get', projectId),
     edit: (projectId, revision, edit) => ipcRenderer.invoke('project-tasks:edit', projectId, revision, edit),
@@ -56,6 +73,7 @@ const bridge: ConductorBridge = {
     respond: (response) => ipcRenderer.invoke('structured:respond', response),
     interrupt: (id, expediteSubmittedInput) => ipcRenderer.invoke('structured:interrupt', id, expediteSubmittedInput),
     resume: (id, settings) => ipcRenderer.invoke('structured:resume', id, settings),
+    saveSettings: (id, settings) => ipcRenderer.invoke('structured:settings', id, settings),
     fork: (id) => ipcRenderer.invoke('structured:fork', id),
     discover: (id) => ipcRenderer.invoke('structured:discover', id),
     rename: (id, title) => ipcRenderer.invoke('structured:rename', id, title),
@@ -64,6 +82,8 @@ const bridge: ConductorBridge = {
     artifact: (id, artifactId) => ipcRenderer.invoke('structured:artifact', id, artifactId),
     output: (id, artifactId) => ipcRenderer.invoke('structured:output', id, artifactId),
     review: (id, artifactId, action) => ipcRenderer.invoke('structured:review', id, artifactId, action),
+    changeHistory: (id) => ipcRenderer.invoke('structured:change-history', id),
+    revertChanges: (id, scope) => ipcRenderer.invoke('structured:revert-changes', id, scope),
     onEvents: (callback) => subscribe('structured:events', callback)
   },
   orchestration: orchestrationBridge,
@@ -87,6 +107,7 @@ const bridge: ConductorBridge = {
     setThemeVariant: (themeVariant) => ipcRenderer.invoke('settings:set-theme-variant', themeVariant),
     setThemeAuto: (enabled) => ipcRenderer.invoke('settings:set-theme-auto', enabled),
     setDebugLogging: (enabled) => ipcRenderer.invoke('settings:set-debug-logging', enabled),
+    setShowHiddenFiles: (enabled) => ipcRenderer.invoke('settings:set-show-hidden-files', enabled),
     setAgentSoundProfile: (profile) => ipcRenderer.invoke('settings:set-agent-sound-profile', profile),
     setDefaultNewFileExtension: (extension) => ipcRenderer.invoke('settings:set-default-file-extension', extension),
     setUpdateFeedUrl: (url) => ipcRenderer.invoke('settings:set-update-feed-url', url),
@@ -136,10 +157,11 @@ const bridge: ConductorBridge = {
     confirmClose: (tabIds) => ipcRenderer.invoke('files:confirm-close', tabIds),
     onDraftResolved: (callback) => subscribe('files:draft-resolved', callback),
     onDraftConflict: (callback) => subscribe('files:draft-conflict', callback),
-    search: (projectIds, query) => ipcRenderer.invoke('files:search', projectIds, query),
+    search: (projectIds, query, options) => ipcRenderer.invoke('files:search', projectIds, query, options),
     list: (projectId, relativePath) => ipcRenderer.invoke('files:list', projectId, relativePath),
     read: (projectId, relativePath) => ipcRenderer.invoke('files:read', projectId, relativePath),
-    readForEditor: (projectId, relativePath) => ipcRenderer.invoke('files:read-for-editor', projectId, relativePath),
+    stat: (projectId, relativePath) => ipcRenderer.invoke('files:stat', projectId, relativePath),
+    readForEditor: (projectId, relativePath, allowBinary) => ipcRenderer.invoke('files:read-for-editor', projectId, relativePath, allowBinary),
     readDataUrl: (projectId, relativePath) => ipcRenderer.invoke('files:read-data-url', projectId, relativePath),
     write: (projectId, relativePath, content, expectedContent) =>
       ipcRenderer.invoke('files:write', projectId, relativePath, content, expectedContent),
@@ -190,14 +212,26 @@ const bridge: ConductorBridge = {
     listProviders: () => ipcRenderer.invoke('agent:list-providers'),
     listProcesses: (projectId) => ipcRenderer.invoke('runtime:list-processes', projectId)
   },
+  usageCaps: {
+    read: (agentSessionId, workspaceId) => ipcRenderer.invoke('usage-cap:read', agentSessionId, workspaceId),
+    write: (scope, id, setting) => ipcRenderer.invoke('usage-cap:write', scope, id, setting)
+  },
+  activity: {
+    projects: () => ipcRenderer.invoke('activity:projects'),
+    onProjectsChanged: (callback) => subscribe('activity:projects', callback)
+  },
   memory: {
     list: (projectId, agentKey) => ipcRenderer.invoke('memory:list', projectId, agentKey),
     remember: (input) => ipcRenderer.invoke('memory:remember', input),
+    update: (input) => ipcRenderer.invoke('memory:update', input),
     recall: (projectId, query, agentKey, limit) => ipcRenderer.invoke('memory:recall', projectId, query, agentKey, limit),
-    remove: (id) => ipcRenderer.invoke('memory:remove', id)
+    remove: (id) => ipcRenderer.invoke('memory:remove', id),
+    pruneCandidates: (projectId, limit) => ipcRenderer.invoke('memory:prune-candidates', projectId, limit),
+    turnRecalls: (agentSessionId) => ipcRenderer.invoke('memory:turn-recalls', agentSessionId)
   },
   system: {
     openExternal: (url) => ipcRenderer.invoke('system:open-external', url),
+    copyText: (value) => ipcRenderer.invoke('system:copy-text', value),
     getDiagnostics: () => ipcRenderer.invoke('system:get-diagnostics'),
     getPerformance: (browserWebContents) => ipcRenderer.invoke('system:get-performance', browserWebContents)
   },

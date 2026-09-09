@@ -4,3 +4,6 @@
 .default-file-extension { display: grid; grid-template-columns: 1fr 100px; align-items: center; gap: 8px; font-size: 11px; color: var(--text-2); }
 .default-file-extension input { width: 100%; padding: 6px 8px; background: var(--surface-0); color: var(--text); border: 1px solid var(--border); border-radius: 4px; }
 .default-file-extension small { grid-column: 1 / -1; color: var(--text-3); }
+
+.file-tab-context-menu { width: 226px; }
+.file-tab-context-menu .context-shortcut { margin-left: auto; color: var(--text-3); font-size: 7px; }

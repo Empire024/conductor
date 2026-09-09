@@ -1,8 +1,14 @@
+import { defaultFileViewMode } from './workspace-sidebar-types'
+
 export type FileViewMode = 'editor' | 'preview' | 'browser'
-export interface WorkspaceFile { id: string; projectId: string; path: string; mode: FileViewMode; line?: number }
-export interface OpenWorkspaceFile { projectId: string; path: string; mode: FileViewMode; line?: number }
-export function openWorkspaceFile(projectId: string, path: string, mode: FileViewMode = 'editor', line?: number): void {
-  window.dispatchEvent(new CustomEvent<OpenWorkspaceFile>('conductor:open-file', { detail: { projectId, path, mode, line } }))
+export interface WorkspaceFile { id: string; projectId: string; path: string; mode: FileViewMode; line?: number; allowBinary?: boolean }
+export interface OpenWorkspaceFile { projectId: string; path: string; mode: FileViewMode; line?: number; allowBinary?: boolean }
+/** 'auto' picks the view from the file type, so a click on a video, an archive
+ * or a font never loads it into the text editor. Callers that mean a specific
+ * view, such as the task list opening feature-list.md, still pass one. */
+export function openWorkspaceFile(projectId: string, path: string, mode: FileViewMode | 'auto' = 'auto', line?: number, allowBinary?: boolean): void {
+  const resolved = mode === 'auto' ? defaultFileViewMode(path) : mode
+  window.dispatchEvent(new CustomEvent<OpenWorkspaceFile>('conductor:open-file', { detail: { projectId, path, mode: resolved, line, allowBinary } }))
 }
 export function changeWorkspacePath(projectId: string, previousPath: string, nextPath: string | null, kind: 'file' | 'directory'): void {
   const update = (files: WorkspaceFile[]): WorkspaceFile[] => files.flatMap((file) => {
@@ -26,6 +32,22 @@ export function loadWorkspaceFiles(workspaceId: string): { files: WorkspaceFile[
   return { files: [], activeId: null }
 }
 
+export function recentWorkspaceFiles(): { projectId: string; path: string }[] {
+  const seen = new Set<string>(), files: { projectId: string; path: string }[] = []
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index)
+    if (!key?.startsWith('conductor.workspaceFiles.')) continue
+    try {
+      const record = JSON.parse(localStorage.getItem(key) ?? '{}')
+      for (const file of record.files ?? []) {
+        if (typeof file.projectId !== 'string' || typeof file.path !== 'string') continue
+        const id = file.projectId + ':' + file.path
+        if (!seen.has(id)) { seen.add(id); files.push({ projectId: file.projectId, path: file.path }) }
+      }
+    } catch { /* stale UI record */ }
+  }
+  return files
+}
 export function workspaceFileIds(projectId?: string, workspaceId?: string): string[] {
   const ids = new Set<string>()
   for (let index = 0; index < localStorage.length; index++) {
