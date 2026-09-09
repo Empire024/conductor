@@ -113,6 +113,25 @@ describe('immutable diff artifacts and conflict-safe snapshot restore', () => {
     expect(f.store.artifact('session', patchOnly.artifactId!)).toMatchObject({ before: null, after: null, canUndo: false })
     expect(patchCounts(patch)).toEqual({ additions: 1, deletions: 1 })
   })
+
+  it('skips out-of-workspace and not-yet-addressable targets quietly and still snapshots the workspace file in the same call', async () => {
+    const f = fixture(), path = join(f.workspace, 'panel.mjs')
+    const outside = join(f.root, 'memory'); mkdirSync(outside)
+    const note = join(outside, 'note.md'); writeFileSync(note, 'before memory\n')
+    writeFileSync(path, beforePanel)
+    const wsl = process.platform === 'win32' ? '/mnt/c/Users/owner/memory.md' : '/etc/conductor-fixture-passwd'
+    const targets = ['../memory/note.md', wsl, 'panel.mjs', 'not-created-yet/deep/new.txt']
+    await expect(f.artifacts.beforeTool('session', f.workspace, 'edit', targets)).resolves.toBeUndefined()
+    writeFileSync(note, 'after memory\n')
+    writeFileSync(path, afterPanel)
+    mkdirSync(join(f.workspace, 'not-created-yet', 'deep'), { recursive: true })
+    writeFileSync(join(f.workspace, 'not-created-yet', 'deep', 'new.txt'), 'created\n')
+    const changes = await f.artifacts.afterTool('session', f.workspace, 'edit', targets, true)
+    expect(changes.map((change) => change.path)).toEqual(['panel.mjs'])
+    expect(f.store.artifact('session', changes[0]!.artifactId!)).toMatchObject({ before: beforePanel, after: afterPanel })
+    expect(readFileSync(note, 'utf8')).toBe('after memory\n')
+  })
+
   it('rejects path traversal, external junctions, binary and oversized files', async () => {
     const f = fixture(), outside = join(f.root, 'outside'); mkdirSync(outside)
     writeFileSync(join(outside, 'outside.txt'), 'private fixture')

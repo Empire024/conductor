@@ -17,28 +17,48 @@ export function patchCounts(patch: string): { additions: number; deletions: numb
   return { additions, deletions }
 }
 
+/** A containment refusal from `workspacePath`: the requested path is not addressable inside
+ *  this workspace. Every refusal message and every rejection is exactly what it always was —
+ *  the subclass only lets a caller ask "is this path simply not mine to touch?" without
+ *  matching on message text, and never turns a refusal into an allowance. */
+export class OutsideWorkspaceError extends Error {}
+
 /** Lexical + canonical path check, including existing parent for new/deleted files. */
 function lexicalWorkspaceTarget(cwd: string, root: string, requested: string): string {
   const lexicalRoot = resolve(cwd), target = resolve(lexicalRoot, requested)
   const inside = (base: string): boolean => { const part = relative(base, target); return part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part) }
   if (inside(lexicalRoot)) return resolve(root, relative(lexicalRoot, target))
   if (inside(root)) return target
-  throw new Error('File is outside the session workspace')
+  throw new OutsideWorkspaceError('File is outside the session workspace')
 }
 export async function workspacePath(cwd: string, requested: string, allowMissing = false): Promise<string> {
-  if (!requested || requested.includes('\0') || (process.platform === 'win32' && /^(?:\/|[a-z]:[^\\/])/i.test(requested))) throw new Error('Invalid workspace path; WSL paths require an explicit mapping')
+  if (!requested || requested.includes('\0') || (process.platform === 'win32' && /^(?:\/|[a-z]:[^\\/])/i.test(requested))) throw new OutsideWorkspaceError('Invalid workspace path; WSL paths require an explicit mapping')
   const root = await realpath(cwd), target = lexicalWorkspaceTarget(cwd, root, requested)
   const inside = (candidate: string): boolean => { const part = relative(root, candidate); return part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part) }
-  if (!inside(target)) throw new Error('File is outside the session workspace')
+  if (!inside(target)) throw new OutsideWorkspaceError('File is outside the session workspace')
   try {
     const canonical = await realpath(target)
-    if (!inside(canonical)) throw new Error('Symlink or junction leaves the session workspace')
+    if (!inside(canonical)) throw new OutsideWorkspaceError('Symlink or junction leaves the session workspace')
     return canonical
   } catch (error) {
     if (!allowMissing || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
     const parent = await realpath(dirname(target))
-    if (!inside(parent)) throw new Error('Parent junction leaves the session workspace')
+    if (!inside(parent)) throw new OutsideWorkspaceError('Parent junction leaves the session workspace')
     return resolve(parent, basename(target))
+  }
+}
+
+/** The snapshot target for one path a tool is about to touch, or null when this feature simply
+ *  has nothing to capture: the path lives outside the workspace (a memory file under the user
+ *  profile, a temp file, a sibling project), or it is not addressable yet because a parent
+ *  directory the tool is about to create does not exist. Both are ordinary, so they are skipped
+ *  silently — the containment refusal is still a refusal, it just is not an incident to report.
+ *  Anything else (unreadable, permission denied) is a real failure and still propagates. */
+async function snapshotTarget(cwd: string, requested: string): Promise<string | null> {
+  try { return await workspacePath(cwd, requested, true) }
+  catch (error) {
+    if (error instanceof OutsideWorkspaceError || (error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
   }
 }
 
@@ -91,9 +111,9 @@ export class AgentArtifacts {
     capture.ready = (async () => {
       for (const requested of paths.slice(0, 100)) {
         if (this.before.get(key) !== capture) return
-        const path = await workspacePath(cwd, requested, true)
+        const path = await snapshotTarget(cwd, requested)
         if (this.before.get(key) !== capture) return
-        if (capture.versions.has(path)) continue
+        if (path === null || capture.versions.has(path)) continue
         const version = await textVersion(path, (bytes) => {
           if (this.before.get(key) !== capture) return false
           if (this.beforeBytes + bytes > 32 * 1024 * 1024) throw new Error('Pending file snapshots exceed the 32 MiB memory allowance')
@@ -126,9 +146,9 @@ export class AgentArtifacts {
     try {
       const snapshots: Array<Omit<DiffArtifact, 'id'>> = []
       for (const requested of paths.slice(0, 100)) {
-        const path = await workspacePath(cwd, requested, true)
+        const path = await snapshotTarget(cwd, requested)
         if (this.before.get(key) !== capture) return []
-        if (!capture.versions.has(path)) continue
+        if (path === null || !capture.versions.has(path)) continue
         const before = capture.versions.get(path)!, after = await textVersion(path)
         if (this.before.get(key) !== capture) return []
         if (before === after) continue

@@ -155,7 +155,7 @@ models they want
   
   ![image.png](.conductor/prompt-images/7e6bc8b3-6fe6-4b4e-8359-e9f47f45406b.png)
 
-- [x] Stop button is amazing, but send button is still nasty.. <!-- conductor-task:46f70c53-7942-4489-90f0-2f4a4584fdea agent=agent_mtu035p5_ezlg01o -->
+- [ ] Stop button is amazing, but send button is still nasty.. [update: this was marked done, not done, it hasn't been re-designed] <!-- conductor-task:46f70c53-7942-4489-90f0-2f4a4584fdea agent=agent_mtu035p5_ezlg01o -->
 
 - [x] Chevron to minify tabs should be next to 01 Workspace 1 not in between workspace and tabs.. <!-- conductor-task:a9dd0370-5280-4d12-9ea9-cee8c7821bf4 agent=agent_mtu035p5_ezlg01o -->
 
@@ -169,9 +169,7 @@ models they want
 
 - [x] Dragging tabs is fully broken. <!-- conductor-task:64352192-e182-4d66-8b5e-eecce2901a2c agent=agent_mtu404o5_zhiclam priority=high -->
 
-- [x] Double dot + invisible chevron bug, fix <!-- conductor-task:ea09f946-5ebd-494c-9eba-8dad432bb3c4 agent=agent_mtu406m9_t5a1uqd -->
-  
-  ![image.png](.conductor/prompt-images/57943f12-2c30-4944-b42e-c94d9c41127d.png)
+- [ ] Still see the broken chevron, please fix <!-- conductor-task:ea09f946-5ebd-494c-9eba-8dad432bb3c4 agent=agent_mtu406m9_t5a1uqd -->
 
 - [x] Redesign priority selector, currently broken (colors all red when high selected) <!-- conductor-task:a2c8c28b-8950-47a4-aa10-1b5943d1ec8b agent=agent_mtu405ms_r25z7jc priority=high -->
   
@@ -194,6 +192,50 @@ models they want
   ![image.png](.conductor/prompt-images/bb164458-1aa4-4464-b2f0-b697f209ba36.png)
 
 - [ ] Updater should be one click -> if a user clicks it, we go all the way to restarting. BUT: if there's any tab still running, ask the user if he really wants to quit, since that tab is running still.. <!-- conductor-task:39a207c9-b656-4b36-8ea1-52627b466913 -->
+
+- [ ] need to be able to remove queued messages <!-- conductor-task:c5d6d189-ff27-430e-ad30-0404f168ee1a -->
+
+- [ ] projects that have disconnected tabs show yellow even if they were done before, so all projects are just yellow all the time.. should be only if they were actually stopped during output, not if they were done in the first place. plus, there can be multiple states, currently, yellow takes over all.. <!-- conductor-task:0d76c319-42df-4c63-8628-fc74b8e5afdc -->
+
+- [ ] tasks should also just have a default 'Task' one, not just bug/feature.. <!-- conductor-task:2336b162-6bd5-41bd-b446-bbedbfe0e1aa -->
+
+- [ ] Agent creating new tab took my focus out of my current project and plopped me into said tab in another project. Maybe a notification'd be good, but not this. <!-- conductor-task:f379a89b-d3a5-457e-a511-ccc6e2d7fcb3 -->
+
+- [ ] 'CONDUCTOR_MEMORY[semantic]:' we get these messages in chat.. fix <!-- conductor-task:2c9f312e-a520-4bcd-aa86-1fae776ba1e0 -->
+
+- [ ] can't remove project tasks, add delete icon (ask if you really wanna delete it by icons only) available also via select multiple <!-- conductor-task:ae534926-469d-4e37-ae60-e149cdc72a10 -->
+
+- [ ] can't undetach a detached tab by bringing it back to workspace, it just leaves more ghost conductors behind and is always detached.. also drag cursor is just 'block' icon - fix <!-- conductor-task:4e23b5c0-afd9-4fc7-b73e-5df4f969551c -->
+
+- [ ] When selecting tasks and sending them off to an agent, we should be able to add a prompt to it also if we want. <!-- conductor-task:758c424a-d177-4460-9bef-7dab1790b37e -->
+
+- [ ] Work more on 'agent wants to forget memory' - currently, a nasty windows popup.. <!-- conductor-task:ef91741d-7368-4083-b923-e96dbf3e633e -->
+
+- [ ] this shouldn't happen, i.e. askuserquestions and then claude needs your input? that's weird.. (that's after I answered questions) - should just be one nice output. <!-- conductor-task:a818b8ca-1104-4186-9b67-7ceaea1b888f -->
+  
+  ![image.png](.conductor/prompt-images/b3693788-bd70-4116-b983-a4760b825411.png)
+
+- [ ] make sure effort is always displayed.. sometimes, we just don't see it, like this one tab has claude-opus-5, on hover i see effort 'low' but I don't see the changer anywhere.. <!-- conductor-task:c392beab-56dc-4c33-a0cb-04ff74662897 -->
+
+- [ ] tasks need another selector next to urgency - weight - to set which models should be used for it, i.e. if we think task is heavy, we'll use smarter, more costly models, if we think it's a itty bitty task, some smaller models could do it - same for effort. <!-- conductor-task:a547f4a6-6226-41cb-84ab-3c4be1a672d0 -->
+
+- [ ] @browser should call browser like it does in vscode claude integration. <!-- conductor-task:05adbbcf-2534-4fe7-af43-b4b6ede981b8 -->
+
+- [x] INSANE BUG 'Snapshot unavailable: File is outside the session workspace' <!-- conductor-task:241cda0c-105f-4de8-a16b-2f064b235717 agent=agent_mtums6qy_vdgtdde priority=high -->
+  SPAMS THE FUCK OUT OF WORKSPACE
+  should ask for permission or something FIX FIX FIX
+
+- [ ] Memories are being recalled with every one of my messages sent - is that correct? It's at least annoying for me  to see. <!-- conductor-task:e5b29430-909e-41c6-961a-65c2f2e01422 -->
+
+- [ ] Currently, when asking questions, selecting an option, we can still write in the textbox custom option. Should be a selectable option therefore.. <!-- conductor-task:2a82a315-c06e-45ae-8fea-196051840b3e -->
+
+- [ ] When giving a project task to an agent, we should be able to select permission mode also not just model. <!-- conductor-task:311d3613-32ba-461f-8d67-7ccc1e833911 -->
+
+- [ ] Processes - In Progress claude tasks show 'Choose model' instead of correct model. <!-- conductor-task:9dafbe07-0b7b-4f8b-8551-3c71cdd809f4 -->
+
+- [ ] Instead of the Local Status BS with Local Workspcae in bottom left corner, add an ultra minified 'Processes' that just shows us whats going on (mostly to track token usage amongst multiple projects and theri workspaces. <!-- conductor-task:23983160-8163-4587-82c7-eacaff9cdd79 -->
+
+- [ ] Dragging works, but there are no 'ghost previews' showing where the window would land + resizing of the existing windows is naaasty! <!-- conductor-task:6bdabd01-fdcc-473e-82ef-9b9b9bd7066f -->
 
 Feature list:
 
@@ -261,7 +303,11 @@ Latest completion and validation: [remaining checklist delivery](docs/backlog-co
 
 - [x] Add the Check icon somewhere to done tasks i.e. make a done task more visible, currently, it's not immidiately visible which are in fact done and which are not. <!-- conductor-task:663db862-e082-436a-9826-c385c232ae2d agent=agent_mtu035p5_ezlg01o -->
 
-- [x] Add logging in via github for credentials. Then, add a system which can launch a server for remote control of this machines Conductor project and Conductor filespace by another Conductor logged in with the same github credentials. Orcherstrate this via the highest, latest model available, but that model will use lower class workers for the churning. The finished integration needs to let the user select a machine that actually runs that window, that way, for example, I'll be able to run a heavy render from the comfort of my conductor window, while the render runs on a PC, I run it off my laptop. The agents need to be aware of this fact, because when they'll be creating another linked tab or something similiar, those tabs need to run on that same machine as previously selected unless prompted differently.. <!-- conductor-task:a17381dc-57e2-4232-9e3c-85bfdbb32455 agent=agent_mtu4ut5i_6fehmhy priority=low -->
+- [~] Add logging in via github for credentials. Then, add a system which can launch a server for remote control of this machines Conductor project and Conductor filespace by another Conductor logged in with the same github credentials. Orcherstrate this via the highest, latest model available, but that model will use lower class workers for the churning. The finished integration needs to let the user select a machine that actually runs that window, that way, for example, I'll be able to run a heavy render from the comfort of my conductor window, while the render runs on a PC, I run it off my laptop. The agents need to be aware of this fact, because when they'll be creating another linked tab or something similiar, those tabs need to run on that same machine as previously selected unless prompted differently.. <!-- conductor-task:a17381dc-57e2-4232-9e3c-85bfdbb32455 agent=agent_mtuf49my_96vnd6a priority=low -->
+
+- [ ] Add CTRL+F To chats (searches entire workspace for messages sent with agents and canhighlight it) <!-- conductor-task:3439f02b-608f-4bd6-9ded-97ed51ec573a -->
+
+- [ ] To usage - give me visible warnings in a tab when it starts becoming expensive. Show it in processes also. <!-- conductor-task:2aa42f5b-c9d6-45a4-b71e-c75776557094 -->
 
 ## Urgent bugs and permissions - 2026-09-08
 
@@ -316,6 +362,8 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] Ctrl+Shift+Alt+Arrow does not move a tab/window - it resizes exactly like Ctrl+Shift+Arrow. Make the move shortcut actually relocate the tab in the layout, distinct from resizing. <!-- conductor-task:bug-move-tab-shortcut -->
 
 - [x] Switching the theme from day to night and back is extremely laggy. Make the theme swap fast and smooth. <!-- conductor-task:bug-theme-switch-lag agent=agent_mtt8r78u_bfzsv3d -->
+
+- [x] An agent in one open project could not see, read or hand work to another project open in the same window: app.state showed only its own project and there was no way to enumerate or target a sibling. projects.list now names every co-open project, files.list/files.read/files.open, tabs.list and tasks.list accept a sibling projectId, and tabs.open/router.dispatch hand a visible worker tab to a sibling project that its controller can then steer. Writes into a sibling still go through a tab opened there, and a conversation a paired machine is driving stays inside the project shared with it. <!-- conductor-task:bug-cross-project-access agent=agent_mtulo6oo_08ud6sk -->
 
 ## Features
 

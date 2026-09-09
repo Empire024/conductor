@@ -37,6 +37,9 @@ interface LiveSession {
   closed: boolean
   responses: Set<string>
   budget?: LiveRuntimeBudget
+  /** Snapshot failure reasons already reported in this conversation, so an unactionable
+   *  reason is stated once instead of on every tool call that hits it. */
+  snapshotNotices?: Set<string>
   shutdownTimer?: NodeJS.Timeout
   /** The cap decision that stopped this conversation; cleared when the owner changes the cap. */
   capStop?: { reason: string; capKey: string }
@@ -116,14 +119,26 @@ export class StructuredSessions {
       beforeTool: async (itemId, paths) => {
         if (live.runtimeId !== runtimeId || live.closed) return
         try { await this.artifacts.beforeTool(id, live.spec.cwd, `${runtimeId}:${itemId}`, paths) }
-        catch (error) { if (live.runtimeId === runtimeId && !live.closed) this.emit(live, { itemId, data: { type: 'notice', message: `Snapshot unavailable: ${error instanceof Error ? error.message : 'unsupported file'}` } }) }
+        catch (error) { this.snapshotNotice(live, runtimeId, itemId, error) }
       },
       afterTool: async (itemId, paths, success) => {
         if (live.runtimeId !== runtimeId || live.closed) return
         try { const changes = await this.artifacts.afterTool(id, live.spec.cwd, `${runtimeId}:${itemId}`, paths, success); if (changes.length && live.runtimeId === runtimeId && !live.closed) this.emit(live, { itemId, data: { type: 'changes', changes } }) }
-        catch (error) { if (live.runtimeId === runtimeId && !live.closed) this.emit(live, { itemId, data: { type: 'notice', message: `Snapshot unavailable: ${error instanceof Error ? error.message : 'unsupported file'}` } }) }
+        catch (error) { this.snapshotNotice(live, runtimeId, itemId, error) }
       }
     }
+  }
+  /** Report a snapshot failure the owner could not have predicted — once. The same reason
+   *  recurring on every tool call says nothing new after the first time, and burying the
+   *  conversation under identical notices is worse than not mentioning it again. Paths the
+   *  snapshot layer has nothing to capture for never reach here at all. */
+  private snapshotNotice(live: LiveSession, runtimeId: string, itemId: string, error: unknown): void {
+    if (live.runtimeId !== runtimeId || live.closed) return
+    const message = `Snapshot unavailable: ${error instanceof Error ? error.message : 'unsupported file'}`
+    const seen = live.snapshotNotices ??= new Set<string>()
+    if (seen.has(message)) return
+    seen.add(message)
+    this.emit(live, { itemId, data: { type: 'notice', message } })
   }
   private async connect(live: LiveSession): Promise<void> {
     if (live.starting) return live.starting
