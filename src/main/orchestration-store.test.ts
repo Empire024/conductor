@@ -42,7 +42,7 @@ describe('OrchestrationStore', () => {
         assignedAgentId: agent.id
       })
       expect(store.updateTask(task.id, { status: 'in_progress' }).status).toBe('in_progress')
-      expect(store.snapshot(projectId).agents[0]).toMatchObject({
+      expect(store.snapshot(projectId).agents.find(entry => entry.id === agent.id)).toMatchObject({
         name: 'Release reviewer', provider: 'codex', status: 'active'
       })
 

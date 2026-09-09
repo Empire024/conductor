@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { makeId } from '../shared/models'
+import { BUILT_IN_AGENTS, DISPATCHED_COWORKER_ROLE } from '../shared/orchestration'
 import type {
   CreateOrchestrationTaskInput,
   OrchestrationAgent,
@@ -133,8 +134,45 @@ export class OrchestrationStore {
     `)
   }
 
+  /**
+   * Reusable identities the roster ships with. Re-saved on read so an improved brief reaches a
+   * project that seeded an older one, while the owner's own name and model choice are left alone.
+   */
+  seedBuiltInAgents(projectId: string): OrchestrationAgent[] {
+    this.requireProject(projectId)
+    const existing = this.listAgents(projectId)
+    return BUILT_IN_AGENTS.map(builtIn => {
+      const match = existing.find(agent => agent.role === builtIn.role)
+      return this.saveAgent({
+        id: match?.id,
+        projectId,
+        name: match?.name ?? builtIn.name,
+        provider: match?.provider ?? builtIn.provider,
+        model: match?.model ?? null,
+        role: builtIn.role,
+        instructions: builtIn.instructions,
+        status: match?.status ?? 'active'
+      })
+    })
+  }
+
+  /**
+   * Every router.dispatch used to mint an agent named after the task it ran, so the roster filled
+   * with one-shot entries like "Fix broken tab dragging". Those are runs, and the task table
+   * already records them; drop the identities and leave their tasks unassigned rather than
+   * deleting the owner's work.
+   */
+  retireDispatchedCoworkerAgents(projectId: string): number {
+    this.requireProject(projectId)
+    const stale = this.listAgents(projectId).filter(agent => agent.role === DISPATCHED_COWORKER_ROLE)
+    for (const agent of stale) this.db.prepare('DELETE FROM orchestration_agents WHERE id = ?').run(agent.id)
+    return stale.length
+  }
+
   snapshot(projectId: string): OrchestrationSnapshot {
     this.requireProject(projectId)
+    this.retireDispatchedCoworkerAgents(projectId)
+    this.seedBuiltInAgents(projectId)
     return {
       agents: this.listAgents(projectId),
       tasks: this.listTasks(projectId),

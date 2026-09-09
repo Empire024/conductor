@@ -3,6 +3,7 @@ import { generateDeviceKey, keyFingerprint, signChallenge, type ChallengePayload
 import { hashBody, RemoteAccessError, RemotePeers, type PairingAttempt } from './remote-peers'
 import type { SecretKeyValueStore } from './secret-store'
 import type { RemoteProjectSummary } from '../shared/remote-control'
+import type { ProjectIdentity } from '../shared/project-identity'
 
 class MapStore implements SecretKeyValueStore {
   readonly values = new Map<string, string>()
@@ -12,9 +13,11 @@ class MapStore implements SecretKeyValueStore {
 }
 
 const FINGERPRINT = 'AA:BB:CC:DD'
+const identityOf = (key: string, path: string, name: string, createdAt = '2026-01-01T00:00:00.000Z'): ProjectIdentity =>
+  ({ key, keyCreatedAt: createdAt, path, name })
 const PROJECTS: RemoteProjectSummary[] = [
-  { id: 'project-a', name: 'Conductor', path: '/tmp/a' },
-  { id: 'project-b', name: 'Renders', path: '/tmp/b' }
+  { id: 'project-a', name: 'Conductor', path: '/tmp/a', identity: identityOf('a'.repeat(32), '/tmp/a', 'Conductor'), identityError: null },
+  { id: 'project-b', name: 'Renders', path: '/tmp/b', identity: identityOf('b'.repeat(32), '/tmp/b', 'Renders'), identityError: null }
 ]
 
 function fixture(options: { accountKeys?: DeviceKeyPair[]; accountId?: number | null } = {}) {
@@ -165,7 +168,10 @@ describe('pairing a machine', () => {
     expect(fix.peers.listPeers()).toHaveLength(0)
     expect(request.grants.map(grant => grant.label)).toContain('Not granted')
     const peer = fix.peers.approve(request.id, ['project-a', 'not-a-real-project'])
-    expect(peer.grantedProjectIds).toEqual(['project-a'])
+    expect(peer.grantedProjects.map(granted => granted.projectId)).toEqual(['project-a'])
+    // What the owner approved is the working copy, recorded so a swapped folder can be noticed.
+    expect(peer.grantedProjects[0]?.identity).toEqual(PROJECTS[0]!.identity)
+    expect(request.grants[0]?.detail).toContain('/tmp/a')
     expect(fix.peers.listPending()).toHaveLength(0)
   })
 
@@ -234,7 +240,7 @@ describe('authenticating each remote call', () => {
     const body = JSON.stringify({ method: 'projects.list', args: {} })
     const result = await fix.peers.authenticate(callCredentials(fix.peers, fix.owner, peerId, body, fix.now()))
     expect(result.peer.id).toBe(peerId)
-    expect(result.grantedProjectIds).toEqual(['project-a'])
+    expect(result.grantedProjects.map(granted => granted.projectId)).toEqual(['project-a'])
     expect(fix.peers.listPeers()[0]?.lastSeenAt).not.toBeNull()
   })
 
@@ -374,6 +380,81 @@ describe('project scope', () => {
     const peer = peers.approve(request.id, ['project-a'])
     projects = projects.filter(project => project.id !== 'project-a')
     expect(() => peers.requireProject(peer, 'project-a')).toThrow(/no longer registered/)
+  })
+
+  /**
+   * The identity is what proves a shared project id still points at the working copy the owner
+   * approved. Without it, repointing a project at another folder would silently hand a paired
+   * machine a different repository under a name it already trusts.
+   */
+  it('refuses a shared project whose folder now holds a different working copy', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    const swapped = { ...PROJECTS[0]!, identity: identityOf('c'.repeat(32), '/tmp/a', 'Conductor') }
+    const peers = new RemotePeers({
+      store: fix.store, accountId: () => 4242, accountLogin: () => 'Empire024',
+      accountKeys: async () => [fix.owner.publicKey], projects: () => [swapped, PROJECTS[1]!]
+    })
+    expect(() => peers.requireProject(peers.listPeers()[0]!, 'project-a')).toThrow(/different working copy/)
+    expect(() => peers.reshareProject(peer.id, 'project-a')).toThrow(/cannot be confirmed as a move/)
+  })
+
+  it('refuses a shared project that moved, until the owner confirms the new location here', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    const moved = { ...PROJECTS[0]!, path: '/tmp/moved', identity: identityOf('a'.repeat(32), '/tmp/moved', 'Conductor') }
+    const peers = new RemotePeers({
+      store: fix.store, accountId: () => 4242, accountLogin: () => 'Empire024',
+      accountKeys: async () => [fix.owner.publicKey], projects: () => [moved, PROJECTS[1]!]
+    })
+    expect(() => peers.requireProject(peers.listPeers()[0]!, 'project-a')).toThrow(/moved from \/tmp\/a to \/tmp\/moved/)
+    // The project is still advertised, carrying the reason, rather than quietly disappearing.
+    expect(peers.sharedProjects(peers.listPeers()[0]!)[0]?.identityError).toMatch(/moved from/)
+    peers.reshareProject(peer.id, 'project-a')
+    expect(peers.requireProject(peers.listPeers()[0]!, 'project-a').path).toBe('/tmp/moved')
+  })
+
+  it('will not share a project whose identity cannot be read', async () => {
+    const store = new MapStore()
+    const owner = generateDeviceKey('owner')
+    const peers = new RemotePeers({
+      store, accountId: () => 1, accountLogin: () => 'owner', accountKeys: async () => [owner.publicKey], now: () => 1000,
+      projects: () => [{ ...PROJECTS[0]!, identity: null, identityError: 'project.json is not readable JSON.' }]
+    })
+    peers.setFingerprint(FINGERPRINT)
+    peers.updateSettings({ enabled: true })
+    const request = await peers.beginPairing(attemptFor(peers, owner, peers.issueTicket().code, 1000))
+    expect(() => peers.approve(request.id, ['project-a'])).toThrow(/not readable JSON/)
+  })
+})
+
+/**
+ * A pairing the owner already approved must survive this change. What cannot survive is a claim
+ * that they approved a particular working copy, because no identity was recorded back then.
+ */
+describe('pairings stored before projects carried an identity', () => {
+  it('keeps the peer and everything it was granted, with nothing invented for it', () => {
+    const store = new MapStore()
+    const owner = generateDeviceKey('owner')
+    store.setSetting('remote-control.peers', JSON.stringify([{
+      id: 'peer-1', machineId: 'laptop', machineName: 'Laptop', accountId: 4242, accountLogin: 'Empire024',
+      keyFingerprint: 'SHA256:stale', publicKey: owner.publicKey, grantedProjectIds: ['project-a', 'project-b'],
+      approvedAt: '2026-01-01T00:00:00.000Z', lastSeenAt: '2026-01-02T00:00:00.000Z', revokedAt: null
+    }]))
+    const peers = new RemotePeers({
+      store, accountId: () => 4242, accountLogin: () => 'Empire024',
+      accountKeys: async () => [owner.publicKey], projects: () => PROJECTS
+    })
+    const peer = peers.listPeers()[0]!
+    expect(peer.machineName).toBe('Laptop')
+    expect(peer.grantedProjects).toEqual([
+      { projectId: 'project-a', identity: null },
+      { projectId: 'project-b', identity: null }
+    ])
+    // It keeps exactly the access it had, and gains nothing: no identity is adopted on first use.
+    expect(peers.requireProject(peer, 'project-a').name).toBe('Conductor')
+    expect(() => peers.requireProject(peer, 'unknown')).toThrow(/not shared with this machine/)
+    expect(peers.listPeers()[0]?.grantedProjects[0]?.identity).toBeNull()
   })
 })
 

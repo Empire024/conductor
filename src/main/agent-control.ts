@@ -245,7 +245,7 @@ export class AgentControl {
   }
 
   private machines(): MachineDescriptor[] {
-    return this.deps.machines?.() ?? [{ id: LOCAL_MACHINE_ID, name: 'This machine', kind: 'local', status: 'online', accountLogin: null, grantedProjectIds: [] }]
+    return this.deps.machines?.() ?? [{ id: LOCAL_MACHINE_ID, name: 'This machine', kind: 'local', status: 'online', accountLogin: null, projects: [] }]
   }
 
   /** Where the caller itself is running; a tab it opens follows unless it says otherwise. */
@@ -299,7 +299,10 @@ export class AgentControl {
    */
   private async openOnMachine(scope: AgentControlScope, machineId: string, machines: MachineDescriptor[], args: Args): Promise<unknown> {
     const machine = machines.find(candidate => candidate.id === machineId)!
-    if (!machineRunsProject(machine, scope.projectId)) throw new Error(`${machine.name} does not have this project shared with it; pair that project first`)
+    // Refused before anything is dialled, and refused again against a live answer inside
+    // openRemote; the message names which identity rule stopped it so the owner can act on it.
+    const placement = machineRunsProject(machine, scope.projectId)
+    if (!placement.ok) throw new Error(placement.message)
     if (!this.deps.openRemote) throw new Error('Remote machine placement is unavailable in this window')
     if (args.kind !== undefined && args.kind !== 'agent') throw new Error('Only agent tabs can be opened on another machine')
     const created = await this.deps.openRemote(machineId, {
@@ -320,7 +323,12 @@ export class AgentControl {
     if (args.projectId !== undefined && args.projectId !== scope.projectId || args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
     if (method === 'tools.list') return toolSignatures
     if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: [...this.links(scope)].map(([agentSessionId, controllerAgentSessionId]) => ({ agentSessionId, controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines() }
-    if (method === 'machines.list') return this.machines().map(machine => ({ ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: machineRunsProject(machine, scope.projectId) }))
+    if (method === 'machines.list') {
+      return this.machines().map(machine => {
+        const placement = machineRunsProject(machine, scope.projectId)
+        return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: placement.ok ? null : placement.message }
+      })
+    }
     if (method === 'models.list') return this.catalog(scope)
     if (method === 'tabs.list') return this.tabs(scope)
     if (method === 'tabs.open') return this.open(scope, args)
@@ -479,10 +487,16 @@ export class AgentControl {
     const claimable = (task: NonNullable<typeof board>['tasks'][number] | undefined): boolean => Boolean(task && task.status !== 'done' && (task.agentId === scope.agentSessionId || task.status === 'todo'))
     for (const id of seen) if (!claimable(selected.get(id))) throw new Error('A selected project task is missing, finished, or owned by another active agent')
     const results: unknown[] = []
+    // Whoever is dispatching, if they are themselves a roster identity (the Conductor router, the
+    // Auto Fixer), owns every run started here.
+    const dispatcherAgentId = this.deps.orchestration.snapshot(scope.projectId).agents
+      .find(agent => agent.role === 'conductor-router' || agent.role === 'auto-fixer')?.id ?? null
     for (const request of requests) {
       const tab = await this.open(scope, { ...request, kind: 'agent', ...(request.projectTaskIds.length ? { focus: false } : {}) })
-      const assigned = this.deps.orchestration.saveAgent({ projectId: scope.projectId, name: tab.title, provider: tab.state!.provider as StructuredProvider, model: String(tab.state!.model), role: 'Routed coworker', instructions: String(request.prompt) })
-      const task = this.deps.orchestration.createTask({ projectId: scope.projectId, title: String(request.title), description: String(request.prompt), status: 'in_progress', assignedAgentId: assigned.id })
+      // A dispatched coworker is a run of this work, not a new identity. Minting an agent per
+      // dispatch turned the roster into a task log; the task row below already records the run,
+      // and it is attributed to the reusable agent that dispatched it when there is one.
+      const task = this.deps.orchestration.createTask({ projectId: scope.projectId, title: String(request.title), description: String(request.prompt), status: 'in_progress', assignedAgentId: dispatcherAgentId })
       let accepted = false
       try {
         await this.deps.sessions.connectSession(tab.resourceId!)

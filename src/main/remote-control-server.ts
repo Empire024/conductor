@@ -2,7 +2,7 @@ import { randomUUID, X509Certificate } from 'node:crypto'
 import { networkInterfaces } from 'node:os'
 import { createServer, type Server } from 'node:https'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import type { RemoteControlSettings, RemotePairingTicket } from '../shared/remote-control'
+import type { RemoteControlSettings, RemotePairingTicket, RemoteProjectSummary } from '../shared/remote-control'
 import type { RemoteControlHost } from './remote-control-host'
 import { NONCE_HEADER, PEER_HEADER, RemoteAccessError, SIGNATURE_HEADER, TIMESTAMP_HEADER, type RemotePeers } from './remote-peers'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
@@ -224,7 +224,7 @@ export class RemoteControlServer {
    * The waiting machine asks whether the owner approved. It must sign the poll with the same
    * device key, so the answer — including its peer id — is only ever handed to the key holder.
    */
-  private async pairStatus(payload: Record<string, unknown>): Promise<{ status: string; peerId?: string; grantedProjectIds?: string[]; machineName?: string }> {
+  private async pairStatus(payload: Record<string, unknown>): Promise<{ status: string; peerId?: string; projects?: RemoteProjectSummary[]; machineName?: string }> {
     const fingerprint = this.deps.peers.verifyPairingPoll({
       publicKey: String(payload.publicKey ?? ''),
       nonce: String(payload.nonce ?? ''),
@@ -233,8 +233,10 @@ export class RemoteControlServer {
       fingerprint: this.fingerprint()
     })
     const result = this.deps.peers.pairingResult(fingerprint)
+    // The shared projects go back with their identities so the controlling machine can put the
+    // owner's confirmation of which project is which in front of them straight after pairing.
     return result.peer
-      ? { status: result.status, peerId: result.peer.id, grantedProjectIds: result.peer.grantedProjectIds, machineName: this.deps.machineName() }
+      ? { status: result.status, peerId: result.peer.id, projects: this.deps.peers.sharedProjects(result.peer), machineName: this.deps.machineName() }
       : { status: result.status }
   }
 

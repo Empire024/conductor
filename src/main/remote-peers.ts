@@ -4,10 +4,12 @@ import type {
   RemoteActivityEntry,
   RemoteControlSettings,
   RemoteGrant,
+  RemoteGrantedProject,
   RemotePeerRecord,
   RemoteProjectSummary
 } from '../shared/remote-control'
-import { normalizeRemoteSettings } from '../shared/remote-control'
+import { normalizeRemoteSettings, readGrantedProjects } from '../shared/remote-control'
+import { samePath, sameWorkingCopy } from '../shared/project-identity'
 import { keyFingerprint, secretsMatch, verifyChallenge, type ChallengePayload } from './device-key'
 import type { SecretKeyValueStore } from './secret-store'
 
@@ -60,7 +62,7 @@ export interface PairingAttempt {
 
 export interface AuthenticatedPeer {
   peer: RemotePeerRecord
-  grantedProjectIds: string[]
+  grantedProjects: RemoteGrantedProject[]
 }
 
 export class RemoteAccessError extends Error {
@@ -130,7 +132,10 @@ export class RemotePeers {
         accountLogin: String(record.accountLogin ?? ''),
         keyFingerprint: fingerprint,
         publicKey: record.publicKey,
-        grantedProjectIds: Array.isArray(record.grantedProjectIds) ? record.grantedProjectIds.filter((id): id is string => typeof id === 'string') : [],
+        // A pairing stored before projects had identities keeps every project it was granted; it
+        // simply has no recorded identity to compare against, which readGrantedProjects records
+        // honestly rather than inventing one.
+        grantedProjects: readGrantedProjects(entry),
         approvedAt: String(record.approvedAt ?? new Date(0).toISOString()),
         lastSeenAt: typeof record.lastSeenAt === 'string' ? record.lastSeenAt : null,
         revokedAt: typeof record.revokedAt === 'string' ? record.revokedAt : null
@@ -143,7 +148,7 @@ export class RemotePeers {
     this.deps.changed?.()
   }
 
-  listPeers(): RemotePeerRecord[] { return this.peers.map(peer => ({ ...peer })) }
+  listPeers(): RemotePeerRecord[] { return this.peers.map(peer => ({ ...peer, grantedProjects: peer.grantedProjects.map(granted => ({ ...granted })) })) }
   listPending(): PendingPairingRequest[] {
     const now = this.now()
     this.pending = this.pending.filter(request => Date.parse(request.expiresAt) > now)
@@ -235,7 +240,9 @@ export class RemotePeers {
   private grantsFor(projectIds: string[]): RemoteGrant[] {
     const projects = this.deps.projects().filter(project => projectIds.includes(project.id))
     return [
-      { label: 'Conductor projects', detail: projects.length ? projects.map(project => project.name).join(', ') : 'No projects selected yet' },
+      // Named with their folders: the same project name on two machines is exactly how work ends
+      // up in the wrong checkout, so the owner approves a path, not a label.
+      { label: 'Conductor projects', detail: projects.length ? projects.map(project => `${project.name} — ${project.path}`).join(', ') : 'No projects selected yet' },
       { label: 'Project files', detail: 'Read and write files inside those project folders only' },
       { label: 'Agent tabs', detail: 'Open, steer and close agent tabs in those projects; every action shows in this window' },
       { label: 'Not granted', detail: 'No shell, no access to files outside those projects, no GitHub token' }
@@ -286,9 +293,14 @@ export class RemotePeers {
   approve(pendingId: string, grantedProjectIds: string[]): RemotePeerRecord {
     const request = this.listPending().find(entry => entry.id === pendingId)
     if (!request) throw new RemoteAccessError('That pairing request is no longer waiting.', 404)
-    const registered = new Set(this.deps.projects().map(project => project.id))
-    const granted = [...new Set(grantedProjectIds.filter(id => registered.has(id)))]
-    if (!granted.length) throw new RemoteAccessError('Choose at least one registered project to share.', 400)
+    const registered = this.deps.projects()
+    const chosen = [...new Set(grantedProjectIds)].flatMap(id => registered.filter(project => project.id === id))
+    if (!chosen.length) throw new RemoteAccessError('Choose at least one registered project to share.', 400)
+    // Refusing here keeps a project whose identity cannot be read from being shared under a
+    // freshly minted one, which is the case that could later pass an identity check it should fail.
+    const unreadable = chosen.find(project => !project.identity)
+    if (unreadable) throw new RemoteAccessError(unreadable.identityError || `Conductor cannot read the project identity of “${unreadable.name}”, so it will not share it.`, 409)
+    const granted: RemoteGrantedProject[] = chosen.map(project => ({ projectId: project.id, identity: project.identity }))
     const peer: RemotePeerRecord = {
       id: randomUUID(),
       machineId: request.machineId,
@@ -297,7 +309,7 @@ export class RemotePeers {
       accountLogin: request.accountLogin,
       keyFingerprint: request.keyFingerprint,
       publicKey: request.publicKey,
-      grantedProjectIds: granted,
+      grantedProjects: granted,
       approvedAt: new Date(this.now()).toISOString(),
       lastSeenAt: null,
       revokedAt: null
@@ -405,20 +417,74 @@ export class RemotePeers {
     }
     peer.lastSeenAt = new Date(this.now()).toISOString()
     this.persist()
-    return { peer: { ...peer }, grantedProjectIds: [...peer.grantedProjectIds] }
+    return { peer: { ...peer, grantedProjects: peer.grantedProjects.map(granted => ({ ...granted })) }, grantedProjects: peer.grantedProjects.map(granted => ({ ...granted })) }
   }
 
   /** The fingerprint of the certificate currently being served; set by the server each time it binds. */
   private currentFingerprint = ''
   setFingerprint(fingerprint: string): void { this.currentFingerprint = fingerprint }
 
-  /** Remote calls may only name a project that is both registered here and granted to that peer. */
+  /**
+   * Remote calls may only name a project that is registered here, granted to that peer, and still
+   * the working copy the owner approved. The last part is what stops a peer from being handed a
+   * different repository because the folder behind a shared project id was swapped or moved since.
+   */
   requireProject(peer: RemotePeerRecord, projectId: unknown): RemoteProjectSummary {
     if (typeof projectId !== 'string' || !projectId) throw new RemoteAccessError('Name a project for this request.', 400)
-    if (!peer.grantedProjectIds.includes(projectId)) throw new RemoteAccessError('That project was not shared with this machine.', 403)
+    const granted = peer.grantedProjects.find(entry => entry.projectId === projectId)
+    if (!granted) throw new RemoteAccessError('That project was not shared with this machine.', 403)
     const project = this.deps.projects().find(entry => entry.id === projectId)
     if (!project) throw new RemoteAccessError('That project is no longer registered on this machine.', 404)
+    // A pairing approved before identities existed has nothing recorded to compare against. It
+    // keeps the access it already had; recording what it happens to find now would be this machine
+    // approving a working copy on the owner's behalf.
+    if (!granted.identity) return project
+    if (!project.identity) throw new RemoteAccessError(project.identityError || 'This machine cannot read that project identity, so it will not act on it.', 409)
+    if (!sameWorkingCopy(project.identity, granted.identity)) {
+      throw new RemoteAccessError('That project folder now holds a different working copy than the one shared with this machine. Share it again from this machine first.', 409)
+    }
+    if (!samePath(project.identity.path, granted.identity.path)) {
+      throw new RemoteAccessError(`That project moved from ${granted.identity.path} to ${project.identity.path} since it was shared. Confirm the new location on this machine first.`, 409)
+    }
     return project
+  }
+
+  /**
+   * The projects this peer may name, as this machine sees them now. A project whose folder no
+   * longer matches what was approved is still listed, carrying the reason it will be refused, so
+   * the other machine can tell the owner what happened instead of the project silently vanishing.
+   */
+  sharedProjects(peer: RemotePeerRecord): RemoteProjectSummary[] {
+    const registered = this.deps.projects()
+    // Answering a peer must not depend on the shape of a stored record being well formed.
+    return (Array.isArray(peer.grantedProjects) ? peer.grantedProjects : []).flatMap(granted => {
+      const project = registered.find(entry => entry.id === granted.projectId)
+      if (!project) return []
+      try { this.requireProject(peer, granted.projectId); return [project] }
+      catch (error) { return [{ ...project, identityError: error instanceof Error ? error.message : String(error) }] }
+    })
+  }
+
+  /**
+   * The owner confirming, on this machine, that a shared project's new location is the same
+   * project. Only a move is confirmable: a folder that now holds a different working copy has to
+   * go through pairing again rather than inherit an approval given to something else.
+   */
+  reshareProject(peerId: string, projectId: string): RemotePeerRecord {
+    const peer = this.peers.find(entry => entry.id === peerId)
+    if (!peer) throw new RemoteAccessError('This machine does not know that peer.', 404)
+    if (peer.revokedAt) throw new RemoteAccessError('Access for this machine was revoked.', 403)
+    const granted = peer.grantedProjects.find(entry => entry.projectId === projectId)
+    if (!granted) throw new RemoteAccessError('That project was not shared with this machine.', 403)
+    const project = this.deps.projects().find(entry => entry.id === projectId)
+    if (!project?.identity) throw new RemoteAccessError(project?.identityError || 'That project is no longer registered on this machine.', 404)
+    if (granted.identity && !sameWorkingCopy(project.identity, granted.identity)) {
+      throw new RemoteAccessError('That folder holds a different working copy than the one shared, so it cannot be confirmed as a move. Pair the project again.', 409)
+    }
+    granted.identity = project.identity
+    this.persist()
+    this.record(peer, 'peer.reshare', projectId, `Confirmed the new location of ${project.name} for ${peer.machineName}`, 'allowed')
+    return { ...peer, grantedProjects: peer.grantedProjects.map(entry => ({ ...entry })) }
   }
 
   record(peer: Pick<RemotePeerRecord, 'id' | 'machineName' | 'accountLogin'>, method: string, projectId: string | null, detail: string, outcome: 'allowed' | 'denied', message?: string): void {

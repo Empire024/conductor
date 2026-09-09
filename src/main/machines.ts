@@ -1,5 +1,6 @@
-import type { MachineDescriptor, RemoteConnection } from '../shared/remote-control'
+import type { MachineDescriptor, MachineProjectLink, RemoteConnection } from '../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../shared/remote-control'
+import { checkRemoteProjectPlacement, type ProjectPlacement } from '../shared/project-identity'
 import type { PaneTab } from '../shared/models'
 
 /** Where a tab actually runs. Absent state means it has always run here. */
@@ -29,21 +30,31 @@ export function inheritMachineId(parentMachineId: string, requested: unknown, ma
   return usable(parentMachineId) ? parentMachineId : LOCAL_MACHINE_ID
 }
 
-/** Only a machine that shares the project can run a tab for it. */
-export function machineRunsProject(machine: MachineDescriptor, projectId: string): boolean {
-  return machine.kind === 'local' || machine.grantedProjectIds.includes(projectId)
+/**
+ * Whether a machine may run a tab for this project. For a peer this is an identity comparison
+ * against the pair of projects the owner confirmed, never a name or a project id, because ids are
+ * private to each machine and a name is exactly how work ends up in the wrong repository. The
+ * whole rule lives in checkRemoteProjectPlacement; this only supplies what that machine last said.
+ */
+export function machineRunsProject(machine: MachineDescriptor, projectId: string): ProjectPlacement {
+  if (machine.kind === 'local') return { ok: true, grant: null }
+  const link = machine.projects.find(entry => entry.grant.localProjectId === projectId)
+  return checkRemoteProjectPlacement({ machineName: machine.name, grant: link?.grant, advertised: link?.observed })
 }
 
 export function describeMachines(localName: string, connections: RemoteConnection[]): MachineDescriptor[] {
   return [
-    { id: LOCAL_MACHINE_ID, name: localName, kind: 'local', status: 'online', accountLogin: null, grantedProjectIds: [] },
+    { id: LOCAL_MACHINE_ID, name: localName, kind: 'local', status: 'online', accountLogin: null, projects: [] },
     ...connections.map((connection): MachineDescriptor => ({
       id: connection.machineId,
       name: connection.machineName,
       kind: 'peer',
       status: connection.status === 'revoked' ? 'revoked' : connection.status === 'connected' ? 'online' : 'offline',
       accountLogin: connection.accountLogin || null,
-      grantedProjectIds: [...connection.grantedProjectIds]
+      projects: connection.projectGrants.map((grant): MachineProjectLink => ({
+        grant,
+        observed: connection.remoteProjects.find(project => project.id === grant.remoteProjectId)?.identity ?? null
+      }))
     }))
   ]
 }

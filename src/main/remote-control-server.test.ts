@@ -24,7 +24,8 @@ const cipher: SecretCipher = {
   decrypt: value => Buffer.from(value.toString('utf8').replace(/^enc:/, ''), 'hex').toString('utf8')
 }
 
-const PROJECTS: RemoteProjectSummary[] = [{ id: 'project-a', name: 'Conductor', path: '/tmp/a' }]
+const PROJECT_IDENTITY = { key: 'a'.repeat(32), keyCreatedAt: '2026-01-01T00:00:00.000Z', path: '/tmp/a', name: 'Conductor' }
+const PROJECTS: RemoteProjectSummary[] = [{ id: 'project-a', name: 'Conductor', path: '/tmp/a', identity: PROJECT_IDENTITY, identityError: null }]
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
@@ -42,7 +43,7 @@ async function hostFixture() {
   })
   peers.updateSettings({ enabled: true, port: 0, machineName: 'Render Desktop' })
   const host = {
-    call: vi.fn(async (peer: RemotePeerRecord, method: string, args: unknown) => { calls.push({ peer, method, args }); return { echoed: method, projects: peer.grantedProjectIds } })
+    call: vi.fn(async (peer: RemotePeerRecord, method: string, args: unknown) => { calls.push({ peer, method, args }); return { echoed: method, projects: peer.grantedProjects.map(granted => granted.projectId) } })
   } as unknown as RemoteControlHost
   const server = new RemoteControlServer({
     peers, host, store, vault,
@@ -130,7 +131,11 @@ describe('an end-to-end pairing and call between two machines', () => {
     const laptop = clientFixture(fix.ownerKey)
     const connection = await pair(fix, laptop.client)
     expect(connection.status).toBe('connected')
-    expect(connection.grantedProjectIds).toEqual(['project-a'])
+    // Pairing tells this machine what the other one shares, identity and all, but confirms no
+    // mapping on its own: which project here is which over there stays the owner's answer.
+    expect(connection.remoteProjects.map(project => project.id)).toEqual(['project-a'])
+    expect(connection.remoteProjects[0]?.identity).toEqual(PROJECT_IDENTITY)
+    expect(connection.projectGrants).toEqual([])
     expect(connection.machineName).toBe('Render Desktop')
 
     const result = await laptop.client.call(connection.machineId, 'projects.list', { projectId: 'project-a' })
@@ -270,7 +275,7 @@ describe('how the controlling machine reads a refusal', () => {
     const ticket = fix.server.ticket()
     vi.spyOn(fix.peers, 'pairingResult').mockReturnValue({
       status: 'approved',
-      peer: { ...fix.peers.listPeers()[0], id: 'bad\r\nX-Injected: 1', grantedProjectIds: 'not-an-array' } as never
+      peer: { ...fix.peers.listPeers()[0], id: 'bad\r\nX-Injected: 1', grantedProjects: 'not-an-array' } as never
     })
     await expect(laptop.client.connect(encodeTicket(ticket), async () => {})).rejects.toThrow(/did not approve in time/)
     expect(laptop.client.list()[0]?.peerId).toBe('')

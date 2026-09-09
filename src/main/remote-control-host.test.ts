@@ -25,11 +25,12 @@ let junction = false
 try { symlinkSync(private_, join(shared, 'escape'), 'junction'); junction = true } catch { /* needs privilege on some hosts */ }
 afterAll(() => { rmSync(root, { recursive: true, force: true }) })
 
-const PROJECTS: RemoteProjectSummary[] = [{ id: 'shared-project', name: 'Shared', path: shared }]
+const sharedIdentity = { key: 'a'.repeat(32), keyCreatedAt: '2026-01-01T00:00:00.000Z', path: shared, name: 'Shared' }
+const PROJECTS: RemoteProjectSummary[] = [{ id: 'shared-project', name: 'Shared', path: shared, identity: sharedIdentity, identityError: null }]
 
 const peer: RemotePeerRecord = {
   id: 'peer-1', machineId: 'laptop', machineName: 'Laptop', accountId: 4242, accountLogin: 'Empire024',
-  keyFingerprint: 'SHA256:x', publicKey: 'ssh-ed25519 x', grantedProjectIds: ['shared-project'],
+  keyFingerprint: 'SHA256:x', publicKey: 'ssh-ed25519 x', grantedProjects: [{ projectId: 'shared-project', identity: sharedIdentity }],
   approvedAt: new Date(0).toISOString(), lastSeenAt: null, revokedAt: null
 }
 
@@ -40,9 +41,10 @@ function fixture() {
     machineId: 'host-machine',
     requireProject: (_peer: RemotePeerRecord, projectId: unknown) => {
       const project = PROJECTS.find(entry => entry.id === projectId)
-      if (!project || !peer.grantedProjectIds.includes(project.id)) throw new RemoteAccessError('That project was not shared with this machine.', 403)
+      if (!project || !peer.grantedProjects.some(granted => granted.projectId === project.id)) throw new RemoteAccessError('That project was not shared with this machine.', 403)
       return project
     },
+    sharedProjects: (subject: RemotePeerRecord) => PROJECTS.filter(project => subject.grantedProjects.some(granted => granted.projectId === project.id)),
     record: vi.fn()
   } as unknown as RemotePeers
   const database = {

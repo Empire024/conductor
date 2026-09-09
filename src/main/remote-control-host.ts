@@ -134,13 +134,13 @@ export class RemoteControlHost {
         machineId: this.deps.peers.machineId,
         machineName: this.deps.machineName(),
         observedAt: new Date().toISOString(),
-        projects: peer.grantedProjectIds.flatMap(id => { const project = database.getProject(id); return project ? [{ id: project.id, name: project.name, path: project.path }] : [] }),
+        // Each project is advertised with the identity of the working copy behind it, so the
+        // controlling machine can tell that it is still the project its owner confirmed.
+        projects: this.deps.peers.sharedProjects(peer),
         providers: this.deps.providers().filter(provider => provider.available).map(provider => ({ id: provider.id, models: provider.models.map(model => model.id) }))
       }
     }
-    if (method === 'projects.list') {
-      return peer.grantedProjectIds.flatMap(id => { const project = database.getProject(id); return project ? [{ id: project.id, name: project.name, path: project.path }] : [] })
-    }
+    if (method === 'projects.list') return this.deps.peers.sharedProjects(peer)
     if (method === 'workspaces.list') {
       const project = this.deps.peers.requireProject(peer, args.projectId)
       return database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name, projectId: workspace.projectId }))

@@ -96,6 +96,20 @@
 .remote-projects legend { padding: 0 4px; color: var(--text-3); font-size: 9.5px; }
 .remote-projects label { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; }
 
+.remote-peer-block { display: flex; flex-direction: column; gap: 6px; padding-top: 7px; border-top: 1px solid var(--border-soft); }
+.remote-peer-block:first-of-type { border-top: 0; padding-top: 0; }
+.remote-peer-block .remote-peer { padding-top: 0; border-top: 0; }
+.remote-mapping { display: flex; flex-direction: column; gap: 2px; padding-left: 9px; border-left: 2px solid var(--border-soft); }
+.remote-mapping strong { font-size: 10.5px; }
+.remote-mapping small { color: var(--text-3); font-size: 9.5px; overflow-wrap: anywhere; }
+.remote-mapping .remote-actions { margin-top: 4px; }
+.remote-mapping select {
+  min-width: 0; max-width: 240px; padding: 4px 6px; border: 1px solid var(--border-soft);
+  border-radius: 6px; background: var(--surface-2); color: var(--text); font-size: 10px;
+}
+.remote-project-problem { color: #d9a441 !important; }
+.remote-projects label > span { display: flex; flex-direction: column; gap: 1px; }
+.remote-projects label small { color: var(--text-3); font-size: 9px; overflow-wrap: anywhere; }
 .remote-peer { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-top: 7px; border-top: 1px solid var(--border-soft); }
 .remote-peer:first-of-type { border-top: 0; padding-top: 0; }
 .remote-peer > div { display: flex; flex-direction: column; gap: 1px; min-width: 0; }

@@ -7,12 +7,15 @@ import type {
   MachineDescriptor,
   RemoteControlSettings,
   RemoteControlState,
-  RemotePairingTicket
+  RemotePairingTicket,
+  RemoteProjectSummary
 } from '../shared/remote-control'
-import { encodeTicket, LOCAL_MACHINE_ID } from '../shared/remote-control'
+import { encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries } from '../shared/remote-control'
+import { checkRemoteProjectPlacement } from '../shared/project-identity'
 import type { ConductorDatabase } from './database'
 import { GitHubAuth } from './github-auth'
 import { describeMachines, machineBriefing, tabMachineId } from './machines'
+import { projectSummary } from './project-identity'
 import type { ProjectBacklogs } from './project-backlog'
 import { RemoteControlClient } from './remote-control-client'
 import { RemoteControlHost } from './remote-control-host'
@@ -72,7 +75,7 @@ export class RemoteControlService {
       accountId: () => this.auth.identity()?.id ?? null,
       accountLogin: () => this.auth.identity()?.login ?? null,
       accountKeys: force => this.auth.accountKeys(force),
-      projects: () => deps.database.listProjects().map(project => ({ id: project.id, name: project.name, path: project.path })),
+      projects: () => deps.database.listProjects().map(projectSummary),
       changed: () => this.publishState(),
       activity: entry => deps.publish('remote:activity', entry)
     })
@@ -118,21 +121,59 @@ export class RemoteControlService {
     return machineBriefing(this.machines(), tabMachineId(tab))
   }
 
+  /** Asks a paired machine what it shares now and remembers the answer against the mapping. */
+  async refreshRemoteProjects(machineId: string): Promise<RemoteProjectSummary[]> {
+    return this.client.recordRemoteProjects(machineId, readRemoteProjectSummaries(await this.client.call(machineId, 'projects.list')))
+  }
+
   /**
-   * Places a tab on a paired machine. The project has to exist on both sides; matching by name
-   * keeps the mapping something the owner can see and reason about rather than a hidden table.
+   * The owner confirming that this project here is that project there. Both identities are read
+   * fresh — the local one off disk, the remote one from that machine right now — so what is stored
+   * is what the owner was actually looking at when they said yes.
+   */
+  async confirmProject(machineId: string, localProjectId: string, remoteProjectId: string): Promise<RemoteControlState> {
+    const connection = this.client.get(machineId)
+    if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
+    const project = this.deps.database.getProject(localProjectId)
+    if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
+    const local = projectSummary(project)
+    if (!local.identity) throw new RemoteAccessError(local.identityError || 'Conductor cannot read this project identity, so it will not pair it.', 409)
+    const remote = (await this.refreshRemoteProjects(machineId)).find(entry => entry.id === remoteProjectId)
+    if (!remote) throw new RemoteAccessError(`${connection.machineName} is not sharing that project.`, 409)
+    if (!remote.identity) throw new RemoteAccessError(remote.identityError || `${connection.machineName} cannot read that project identity, so it cannot be paired.`, 409)
+    this.client.confirmProject(machineId, {
+      localProjectId,
+      local: local.identity,
+      remoteProjectId,
+      remote: remote.identity,
+      confirmedAt: new Date().toISOString()
+    })
+    return this.state()
+  }
+
+  /**
+   * Places a tab on a paired machine, in the project the owner mapped to this one. The mapping is
+   * checked against what that machine advertises at this moment, not against what it advertised
+   * when the mapping was made, so a project that was swapped, copied or moved in between stops the
+   * placement instead of quietly receiving the work.
    */
   async openRemote(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string }> {
     const connection = this.client.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     const localProject = this.deps.database.getProject(request.projectId)
     if (!localProject) throw new RemoteAccessError('This project is not registered on this machine.', 404)
-    const projects = await this.client.call(machineId, 'projects.list') as Array<{ id: string; name: string }>
-    const matches = projects.filter(project => project.name === localProject.name)
-    if (matches.length !== 1) {
-      throw new RemoteAccessError(`${connection.machineName} does not share exactly one project named “${localProject.name}”. Share the matching project on that machine first.`, 409)
-    }
-    const remoteProjectId = matches[0]!.id
+    const local = projectSummary(localProject)
+    if (!local.identity) throw new RemoteAccessError(local.identityError || 'Conductor cannot read this project identity, so it will not place work elsewhere.', 409)
+    const advertised = await this.refreshRemoteProjects(machineId)
+    const grant = this.client.get(machineId)?.projectGrants.find(entry => entry.localProjectId === request.projectId)
+    const placement = checkRemoteProjectPlacement({
+      grant,
+      advertised: advertised.find(entry => entry.id === grant?.remoteProjectId)?.identity,
+      local: local.identity,
+      machineName: connection.machineName
+    })
+    if (!placement.ok) throw new RemoteAccessError(placement.message, 409)
+    const remoteProjectId = placement.grant!.remoteProjectId
     const workspaces = await this.client.call(machineId, 'workspaces.list', { projectId: remoteProjectId }) as Array<{ id: string }>
     const remoteSessionId = workspaces[0]?.id
     if (!remoteSessionId) throw new RemoteAccessError(`${connection.machineName} has no open workspace for that project.`, 409)
@@ -155,7 +196,7 @@ export class RemoteControlService {
       endpoint: status.endpoint,
       fingerprint: status.fingerprint,
       message: status.message,
-      projects: this.deps.database.listProjects().map(project => ({ id: project.id, name: project.name, path: project.path })),
+      projects: this.deps.database.listProjects().map(projectSummary),
       peers: this.peers.listPeers(),
       pending: this.peers.listPending(),
       activity: this.peers.listActivity().slice(0, 50),
@@ -196,11 +237,22 @@ export class RemoteControlService {
       this.peers.approve(String(pendingId), Array.isArray(projectIds) ? projectIds.map(String) : [])
       return this.state()
     })
+    handle<RemoteControlState>('remote:reshare-project', (peerId: string, projectId: string) => {
+      this.peers.reshareProject(String(peerId), String(projectId))
+      return this.state()
+    })
     handle<RemoteControlState>('remote:deny', (pendingId: string) => { this.peers.deny(String(pendingId)); return this.state() })
     handle<RemoteControlState>('remote:revoke', (peerId: string) => { this.peers.revoke(String(peerId)); return this.state() })
     handle<RemoteControlState>('remote:connect', async (ticket: string) => { await this.client.connect(String(ticket)); return this.state() })
     handle<RemoteControlState>('remote:forget', (machineId: string) => {
       this.client.forget(String(machineId) || LOCAL_MACHINE_ID)
+      return this.state()
+    })
+    handle<RemoteProjectSummary[]>('remote:remote-projects', (machineId: string) => this.refreshRemoteProjects(String(machineId)))
+    handle<RemoteControlState>('remote:confirm-project', (machineId: string, localProjectId: string, remoteProjectId: string) =>
+      this.confirmProject(String(machineId), String(localProjectId), String(remoteProjectId)))
+    handle<RemoteControlState>('remote:release-project', (machineId: string, localProjectId: string) => {
+      this.client.releaseProject(String(machineId), String(localProjectId))
       return this.state()
     })
     handle<MachineDescriptor[]>('remote:machines', () => this.machines())
@@ -209,8 +261,9 @@ export class RemoteControlService {
   async dispose(): Promise<void> {
     if (this.registered) {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
-        'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:deny', 'remote:revoke',
-        'remote:connect', 'remote:forget', 'remote:machines']) ipcMain.removeHandler(channel)
+        'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
+        'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
+        'remote:machines']) ipcMain.removeHandler(channel)
       this.registered = false
     }
     await this.server.close()

@@ -11,6 +11,8 @@ import { AgentCollaborationStore } from './agent-collaboration-store'
 import { ProjectBacklogs } from './project-backlog'
 import type { AgentControlScope, AgentControlTab, AgentControlUiRequest } from '../shared/agent-control'
 import type { AgentProviderInfo, AgentSpec, PaneTab } from '../shared/models'
+import type { MachineProjectLink } from '../shared/remote-control'
+import type { ProjectIdentity } from '../shared/project-identity'
 import type { AgentEventData, ProviderCapabilities, SessionProjection, StructuredProvider } from '../shared/structured-agent'
 import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
 
@@ -341,13 +343,27 @@ const placeControllerOn = (f: ReturnType<typeof fixture>, machineId: string): vo
 
 describe('which machine a controlled tab runs on', () => {
   const MACHINES = [
-    { id: 'local', name: 'This Laptop', kind: 'local' as const, status: 'online' as const, accountLogin: null, grantedProjectIds: [] },
-    { id: 'render-desktop', name: 'Render Desktop', kind: 'peer' as const, status: 'online' as const, accountLogin: 'Empire024', grantedProjectIds: [] },
-    { id: 'studio', name: 'Studio', kind: 'peer' as const, status: 'revoked' as const, accountLogin: 'Empire024', grantedProjectIds: [] }
+    { id: 'local', name: 'This Laptop', kind: 'local' as const, status: 'online' as const, accountLogin: null, projects: [] },
+    { id: 'render-desktop', name: 'Render Desktop', kind: 'peer' as const, status: 'online' as const, accountLogin: 'Empire024', projects: [] },
+    { id: 'studio', name: 'Studio', kind: 'peer' as const, status: 'revoked' as const, accountLogin: 'Empire024', projects: [] }
   ]
+  /** The owner-confirmed pair of projects, plus what the other machine currently advertises. */
+  const link = (localProjectId: string): MachineProjectLink => {
+    const remote: ProjectIdentity = { key: 'b'.repeat(32), keyCreatedAt: '2026-02-02T00:00:00.000Z', path: '/renders/conductor', name: 'Conductor' }
+    return {
+      grant: {
+        localProjectId,
+        local: { key: 'a'.repeat(32), keyCreatedAt: '2026-01-01T00:00:00.000Z', path: '/laptop/conductor', name: 'Conductor' },
+        remoteProjectId: 'remote-project',
+        remote,
+        confirmedAt: '2026-02-03T00:00:00.000Z'
+      },
+      observed: remote
+    }
+  }
   const withMachines = (f: ReturnType<typeof fixture>) => {
     const openRemote = vi.fn(async (machineId: string) => ({ tabId: 'remote-tab', agentSessionId: 'remote-agent', machineName: machineId === 'render-desktop' ? 'Render Desktop' : machineId }))
-    const machines = MACHINES.map(machine => ({ ...machine, grantedProjectIds: machine.kind === 'peer' ? [f.project.id] : [] }))
+    const machines = MACHINES.map(machine => ({ ...machine, projects: machine.kind === 'peer' ? [link(f.project.id)] : [] }))
     return { openRemote, control: new AgentControl({ ...f.deps, machines: () => machines, openRemote }) }
   }
 
@@ -396,14 +412,26 @@ describe('which machine a controlled tab runs on', () => {
     expect(tab.state?.machineId).toBe('local')
   })
 
-  it('refuses to place a tab on a machine that does not have this project shared', async () => {
+  it('refuses to place a tab on a machine this project was never paired with', async () => {
     const f = fixture()
     const openRemote = vi.fn()
     const control = new AgentControl({ ...f.deps, openRemote, machines: () => [
-      { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, grantedProjectIds: [] },
-      { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: 'Empire024', grantedProjectIds: ['some-other-project'] }
+      { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, projects: [] },
+      { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: 'Empire024', projects: [link('some-other-project')] }
     ] })
-    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/does not have this project shared/)
+    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/has not been told which of its projects this one is/)
+    expect(openRemote).not.toHaveBeenCalled()
+  })
+
+  it('refuses when the paired machine is now sharing a different project under that mapping', async () => {
+    const f = fixture()
+    const openRemote = vi.fn()
+    const mapped = link(f.project.id)
+    const control = new AgentControl({ ...f.deps, openRemote, machines: () => [
+      { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, projects: [] },
+      { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: 'Empire024', projects: [{ ...mapped, observed: { ...mapped.grant.remote, key: 'c'.repeat(32) } }] }
+    ] })
+    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/sharing a different project/)
     expect(openRemote).not.toHaveBeenCalled()
   })
 
@@ -422,8 +450,8 @@ describe('which machine a controlled tab runs on', () => {
     const f = fixture()
     placeControllerOn(f, 'render-desktop')
     const control = new AgentControl({ ...f.deps, machines: () => [
-      { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, grantedProjectIds: [] },
-      { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: null, grantedProjectIds: [f.project.id] }
+      { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, projects: [] },
+      { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: null, projects: [link(f.project.id)] }
     ] })
     await expect(control.call(f.scope, 'tabs.open', {})).rejects.toThrow(/Remote machine placement is unavailable/)
   })

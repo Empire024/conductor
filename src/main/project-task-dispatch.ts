@@ -4,6 +4,7 @@ import type { AgentControl, } from './agent-control'
 import type { AgentControlScope, AgentControlUiRequest } from '../shared/agent-control'
 import type { ProjectTask, ProjectTaskDispatchAssignment, ProjectTaskDispatchOptions, ProjectTaskDispatchRequest, ProjectTaskDispatchResult } from '../shared/project-backlog'
 import type { SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import { AUTO_FIXER_INSTRUCTIONS } from '../shared/orchestration'
 import { resolveEffortChoice } from '../shared/model-effort'
 import type { ConductorDatabase } from './database'
 import type { ProjectBacklogs } from './project-backlog'
@@ -23,7 +24,7 @@ const validId = (value:unknown):value is string => typeof value==='string' && Bo
 export const projectTaskPrompt = (tasks:ProjectTask[],fixer=false):string => {
   const requested=tasks.map(task=>`Task ${task.id} (${task.kind}):\n${task.title}`).join('\n\n')
   const instructions=fixer
-    ? 'You are the visible Project tasks Fixer. Complete the selected tasks below. First read models.list and app.state using Conductor app control. Choose an actual available provider, model, and supported effort deliberately for each task, based on its complexity. Delegate through router.dispatch with explicit provider, model, effort (when supported), and projectTaskIds containing the matching exact IDs; dispatch at most four independent tasks per call. Use further batches for the remaining tasks. Those calls open visible native coworker tabs and transfer only your selected task claims after submission. Coordinate overlapping files, inspect coworker results, integrate and verify the finished work. Do not launch nested CLI agents, another router, or unrelated work.'
+    ? AUTO_FIXER_INSTRUCTIONS
     : 'Complete the selected Project tasks below. Read feature-list.md and the project instructions, coordinate overlapping files with active coworkers, and use Conductor tasks APIs to update only these exact task IDs. Preserve unrelated tasks and claims. Mark tasks done only after finishing and verifying them.'
   return `${instructions}\n\n${requested}\n\nThis assignment was requested by the owner in Project tasks. The app records ownership after native prompt acceptance; read tasks.list before changing task status. If a selected task is still assigned elsewhere, wait for the handoff rather than seizing another agent\'s claim. Do not repeat a submission after an uncertain transport result.`
 }
