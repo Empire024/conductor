@@ -36,3 +36,16 @@ export function runtimeModelLabel(configuredModel?: string, models: Array<{ id: 
   if (!model) return models.find(option => explicit(option.id))?.label ?? 'Choose model'
   return models.find(option => option.id === model)?.label || model
 }
+
+/** A process row only ever persists the model it was configured with, which is commonly 'default'
+ *  or unset - the concrete model a running turn actually resolved to lives in that session's own
+ *  runtime settings instead. A process still waiting for the owner to pick a model has no such
+ *  runtime to report, so it correctly keeps showing the 'Choose model' placeholder. */
+export function processModelLabel(
+  process: { id: string; provider?: string; model?: string },
+  providers: ReadonlyArray<{ id: string; models: Array<{ id: string; label: string }> }>,
+  reportedModels: ReadonlyMap<string, string>
+): string {
+  const models = providers.find((provider) => provider.id === process.provider)?.models ?? []
+  return runtimeModelLabel(process.model, models, reportedModels.get(process.id))
+}

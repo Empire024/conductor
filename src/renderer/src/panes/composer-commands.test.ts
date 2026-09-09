@@ -3,7 +3,7 @@ import { composerCommands, matchingComposerCommands } from './composer-commands'
 import type { ProviderCapabilities } from '../../../shared/structured-agent'
 describe('chat command discovery', () => {
   it('keeps useful local commands before connecting and only advertises supported modes', () => {
-    expect(composerCommands().map(command => command.name)).toEqual(['attach', 'model', 'settings', 'history', 'stop', 'resume'])
+    expect(composerCommands().map(command => command.name)).toEqual(['attach', 'model', 'settings', 'history', 'stop', 'resume', 'browser'])
     const capabilities = { plans: true, fork: true } as ProviderCapabilities
     expect(composerCommands(capabilities).map(command => command.name)).toContain('plan')
     expect(composerCommands(capabilities).map(command => command.name)).toContain('fork')
@@ -24,5 +24,13 @@ describe('chat command discovery', () => {
     const commands = composerCommands()
     expect(matchingComposerCommands('/MO', commands).map(command => command.name)).toEqual(['model'])
     for (const text of ['Use /model please', '/model argument', '/file.ts', 'ordinary text', '']) expect(matchingComposerCommands(text, commands)).toEqual([])
+  })
+  it('recognizes @browser as a mention token like the VS Code Claude integration, not literal text', () => {
+    const commands = composerCommands()
+    expect(matchingComposerCommands('@', commands).map(command => command.name)).toEqual(['browser'])
+    expect(matchingComposerCommands('@bro', commands)).toEqual([{ name: 'browser', description: 'Attach the browser preview to this turn', trigger: '@' }])
+    expect(matchingComposerCommands('@model', commands)).toEqual([])
+    expect(matchingComposerCommands('/browser', commands)).toEqual([])
+    for (const text of ['Use @browser please', '@browser argument', '@file.ts']) expect(matchingComposerCommands(text, commands)).toEqual([])
   })
 })

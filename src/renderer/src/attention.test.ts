@@ -57,13 +57,14 @@ describe('session activity status', () => {
   it.each([
     ['waiting_input', 'waiting'],
     ['failed', 'waiting'],
-    ['disconnected', 'waiting'],
     ['working', 'working'],
     ['limited', 'working'],
     ['complete', 'done'],
     ['idle', undefined],
     // Stopped is a deliberate halt, so it does not pull the workspace into the waiting list.
-    ['stopped', undefined]
+    ['stopped', undefined],
+    // A session only reaches this layer as disconnected when it lost its connection mid-flight.
+    ['disconnected', 'waiting']
   ] as const)('maps phase %s to status %s', (phase, expected) => {
     const session = makeSession()
     const phases = new Map<string, AgentActivityPhase>([['agent-resource', phase]])
@@ -79,6 +80,17 @@ describe('session activity status', () => {
       ['agent-resource-2', 'waiting_input']
     ])
     expect(getSessionActivityStatuses([session], phases).get('workspace-1')).toBe('waiting')
+  })
+
+  it('reports done when a finished tab sits next to one that settled before losing its connection', () => {
+    const session = makeSession()
+    if (session.layout.root.type !== 'group') throw new Error('Expected a tab group')
+    session.layout.root.tabs.push({ id: 'agent-tab-2', kind: 'agent', title: 'Claude', resourceId: 'agent-resource-2' })
+    const phases = new Map<string, AgentActivityPhase>([
+      ['agent-resource', 'complete'],
+      ['agent-resource-2', 'idle']
+    ])
+    expect(getSessionActivityStatuses([session], phases).get('workspace-1')).toBe('done')
   })
 
   it('ignores resources without a matching visible tab', () => {

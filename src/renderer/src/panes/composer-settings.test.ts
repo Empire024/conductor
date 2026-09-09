@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { composerChildKey, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
+import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
+import { MAX_PROMPT_CHARS } from '../../../shared/structured-agent'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 const settings = (model: string): SessionSettings => ({ permission: 'default', plan: false, model })
 const capabilities = (model: string, effort: string): ProviderCapabilities => ({ provider: 'claude', models: [{ id: 'opus', label: 'Opus' }, { id: 'sonnet', label: 'Sonnet' }], effectiveSettings: { model, effort } } as unknown as ProviderCapabilities)
@@ -22,6 +23,30 @@ describe('composer setting changes', () => {
     const granted: SessionSettings = { permission: 'accept-edits', plan: false, temporaryPermission: { runtimeId: 'runtime-1', restore: 'default' } }
     expect(nextComposerSettings(granted, { permission: 'auto', plan: false })).toEqual({ permission: 'auto', plan: false })
     expect(nextComposerSettings(granted, { effort: 'high' })).toEqual({ ...granted, effort: 'high' })
+  })
+})
+
+describe('composer send blocking', () => {
+  it('blocks an empty or whitespace-only draft even when attachments are present', () => {
+    expect(composerSendBlock('', [])).toBe('empty')
+    expect(composerSendBlock('   \n\t  ', [])).toBe('empty')
+    expect(composerSendBlock('   ', [{ content: 'x'.repeat(500) }])).toBe('empty')
+  })
+  it('allows an ordinary short draft', () => {
+    expect(composerSendBlock('Fix the bug', [])).toBeUndefined()
+  })
+  it('blocks once the draft plus attachment content crosses the true prompt ceiling', () => {
+    const huge = [{ content: 'x'.repeat(MAX_PROMPT_CHARS + 1) }]
+    expect(composerSendBlock('short draft', huge)).toBe('oversized')
+    expect(promptCharacterCount('short draft', huge)).toBe('short draft'.length + MAX_PROMPT_CHARS + 1)
+  })
+  it('counts a short draft with no attachments as just its trimmed length', () => {
+    expect(promptCharacterCount('  hello  ', [])).toBe(5)
+    expect(promptCharacterCount('  hello  ', [{ content: undefined }])).toBe(5)
+  })
+  it('stays within the limit right at the boundary', () => {
+    expect(composerSendBlock('a'.repeat(MAX_PROMPT_CHARS), [])).toBeUndefined()
+    expect(composerSendBlock('a'.repeat(MAX_PROMPT_CHARS + 1), [])).toBe('oversized')
   })
 })
 

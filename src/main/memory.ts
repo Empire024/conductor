@@ -10,6 +10,11 @@ const STOP_WORDS = new Set([
 // from this module.
 export { MEMORY_KINDS, isMemoryKind } from '../shared/models'
 
+// Stripping the write-directive out of what the user reads has to run in the renderer too
+// (assistant text is rendered straight off the shared structured-agent projection), so the
+// logic lives in shared/ and is re-exported here for the main process's own imports.
+export { stripMemoryDirectives } from '../shared/memory-directive'
+
 export const clampMemoryWeight = (value: number): number => Math.min(1, Math.max(0, value))
 
 export const memoryTokens = (value: string): string[] => [

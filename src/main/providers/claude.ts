@@ -31,6 +31,12 @@ const string = (value: Json | undefined): string | undefined => typeof value ===
 const number = (value: Json | undefined): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined
 const array = (value: Json | undefined): Json[] => Array.isArray(value) ? value : []
 const display = (value: Json | undefined): string => typeof value === 'string' ? value : value === undefined ? '' : JSON.stringify(value, null, 2)
+/** A roster name is a one-line label, but a task summary can be an agent's entire final
+ *  report, which would otherwise be pasted verbatim into the subagent list heading. */
+export const taskLabel = (value: string | undefined): string | undefined => {
+  const line = value?.split('\n').map(part => part.trim()).find(Boolean)
+  return line === undefined ? undefined : line.length > 120 ? line.slice(0, 119).trimEnd() + '…' : line
+}
 interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean }
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; captured?: boolean }
@@ -222,6 +228,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (!pending.interaction.choices.some(choice => choice.id === decision && !choice.disabled)) throw new Error('Unsupported Claude permission decision')
     const allowed = decision === 'allow' || decision === 'allow-session' || decision === 'auto-mode'
     let input: Json = pending.input
+    let answered: Record<string, string | string[]> | undefined
     if (pending.interaction.kind === 'question' && decision === 'allow') {
       const answers: ObjectValue = {}
       for (const question of pending.interaction.questions ?? []) {
@@ -231,6 +238,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         answers[question.question] = question.multiSelect ? values : values[0]!
       }
       input = { ...pending.input, answers }
+      answered = answers as Record<string, string | string[]>
     }
     pending.submitting = true // claim synchronously across every pane before sending
     try {
@@ -259,7 +267,7 @@ export class ClaudeAdapter implements ProviderAdapter {
         ? { behavior: 'allow', updatedInput: input, ...(decision === 'allow-session' ? { updatedPermissions: pending.permissionUpdates ?? [] } : {}), ...(pending.toolId ? { toolUseID: pending.toolId } : {}) }
         : { behavior: 'deny', message: decision === 'abort' ? 'User cancelled this turn' : 'User denied this operation', interrupt: decision === 'abort', ...(pending.toolId ? { toolUseID: pending.toolId } : {}) })
       this.requests.delete(response.requestId)
-      this.emit({ requestId: response.requestId, itemId: pending.toolId, data: { type: 'interaction', interaction: { ...pending.interaction, status: 'resolved', outcome: decision } } })
+      this.emit({ requestId: response.requestId, itemId: pending.toolId, data: { type: 'interaction', interaction: { ...pending.interaction, status: 'resolved', outcome: decision, ...(answered ? { answers: answered } : {}) } } })
       if (pending.toolId) this.updateTool(pending.toolId, { status: allowed ? 'preparing' : decision === 'abort' ? 'interrupted' : 'rejected' })
       if (decision === 'abort') {
         this.stopRequested = true
@@ -499,8 +507,10 @@ export class ClaudeAdapter implements ProviderAdapter {
         return
       }
       // Completions carry only a summary ("... completed (exit code 0)"), so the launch
-      // description is kept as the name rather than being overwritten by it.
-      const name = (id ? this.backgroundTasks.get(id) : '') || description || string(message.summary) || 'Background activity'
+      // description is kept as the name rather than being overwritten by it. A task that
+      // never reported a description falls back to the summary, and an Agent task's summary
+      // is its whole final report, so every candidate is clamped to a one-line label.
+      const name = taskLabel(id ? this.backgroundTasks.get(id) : undefined) ?? taskLabel(description) ?? taskLabel(string(message.summary)) ?? 'Background activity'
       if (id && status !== 'running') this.backgroundTasks.delete(id)
       // Backgrounded work keeps running after the turn ends, so the roster must not
       // treat a finished parent turn as evidence that its status went stale.

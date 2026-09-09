@@ -1,6 +1,7 @@
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs } from 'node:fs'
 import { pathToFileURL } from 'node:url'
+import { randomUUID } from 'node:crypto'
 import { importPromptImage } from './prompt-images'
 import { ProjectBacklogs } from './project-backlog'
 import { ProjectTaskDispatcher } from './project-task-dispatch'
@@ -30,6 +31,7 @@ import type {
   WorkspaceLayout
 } from '../shared/models'
 import { AGENT_SOUND_PROFILES, isMemoryKind, THEME_IDS, THEME_VARIANTS } from '../shared/models'
+import type { AgentConfirmResponse } from '../shared/agent-confirm'
 import { ConductorDatabase } from './database'
 import { TerminalManager } from './terminal-manager'
 import { AgentManager, onAgentStatusChange } from './agent-manager'
@@ -79,6 +81,10 @@ let projectFileChanges: ProjectFileChanges | undefined
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
 const detachedWindows = new Map<string, BrowserWindow>()
+// Native message boxes steal focus and freeze the process behind them; an agent's request to
+// close a tab or forget a memory is routed through the renderer's own confirm UI instead, with
+// this map resolving the owner's answer back to whichever AgentControl call is waiting on it.
+const pendingAgentConfirms = new Map<string, { resolve(allow: boolean): void; timer: ReturnType<typeof setTimeout> }>()
 const floatingDetachedIds = (): string[] => {
   try { const value: unknown = JSON.parse(database.getSetting('floatingDetachedWindows') ?? '[]'); return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : [] }
   catch { return [] }
@@ -602,15 +608,29 @@ const registerIpc = (): void => {
     return attachment
   })
   ipcMain.handle('structured:queue', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.queue(structuredId(id), text, settings, attachments) })
-  ipcMain.handle('structured:steer', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.steer(structuredId(id), text, settings, attachments) })
+  ipcMain.handle('structured:steer', (event, id, text, settings, attachments) => {
+    trustedStructured(event)
+    if (remoteControl?.mirror.isRemote(structuredId(id))) return remoteControl.mirror.submit(structuredId(id), String(text), 'agents.steer')
+    return agents.structured.steer(structuredId(id), text, settings, attachments)
+  })
   ipcMain.handle('structured:cancel-queued', (event, id, promptId?: string) => { trustedStructured(event); if (promptId !== undefined && typeof promptId !== 'string') throw new Error('Invalid queued prompt'); return agents.structured.cancelQueued(structuredId(id), promptId) })
   ipcMain.handle('native-cli:ensure', (event, id) => { trustedStructured(event); return agents.nativeCli.ensure(structuredId(id)) })
   ipcMain.handle('native-cli:chat', (event, id) => { trustedStructured(event); return agents.nativeCli.switchToChat(structuredId(id)) })
   ipcMain.on('native-cli:write', (event, id, data) => { try { trustedStructured(event); agents.nativeCli.write(structuredId(id), data) } catch { /* reject untrusted/invalid input */ } })
   ipcMain.on('native-cli:resize', (event, id, cols, rows) => { try { trustedStructured(event); agents.nativeCli.resize(structuredId(id), cols, rows) } catch { /* reject untrusted/invalid input */ } })
-  ipcMain.handle('structured:submit', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.submit(structuredId(id), text, settings, attachments) })
+  ipcMain.handle('structured:submit', (event, id, text, settings, attachments) => {
+    trustedStructured(event)
+    // A tab placed on another machine has no local runtime; the prompt belongs to that machine.
+    if (remoteControl?.mirror.isRemote(structuredId(id))) return remoteControl.mirror.submit(structuredId(id), String(text))
+    return agents.structured.submit(structuredId(id), text, settings, attachments)
+  })
   ipcMain.handle('structured:respond', (event, response) => { trustedStructured(event); return agents.structured.respond(response) })
-  ipcMain.handle('structured:interrupt', (event, id, expediteSubmittedInput?: boolean) => { trustedStructured(event); if (expediteSubmittedInput !== undefined && typeof expediteSubmittedInput !== 'boolean') throw new Error('Invalid interrupt option'); return agents.structured.interrupt(structuredId(id), expediteSubmittedInput === true) })
+  ipcMain.handle('structured:interrupt', (event, id, expediteSubmittedInput?: boolean) => {
+    trustedStructured(event)
+    if (expediteSubmittedInput !== undefined && typeof expediteSubmittedInput !== 'boolean') throw new Error('Invalid interrupt option')
+    if (remoteControl?.mirror.isRemote(structuredId(id))) return remoteControl.mirror.interrupt(structuredId(id))
+    return agents.structured.interrupt(structuredId(id), expediteSubmittedInput === true)
+  })
   ipcMain.handle('structured:bind-workspace', (event, id, sessionId) => { trustedStructured(event); if (typeof sessionId !== 'string' || sessionId.length > 160) throw new Error('Invalid workspace'); return agents.structured.bindWorkspace(structuredId(id), sessionId) })
   ipcMain.handle('structured:resume', (event, id, settings) => { trustedStructured(event); return agents.structured.resume(structuredId(id), settings) })
   ipcMain.handle('structured:settings', (event, id, settings) => { trustedStructured(event); return agents.structured.saveSettings(structuredId(id), settings) })
@@ -1190,6 +1210,14 @@ const registerIpc = (): void => {
     try { trustedStructured(event) } catch { return }
     agents.interrupt(id)
   })
+  ipcMain.on('agent-confirm:response', (event, response: AgentConfirmResponse) => {
+    try { trustedStructured(event) } catch { return }
+    const pending = pendingAgentConfirms.get(response?.id)
+    if (!pending) return
+    clearTimeout(pending.timer)
+    pendingAgentConfirms.delete(response.id)
+    pending.resolve(response.allow === true)
+  })
 
   ipcMain.handle('memory:list', (_event, projectId: string, agentKey?: string) =>
     database.listMemories(projectId, agentKey)
@@ -1430,9 +1458,15 @@ app.whenReady().then(async () => {
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
     confirm: async (_scope, message) => {
-      const options: Electron.MessageBoxOptions = { type: 'question', title: 'Agent request', message, buttons: ['Cancel', 'Allow'], defaultId: 0, cancelId: 0, noLink: true }
-      const result = mainWindow && !mainWindow.isDestroyed() ? await dialog.showMessageBox(mainWindow, options) : await dialog.showMessageBox(options)
-      return result.response === 1
+      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return false
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show(); mainWindow.focus()
+      const id = randomUUID()
+      return new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => { pendingAgentConfirms.delete(id); resolve(false) }, 120_000)
+        pendingAgentConfirms.set(id, { resolve, timer })
+        mainWindow!.webContents.send('agent-confirm:request', { id, title: 'Agent request', message })
+      })
     },
     fileChanged: change => projectFileChanges?.changed(change),
     linksChanged: scope => publish('agent-control:links-changed', { projectId: scope.projectId, sessionId: scope.sessionId })

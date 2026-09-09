@@ -21,12 +21,19 @@ type Dependencies = {
 }
 const active = new Set(['starting','running','waiting_input','waiting_approval'])
 const validId = (value:unknown):value is string => typeof value==='string' && Boolean(value.trim()) && value.length<=160 && !value.includes('\0')
-export const projectTaskPrompt = (tasks:ProjectTask[],fixer=false):string => {
+/** The real, static permission modes each provider's adapter declares (see the Claude and
+ *  Codex ProviderAdapter classes) — used only until a live runtime reports its own catalog. */
+const staticPermissions:Record<StructuredProvider,SessionSettings['permission'][]> = {
+  claude:['default','accept-edits','auto'],
+  codex:['default','read-only','accept-edits']
+}
+export const projectTaskPrompt = (tasks:ProjectTask[],fixer=false,extra?:string):string => {
   const requested=tasks.map(task=>`Task ${task.id} (${task.kind}):\n${task.title}`).join('\n\n')
   const instructions=fixer
     ? AUTO_FIXER_INSTRUCTIONS
     : 'Complete the selected Project tasks below. Read feature-list.md and the project instructions, coordinate overlapping files with active coworkers, and use Conductor tasks APIs to update only these exact task IDs. Preserve unrelated tasks and claims. Mark tasks done only after finishing and verifying them.'
-  return `${instructions}\n\n${requested}\n\nThis assignment was requested by the owner in Project tasks. The app records ownership after native prompt acceptance; read tasks.list before changing task status. If a selected task is still assigned elsewhere, wait for the handoff rather than seizing another agent\'s claim. Do not repeat a submission after an uncertain transport result.`
+  const addition=extra?.trim() ? `\n\nAdditional instructions from the owner:\n${extra.trim()}` : ''
+  return `${instructions}\n\n${requested}\n\nThis assignment was requested by the owner in Project tasks. The app records ownership after native prompt acceptance; read tasks.list before changing task status. If a selected task is still assigned elsewhere, wait for the handoff rather than seizing another agent\'s claim. Do not repeat a submission after an uncertain transport result.${addition}`
 }
 
 /** Owner-triggered dispatch. Uses the same visible tabs and native session manager as app control. */
@@ -45,7 +52,8 @@ export class ProjectTaskDispatcher {
     const providers=this.deps.providers().filter(provider=>provider.id==='codex'||provider.id==='claude').map(provider=> {
       const runtime=targets.filter(target=>target.provider===provider.id).map(target=>database.structured.snapshot(target.agentSessionId)?.capabilities).find(capabilities=>capabilities?.models.length)
       return {provider:provider.id as StructuredProvider,available:provider.available,source:runtime?'runtime' as const:'configured' as const,
-        models:runtime?.models??provider.models.filter(model=>!['default','auto'].includes(model.id)).map(model=>({...model,effort:provider.efforts.map(effort=>effort.id).filter(effort=>effort!=='auto')}))}
+        models:runtime?.models??provider.models.filter(model=>!['default','auto'].includes(model.id)).map(model=>({...model,effort:provider.efforts.map(effort=>effort.id).filter(effort=>effort!=='auto')})),
+        permissions:runtime?.permissions??staticPermissions[provider.id as StructuredProvider]}
     })
     return {workspaces,targets,providers}
   }
@@ -58,12 +66,13 @@ export class ProjectTaskDispatcher {
     const {database,backlogs,sessions}=this.deps
     const options=this.options(projectId)
     if(!request||!Array.isArray(request.taskIds)||!request.taskIds.length||request.taskIds.length>50||request.taskIds.some(id=>!validId(id))||new Set(request.taskIds).size!==request.taskIds.length)throw new Error('Select between 1 and 50 distinct project tasks')
+    if(request.prompt!==undefined&&(typeof request.prompt!=='string'||request.prompt.length>4000))throw new Error('Keep the extra instructions under 4000 characters')
     const board=await backlogs.get(projectId)
     if(board.revision!==revision)throw new Error('The task list changed. Refresh and review the selection before assigning it.')
     const tasks=request.taskIds.map(id=> {const task=board.tasks.find(task=>task.id===id);if(!task)throw new Error('A selected task no longer exists');if(task.status==='done')throw new Error('Reopen completed tasks before assigning them');return task})
     const target=request.target
     if(!target||!['existing','new','auto'].includes(target.type))throw new Error('Choose an assignment destination')
-    const prompt=projectTaskPrompt(tasks,target.type==='auto')
+    const prompt=projectTaskPrompt(tasks,target.type==='auto',request.prompt)
     if(prompt.length>50_000)throw new Error('These task descriptions are too large for one assignment. Select fewer tasks.')
     let assignment:ProjectTaskDispatchAssignment
     if(target.type==='existing') {
@@ -81,15 +90,17 @@ export class ProjectTaskDispatcher {
       if(!model)throw new Error('Choose a model from the available provider catalog')
       const effort=target.type==='new'?target.effort:resolveEffortChoice(model.effort??[],model.defaultEffort)
       if(effort!==undefined&&(!validId(effort)||!model.effort?.includes(effort)))throw new Error('Choose an effort supported by the selected model')
-      const tab:PaneTab={id:makeId('tab'),kind:'agent',resourceId:makeId('agent'),title:target.type==='auto'?'Project tasks Fixer':tasks.length===1?tasks[0]!.title.replace(/\s+/g,' ').slice(0,100):`${tasks.length} project tasks`,state:{provider:catalog.provider,model:model.id,effort:effort??'auto',viewMode:'visual'}}
+      const permission=target.type==='new'?target.permission:undefined
+      if(permission!==undefined&&(!validId(permission)||!catalog.permissions.includes(permission)))throw new Error('Choose a permission mode supported by the selected model')
+      const tab:PaneTab={id:makeId('tab'),kind:'agent',resourceId:makeId('agent'),title:target.type==='auto'?'Project tasks Fixer':tasks.length===1?tasks[0]!.title.replace(/\s+/g,' ').slice(0,100):`${tasks.length} project tasks`,state:{provider:catalog.provider,model:model.id,effort:effort??'auto',...(permission?{permission}:{}),viewMode:'visual'}}
       const spec:AgentSpec={id:tab.resourceId!,projectId,sessionId:target.sessionId,provider:catalog.provider,model:model.id,title:tab.title,cwd:database.getProject(projectId)!.path}
       const ensured=sessions.ensure(spec)
       if(!ensured.available)throw new Error(ensured.message||'Provider unavailable')
-      database.structured.update(spec.id,{settings:{...database.structured.snapshot(spec.id)!.settings,model:model.id,effort}})
+      database.structured.update(spec.id,{settings:{...database.structured.snapshot(spec.id)!.settings,model:model.id,effort,...(permission?{permission:permission as SessionSettings['permission']}:{})}})
       const scope:AgentControlScope={projectId,sessionId:target.sessionId,agentSessionId:''}
       await this.deps.ui({...scope,id:randomUUID(),action:'tabs.open',params:{tab,focus:false}})
       if(!this.deps.control.tabs(scope).some(current=>current.id===tab.id&&current.resourceId===spec.id))throw new Error('The new native tab was not acknowledged. Inspect the workspace before retrying.')
-      assignment={taskIds:request.taskIds,agentSessionId:spec.id,tabId:tab.id,sessionId:target.sessionId,provider:catalog.provider,model:model.id,effort,status:'failed'}
+      assignment={taskIds:request.taskIds,agentSessionId:spec.id,tabId:tab.id,sessionId:target.sessionId,provider:catalog.provider,model:model.id,effort,...(permission?{permission}:{}),status:'failed'}
     }
     try {
       let state=database.structured.snapshot(assignment.agentSessionId)!
@@ -99,8 +110,9 @@ export class ProjectTaskDispatcher {
         const model=state.capabilities?.models.find(model=>model.id===assignment.model)
         if(!model)throw new Error('The native runtime did not advertise the chosen model. Inspect the new tab and select an available model before retrying.')
         if(assignment.effort!==undefined&&!model.effort?.includes(assignment.effort))throw new Error('The native runtime did not advertise the chosen effort. No task prompt was sent.')
+        if(assignment.permission!==undefined&&state.capabilities?.permissions&&!state.capabilities.permissions.includes(assignment.permission as SessionSettings['permission']))throw new Error('The native runtime did not advertise the chosen permission mode. No task prompt was sent.')
       }
-      const settings:SessionSettings={...state.settings,...(target.type==='existing'?{}:{model:assignment.model,effort:assignment.effort})}
+      const settings:SessionSettings={...state.settings,...(target.type==='existing'?{}:{model:assignment.model,effort:assignment.effort,...(assignment.permission?{permission:assignment.permission as SessionSettings['permission']}:{})})}
       // Revalidate the optimistic task snapshot after potentially slow native connection.
       if((await backlogs.get(projectId)).revision!==revision)throw new Error('The task list changed during connection. No task prompt was sent; review the selection before retrying.')
       if(active.has(state.phase)) {await sessions.queue(assignment.agentSessionId,prompt,settings);assignment.status='queued'}

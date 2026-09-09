@@ -104,11 +104,11 @@ try {
   results.checks.push('Reload and close/reopen preserve captured file context' + (provider === 'codex' ? '; restored image attachments can be inspected' : ''))
 
   await page.locator('.pane-menu-button').first().click()
-  await page.getByRole('button', { name: 'Split right', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Split right', exact: true }).click()
   await expect(page.locator('.pane-group')).toHaveCount(2)
   await page.locator('.pane-menu-button').first().click()
   const nextWindow = app.waitForEvent('window')
-  await page.getByRole('button', { name: 'Open as window', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Open as window', exact: true }).click()
   const detached = await nextWindow
   detached.on('pageerror', error => errors.push(error.message))
   await expect(detached.getByRole('textbox', { name: /^Message / })).toHaveValue(firstText)
@@ -123,7 +123,7 @@ try {
   await detached.getByRole('button', { name: 'Close', exact: true }).click()
   await expect.poll(() => app.windows().length).toBe(1)
   await page.locator('.pane-menu-button').first().click()
-  await page.getByRole('button', { name: 'Retrieve closed tab', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Retrieve closed tab', exact: true }).click()
   await expect(composer()).toHaveValue(detachedText)
   await expect(page.locator('.sa-context-chips > span')).toHaveCount(attachmentCount)
   results.checks.push('Detaching and retrieving a pane preserve text, attached context, and edits made in the other window')

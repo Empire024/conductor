@@ -6,6 +6,7 @@ import { AgentDialog, coalescedEditLabel, coalescedEditSummary, groupConversatio
 import { ProviderIcon } from '../components/ProviderIcon'
 import { StructuredUsageContent } from './StructuredUsageDetails'
 import { distinguishSubagentLabels, liveTokenLabel, subagentColorIndex, subagentCountLabel, subagentModelLabel, subagentStatusLabels, subagentTokenLabel, summarizeSubagents, summarizeWorkingUsage, summarizeContext } from './usage-summary'
+import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import './StructuredAgentTelemetry.css'
 import type { SubagentSummary } from './usage-summary'
 
@@ -59,7 +60,7 @@ export function StructuredUsageSummary({ items, runtimeId, truncated = false, mo
 
 function activityText(item: TimelineItem): string {
   const data = item.data
-  if (data.type === 'text') return data.text
+  if (data.type === 'text') return data.role === 'assistant' ? stripMemoryDirectives(data.text) : data.text
   if (data.type === 'error') return data.message
   if (data.type === 'tool') return [data.description ?? data.name, data.status.replaceAll('_', ' '), data.output, data.stderr].filter(Boolean).join(' · ')
   if (data.type === 'changes') return data.changes.map(change => `${change.status}: ${change.path}`).join('\n')
@@ -103,7 +104,7 @@ function SubagentCard({ agent, label, colorIndex, runtimeId, detail, open, onTog
   return <li><article className="sa-agent-card">
     <button type="button" className="sa-agent-card-heading" aria-expanded={open} onClick={onToggle}>
       <span className={'sa-subagent-dot status-' + agent.status} />
-      <span><strong><span className={'sa-subagent-identity sa-agent-hue-' + colorIndex} aria-hidden="true" />{label}</strong><small>{agent.detached && <em className="sa-subagent-detached">Background</em>}{agent.detached ? (agent.output !== undefined ? 'Command output available' : agent.outputFile ? 'Command output file' : 'Background command') : <>{tools.length} {tools.length === 1 ? 'tool' : 'tools'} &middot; {activity.length} activity items</>}</small></span>
+      <span><strong title={label}><span className={'sa-subagent-identity sa-agent-hue-' + colorIndex} aria-hidden="true" />{label}</strong><small>{agent.detached && <><em className="sa-subagent-detached">Background</em>{' '}</>}{agent.detached ? (agent.output !== undefined ? 'Command output available' : agent.outputFile ? 'Command output file' : 'Background command') : <>{tools.length} {tools.length === 1 ? 'tool' : 'tools'} &middot; {activity.length} activity items</>}</small></span>
       {modelLabel && <span className="sa-subagent-model" title={'Runs on ' + modelLabel}><ProviderIcon provider={agent.modelProvider} model={agent.model} size={11} />{modelLabel}</span>}
       {tokenLabel && <span className="sa-subagent-tokens" title="Tokens reported for this subagent">{tokenLabel}</span>}
       <span className={'sa-subagent-state status-' + agent.status}>{subagentStatusLabels[agent.status]}</span>
@@ -116,7 +117,7 @@ function SubagentCard({ agent, label, colorIndex, runtimeId, detail, open, onTog
       {agent.status === 'unknown' && <p className="sa-detail-hint">The connection ended or changed before a final status was reported.</p>}
       {agent.task && <section><h4>Assigned task</h4><StructuredMarkdown text={agent.task} cwd={detail.cwd} projectId={detail.projectId} onOpenFile={detail.onOpenFile} /></section>}
       {agent.outputFile && <section><h4>Command output{agent.outputTruncated ? ' (last 32 KB)' : ''}</h4><small>{agent.outputFile}</small>{agent.output !== undefined ? <pre>{agent.output || 'No output written.'}</pre> : <p className="sa-detail-hint">{agent.outputError ?? 'Reading task output…'}</p>}</section>}
-      <section><h4>Latest response</h4>{output?.data.type === 'text' ? <StructuredMarkdown text={output.data.text} cwd={detail.cwd} projectId={detail.projectId} onOpenFile={detail.onOpenFile} /> : <p className="sa-detail-hint">No response reported in the available history.</p>}</section>
+      <section><h4>Latest response</h4>{output?.data.type === 'text' ? <StructuredMarkdown text={stripMemoryDirectives(output.data.text)} cwd={detail.cwd} projectId={detail.projectId} onOpenFile={detail.onOpenFile} /> : <p className="sa-detail-hint">No response reported in the available history.</p>}</section>
       <details className="sa-agent-activity"><summary>Activity ({activity.length})</summary>{groups.length ? groups.map(group => {
         const rows = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={detail.sessionId} projectId={detail.projectId} onInspectAttachment={detail.onInspectAttachment} cwd={detail.cwd} expanded={itemExpansion[item.id] ?? false} interactive={detail.interactive && item.runtimeId === runtimeId} onExpand={onExpand} onOpenFile={detail.onOpenFile} onDiff={detail.onDiff} onRespond={detail.onRespond} />)
         if (group.length === 1) return rows[0]

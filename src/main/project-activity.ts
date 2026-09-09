@@ -10,6 +10,9 @@ export interface AgentActivityRow {
   activityPhase: AgentActivityPhase
 }
 
+/** A session only reports 'disconnected' when the connection was lost while it was still in
+ *  flight (see structured-sessions), so it does mean interrupted work; one that had already
+ *  settled keeps the state it settled in and never forces this warning onto its project. */
 const STATUS_FOR_PHASE: Partial<Record<AgentActivityPhase, ProjectActivityStatus>> = {
   waiting_input: 'attention',
   failed: 'waiting',

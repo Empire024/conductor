@@ -200,7 +200,7 @@ try {
   await page.getByRole('button', { name: 'Close panel.mjs', exact: true }).click()
   results.checks.push('File link opens actual Monaco code pane without writes; explicit editor context is inspectable and removable')
   await page.locator('.pane-menu-button').first().click()
-  await page.getByRole('button', { name: 'Split right', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Split right', exact: true }).click()
   await expect(page.locator('.pane-group')).toHaveCount(2)
   const separator = page.getByRole('separator', { name: 'Resize tab areas' })
   assert.equal(await separator.evaluate(el => getComputedStyle(el).flexBasis), '0px')
@@ -209,7 +209,15 @@ try {
   const initialRatio = Number(await separator.getAttribute('aria-valuenow'))
   await separator.press('ArrowRight')
   await expect(separator).toHaveAttribute('aria-valuenow', String(initialRatio + 2))
-  const handle = await separator.boundingBox()
+  // Panes animate to their committed size, so measure the handle only once it has settled;
+  // grabbing it mid-transition starts the drag from a stale position and nets no movement.
+  let handle = await separator.boundingBox()
+  for (let settle = 0; settle < 40; settle++) {
+    await page.waitForTimeout(25)
+    const again = await separator.boundingBox()
+    if (Math.abs(again.x - handle.x) < 0.5) { handle = again; break }
+    handle = again
+  }
   await page.mouse.move(handle.x, handle.y + handle.height / 2)
   await page.mouse.down()
   await page.mouse.move(handle.x + 30, handle.y + handle.height / 2, { steps: 4 })
@@ -244,7 +252,7 @@ try {
   results.checks.push('Explicit runtime resume and second synthetic turn preserve native conversation ID and history; labeled fixture continuation, not live-context proof')
   await page.locator('.pane-menu-button').first().click()
   const detachedWindow = app.waitForEvent('window', { timeout: 10_000 })
-  await page.getByRole('button', { name: 'Open as window', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Open as window', exact: true }).click()
   const detached = await detachedWindow
   detached.on('pageerror', error => errors.push(error.message))
   await detached.locator('.structured-agent-pane').waitFor()
@@ -258,7 +266,7 @@ try {
   await detached.getByRole('button', { name: 'Close', exact: true }).click()
   await expect.poll(() => app.windows().length).toBe(1)
   await page.locator('.pane-menu-button').first().click()
-  await page.getByRole('button', { name: 'Retrieve closed tab', exact: true }).click()
+  await page.getByRole('menuitem', { name: 'Retrieve closed tab', exact: true }).click()
   await page.locator('.structured-agent-pane').waitFor()
   const retrieved = await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)
   assert.equal(retrieved.nativeSessionId, nativeId)

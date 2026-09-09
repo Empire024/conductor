@@ -1,7 +1,7 @@
-import { runtimeModelLabel } from '../agent-models'
+import { processModelLabel } from '../agent-models'
 import { useEffect, useMemo, useState } from 'react'
 import { Bot, Check, CircleDot, Clock3, Gauge, RefreshCw, TerminalSquare, UserRound } from 'lucide-react'
-import type { ProjectRecord, RuntimeProcessSummary } from '../../../shared/models'
+import type { AgentProviderInfo, ProjectRecord, RuntimeProcessSummary } from '../../../shared/models'
 import type { AgentCollaborationSnapshot } from '../../../shared/agent-collaboration'
 
 const relativeTime = (timestamp: string): string => {
@@ -14,7 +14,14 @@ const relativeTime = (timestamp: string): string => {
 export function ProcessDashboardPane({ project }: { project: ProjectRecord }): React.JSX.Element {
   const [processes, setProcesses] = useState<RuntimeProcessSummary[]>([])
   const [collaboration, setCollaboration] = useState<AgentCollaborationSnapshot>({ messages: [], presence: [] })
+  const [providers, setProviders] = useState<AgentProviderInfo[]>([])
+  const [reportedModels, setReportedModels] = useState<Map<string, string>>(new Map())
   const [tick, setTick] = useState(0)
+  useEffect(() => {
+    let active = true
+    void window.conductor.agents.listProviders().then((items) => { if (active) setProviders(items) })
+    return () => { active = false }
+  }, [])
   useEffect(() => {
     let active = true
     const load = (): void => {
@@ -25,6 +32,16 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
         if (!active) return
         setProcesses(items)
         setCollaboration(snapshot)
+        // The persisted process row only ever knows the model it was configured with (often
+        // 'default'); the model a running turn actually resolved to lives in its own session.
+        void Promise.all(items.filter((item) => item.kind === 'agent').map((item) =>
+          window.conductor.structured.snapshot(item.id)
+            .then((snapshot) => [item.id, snapshot?.settings.model] as const)
+            .catch(() => [item.id, undefined] as const)
+        )).then((entries) => {
+          if (!active) return
+          setReportedModels(new Map(entries.filter((entry): entry is [string, string] => Boolean(entry[1]))))
+        })
       })
     }
     load()
@@ -80,7 +97,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
                   onDoubleClick={() => window.dispatchEvent(new CustomEvent('conductor:focus-process', { detail: process }))}
                 >
                   <span className={`process-icon ${process.status}`}><Icon size={17} /></span>
-                  <div><strong>{process.title}</strong><small>{process.provider ? `${process.provider} · ${runtimeModelLabel(process.model)}` : 'PowerShell'} · {relativeTime(process.updatedAt)}</small>
+                  <div><strong>{process.title}</strong><small>{process.provider ? `${process.provider} · ${processModelLabel(process, providers, reportedModels)}` : 'PowerShell'} · {relativeTime(process.updatedAt)}</small>
                     {section === 'running' && <div className="process-progress"><i /></div>}
                   </div>
                   <span className={`process-status ${process.status}`}>{process.status === 'limited' && process.resumeAt ? <><Clock3 size={12} /> {Math.ceil(eta / 60000)}m</> : section === 'ready' ? 'ready' : process.status.replace('_', ' ')}</span>

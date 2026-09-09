@@ -1,8 +1,8 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
-import type { AgentEventData, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
-import { activityCoalesceTarget, coalescedEditLabel, coalescedEditSummary, commandSummary, groupConversationActivities, interactionOutcome, isConversationActivity, isRuntimeHeartbeat, legacyAttachedContext, parentLabelAnchors, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
+import type { AgentEventData, InputQuestion, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
+import { activityCoalesceTarget, coalescedEditLabel, coalescedEditSummary, combinedQuestionAnswer, commandSummary, groupConversationActivities, interactionOutcome, isAnsweredThroughInteraction, isConversationActivity, isRuntimeHeartbeat, legacyAttachedContext, parentLabelAnchors, readableAnswerValue, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
 
 const cwd = 'C:\\work\\My project'
 function renderActivity(data: AgentEventData, expanded = true): string {
@@ -382,5 +382,128 @@ describe('stepped questions', () => {
     expect(html).not.toContain('Question 1 of 1')
     expect(html).not.toContain('sa-question-steps')
     expect(html).toContain('Submit answers</button>')
+  })
+})
+
+describe('AskUserQuestion tool call and interaction correlation', () => {
+  const toolItem = (nativeItemId: string, output?: string): TimelineItem =>
+    ({ id: 'tool-' + nativeItemId, runtimeId: 'runtime', nativeItemId, sequence: 1, timestamp: '', data: { type: 'tool', name: 'AskUserQuestion', status: 'completed', output } })
+  const questionInteractionItem = (nativeItemId: string, status: PendingInteraction['status'] = 'resolved'): TimelineItem =>
+    ({ id: 'interaction-' + nativeItemId, runtimeId: 'runtime', nativeItemId, sequence: 2, timestamp: '', data: { type: 'interaction', interaction: {
+      id: 'req-' + nativeItemId, kind: 'question', title: 'Claude needs your input', status, input: {}, choices: [],
+      questions: [{ id: 'q', question: 'Pick one', options: [{ label: 'Blue' }], multiSelect: false }]
+    } } })
+
+  it('hides the AskUserQuestion tool call once its answer lives in the paired interaction', () => {
+    const items = [toolItem('toolu_1', 'The user answered: "Pick one"="Blue"'), questionInteractionItem('toolu_1')]
+    expect(isAnsweredThroughInteraction(items[0]!, items)).toBe(true)
+    expect(items.filter((item, index) => isConversationActivity(item, index, items)).map((entry) => entry.id)).toEqual(['interaction-toolu_1'])
+  })
+
+  it('keeps a real approval tool call visible next to its approve/deny interaction', () => {
+    const approvalTool = toolItem('toolu_2')
+    approvalTool.data = { type: 'tool', name: 'Bash', status: 'completed', input: { command: 'ls' } }
+    const approvalInteraction: TimelineItem = { id: 'interaction-toolu_2', runtimeId: 'runtime', nativeItemId: 'toolu_2', sequence: 2, timestamp: '', data: { type: 'interaction', interaction: { id: 'req-toolu_2', kind: 'approval', title: 'Allow Bash?', status: 'resolved', outcome: 'allow', input: {}, choices: [] } } }
+    const items = [approvalTool, approvalInteraction]
+    expect(isAnsweredThroughInteraction(approvalTool, items)).toBe(false)
+    expect(items.filter((item, index) => isConversationActivity(item, index, items)).map((entry) => entry.id)).toEqual(['tool-toolu_2', 'interaction-toolu_2'])
+  })
+
+  it('never hides a tool call with no correlated question interaction', () => {
+    const items = [toolItem('toolu_3')]
+    expect(isConversationActivity(items[0]!, 0, items)).toBe(true)
+  })
+
+  it('shows a resolved question as one answered block, naming the actual question instead of the generic prompt', () => {
+    const html = renderActivity({ type: 'interaction', interaction: {
+      id: 'req-toolu_4', kind: 'question', title: 'Claude needs your input', status: 'resolved', input: {}, choices: [],
+      questions: [{ id: 'q', question: 'Pick one', options: [{ label: 'Blue' }], multiSelect: false }]
+    } })
+    expect(html).toContain('<span>Pick one</span>')
+    expect(html).not.toContain('<span>Claude needs your input</span>')
+    expect(html).toContain('<small>Answered</small>')
+    expect(html).not.toContain('needs-attention')
+    expect(html).not.toContain('No output')
+  })
+
+  it('shows each question with its recorded answer, and an honest fallback when none was captured', () => {
+    const withoutAnswer = renderActivity({ type: 'interaction', interaction: { id: 'q', kind: 'question', title: 'Claude needs your input', status: 'resolved', input: {}, choices: [], questions: [{ id: 'color', question: 'Which theme?', options: [{ label: 'Night' }, { label: 'Day' }], multiSelect: false }] } })
+    expect(withoutAnswer).toContain('<dt>Which theme?</dt>')
+    expect(withoutAnswer).toContain('No recorded answer')
+  })
+
+  it('expires a resolved-looking question interaction correctly when it was actually cancelled', () => {
+    const expired = renderActivity({ type: 'interaction', interaction: { id: 'q', kind: 'question', title: 'Claude needs your input', status: 'expired', outcome: 'Interrupted by user', input: {}, choices: [], questions: [{ id: 'color', question: 'Which theme?', options: [{ label: 'Night' }], multiSelect: false }] } })
+    expect(expired).toContain('<small>Expired</small>')
+    expect(expired).toContain('Interrupted by user')
+  })
+})
+
+describe('readableAnswerValue', () => {
+  it('returns short values unchanged', () => {
+    expect(readableAnswerValue('Blue')).toBe('Blue')
+  })
+  it('decodes percent-encoding', () => {
+    expect(readableAnswerValue('Ice%20Berry')).toBe('Ice Berry')
+  })
+  it('shows an unparseable percent sequence verbatim instead of throwing', () => {
+    expect(readableAnswerValue('50% done')).toBe('50% done')
+  })
+  it('truncates a long file path to its readable filename tail instead of cutting mid-word', () => {
+    const value = 'file:///C:/Claude/miron/Chinese%20jar/deliveries/batch-20260909-151338-199935/08-ice-berry-haf-wide.jpg'
+    expect(readableAnswerValue(value)).toBe('…/08-ice-berry-haf-wide.jpg')
+  })
+  it('truncates long free text on a word boundary', () => {
+    const value = 'word '.repeat(20)
+    const result = readableAnswerValue(value)
+    expect(result.endsWith('…')).toBe(true)
+    expect(result.slice(0, -1).trimEnd().endsWith('word')).toBe(true)
+  })
+})
+
+describe('combinedQuestionAnswer', () => {
+  const withOptions = (multiSelect: boolean): InputQuestion => ({ id: 'q', question: 'Q', options: [{ label: 'A' }, { label: 'B' }], multiSelect })
+  const freeText: InputQuestion = { id: 'q', question: 'Why?', options: [], multiSelect: false }
+
+  it('uses the selected option when custom is not selected', () => {
+    expect(combinedQuestionAnswer(withOptions(false), ['A'], false, 'ignored')).toEqual(['A'])
+  })
+  it('uses only the custom text once selected, for a single-select question', () => {
+    expect(combinedQuestionAnswer(withOptions(false), [], true, 'My answer')).toEqual(['My answer'])
+  })
+  it('falls back to the selected options when custom is selected but left empty', () => {
+    expect(combinedQuestionAnswer(withOptions(false), ['A'], true, '   ')).toEqual(['A'])
+  })
+  it('adds the custom text alongside checked options for a multi-select question', () => {
+    expect(combinedQuestionAnswer(withOptions(true), ['A', 'B'], true, 'Also this')).toEqual(['A', 'B', 'Also this'])
+  })
+  it('ignores an unselected custom text for a multi-select question', () => {
+    expect(combinedQuestionAnswer(withOptions(true), ['A'], false, 'typed but not selected')).toEqual(['A'])
+  })
+  it('treats a plain free-text question as answered only once typed', () => {
+    expect(combinedQuestionAnswer(freeText, [], false, '')).toEqual([])
+    expect(combinedQuestionAnswer(freeText, [], false, 'Because')).toEqual(['Because'])
+  })
+})
+
+describe('custom answer as a selectable option', () => {
+  it('offers "Other" as one more selectable choice instead of a parallel textbox', () => {
+    const interaction: PendingInteraction = { id: 'q', kind: 'question', title: 'Pick', status: 'pending', input: {}, choices: [], questions: [{ id: 'color', question: 'Pick a color', options: [{ label: 'Blue' }, { label: 'Green' }], multiSelect: false }] }
+    const html = renderActivity({ type: 'interaction', interaction })
+    expect(html).toContain('<strong>Other</strong>')
+    expect((html.match(/type="radio"/g) ?? []).length).toBe(3)
+    expect(html).not.toContain('class="sa-custom-answer"')
+  })
+  it('still offers a plain free-text field for a question with no options at all', () => {
+    const interaction: PendingInteraction = { id: 'q', kind: 'question', title: 'Explain', status: 'pending', input: {}, choices: [], questions: [{ id: 'why', question: 'Why?', options: [], multiSelect: false }] }
+    const html = renderActivity({ type: 'interaction', interaction })
+    expect(html).not.toContain('<strong>Other</strong>')
+    expect(html).toContain('class="sa-custom-answer"')
+  })
+  it('offers "Other" as one more checkbox for a multi-select question', () => {
+    const interaction: PendingInteraction = { id: 'q', kind: 'question', title: 'Pick', status: 'pending', input: {}, choices: [], questions: [{ id: 'systems', question: 'Which systems?', options: [{ label: 'Windows' }, { label: 'Linux' }], multiSelect: true }] }
+    const html = renderActivity({ type: 'interaction', interaction })
+    expect((html.match(/type="checkbox"/g) ?? []).length).toBe(3)
+    expect(html).toContain('<strong>Other</strong>')
   })
 })

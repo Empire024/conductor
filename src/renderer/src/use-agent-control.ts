@@ -68,7 +68,10 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
       // returns, including when Project tasks is itself the active pane tab.
       next = { ...session, layout: focus ? added : activateTab(added, group.id, group.activeTabId), maximizedGroupId: focus ? null : session.maximizedGroupId }
     }
-    focusedGroupId = group.id; tab = created; reveal = focus; result = serialize(created, group.id)
+    // A tab an agent opens lands active in its own group, so it's already there the moment the
+    // owner looks - but only an explicit focus:true asks to move the owner's actual attention
+    // there. Without it, the window, project and workspace the owner is looking at never move.
+    focusedGroupId = group.id; tab = created; reveal = request.params.focus === true; result = serialize(created, group.id)
   } else {
     if (!tab) throw new Error('The requested tab is no longer open.')
     if (request.action === 'tabs.rename') {

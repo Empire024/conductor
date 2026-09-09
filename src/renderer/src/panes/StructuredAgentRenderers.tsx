@@ -5,7 +5,8 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DiffEditor, type DiffOnMount } from '@monaco-editor/react'
 import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, Copy, FileCode2, Link2, Maximize2, X } from 'lucide-react'
-import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
+import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, InputQuestion, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
+import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import { languageForPath, SyntaxCode } from './SyntaxCode'
 import { fileTypeStyle } from '../file-types'
 import { copyText } from '../clipboard'
@@ -35,12 +36,23 @@ export function parentLabelAnchors(items: TimelineItem[]): Set<string> {
   }
   return anchors
 }
-/** Diagnostics remain in the event inspector, not the conversation timeline. */
-export function isConversationActivity(item: TimelineItem): boolean {
+/** Claude represents "ask the user a question" as both a real `AskUserQuestion` tool call and a
+ *  separate interaction request, correlated by sharing the same native tool_use id. The tool
+ *  call's own row only ever repeats the question and the provider's raw, unreadable echo of the
+ *  answer, so once a sibling question interaction shares that id the bare tool call is a
+ *  duplicate rather than new information. */
+export function isAnsweredThroughInteraction(item: TimelineItem, items: TimelineItem[]): boolean {
+  if (item.data.type !== 'tool' || !item.nativeItemId) return false
+  return items.some((other) => other !== item && other.runtimeId === item.runtimeId && other.nativeItemId === item.nativeItemId && other.data.type === 'interaction' && other.data.interaction.kind === 'question')
+}
+/** Diagnostics remain in the event inspector, not the conversation timeline. `items` is only
+ *  supplied when called through `Array.prototype.filter`, which passes it as the third argument. */
+export function isConversationActivity(item: TimelineItem, _index?: number, items: TimelineItem[] = []): boolean {
   const data = item.data
   if (data.type === 'session' || data.type === 'usage') return false
   if (isRuntimeHeartbeat(item)) return false
   if (data.type === 'subagent') return ['failed', 'interrupted', 'rejected'].includes(data.status)
+  if (isAnsweredThroughInteraction(item, items)) return false
   if (data.type !== 'notice') return true
   if (data.outputArtifactId) return true
   if (/^(?:Snapshot unavailable:|Unsupported .*control request:|Live retry stopped:|Incomplete tool input JSON;)/.test(data.message) || data.message.includes('Interruption requested;')) return true
@@ -369,14 +381,63 @@ export function interactionOutcome(outcome?: string): string {
   if (!outcome) return 'Resolved'
   return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', 'allow-session': 'Allowed for session', 'auto-mode': 'Auto-mode enabled', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
 }
+const MAX_ANSWER_VALUE_LENGTH = 72
+/** Claude can offer a raw, percent-encoded path as an answer choice (a disambiguating
+ *  `file:///…` URI). Shown verbatim these are unreadable, and naive truncation used to cut them
+ *  off mid-word; decoding first and, once too long, keeping the meaningful tail (the filename)
+ *  reads the way the owner actually chose it. */
+export function readableAnswerValue(value: string): string {
+  let decoded = value
+  try { decoded = decodeURIComponent(value) } catch { /* Not percent-encoded, or malformed; show it verbatim. */ }
+  if (decoded.length <= MAX_ANSWER_VALUE_LENGTH) return decoded
+  const segments = decoded.replaceAll('\\', '/').split('/').filter(Boolean)
+  const tail = segments.length > 1 ? segments.at(-1)! : ''
+  if (tail && tail.length <= MAX_ANSWER_VALUE_LENGTH - 2) return '…/' + tail
+  const truncated = decoded.slice(0, MAX_ANSWER_VALUE_LENGTH)
+  const lastSpace = truncated.lastIndexOf(' ')
+  return (lastSpace > MAX_ANSWER_VALUE_LENGTH * 0.6 ? truncated.slice(0, lastSpace) : truncated).trimEnd() + '…'
+}
 function InteractionCard({ item, interactive, onRespond }: ActivityProps): React.JSX.Element | null {
+  const [submittedAnswers, setSubmittedAnswers] = useState<Record<string, string[]> | null>(null)
   if (item.data.type !== 'interaction') return null
   const request: PendingInteraction = item.data.interaction
-  if (request.status === 'pending' && interactive) return <PendingInteractionForm item={item} request={request} onRespond={onRespond} />
+  if (request.status === 'pending' && interactive) return <PendingInteractionForm item={item} request={request} onRespond={async (target, decision, answers) => {
+    if (answers) setSubmittedAnswers(answers)
+    await onRespond(target, decision, answers)
+  }} />
+  const questions = request.questions ?? []
+  // A question's own row IS the interaction: once answered, its collapsed heading names the
+  // question that was actually asked instead of repeating the generic, now-stale "needs your
+  // input" prompt, and its body reads as question/answer text instead of a raw request dump.
+  const heading = request.kind === 'question' && questions.length ? (questions.length === 1 ? questions[0]!.question : `${questions.length} questions`) : request.title
+  const status = request.kind === 'question' && request.status === 'resolved' ? 'Answered' : request.status === 'resolved' ? interactionOutcome(request.outcome) : request.status === 'expired' ? 'Expired' : 'Unavailable'
   return <details className="sa-interaction sa-interaction-resolved" aria-label={request.kind + ': ' + request.title}>
-    <summary><span>{request.title}</span><small>{request.status === 'resolved' ? interactionOutcome(request.outcome) : request.status === 'expired' ? 'Expired' : 'Unavailable'}</small></summary>
-    <div className="sa-interaction-detail">{request.status === 'expired' && request.outcome && <p>{request.outcome}</p>}<pre><SyntaxCode value={JSON.stringify(request.input, null, 2)} language="json" /></pre>{request.questions?.map((question) => <p key={question.id}>{question.question}</p>)}</div>
+    <summary><span>{heading}</span><small>{status}</small></summary>
+    <div className="sa-interaction-detail">
+      {request.status === 'expired' && request.outcome && <p>{request.outcome}</p>}
+      {request.kind === 'question' && questions.length
+        ? <dl className="sa-question-answers">{questions.map((question) => {
+          // The provider records answers by question text on the resolved interaction, so a
+          // conversation reloaded from history still reads back what was chosen.
+          const recorded = request.answers?.[question.question]
+          const chosen = submittedAnswers?.[question.id] ?? (recorded === undefined ? undefined : Array.isArray(recorded) ? recorded : [recorded])
+          return <div key={question.id}><dt>{question.question}</dt><dd>{chosen?.length ? chosen.map((value) => readableAnswerValue(value)).join(', ') : 'No recorded answer'}</dd></div>
+        })}</dl>
+        : <pre><SyntaxCode value={JSON.stringify(request.input, null, 2)} language="json" /></pre>}
+      {request.kind === 'question' && questions.length > 0 && <details className="sa-request-details"><summary title="Inspect exact request and scope">Request details</summary><pre>{JSON.stringify(request.input, null, 2)}</pre></details>}
+    </div>
   </details>
+}
+/** A question's free-text answer used to sit in its own textbox next to the real options, so an
+ *  option could stay checked while text was also typed: two answers looked chosen at once.
+ *  "Custom"/"Other" is a selectable entry itself; only after picking it does its text field
+ *  matter, and picking a normal option clears it. Multi-select keeps custom as one more entry in
+ *  the checked set, combined with whatever normal options are also checked. */
+export function combinedQuestionAnswer(question: InputQuestion, selected: string[], customSelected: boolean, customText: string): string[] {
+  const text = customText.trim()
+  if (question.options.length === 0) return text ? [text] : []
+  if (!customSelected || !text) return selected
+  return question.multiSelect ? [...selected, text] : [text]
 }
 /** A live request asks one question at a time rather than stacking them all, and pins itself to
  *  the bottom of the conversation while the pane is tall enough to still read the transcript
@@ -384,6 +445,7 @@ function InteractionCard({ item, interactive, onRespond }: ActivityProps): React
 function PendingInteractionForm({ item, request, onRespond }: { item: TimelineItem; request: PendingInteraction; onRespond: ActivityProps['onRespond'] }): React.JSX.Element {
   const [answers, setAnswers] = useState<Record<string, string[]>>({})
   const [custom, setCustom] = useState<Record<string, string>>({})
+  const [customSelected, setCustomSelected] = useState<Record<string, boolean>>({})
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [step, setStep] = useState(0)
@@ -392,7 +454,8 @@ function PendingInteractionForm({ item, request, onRespond }: { item: TimelineIt
   const questions = request.questions ?? []
   const stepped = request.kind === 'question' && questions.length > 1
   const current = Math.min(step, Math.max(0, questions.length - 1))
-  const answered = (question: { id: string }): boolean => Boolean(answers[question.id]?.length || custom[question.id]?.trim())
+  const finalAnswer = (question: InputQuestion): string[] => combinedQuestionAnswer(question, answers[question.id] ?? [], Boolean(customSelected[question.id]), custom[question.id] ?? '')
+  const answered = (question: InputQuestion): boolean => finalAnswer(question).length > 0
   const unanswered = questions.some((question) => !answered(question))
   const lastStep = !stepped || current === questions.length - 1
   useLayoutEffect(() => {
@@ -409,7 +472,7 @@ function PendingInteractionForm({ item, request, onRespond }: { item: TimelineIt
   const respond = async (decision?: string): Promise<void> => {
     if (busy || request.kind === 'question' && unanswered) return
     setBusy(true)
-    try { await onRespond(item, decision, request.kind === 'question' ? Object.fromEntries(questions.map((question) => [question.id, custom[question.id]?.trim() ? [custom[question.id]!.trim()] : answers[question.id] ?? []])) : undefined) }
+    try { await onRespond(item, decision, request.kind === 'question' ? Object.fromEntries(questions.map((question) => [question.id, finalAnswer(question)])) : undefined) }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false) }
   }
   const proceed = (): void => {
@@ -426,17 +489,28 @@ function PendingInteractionForm({ item, request, onRespond }: { item: TimelineIt
     {(stepped ? questions.slice(current, current + 1) : questions).map((question) => <fieldset key={question.id} disabled={busy}>
       <legend>{question.header && <small>{question.header}</small>}{question.question}</legend>
       <div className="sa-question-options">{question.options.map((option) => {
-        const checked = !custom[question.id]?.trim() && (answers[question.id] ?? []).includes(option.label)
+        const checked = (answers[question.id] ?? []).includes(option.label)
         return <label className={'sa-question-option' + (checked ? ' selected' : '')} key={option.label}>
           <input type={question.multiSelect ? 'checkbox' : 'radio'} name={item.id + '-' + question.id} checked={checked} onChange={(event) => {
-            setCustom((value) => ({ ...value, [question.id]: '' }))
+            if (!question.multiSelect) { setCustomSelected((value) => ({ ...value, [question.id]: false })); setCustom((value) => ({ ...value, [question.id]: '' })) }
             setAnswers((value) => ({ ...value, [question.id]: question.multiSelect ? event.target.checked ? [...(value[question.id] ?? []), option.label] : (value[question.id] ?? []).filter((label) => label !== option.label) : [option.label] }))
           }} />
           <span className="sa-choice-indicator" aria-hidden="true">{checked && <Check size={12} />}</span>
           <span><strong>{option.label}</strong>{option.description && <small>{option.description}</small>}</span>
         </label>
-      })}</div>
-      {question.allowCustom !== false && <label className="sa-custom-answer"><span>{question.options.length ? 'Or type an answer' : 'Your answer'}</span><input type={question.isSecret ? 'password' : 'text'} value={custom[question.id] ?? ''} onChange={(event) => setCustom((value) => ({ ...value, [question.id]: event.target.value }))} /></label>}
+      })}
+      {question.options.length > 0 && question.allowCustom !== false && <label className={'sa-question-option' + (customSelected[question.id] ? ' selected' : '')}>
+        <input type={question.multiSelect ? 'checkbox' : 'radio'} name={item.id + '-' + question.id} checked={Boolean(customSelected[question.id])} onChange={(event) => {
+          const selected = question.multiSelect ? event.target.checked : true
+          setCustomSelected((value) => ({ ...value, [question.id]: selected }))
+          if (!question.multiSelect) setAnswers((value) => ({ ...value, [question.id]: [] }))
+          if (!selected) setCustom((value) => ({ ...value, [question.id]: '' }))
+        }} />
+        <span className="sa-choice-indicator" aria-hidden="true">{customSelected[question.id] && <Check size={12} />}</span>
+        <span><strong>Other</strong></span>
+      </label>}
+      </div>
+      {question.allowCustom !== false && (question.options.length === 0 || customSelected[question.id]) && <label className="sa-custom-answer"><span>Your answer</span><input type={question.isSecret ? 'password' : 'text'} value={custom[question.id] ?? ''} onChange={(event) => setCustom((value) => ({ ...value, [question.id]: event.target.value }))} /></label>}
     </fieldset>)}
     <div className="sa-interaction-actions">{request.kind === 'question'
       ? <>
@@ -458,8 +532,11 @@ export function legacyAttachedContext(text: string): { prompt: string; context: 
   return { prompt: text.slice(0, match.index), context: text.slice(match.index).trimStart() }
 }
 function MessageText({ data, cwd, projectId, onOpenFile }: { data: Extract<AgentEventData, { type: 'text' }>; cwd: string; projectId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
+  // The memory-write directive is a control instruction for Conductor, not something the user
+  // asked to read; it is captured elsewhere and must never surface in the rendered reply.
+  const text = data.role === 'assistant' ? stripMemoryDirectives(data.text) : data.text
   const legacy = data.role === 'user' && !data.attachments?.length ? legacyAttachedContext(data.text) : null
-  return <><StructuredMarkdown text={legacy?.prompt ?? data.text} cwd={cwd} projectId={projectId} onOpenFile={onOpenFile} />{legacy && <details className="sa-legacy-context"><summary>Attached context</summary><StructuredMarkdown text={legacy.context} cwd={cwd} projectId={projectId} onOpenFile={onOpenFile} /></details>}</>
+  return <><StructuredMarkdown text={legacy?.prompt ?? text} cwd={cwd} projectId={projectId} onOpenFile={onOpenFile} />{legacy && <details className="sa-legacy-context"><summary>Attached context</summary><StructuredMarkdown text={legacy.context} cwd={cwd} projectId={projectId} onOpenFile={onOpenFile} /></details>}</>
 }
 
 export const StructuredActivity = memo(function StructuredActivity(props: ActivityProps): React.JSX.Element | null {

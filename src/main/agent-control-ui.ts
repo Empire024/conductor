@@ -24,8 +24,13 @@ export class AgentControlUi {
   request = (request: AgentControlUiRequest): Promise<unknown> => {
     const window = this.windowFor(request)
     if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return Promise.reject(new Error('Open the workspace in Conductor before controlling its tabs'))
-    if (window.isMinimized()) window.restore()
-    window.show(); window.focus()
+    // Opening a tab is the one thing an agent reaches for on its own initiative; raising the
+    // window for it is exactly the focus-stealing this silences. Every other action is a
+    // deliberate ask to look at something, and an explicit focus:true still raises the window.
+    if (request.action !== 'tabs.open' || request.params.focus === true) {
+      if (window.isMinimized()) window.restore()
+      window.show(); window.focus()
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.pending.delete(request.id); reject(new Error('Workspace did not acknowledge the action. Inspect the UI before retrying.')) }, 30000)
       this.pending.set(request.id, { senderId: window.webContents.id, resolve, reject, timer })

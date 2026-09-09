@@ -42,17 +42,18 @@ const object = (value: unknown): Args => {
 }
 const toolSignatures = {
   'tools.list': '() — discover these methods and arguments',
-  'app.state': '() — current project, workspace, tabs, relationships and the machine each tab runs on',
+  'app.state': '() — current project, workspace, tabs, relationships, the machine each tab runs on, and the other projects open in this Conductor',
+  'projects.list': '() — every project open in this Conductor with its workspaces; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks',
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
-  'tabs.list': '() — open tabs in this workspace, including detached windows',
-  'tabs.open': '({kind?,provider?,model?,effort?,title?,machineId?}) — visible tab; agent default kind, provider/model must be available; a new agent tab inherits the controller permission mode, clamped to the target provider, and runs on the controller machine unless machineId names another from machines.list',
+  'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
+  'tabs.open': '({kind?,provider?,model?,effort?,title?,machineId?,projectId?,workspaceId?}) — visible tab; agent default kind, provider/model must be available; a new agent tab inherits the controller permission mode, clamped to the target provider, and runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it',
   'tabs.focus': '({tabId})',
   'tabs.rename': '({tabId,title})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
   'tabs.detach': '({tabId})',
   'tabs.close': '({tabId}) — asks the owner to confirm; never closes the caller or its ancestors',
-  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt',
+  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project',
   'agents.snapshot': '({agentSessionId}) — observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
@@ -61,11 +62,11 @@ const toolSignatures = {
   'agents.resume': '({agentSessionId}) ? reconnect an idle/disconnected native conversation with its existing settings',
   'agents.fork': '({agentSessionId,title?}) ? fork supported idle native history into a visible linked tab',
   'agents.release': '({agentSessionId}) — release this controller relationship',
-  'files.list': '({query?}) — indexed project search, at most 100 matches with stable URIs',
-  'files.read': '({path}) — UTF-8 text up to 1 MiB',
-  'files.write': '({path,content,expectedContent}) — atomic compare-and-save; expectedContent:null creates a file; live views refresh',
-  'files.open': '({path}) — open the file in a visible editor',
-  'tasks.list': '() — feature-list.md bug/feature/idea tasks, their recorded owners and revision',
+  'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
+  'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
+  'files.write': '({path,content,expectedContent}) — atomic compare-and-save in this project only; expectedContent:null creates a file; live views refresh. To change a sibling project, open a tab there with tabs.open({projectId}) and dispatch the work to it',
+  'files.open': '({path,projectId?}) — open the file in a visible editor',
+  'tasks.list': '({projectId?}) — feature-list.md bug/feature/idea tasks, their recorded owners and revision',
   'tasks.update': '({revision,id,status?:"todo"|"doing"|"done",title?,priority?:"high"|"normal"|"low"}) — optimistic update preserving markers and other agents’ claims',
   'memory.recall': '({query?})',
   'memory.remember': `({gist,kind?:${MEMORY_KINDS.map(kind => JSON.stringify(kind)).join('|')},cues?:string[]}) — writes agent-owned memory`,
@@ -76,8 +77,12 @@ const toolSignatures = {
   'orchestration.routines.save': '({id?,name,description?,steps:[{title,instructions?,assignedAgentId?}]})',
   'workspace.rename': '({title})',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,projectTaskIds?:string[]}]}) - one to four visible coworkers with actual models/efforts; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,projectTaskIds?:string[],projectId?,workspaceId?}]}) - one to four visible coworkers with actual models/efforts; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it'
 } as const
+
+/** The methods a caller may point at another project the owner has open in this window. Writes
+ *  stay out: a change to a sibling project is made by a tab that lives there and shows its work. */
+const crossProjectMethods: string[] = ['tabs.list', 'tabs.open', 'files.list', 'files.read', 'files.open', 'tasks.list']
 
 export interface AgentControlDependencies {
   database: ConductorDatabase
@@ -176,38 +181,60 @@ export class AgentControl {
     }
   }
 
-  private target(scope: AgentControlScope, id: string, mutate = false): AgentControlTab {
+  /**
+   * The tab an agents.* call names, and the workspace it actually lives in. Anything in the
+   * caller's own workspace stays open to it as before. A tab somewhere else - another workspace,
+   * or a sibling project the owner co-opened - is reachable only to the controller that opened it
+   * there, so a project cannot reach sideways into conversations it did not create.
+   */
+  private target(scope: AgentControlScope, id: string, mutate = false): { tab: AgentControlTab; scope: AgentControlScope } {
     const spec = this.deps.database.structured.spec<AgentSpec>(id)
-    const tab = this.tabs(scope).find(tab => tab.kind === 'agent' && tab.resourceId === id)
-    if (!tab || !spec || spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId) throw new Error('Agent is outside this workspace or has no visible tab')
+    const missing = new Error('Agent is outside this workspace or has no visible tab')
+    if (!spec) throw missing
+    const elsewhere = spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId
+    const link = this.linkFor(id)
+    if (elsewhere && link?.controllerAgentSessionId !== scope.agentSessionId) throw missing
+    const target = elsewhere ? { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId } : scope
+    const tab = this.tabs(target).find(tab => tab.kind === 'agent' && tab.resourceId === id)
+    if (!tab) throw missing
     if (mutate) {
-      const links = this.links(scope)
       const ancestors = new Set([scope.agentSessionId])
-      for (let cursor = scope.agentSessionId; links.has(cursor);) {
-        cursor = links.get(cursor)!
-        if (ancestors.has(cursor)) break
-        ancestors.add(cursor)
+      for (let cursor = scope.agentSessionId;;) {
+        const parent = this.linkFor(cursor)?.controllerAgentSessionId
+        if (!parent || ancestors.has(parent)) break
+        ancestors.add(parent); cursor = parent
       }
       if (ancestors.has(id)) throw new Error('An agent cannot control itself or an ancestor')
-      const owner = links.get(id)
-      if (owner && owner !== scope.agentSessionId) throw new Error('Another agent already controls this tab; its controller must release it first')
+      if (link && link.controllerAgentSessionId !== scope.agentSessionId) throw new Error('Another agent already controls this tab; its controller must release it first')
     }
-    return tab
+    return { tab, scope: target }
   }
 
-  private links(scope: AgentControlScope): Map<string, string> {
-    return new Map(this.listLinks(scope.projectId, scope.sessionId).map(link => [link.targetAgentSessionId, link.controllerAgentSessionId]))
+  /**
+   * Who controls this tab, wherever that controller sits. A link only binds while the controller
+   * still has an open tab of its own; otherwise a closed or crashed controller would hold the tab
+   * forever and nobody could take it over. A controller in a sibling project recorded its own
+   * workspace on the link, so ownership is checked there rather than beside the controlled tab.
+   */
+  private linkFor(agentSessionId: string): AgentControlLink | null {
+    const stored = this.deps.database.getSetting('agentControlParent:' + agentSessionId)
+    if (!stored) return null
+    let link: AgentControlLink
+    try { link = JSON.parse(stored) as AgentControlLink } catch { return null }
+    if (link.targetAgentSessionId !== agentSessionId) return null
+    const projectId = link.controllerProjectId ?? link.projectId, sessionId = link.controllerSessionId ?? link.sessionId
+    if (this.deps.database.getSession(sessionId)?.projectId !== projectId) return null
+    return this.tabs({ projectId, sessionId, agentSessionId: '' }).some(tab => tab.resourceId === link.controllerAgentSessionId) ? link : null
   }
 
   listLinks(projectId: string, sessionId: string): AgentControlLink[] {
     const tabs = this.tabs({ projectId, sessionId, agentSessionId: '' }), ids = new Set(tabs.map(tab => tab.resourceId))
     return tabs.flatMap(tab => {
-      const stored = tab.resourceId && this.deps.database.getSetting('agentControlParent:' + tab.resourceId)
-      if (!stored) return []
-      try {
-        const link = JSON.parse(stored) as AgentControlLink
-        return link.projectId === projectId && link.sessionId === sessionId && ids.has(link.controllerAgentSessionId) && link.targetAgentSessionId === tab.resourceId ? [{ ...link, controllerTitle: tabs.find(tab => tab.resourceId === link.controllerAgentSessionId)?.title, controlledTitle: tab.title }] : []
-      } catch { return [] }
+      // The cable is only drawn between two tabs of one workspace; a cross-project controller has
+      // no tab here to draw it from, so its link stays invisible while still binding ownership.
+      const link = tab.resourceId ? this.linkFor(tab.resourceId) : null
+      return link && link.projectId === projectId && link.sessionId === sessionId && ids.has(link.controllerAgentSessionId)
+        ? [{ ...link, controllerTitle: tabs.find(tab => tab.resourceId === link.controllerAgentSessionId)?.title, controlledTitle: tab.title }] : []
     })
   }
 
@@ -218,19 +245,73 @@ export class AgentControl {
     this.deps.database.removeSetting('agentControlParent:' + targetAgentSessionId)
     if (stored) {
       const link = JSON.parse(stored) as AgentControlLink
-      this.deps.collaboration.postMessage({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: link.controllerAgentSessionId, toAgentSessionId: targetAgentSessionId, kind: 'handoff', body: 'The owner released this control relationship.', metadata: { control: 'detached', controllerTabId: link.controllerTabId, controlledTabId: link.controlledTabId } })
+      // Same rule as relationship(): there is no shared thread to post to when the controller
+      // that was just released lives in another project.
+      if (!link.controllerProjectId || link.controllerProjectId === spec.projectId && link.controllerSessionId === spec.sessionId) {
+        this.deps.collaboration.postMessage({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: link.controllerAgentSessionId, toAgentSessionId: targetAgentSessionId, kind: 'handoff', body: 'The owner released this control relationship.', metadata: { control: 'detached', controllerTabId: link.controllerTabId, controlledTabId: link.controlledTabId } })
+      } else this.deps.linksChanged?.({ projectId: link.controllerProjectId, sessionId: link.controllerSessionId ?? link.sessionId })
     }
     this.deps.linksChanged?.({ projectId: spec.projectId, sessionId: spec.sessionId })
   }
 
-  private relationship(scope: AgentControlScope, tab: AgentControlTab, state: 'attached' | 'detached'): void {
+  private relationship(scope: AgentControlScope, target: AgentControlScope, tab: AgentControlTab, state: 'attached' | 'detached'): void {
     const source = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)
+    const together = target.projectId === scope.projectId && target.sessionId === scope.sessionId
     if (state === 'attached') {
-      const link: AgentControlLink = { projectId: scope.projectId, sessionId: scope.sessionId, controllerAgentSessionId: scope.agentSessionId, targetAgentSessionId: tab.resourceId!, controllerTabId: source!.id, controlledTabId: tab.id }
+      const link: AgentControlLink = { projectId: target.projectId, sessionId: target.sessionId, controllerAgentSessionId: scope.agentSessionId, targetAgentSessionId: tab.resourceId!, controllerTabId: source!.id, controlledTabId: tab.id, ...(together ? {} : { controllerProjectId: scope.projectId, controllerSessionId: scope.sessionId }) }
       this.deps.database.setSetting('agentControlParent:' + tab.resourceId, JSON.stringify(link))
     } else this.deps.database.removeSetting('agentControlParent:' + tab.resourceId)
-    this.deps.linksChanged?.(scope)
-    this.deps.collaboration.postMessage({ ...scope, toAgentSessionId: tab.resourceId, kind: 'handoff', body: state === 'attached' ? `Controlling ${tab.title}` : `Released ${tab.title}`, metadata: { control: state, controllerTabId: source?.id, controlledTabId: tab.id } })
+    this.deps.linksChanged?.(target)
+    if (!together) { this.deps.linksChanged?.(scope); return }
+    // A collaboration message is a note between coworkers of one project; there is no shared
+    // thread to post it to when the controller lives in another one.
+    this.deps.collaboration.postMessage({ ...target, agentSessionId: scope.agentSessionId, toAgentSessionId: tab.resourceId, kind: 'handoff', body: state === 'attached' ? `Controlling ${tab.title}` : `Released ${tab.title}`, metadata: { control: state, controllerTabId: source?.id, controlledTabId: tab.id } })
+  }
+
+  /**
+   * Every project open in this Conductor. Two projects side by side in one window is the owner's
+   * own arrangement, so an agent may look across at a sibling and hand work to it; this never
+   * reaches past this window, and writing into a sibling still goes through a tab opened there.
+   */
+  private projects(scope: AgentControlScope): Array<{ id: string; name: string; path: string; current: boolean; uri: string; workspaces: Array<{ id: string; name: string; uri: string; current: boolean }> }> {
+    return this.deps.database.listProjects().map(project => ({
+      id: project.id, name: project.name, path: project.path, current: project.id === scope.projectId,
+      uri: conductorUri(project.id, 'workspace', this.deps.database.listSessions(project.id)[0]?.id ?? ''),
+      workspaces: this.deps.database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name, uri: conductorUri(project.id, 'workspace', workspace.id), current: workspace.id === scope.sessionId }))
+    }))
+  }
+
+  /** The tabs this caller opened outside its own workspace, so a handoff stays findable after the
+   *  agentSessionId that tabs.open returned has scrolled out of the caller's context. */
+  private controlledElsewhere(scope: AgentControlScope): Array<{ tab: AgentControlTab; scope: AgentControlScope }> {
+    const found: Array<{ tab: AgentControlTab; scope: AgentControlScope }> = []
+    for (const project of this.deps.database.listProjects()) {
+      for (const workspace of this.deps.database.listSessions(project.id)) {
+        if (project.id === scope.projectId && workspace.id === scope.sessionId) continue
+        const target = { projectId: project.id, sessionId: workspace.id, agentSessionId: scope.agentSessionId }
+        for (const tab of this.tabs(target)) {
+          if (tab.kind !== 'agent' || !tab.resourceId) continue
+          if (this.linkFor(tab.resourceId)?.controllerAgentSessionId === scope.agentSessionId) found.push({ tab, scope: target })
+        }
+      }
+    }
+    return found
+  }
+
+  /** Resolves an optional projectId/workspaceId onto a co-open project. Omitting both always
+   *  means the caller's own workspace, so every existing call keeps its exact meaning. */
+  private sibling(scope: AgentControlScope, args: Args): AgentControlScope {
+    if (args.projectId === undefined && args.workspaceId === undefined) return scope
+    const projectId = args.projectId === undefined ? scope.projectId : text(args, 'projectId', 160)
+    // Co-opening two projects is the owner's consent for this window's own agents. A conversation
+    // a paired machine is driving stays inside the one project that machine was granted, which is
+    // what the pairing approval promised.
+    if (projectId !== scope.projectId && this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
+    if (!this.deps.database.getProject(projectId)) throw new Error('No project with that id is open in this Conductor; use projects.list')
+    const workspaces = this.deps.database.listSessions(projectId)
+    const sessionId = args.workspaceId === undefined ? projectId === scope.projectId ? scope.sessionId : workspaces[0]?.id : text(args, 'workspaceId', 160)
+    if (!sessionId || !workspaces.some(workspace => workspace.id === sessionId)) throw new Error('That workspace is not open in the requested project; use projects.list')
+    return { projectId, sessionId, agentSessionId: scope.agentSessionId }
   }
 
   private ui(scope: AgentControlScope, action: AgentControlUiRequest['action'], params: Args): Promise<unknown> {
@@ -253,13 +334,16 @@ export class AgentControl {
     return tabMachineId(this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId))
   }
 
-  private async open(scope: AgentControlScope, args: Args): Promise<AgentControlTab> {
+  private async open(scope: AgentControlScope, args: Args): Promise<AgentControlTab & { projectId: string; workspaceId: string }> {
     const kind = (args.kind ?? 'agent') as PaneKind
     const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs']
     if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
+    // Where the tab is going. Only the caller's own scope is ever authorized; the target only
+    // says which open workspace receives the tab.
+    const target = this.sibling(scope, args)
     const machines = this.machines()
     const machineId = inheritMachineId(this.callerMachineId(scope), args.machineId, machines)
-    if (machineId !== LOCAL_MACHINE_ID) return this.openOnMachine(scope, machineId, machines, args) as Promise<AgentControlTab>
+    if (machineId !== LOCAL_MACHINE_ID) return this.openOnMachine(scope, target, machineId, machines, args) as Promise<AgentControlTab & { projectId: string; workspaceId: string }>
     const title = args.title === undefined ? kind === 'agent' ? 'Agent' : kind : text(args, 'title', 120)
     const tab: PaneTab = { id: makeId('tab'), kind, title }
     if (kind === 'agent') {
@@ -275,7 +359,10 @@ export class AgentControl {
       tab.resourceId = makeId('agent')
       tab.title = args.title === undefined ? model.label : title
       tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual', machineId }
-      const spec: AgentSpec = { id: tab.resourceId, projectId: scope.projectId, sessionId: scope.sessionId, provider, model: model.id, title: tab.title, cwd: source.cwd }
+      // A tab handed to a sibling project belongs to that project and works in its folder, not in
+      // the folder of whoever asked for it.
+      const cwd = target.projectId === scope.projectId ? source.cwd : this.deps.database.getProject(target.projectId)!.path
+      const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd }
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || 'Provider unavailable')
       const created = this.deps.database.structured.snapshot(spec.id)!
@@ -287,50 +374,55 @@ export class AgentControl {
       if (kind === 'terminal') tab.resourceId = makeId('terminal')
       tab.state = { ...tab.state, machineId }
     }
-    await this.ui(scope, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
-    const opened = this.tab(scope, tab.id)
-    if (kind === 'agent') this.relationship(scope, opened, 'attached')
-    return opened
+    await this.ui(target, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
+    const opened = this.tab(target, tab.id)
+    if (kind === 'agent') this.relationship(scope, target, opened, 'attached')
+    return { ...opened, projectId: target.projectId, workspaceId: target.sessionId }
   }
 
   /**
    * Places the tab on a paired machine instead of this one. The tab is created and shown over
    * there; what comes back identifies it so the caller can steer it through the same machine.
    */
-  private async openOnMachine(scope: AgentControlScope, machineId: string, machines: MachineDescriptor[], args: Args): Promise<unknown> {
+  private async openOnMachine(scope: AgentControlScope, target: AgentControlScope, machineId: string, machines: MachineDescriptor[], args: Args): Promise<unknown> {
     const machine = machines.find(candidate => candidate.id === machineId)!
     // Refused before anything is dialled, and refused again against a live answer inside
     // openRemote; the message names which identity rule stopped it so the owner can act on it.
-    const placement = machineRunsProject(machine, scope.projectId)
+    // The identity that has to match is the project the tab is for, not the caller's own.
+    const placement = machineRunsProject(machine, target.projectId)
     if (!placement.ok) throw new Error(placement.message)
     if (!this.deps.openRemote) throw new Error('Remote machine placement is unavailable in this window')
     if (args.kind !== undefined && args.kind !== 'agent') throw new Error('Only agent tabs can be opened on another machine')
     const created = await this.deps.openRemote(machineId, {
-      projectId: scope.projectId,
-      sessionId: scope.sessionId,
+      projectId: target.projectId,
+      sessionId: target.sessionId,
       ...(typeof args.provider === 'string' ? { provider: args.provider } : {}),
       ...(typeof args.model === 'string' ? { model: args.model } : {}),
       ...(typeof args.effort === 'string' ? { effort: args.effort } : {}),
       ...(args.title === undefined ? {} : { title: text(args, 'title', 120) })
     })
-    return { machineId, machineName: created.machineName, remote: true, tabId: created.tabId, agentSessionId: created.agentSessionId,
+    return { machineId, machineName: created.machineName, remote: true, tabId: created.tabId, agentSessionId: created.agentSessionId, projectId: target.projectId, workspaceId: target.sessionId,
       note: `This tab runs on ${created.machineName}. Steer it with agents.* through that machine; it is not a local tab.` }
   }
 
   async call(scope: AgentControlScope, method: string, rawArgs: unknown = {}): Promise<unknown> {
     const source = this.authorize(scope), args = object(rawArgs), { database, sessions, backlogs, orchestration } = this.deps
     if (process.env.CONDUCTOR_LIVE_TESTS === '1') throw new Error('App control is disabled during isolated live acceptance tests')
-    if (args.projectId !== undefined && args.projectId !== scope.projectId || args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
+    if (args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
+    // Naming another project is only meaningful for the methods that were opened to a sibling;
+    // everywhere else it is still an attempt to act outside the authorized scope.
+    if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
     if (method === 'tools.list') return toolSignatures
-    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: [...this.links(scope)].map(([agentSessionId, controllerAgentSessionId]) => ({ agentSessionId, controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines() }
+    if (method === 'projects.list') return this.projects(scope)
+    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope) }
     if (method === 'machines.list') {
       return this.machines().map(machine => {
         const placement = machineRunsProject(machine, scope.projectId)
-        return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: placement.ok ? null : placement.message }
+        return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: !placement.ok ? placement.message : machine.kind === 'local' ? 'Runs every project open in this Conductor; projects.list names them.' : null }
       })
     }
     if (method === 'models.list') return this.catalog(scope)
-    if (method === 'tabs.list') return this.tabs(scope)
+    if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
     if (method === 'tabs.open') return this.open(scope, args)
     if (['tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close'].includes(method)) {
       const tab = this.tab(scope, text(args, 'tabId', 160))
@@ -341,20 +433,23 @@ export class AgentControl {
       this.authorize(scope); this.tab(scope, tab.id)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
       const result = await this.ui(scope, method as AgentControlUiRequest['action'], args)
-      if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, tab, 'detached')
+      if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, scope, tab, 'detached')
       return result
     }
     if (method === 'agents.list') {
       const observedAt = new Date().toISOString()
-      return this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
+      const own = this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
+      // A tab this caller handed to another open project is still its own work to follow, and it
+      // would otherwise be unfindable after the id that came back from tabs.open is forgotten.
+      return [...own, ...this.controlledElsewhere(scope).map(({ tab, scope: target }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true }))]
     }
     if (method.startsWith('agents.')) {
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history'].includes(method)
-      const tab = this.target(scope, id, mutate), state = database.structured.snapshot(id)!
+      const { tab, scope: target } = this.target(scope, id, mutate), state = database.structured.snapshot(id)!
       if (method === 'agents.snapshot') {
         const recent = [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence)).slice(0, 60)
         const activeTools = state.items.filter(item => item.data.type === 'tool' && ['preparing', 'running', 'awaiting_approval'].includes(item.data.status))
-        return { ...this.observation(scope, tab, state, new Date().toISOString()), ...state, activeTools, items: recent.sort((a, b) => a.sequence - b.sequence), truncated: state.truncated || state.items.length > recent.length }
+        return { ...this.observation(target, tab, state, new Date().toISOString()), ...state, activeTools, items: recent.sort((a, b) => a.sequence - b.sequence), truncated: state.truncated || state.items.length > recent.length }
       }
       if (method === 'agents.history') return database.structured.events(id, typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0).slice(0, 100)
       if (method === 'agents.resume' || method === 'agents.fork') {
@@ -362,39 +457,49 @@ export class AgentControl {
         if (method === 'agents.resume') { await sessions.resume(id, state.settings); return { agentSessionId: id, phase: database.structured.snapshot(id)?.phase } }
         const forkId = await sessions.fork(id)
         const forkTab: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: forkId, title: args.title === undefined ? tab.title + ' (fork)' : text(args, 'title', 120), state: { ...tab.state, viewMode: 'visual' } }
-        await this.ui(scope, 'tabs.open', { tab: forkTab })
-        const opened = this.tab(scope, forkTab.id)
-        this.relationship(scope, opened, 'attached')
-        return opened
+        await this.ui(target, 'tabs.open', { tab: forkTab })
+        const opened = this.tab(target, forkTab.id)
+        this.relationship(scope, target, opened, 'attached')
+        return { ...opened, projectId: target.projectId, workspaceId: target.sessionId }
       }
-      if (method === 'agents.release') { this.relationship(scope, tab, 'detached'); return { released: true } }
+      if (method === 'agents.release') { this.relationship(scope, target, tab, 'detached'); return { released: true } }
       if (method === 'agents.interrupt') { await sessions.interrupt(id); return { interrupted: true } }
       if (method === 'agents.submit' || method === 'agents.steer') {
         const prompt = text(args, 'prompt')
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot dispatch to a writable conversation')
-        this.relationship(scope, tab, 'attached')
+        this.relationship(scope, target, tab, 'attached')
         // A coordinated prompt is not the owner's message. Record the controlling tab so the
         // conversation attributes it to that coworker instead of to "You".
         const controller = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
-        const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: controller?.title || 'Another Conductor tab' }
+        const label = controller?.title || 'Another Conductor tab'
+        const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: target.projectId === scope.projectId ? label : `${label} (${database.getProject(scope.projectId)?.name ?? 'another project'})` }
         try {
           if (method === 'agents.submit') await sessions.submit(id, prompt, state.settings, [], origin)
           else await sessions.steer(id, prompt, state.settings, [], origin)
-        } catch (error) { this.relationship(scope, tab, 'detached'); throw error }
-        return { agentSessionId: id, tabId: tab.id, uri: tab.uri, phase: database.structured.snapshot(id)?.phase }
+        } catch (error) { this.relationship(scope, target, tab, 'detached'); throw error }
+        return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: target.projectId, workspaceId: target.sessionId, phase: database.structured.snapshot(id)?.phase }
       }
     }
-    if (method === 'files.list') return (await searchProjectFiles([database.getProject(scope.projectId)!], typeof args.query === 'string' ? args.query.slice(0, 300) : '', { showHidden: true })).map(file => ({ ...file, uri: conductorUri(scope.projectId, 'file', file.path) }))
+    if (method === 'files.list') {
+      const target = this.sibling(scope, args)
+      return (await searchProjectFiles([database.getProject(target.projectId)!], typeof args.query === 'string' ? args.query.slice(0, 300) : '', { showHidden: true })).map(file => ({ ...file, projectId: target.projectId, uri: conductorUri(target.projectId, 'file', file.path) }))
+    }
     if (['files.read', 'files.write', 'files.open'].includes(method)) {
-      const path = await workspacePath(source.cwd, text(args, 'path', 4000), method === 'files.write')
+      const target = this.sibling(scope, args)
+      const foreign = target.projectId !== scope.projectId
+      // Reading across co-open projects is fine; changing one is not. A sibling's files are
+      // edited by a tab that lives there, where the owner can see the work being done.
+      if (foreign && method === 'files.write') throw new Error('files.write only writes in this project. Open a tab in the other project with tabs.open({projectId}) and dispatch the change to it.')
+      const root = foreign ? database.getProject(target.projectId)!.path : source.cwd
+      const path = await workspacePath(root, text(args, 'path', 4000), method === 'files.write')
       if (method !== 'files.write' && (!statSync(path).isFile() || statSync(path).size > 1024 * 1024)) throw new Error('Only text files up to 1 MiB are supported')
       // Match workspacePath's native resolver, including Windows 8.3 folder aliases.
-      const relativePath = relative(await realpath(source.cwd), path).replaceAll('\\', '/')
+      const relativePath = relative(await realpath(root), path).replaceAll('\\', '/')
       this.authorize(scope)
-      if (method === 'files.open') return this.ui(scope, 'files.open', { path: relativePath })
+      if (method === 'files.open') return this.ui(target, 'files.open', { path: relativePath })
       // Same guard the editor uses: an agent asking for a binary file gets a
       // clear refusal rather than a megabyte of mojibake it will act on.
-      if (method === 'files.read') return { path: relativePath, content: readTextFile(path), uri: conductorUri(scope.projectId, 'file', relativePath) }
+      if (method === 'files.read') return { path: relativePath, projectId: target.projectId, content: readTextFile(path), uri: conductorUri(target.projectId, 'file', relativePath) }
       if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
       if (typeof args.content !== 'string' || Buffer.byteLength(args.content) > 1024 * 1024 || !(args.expectedContent === null || typeof args.expectedContent === 'string' && Buffer.byteLength(args.expectedContent) <= 1024 * 1024)) throw new Error('Provide content and the exact expectedContent (null for a new file), up to 1 MiB')
       const lease = this.deps.collaboration.announcePresence({ ...scope, path: relativePath, intent: args.expectedContent === null ? 'create' : 'edit', ttlSeconds: 90 })
@@ -403,7 +508,7 @@ export class AgentControl {
       if (saved.status === 'saved') { invalidateProjectFiles(source.cwd); this.deps.fileChanged({ ...scope, path: relativePath }) }
       return saved
     }
-    if (method === 'tasks.list') return backlogs.get(scope.projectId)
+    if (method === 'tasks.list') return backlogs.get(this.sibling(scope, args).projectId)
     if (method === 'tasks.update') {
       if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
       const board = await backlogs.get(scope.projectId), id = text(args, 'id', 160), task = board.tasks.find(task => task.id === id)
@@ -479,6 +584,9 @@ export class AgentControl {
       const request = object(value); text(request, 'title', 120); text(request, 'prompt')
       const ids = request.projectTaskIds ?? []
       if (!Array.isArray(ids) || ids.length > 50 || ids.some(id => typeof id !== 'string' || !id || id.length > 160 || seen.has(id) || !seen.add(id))) throw new Error('Provide distinct exact project task IDs across this dispatch')
+      // A checklist claim is owned by the project whose feature-list.md holds it, and only an
+      // agent of that project can be seen to still hold it. Handing one across would strand it.
+      if (ids.length && request.projectId !== undefined && request.projectId !== scope.projectId) throw new Error('A worker in another project cannot take this project’s task claims; dispatch it without projectTaskIds')
       return { ...request, projectTaskIds: ids as string[] }
     })
     if (seen.size && restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('A read-only or planning controller cannot assign project tasks')
@@ -511,7 +619,12 @@ export class AgentControl {
           }
         }
         const ownership = request.projectTaskIds.length ? '\n\nExact Project tasks assigned to this worker: ' + request.projectTaskIds.join(', ') + '. Read tasks.list before updating these IDs. Ownership is transferred immediately after prompt acceptance; wait for the handoff if it is not visible yet. Do not seize unrelated claims.' : ''
-        await this.call(scope, 'agents.submit', { agentSessionId: tab.resourceId, prompt: String(request.prompt) + ownership + '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol.' })
+        // The orchestration row belongs to the dispatching project, so a worker handed to a
+        // sibling project is not asked to close a task it cannot even see; its controller does that.
+        const coordination = tab.projectId === scope.projectId
+          ? '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol.'
+          : '\n\nThis work was handed to the ' + (this.deps.database.getProject(tab.projectId)?.name ?? 'this') + ' project by a coworker in ' + (this.deps.database.getProject(scope.projectId)?.name ?? 'another project') + '. You work only in this project; your controller is ' + scope.agentSessionId + ' and tracks the task on its own side, so report your result here rather than looking for its task board.'
+        await this.call(scope, 'agents.submit', { agentSessionId: tab.resourceId, prompt: String(request.prompt) + ownership + coordination })
         accepted = true
         if (request.projectTaskIds.length) {
           let current = await this.deps.backlogs.get(scope.projectId)
@@ -523,10 +636,10 @@ export class AgentControl {
           }
           this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
         }
-        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, provider: tab.state!.provider, model: tab.state!.model, effort: state.settings.effort, uri: tab.uri, accepted })
+        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, provider: tab.state!.provider, model: tab.state!.model, effort: state.settings.effort, uri: tab.uri, accepted })
       } catch (error) {
         this.deps.orchestration.updateTask(task.id, { status: 'blocked' })
-        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, accepted, error: error instanceof Error ? error.message : String(error) })
+        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, accepted, error: error instanceof Error ? error.message : String(error) })
       }
     }
     return results

@@ -167,6 +167,16 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(f.transport.sent.at(-1)).toMatchObject({ type: 'control_response', response: { request_id: 'ask', response: { behavior: 'allow', updatedInput: { ...input, answers: { 'Which systems?': ['Windows', 'Linux'] } } } } })
   })
 
+  it('records the chosen answers on the resolved interaction so history can read them back', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    const input = { questions: [{ question: 'Which label?', header: 'Label', options: [{ label: 'Ice Berry' }, { label: 'Sun Berry' }] }] }
+    f.transport.receive(permission('ask', 'question-tool', 'AskUserQuestion', input))
+    await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'ask', answers: { 'question:0': ['Ice Berry'] } })
+    const resolved = f.events.filter(event => event.data.type === 'interaction').map(event => event.data).at(-1)
+    expect(resolved).toMatchObject({ interaction: { status: 'resolved', answers: { 'Which label?': 'Ice Berry' } } })
+  })
+
   it('expires cancelled requests, interrupts through control protocol, and does not turn ACK into completion', async () => {
     const f = fixture()
     await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
@@ -544,6 +554,18 @@ describe('Claude background task reporting (payloads captured from a real sessio
     expect(reported[0]).toMatchObject({ name: 'Run Codex on the steering implementation', status: 'running', detached: true })
     expect(reported[1]).toMatchObject({ name: 'Run Codex on the steering implementation', status: 'completed' })
     expect(reported[1]?.name).not.toContain('exit code')
+  })
+
+  it('clamps a report-sized summary to a one-line roster name', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    const report = '## 1. `HAF_Blaze_Tax_Price_Sync` - includes/class-tax-price-sync.php ' + 'design notes and verified call sites '.repeat(400)
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'agent-1', tool_use_id: 'toolu_R', is_backgrounded: true, task_type: 'local_bash' })
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'agent-1', tool_use_id: 'toolu_R', status: 'completed', output_file: 'C:/tmp/agent-1.output', summary: report })
+    const named = subagents(f).at(-1)?.name ?? ''
+    expect(named.length).toBeLessThanOrEqual(120)
+    expect(named).toContain('HAF_Blaze_Tax_Price_Sync')
+    expect(named).not.toContain('\n')
   })
 
   it('still reports a completion that names an output file after its start was missed', async () => {

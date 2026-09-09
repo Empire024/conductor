@@ -3,7 +3,7 @@ import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-hist
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
-import { settingsForRuntime } from '../shared/structured-agent'
+import { MAX_PROMPT_CHARS, settingsForRuntime } from '../shared/structured-agent'
 import type { AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
@@ -41,12 +41,15 @@ interface LiveSession {
    *  reason is stated once instead of on every tool call that hits it. */
   snapshotNotices?: Set<string>
   shutdownTimer?: NodeJS.Timeout
+  activityPhase?: AgentActivityPhase
   /** The cap decision that stopped this conversation; cleared when the owner changes the cap. */
   capStop?: { reason: string; capKey: string }
   capTimer?: NodeJS.Timeout
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
+/** Activity states a conversation can be cut off in; anything else has already settled. */
+const inFlight = new Set<AgentActivityPhase>(['working', 'waiting_input'])
 
 export class StructuredSessions {
   private live = new Map<string, LiveSession>()
@@ -325,6 +328,7 @@ export class StructuredSessions {
       if (typeof text !== 'string' || !text.trim() || text.length > 60000) throw new Error('Prompt must contain 1-60000 characters')
       this.validateSettings(settings, state.capabilities)
       const context = await this.attachments(live, captured)
+      this.assertPromptWithinLimit(text.trim().length + context.length)
       let latest = this.database.structured.snapshot(id)!
       if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
       let refusal = 'The current turn does not support steering'
@@ -464,6 +468,7 @@ export class StructuredSessions {
       const userItemId = randomUUID()
       const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId) ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
+      this.assertPromptWithinLimit(submitted.length)
       this.reserveLive(live, settings, submitted)
       store.update(id, { settings, title: state.title || text.trim().replace(/\s+/g, ' ').slice(0, 80) })
       await this.connect(live)
@@ -490,6 +495,12 @@ export class StructuredSessions {
     if (settings.approvalPolicy && !capabilities?.approvalPolicies?.includes(settings.approvalPolicy)) throw new Error('Approval policy unsupported by this provider')
     if (settings.model && (settings.model.length > 160 || /[\r\n\0]/.test(settings.model))) throw new Error('Invalid model')
     if (settings.effort && settings.effort !== 'auto' && !capabilities?.effort.includes(settings.effort)) throw new Error('Effort is not supported by this provider')
+  }
+  /** The CLI/API refuses the whole turn with an opaque error past this ceiling. Attachment and
+   *  recalled-memory expansion can silently inflate a short-looking draft well past it, so the
+   *  final assembled text is checked here rather than trusting the raw typed length. */
+  private assertPromptWithinLimit(length: number): void {
+    if (length > MAX_PROMPT_CHARS) throw new Error(`Prompt must contain 1-${MAX_PROMPT_CHARS} characters; this message is ${length.toLocaleString()} characters including attached context. Remove or shorten an attachment, or trim the message.`)
   }
   private async attachments(live: LiveSession, attachments: ContextAttachment[]): Promise<string> {
     if (!Array.isArray(attachments) || attachments.length > 20) throw new Error('Too many attachments')
@@ -680,7 +691,13 @@ export class StructuredSessions {
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), 32)
     if (data.type === 'session') queueMicrotask(() => { void this.drainQueue(live) })
     if (data.type === 'session') {
-      const phase: AgentActivityPhase = data.phase === 'running' || data.phase === 'starting' || data.phase === 'interrupting' ? 'working' : data.phase.startsWith('waiting') ? 'waiting_input' : data.phase === 'completed' ? 'complete' : data.phase === 'failed' ? 'failed' : data.phase === 'disconnected' ? 'disconnected' : data.phase === 'interrupted' ? 'stopped' : 'idle'
+      const reported: AgentActivityPhase = data.phase === 'running' || data.phase === 'starting' || data.phase === 'interrupting' ? 'working' : data.phase.startsWith('waiting') ? 'waiting_input' : data.phase === 'completed' ? 'complete' : data.phase === 'failed' ? 'failed' : data.phase === 'disconnected' ? 'disconnected' : data.phase === 'interrupted' ? 'stopped' : 'idle'
+      // A lost connection says nothing on its own about whether output was cut off, so only a
+      // conversation that was still in flight reports as disconnected; one that had already
+      // settled keeps the state it settled in rather than turning its project into a warning.
+      const settled = live.activityPhase ?? 'idle'
+      const phase: AgentActivityPhase = reported === 'disconnected' && !inFlight.has(settled) ? settled : reported
+      live.activityPhase = phase
       // AgentRecord.status is a coarser union than the phase, so the unhappy phases collapse
       // back onto its own vocabulary here rather than leaking new values into stored rows.
       const status = phase === 'working' || phase === 'idle' ? 'running' : phase === 'failed' || phase === 'disconnected' ? 'error' : phase === 'stopped' ? 'exited' : phase

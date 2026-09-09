@@ -282,6 +282,19 @@ export const applyTabDrop = (
 /** Whether `target` would actually move the tab. A pane's last tab cannot peel off the pane
  * it already fills, so the drag preview asks this before squeezing that pane open for an
  * edge it will then refuse - the indicator only ever promises a drop that really happens. */
+/** Grafts a tab this layout has never seen - one dragged in from another window - onto a drop
+ * target resolved the same way a local drag resolves one. There is no source group to remove it
+ * from here: the window it came from clears its own copy once the drag session confirms the
+ * drop landed somewhere. */
+export const insertForeignTab = (
+  layout: WorkspaceLayout,
+  tab: PaneTab,
+  target: TabDropTarget
+): WorkspaceLayout =>
+  target.kind === 'bar'
+    ? addTab(layout, target.groupId, tab, target.index)
+    : splitGroup(layout, target.groupId, target.edge, tab)
+
 export const tabDropLands = (
   layout: WorkspaceLayout,
   sourceGroupId: string,

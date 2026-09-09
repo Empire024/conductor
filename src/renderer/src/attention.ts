@@ -22,7 +22,9 @@ export const getAttentionSessionIds = (
 export type SessionActivityStatus = 'working' | 'waiting' | 'done'
 
 const statusForPhase = (phase: AgentActivityPhase): SessionActivityStatus | null => {
-  // A stopped agent is quiet on purpose, so only the two involuntary states ask for a look.
+  // A stopped agent is quiet on purpose, so only the involuntary states ask for a look; a
+  // conversation that had already settled before losing its connection never reports as
+  // disconnected in the first place.
   if (phase === 'waiting_input' || phase === 'failed' || phase === 'disconnected') return 'waiting'
   if (phase === 'working' || phase === 'limited') return 'working'
   if (phase === 'complete') return 'done'

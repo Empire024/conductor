@@ -4,6 +4,7 @@ import { ProviderIcon } from '../components/ProviderIcon'
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Archive, ArrowDown, ArrowLeft, FileDiff, FilePlus2, History, ListTree, Pin, Play, PlugZap, Settings2, TerminalSquare, MessagesSquare, LoaderCircle, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
+import { MAX_PROMPT_CHARS } from '../../../shared/structured-agent'
 import type { AgentEvent, ContextAttachment, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../../../shared/structured-agent-reducer'
 import { coalesceTextDeltas } from './coalesce-stream-events'
@@ -17,8 +18,8 @@ import { StructuredAgentTelemetry, StructuredLiveTokens, StructuredUsageSummary 
 import { distinguishSubagentLabels, subagentColorIndex, subagentIdentityId, summarizeSubagents } from './usage-summary'
 import { followsBottomAfterScroll, hasTimelineSelection, latestOwnerPrompt, truncatePromptPreview } from './conversation-scroll'
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
-import { composerChildKey, nextComposerSettings, resolvedComposerSettings } from './composer-settings'
-import { CommandAutocomplete } from './CommandAutocomplete'
+import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
+import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
 import { composerCommands, matchingComposerCommands, type ComposerCommand } from './composer-commands'
 import { concreteModel } from '../../../shared/agent-model-selection'
 import { useComposerDraft } from './use-composer-draft'
@@ -282,7 +283,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     const text = message.trim()
     const connectingMetadata = projection.phase === 'starting' && metadataConnectionId.current === activeId
     const queuing = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase)
-    if (!text || submitLock.current || conversationSwitch.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived) return
+    if (composerSendBlock(message, attachments) || submitLock.current || conversationSwitch.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived) return
     submitLock.current = true
     setSubmitting(true)
     setError('')
@@ -395,7 +396,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return () => window.removeEventListener('keydown', escape)
   }, [activeId, projection.phase, historical, addFileOpen])
 
-  const canSubmit = ready && !historical && !resuming && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
+  const promptChars = promptCharacterCount(message, attachments)
+  const sendBlocked = composerSendBlock(message, attachments)
+  const canSubmit = ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
   const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
   const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: Boolean(message.trim()), needsResume, steering, historical, canSubmit, submitting })
   const pendingSteering = projection.pendingSteering ?? []
@@ -514,6 +517,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setMessage(command.insert ?? '')
     if (command.insert) { composer.current?.focus(); return }
     if (command.name === 'attach') setAddFileOpen(true)
+    else if (command.name === 'browser' && command.trigger === '@') activateBrowserMention()
     else if (command.name === 'settings') setSettingsOpen(true)
     else if (command.name === 'model') pane.current?.querySelector<HTMLButtonElement>('[aria-label="Model"]')?.click()
     else if (command.name === 'history') setHistoryOpen(true)
@@ -598,6 +602,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         void window.conductor.structured.cancelQueued(activeId, prompt.id).then((queued) => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments((current) => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch((reason: unknown) => setError(String(reason)))
       }}><X size={12} /></button></div>)}</div>}
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title="Inspect attached context" onClick={() => setInspectAttachment(attachment)}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button><button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => setAttachments(current => current.filter(item => item.id !== attachment.id))}><X size={11} /></button></span>)}</div>}
+      {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
       <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? 'Message after the next tool use' : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => setCommandDismissed(true)} onChange={event => { setMessage(event.target.value); setCommandDismissed(false); setCommandIndex(0) }} onKeyDown={event => {
         if (event.nativeEvent.isComposing) return

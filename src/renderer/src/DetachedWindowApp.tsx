@@ -105,6 +105,14 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     }, 100)
   }, [detachedId, layout, maximizedGroupId])
 
+  // A detached window exists to hold the one tab it was created for. Once that tab leaves it -
+  // dragged back onto a workspace, dragged into another window, or simply closed - an empty
+  // floating window left behind is a ghost with nothing left to show; closing it here is what
+  // makes detach, re-attach and close symmetrical instead of only ever accumulating windows.
+  useEffect(() => {
+    if (layout && layout.root.type === 'group' && layout.root.tabs.length === 0) window.conductor.window.close()
+  }, [layout])
+
   useEffect(() => {
     const flush = (): void => {
       if (!layoutRef.current) return
@@ -252,6 +260,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               layout={layout}
               project={bundle.project}
               session={bundle.session}
+              detachedId={detachedId}
               focusedGroupId={focusedGroupId}
               maximizedGroupId={maximizedGroupId}
               onLayout={setLayout}

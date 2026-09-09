@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import type { AgentSpec } from '../shared/models'
-import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskEdit, ProjectTaskKind, ProjectTaskOwner, ProjectTaskPriority } from '../shared/project-backlog'
+import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskEdit, ProjectTaskKind, ProjectTaskOwner, ProjectTaskPriority, ProjectTaskWeight } from '../shared/project-backlog'
 import type { SourceControlChangeSet } from '../shared/source-control'
 import type { ConductorDatabase } from './database'
 import type { SourceControl } from './source-control'
@@ -10,7 +10,7 @@ import { writeEditorFile } from './editor-files'
 
 export const PROJECT_TASK_FILE = 'feature-list.md'
 const maximum = 1024 * 1024
-const template = '# Project tasks\n\nUse [ ] for to do, [~] for in progress, and [x] for done. Conductor keeps this file and the project task view in sync. Agents: preserve task markers and add your agent ID as agent=ID inside the marker when claiming an item. In native CLI sessions, CONDUCTOR_AGENT_ID contains your ID. Mark done only after completing the requested work.\n\n## Bugs\n\n## Features\n\n## Ideas\n'
+const template = '# Project tasks\n\nUse [ ] for to do, [~] for in progress, and [x] for done. Conductor keeps this file and the project task view in sync. Agents: preserve task markers and add your agent ID as agent=ID inside the marker when claiming an item. In native CLI sessions, CONDUCTOR_AGENT_ID contains your ID. Mark done only after completing the requested work.\n\n## Tasks\n\n## Bugs\n\n## Features\n\n## Ideas\n'
 const digest = (text:string):string => createHash('sha256').update(text).digest('hex')
 // Attributes (agent=, priority=...) are order-independent so hand-edited or older-version
 // markers still parse; anything unrecognized simply isn't picked up by attr() below.
@@ -23,8 +23,14 @@ const parsePriority = (value?:string):ProjectTaskPriority => {
   const lower=value?.toLowerCase()
   return lower==='high' || lower==='low' ? lower : 'normal'
 }
-const taskMarker = (id:string,agentId?:string|null,priority?:ProjectTaskPriority):string => '<!-- conductor-task:'+id+(agentId?' agent='+agentId:'')+(priority && priority!=='normal'?' priority='+priority:'')+' -->'
+/** Same degrade-to-default rule as priority, applied to the model weight suggestion. */
+const parseWeight = (value?:string):ProjectTaskWeight => {
+  const lower=value?.toLowerCase()
+  return lower==='heavy' || lower==='light' ? lower : 'medium'
+}
+const taskMarker = (id:string,agentId?:string|null,priority?:ProjectTaskPriority,weight?:ProjectTaskWeight):string => '<!-- conductor-task:'+id+(agentId?' agent='+agentId:'')+(priority && priority!=='normal'?' priority='+priority:'')+(weight && weight!=='medium'?' weight='+weight:'')+' -->'
 const sections:Record<ProjectTaskKind,{heading:string;pattern:RegExp}> = {
+  task: {heading:'Tasks', pattern: /^(?:#{1,6}\s*)?(?:tasks?|task list)\s*:?\s*$/i},
   bug: {heading:'Bugs', pattern: /^(?:#{1,6}\s*)?(?:bugs?|bug list)\s*:?\s*$/i},
   feature: {heading:'Features', pattern: /^(?:#{1,6}\s*)?(?:features?|feature list)\s*:?\s*$/i},
   idea: {heading:'Ideas', pattern: /^(?:#{1,6}\s*)?(?:ideas?|idea list)\s*:?\s*$/i}
@@ -43,6 +49,7 @@ export function parseProjectTasks(text:string):ProjectTask[] {
     if(/^\s*(```|~~~)/.test(source)) {fenced=!fenced;continue}
     if(fenced)continue
     const heading=source.replace(/^\s*#{1,6}\s*/,'').trim()
+    if(/^(tasks?|task list)\s*:?$/i.test(heading)) {kind='task';continue}
     if(/^(bugs?|bug list)\s*:?$/i.test(heading)) {kind='bug';continue}
     if(/^(features?|feature list)\s*:?$/i.test(heading)) {kind='feature';continue}
     if(/^(ideas?|idea list)\s*:?$/i.test(heading)) {kind='idea';continue}
@@ -55,7 +62,7 @@ export function parseProjectTasks(text:string):ProjectTask[] {
     const hash=digest(kind+'\n'+title).slice(0,20), count=duplicates.get(hash)??0
     duplicates.set(hash,count+1)
     const status=/^(x|implemented|done)$/i.test(item[1]??'')?'done':/^(~|in progress|working)$/i.test(item[1]??'')?'doing':'todo'
-    tasks.push({id:metadata?.[1] ?? hash+'-'+count,title,kind,status,agentId:attr(metadata?.[2],'agent'),priority:parsePriority(attr(metadata?.[2],'priority')),line:line+1,activity:[]})
+    tasks.push({id:metadata?.[1] ?? hash+'-'+count,title,kind,status,agentId:attr(metadata?.[2],'agent'),priority:parsePriority(attr(metadata?.[2],'priority')),weight:parseWeight(attr(metadata?.[2],'weight')),line:line+1,activity:[]})
     line=end-1
   }
   return tasks
@@ -76,16 +83,16 @@ export function updateProjectTaskText(text:string,edit:ProjectTaskEdit):string {
   const lines=text.split(/\r?\n/)
   if(edit.type==='add') {
     const section=sections[edit.kind as ProjectTaskKind]
-    if(!section)throw new Error('Choose Bug, Feature, or Idea')
+    if(!section)throw new Error('Choose Task, Bug, Feature, or Idea')
     const title=cleanTitle(edit.title)
     let index=-1
     for(let line=0;line<lines.length;line=taskEnd(lines,line)) {
       if(section.pattern.test(lines[line]!.trim())) {index=line;break}
     }
-    const added=taskLines('- [ ] ',title,taskMarker(randomUUID(),undefined,edit.priority && parsePriority(edit.priority)))
+    const added=taskLines('- [ ] ',title,taskMarker(randomUUID(),undefined,edit.priority && parsePriority(edit.priority),edit.weight && parseWeight(edit.weight)))
     if(index<0)lines.push('', '## '+section.heading, '', ...added)
     else {
-      while(index+1<lines.length && !/^\s*(?:#{1,6}\s+|(?:Bug|Feature|Idea) list:)/i.test(lines[index+1]!))index=taskEnd(lines,index+1)-1
+      while(index+1<lines.length && !/^\s*(?:#{1,6}\s+|(?:Bug|Feature|Idea|Task) list:)/i.test(lines[index+1]!))index=taskEnd(lines,index+1)-1
       lines.splice(index+1,0,...added,'')
     }
     return lines.join(ending)
@@ -100,8 +107,9 @@ export function updateProjectTaskText(text:string,edit:ProjectTaskEdit):string {
   const agentId=edit.agentId===undefined?task.agentId:edit.agentId
   if(agentId && !/^[a-zA-Z0-9_-]{1,160}$/.test(agentId))throw new Error('Invalid agent')
   const priority=edit.priority===undefined?task.priority:parsePriority(edit.priority)
+  const weight=edit.weight===undefined?task.weight:parseWeight(edit.weight)
   const prefix=/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.exec(lines[task.line-1]!)?.[0]??'- '
-  const replacement=taskLines(prefix+'['+({todo:' ',doing:'~',done:'x'}[status])+'] ',edit.title===undefined?task.title:cleanTitle(edit.title),taskMarker(task.id,agentId,priority))
+  const replacement=taskLines(prefix+'['+({todo:' ',doing:'~',done:'x'}[status])+'] ',edit.title===undefined?task.title:cleanTitle(edit.title),taskMarker(task.id,agentId,priority,weight))
   lines.splice(start,length,...replacement)
   return lines.join(ending)
 }

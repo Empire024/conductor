@@ -8,6 +8,7 @@ import { StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
+import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
 const roots: string[] = [], databases: ConductorDatabase[] = [], managers: StructuredSessions[] = []
@@ -274,6 +275,16 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(user?.data).toMatchObject({ text: 'Inspect selected context', attachments: [{ id: 'file', name: 'context.txt' }, { id: 'editor', name: 'context.txt (unsaved)' }, { id: 'selection', startLine: 2, endLine: 3 }] })
     expect(JSON.stringify(user?.data)).not.toContain('saved content')
     expect(JSON.stringify(user?.data)).not.toContain('[Attached')
+  })
+
+  it('refuses to dispatch once recalled memory or attachment expansion pushes the assembled prompt past the true CLI ceiling', async () => {
+    const f = fixture()
+    f.manager.dispose()
+    const huge = 'x'.repeat(MAX_PROMPT_CHARS + 1)
+    const withRecall = new StructuredSessions(f.database, () => 'synthetic-executable', f.broadcast, f.factory, () => huge)
+    managers.push(withRecall); withRecall.ensure(f.spec)
+    await expect(withRecall.submit(f.spec.id, 'short draft', settings)).rejects.toThrow('Prompt must contain')
+    expect(f.adapters.reduce((count, adapter) => count + adapter.submissions.length, 0)).toBe(0)
   })
 
   it('forks native context and copies immutable historical artifacts without an inference submission', async () => {
@@ -891,5 +902,27 @@ describe('composer settings persistence', () => {
     const f = fixture()
     expect(() => f.manager.saveSettings(f.spec.id, { ...settings, effort: 'ultra' })).toThrow(/Effort/)
     expect(f.database.structured.snapshot(f.spec.id)?.settings.effort).toBeUndefined()
+  })
+})
+
+describe('activity reported for a lost connection', () => {
+  const activityPhase = (f: ReturnType<typeof fixture>) =>
+    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+
+  it('reports disconnected when the connection is lost while the turn is still in flight', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Synthetic turn', settings)
+    expect(activityPhase(f)).toBe('working')
+    f.current.emit({ data: { type: 'session', phase: 'disconnected' } })
+    expect(activityPhase(f)).toBe('disconnected')
+  })
+
+  it('keeps the state a settled conversation finished in when its connection is lost afterwards', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Synthetic turn', settings)
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
+    expect(activityPhase(f)).toBe('complete')
+    f.current.emit({ data: { type: 'session', phase: 'disconnected' } })
+    expect(activityPhase(f)).toBe('complete')
   })
 })

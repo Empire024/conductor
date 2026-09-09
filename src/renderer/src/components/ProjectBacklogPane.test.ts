@@ -67,7 +67,7 @@ describe('sorting project tasks for display (priority first, then newest added)'
   // order, and the pane reorders only what it renders (see ProjectBacklogPane).
   const created = (at: string): ProjectTaskActivity[] => [{ id: at, status: 'todo', actor: 'file', at }]
   const task = (overrides: Partial<ProjectTask> & { id: string }): ProjectTask =>
-    ({ title: overrides.id, kind: 'bug', status: 'todo', priority: 'normal', line: 1, activity: [], ...overrides })
+    ({ title: overrides.id, kind: 'bug', status: 'todo', priority: 'normal', weight: 'medium', line: 1, activity: [], ...overrides })
 
   it('always ranks high above normal above low, independent of when each was added', () => {
     const low = task({ id: 'low', priority: 'low', activity: created('2026-01-03T00:00:00Z') })
@@ -180,5 +180,27 @@ describe('ProjectBacklogPane compose form image upload', () => {
     const html = render()
     expect(html).toContain('Still works')
     expect(html).not.toContain('sa-context-chips')
+  })
+
+  it('defaults a newly filed task to the neutral Task kind, not Bug', () => {
+    const html = render()
+    expect(html).toContain('aria-label="New task type"')
+    expect(html).toContain('<option value="task" selected="">Task</option>')
+    expect(html).toContain('<option value="bug">Bug</option>')
+  })
+
+  it('offers a compact weight control alongside the new task type, defaulting to medium', () => {
+    const html = render()
+    expect(html).toContain('aria-label="New task weight"')
+    expect(html).toContain('aria-haspopup="listbox"')
+    expect(html).toContain('project-weight-trigger weight-medium')
+    expect(html).toContain('Medium weight')
+    expect(html).not.toContain('<select aria-label="New task weight"')
+  })
+
+  it('lists Task alongside Bug, Feature and Idea in the type filter', () => {
+    const html = render()
+    expect(html).toContain('aria-label="Task type filter"')
+    expect(html).toContain('<option value="task">Tasks</option>')
   })
 })

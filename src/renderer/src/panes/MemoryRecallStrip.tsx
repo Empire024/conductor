@@ -6,13 +6,24 @@ import { kindMeta } from './MemoryPane'
 import './MemoryRecallStrip.css'
 
 /** Indexes a conversation's recall ledger by the user message each recall travelled with, so a
- *  turn can show exactly which memories reached the agent instead of only the prompt you typed. */
+ *  turn can show exactly which memories reached the agent instead of only the prompt you typed.
+ *
+ *  A memory that keeps scoring high for the same topic is recalled again on every message about
+ *  it, which would otherwise re-announce the same strip turn after turn. Recalls are ordered
+ *  oldest-first, so each turn here only keeps the memories not already shown earlier in this same
+ *  conversation; once nothing new reached the turn there is nothing left to say about it. */
 export function recallsByItem(recalls: readonly TurnMemoryRecall[]): Map<string, TurnMemoryRecall> {
+  // A resubmitted item id keeps the newest record: that is the recall that actually ran, so a
+  // superseded one must neither render nor claim memories out of the dedup pass below.
+  const latest = new Map<string, TurnMemoryRecall>()
+  for (const recall of recalls) if (recall.itemId) latest.set(recall.itemId, recall)
   const byItem = new Map<string, TurnMemoryRecall>()
+  const alreadyShown = new Set<string>()
   for (const recall of recalls) {
-    if (!recall.itemId) continue
-    // A resubmitted item id keeps the newest record: that is the recall that actually ran.
-    byItem.set(recall.itemId, recall)
+    if (!recall.itemId || latest.get(recall.itemId) !== recall) continue
+    const memories = recall.memories.filter((memory) => !alreadyShown.has(memory.id))
+    for (const memory of recall.memories) alreadyShown.add(memory.id)
+    byItem.set(recall.itemId, { ...recall, memories })
   }
   return byItem
 }

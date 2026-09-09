@@ -52,6 +52,8 @@
 .sa-agent-card { width: 100%; min-width: 0; }
 .sa-agent-card-heading { display: flex; width: 100%; gap: 9px; padding: 7px !important; text-align: left; border-radius: 6px; }
 .sa-agent-card-heading > span:nth-child(2) { min-width: 0; flex: 1; }
+/* A provider can report a name as long as a whole agent report; the row stays one line. */
+.sa-agent-card-heading > span:nth-child(2) > strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sa-agent-card-heading > svg { flex-shrink: 0; transition: transform 120ms; }
 .sa-agent-card-heading > svg.expanded { transform: rotate(180deg); }
 .sa-agent-card-heading:focus-visible { outline: 2px solid var(--accent); }

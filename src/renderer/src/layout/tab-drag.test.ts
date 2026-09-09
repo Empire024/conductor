@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { dropTargetAt, gapAnchorId, nearestEdge, tabInsertionIndex, type PaneGeometry, type TabRect } from './tab-drag'
+import {
+  decodeCrossWindowTab,
+  dropTargetAt,
+  encodeCrossWindowTab,
+  gapAnchorId,
+  nearestEdge,
+  tabInsertionIndex,
+  type CrossWindowTabPayload,
+  type PaneGeometry,
+  type TabRect
+} from './tab-drag'
 
 const rects: TabRect[] = [
   { id: 'a', left: 0, right: 100 },
@@ -113,5 +123,35 @@ describe('dropTargetAt', () => {
 
   it('reports an empty pane bar as index 0 so the first tab can be dropped in', () => {
     expect(dropTargetAt({ x: 200, y: 16 }, { ...pane, tabs: [] }, 'c')).toEqual({ kind: 'bar', groupId: 'g1', index: 0 })
+  })
+})
+
+describe('cross-window tab payload', () => {
+  const payload: CrossWindowTabPayload = {
+    tab: { id: 'tab-1', kind: 'agent', title: 'Worker', resourceId: 'agent-1' },
+    sourceGroupId: 'group-1',
+    projectId: 'project-1',
+    sessionId: 'session-1',
+    detachedId: 'detached-1'
+  }
+
+  it('round-trips a tab dragged out of a detached window', () => {
+    expect(decodeCrossWindowTab(encodeCrossWindowTab(payload))).toEqual(payload)
+  })
+
+  it('omits detachedId for a tab dragged out of the main window, and round-trips that too', () => {
+    const { detachedId: _detachedId, ...fromMain } = payload
+    const encoded = encodeCrossWindowTab(fromMain)
+    expect(encoded).not.toContain('detachedId')
+    expect(decodeCrossWindowTab(encoded)).toEqual(fromMain)
+  })
+
+  it('rejects malformed, foreign or incomplete payloads instead of throwing', () => {
+    expect(decodeCrossWindowTab('not json')).toBeNull()
+    expect(decodeCrossWindowTab('null')).toBeNull()
+    expect(decodeCrossWindowTab('42')).toBeNull()
+    expect(decodeCrossWindowTab(JSON.stringify({ tab: { id: 'x' } }))).toBeNull()
+    expect(decodeCrossWindowTab(JSON.stringify({ ...payload, tab: undefined }))).toBeNull()
+    expect(decodeCrossWindowTab(JSON.stringify({ ...payload, sessionId: 42 }))).toBeNull()
   })
 })

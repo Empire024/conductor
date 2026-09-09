@@ -1,5 +1,5 @@
 import type { Json, ProviderCapabilities } from '../../../shared/structured-agent'
-export interface ComposerCommand { name: string; description: string; insert?: string }
+export interface ComposerCommand { name: string; description: string; insert?: string; trigger?: '/' | '@' }
 const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 export function composerCommands(capabilities?: ProviderCapabilities, discovery?: Json): ComposerCommand[] {
   const commands: ComposerCommand[] = [
@@ -8,7 +8,8 @@ export function composerCommands(capabilities?: ProviderCapabilities, discovery?
     { name: 'settings', description: 'Open conversation settings' },
     { name: 'history', description: 'Browse saved conversations' },
     { name: 'stop', description: 'Stop the current turn' },
-    { name: 'resume', description: 'Reconnect this conversation' }
+    { name: 'resume', description: 'Reconnect this conversation' },
+    { name: 'browser', description: 'Attach the browser preview to this turn', trigger: '@' }
   ]
   if (capabilities?.plans) commands.push({ name: 'plan', description: 'Plan before making changes' }, { name: 'edit', description: 'Work on the task and make changes' })
   if (capabilities?.fork) commands.push({ name: 'fork', description: 'Continue in a copy of this conversation' })
@@ -27,8 +28,10 @@ export function composerCommands(capabilities?: ProviderCapabilities, discovery?
   if (Array.isArray(skillGroups)) for (const group of skillGroups) { const skills = object(group).skills; if (Array.isArray(skills)) skills.forEach(value => add(value, true)) }
   return commands
 }
+const triggerPatterns: Record<'/' | '@', RegExp> = { '/': /^\/[a-zA-Z0-9:_-]*$/, '@': /^@[a-zA-Z0-9:_-]*$/ }
 export function matchingComposerCommands(message: string, commands: ComposerCommand[]): ComposerCommand[] {
-  if (!/^\/[a-zA-Z0-9:_-]*$/.test(message)) return []
+  const trigger = message.startsWith('@') ? '@' : message.startsWith('/') ? '/' : undefined
+  if (!trigger || !triggerPatterns[trigger].test(message)) return []
   const query = message.slice(1).toLowerCase()
-  return commands.filter(command => command.name.toLowerCase().startsWith(query)).slice(0, 30)
+  return commands.filter(command => (command.trigger ?? '/') === trigger && command.name.toLowerCase().startsWith(query)).slice(0, 30)
 }

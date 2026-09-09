@@ -155,7 +155,7 @@ models they want
   
   ![image.png](.conductor/prompt-images/7e6bc8b3-6fe6-4b4e-8359-e9f47f45406b.png)
 
-- [ ] Stop button is amazing, but send button is still nasty.. [update: this was marked done, not done, it hasn't been re-designed] <!-- conductor-task:46f70c53-7942-4489-90f0-2f4a4584fdea agent=agent_mtu035p5_ezlg01o -->
+- [x] Stop button is amazing, but send button is still nasty.. [update: this was marked done, not done, it hasn't been re-designed] <!-- conductor-task:46f70c53-7942-4489-90f0-2f4a4584fdea agent=agent_mtunlyoz_mm2k2ey agent=agent_mtu035p5_ezlg01o -->
 
 - [x] Chevron to minify tabs should be next to 01 Workspace 1 not in between workspace and tabs.. <!-- conductor-task:a9dd0370-5280-4d12-9ea9-cee8c7821bf4 agent=agent_mtu035p5_ezlg01o -->
 
@@ -169,7 +169,7 @@ models they want
 
 - [x] Dragging tabs is fully broken. <!-- conductor-task:64352192-e182-4d66-8b5e-eecce2901a2c agent=agent_mtu404o5_zhiclam priority=high -->
 
-- [ ] Still see the broken chevron, please fix <!-- conductor-task:ea09f946-5ebd-494c-9eba-8dad432bb3c4 agent=agent_mtu406m9_t5a1uqd -->
+- [x] Still see the broken chevron, please fix <!-- conductor-task:ea09f946-5ebd-494c-9eba-8dad432bb3c4 agent=agent_mtunlyoz_mm2k2ey agent=agent_mtu406m9_t5a1uqd -->
 
 - [x] Redesign priority selector, currently broken (colors all red when high selected) <!-- conductor-task:a2c8c28b-8950-47a4-aa10-1b5943d1ec8b agent=agent_mtu405ms_r25z7jc priority=high -->
   
@@ -191,51 +191,55 @@ models they want
   
   ![image.png](.conductor/prompt-images/bb164458-1aa4-4464-b2f0-b697f209ba36.png)
 
-- [ ] Updater should be one click -> if a user clicks it, we go all the way to restarting. BUT: if there's any tab still running, ask the user if he really wants to quit, since that tab is running still.. <!-- conductor-task:39a207c9-b656-4b36-8ea1-52627b466913 -->
+- [x] Updater should be one click -> if a user clicks it, we go all the way to restarting. BUT: if there's any tab still running, ask the user if he really wants to quit, since that tab is running still.. <!-- conductor-task:39a207c9-b656-4b36-8ea1-52627b466913 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] need to be able to remove queued messages <!-- conductor-task:c5d6d189-ff27-430e-ad30-0404f168ee1a -->
+- [x] need to be able to remove queued messages <!-- conductor-task:c5d6d189-ff27-430e-ad30-0404f168ee1a agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] projects that have disconnected tabs show yellow even if they were done before, so all projects are just yellow all the time.. should be only if they were actually stopped during output, not if they were done in the first place. plus, there can be multiple states, currently, yellow takes over all.. <!-- conductor-task:0d76c319-42df-4c63-8628-fc74b8e5afdc -->
+- [x] projects that have disconnected tabs show yellow even if they were done before, so all projects are just yellow all the time.. should be only if they were actually stopped during output, not if they were done in the first place. plus, there can be multiple states, currently, yellow takes over all.. <!-- conductor-task:0d76c319-42df-4c63-8628-fc74b8e5afdc agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] tasks should also just have a default 'Task' one, not just bug/feature.. <!-- conductor-task:2336b162-6bd5-41bd-b446-bbedbfe0e1aa -->
+- [x] tasks should also just have a default 'Task' one, not just bug/feature.. <!-- conductor-task:2336b162-6bd5-41bd-b446-bbedbfe0e1aa agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] Agent creating new tab took my focus out of my current project and plopped me into said tab in another project. Maybe a notification'd be good, but not this. <!-- conductor-task:f379a89b-d3a5-457e-a511-ccc6e2d7fcb3 -->
+- [x] Agent creating new tab took my focus out of my current project and plopped me into said tab in another project. Maybe a notification'd be good, but not this. <!-- conductor-task:f379a89b-d3a5-457e-a511-ccc6e2d7fcb3 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] 'CONDUCTOR_MEMORY[semantic]:' we get these messages in chat.. fix <!-- conductor-task:2c9f312e-a520-4bcd-aa86-1fae776ba1e0 -->
+- [x] 'CONDUCTOR_MEMORY[semantic]:' we get these messages in chat.. fix <!-- conductor-task:2c9f312e-a520-4bcd-aa86-1fae776ba1e0 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] can't remove project tasks, add delete icon (ask if you really wanna delete it by icons only) available also via select multiple <!-- conductor-task:ae534926-469d-4e37-ae60-e149cdc72a10 -->
+- [x] can't remove project tasks, add delete icon (ask if you really wanna delete it by icons only) available also via select multiple <!-- conductor-task:ae534926-469d-4e37-ae60-e149cdc72a10 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] can't undetach a detached tab by bringing it back to workspace, it just leaves more ghost conductors behind and is always detached.. also drag cursor is just 'block' icon - fix <!-- conductor-task:4e23b5c0-afd9-4fc7-b73e-5df4f969551c -->
+- [x] can't undetach a detached tab by bringing it back to workspace, it just leaves more ghost conductors behind and is always detached.. also drag cursor is just 'block' icon - fix <!-- conductor-task:4e23b5c0-afd9-4fc7-b73e-5df4f969551c agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] When selecting tasks and sending them off to an agent, we should be able to add a prompt to it also if we want. <!-- conductor-task:758c424a-d177-4460-9bef-7dab1790b37e -->
+- [x] When selecting tasks and sending them off to an agent, we should be able to add a prompt to it also if we want. <!-- conductor-task:758c424a-d177-4460-9bef-7dab1790b37e agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] Work more on 'agent wants to forget memory' - currently, a nasty windows popup.. <!-- conductor-task:ef91741d-7368-4083-b923-e96dbf3e633e -->
+- [x] Work more on 'agent wants to forget memory' - currently, a nasty windows popup.. <!-- conductor-task:ef91741d-7368-4083-b923-e96dbf3e633e agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] this shouldn't happen, i.e. askuserquestions and then claude needs your input? that's weird.. (that's after I answered questions) - should just be one nice output. <!-- conductor-task:a818b8ca-1104-4186-9b67-7ceaea1b888f -->
+- [x] this shouldn't happen, i.e. askuserquestions and then claude needs your input? that's weird.. (that's after I answered questions) - should just be one nice output. <!-- conductor-task:a818b8ca-1104-4186-9b67-7ceaea1b888f agent=agent_mtunlyoz_mm2k2ey -->
   
   ![image.png](.conductor/prompt-images/b3693788-bd70-4116-b983-a4760b825411.png)
 
-- [ ] make sure effort is always displayed.. sometimes, we just don't see it, like this one tab has claude-opus-5, on hover i see effort 'low' but I don't see the changer anywhere.. <!-- conductor-task:c392beab-56dc-4c33-a0cb-04ff74662897 -->
+- [x] make sure effort is always displayed.. sometimes, we just don't see it, like this one tab has claude-opus-5, on hover i see effort 'low' but I don't see the changer anywhere.. <!-- conductor-task:c392beab-56dc-4c33-a0cb-04ff74662897 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] tasks need another selector next to urgency - weight - to set which models should be used for it, i.e. if we think task is heavy, we'll use smarter, more costly models, if we think it's a itty bitty task, some smaller models could do it - same for effort. <!-- conductor-task:a547f4a6-6226-41cb-84ab-3c4be1a672d0 -->
+- [x] tasks need another selector next to urgency - weight - to set which models should be used for it, i.e. if we think task is heavy, we'll use smarter, more costly models, if we think it's a itty bitty task, some smaller models could do it - same for effort. <!-- conductor-task:a547f4a6-6226-41cb-84ab-3c4be1a672d0 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] @browser should call browser like it does in vscode claude integration. <!-- conductor-task:05adbbcf-2534-4fe7-af43-b4b6ede981b8 -->
+- [x] @browser should call browser like it does in vscode claude integration. <!-- conductor-task:05adbbcf-2534-4fe7-af43-b4b6ede981b8 agent=agent_mtunlyoz_mm2k2ey -->
 
 - [x] INSANE BUG 'Snapshot unavailable: File is outside the session workspace' <!-- conductor-task:241cda0c-105f-4de8-a16b-2f064b235717 agent=agent_mtums6qy_vdgtdde priority=high -->
   SPAMS THE FUCK OUT OF WORKSPACE
   should ask for permission or something FIX FIX FIX
 
-- [ ] Memories are being recalled with every one of my messages sent - is that correct? It's at least annoying for me  to see. <!-- conductor-task:e5b29430-909e-41c6-961a-65c2f2e01422 -->
+- [x] Memories are being recalled with every one of my messages sent - is that correct? It's at least annoying for me  to see. <!-- conductor-task:e5b29430-909e-41c6-961a-65c2f2e01422 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] Currently, when asking questions, selecting an option, we can still write in the textbox custom option. Should be a selectable option therefore.. <!-- conductor-task:2a82a315-c06e-45ae-8fea-196051840b3e -->
+- [x] Currently, when asking questions, selecting an option, we can still write in the textbox custom option. Should be a selectable option therefore.. <!-- conductor-task:2a82a315-c06e-45ae-8fea-196051840b3e agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] When giving a project task to an agent, we should be able to select permission mode also not just model. <!-- conductor-task:311d3613-32ba-461f-8d67-7ccc1e833911 -->
+- [x] When giving a project task to an agent, we should be able to select permission mode also not just model. <!-- conductor-task:311d3613-32ba-461f-8d67-7ccc1e833911 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] Processes - In Progress claude tasks show 'Choose model' instead of correct model. <!-- conductor-task:9dafbe07-0b7b-4f8b-8551-3c71cdd809f4 -->
+- [x] Processes - In Progress claude tasks show 'Choose model' instead of correct model. <!-- conductor-task:9dafbe07-0b7b-4f8b-8551-3c71cdd809f4 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] Instead of the Local Status BS with Local Workspcae in bottom left corner, add an ultra minified 'Processes' that just shows us whats going on (mostly to track token usage amongst multiple projects and theri workspaces. <!-- conductor-task:23983160-8163-4587-82c7-eacaff9cdd79 -->
+- [x] Instead of the Local Status BS with Local Workspcae in bottom left corner, add an ultra minified 'Processes' that just shows us whats going on (mostly to track token usage amongst multiple projects and theri workspaces. <!-- conductor-task:23983160-8163-4587-82c7-eacaff9cdd79 agent=agent_mtunlyoz_mm2k2ey -->
 
-- [ ] Dragging works, but there are no 'ghost previews' showing where the window would land + resizing of the existing windows is naaasty! <!-- conductor-task:6bdabd01-fdcc-473e-82ef-9b9b9bd7066f -->
+- [x] Dragging works, but there are no 'ghost previews' showing where the window would land + resizing of the existing windows is naaasty! <!-- conductor-task:6bdabd01-fdcc-473e-82ef-9b9b9bd7066f agent=agent_mtunlyoz_mm2k2ey -->
+
+- [x] INSANE FUCKING BUG - PROMPT MUST CONTAIN 1-600000 CHARACTERS - FIX <!-- conductor-task:2153a831-299d-425d-a430-8e86d121920d agent=agent_mtunlyoz_mm2k2ey -->
+
+- [ ] Workspace can get flagged green even though an agent is actively churning - this seems to happen when it's controling other tabs and then they finish and it works, it doesn't even have a loader. <!-- conductor-task:038c7a04-7e22-4821-be7e-cc7f82f2a094 -->
 
 Feature list:
 

@@ -206,7 +206,24 @@ export interface RemoteControlBridge {
   confirmProject(machineId: string, localProjectId: string, remoteProjectId: string): Promise<RemoteControlState>
   releaseProject(machineId: string, localProjectId: string): Promise<RemoteControlState>
   machines(): Promise<MachineDescriptor[]>
+  /**
+   * Places a new conversation on a paired machine and mirrors it into a local tab. The returned
+   * session id is the local one the tab binds to; the remote machine's own ids stay private to it.
+   */
+  openTab(request: RemoteTabRequest): Promise<{ localSessionId: string; machineId: string; machineName: string }>
+  /** Stops mirroring a tab the owner closed here, leaving the work itself running there. */
+  releaseTab(localSessionId: string): Promise<boolean>
   onState(callback: (state: RemoteControlState) => void): () => void
+}
+
+export interface RemoteTabRequest {
+  machineId: string
+  projectId: string
+  sessionId: string
+  provider?: string
+  model?: string
+  effort?: string
+  title?: string
 }
 
 export const DEFAULT_REMOTE_PORT = 51840

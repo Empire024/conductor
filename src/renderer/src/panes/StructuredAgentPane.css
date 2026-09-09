@@ -190,18 +190,23 @@
 .sa-empty p { max-width: 300px; font-size: 11px; color: var(--text-3); }
 .sa-composer { margin: 0 10px 10px; padding: 7px 9px 5px; position: relative; z-index: 4; border-radius: 12px; }
 .sa-composer textarea { resize: none; min-height: 47px; max-height: 150px; font-size: 12px; }
+.sa-prompt-limit { margin: 0 2px 4px; font-size: 10px; color: var(--text-3); text-align: right; }
+.sa-prompt-limit-over { color: var(--danger); font-weight: 500; text-align: left; }
 .sa-composer > footer { min-height: 32px; gap: 5px; flex-wrap: nowrap; }
-/* One send/stop/resume control: shape, fill and glyphs morph between states, and a turn in flight
-   is shown by an arc orbiting the button rather than by swapping the icon out from under the cursor. */
-.sa-composer .sa-send { position: relative; flex: 0 0 30px; min-height: 30px; height: 30px; width: 30px; padding: 0; border: 0 !important; border-radius: 10px; color: var(--surface-0); background: var(--accent-muted) !important; box-shadow: 0 1px 4px #0003, 0 0 0 1px color-mix(in srgb, var(--accent) 30%, transparent) inset; transition: background-color 140ms ease, color 140ms ease, border-radius 160ms cubic-bezier(.2,.85,.25,1), box-shadow 150ms ease, transform 130ms cubic-bezier(.2,.85,.25,1), opacity 130ms ease; }
-.sa-composer .sa-send:hover:not(:disabled) { color: var(--surface-0); background: color-mix(in srgb, var(--accent) 80%, var(--accent-muted)) !important; box-shadow: 0 3px 10px color-mix(in srgb, var(--accent) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--accent) 65%, white) inset; transform: translateY(-1px); }
+/* One send/stop/resume pill: same shape and size in every state, so nothing morphs but the fill,
+   glow and glyph. A turn in flight is shown by an arc orbiting the button rather than by swapping
+   the icon out from under the cursor. Disabled is its own deliberate flat/muted look, not a fade. */
+.sa-composer .sa-send { position: relative; flex: 0 0 30px; min-height: 30px; height: 30px; width: 30px; padding: 0; border: 0 !important; border-radius: 999px; color: var(--surface-0); background: linear-gradient(155deg, color-mix(in srgb, var(--accent) 112%, white 8%), var(--accent)) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent) inset; transition: background 150ms ease, color 140ms ease, box-shadow 150ms ease, transform 130ms cubic-bezier(.2,.85,.25,1), opacity 130ms ease; }
+.sa-composer .sa-send:hover:not(:disabled) { color: var(--surface-0); background: linear-gradient(155deg, color-mix(in srgb, var(--accent) 130%, white 14%), color-mix(in srgb, var(--accent) 92%, white 4%)) !important; box-shadow: 0 3px 12px color-mix(in srgb, var(--accent) 35%, transparent), 0 0 0 1px color-mix(in srgb, var(--accent) 70%, white) inset; transform: translateY(-1px); }
 .sa-composer .sa-send:active:not(:disabled) { transform: translateY(0) scale(.89); box-shadow: 0 1px 3px #0005; transition-duration: 90ms; }
-.sa-composer .sa-send:disabled { opacity: .35; box-shadow: none; }
-.sa-composer .sa-send.sa-stop { border-radius: 999px; color: var(--text); background: var(--surface-2) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px var(--border) inset; }
-.sa-composer .sa-send.sa-stop:hover:not(:disabled) { color: var(--text); background: var(--surface-3) !important; box-shadow: 0 3px 10px #0005, 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border)) inset; }
-.sa-composer .sa-send.sa-stop:disabled { opacity: .6; }
-.sa-send-glyphs { display: grid; place-items: center; width: 100%; height: 100%; }
-.sa-send-glyph { grid-area: 1 / 1; transition: opacity 120ms ease, transform 170ms cubic-bezier(.2,.85,.25,1); }
+.sa-composer .sa-send.sa-stop { color: var(--text); background: var(--surface-2) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px var(--border) inset; }
+.sa-composer .sa-send.sa-stop:hover:not(:disabled) { color: var(--text); background: var(--surface-3) !important; box-shadow: 0 3px 12px #0005, 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border)) inset; }
+.sa-composer .sa-send[data-state="resume"] { background: linear-gradient(155deg, color-mix(in srgb, var(--blue) 118%, white 10%), var(--blue)) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px color-mix(in srgb, var(--blue) 40%, transparent) inset; }
+.sa-composer .sa-send[data-state="resume"]:hover:not(:disabled) { background: linear-gradient(155deg, color-mix(in srgb, var(--blue) 134%, white 16%), color-mix(in srgb, var(--blue) 92%, white 4%)) !important; box-shadow: 0 3px 12px color-mix(in srgb, var(--blue) 35%, transparent), 0 0 0 1px color-mix(in srgb, var(--blue) 70%, white) inset; }
+.sa-composer .sa-send:disabled { background: var(--surface-2) !important; color: var(--text-3) !important; box-shadow: none !important; transform: none !important; cursor: not-allowed; }
+.sa-composer .sa-send:disabled .sa-send-glyphs { opacity: .55; }
+.sa-send-glyphs { display: grid; place-items: center; width: 100%; height: 100%; transition: opacity 130ms ease; }
+.sa-send-glyph { grid-area: 1 / 1; transition: opacity 130ms ease, transform 190ms cubic-bezier(.2,.85,.25,1); }
 .sa-glyph-send { opacity: 0; transform: translate(7px, -7px) rotate(12deg) scale(.55); }
 .sa-glyph-stop { opacity: 0; transform: rotate(-40deg) scale(.35); }
 .sa-glyph-resume { opacity: 0; transform: translateX(-7px) scale(.55); }
@@ -368,3 +373,6 @@
 .sa-activity { transition: box-shadow 700ms ease; }
 .sa-activity-flash { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent); border-radius: 8px; }
 @media (prefers-reduced-motion: reduce) { .sa-activity { transition: none; } }
+
+.sa-queue > button { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); cursor: pointer; transition: background 120ms ease, color 120ms ease; }
+.sa-queue > button:hover { background: var(--surface-3); color: var(--text); }

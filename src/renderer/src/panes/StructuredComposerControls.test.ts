@@ -148,9 +148,20 @@ it('shows a concrete effort for a fresh Claude session before the model catalog 
   expect(onChange).not.toHaveBeenCalled()
 })
 
+it('keeps the effort control visible when the current model is not listed in an otherwise loaded catalog', () => {
+  // A saved alias or a runtime-reported concrete ID the catalog never listed must read as
+  // "unreported for this model", not "this model has no effort" — the tooltip already showed a
+  // resolved value from settings, so the control must not silently disappear underneath it.
+  const html = render({ capabilities, settings: { ...settings, model: 'claude-opus-5', effort: 'low' } }).html
+  expect(html).toContain('aria-label="Reasoning effort"')
+  expect(html).toContain('aria-valuetext="Low"')
+  expect(html).not.toContain('Unavailable:')
+})
+
 it('always resolves a concrete effort for models that report one', () => {
   expect(supportedEffortChoices(capabilities)).toEqual(['minimal', 'low', 'medium', 'high'])
   expect(supportedEffortChoices(capabilities, 'model-two')).toEqual([])
+  expect(supportedEffortChoices(capabilities, 'unknown-model-id')).toEqual(['minimal', 'low', 'medium', 'high'])
   expect(resolveEffortChoice(['minimal', 'low', 'medium', 'high'])).toBe('medium')
   expect(resolveEffortChoice(['minimal', 'low', 'medium', 'high'], 'low')).toBe('low')
   expect(resolveEffortChoice(['minimal', 'low', 'medium', 'high'], 'unsupported')).toBe('medium')

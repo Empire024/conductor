@@ -77,6 +77,8 @@ import { TabPerformancePopover } from './components/TabPerformancePopover'
 import { playAgentSound } from './agent-sounds'
 import { AppUpdateButton } from './components/AppUpdateButton'
 import { UpdatePrompt } from './components/UpdatePrompt'
+import { AgentConfirmDialog } from './components/AgentConfirmDialog'
+import { useAgentConfirm } from './use-agent-confirm'
 import { summarizeSubagents } from './panes/usage-summary'
 import { spinPhaseStyle } from './spin-sync'
 
@@ -343,21 +345,34 @@ export function App(): React.JSX.Element {
 
   useEffect(() => {
     const phases = new Map<string, string>()
-    const onActivity = (event: Event): void => {
-      const detail = (event as CustomEvent<{ id: string; phase: AgentActivityPhase }>).detail
-      if (phases.get(detail.id) === detail.phase) return
-      phases.set(detail.id, detail.phase)
-      debugLog('agent', `Activity changed to ${detail.phase}`, { resourceId: detail.id })
+    const recordPhase = (id: string, phase: AgentActivityPhase): void => {
+      if (phases.get(id) === phase) return
+      phases.set(id, phase)
+      debugLog('agent', `Activity changed to ${phase}`, { resourceId: id })
       setAttentionResourceIds((current) => {
         const next = new Set(current)
-        if (detail.phase === 'waiting_input') next.add(detail.id)
-        else next.delete(detail.id)
+        if (phase === 'waiting_input') next.add(id)
+        else next.delete(id)
         return next
       })
-      setActivityPhases((current) => new Map(current).set(detail.id, detail.phase))
+      setActivityPhases((current) => new Map(current).set(id, phase))
+    }
+    const onActivity = (event: Event): void => {
+      const detail = (event as CustomEvent<{ id: string; phase: AgentActivityPhase }>).detail
+      recordPhase(detail.id, detail.phase)
     }
     window.addEventListener('conductor:agent-activity', onActivity)
-    return () => window.removeEventListener('conductor:agent-activity', onActivity)
+    // A tab an agent opens away from the workspace the owner is looking at never mounts the pane
+    // that would otherwise dispatch conductor:agent-activity, so its own needs-attention/working
+    // dot would never light up. This backend broadcast carries the same phases regardless of
+    // which window or tab is mounted, which is what lets that indicator reach it unobtrusively.
+    const offStatus = window.conductor.agents.onStatus((event) => {
+      if (event.phase) recordPhase(event.id, event.phase)
+    })
+    return () => {
+      window.removeEventListener('conductor:agent-activity', onActivity)
+      offStatus()
+    }
   }, [])
 
   useEffect(() => {
@@ -948,6 +963,8 @@ export function App(): React.JSX.Element {
     openFile: (projectId, path) => openWorkspaceFile(projectId, path)
   })
 
+  const agentConfirm = useAgentConfirm()
+
   useEffect(() => window.conductor.window.onDetachedClosed(({ sessionId }) => {
     if (!activeProjectId || !sessions.some((session) => session.id === sessionId)) return
     void window.conductor.sessions.list(activeProjectId).then(setSessions)
@@ -1431,6 +1448,7 @@ export function App(): React.JSX.Element {
           onDismiss={() => setDismissedUpdateVersion(updateState.availableVersion ?? null)}
         />
       )}
+      {agentConfirm.request && <AgentConfirmDialog request={agentConfirm.request} onRespond={agentConfirm.respond} />}
       {appSettings.debugLogging && debugConsoleOpen && (
         <DebugConsole
           context={debugContext}

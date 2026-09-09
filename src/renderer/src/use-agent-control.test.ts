@@ -52,6 +52,16 @@ describe('visible agent control', () => {
     release(); await promise
     expect(done).toBe(true)
   })
+  it('opens an agent-created tab active in its own group without revealing it to the owner', async () => {
+    const { host, request, current } = fixture()
+    const initial = listGroups(current().layout.root)[0]!
+    const tab = { id: 'quiet-worker', kind: 'agent', title: 'Coworker', resourceId: 'quiet' }
+    await handleAgentControlRequest(request('tabs.open', { tab }), host)
+    expect(listGroups(current().layout.root)[0]!.activeTabId).toBe(tab.id)
+    expect(host.commit).toHaveBeenLastCalledWith(current(), initial.id, false)
+    await handleAgentControlRequest(request('tabs.open', { tab: { id: 'seen-worker', kind: 'agent' }, focus: true }), host)
+    expect(host.commit).toHaveBeenLastCalledWith(current(), initial.id, true)
+  })
   it('keeps the current task pane and utility panel open until the owner explicitly focuses an assigned tab', async () => {
     const { host, request, current } = fixture()
     const initial = listGroups(current().layout.root)[0]!

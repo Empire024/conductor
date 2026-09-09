@@ -2,6 +2,7 @@ import { ipcMain } from 'electron'
 import { hostname } from 'node:os'
 import type { AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import type { AgentProviderInfo, AgentSpec } from '../shared/models'
+import { makeId } from '../shared/models'
 import type {
   GitHubAuthState,
   MachineDescriptor,
@@ -21,6 +22,7 @@ import { RemoteControlClient } from './remote-control-client'
 import { RemoteControlHost } from './remote-control-host'
 import { RemoteControlServer } from './remote-control-server'
 import { RemoteAccessError, RemotePeers } from './remote-peers'
+import { RemoteSessionMirror } from './remote-session-mirror'
 import { StoredSecretVault, type SecretCipher } from './secret-store'
 import type { StructuredSessions } from './structured-sessions'
 
@@ -50,6 +52,7 @@ export class RemoteControlService {
   readonly host: RemoteControlHost
   readonly server: RemoteControlServer
   readonly client: RemoteControlClient
+  readonly mirror: RemoteSessionMirror
   private registered = false
 
   constructor(private readonly deps: RemoteControlServiceDependencies) {
@@ -96,6 +99,11 @@ export class RemoteControlService {
       machineName: () => this.machineName(),
       deviceKey: () => this.auth.deviceKey(),
       changed: () => this.publishState()
+    })
+    this.mirror = new RemoteSessionMirror({
+      database: store,
+      call: (machineId, method, args) => this.client.call(machineId, method, args),
+      publish: deps.publish
     })
   }
 
@@ -157,7 +165,7 @@ export class RemoteControlService {
    * when the mapping was made, so a project that was swapped, copied or moved in between stops the
    * placement instead of quietly receiving the work.
    */
-  async openRemote(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string }> {
+  async openRemote(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string; remoteProjectId: string; remoteSessionId: string }> {
     const connection = this.client.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     const localProject = this.deps.database.getProject(request.projectId)
@@ -184,7 +192,41 @@ export class RemoteControlService {
       ...(request.effort ? { effort: request.effort } : {}),
       ...(request.title ? { title: request.title } : {})
     }) as { id: string; resourceId?: string }
-    return { tabId: tab.id, agentSessionId: tab.resourceId, machineName: connection.machineName }
+    return { tabId: tab.id, agentSessionId: tab.resourceId, machineName: connection.machineName, remoteProjectId, remoteSessionId }
+  }
+
+  /**
+   * The owner placing a tab on another machine from the launcher. The remote tab is opened first
+   * and only then mirrored, so a placement that machine refuses leaves nothing bound here. The
+   * local session id is minted here rather than reusing the remote one: ids are private to each
+   * machine, and two machines that had both ever opened the same conversation would otherwise
+   * collide in this store.
+   */
+  async openRemoteTab(request: { machineId: string; projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ localSessionId: string; machineId: string; machineName: string }> {
+    const project = this.deps.database.getProject(request.projectId)
+    if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
+    // Only a provider this store can journal may be mirrored; anything else would bind a tab to a
+    // conversation the local projection cannot represent.
+    const provider = request.provider ?? 'claude'
+    if (provider !== 'claude' && provider !== 'codex') throw new RemoteAccessError(`${provider} cannot run on another machine yet.`, 400)
+    const opened = await this.openRemote(request.machineId, request)
+    if (!opened.agentSessionId) throw new RemoteAccessError(`${opened.machineName} opened a tab that runs no conversation.`, 409)
+    const localSessionId = makeId('agent')
+    this.mirror.bind({
+      localSessionId,
+      machineId: request.machineId,
+      projectId: request.projectId,
+      workspaceId: request.sessionId,
+      provider,
+      cwd: project.path,
+      remoteProjectId: opened.remoteProjectId,
+      remoteSessionId: opened.remoteSessionId,
+      remoteAgentSessionId: opened.agentSessionId,
+      remoteSequence: 0
+    })
+    this.mirror.start()
+    void this.mirror.pull(localSessionId).catch(error => console.warn('Remote session did not load', error))
+    return { localSessionId, machineId: request.machineId, machineName: opened.machineName }
   }
 
   state(): RemoteControlState {
@@ -210,6 +252,8 @@ export class RemoteControlService {
 
   async start(): Promise<void> {
     await this.server.apply()
+    // Tabs placed elsewhere in an earlier run keep catching up without the owner reopening them.
+    if (this.mirror.list().length) this.mirror.start()
   }
 
   private async setSettings(patch: Partial<RemoteControlSettings>): Promise<RemoteControlState> {
@@ -245,7 +289,10 @@ export class RemoteControlService {
     handle<RemoteControlState>('remote:revoke', (peerId: string) => { this.peers.revoke(String(peerId)); return this.state() })
     handle<RemoteControlState>('remote:connect', async (ticket: string) => { await this.client.connect(String(ticket)); return this.state() })
     handle<RemoteControlState>('remote:forget', (machineId: string) => {
-      this.client.forget(String(machineId) || LOCAL_MACHINE_ID)
+      const id = String(machineId) || LOCAL_MACHINE_ID
+      this.client.forget(id)
+      // A tab cannot keep mirroring a machine the owner just cut loose.
+      this.mirror.releaseMachine(id)
       return this.state()
     })
     handle<RemoteProjectSummary[]>('remote:remote-projects', (machineId: string) => this.refreshRemoteProjects(String(machineId)))
@@ -256,6 +303,19 @@ export class RemoteControlService {
       return this.state()
     })
     handle<MachineDescriptor[]>('remote:machines', () => this.machines())
+    handle<{ localSessionId: string; machineId: string; machineName: string }>('remote:open-tab', (request: unknown) => {
+      const args = (request ?? {}) as Record<string, unknown>
+      const required = ['machineId', 'projectId', 'sessionId'] as const
+      if (required.some(field => typeof args[field] !== 'string' || !args[field])) throw new RemoteAccessError('A remote tab needs a machine, a project and a workspace.', 400)
+      return this.openRemoteTab({
+        machineId: String(args.machineId), projectId: String(args.projectId), sessionId: String(args.sessionId),
+        ...(typeof args.provider === 'string' ? { provider: args.provider } : {}),
+        ...(typeof args.model === 'string' ? { model: args.model } : {}),
+        ...(typeof args.effort === 'string' ? { effort: args.effort } : {}),
+        ...(typeof args.title === 'string' ? { title: args.title } : {})
+      })
+    })
+    handle<boolean>('remote:release-tab', (localSessionId: string) => { this.mirror.release(String(localSessionId)); return true })
   }
 
   async dispose(): Promise<void> {
@@ -263,9 +323,10 @@ export class RemoteControlService {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
         'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
-        'remote:machines']) ipcMain.removeHandler(channel)
+        'remote:machines', 'remote:open-tab', 'remote:release-tab']) ipcMain.removeHandler(channel)
       this.registered = false
     }
+    this.mirror.stop()
     await this.server.close()
   }
 }

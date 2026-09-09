@@ -1,0 +1,13 @@
+.agent-confirm-backdrop { position: fixed; inset: 0; z-index: 1400; display: grid; place-items: center; padding: 24px; background: #05070aaa; backdrop-filter: blur(3px); }
+.agent-confirm-dialog { width: min(420px, calc(100vw - 32px)); overflow: hidden; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface-1); box-shadow: 0 26px 90px #000c; }
+.agent-confirm-dialog > header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border-soft); }
+.agent-confirm-icon { width: 32px; height: 32px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 8px; color: var(--accent); background: var(--accent-bg); }
+.agent-confirm-dialog > header strong { flex: 1; min-width: 0; color: var(--text); font-size: 12px; font-weight: 650; }
+.agent-confirm-dialog > header button { width: 27px; height: 27px; flex: 0 0 auto; display: grid; place-items: center; border: 0; border-radius: 5px; color: var(--text-3); background: transparent; }
+.agent-confirm-dialog > header button:hover { color: var(--text); background: var(--surface-hover); }
+.agent-confirm-dialog > p { margin: 0; padding: 14px 16px; font-size: 10px; line-height: 1.55; white-space: pre-wrap; }
+.agent-confirm-dialog > footer { display: flex; justify-content: flex-end; gap: 7px; padding: 0 16px 16px; }
+.agent-confirm-dialog > footer button { height: 30px; padding: 0 12px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-2); background: var(--surface-2); font-size: 9px; cursor: pointer; }
+.agent-confirm-dialog > footer button:hover:not(:disabled) { color: var(--text); background: var(--surface-hover); }
+.agent-confirm-dialog > footer button.primary { border-color: var(--accent); color: #10140c; background: var(--accent); font-weight: 650; }
+.agent-confirm-dialog > footer button:disabled { opacity: .55; }

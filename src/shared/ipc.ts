@@ -43,6 +43,7 @@ export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: str
 
 export interface ConductorBridge {
   agentControl: import('./agent-control').AgentControlBridge
+  agentConfirm: import('./agent-confirm').AgentConfirmBridge
   remote: import('./remote-control').RemoteControlBridge
   projectTasks: import('./project-backlog').ProjectBacklogBridge
   nativeCli: {

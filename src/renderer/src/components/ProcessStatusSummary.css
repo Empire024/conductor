@@ -1,0 +1,56 @@
+/* Ultra-minified replacement for the old static "Local status / Local workspace" sidebar footer:
+   a status bar corner, not a panel, so it stays as compact as the row it replaced. */
+
+.process-status-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 12px 9px;
+  border-top: 1px solid var(--border-soft);
+  cursor: pointer;
+}
+.process-status-summary:hover { background: var(--surface-2); }
+.process-status-summary:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+.process-status-summary-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-2);
+}
+.process-status-summary-head strong { font-size: 10px; font-weight: 500; color: var(--text-2); }
+.process-status-summary-head span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--text-3);
+}
+.process-status-summary-head span i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.process-status-summary-head span.process-status-summary-running { color: var(--accent-muted); }
+.process-status-summary-head span.process-status-summary-running i {
+  background: var(--accent);
+  box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 55%, transparent);
+  animation: session-activity-pulse 1.2s ease-in-out infinite;
+}
+.process-status-summary-cost { font-variant-numeric: tabular-nums; }
+
+.process-status-summary-rows { display: flex; flex-direction: column; gap: 2px; }
+.process-status-summary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 8.5px;
+  color: var(--text-3);
+}
+.process-status-summary-row > span:first-child { min-width: 0; color: var(--text-2); }
+.process-status-summary-row.process-status-summary-empty > span { color: var(--text-3); }
+
+@media (prefers-reduced-motion: reduce) { .process-status-summary-head span.process-status-summary-running i { animation: none; } }

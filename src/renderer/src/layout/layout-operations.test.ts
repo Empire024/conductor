@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { PaneGroupNode, SplitNode } from '../../../shared/models'
 import { createDefaultLayout, makeLauncherTab } from '../../../shared/models'
-import { addTab, applyTabDrop, closeTab, dockTab, findGroup, instantiateLayout, listGroups, moveTabToGroup, reorderTab, splitGroup, stripWorkspaceUtilityTabs, tabDropLands } from './layout-operations'
+import { addTab, applyTabDrop, closeTab, dockTab, findGroup, insertForeignTab, instantiateLayout, listGroups, moveTabToGroup, reorderTab, splitGroup, stripWorkspaceUtilityTabs, tabDropLands } from './layout-operations'
 import { gapAnchorId } from './tab-drag'
 
 describe('layout operations', () => {
@@ -185,6 +185,37 @@ describe('Chrome-style tab bar reordering and drop', () => {
     const dropped = applyTabDrop(layout, groupId, tabId, { kind: 'canvas', groupId, edge: 'right' })
     expect(dropped.root.type).toBe('split')
     expect(listGroups(dropped.root)).toHaveLength(2)
+  })
+
+  it('insertForeignTab joins a tab bar the tab has never been part of, at the resolved index', () => {
+    let layout = createDefaultLayout()
+    const groupId = layout.root.id
+    const firstId = findGroup(layout.root, groupId)!.activeTabId
+    layout = addTab(layout, groupId, { id: 'b', kind: 'code', title: 'B' })
+    const foreign = { id: 'foreign', kind: 'agent', title: 'Reattached', resourceId: 'agent-remote' } as const
+    const dropped = insertForeignTab(layout, foreign, { kind: 'bar', groupId, index: 1 })
+    const tabs = findGroup(dropped.root, groupId)!.tabs
+    expect(tabs.map((tab) => tab.id)).toEqual([firstId, 'foreign', 'b'])
+    expect(findGroup(dropped.root, groupId)!.activeTabId).toBe('foreign')
+  })
+
+  it('insertForeignTab splits a pane open for a canvas edge, carrying the conversation across', () => {
+    const layout = createDefaultLayout()
+    const groupId = layout.root.id
+    const foreign = { id: 'foreign', kind: 'agent' as const, title: 'Reattached', resourceId: 'agent-remote', state: { provider: 'claude' } }
+    const dropped = insertForeignTab(layout, foreign, { kind: 'canvas', groupId, edge: 'right' })
+    expect(dropped.root.type).toBe('split')
+    const groups = listGroups(dropped.root)
+    expect(groups).toHaveLength(2)
+    const landed = groups.flatMap((group) => group.tabs).find((tab) => tab.id === 'foreign')
+    expect(landed).toMatchObject({ resourceId: 'agent-remote', state: { provider: 'claude' } })
+  })
+
+  it('insertForeignTab leaves the layout untouched when the target group no longer exists', () => {
+    const layout = createDefaultLayout()
+    const foreign = { id: 'foreign', kind: 'agent' as const, title: 'Reattached' }
+    expect(insertForeignTab(layout, foreign, { kind: 'bar', groupId: 'missing', index: 0 })).toEqual(layout)
+    expect(insertForeignTab(layout, foreign, { kind: 'canvas', groupId: 'missing', edge: 'right' })).toEqual(layout)
   })
 
   it('tabDropLands rejects the canvas edges of the pane a lone tab already fills', () => {

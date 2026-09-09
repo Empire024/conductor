@@ -53,11 +53,42 @@ describe('aggregateProjectActivity', () => {
     expect(aggregateProjectActivity(['project-a'], workspaces, agents.slice(0, 1))['project-a']).toBe('done')
   })
 
-  it('treats a disconnected or failed agent as needing attention, and a limited one as working', () => {
+  it('treats a failed agent as needing attention, a limited one as working, and an interrupted disconnect as needing a look', () => {
     const workspaces = [workspace('workspace-1', 'project-a', 'agent-1')]
     expect(aggregateProjectActivity(['project-a'], workspaces, [agent('agent-1', 'project-a', 'workspace-1', 'failed')])['project-a']).toBe('waiting')
     expect(aggregateProjectActivity(['project-a'], workspaces, [agent('agent-1', 'project-a', 'workspace-1', 'disconnected')])['project-a']).toBe('waiting')
     expect(aggregateProjectActivity(['project-a'], workspaces, [agent('agent-1', 'project-a', 'workspace-1', 'limited')])['project-a']).toBe('working')
+  })
+
+  it('does not let a settled tab that lost its connection paint over a project that already finished', () => {
+    const doneAndDisconnected = [
+      workspace('workspace-1', 'project-a', 'agent-done'),
+      workspace('workspace-2', 'project-a', 'agent-disconnected')
+    ]
+    expect(aggregateProjectActivity(['project-a'], doneAndDisconnected, [
+      agent('agent-done', 'project-a', 'workspace-1', 'complete'),
+      agent('agent-disconnected', 'project-a', 'workspace-2', 'idle')
+    ])['project-a']).toBe('done')
+
+    const workingAndSettled = [
+      workspace('workspace-1', 'project-a', 'agent-working'),
+      workspace('workspace-2', 'project-a', 'agent-settled')
+    ]
+    expect(aggregateProjectActivity(['project-a'], workingAndSettled, [
+      agent('agent-working', 'project-a', 'workspace-1', 'working'),
+      agent('agent-settled', 'project-a', 'workspace-2', 'complete')
+    ])['project-a']).toBe('working')
+  })
+
+  it('surfaces a tab cut off mid-output over one still working, the same way a failure is surfaced', () => {
+    const workspaces = [
+      workspace('workspace-1', 'project-a', 'agent-working'),
+      workspace('workspace-2', 'project-a', 'agent-disconnected')
+    ]
+    expect(aggregateProjectActivity(['project-a'], workspaces, [
+      agent('agent-working', 'project-a', 'workspace-1', 'working'),
+      agent('agent-disconnected', 'project-a', 'workspace-2', 'disconnected')
+    ])['project-a']).toBe('waiting')
   })
 
   it('ignores agents whose tab or workspace is no longer open, and projects with none at all', () => {

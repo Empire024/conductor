@@ -41,6 +41,7 @@ import {
   closeTab,
   collapseTabGroup,
   findGroup,
+  insertForeignTab,
   resizeSplit,
   tabDropLands,
   type TabDropTarget,
@@ -48,9 +49,19 @@ import {
   updateTab
 } from './layout-operations'
 import { tabGroupsOf, tabStripSlots, type TabGroupAction } from './tab-groups'
-import { dropTargetAt, gapAnchorId, type CanvasEdge, type PaneGeometry, type TabRect } from './tab-drag'
-import { ChevronRight } from 'lucide-react'
+import {
+  CROSS_WINDOW_TAB_MIME,
+  decodeCrossWindowTab,
+  dropTargetAt,
+  encodeCrossWindowTab,
+  gapAnchorId,
+  type CanvasEdge,
+  type PaneGeometry,
+  type TabRect
+} from './tab-drag'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { createPaneTab } from '../panes/pane-factory'
+import { createPlacedTab, readPlacement, writePlacement } from './machine-placement'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { RuntimeTerminal } from '../panes/RuntimeTerminal'
 import { LauncherPane } from '../panes/LauncherPane'
@@ -63,6 +74,10 @@ interface PaneWorkspaceProps {
   layout: WorkspaceLayout
   project: ProjectRecord
   session: SessionRecord
+  /** Absent for the main window. Threaded through so a dragged tab's cross-window payload can
+   *  name which detached window it came from, which is what lets that window close itself once
+   *  the tab leaves it for good. */
+  detachedId?: string
   focusedGroupId: string
   maximizedGroupId: string | null
   onLayout(layout: WorkspaceLayout): void
@@ -99,6 +114,13 @@ const iconFor = (tab: PaneTab): typeof Bot => {
 const TAB_ANIMATION_MS = 110
 const TAB_SPOTLIGHT_MS = 1600
 
+/** Stands in for a tab dragged in from another window while it is still in flight: its real
+ * identity is locked inside the OS drag session and unreadable until it actually drops, but the
+ * gap/ghost geometry needs some tab-shaped thing to measure against in the meantime. Its id never
+ * matches a real tab, so it is never excluded from a bar's own insertion maths. */
+const FOREIGN_DRAG_TAB: PaneTab = { id: '__conductor-foreign-drag__', kind: 'tasks', title: 'Tab' }
+const FOREIGN_DRAG_WIDTH = 150
+
 const PaneBody = ({
   tab,
   groupId,
@@ -107,18 +129,24 @@ const PaneBody = ({
   onOpen,
   onOpenFile,
   onUpdateTab,
-  onConversationChange
+  onConversationChange,
+  placement,
+  placementError,
+  onSelectMachine
 }: {
   tab: PaneTab
   groupId: string
   project: ProjectRecord
   session: SessionRecord
+  placement: string
+  placementError: string
+  onSelectMachine(machineId: string): void
   onOpen(kind: PaneKind, provider?: AgentProviderId): void
   onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   onUpdateTab(tabId: string, state: Record<string, unknown>): void
   onConversationChange(tabId: string, conversation: ConversationIdentity): Promise<void>
 }): React.JSX.Element => {
-  if (tab.kind === 'launcher') return <LauncherPane onOpen={onOpen} />
+  if (tab.kind === 'launcher') return <LauncherPane machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} />
   if (tab.kind === 'terminal') {
     return (
       <RuntimeTerminal
@@ -183,6 +211,8 @@ function PaneGroup({
 }): React.JSX.Element {
   const groupRef = useRef<HTMLElement>(null)
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number; tabId: string } | null>(null)
+  const [placement, setPlacement] = useState(() => readPlacement(workspace.session.id))
+  const [placementError, setPlacementError] = useState('')
   const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; tabGroupId: string } | null>(null)
   /** A group created from the tab menu opens its name editor as soon as the chip exists,
    * the way Chrome drops you straight into naming a new group. */
@@ -282,23 +312,18 @@ function PaneGroup({
 
   const beginDrag = (event: React.DragEvent, tab: PaneTab): void => {
     event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('application/x-conductor-pane', JSON.stringify({ groupId: group.id, tabId: tab.id }))
+    event.dataTransfer.setData(CROSS_WINDOW_TAB_MIME, encodeCrossWindowTab({
+      tab,
+      sourceGroupId: group.id,
+      projectId: workspace.project.id,
+      sessionId: workspace.session.id,
+      ...(workspace.detachedId ? { detachedId: workspace.detachedId } : {})
+    }))
     const transparentImage = document.createElement('canvas')
     transparentImage.width = 1
     transparentImage.height = 1
     event.dataTransfer.setDragImage(transparentImage, 0, 0)
     dragActions.start(group.id, tab, event.currentTarget.getBoundingClientRect().width, { x: event.clientX, y: event.clientY })
-  }
-
-  const finishDrag = (event: React.DragEvent, tab: PaneTab): void => {
-    if (event.dataTransfer.dropEffect !== 'none') return
-    // Native applications often zero out DragEvent screen coordinates when they
-    // accept the drop. Electron's cursor position remains reliable across apps, and the
-    // top-level drag effect already preventDefaults every dragover inside the window, so
-    // dropEffect only stays 'none' here when the drag ended outside it entirely.
-    void window.conductor.window.isCursorOutside().then((outsideWindow) => {
-      if (outsideWindow) workspace.onDetach(group.id, tab)
-    })
   }
 
   const showContextMenu = (event: React.MouseEvent, tab: PaneTab = activeTab): void => {
@@ -328,10 +353,20 @@ function PaneGroup({
     if (result.tabGroupId) setPendingRename(result.tabGroupId)
   }
 
+  /** Remembering the choice is what makes the next tab inherit this machine. */
+  const choose = (machineId: string): void => {
+    setPlacement(machineId)
+    setPlacementError('')
+    writePlacement(workspace.session.id, machineId)
+  }
+
   const open = (kind: PaneKind, provider?: AgentProviderId): void => {
     if (kind !== 'agent' && kind !== 'terminal') return
-    const tab = createPaneTab(kind, { provider })
-    workspace.onLayout(replaceTab(workspace.layout, group.id, activeTab.id, tab))
+    // Placing a tab on another machine has to reach that machine first, so the launcher stays put
+    // until it answers; a refusal leaves the launcher open with the reason rather than a dead tab.
+    void createPlacedTab({ kind, provider, machineId: placement, projectId: workspace.project.id, sessionId: workspace.session.id })
+      .then(tab => workspace.onLayout(replaceTab(workspace.layout, group.id, activeTab.id, tab)))
+      .catch((reason: unknown) => setPlacementError(String(reason instanceof Error ? reason.message : reason)))
   }
 
   const openFile = (path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void => {
@@ -418,7 +453,6 @@ function PaneGroup({
         data-autoscroll="off"
         draggable
         onDragStart={(event) => beginDrag(event, tab)}
-        onDragEnd={(event) => finishDrag(event, tab)}
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
         <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
@@ -444,6 +478,7 @@ function PaneGroup({
       style={{ viewTransitionName: `pane-${group.id.replace(/[^a-zA-Z0-9_-]/g, '-')}` }}
       onMouseDown={() => workspace.onFocus(group.id)}
     >
+      {canvasEdge && <div className="dock-preview" />}
       <header
         className="pane-header"
         onDoubleClick={(event) => {
@@ -485,7 +520,7 @@ function PaneGroup({
                   <i className="tab-group-dot" data-tab-group-color={slot.group.color} />
                   {slot.group.title && <span className="tab-group-name">{slot.group.title}</span>}
                   {slot.collapsed && <span className="tab-group-count">{count}</span>}
-                  {slot.collapsed && <ChevronRight size={11} className="tab-group-caret" />}
+                  {slot.collapsed ? <ChevronRight size={11} className="tab-group-caret" /> : <ChevronDown size={11} className="tab-group-caret" />}
                 </button>
                 {!slot.collapsed && slot.tabs.map((tab) => renderTab(tab, gapBeforeId === tab.id && tab.id !== runFirstId))}
               </div>
@@ -500,7 +535,6 @@ function PaneGroup({
             className="pane-drag-handle"
             draggable
             onDragStart={(event) => beginDrag(event, activeTab)}
-            onDragEnd={(event) => finishDrag(event, activeTab)}
             title="Drag tab area"
           ><GripVertical size={17} /></button>
           <button className="pane-menu-button" onClick={(event) => showContextMenu(event)} title="Tab actions"><MoreHorizontal size={19} /></button>
@@ -510,7 +544,8 @@ function PaneGroup({
       <div className="pane-content">
         {group.tabs.map((tab) => (
           <div key={tab.id} className="pane-tab-content" data-performance-tab-id={tab.id} style={{ display: tab.id === activeTab.id ? 'flex' : 'none' }}>
-            <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={openFile} onUpdateTab={setTabState} onConversationChange={changeConversation} />
+            <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={openFile} onUpdateTab={setTabState} onConversationChange={changeConversation}
+              placement={placement} placementError={placementError} onSelectMachine={choose} />
           </div>
         ))}
       </div>
@@ -555,6 +590,15 @@ function SplitView({
 }): React.JSX.Element {
   const containerRef = useRef<HTMLDivElement>(null)
   const [resizing, setResizing] = useState(false)
+  // While the gutter is actually being dragged, sizes are painted from this local state instead
+  // of round-tripping every pointer move through workspace.onLayout: that call lands all the way
+  // up in the app's own session state, and re-rendering everything hanging off it on every frame
+  // is what made dragging the gutter feel janky. The real layout only gets one commit, on release.
+  const [liveSizes, setLiveSizes] = useState<[number, number] | null>(null)
+  // Dropping the painted sizes before the commit has come back through the layout would show
+  // the pane at its old width for a frame, so the drag is held on screen until it lands.
+  const committedFirst = node.type === 'split' ? node.sizes[0] : undefined
+  useEffect(() => setLiveSizes(null), [committedFirst])
   const [ready, setReady] = useState(false)
   useEffect(() => setReady(true), [])
   // When a group's last tab closes, its parent split collapses and this same slot is handed
@@ -588,7 +632,7 @@ function SplitView({
 
   const split = node.type === 'split' ? node : null
   const direction = split ? split.direction : remnant!.direction
-  const sizes: [number, number] = split ? split.sizes : remnant!.survivorSide === 0 ? [100, 0] : [0, 100]
+  const sizes: [number, number] = split && liveSizes ? liveSizes : split ? split.sizes : remnant!.survivorSide === 0 ? [100, 0] : [0, 100]
 
   const startResize = (event: React.PointerEvent): void => {
     if (!split || event.button !== 0) return
@@ -604,24 +648,22 @@ function SplitView({
     let pendingFirst = split.sizes[0]
     let finished = false
 
-    const commit = (): void => {
+    const paint = (): void => {
       animationFrame = 0
-      workspace.onLayout(resizeSplit(workspace.layout, split.id, [pendingFirst, 100 - pendingFirst]))
+      setLiveSizes([pendingFirst, 100 - pendingFirst])
     }
     const move = (moveEvent: PointerEvent): void => {
       const raw = split.direction === 'horizontal'
         ? ((moveEvent.clientX - rect.left) / rect.width) * 100
         : ((moveEvent.clientY - rect.top) / rect.height) * 100
       pendingFirst = Math.min(100 - minimumPercent, Math.max(minimumPercent, raw))
-      if (!animationFrame) animationFrame = requestAnimationFrame(commit)
+      if (!animationFrame) animationFrame = requestAnimationFrame(paint)
     }
     const stop = (upEvent: PointerEvent): void => {
       if (finished) return
       finished = true
-      if (animationFrame) {
-        cancelAnimationFrame(animationFrame)
-        commit()
-      }
+      if (animationFrame) cancelAnimationFrame(animationFrame)
+      workspace.onLayout(resizeSplit(workspace.layout, split.id, [pendingFirst, 100 - pendingFirst]))
       if (gutter.hasPointerCapture(upEvent.pointerId)) gutter.releasePointerCapture(upEvent.pointerId)
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', stop)
@@ -733,47 +775,116 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   // registered once for the lifetime of the workspace rather than by an effect keyed on
   // `dragging`, so they cannot miss the first dragover while React is still committing.
   const draggingRef = useRef<TabDragState | null>(null)
+  // Whether *this* window's own commitDrop already handled the drop in progress. dragend fires
+  // in the window a drag started in no matter which window actually received the drop, so this
+  // is what tells that difference apart from a plain rejected drag.
+  const consumedRef = useRef(false)
   const propsRef = useRef(props)
   propsRef.current = props
   const maximized = props.maximizedGroupId ? findGroup(props.layout.root, props.maximizedGroupId) : null
   const emptyGroup = props.layout.root.type === 'group' && props.layout.root.tabs.length === 0
 
   useEffect(() => {
-    const endDrag = (): void => {
+    let foreignStaleTimer = 0
+    const clearForeignSoon = (): void => {
+      window.clearTimeout(foreignStaleTimer)
+      // A foreign drag never fires dragend or dragleave reliably in this window - only the
+      // window it started in gets those - so its preview has to expire itself once dragover
+      // stops arriving, which is what happens the instant the pointer leaves for good.
+      foreignStaleTimer = window.setTimeout(() => {
+        latestTargetRef.current = null
+        setDragging(null)
+        setDropTarget(null)
+      }, 150)
+    }
+    const endDrag = (event: DragEvent): void => {
+      window.clearTimeout(foreignStaleTimer)
+      const drag = draggingRef.current
+      if (drag && !consumedRef.current) {
+        if (event.dataTransfer?.dropEffect === 'move') {
+          // Nothing in this window accepted the drop, yet it was accepted somewhere: another
+          // Conductor window just grafted this tab into its own layout, so this window's copy
+          // has to go, and with it a detached window that has nothing left to show.
+          const current = propsRef.current
+          const result = closeTab(current.layout, drag.sourceGroupId, drag.tab.id)
+          if (result.closed) current.onLayout(result.layout)
+        } else {
+          // Native applications often zero out DragEvent screen coordinates when they accept
+          // the drop. Electron's cursor position remains reliable across apps, and every
+          // dragover inside a Conductor window already preventDefaults, so dropEffect only
+          // stays 'none' here when the drag ended outside every one of them entirely.
+          void window.conductor.window.isCursorOutside().then((outsideWindow) => {
+            if (outsideWindow) propsRef.current.onDetach(drag.sourceGroupId, drag.tab)
+          })
+        }
+      }
       latestTargetRef.current = null
       draggingRef.current = null
+      consumedRef.current = false
       setDragging(null)
       setDropTarget(null)
     }
     const trackPointer = (event: DragEvent): void => {
       const drag = draggingRef.current
-      if (!drag) return
+      if (drag) {
+        if (!event.clientX && !event.clientY) return
+        event.preventDefault()
+        if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+        if (dragGhostRef.current) dragGhostRef.current.style.transform = `translate3d(${event.clientX + 14}px, ${event.clientY + 14}px, 0)`
+        const found = resolveDropTarget(event.clientX, event.clientY, drag.sourceGroupId, drag.tab.id)
+        const resolved = found && tabDropLands(propsRef.current.layout, drag.sourceGroupId, drag.tab.id, found) ? found : null
+        latestTargetRef.current = resolved
+        setDropTarget((current) => sameDropTarget(current, resolved) ? current : resolved)
+        return
+      }
+      // A tab dragged in from another window: its own data is unreadable until it drops, but
+      // the mimetype alone is enough to preview and accept the drop here.
+      if (!event.dataTransfer?.types.includes(CROSS_WINDOW_TAB_MIME)) return
       if (!event.clientX && !event.clientY) return
       event.preventDefault()
-      if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+      clearForeignSoon()
       if (dragGhostRef.current) dragGhostRef.current.style.transform = `translate3d(${event.clientX + 14}px, ${event.clientY + 14}px, 0)`
-      const found = resolveDropTarget(event.clientX, event.clientY, drag.sourceGroupId, drag.tab.id)
-      const resolved = found && tabDropLands(propsRef.current.layout, drag.sourceGroupId, drag.tab.id, found) ? found : null
-      latestTargetRef.current = resolved
-      setDropTarget((current) => sameDropTarget(current, resolved) ? current : resolved)
+      const found = resolveDropTarget(event.clientX, event.clientY, '', FOREIGN_DRAG_TAB.id)
+      if (event.dataTransfer) event.dataTransfer.dropEffect = found ? 'move' : 'none'
+      latestTargetRef.current = found
+      setDragging((current) => current ?? { sourceGroupId: '', tab: FOREIGN_DRAG_TAB, width: FOREIGN_DRAG_WIDTH, x: event.clientX, y: event.clientY })
+      setDropTarget((current) => sameDropTarget(current, found) ? current : found)
     }
     const commitDrop = (event: DragEvent): void => {
       const drag = draggingRef.current
-      if (!drag) return
-      event.preventDefault()
+      if (drag) {
+        event.preventDefault()
+        consumedRef.current = true
+        const target = latestTargetRef.current
+        if (target) {
+          const current = propsRef.current
+          current.onLayout(applyTabDrop(current.layout, drag.sourceGroupId, drag.tab.id, target))
+          current.onFocus(target.groupId)
+          if (target.kind === 'canvas') setSnapArrival({ groupId: target.groupId, edge: target.edge })
+        }
+        endDrag(event)
+        return
+      }
+      const raw = event.dataTransfer?.getData(CROSS_WINDOW_TAB_MIME)
+      const payload = raw ? decodeCrossWindowTab(raw) : null
       const target = latestTargetRef.current
-      if (target) {
+      if (payload && target) {
+        event.preventDefault()
         const current = propsRef.current
-        current.onLayout(applyTabDrop(current.layout, drag.sourceGroupId, drag.tab.id, target))
+        current.onLayout(insertForeignTab(current.layout, payload.tab, target))
         current.onFocus(target.groupId)
         if (target.kind === 'canvas') setSnapArrival({ groupId: target.groupId, edge: target.edge })
       }
-      endDrag()
+      window.clearTimeout(foreignStaleTimer)
+      latestTargetRef.current = null
+      setDragging(null)
+      setDropTarget(null)
     }
     document.addEventListener('dragover', trackPointer, true)
     document.addEventListener('drop', commitDrop, true)
     document.addEventListener('dragend', endDrag, true)
     return () => {
+      window.clearTimeout(foreignStaleTimer)
       document.removeEventListener('dragover', trackPointer, true)
       document.removeEventListener('drop', commitDrop, true)
       document.removeEventListener('dragend', endDrag, true)
@@ -789,6 +900,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   const dragActions: PaneDragActions = {
     start: (sourceGroupId, tab, width, point) => {
       draggingRef.current = { sourceGroupId, tab, width, ...point }
+      consumedRef.current = false
       setDragging(draggingRef.current)
       if (props.maximizedGroupId) {
         window.setTimeout(() => {

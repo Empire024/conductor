@@ -28,6 +28,10 @@ const bridge: ConductorBridge = {
     onRequest: callback => subscribe('agent-control:request', callback),
     respond: response => ipcRenderer.send('agent-control:response', response)
   },
+  agentConfirm: {
+    onRequest: callback => subscribe('agent-confirm:request', callback),
+    respond: response => ipcRenderer.send('agent-confirm:response', response)
+  },
   remote: {
     githubState: () => ipcRenderer.invoke('remote:github-state'),
     signIn: () => ipcRenderer.invoke('remote:github-sign-in'),
@@ -47,6 +51,8 @@ const bridge: ConductorBridge = {
     confirmProject: (machineId, localProjectId, remoteProjectId) => ipcRenderer.invoke('remote:confirm-project', machineId, localProjectId, remoteProjectId),
     releaseProject: (machineId, localProjectId) => ipcRenderer.invoke('remote:release-project', machineId, localProjectId),
     machines: () => ipcRenderer.invoke('remote:machines'),
+    openTab: (request) => ipcRenderer.invoke('remote:open-tab', request),
+    releaseTab: (localSessionId) => ipcRenderer.invoke('remote:release-tab', localSessionId),
     onState: (callback) => subscribe('remote:changed', callback)
   },
   projectTasks: {

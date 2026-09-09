@@ -42,7 +42,12 @@ describe('Project tasks native dispatch',()=> {
   it('lists visible native targets and runtime-reported model efforts',()=>{
     const f=fixture(),options=f.dispatcher.options(f.project.id)
     expect(options.targets).toEqual([expect.objectContaining({agentSessionId:f.spec.id,tabId:'existing-tab',sessionId:f.workspace.id})])
-    expect(options.providers[0]).toMatchObject({source:'runtime',models:[{id:'codex-native',effort:['low','high']}]})
+    expect(options.providers[0]).toMatchObject({source:'runtime',models:[{id:'codex-native',effort:['low','high']}],permissions:['default','read-only']})
+  })
+  it('falls back to each provider\'s real static permission modes before any runtime has reported its own',()=>{
+    const f=fixture(),options=f.dispatcher.options(f.project.id)
+    const claude=options.providers.find(provider=>provider.provider==='claude')
+    expect(claude).toMatchObject({source:'configured',permissions:['default','accept-edits','auto']})
   })
   it('sends selected tasks once to an existing tab while preserving its permissions and unrelated tasks',async()=>{
     const f=fixture(),board=await f.backlogs.get(f.project.id)
@@ -91,7 +96,31 @@ describe('Project tasks native dispatch',()=> {
     await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'existing',agentSessionId:'not-visible'}})).rejects.toThrow('currently open')
     await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one','one'],target})).rejects.toThrow('distinct')
     await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'new',sessionId:f.workspace.id,provider:'claude',model:'claude-native',effort:'imaginary'}})).rejects.toThrow('supported')
+    await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'new',sessionId:f.workspace.id,provider:'claude',model:'claude-native',effort:'low',permission:'read-only'}})).rejects.toThrow('supported')
     expect(f.submissions).toHaveLength(0);expect(f.ui).not.toHaveBeenCalled()
+  })
+  it('applies an explicitly chosen permission mode to a new tab and threads it into the submitted settings',async()=>{
+    const f=fixture(),board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'new',sessionId:f.workspace.id,provider:'codex',model:'codex-native',effort:'low',permission:'read-only'}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',permission:'read-only'})
+    expect(f.submissions[0]?.settings).toMatchObject({permission:'read-only'})
+    expect(f.database.structured.snapshot(result.assignments[0]!.agentSessionId)?.settings).toMatchObject({permission:'read-only'})
+  })
+  it('appends an optional owner instruction to the dispatched prompt, and omits it entirely when blank',async()=>{
+    const f=fixture(),board=await f.backlogs.get(f.project.id)
+    const withExtra=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'existing',agentSessionId:f.spec.id},prompt:'Please also update the changelog'})
+    expect(withExtra.assignments[0]?.status).toBe('submitted')
+    expect(f.submissions[0]?.prompt).toContain('Additional instructions from the owner')
+    expect(f.submissions[0]?.prompt).toContain('Please also update the changelog')
+    const before=f.submissions.length
+    const board2=await f.backlogs.get(f.project.id)
+    await f.dispatcher.dispatch(f.project.id,board2.revision,{taskIds:['two'],target:{type:'existing',agentSessionId:f.spec.id}})
+    expect(f.submissions[before]?.prompt).not.toContain('Additional instructions from the owner')
+  })
+  it('rejects an overlong extra instruction before submitting anything',async()=>{
+    const f=fixture(),board=await f.backlogs.get(f.project.id)
+    await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'existing',agentSessionId:f.spec.id},prompt:'x'.repeat(4001)})).rejects.toThrow('4000 characters')
+    expect(f.submissions).toHaveLength(0)
   })
   it('keeps tasks unchanged on native failure, retains the visible tab, and never retries the prompt',async()=>{
     const f=fixture({fail:true}),board=await f.backlogs.get(f.project.id),before=readFileSync(join(f.root,'feature-list.md'),'utf8')

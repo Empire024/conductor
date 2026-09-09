@@ -14,7 +14,10 @@ export function modelEfforts(capabilities: ProviderCapabilities | undefined, mod
  * slider is not gated behind a connect the user hasn't triggered yet. */
 export function supportedEffortChoices(capabilities: ProviderCapabilities | undefined, model?: string): string[] {
   if (!capabilities) return []
-  const ladder = capabilities.models.length === 0 ? capabilities.effort : modelEfforts(capabilities, model)
+  // A catalog entry not found for this exact model (a saved alias, a runtime-reported concrete
+  // ID the catalog never listed, ...) is unreported, not unsupported — fall back to the provider's
+  // own declared ladder so the control still shows instead of vanishing until a fresh connect.
+  const ladder = modelEfforts(capabilities, model) ?? capabilities.effort
   return (ladder ?? []).filter(effort => effort && effort !== 'auto')
 }
 

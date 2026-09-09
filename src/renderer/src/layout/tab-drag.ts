@@ -1,6 +1,41 @@
 /** Pure geometry for Chrome-style tab dragging: where a dragged tab lands, kept free of
  * DOM/React so the maths can be unit tested without mounting anything. */
+import type { PaneTab } from '../../../shared/models'
 import type { TabDropTarget } from './layout-operations'
+
+/** The one mimetype a Conductor tab drag carries. A detached window is a separate OS window
+ * with its own renderer, so re-attaching a tab it owns back into a workspace has to travel the
+ * payload through the OS drag session itself rather than through any shared React state. */
+export const CROSS_WINDOW_TAB_MIME = 'application/x-conductor-pane'
+
+/** Everything a target window needs to graft a foreign tab into its own layout, and everything
+ * the source window needs to know which of its own tabs just left. `detachedId` is absent for
+ * the main window, so its presence alone tells a source which kind of window it came from. */
+export interface CrossWindowTabPayload {
+  tab: PaneTab
+  sourceGroupId: string
+  projectId: string
+  sessionId: string
+  detachedId?: string
+}
+
+export const encodeCrossWindowTab = (payload: CrossWindowTabPayload): string => JSON.stringify(payload)
+
+/** `dataTransfer.getData` only ever returns a plain string, and only at drop time, so a
+ * malformed or foreign payload has to fail closed rather than crash the drop handler. */
+export const decodeCrossWindowTab = (raw: string): CrossWindowTabPayload | null => {
+  try {
+    const value = JSON.parse(raw) as Partial<CrossWindowTabPayload> | null
+    if (!value || typeof value !== 'object') return null
+    const { tab, sourceGroupId, projectId, sessionId, detachedId } = value
+    if (!tab || typeof tab !== 'object' || typeof tab.id !== 'string' || typeof tab.kind !== 'string') return null
+    if (typeof sourceGroupId !== 'string' || typeof projectId !== 'string' || typeof sessionId !== 'string') return null
+    if (detachedId !== undefined && typeof detachedId !== 'string') return null
+    return { tab, sourceGroupId, projectId, sessionId, ...(detachedId ? { detachedId } : {}) }
+  } catch {
+    return null
+  }
+}
 
 export type CanvasEdge = 'left' | 'right' | 'above' | 'below'
 

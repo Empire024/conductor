@@ -1,0 +1,11 @@
+.update-quit-confirm-backdrop { position: fixed; inset: 0; z-index: 1400; display: grid; place-items: center; padding: 24px; background: #05070aaa; backdrop-filter: blur(3px); }
+.update-quit-confirm { width: min(420px, calc(100vw - 32px)); overflow: hidden; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface-1); box-shadow: 0 26px 90px #000c; }
+.update-quit-confirm > header { display: flex; align-items: center; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border-soft); }
+.update-quit-confirm-icon { width: 32px; height: 32px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 8px; color: #e2b93b; background: color-mix(in srgb, #e2b93b 16%, var(--surface-1)); }
+.update-quit-confirm > header strong { color: var(--text); font-size: 12px; font-weight: 650; }
+.update-quit-confirm > p { margin: 0; padding: 12px 16px 0; font-size: 10px; line-height: 1.55; }
+.update-quit-confirm-list { margin: 8px 16px 0; padding: 0 0 0 18px; max-height: 140px; overflow: auto; color: var(--text); font-size: 10px; }
+.update-quit-confirm > footer { display: flex; justify-content: flex-end; gap: 7px; padding: 16px; }
+.update-quit-confirm > footer button { height: 30px; padding: 0 12px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-2); background: var(--surface-2); font-size: 9px; cursor: pointer; }
+.update-quit-confirm > footer button:hover { color: var(--text); background: var(--surface-hover); }
+.update-quit-confirm > footer button.primary { border-color: var(--accent); color: #10140c; background: var(--accent); font-weight: 650; }

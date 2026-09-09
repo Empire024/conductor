@@ -15,14 +15,23 @@ describe('the Auto Fixer brief', () => {
     expect(projectTaskPrompt([task()], false)).toContain('task-1')
   })
 
-  // Each of these is a rule the owner paid for once already: coworker windows appearing over
-  // their screen, a git checkout that would have wiped concurrent uncommitted work, and agents
-  // reporting a task done that nobody had actually looked at.
+  // Each of these is a rule the owner paid for once already: a git checkout that would have
+  // wiped concurrent uncommitted work, and agents reporting a task done that nobody had
+  // actually looked at.
   it('forbids the coworker behaviours that have hurt the owner before', () => {
-    expect(fixer).toMatch(/do not open a visible app window/i)
-    expect(fixer).toMatch(/steal the mouse and keyboard/i)
+    expect(fixer).toMatch(/steals the mouse and keyboard/i)
     expect(fixer).toMatch(/do not run git commit, git push, or git checkout/i)
     expect(fixer).toMatch(/destroy other agents' uncommitted work/i)
+  })
+
+  // The owner paid for the opposite mistake too: a blanket "do not open a window" read as "the
+  // UI is off limits", so a coworker shipped a fix it had never once seen run.
+  it('tells coworkers the real app is available to them rather than forbidden', () => {
+    expect(fixer).toMatch(/can and should drive the real app/i)
+    expect(fixer).toMatch(/CONDUCTOR_TEST_USER_DATA/)
+    expect(fixer).toMatch(/parks its window off every display/i)
+    expect(fixer).toMatch(/not an acceptable sign-off/i)
+    expect(fixer).not.toMatch(/do not open a visible app window/i)
   })
 
   it('requires the tree to be partitioned before work is handed out', () => {
@@ -45,5 +54,18 @@ describe('the Auto Fixer brief', () => {
     const plain = projectTaskPrompt([task()], false)
     expect(plain).not.toMatch(/router\.dispatch/)
     expect(plain).toMatch(/Mark tasks done only after finishing and verifying them/i)
+  })
+
+  it('leaves the brief byte-for-byte unchanged when no extra instruction is given', () => {
+    expect(projectTaskPrompt([task()], false, undefined)).toBe(projectTaskPrompt([task()], false))
+    expect(projectTaskPrompt([task()], false, '')).toBe(projectTaskPrompt([task()], false))
+    expect(projectTaskPrompt([task()], false, '   ')).toBe(projectTaskPrompt([task()], false))
+  })
+
+  it('appends an optional owner instruction after the standard brief', () => {
+    const withExtra = projectTaskPrompt([task()], false, 'Also update the changelog')
+    expect(withExtra.startsWith(projectTaskPrompt([task()], false))).toBe(true)
+    expect(withExtra).toContain('Additional instructions from the owner')
+    expect(withExtra).toContain('Also update the changelog')
   })
 })

@@ -1,6 +1,20 @@
 import { concreteModel } from '../../../shared/agent-model-selection'
-import { settingsForRuntime } from '../../../shared/structured-agent'
-import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
+import { MAX_PROMPT_CHARS, settingsForRuntime } from '../../../shared/structured-agent'
+import type { ContextAttachment, ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
+
+/** Attachment content is expanded into the same request text the CLI/API sees, so a short-looking
+ *  draft with large attachments can silently cross the true prompt ceiling. Counting it here is
+ *  what lets the composer warn before sending instead of surfacing the provider's raw rejection. */
+export function promptCharacterCount(message: string, attachments: Pick<ContextAttachment, 'content'>[]): number {
+  return message.trim().length + attachments.reduce((sum, attachment) => sum + (attachment.content?.length ?? 0), 0)
+}
+
+export type ComposerSendBlock = 'empty' | 'oversized'
+export function composerSendBlock(message: string, attachments: Pick<ContextAttachment, 'content'>[]): ComposerSendBlock | undefined {
+  if (!message.trim()) return 'empty'
+  if (promptCharacterCount(message, attachments) > MAX_PROMPT_CHARS) return 'oversized'
+  return undefined
+}
 
 const reported = (value: unknown): value is string => typeof value === 'string' && Boolean(value) && !['default', 'auto'].includes(value)
 export function modelDisplayName(id: string): string {

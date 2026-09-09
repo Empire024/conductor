@@ -1,16 +1,18 @@
 import { useEffect, useState } from 'react'
 import type { ProjectRecord } from '../../../shared/models'
+import { heaviestProjectTaskWeight, projectTaskWeightDefaults } from '../../../shared/project-backlog'
 import type { ProjectTask, ProjectTaskDispatchOptions, ProjectTaskDispatchResult, ProjectTaskDispatchTarget } from '../../../shared/project-backlog'
 import { AgentDialog } from '../panes/StructuredAgentRenderers'
 import { assignmentStatus } from './project-task-assignment-status'
 
 export type ProjectTaskAssignmentMode = 'existing' | 'new' | 'auto'
+const permissionLabels: Record<string, string> = { default: 'Ask', auto: 'Auto', 'accept-edits': 'Edit', 'read-only': 'Read only' }
 
 export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClose }: {
   project: ProjectRecord
   tasks: ProjectTask[]
   mode: ProjectTaskAssignmentMode
-  onDispatch(target: ProjectTaskDispatchTarget): Promise<ProjectTaskDispatchResult>
+  onDispatch(target: ProjectTaskDispatchTarget, prompt?: string): Promise<ProjectTaskDispatchResult>
   onClose(): void
 }): React.JSX.Element {
   const [options, setOptions] = useState<ProjectTaskDispatchOptions | null>(null)
@@ -18,13 +20,17 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
   const [submitted, setSubmitted] = useState(false)
   const [workspace, setWorkspace] = useState(''), [agent, setAgent] = useState('')
   const [provider, setProvider] = useState<'codex' | 'claude'>('codex')
-  const [model, setModel] = useState(''), [effort, setEffort] = useState('')
+  const [model, setModel] = useState(''), [effort, setEffort] = useState(''), [permission, setPermission] = useState('')
+  const [prompt, setPrompt] = useState('')
   const [result, setResult] = useState<ProjectTaskDispatchResult | null>(null)
   const [delivered, setDelivered] = useState<string[]>([])
   const title = mode === 'existing' ? 'Assign to an open tab' : mode === 'new' ? 'Assign to a new agent' : 'Auto Fixer'
   const catalog = options?.providers.find(item => item.provider === provider)
   const chosenModel = catalog?.models.find(item => item.id === model)
   const chosenAgent = options?.targets.find(item => item.agentSessionId === agent)
+  // The heaviest selected task wins, so a mixed batch is never under-provisioned; this is
+  // only ever a starting suggestion the owner can still override below.
+  const suggestedWeight = heaviestProjectTaskWeight(tasks.map(task => task.weight))
 
   useEffect(() => {
     let active = true
@@ -36,20 +42,26 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
       const available = next.providers.find(item => item.available && item.models.length > 0)
       if (available) {
         setProvider(available.provider)
-        const initial = available.models.find(item => item.isDefault) ?? available.models[0]!
+        const suggestion = projectTaskWeightDefaults[available.provider][suggestedWeight]
+        const preferred = available.models.find(item => item.id === suggestion.model)
+        const initial = preferred ?? available.models.find(item => item.isDefault) ?? available.models[0]!
         setModel(initial.id)
-        setEffort(initial.effort?.includes(initial.defaultEffort ?? '') ? initial.defaultEffort! : initial.effort?.[0] ?? '')
+        setEffort(preferred && initial.effort?.includes(suggestion.effort) ? suggestion.effort : initial.effort?.includes(initial.defaultEffort ?? '') ? initial.defaultEffort! : initial.effort?.[0] ?? '')
+        setPermission(available.permissions.includes('default') ? 'default' : available.permissions[0] ?? '')
       }
     }).catch((reason: unknown) => { if (active) setError(String(reason)) })
     return () => { active = false }
-  }, [project.id])
+  }, [project.id, suggestedWeight])
 
   const chooseProvider = (value: 'codex' | 'claude'): void => {
     setProvider(value)
     const next = options?.providers.find(item => item.provider === value)
-    const initial = next?.models.find(item => item.isDefault) ?? next?.models[0]
+    const suggestion = projectTaskWeightDefaults[value][suggestedWeight]
+    const preferred = next?.models.find(item => item.id === suggestion.model)
+    const initial = preferred ?? next?.models.find(item => item.isDefault) ?? next?.models[0]
     setModel(initial?.id ?? '')
-    setEffort(initial?.effort?.includes(initial.defaultEffort ?? '') ? initial.defaultEffort! : initial?.effort?.[0] ?? '')
+    setEffort(preferred && initial?.effort?.includes(suggestion.effort) ? suggestion.effort : initial?.effort?.includes(initial.defaultEffort ?? '') ? initial.defaultEffort! : initial?.effort?.[0] ?? '')
+    setPermission(next?.permissions.includes('default') ? 'default' : next?.permissions[0] ?? '')
   }
   const chooseModel = (value: string): void => {
     setModel(value)
@@ -67,8 +79,8 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
     setBusy(true); setSubmitted(true); setError('')
     const target: ProjectTaskDispatchTarget = mode === 'existing' ? { type: 'existing', agentSessionId: agent }
       : mode === 'auto' ? { type: 'auto', sessionId: workspace }
-        : { type: 'new', sessionId: workspace, provider, model, ...(chosenModel?.effort?.length ? { effort } : {}) }
-    try { setDelivered([]); setResult(await onDispatch(target)) }
+        : { type: 'new', sessionId: workspace, provider, model, ...(chosenModel?.effort?.length ? { effort } : {}), ...(permission ? { permission } : {}) }
+    try { setDelivered([]); setResult(await onDispatch(target, prompt.trim() || undefined)) }
     catch (reason) { setError(String(reason)) }
     finally { setBusy(false) }
   }
@@ -122,11 +134,16 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
             {Boolean(chosenModel?.effort?.length) && <label>Reasoning effort<select aria-label="Task agent reasoning effort" value={effort} disabled={busy} onChange={event => setEffort(event.target.value)}>
               {chosenModel?.effort?.map(value => <option key={value} value={value}>{value}</option>)}
             </select></label>}
+            {Boolean(catalog?.permissions.length) && <label>Permission mode<select aria-label="Task agent permission mode" value={permission} disabled={busy} onChange={event => setPermission(event.target.value)}>
+              {catalog?.permissions.map(value => <option key={value} value={value}>{permissionLabels[value] ?? value}</option>)}
+            </select></label>}
+            <p className="project-task-assignment-note">Defaults follow the {suggestedWeight} weight of the selected tasks; pick a different model, effort, or permission mode to override.</p>
             <p className="project-task-assignment-note">A new agent tab receives the selected tasks together with these settings.</p>
           </> : <p className="project-task-assignment-note">Auto Fixer chooses a model and reasoning effort for each task, opens agents to work on them, and reviews their results.</p>}
           {!options.providers.some(item => item.available && item.models.length > 0) && <p role="status">Connect a native agent provider to assign tasks.</p>}
         </>}
       </>}
+      {options && !result && <label>Extra instructions (optional)<textarea aria-label="Extra instructions for this assignment" value={prompt} disabled={busy} maxLength={4000} rows={2} onChange={event => setPrompt(event.target.value)} placeholder="Add anything specific you want the agent to know"/></label>}
       {tasks.length > 50 && <p className="project-task-error" role="alert">Select up to 50 tasks at a time.</p>}
       {hasCompleted && <p className="project-task-error" role="alert">Reopen completed tasks before assigning them.</p>}
       {result && <div className="project-task-assignment-results" role="status">{result.assignments.map((assignment, index) => <div key={assignment.agentSessionId + index}>

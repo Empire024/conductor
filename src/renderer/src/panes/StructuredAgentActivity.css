@@ -10,3 +10,7 @@
 .sa-agent-hue-3::before { background: #e2b872; }
 .sa-agent-hue-4::before { background: var(--danger); }
 .sa-agent-hue-5::before { background: var(--accent-muted); }
+
+.sa-question-answers { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.sa-question-answers dt { font-size: 11px; color: var(--text); }
+.sa-question-answers dd { margin: 2px 0 0; font-size: 10.5px; color: var(--text-2); overflow-wrap: anywhere; }

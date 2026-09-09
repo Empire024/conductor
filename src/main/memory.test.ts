@@ -13,7 +13,8 @@ import {
   rankMemoriesForPrune,
   scoreMemory,
   shouldConsolidateMemory,
-  shouldForgetMemory
+  shouldForgetMemory,
+  stripMemoryDirectives
 } from './memory'
 
 const memory = (patch: Partial<AgentMemory> = {}): AgentMemory => ({
@@ -104,6 +105,11 @@ describe('the memory-write contract agents are handed', () => {
     const [again] = captureMemories('Some earlier prose. CONDUCTOR_MEMORY: vitest runs in a NODE environment here')
     expect(capturedMemoryKey('item-1', first!)).toBe(capturedMemoryKey('item-1', again!))
     expect(capturedMemoryKey('item-2', first!)).not.toBe(capturedMemoryKey('item-1', first!))
+  })
+  // The directive is still parsed here for capture; hiding it from the reply is the shared
+  // helper's job, re-exported so the renderer strips the same pattern it was written against.
+  it('re-exports the directive-stripping helper the renderer hides the sentinel with', () => {
+    expect(stripMemoryDirectives('Noted.\nCONDUCTOR_MEMORY: Vitest runs in a node environment')).toBe('Noted.\n')
   })
 })
 

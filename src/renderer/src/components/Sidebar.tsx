@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useState } from 'react'
 import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
 import { RemoveProjectDialog } from './RemoveProjectDialog'
+import { ProcessStatusSummary } from './ProcessStatusSummary'
 import type { TabGroupAction } from '../layout/tab-groups'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
 import type { ProjectActivityStatus, SessionActivityStatus } from '../attention'
@@ -12,7 +13,6 @@ import {
   ChevronDown,
   ChevronRight,
   Clock3,
-  Folder,
   FolderInput,
   FolderOpen,
   FolderGit2,
@@ -402,22 +402,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
           </div>
         </section>
 
-        <section className="sidebar-section status-section">
-          <div className="sidebar-heading"><span>Local status</span></div>
-          <div className="status-card">
-            <div><span className="status-light online" /> Runtime host</div>
-            <span>ready</span>
-          </div>
-          <div className="status-card">
-            <div><Folder size={13} /> State store</div>
-            <span>SQLite</span>
-          </div>
-        </section>
-
-        <footer className="sidebar-footer">
-          <div className="avatar">LC</div>
-          <div><strong>Local workspace</strong><span>Private · on this PC</span></div>
-        </footer>
+        <ProcessStatusSummary projects={props.projects} onOpen={() => props.onUtilityPanel(props.utilityPanel === 'processes' ? null : 'processes')} />
           </>}
         />
       </aside>}

@@ -10,7 +10,9 @@ export interface AgentControlUiRequest extends AgentControlScope {
 export interface AgentControlUiResponse { id: string; result?: unknown; error?: string }
 export interface AgentControlTab extends PaneTab { groupId: string; detachedId?: string; uri: string }
 export interface AgentFileChange { projectId: string; path: string; agentSessionId?: string }
-export interface AgentControlLink { projectId: string; sessionId: string; controllerAgentSessionId: string; targetAgentSessionId: string; controllerTabId: string; controlledTabId: string; controllerTitle?: string; controlledTitle?: string }
+/** projectId/sessionId locate the controlled tab. A controller in another open project records
+ *  where it sits as well, so ownership survives even though the cable is only drawn in one workspace. */
+export interface AgentControlLink { projectId: string; sessionId: string; controllerAgentSessionId: string; targetAgentSessionId: string; controllerTabId: string; controlledTabId: string; controllerProjectId?: string; controllerSessionId?: string; controllerTitle?: string; controlledTitle?: string }
 export interface AgentControlBridge {
   openUri(uri: string): Promise<void>
   onRequest(callback: (request: AgentControlUiRequest) => void): () => void

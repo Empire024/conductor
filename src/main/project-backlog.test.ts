@@ -295,3 +295,59 @@ describe('project task priority',()=> {
     } finally {f.db.close()}
   })
 })
+
+describe('the neutral Task kind',()=> {
+  it('parses a Tasks section distinctly from Bugs, Features and Ideas',()=>{
+    const source='## Tasks\n- [ ] Write the onboarding doc\n\n## Bugs\n- [ ] Fix the crash\n'
+    const tasks=parseProjectTasks(source)
+    expect(tasks.map(task=>[task.title,task.kind])).toEqual([['Write the onboarding doc','task'],['Fix the crash','bug']])
+  })
+  it('adds a new Task kind to its own section, creating it when missing',()=>{
+    const source=updateProjectTaskText('## Bugs\n',{type:'add',kind:'task',title:'Draft the release notes'})
+    expect(parseProjectTasks(source)).toEqual([expect.objectContaining({title:'Draft the release notes',kind:'task'})])
+    expect(source).toContain('## Tasks')
+  })
+  it('still rejects an unsupported kind, naming Task alongside Bug, Feature and Idea',()=>{
+    expect(()=>updateProjectTaskText('## Bugs\n',{type:'add',kind:'chore' as never,title:'No'})).toThrow('Task, Bug, Feature, or Idea')
+  })
+})
+
+describe('project task weight',()=> {
+  it('defaults missing or unrecognized weight markers to medium without failing',()=>{
+    const source='## Bugs\n- [ ] No marker at all\n- [ ] Garbled value <!-- conductor-task:odd weight=huge -->\n- [ ] Wrong case <!-- conductor-task:cased weight=HEAVY -->\n'
+    const tasks=parseProjectTasks(source)
+    expect(tasks.map(task=>task.weight)).toEqual(['medium','medium','heavy'])
+  })
+  it('writes a heavy or light weight into the marker and reads it back, leaving medium unmarked',()=>{
+    let source=updateProjectTaskText('## Bugs\n',{type:'add',kind:'bug',title:'Big refactor',weight:'heavy'})
+    source=updateProjectTaskText(source,{type:'add',kind:'bug',title:'Tiny tweak',weight:'light'})
+    source=updateProjectTaskText(source,{type:'add',kind:'bug',title:'Usual pace'})
+    expect(source).toContain('weight=heavy')
+    expect(source).toContain('weight=light')
+    expect(source).not.toContain('weight=medium')
+    const tasks=parseProjectTasks(source)
+    expect(tasks.map(task=>[task.title,task.weight])).toEqual([['Big refactor','heavy'],['Tiny tweak','light'],['Usual pace','medium']])
+  })
+  it('sets weight on one task alongside its priority without disturbing a sibling claim',()=>{
+    const sibling='- [ ] Keep sibling <!-- conductor-task:sibling agent=agent_B -->'
+    const source='## Bugs\r\n- [~] Target <!-- conductor-task:target agent=agent_A priority=high -->\r\n'+sibling+'\r\n'
+    const updated=updateProjectTaskText(source,{type:'update',id:'target',weight:'heavy'})
+    expect(updated).toContain('<!-- conductor-task:target agent=agent_A priority=high weight=heavy -->')
+    expect(updated).toContain(sibling)
+    const tasks=parseProjectTasks(updated)
+    expect(tasks[0]).toMatchObject({id:'target',priority:'high',weight:'heavy'})
+    expect(tasks[1]).toMatchObject({id:'sibling',weight:'medium'})
+  })
+  it('saves an agent-set weight through the real service and keeps it after reloading',async()=>{
+    const f=fixture()
+    try {
+      const first=await f.service.get(f.project.id)
+      const added=await f.service.edit(f.project.id,first.revision,{type:'add',kind:'bug',title:'Ship it'})
+      const id=added.tasks[0]!.id
+      expect(added.tasks[0]).toMatchObject({weight:'medium'})
+      const weighted=await f.service.edit(f.project.id,added.revision,{type:'update',id,weight:'heavy'})
+      expect(weighted.tasks[0]).toMatchObject({weight:'heavy'})
+      expect((await f.service.get(f.project.id)).tasks[0]).toMatchObject({weight:'heavy'})
+    } finally {f.db.close()}
+  })
+})

@@ -2,9 +2,9 @@
 // Only fixed panel smoke operations are executable. The fixture refuses arbitrary prompts/tools.
 import readline from 'node:readline'
 import { randomUUID } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
 
 if (process.env.CONDUCTOR_OFFLINE_TESTS !== '1') throw new Error('Synthetic Claude UI fixture requires CONDUCTOR_OFFLINE_TESTS=1')
 const input = readline.createInterface({ input: process.stdin })
@@ -36,6 +36,31 @@ let permissionMode = process.argv[process.argv.indexOf('--permission-mode') + 1]
 const sessionRules = new Set()
 const steeringHeld = new Map()
 const steeringTimers = new Set()
+
+// One turn that writes where a real agent writes: a memory file under the owner's profile, a
+// sibling project, a brand-new nested directory, and one ordinary in-workspace edit. Only the
+// last two are the workspace's business; the snapshot layer has nothing to capture for the rest
+// and must not narrate that fact once per tool call.
+const outsideDirectory = process.env.CONDUCTOR_SMOKE_OUTSIDE_DIR
+const outsideEdits = outsideDirectory ? [
+  { path: resolve(outsideDirectory, 'memory', 'fact.md'), body: 'remembered outside the workspace\n' },
+  { path: resolve(outsideDirectory, 'sibling-project', 'notes.md'), body: 'a sibling project file\n' },
+  { path: resolve(outsideDirectory, 'memory', 'second.md'), body: 'a second memory write\n' },
+  { path: resolve('panel.mjs'), body: null },
+  { path: resolve('brand-new/nested/created.txt'), body: 'created inside a directory that did not exist\n' }
+] : []
+let outsideIndex = 0
+const stepOutside = () => {
+  const edit = outsideEdits[outsideIndex]
+  if (!edit) {
+    text(`**Synthetic fixture:** completed ${outsideEdits.length} writes, ${outsideEdits.length - 2} of them outside the workspace.`)
+    pending = undefined; finish(); return
+  }
+  const input = { file_path: edit.path, old_string: '', new_string: edit.body ?? '', description: 'Synthetic out-of-workspace write' }
+  declare(`outside-${outsideIndex}`, 'Edit', input)
+  pending = `outside-pre-${outsideIndex}`
+  hook(pending, 'conductor_before', `outside-${outsideIndex}`, 'Edit', input)
+}
 
 for await (const line of input) {
   const message = JSON.parse(line)
@@ -127,6 +152,13 @@ for await (const line of input) {
       send({ type: 'control_request', request_id: pending, request: { subtype: 'can_use_tool', tool_name: 'AskUserQuestion', tool_use_id: pending, input: { questions: [{ header: 'Appearance', question: 'Which theme should this workspace use?', multiSelect: false, options: [{ label: 'Night', description: 'A quiet, dark workspace.' }, { label: 'Day', description: 'A bright workspace for daytime.' }] }] } } })
       continue
     }
+    if (prompt.startsWith('SYNTHETIC OUTSIDE')) {
+      if (!outsideEdits.length) throw new Error('Synthetic out-of-workspace scenario requires CONDUCTOR_SMOKE_OUTSIDE_DIR')
+      text('**Synthetic Claude activity:** writing a memory file, a sibling project file and one file in this workspace.')
+      outsideIndex = 0
+      stepOutside()
+      continue
+    }
     if (prompt.startsWith('SYNTHETIC B')) {
       text('**Synthetic fixture continuation:** `wasOpen` and `wasPinned` were removed; the local Node test passed. This is offline fixture behavior, not live-provider context evidence.')
       finish(); continue
@@ -160,7 +192,17 @@ for await (const line of input) {
       pending = undefined
       continue
     }
-    if (id === `pre-${turn}`) {
+    if (id === `outside-pre-${outsideIndex}`) {
+      const edit = outsideEdits[outsideIndex]
+      mkdirSync(dirname(edit.path), { recursive: true })
+      writeFileSync(edit.path, edit.body ?? readFileSync(edit.path, 'utf8').replace(oldDeclarations, ''))
+      pending = `outside-post-${outsideIndex}`
+      hook(pending, 'conductor_after', `outside-${outsideIndex}`, 'Edit', { file_path: edit.path }, { filePath: edit.path })
+    } else if (id === `outside-post-${outsideIndex}`) {
+      result(`outside-${outsideIndex}`, `Synthetic fixture wrote ${outsideEdits[outsideIndex].path}.`)
+      outsideIndex++
+      stepOutside()
+    } else if (id === `pre-${turn}`) {
       pending = `approval-${turn}`
       send({ type: 'control_request', request_id: pending, request: { subtype: 'can_use_tool', tool_use_id: `edit-${turn}`, tool_name: 'Edit', input: editInput, title: 'Allow synthetic two-line edit?' } })
     } else if (id === `approval-${turn}`) {

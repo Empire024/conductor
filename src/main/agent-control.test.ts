@@ -76,7 +76,8 @@ describe('authorized native app control', () => {
     const f = fixture()
     const otherPath = join(f.root, 'other'); mkdirSync(otherPath)
     const other = f.database.upsertProject(otherPath, 'Other'), otherWorkspace = f.database.listSessions(other.id)[0]!
-    await expect(f.control.call(f.scope, 'tabs.list', { projectId: other.id })).rejects.toThrow('scope')
+    await expect(f.control.call(f.scope, 'tabs.list', { projectId: 'project_not_open' })).rejects.toThrow('projects.list')
+    await expect(f.control.call(f.scope, 'tasks.update', { projectId: other.id, revision: '1', id: 'anything' })).rejects.toThrow('only runs in the authorized project')
     await expect(f.control.call({ ...f.scope, sessionId: otherWorkspace.id }, 'app.state')).rejects.toThrow('scope')
     const hidden = { ...f.spec, id: 'hidden' }; f.sessions.ensure(hidden)
     await expect(f.control.call(f.scope, 'agents.submit', { agentSessionId: hidden.id, prompt: 'Do work' })).rejects.toThrow('visible tab')
@@ -454,5 +455,98 @@ describe('which machine a controlled tab runs on', () => {
       { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: null, projects: [link(f.project.id)] }
     ] })
     await expect(control.call(f.scope, 'tabs.open', {})).rejects.toThrow(/Remote machine placement is unavailable/)
+  })
+})
+
+/** A second project the owner has open in the same window, with its own workspace. */
+const sibling = (f: ReturnType<typeof fixture>, name = 'Theme') => {
+  const path = join(f.root, name.toLowerCase()); mkdirSync(path)
+  const project = f.database.upsertProject(path, name), workspace = f.database.listSessions(project.id)[0]!
+  return { project, workspace, path }
+}
+
+/** An unrelated agent with a visible tab in the given workspace, able to call control itself. */
+const agentIn = (f: ReturnType<typeof fixture>, projectId: string, sessionId: string, id: string): AgentControlScope => {
+  f.sessions.ensure({ id, projectId, sessionId, cwd: f.database.getProject(projectId)!.path, provider: 'codex', title: id, model: 'codex-synthetic' })
+  const current = f.database.getSession(sessionId)!
+  if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+  current.layout.root.tabs.push({ id: 'tab-' + id, kind: 'agent', resourceId: id, title: id, state: { provider: 'codex', model: 'codex-synthetic' } })
+  f.database.saveSession(sessionId, current.layout, null, [])
+  return { projectId, sessionId, agentSessionId: id }
+}
+
+describe('projects open side by side in one window', () => {
+  it('names every open project and reads a sibling without being able to write to it', async () => {
+    const f = fixture(), other = sibling(f)
+    writeFileSync(join(other.path, 'style.css'), 'body { color: teal }')
+    const listed = await f.control.call(f.scope, 'projects.list') as Array<{ id: string; name: string; current: boolean; workspaces: Array<{ id: string }> }>
+    expect(listed.map(project => project.name).sort()).toEqual(['Control project', 'Theme'])
+    expect(listed.find(project => project.id === f.project.id)?.current).toBe(true)
+    expect(listed.find(project => project.id === other.project.id)?.workspaces.map(workspace => workspace.id)).toEqual([other.workspace.id])
+    const state = await f.control.call(f.scope, 'app.state') as { projects: Array<{ id: string }> }
+    expect(state.projects.map(project => project.id)).toContain(other.project.id)
+    const read = await f.control.call(f.scope, 'files.read', { projectId: other.project.id, path: 'style.css' }) as { content: string; uri: string }
+    expect(read.content).toBe('body { color: teal }')
+    expect(read.uri).toBe('conductor://' + other.project.id + '/file/style.css')
+    await expect(f.control.call(f.scope, 'files.write', { projectId: other.project.id, path: 'style.css', content: 'x', expectedContent: 'body { color: teal }' }))
+      .rejects.toThrow(/only runs in the authorized project/)
+    expect(readFileSync(join(other.path, 'style.css'), 'utf8')).toBe('body { color: teal }')
+  })
+
+  it('hands work to a tab opened in the sibling project and keeps steering only that tab', async () => {
+    const f = fixture(), other = sibling(f)
+    const handed = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'Theme worker' }) as AgentControlTab & { projectId: string; workspaceId: string }
+    expect(handed.projectId).toBe(other.project.id)
+    expect(handed.workspaceId).toBe(other.workspace.id)
+    // The tab belongs to the project that received it, and works in that project's folder.
+    const spec = f.database.structured.spec<AgentSpec>(handed.resourceId!)!
+    expect(spec).toMatchObject({ projectId: other.project.id, sessionId: other.workspace.id, cwd: other.path })
+    expect(f.database.getSession(other.workspace.id)!.layout.root).toMatchObject({ activeTabId: handed.id })
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: handed.resourceId, prompt: 'Integrate the exported model' })
+    expect(f.submissions.at(-1)?.prompt).toContain('Integrate the exported model')
+    const listed = await f.control.call(f.scope, 'agents.list') as Array<{ agentSessionId?: string; projectId: string; crossProject?: boolean }>
+    expect(listed.find(agent => agent.agentSessionId === handed.resourceId)).toMatchObject({ projectId: other.project.id, crossProject: true })
+    // Ownership binds in the receiving project too, so nobody there can take the tab over.
+    const local = agentIn(f, other.project.id, other.workspace.id, 'theme-agent')
+    await expect(f.control.call(local, 'agents.steer', { agentSessionId: handed.resourceId, prompt: 'Mine now' })).rejects.toThrow(/already controls this tab/)
+    // And an unrelated agent cannot reach across into a conversation it did not open.
+    const stranger = agentIn(f, f.project.id, f.workspace.id, 'stranger')
+    await expect(f.control.call(stranger, 'agents.snapshot', { agentSessionId: handed.resourceId })).rejects.toThrow(/outside this workspace/)
+    await f.control.call(f.scope, 'agents.release', { agentSessionId: handed.resourceId })
+    await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: handed.resourceId, prompt: 'Once more' })).rejects.toThrow(/outside this workspace/)
+    // The owner's own release button reaches a cross-project link as well.
+    const second = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'Second worker' }) as AgentControlTab
+    f.control.releaseByOwner(second.resourceId!)
+    await expect(f.control.call(f.scope, 'agents.snapshot', { agentSessionId: second.resourceId })).rejects.toThrow(/outside this workspace/)
+  })
+
+  it('dispatches a coworker into the sibling project but never hands it this project’s task claims', async () => {
+    const f = fixture(), other = sibling(f)
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Integrate', prompt: 'Wire the asset in', projectId: other.project.id, projectTaskIds: ['bug-1'] }] }))
+      .rejects.toThrow(/cannot take this project’s task claims/)
+    const dispatched = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Integrate', prompt: 'Wire the asset in', projectId: other.project.id }] }) as Array<{ accepted: boolean; projectId: string; agentSessionId: string }>
+    expect(dispatched[0]).toMatchObject({ accepted: true, projectId: other.project.id })
+    expect(f.database.structured.spec<AgentSpec>(dispatched[0]!.agentSessionId)!.projectId).toBe(other.project.id)
+    // The orchestration row stays with the dispatcher, so the worker is not told to close a task it cannot see.
+    expect(f.orchestration.listTasks(other.project.id)).toHaveLength(0)
+    expect(f.submissions.at(-1)?.prompt).toContain('handed to the Theme project')
+    expect(f.submissions.at(-1)?.prompt).not.toContain('orchestration.tasks.update')
+  })
+})
+
+describe('a conversation a paired machine is driving', () => {
+  it('stays inside the project that machine was granted, even with another project open here', async () => {
+    const f = fixture(), other = sibling(f, 'Private')
+    writeFileSync(join(other.path, 'secrets.md'), 'not shared')
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    // The stamp RemoteControlHost puts on a tab it opens for a peer.
+    current.layout.root.tabs[0]!.state = { ...current.layout.root.tabs[0]!.state, remotePeerId: 'peer-1', remoteMachineName: 'Render Desktop' }
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+    for (const [method, args] of [['files.read', { path: 'secrets.md' }], ['files.list', {}], ['tabs.list', {}], ['tabs.open', {}]] as const) {
+      await expect(f.control.call(f.scope, method, { ...args, projectId: other.project.id })).rejects.toThrow(/driven by a paired machine/)
+    }
+    // Its own project is unaffected.
+    await expect(f.control.call(f.scope, 'tabs.list', { projectId: f.project.id })).resolves.toBeTruthy()
   })
 })

@@ -26,6 +26,7 @@
     "test:composer-drafts": "npm run build && node scripts/smoke-composer-drafts.mjs && node scripts/smoke-composer-drafts.mjs --provider=claude",
     "test:composer-settings": "npm run build && node scripts/smoke-composer-settings.mjs",
     "test:change-history": "npm run build && node scripts/smoke-change-history.mjs",
+    "test:snapshot-notices": "npm run build && node scripts/smoke-snapshot-notices.mjs",
     "test:agent-live": "node scripts/live-structured-codex.mjs",
     "smoke:ui": "node scripts/smoke-ui.mjs",
     "test:backlog": "npm run build && node scripts/smoke-backlog.mjs",

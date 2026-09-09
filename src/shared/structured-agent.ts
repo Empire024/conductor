@@ -3,6 +3,9 @@ import type { AgentChangeHistory, RevertOutcome, RevertScope } from './agent-cha
 export type StructuredProvider = 'codex' | 'claude'
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 export type SessionPhase = 'idle' | 'starting' | 'running' | 'waiting_approval' | 'waiting_input' | 'interrupting' | 'completed' | 'failed' | 'disconnected' | 'interrupted'
+/** The true native CLI/API ceiling. Text, attachment expansion and recalled memory context
+ *  together must stay under this or the provider refuses the whole turn with an opaque error. */
+export const MAX_PROMPT_CHARS = 600_000
 export type ActivityStatus = 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'
 export interface ProviderCapabilities {
   provider: StructuredProvider
@@ -72,6 +75,9 @@ export interface PendingInteraction {
   questions?: InputQuestion[]
   status: 'pending' | 'resolved' | 'expired'
   outcome?: string
+  /** What the owner actually answered, kept on the resolved interaction so a conversation
+   *  reloaded from history still shows the answer rather than only that one was given. */
+  answers?: Record<string, string | string[]>
 }
 export interface FileChange {
   path: string
