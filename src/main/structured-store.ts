@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import type { AgentEvent, DiffArtifact, SessionProjection, StructuredProvider } from '../shared/structured-agent'
+import type { AgentEvent, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, StructuredProvider, TimelineItem } from '../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
 import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
 
@@ -16,6 +16,21 @@ export function sanitizeDiagnostic(value: unknown): unknown {
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, /^(authorization|api_?key|access_?token|refresh_?token|password|secret|env|environment)$/i.test(key) ? '[REDACTED]' : sanitizeDiagnostic(item)]))
   return value
 }
+
+/** Find only searches what the owner actually read: a message. Tool payloads, diffs, ids and
+ *  provider internals are in the projection too, and matching them turns a find into noise. */
+export function searchableMessage(item: TimelineItem): { role: 'user' | 'assistant' | 'status'; text: string } | null {
+  return item.data.type === 'text' && item.data.text ? { role: item.data.role, text: item.data.text } : null
+}
+const SNIPPET_RADIUS = 70
+/** Whitespace is flattened one character at a time (never collapsed) so the reported offset still
+ *  addresses the match inside the snippet the renderer marks. */
+export function messageSnippet(text: string, index: number, length: number, radius = SNIPPET_RADIUS): { snippet: string; matchStart: number } {
+  const start = Math.max(0, index - radius), end = Math.min(text.length, index + length + radius)
+  const lead = start > 0 ? '…' : ''
+  return { snippet: lead + text.slice(start, end).replace(/\s/g, ' ') + (end < text.length ? '…' : ''), matchStart: index - start + lead.length }
+}
+const MAX_SEARCH_GROUPS = 20, MAX_SEARCH_HITS = 5, MIN_SEARCH_QUERY = 2
 
 export class StructuredAgentStore {
   private artifactBytes = 0
@@ -133,6 +148,37 @@ export class StructuredAgentStore {
     const needle = query.toLocaleLowerCase()
     // An untouched session (no items ever sent/received, never titled) is a bookkeeping row, not history.
     return ids.flatMap(row => { const state = this.snapshot(row.id); return state && (state.items.length || state.title) && (!needle || JSON.stringify(state.items).toLocaleLowerCase().includes(needle) || state.title.toLocaleLowerCase().includes(needle)) ? [{ id: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, phase: state.phase }] : [] }).slice(0, 200)
+  }
+  /** Message find across a whole workspace. Projections are already resident, so this is a bounded
+   *  in-memory scan; only snippets cross the IPC boundary, never another conversation's items. */
+  searchMessages(projectId: string, query: string, excludeId = ''): ConversationSearchResult {
+    const needle = query.trim().toLocaleLowerCase()
+    if (needle.length < MIN_SEARCH_QUERY) return { groups: [], truncated: false }
+    const rows = this.db.prepare('SELECT id, provider FROM structured_sessions WHERE project_id=? ORDER BY rowid DESC').all(projectId) as Array<{ id: string; provider: StructuredProvider }>
+    const groups: ConversationSearchGroup[] = []
+    let truncated = false
+    for (const row of rows) {
+      if (row.id === excludeId) continue
+      const state = this.snapshot(row.id)
+      if (!state) continue
+      const group: ConversationSearchGroup = { sessionId: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, messages: 0, hits: [] }
+      for (const item of state.items) {
+        const message = searchableMessage(item)
+        if (!message) continue
+        const haystack = message.text.toLocaleLowerCase()
+        const index = haystack.indexOf(needle)
+        if (index === -1) continue
+        group.messages++
+        if (group.hits.length >= MAX_SEARCH_HITS) continue
+        let matches = 0
+        for (let cursor = index; cursor !== -1; cursor = haystack.indexOf(needle, cursor + needle.length)) matches++
+        group.hits.push({ itemId: item.id, sequence: item.sequence, role: message.role, ...messageSnippet(message.text, index, needle.length), matchLength: needle.length, matches })
+      }
+      if (!group.messages) continue
+      if (groups.length >= MAX_SEARCH_GROUPS) { truncated = true; break }
+      groups.push(group)
+    }
+    return { groups, truncated }
   }
   putArtifact(sessionId: string, value: Omit<DiffArtifact, 'id'>): DiffArtifact {
     const id = randomUUID()

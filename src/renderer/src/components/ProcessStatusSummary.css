@@ -41,6 +41,14 @@
 }
 .process-status-summary-cost { font-variant-numeric: tabular-nums; }
 
+/* Same two-step "getting expensive" language as the composer's usage pill: amber for
+   approaching a cap (or the flat cost fallback), red once it is actually high. Calm by
+   default -- only the high step gets the (already-established) subtle pulse. */
+.process-status-summary-warning { color: #df9a49; margin-left: 0; }
+.process-status-summary-warning.level-high { color: #ed6d72; }
+.process-status-summary-warning svg { display: block; animation: session-activity-pulse 1.6s ease-in-out infinite; }
+.process-status-summary-warning.level-approaching svg { animation: none; }
+
 .process-status-summary-rows { display: flex; flex-direction: column; gap: 2px; }
 .process-status-summary-row {
   display: flex;
@@ -52,5 +60,11 @@
 }
 .process-status-summary-row > span:first-child { min-width: 0; color: var(--text-2); }
 .process-status-summary-row.process-status-summary-empty > span { color: var(--text-3); }
+.process-status-summary-row.level-approaching > span:first-child { color: #df9a49; }
+.process-status-summary-row.level-high > span:first-child { color: #ed6d72; }
+.process-status-summary-flame { flex: 0 0 auto; margin-right: 3px; vertical-align: -1px; }
 
-@media (prefers-reduced-motion: reduce) { .process-status-summary-head span.process-status-summary-running i { animation: none; } }
+@media (prefers-reduced-motion: reduce) {
+  .process-status-summary-head span.process-status-summary-running i { animation: none; }
+  .process-status-summary-warning svg { animation: none; }
+}

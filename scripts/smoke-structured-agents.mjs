@@ -190,7 +190,9 @@ try {
   await expect(page.locator('.code-path')).toContainText('panel.mjs')
   assert.equal(await readFile(join(project.path, 'panel.mjs'), 'utf8'), expected)
   await page.getByRole('button', { name: 'Attach context', exact: true }).click()
-  await page.locator('.pane-tab').filter({ hasText: providerName }).first().click()
+  // The tab auto-names itself from the first message, so address it by its session rather than
+  // by the provider label it only carries until then.
+  await page.locator(`.pane-tab[data-control-agent-id="${sessionId}"]`).first().click()
   await expect(page.locator('.sa-context-chips')).toContainText('panel.mjs')
   await page.locator('.sa-context-chips button').first().click()
   await expect(page.getByRole('dialog')).toContainText("el.classList.add('is-loading')")

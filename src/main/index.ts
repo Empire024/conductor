@@ -194,6 +194,9 @@ const createWindow = (
       webviewTag: true
     }
   })
+  // A parked window must not take the speakers either: a smoke run completes agent after agent,
+  // and every one of them would ring the owner's "finished" cue while they work in another app.
+  if (backgroundWindows) window.webContents.setAudioMuted(true)
   // Browser guests do not bubble keyboard events into the workspace renderer.
   window.webContents.on('did-attach-webview', (_event, guest) => {
     guest.on('before-input-event', (event, input) => {
@@ -405,7 +408,8 @@ const projectActivitySnapshot = (): ProjectActivitySnapshot => {
   return aggregateProjectActivity(
     projects.map((project) => project.id),
     projects.flatMap((project) => database.listSessions(project.id)),
-    database.listAgentActivity()
+    database.listAgentActivity(),
+    database.listDetachedWindows()
   )
 }
 
@@ -643,6 +647,7 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:rename', (event, id, title) => { trustedStructured(event); if (typeof title !== 'string' || !title.trim() || title.length > 160) throw new Error('Invalid title'); return agents.structured.rename(structuredId(id), title.trim()) })
   ipcMain.handle('structured:archive', (event, id, archived) => { trustedStructured(event); if (typeof archived !== 'boolean') throw new Error('Invalid archive setting'); return agents.structured.archive(structuredId(id), archived) })
   ipcMain.handle('structured:history', (event, projectId, query) => { trustedStructured(event); if (query !== undefined && (typeof query !== 'string' || query.length > 500)) throw new Error('Invalid search'); return database.structured.history(structuredId(projectId), query) })
+  ipcMain.handle('structured:search-messages', (event, projectId, query, excludeId) => { trustedStructured(event); if (typeof query !== 'string' || query.length > 500) throw new Error('Invalid search'); return database.structured.searchMessages(structuredId(projectId), query, excludeId === undefined ? undefined : structuredId(excludeId)) })
   ipcMain.handle('structured:artifact', (event, id, artifactId) => { trustedStructured(event); return database.structured.artifact(structuredId(id), structuredId(artifactId)) })
   ipcMain.handle('structured:output', (event, id, artifactId) => { trustedStructured(event); return database.structured.output(structuredId(id), structuredId(artifactId)) })
   ipcMain.handle('structured:review', (event, id, artifactId, action) => { trustedStructured(event); return agents.structured.review(structuredId(id), structuredId(artifactId), action) })

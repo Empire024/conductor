@@ -12,6 +12,8 @@ import { fileTypeStyle } from '../file-types'
 import { copyText } from '../clipboard'
 import { runFileLinkAction } from '../components/file-link-actions'
 import { buildFileLinkMenuEntries, FILE_LINK_MENU_ICONS, type FileLinkMenuAction } from '../components/file-link-menu'
+import { resolveFileLinkTarget, useFileLinkProjectRoots, type ResolvedFileLink } from '../components/file-link-target'
+import { openWorkspaceFile } from '../components/workspace-files-state'
 import './StructuredAgentActivity.css'
 import './StructuredFileLinkMenu.css'
 
@@ -176,20 +178,11 @@ export function toolPresentation(tool: ToolData): { kind: ToolRendererKind; titl
   const input = command ?? (kind === 'read' ? [path, data.offset !== undefined ? 'Offset: ' + data.offset : '', data.limit !== undefined ? 'Limit: ' + data.limit : ''].filter(Boolean).join('\n') : kind === 'search' ? [query, path].filter(Boolean).join('\n') : undefined)
   return { kind, title: generatedCommandDescription ? fallback : suppliedDescription || fallback, input: tool.inputDelta || input || (tool.input !== undefined ? JSON.stringify(tool.input, null, 2) : ''), path, cwd: field(data, 'cwd', 'workdir', 'working_directory') }
 }
+/** A link addressed to this conversation's own workspace. Callers that can also act on another
+ *  open project's file use resolveFileLinkTarget directly, which reports the owning project too. */
 export function safeFileTarget(raw: string, cwd: string): { path: string; line?: number } | null {
-  let decoded: string
-  try { decoded = decodeURIComponent(raw) } catch { return null }
-  if (/[\u0000-\u001f]/.test(decoded)) return null
-  let path = decoded.replaceAll('\\', '/')
-  const lineMatch = path.match(/(?::(\d+)(?::\d+)?|#L(\d+))$/)
-  const line = lineMatch ? Number(lineMatch[1] ?? lineMatch[2]) : undefined
-  if (lineMatch) path = path.slice(0, lineMatch.index)
-  const root = cwd.replaceAll('\\', '/').replace(/\/$/, '')
-  if (path.toLowerCase().startsWith(root.toLowerCase() + '/')) path = path.slice(root.length + 1)
-  else if (/^(?:[a-z][a-z\d+.-]*:|\/\/|\/)/i.test(path)) return null
-  path = path.replace(/^\.\//, '')
-  if (!path || path.split('/').some((part) => part === '..' || !part) || path.includes(':')) return null
-  return { path, line: line && Number.isSafeInteger(line) && line > 0 ? line : undefined }
+  const target = resolveFileLinkTarget(raw, cwd)
+  return target ? { path: target.path, line: target.line } : null
 }
 export function safeExternalLink(href: string): boolean {
   try { const url = new URL(href); return (url.protocol === 'https:' || url.protocol === 'http:') && !url.username && !url.password } catch { return false }
@@ -203,7 +196,8 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
   // click already understands (Click = edit, Ctrl+Click = browser preview, Ctrl+Shift+Click =
   // default browser) and adds the two explorer reveal actions. External and conductor:// links
   // keep their plain click-only behaviour, matching what they already do.
-  const [menu, setMenu] = useState<{ target: { path: string; line?: number }; x: number; y: number } | null>(null)
+  const [menu, setMenu] = useState<{ target: ResolvedFileLink; x: number; y: number } | null>(null)
+  const projects = useFileLinkProjectRoots()
   useEffect(() => {
     if (!menu) return
     const close = (): void => setMenu(null)
@@ -213,34 +207,48 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
     window.addEventListener('keydown', onEscape)
     return () => { window.removeEventListener('mousedown', close); window.removeEventListener('resize', close); window.removeEventListener('keydown', onEscape) }
   }, [menu])
-  const showMenu = (event: React.MouseEvent, target: { path: string; line?: number }): void => {
+  const showMenu = (event: React.MouseEvent, target: ResolvedFileLink): void => {
     event.preventDefault(); event.stopPropagation()
     setMenu({ target, x: Math.min(event.clientX, window.innerWidth - 226), y: Math.max(6, Math.min(event.clientY, window.innerHeight - 250)) })
   }
-  const runMenuAction = (action: FileLinkMenuAction): void => {
-    if (!menu || !projectId) return
-    const { path, line } = menu.target
-    setMenu(null)
-    runFileLinkAction(action, { projectId, path, line }, onOpenFile, (message) => setLinkError(message))
+  // A file that belongs to another open project cannot go through the pane's onOpenFile: that
+  // resolves paths inside this conversation's workspace. It opens as its own project's file tab,
+  // in the same type-aware view the explorer would pick, so a PNG previews and a .blend is
+  // described rather than loaded into the text editor.
+  const editTarget = (target: ResolvedFileLink, path: string, line?: number): void => {
+    if (target.projectId && target.projectId !== projectId) openWorkspaceFile(target.projectId, path, 'auto', line)
+    else onOpenFile(path, line)
   }
-  return <div className="sa-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={(url) => safeConductorLink(url) || safeExternalLink(url) || safeFileTarget(url, cwd) ? url : ''} components={{
+  const runLinkAction = (action: FileLinkMenuAction, target: ResolvedFileLink): void => {
+    const owner = target.projectId ?? projectId
+    if (!owner) return
+    runFileLinkAction(action, { projectId: owner, path: target.path, line: target.line }, (path, line) => editTarget(target, path, line), (message) => setLinkError(message))
+  }
+  const runMenuAction = (action: FileLinkMenuAction): void => {
+    if (!menu) return
+    const target = menu.target
+    setMenu(null)
+    runLinkAction(action, target)
+  }
+  return <div className="sa-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={(url) => safeConductorLink(url) || safeExternalLink(url) || resolveFileLinkTarget(url, cwd, projects) ? url : ''} components={{
     a: ({ href, children }) => {
       if (!href) return <span>{children}</span>
       const internal = safeConductorLink(href)
       const external = safeExternalLink(href)
-      const target = external || internal ? null : safeFileTarget(href, cwd)
+      const target = external || internal ? null : resolveFileLinkTarget(href, cwd, projects)
+      const sibling = Boolean(target?.projectId && target.projectId !== projectId)
       return <a href={external ? href : '#'}
-        onClick={(event) => { event.preventDefault(); if (internal) void window.conductor.agentControl.openUri(href).catch(reason => setLinkError(reason instanceof Error ? reason.message : String(reason))); else if (external) void window.conductor.system.openExternal(href); else if (target) { if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, path: target.path, line: target.line, mode: event.shiftKey ? 'external' : 'browser' } })); else onOpenFile(target.path, target.line) } }}
-        onContextMenu={target && projectId ? (event) => showMenu(event, target) : undefined}
+        onClick={(event) => { event.preventDefault(); if (internal) void window.conductor.agentControl.openUri(href).catch(reason => setLinkError(reason instanceof Error ? reason.message : String(reason))); else if (external) void window.conductor.system.openExternal(href); else if (target) { if (sibling) runLinkAction(event.ctrlKey || event.metaKey ? event.shiftKey ? 'default-browser' : 'live-preview' : 'edit', target); else if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, path: target.path, line: target.line, mode: event.shiftKey ? 'external' : 'browser' } })); else onOpenFile(target.path, target.line) } }}
+        onContextMenu={target && (target.projectId ?? projectId) ? (event) => showMenu(event, target) : undefined}
       >{children}</a>
     },
     img: ({ alt }) => <span className="sa-muted">{alt ? '[Image: ' + alt + ']' : '[Image omitted]'}</span>,
     pre: ({ children }) => <MarkdownCodeBlock>{children}</MarkdownCodeBlock>
   }}>{text}</ReactMarkdown>{linkError && <span className="sa-error" role="alert">{linkError}</span>}
   {menu && createPortal(
-    <div className="cursor-context-menu sa-file-link-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
+    <div className="cursor-context-menu sa-file-link-menu" role="menu" aria-label={'Actions for ' + menu.target.path} style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
       <div className="context-menu-label">{menu.target.path.split('/').pop()}</div>
-      {buildFileLinkMenuEntries().map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} onClick={() => runMenuAction(entry.action)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
+      {buildFileLinkMenuEntries().map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} role="menuitem" onClick={() => runMenuAction(entry.action)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
     </div>,
     document.body
   )}</div>

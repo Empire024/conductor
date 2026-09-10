@@ -18,7 +18,7 @@ import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
-function fixture(aliasedRoot = false) {
+function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['permissions']>>) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0'); vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
   const root = mkdtempSync(join(tmpdir(), 'conductor-control-')), canonicalProjectPath = join(root, 'project')
   mkdirSync(canonicalProjectPath)
@@ -33,7 +33,7 @@ function fixture(aliasedRoot = false) {
   const submissions: Array<{ provider: StructuredProvider; prompt: string; options: AdapterOptions }> = []
   const broadcast = vi.fn()
   const sessions = new StructuredSessions(database, () => 'synthetic-provider', broadcast, (provider, options): ProviderAdapter => {
-    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: ['default', 'read-only', 'accept-edits'], sandboxModes: ['inherit', 'read-only', 'workspace-write'], effort: ['low'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }], limitations: ['Zero inference fixture'] }
+    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: ['inherit', 'read-only', 'workspace-write'], effort: ['low'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }], limitations: ['Zero inference fixture'] }
     return { provider, capabilities, start: async () => { options.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: 'native-' + options.runtimeId } }) },
       submit: async prompt => { submissions.push({ provider, prompt, options }); options.emit({ itemId: 'result', data: { type: 'text', role: 'assistant', text: 'Native fixture result', mode: 'snapshot' } }); options.emit({ data: { type: 'session', phase: 'completed' } }) }, respond: async () => {}, interrupt: async () => {}, dispose: () => {} }
   })
@@ -195,6 +195,41 @@ describe('authorized native app control', () => {
     f.database.structured.update(f.spec.id, { settings: { permission: 'accept-edits', plan: false, temporaryPermission: { runtimeId: 'earlier-runtime', restore: 'default' } } })
     const guarded = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
     expect(f.database.structured.snapshot(guarded.resourceId!)?.settings).toMatchObject({ permission: 'default' })
+  })
+
+  it('opens a new agent tab on the owner\'s remembered mode for that provider, not just whatever the controller happens to be on', async () => {
+    const f = fixture()
+    f.database.setSetting('rememberedPermission:claude', 'read-only')
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude' }) as AgentControlTab
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'read-only' })
+  })
+
+  it('lets an explicit tabs.open permission win over the owner\'s remembered mode', async () => {
+    const f = fixture()
+    f.database.setSetting('rememberedPermission:claude', 'read-only')
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'default' }) as AgentControlTab
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'default' })
+  })
+
+  it('rejects an explicit tabs.open permission that is not a real mode, or one this provider does not offer', async () => {
+    const f = fixture()
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'plan' })).rejects.toThrow('Invalid permission mode')
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'auto' })).rejects.toThrow('supported by this provider')
+  })
+
+  it('never lets a Claude-only remembered mode leak into a new Codex tab', async () => {
+    const f = fixture(false, { claude: ['default', 'read-only', 'accept-edits', 'auto'], codex: ['default', 'read-only', 'accept-edits'] })
+    f.database.setSetting('rememberedPermission:claude', 'auto')
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex' }) as AgentControlTab
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'default' })
+  })
+
+  it('still clamps a remembered mode to the controller\'s own autonomy', async () => {
+    const f = fixture()
+    f.database.structured.update(f.spec.id, { settings: { permission: 'read-only', plan: false } })
+    f.database.setSetting('rememberedPermission:claude', 'accept-edits')
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude' }) as AgentControlTab
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'read-only' })
   })
 
   it('preserves human memories and checklist ownership during agent writes', async () => {

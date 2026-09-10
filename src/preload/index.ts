@@ -89,6 +89,7 @@ const bridge: ConductorBridge = {
     rename: (id, title) => ipcRenderer.invoke('structured:rename', id, title),
     archive: (id, archived) => ipcRenderer.invoke('structured:archive', id, archived),
     history: (projectId, query) => ipcRenderer.invoke('structured:history', projectId, query),
+    searchMessages: (projectId, query, excludeId) => ipcRenderer.invoke('structured:search-messages', projectId, query, excludeId),
     artifact: (id, artifactId) => ipcRenderer.invoke('structured:artifact', id, artifactId),
     output: (id, artifactId) => ipcRenderer.invoke('structured:output', id, artifactId),
     review: (id, artifactId, action) => ipcRenderer.invoke('structured:review', id, artifactId, action),

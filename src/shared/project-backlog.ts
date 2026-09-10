@@ -57,6 +57,9 @@ export interface ProjectTaskDispatchOptions {
   targets:Array<{agentSessionId:string;tabId:string;sessionId:string;title:string;provider:'codex'|'claude';phase:string}>
   providers:Array<{provider:'codex'|'claude';available:boolean;source:'runtime'|'configured';models:ProjectTaskDispatchModel[];permissions:string[]}>
 }
+/** `new`/`auto` register a fresh native session, which opens on the owner's remembered permission
+ *  for its provider (see structured-sessions.ts ensure()); an explicit `permission` on `new`
+ *  overrides that inherited default instead of leaving the choice to whatever was last remembered. */
 export type ProjectTaskDispatchTarget = {type:'existing';agentSessionId:string} | {type:'new';sessionId:string;provider:'codex'|'claude';model:string;effort?:string;permission?:string} | {type:'auto';sessionId:string}
 export interface ProjectTaskDispatchRequest {taskIds:string[];target:ProjectTaskDispatchTarget;prompt?:string}
 export interface ProjectTaskDispatchAssignment {taskIds:string[];agentSessionId:string;tabId:string;sessionId:string;provider:'codex'|'claude';model:string;effort?:string;permission?:string;status:'submitted'|'queued'|'failed';error?:string}

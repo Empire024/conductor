@@ -376,3 +376,32 @@
 
 .sa-queue > button { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); cursor: pointer; transition: background 120ms ease, color 120ms ease; }
 .sa-queue > button:hover { background: var(--surface-3); color: var(--text); }
+
+/* Ctrl+F find. An in-theme strip above the timeline, never a modal: the conversation stays
+   readable and the composer keeps its draft while a search runs. */
+.sa-find { border-bottom: 1px solid var(--border); background: var(--surface-1); }
+.sa-find-row { display: flex; align-items: center; gap: 7px; padding: 5px 9px; }
+.sa-find-row > svg { flex: 0 0 auto; color: var(--text-3); }
+.sa-find-row > input { flex: 1; min-width: 0; height: 24px; padding: 0 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-0); color: var(--text); font-size: 11px; }
+.sa-find-row > input:focus-visible { border-color: var(--accent-muted); outline: none; }
+.sa-find-count { flex: 0 0 auto; min-width: 56px; color: var(--text-3); font-size: 10.5px; text-align: right; font-variant-numeric: tabular-nums; }
+.sa-find-row > button { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); cursor: pointer; }
+.sa-find-row > button:hover:not(:disabled) { background: var(--surface-3); color: var(--text); }
+.sa-find-row > button:disabled { opacity: .4; cursor: default; }
+.sa-find-results { max-height: 190px; overflow: auto; padding: 0 5px 5px; border-top: 1px solid var(--border-soft); }
+.sa-find-results section { padding: 4px 0 2px; }
+.sa-find-results h4 { display: flex; align-items: baseline; gap: 7px; margin: 0; padding: 3px 5px; color: var(--text-2); font-size: 10.5px; font-weight: 600; }
+.sa-find-results h4 > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sa-find-results h4 > small { flex: 0 0 auto; margin-left: auto; color: var(--text-3); font-size: 9.5px; font-weight: 400; }
+.sa-find-results section > button { display: flex; width: 100%; align-items: baseline; gap: 7px; padding: 4px 6px; border: 0; border-radius: 5px; background: transparent; color: var(--text-2); text-align: left; font-size: 11px; cursor: pointer; }
+.sa-find-results section > button:hover { background: var(--surface-hover); }
+.sa-find-role { flex: 0 0 auto; color: var(--text-3); font-size: 9.5px; }
+.sa-find-snippet { min-width: 0; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sa-find-snippet mark { background: color-mix(in srgb, var(--accent) 40%, transparent); color: var(--text); border-radius: 2px; }
+.sa-find-note { display: flex; align-items: center; gap: 6px; margin: 0; padding: 4px 6px; color: var(--text-3); font-size: 10.5px; }
+/* Message-level highlight always applies. The per-occurrence highlight below is paint-only
+   (CSS Custom Highlight API), so rendered markdown and code are never rewritten to mark a hit. */
+.sa-find-hit { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 26%, transparent); border-radius: 8px; }
+.sa-find-current { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 60%, transparent); border-radius: 8px; }
+::highlight(conductor-find) { background-color: color-mix(in srgb, var(--accent) 34%, transparent); color: var(--text); }
+::highlight(conductor-find-current) { background-color: var(--accent); color: var(--surface-0); }

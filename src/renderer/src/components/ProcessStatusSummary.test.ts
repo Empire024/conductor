@@ -28,8 +28,8 @@ describe('aggregateProjectProcessUsage', () => {
     ])
     const totals = aggregateProjectProcessUsage(processes, projects, usage)
     expect(totals).toEqual([
-      { projectId: 'project-a', projectName: 'Project A', running: 1, costUsd: 0.75, totalTokens: 2000 },
-      { projectId: 'project-b', projectName: 'Project B', running: 0, costUsd: 0, totalTokens: 0 }
+      { projectId: 'project-a', projectName: 'Project A', running: 1, costUsd: 0.75, totalTokens: 2000, expensiveTitles: [] },
+      { projectId: 'project-b', projectName: 'Project B', running: 0, costUsd: 0, totalTokens: 0, expensiveTitles: [] }
     ])
   })
 
@@ -56,5 +56,53 @@ describe('aggregateProjectProcessUsage', () => {
     const usage = new Map([['agent-1', { costUsd: 5, totalTokens: 0 }]])
     const totals = aggregateProjectProcessUsage(processes, projects, usage)
     expect(totals[0]!.projectId).toBe('project-a')
+  })
+
+  it('surfaces the highest warning level among a project\'s processes and names which tab(s)', () => {
+    const processes = [
+      process({ id: 'agent-1', projectId: 'project-a', title: 'Refactor pass' }),
+      process({ id: 'agent-2', projectId: 'project-a', title: 'Docs pass' })
+    ]
+    const usage = new Map([
+      ['agent-1', { costUsd: 1, totalTokens: 100, warning: 'approaching' as const }],
+      ['agent-2', { costUsd: 6, totalTokens: 200, warning: 'high' as const }]
+    ])
+    const [entry] = aggregateProjectProcessUsage(processes, projects, usage)
+    expect(entry).toMatchObject({ projectId: 'project-a', warning: 'high' })
+    expect(entry!.expensiveTitles).toEqual(['Refactor pass', 'Docs pass'])
+  })
+
+  it('leaves a project without any expensive process unflagged', () => {
+    const processes = [process({ id: 'agent-1', projectId: 'project-a' })]
+    const usage = new Map([['agent-1', { costUsd: 0.1, totalTokens: 10 }]])
+    const [entry] = aggregateProjectProcessUsage(processes, projects, usage)
+    expect(entry!.warning).toBeUndefined()
+    expect(entry!.expensiveTitles).toEqual([])
+  })
+
+  it('puts a flagged project first even when another project has a bigger raw spend', () => {
+    const processes = [
+      process({ id: 'agent-1', projectId: 'project-b' }),
+      process({ id: 'agent-2', projectId: 'project-a' })
+    ]
+    const usage = new Map([
+      ['agent-1', { costUsd: 50, totalTokens: 100_000 }],
+      ['agent-2', { costUsd: 1, totalTokens: 100, warning: 'approaching' as const }]
+    ])
+    const totals = aggregateProjectProcessUsage(processes, projects, usage)
+    expect(totals[0]!.projectId).toBe('project-a')
+  })
+
+  it('ranks a high warning ahead of a merely approaching one across projects', () => {
+    const processes = [
+      process({ id: 'agent-1', projectId: 'project-a' }),
+      process({ id: 'agent-2', projectId: 'project-b' })
+    ]
+    const usage = new Map([
+      ['agent-1', { costUsd: 1, totalTokens: 100, warning: 'approaching' as const }],
+      ['agent-2', { costUsd: 1, totalTokens: 100, warning: 'high' as const }]
+    ])
+    const totals = aggregateProjectProcessUsage(processes, projects, usage)
+    expect(totals[0]!.projectId).toBe('project-b')
   })
 })

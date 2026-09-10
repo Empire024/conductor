@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
+import { normalizeNewFileExtension, normalizeThemeSettings, rememberedPermission, rememberPermission } from './app-settings'
+import type { ProviderCapabilities } from '../shared/structured-agent'
+
+function fakeStore(seed: Record<string, string> = {}) {
+  const rows = new Map(Object.entries(seed))
+  return { rows, getSetting: (key: string) => rows.get(key) ?? null, setSetting: (key: string, value: string) => { rows.set(key, value) } }
+}
+const claude = (permissions: ProviderCapabilities['permissions']): ProviderCapabilities => ({
+  provider: 'claude', runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: false,
+  toolInputStreaming: false, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: true, plans: true,
+  permissions, effort: [], models: [], limitations: []
+})
 
 describe('theme settings migration', () => {
   it.each([
@@ -30,5 +41,36 @@ describe('new file extension settings', () => {
     expect(normalizeNewFileExtension(' .MD ')).toBe('md')
     expect(normalizeNewFileExtension('test.ts')).toBe('test.ts')
     for (const value of ['../ts', 'a/b', 'a\\b', '', '.', 'md.', '..md', 'a'.repeat(33), null]) expect(normalizeNewFileExtension(value)).toBeNull()
+  })
+})
+
+describe('main-process remembered permission (mirrors renderer permission-memory.ts)', () => {
+  it('remembers a mode the provider actually offers and replays it for that provider only', () => {
+    const store = fakeStore()
+    rememberPermission(store.setSetting, 'claude', 'auto', claude(['default', 'auto', 'accept-edits']))
+    expect(rememberedPermission(store.getSetting, 'claude')).toBe('auto')
+    expect(rememberedPermission(store.getSetting, 'codex')).toBeUndefined()
+    expect(store.rows.get('rememberedPermission:codex')).toBeUndefined()
+  })
+  it('refuses to remember a mode the provider never offered', () => {
+    const store = fakeStore()
+    rememberPermission(store.setSetting, 'claude', 'auto', claude(['default', 'accept-edits']))
+    expect(rememberedPermission(store.getSetting, 'claude')).toBeUndefined()
+  })
+  it('ignores capabilities reported by a different provider than the one being remembered', () => {
+    const store = fakeStore()
+    rememberPermission(store.setSetting, 'codex', 'auto', claude(['default', 'auto']))
+    expect(rememberedPermission(store.getSetting, 'codex')).toBeUndefined()
+  })
+  it('never surfaces a stored value that is not one of the real permission literals', () => {
+    const store = fakeStore({ 'rememberedPermission:claude': 'plan' })
+    expect(rememberedPermission(store.getSetting, 'claude')).toBeUndefined()
+  })
+  it('keeps providers independent when both have a remembered mode', () => {
+    const store = fakeStore()
+    rememberPermission(store.setSetting, 'claude', 'auto', claude(['default', 'auto']))
+    rememberPermission(store.setSetting, 'codex', 'read-only', undefined)
+    expect(rememberedPermission(store.getSetting, 'claude')).toBe('auto')
+    expect(rememberedPermission(store.getSetting, 'codex')).toBe('read-only')
   })
 })

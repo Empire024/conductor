@@ -40,6 +40,11 @@ export interface SessionSettings {
   approvalPolicy?: 'inherit' | 'untrusted' | 'on-request' | 'never'
   plan: boolean
 }
+/** The only real permission literals a session ever carries. Shared by the renderer's per-provider
+ *  memory (permission-memory.ts) and the main-process mirror (app-settings.ts) so both sides
+ *  reject the same junk instead of keeping two independent notions of "valid". */
+export const SESSION_PERMISSIONS: SessionSettings['permission'][] = ['default', 'read-only', 'accept-edits', 'auto']
+export const isSessionPermission = (value: unknown): value is SessionSettings['permission'] => SESSION_PERMISSIONS.includes(value as SessionSettings['permission'])
 /** Expire a session approval whenever a new provider process takes ownership. */
 export function settingsForRuntime(settings: SessionSettings, runtimeId?: string): SessionSettings {
   const { temporaryPermission, ...permanent } = settings
@@ -175,6 +180,27 @@ export interface DiffArtifact {
   canUndo: boolean
   limitation?: string
 }
+/** One matching message: the snippet is flattened context around the first match, with
+ *  `matchStart` an offset into that snippet so the renderer can mark it without re-searching. */
+export interface ConversationSearchHit {
+  itemId: string
+  sequence: number
+  role: 'user' | 'assistant' | 'status'
+  snippet: string
+  matchStart: number
+  matchLength: number
+  matches: number
+}
+export interface ConversationSearchGroup {
+  sessionId: string
+  title: string
+  provider: StructuredProvider
+  archived: boolean
+  /** Matching messages in this conversation, including any beyond the returned `hits`. */
+  messages: number
+  hits: ConversationSearchHit[]
+}
+export interface ConversationSearchResult { groups: ConversationSearchGroup[]; truncated: boolean }
 export interface InteractionResponse {
   sessionId: string
   runtimeId: string
@@ -200,6 +226,9 @@ export interface StructuredAgentBridge {
   rename(id: string, title: string): Promise<void>
   archive(id: string, archived: boolean): Promise<void>
   history(projectId: string, query?: string): Promise<Array<{ id: string; title: string; provider: StructuredProvider; archived: boolean; phase: SessionPhase }>>
+  /** Message-level find across every conversation of a workspace, answered from the main
+   *  process so no other conversation's projection is ever shipped to the renderer. */
+  searchMessages(projectId: string, query: string, excludeId?: string): Promise<ConversationSearchResult>
   artifact(id: string, artifactId: string): Promise<DiffArtifact>
   output(id: string, artifactId: string): Promise<string>
   review(id: string, artifactId: string, action: 'keep' | 'undo'): Promise<{ outcome: 'kept' | 'reverted' | 'conflict'; message?: string }>

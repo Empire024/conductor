@@ -1,14 +1,14 @@
 import { useAnimatedCount } from './use-animated-count'
-import { useMemo, useState } from 'react'
-import { ChevronDown, Search, Users } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { ChevronDown, Flame, Search, Users } from 'lucide-react'
 import type { ContextAttachment, FileChange, SessionPhase, TimelineItem } from '../../../shared/structured-agent'
 import { AgentDialog, coalescedEditLabel, coalescedEditSummary, groupConversationActivities, isConversationActivity, StructuredActivity, StructuredMarkdown } from './StructuredAgentRenderers'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { StructuredUsageContent } from './StructuredUsageDetails'
-import { distinguishSubagentLabels, liveTokenLabel, subagentColorIndex, subagentCountLabel, subagentModelLabel, subagentStatusLabels, subagentTokenLabel, summarizeSubagents, summarizeWorkingUsage, summarizeContext } from './usage-summary'
+import { distinguishSubagentLabels, evaluateUsageWarning, liveTokenLabel, subagentColorIndex, subagentCountLabel, subagentModelLabel, subagentStatusLabels, subagentTokenLabel, summarizeSubagents, summarizeUsageRun, summarizeWorkingUsage, summarizeContext } from './usage-summary'
 import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import './StructuredAgentTelemetry.css'
-import type { SubagentSummary } from './usage-summary'
+import type { SubagentSummary, UsageCapSetting } from './usage-summary'
 
 export function StructuredLiveTokens({ items }: { items: TimelineItem[] }): React.JSX.Element {
   const summary = useMemo(() => summarizeWorkingUsage(items), [items])
@@ -49,10 +49,28 @@ export function StructuredAgentTelemetry({ items, runtimeId, phase, truncated = 
 export function StructuredUsageSummary({ items, runtimeId, truncated = false, modelLabel, agentSessionId, workspaceId }: { items: TimelineItem[]; runtimeId: string; truncated?: boolean; modelLabel?: string; agentSessionId?: string; workspaceId?: string }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const context = useMemo(() => summarizeContext(items, runtimeId), [items, runtimeId])
+  // Polled rather than read once: the cap that applies here can change from this same dialog,
+  // from another tab sharing a workspace cap, or from the account-wide default, and the warning
+  // has to clear (or newly appear) without requiring this pane to remount.
+  const [cap, setCap] = useState<UsageCapSetting | null>(null)
+  useEffect(() => {
+    if (!agentSessionId || !workspaceId) return
+    let active = true
+    const read = (): void => {
+      window.conductor.usageCaps.read(agentSessionId, workspaceId)
+        .then(snapshot => { if (active) setCap(snapshot.effective?.setting ?? null) })
+        .catch(() => { /* stays at its last known cap; the flat-cost fallback still applies */ })
+    }
+    read()
+    const timer = window.setInterval(read, 5000)
+    return () => { active = false; window.clearInterval(timer) }
+  }, [agentSessionId, workspaceId])
+  const warning = useMemo(() => evaluateUsageWarning(summarizeUsageRun(items).conversation, cap), [items, cap])
   return <div className="sa-usage-summary">
     {context && context.percent >= 40 && <button type="button" className={'sa-context-circle level-' + context.level} aria-label={`Context ${Math.floor(context.percent)}% used`} title={`${Math.floor(context.percent)}% context used (${context.used.toLocaleString()} / ${context.capacity.toLocaleString()} tokens). ${context.percent >= 90 ? 'Context nearly full. Use /compact to make room.' : 'View context details.'}`} aria-expanded={open} onClick={() => setOpen(current => !current)}>
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle className="sa-context-track" cx="12" cy="12" r="9" /><circle className="sa-context-fill" cx="12" cy="12" r="9" pathLength="100" strokeDasharray={`${context.percent} 100`} transform="rotate(-90 12 12)" /></svg><span>{Math.floor(context.percent)}%</span>
     </button>}
+    {warning && <span className={'sa-usage-warning level-' + warning.level} role="status" title={warning.detail}><Flame size={11} aria-hidden="true" /><span>{warning.level === 'high' ? 'Expensive' : 'Rising cost'}</span></span>}
     <button type="button" className="sa-usage-link" aria-expanded={open} onClick={() => setOpen(current => !current)}>View usage</button>
     {open && <AgentDialog title="Usage" onClose={() => setOpen(false)}><StructuredUsageContent items={items} truncated={truncated} modelLabel={modelLabel} agentSessionId={agentSessionId} workspaceId={workspaceId} /></AgentDialog>}
   </div>

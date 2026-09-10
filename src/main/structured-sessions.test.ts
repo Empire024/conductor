@@ -697,6 +697,47 @@ describe('permission response acknowledgment and mode persistence', () => {
   })
 })
 
+describe('remembered permission mirrored between the renderer and the main process', () => {
+  it('registers a brand-new session on the owner\'s remembered mode for its provider', () => {
+    const f = fixture()
+    f.database.setSetting('rememberedPermission:claude', 'accept-edits')
+    const second: AgentSpec = { ...f.spec, id: 'agent-session-second' }
+    f.manager.ensure(second)
+    expect(f.database.structured.snapshot(second.id)?.settings.permission).toBe('accept-edits')
+    // The first session was already registered before the preference existed; it keeps its own history.
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.permission).toBe('default')
+  })
+  it('never re-applies a later remembered mode to an already-registered session', () => {
+    const f = fixture()
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.permission).toBe('default')
+    f.database.setSetting('rememberedPermission:claude', 'accept-edits')
+    f.manager.ensure(f.spec)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.permission).toBe('default')
+  })
+  it('never lets a different provider\'s remembered mode leak into a new session', () => {
+    const f = fixture()
+    f.database.setSetting('rememberedPermission:codex', 'accept-edits')
+    const second: AgentSpec = { ...f.spec, id: 'agent-session-second' }
+    f.manager.ensure(second)
+    expect(f.database.structured.snapshot(second.id)?.settings.permission).toBe('default')
+  })
+  it('never seeds a mode this runtime does not actually offer', () => {
+    const f = fixture()
+    f.database.setSetting('rememberedPermission:claude', 'auto')
+    const second: AgentSpec = { ...f.spec, id: 'agent-session-second' }
+    f.manager.ensure(second)
+    // The fake provider's capabilities stop at accept-edits; 'auto' is never applied.
+    expect(f.database.structured.snapshot(second.id)?.settings.permission).toBe('default')
+  })
+  it('remembers a deliberate saveSettings permission choice for the next session of the same provider', async () => {
+    const f = fixture(); await f.manager.submit(f.spec.id, 'Synthetic', settings)
+    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'accept-edits' })
+    expect(f.database.getSetting('rememberedPermission:claude')).toBe('accept-edits')
+    const second: AgentSpec = { ...f.spec, id: 'agent-session-second' }
+    f.manager.ensure(second)
+    expect(f.database.structured.snapshot(second.id)?.settings.permission).toBe('accept-edits')
+  })
+})
 
 it.each(['resume', 'handoff', 'restore'] as const)('expires a provider session Edit grant on %s', async transition => {
   const f = fixture(); await f.manager.submit(f.spec.id, 'Synthetic', settings)
@@ -923,6 +964,60 @@ describe('activity reported for a lost connection', () => {
     f.current.emit({ data: { type: 'session', phase: 'completed' } })
     expect(activityPhase(f)).toBe('complete')
     f.current.emit({ data: { type: 'session', phase: 'disconnected' } })
+    expect(activityPhase(f)).toBe('complete')
+  })
+})
+
+describe('activity reported while subagent work outlives its turn', () => {
+  const activityPhase = (f: ReturnType<typeof fixture>) =>
+    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  const subagent = (name: string, status: 'running' | 'completed' | 'failed', detached = true) =>
+    ({ itemId: name, data: { type: 'subagent' as const, name, status, detached } })
+
+  it('keeps a conversation working while a subagent it launched runs past the end of its turn', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Dispatch the wave', settings)
+    f.current.emit(subagent('worker-1', 'running'))
+    // Claude reports its turn result as soon as it hands work off; the children keep streaming.
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
+    expect(activityPhase(f)).toBe('working')
+    f.current.emit(subagent('worker-2', 'running'))
+    expect(activityPhase(f)).toBe('working')
+    f.current.emit(subagent('worker-1', 'completed'))
+    expect(activityPhase(f)).toBe('working')
+    f.current.emit(subagent('worker-2', 'completed'))
+    expect(activityPhase(f)).toBe('complete')
+  })
+
+  it('reports the conversation done when every subagent settled before its turn ended', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Dispatch the wave', settings)
+    f.current.emit(subagent('worker-1', 'running'))
+    f.current.emit(subagent('worker-1', 'failed'))
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
+    expect(activityPhase(f)).toBe('complete')
+  })
+
+  it('never lets a child revive a turn that stopped, failed or lost its runtime', async () => {
+    for (const phase of ['interrupted', 'failed', 'disconnected'] as const) {
+      const f = fixture()
+      await f.manager.submit(f.spec.id, 'Dispatch the wave', settings)
+      f.current.emit(subagent('worker-1', 'running'))
+      f.current.emit({ data: { type: 'session', phase } })
+      f.current.emit(subagent('worker-2', 'running'))
+      expect(activityPhase(f)).toBe(phase === 'interrupted' ? 'stopped' : phase === 'failed' ? 'failed' : 'disconnected')
+    }
+  })
+
+  it('forgets subagents reported by a runtime that is no longer the live one', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Dispatch the wave', settings)
+    f.current.emit(subagent('worker-1', 'running'))
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
+    expect(activityPhase(f)).toBe('working')
+    // A fresh runtime cannot vouch for a child the previous process launched.
+    await f.manager.resume(f.spec.id)
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
     expect(activityPhase(f)).toBe('complete')
   })
 })

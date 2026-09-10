@@ -189,9 +189,9 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
     </aside>}
     {picker && <FilePicker projects={projects} activeProjectId={projectId} recentPaths={recentWorkspaceFiles()} showHiddenDefault={showHiddenFilesDefault} onClose={() => setPicker(false)} onPick={(file) => openWorkspaceFile(file.projectId, file.path)} />}
     {menu && createPortal(
-      <div className="cursor-context-menu file-tab-context-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
+      <div className="cursor-context-menu file-tab-context-menu" role="menu" aria-label={'Actions for ' + menu.file.path} style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
         <div className="context-menu-label">{menu.file.path.split('/').pop()}</div>
-        {buildFileLinkMenuEntries().map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} onClick={() => runFileMenuAction(entry.action, menu.file)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
+        {buildFileLinkMenuEntries().map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} role="menuitem" onClick={() => runFileMenuAction(entry.action, menu.file)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
       </div>,
       document.body
     )}

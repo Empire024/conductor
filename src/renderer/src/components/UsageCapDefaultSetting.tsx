@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Gauge } from 'lucide-react'
 import type { UsageCap, UsageCapMetric, UsageCapSetting } from '../../../shared/usage-accounting'
 import { describeUsageCap, parseUsageCapSetting } from '../../../shared/usage-accounting'
+import { USAGE_WARNING_FRACTIONS } from '../../../shared/usage-warning'
 import './UsageCapDefaultSetting.css'
 
 const metrics: Array<{ id: UsageCapMetric; label: string }> = [
@@ -64,6 +65,7 @@ export function UsageCapDefaultSetting(): React.JSX.Element {
       </label>}
     </>}
     <p>A cap is separate from limit continuation: continuation resumes work when the provider's own window reopens, while a cap you set stays stopped until you change it.</p>
+    <p>{cap ? <>A calm warning also appears on a tab, and in Processes, once it reaches {Math.round(USAGE_WARNING_FRACTIONS.approaching * 100)}% of this cap, and again past {Math.round(USAGE_WARNING_FRACTIONS.high * 100)}% -- well before the cap itself stops it.</> : <>With no cap set, that same warning falls back to a flat cost figure per conversation instead of staying silent.</>}</p>
     {error && <p className="usage-cap-error">{error}</p>}
   </section>
 }

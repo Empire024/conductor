@@ -6,7 +6,8 @@ import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControl
 import { conductorUri } from '../shared/agent-control'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type LayoutNode, type PaneKind, type PaneTab } from '../shared/models'
 import type { PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
-import { settingsForRuntime } from '../shared/structured-agent'
+import { isSessionPermission, settingsForRuntime } from '../shared/structured-agent'
+import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
 import type { StructuredSessions } from './structured-sessions'
@@ -24,11 +25,17 @@ import { LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-contr
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
 const permissionOrder: SessionSettings['permission'][] = ['read-only', 'default', 'accept-edits', 'auto']
-/** A controlled tab inherits its controller autonomy, never more, and only what the target provider offers. */
-const inheritedPermission = (source: SessionSettings, supported?: SessionSettings['permission'][]): SessionSettings['permission'] => {
+/** A controlled tab inherits its controller autonomy, never more, and only what the target provider
+ *  offers. `requested` names a different starting point than the controller's own permission — an
+ *  explicit ask or the owner's remembered mode for the target provider — but it is still clamped to
+ *  the controller's ceiling and to what the provider actually advertises; omitted, behavior is
+ *  unchanged from before requested existed (inherit the controller's own permission outright). */
+const inheritedPermission = (source: SessionSettings, supported?: SessionSettings['permission'][], requested?: SessionSettings['permission']): SessionSettings['permission'] => {
   const ceiling = restricted(source) ? 'read-only' : source.permission
+  const desired = requested ?? source.permission
+  const cap = permissionOrder.indexOf(desired) <= permissionOrder.indexOf(ceiling) ? desired : ceiling
   const offered = supported?.length ? supported : permissionOrder
-  const allowed = offered.filter(value => permissionOrder.indexOf(value) <= permissionOrder.indexOf(ceiling))
+  const allowed = offered.filter(value => permissionOrder.indexOf(value) <= permissionOrder.indexOf(cap))
   return allowed.sort((a, b) => permissionOrder.indexOf(b) - permissionOrder.indexOf(a))[0] ?? 'default'
 }
 const text = (args: Args, key: string, maximum = 20000): string => {
@@ -47,7 +54,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,title?,machineId?,projectId?,workspaceId?}) — visible tab; agent default kind, provider/model must be available; a new agent tab inherits the controller permission mode, clamped to the target provider, and runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,title?,machineId?,projectId?,workspaceId?}) — visible tab; agent default kind, provider/model must be available; a new agent tab opens on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode — always clamped to the controller’s autonomy and to what the target provider offers; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it',
   'tabs.focus': '({tabId})',
   'tabs.rename': '({tabId,title})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
@@ -77,7 +84,7 @@ const toolSignatures = {
   'orchestration.routines.save': '({id?,name,description?,steps:[{title,instructions?,assignedAgentId?}]})',
   'workspace.rename': '({title})',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,projectTaskIds?:string[],projectId?,workspaceId?}]}) - one to four visible coworkers with actual models/efforts; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it'
 } as const
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
@@ -356,6 +363,8 @@ export class AgentControl {
       if (!model) throw new Error('Choose a model from models.list')
       const effort = args.effort === undefined ? model.defaultEffort : text(args, 'effort', 40)
       if (effort && !model.effort?.includes(effort)) throw new Error('Choose an effort supported by this model')
+      if (args.permission !== undefined && !isSessionPermission(args.permission)) throw new Error('Invalid permission mode')
+      const explicitPermission = args.permission as SessionSettings['permission'] | undefined
       tab.resourceId = makeId('agent')
       tab.title = args.title === undefined ? model.label : title
       tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual', machineId }
@@ -366,8 +375,13 @@ export class AgentControl {
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || 'Provider unavailable')
       const created = this.deps.database.structured.snapshot(spec.id)!
+      if (explicitPermission && !created.capabilities?.permissions?.includes(explicitPermission)) throw new Error('Choose a permission mode supported by this provider')
       const sourceSettings = settingsForRuntime(this.deps.database.structured.snapshot(scope.agentSessionId)!.settings)
-      const permission = inheritedPermission(sourceSettings, created.capabilities?.permissions)
+      // An explicit ask always wins; otherwise a new tab opens on the owner's remembered mode for
+      // this provider (permission-memory.ts on the renderer side, mirrored via app-settings.ts) —
+      // still capped by the controller's own autonomy and by what this provider actually offers.
+      const requested = explicitPermission ?? rememberedPermission(key => this.deps.database.getSetting(key), provider)
+      const permission = inheritedPermission(sourceSettings, created.capabilities?.permissions, requested)
       const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(permission === 'read-only' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude' }
       this.deps.database.structured.update(spec.id, { settings })
     } else {

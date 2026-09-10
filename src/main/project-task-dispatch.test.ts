@@ -106,6 +106,27 @@ describe('Project tasks native dispatch',()=> {
     expect(f.submissions[0]?.settings).toMatchObject({permission:'read-only'})
     expect(f.database.structured.snapshot(result.assignments[0]!.agentSessionId)?.settings).toMatchObject({permission:'read-only'})
   })
+  it('opens a new tab on the owner\'s remembered permission for that provider when the request leaves it unset',async()=>{
+    const f=fixture(),board=await f.backlogs.get(f.project.id)
+    f.database.setSetting('rememberedPermission:claude','read-only')
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'new',sessionId:f.workspace.id,provider:'claude',model:'claude-native',effort:'low'}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted'})
+    expect(f.submissions[0]?.settings).toMatchObject({permission:'read-only'})
+    expect(f.database.structured.snapshot(result.assignments[0]!.agentSessionId)?.settings).toMatchObject({permission:'read-only'})
+  })
+  it('still lets an explicit dispatch permission win over the owner\'s remembered mode',async()=>{
+    const f=fixture(),board=await f.backlogs.get(f.project.id)
+    f.database.setSetting('rememberedPermission:codex','read-only')
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'new',sessionId:f.workspace.id,provider:'codex',model:'codex-native',effort:'low',permission:'default'}})
+    expect(f.submissions[0]?.settings).toMatchObject({permission:'default'})
+  })
+  it('opens the auto Fixer tab on the owner\'s remembered permission too',async()=>{
+    const f=fixture(),board=await f.backlogs.get(f.project.id)
+    f.database.setSetting('rememberedPermission:codex','read-only')
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one','two'],target:{type:'auto',sessionId:f.workspace.id}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted'})
+    expect(f.submissions[0]?.settings).toMatchObject({permission:'read-only'})
+  })
   it('appends an optional owner instruction to the dispatched prompt, and omits it entirely when blank',async()=>{
     const f=fixture(),board=await f.backlogs.get(f.project.id)
     const withExtra=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'existing',agentSessionId:f.spec.id},prompt:'Please also update the changelog'})

@@ -239,17 +239,19 @@ models they want
 
 - [x] INSANE FUCKING BUG - PROMPT MUST CONTAIN 1-600000 CHARACTERS - FIX <!-- conductor-task:2153a831-299d-425d-a430-8e86d121920d agent=agent_mtunlyoz_mm2k2ey -->
 
-- [~] Workspace can get flagged green even though an agent is actively churning - this seems to happen when it's controling other tabs and then they finish and it works, it doesn't even have a loader. <!-- conductor-task:038c7a04-7e22-4821-be7e-cc7f82f2a094 agent=agent_mturhxcc_t1p06lm -->
+- [x] Workspace can get flagged green even though an agent is actively churning - this seems to happen when it's controling other tabs and then they finish and it works, it doesn't even have a loader. <!-- conductor-task:038c7a04-7e22-4821-be7e-cc7f82f2a094 agent=agent_mturhxcc_t1p06lm -->
 
-- [~] right click to open and the other context menu in windows explorer should be available straight in chat for files / links to files from agents <!-- conductor-task:3c742022-1449-4898-97be-d574808db6e3 agent=agent_mturhxcc_t1p06lm -->
+- [x] right click to open and the other context menu in windows explorer should be available straight in chat for files / links to files from agents <!-- conductor-task:3c742022-1449-4898-97be-d574808db6e3 agent=agent_mturhxcc_t1p06lm -->
 
-- [~] Fix broken Windows file links in Conductor assistant messages: the CR5 "Before/after comparison" and "Updated Blender model" links used `/C:/Claude/miron/...` and did not open despite both files existing. Handle or normalize Windows drive paths and spaces, and verify PNG preview and Blender-file opening. Also make sure other projects can work with other project tasks open in the same session. <!-- conductor-task:edbcfcb8-c338-4434-b12a-6be5b1b69c46 agent=agent_mturhxcc_t1p06lm -->
+- [x] Fix broken Windows file links in Conductor assistant messages: the CR5 "Before/after comparison" and "Updated Blender model" links used `/C:/Claude/miron/...` and did not open despite both files existing. Handle or normalize Windows drive paths and spaces, and verify PNG preview and Blender-file opening. Also make sure other projects can work with other project tasks open in the same session. <!-- conductor-task:edbcfcb8-c338-4434-b12a-6be5b1b69c46 agent=agent_mturhxcc_t1p06lm -->
 
-- [~] If I open a tab with Claude, switch to Auto mode, it needs to be remembered for future tabs open with Claude. Same for tabs that agents auto open (unless they specifically set another mode by force) <!-- conductor-task:39a3d0fa-b6c7-4c55-a3ef-d4122d59e146 agent=agent_mturhxcc_t1p06lm -->
+- [x] If I open a tab with Claude, switch to Auto mode, it needs to be remembered for future tabs open with Claude. Same for tabs that agents auto open (unless they specifically set another mode by force) <!-- conductor-task:39a3d0fa-b6c7-4c55-a3ef-d4122d59e146 agent=agent_mturhxcc_t1p06lm -->
 
-- [~] Tabs should get auto named when first message is sent <!-- conductor-task:26d660cd-b2ff-4f27-ace2-acff9b1280ab agent=agent_mturhxcc_t1p06lm -->
+- [x] Tabs should get auto named when first message is sent <!-- conductor-task:26d660cd-b2ff-4f27-ace2-acff9b1280ab agent=agent_mturhxcc_t1p06lm -->
 
 - [x] Add right click menu.. copy, all that jazz.. curreently I select text and i can't do nothing <!-- conductor-task:05579479-d437-41de-853e-908c4834db6d agent=agent_mtusoeta_9h639l8 -->
+
+- [ ] Messages from an agent in a tab I haven't sent a message to yet should be stickied to the top - sticky should be actually on top-top of messages, currently, a line can appear in the space between the top bar and the stickied message, which leads to the message being hard to read. <!-- conductor-task:bd4b357f-8b50-4d82-b373-3eb1bd7aa56a -->
 
 Feature list:
 
@@ -319,11 +321,13 @@ Latest completion and validation: [remaining checklist delivery](docs/backlog-co
 
 - [~] Add logging in via github for credentials. Then, add a system which can launch a server for remote control of this machines Conductor project and Conductor filespace by another Conductor logged in with the same github credentials. Orcherstrate this via the highest, latest model available, but that model will use lower class workers for the churning. The finished integration needs to let the user select a machine that actually runs that window, that way, for example, I'll be able to run a heavy render from the comfort of my conductor window, while the render runs on a PC, I run it off my laptop. The agents need to be aware of this fact, because when they'll be creating another linked tab or something similiar, those tabs need to run on that same machine as previously selected unless prompted differently.. <!-- conductor-task:a17381dc-57e2-4232-9e3c-85bfdbb32455 agent=agent_mtuf49my_96vnd6a priority=low -->
 
-- [~] Add CTRL+F To chats (searches entire workspace for messages sent with agents and canhighlight it) <!-- conductor-task:3439f02b-608f-4bd6-9ded-97ed51ec573a agent=agent_mturhxcc_t1p06lm -->
+- [x] Add CTRL+F To chats (searches entire workspace for messages sent with agents and canhighlight it) <!-- conductor-task:3439f02b-608f-4bd6-9ded-97ed51ec573a agent=agent_mturhxcc_t1p06lm -->
 
-- [~] To usage - give me visible warnings in a tab when it starts becoming expensive. Show it in processes also. <!-- conductor-task:2aa42f5b-c9d6-45a4-b71e-c75776557094 agent=agent_mturhxcc_t1p06lm -->
+- [x] To usage - give me visible warnings in a tab when it starts becoming expensive. Show it in processes also. <!-- conductor-task:2aa42f5b-c9d6-45a4-b71e-c75776557094 agent=agent_mturhxcc_t1p06lm -->
 
 - [ ] Add 'Open session' 'Save session' to menu - this will save/open an entire session with all projects loaded, agents, all that jazz. Also show session name on top bar. <!-- conductor-task:9a048670-02d1-4315-85b9-28356a06f42e -->
+
+- [ ] Message from agent -> Name of agent with link icon should link to tab (tab opens upon click) <!-- conductor-task:a9fbb1af-a90c-454c-9242-71cba7350e85 -->
 
 ## Urgent bugs and permissions - 2026-09-08
 
@@ -381,7 +385,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] An agent in one open project could not see, read or hand work to another project open in the same window: app.state showed only its own project and there was no way to enumerate or target a sibling. projects.list now names every co-open project, files.list/files.read/files.open, tabs.list and tasks.list accept a sibling projectId, and tabs.open/router.dispatch hand a visible worker tab to a sibling project that its controller can then steer. Writes into a sibling still go through a tab opened there, and a conversation a paired machine is driving stays inside the project shared with it. <!-- conductor-task:bug-cross-project-access agent=agent_mtulo6oo_08ud6sk -->
 
-- [ ] The GitHub release workflow fails on every push to main, so installed updates only come from local builds. One cause is fixed already (Get-Acl needed the on-demand Microsoft.PowerShell.Security module, which the runner offers but cannot load); what remains is that scripts/repair-codex-workspace-owner.test.mjs compares paths from os.tmpdir() (C:\Users\RUNNER~1\...) against the long names PowerShell resolves (C:\Users\runneradmin\...), failing 'diagnostic mode reads both directory owners', 'a worktree .git pointer is left untouched' and 'reads owners where the Security module cannot be loaded'. Compare real paths on both sides, then confirm the workflow publishes an installer, blockmap and latest.yml again. <!-- conductor-task:bug-release-workflow-short-paths -->
+- [ ] The GitHub release workflow fails on every push to main, so installed updates only come from local builds. One cause is fixed already (Get-Acl needed the on-demand Microsoft.PowerShell.Security module, which the runner offers but cannot load); what remains is that scripts/repair-codex-workspace-owner.test.mjs compares paths from os.tmpdir() (C:\Users\RUNNER~1\...) against the long names PowerShell resolves (C:\Users\runneradmin\...), failing 'diagnostic mode reads both directory owners', 'a worktree .git pointer is left untouched' and 'reads owners where the Security module cannot be loaded'. Compare real paths on both sides, then confirm the workflow publishes an installer, blockmap and latest.yml again. <!-- conductor-task:bug-release-workflow-short-paths priority=low -->
 
 ## Features
 

@@ -507,3 +507,19 @@ describe('custom answer as a selectable option', () => {
     expect(html).toContain('<strong>Other</strong>')
   })
 })
+
+it('resolves the Windows drive-path link shapes an agent actually writes', () => {
+  expect(safeFileTarget('/C:/work/My project/src/panel.mjs', cwd)).toEqual({ path: 'src/panel.mjs', line: undefined })
+  expect(safeFileTarget('/C:/work/My%20project/CR5%20render.png', cwd)).toEqual({ path: 'CR5 render.png', line: undefined })
+  expect(safeFileTarget('file:///C:/work/My project/src/panel.mjs', cwd)).toEqual({ path: 'src/panel.mjs', line: undefined })
+})
+
+it('keeps a drive-path link clickable instead of blanking its href, and still drops one outside every project', () => {
+  const render = (target: string): string => renderToStaticMarkup(createElement(StructuredMarkdown, { cwd, projectId: 'project-1', onOpenFile: vi.fn(), text: '[render](' + target + ')' }))
+  // A destination with literal spaces is only a link at all inside angle brackets; both that
+  // shape and the percent-encoded one name the same file and both must survive urlTransform.
+  for (const target of ['/C:/work/My%20project/CR5%20render.png', '<file:///C:/work/My project/CR5 render.png>', '<C:\\work\\My project\\CR5 render.png>']) {
+    expect(render(target)).toContain('<a href="#">render</a>')
+  }
+  expect(render('/C:/elsewhere/secret.png')).toBe('<div class="sa-markdown"><p><span>render</span></p></div>')
+})

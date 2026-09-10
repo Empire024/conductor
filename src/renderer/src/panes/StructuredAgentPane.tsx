@@ -5,7 +5,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { Archive, ArrowDown, ArrowLeft, FileDiff, FilePlus2, History, ListTree, Pin, Play, PlugZap, Settings2, TerminalSquare, MessagesSquare, LoaderCircle, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { MAX_PROMPT_CHARS } from '../../../shared/structured-agent'
-import type { AgentEvent, ContextAttachment, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
+import type { AgentEvent, ContextAttachment, ConversationSearchResult, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../../../shared/structured-agent-reducer'
 import { coalesceTextDeltas } from './coalesce-stream-events'
 import type { RuntimeTerminalProps } from './RuntimeTerminal'
@@ -17,6 +17,8 @@ import { StructuredSendButton, sendButtonIntent } from './StructuredSendButton'
 import { StructuredAgentTelemetry, StructuredLiveTokens, StructuredUsageSummary } from './StructuredAgentTelemetry'
 import { distinguishSubagentLabels, subagentColorIndex, subagentIdentityId, summarizeSubagents } from './usage-summary'
 import { followsBottomAfterScroll, hasTimelineSelection, latestOwnerPrompt, truncatePromptPreview } from './conversation-scroll'
+import { ConversationFindBar } from './ConversationFindBar'
+import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, findReducer, paintFindRanges, type FindAction } from './conversation-find'
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
 import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
@@ -99,6 +101,15 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [visibleCount, setVisibleCount] = useState(250)
   const [readingWindow, setReadingWindow] = useState<TimelineItem[] | null>(null)
   const [pendingPromptScroll, setPendingPromptScroll] = useState<string | null>(null)
+  const [find, setFind] = useState(CLOSED_FIND)
+  const dispatchFind = useCallback((action: FindAction): void => setFind(current => findReducer(current, action)), [])
+  const [findFocus, setFindFocus] = useState(0)
+  const [findResults, setFindResults] = useState<ConversationSearchResult | null>(null)
+  const [findSearching, setFindSearching] = useState(false)
+  const [findJump, setFindJump] = useState<string | null>(null)
+  const findPainted = useRef(false)
+  const findScrolled = useRef('')
+  const findWidened = useRef('')
   const promptFlashTimer = useRef(0)
   const lastVisibleItems = useRef<TimelineItem[]>([])
   const timeline = useRef<HTMLDivElement>(null)
@@ -177,6 +188,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       queue = []
       initialized = true
       setProjection(state)
+      // Trusting the backend's permission outright (over the initialPermission() seed above) is
+      // safe: a brand-new session is registered on the owner's remembered mode for this provider
+      // (structured-sessions.ts ensure()), and an existing one carries whatever was last saved for
+      // it, so the snapshot is never a context-blind default that should lose to local storage.
       if (snapshot) setSettings({ ...state.settings, model: concreteModel(state.capabilities?.provider ?? provider, state.settings.model, state.capabilities) })
       setReady(true)
     }
@@ -284,6 +299,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     const connectingMetadata = projection.phase === 'starting' && metadataConnectionId.current === activeId
     const queuing = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase)
     if (composerSendBlock(message, attachments) || submitLock.current || conversationSwitch.current || !ready || historical || (activePhases.has(projection.phase) && !connectingMetadata && !queuing) || projection.archived) return
+    // Captured before the turn starts, and off actual user turns rather than
+    // unstartedConversation: focusing the composer alone can already connect a runtime (to load
+    // its model catalog) and set a native session id, well before anything is sent. This is the
+    // one moment a tab is still eligible for its first-message auto-name (see
+    // bindConversationTab); it is false for every later message.
+    const firstMessage = !projection.items.some(item => item.data.type === 'text' && item.data.role === 'user')
     submitLock.current = true
     setSubmitting(true)
     setError('')
@@ -296,6 +317,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       else if (queuing) await window.conductor.structured.queue(activeId, text, settings, attachments)
       else await window.conductor.structured.submit(activeId, text, settings, attachments)
       clearSubmitted(draft.revision)
+      if (firstMessage) {
+        const snapshot = await window.conductor.structured.snapshot(activeId)
+        if (snapshot && activeIdRef.current === activeId) void propsRef.current.onConversationChange?.({ ...conversationIdentity(snapshot, provider), title: text, auto: true })
+      }
       if (activeIdRef.current === activeId) {
         setImagePreviews({})
         setReadingWindow(null)
@@ -395,6 +420,26 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     window.addEventListener('keydown', escape)
     return () => window.removeEventListener('keydown', escape)
   }, [activeId, projection.phase, historical, addFileOpen])
+  useEffect(() => {
+    const openFind = (event: KeyboardEvent): void => {
+      if (event.key.toLowerCase() !== 'f' || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey || event.defaultPrevented) return
+      // A dialog's own search field, the attach-a-file input and other panes keep Ctrl+F.
+      if (document.querySelector('dialog[open], [aria-modal="true"], .settings-scrim, .palette-backdrop') || addFileOpen || !pane.current) return
+      const focused = document.activeElement
+      // Every other text field in this pane is itself a search (model picker, file path), so it
+      // keeps the shortcut; the composer is a textarea and still opens find while typing.
+      if (focused instanceof HTMLInputElement && focused.type !== 'checkbox' && !focused.closest('.sa-find')) return
+      const mine = pane.current.contains(focused)
+      // Clicking a message focuses nothing focusable, so a pane that merely holds the last agent
+      // focus still answers Ctrl+F - but never while an editor or another pane owns the caret.
+      if (!mine && !(focusedAgent?.sessionId === activeId && (!focused || focused === document.body))) return
+      event.preventDefault(); event.stopPropagation()
+      dispatchFind({ type: 'open' })
+      setFindFocus(token => token + 1)
+    }
+    window.addEventListener('keydown', openFind)
+    return () => window.removeEventListener('keydown', openFind)
+  }, [activeId, addFileOpen, dispatchFind])
 
   const promptChars = promptCharacterCount(message, attachments)
   const sendBlocked = composerSendBlock(message, attachments)
@@ -471,6 +516,73 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setReadingWindow(conversationItems.slice(-visibleCount))
     element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
   }, [conversationItems, ready, historical, projection.runtimeId, visibleCount])
+  const findMatches = useMemo(() => find.open ? conversationMatches(conversationItems, find.query) : [], [find.open, find.query, conversationItems])
+  const currentMatch = findMatches[Math.min(find.index, findMatches.length - 1)]
+  // Everything but this conversation is searched in the main process against the store, so no
+  // other projection is ever shipped here; typing only costs one debounced call.
+  useEffect(() => {
+    if (!find.open || find.query.trim().length < 2) { setFindResults(null); setFindSearching(false); return }
+    let disposed = false
+    setFindSearching(true)
+    const timer = window.setTimeout(() => void window.conductor.structured.searchMessages(props.project.id, find.query, activeId)
+      .then(result => { if (!disposed) setFindResults(result) })
+      .catch(() => { if (!disposed) setFindResults(null) })
+      .finally(() => { if (!disposed) setFindSearching(false) }), 180)
+    return () => { disposed = true; window.clearTimeout(timer) }
+  }, [find.open, find.query, props.project.id, activeId])
+  // A result opened from another conversation selects its match once that projection has loaded.
+  useEffect(() => {
+    if (!findJump) return
+    const index = findMatches.findIndex(match => match.itemId === findJump)
+    if (index >= 0) dispatchFind({ type: 'select', index, count: findMatches.length })
+  }, [findJump, findMatches, dispatchFind])
+  useLayoutEffect(() => {
+    if (!find.open || !currentMatch) { findScrolled.current = ''; return }
+    const key = activeId + ':' + currentMatch.itemId
+    if (findScrolled.current === key) return
+    const element = timeline.current
+    const card = element?.querySelector<HTMLElement>('[data-item-id="' + CSS.escape(currentMatch.itemId) + '"]')
+    if (!element || !card) {
+      // The match is older than the rendered window; widen it once and scroll on the next commit.
+      const index = conversationItems.findIndex(item => item.id === currentMatch.itemId)
+      if (index >= 0 && findWidened.current !== key) { findWidened.current = key; nearBottom.current = false; setReadingWindow(conversationItems.slice(Math.max(0, index - 5))) }
+      return
+    }
+    findScrolled.current = key
+    nearBottom.current = false
+    userScrollUntil.current = Date.now() + 800
+    element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
+    if (findJump === currentMatch.itemId) setFindJump(null)
+  }, [find.open, currentMatch, conversationItems, visibleItems, activeId, findJump])
+  useLayoutEffect(() => {
+    const element = timeline.current
+    // Streaming output must not pay for find: with the bar closed and nothing painted, stop here.
+    if (!element || (!find.open && !findPainted.current)) return
+    for (const marked of element.querySelectorAll('.sa-find-hit, .sa-find-current')) marked.classList.remove('sa-find-hit', 'sa-find-current')
+    if (!find.open || !findMatches.length) { clearFindRanges(props.resourceId); findPainted.current = false; return }
+    const others: Range[] = []
+    let current: Range[] = []
+    for (const match of findMatches) {
+      const card = element.querySelector<HTMLElement>('[data-item-id="' + CSS.escape(match.itemId) + '"]')
+      if (!card) continue
+      card.classList.add('sa-find-hit')
+      const ranges = collectQueryRanges(card, find.query)
+      if (match === currentMatch) { card.classList.add('sa-find-current'); current = ranges } else others.push(...ranges)
+    }
+    paintFindRanges(props.resourceId, others, current)
+    findPainted.current = true
+  }, [find.open, find.query, findMatches, currentMatch, visibleItems])
+  // Each pane owns its own entry in the shared highlight registry, so a closing pane drops only
+  // its own ranges and leaves any other open find bar still painted.
+  useEffect(() => () => { clearFindRanges(props.resourceId) }, [props.resourceId])
+  const openFindHit = (sessionId: string, itemId: string): void => {
+    if (sessionId !== activeId) {
+      setReady(false)
+      setActiveId(sessionId)
+      setHistorical(sessionId !== props.resourceId)
+    }
+    setFindJump(itemId)
+  }
   const earlierCount = readingWindow ? conversationItems.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).length : Math.max(0, conversationItems.length - visibleCount)
   const showEarlier = (): void => {
     const el = timeline.current
@@ -564,6 +676,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {shownError && <div className="sa-error-bar" role="alert"><span>{shownError}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
     {historical && <div className="sa-history-banner" role="status"><span><strong>{resuming ? 'Reconnecting conversation...' : 'Previewing saved conversation'}</strong><small>{projection.title || 'Saved messages'} ? Resume to continue from here.</small></span><button disabled={resuming} onClick={() => { setReady(false); setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button disabled={!ready || resuming || projection.archived} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume this conversation'}</button>}</div>}
     {banner && <div className="sa-runtime-banner" role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
+    {find.open && <ConversationFindBar query={find.query} count={findMatches.length} index={find.index} results={findResults} searching={findSearching} focusToken={findFocus} onQuery={query => dispatchFind({ type: 'query', query })} onStep={direction => dispatchFind({ type: 'step', direction, count: findMatches.length })} onOpenHit={openFindHit} onClose={() => { dispatchFind({ type: 'close' }); if (composer.current && !composer.current.disabled) composer.current.focus(); else timeline.current?.focus() }} />}
     <div className="sa-timeline-wrap"><div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
       const el = timeline.current
       // Layout and content growth can emit scroll events too. Only user input
@@ -629,6 +742,6 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {eventsOpen && <AgentDialog title="Event log" onClose={() => setEventsOpen(false)}><p className="sa-notice">Diagnostics only. Showing the latest {rawEvents.length} events.</p><div className="sa-diff-toolbar"><button onClick={() => void copyText(JSON.stringify(rawEvents, null, 2))}>Copy events</button><button onClick={() => void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200)))}>Refresh</button></div><div className="sa-event-list">{rawEvents.map((event) => <details key={event.id}><summary>#{event.sequence} · {event.data.type} · {event.native?.method ?? event.itemId ?? event.requestId ?? ''}</summary><pre>{JSON.stringify(event, null, 2)}</pre></details>)}</div></AgentDialog>}
     {historyOpen && <AgentDialog title="Conversation history" onClose={() => setHistoryOpen(false)}><input className="sa-history-search" aria-label="Search conversation history" placeholder="Search conversations" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} /><p className="sa-history-help">Choose a conversation to preview its messages, then resume when you are ready to continue.</p>{historyLoading && <p className="sa-history-loading" role="status"><LoaderCircle size={13} className="spin" /> Loading conversations...</p>}<div className="sa-history-list" aria-busy={historyLoading}>{historyItems.map((item) => <button key={item.id} title="Preview saved conversation" onClick={() => { if (item.id !== activeId) setReady(false); setActiveId(item.id); setHistorical(item.id !== props.resourceId); setHistoryOpen(false) }}><strong>{item.title || 'Untitled conversation'}</strong><small>{item.provider} · {displayPhase(item.phase)}{item.archived ? ' · archived' : ''}</small></button>)}{!historyLoading && !historyItems.length && <p>No saved conversations match.</p>}</div></AgentDialog>}
     {discovery !== undefined && <AgentDialog title={name + ' configuration'} onClose={() => setDiscovery(undefined)}><p className="sa-notice">Read-only details of configured skills, commands and connections. Nothing here runs a command or changes your configuration.</p><div className="sa-event-list">{discovery && typeof discovery === 'object' && !Array.isArray(discovery) ? Object.entries(discovery).map(([category, value]) => <details key={category}><summary>{category.replaceAll('_', ' ')}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>) : <pre>{JSON.stringify(discovery, null, 2)}</pre>}</div></AgentDialog>}
-    {rename !== null && <AgentDialog title="Rename conversation" onClose={() => setRename(null)}><form className="sa-rename" onSubmit={(event) => { event.preventDefault(); const title = rename.trim(); if (!title) return; void window.conductor.structured.rename(activeId, title).then(() => { setProjection((current) => ({ ...current, title })); setRename(null) }).catch((reason: unknown) => setError(String(reason))) }}><input autoFocus aria-label="Conversation title" maxLength={160} value={rename} onChange={(event) => setRename(event.target.value)} /><button type="submit">Save name</button></form></AgentDialog>}
+    {rename !== null && <AgentDialog title="Rename conversation" onClose={() => setRename(null)}><form className="sa-rename" onSubmit={(event) => { event.preventDefault(); const title = rename.trim(); if (!title) return; void window.conductor.structured.rename(activeId, title).then(() => { setProjection((current) => ({ ...current, title })); return propsRef.current.onConversationChange?.({ ...conversationIdentity(projection, provider), title, manual: true }) }).then(() => setRename(null)).catch((reason: unknown) => setError(String(reason))) }}><input autoFocus aria-label="Conversation title" maxLength={160} value={rename} onChange={(event) => setRename(event.target.value)} /><button type="submit">Save name</button></form></AgentDialog>}
   </section>
 }

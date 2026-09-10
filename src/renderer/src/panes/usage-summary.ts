@@ -15,9 +15,13 @@ export {
   summarizeWorkingUsage, updatedSequence, usageWindowLabel, weeklyWindow
 } from '../../../shared/usage-accounting'
 export type {
-  ContextSummary, TokenFigures, UsageCap, UsageCapBasis, UsageCapMetric, UsageCapSetting, UsageCapStatus,
-  UsageRunReport, UsageScopeReport, UsageSummary, UsageWindow, UsageWindowKind, UsageWindowMovement
+  ContextSummary, TokenFigures, UsageCap, UsageCapBasis, UsageCapMetric, UsageCapSetting, UsageCapSnapshot,
+  UsageCapStatus, UsageRunReport, UsageScopeReport, UsageSummary, UsageWindow, UsageWindowKind, UsageWindowMovement
 } from '../../../shared/usage-accounting'
+// "Becoming expensive" while a conversation runs, well before a cap would stop it -- one
+// shared definition with the tab-strip's own warning and the cross-project Processes summary.
+export { evaluateUsageWarning } from '../../../shared/usage-warning'
+export type { UsageWarning, UsageWarningLevel } from '../../../shared/usage-warning'
 
 export interface SubagentSummary {
   id: string

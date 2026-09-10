@@ -1,10 +1,11 @@
 import { concreteModel } from '../shared/agent-model-selection'
+import { deriveConversationTitle } from '../shared/conversation-title'
 import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-history'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import { MAX_PROMPT_CHARS, settingsForRuntime } from '../shared/structured-agent'
-import type { AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
@@ -15,6 +16,7 @@ import { activeUsageCap, usageCapKey } from './usage-limit'
 import { describeUsageCap, evaluateUsageCap, summarizeUsageRun, type UsageCapStatus } from '../shared/usage-accounting'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
+import { rememberedPermission, rememberPermission } from './app-settings'
 
 interface LiveSession {
   spec: AgentSpec
@@ -50,6 +52,16 @@ type Factory = (provider: StructuredProvider, options: AdapterOptions) => Provid
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 /** Activity states a conversation can be cut off in; anything else has already settled. */
 const inFlight = new Set<AgentActivityPhase>(['working', 'waiting_input'])
+/** A subagent in one of these has not produced its result yet, whatever its parent turn says. */
+const runningSubagent = new Set<ActivityStatus>(['preparing', 'running', 'awaiting_approval'])
+/** The runtime's own lifecycle vocabulary, in the terms every activity indicator speaks. */
+const activityPhaseOf = (phase: SessionPhase): AgentActivityPhase =>
+  phase === 'running' || phase === 'starting' || phase === 'interrupting' ? 'working'
+    : phase.startsWith('waiting') ? 'waiting_input'
+      : phase === 'completed' ? 'complete'
+        : phase === 'failed' ? 'failed'
+          : phase === 'disconnected' ? 'disconnected'
+            : phase === 'interrupted' ? 'stopped' : 'idle'
 
 export class StructuredSessions {
   private live = new Map<string, LiveSession>()
@@ -92,6 +104,15 @@ export class StructuredSessions {
       const projection = store.snapshot(spec.id)!
       projection.capabilities = adapter.capabilities
       store.checkpoint(spec.id)
+    }
+    // A brand-new conversation opens on the owner's remembered mode for this provider, the same
+    // preference a manually opened renderer tab seeds from localStorage (permission-memory.ts);
+    // an already-registered session keeps whatever permission its own history carries, and only a
+    // mode this runtime just advertised as supported is ever applied.
+    if (!previousSpec) {
+      const remembered = rememberedPermission(key => this.database.getSetting(key), spec.provider as StructuredProvider)
+      const capabilities = store.snapshot(spec.id)?.capabilities
+      if (remembered && capabilities?.permissions?.includes(remembered)) store.update(spec.id, { settings: { ...store.snapshot(spec.id)!.settings, permission: remembered } })
     }
     return { id: spec.id, available: Boolean(executable), status: executable ? 'running' : 'unavailable', transcript: '', executable: executable ?? undefined, model: state.settings.model ?? spec.model ?? 'default', message: executable ? undefined : 'Provider CLI not found. Configure its executable before connecting.' }
   }
@@ -254,6 +275,10 @@ export class StructuredSessions {
     if (!state) throw new Error('Session not found')
     this.validateSettings(settings, state.capabilities)
     this.database.structured.update(id, { settings })
+    // This is the one path a deliberate composer change always takes (see updateSettings in
+    // StructuredAgentPane.tsx), so it is also where the owner's choice is remembered for the
+    // next conversation of this provider, manual or agent-opened.
+    if (state.capabilities) rememberPermission((key, value) => this.database.setSetting(key, value), state.capabilities.provider, settings.permission, state.capabilities)
   }
 
   async resume(id: string, settings?: SessionSettings): Promise<void> {
@@ -470,7 +495,9 @@ export class StructuredSessions {
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.assertPromptWithinLimit(submitted.length)
       this.reserveLive(live, settings, submitted)
-      store.update(id, { settings, title: state.title || text.trim().replace(/\s+/g, ' ').slice(0, 80) })
+      // Short and word-bounded, so history rows read the same name the tab strip auto-names
+      // itself from (see conversation-tab.ts's bindConversationTab).
+      store.update(id, { settings, title: state.title || deriveConversationTitle(text) })
       await this.connect(live)
       if (live.closed || this.live.get(id) !== live || !live.adapter) throw new Error('Session closed during initialization; no prompt was sent')
       // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
@@ -659,6 +686,35 @@ export class StructuredSessions {
     }
   }
 
+  /** Whether this conversation still owns a subagent that has not reported back. A detached
+   *  background task is defined to outlive the turn that launched it, so only the runtime that
+   *  reported it can vouch for it: after a relaunch nothing claims work that died with its
+   *  process. */
+  private ownsActiveSubagent(live: LiveSession): boolean {
+    if (!live.adapter || live.closed) return false
+    const items = this.database.structured.snapshot(live.spec.id)?.items ?? []
+    const latest = new Map<string, ActivityStatus>()
+    for (const item of [...items].sort((a, b) => (a.updatedSequence ?? a.sequence) - (b.updatedSequence ?? b.sequence))) {
+      if (item.data.type !== 'subagent' || item.runtimeId !== live.runtimeId) continue
+      latest.set(item.data.nativeSessionId ?? item.nativeItemId ?? item.id, item.data.status)
+    }
+    return [...latest.values()].some(status => runningSubagent.has(status))
+  }
+  /** A finished turn that still owns running subagent work is not finished: reporting 'complete'
+   *  turns the tab's loader into a checkmark and rolls its project up green while output is still
+   *  streaming in. Every other phase speaks for itself. */
+  private owningActivityPhase(live: LiveSession, reported: AgentActivityPhase): AgentActivityPhase {
+    return reported === 'complete' && this.ownsActiveSubagent(live) ? 'working' : reported
+  }
+  /** The one writer of the phase every project rolls up and every tab indicator follows. */
+  private recordActivityPhase(live: LiveSession, phase: AgentActivityPhase): void {
+    live.activityPhase = phase
+    // AgentRecord.status is a coarser union than the phase, so the unhappy phases collapse
+    // back onto its own vocabulary here rather than leaking new values into stored rows.
+    const status = phase === 'working' || phase === 'idle' ? 'running' : phase === 'failed' || phase === 'disconnected' ? 'error' : phase === 'stopped' ? 'exited' : phase
+    this.database.setAgentStatus(live.spec.id, status, phase)
+    this.broadcast('agent:status', { id: live.spec.id, status, phase })
+  }
   private emit(live: LiveSession, source: AdapterEvent): void {
     const store = this.database.structured, state = store.snapshot(live.spec.id)
     if (!state || live.closed) return
@@ -691,21 +747,25 @@ export class StructuredSessions {
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), 32)
     if (data.type === 'session') queueMicrotask(() => { void this.drainQueue(live) })
     if (data.type === 'session') {
-      const reported: AgentActivityPhase = data.phase === 'running' || data.phase === 'starting' || data.phase === 'interrupting' ? 'working' : data.phase.startsWith('waiting') ? 'waiting_input' : data.phase === 'completed' ? 'complete' : data.phase === 'failed' ? 'failed' : data.phase === 'disconnected' ? 'disconnected' : data.phase === 'interrupted' ? 'stopped' : 'idle'
+      const reported = activityPhaseOf(data.phase)
       // A lost connection says nothing on its own about whether output was cut off, so only a
       // conversation that was still in flight reports as disconnected; one that had already
       // settled keeps the state it settled in rather than turning its project into a warning.
       const settled = live.activityPhase ?? 'idle'
       const phase: AgentActivityPhase = reported === 'disconnected' && !inFlight.has(settled) ? settled : reported
-      live.activityPhase = phase
-      // AgentRecord.status is a coarser union than the phase, so the unhappy phases collapse
-      // back onto its own vocabulary here rather than leaking new values into stored rows.
-      const status = phase === 'working' || phase === 'idle' ? 'running' : phase === 'failed' || phase === 'disconnected' ? 'error' : phase === 'stopped' ? 'exited' : phase
-      this.database.setAgentStatus(live.spec.id, status, phase)
-      this.broadcast('agent:status', { id: live.spec.id, status, phase })
+      this.recordActivityPhase(live, this.owningActivityPhase(live, phase))
       live.budget?.setPhase(data.phase)
       if (['disconnected', 'failed', 'interrupted', 'completed'].includes(data.phase)) this.artifacts.discardSession(live.spec.id)
       if (!active.has(data.phase)) { live.budget?.dispose(); live.budget = undefined }
+    }
+    // A conversation whose own turn reported 'completed' is still churning while a subagent it
+    // launched runs on: Claude's turn result lands as soon as it hands work to detached children,
+    // and their output keeps streaming into this same conversation for as long as they take.
+    // Nothing else re-opens the phase, so the tab dropped its loader for a checkmark and the
+    // project rolled up green. Every child lifecycle event re-decides it.
+    if (data.type === 'subagent') {
+      const phase = this.owningActivityPhase(live, activityPhaseOf(state.phase))
+      if (phase !== live.activityPhase) this.recordActivityPhase(live, phase)
     }
     if (data.type === 'usage' && data.costUsd && process.env.CONDUCTOR_LIVE_TESTS === '1') {
       store.addLiveCost(process.env.CONDUCTOR_LIVE_SUITE_ID!, live.spec.provider as StructuredProvider, data.costUsd)

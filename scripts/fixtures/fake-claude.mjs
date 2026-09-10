@@ -159,6 +159,33 @@ for await (const line of input) {
       stepOutside()
       continue
     }
+    if (prompt.startsWith('SYNTHETIC BACKGROUND')) {
+      // A turn that hands its work to a backgrounded task and then reports its own result while
+      // that child is still going, which is what Claude does whenever an agent dispatches work.
+      const taskId = `background-task-${++turn}`
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
+      declare(`task-tool-${turn}`, 'Task', { description: 'Synthetic background worker' })
+      emit({ type: 'system', subtype: 'task_started', task_id: taskId, tool_use_id: `task-tool-${turn}`, description: 'Synthetic background worker', is_backgrounded: true, status: 'running' })
+      text('Handing this to a background worker; holding here until it reports.')
+      finish()
+      // The child reports back long after the parent turn ended. The wait is what the caller
+      // observes the conversation in: still working, with no turn of its own in flight.
+      const timer = setTimeout(() => {
+        steeringTimers.delete(timer)
+        emit({ type: 'system', subtype: 'task_notification', task_id: taskId, tool_use_id: `task-tool-${turn}`, status: 'completed', summary: 'Synthetic background worker completed (exit code 0)' })
+      }, Number(process.env.CONDUCTOR_SMOKE_BACKGROUND_MS ?? 6000))
+      steeringTimers.add(timer)
+      continue
+    }
+    if (prompt.startsWith('SYNTHETIC FILELINKS')) {
+      // The caller supplies the exact Markdown to answer with between <<< and >>>, so this fixture
+      // never has to know which link shapes a smoke test exercises, and Conductor's own appended
+      // prompt sections are not echoed back into the reply.
+      const body = /<<<([\s\S]*?)>>>/.exec(prompt)?.[1]?.trim()
+      if (!body) throw new Error('Synthetic file-link scenario requires the reply Markdown between <<< and >>>')
+      text(body)
+      finish(); continue
+    }
     if (prompt.startsWith('SYNTHETIC B')) {
       text('**Synthetic fixture continuation:** `wasOpen` and `wasPinned` were removed; the local Node test passed. This is offline fixture behavior, not live-provider context evidence.')
       finish(); continue

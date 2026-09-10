@@ -94,6 +94,12 @@ export interface PaneTab {
   state?: Record<string, unknown>
   /** The TabGroup in this tab's own pane that it belongs to, if any. */
   tabGroupId?: string
+  /** True once `title` has been deliberately set: by hand through the "Rename conversation"
+   *  dialog, or once by the first-message auto-name (see bindConversationTab). Guards both the
+   *  same way, so neither a later resume/fork nor a second message ever overwrites the title
+   *  again — without this flag there would be no way to tell "still the generic default" apart
+   *  from "already named" other than guessing from the string. */
+  titleLocked?: boolean
 }
 
 export interface PaneGroupNode {

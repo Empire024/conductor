@@ -1,6 +1,6 @@
 /** Automation must never take the desktop from whoever is working. This proves a smoke-profile
  *  launch parks its window off every display, keeps it out of the taskbar, never activates it,
- *  and still paints - so screenshots in the other smoke scripts stay real. */
+ *  stays silent, and still paints - so screenshots in the other smoke scripts stay real. */
 import { _electron as electron } from '@playwright/test'
 import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -25,6 +25,7 @@ const state = await app.evaluate(async ({ BrowserWindow, screen }) => {
     bounds: window.getBounds(),
     visible: window.isVisible(),
     focused: window.isFocused(),
+    audioMuted: window.webContents.isAudioMuted(),
     displays: screen.getAllDisplays().map(display => display.bounds)
   }
 })
@@ -40,6 +41,8 @@ await writeFile(join(output, 'parked-window.png'), Buffer.from(png, 'base64'))
 await app.close()
 
 assert.equal(state.focused, false, 'a smoke-profile window must never take focus from the owner')
+// A smoke run finishes agent after agent; unmuted, each one rings the owner's completion cue.
+assert.equal(state.audioMuted, true, 'a smoke-profile window must never play sound over the owner')
 assert.equal(overlapsAnyDisplay, false, `a smoke-profile window must sit off every display, got ${JSON.stringify(state.bounds)}`)
 assert.ok(Buffer.from(png, 'base64').length > 5000, 'a parked window must still paint so screenshots stay real')
-console.log('background windows: parked at', JSON.stringify(state.bounds), '· focused', state.focused, '· painted', Buffer.from(png, 'base64').length, 'bytes')
+console.log('background windows: parked at', JSON.stringify(state.bounds), '· focused', state.focused, '· muted', state.audioMuted, '· painted', Buffer.from(png, 'base64').length, 'bytes')

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
-import type { AgentSpec, PaneTab, SessionRecord, WorkspaceLayout } from '../shared/models'
+import type { AgentSpec, DetachedWindowRecord, PaneTab, SessionRecord, WorkspaceLayout } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { aggregateProjectActivity, type AgentActivityRow } from './project-activity'
 
@@ -102,6 +102,23 @@ describe('aggregateProjectActivity', () => {
       ]
     )
     expect(statuses).toEqual({ 'project-a': 'idle', 'project-b': 'done', 'project-c': 'idle' })
+  })
+
+  it('lets an agent detached into its own window keep its project off green', () => {
+    const workspaces = [workspace('workspace-1', 'project-a', 'agent-done')]
+    const detached: DetachedWindowRecord = {
+      id: 'window-1', projectId: 'project-a', sessionId: 'workspace-1', layout: layoutWith('agent-detached'),
+      maximizedGroupId: null, createdAt: '2026-09-09T00:00:00.000Z', updatedAt: '2026-09-09T00:00:00.000Z'
+    }
+    const agents = [
+      agent('agent-done', 'project-a', 'workspace-1', 'complete'),
+      agent('agent-detached', 'project-a', 'workspace-1', 'working')
+    ]
+    // The detached tab is gone from its workspace layout, so without its own window's layout the
+    // roll-up only sees the finished tab and reports the project done.
+    expect(aggregateProjectActivity(['project-a'], workspaces, agents)['project-a']).toBe('done')
+    expect(aggregateProjectActivity(['project-a'], workspaces, agents, [detached])['project-a']).toBe('working')
+    expect(aggregateProjectActivity(['project-a'], workspaces, agents, [{ ...detached, projectId: 'project-b' }])['project-a']).toBe('done')
   })
 
   it('never lets one project speak for another', () => {
