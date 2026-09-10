@@ -32,6 +32,11 @@ html { view-transition-name: none; }
 
 body { background: var(--bg); user-select: none; }
 
+/* Read-only surfaces the owner reads and copies from: dialog/notice bodies and backlog task
+   rows. Opt in per surface rather than flipping the body default, which would turn drag
+   gestures (tab reorder, pane resize, sidebar rows) into accidental text selection. */
+.sa-dialog, .project-task-body { user-select: text; }
+
 button, input { font: inherit; }
 button { color: inherit; }
 button:focus-visible, input:focus-visible { outline: 1px solid var(--accent-muted); outline-offset: -1px; }

@@ -249,6 +249,8 @@ models they want
 
 - [~] Tabs should get auto named when first message is sent <!-- conductor-task:26d660cd-b2ff-4f27-ace2-acff9b1280ab agent=agent_mturhxcc_t1p06lm -->
 
+- [x] Add right click menu.. copy, all that jazz.. curreently I select text and i can't do nothing <!-- conductor-task:05579479-d437-41de-853e-908c4834db6d agent=agent_mtusoeta_9h639l8 -->
+
 Feature list:
 
 0. [Implemented] Beautify the 'send' button.
@@ -320,6 +322,8 @@ Latest completion and validation: [remaining checklist delivery](docs/backlog-co
 - [~] Add CTRL+F To chats (searches entire workspace for messages sent with agents and canhighlight it) <!-- conductor-task:3439f02b-608f-4bd6-9ded-97ed51ec573a agent=agent_mturhxcc_t1p06lm -->
 
 - [~] To usage - give me visible warnings in a tab when it starts becoming expensive. Show it in processes also. <!-- conductor-task:2aa42f5b-c9d6-45a4-b71e-c75776557094 agent=agent_mturhxcc_t1p06lm -->
+
+- [ ] Add 'Open session' 'Save session' to menu - this will save/open an entire session with all projects loaded, agents, all that jazz. Also show session name on top bar. <!-- conductor-task:9a048670-02d1-4315-85b9-28356a06f42e -->
 
 ## Urgent bugs and permissions - 2026-09-08
 

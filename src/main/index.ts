@@ -15,6 +15,7 @@ import { RemoteControlService } from './remote-control-ipc'
 import { safeStorageCipher } from './safe-storage-vault'
 import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
+import { installContextMenu } from './context-menu'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell, webContents } from 'electron'
 import type {
   AgentSpec,
@@ -152,6 +153,9 @@ app.on('second-instance', () => {
   if (window.isMinimized()) window.restore()
   revealWindow(window)
 })
+
+// Electron ships no native right-click menu by default; every window and webview needs this.
+app.on('web-contents-created', (_event, contents) => installContextMenu(contents))
 
 const createWindow = (
   detachedId?: string,
