@@ -5,6 +5,7 @@ import { ProcessStatusSummary } from './ProcessStatusSummary'
 import type { TabGroupAction } from '../layout/tab-groups'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
 import type { ProjectActivityStatus, SessionActivityStatus } from '../attention'
+import { displayActivityStatus } from '../attention'
 import { createPortal } from 'react-dom'
 import {
   X,
@@ -367,7 +368,10 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                     <div className="session-tree">
                       {props.sessions.map((session, index) => {
                       const attention = props.attentionIds.has(session.id)
+                      // A workspace whose only warning is a disconnected tab reports 'stalled';
+                      // it paints the same amber dot, but it never outranked a sibling working.
                       const activity = props.sessionActivity.get(session.id)
+                      const activityDot = activity ? displayActivityStatus(activity) : undefined
                       return (
                         <Fragment key={session.id}><div className="sidebar-session-row" draggable={editingSessionId !== session.id} onContextMenu={event => { if (editingSessionId === session.id) return; event.preventDefault(); event.stopPropagation(); setMenu(null); setWorkspaceMenu({ session, x: event.clientX, y: event.clientY }) }}
                           onDragStart={(event) => { event.stopPropagation(); event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('application/x-conductor-session', session.id) }}
@@ -384,7 +388,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                           <span className="session-number">{String(index + 1).padStart(2, '0')}</span>
                           <span className="ellipsis">{editingSessionId === session.id ? <input className="sidebar-session-rename" aria-label="Workspace name" autoFocus value={sessionName} onFocus={event => event.currentTarget.select()} onClick={event => event.stopPropagation()} onDoubleClick={event => event.stopPropagation()} onChange={event => setSessionName(event.target.value)} onBlur={() => finishSessionRename(true)} onKeyDown={event => { event.stopPropagation(); if (event.key === 'Enter') { event.preventDefault(); finishSessionRename(true) }; if (event.key === 'Escape') { event.preventDefault(); finishSessionRename(false) } }} /> : session.name}</span>
                           {attention && <span className="session-attention-badge" title="An agent in this workspace needs your attention"><Bell size={11} strokeWidth={1.7} /></span>}
-                          {!attention && activity && <span className={`session-activity-dot ${activity}`} title={activity === 'working' ? 'Actively working' : activity === 'waiting' ? 'Waiting on you' : 'Finished working'} />}
+                          {!attention && activityDot && <span className={`session-activity-dot ${activityDot}`} title={activityDot === 'working' ? 'Actively working' : activityDot === 'waiting' ? 'Waiting on you' : 'Finished working'} />}
                         </button>
                         <button className="sidebar-session-close" aria-label={'Close ' + session.name} title={'Close ' + session.name} onClick={() => props.onCloseSession(session.id)}><X size={11} /></button>
                         </div>
