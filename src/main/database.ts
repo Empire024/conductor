@@ -540,21 +540,23 @@ export class ConductorDatabase {
     const activeSessionId = this.getSetting('activeSessionId') || null
     const project = activeProjectId ? this.getProject(activeProjectId) : null
     const session = activeSessionId && activeProjectId ? this.listSessions(activeProjectId).find(item => item.id === activeSessionId) : null
-    let focusedGroupIds: Record<string, string> = {}
-    try {
-      const parsed = JSON.parse(this.getSetting('focusedGroupIds') || '{}') as unknown
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        focusedGroupIds = Object.fromEntries(
-          Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
-        )
-      }
-    } catch {
-      focusedGroupIds = {}
-    }
     return {
       activeProjectId: project?.id ?? null,
       activeSessionId: project && session?.projectId === project.id ? session.id : null,
-      focusedGroupIds
+      focusedGroupIds: this.readStringMapSetting('focusedGroupIds'),
+      sessionIdsByProject: this.readStringMapSetting('sessionIdsByProject')
+    }
+  }
+
+  private readStringMapSetting(key: string): Record<string, string> {
+    try {
+      const parsed = JSON.parse(this.getSetting(key) || '{}') as unknown
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+      return Object.fromEntries(
+        Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+      )
+    } catch {
+      return {}
     }
   }
 
@@ -583,6 +585,7 @@ export class ConductorDatabase {
       saveSetting.run('activeProjectId', checkpoint.activeProjectId ?? '', timestamp)
       saveSetting.run('activeSessionId', checkpoint.activeSessionId && this.db.prepare('SELECT id FROM sessions WHERE id = ? AND closed_at IS NULL').get(checkpoint.activeSessionId) ? checkpoint.activeSessionId : '', timestamp)
       saveSetting.run('focusedGroupIds', JSON.stringify(checkpoint.focusedGroupIds), timestamp)
+      saveSetting.run('sessionIdsByProject', JSON.stringify(checkpoint.sessionIdsByProject), timestamp)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')

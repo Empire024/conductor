@@ -61,7 +61,7 @@ describe('reversible workspace closure', () => {
     if (stale.root.type !== 'group') throw new Error('Expected a group')
     stale.root.tabs = []
     database.saveSession(session.id, stale, null, [])
-    database.saveRecoveryCheckpoint({ activeProjectId: project.id, activeSessionId: session.id, focusedGroupIds: {}, sessions: [{ id: session.id, layout: stale, maximizedGroupId: null, closedTabs: [] }] })
+    database.saveRecoveryCheckpoint({ activeProjectId: project.id, activeSessionId: session.id, focusedGroupIds: {}, sessionIdsByProject: {}, sessions: [{ id: session.id, layout: stale, maximizedGroupId: null, closedTabs: [] }] })
     expect(database.getWorkspaceRecoveryState().activeSessionId).toBeNull()
     expect(database.restoreSession()?.layout).toEqual(session.layout)
   })

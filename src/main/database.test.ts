@@ -255,6 +255,7 @@ describe('ConductorDatabase persistence', () => {
           activeProjectId: project.id,
           activeSessionId: session.id,
           focusedGroupIds: { [session.id]: focusedGroupId },
+          sessionIdsByProject: { [project.id]: session.id },
           sessions: [{
             id: session.id,
             layout: session.layout,
@@ -271,7 +272,8 @@ describe('ConductorDatabase persistence', () => {
         expect(database.getWorkspaceRecoveryState()).toEqual({
           activeProjectId: project.id,
           activeSessionId: session.id,
-          focusedGroupIds: { [session.id]: focusedGroupId }
+          focusedGroupIds: { [session.id]: focusedGroupId },
+          sessionIdsByProject: { [project.id]: session.id }
         })
         const restored = database.getSession(session.id)!
         expect(restored.maximizedGroupId).toBe(focusedGroupId)

@@ -249,6 +249,7 @@ export interface WorkspaceRecoveryState {
   activeProjectId: string | null
   activeSessionId: string | null
   focusedGroupIds: Record<string, string>
+  sessionIdsByProject: Record<string, string>
 }
 
 export interface WorkspaceRecoveryCheckpoint extends WorkspaceRecoveryState {

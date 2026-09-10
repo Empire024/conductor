@@ -202,6 +202,7 @@ export function App(): React.JSX.Element {
   const activeProjectIdRef = useRef<string | null>(activeProjectId)
   const activeSessionIdRef = useRef<string | null>(activeSessionId)
   const focusedGroupIdsRef = useRef<Record<string, string>>({})
+  const sessionIdsByProjectRef = useRef<Record<string, string>>({})
   const recoveryReadyRef = useRef(false)
   const checkpointTimerRef = useRef<number | null>(null)
   const saveRevisionRef = useRef(0)
@@ -211,11 +212,13 @@ export function App(): React.JSX.Element {
   activeSessionIdRef.current = activeSessionId
   soundProfileRef.current = appSettings.agentSoundProfile
   if (activeSessionId && focusedGroupId) focusedGroupIdsRef.current[activeSessionId] = focusedGroupId
+  if (activeProjectId && activeSessionId) sessionIdsByProjectRef.current[activeProjectId] = activeSessionId
 
   const recoveryCheckpoint = useCallback((): WorkspaceRecoveryCheckpoint => ({
     activeProjectId: activeProjectIdRef.current,
     activeSessionId: activeSessionIdRef.current,
     focusedGroupIds: { ...focusedGroupIdsRef.current },
+    sessionIdsByProject: { ...sessionIdsByProjectRef.current },
     sessions: sessionsRef.current.map((session) => ({
       id: session.id,
       layout: session.layout,
@@ -266,7 +269,10 @@ export function App(): React.JSX.Element {
     const layouts = await window.conductor.sessions.listTemplates(projectId)
     setSessions(loaded)
     setTemplates(layouts)
-    const next = loaded.find((session) => session.id === preferredSessionId) ?? loaded[0]
+    const remembered = sessionIdsByProjectRef.current[projectId]
+    const next = loaded.find((session) => session.id === preferredSessionId)
+      ?? loaded.find((session) => session.id === remembered)
+      ?? loaded[0]
     if (next) selectSession(next)
   }, [selectSession])
 
@@ -280,6 +286,7 @@ export function App(): React.JSX.Element {
       setAppSettings(settings)
       if (settings.debugLogging) setDebugConsoleOpen(true)
       focusedGroupIdsRef.current = recovery.focusedGroupIds
+      sessionIdsByProjectRef.current = { ...recovery.sessionIdsByProject }
       const project = loaded.find((item) => item.id === recovery.activeProjectId) ?? loaded[0]
       if (project) await loadProject(project.id, recovery.activeSessionId ?? undefined)
     }).catch((reason: unknown) => {
