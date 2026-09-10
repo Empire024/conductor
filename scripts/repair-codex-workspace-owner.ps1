@@ -14,6 +14,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# Get-Acl lives in the on-demand Microsoft.PowerShell.Security module, which does not load on
+# every host (a CI runner, or a shell started with a rewritten PSModulePath). Read the same
+# descriptor through the DirectoryInfo method the cmdlet itself calls.
+function Get-DirectoryAcl([string]$Path) { (Get-Item -LiteralPath $Path -Force).GetAccessControl() }
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
 $targetOwner = $identity.User
 $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
@@ -53,7 +57,7 @@ if (Test-Path -LiteralPath $gitPath -PathType Container) {
 }
 
 $entries = @(foreach ($directory in $targets) {
-  $acl = Get-Acl -LiteralPath $directory.FullName
+  $acl = Get-DirectoryAcl $directory.FullName
   $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
   [pscustomobject]@{
     Path = $directory.FullName
@@ -78,7 +82,7 @@ Write-Output "Original ownership and DACL backup: $backupPath"
 foreach ($entry in $repairs) {
   $directory = Get-Item -LiteralPath $entry.Path -Force
   Assert-OrdinaryDirectory $directory
-  $current = Get-Acl -LiteralPath $directory.FullName
+  $current = Get-DirectoryAcl $directory.FullName
   if ($current.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $entry.OwnerSid -or
       $current.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access) -ne $entry.Dacl) {
     throw "Directory permissions changed during repair; inspect before retrying: $($entry.Path)"
@@ -87,7 +91,7 @@ foreach ($entry in $repairs) {
   $ownerOnly = [System.Security.AccessControl.DirectorySecurity]::new()
   $ownerOnly.SetOwner($targetOwner)
   $directory.SetAccessControl($ownerOnly)
-  $after = Get-Acl -LiteralPath $entry.Path
+  $after = Get-DirectoryAcl $entry.Path
   if ($after.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $targetOwner.Value -or
       $after.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access) -ne $entry.Dacl) {
     throw "Ownership or unchanged-DACL verification failed: $($entry.Path). Backup: $backupPath"

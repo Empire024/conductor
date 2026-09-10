@@ -16,6 +16,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# Get-Acl lives in the on-demand Microsoft.PowerShell.Security module, which does not load on
+# every host (a CI runner, or a shell started with a rewritten PSModulePath). Read the same
+# descriptor through the DirectoryInfo method the cmdlet itself calls.
+function Get-DirectoryAcl([string]$Path) { (Get-Item -LiteralPath $Path -Force).GetAccessControl() }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 $workspace = Get-Item -LiteralPath $WorkspacePath -Force
@@ -63,7 +67,7 @@ $workspaceKey = $workspace.FullName.Replace('\', '/').ToLowerInvariant()
 $nativeCapability = @($capabilities.workspace_by_cwd.PSObject.Properties | Where-Object { $_.Name -eq $workspaceKey })
 if ($nativeCapability.Count -ne 1) { throw 'No unique existing native Codex capability for this exact workspace.' }
 $capabilitySid = [Security.Principal.SecurityIdentifier]::new([string]$nativeCapability[0].Value)
-$rootAcl = Get-Acl -LiteralPath $workspace.FullName
+$rootAcl = Get-DirectoryAcl $workspace.FullName
 $rootDacl = $rootAcl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access)
 $nativeRootRules = @($rootAcl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object {
   $_.IdentityReference.Value -eq $capabilitySid.Value -and $_.AccessControlType -eq 'Allow' -and
@@ -127,7 +131,7 @@ $backupPath = Join-Path ([IO.Path]::GetTempPath()) ('conductor-codex-inheritance
 [pscustomobject]@{Summary=$summary;RootDacl=$rootDacl;Entries=$entries} | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $backupPath -Encoding UTF8
 Write-Output "Original ACL inventory: $backupPath"
 # Recheck the root and every link immediately before the single native ACL write.
-if ((Get-Acl -LiteralPath $workspace.FullName).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) -ne $rootDacl) { throw 'Root permissions changed; inspect before retrying.' }
+if ((Get-DirectoryAcl $workspace.FullName).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) -ne $rootDacl) { throw 'Root permissions changed; inspect before retrying.' }
 $expectedLinks = @{}
 foreach ($link in $links) { $expectedLinks[$link.Path] = $link.Target }
 $checkedLinks = 0
@@ -146,7 +150,7 @@ if ($checkedLinks -ne $links.Count) { throw 'Reparse inventory changed during in
 $descriptor = [Security.AccessControl.DirectorySecurity]::new()
 $descriptor.SetSecurityDescriptorSddlForm($rootDacl, [Security.AccessControl.AccessControlSections]::Access)
 $workspace.SetAccessControl($descriptor)
-if ((Get-Acl -LiteralPath $workspace.FullName).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) -ne $rootDacl) { throw 'Root DACL unexpectedly changed.' }
+if ((Get-DirectoryAcl $workspace.FullName).GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access) -ne $rootDacl) { throw 'Root DACL unexpectedly changed.' }
 
 $removed = 0
 $missingAfter = 0

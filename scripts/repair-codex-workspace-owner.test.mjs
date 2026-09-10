@@ -7,7 +7,8 @@ import { test } from 'node:test'
 
 const windows = process.platform === 'win32'
 const script = path.resolve('scripts/repair-codex-workspace-owner.ps1')
-const run = (...args) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', script, ...args], { encoding: 'utf8', windowsHide: true, timeout: 15_000 })
+const runIn = (env, ...args) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', script, ...args], { encoding: 'utf8', windowsHide: true, timeout: 15_000, env: { ...process.env, ...env } })
+const run = (...args) => runIn({}, ...args)
 const fixture = () => fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-owner-guard-'))
 const cleanup = directory => {
   const actual = fs.realpathSync(directory)
@@ -71,6 +72,24 @@ test('a worktree .git pointer is left untouched', { skip: !windows }, () => {
     assert.equal(result.status, 0, result.stderr)
     assert.equal(JSON.parse(result.stdout).Path, directory)
     assert.equal(fs.readFileSync(path.join(directory, '.git'), 'utf8'), 'gitdir: ../other/worktrees/test\n')
+  } finally { cleanup(directory) }
+})
+
+// A host can offer the Microsoft.PowerShell.Security module without being able to load it
+// (a GitHub Windows runner does exactly this), so the script must not depend on Get-Acl.
+test('reads owners where the Security module cannot be loaded', { skip: !windows }, () => {
+  const directory = fixture()
+  try {
+    const shadow = path.join(directory, 'modules', 'Microsoft.PowerShell.Security')
+    fs.mkdirSync(shadow, { recursive: true })
+    fs.writeFileSync(path.join(shadow, 'Microsoft.PowerShell.Security.psm1'), "throw 'Security module refuses to load.'\n")
+    fs.writeFileSync(path.join(shadow, 'Microsoft.PowerShell.Security.psd1'), "@{ ModuleVersion = '1.0'; GUID = '5c1f5c3a-1d0e-4a3f-9a0a-2f6f3c1c4d55'; RootModule = 'Microsoft.PowerShell.Security.psm1'; FunctionsToExport = @('Get-Acl'); CmdletsToExport = @() }\n")
+    const shadowed = { PSModulePath: `${path.join(directory, 'modules')};${process.env.PSModulePath ?? ''}` }
+    const probe = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-Acl -LiteralPath $env:TEMP'], { encoding: 'utf8', windowsHide: true, timeout: 15_000, env: { ...process.env, ...shadowed } })
+    assert.match(probe.stderr, /CouldNotAutoloadMatchingModule/, 'The fixture must actually break Get-Acl')
+    const result = runIn(shadowed, '-WorkspacePath', directory)
+    assert.equal(result.status, 0, result.stderr)
+    assert.equal(JSON.parse(result.stdout).Path, directory)
   } finally { cleanup(directory) }
 })
 
