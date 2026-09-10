@@ -1,5 +1,6 @@
 import type { AgentActivityPhase, DetachedWindowRecord, LayoutNode, SessionRecord } from '../shared/models'
-import type { ProjectActivitySnapshot, ProjectActivityStatus } from '../shared/project-activity'
+import type { ActivityRollupStatus, ProjectActivitySnapshot } from '../shared/project-activity'
+import { displayActivityStatus, foldActivityStatuses } from '../shared/project-activity'
 
 /** One persisted agent row: the phase the main process last recorded for it, independent of
  *  whether any renderer pane for it was ever mounted. */
@@ -12,18 +13,17 @@ export interface AgentActivityRow {
 
 /** A session only reports 'disconnected' when the connection was lost while it was still in
  *  flight (see structured-sessions), so it does mean interrupted work; one that had already
- *  settled keeps the state it settled in and never forces this warning onto its project. */
-const STATUS_FOR_PHASE: Partial<Record<AgentActivityPhase, ProjectActivityStatus>> = {
+ *  settled keeps the state it settled in and never forces this warning onto its project. It
+ *  still warns for a tab of its own and for a project with nothing else running, but as
+ *  'stalled' it loses to any sibling the owner can watch working. */
+const STATUS_FOR_PHASE: Partial<Record<AgentActivityPhase, ActivityRollupStatus>> = {
   waiting_input: 'attention',
   failed: 'waiting',
-  disconnected: 'waiting',
+  disconnected: 'stalled',
   working: 'working',
   limited: 'working',
   complete: 'done'
 }
-
-/** Needs-attention beats still-working, which beats finished; 'idle' is the absence of all three. */
-const PRIORITY: ProjectActivityStatus[] = ['attention', 'waiting', 'working', 'done']
 
 const tabResourceIds = (node: LayoutNode): string[] =>
   node.type === 'group'
@@ -65,7 +65,7 @@ export const aggregateProjectActivity = (
       const status = STATUS_FOR_PHASE[agent.activityPhase]
       return status ? [status] : []
     }))
-    snapshot[projectId] = PRIORITY.find((status) => statuses.has(status)) ?? 'idle'
+    snapshot[projectId] = displayActivityStatus(foldActivityStatuses(statuses))
   }
   return snapshot
 }

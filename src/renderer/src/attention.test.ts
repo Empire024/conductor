@@ -8,6 +8,7 @@ import {
   getProjectActivityStatuses,
   mergeProjectActivity,
   getSessionActivityStatuses,
+  displayActivityStatus,
   hasActiveSubagent,
   resolveActivityPhase,
   resolveActivityPhases,
@@ -64,7 +65,9 @@ describe('session activity status', () => {
     // Stopped is a deliberate halt, so it does not pull the workspace into the waiting list.
     ['stopped', undefined],
     // A session only reaches this layer as disconnected when it lost its connection mid-flight.
-    ['disconnected', 'waiting']
+    // It carries 'stalled' rather than 'waiting' so the roll-ups above can rank it below work
+    // that is still running; on its own it still paints the waiting dot.
+    ['disconnected', 'stalled']
   ] as const)('maps phase %s to status %s', (phase, expected) => {
     const session = makeSession()
     const phases = new Map<string, AgentActivityPhase>([['agent-resource', phase]])
@@ -91,6 +94,24 @@ describe('session activity status', () => {
       ['agent-resource-2', 'idle']
     ])
     expect(getSessionActivityStatuses([session], phases).get('workspace-1')).toBe('done')
+  })
+
+  it('keeps a workspace working while a sibling tab sits disconnected', () => {
+    const session = makeSession()
+    if (session.layout.root.type !== 'group') throw new Error('Expected a tab group')
+    session.layout.root.tabs.push({ id: 'agent-tab-2', kind: 'agent', title: 'Claude', resourceId: 'agent-resource-2' })
+    const phases = new Map<string, AgentActivityPhase>([
+      ['agent-resource', 'working'],
+      ['agent-resource-2', 'disconnected']
+    ])
+    expect(getSessionActivityStatuses([session], phases).get('workspace-1')).toBe('working')
+
+    const allDisconnected = new Map<string, AgentActivityPhase>([
+      ['agent-resource', 'disconnected'],
+      ['agent-resource-2', 'disconnected']
+    ])
+    expect(getSessionActivityStatuses([session], allDisconnected).get('workspace-1')).toBe('stalled')
+    expect(displayActivityStatus(getSessionActivityStatuses([session], allDisconnected).get('workspace-1')!)).toBe('waiting')
   })
 
   it('ignores resources without a matching visible tab', () => {
@@ -173,6 +194,33 @@ describe('project activity status roll-up', () => {
 
     const onlyDone: ReadonlyMap<string, SessionActivityStatus> = new Map([['session-done', 'done']])
     expect(getProjectActivityStatuses([doneSession], new Set(), onlyDone).get('project-1')).toBe('done')
+  })
+
+  it('never paints a project as a warning while work is running in it', () => {
+    const workingSession = makeSession('working-resource', { id: 'session-working' })
+    const droppedSession = makeSession('dropped-resource', { id: 'session-dropped' })
+    const sessions = [workingSession, droppedSession]
+    const mixed: ReadonlyMap<string, SessionActivityStatus> = new Map([
+      ['session-working', 'working'],
+      ['session-dropped', 'stalled']
+    ])
+    expect(getProjectActivityStatuses(sessions, new Set(), mixed).get('project-1')).toBe('working')
+
+    // Nothing running: the tab that lost its connection is the most urgent thing left, and a
+    // finished sibling does not bury it.
+    const settled: ReadonlyMap<string, SessionActivityStatus> = new Map([
+      ['session-working', 'done'],
+      ['session-dropped', 'stalled']
+    ])
+    expect(getProjectActivityStatuses(sessions, new Set(), settled).get('project-1')).toBe('waiting')
+
+    // A failure or a question is not a lost connection: those still outrank running work.
+    const failed: ReadonlyMap<string, SessionActivityStatus> = new Map([
+      ['session-working', 'working'],
+      ['session-dropped', 'waiting']
+    ])
+    expect(getProjectActivityStatuses(sessions, new Set(), failed).get('project-1')).toBe('waiting')
+    expect(getProjectActivityStatuses(sessions, new Set(['session-dropped']), mixed).get('project-1')).toBe('attention')
   })
 
   it('falls back to idle when no session reports an activity status', () => {

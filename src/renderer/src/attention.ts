@@ -1,9 +1,11 @@
 import type { AgentActivityPhase, SessionRecord } from '../../shared/models'
 import type { ActivityStatus } from '../../shared/structured-agent'
-import type { ProjectActivitySnapshot, ProjectActivityStatus } from '../../shared/project-activity'
+import type { ActivityRollupStatus, ProjectActivitySnapshot, ProjectActivityStatus } from '../../shared/project-activity'
+import { displayActivityStatus, foldActivityStatuses } from '../../shared/project-activity'
 import { listGroups } from './layout/layout-operations'
 
 export type { ProjectActivityStatus }
+export { displayActivityStatus }
 
 export const getAttentionSessionIds = (
   sessions: SessionRecord[],
@@ -19,19 +21,22 @@ export const getAttentionSessionIds = (
   return ids
 }
 
-export type SessionActivityStatus = 'working' | 'waiting' | 'done'
+/** A workspace row speaks the roll-up vocabulary, not the painted one: it carries 'stalled'
+ *  onwards so the project row above it can still tell a lost connection from a failure. Both
+ *  rows paint it through displayActivityStatus. */
+export type SessionActivityStatus = Exclude<ActivityRollupStatus, 'attention' | 'idle'>
 
 const statusForPhase = (phase: AgentActivityPhase): SessionActivityStatus | null => {
   // A stopped agent is quiet on purpose, so only the involuntary states ask for a look; a
   // conversation that had already settled before losing its connection never reports as
-  // disconnected in the first place.
-  if (phase === 'waiting_input' || phase === 'failed' || phase === 'disconnected') return 'waiting'
+  // disconnected in the first place. A tab that really was cut off warns for itself, but as
+  // 'stalled' it never speaks for a workspace or project with work still running in it.
+  if (phase === 'waiting_input' || phase === 'failed') return 'waiting'
+  if (phase === 'disconnected') return 'stalled'
   if (phase === 'working' || phase === 'limited') return 'working'
   if (phase === 'complete') return 'done'
   return null
 }
-
-const STATUS_PRIORITY: SessionActivityStatus[] = ['waiting', 'working', 'done']
 
 export const getSessionActivityStatuses = (
   sessions: SessionRecord[],
@@ -39,15 +44,17 @@ export const getSessionActivityStatuses = (
 ): Map<string, SessionActivityStatus> => {
   const result = new Map<string, SessionActivityStatus>()
   for (const session of sessions) {
-    const statuses = new Set(listGroups(session.layout.root).flatMap((group) =>
+    const statuses = listGroups(session.layout.root).flatMap((group) =>
       group.tabs.flatMap((tab) => {
         const phase = tab.resourceId ? activityPhases.get(tab.resourceId) : undefined
         const status = phase ? statusForPhase(phase) : null
         return status ? [status] : []
       })
-    ))
-    const winner = STATUS_PRIORITY.find((status) => statuses.has(status))
-    if (winner) result.set(session.id, winner)
+    )
+    // Nothing at tab level reports 'attention' - the bell is driven by attentionResourceIds -
+    // and an empty workspace folds to 'idle', which is the absence of a dot rather than a state.
+    const winner = foldActivityStatuses(statuses)
+    if (winner !== 'idle' && winner !== 'attention') result.set(session.id, winner)
   }
   return result
 }
@@ -84,11 +91,11 @@ export const resolveActivityPhases = (
   return result
 }
 
-const PROJECT_STATUS_PRIORITY: SessionActivityStatus[] = ['waiting', 'working', 'done']
-
 /** One level above getSessionActivityStatuses: rolls each project's sessions up into a single
  *  status so the Workspaces project row can show working/needs-attention/done/idle, reusing the
- *  same vocabulary, with needs-attention winning over working, which wins over done. */
+ *  same vocabulary, with needs-attention winning over working, which wins over done. A workspace
+ *  that only holds a disconnected tab is the one warning that does not win here: a project the
+ *  owner can see working must not read as a warning because of it. */
 export const getProjectActivityStatuses = (
   sessions: SessionRecord[],
   attentionSessionIds: ReadonlySet<string>,
@@ -99,8 +106,8 @@ export const getProjectActivityStatuses = (
   const result = new Map<string, ProjectActivityStatus>()
   for (const [projectId, projectSessions] of sessionsByProject) {
     if (projectSessions.some((session) => attentionSessionIds.has(session.id))) { result.set(projectId, 'attention'); continue }
-    const statuses = new Set(projectSessions.flatMap((session) => { const status = sessionActivity.get(session.id); return status ? [status] : [] }))
-    result.set(projectId, PROJECT_STATUS_PRIORITY.find((status) => statuses.has(status)) ?? 'idle')
+    const statuses = projectSessions.flatMap((session) => { const status = sessionActivity.get(session.id); return status ? [status] : [] })
+    result.set(projectId, displayActivityStatus(foldActivityStatuses(statuses)))
   }
   return result
 }

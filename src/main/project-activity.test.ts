@@ -80,15 +80,41 @@ describe('aggregateProjectActivity', () => {
     ])['project-a']).toBe('working')
   })
 
-  it('surfaces a tab cut off mid-output over one still working, the same way a failure is surfaced', () => {
+  it('keeps a project with live work green while a sibling tab sits disconnected', () => {
     const workspaces = [
       workspace('workspace-1', 'project-a', 'agent-working'),
       workspace('workspace-2', 'project-a', 'agent-disconnected')
     ]
+    const disconnected = agent('agent-disconnected', 'project-a', 'workspace-2', 'disconnected')
+    // The owner can watch the running tab, so the project is not a warning; it becomes one again
+    // as soon as nothing in it is running.
     expect(aggregateProjectActivity(['project-a'], workspaces, [
       agent('agent-working', 'project-a', 'workspace-1', 'working'),
-      agent('agent-disconnected', 'project-a', 'workspace-2', 'disconnected')
+      disconnected
+    ])['project-a']).toBe('working')
+    expect(aggregateProjectActivity(['project-a'], workspaces, [
+      agent('agent-working', 'project-a', 'workspace-1', 'limited'),
+      disconnected
+    ])['project-a']).toBe('working')
+    expect(aggregateProjectActivity(['project-a'], workspaces, [
+      agent('agent-working', 'project-a', 'workspace-1', 'disconnected'),
+      disconnected
     ])['project-a']).toBe('waiting')
+  })
+
+  it('lets a lost connection outrank a finished tab, and a failure or a question outrank it', () => {
+    const workspaces = [
+      workspace('workspace-1', 'project-a', 'agent-other'),
+      workspace('workspace-2', 'project-a', 'agent-disconnected')
+    ]
+    const rollup = (phase: AgentActivityRow['activityPhase']): string | undefined => aggregateProjectActivity(['project-a'], workspaces, [
+      agent('agent-other', 'project-a', 'workspace-1', phase),
+      agent('agent-disconnected', 'project-a', 'workspace-2', 'disconnected')
+    ])['project-a']
+    expect(rollup('complete')).toBe('waiting')
+    expect(rollup('idle')).toBe('waiting')
+    expect(rollup('failed')).toBe('waiting')
+    expect(rollup('waiting_input')).toBe('attention')
   })
 
   it('ignores agents whose tab or workspace is no longer open, and projects with none at all', () => {
