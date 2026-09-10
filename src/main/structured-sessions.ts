@@ -76,7 +76,10 @@ export class StructuredSessions {
     // `itemId` is the user message this context rides along with: recall is recorded against
     // it so the conversation can show which memories reached the turn.
     private context?: (spec: AgentSpec, prompt: string, itemId: string) => string,
-    private observe?: (spec: AgentSpec, event: AgentEvent) => void
+    private observe?: (spec: AgentSpec, event: AgentEvent) => void,
+    // Conductor-owned MCP servers for one session, serialized for the CLI's --mcp-config. Bound
+    // at launch because a running conversation cannot be handed a new server later.
+    private mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
   ) { this.artifacts = new AgentArtifacts(database.structured) }
 
   ensure(spec: AgentSpec): RuntimeEnsureResult {
@@ -138,6 +141,7 @@ export class StructuredSessions {
     return {
       executable: live.executable, cwd: live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
       settings: settingsForRuntime(state.settings, runtimeId),
+      mcpConfig: this.mcp?.configure(live.spec) ?? '',
       newNativeSession: live.spec.provider === 'claude' && Boolean(state.nativeSessionId) && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!),
       emit: event => { if (live.runtimeId === runtimeId && !live.closed) this.emit(live, event) },
       beforeTool: async (itemId, paths) => {
@@ -804,7 +808,7 @@ export class StructuredSessions {
   killWhere(predicate: (spec: AgentSpec) => boolean): void {
     for (const [id, live] of this.live) if (predicate(live.spec)) {
       if (live.adapter) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Backend stopped; native resume is an explicit action' } })
-      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id)
+      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id)
     }
     this.flush()
   }

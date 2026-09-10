@@ -12,6 +12,8 @@ export interface AdapterOptions {
   beforeTool?(itemId: string, paths: string[]): Promise<void>
   afterTool?(itemId: string, paths: string[], success: boolean): Promise<void>
   environment?: NodeJS.ProcessEnv
+  /** Serialized `mcpServers` configuration handed to the CLI at launch, or '' for none. */
+  mcpConfig?: string
 }
 export interface ProviderAdapter {
   readonly provider: StructuredProvider

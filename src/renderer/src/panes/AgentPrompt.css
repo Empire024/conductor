@@ -6,6 +6,7 @@
 .agent-prompt textarea::placeholder { color: var(--text-3); }
 .agent-prompt-controls { min-height: 30px; display: flex; align-items: center; gap: 5px; }
 .agent-prompt-controls button { border: 0; }
+.agent-prompt-controls button[aria-pressed="true"] { color: var(--accent-muted); background: var(--accent-bg); }
 .agent-mode-control { position: relative; }
 .agent-mode-button { height: 29px; padding: 0 8px; display: flex; align-items: center; gap: 6px; border-radius: 9px; color: var(--text-2); background: var(--surface-2); font-size: 8.5px; }
 .agent-mode-button.mode-auto { color: var(--accent); background: var(--accent-bg); }

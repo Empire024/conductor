@@ -11,6 +11,8 @@ import type { RevertScope } from '../shared/agent-change-history'
 import { AgentControl } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
 import { AgentControlUi } from './agent-control-ui'
+import { BrowserMcpServer } from './browser-mcp'
+import { BrowserViews } from './browser-views'
 import { RemoteControlService } from './remote-control-ipc'
 import { safeStorageCipher } from './safe-storage-vault'
 import { ProjectFileChanges } from './project-file-changes'
@@ -78,6 +80,8 @@ let snapshotPruneTimer: NodeJS.Timeout | undefined
 let agentControlServer: AgentControlServer | undefined
 let remoteControl: RemoteControlService | undefined
 let agentControlUi: AgentControlUi | undefined
+let browserMcp: BrowserMcpServer | undefined
+let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
@@ -199,6 +203,9 @@ const createWindow = (
   if (backgroundWindows) window.webContents.setAudioMuted(true)
   // Browser guests do not bubble keyboard events into the workspace renderer.
   window.webContents.on('did-attach-webview', (_event, guest) => {
+    // Every browser guest is registered with the main process here, so the browser MCP bridge
+    // only ever drives a view it watched attach to a workspace window it knows.
+    browserViews?.attach(window, guest)
     guest.on('before-input-event', (event, input) => {
       if (input.type === 'keyDown' && (input.control || input.meta) && !input.alt && input.key.toLowerCase() === 'e') {
         event.preventDefault()
@@ -417,7 +424,7 @@ const disposeRuntimeServices = (): void => {
   if (servicesDisposed) return
   servicesDisposed = true
   const disposals: Array<[string, () => void]> = [
-    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); projectFileChanges?.close() }],
+    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
@@ -1430,7 +1437,16 @@ app.whenReady().then(async () => {
   projectBacklogs = new ProjectBacklogs(database, sourceControl)
   for (const project of database.listProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
   terminals = new TerminalManager(database)
-  agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '')
+  // The browser bridge resolves views out of the caller's own workspace through AgentControl,
+  // so a session can only reach the browser tabs its own project and workspace own. It is built
+  // before AgentManager because every Claude session is handed its --mcp-config at launch.
+  browserViews = new BrowserViews({
+    tabs: scope => control.tabs(scope),
+    openBrowserTab: async scope => { await control.call(scope, 'tabs.open', { kind: 'browser', title: 'Browser' }) },
+    rendererPath: join(__dirname, '../renderer/index.html')
+  })
+  browserMcp = new BrowserMcpServer(browserViews)
+  agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '', browserMcp)
   const publish = (channel: string, payload: unknown): void => {
     for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload)
   }
@@ -1462,7 +1478,9 @@ app.whenReady().then(async () => {
     cipher: safeStorageCipher,
     publish: (channel, payload) => publish(channel, payload)
   })
-  const control = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
+  // Annotated because the browser bridge is built earlier and reaches back through this handle;
+  // without it the two initializers form an inference cycle.
+  const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
@@ -1484,6 +1502,7 @@ app.whenReady().then(async () => {
   agentControlUi.register(control)
   agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '')
   await agentControlServer.start()
+  await browserMcp.start()
   remoteControl.registerIpc()
   await remoteControl.start()
   updates = new UpdateManager({

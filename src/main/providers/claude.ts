@@ -122,6 +122,11 @@ export class ClaudeAdapter implements ProviderAdapter {
       '--forward-subagent-text', '--permission-mode', this.permissionMode(this.settings)]
     if (this.settings.model) args.push('--model', this.settings.model)
     if (this.settings.effort) args.push('--effort', this.settings.effort)
+    // Conductor's own MCP servers (currently the browser view) are attached at launch so the
+    // tools are simply present: there is no way to hand a running conversation a new server, and
+    // the owner should never have to restart one to get them. --mcp-config is additive, so the
+    // owner's own MCP configuration is untouched; --strict-mcp-config is deliberately not sent.
+    if (this.options.mcpConfig) args.push('--mcp-config', this.options.mcpConfig)
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // No --bare, --system-prompt, --setting-sources, or environment auth mutation:
     // CLI defaults retain the coding-agent prompt, user/project/local configuration and policy.

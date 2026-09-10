@@ -52,6 +52,7 @@ import {
   type ResizeDirection
 } from './layout/tab-keyboard'
 import { createPaneTab } from './panes/pane-factory'
+import { toggleBrowserTab } from './layout/browser-tab'
 import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
@@ -815,6 +816,27 @@ export function App(): React.JSX.Element {
     else apply()
     return true
   }, [activeSession, focusedGroupId, patchActiveSession])
+
+  // Shared by the composer's Browser button and the @browser mention (StructuredAgentPane.tsx,
+  // CommandAutocomplete.tsx): focus/create/close the workspace's browser pane tab, the same
+  // surface the browser MCP tools drive (they resolve a webview by pane tab id, filtered to
+  // kind 'browser'). This keeps the owner and the agent looking at one browser, not two.
+  const toggleBrowserTabAction = useCallback((): void => {
+    if (!activeSession) return
+    const result = toggleBrowserTab(activeSession.layout, focusedGroupId)
+    patchActiveSession((session) => ({
+      ...session,
+      layout: result.layout,
+      ...(result.maximizedGroupId === null ? { maximizedGroupId: null } : {}),
+      closedTabs: result.closedTab ? [...session.closedTabs, result.closedTab].slice(-20) : session.closedTabs
+    }))
+    setFocusedGroupId(result.focusedGroupId)
+  }, [activeSession, focusedGroupId, patchActiveSession])
+
+  useEffect(() => {
+    window.addEventListener('conductor:toggle-browser-tab', toggleBrowserTabAction)
+    return () => window.removeEventListener('conductor:toggle-browser-tab', toggleBrowserTabAction)
+  }, [toggleBrowserTabAction])
 
   const saveTemplate = async (name: string): Promise<void> => {
     if (!activeProject || !activeSession || !name.trim()) return

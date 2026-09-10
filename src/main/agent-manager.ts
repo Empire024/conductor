@@ -224,7 +224,8 @@ export class AgentManager {
   constructor(
     private readonly database: ConductorDatabase,
     private readonly collaboration?: AgentCollaborationRuntime,
-    private readonly controlBriefing?: (spec: AgentSpec) => string
+    private readonly controlBriefing?: (spec: AgentSpec) => string,
+    private readonly mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
   ) {
     this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
       undefined,
@@ -252,7 +253,8 @@ export class AgentManager {
         if (event.data.type === 'text' && event.data.role === 'assistant' && event.data.mode === 'snapshot') this.bankMemories(spec, event.itemId, event.data.text)
         if (event.data.type !== 'tool' && event.data.type !== 'changes') return
         try { collaboration?.observeEvent(spec, { id: event.id, agentSessionId: spec.id, type: event.data.type === 'changes' ? 'file_change' : 'tool_call', message: event.data.type === 'tool' ? event.data.name : event.data.changes.map(change => change.path).join(', '), metadata: { structured: true, itemId: event.itemId, input: event.data.type === 'tool' ? event.data.input : undefined }, createdAt: event.timestamp }) } catch { /* Coordination remains advisory. */ }
-      })
+      },
+      mcp)
     this.nativeCli = new NativeCliManager(this.structured, database, (provider) => providers[provider].resolveExecutable(), broadcast)
   }
 

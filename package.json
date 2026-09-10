@@ -42,6 +42,7 @@
     "test:project-tasks": "npm run build && node scripts/smoke-project-task-dispatch.mjs",
     "test:steering": "npm run build && node scripts/smoke-steering.mjs",
     "test:claude-permissions": "npm run build && node scripts/smoke-claude-permissions.mjs",
+    "test:browser-mcp": "npm run build && node scripts/smoke-browser-mcp.mjs",
     "test:perf-streaming": "npm run build && node scripts/perf-streaming.mjs"
   },
   "dependencies": {

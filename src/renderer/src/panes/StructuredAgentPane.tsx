@@ -2,7 +2,7 @@ import { conversationIdentity } from './conversation-tab'
 import { PromptImageUpload, PromptImageThumbnail } from '../components/PromptImageUpload'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Archive, ArrowDown, ArrowLeft, FileDiff, FilePlus2, History, ListTree, Pin, Play, PlugZap, Settings2, TerminalSquare, MessagesSquare, LoaderCircle, X } from 'lucide-react'
+import { Archive, ArrowDown, ArrowLeft, FileDiff, FilePlus2, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, TerminalSquare, MessagesSquare, LoaderCircle, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { MAX_PROMPT_CHARS } from '../../../shared/structured-agent'
 import type { AgentEvent, ContextAttachment, ConversationSearchResult, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
@@ -22,6 +22,7 @@ import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, 
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
 import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
+import { browserTabOpen } from '../layout/browser-tab'
 import { composerCommands, matchingComposerCommands, type ComposerCommand } from './composer-commands'
 import { concreteModel } from '../../../shared/agent-model-selection'
 import { useComposerDraft } from './use-composer-draft'
@@ -107,6 +108,11 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [findResults, setFindResults] = useState<ConversationSearchResult | null>(null)
   const [findSearching, setFindSearching] = useState(false)
   const [findJump, setFindJump] = useState<string | null>(null)
+  // Derived straight from the workspace layout the session already carries, so it can never
+  // drift: true only when a browser pane tab exists in this workspace and is the tab actually
+  // showing, whether it was opened from this button, the @browser mention, another tab's own
+  // strip, or the agent's own browser tool.
+  const browserPanelOpen = useMemo(() => browserTabOpen(props.session.layout), [props.session.layout])
   const findPainted = useRef(false)
   const findScrolled = useRef('')
   const findWidened = useRef('')
@@ -729,6 +735,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       <footer className="agent-prompt-controls">
         <PromptImageUpload key={composerChildKey('images', activeId)} projectId={props.project.id} disabled={historical || !capabilities?.imageAttachments} onError={setError} onAttach={(images) => setAttachments(current => { if (current.length + images.length > 20) { setError('A prompt can have up to 20 attachments. Remove some and attach these images again.'); return current }; return [...current, ...images] })} />
         <button type="button" aria-label="Attach file context" title="Attach context" disabled={historical} onClick={() => setAddFileOpen(open => !open)}><FilePlus2 size={15} /></button>
+        <button type="button" className={browserPanelOpen ? 'active' : undefined} aria-pressed={browserPanelOpen} aria-label={browserPanelOpen ? 'Close browser tab' : 'Open browser tab'} title="Browser tab (the surface the browser tools drive)" onClick={activateBrowserMention}><Globe2 size={15} /></button>
         <StructuredComposerControls key={composerChildKey('controls', activeId)} settings={settings} capabilities={capabilities} disabled={historical || !ready} onChange={updateSettings} onDiscover={connect} />
         <StructuredUsageSummary key={composerChildKey('usage', activeId)} items={projection.items} runtimeId={projection.runtimeId} truncated={projection.truncated} modelLabel={resolvedComposerSettings(settings, capabilities).label} agentSessionId={activeId} workspaceId={props.session.id} />
         <span className="sa-spacer" />

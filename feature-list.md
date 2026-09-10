@@ -253,6 +253,21 @@ models they want
 
 - [ ] Messages from an agent in a tab I haven't sent a message to yet should be stickied to the top - sticky should be actually on top-top of messages, currently, a line can appear in the space between the top bar and the stickied message, which leads to the message being hard to read. <!-- conductor-task:bd4b357f-8b50-4d82-b373-3eb1bd7aa56a -->
 
+- [ ] edit task should let me edit type of task. currentlyt, there's a bunch of 'tasks' that were supposed to be bugs. <!-- conductor-task:b0404623-d8ee-44c4-9954-16eea1904718 -->
+
+- [ ] AutoFixer was auto-called with Astra even though we barely have usage left there. Make sure it uses a provider where we still have usage.. <!-- conductor-task:215fb17f-21d2-45db-aa31-319e35589f9e -->
+
+
+- [ ] I HAVE ALREADY SAID THIS: THE CHEVRON NEXT TO WORKSPACE THAT'S SELECTED GETS COVERED BY THE LINE WE HAVE ON SELECTED WORKSPACE!!!!!!!!!! FIX SO THE CHEVRON DOES NOT GET IN FACT COVERED,!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! <!-- conductor-task:d9929b6d-b0ce-444f-aec0-292026e75d46 priority=high -->
+  
+  ![image.png](.conductor/prompt-images/35616786-2825-42dd-8b26-5a36c76ddef1.png)
+
+- [ ] dragging md files in chatbox, mp4 files, etc, says ' choose a png or jpeg'. Should attacch them as context for the prompt Im about to make. dragging file elsewhere than agent chatbox -> try to open file in our editor. dragging file to files in explorer? move that file to where we've pointed. <!-- conductor-task:c5519807-7b48-4b33-9ee8-a76bc2771718 priority=high -->
+
+- [ ] Possible bug - Codex working with Claude left this in the chat: <!-- conductor-task:f6efd042-f3f9-478c-94b7-9ce8ab5687a1 -->
+  
+  ![image.png](.conductor/prompt-images/3f222ccb-cc77-4abf-ae97-7f0a0391af9e.png)
+
 Feature list:
 
 0. [Implemented] Beautify the 'send' button.
@@ -394,3 +409,28 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] Match VS Code file type colors/icons for every language and extension (.mjs, .cjs, .ts, .tsx, .json, .css, .md, .ps1, .yml, dotfiles, ...), applied consistently in the explorer, file tabs, Ctrl+E picker and agent file links. <!-- conductor-task:feature-file-type-colors agent=agent_mtu4f5v5_4ia8e4w -->
 
 - [x] Subagents view currently shows almost nothing. Per subagent, show the model/provider it runs on (with effort), which tab and workspace it belongs to when that differs from the calling tab or is another company's model, live status, token usage, and a click-through to open it. It should render like the real agent view, with real designed steps rather than plain text. <!-- conductor-task:feature-subagents-view-detail agent=agent_mtu49or3_7l3m8st -->
+
+## Tasks
+
+- [ ] Trying to send a message to an agent that runtime has disconnected should resume it automatically... Also, play button is dark on dark for some reason in night mode. <!-- conductor-task:7afeb35f-7d25-4674-b49c-909242c08070 -->
+- [ ] priority and weight should be sliders in task send. 'Add task button' will be just a send icon <!-- conductor-task:5c928ae5-389c-49dd-bca9-cc2199947109 -->
+
+- [x] When a project has tabs working, but other tabs disconnected, it's status on the left side is shown as 'yellow'. That is inherently very wrong, seeing as other tabs there are working. FIX. <!-- conductor-task:24b0a4de-e4a3-4ff7-b9ec-57f88ad84da4 agent=agent_mtvhzfpf_guru1db priority=high -->
+
+- [x] going back & forth in projects should land you at the workspace you had open before.. currently always the first one in view. <!-- conductor-task:90565509-288b-467a-9e77-eebd319485bf agent=agent_mtvtczsx_5w8wejb -->
+
+- [x] No @browser MCP tool is wired into this session <!-- conductor-task:42bcf09f-562f-4a85-b308-a3e8accfaa30 agent=agent_mtvsyod1_6hfmig5 agent=agent_mtvsypnx_u4q14mi priority=high -->
+  
+  @browser needs to be available as a command and also as a button we can press on the bottom bar next to chatbox
+
+- [ ] The Conductor browser view uses one `persist:conductor-browser` partition for every project, so every workspace shares one logged-in browsing profile. Demonstrated: a session in project A wrote a cookie and a localStorage key, and a session in project B read both back through `browser_evaluate`. An agent in any project can therefore reach whatever the owner is signed into in the browser view. Give the partition a per-project name in `BrowserPane.tsx` (`persist:conductor-browser-<projectId>`); the main-process scope checks are correct, it is only the profile that is global. <!-- conductor-task:9f0e21b4-browser-partition priority=high -->
+
+- [ ] `BrowserPane.tsx` sets `allowpopups: 'false'` on the `<webview>`, but Electron reads `allowpopups` as a presence attribute — the string "false" switches popups ON. Demonstrated: a page called `window.open` and a second BrowserWindow appeared over the owner's desktop. The main process now denies these in `BrowserViews.attach`, so the hole is closed; the attribute should still go, since leaving it reads as protection that is not there. <!-- conductor-task:6c1d77a2-webview-allowpopups -->
+
+- [ ] when multiple messages queued, esc should send them all at once. <!-- conductor-task:c3edd052-0f61-4222-b103-2301735b1d77 -->
+
+- [ ] now we show all commands in '27 completed actions', so it sometimes can loook like a model is not doing anything if it's just doing a bunch of them. Make sure we're at least showing the currect task it's on in that case. Also, one-line outputs from bashes show up as code in a line, it can read like agent output - add the OUT prefix so we know what it is. <!-- conductor-task:cd2ebc99-4682-44a2-9568-cbd1563988c9 -->
+
+- [ ] Currently, it's not immidiately obvious which the main task opening more tabs is. Let's make sure it's always very clear and inherent. <!-- conductor-task:1e7535e5-eb65-4a1a-927c-dd962fa92183 -->
+
+- [ ] Every message needs a timestamp - hoverable at least <!-- conductor-task:2f0c12e2-979f-40a9-ac26-0d396419f0b7 -->
