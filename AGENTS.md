@@ -27,3 +27,12 @@ Conductor is a local desktop application for its owner. GitHub is used only as t
 - Running installed windows must discover releases automatically and show `Update pending`.
 - A newly launched installed app must check shortly after startup and offer the update.
 - Users may opt into automatic update downloads; downloaded updates install on normal app exit or via `Restart to update`.
+
+## Ask the owner only when asking is the shortest path
+
+- Prefer the obvious equivalent route over a question. A denied scratch write means write the scratch file somewhere else; a missing optional tool means use the one that is installed. Take the detour, say in one line that you took it, and keep going.
+- Ask when the answer changes what you do *and* you cannot get it yourself: a credential only the owner holds, a destructive or outward-facing action, a decision between materially different pieces of work.
+- Ask *before* the expensive detour, not after it. Reconstructing by inference what one question would have answered is the failure mode, and it usually produces a weaker answer too.
+- Never silently downgrade the approach. Switching from "read the real logs" to "guess from the theory I was given" is a change to the task and the owner decides it. Switching scratch directories is not.
+- When you do ask, make it cheap to answer: say what you were blocked on, why you need it, and the concrete ways to unblock you.
+- A denied call is not a reason to stop with nothing delivered. Finish everything that does not depend on the answer, then ask.
