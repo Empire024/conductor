@@ -251,26 +251,26 @@ models they want
 
 - [x] Add right click menu.. copy, all that jazz.. curreently I select text and i can't do nothing <!-- conductor-task:05579479-d437-41de-853e-908c4834db6d agent=agent_mtusoeta_9h639l8 -->
 
-- [~] Messages from an agent in a tab I haven't sent a message to yet should be stickied to the top - sticky should be actually on top-top of messages, currently, a line can appear in the space between the top bar and the stickied message, which leads to the message being hard to read. <!-- conductor-task:bd4b357f-8b50-4d82-b373-3eb1bd7aa56a agent=agent_mtyb8yzy_xz0tseo -->
+- [x] Messages from an agent in a tab I haven't sent a message to yet should be stickied to the top - sticky should be actually on top-top of messages, currently, a line can appear in the space between the top bar and the stickied message, which leads to the message being hard to read. <!-- conductor-task:bd4b357f-8b50-4d82-b373-3eb1bd7aa56a agent=agent_mtyb8yzy_xz0tseo -->
 
-- [~] edit task should let me edit type of task. currentlyt, there's a bunch of 'tasks' that were supposed to be bugs. <!-- conductor-task:b0404623-d8ee-44c4-9954-16eea1904718 agent=agent_mtyb8xxf_xza5x75 -->
+- [x] edit task should let me edit type of task. currentlyt, there's a bunch of 'tasks' that were supposed to be bugs. <!-- conductor-task:b0404623-d8ee-44c4-9954-16eea1904718 agent=agent_mtyb8xxf_xza5x75 -->
 
-- [~] AutoFixer was auto-called with Astra even though we barely have usage left there. Make sure it uses a provider where we still have usage.. <!-- conductor-task:215fb17f-21d2-45db-aa31-319e35589f9e agent=agent_mtyc5dtk_w02c8ok -->
+- [x] AutoFixer was auto-called with Astra even though we barely have usage left there. Make sure it uses a provider where we still have usage.. <!-- conductor-task:215fb17f-21d2-45db-aa31-319e35589f9e agent=agent_mtyc5dtk_w02c8ok -->
 
 
 - [~] THE CHEVRON NEXT TO WORKSPACE THAT'S SELECTED GETS COVERED BY THE LINE WE HAVE ON SELECTED WORKSPACE. FIX SO THE CHEVRON DOES NOT GET IN FACT COVERED. <!-- conductor-task:d9929b6d-b0ce-444f-aec0-292026e75d46 agent=agent_mtyb3x4p_1bwzrur priority=high -->
   
   ![image.png](.conductor/prompt-images/35616786-2825-42dd-8b26-5a36c76ddef1.png)
 
-- [~] dragging md files in chatbox, mp4 files, etc, says ' choose a png or jpeg'. Should attacch them as context for the prompt Im about to make. dragging file elsewhere than agent chatbox -> try to open file in our editor. dragging file to files in explorer? move that file to where we've pointed. <!-- conductor-task:c5519807-7b48-4b33-9ee8-a76bc2771718 agent=agent_mtyem8ei_sh89unm priority=high -->
+- [x] dragging md files in chatbox, mp4 files, etc, says ' choose a png or jpeg'. Should attacch them as context for the prompt Im about to make. dragging file elsewhere than agent chatbox -> try to open file in our editor. dragging file to files in explorer? move that file to where we've pointed. <!-- conductor-task:c5519807-7b48-4b33-9ee8-a76bc2771718 agent=agent_mtyem8ei_sh89unm priority=high -->
 
 - [~] Possible bug - Codex working with Claude left this in the chat: <!-- conductor-task:f6efd042-f3f9-478c-94b7-9ce8ab5687a1 agent=agent_mtyem8ei_sh89unm -->
   
   ![image.png](.conductor/prompt-images/3f222ccb-cc77-4abf-ae97-7f0a0391af9e.png)
 
-- [~] 'Weekly (incl. overage)' in Claude is actually Fable limit <!-- conductor-task:a7ba1584-2b38-49c2-8488-57fbed49995b agent=agent_mtyc5dtk_w02c8ok -->
+- [x] 'Weekly (incl. overage)' in Claude is actually Fable limit <!-- conductor-task:a7ba1584-2b38-49c2-8488-57fbed49995b agent=agent_mtyc5dtk_w02c8ok -->
 
-- [~] agents should use the browser on the left side, that browser should have panes and should be able to be detached - agent chooses whether detached, invisible run, etc. curently they're tabs, that's wrong <!-- conductor-task:87f8310b-e91f-41fc-8b90-6b87233ec794 agent=agent_mtyem8ei_sh89unm -->
+- [x] agents should use the browser on the left side, that browser should have panes and should be able to be detached - agent chooses whether detached, invisible run, etc. curently they're tabs, that's wrong <!-- conductor-task:87f8310b-e91f-41fc-8b90-6b87233ec794 agent=agent_mtyem8ei_sh89unm -->
 
 Feature list:
 
@@ -338,15 +338,15 @@ Latest completion and validation: [remaining checklist delivery](docs/backlog-co
 
 - [x] Add the Check icon somewhere to done tasks i.e. make a done task more visible, currently, it's not immidiately visible which are in fact done and which are not. <!-- conductor-task:663db862-e082-436a-9826-c385c232ae2d agent=agent_mtu035p5_ezlg01o -->
 
-- [~] Add logging in via github for credentials. Then, add a system which can launch a server for remote control of this machines Conductor project and Conductor filespace by another Conductor logged in with the same github credentials. Orcherstrate this via the highest, latest model available, but that model will use lower class workers for the churning. The finished integration needs to let the user select a machine that actually runs that window, that way, for example, I'll be able to run a heavy render from the comfort of my conductor window, while the render runs on a PC, I run it off my laptop. The agents need to be aware of this fact, because when they'll be creating another linked tab or something similiar, those tabs need to run on that same machine as previously selected unless prompted differently.. <!-- conductor-task:a17381dc-57e2-4232-9e3c-85bfdbb32455 agent=agent_mtybvpmw_fdnpyc5 priority=low -->
+- [x] Add logging in via github for credentials. Then, add a system which can launch a server for remote control of this machines Conductor project and Conductor filespace by another Conductor logged in with the same github credentials. Orcherstrate this via the highest, latest model available, but that model will use lower class workers for the churning. The finished integration needs to let the user select a machine that actually runs that window, that way, for example, I'll be able to run a heavy render from the comfort of my conductor window, while the render runs on a PC, I run it off my laptop. The agents need to be aware of this fact, because when they'll be creating another linked tab or something similiar, those tabs need to run on that same machine as previously selected unless prompted differently.. <!-- conductor-task:a17381dc-57e2-4232-9e3c-85bfdbb32455 agent=agent_mtybvpmw_fdnpyc5 priority=low -->
 
 - [x] Add CTRL+F To chats (searches entire workspace for messages sent with agents and canhighlight it) <!-- conductor-task:3439f02b-608f-4bd6-9ded-97ed51ec573a agent=agent_mturhxcc_t1p06lm -->
 
 - [x] To usage - give me visible warnings in a tab when it starts becoming expensive. Show it in processes also. <!-- conductor-task:2aa42f5b-c9d6-45a4-b71e-c75776557094 agent=agent_mturhxcc_t1p06lm -->
 
-- [~] Add 'Open session' 'Save session' to menu - this will save/open an entire session with all projects loaded, agents, all that jazz. Also show session name on top bar. <!-- conductor-task:9a048670-02d1-4315-85b9-28356a06f42e agent=agent_mtycn51c_al80cic -->
+- [x] Add 'Open session' 'Save session' to menu - this will save/open an entire session with all projects loaded, agents, all that jazz. Also show session name on top bar. <!-- conductor-task:9a048670-02d1-4315-85b9-28356a06f42e agent=agent_mtycn51c_al80cic -->
 
-- [~] Message from agent -> Name of agent with link icon should link to tab (tab opens upon click) <!-- conductor-task:a9fbb1af-a90c-454c-9242-71cba7350e85 agent=agent_mtyb8yzy_xz0tseo -->
+- [x] Message from agent -> Name of agent with link icon should link to tab (tab opens upon click) <!-- conductor-task:a9fbb1af-a90c-454c-9242-71cba7350e85 agent=agent_mtyb8yzy_xz0tseo -->
 
 ## Urgent bugs and permissions - 2026-09-08
 
@@ -416,8 +416,8 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 ## Tasks
 
-- [~] Trying to send a message to an agent that runtime has disconnected should resume it automatically... Also, play button is dark on dark for some reason in night mode. <!-- conductor-task:7afeb35f-7d25-4674-b49c-909242c08070 agent=agent_mtyem8ei_sh89unm -->
-- [~] priority and weight should be sliders in task send. 'Add task button' will be just a send icon <!-- conductor-task:5c928ae5-389c-49dd-bca9-cc2199947109 agent=agent_mtyb8xxf_xza5x75 -->
+- [x] Trying to send a message to an agent that runtime has disconnected should resume it automatically... Also, play button is dark on dark for some reason in night mode. <!-- conductor-task:7afeb35f-7d25-4674-b49c-909242c08070 agent=agent_mtyem8ei_sh89unm -->
+- [x] priority and weight should be sliders in task send. 'Add task button' will be just a send icon <!-- conductor-task:5c928ae5-389c-49dd-bca9-cc2199947109 agent=agent_mtyb8xxf_xza5x75 -->
 
 - [x] When a project has tabs working, but other tabs disconnected, it's status on the left side is shown as 'yellow'. That is inherently very wrong, seeing as other tabs there are working. FIX. <!-- conductor-task:24b0a4de-e4a3-4ff7-b9ec-57f88ad84da4 agent=agent_mtvhzfpf_guru1db priority=high -->
 
@@ -427,29 +427,29 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
   
   @browser needs to be available as a command and also as a button we can press on the bottom bar next to chatbox
 
-- [~] The Conductor browser view uses one `persist:conductor-browser` partition for every project, so every workspace shares one logged-in browsing profile. Demonstrated: a session in project A wrote a cookie and a localStorage key, and a session in project B read both back through `browser_evaluate`. An agent in any project can therefore reach whatever the owner is signed into in the browser view. Give the partition a per-project name in `BrowserPane.tsx` (`persist:conductor-browser-<projectId>`); the main-process scope checks are correct, it is only the profile that is global. <!-- conductor-task:9f0e21b4-browser-partition agent=agent_mtybea8g_083yk82 priority=high -->
+- [x] The Conductor browser view uses one `persist:conductor-browser` partition for every project, so every workspace shares one logged-in browsing profile. Demonstrated: a session in project A wrote a cookie and a localStorage key, and a session in project B read both back through `browser_evaluate`. An agent in any project can therefore reach whatever the owner is signed into in the browser view. Give the partition a per-project name in `BrowserPane.tsx` (`persist:conductor-browser-<projectId>`); the main-process scope checks are correct, it is only the profile that is global. <!-- conductor-task:9f0e21b4-browser-partition agent=agent_mtybea8g_083yk82 priority=high -->
 
-- [~] `BrowserPane.tsx` sets `allowpopups: 'false'` on the `<webview>`, but Electron reads `allowpopups` as a presence attribute — the string "false" switches popups ON. Demonstrated: a page called `window.open` and a second BrowserWindow appeared over the owner's desktop. The main process now denies these in `BrowserViews.attach`, so the hole is closed; the attribute should still go, since leaving it reads as protection that is not there. <!-- conductor-task:6c1d77a2-webview-allowpopups agent=agent_mtybea8g_083yk82 -->
+- [x] `BrowserPane.tsx` sets `allowpopups: 'false'` on the `<webview>`, but Electron reads `allowpopups` as a presence attribute — the string "false" switches popups ON. Demonstrated: a page called `window.open` and a second BrowserWindow appeared over the owner's desktop. The main process now denies these in `BrowserViews.attach`, so the hole is closed; the attribute should still go, since leaving it reads as protection that is not there. <!-- conductor-task:6c1d77a2-webview-allowpopups agent=agent_mtybea8g_083yk82 -->
 
-- [~] when multiple messages queued, esc should send them all at once. <!-- conductor-task:c3edd052-0f61-4222-b103-2301735b1d77 agent=agent_mtyem8ei_sh89unm -->
+- [x] when multiple messages queued, esc should send them all at once. <!-- conductor-task:c3edd052-0f61-4222-b103-2301735b1d77 agent=agent_mtyem8ei_sh89unm -->
 
-- [~] now we show all commands in '27 completed actions', so it sometimes can loook like a model is not doing anything if it's just doing a bunch of them. Make sure we're at least showing the currect task it's on in that case. Also, one-line outputs from bashes show up as code in a line, it can read like agent output - add the OUT prefix so we know what it is. <!-- conductor-task:cd2ebc99-4682-44a2-9568-cbd1563988c9 agent=agent_mtyb8yzy_xz0tseo -->
+- [x] now we show all commands in '27 completed actions', so it sometimes can loook like a model is not doing anything if it's just doing a bunch of them. Make sure we're at least showing the currect task it's on in that case. Also, one-line outputs from bashes show up as code in a line, it can read like agent output - add the OUT prefix so we know what it is. <!-- conductor-task:cd2ebc99-4682-44a2-9568-cbd1563988c9 agent=agent_mtyb8yzy_xz0tseo -->
 
-- [~] Currently, it's not immidiately obvious which the main task opening more tabs is. Let's make sure it's always very clear and inherent. <!-- conductor-task:1e7535e5-eb65-4a1a-927c-dd962fa92183 agent=agent_mtydfzvr_sxv01gz -->
+- [x] Currently, it's not immidiately obvious which the main task opening more tabs is. Let's make sure it's always very clear and inherent. <!-- conductor-task:1e7535e5-eb65-4a1a-927c-dd962fa92183 agent=agent_mtydfzvr_sxv01gz -->
 
-- [~] Every message needs a timestamp - hoverable at least <!-- conductor-task:2f0c12e2-979f-40a9-ac26-0d396419f0b7 agent=agent_mtyb8yzy_xz0tseo -->
+- [x] Every message needs a timestamp - hoverable at least <!-- conductor-task:2f0c12e2-979f-40a9-ac26-0d396419f0b7 agent=agent_mtyb8yzy_xz0tseo -->
 
-- [~] ctrl w should NEVER close the app while tasks are running!! matter of fact, while tasks are running in any project / workspace / tab, ask the user if we want to close actually.. <!-- conductor-task:e145f826-7a27-459c-8eef-0a36d9dcd706 agent=agent_mtycn51c_al80cic priority=high -->
+- [x] ctrl w should NEVER close the app while tasks are running!! matter of fact, while tasks are running in any project / workspace / tab, ask the user if we want to close actually.. <!-- conductor-task:e145f826-7a27-459c-8eef-0a36d9dcd706 agent=agent_mtycn51c_al80cic priority=high -->
 
-- [~] need to be able to click away questions when scrolling (make them just stick on the bottom) via some icon or something <!-- conductor-task:8c9cc6a2-ae55-4a49-a82d-e675ffb4a9c0 agent=agent_mtyb8yzy_xz0tseo -->
+- [x] need to be able to click away questions when scrolling (make them just stick on the bottom) via some icon or something <!-- conductor-task:8c9cc6a2-ae55-4a49-a82d-e675ffb4a9c0 agent=agent_mtyb8yzy_xz0tseo -->
 
-- [~] browser icon in chatbox should allow MCP for model, not open browser. The icon for viewing browser tab it's driving should be kept though, but moved elsewhere for UI clarity. Along to the changes to the browser (like tabs) make it possible to easily expand over the entire workspace (easily hide-able again) to preview full PC layout. <!-- conductor-task:f7e72b8d-94c7-4b47-adc1-ce0005eb83d5 agent=agent_mtyem8ei_sh89unm -->
+- [x] browser icon in chatbox should allow MCP for model, not open browser. The icon for viewing browser tab it's driving should be kept though, but moved elsewhere for UI clarity. Along to the changes to the browser (like tabs) make it possible to easily expand over the entire workspace (easily hide-able again) to preview full PC layout. <!-- conductor-task:f7e72b8d-94c7-4b47-adc1-ce0005eb83d5 agent=agent_mtyem8ei_sh89unm -->
 
 - [~] Run some tests on qwen to make it really viable as a 'free' subagent running easier tasks that'd churn useless credits. Do the same for 3.8, although I personally haven't tested it. Make sure the harness is really powerful for use, currently, it's quite basic - also, the sandbox limitations seem like it tries to save memories, but can't, so I don't know if it can fully work with Conductor MCP. Make sure the sandbox is very fluid. and it has sandboxed access to a lot of stuff - even web access for local researching, scouting, etc.. The idea is to make qwen's extremely powerful local tools for smart agents like Astra. <!-- conductor-task:d7be3750-9883-4597-8f0b-339b11434a6d agent=agent_mtyb8x94_639ozf4 priority=high weight=heavy -->
 
-- [~] Redesign the 'Processes' tab and mini-tab. It doesn't seem to be in sync with what's actually going on in the projects. It should be our simple, visual tracker for what's going on in projects with simple data points (especially showing usage, time running, how far it's gotten, etc.). Also, if the process still has a tab available (disconnected even, but just the chat history we can open in a tab and maybe reconnect), we should be able to access it from here. Refine it for easier access and real process & usage management. <!-- conductor-task:cbbdb1a8-60c9-47d3-9718-bef1ebe90a6e agent=agent_mtydfzvr_sxv01gz -->
+- [x] Redesign the 'Processes' tab and mini-tab. It doesn't seem to be in sync with what's actually going on in the projects. It should be our simple, visual tracker for what's going on in projects with simple data points (especially showing usage, time running, how far it's gotten, etc.). Also, if the process still has a tab available (disconnected even, but just the chat history we can open in a tab and maybe reconnect), we should be able to access it from here. Refine it for easier access and real process & usage management. <!-- conductor-task:cbbdb1a8-60c9-47d3-9718-bef1ebe90a6e agent=agent_mtydfzvr_sxv01gz -->
 
-- [~] Subagents view seems to now show all Activity (0) mostly in Claude and <!-- conductor-task:3b124a0c-c10e-404a-aaf2-bfb0e94318d3 agent=agent_mtydfzvr_sxv01gz -->
+- [x] Subagents view seems to now show all Activity (0) mostly in Claude and <!-- conductor-task:3b124a0c-c10e-404a-aaf2-bfb0e94318d3 agent=agent_mtydfzvr_sxv01gz -->
   
   '
   cd "C:/Users/stilj/Local Sites/hashandflowers-shop/app/public/wp-content/themes/haftheme/tests-e2e" && powershell -NoPr… #3
@@ -479,16 +479,20 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
   
   this is the sort of the stuff it shows as subagents. Are those real subagents, or just detached sessions? Subagents view should show real subagents the model calls. Refine it a bit visually also, it shows two dots to each other, hovering them shows no info. Also Claude has 1% usage left, so be extremely restrictive with tests churning credits, but do test.
 
-- [~] Sometimes, Claude likes to send the final message without actual links, make sure Conductor tries to resolve paths that make sense in the local project, i.e. project path + the path what the model sent, if that resolves to anything. <!-- conductor-task:f36121ad-bb30-41cc-9cca-d1729fdd2c1e agent=agent_mtyea233_4x9yjti -->
+- [x] Sometimes, Claude likes to send the final message without actual links, make sure Conductor tries to resolve paths that make sense in the local project, i.e. project path + the path what the model sent, if that resolves to anything. <!-- conductor-task:f36121ad-bb30-41cc-9cca-d1729fdd2c1e agent=agent_mtyea233_4x9yjti -->
 
-- [~] Spelunking + output tokens is currently sort of useless visually, it doesn't count up when actions are being done therefore it doesn't properly reflect the state of an agent churning, let's fix that. <!-- conductor-task:2ca846e3-ec45-4a15-84a2-566e231da69d agent=agent_mtyb3x4p_1bwzrur -->
+- [x] Spelunking + output tokens is currently sort of useless visually, it doesn't count up when actions are being done therefore it doesn't properly reflect the state of an agent churning, let's fix that. <!-- conductor-task:2ca846e3-ec45-4a15-84a2-566e231da69d agent=agent_mtyb3x4p_1bwzrur -->
 
-- [~] When asigning project task to project tasks fixer that's already running, it just queues it and never sends it. <!-- conductor-task:26fe51b6-3c25-4bf2-bc54-0d19cd81ef64 agent=agent_mtyem8ei_sh89unm -->
+- [x] When asigning project task to project tasks fixer that's already running, it just queues it and never sends it. <!-- conductor-task:26fe51b6-3c25-4bf2-bc54-0d19cd81ef64 agent=agent_mtyem8ei_sh89unm -->
 
-- [~] stop should be red - i barely realized my models stopped halfway :c <!-- conductor-task:4c1f63a2-c91e-436f-8ff3-a2ee67c8067c agent=agent_mtyem8ei_sh89unm -->
+- [x] stop should be red - i barely realized my models stopped halfway :c <!-- conductor-task:4c1f63a2-c91e-436f-8ff3-a2ee67c8067c agent=agent_mtyem8ei_sh89unm -->
 
-- [~] Conductor should have a button for 'grill-me' skill type of sessions when starting out big ideas - let's implement a couple of these types of starter prompt helpers and add them to our text-box. Add a whole Skills suite that agents can pick from + the selector in textbox. <!-- conductor-task:b7655962-d90e-4d55-98a8-45d79109ff7f agent=agent_mtyem8ei_sh89unm weight=heavy -->
+- [x] Conductor should have a button for 'grill-me' skill type of sessions when starting out big ideas - let's implement a couple of these types of starter prompt helpers and add them to our text-box. Add a whole Skills suite that agents can pick from + the selector in textbox. <!-- conductor-task:b7655962-d90e-4d55-98a8-45d79109ff7f agent=agent_mtyem8ei_sh89unm weight=heavy -->
 
-- [~] Let Conductor's app control API change an existing coworker's model and effort, with validated model choices and visible settings that agree with the native runtime. <!-- conductor-task:api-coworker-model-effort agent=agent_mtyhyzl0_trwyf1e -->
+- [x] Let Conductor's app control API change an existing coworker's model and effort, with validated model choices and visible settings that agree with the native runtime. <!-- conductor-task:api-coworker-model-effort agent=agent_mtyhyzl0_trwyf1e -->
 
 - [ ] revert stop button in chatbox to blue - red was supposed to be for 'this session has stopped' indicator (currently gray) <!-- conductor-task:ed4ec639-8f09-4048-b662-3013bd6f4a89 -->
+
+- [ ] add performance monitor (ram gpu cpu) for local sessions and show it somewhere on screen if local sessions are launched (or if conductor is taking more %, or if blender is activate, or something similiar - show a small summary over processes, clickable to expand) <!-- conductor-task:e1492d28-2b1b-4098-af3d-e201ee7a1b4e -->
+
+- [x] Local model turns failed with HTTP 500 and, once a tool round was left open, with an HTTP 400 no later prompt could recover; a message queued behind a failed turn was never sent. The agent loop now repairs the tool protocol and keeps the prompt inside the window before every request, retries a refused request once with a shorter, plainer one, reports what the owner can act on, and the queue drains after a failed turn as well as a completed one. <!-- conductor-task:local-request-failures agent=agent_mtyoimmx_1gg25ip -->

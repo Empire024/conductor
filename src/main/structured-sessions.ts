@@ -35,6 +35,8 @@ interface LiveSession {
   expediteQueued?: Set<string>
   expediteReady?: boolean
   sendAfterInterrupt?: boolean
+  /** Queued messages already dispatched once into a failed phase; never retried a second time. */
+  failedDrain?: Set<string>
   turnId?: string
   submitting: boolean
   closed: boolean
@@ -618,7 +620,14 @@ export class StructuredSessions {
     const steerable = live.adapter.capabilities.steering && ['running', 'waiting_input', 'waiting_approval'].includes(state.phase)
     const queued = (steerable && state.queuedPrompts?.find(input => input.steer)) || state.queued
     const canSteer = queued.steer && steerable
-    if (!canSteer && !['completed', 'idle'].includes(state.phase) && !(state.phase === 'interrupted' && live.sendAfterInterrupt)) return
+    // A turn that ended in error is as settled as one that completed, and the queued message is
+    // usually the continuation that recovers it — a local model fails its whole turn on a single
+    // bad request. Without this the message waits behind a phase that never comes back.
+    // Dispatched at most once per message, so a runtime that fails every dispatch and re-enters
+    // this drain from its own failure event cannot spin on the same text.
+    const afterFailure = state.phase === 'failed' && !live.failedDrain?.has(queued.id)
+    if (!canSteer && !['completed', 'idle'].includes(state.phase) && !afterFailure && !(state.phase === 'interrupted' && live.sendAfterInterrupt)) return
+    if (afterFailure) (live.failedDrain ??= new Set()).add(queued.id)
     live.dispatchingQueue = true
     live.dispatchingPromptId = queued.id
     let sent = false

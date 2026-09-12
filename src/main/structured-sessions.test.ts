@@ -642,6 +642,27 @@ describe('queued messages and native CLI handoff', () => {
     expect(f.current.submissions.map(item => item.text)).toEqual(['first', 'second', 'third'])
     expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
   })
+  it('dispatches a queued message after a turn fails instead of holding it forever', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'first', settings)
+    await f.manager.queue(f.spec.id, 'second', settings)
+    f.current.emit({ data: { type: 'error', message: 'Local model request failed with HTTP 500' } })
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+    await vi.waitFor(() => expect(f.current.submissions.map(item => item.text)).toEqual(['first', 'second']))
+    expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+  })
+  it('retries a queued message into a failed phase only once', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'first', settings)
+    await f.manager.queue(f.spec.id, 'second', settings)
+    f.current.disposed = true
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(f.spec.id)!.items.some(item => item.data.type === 'notice' && item.data.message.startsWith('Queued message was not sent'))).toBe(true))
+    await new Promise(resolve => setTimeout(resolve, 50))
+    const state = f.database.structured.snapshot(f.spec.id)!
+    expect(state.items.filter(item => item.data.type === 'notice' && item.data.message.startsWith('Queued message was not sent'))).toHaveLength(1)
+    expect(state.queued?.text).toBe('second')
+  })
   it('captures file contents when queued and removes a selected message without dropping its neighbors', async () => {
     const f = fixture(), path = join(f.workspace, 'queued.txt')
     writeFileSync(path, 'original queued bytes')

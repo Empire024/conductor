@@ -6,7 +6,7 @@ import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError,
 import { containerRunArgs, detectSecretPaths, execArgs, SandboxUnavailableError, sandboxContainerName } from './sandbox.ts'
 import { llamaServerArgs, validateExtraArgs } from './llama.ts'
 import { StreamAccumulator } from './client.ts'
-import { trimMessages } from './agent.ts'
+import { repairToolProtocol, RESPONSE_RESERVE_TOKENS, trimMessages } from './agent.ts'
 import { runTool, toolSpecs } from './tools.ts'
 import { DEFAULT_SANDBOX, defaultModelConfig, QWEN_35B, QWEN_9B, validateConfig } from './config.ts'
 import type { LocalStackConfig } from './config.ts'
@@ -176,6 +176,52 @@ describe('context budget', () => {
     expect(trimmed[0]?.content).toBe('system')
     expect(trimmed.length).toBeLessThan(messages.length)
     expect(trimmed.at(-1)?.content).toBe(messages.at(-1)?.content)
+  })
+
+  it('leaves room for the answer and the tool schemas rather than filling the window', () => {
+    const context = 32768, overhead = 900
+    const messages = [{ role: 'system' as const, content: 'system' }, ...Array.from({ length: 400 }, (_value, index) => ({ role: 'user' as const, content: `message ${index} `.repeat(200) }))]
+    const trimmed = trimMessages(messages, context, overhead)
+    const characters = trimmed.reduce((total, message) => total + message.content.length, 0)
+    expect(characters).toBeLessThanOrEqual((context - RESPONSE_RESERVE_TOKENS - overhead) * 3)
+  })
+
+  it('elides the middle of a tool result no amount of dropping older turns could fit', () => {
+    const [, , result] = trimMessages([
+      { role: 'system', content: 'system' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'call', type: 'function', function: { name: 'search', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'call', content: 'x'.repeat(120_000) }
+    ], 8192)
+    expect(result!.content.length).toBeLessThan(120_000)
+    expect(result!.content).toContain('characters elided')
+  })
+})
+
+describe('tool protocol repair', () => {
+  const assistant = (id: string) => ({ role: 'assistant' as const, content: '', tool_calls: [{ id, type: 'function' as const, function: { name: 'read_file', arguments: '{}' } }] })
+
+  it('fills the result of a call whose turn never finished', () => {
+    const repaired = repairToolProtocol([{ role: 'system', content: 'system' }, { role: 'user', content: 'go' }, assistant('open')])
+    expect(repaired.at(-1)).toMatchObject({ role: 'tool', tool_call_id: 'open' })
+    expect(repaired.at(-1)!.content).toContain('never ran')
+  })
+
+  it('drops a result that answers no call and keeps one result per call in order', () => {
+    const repaired = repairToolProtocol([
+      { role: 'tool', tool_call_id: 'orphan', content: 'from a dropped assistant' },
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'a', type: 'function', function: { name: 'read_file', arguments: '{}' } }, { id: 'b', type: 'function', function: { name: 'search', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'b', content: 'second' },
+      { role: 'tool', tool_call_id: 'unknown', content: 'answers nothing' }
+    ])
+    expect(repaired.map(message => message.role)).toEqual(['user', 'assistant', 'tool', 'tool'])
+    expect(repaired.slice(2).map(message => message.tool_call_id)).toEqual(['a', 'b'])
+    expect(repaired.at(-1)!.content).toBe('second')
+  })
+
+  it('leaves a complete conversation untouched', () => {
+    const messages = [{ role: 'system' as const, content: 'system' }, { role: 'user' as const, content: 'go' }, assistant('a'), { role: 'tool' as const, tool_call_id: 'a', content: 'done' }, { role: 'assistant' as const, content: 'answer' }]
+    expect(repairToolProtocol(messages)).toEqual(messages)
   })
 })
 

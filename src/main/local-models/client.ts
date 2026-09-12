@@ -99,6 +99,37 @@ export interface CompletionRequest {
   onReasoning?(delta: string): void
 }
 
+/** A refusal from the local server. The status is kept because the agent loop treats the two
+ *  kinds very differently: llama.cpp answers 400 for a request it will not render at all (a
+ *  history its chat template rejects, an over-long prompt, a parameter this build does not
+ *  know) and 5xx for a slot that failed, and the first kind stays broken for every later turn
+ *  unless the conversation is repaired. The server's own text is never surfaced — error bodies
+ *  echo the rendered prompt back — but its machine-readable type is safe and is reported. */
+export class LocalRequestError extends Error {
+  constructor(readonly status: number, readonly serverType?: string) {
+    super(`Local model request failed with HTTP ${status}${serverType ? ` (${serverType})` : ''}`)
+    this.name = 'LocalRequestError'
+  }
+  /** Worth one more attempt with a repaired, shorter request rather than a dead turn. */
+  get recoverable(): boolean { return this.status === 400 || this.status === 413 || this.status >= 500 }
+  get contextExceeded(): boolean { return this.serverType === 'exceed_context_size' }
+}
+
+/** The status alone does not say which of those two cases happened, so the body is parsed for
+ *  the OpenAI-shaped error type. A prompt echoed back into a chat would be a leak, so the raw
+ *  body only ever reaches the main-process log, where a diagnosis has to start. */
+async function readErrorType(response: Response): Promise<string | undefined> {
+  let body = ''
+  try { body = (await response.text()).slice(0, 4000) } catch { /* A body that cannot be read adds nothing. */ }
+  if (body) console.warn(`[local-models] HTTP ${response.status} from llama.cpp: ${body.slice(0, 600)}`)
+  try {
+    const parsed = JSON.parse(body) as { error?: { type?: string; code?: string | number; message?: string } }
+    const reported = parsed.error?.type ?? (parsed.error?.code != null ? String(parsed.error.code) : undefined)
+    if (/context/i.test(parsed.error?.message ?? '')) return 'exceed_context_size'
+    return reported && /^[A-Za-z0-9_.-]{1,40}$/.test(reported) ? reported : undefined
+  } catch { return undefined }
+}
+
 const readUsage = (value: unknown): Usage | undefined => {
   const usage = value as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined
   if (!usage || typeof usage !== 'object') return undefined
@@ -122,10 +153,7 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
     })
   })
   if (response.status === 401 || response.status === 403) throw new Error('Local model rejected the API key; regenerate it with setup and restart the servers')
-  if (!response.ok || !response.body) {
-    // Server error bodies can echo the prompt back; only the status is reported.
-    throw new Error(`Local model request failed with HTTP ${response.status}`)
-  }
+  if (!response.ok || !response.body) throw new LocalRequestError(response.status, response.ok ? undefined : await readErrorType(response))
   const accumulator = new StreamAccumulator()
   const decoder = new TextDecoder()
   let buffer = ''

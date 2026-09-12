@@ -8,7 +8,7 @@ import { LocalAgentSession } from './agent.ts'
 /** A stand-in for llama.cpp's OpenAI-compatible endpoint: it checks the API key, records the
  *  requests, and replays scripted SSE frames. Enough to exercise streaming, tool dispatch and
  *  message threading without a model. */
-function stubServer(scripts: string[][]): Promise<{ endpoint: string; server: Server; requests: Array<Record<string, unknown>>; unauthorized: number }> {
+function stubServer(scripts: string[][], failures: Array<{ status: number; body: string }> = []): Promise<{ endpoint: string; server: Server; requests: Array<Record<string, unknown>>; unauthorized: number }> {
   const requests: Array<Record<string, unknown>> = []
   const state = { unauthorized: 0 }
   let turn = 0
@@ -22,6 +22,10 @@ function stubServer(scripts: string[][]): Promise<{ endpoint: string; server: Se
         return
       }
       requests.push(JSON.parse(body) as Record<string, unknown>)
+      // A scripted refusal for this turn, exactly as llama.cpp reports one: a status and a
+      // JSON error body, with no stream at all.
+      const refusal = failures[turn]
+      if (refusal) { turn++; response.writeHead(refusal.status, { 'Content-Type': 'application/json' }).end(refusal.body); return }
       response.writeHead(200, { 'Content-Type': 'text/event-stream' })
       for (const frame of scripts[Math.min(turn, scripts.length - 1)] ?? []) response.write(`data: ${frame}\n\n`)
       turn++
@@ -123,6 +127,53 @@ describe('local agent loop', () => {
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
     await session.run('Summarize', {})
     expect((stub.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read'])
+  })
+
+  it('repairs and retries once when the server refuses the request, then reports what it cannot fix', async () => {
+    const refusal = JSON.stringify({ error: { type: 'invalid_request_error', message: 'tool_call_id not found in the preceding assistant message' } })
+    const stub = await stubServer([[], [frame({ content: 'Recovered' }, 'stop')]], [{ status: 400, body: refusal }])
+    cleanup.push(() => stub.server.close())
+    const notices: string[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
+    expect((await session.run('Continue', { notice: message => notices.push(message) })).text).toBe('Recovered')
+    expect(stub.requests).toHaveLength(2)
+    expect(stub.requests[0]!.reasoning_effort).toBe('none')
+    // The retry gives up the optional parameter as well: an unrecognized one is refused with
+    // the same status as a history the template cannot render.
+    expect(stub.requests[1]!.reasoning_effort).toBeUndefined()
+    expect(notices.join(' ')).toContain('HTTP 400')
+  })
+
+  it('names the context window when neither the first request nor the shorter retry fits', async () => {
+    const overflow = JSON.stringify({ error: { type: 'exceed_context_size', message: 'the request exceeds the available context size' } })
+    const stub = await stubServer([[]], [{ status: 400, body: overflow }, { status: 400, body: overflow }])
+    cleanup.push(() => stub.server.close())
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
+    await expect(session.run('Continue', {})).rejects.toThrow(/32768 tokens of local context/)
+    expect(stub.requests).toHaveLength(2)
+  })
+
+  it('asks once for the answer when a thinking model replies with reasoning only', async () => {
+    const stub = await stubServer([
+      [frame({ reasoning_content: 'Thinking about it at length' }, 'stop')],
+      [frame({ content: 'The answer is 42.' }, 'stop')]
+    ])
+    cleanup.push(() => stub.server.close())
+    const notices: string[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
+    const outcome = await session.run('What is the answer?', { notice: message => notices.push(message) })
+    expect(outcome).toMatchObject({ stopReason: 'complete', text: 'The answer is 42.' })
+    expect(notices.join(' ')).toContain('reasoning only')
+    expect((stub.requests[1] as { messages: Array<{ role: string; content: string }> }).messages.at(-1)).toMatchObject({ role: 'user' })
+  })
+
+  it('keeps a truncated answer instead of failing the whole turn', async () => {
+    const stub = await stubServer([[frame({ content: 'Half of an ans' }, 'length')]])
+    cleanup.push(() => stub.server.close())
+    const notices: string[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
+    expect(await session.run('Explain', { notice: message => notices.push(message) })).toMatchObject({ stopReason: 'complete', text: 'Half of an ans' })
+    expect(notices.join(' ')).toContain('token limit')
   })
 
   it('fails the turn when the local API key is rejected', async () => {
