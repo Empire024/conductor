@@ -1,11 +1,15 @@
 import type { AgentProviderId, PaneKind, PaneTab } from '../../../shared/models'
 import { makeId } from '../../../shared/models'
+import { localModelLabel } from '../../../shared/local-models'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 
 export const createPaneTab = (
   kind: PaneKind,
   options?: {
     provider?: AgentProviderId; path?: string; title?: string; resume?: boolean; line?: number
+    /** A model chosen when the tab was created, for providers whose models are picked up front
+     *  (Local). Absent means the provider's own default, which is what every tab used to get. */
+    model?: string
     /** Where this tab runs. Absent means this machine, which is what an unplaced tab has always meant. */
     machineId?: string
     /** The mirrored session id minted when the tab was placed on another machine. */
@@ -19,9 +23,9 @@ export const createPaneTab = (
       return {
         id: makeId('pane'),
         kind,
-        title: options?.title ?? ({ codex: 'Codex', claude: 'Claude', gemini: 'Gemini', qwen: 'Qwen Code', kimi: 'Kimi Code' }[provider]),
+        title: options?.title ?? (provider === 'local' ? localModelLabel(options?.model) : { codex: 'Codex', claude: 'Claude', gemini: 'Gemini', qwen: 'Qwen Code', kimi: 'Kimi Code' }[provider]),
         resourceId: options?.resourceId ?? makeId('agent'),
-        state: { provider, resume: Boolean(options?.resume), model: 'default', effort: 'auto', ...remote }
+        state: { provider, resume: Boolean(options?.resume), model: options?.model ?? 'default', effort: 'auto', ...remote }
       }
     }
     case 'terminal':

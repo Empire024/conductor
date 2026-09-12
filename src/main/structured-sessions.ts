@@ -115,12 +115,19 @@ export class StructuredSessions {
     if (!previousSpec) {
       const remembered = rememberedPermission(key => this.database.getSetting(key), spec.provider as StructuredProvider)
       const capabilities = store.snapshot(spec.id)?.capabilities
-      if (remembered && capabilities?.permissions?.includes(remembered)) store.update(spec.id, { settings: { ...store.snapshot(spec.id)!.settings, permission: remembered } })
+      const offered = capabilities?.permissions
+      // A runtime that does not offer the neutral default at all (the local models never ask
+      // for anything, so 'Ask' would be a mode they cannot honour) opens on its own first mode
+      // instead of a permission the composer could not show as selected.
+      const opening = remembered && offered?.includes(remembered) ? remembered
+        : offered?.length && !offered.includes(store.snapshot(spec.id)!.settings.permission) ? offered[0]
+          : undefined
+      if (opening) store.update(spec.id, { settings: { ...store.snapshot(spec.id)!.settings, permission: opening } })
     }
     return { id: spec.id, available: Boolean(executable), status: executable ? 'running' : 'unavailable', transcript: '', executable: executable ?? undefined, model: state.settings.model ?? spec.model ?? 'default', message: executable ? undefined : 'Provider CLI not found. Configure its executable before connecting.' }
   }
   private validateSpec(spec: AgentSpec): void {
-    if (!spec || !/^[a-zA-Z0-9_-]{1,160}$/.test(spec.id) || !['claude', 'codex'].includes(spec.provider)) throw new Error('Invalid structured agent session')
+    if (!spec || !/^[a-zA-Z0-9_-]{1,160}$/.test(spec.id) || !['claude', 'codex', 'local'].includes(spec.provider)) throw new Error('Invalid structured agent session')
     const project = this.database.getProject(spec.projectId), workspace = this.database.getSession(spec.sessionId)
     if (!project || !workspace || workspace.projectId !== project.id) throw new Error('Invalid project/workspace binding')
     // Existing project model has no separate authorized-worktree catalog.

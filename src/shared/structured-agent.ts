@@ -1,6 +1,6 @@
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from './agent-change-history'
 /** Versioned, provider-neutral envelope. Native IDs never double as Conductor IDs. */
-export type StructuredProvider = 'codex' | 'claude'
+export type StructuredProvider = 'codex' | 'claude' | 'local'
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 export type SessionPhase = 'idle' | 'starting' | 'running' | 'waiting_approval' | 'waiting_input' | 'interrupting' | 'completed' | 'failed' | 'disconnected' | 'interrupted'
 /** The true native CLI/API ceiling. Text, attachment expansion and recalled memory context

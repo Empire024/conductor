@@ -7,6 +7,7 @@ import {
   Sparkles,
   TerminalSquare
 } from 'lucide-react'
+import { LOCAL_MODELS } from '../../../shared/local-models'
 import type { AgentProviderId, PaneKind } from '../../../shared/models'
 import type { MachineDescriptor } from '../../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
@@ -17,19 +18,27 @@ interface LauncherPaneProps {
   /** A placement the other machine refused, shown where the choice was made. */
   error?: string
   onSelectMachine?(machineId: string): void
-  onOpen(kind: PaneKind, provider?: AgentProviderId): void
+  onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
 }
 
 const choices: Array<{
   kind: PaneKind
   provider?: AgentProviderId
+  /** Providers whose model is chosen when the session is created rather than in the composer. */
+  model?: string
   icon: typeof Bot
   title: string
+  /** Second line, naming the family a runtime belongs to when its title alone does not. */
+  detail?: string
   tone: string
   key: string
 }> = [
   { kind: 'agent', provider: 'claude', icon: Sparkles, title: 'Claude Code', tone: 'amber', key: 'C' },
   { kind: 'agent', provider: 'codex', icon: Bot, title: 'Codex', tone: 'green', key: 'X' },
+  ...LOCAL_MODELS.map((model, index) => ({
+    kind: 'agent' as PaneKind, provider: 'local' as AgentProviderId, model: model.id, icon: Bot,
+    title: model.label, detail: 'Local · runs on this machine', tone: 'cyan', key: index === 0 ? 'L' : ''
+  })),
   { kind: 'agent', provider: 'qwen', icon: Bot, title: 'Qwen Code', tone: 'cyan', key: 'Q' },
   { kind: 'agent', provider: 'kimi', icon: Sparkles, title: 'Kimi Code', tone: 'violet', key: 'K' },
   { kind: 'agent', provider: 'gemini', icon: Sparkles, title: 'Gemini CLI', tone: 'blue', key: 'G' },
@@ -97,7 +106,7 @@ export function LauncherPane({ machineId, error, onSelectMachine, onOpen }: Laun
         </div>
       )}
       <div className="launcher-grid" aria-label="Open runtime">
-        {choices.map(({ kind, provider, icon: Icon, title, tone, key }) => {
+        {choices.map(({ kind, provider, model, icon: Icon, title, detail, tone, key }) => {
           // A terminal is a local process on the machine that owns it; only agent tabs travel, and
           // only the two providers whose conversations this app can journal can be mirrored.
           const elsewhere = selected !== LOCAL_MACHINE_ID
@@ -105,14 +114,14 @@ export function LauncherPane({ machineId, error, onSelectMachine, onOpen }: Laun
           const blocked = kind !== 'agent' ? elsewhere : Boolean(current?.reason) || (elsewhere && !mirrorable)
           return (
             <button
-              key={`${kind}-${provider ?? ''}`}
+              key={`${kind}-${provider ?? ''}-${model ?? ''}`}
               disabled={blocked}
               title={blocked ? (current?.reason || (kind === 'agent' ? `${title} cannot run on another machine yet.` : 'A terminal always runs on this machine.')) : undefined}
-              onClick={() => onOpen(kind, provider)}
+              onClick={() => onOpen(kind, provider, model)}
             >
               <span className={`launch-icon ${tone}`}>{provider ? <ProviderIcon provider={provider} size={21} /> : <Icon size={19} />}</span>
-              <span><strong>{title}</strong></span>
-              <kbd>{key}</kbd>
+              <span><strong>{title}</strong>{detail && <small>{detail}</small>}</span>
+              {key && <kbd>{key}</kbd>}
               <ChevronRight className="launch-arrow" size={15} />
             </button>
           )

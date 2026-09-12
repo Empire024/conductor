@@ -10,7 +10,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "allowImportingTsExtensions": false,
+    "allowImportingTsExtensions": true,
     "types": ["node", "vite/client"],
     "baseUrl": ".",
     "paths": {
@@ -18,5 +18,5 @@
       "@renderer/*": ["src/renderer/src/*"]
     }
   },
-  "include": ["src/**/*.ts", "src/**/*.tsx", "electron.vite.config.ts", "vitest.config.ts"]
+  "include": ["src/**/*.ts", "src/**/*.tsx", "scripts/local-models/**/*.ts", "electron.vite.config.ts", "vitest.config.ts"]
 }

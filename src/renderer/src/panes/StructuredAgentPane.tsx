@@ -25,6 +25,7 @@ import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomple
 import { browserTabOpen } from '../layout/browser-tab'
 import { composerCommands, matchingComposerCommands, type ComposerCommand } from './composer-commands'
 import { concreteModel } from '../../../shared/agent-model-selection'
+import { localModelLabel } from '../../../shared/local-models'
 import { useComposerDraft } from './use-composer-draft'
 import { initialPermission, rememberPermission } from './permission-memory'
 import { bannerAbsorbsError, runtimeBanner } from './runtime-banner'
@@ -69,7 +70,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [workingWord, setWorkingWord] = useState(0)
   useEffect(() => { if (projection.phase !== 'running') return; const timer = window.setInterval(() => setWorkingWord((current) => (current + 1) % 4), 7000); return () => window.clearInterval(timer) }, [projection.phase])
   const [submitting, setSubmitting] = useState(false)
-  const [settings, setSettings] = useState<SessionSettings>({ permission: initialPermission(props.provider === 'claude' ? 'claude' : 'codex'), plan: false, model: concreteModel(props.provider === 'claude' ? 'claude' : 'codex', props.model), effort: props.effort === 'auto' ? undefined : props.effort })
+  const structuredProvider = props.provider === 'claude' || props.provider === 'local' ? props.provider : 'codex'
+  const [settings, setSettings] = useState<SessionSettings>({ permission: initialPermission(structuredProvider), plan: false, model: concreteModel(structuredProvider, props.model), effort: props.effort === 'auto' ? undefined : props.effort })
   const settingsRef = useRef(settings)
   settingsRef.current = settings
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -130,8 +132,11 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const activeIdRef = useRef(activeId)
   activeIdRef.current = activeId
   const lastConversationItems = useRef<TimelineItem[]>([])
-  const provider = props.provider === 'claude' ? 'claude' : 'codex'
-  const name = (projection.capabilities?.provider ?? provider) === 'claude' ? 'Claude Code' : 'Codex'
+  const provider = structuredProvider
+  // A local conversation is named by the model it is talking to; the two CLI providers are
+  // named by the product, exactly as they were.
+  const reportedProvider = projection.capabilities?.provider ?? provider
+  const name = reportedProvider === 'claude' ? 'Claude Code' : reportedProvider === 'local' ? localModelLabel(settings.model) : 'Codex'
   // A runtime that never reached a native session exchanged nothing: startup notices and the
   // failure itself must not lock the composer, or a failed connect leaves no way to retry.
   const unstartedConversation = !projection.nativeSessionId && !projection.truncated && projection.items.every(item => (item.data.type === 'notice' || item.data.type === 'error') && !item.turnId)

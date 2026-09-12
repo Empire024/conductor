@@ -36,15 +36,18 @@ export function travels(kind: PaneKind): boolean { return kind === 'agent' }
 export async function createPlacedTab(request: {
   kind: PaneKind
   provider?: AgentProviderId
+  /** A model the owner chose while creating the tab; only Local picks one up front. */
+  model?: string
   machineId: string
   projectId: string
   sessionId: string
 }): Promise<PaneTab> {
-  const { kind, provider, machineId, projectId, sessionId } = request
-  if (machineId === LOCAL_MACHINE_ID || !travels(kind)) return createPaneTab(kind, { provider })
+  const { kind, provider, model, machineId, projectId, sessionId } = request
+  if (machineId === LOCAL_MACHINE_ID || !travels(kind)) return createPaneTab(kind, { provider, model })
   const placed = await window.conductor.remote.openTab({ machineId, projectId, sessionId, ...(provider ? { provider } : {}) })
   return createPaneTab(kind, {
     provider,
+    model,
     machineId: placed.machineId,
     resourceId: placed.localSessionId,
     title: `${provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : provider ?? 'Agent'} · ${placed.machineName}`

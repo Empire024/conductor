@@ -1,3 +1,4 @@
+import { DEFAULT_LOCAL_MODEL, localModelLabel } from '../../../shared/local-models'
 import type { AgentProviderId, LayoutNode, PaneGroupNode, PaneKind, SplitNode, WorkspaceLayout } from '../../../shared/models'
 import { dockTab, findGroup, listGroups, resizeSplit, type DockEdge } from './layout-operations'
 
@@ -7,6 +8,8 @@ export type ResizeDirection = 'left' | 'right' | 'up' | 'down'
 export interface ChordTarget {
   kind: PaneKind
   provider?: AgentProviderId
+  /** Only Local picks its model when the tab is made, so only Local sets this. */
+  model?: string
   label: string
 }
 
@@ -17,6 +20,7 @@ export const TAB_CHORD: Record<string, ChordTarget> = {
   q: { kind: 'agent', provider: 'qwen', label: 'Qwen Code' },
   k: { kind: 'agent', provider: 'kimi', label: 'Kimi Code' },
   g: { kind: 'agent', provider: 'gemini', label: 'Gemini CLI' },
+  l: { kind: 'agent', provider: 'local', model: DEFAULT_LOCAL_MODEL, label: localModelLabel(DEFAULT_LOCAL_MODEL) },
   t: { kind: 'terminal', label: 'PowerShell' },
   n: { kind: 'launcher', label: 'New tab' }
 }

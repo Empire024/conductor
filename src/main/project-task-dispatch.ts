@@ -25,7 +25,8 @@ const validId = (value:unknown):value is string => typeof value==='string' && Bo
  *  Codex ProviderAdapter classes) — used only until a live runtime reports its own catalog. */
 const staticPermissions:Record<StructuredProvider,SessionSettings['permission'][]> = {
   claude:['default','accept-edits','auto'],
-  codex:['default','read-only','accept-edits']
+  codex:['default','read-only','accept-edits'],
+  local:['accept-edits','read-only']
 }
 export const projectTaskPrompt = (tasks:ProjectTask[],fixer=false,extra?:string):string => {
   const requested=tasks.map(task=>`Task ${task.id} (${task.kind}):\n${task.title}`).join('\n\n')
@@ -47,11 +48,11 @@ export class ProjectTaskDispatcher {
     const targets=workspaces.flatMap(workspace=>control.tabs({projectId,sessionId:workspace.id,agentSessionId:''}).flatMap(tab=> {
       const spec=tab.resourceId?database.structured.spec<AgentSpec>(tab.resourceId):undefined
       if(tab.kind!=='agent'||!spec||!['codex','claude'].includes(spec.provider)||spec.projectId!==projectId||spec.sessionId!==workspace.id)return []
-      return [{agentSessionId:spec.id,tabId:tab.id,sessionId:workspace.id,title:tab.title,provider:spec.provider as StructuredProvider,phase:database.structured.snapshot(spec.id)?.phase??'idle'}]
+      return [{agentSessionId:spec.id,tabId:tab.id,sessionId:workspace.id,title:tab.title,provider:spec.provider as 'codex'|'claude',phase:database.structured.snapshot(spec.id)?.phase??'idle'}]
     }))
     const providers=this.deps.providers().filter(provider=>provider.id==='codex'||provider.id==='claude').map(provider=> {
       const runtime=targets.filter(target=>target.provider===provider.id).map(target=>database.structured.snapshot(target.agentSessionId)?.capabilities).find(capabilities=>capabilities?.models.length)
-      return {provider:provider.id as StructuredProvider,available:provider.available,source:runtime?'runtime' as const:'configured' as const,
+      return {provider:provider.id as 'codex'|'claude',available:provider.available,source:runtime?'runtime' as const:'configured' as const,
         models:runtime?.models??provider.models.filter(model=>!['default','auto'].includes(model.id)).map(model=>({...model,effort:provider.efforts.map(effort=>effort.id).filter(effort=>effort!=='auto')})),
         permissions:runtime?.permissions??staticPermissions[provider.id as StructuredProvider]}
     })

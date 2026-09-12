@@ -43,7 +43,11 @@
     "test:steering": "npm run build && node scripts/smoke-steering.mjs",
     "test:claude-permissions": "npm run build && node scripts/smoke-claude-permissions.mjs",
     "test:browser-mcp": "npm run build && node scripts/smoke-browser-mcp.mjs",
-    "test:perf-streaming": "npm run build && node scripts/perf-streaming.mjs"
+    "test:perf-streaming": "npm run build && node scripts/perf-streaming.mjs",
+    "test:local-models": "npm run build && node scripts/smoke-local-models.mjs",
+    "local": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts",
+    "local:smoke": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts smoke",
+    "local:security": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts security-test"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

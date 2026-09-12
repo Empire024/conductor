@@ -141,7 +141,7 @@ const PaneBody = ({
   placement: string
   placementError: string
   onSelectMachine(machineId: string): void
-  onOpen(kind: PaneKind, provider?: AgentProviderId): void
+  onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
   onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   onUpdateTab(tabId: string, state: Record<string, unknown>): void
   onConversationChange(tabId: string, conversation: ConversationIdentity): Promise<void>
@@ -360,11 +360,11 @@ function PaneGroup({
     writePlacement(workspace.session.id, machineId)
   }
 
-  const open = (kind: PaneKind, provider?: AgentProviderId): void => {
+  const open = (kind: PaneKind, provider?: AgentProviderId, model?: string): void => {
     if (kind !== 'agent' && kind !== 'terminal') return
     // Placing a tab on another machine has to reach that machine first, so the launcher stays put
     // until it answers; a refusal leaves the launcher open with the reason rather than a dead tab.
-    void createPlacedTab({ kind, provider, machineId: placement, projectId: workspace.project.id, sessionId: workspace.session.id })
+    void createPlacedTab({ kind, provider, model, machineId: placement, projectId: workspace.project.id, sessionId: workspace.session.id })
       .then(tab => workspace.onLayout(replaceTab(workspace.layout, group.id, activeTab.id, tab)))
       .catch((reason: unknown) => setPlacementError(String(reason instanceof Error ? reason.message : reason)))
   }

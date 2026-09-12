@@ -16,7 +16,9 @@ import { parseUsageLimitReset } from './usage-limit'
 import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSignalAgentOutput } from './agent-activity'
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { captureMemories, capturedMemoryKey, formatRecalledMemories, MEMORY_PROTOCOL } from './memory'
+import { LOCAL_MODELS } from '../shared/local-models'
 import { NativeCliManager } from './native-cli-manager'
+import { loadConfig } from './local-models/config.ts'
 import { StructuredSessions } from './structured-sessions'
 import { projectTaskBriefing } from './project-backlog'
 
@@ -145,6 +147,21 @@ const providers: Record<AgentProviderId, AgentProvider> = {
     ],
     efforts: [{ id: 'auto', label: 'Provider default' }],
     launch: (spec, executable) => ({ executable, args: modelArg(spec) })
+  },
+  local: {
+    id: 'local',
+    displayName: 'Local',
+    // The "executable" for this provider is the llama.cpp server the local stack was set up
+    // with; finding it is what makes Local available at all. Nothing is launched from here -
+    // the adapter starts and reuses the loopback servers itself, and a missing config simply
+    // reports the provider as unavailable.
+    resolveExecutable: () => {
+      try { return loadConfig().llamaServer } catch { return null }
+    },
+    installUrl: 'https://github.com/ggml-org/llama.cpp',
+    models: LOCAL_MODELS.map(model => ({ ...model })),
+    efforts: [{ id: 'auto', label: 'Provider default' }],
+    launch: () => { throw new Error('Local models run through the structured local runtime, never as a terminal CLI') }
   },
   kimi: {
     id: 'kimi',
@@ -295,7 +312,7 @@ export class AgentManager {
   }
 
   ensure(spec: AgentSpec): RuntimeEnsureResult {
-    if (spec.provider === 'codex' || spec.provider === 'claude') return this.structured.ensure(spec)
+    if (spec.provider === 'codex' || spec.provider === 'claude' || spec.provider === 'local') return this.structured.ensure(spec)
     // Choose and launch the same concrete catalog model shown in this tab.
     if (!spec.model || ['default', 'auto'].includes(spec.model)) spec = { ...spec, model: this.agents.get(spec.id)?.spec.model ?? providers[spec.provider].models.find(model => !['default', 'auto'].includes(model.id))?.id }
     const continuation = this.database.getContinuation(spec.id)

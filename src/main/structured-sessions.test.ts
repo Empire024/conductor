@@ -6,6 +6,7 @@ import { claudeHistoryPath } from './native-history'
 import { ConductorDatabase } from './database'
 import { StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
+import type { StructuredProvider } from '../shared/structured-agent'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
 import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
@@ -62,7 +63,7 @@ function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart 
   const spec: AgentSpec = { id: 'agent-session', projectId: project.id, sessionId: session.id, provider, title: 'Synthetic Claude', cwd: workspace }
   const adapters: FakeProvider[] = [], broadcast = vi.fn()
   let startGate: Promise<void> | undefined
-  const factory = (_provider: 'claude' | 'codex', options: AdapterOptions) => { const adapter = new FakeProvider(options); adapter.startGate = startGate; adapter.nativeIdentityOnStart = nativeIdentityOnStart; adapters.push(adapter); return adapter }
+  const factory = (_provider: StructuredProvider, options: AdapterOptions) => { const adapter = new FakeProvider(options); adapter.startGate = startGate; adapter.nativeIdentityOnStart = nativeIdentityOnStart; adapters.push(adapter); return adapter }
   const manager = new StructuredSessions(database, () => 'synthetic-executable', broadcast, factory); managers.push(manager)
   manager.ensure(spec)
   return { root, workspace, databasePath, database, spec, adapters, broadcast, factory, manager, gateStart(gate: Promise<void>) { startGate = gate }, get current() { return adapters.at(-1)! } }
@@ -200,7 +201,7 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     f.current.approval('historical-request')
     f.manager.flush(); f.manager.dispose(); f.database.close()
     const reopened = new ConductorDatabase(f.databasePath); databases.push(reopened)
-    const factory = vi.fn((_provider: 'claude' | 'codex', options: AdapterOptions) => new FakeProvider(options))
+    const factory = vi.fn((_provider: StructuredProvider, options: AdapterOptions) => new FakeProvider(options))
     const restored = new StructuredSessions(reopened, () => 'synthetic-executable', vi.fn(), factory); managers.push(restored)
     const projection = reopened.structured.snapshot(f.spec.id)
     expect(projection?.phase).toBe('disconnected')

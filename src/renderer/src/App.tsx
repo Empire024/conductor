@@ -51,6 +51,7 @@ import {
   tabIdByOffset,
   type ResizeDirection
 } from './layout/tab-keyboard'
+import { LOCAL_MODELS } from '../../shared/local-models'
 import { createPaneTab } from './panes/pane-factory'
 import { toggleBrowserTab } from './layout/browser-tab'
 import { MemoryPane } from './panes/MemoryPane'
@@ -851,15 +852,15 @@ export function App(): React.JSX.Element {
     setFocusedGroupId(listGroups(layout.root)[0]?.id ?? '')
   }
 
-  const makeTab = (kind: PaneKind, provider?: AgentProviderId): PaneTab =>
-    createPaneTab(kind, { provider })
+  const makeTab = (kind: PaneKind, provider?: AgentProviderId, model?: string): PaneTab =>
+    createPaneTab(kind, { provider, model })
 
-  const openInFocused = useCallback((kind: PaneKind, provider?: AgentProviderId): void => {
+  const openInFocused = useCallback((kind: PaneKind, provider?: AgentProviderId, model?: string): void => {
     if (!['launcher', 'agent', 'terminal'].includes(kind)) return
     if (!activeSession) return
     const group = findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0]
     if (!group) return
-    const tab = kind === 'launcher' ? makeLauncherTab() : makeTab(kind, provider)
+    const tab = kind === 'launcher' ? makeLauncherTab() : makeTab(kind, provider, model)
     const activeTab = group.tabs.find((item) => item.id === group.activeTabId)
     // A chosen runtime takes the open launcher's place; asking for another launcher must
     // still add a tab, or Ctrl+T on a new tab would silently swap it for an identical one.
@@ -1002,6 +1003,7 @@ export function App(): React.JSX.Element {
   const commands = useMemo<PaletteCommand[]>(() => [
     { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then C', run: () => openInFocused('agent', 'claude') },
     { id: 'open-codex', label: 'Open Codex', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then X', run: () => openInFocused('agent', 'codex') },
+    ...LOCAL_MODELS.map(model => ({ id: 'open-' + model.id, label: `Open Local · ${model.label}`, detail: 'Runs on this machine through llama.cpp', category: 'Agents', icon: 'agent' as const, run: () => openInFocused('agent', 'local', model.id) })),
     { id: 'open-qwen', label: 'Open Qwen Code', detail: 'Open the real local Qwen runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then Q', run: () => openInFocused('agent', 'qwen') },
     { id: 'open-kimi', label: 'Open Kimi Code', detail: 'Open the real local Moonshot runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then K', run: () => openInFocused('agent', 'kimi') },
     { id: 'open-gemini', label: 'Open Gemini CLI', detail: 'Open the real local Google runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then G', run: () => openInFocused('agent', 'gemini') },
@@ -1105,7 +1107,7 @@ export function App(): React.JSX.Element {
         disarmChord()
         if (target) {
           event.preventDefault()
-          openInFocused(target.kind, target.provider)
+          openInFocused(target.kind, target.provider, target.model)
           return
         }
         // Escape only cancels a chord that is actually pending; a focused launcher must not

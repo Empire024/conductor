@@ -82,7 +82,7 @@ const lightTerminalTheme = {
 }
 
 export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element {
-  if (props.mode === 'agent' && (props.provider === 'codex' || props.provider === 'claude' || !props.provider)) {
+  if (props.mode === 'agent' && (props.provider === 'codex' || props.provider === 'claude' || props.provider === 'local' || !props.provider)) {
     return <StructuredRuntime {...props} />
   }
   return <TerminalRuntimePane {...props} />
@@ -104,7 +104,8 @@ function StructuredRuntime(props: RuntimeTerminalProps): React.JSX.Element {
     : <StructuredAgentPane {...props} conversationId={conversation} onConversationChange={async identity => {
       await props.onConversationChange?.(identity)
       setConversation(identity.id)
-    }} onRequestCli={(id) => {
+    }} onRequestCli={props.provider === 'local' ? undefined : (id) => {
+      // Local models have no native CLI of their own to continue the conversation in.
       setConversation(id)
       void window.conductor.nativeCli.ensure(id).then(() => changeView('cli')).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: String(reason) })))
     }} />

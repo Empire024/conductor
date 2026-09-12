@@ -12,7 +12,7 @@ export type PaneKind =
   | 'routine'
   | 'logs'
 
-export type AgentProviderId = 'codex' | 'claude' | 'gemini' | 'qwen' | 'kimi'
+export type AgentProviderId = 'codex' | 'claude' | 'gemini' | 'qwen' | 'kimi' | 'local'
 export type AgentEffort = 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 export const THEME_IDS = ['night-owl', 'obsidian', 'nord'] as const

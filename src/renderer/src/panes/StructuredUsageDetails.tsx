@@ -4,7 +4,7 @@ import type { UsageCap, UsageCapMetric, UsageCapScope, UsageCapSetting, UsageCap
 import { describeUsageCap, evaluateUsageCap, shortWindow, summarizeContext, summarizeUsage, summarizeUsageRun, weeklyWindow } from './usage-summary'
 import './StructuredUsageDetails.css'
 
-const providerNames: Record<StructuredProvider, string> = { codex: 'Codex', claude: 'Claude' }
+const providerNames: Record<StructuredProvider, string> = { codex: 'Codex', claude: 'Claude', local: 'Local model' }
 const percent = (value: number): string => `${Math.round(value * 10) / 10}%`
 const points = (value: number): string => `${Math.round(value * 10) / 10}`
 

@@ -11,3 +11,5 @@ Thumbs.db
 .managed-project-*/
 .recovery-*/
 .smoke-*/
+# Local model GGUFs, the generated local API key, logs and run state. Never committed.
+.local-models/
