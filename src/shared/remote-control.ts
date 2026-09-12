@@ -185,6 +185,8 @@ export interface MachineDescriptor {
 }
 
 export interface RemoteControlBridge {
+  /** Remote-only file operations. Keeping them nested prevents accidental local-disk fallback. */
+  files: import('./remote-files').RemoteFilesBridge & import('./remote-files').RemoteFileResourceBridge
   githubState(): Promise<GitHubAuthState>
   signIn(): Promise<GitHubAuthState>
   cancelSignIn(): Promise<GitHubAuthState>
@@ -213,6 +215,10 @@ export interface RemoteControlBridge {
   openTab(request: RemoteTabRequest): Promise<{ localSessionId: string; machineId: string; machineName: string }>
   /** Stops mirroring a tab the owner closed here, leaving the work itself running there. */
   releaseTab(localSessionId: string): Promise<boolean>
+  /** Durable execution owner for a mirrored session, including released/offline tombstones. */
+  sessionMachine(localSessionId: string): Promise<string>
+  /** Machine and workspace root used to resolve file links for this conversation. */
+  sessionFileContext(localSessionId: string): Promise<{ machineId: string; cwd: string | null }>
   onState(callback: (state: RemoteControlState) => void): () => void
 }
 

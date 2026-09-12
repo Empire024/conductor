@@ -1,16 +1,10 @@
 import { useEffect, useRef } from 'react'
 import { Command } from 'lucide-react'
 import type { ComposerCommand } from './composer-commands'
-/** The browser MCP tools drive a browser pane tab in the caller's own workspace, resolving the
- *  webview by matching the tab id the pane stamps on it - they cannot attribute the sidebar's
- *  browser panel to a project and workspace, so that surface is not something the agent's own
- *  tool calls can reach. This is the one place that knows how to reach the *same* surface the
- *  agent uses: the @browser mention (via chooseCommand, which covers both the click and
- *  keyboard selection paths below) and the composer footer's Browser button both call it, so
- *  the owner and the agent end up looking at one browser tab, not two. App.tsx listens for the
- *  event and does the actual find/focus/create/close (see layout/browser-tab.ts). */
+/** @browser is the view-driven control: reveal the project's persistent left browser. The
+ * composer globe has a deliberately different job and changes model-tool authority only. */
 export function activateBrowserMention(): void {
-  window.dispatchEvent(new Event('conductor:toggle-browser-tab'))
+  window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'browser' }))
 }
 export function CommandAutocomplete({ id, commands, selected, loading, onSelect, onChoose }: { id: string; commands: ComposerCommand[]; selected: number; loading: boolean; onSelect(index: number): void; onChoose(command: ComposerCommand): void }): React.JSX.Element {
   const host = useRef<HTMLDivElement>(null)

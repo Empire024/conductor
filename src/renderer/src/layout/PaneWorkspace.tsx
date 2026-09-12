@@ -63,12 +63,15 @@ import { ChevronDown, ChevronRight } from 'lucide-react'
 import { createPaneTab } from '../panes/pane-factory'
 import { createPlacedTab, readPlacement, writePlacement } from './machine-placement'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
-import { RuntimeTerminal } from '../panes/RuntimeTerminal'
+import { TerminalPane } from '../panes/TerminalPane'
 import { LauncherPane } from '../panes/LauncherPane'
 import { FileTreePane } from '../panes/FileTreePane'
 import { CodePane } from '../panes/CodePane'
 import { BrowserPane } from '../panes/BrowserPane'
+import { SessionArchiveDormantPane } from '../components/SessionArchiveDormantPane'
 import { debugLog } from '../debug-log'
+import { openWorkspaceFile } from '../components/workspace-files-state'
+import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
 
 interface PaneWorkspaceProps {
   layout: WorkspaceLayout
@@ -89,6 +92,7 @@ interface PaneWorkspaceProps {
   canReopen: boolean
   onReopen(groupId: string): void
   onOpenFile?(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
+  onMachinePlacement?(machineId: string): void
   /** App.tsx's phase map, already downgraded away from 'complete' while a tab still owns active
    *  subagent work (see resolveActivityPhases in attention.ts). Falls back to this pane's own raw
    *  per-tab listener when absent, e.g. in a detached window that doesn't thread this prop. */
@@ -146,22 +150,25 @@ const PaneBody = ({
   onUpdateTab(tabId: string, state: Record<string, unknown>): void
   onConversationChange(tabId: string, conversation: ConversationIdentity): Promise<void>
 }): React.JSX.Element => {
-  if (tab.kind === 'launcher') return <LauncherPane machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} />
+  if (tab.kind === 'launcher') return <LauncherPane projectId={project.id} machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} />
   if (tab.kind === 'terminal') {
     return (
-      <RuntimeTerminal
+      <TerminalPane
         mode="terminal"
         resourceId={tab.resourceId!}
         title={tab.title}
         project={project}
         session={session}
         onOpenFile={onOpenFile}
+        archiveDormant={tab.state?.archiveDormant === true}
+        machineId={(tab.state?.machineId as string) ?? 'local'}
+        onArchiveActivated={() => onUpdateTab(tab.id, { ...tab.state, archiveDormant: false })}
       />
     )
   }
   if (tab.kind === 'agent') {
     return (
-      <RuntimeTerminal
+      <TerminalPane
         mode="agent"
         provider={(tab.state?.provider as AgentProviderId) ?? 'codex'}
         resume={Boolean(tab.state?.resume)}
@@ -178,14 +185,21 @@ const PaneBody = ({
         onModelChange={(model) => onUpdateTab(tab.id, { ...tab.state, model })}
         onEffortChange={(effort) => onUpdateTab(tab.id, { ...tab.state, effort })}
         onViewModeChange={(viewMode) => onUpdateTab(tab.id, { ...tab.state, viewMode })}
+        archiveDormant={tab.state?.archiveDormant === true}
+        machineId={(tab.state?.machineId as string) ?? 'local'}
+        onArchiveActivated={() => onUpdateTab(tab.id, { ...tab.state, archiveDormant: false })}
       />
     )
   }
   if (tab.kind === 'file-tree') return <FileTreePane project={project} onOpenFile={onOpenFile} />
   if (tab.kind === 'tasks') return <ProjectBacklogPane project={project} />
-  if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} />
-  if (tab.kind === 'preview') return <FilePreviewPane project={project} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} onOpenEditor={(path, allowBinary) => onOpenFile(path, undefined, 'editor', allowBinary)} />
-  if (tab.kind === 'browser') return <BrowserPane performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { ...tab.state, url })} />
+  if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} machineId={fileMachineId(tab.state?.machineId as string | undefined)} />
+  if (tab.kind === 'preview') return isRemoteFileMachine(tab.state?.machineId as string | undefined)
+    ? <div className="coming-pane"><span>Remote file</span><strong>Preview is unavailable. Open this host file in the guarded editor.</strong></div>
+    : <FilePreviewPane project={project} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} onOpenEditor={(path, allowBinary) => onOpenFile(path, undefined, 'editor', allowBinary)} />
+  if (tab.kind === 'browser') return tab.state?.archiveDormant === true
+    ? <SessionArchiveDormantPane kind="browser" title={tab.title} onActivate={() => onUpdateTab(tab.id, { ...tab.state, archiveDormant: false })} />
+    : <BrowserPane projectId={project.id} performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { ...tab.state, url })} />
   return (
     <div className="coming-pane">
       <span>{tab.kind}</span>
@@ -358,6 +372,7 @@ function PaneGroup({
     setPlacement(machineId)
     setPlacementError('')
     writePlacement(workspace.session.id, machineId)
+    workspace.onMachinePlacement?.(machineId)
   }
 
   const open = (kind: PaneKind, provider?: AgentProviderId, model?: string): void => {
@@ -369,8 +384,13 @@ function PaneGroup({
       .catch((reason: unknown) => setPlacementError(String(reason instanceof Error ? reason.message : reason)))
   }
 
-  const openFile = (path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void => {
-    workspace.onOpenFile?.(path, line, mode, allowBinary)
+  const openFile = (path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean, machineId?: string): void => {
+    const ownerMachine = fileMachineId(machineId)
+    void statMachineFile(ownerMachine, workspace.project.id, path).then((info) => {
+      if (!info.isFile) throw new Error('That path is not a file.')
+      if (isRemoteFileMachine(ownerMachine)) openWorkspaceFile(workspace.project.id, path, 'editor', line, undefined, ownerMachine)
+      else workspace.onOpenFile?.(path, line, mode, allowBinary)
+    }).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Cannot open file: ' + (reason instanceof Error ? reason.message : String(reason)) })))
   }
 
   const setTabState = (tabId: string, state: Record<string, unknown>): void => {
@@ -544,7 +564,7 @@ function PaneGroup({
       <div className="pane-content">
         {group.tabs.map((tab) => (
           <div key={tab.id} className="pane-tab-content" data-performance-tab-id={tab.id} style={{ display: tab.id === activeTab.id ? 'flex' : 'none' }}>
-            <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={openFile} onUpdateTab={setTabState} onConversationChange={changeConversation}
+            <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={(path, line, mode, allowBinary) => openFile(path, line, mode, allowBinary, tab.state?.machineId as string | undefined)} onUpdateTab={setTabState} onConversationChange={changeConversation}
               placement={placement} placementError={placementError} onSelectMachine={choose} />
           </div>
         ))}

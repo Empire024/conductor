@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { ConductorBridge } from '../shared/ipc'
 import type {
   AgentSpec,
@@ -19,20 +19,44 @@ const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => v
 }
 
 const bridge: ConductorBridge = {
+  sessionArchive: {
+    name: () => ipcRenderer.invoke('session-archive:name'),
+    save: () => ipcRenderer.invoke('session-archive:save'),
+    open: () => ipcRenderer.invoke('session-archive:open'),
+    activateResource: (kind, id) => ipcRenderer.invoke('session-archive:activate-resource', kind, id),
+    onChanged: callback => subscribe('session-archive:changed', callback)
+  },
   agentControl: {
     openUri: uri => ipcRenderer.invoke('agent-control:open-uri', uri),
     focusTab: (projectId, sessionId, tabId) => ipcRenderer.invoke('agent-control:focus-tab', projectId, sessionId, tabId),
+    focusOrigin: agentSessionId => ipcRenderer.invoke('agent-control:focus-origin', agentSessionId),
     links: (projectId, sessionId) => ipcRenderer.invoke('agent-control:links', projectId, sessionId),
     release: agentSessionId => ipcRenderer.invoke('agent-control:release', agentSessionId),
     onLinksChanged: callback => subscribe('agent-control:links-changed', callback),
     onRequest: callback => subscribe('agent-control:request', callback),
     respond: response => ipcRenderer.send('agent-control:response', response)
   },
+  browser: {
+    mount: request => ipcRenderer.invoke('browser:mount', request),
+    update: request => ipcRenderer.invoke('browser:update', request),
+    command: (projectId, command) => ipcRenderer.invoke('browser:command', projectId, command),
+    present: (projectId, presentation) => ipcRenderer.invoke('browser:present', projectId, presentation),
+    onState: callback => subscribe('browser:state', callback)
+  },
   agentConfirm: {
     onRequest: callback => subscribe('agent-confirm:request', callback),
     respond: response => ipcRenderer.send('agent-confirm:response', response)
   },
   remote: {
+    files: {
+      list: (request) => ipcRenderer.invoke('remote:files-list', request),
+      stat: (request) => ipcRenderer.invoke('remote:files-stat', request),
+      read: (request) => ipcRenderer.invoke('remote:files-read', request),
+      write: (request) => ipcRenderer.invoke('remote:files-write', request),
+      preview: (request) => ipcRenderer.invoke('remote:files-preview', request),
+      revokePreview: (url) => ipcRenderer.invoke('remote:files-revoke-preview', url),
+      download: (request) => ipcRenderer.invoke('remote:files-download', request)
+    },
     githubState: () => ipcRenderer.invoke('remote:github-state'),
     signIn: () => ipcRenderer.invoke('remote:github-sign-in'),
     cancelSignIn: () => ipcRenderer.invoke('remote:github-cancel'),
@@ -53,6 +77,8 @@ const bridge: ConductorBridge = {
     machines: () => ipcRenderer.invoke('remote:machines'),
     openTab: (request) => ipcRenderer.invoke('remote:open-tab', request),
     releaseTab: (localSessionId) => ipcRenderer.invoke('remote:release-tab', localSessionId),
+    sessionMachine: (localSessionId) => ipcRenderer.invoke('remote:session-machine', localSessionId),
+    sessionFileContext: (localSessionId) => ipcRenderer.invoke('remote:session-file-context', localSessionId),
     onState: (callback) => subscribe('remote:changed', callback)
   },
   projectTasks: {
@@ -162,6 +188,10 @@ const bridge: ConductorBridge = {
   files: {
     onChanged: callback => subscribe('files:changed', callback),
     importImage: (projectId, name, bytes) => ipcRenderer.invoke('files:import-image', projectId, name, bytes),
+    attachContext: (projectId, relativePath) => ipcRenderer.invoke('files:attach-context', projectId, relativePath),
+    importContextPath: (projectId, sourcePath, name, mimeType) => ipcRenderer.invoke('files:import-context-path', projectId, sourcePath, name, mimeType),
+    pathForFile: file => webUtils.getPathForFile(file),
+    moveExternalDrop: (projectId, sourcePath, destinationDirectory) => ipcRenderer.invoke('files:move-external-drop', projectId, sourcePath, destinationDirectory),
     onOpenShortcut: (callback) => subscribe('files:open-shortcut', callback),
     browserUrl: (projectId, path) => ipcRenderer.invoke('files:browser-url', projectId, path),
     openInBrowser: (projectId, path) => ipcRenderer.invoke('files:open-in-browser', projectId, path),
@@ -188,12 +218,12 @@ const bridge: ConductorBridge = {
     reveal: (projectId, relativePath) => ipcRenderer.invoke('files:reveal', projectId, relativePath),
     openExternal: (projectId, relativePath) =>
       ipcRenderer.invoke('files:open-external', projectId, relativePath),
-    getDraft: (tabId, projectId, relativePath) =>
-      ipcRenderer.invoke('files:get-draft', tabId, projectId, relativePath),
-    checkpointDraft: (tabId, projectId, relativePath, content, viewState, baseContent) =>
-      ipcRenderer.send('files:checkpoint-draft', tabId, projectId, relativePath, content, viewState, baseContent),
-    flushDraft: (tabId, projectId, relativePath, content, viewState, baseContent) =>
-      ipcRenderer.sendSync('files:flush-draft', tabId, projectId, relativePath, content, viewState, baseContent),
+    getDraft: (tabId, projectId, relativePath, machineId) =>
+      ipcRenderer.invoke('files:get-draft', tabId, projectId, relativePath, machineId),
+    checkpointDraft: (tabId, projectId, relativePath, content, viewState, baseContent, machineId) =>
+      ipcRenderer.send('files:checkpoint-draft', tabId, projectId, relativePath, content, viewState, baseContent, machineId),
+    flushDraft: (tabId, projectId, relativePath, content, viewState, baseContent, machineId) =>
+      ipcRenderer.sendSync('files:flush-draft', tabId, projectId, relativePath, content, viewState, baseContent, machineId),
     removeDraft: (tabId) => ipcRenderer.invoke('files:remove-draft', tabId)
   },
   terminals: {
@@ -277,3 +307,4 @@ const bridge: ConductorBridge = {
 }
 
 contextBridge.exposeInMainWorld('conductor', bridge)
+ipcRenderer.on('window:close-tab', () => window.dispatchEvent(new Event('conductor:close-tab')))

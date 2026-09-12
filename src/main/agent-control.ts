@@ -63,6 +63,7 @@ const toolSignatures = {
   'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project',
   'agents.snapshot': '({agentSessionId}) — observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
+  'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
   'agents.steer': '({agentSessionId,prompt}) — same steering/queue behavior as the user composer',
   'agents.interrupt': '({agentSessionId})',
@@ -217,6 +218,37 @@ export class AgentControl {
     return { tab, scope: target }
   }
 
+  /** Settings are more durable than a prompt: changing an unclaimed neighbour would leave it
+   * altered after this caller went away. Only a relationship the caller already owns qualifies. */
+  private configuredTarget(scope: AgentControlScope, id: string): { tab: AgentControlTab; scope: AgentControlScope } {
+    const target = this.target(scope, id, true)
+    if (this.linkFor(id)?.controllerAgentSessionId !== scope.agentSessionId) throw new Error('Configure only a coworker this agent already controls')
+    const spec = this.deps.database.structured.spec<AgentSpec>(id)
+    // The durable spec is the execution owner. Old layouts may predate the machine badge, so
+    // accepting a missing/local-looking tab stamp would turn a remote configuration into a local
+    // settings-only lie. A remote tab stamp is likewise sufficient to fail closed.
+    if (spec?.machineId && spec.machineId !== LOCAL_MACHINE_ID || tabMachineId(target.tab) !== LOCAL_MACHINE_ID) throw new Error('This coworker runs on another machine; agents.configure must be sent to its owning machine')
+    return target
+  }
+
+  private configurableSettings(id: string, provider: StructuredProvider, args: Args): { previous: SessionSettings; next: SessionSettings; model: string; effort?: string } {
+    const state = this.deps.database.structured.snapshot(id)
+    if (!state) throw new Error('Agent session is no longer available')
+    if (['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase) || state.queued || state.queuedPrompts?.length || state.pendingSteering?.length) {
+      throw new Error('Wait until the coworker is idle and has no queued or pending input before changing its model and effort')
+    }
+    if (state.capabilities?.provider !== provider) throw new Error('The visible tab provider does not match the native conversation')
+    const model = text(args, 'model', 160)
+    const choice = state.capabilities.models.find(candidate => candidate.id === model)
+    if (!choice) throw new Error('Choose an exact model advertised for this coworker by models.list')
+    let effort: string | undefined
+    if (choice.effort?.length) {
+      effort = text(args, 'effort', 40)
+      if (!choice.effort.includes(effort)) throw new Error('Choose an effort supported by this model')
+    } else if (args.effort !== undefined) throw new Error('This model does not accept an effort setting')
+    return { previous: structuredClone(state.settings), next: { ...state.settings, model, effort }, model, effort }
+  }
+
   /**
    * Who controls this tab, wherever that controller sits. A link only binds while the controller
    * still has an open tab of its own; otherwise a closed or crashed controller would hold the tab
@@ -243,6 +275,26 @@ export class AgentControl {
       return link && link.projectId === projectId && link.sessionId === sessionId && ids.has(link.controllerAgentSessionId)
         ? [{ ...link, controllerTitle: tabs.find(tab => tab.resourceId === link.controllerAgentSessionId)?.title, controlledTitle: tab.title }] : []
     })
+  }
+
+  /**
+   * Focuses the concrete tab that originated a persisted coordinated message. This deliberately
+   * searches durable tab/resource identity rather than control links: a release drops control
+   * authority but must not make the owner-facing transcript lose its sender. A closed tab can be
+   * restored only in its recorded workspace, never reconstructed from a label or a guessed ID.
+   */
+  async focusOrigin(agentSessionId: string): Promise<void> {
+    if (!agentSessionId || agentSessionId.length > 160) throw new Error('Invalid originating agent')
+    for (const project of this.deps.database.listProjects()) for (const workspace of this.deps.database.listSessions(project.id)) {
+      const scope: AgentControlScope = { projectId: project.id, sessionId: workspace.id, agentSessionId: '' }
+      const open = this.tabs(scope).find(tab => tab.kind === 'agent' && tab.resourceId === agentSessionId)
+      if (open) { await this.ui(scope, 'tabs.focus', { tabId: open.id }); return }
+      if (workspace.closedTabs.some(tab => tab.kind === 'agent' && tab.resourceId === agentSessionId)) {
+        await this.ui(scope, 'tabs.focus-origin', { agentSessionId })
+        return
+      }
+    }
+    throw new Error('The originating agent tab is no longer available.')
   }
 
   releaseByOwner(targetAgentSessionId: string): void {
@@ -326,7 +378,7 @@ export class AgentControl {
   }
 
   private catalog(scope: AgentControlScope): Array<{ provider: StructuredProvider; available: boolean; source: 'runtime' | 'configured'; models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }> }> {
-    return this.deps.providers().filter(provider => provider.id === 'codex' || provider.id === 'claude').map(provider => {
+    return this.deps.providers().filter(provider => provider.id === 'codex' || provider.id === 'claude' || provider.id === 'local').map(provider => {
       const runtime = this.tabs(scope).filter(tab => tab.kind === 'agent' && tab.state?.provider === provider.id).map(tab => this.deps.database.structured.snapshot(tab.resourceId!)?.capabilities).find(capabilities => capabilities?.models.length)
       return { provider: provider.id as StructuredProvider, available: provider.available, source: runtime ? 'runtime' : 'configured', models: runtime?.models ?? provider.models.filter(model => !['default', 'auto'].includes(model.id)).map(model => ({ ...model, effort: provider.efforts.map(effort => effort.id).filter(id => id !== 'auto') })) }
     })
@@ -466,6 +518,40 @@ export class AgentControl {
         return { ...this.observation(target, tab, state, new Date().toISOString()), ...state, activeTools, items: recent.sort((a, b) => a.sequence - b.sequence), truncated: state.truncated || state.items.length > recent.length }
       }
       if (method === 'agents.history') return database.structured.events(id, typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0).slice(0, 100)
+      if (method === 'agents.configure') {
+        if (Object.keys(args).some(key => !['agentSessionId', 'model', 'effort'].includes(key))) throw new Error('agents.configure accepts only agentSessionId, model, and effort')
+        const spec = database.structured.spec<AgentSpec>(id)
+        if (!spec || !['codex', 'claude', 'local'].includes(spec.provider)) throw new Error('This native provider does not support structured model configuration')
+        const provider = spec.provider as StructuredProvider
+        if (provider !== tab.state?.provider) throw new Error('The visible tab provider does not match the native conversation')
+        const configured = this.configuredTarget(scope, id)
+        const desired = this.configurableSettings(id, provider, args)
+        const visibleBefore = { provider, model: String(configured.tab.state?.model ?? desired.previous.model ?? ''), ...(configured.tab.state?.effort === undefined ? {} : { effort: String(configured.tab.state.effort) }) }
+        await this.ui(configured.scope, 'agents.configure', { tabId: configured.tab.id, agentSessionId: id, provider, model: desired.model, ...(desired.effort === undefined ? {} : { effort: desired.effort }) })
+        try {
+          this.authorize(scope)
+          const current = this.configuredTarget(scope, id)
+          if (current.tab.id !== configured.tab.id) throw new Error('The controlled tab changed while its settings were being applied')
+          const fresh = this.configurableSettings(id, provider, args)
+          if (JSON.stringify(fresh.previous) !== JSON.stringify(desired.previous)) throw new Error('The coworker settings changed while its model and effort were being applied')
+          sessions.saveSettings(id, desired.next)
+        } catch (error) {
+          // Compensation is compare-and-set too. A relationship release can race this renderer
+          // round trip, and the owner may immediately choose something newer. Restore the old tab
+          // metadata only while both durable settings and visible metadata are still exactly the
+          // values this call observed/applied.
+          const currentState = database.structured.snapshot(id)
+          const currentTab = this.tabs(configured.scope).find(candidate => candidate.id === configured.tab.id && candidate.resourceId === id)
+          const visibleIsOurs = currentTab?.state?.provider === provider && currentTab.state.model === desired.model && (currentTab.state.effort === desired.effort || desired.effort === undefined && currentTab.state.effort === 'auto')
+          if (currentState && JSON.stringify(currentState.settings) === JSON.stringify(desired.previous) && visibleIsOurs) {
+            await this.ui(configured.scope, 'agents.configure', { tabId: configured.tab.id, agentSessionId: id, ...visibleBefore, expectedModel: desired.model, expectedEffort: desired.effort ?? 'auto' }).catch(() => undefined)
+          }
+          throw error
+        }
+        await this.ui(configured.scope, 'agents.configure-confirmed', { tabId: configured.tab.id, agentSessionId: id, model: desired.model, ...(desired.effort === undefined ? {} : { effort: desired.effort }) })
+        const saved = database.structured.snapshot(id)!
+        return { agentSessionId: id, tabId: configured.tab.id, uri: configured.tab.uri, projectId: configured.scope.projectId, workspaceId: configured.scope.sessionId, provider, model: saved.settings.model, effort: saved.settings.effort ?? null, effective: 'next-turn', phase: saved.phase }
+      }
       if (method === 'agents.resume' || method === 'agents.fork') {
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot resume or fork a writable conversation')
         if (method === 'agents.resume') { await sessions.resume(id, state.settings); return { agentSessionId: id, phase: database.structured.snapshot(id)?.phase } }
@@ -636,7 +722,9 @@ export class AgentControl {
         // The orchestration row belongs to the dispatching project, so a worker handed to a
         // sibling project is not asked to close a task it cannot even see; its controller does that.
         const coordination = tab.projectId === scope.projectId
-          ? '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol.'
+          ? tab.state!.provider === 'local'
+            ? '\n\nConductor orchestration task: ' + task.id + '. When finished, report concrete evidence, tests, and remaining limitations to your controller ' + scope.agentSessionId + '. Your controller updates the orchestration task.'
+            : '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol.'
           : '\n\nThis work was handed to the ' + (this.deps.database.getProject(tab.projectId)?.name ?? 'this') + ' project by a coworker in ' + (this.deps.database.getProject(scope.projectId)?.name ?? 'another project') + '. You work only in this project; your controller is ' + scope.agentSessionId + ' and tracks the task on its own side, so report your result here rather than looking for its task board.'
         await this.call(scope, 'agents.submit', { agentSessionId: tab.resourceId, prompt: String(request.prompt) + ownership + coordination })
         accepted = true

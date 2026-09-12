@@ -33,6 +33,7 @@ import {
   type ExplorerOpenMode
 } from './workspace-sidebar-types'
 import './ExplorerSidebar.css'
+import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag, encodeConductorFileDrag, isComposerFileDrag } from './composer-file-drop'
 
 interface ExplorerSidebarProps {
   project: ProjectRecord
@@ -559,11 +560,15 @@ export function ExplorerSidebar({
     setSelectedPath(entry.relativePath)
     event.dataTransfer.effectAllowed = 'move'
     event.dataTransfer.setData('text/plain', entry.relativePath)
+    event.dataTransfer.setData(CONDUCTOR_FILE_DRAG, encodeConductorFileDrag({ projectId: project.id, path: entry.relativePath, kind: entry.kind }))
   }
 
   const dragOver = (event: React.DragEvent, directory: string): void => {
     const entry = draggingEntryRef.current
-    if (!entry || !canMoveTo(entry, directory)) return
+    const transferred = decodeConductorFileDrag(event.dataTransfer.getData(CONDUCTOR_FILE_DRAG))
+    const external = event.dataTransfer.types.includes('Files')
+    const internalType = event.dataTransfer.types.includes(CONDUCTOR_FILE_DRAG)
+    if (entry ? !canMoveTo(entry, directory) : !external && !internalType && !(transferred?.kind === 'file' && transferred.projectId === project.id)) return
     event.preventDefault()
     event.stopPropagation()
     event.dataTransfer.dropEffect = 'move'
@@ -574,7 +579,34 @@ export function ExplorerSidebar({
     event.preventDefault()
     event.stopPropagation()
     const entry = draggingEntryRef.current
-    if (entry && canMoveTo(entry, directory)) void moveEntry(entry, directory)
+    if (entry && canMoveTo(entry, directory)) { void moveEntry(entry, directory); return }
+    const transferred = decodeConductorFileDrag(event.dataTransfer.getData(CONDUCTOR_FILE_DRAG))
+    if (transferred) {
+      if (transferred.projectId !== project.id || transferred.kind !== 'file') { notify('Move files only within their own project.'); return }
+      void window.conductor.files.move(project.id, transferred.path, directory).then(moved => {
+        onPathChanged?.(transferred.path, moved.relativePath, 'file')
+        return refresh()
+      }).catch(reason => notify(cleanIpcError(reason)))
+      return
+    }
+    if (!isComposerFileDrag(event.dataTransfer.types)) return
+    const files = [...event.dataTransfer.files]
+    void (async () => {
+      let moved = 0
+      try {
+        for (const file of files) {
+          const sourcePath = window.conductor.files.pathForFile(file)
+          if (!sourcePath) throw new Error(`The operating system did not provide a path for ${file.name}`)
+          await window.conductor.files.moveExternalDrop(project.id, sourcePath, directory)
+          moved++
+        }
+      } catch (reason) {
+        if (moved) await refresh()
+        throw new Error(`${moved ? `${moved} file${moved === 1 ? '' : 's'} moved before the failure. ` : ''}${cleanIpcError(reason)}`)
+      }
+      await refresh()
+      notify(`Moved ${files.length} file${files.length === 1 ? '' : 's'} into ${directory || project.name}`)
+    })().catch(reason => notify(cleanIpcError(reason)))
   }
 
   const renameProject = async (name: string): Promise<void> => {

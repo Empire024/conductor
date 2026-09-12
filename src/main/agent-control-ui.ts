@@ -47,10 +47,15 @@ export class AgentControlUi {
       if (!control.tabs(scope).some(tab => tab.id === tabId)) throw new Error('Tab is no longer open')
       await this.request({ ...scope, id: randomUUID(), action: 'tabs.focus', params: { tabId } })
     })
+    ipcMain.handle('agent-control:focus-origin', async (event, agentSessionId: string) => {
+      this.trusted(event)
+      if (typeof agentSessionId !== 'string' || !agentSessionId || agentSessionId.length > 160) throw new Error('Invalid originating agent')
+      await control.focusOrigin(agentSessionId)
+    })
   }
   close(): void {
     ipcMain.removeListener('agent-control:response', this.response)
-    for (const channel of ['agent-control:links', 'agent-control:release', 'agent-control:focus-tab', 'agent-control:open-uri']) ipcMain.removeHandler(channel)
+    for (const channel of ['agent-control:links', 'agent-control:release', 'agent-control:focus-tab', 'agent-control:focus-origin', 'agent-control:open-uri']) ipcMain.removeHandler(channel)
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('Conductor is shutting down')) }
     this.pending.clear()
   }

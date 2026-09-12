@@ -32,6 +32,48 @@ describe('visible agent control', () => {
     await expect(handleAgentControlRequest(request('tabs.close', { tabId: 'missing' }), host)).rejects.toThrow('no longer open')
     expect(host.commit).not.toHaveBeenCalled()
   })
+  it('restores and focuses only the exact retained origin tab', async () => {
+    const { host, request, current } = fixture()
+    const initial = listGroups(current().layout.root)[0]!
+    const retained = { id: 'retained-source-tab', kind: 'agent' as const, title: 'Retained source', resourceId: 'retained-source' }
+    current().closedTabs = [{ id: 'same-title', kind: 'agent', title: 'Retained source', resourceId: 'different-source' }, retained]
+    const restored = await handleAgentControlRequest(request('tabs.focus-origin', { agentSessionId: retained.resourceId }), host)
+    expect(restored).toMatchObject({ id: retained.id, uri: 'conductor://project/tab/' + retained.id })
+    expect(listGroups(current().layout.root)[0]!.tabs.find(tab => tab.id === retained.id)).toEqual(retained)
+    expect(listGroups(current().layout.root)[0]!.activeTabId).toBe(retained.id)
+    expect(current().closedTabs).toEqual([expect.objectContaining({ id: 'same-title' })])
+    expect(host.commit).toHaveBeenLastCalledWith(current(), initial.id, true)
+    await expect(handleAgentControlRequest(request('tabs.focus-origin', { agentSessionId: 'guessed-source' }), host)).rejects.toThrow('no longer retained')
+  })
+  it('persists only model and effort on the exact visible agent tab', async () => {
+    const { host, request, current } = fixture()
+    const group = listGroups(current().layout.root)[0]!
+    const tab = { id: 'worker-tab', kind: 'agent' as const, title: 'Worker', resourceId: 'worker', state: { provider: 'codex', model: 'old-model', effort: 'low', machineId: 'local', permission: 'accept-edits' } }
+    current().layout = { ...current().layout, root: { ...group, activeTabId: tab.id, tabs: [...group.tabs, tab] } }
+    const result = await handleAgentControlRequest(request('agents.configure', { tabId: tab.id, agentSessionId: tab.resourceId, provider: 'codex', model: 'new-model', effort: 'high', permission: 'auto' }), host)
+    expect(result).toMatchObject({ id: tab.id, state: { provider: 'codex', model: 'new-model', effort: 'high', machineId: 'local', permission: 'accept-edits' } })
+    expect(listGroups(current().layout.root)[0]!.tabs.find(candidate => candidate.id === tab.id)?.state).toEqual({ provider: 'codex', model: 'new-model', effort: 'high', machineId: 'local', permission: 'accept-edits' })
+    expect(host.commit).toHaveBeenLastCalledWith(current(), group.id, false)
+    await expect(handleAgentControlRequest(request('agents.configure', { tabId: tab.id, agentSessionId: 'someone-else', provider: 'codex', model: 'x', effort: 'low' }), host)).rejects.toThrow('no longer open')
+  })
+  it('announces only a durable confirmation that still matches visible metadata', async () => {
+    class TestCustomEvent<T = unknown> extends Event { detail: T; constructor(type: string, init: CustomEventInit<T>) { super(type); this.detail = init.detail as T } }
+    vi.stubGlobal('window', new EventTarget())
+    vi.stubGlobal('CustomEvent', TestCustomEvent)
+    const { host, request, current } = fixture()
+    const group = listGroups(current().layout.root)[0]!
+    const tab = { id: 'worker-tab', kind: 'agent' as const, title: 'Worker', resourceId: 'worker', state: { provider: 'codex', model: 'new-model', effort: 'high' } }
+    current().layout = { ...current().layout, root: { ...group, tabs: [...group.tabs, tab] } }
+    const changes: unknown[] = []
+    const listener = (event: Event): void => { changes.push((event as CustomEvent).detail) }
+    window.addEventListener('conductor:agent-control-settings-changed', listener)
+    await expect(handleAgentControlRequest(request('agents.configure-confirmed', { tabId: tab.id, agentSessionId: 'worker', model: 'new-model', effort: 'high' }), host)).resolves.toEqual({ notified: true })
+    await expect(handleAgentControlRequest(request('agents.configure-confirmed', { tabId: tab.id, agentSessionId: 'worker', model: 'stale-model', effort: 'low' }), host)).resolves.toEqual({ notified: false, superseded: true })
+    window.removeEventListener('conductor:agent-control-settings-changed', listener)
+    expect(changes).toEqual([{ agentSessionId: 'worker', model: 'new-model', effort: 'high' }])
+    expect(host.commit).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
   it('splits into a visible new group and identifies detached tabs in list results', async () => {
     const { host, request, current } = fixture()
     host.detachedId = 'floating'

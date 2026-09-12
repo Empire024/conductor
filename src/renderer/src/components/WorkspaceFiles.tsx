@@ -10,7 +10,10 @@ import { FilePicker } from './FilePicker'
 import { runFileLinkAction } from './file-link-actions'
 import { buildFileLinkMenuEntries, FILE_LINK_MENU_ICONS, type FileLinkMenuAction } from './file-link-menu'
 import { changeWorkspacePath, loadWorkspaceFiles, openWorkspaceFile, recentWorkspaceFiles, type OpenWorkspaceFile, type WorkspaceFile } from './workspace-files-state'
+import { workspaceFileKey, workspaceFileMachine } from './workspace-files-state'
 import { recordRecentFile } from './recent-files-store'
+import { isRemoteFileMachine } from '../remote-files'
+import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import './WorkspaceFiles.css'
 
 const notify = (message: string): void => { window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })) }
@@ -18,7 +21,7 @@ const notify = (message: string): void => { window.dispatchEvent(new CustomEvent
 function FileBrowser({ project, file }: { project: ProjectRecord; file: WorkspaceFile }): React.JSX.Element {
   const [url, setUrl] = useState(''), [error, setError] = useState('')
   useEffect(() => { let live = true; void window.conductor.files.browserUrl(project.id, file.path).then((value) => { if (live) setUrl(value) }).catch((reason: unknown) => { if (live) setError(String(reason)) }); return () => { live = false } }, [project.id, file.path])
-  return url ? <BrowserPane key={url} initialUrl={url} compact performanceTabId={file.id} /> : <p className="editor-loading">{error || 'Opening browser…'}</p>
+  return url ? <BrowserPane key={url} projectId={project.id} initialUrl={url} compact performanceTabId={file.id} /> : <p className="editor-loading">{error || 'Opening browser…'}</p>
 }
 export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFilesDefault }: { projects: ProjectRecord[]; projectId: string; workspaceId: string; showHiddenFilesDefault?: boolean }): React.JSX.Element | null {
   const [state, setState] = useState(() => loadWorkspaceFiles(workspaceId))
@@ -37,11 +40,12 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
   const stateRef = useRef(state); stateRef.current = state
   const active = state.files.find((file) => file.id === state.activeId) ?? state.files[0]
   const open = (file: OpenWorkspaceFile): void => {
+    const scoped = { ...file, machineId: file.machineId || LOCAL_MACHINE_ID, mode: isRemoteFileMachine(file.machineId) ? 'editor' as const : file.mode }
     // Only a real editor open counts as "opened" — previews and browser links must not skew recency.
-    if (file.mode === 'editor') recordRecentFile(file.projectId, file.path)
+    if (scoped.mode === 'editor' && !isRemoteFileMachine(scoped.machineId)) recordRecentFile(scoped.projectId, scoped.path)
     setState((current) => {
-      const existing = current.files.find((item) => item.projectId === file.projectId && item.path === file.path)
-      const next = { ...file, id: existing?.id ?? 'document:' + workspaceId + ':' + crypto.randomUUID() }
+      const existing = current.files.find((item) => workspaceFileKey(item) === workspaceFileKey(scoped))
+      const next = { ...scoped, id: existing?.id ?? 'document:' + workspaceId + ':' + crypto.randomUUID() }
       return { files: existing ? current.files.map((item) => item.id === existing.id ? { ...item, ...next } : item) : [...current.files, next], activeId: next.id }
     })
   }
@@ -52,7 +56,8 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
   }
   const runFileMenuAction = (action: FileLinkMenuAction, file: WorkspaceFile): void => {
     setMenu(null)
-    runFileLinkAction(action, { projectId: file.projectId, path: file.path, line: file.line }, (path, line) => open({ projectId: file.projectId, path, mode: 'editor', line, allowBinary: file.allowBinary }), notify)
+    if (isRemoteFileMachine(file.machineId) && action !== 'edit') { notify('Remote files stay on their host. Open this file in the editor to inspect or change it.'); return }
+    runFileLinkAction(action, { projectId: file.projectId, path: file.path, line: file.line }, (path, line) => open({ machineId: workspaceFileMachine(file), projectId: file.projectId, path, mode: 'editor', line, allowBinary: file.allowBinary }), notify)
   }
   useEffect(() => {
     if (!menu) return
@@ -67,6 +72,7 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
   const finishNaming = async (): Promise<void> => {
     const entry = namingRef.current
     if (!entry || renamingRef.current) return
+    if (isRemoteFileMachine(entry.file.machineId)) { setError('Rename remote files from their host.'); return }
     const name = entry.value.trim()
     if (!name || name === entry.file.path.split('/').pop()) { stopNaming(); return }
     renamingRef.current = true; setRenaming(true); setError('')
@@ -81,12 +87,13 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
   }
   const createFile = async (): Promise<void> => {
     if (creatingRef.current) return
+    if (active && isRemoteFileMachine(active.machineId)) { setError('Create remote files from their host. No local file was created.'); return }
     creatingRef.current = true; setCreating(true); setError('')
     try {
       const owner = active?.projectId ?? projectId
       const directory = active?.path.includes('/') ? active.path.slice(0, active.path.lastIndexOf('/')) : ''
       const created = await window.conductor.files.createUntitled(owner, directory)
-      const file: WorkspaceFile = { id: 'document:' + workspaceId + ':' + crypto.randomUUID(), projectId: owner, path: created.relativePath, mode: 'editor' }
+      const file: WorkspaceFile = { id: 'document:' + workspaceId + ':' + crypto.randomUUID(), machineId: LOCAL_MACHINE_ID, projectId: owner, path: created.relativePath, mode: 'editor' }
       // A workspace may change while the file is being created. Persist its
       // new tab under the original workspace even if this view was unmounted.
       const current = mounted.current ? stateRef.current : loadWorkspaceFiles(workspaceId)
@@ -123,9 +130,10 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
     const receive = (event: Event): void => open((event as CustomEvent<OpenWorkspaceFile>).detail)
     const pathChanged = (): void => setState(loadWorkspaceFiles(workspaceId))
     const agentFile = (event: Event): void => {
-      const detail = (event as CustomEvent<{ cwd: string; path: string; mode: 'browser' | 'external'; line?: number }>).detail
-      const project = projects.find((item) => item.path.replaceAll('\\', '/').toLowerCase() === detail.cwd.replaceAll('\\', '/').replace(/\/$/, '').toLowerCase())
+      const detail = (event as CustomEvent<{ cwd: string; projectId?: string; machineId?: string; path: string; mode: 'browser' | 'external'; line?: number }>).detail
+      const project = detail.projectId ? projects.find((item) => item.id === detail.projectId) : projects.find((item) => item.path.replaceAll('\\', '/').toLowerCase() === detail.cwd.replaceAll('\\', '/').replace(/\/$/, '').toLowerCase())
       if (!project) return
+      if (isRemoteFileMachine(detail.machineId)) { notify('Browser and external-app views are not available for a remote host file.'); return }
       if (detail.mode === 'external') void window.conductor.files.openInBrowser(project.id, detail.path).catch((reason: unknown) => notify(String(reason)))
       else open({ projectId: project.id, path: detail.path, mode: 'browser', line: detail.line })
     }
@@ -166,23 +174,23 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
           {naming?.file.id === file.id ? <div className="file-tab-naming">{(() => { const { icon: NamingIcon, colorClass } = fileTypeStyle(naming.value); return <NamingIcon size={13} className={colorClass} /> })()}<input ref={namingInput} className="file-tab-name" aria-label="New file name" value={naming.value} disabled={renaming} onChange={(event) => { const next = { ...naming, value: event.target.value }; namingRef.current = next; setNaming(next) }} onBlur={() => void finishNaming()} onKeyDown={(event) => {
             if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); stopNaming(); focusEditor() }
             if (event.key === 'Enter') { event.preventDefault(); event.stopPropagation(); void finishNaming().then(focusEditor) }
-          }} /></div> : <button role="tab" aria-selected={file.id === active.id} title={projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
+          }} /></div> : <button role="tab" aria-selected={file.id === active.id} title={(isRemoteFileMachine(file.machineId) ? 'Remote ' + workspaceFileMachine(file) + ' · ' : '') + projects.find((item) => item.id === file.projectId)?.name + ' / ' + file.path + (file.mode === 'browser' ? ' · Open in browser' : '')}
             onClick={() => setState((current) => ({ ...current, activeId: file.id }))} onAuxClick={(event) => { if (event.button === 1) { event.preventDefault(); void close(file.id) } }} onContextMenu={(event) => showFileMenu(event, file)} data-autoscroll="off">
             {file.mode === 'browser' ? <Globe2 size={13} /> : (() => { const { icon: TabIcon, colorClass } = fileTypeStyle(file.path); return <TabIcon size={13} className={colorClass} /> })()}<span>{file.path.split('/').pop()}</span>{dirtyIds.has(file.id) && <i className="file-dirty-dot" aria-label="Unsaved changes" />}
           </button>}<button className="file-tab-close" aria-label={'Close ' + file.path} onMouseDown={() => { if (namingRef.current?.file.id === file.id) stopNaming() }} onClick={() => void close(file.id)}><X size={12} /></button>
         </div>)}
-        <button className="file-new" title="New file" aria-label="New file" disabled={creating || renaming} onClick={() => void createFile()}><Plus size={15} /></button>
+        <button className="file-new" title={active && isRemoteFileMachine(active.machineId) ? 'Create files on the remote host' : 'New file'} aria-label="New file" disabled={creating || renaming || Boolean(active && isRemoteFileMachine(active.machineId))} onClick={() => void createFile()}><Plus size={15} /></button>
       </div>
       {error && <p className="file-create-error" role="alert">{error}</p>}
-      <div className="file-view-toolbar"><span title={active.path}>{active.path}</span>
-        {([['editor', FileCode2, 'Edit'], ['preview', Eye, 'Preview'], ['browser', Globe2, 'Open in browser']] as const).map(([mode, Icon, label]) => <button key={mode} title={label} aria-label={label} aria-pressed={active.mode === mode} onClick={() => open({ ...active, mode })}><Icon size={14} /></button>)}
+      <div className="file-view-toolbar"><span title={active.path}>{isRemoteFileMachine(active.machineId) ? `Remote · ${workspaceFileMachine(active)} · ` : ''}{active.path}</span>
+        {([['editor', FileCode2, 'Edit'], ['preview', Eye, 'Preview'], ['browser', Globe2, 'Open in browser']] as const).map(([mode, Icon, label]) => <button key={mode} title={isRemoteFileMachine(active.machineId) && mode !== 'editor' ? `${label} is unavailable for remote files` : label} aria-label={label} aria-pressed={active.mode === mode} disabled={isRemoteFileMachine(active.machineId) && mode !== 'editor'} onClick={() => open({ ...active, mode })}><Icon size={14} /></button>)}
       </div>
       <div className="workspace-document-body">
         {state.files.map((file) => {
           const project = projects.find((item) => item.id === file.projectId)
           if (!project) return file.id === active.id ? <p key={file.id}>This project is no longer loaded.</p> : null
           return <div className="file-tab-content" key={file.id} hidden={file.id !== active.id}>
-            {file.mode === 'editor' ? <CodePane project={project} tabId={file.id} path={file.path} line={file.line} allowBinary={file.allowBinary} autoFocus={naming?.file.id !== file.id} /> : file.mode === 'browser' ? <FileBrowser project={project} file={file} /> : <FilePreviewPane project={project} path={file.path} onOpenEditor={(path, allowBinary) => open({ projectId: project.id, path, mode: 'editor', allowBinary })} />}
+            {isRemoteFileMachine(file.machineId) && file.mode !== 'editor' ? <p className="editor-loading">Remote files open in the guarded text editor only.</p> : file.mode === 'editor' ? <CodePane project={project} tabId={file.id} path={file.path} line={file.line} allowBinary={file.allowBinary} autoFocus={naming?.file.id !== file.id} machineId={workspaceFileMachine(file)} /> : file.mode === 'browser' ? <FileBrowser project={project} file={file} /> : <FilePreviewPane project={project} path={file.path} onOpenEditor={(path, allowBinary) => open({ machineId: LOCAL_MACHINE_ID, projectId: project.id, path, mode: 'editor', allowBinary })} />}
           </div>
         })}
       </div>
@@ -191,7 +199,7 @@ export function WorkspaceFiles({ projects, projectId, workspaceId, showHiddenFil
     {menu && createPortal(
       <div className="cursor-context-menu file-tab-context-menu" role="menu" aria-label={'Actions for ' + menu.file.path} style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
         <div className="context-menu-label">{menu.file.path.split('/').pop()}</div>
-        {buildFileLinkMenuEntries().map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} role="menuitem" onClick={() => runFileMenuAction(entry.action, menu.file)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
+        {buildFileLinkMenuEntries().filter(entry => !isRemoteFileMachine(menu.file.machineId) || entry.action === 'edit').map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} role="menuitem" onClick={() => runFileMenuAction(entry.action, menu.file)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
       </div>,
       document.body
     )}

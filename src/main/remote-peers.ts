@@ -70,6 +70,7 @@ export class RemoteAccessError extends Error {
   constructor(message: string, readonly status = 403, readonly code?: 'peer-revoked') { super(message) }
 }
 
+/** Durable authority stamped by the authenticated host, never accepted from a remote caller. */
 /**
  * True when the account check failed for a reason waiting cannot fix: GitHub rejected the
  * credential, or this machine has no usable one to ask with. The offline grace exists for a flaky
@@ -98,6 +99,8 @@ export class RemotePeers {
   private seenNonces = new Map<string, number>()
   private lastKeyCheck = 0
   private keyCheckOk = 0
+  /** Changes whenever an owner action invalidates authority already being checked asynchronously. */
+  private authorityRevision = 0
   private activityLog: RemoteActivityEntry[] = []
   readonly machineId: string
 
@@ -159,7 +162,9 @@ export class RemotePeers {
   getSettings(): RemoteControlSettings { return { ...this.settings } }
 
   updateSettings(patch: Partial<RemoteControlSettings>): RemoteControlSettings {
+    const before = this.settings
     this.settings = normalizeRemoteSettings({ ...this.settings, ...patch })
+    if (before.enabled !== this.settings.enabled) this.authorityRevision++
     this.deps.store.setSetting(SETTINGS_SETTING, JSON.stringify(this.settings))
     this.deps.changed?.()
     return this.getSettings()
@@ -254,8 +259,10 @@ export class RemotePeers {
    * key the account actually lists, so the approval prompt can never be raised by a stranger.
    */
   async beginPairing(attempt: PairingAttempt): Promise<PendingPairingRequest> {
+    if (!this.settings.enabled) throw new RemoteAccessError('Remote control is switched off on this machine.', 503)
     const accountId = this.deps.accountId()
     if (accountId === null) throw new RemoteAccessError('This machine is not signed in to GitHub.', 401)
+    const authorityRevision = this.authorityRevision
     this.consumeTicket(attempt.code)
     this.checkFreshness(attempt.nonce, attempt.timestamp, attempt.fingerprint, this.currentFingerprint)
     const payload: ChallengePayload = {
@@ -271,6 +278,15 @@ export class RemotePeers {
     if (!await this.keyBelongsToAccount(attempt.publicKey, true)) {
       throw new RemoteAccessError('That machine is not signed in to the same GitHub account. Its device key is not registered on this account.', 403)
     }
+    // GitHub is a network boundary. Re-read every piece of local authority after crossing it:
+    // disabling remote control, signing out, switching account or explicitly revoking all access
+    // while the request is waiting must win over the stale answer that just came back.
+    if (authorityRevision !== this.authorityRevision || !this.settings.enabled) {
+      throw new RemoteAccessError('Remote access changed while GitHub was confirming this machine. Start pairing again.', 409)
+    }
+    const currentAccountId = this.deps.accountId()
+    if (currentAccountId === null) throw new RemoteAccessError('This machine is not signed in to GitHub.', 401)
+    if (currentAccountId !== accountId) throw new RemoteAccessError('This machine changed GitHub accounts while pairing. Start again.', 409)
     const now = this.now()
     const request: PendingPairingRequest = {
       id: randomUUID(),
@@ -293,6 +309,10 @@ export class RemotePeers {
   approve(pendingId: string, grantedProjectIds: string[]): RemotePeerRecord {
     const request = this.listPending().find(entry => entry.id === pendingId)
     if (!request) throw new RemoteAccessError('That pairing request is no longer waiting.', 404)
+    if (!this.settings.enabled) throw new RemoteAccessError('Remote control is switched off on this machine.', 503)
+    const accountId = this.deps.accountId()
+    if (accountId === null) throw new RemoteAccessError('This machine is not signed in to GitHub.', 401)
+    if (request.accountId !== accountId) throw new RemoteAccessError('That pairing request belongs to a different GitHub account. Start again.', 409)
     const registered = this.deps.projects()
     const chosen = [...new Set(grantedProjectIds)].flatMap(id => registered.filter(project => project.id === id))
     if (!chosen.length) throw new RemoteAccessError('Choose at least one registered project to share.', 400)
@@ -336,6 +356,8 @@ export class RemotePeers {
    * it answers with; it gets exactly the freshness rules a call gets.
    */
   verifyPairingPoll(input: { publicKey: string; nonce: string; timestamp: number; signature: string; fingerprint: string }): string {
+    if (!this.settings.enabled) throw new RemoteAccessError('Remote control is switched off on this machine.', 503)
+    if (this.deps.accountId() === null) throw new RemoteAccessError('This machine is not signed in to GitHub.', 401)
     this.checkFreshness(input.nonce, input.timestamp, input.fingerprint, this.currentFingerprint)
     const verified = verifyChallenge(input.publicKey, {
       audienceMachineId: this.machineId,
@@ -352,7 +374,10 @@ export class RemotePeers {
 
   /** A pending pairing request the peer can poll for, so it learns the owner's answer. */
   pairingResult(keyFingerprint: string): { status: 'pending' | 'approved' | 'denied'; peer?: RemotePeerRecord } {
-    const peer = this.peers.find(entry => entry.keyFingerprint === keyFingerprint && !entry.revokedAt)
+    if (!this.settings.enabled) throw new RemoteAccessError('Remote control is switched off on this machine.', 503)
+    const accountId = this.deps.accountId()
+    if (accountId === null) throw new RemoteAccessError('This machine is not signed in to GitHub.', 401)
+    const peer = this.peers.find(entry => entry.keyFingerprint === keyFingerprint && !entry.revokedAt && entry.accountId === accountId)
     if (peer) return { status: 'approved', peer: { ...peer } }
     return { status: this.listPending().some(entry => entry.keyFingerprint === keyFingerprint) ? 'pending' : 'denied' }
   }
@@ -360,18 +385,23 @@ export class RemotePeers {
   revoke(peerId: string): void {
     const peer = this.peers.find(entry => entry.id === peerId)
     if (!peer) return
+    this.authorityRevision++
     peer.revokedAt = new Date(this.now()).toISOString()
     this.persist()
     this.record(peer, 'peer.revoke', null, `Revoked ${peer.machineName}`, 'denied')
   }
 
   forget(peerId: string): void {
-    this.peers = this.peers.filter(entry => entry.id !== peerId)
+    const peers = this.peers.filter(entry => entry.id !== peerId)
+    if (peers.length === this.peers.length) return
+    this.authorityRevision++
+    this.peers = peers
     this.persist()
   }
 
   /** Signing out of GitHub takes every peer with it; nothing survives the identity it was tied to. */
   revokeAll(reason = 'Signed out of GitHub'): void {
+    this.authorityRevision++
     const at = new Date(this.now()).toISOString()
     for (const peer of this.peers) if (!peer.revokedAt) { peer.revokedAt = at; this.record(peer, 'peer.revoke', null, reason, 'denied') }
     this.pending = []
@@ -400,6 +430,7 @@ export class RemotePeers {
     if (!peer) throw new RemoteAccessError('This machine does not know that peer.', 401, 'peer-revoked')
     if (peer.revokedAt) throw new RemoteAccessError('Access for this machine was revoked.', 403, 'peer-revoked')
     if (peer.accountId !== accountId) throw new RemoteAccessError('That peer was paired with a different GitHub account.', 403, 'peer-revoked')
+    const authorityRevision = this.authorityRevision
     this.checkFreshness(input.nonce, input.timestamp, input.fingerprint, this.currentFingerprint)
     const payload: ChallengePayload = {
       audienceMachineId: this.machineId,
@@ -415,9 +446,27 @@ export class RemotePeers {
       this.revoke(peer.id)
       throw new RemoteAccessError('That device key is no longer registered on this GitHub account, so the peer was revoked.', 403, 'peer-revoked')
     }
-    peer.lastSeenAt = new Date(this.now()).toISOString()
+    // Never return the object captured before the GitHub request. Every owner-controlled source of
+    // authority is mutable while that await is in flight, and revocation must take effect before
+    // the remote method is dispatched.
+    if (authorityRevision !== this.authorityRevision || !this.settings.enabled) {
+      throw new RemoteAccessError('Remote access changed while GitHub was confirming this request.', 403, 'peer-revoked')
+    }
+    const currentAccountId = this.deps.accountId()
+    if (currentAccountId === null) throw new RemoteAccessError('This machine is not signed in to GitHub.', 401, 'peer-revoked')
+    if (currentAccountId !== accountId) throw new RemoteAccessError('That peer was paired with a different GitHub account.', 403, 'peer-revoked')
+    const currentPeer = this.peers.find(entry => entry.id === input.peerId)
+    if (!currentPeer) throw new RemoteAccessError('This machine does not know that peer.', 401, 'peer-revoked')
+    if (currentPeer.revokedAt) throw new RemoteAccessError('Access for this machine was revoked.', 403, 'peer-revoked')
+    if (currentPeer.accountId !== currentAccountId || currentPeer.publicKey !== peer.publicKey) {
+      throw new RemoteAccessError('That peer no longer belongs to this GitHub account.', 403, 'peer-revoked')
+    }
+    currentPeer.lastSeenAt = new Date(this.now()).toISOString()
     this.persist()
-    return { peer: { ...peer, grantedProjects: peer.grantedProjects.map(granted => ({ ...granted })) }, grantedProjects: peer.grantedProjects.map(granted => ({ ...granted })) }
+    return {
+      peer: { ...currentPeer, grantedProjects: currentPeer.grantedProjects.map(granted => ({ ...granted })) },
+      grantedProjects: currentPeer.grantedProjects.map(granted => ({ ...granted }))
+    }
   }
 
   /** The fingerprint of the certificate currently being served; set by the server each time it binds. */
@@ -447,6 +496,49 @@ export class RemotePeers {
       throw new RemoteAccessError(`That project moved from ${granted.identity.path} to ${project.identity.path} since it was shared. Confirm the new location on this machine first.`, 409)
     }
     return project
+  }
+
+  /**
+   * Re-resolves an authenticated snapshot against owner-controlled state. Host operations call
+   * this after every filesystem await so disable, sign-out, revoke, forget or grant changes win.
+   */
+  requireCurrentProject(peer: RemotePeerRecord, projectId: unknown, expectedRevision?: number): RemoteProjectSummary {
+    if (expectedRevision !== undefined && expectedRevision !== this.authorityRevision) {
+      throw new RemoteAccessError('Remote access changed while this request was pending.', 403, 'peer-revoked')
+    }
+    if (!this.settings.enabled) throw new RemoteAccessError('Remote control is switched off on this machine.', 503, 'peer-revoked')
+    const accountId = this.deps.accountId()
+    if (accountId === null) throw new RemoteAccessError('This machine is not signed in to GitHub.', 401, 'peer-revoked')
+    const current = this.peers.find(entry => entry.id === peer.id)
+    if (!current || current.revokedAt || current.accountId !== accountId || current.publicKey !== peer.publicKey) {
+      throw new RemoteAccessError('Remote access changed while this request was pending.', 403, 'peer-revoked')
+    }
+    if (typeof projectId !== 'string' || !projectId) throw new RemoteAccessError('Name a project for this request.', 400)
+    const captured = peer.grantedProjects.find(entry => entry.projectId === projectId)
+    const granted = current.grantedProjects.find(entry => entry.projectId === projectId)
+    const capturedIdentity = captured?.identity
+    const currentIdentity = granted?.identity
+    if (!captured || !granted
+      || Boolean(capturedIdentity) !== Boolean(currentIdentity)
+      || capturedIdentity && currentIdentity && (!sameWorkingCopy(capturedIdentity, currentIdentity) || !samePath(capturedIdentity.path, currentIdentity.path))) {
+      throw new RemoteAccessError('The project grant changed while this request was pending.', 403)
+    }
+    return this.requireProject(current, projectId)
+  }
+
+  /** Reauthorizes a persisted remote-origin prompt at the instant it reaches a provider. */
+  requirePromptAuthority(peerId: unknown, projectId: unknown): RemoteProjectSummary {
+    if (typeof peerId !== 'string' || !peerId || peerId.length > 160) {
+      throw new RemoteAccessError('Remote prompt authority has no valid peer.', 403, 'peer-revoked')
+    }
+    const peer = this.peers.find(entry => entry.id === peerId)
+    if (!peer) throw new RemoteAccessError('The remote peer that queued this prompt is no longer paired.', 403, 'peer-revoked')
+    return this.requireCurrentProject(peer, projectId)
+  }
+
+  captureProjectAuthority(peer: RemotePeerRecord, projectId: unknown): { project: RemoteProjectSummary; revision: number } {
+    const revision = this.authorityRevision
+    return { project: this.requireCurrentProject(peer, projectId, revision), revision }
   }
 
   /**
@@ -481,6 +573,7 @@ export class RemotePeers {
     if (granted.identity && !sameWorkingCopy(project.identity, granted.identity)) {
       throw new RemoteAccessError('That folder holds a different working copy than the one shared, so it cannot be confirmed as a move. Pair the project again.', 409)
     }
+    this.authorityRevision++
     granted.identity = project.identity
     this.persist()
     this.record(peer, 'peer.reshare', projectId, `Confirmed the new location of ${project.name} for ${peer.machineName}`, 'allowed')

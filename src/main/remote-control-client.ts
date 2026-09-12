@@ -98,6 +98,8 @@ async function post(host: string, port: number, fingerprint: string, path: strin
 /** This machine acting as the controller: pairing with, and then calling, other machines. */
 export class RemoteControlClient {
   private connections: RemoteConnection[] = []
+  /** Local-only generations make an exact forget/re-pair or release/reconfirm observable. */
+  private readonly authorityRevisions = new Map<string, number>()
 
   constructor(private readonly deps: RemoteControlClientDependencies) {
     this.connections = this.read()
@@ -157,7 +159,14 @@ export class RemoteControlClient {
 
   get(machineId: string): RemoteConnection | undefined { return this.connections.find(connection => connection.machineId === machineId) }
 
+  authorityRevision(machineId: string): number { return this.authorityRevisions.get(machineId) ?? 0 }
+
+  private bumpAuthority(machineId: string): void {
+    this.authorityRevisions.set(machineId, this.authorityRevision(machineId) + 1)
+  }
+
   forget(machineId: string): void {
+    if (this.connections.some(connection => connection.machineId === machineId)) this.bumpAuthority(machineId)
     this.connections = this.connections.filter(connection => connection.machineId !== machineId)
     this.persist()
   }
@@ -216,6 +225,7 @@ export class RemoteControlClient {
       status: 'pending',
       message: 'Waiting for approval on the other machine.'
     }
+    this.bumpAuthority(ticket.machineId)
     this.connections = [...this.connections.filter(entry => entry.machineId !== ticket.machineId), pending]
     this.persist()
     for (let attempt = 0; attempt < 60; attempt++) {
@@ -233,6 +243,7 @@ export class RemoteControlClient {
           message: null,
           lastContactAt: new Date(this.now()).toISOString()
         }
+        this.bumpAuthority(ticket.machineId)
         this.connections = [...this.connections.filter(entry => entry.machineId !== ticket.machineId), connected]
         this.persist()
         return connected
@@ -274,6 +285,7 @@ export class RemoteControlClient {
       ...connection.projectGrants.filter(entry => entry.localProjectId !== grant.localProjectId && entry.remoteProjectId !== grant.remoteProjectId),
       grant
     ]
+    this.bumpAuthority(machineId)
     connection.unconfirmedRemoteProjectIds = connection.unconfirmedRemoteProjectIds.filter(id => id !== grant.remoteProjectId)
     this.persist()
     return { ...connection }
@@ -282,7 +294,9 @@ export class RemoteControlClient {
   releaseProject(machineId: string, localProjectId: string): void {
     const connection = this.connections.find(entry => entry.machineId === machineId)
     if (!connection) return
-    connection.projectGrants = connection.projectGrants.filter(entry => entry.localProjectId !== localProjectId)
+    const grants = connection.projectGrants.filter(entry => entry.localProjectId !== localProjectId)
+    if (grants.length !== connection.projectGrants.length) this.bumpAuthority(machineId)
+    connection.projectGrants = grants
     this.persist()
   }
 
@@ -299,6 +313,7 @@ export class RemoteControlClient {
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     if (connection.status === 'revoked') throw new RemoteAccessError('That machine revoked this pairing.', 403)
     if (!connection.peerId) throw new RemoteAccessError('That pairing has not been approved yet.', 409)
+    const authorityRevision = this.authorityRevision(machineId)
     const body = Buffer.from(JSON.stringify({ method, args }), 'utf8')
     const { payload, signature } = this.sign(connection, 'call', hashBody(body))
     try {
@@ -308,7 +323,10 @@ export class RemoteControlClient {
         [TIMESTAMP_HEADER]: String(payload.issuedAt),
         [SIGNATURE_HEADER]: signature
       })
-      this.mark(machineId, { status: 'connected', message: null, lastContactAt: new Date(this.now()).toISOString() })
+      if (this.get(machineId) !== connection || this.authorityRevision(machineId) !== authorityRevision) {
+        throw new RemoteAccessError('Remote access changed while this request was pending.', 409)
+      }
+      this.mark(machineId, { status: 'connected', message: null, lastContactAt: new Date(this.now()).toISOString() }, connection, authorityRevision)
       return result
     } catch (error) {
       // Only a dead pairing marks the machine revoked. One call being refused — an unshared
@@ -319,20 +337,23 @@ export class RemoteControlClient {
       this.mark(machineId, {
         status: revoked ? 'revoked' : answered ? 'connected' : 'unreachable',
         message: error instanceof Error ? error.message : String(error)
-      })
+      }, connection, authorityRevision)
       throw error
     }
   }
 
-  private mark(machineId: string, patch: Partial<RemoteConnection>): void {
+  private mark(machineId: string, patch: Partial<RemoteConnection>, expected?: RemoteConnection, revision?: number): void {
     const connection = this.connections.find(entry => entry.machineId === machineId)
     if (!connection) return
+    if (expected && connection !== expected) return
+    if (revision !== undefined && this.authorityRevision(machineId) !== revision) return
     Object.assign(connection, patch)
     this.persist()
   }
 
   /** Signing out drops every outbound pairing; they were only ever valid for that account. */
   clear(): void {
+    for (const connection of this.connections) this.bumpAuthority(connection.machineId)
     this.connections = []
     this.persist()
   }

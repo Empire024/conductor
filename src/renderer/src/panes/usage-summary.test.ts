@@ -187,14 +187,14 @@ describe('detached background tasks', () => {
     expect(summarizeSubagents([child], 'runtime', 'completed')[0]?.status).toBe('unknown')
   })
 
-  it('describes a backgrounded shell task by its command and links its runtime', () => {
+  it('filters a legacy background Bash record from the subagent roster without dropping its tool row', () => {
+    const shell = item(1, { type: 'tool', name: 'Bash', status: 'running', input: { command: 'codex exec --approve-for-me steer' } }, { nativeItemId: 'launch' })
     const agents = summarizeSubagents([
-      item(1, { type: 'tool', name: 'Bash', status: 'running', input: { command: 'codex exec --approve-for-me steer' } }, { nativeItemId: 'launch' }),
+      shell,
       item(2, { type: 'subagent', name: 'Run Codex', status: 'running', detached: true }, { parentId: 'launch', nativeItemId: 'task:a' })
     ], 'runtime', 'running')
-    expect(agents[0]?.task).toContain('codex exec')
-    expect(agents[0]?.linkedProvider).toBe('codex')
-    expect(agents[0]?.detached).toBe(true)
+    expect(agents).toEqual([])
+    expect(shell.data.type).toBe('tool')
   })
 
   it('matches the executable rather than a passing mention of a runtime', () => {

@@ -34,24 +34,26 @@ export const sandboxContainerName = (sessionId: string): string => {
  *  model-produced text is ever parsed by PowerShell or cmd.exe. */
 export const dockerExecutable = (): string => process.env.CONDUCTOR_DOCKER_PATH?.trim() || 'docker'
 
-interface RunOutcome { code: number | null; stdout: string; stderr: string; timedOut: boolean; spawnError?: Error }
+interface RunOutcome { code: number | null; stdout: string; stderr: string; timedOut: boolean; truncated: boolean; spawnError?: Error }
 
 function runDocker(args: string[], timeoutMs: number, maxBytes: number): Promise<RunOutcome> {
   return new Promise(resolvePromise => {
-    let stdout = '', stderr = '', bytes = 0, timedOut = false, settled = false
+    let stdout = '', stderr = '', bytes = 0, timedOut = false, truncated = false, settled = false
     const child = spawn(dockerExecutable(), args, { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
     const finish = (outcome: RunOutcome): void => { if (settled) return; settled = true; clearTimeout(timer); resolvePromise(outcome) }
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, timeoutMs)
     const capture = (chunk: Buffer, target: 'out' | 'err'): void => {
+      const remaining = Math.max(0, maxBytes - bytes)
       bytes += chunk.length
-      if (bytes > maxBytes) { child.kill('SIGKILL'); return }
-      if (target === 'out') stdout += chunk.toString('utf8')
-      else stderr += chunk.toString('utf8')
+      const captured = chunk.subarray(0, remaining).toString('utf8')
+      if (target === 'out') stdout += captured
+      else stderr += captured
+      if (bytes > maxBytes) { truncated = true; child.kill('SIGKILL') }
     }
     child.stdout.on('data', chunk => capture(chunk as Buffer, 'out'))
     child.stderr.on('data', chunk => capture(chunk as Buffer, 'err'))
-    child.on('error', error => finish({ code: null, stdout, stderr, timedOut, spawnError: error as Error }))
-    child.on('close', code => finish({ code, stdout, stderr, timedOut }))
+    child.on('error', error => finish({ code: null, stdout, stderr, timedOut, truncated, spawnError: error as Error }))
+    child.on('close', code => finish({ code, stdout, stderr, timedOut, truncated }))
   })
 }
 
@@ -70,21 +72,24 @@ export async function sandboxImageExists(image: string): Promise<boolean> {
 
 /** Files inside the workspace that policy hides from local models. Masked in the container and
  *  refused by the host-side file tools, so a secret is not merely absent from one of the two.
- *  The scan is shallow and bounded: it exists to catch the ordinary cases (.env, key material,
- *  registry credentials) without walking a large repository on every container start. */
-export function detectSecretPaths(workspace: string, maxDepth = 3, limit = 64): Array<{ relative: string; directory: boolean }> {
+ *  The recursive scan is bounded and fails closed if incomplete; silently truncating a scan
+ *  would expose the rest of the workspace through the command tool. */
+export function detectSecretPaths(workspace: string, maxDepth = 64, limit = 4096): Array<{ relative: string; directory: boolean }> {
   const found: Array<{ relative: string; directory: boolean }> = []
-  const skip = new Set(['node_modules', '.git', 'out', 'dist', 'release', 'build', '.venv', 'venv', '__pycache__'])
+  let visited = 0
   const walk = (dir: string, depth: number): void => {
-    if (found.length >= limit) return
+    if (depth > maxDepth) throw new SandboxUnavailableError('Secret scan exceeded its depth budget; command execution refused')
     let entries: import('node:fs').Dirent[]
-    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { throw new SandboxUnavailableError('Secret scan could not inspect a workspace directory; command execution refused') }
     for (const entry of entries) {
-      if (found.length >= limit) return
+      if (++visited > 200_000) throw new SandboxUnavailableError('Secret scan exceeded its entry budget; command execution refused')
       const full = join(dir, entry.name)
       const rel = relative(workspace, full).replace(/\\/g, '/')
-      if (isSecretPath(rel)) { found.push({ relative: rel, directory: entry.isDirectory() }); continue }
-      if (entry.isDirectory() && depth < maxDepth && !skip.has(entry.name)) walk(full, depth + 1)
+      if (isSecretPath(rel)) {
+        if (found.length >= limit) throw new SandboxUnavailableError('Secret scan exceeded its mask budget; command execution refused')
+        found.push({ relative: rel, directory: entry.isDirectory() }); continue
+      }
+      if (entry.isDirectory()) walk(full, depth + 1)
     }
   }
   walk(workspace, 0)
@@ -138,7 +143,7 @@ export function containerRunArgs(options: {
     ...(existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : [])
   ]
   for (const mask of options.masks) {
-    if (mask.relative.includes(',') || mask.relative.includes('=')) continue
+    if (/[,=\r\n]/.test(mask.relative)) throw new SandboxUnavailableError('A secret path cannot be represented safely as a Docker mask')
     if (mask.directory) args.push('--tmpfs', `/workspace/${mask.relative}:rw,nosuid,nodev,size=1m`)
     else args.push('--mount', `type=bind,source=${dockerPath(options.emptyFile)},target=/workspace/${mask.relative},readonly`)
   }
@@ -166,6 +171,7 @@ export class DockerSandbox {
   private readonly sandbox: SandboxConfig
   private started = false
   private starting?: Promise<void>
+  private maskSignature?: string
 
   constructor(sessionId: string, workspace: string, sandbox: SandboxConfig) {
     this.name = sandboxContainerName(sessionId)
@@ -192,20 +198,37 @@ export class DockerSandbox {
     const emptyFile = join(runDir(), 'masked-empty')
     if (!existsSync(emptyFile)) writeFileSync(emptyFile, '', 'utf8')
     const masks = detectSecretPaths(this.workspace)
+    this.maskSignature = JSON.stringify(masks)
     const created = await runDocker(containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks, emptyFile }), 120_000, 256 * 1024)
     if (created.spawnError || created.code !== 0) throw new SandboxUnavailableError(`Sandbox failed to start: ${(created.stderr || created.stdout).trim().slice(0, 400) || 'docker run failed'}`)
   }
 
   /** Run one command inside the container. Refuses closed on any sandbox problem. */
-  async exec(command: string, timeoutSec = this.sandbox.timeoutSec): Promise<SandboxResult> {
+  async exec(command: string, timeoutSec = this.sandbox.timeoutSec, signal?: AbortSignal): Promise<SandboxResult> {
+    signal?.throwIfAborted()
+    // Other coworkers may create credential files between commands. A running container's
+    // bind mounts cannot acquire new masks; recreate it before executing against changed masks.
+    if (this.started && JSON.stringify(detectSecretPaths(this.workspace)) !== this.maskSignature) await this.stop()
     await this.start()
+    signal?.throwIfAborted()
     const started = Date.now()
-    const outcome = await runDocker(execArgs(this.name, command, timeoutSec), (timeoutSec + 15) * 1000, this.sandbox.maxOutputBytes)
+    // Killing only the docker client leaves the Linux command running. Remove this session's
+    // container on cancellation and await removal before allowing another turn to start.
+    let stopping: Promise<void> | undefined
+    const cancel = (): void => { stopping ??= this.stop() }
+    signal?.addEventListener('abort', cancel, { once: true })
+    let outcome: RunOutcome
+    try { outcome = await runDocker(execArgs(this.name, command, timeoutSec), (timeoutSec + 15) * 1000, this.sandbox.maxOutputBytes) }
+    finally { signal?.removeEventListener('abort', cancel); await stopping }
+    signal?.throwIfAborted()
     if (outcome.spawnError) throw new SandboxUnavailableError('Docker unavailable: the docker CLI could not be launched')
-    const truncated = outcome.stdout.length + outcome.stderr.length >= this.sandbox.maxOutputBytes
+    const truncated = outcome.truncated
     // 124 is `timeout` reporting that it killed the command; 137 is the kill that followed.
     const timedOut = outcome.timedOut || outcome.code === 124 || outcome.code === 137
-    return { exitCode: outcome.code ?? -1, stdout: outcome.stdout, stderr: outcome.stderr, truncated, timedOut, durationMs: Date.now() - started }
+    // Overflow terminates the Docker client, not the container's process tree. Waiting for
+    // container removal also prevents escaped/delayed children surviving a command timeout.
+    if (truncated || timedOut) await this.stop()
+    return { exitCode: truncated ? -1 : outcome.code ?? -1, stdout: outcome.stdout, stderr: outcome.stderr, truncated, timedOut, durationMs: Date.now() - started }
   }
 
   async stop(): Promise<void> {

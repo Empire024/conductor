@@ -5,11 +5,13 @@ import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useSta
 import { Archive, ArrowDown, ArrowLeft, FileDiff, FilePlus2, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, TerminalSquare, MessagesSquare, LoaderCircle, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { MAX_PROMPT_CHARS } from '../../../shared/structured-agent'
-import type { AgentEvent, ContextAttachment, ConversationSearchResult, FileChange, Json, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
+import type { AgentEvent, ContextAttachment, ConversationSearchResult, FileChange, Json, PromptOrigin, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../../../shared/structured-agent-reducer'
 import { coalesceTextDeltas } from './coalesce-stream-events'
 import type { RuntimeTerminalProps } from './RuntimeTerminal'
-import { AgentDialog, ImmutableDiff, coalescedEditLabel, coalescedEditSummary, groupConversationActivities, isConversationActivity, parentLabelAnchors, safeFileTarget, StructuredActivity, toolPresentation } from './StructuredAgentRenderers'
+import { AgentDialog, AgentFileMachineContext, ImmutableDiff, coalescedEditLabel, coalescedEditSummary, groupConversationActivities, isConversationActivity, parentLabelAnchors, safeFileTarget, StructuredActivity, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
+import { isRemoteFileMachine } from '../remote-files'
+import { openConversationFile } from '../conversation-file-open'
 import { MemoryRecallStrip, recallsByItem } from './MemoryRecallStrip'
 import { AgentChangeHistoryView } from './AgentChangeHistory'
 import { StructuredComposerControls } from './StructuredComposerControls'
@@ -22,8 +24,10 @@ import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, 
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
 import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
-import { browserTabOpen } from '../layout/browser-tab'
 import { composerCommands, matchingComposerCommands, type ComposerCommand } from './composer-commands'
+import { ComposerStarterMenu } from './ComposerStarterMenu'
+import { composerStarterChoices, prepareComposerDraft } from './composer-starters'
+import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag, isComposerFileDrag } from '../components/composer-file-drop'
 import { concreteModel } from '../../../shared/agent-model-selection'
 import { localModelLabel } from '../../../shared/local-models'
 import { useComposerDraft } from './use-composer-draft'
@@ -31,6 +35,7 @@ import { initialPermission, rememberPermission } from './permission-memory'
 import { bannerAbsorbsError, runtimeBanner } from './runtime-banner'
 import { cleanIpcError } from '../ipc-errors'
 import { copyText } from '../clipboard'
+import { onAgentControlSettings } from '../agent-control-settings'
 import './StructuredAgentPane.css'
 
 let focusedAgent: { sessionId: string; projectId: string } | null = null
@@ -47,9 +52,14 @@ function storedExpansion(id: string): Record<string, boolean> {
 }
 const activePhases = new Set(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 const displayPhase = (phase: string): string => phase === 'waiting_approval' ? 'Waiting for approval' : phase === 'waiting_input' ? 'Waiting for your answer' : phase.replaceAll('_', ' ')
+type PinnedPrompt = { id: string; text: string; sequence: number; origin?: PromptOrigin }
 
 export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Element {
   const [activeId, setActiveId] = useState(props.conversationId ?? props.resourceId)
+  // Until main reports the durable execution owner, fail closed as remote. This prevents an early
+  // render from probing a same-named controller file for a mirrored conversation.
+  const [fileMachineId, setFileMachineId] = useState('unresolved-remote-owner')
+  const [fileCwd, setFileCwd] = useState(props.project.path)
   const [historical, setHistorical] = useState(false)
   const [projection, setProjection] = useState<SessionProjection>(() => emptyProjection(props.resourceId))
   const [ready, setReady] = useState(false)
@@ -74,6 +84,13 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [settings, setSettings] = useState<SessionSettings>({ permission: initialPermission(structuredProvider), plan: false, model: concreteModel(structuredProvider, props.model), effort: props.effort === 'auto' ? undefined : props.effort })
   const settingsRef = useRef(settings)
   settingsRef.current = settings
+  useEffect(() => onAgentControlSettings(activeId, change => {
+    setSettings(current => {
+      const next = { ...current, model: change.model, effort: change.effort }
+      settingsRef.current = next
+      return next
+    })
+  }), [activeId])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [expansion, setExpansion] = useState<Record<string, boolean>>(() => storedExpansion(props.resourceId))
   const [imagePreviews, setImagePreviews] = useState<Record<string, string>>({})
@@ -90,6 +107,15 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [resuming, setResuming] = useState(false)
   const conversationSwitch = useRef(false)
   const [historyItems, setHistoryItems] = useState<Awaited<ReturnType<typeof window.conductor.structured.history>>>([])
+  useEffect(() => {
+    let current = true
+    setFileMachineId('unresolved-remote-owner')
+    setFileCwd(props.project.path)
+    void window.conductor.remote.sessionFileContext(activeId).then(context => { if (current) { setFileMachineId(context.machineId); setFileCwd(context.cwd ?? props.project.path) } }).catch(reason => {
+      if (current) setError('Cannot establish this conversation\'s file machine: ' + (reason instanceof Error ? reason.message : String(reason)))
+    })
+    return () => { current = false }
+  }, [activeId, props.project.path])
   const [rename, setRename] = useState<string | null>(null)
   const [discovery, setDiscovery] = useState<Json | undefined>(undefined)
   const [commandDiscovery, setCommandDiscovery] = useState<Json | undefined>()
@@ -99,8 +125,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [commandIndex, setCommandIndex] = useState(0)
   const commandListId = useId()
   const commands = matchingComposerCommands(message, composerCommands(projection.capabilities, commandDiscovery))
+  const starterChoices = useMemo(() => composerStarterChoices(projection.capabilities, commandDiscovery), [projection.capabilities, commandDiscovery])
   const commandsOpen = !commandDismissed && !addFileOpen && !historical && commands.length > 0
   const [newOutput, setNewOutput] = useState(false)
+  const [dockedQuestions, setDockedQuestions] = useState<ReadonlySet<string>>(() => new Set())
   const [visibleCount, setVisibleCount] = useState(250)
   const [readingWindow, setReadingWindow] = useState<TimelineItem[] | null>(null)
   const [pendingPromptScroll, setPendingPromptScroll] = useState<string | null>(null)
@@ -110,11 +138,6 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [findResults, setFindResults] = useState<ConversationSearchResult | null>(null)
   const [findSearching, setFindSearching] = useState(false)
   const [findJump, setFindJump] = useState<string | null>(null)
-  // Derived straight from the workspace layout the session already carries, so it can never
-  // drift: true only when a browser pane tab exists in this workspace and is the tab actually
-  // showing, whether it was opened from this button, the @browser mention, another tab's own
-  // strip, or the agent's own browser tool.
-  const browserPanelOpen = useMemo(() => browserTabOpen(props.session.layout), [props.session.layout])
   const findPainted = useRef(false)
   const findScrolled = useRef('')
   const findWidened = useRef('')
@@ -155,6 +178,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setVisibleCount(250)
     setReadingWindow(null)
     setPendingPromptScroll(null)
+    setDockedQuestions(new Set())
     window.clearTimeout(promptFlashTimer.current)
     lastVisibleItems.current = []
     priorSequence.current = 0
@@ -272,23 +296,23 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
 
   useEffect(() => {
     if (inspectAttachment?.kind !== 'image' || !inspectAttachment.path || imagePreviews[inspectAttachment.id]) return
+    if (isRemoteFileMachine(fileMachineId)) { setError('Remote image attachments stay on their host and cannot be previewed here.'); return }
     let disposed = false
     const attachment = inspectAttachment
     void window.conductor.files.readDataUrl(props.project.id, attachment.path!).then(image => {
       if (!disposed) setImagePreviews(current => ({ ...current, [attachment.id]: image.dataUrl }))
     }).catch((reason: unknown) => { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) })
     return () => { disposed = true }
-  }, [inspectAttachment, imagePreviews, props.project.id])
+  }, [inspectAttachment, imagePreviews, props.project.id, fileMachineId])
 
   const onOpenFile = useCallback((raw: string, line?: number): void => {
     const current = propsRef.current
-    const target = safeFileTarget(raw, current.project.path)
+    const target = safeFileTarget(raw, fileCwd)
     if (!target) { setError('The file link is outside this workspace or has an invalid path.'); return }
-    // Confirming the path exists must not read the bytes: an agent can link a
-    // video or a database dump, and loading one to answer "is it there?" stalls
-    // the window before the file tab has decided how to show it.
-    void window.conductor.files.stat(current.project.id, target.path).then(() => current.onOpenFile?.(target.path, line ?? target.line)).catch((reason: unknown) => setError('Cannot open current file: ' + (reason instanceof Error ? reason.message : String(reason))))
-  }, [])
+    void openConversationFile({ machineId: fileMachineId, projectId: current.project.id, path: target.path, line: line ?? target.line },
+      (path, targetLine) => current.onOpenFile?.(path, targetLine))
+      .catch((reason: unknown) => setError('Cannot open current file: ' + (reason instanceof Error ? reason.message : String(reason))))
+  }, [fileCwd, fileMachineId])
   const onExpand = useCallback((id: string): void => {
     setExpansion((current) => {
       const next = { ...current, [id]: !current[id] }
@@ -391,33 +415,66 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
   const addFile = async (requested = filePath): Promise<void> => {
-    const target = safeFileTarget(requested.trim(), props.project.path)
+    if (isRemoteFileMachine(fileMachineId)) { setError('Attach remote file context from the host conversation. No controller file was read.'); return }
+    if (draftRef.current.attachments.length >= 20) { setError('A prompt can have up to 20 attachments.'); return }
+    const target = safeFileTarget(requested.trim(), fileCwd)
     if (!target) { setError('Choose a file within this workspace.'); return }
     try {
-      if (/\.(png|jpe?g|gif|webp)$/i.test(target.path)) {
-        if (!projection.capabilities?.imageAttachments) throw new Error('This provider connection does not currently support local image attachments.')
-        const image = await window.conductor.files.readDataUrl(props.project.id, target.path)
-        const id = crypto.randomUUID()
-        setAttachments((current) => [...current, { id, kind: 'image' as const, name: target.path, path: target.path }].slice(-20))
-        setImagePreviews((current) => Object.fromEntries([...Object.entries(current), [id, image.dataUrl]].slice(-20)))
-        setFilePath('')
-        setAddFileOpen(false)
-        composer.current?.focus()
-        return
+      const attachment = await window.conductor.files.attachContext(props.project.id, target.path)
+      if (attachment.kind === 'image' && !projection.capabilities?.imageAttachments) throw new Error('This provider connection does not currently support local image attachments.')
+      setAttachments(current => {
+        if (current.length >= 20) { setError('A prompt can have up to 20 attachments.'); return current }
+        return [...current.filter(item => item.id !== attachment.id), attachment]
+      })
+      if (attachment.kind === 'image' && attachment.path) {
+        const image = await window.conductor.files.readDataUrl(props.project.id, attachment.path)
+        setImagePreviews(current => Object.fromEntries([...Object.entries(current), [attachment.id, image.dataUrl]].slice(-20)))
       }
-      const content = await window.conductor.files.read(props.project.id, target.path)
-      if (content.length > 160_000) throw new Error('This file is too large to attach. Select a relevant range in the editor.')
-      setAttachments((current) => [...current, { id: crypto.randomUUID(), kind: 'file' as const, name: target.path, path: target.path, content }].slice(-20))
       setFilePath('')
       setAddFileOpen(false)
       composer.current?.focus()
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
   }
 
-  useEffect(() => {
-    if (!commandsOpen || commandLoad.current === activeId || !ready || historical) return
+  const dropComposerFiles = async (transfer: DataTransfer): Promise<void> => {
+    if (historical) return
+    if (isRemoteFileMachine(fileMachineId)) { setError('Attach remote file context from the host conversation. No controller file was read.'); return }
+    const internal = decodeConductorFileDrag(transfer.getData(CONDUCTOR_FILE_DRAG))
+    if (internal) {
+      if (internal.projectId !== props.project.id) { setError('Drop project context only into a conversation for that same project.'); return }
+      if (internal.kind !== 'file') { setError('Choose a file, not a folder, to attach as context.'); return }
+      await addFile(internal.path)
+      return
+    }
+    const files = [...transfer.files]
+    if (!files.length) return
+    const remaining = Math.max(0, 20 - draftRef.current.attachments.length)
+    if (!remaining) { setError('A prompt can have up to 20 attachments.'); return }
+    for (const file of files.slice(0, remaining)) {
+      try {
+        if (/\.(png|jpe?g|gif|webp)$/i.test(file.name) && !projection.capabilities?.imageAttachments) throw new Error('This provider connection does not currently support local image attachments.')
+        const sourcePath = window.conductor.files.pathForFile(file)
+        if (!sourcePath) throw new Error(`The operating system did not provide a path for ${file.name}`)
+        const attachment = await window.conductor.files.importContextPath(props.project.id, sourcePath, file.name, file.type)
+        if (attachment.kind === 'image' && !projection.capabilities?.imageAttachments) throw new Error('This provider connection does not currently support local image attachments.')
+        setAttachments(current => current.length >= 20 ? current : [...current, attachment])
+        if (attachment.kind === 'image' && attachment.path) {
+          const image = await window.conductor.files.readDataUrl(props.project.id, attachment.path)
+          setImagePreviews(current => Object.fromEntries([...Object.entries(current), [attachment.id, image.dataUrl]].slice(-20)))
+        }
+      } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); break }
+    }
+    if (files.length > remaining) setError(`Attached ${remaining} files. A prompt can have up to 20 attachments.`)
+  }
+
+  const loadComposerDiscovery = (): void => {
+    if (commandLoad.current === activeId || !ready || historical) return
     commandLoad.current = activeId; setCommandLoading(true)
     void connect().then(() => window.conductor.structured.discover(activeId)).then(result => { if (activeIdRef.current === activeId) setCommandDiscovery(result) }).catch(() => { /* Local commands remain available if provider discovery fails. */ }).finally(() => { if (activeIdRef.current === activeId) setCommandLoading(false) })
+  }
+  useEffect(() => {
+    if (!commandsOpen) return
+    loadComposerDiscovery()
   }, [commandsOpen, activeId, ready, historical])
 
   const stop = (expediteSubmittedInput = false): void => { void window.conductor.structured.interrupt(activeId, expediteSubmittedInput).catch((reason: unknown) => setError(String(reason))) }
@@ -454,9 +511,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
 
   const promptChars = promptCharacterCount(message, attachments)
   const sendBlocked = composerSendBlock(message, attachments)
-  const canSubmit = ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation)
+  const canSubmit = ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation || Boolean(projection.nativeSessionId))
   const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
-  const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: Boolean(message.trim()), needsResume, steering, historical, canSubmit, submitting })
+  const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: Boolean(message.trim()), needsResume, autoResumeOnSend: projection.phase === 'disconnected', steering, historical, canSubmit, submitting })
   const pendingSteering = projection.pendingSteering ?? []
   const queuedPrompts = projection.queuedPrompts ?? (projection.queued ? [projection.queued] : [])
   const capabilities = projection.capabilities
@@ -465,8 +522,27 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const pending = projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length
   const conversationItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
   // Independent of the windowed/reading-view slice below: the pin must reflect the true latest
-  // prompt even while the visible window only covers older or newer activity.
-  const pinnedPrompt = useMemo(() => latestOwnerPrompt(conversationItems), [conversationItems])
+  // prompt even while the visible window only covers older or newer activity. Coworker-only
+  // tabs have no owner prompt, so retain their initiating coordinated prompt instead.
+  const pinnedPrompt = useMemo<PinnedPrompt | null>(() => {
+    const owner = latestOwnerPrompt(conversationItems)
+    if (owner) return owner
+    const initiating = conversationItems.find((item) => item.data.type === 'text' && item.data.role === 'user' && Boolean(item.data.origin))
+    return initiating?.data.type === 'text' ? { id: initiating.id, text: initiating.data.text, sequence: initiating.sequence, origin: initiating.data.origin } : null
+  }, [conversationItems])
+  const focusOrigin = useCallback((origin: { agentSessionId: string }): void => {
+    // This is a trusted owner-UI lookup by exact persisted agent identity. It does not confer
+    // control over the source agent and remains valid after its controller released it.
+    void window.conductor.agentControl.focusOrigin(origin.agentSessionId)
+      .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))
+  }, [])
+  const setQuestionDocked = useCallback((id: string, docked: boolean): void => {
+    setDockedQuestions((current) => {
+      const next = new Set(current)
+      if (docked) next.add(id); else next.delete(id)
+      return next
+    })
+  }, [])
   const visibleItems = useMemo(() => {
     if (!readingWindow) return conversationItems.slice(-visibleCount)
     const latest = new Map(projection.items.map((item) => [item.id, item]))
@@ -651,7 +727,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     else if (command.name === 'fork' && !activePhases.has(projection.phase)) void fork()
   }
 
-  return <section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
+  return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
     <header className="sa-session-bar">
       <ProviderIcon provider={provider} size={15} />
       {props.onRequestCli && <div className="agent-view-switch"><button className="active" aria-pressed title="Chat"><MessagesSquare size={13} /> Chat</button><button title="Continue the same conversation in the native CLI" disabled={!ready || historical || activePhases.has(projection.phase) || Boolean(projection.queued)} onClick={() => props.onRequestCli?.(activeId)}><TerminalSquare size={13} /> CLI</button></div>}
@@ -686,9 +762,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     </AgentDialog>}
     {shownError && <div className="sa-error-bar" role="alert"><span>{shownError}</span><button aria-label="Dismiss error" onClick={() => setError('')}><X size={13} /></button></div>}
     {historical && <div className="sa-history-banner" role="status"><span><strong>{resuming ? 'Reconnecting conversation...' : 'Previewing saved conversation'}</strong><small>{projection.title || 'Saved messages'} ? Resume to continue from here.</small></span><button disabled={resuming} onClick={() => { setReady(false); setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button disabled={!ready || resuming || projection.archived} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume this conversation'}</button>}</div>}
-    {banner && <div className="sa-runtime-banner" role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
+    {banner && <div className={'sa-runtime-banner sa-runtime-' + projection.phase} role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
     {find.open && <ConversationFindBar query={find.query} count={findMatches.length} index={find.index} results={findResults} searching={findSearching} focusToken={findFocus} onQuery={query => dispatchFind({ type: 'query', query })} onStep={direction => dispatchFind({ type: 'step', direction, count: findMatches.length })} onOpenHit={openFindHit} onClose={() => { dispatchFind({ type: 'close' }); if (composer.current && !composer.current.disabled) composer.current.focus(); else timeline.current?.focus() }} />}
-    <div className="sa-timeline-wrap"><div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
+    <div className="sa-timeline-wrap">{pinnedPrompt && <button type="button" className="sa-pinned-prompt" title={pinnedPrompt.text} aria-label={'Scroll to ' + (pinnedPrompt.origin ? pinnedPrompt.origin.label + '\'s initiating message' : 'your last message') + ': ' + pinnedPrompt.text} onClick={scrollToPinnedPrompt}><Pin size={11} aria-hidden="true" /><span>{truncatePromptPreview(pinnedPrompt.text)}</span></button>}<div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
       const el = timeline.current
       // Layout and content growth can emit scroll events too. Only user input
       // should release automatic following while the view is pinned to the end.
@@ -697,23 +773,25 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       if (!nearBottom.current) setReadingWindow((current) => current ?? lastVisibleItems.current)
       else if (!hasTimelineSelection(el, window.getSelection())) { setReadingWindow(null); setNewOutput(false) }
     }}><div ref={timelineContent} className="sa-timeline-content">
-      {pinnedPrompt && <button type="button" className="sa-pinned-prompt" title={pinnedPrompt.text} aria-label={'Scroll to your last message: ' + pinnedPrompt.text} onClick={scrollToPinnedPrompt}><Pin size={11} aria-hidden="true" /><span>{truncatePromptPreview(pinnedPrompt.text)}</span></button>}
       {(!ready || !conversationItems.length) && <div className="sa-empty"><strong>{ready ? 'What are we working on?' : 'Opening conversation…'}</strong>{ready && <p>Ask {name} about your code, or describe a change.</p>}</div>}
       {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
       {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
       {ready && activityGroups.map(group => {
-        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={props.project.path} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />)
+        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} />)
         // A recall belongs to the message it was injected with, so it renders directly under it.
         const recall = group.length === 1 && group[0]!.nativeItemId ? recallByItem.get(group[0]!.nativeItemId) : undefined
         if (recall) return <div className="sa-turn" key={group[0]!.id}>{activities[0]}<MemoryRecallStrip recall={recall} onChanged={loadTurnRecalls} /></div>
         if (group.length === 1) return activities[0]
         const coalesced = coalescedEditSummary(group)
-        return <details className="sa-completed-group" key={group[0]!.id}><summary>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</summary><div>{activities}</div></details>
+        const latest = group.at(-1)!
+        const latestTask = latest.data.type === 'tool' ? toolPresentation(latest.data).title : ''
+        const latestOutput = latest.data.type === 'tool' ? toolInlinePreview(latest.data) : ''
+        return <details className="sa-completed-group" key={group[0]!.id}><summary><span>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</span>{latestTask && <span className="sa-completed-latest" title={latestTask}><b>Latest</b> {latestTask}{latestOutput && <code>OUT {latestOutput}</code>}</span>}</summary><div>{activities}</div></details>
       })}
       {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
     </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>
-    <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={props.project.path} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
-    <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }}>
+    <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={fileCwd} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
+    <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }} onDragOver={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy' }} onDrop={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); void dropComposerFiles(event.dataTransfer) }}>
       {pendingSteering.length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{pendingSteering.map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>
         <strong>{input.status === 'sending' ? 'Sending' : input.status === 'accepted' ? 'Received' : input.status === 'cancelled' ? 'Not sent' : 'Delivery uncertain'}</strong>
         <span title={input.text}>{input.text}</span>
@@ -740,7 +818,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       <footer className="agent-prompt-controls">
         <PromptImageUpload key={composerChildKey('images', activeId)} projectId={props.project.id} disabled={historical || !capabilities?.imageAttachments} onError={setError} onAttach={(images) => setAttachments(current => { if (current.length + images.length > 20) { setError('A prompt can have up to 20 attachments. Remove some and attach these images again.'); return current }; return [...current, ...images] })} />
         <button type="button" aria-label="Attach file context" title="Attach context" disabled={historical} onClick={() => setAddFileOpen(open => !open)}><FilePlus2 size={15} /></button>
-        <button type="button" className={browserPanelOpen ? 'active' : undefined} aria-pressed={browserPanelOpen} aria-label={browserPanelOpen ? 'Close browser tab' : 'Open browser tab'} title="Browser tab (the surface the browser tools drive)" onClick={activateBrowserMention}><Globe2 size={15} /></button>
+        <ComposerStarterMenu choices={starterChoices} disabled={historical || !ready} loading={commandLoading} onOpen={loadComposerDiscovery} onPrepare={(choice) => { setMessage(prepareComposerDraft(draftRef.current.message, choice)); requestAnimationFrame(() => composer.current?.focus()) }} />
+        <button type="button" className={settings.browserMcp ? 'active' : undefined} aria-pressed={Boolean(settings.browserMcp)} aria-label={settings.browserMcp ? 'Disable browser tools' : 'Enable browser tools'} title={settings.browserMcp ? 'Disable model browser tools immediately' : 'Enable model browser tools for the next safe connection'} disabled={historical || provider === 'local' || activePhases.has(projection.phase) && !settings.browserMcp} onClick={() => updateSettings({ browserMcp: !settings.browserMcp })}><Globe2 size={15} /></button>
         <StructuredComposerControls key={composerChildKey('controls', activeId)} settings={settings} capabilities={capabilities} disabled={historical || !ready} onChange={updateSettings} onDiscover={connect} />
         <StructuredUsageSummary key={composerChildKey('usage', activeId)} items={projection.items} runtimeId={projection.runtimeId} truncated={projection.truncated} modelLabel={resolvedComposerSettings(settings, capabilities).label} agentSessionId={activeId} workspaceId={props.session.id} />
         <span className="sa-spacer" />
@@ -750,10 +829,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     </form>
     {diff && <ImmutableDiff sessionId={activeId} change={diff} onOpenFile={onOpenFile} onClose={() => setDiff(null)} />}
     {changesOpen && <AgentChangeHistoryView sessionId={activeId} title={projection.title || props.title} busy={activePhases.has(projection.phase)} onOpenFile={onOpenFile} onClose={() => setChangesOpen(false)} />}
-    {inspectAttachment && <AgentDialog title={'Context · ' + inspectAttachment.name} onClose={() => setInspectAttachment(null)}><p className="sa-notice">{inspectAttachment.kind === 'image' ? 'This attached image stays available when you switch projects or reopen the conversation.' : 'This content will be submitted with your message. File content is captured when attached.'}</p>{inspectAttachment.kind === 'image' && imagePreviews[inspectAttachment.id] && <img className="sa-context-image" alt={inspectAttachment.name} src={imagePreviews[inspectAttachment.id]} />}{inspectAttachment.kind !== 'image' && <pre className="sa-expanded-output">{inspectAttachment.content ?? inspectAttachment.path ?? 'No content'}</pre>}</AgentDialog>}
+    {inspectAttachment && <AgentDialog title={'Context · ' + inspectAttachment.name} onClose={() => setInspectAttachment(null)}><p className="sa-notice">{inspectAttachment.kind === 'image' ? 'This attached image stays available when you switch projects or reopen the conversation.' : inspectAttachment.kind === 'media' ? 'This is opaque media. Conductor sends its verified workspace path, type and size; binary bytes are not presented as readable text.' : 'This content will be submitted with your message. File content is captured when attached.'}</p>{inspectAttachment.kind === 'image' && imagePreviews[inspectAttachment.id] && <img className="sa-context-image" alt={inspectAttachment.name} src={imagePreviews[inspectAttachment.id]} />}{inspectAttachment.kind === 'media' ? <pre className="sa-expanded-output">{JSON.stringify({ path: inspectAttachment.path, mimeType: inspectAttachment.mimeType, size: inspectAttachment.size }, null, 2)}</pre> : inspectAttachment.kind !== 'image' && <pre className="sa-expanded-output">{inspectAttachment.content ?? inspectAttachment.path ?? 'No content'}</pre>}</AgentDialog>}
     {eventsOpen && <AgentDialog title="Event log" onClose={() => setEventsOpen(false)}><p className="sa-notice">Diagnostics only. Showing the latest {rawEvents.length} events.</p><div className="sa-diff-toolbar"><button onClick={() => void copyText(JSON.stringify(rawEvents, null, 2))}>Copy events</button><button onClick={() => void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200)))}>Refresh</button></div><div className="sa-event-list">{rawEvents.map((event) => <details key={event.id}><summary>#{event.sequence} · {event.data.type} · {event.native?.method ?? event.itemId ?? event.requestId ?? ''}</summary><pre>{JSON.stringify(event, null, 2)}</pre></details>)}</div></AgentDialog>}
     {historyOpen && <AgentDialog title="Conversation history" onClose={() => setHistoryOpen(false)}><input className="sa-history-search" aria-label="Search conversation history" placeholder="Search conversations" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} /><p className="sa-history-help">Choose a conversation to preview its messages, then resume when you are ready to continue.</p>{historyLoading && <p className="sa-history-loading" role="status"><LoaderCircle size={13} className="spin" /> Loading conversations...</p>}<div className="sa-history-list" aria-busy={historyLoading}>{historyItems.map((item) => <button key={item.id} title="Preview saved conversation" onClick={() => { if (item.id !== activeId) setReady(false); setActiveId(item.id); setHistorical(item.id !== props.resourceId); setHistoryOpen(false) }}><strong>{item.title || 'Untitled conversation'}</strong><small>{item.provider} · {displayPhase(item.phase)}{item.archived ? ' · archived' : ''}</small></button>)}{!historyLoading && !historyItems.length && <p>No saved conversations match.</p>}</div></AgentDialog>}
     {discovery !== undefined && <AgentDialog title={name + ' configuration'} onClose={() => setDiscovery(undefined)}><p className="sa-notice">Read-only details of configured skills, commands and connections. Nothing here runs a command or changes your configuration.</p><div className="sa-event-list">{discovery && typeof discovery === 'object' && !Array.isArray(discovery) ? Object.entries(discovery).map(([category, value]) => <details key={category}><summary>{category.replaceAll('_', ' ')}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>) : <pre>{JSON.stringify(discovery, null, 2)}</pre>}</div></AgentDialog>}
     {rename !== null && <AgentDialog title="Rename conversation" onClose={() => setRename(null)}><form className="sa-rename" onSubmit={(event) => { event.preventDefault(); const title = rename.trim(); if (!title) return; void window.conductor.structured.rename(activeId, title).then(() => { setProjection((current) => ({ ...current, title })); return propsRef.current.onConversationChange?.({ ...conversationIdentity(projection, provider), title, manual: true }) }).then(() => setRename(null)).catch((reason: unknown) => setError(String(reason))) }}><input autoFocus aria-label="Conversation title" maxLength={160} value={rename} onChange={(event) => setRename(event.target.value)} /><button type="submit">Save name</button></form></AgentDialog>}
-  </section>
+  </section></AgentFileMachineContext.Provider>
 }

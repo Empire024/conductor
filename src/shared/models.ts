@@ -250,6 +250,23 @@ export interface WorkspaceRecoveryState {
   activeSessionId: string | null
   focusedGroupIds: Record<string, string>
   sessionIdsByProject: Record<string, string>
+  documents?: WorkspaceDocumentState[]
+}
+
+export interface WorkspaceDocumentRecord {
+  id: string
+  machineId: string
+  projectId: string
+  path: string
+  mode: 'editor' | 'preview' | 'browser'
+  line?: number
+  allowBinary?: boolean
+}
+
+export interface WorkspaceDocumentState {
+  workspaceId: string
+  files: WorkspaceDocumentRecord[]
+  activeId: string | null
 }
 
 export interface WorkspaceRecoveryCheckpoint extends WorkspaceRecoveryState {
@@ -293,6 +310,8 @@ export interface FileDataResource {
 
 export interface EditorDraft {
   tabId: string
+  /** Defaults to `local` only for drafts persisted before machine-aware files. */
+  machineId?: string
   projectId: string
   path: string
   content: string
@@ -332,6 +351,7 @@ export interface AgentSpec {
   provider: AgentProviderId
   title: string
   cwd: string
+  machineId?: string
   resume?: boolean
   model?: string
   effort?: AgentEffort

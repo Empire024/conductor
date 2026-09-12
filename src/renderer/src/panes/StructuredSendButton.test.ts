@@ -55,6 +55,10 @@ describe('send button intent', () => {
     expect(sendButtonIntent({ ...idle, needsResume: true })).toEqual({ state: 'resume', label: 'Resume conversation', title: 'Resume the same conversation', disabled: false })
     expect(sendButtonIntent({ ...idle, needsResume: true, active: true }).state).toBe('stop')
   })
+  it('sends a new draft through automatic reconnect when the disconnected conversation permits it', () => {
+    expect(sendButtonIntent({ ...idle, needsResume: true, autoResumeOnSend: true }).state).toBe('resume')
+    expect(sendButtonIntent({ ...idle, draft: true, needsResume: true, autoResumeOnSend: true })).toMatchObject({ state: 'send', label: 'Send message', disabled: false })
+  })
   it('names the send action for steering, queueing and plain sending', () => {
     expect(sendButtonIntent({ ...idle, draft: true }).label).toBe('Send message')
     expect(sendButtonIntent({ ...idle, draft: true, active: true }).label).toBe('Queue message')

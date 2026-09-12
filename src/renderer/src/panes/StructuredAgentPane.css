@@ -16,8 +16,8 @@
 .sa-session-dot.status-failed, .sa-session-dot.status-disconnected { background: var(--danger); }
 .sa-spacer { flex: 1; }
 .sa-attention-badge { padding: 0 5px; color: #e2b872; border: 1px solid #e2b87266; border-radius: 4px; font-variant-numeric: tabular-nums; }
-.sa-timeline-wrap { position: relative; min-height: 0; flex: 1; }
-.sa-timeline { height: 100%; overflow: auto; overscroll-behavior: contain; padding: 16px 20px 26px 27px; scrollbar-gutter: stable; user-select: text; }
+.sa-timeline-wrap { position: relative; min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.sa-timeline { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; padding: 16px 20px 26px 27px; scrollbar-gutter: stable; user-select: text; }
 .sa-activity { position: relative; padding: 0 0 15px 15px; margin: 0; border-left: 1px solid var(--border); min-width: 0; overflow-wrap: anywhere; content-visibility: auto; contain-intrinsic-size: auto 90px; }
 .sa-marker { position: absolute; top: 9px; left: -3.5px; box-shadow: 0 0 0 4px var(--surface-0); }
 .sa-child { margin-left: 18px; border-left-style: dashed; }
@@ -25,7 +25,7 @@
 .sa-parent-label { display: block; color: var(--text-2); margin-bottom: 4px; font-size: 10px; overflow-wrap: anywhere; }
 .sa-role { display: block; font-size: 10px; color: var(--text-2); padding: 2px 0; }
 /* A coordinated prompt must not read as the owner's own message. */
-.sa-role-coordinated { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-muted); font-weight: 600; letter-spacing: 0.02em; }
+.sa-role-coordinated { display: inline-flex; align-items: center; gap: 4px; color: var(--accent-muted); font-weight: 600; letter-spacing: 0.02em; padding: 2px 0 !important; text-decoration: underline; text-underline-offset: 3px; }
 .sa-user .sa-markdown { border: 1px solid var(--border-soft); border-radius: 7px; padding: 7px 10px; background: var(--surface-1); }
 .sa-user .sa-marker { background: var(--accent); }
 .sa-status .sa-markdown { color: var(--text-2); font-size: 11px; }
@@ -192,18 +192,21 @@
 .sa-composer textarea { resize: none; min-height: 47px; max-height: 150px; font-size: 12px; }
 .sa-prompt-limit { margin: 0 2px 4px; font-size: 10px; color: var(--text-3); text-align: right; }
 .sa-prompt-limit-over { color: var(--danger); font-weight: 500; text-align: left; }
-.sa-composer > footer { min-height: 32px; gap: 5px; flex-wrap: nowrap; }
+.sa-composer > footer { min-height: 32px; max-width: 100%; gap: 5px; flex-wrap: wrap; }
+.sa-composer > footer .sa-spacer { flex: 1 1 4px; min-width: 0; }
+.sa-composer > footer .sa-send { margin-left: auto; }
 /* One send/stop/resume pill: same shape and size in every state, so nothing morphs but the fill,
    glow and glyph. A turn in flight is shown by an arc orbiting the button rather than by swapping
    the icon out from under the cursor. Disabled is its own deliberate flat/muted look, not a fade. */
 .sa-composer .sa-send { position: relative; flex: 0 0 30px; min-height: 30px; height: 30px; width: 30px; padding: 0; border: 0 !important; border-radius: 999px; color: var(--surface-0); background: linear-gradient(155deg, color-mix(in srgb, var(--accent) 112%, white 8%), var(--accent)) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent) inset; transition: background 150ms ease, color 140ms ease, box-shadow 150ms ease, transform 130ms cubic-bezier(.2,.85,.25,1), opacity 130ms ease; }
 .sa-composer .sa-send:hover:not(:disabled) { color: var(--surface-0); background: linear-gradient(155deg, color-mix(in srgb, var(--accent) 130%, white 14%), color-mix(in srgb, var(--accent) 92%, white 4%)) !important; box-shadow: 0 3px 12px color-mix(in srgb, var(--accent) 35%, transparent), 0 0 0 1px color-mix(in srgb, var(--accent) 70%, white) inset; transform: translateY(-1px); }
 .sa-composer .sa-send:active:not(:disabled) { transform: translateY(0) scale(.89); box-shadow: 0 1px 3px #0005; transition-duration: 90ms; }
-.sa-composer .sa-send.sa-stop { color: var(--text); background: var(--surface-2) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px var(--border) inset; }
-.sa-composer .sa-send.sa-stop:hover:not(:disabled) { color: var(--text); background: var(--surface-3) !important; box-shadow: 0 3px 12px #0005, 0 0 0 1px color-mix(in srgb, var(--accent) 45%, var(--border)) inset; }
-.sa-composer .sa-send[data-state="resume"] { background: linear-gradient(155deg, color-mix(in srgb, var(--blue) 118%, white 10%), var(--blue)) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px color-mix(in srgb, var(--blue) 40%, transparent) inset; }
+.sa-composer .sa-send.sa-stop { color: #fff; background: linear-gradient(155deg, color-mix(in srgb, var(--danger) 88%, white 12%), var(--danger)) !important; box-shadow: 0 1px 5px #0005, 0 0 0 1px color-mix(in srgb, var(--danger) 55%, white) inset; }
+.sa-composer .sa-send.sa-stop:hover:not(:disabled) { color: #fff; background: linear-gradient(155deg, color-mix(in srgb, var(--danger) 78%, white 22%), color-mix(in srgb, var(--danger) 92%, black 8%)) !important; box-shadow: 0 3px 12px color-mix(in srgb, var(--danger) 38%, transparent), 0 0 0 1px color-mix(in srgb, var(--danger) 50%, white) inset; }
+.sa-composer .sa-send[data-state="resume"] { color: #fff; background: linear-gradient(155deg, color-mix(in srgb, var(--blue) 118%, white 10%), var(--blue)) !important; box-shadow: 0 1px 4px #0004, 0 0 0 1px color-mix(in srgb, var(--blue) 40%, transparent) inset; }
 .sa-composer .sa-send[data-state="resume"]:hover:not(:disabled) { background: linear-gradient(155deg, color-mix(in srgb, var(--blue) 134%, white 16%), color-mix(in srgb, var(--blue) 92%, white 4%)) !important; box-shadow: 0 3px 12px color-mix(in srgb, var(--blue) 35%, transparent), 0 0 0 1px color-mix(in srgb, var(--blue) 70%, white) inset; }
 .sa-composer .sa-send:disabled { background: var(--surface-2) !important; color: var(--text-3) !important; box-shadow: none !important; transform: none !important; cursor: not-allowed; }
+.sa-composer .sa-send.sa-stop:disabled { color: #fff !important; background: color-mix(in srgb, var(--danger) 64%, var(--surface-2)) !important; box-shadow: 0 0 0 1px color-mix(in srgb, var(--danger) 45%, var(--border)) inset !important; }
 .sa-composer .sa-send:disabled .sa-send-glyphs { opacity: .55; }
 .sa-send-glyphs { display: grid; place-items: center; width: 100%; height: 100%; transition: opacity 130ms ease; }
 .sa-send-glyph { grid-area: 1 / 1; transition: opacity 130ms ease, transform 190ms cubic-bezier(.2,.85,.25,1); }
@@ -214,6 +217,7 @@
 .sa-send[data-state="resume"] .sa-glyph-resume { opacity: 1; transform: translateX(1px); }
 .sa-send-orbit { position: absolute; inset: -2px; border-radius: 999px; opacity: 0; pointer-events: none; background: conic-gradient(from 0turn, transparent 0 52%, color-mix(in srgb, var(--accent) 50%, transparent) 79%, color-mix(in srgb, var(--accent) 96%, white) 97%, transparent 100%); -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px)); transition: opacity 140ms ease; }
 .sa-send[data-busy="true"] .sa-send-orbit { opacity: 1; animation: sa-send-orbit var(--spin-duration) linear infinite; }
+.sa-send.sa-stop .sa-send-orbit { background: conic-gradient(from 0turn, transparent 0 52%, color-mix(in srgb, var(--danger) 50%, transparent) 79%, color-mix(in srgb, var(--danger) 94%, white) 97%, transparent 100%); }
 @keyframes sa-send-orbit { to { transform: rotate(1turn); } }
 /* Reduced motion keeps the running indicator, as a settled ring instead of a sweep. */
 @media (prefers-reduced-motion: reduce) { .sa-send[data-busy="true"] .sa-send-orbit { background: color-mix(in srgb, var(--accent) 75%, transparent); } }
@@ -298,8 +302,14 @@
 .sa-step-back { background: transparent; border-color: var(--border-soft); color: var(--text-2); }
 /* A pending question follows the conversation instead of scrolling away, so the transcript
    behind it stays readable while it is answered. */
-.sa-activity:has(> .sa-interaction-pinned) { position: sticky; bottom: 4px; z-index: 4; }
+.sa-activity:has(> .sa-interaction-pinned), .sa-activity:has(> .sa-interaction-docked) { position: sticky; bottom: 4px; z-index: 4; }
 .sa-interaction-pinned { background: color-mix(in srgb, var(--surface-1) 93%, transparent); backdrop-filter: blur(7px); box-shadow: 0 14px 34px -16px #000c; }
+.sa-question-collapse { margin-left: auto; min-height: 22px !important; padding: 2px 4px !important; color: var(--text-3) !important; }
+.sa-question-dock { display: flex; align-items: center; gap: 8px; }
+.sa-question-dock > span { display: flex; min-width: 0; flex: 1; flex-direction: column; }
+.sa-question-dock strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sa-question-dock small { color: var(--text-2); font-size: 10px; }
+.sa-question-dock > button { flex: 0 0 auto; }
 @media (prefers-reduced-motion: reduce) { .sa-question-steps li { transition: none; } }
 .sa-interaction-actions > button:first-child { color: var(--text); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 .sa-request-summary { margin: 5px 0 8px; font-size: 11px; color: var(--text-2); overflow-wrap: anywhere; }
@@ -308,7 +318,11 @@
 .structured-agent-pane .sa-request-details > summary { width: fit-content; font-size: 9px; color: var(--text-3); }
 
 .sa-completed-group { margin: 0 0 9px; border-left: 1px solid var(--border-soft); padding-left: 15px; color: var(--text-2); }
-.structured-agent-pane .sa-completed-group > summary { width: fit-content; padding: 3px 6px; border-radius: 4px; font-size: 10px; }
+.structured-agent-pane .sa-completed-group > summary { width: 100%; padding: 3px 6px; border-radius: 4px; font-size: 10px; }
+.sa-completed-group > summary > span:first-child { display: block; }
+.sa-completed-latest { display: flex; gap: 5px; align-items: baseline; min-width: 0; color: var(--text); }
+.sa-completed-latest > b { flex: 0 0 auto; color: var(--text-3); font-size: 9px; letter-spacing: .05em; text-transform: uppercase; }
+.sa-completed-latest > code { min-width: 0; overflow: hidden; color: var(--text-2); text-overflow: ellipsis; white-space: nowrap; }
 .sa-completed-group > summary:hover { color: var(--text); background: var(--surface-1); }
 .sa-completed-group[open] > summary { margin-bottom: 6px; }
 .sa-completed-group > div { padding-top: 3px; }
@@ -338,6 +352,20 @@
 .sa-command-menu [role="option"] span { min-width: 0; color: var(--text-2); }
 .sa-command-menu > small { display: block; padding: 7px 7px 2px; color: var(--text-3); font-size: 10px; }
 
+.sa-starter-control { position: relative; flex: 0 0 auto; }
+.sa-starter-control > button { gap: 2px; padding: 3px 5px; }
+.sa-starter-menu { position: absolute; left: 0; bottom: calc(100% + 9px); z-index: 26; width: min(360px, calc(100cqw - 26px)); max-height: min(430px, 62vh); overflow-y: auto; padding: 6px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-1); box-shadow: 0 14px 40px #0006; }
+.sa-starter-menu > header { display: flex; align-items: center; gap: 6px; padding: 5px 7px 3px; color: var(--text); font-size: 11px; }
+.sa-starter-menu > header > small { margin-left: auto; color: var(--text-3); font-size: 9px; }
+.sa-starter-menu > p { margin: 2px 7px 7px; color: var(--text-3); font-size: 9px; line-height: 1.4; }
+.sa-starter-menu > button { position: relative; display: flex; width: 100%; align-items: flex-start; gap: 8px; padding: 8px 7px; text-align: left; }
+.sa-starter-menu > button:hover { background: var(--accent-bg); }
+.sa-starter-menu > button > span { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 2px; }
+.sa-starter-menu > button strong { font-size: 11px; font-weight: 550; }
+.sa-starter-menu > button small { color: var(--text-2); font-size: 9px; line-height: 1.35; }
+.sa-starter-menu > button em { flex: 0 0 auto; color: var(--text-3); font-size: 8px; font-style: normal; text-transform: uppercase; }
+.sa-starter-menu > button kbd { position: absolute; right: 7px; bottom: 6px; color: var(--accent); font-size: 7px; }
+
 /* Measured activity heights keep scroll positions stable while questions and output grow. */
 .sa-activity { content-visibility: visible; contain-intrinsic-size: none; }
 /* Each item mounts once and is memoized, so this plays a single time per new activity, never
@@ -351,6 +379,8 @@
    tint, a legible second line, and the way out attached to the message rather than floated away. */
 .sa-runtime-banner { display: flex; align-items: center; gap: 9px; padding: 7px 10px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--blue) 9%, var(--surface-1)); color: var(--text); font-size: 11px; }
 .sa-runtime-banner > svg { flex: 0 0 auto; color: var(--blue); }
+.sa-runtime-banner.sa-runtime-interrupted { border-bottom-color: color-mix(in srgb, var(--danger) 38%, var(--border)); background: color-mix(in srgb, var(--danger) 11%, var(--surface-1)); }
+.sa-runtime-banner.sa-runtime-interrupted > svg { color: var(--danger); }
 .sa-runtime-banner > span { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
 .sa-runtime-banner strong { font-size: 11px; font-weight: 600; }
 .sa-runtime-banner small { font-size: 10px; color: var(--text-2); overflow-wrap: anywhere; }
@@ -363,8 +393,8 @@
 .sa-steering-prompt { flex-wrap: wrap; }
 .sa-steering-prompt small { order: 1; flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
 
-/* The owner's last sent prompt stays reachable while the rest of the transcript scrolls under it. */
-.sa-pinned-prompt { position: sticky; top: -1px; z-index: 3; display: flex; width: 100%; align-items: center; justify-content: flex-start; gap: 6px; margin: 0 0 10px; padding: 5px 9px; border: 1px solid var(--border-soft); border-radius: 6px; background: color-mix(in srgb, var(--surface-1) 94%, transparent); backdrop-filter: blur(6px); box-shadow: 0 6px 16px -10px #000a; text-align: left; font-size: 11px; }
+/* The pin occupies a non-scrolling row, so no transcript text can paint above or behind it. */
+.structured-agent-pane .sa-pinned-prompt { position: relative; z-index: 3; display: flex; flex: 0 0 auto; width: 100%; align-items: center; justify-content: flex-start; gap: 6px; margin: 0; padding: 5px 9px; border: 1px solid var(--border-soft); border-radius: 0 0 6px 6px; background: var(--surface-1); box-shadow: 0 6px 16px -10px #000a; text-align: left; font-size: 11px; }
 .sa-pinned-prompt > svg { flex: 0 0 auto; color: var(--accent-muted); }
 .sa-pinned-prompt > span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text-2); }
 /* A brief ring around the target activity after jumping to it from the pin, so the click has a
@@ -372,6 +402,8 @@
    it never fights the unrelated mount-in animation already declared on .sa-activity above. */
 .sa-activity { transition: box-shadow 700ms ease; }
 .sa-activity-flash { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 45%, transparent); border-radius: 8px; }
+.sa-activity-time { position: absolute; top: 0; right: 0; z-index: 2; max-width: min(260px, 72%); overflow: hidden; padding: 2px 5px; border-radius: 4px; color: var(--text-2); background: var(--surface-1); font-size: 9px; opacity: 0; pointer-events: none; text-overflow: ellipsis; white-space: nowrap; transition: opacity 120ms ease; }
+.sa-activity:hover > .sa-activity-time, .sa-activity:focus-within > .sa-activity-time { opacity: 1; }
 @media (prefers-reduced-motion: reduce) { .sa-activity { transition: none; } }
 
 .sa-queue > button { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-3); cursor: pointer; transition: background 120ms ease, color 120ms ease; }

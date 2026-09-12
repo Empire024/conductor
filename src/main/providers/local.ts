@@ -41,9 +41,9 @@ async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, ap
 
 /** Conductor's own local runtime: llama.cpp serves tokens on loopback and this adapter owns the
  *  entire agent loop, so a local model never inherits Conductor's host-side tools. Its complete
- *  capability set is the sandbox-bound list in local-models/tools.ts - workspace read, write,
- *  edit, search and execution inside a network-less Docker container - and that restriction is
- *  enforced by dispatch, not by prompt text.
+ *  capability set is the allowlist in local-models/tools.ts: contained workspace file access,
+ *  commands in a network-less Docker container, and narrowly scoped memory/research brokers.
+ *  Restrictions are enforced by dispatch and trusted session scope, not by prompt text.
  *
  *  One adapter is one conversation. The model server is shared; conversation history, the tool
  *  loop, the sandbox container and the cancellation token all live on this instance, so two
@@ -81,8 +81,8 @@ export class LocalAdapter implements ProviderAdapter {
       effort: [],
       models: ids.map(id => ({ id, label: localModelLabel(id), isDefault: id === (configured[DEFAULT_LOCAL_MODEL] ? DEFAULT_LOCAL_MODEL : ids[0]) })),
       limitations: [
-        'Runs entirely on this machine through llama.cpp on 127.0.0.1; no prompt or file ever leaves the host.',
-        `Tools are limited in code to ${LOCAL_TOOLS.join(', ')}; host shell, browser, connector and MCP capabilities are not offered to local models.`,
+        'Inference runs on this machine through llama.cpp on 127.0.0.1. Public web research sends only the requested URL, without cookies or credentials.',
+        `Tools are limited in code to ${LOCAL_TOOLS.join(', ')}; the Conductor bridge exposes project memory and task listing only, with no arbitrary MCP or host shell.`,
         'Commands run in a non-root Docker container with no network access; when the sandbox is unavailable, execution is refused rather than run on Windows.',
         'Nothing asks for approval: choose Read only for a turn that must not write files or run commands.',
         'Conversations are not resumable: history lives with the running adapter, not in a native session store.',
@@ -130,7 +130,7 @@ export class LocalAdapter implements ProviderAdapter {
 
   private ensureSession(model: LocalModelConfig): LocalAgentSession {
     const stack = this.stack!
-    const readOnly = this.settings.permission === 'read-only'
+    const readOnly = this.settings.permission === 'read-only' || this.settings.sandbox === 'read-only' || this.settings.plan
     // A container is only built for a turn that may actually run something, and once built
     // it is reused: a conversation that toggles back to Read only keeps it for later.
     if (!this.sandbox && !readOnly) this.sandbox = new DockerSandbox(this.options.runtimeId, this.options.cwd, stack.sandbox)
@@ -139,6 +139,7 @@ export class LocalAdapter implements ProviderAdapter {
       this.session = new LocalAgentSession({
         endpoint: endpointFor(model), apiKey: this.key(), model: model.id, workspace: this.options.cwd,
         sandbox, readOnly, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
+        control: this.options.localControl,
         beforeTool: paths => this.options.beforeTool?.(this.toolItemId, paths) ?? Promise.resolve(),
         afterTool: (paths, success) => this.options.afterTool?.(this.toolItemId, paths, success) ?? Promise.resolve()
       })
@@ -159,6 +160,7 @@ export class LocalAdapter implements ProviderAdapter {
    *  submit call returns, so holding it open for the whole generation would leave the
    *  message sitting in the box and the Stop control out of reach. */
   async submit(text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
+    if (this.controller) throw new Error('Local model already has a running turn')
     this.settings = settings
     this.turn = this.runTurn(text, attachments)
     await Promise.resolve()
@@ -176,6 +178,7 @@ export class LocalAdapter implements ProviderAdapter {
     const reasoningItem = (): string => `${turnId}:reasoning:${round}`
     try {
       const model = await this.ready(turnId)
+      controller.signal.throwIfAborted()
       const session = this.ensureSession(model)
       const prompt = attachments.filter(item => item.content).map(item => `[Attached ${item.kind}: ${item.name}]\n${item.content}`).concat(text).join('\n\n')
       const outcome = await session.run(prompt, {
@@ -196,7 +199,7 @@ export class LocalAdapter implements ProviderAdapter {
         usage: usage => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider' } }),
         notice: message => this.emit({ turnId, data: { type: 'notice', message } })
       }, controller.signal)
-      this.emit({ turnId, data: { type: 'session', phase: outcome.stopReason === 'interrupted' ? 'interrupted' : 'completed' } })
+      this.emit({ turnId, data: { type: 'session', phase: outcome.stopReason === 'interrupted' ? 'interrupted' : outcome.stopReason === 'iteration_limit' ? 'failed' : 'completed' } })
     } catch (error) {
       if (controller.signal.aborted) { this.emit({ turnId, data: { type: 'session', phase: 'interrupted' } }); return }
       this.emit({ turnId, data: { type: 'error', message: error instanceof Error ? error.message : 'Local model request failed' } })

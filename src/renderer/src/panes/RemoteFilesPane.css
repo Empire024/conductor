@@ -1,0 +1,17 @@
+.remote-files-pane { position: relative; display: flex; flex-direction: column; height: 100%; min-width: 0; background: var(--surface-0); color: var(--text-primary); }
+.remote-files-pane > header, .remote-files-pane > nav, .remote-file-preview > header { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.remote-files-pane > header > span { display: flex; align-items: center; gap: 6px; }
+.remote-files-pane > header > strong { min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-secondary); }
+.remote-files-pane button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 0; background: transparent; color: inherit; }
+.remote-files-pane button:not(:disabled):hover { color: var(--accent); }
+.remote-files-pane > nav code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+.remote-files-list { min-height: 0; overflow: auto; padding: 4px; }
+.remote-file-row { display: flex; align-items: center; gap: 2px; min-height: 28px; border-radius: 5px; }
+.remote-file-row:hover { background: var(--surface-1); }
+.remote-file-name { flex: 1; min-width: 0; justify-content: flex-start !important; padding: 5px 7px; }
+.remote-file-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-files-empty, .remote-files-error { padding: 18px; color: var(--text-secondary); }
+.remote-files-error { color: var(--danger); }
+.remote-file-preview { position: absolute; inset: 42px 12px 12px; display: flex; flex-direction: column; z-index: 3; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-0); box-shadow: var(--shadow-lg); overflow: hidden; }
+.remote-file-preview > header strong { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remote-file-preview img, .remote-file-preview video { display: block; width: 100%; height: 100%; min-height: 0; object-fit: contain; background: #000; }

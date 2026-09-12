@@ -7,6 +7,7 @@ import { AgentDialog } from './StructuredAgentRenderers'
 import { recoverEditorDraft } from './editor-draft-state'
 import { cleanIpcError, isBinaryFileRefusal, isOverridableFileRefusal } from '../ipc-errors'
 import { openWorkspaceFile } from '../components/workspace-files-state'
+import { fileMachineId, isRemoteFileMachine, readMachineFile, writeMachineFile } from '../remote-files'
 import './CodePane.css'
 
 const languageFor = (path: string): string => {
@@ -20,7 +21,9 @@ const languageFor = (path: string): string => {
   )
 }
 
-export function CodePane({ project, tabId, path, line, allowBinary = false, autoFocus = true }: { project: ProjectRecord; tabId: string; path: string; line?: number; allowBinary?: boolean; autoFocus?: boolean }): React.JSX.Element {
+export function CodePane({ project, tabId, path, line, allowBinary = false, autoFocus = true, machineId }: { project: ProjectRecord; tabId: string; path: string; line?: number; allowBinary?: boolean; autoFocus?: boolean; machineId?: string }): React.JSX.Element {
+  const ownerMachineId = fileMachineId(machineId)
+  const remote = isRemoteFileMachine(ownerMachineId)
   const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('conductor.editorWordWrap') !== 'off')
   const toggleWrap = (): void => setWordWrap((current) => { localStorage.setItem('conductor.editorWordWrap', current ? 'off' : 'on'); return !current })
   const [value, setValue] = useState('')
@@ -42,6 +45,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
   const pathRef = useRef(path)
   const tabIdRef = useRef(tabId)
   const projectIdRef = useRef(project.id)
+  const machineIdRef = useRef(ownerMachineId)
   const generationRef = useRef(0)
   const viewStateRef = useRef<unknown | null>(null)
   const editorRef = useRef<Parameters<OnMount>[0] | null>(null)
@@ -56,7 +60,8 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
   pathRef.current = path
   tabIdRef.current = tabId
   projectIdRef.current = project.id
-  useEffect(() => { allowBinaryRef.current = allowBinary; return () => { allowBinaryRef.current = allowBinary } }, [allowBinary, path, project.id, tabId])
+  machineIdRef.current = ownerMachineId
+  useEffect(() => { allowBinaryRef.current = allowBinary; return () => { allowBinaryRef.current = allowBinary } }, [allowBinary, path, project.id, tabId, ownerMachineId])
   const dirty = value !== savedValue
   const language = useMemo(() => languageFor(path), [path])
 
@@ -67,7 +72,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
       draftTimerRef.current = null
     }
     viewStateRef.current = editorRef.current?.saveViewState() ?? viewStateRef.current
-    const ok = window.conductor.files.flushDraft(tabIdRef.current, projectIdRef.current, pathRef.current, valueRef.current, viewStateRef.current, baseContentRef.current)
+    const ok = window.conductor.files.flushDraft(tabIdRef.current, projectIdRef.current, pathRef.current, valueRef.current, viewStateRef.current, baseContentRef.current, machineIdRef.current)
     if (!ok) {
       if (event instanceof CustomEvent && event.detail) event.detail.failed = true
       setError('Could not preserve your editor draft. Keep this window open and try saving again.')
@@ -81,7 +86,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
     draftTimerRef.current = window.setTimeout(() => {
       draftTimerRef.current = null
       viewStateRef.current = editorRef.current?.saveViewState() ?? viewStateRef.current
-      window.conductor.files.checkpointDraft(tabIdRef.current, projectIdRef.current, pathRef.current, valueRef.current, viewStateRef.current, baseContentRef.current)
+      window.conductor.files.checkpointDraft(tabIdRef.current, projectIdRef.current, pathRef.current, valueRef.current, viewStateRef.current, baseContentRef.current, machineIdRef.current)
     }, 100)
   }
 
@@ -97,8 +102,8 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
     setReloadOpen(false)
     setError('')
     void Promise.all([
-      window.conductor.files.readForEditor(project.id, path, allowBinaryRef.current),
-      window.conductor.files.getDraft(tabId, project.id, path)
+      readMachineFile(ownerMachineId, project.id, path, allowBinaryRef.current),
+      window.conductor.files.getDraft(tabId, project.id, path, ownerMachineId)
     ]).then(([content, draft]) => {
       if (cancelled) return
       const state = recoverEditorDraft(content, draft)
@@ -129,7 +134,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
       loadedRef.current = false
       generationRef.current++
     }
-  }, [path, project.id, tabId, reloadKey])
+  }, [path, project.id, tabId, ownerMachineId, reloadKey])
 
   useEffect(() => {
     const onVisibility = (): void => {
@@ -145,7 +150,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
       window.removeEventListener('beforeunload', flushDraft)
       document.removeEventListener('visibilitychange', onVisibility)
     }
-  }, [path, project.id, tabId])
+  }, [path, project.id, tabId, ownerMachineId])
 
   useEffect(() => {
     let disposed = false, sequence = 0
@@ -155,7 +160,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
       if (saveTaskRef.current) { await saveTaskRef.current; if (disposed) return }
       const version = ++sequence, generation = generationRef.current
       try {
-        const content = await window.conductor.files.readForEditor(project.id, path, allowBinaryRef.current)
+        const content = await readMachineFile(ownerMachineId, project.id, path, allowBinaryRef.current)
         if (disposed || version !== sequence || generation !== generationRef.current || content === baseContentRef.current) return
         if (valueRef.current !== savedValueRef.current) {
           setConflict(true)
@@ -176,13 +181,14 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
       } catch (reason) { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) }
     }
     const unsubscribe = window.conductor.files.onChanged(change => {
+      if (remote) return
       if (change.projectId !== project.id) return
       const current = normalize(path), changed = normalize(change.path)
       if (current === changed || current === normalize(project.path) + '/' + changed) void refresh()
     })
     window.addEventListener('focus', refresh)
     return () => { disposed = true; sequence++; unsubscribe(); window.removeEventListener('focus', refresh) }
-  }, [project.id, project.path, path, tabId])
+  }, [project.id, project.path, path, tabId, ownerMachineId, remote])
 
   useEffect(() => {
     const observer = new MutationObserver(() => {
@@ -228,8 +234,8 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
     if (saveTaskRef.current) { saveAgainRef.current = true; return saveTaskRef.current }
     if (valueRef.current === savedValueRef.current && baseContentRef.current !== undefined) return Promise.resolve()
     const generation = generationRef.current
-    const owner = { projectId: projectIdRef.current, path: pathRef.current, tabId: tabIdRef.current }
-    const isCurrent = (): boolean => generationRef.current === generation && owner.path === pathRef.current && owner.tabId === tabIdRef.current && owner.projectId === projectIdRef.current
+    const owner = { machineId: machineIdRef.current, projectId: projectIdRef.current, path: pathRef.current, tabId: tabIdRef.current }
+    const isCurrent = (): boolean => generationRef.current === generation && owner.machineId === machineIdRef.current && owner.path === pathRef.current && owner.tabId === tabIdRef.current && owner.projectId === projectIdRef.current
     editorRef.current?.pushUndoStop()
     setSaving(true)
     setError('')
@@ -239,7 +245,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
           saveAgainRef.current = false
           const submittedValue = valueRef.current
           flushDraft()
-          const result = await window.conductor.files.write(owner.projectId, owner.path, submittedValue, baseContentRef.current)
+          const result = await writeMachineFile(owner.machineId, owner.projectId, owner.path, submittedValue, baseContentRef.current)
           if (!isCurrent()) return
           if (result.status === 'conflict') { setConflict(true); setError(result.message); return }
           editorRef.current?.pushUndoStop()
@@ -268,6 +274,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
   }
 
   const saveCopy = async (): Promise<void> => {
+    if (isRemoteFileMachine(machineIdRef.current)) { setError('Saving a remote file copy on this machine is not available. The original host file was not changed.'); return }
     try {
       const copy = await window.conductor.files.saveCopy(projectIdRef.current, pathRef.current, valueRef.current)
       window.dispatchEvent(new Event('conductor:refresh-files'))
@@ -281,7 +288,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
     const generation = generationRef.current
     const submitted = valueRef.current
     try {
-      const content = await window.conductor.files.readForEditor(projectIdRef.current, pathRef.current, allowBinaryRef.current)
+      const content = await readMachineFile(machineIdRef.current, projectIdRef.current, pathRef.current, allowBinaryRef.current)
       if (generation !== generationRef.current) return
       if (submitted !== valueRef.current) { setError('Your edits changed while reloading. Try again when ready.'); return }
       if (content === null) { setError('The file no longer exists. Save a copy to preserve your edits.'); return }
@@ -390,6 +397,10 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
   }
 
   const attachContext = (): void => {
+    if (isRemoteFileMachine(machineIdRef.current)) {
+      window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Remote editor context stays on its host. Open the file link from that remote conversation instead.' }))
+      return
+    }
     const selected = editorRef.current?.getSelection()
     const model = editorRef.current?.getModel()
     const hasSelection = Boolean(selected && !selected.isEmpty())
@@ -413,6 +424,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
     <div className="code-pane">
       <div className="code-toolbar">
         <span className="code-path">{path}</span>
+        {remote && <span className="code-recovered" title={ownerMachineId}>Remote · {ownerMachineId}</span>}
         {recovered && <span className="code-recovered">Recovered draft</span>}
         <span className="code-language">{language}</span>
         <button aria-pressed={wordWrap} onClick={toggleWrap} title="Toggle word wrap (Alt+Z)" aria-label="Toggle word wrap"><WrapText size={14} /></button>
@@ -431,14 +443,14 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
           <strong>{blocked ? 'Not opened as text' : `Could not open ${path}`}</strong>
           <span>{error}</span>
           <div>
-            <button onClick={() => openWorkspaceFile(project.id, path, 'preview')}><Eye size={14} /> Preview instead</button>
-            <button onClick={() => void window.conductor.files.openExternal(project.id, path)}><ExternalLink size={14} /> Open with default app</button>
-            {blocked && overridable && <button onClick={() => { allowBinaryRef.current = true; setReloadKey((value) => value + 1) }}><FileWarning size={14} /> Show as text anyway</button>}
+            {!remote && <button onClick={() => openWorkspaceFile(project.id, path, 'preview')}><Eye size={14} /> Preview instead</button>}
+            {!remote && <button onClick={() => void window.conductor.files.openExternal(project.id, path)}><ExternalLink size={14} /> Open with default app</button>}
+            {!remote && blocked && overridable && <button onClick={() => { allowBinaryRef.current = true; setReloadKey((value) => value + 1) }}><FileWarning size={14} /> Show as text anyway</button>}
           </div>
         </div>
       ) : (
         <Editor
-          path={`${project.id}/${encodeURIComponent(tabId)}/${path}`}
+          path={`${ownerMachineId}/${project.id}/${encodeURIComponent(tabId)}/${path}`}
           value={value}
           language={language}
           theme={theme}

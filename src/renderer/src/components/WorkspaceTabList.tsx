@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, FileText, Link2, MoreHorizontal, Radio, TerminalSquare } from 'lucide-react'
+import { ChevronDown, ChevronRight, FileText, MoreHorizontal, TerminalSquare } from 'lucide-react'
 import type { AgentActivityPhase, PaneTab, SessionRecord } from '../../../shared/models'
+import type { AgentControlLink } from '../../../shared/agent-control'
 import { listGroups } from '../layout/layout-operations'
 import { tabGroupsOf, type TabGroupAction } from '../layout/tab-groups'
 import type { WorkspaceTabAction } from '../layout/workspace-tab-actions'
@@ -8,6 +9,18 @@ import { PaneTabMenu } from './PaneTabMenu'
 import { TabActivityIndicator } from './TabActivityIndicator'
 import { ProviderIcon } from './ProviderIcon'
 import { useAgentControlLinks } from './useAgentControlLinks'
+import './WorkspaceTabList.css'
+
+export function tabControlRole(tabId: string, links: readonly AgentControlLink[]): { controlledBy?: AgentControlLink; controlling: AgentControlLink[] } {
+  return { controlledBy: links.find(link => link.controlledTabId === tabId), controlling: links.filter(link => link.controllerTabId === tabId) }
+}
+
+export function tabRoleLabel(role: ReturnType<typeof tabControlRole>): 'Coworker' | 'Main' | 'Coworker · Main' | undefined {
+  if (role.controlledBy && role.controlling.length) return 'Coworker · Main'
+  if (role.controlledBy) return 'Coworker'
+  if (role.controlling.length) return 'Main'
+  return undefined
+}
 
 /** The disclosure control belongs beside the workspace name, not stranded between the name and
   * the tabs it opens; it lives here so its label and glyph stay with the list it governs. */
@@ -31,8 +44,9 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
   return <div className="workspace-tab-tree" onContextMenu={event => event.stopPropagation()}>
     {expanded && groups.flatMap(group => group.tabs.map(tab => {
       const tabPhase = (tab.resourceId ? activityPhases.get(tab.resourceId) : undefined) ?? 'idle'
-      const controlledBy = tab.kind === 'agent' ? links.find(link => link.controlledTabId === tab.id) : undefined
-      const controlling = tab.kind === 'agent' ? links.filter(link => link.controllerTabId === tab.id) : []
+      const role = tab.kind === 'agent' ? tabControlRole(tab.id, links) : { controlledBy: undefined, controlling: [] }
+      const { controlledBy, controlling } = role
+      const roleLabel = tabRoleLabel(role)
       const tabGroup = tab.tabGroupId ? tabGroupsOf(group).find(item => item.id === tab.tabGroupId) : undefined
       return <div key={tab.id} className={`workspace-tab-row${active && group.activeTabId === tab.id ? ' selected' : ''}`} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ x: event.clientX, y: event.clientY, groupId: group.id, tab }) }}>
       <button className="workspace-tab-select" title={tab.title} onClick={() => onAction(group.id, tab.id, 'focus')}>
@@ -41,8 +55,7 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
         <span className="ellipsis">{tab.title}</span>
         {tab.kind === 'agent' && <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />}
       </button>
-      {controlledBy && <button type="button" className="workspace-tab-link controlled" title={`Controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)} — show that tab`} aria-label={`${tab.title} is controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)}; show its tab`} onClick={() => focusLinkedTab(controlledBy.controllerTabId)}><Link2 size={11} /></button>}
-      {controlling.length > 0 && <button type="button" className="workspace-tab-link controller" title={`${controlling.length === 1 ? 'Controls ' + titleOf(controlling[0]!.controlledTabId, controlling[0]!.controlledTitle) : 'Controls ' + controlling.length + ' tabs'} — show ${controlling.length === 1 ? 'that tab' : 'the first'}`} aria-label={`${tab.title} controls ${controlling.length === 1 ? titleOf(controlling[0]!.controlledTabId, controlling[0]!.controlledTitle) : controlling.length + ' tabs'}; show its tab`} onClick={() => focusLinkedTab(controlling[0]!.controlledTabId)}><Radio size={11} /></button>}
+      {roleLabel && <button type="button" className={`workspace-tab-role ${controlledBy && controlling.length ? 'both' : controlledBy ? 'coworker' : 'main'}`} title={controlledBy && controlling.length ? `${tab.title} is a coworker controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)} and a main coordinator for ${controlling.length} coworker${controlling.length === 1 ? '' : 's'} — show its main coordinating tab` : controlledBy ? `${tab.title} is a coworker controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)} — show the main coordinating tab` : `${tab.title} is the main coordinating tab and controls ${controlling.length === 1 ? titleOf(controlling[0]!.controlledTabId, controlling[0]!.controlledTitle) : controlling.length + ' coworkers'} — show ${controlling.length === 1 ? 'that coworker' : 'the first coworker'}`} aria-label={controlledBy ? `${tab.title} is ${roleLabel.toLowerCase()} controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)}; show the main tab` : `${tab.title} is the main coordinating tab and controls ${controlling.length === 1 ? titleOf(controlling[0]!.controlledTabId, controlling[0]!.controlledTitle) : controlling.length + ' coworkers'}; show its coworker`} onClick={() => focusLinkedTab(controlledBy?.controllerTabId ?? controlling[0]!.controlledTabId)}><span>{roleLabel}</span>{controlling.length > 0 && <b>{controlling.length}</b>}</button>}
       <button className="workspace-tab-more" aria-label={`${tab.title} tab actions`} onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); setMenu({ x: rect.right, y: rect.top, groupId: group.id, tab }) }}><MoreHorizontal size={12} /></button>
     </div>
     }))}

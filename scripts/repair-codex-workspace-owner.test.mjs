@@ -10,6 +10,7 @@ const script = path.resolve('scripts/repair-codex-workspace-owner.ps1')
 const runIn = (env, ...args) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', script, ...args], { encoding: 'utf8', windowsHide: true, timeout: 15_000, env: { ...process.env, ...env } })
 const run = (...args) => runIn({}, ...args)
 const fixture = () => fs.mkdtempSync(path.join(os.tmpdir(), 'conductor-owner-guard-'))
+const canonicalPath = value => fs.realpathSync.native(value)
 const cleanup = directory => {
   const actual = fs.realpathSync(directory)
   const prefix = path.join(fs.realpathSync(os.tmpdir()), 'conductor-owner-guard-')
@@ -24,7 +25,7 @@ test('diagnostic mode reads both directory owners without changing either ACL', 
     const first = run('-WorkspacePath', directory)
     assert.equal(first.status, 0, first.stderr)
     const before = JSON.parse(first.stdout)
-    assert.deepEqual(before.map(entry => entry.Path), [directory, path.join(directory, '.git')])
+    assert.deepEqual(before.map(entry => canonicalPath(entry.Path)), [canonicalPath(directory), canonicalPath(path.join(directory, '.git'))])
     assert.ok(before.every(entry => entry.OwnerSid && entry.Dacl))
     const second = run('-WorkspacePath', directory)
     assert.equal(second.status, 0, second.stderr)
@@ -70,7 +71,7 @@ test('a worktree .git pointer is left untouched', { skip: !windows }, () => {
     fs.writeFileSync(path.join(directory, '.git'), 'gitdir: ../other/worktrees/test\n')
     const result = run('-WorkspacePath', directory)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(JSON.parse(result.stdout).Path, directory)
+    assert.equal(canonicalPath(JSON.parse(result.stdout).Path), canonicalPath(directory))
     assert.equal(fs.readFileSync(path.join(directory, '.git'), 'utf8'), 'gitdir: ../other/worktrees/test\n')
   } finally { cleanup(directory) }
 })
@@ -89,7 +90,7 @@ test('reads owners where the Security module cannot be loaded', { skip: !windows
     assert.match(probe.stderr, /CouldNotAutoloadMatchingModule/, 'The fixture must actually break Get-Acl')
     const result = runIn(shadowed, '-WorkspacePath', directory)
     assert.equal(result.status, 0, result.stderr)
-    assert.equal(JSON.parse(result.stdout).Path, directory)
+    assert.equal(canonicalPath(JSON.parse(result.stdout).Path), canonicalPath(directory))
   } finally { cleanup(directory) }
 })
 

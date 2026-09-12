@@ -116,6 +116,7 @@ export function distinguishSubagentLabels(agents: Array<{ id: string; name: stri
 
 export function summarizeSubagents(items: TimelineItem[], runtimeId: string, phase: SessionPhase, includeActivity = true): SubagentSummary[] {
   const agents = new Map<string, SubagentSummary>()
+  const legacyShellTasks = new Set<string>()
   for (const item of [...items].sort((a, b) => updatedSequence(a) - updatedSequence(b))) {
     if (item.data.type !== 'subagent') continue
     const id = subagentIdentityId(item.data, item.runtimeId, item.nativeItemId, item.id)
@@ -133,7 +134,12 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
       activity: [], outputFile: item.data.outputFile ?? previous?.outputFile, output: item.data.output ?? previous?.output, outputTruncated: item.data.outputTruncated ?? previous?.outputTruncated, outputError: item.data.outputError, status, sequence: previous?.sequence ?? item.sequence,
       model: item.data.model ?? previous?.model, effort: item.data.effort ?? previous?.effort, modelProvider: item.data.modelProvider ?? previous?.modelProvider })
   }
-  if (!includeActivity) return [...agents.values()].sort((a, b) => a.sequence - b.sequence)
+  for (const agent of agents.values()) {
+    const launch = items.find(item => item.runtimeId === agent.runtimeId && item.nativeItemId && agent.parentIds.includes(item.nativeItemId) && item.data.type === 'tool')
+    if (launch?.data.type === 'tool' && agent.detached && ['bash', 'powershell', 'shell'].includes(launch.data.name.toLowerCase())) legacyShellTasks.add(agent.id)
+  }
+  const visibleAgents = (): SubagentSummary[] => [...agents.values()].filter(agent => !legacyShellTasks.has(agent.id)).sort((a, b) => a.sequence - b.sequence)
+  if (!includeActivity) return visibleAgents()
   // A shared launch/wait tool is not evidence that every child produced its output.
   const owners = new Map<string, Set<string>>()
   for (const agent of agents.values()) for (const parent of agent.parentIds) {
@@ -146,6 +152,9 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
     const scoped = items.filter(item => item.runtimeId === agent.runtimeId)
     const launch = scoped.find(item => item.nativeItemId && parents.has(item.nativeItemId) && item.data.type === 'tool')
     if (launch?.data.type === 'tool') {
+      // Older projections classified any background task with output_file as a subagent. The
+      // parent tool is the durable discriminator available in that saved history: Bash and
+      // PowerShell are processes, while Agent/Task launches remain genuine model-called agents.
       const input = object(launch.data.input)
       // Backgrounded shell work carries a command rather than a prompt; without it these
       // tasks render with no description at all.
@@ -168,7 +177,7 @@ export function summarizeSubagents(items: TimelineItem[], runtimeId: string, pha
     const latest = agent.activity.at(-1)
     if (latest && latest.timestamp > agent.updatedAt) agent.updatedAt = latest.timestamp
   }
-  return [...agents.values()].sort((a, b) => a.sequence - b.sequence)
+  return visibleAgents()
 }
 
 export function subagentCountLabel(agents: SubagentSummary[]): string {

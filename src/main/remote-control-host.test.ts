@@ -19,6 +19,9 @@ const private_ = join(root, 'private')
 mkdirSync(shared)
 mkdirSync(private_)
 writeFileSync(join(shared, 'notes.md'), 'shared notes')
+writeFileSync(join(shared, 'unicode.txt'), '€'.repeat(40_000))
+writeFileSync(join(shared, 'frame.png'), Buffer.from('0123456789abcdef'))
+writeFileSync(join(shared, 'active.svg'), '<svg><script>alert(1)</script></svg>')
 writeFileSync(join(private_, 'secrets.env'), 'GITHUB_TOKEN=ghp_realsecret')
 // A junction is the escape route a lexical check alone would miss.
 let junction = false
@@ -37,26 +40,39 @@ const peer: RemotePeerRecord = {
 function fixture() {
   const opened: Array<Record<string, unknown>> = []
   const updated: Array<Record<string, unknown>> = []
+  let currentAuthority = true
+  let authorityRevision = 0
+  const requireProject = (_peer: RemotePeerRecord, projectId: unknown) => {
+    const project = PROJECTS.find(entry => entry.id === projectId)
+    if (!project || !peer.grantedProjects.some(granted => granted.projectId === project.id)) throw new RemoteAccessError('That project was not shared with this machine.', 403)
+    return project
+  }
   const peers = {
     machineId: 'host-machine',
-    requireProject: (_peer: RemotePeerRecord, projectId: unknown) => {
-      const project = PROJECTS.find(entry => entry.id === projectId)
-      if (!project || !peer.grantedProjects.some(granted => granted.projectId === project.id)) throw new RemoteAccessError('That project was not shared with this machine.', 403)
-      return project
+    requireProject,
+    requireCurrentProject: (subject: RemotePeerRecord, projectId: unknown, expectedRevision?: number) => {
+      if (!currentAuthority || expectedRevision !== undefined && expectedRevision !== authorityRevision) throw new RemoteAccessError('Remote access changed while this request was pending.', 403, 'peer-revoked')
+      return requireProject(subject, projectId)
     },
+    captureProjectAuthority: (subject: RemotePeerRecord, projectId: unknown) => ({ project: requireProject(subject, projectId), revision: authorityRevision }),
     sharedProjects: (subject: RemotePeerRecord) => PROJECTS.filter(project => subject.grantedProjects.some(granted => granted.projectId === project.id)),
     record: vi.fn()
   } as unknown as RemotePeers
   const database = {
     getProject: (id: string) => PROJECTS.find(entry => entry.id === id) ?? null,
-    getSession: (id: string) => id === 'workspace-1' ? { id, projectId: 'shared-project', layout: { version: 1, root: { type: 'group', id: 'group-1', tabs: [] } } } : null,
+    getSession: (id: string) => id === 'workspace-1' ? { id, projectId: 'shared-project', layout: { version: 1, root: { type: 'group', id: 'group-1', activeTabId: 'agent-tab', tabs: [{ id: 'agent-tab', kind: 'agent', title: 'Remote agent', resourceId: 'agent-remote', state: { provider: 'codex' } }] } } } : null,
     listSessions: () => [{ id: 'workspace-1', projectId: 'shared-project', name: 'Main' }],
     listDetachedWindows: () => [],
-    structured: { snapshot: () => ({ settings: { model: 'model-a', permission: 'bypass' }, phase: 'idle', items: [] }), events: () => [], update: (id: string, patch: Record<string, unknown>) => { updated.push({ id, ...patch }) } }
+    structured: { snapshot: () => ({ sessionId: 'agent-remote', runtimeId: 'runtime-remote', settings: { model: 'model-a', permission: 'default', plan: false }, phase: 'idle', items: [], sequence: 0, title: '', archived: false, truncated: false }), events: () => [], update: (id: string, patch: Record<string, unknown>) => { updated.push({ id, ...patch }) } }
   } as unknown as ConductorDatabase
+  const sessions = {
+    ensure: vi.fn(() => ({ available: true })), submit: vi.fn(), steer: vi.fn(), queue: vi.fn(), cancelQueued: vi.fn(() => null),
+    interrupt: vi.fn(), resume: vi.fn(), discover: vi.fn(async () => ({ commands: ['remote'] })), saveSettings: vi.fn(),
+    respond: vi.fn(), rename: vi.fn(), archive: vi.fn()
+  }
   const host = new RemoteControlHost({
     database,
-    sessions: { ensure: () => ({ available: true }), submit: vi.fn(), steer: vi.fn(), interrupt: vi.fn() } as unknown as StructuredSessions,
+    sessions: sessions as unknown as StructuredSessions,
     backlogs: { get: vi.fn(), edit: vi.fn() } as unknown as ProjectBacklogs,
     peers,
     providers: () => [{ id: 'codex', available: true, models: [{ id: 'model-a', label: 'Model A', isDefault: true }] }],
@@ -67,7 +83,11 @@ function fixture() {
   const call = (method: string, args: Record<string, unknown>): Promise<unknown> => host.call(peer, method, args)
   const refusal = (method: string, args: Record<string, unknown>): Promise<string> =>
     call(method, args).then(() => 'ALLOWED', error => (error as Error).message)
-  return { host, call, refusal, opened, updated }
+  return {
+    host, call, refusal, opened, updated, sessions,
+    revoke: () => { currentAuthority = false; authorityRevision++ },
+    cycleAuthority: () => { authorityRevision++ }
+  }
 }
 
 let fix: ReturnType<typeof fixture>
@@ -93,6 +113,63 @@ describe('what a paired machine may read and write', () => {
       .resolves.toMatchObject({ path: 'notes.md', content: 'shared notes' })
   })
 
+  it('rechecks current authority after asynchronous path resolution before reading', async () => {
+    const pending = fix.call('files.read', { projectId: 'shared-project', path: 'notes.md' })
+    fix.revoke()
+    await expect(pending).rejects.toThrow(/access changed/)
+  })
+
+  it('rechecks current authority before a write and leaves the host file unchanged', async () => {
+    writeFileSync(join(shared, 'race.md'), 'before')
+    const pending = fix.call('files.write', { projectId: 'shared-project', path: 'race.md', content: 'after', expectedContent: 'before' })
+    fix.revoke()
+    await expect(pending).rejects.toThrow(/access changed/)
+    expect(readFileSync(join(shared, 'race.md'), 'utf8')).toBe('before')
+  })
+
+  it('rejects an exact disable/re-enable generation change during path resolution', async () => {
+    const pending = fix.call('files.read', { projectId: 'shared-project', path: 'notes.md' })
+    fix.cycleAuthority()
+    await expect(pending).rejects.toThrow(/access changed/)
+  })
+
+  it('lists and stats only relative host paths without disclosing its absolute root', async () => {
+    await expect(fix.call('files.list', { projectId: 'shared-project', path: '' })).resolves.toContainEqual({ name: 'notes.md', path: 'notes.md', kind: 'file' })
+    const result = await fix.call('files.stat', { projectId: 'shared-project', path: 'notes.md' }) as Record<string, unknown>
+    expect(result).toMatchObject({ size: 12, isFile: true })
+    expect(result.modifiedAt).toEqual(expect.any(String))
+  })
+
+  it('serves allowlisted media only through bounded chunks tied to one stable file version', async () => {
+    const described = await fix.call('files.describe', { projectId: 'shared-project', path: 'frame.png' }) as Record<string, unknown>
+    expect(described).toMatchObject({ path: 'frame.png', size: 16, kind: 'image', mimeType: 'image/png' })
+    expect(described.version).toMatch(/^[a-f0-9]{64}$/)
+    const first = await fix.call('files.readChunk', {
+      projectId: 'shared-project', path: 'frame.png', offset: 0, length: 6, version: described.version
+    }) as Record<string, unknown>
+    const second = await fix.call('files.readChunk', {
+      projectId: 'shared-project', path: 'frame.png', offset: 6, length: 20, version: described.version
+    }) as Record<string, unknown>
+    expect(Buffer.concat([
+      Buffer.from(String(first.bytesBase64), 'base64'), Buffer.from(String(second.bytesBase64), 'base64')
+    ]).toString()).toBe('0123456789abcdef')
+    expect(first).toMatchObject({ offset: 0, length: 6, totalSize: 16, eof: false })
+    expect(second).toMatchObject({ offset: 6, length: 10, totalSize: 16, eof: true })
+  })
+
+  it('refuses active media and invalid or stale ranges', async () => {
+    await expect(fix.call('files.describe', { projectId: 'shared-project', path: 'active.svg' })).rejects.toThrow(/safe raster images/)
+    const described = await fix.call('files.describe', { projectId: 'shared-project', path: 'frame.png' }) as Record<string, unknown>
+    await expect(fix.call('files.readChunk', {
+      projectId: 'shared-project', path: 'frame.png', offset: 0, length: 256 * 1024 + 1, version: described.version
+    })).rejects.toThrow(/range or version/)
+    writeFileSync(join(shared, 'frame.png'), Buffer.from('changed-and-longer-content'))
+    await expect(fix.call('files.readChunk', {
+      projectId: 'shared-project', path: 'frame.png', offset: 0, length: 4, version: described.version
+    })).rejects.toThrow(/range or version/)
+    writeFileSync(join(shared, 'frame.png'), Buffer.from('0123456789abcdef'))
+  })
+
   it.each(escapes)('refuses to read through %s', async (_label, path) => {
     const message = await fix.refusal('files.read', { projectId: 'shared-project', path })
     expect(message).not.toBe('ALLOWED')
@@ -111,7 +188,7 @@ describe('what a paired machine may read and write', () => {
   })
 
   it('refuses every file method for a project that was never shared', async () => {
-    for (const method of ['files.read', 'files.list', 'files.write', 'files.open']) {
+    for (const method of ['files.read', 'files.list', 'files.stat', 'files.write', 'files.open']) {
       expect(await fix.refusal(method, { projectId: 'other-project', sessionId: 'workspace-1', path: 'notes.md', content: '', expectedContent: null }))
         .toMatch(/not shared with this machine/)
     }
@@ -152,5 +229,98 @@ describe('which method names reach the host at all', () => {
     const listed = await fix.call('tools.list', {}) as Record<string, string>
     expect(Object.keys(listed)).not.toContain('terminal.write')
     expect(await fix.refusal('shell.exec', { projectId: 'shared-project' })).toMatch(/Unknown remote method/)
+  })
+})
+
+describe('remote structured conversation operations', () => {
+  const base = { projectId: 'shared-project', sessionId: 'workspace-1', agentSessionId: 'agent-remote' }
+  const settings = { model: 'model-a', permission: 'default', plan: false }
+
+  it('executes every supported lifecycle operation on the host session with the remote origin', async () => {
+    await fix.call('agents.submit', {
+      ...base, prompt: 'now', settings,
+      origin: { authority: { kind: 'remote-peer', peerId: 'attacker', projectId: 'other-project' } }
+    })
+    await fix.call('agents.steer', { ...base, prompt: 'next', settings })
+    await fix.call('agents.queue', { ...base, prompt: 'later', settings })
+    await fix.call('agents.cancelQueued', { ...base, promptId: 'queued-1' })
+    await fix.call('agents.interrupt', { ...base, expediteSubmittedInput: true })
+    await fix.call('agents.resume', { ...base, settings })
+    await expect(fix.call('agents.discover', base)).resolves.toEqual({ commands: ['remote'] })
+    await fix.call('agents.settings', { ...base, settings })
+    await fix.call('agents.respond', { ...base, response: { sessionId: 'controller-copy', runtimeId: 'runtime-remote', requestId: 'approval', decision: 'allow' } })
+    await fix.call('agents.rename', { ...base, title: 'New title' })
+    await fix.call('agents.archive', { ...base, archived: true })
+
+    expect(fix.sessions.submit).toHaveBeenCalledWith('agent-remote', 'now', settings, [], expect.objectContaining({ label: 'Laptop (remote)' }))
+    expect(fix.sessions.submit).toHaveBeenCalledWith('agent-remote', 'now', settings, [], expect.objectContaining({
+      authority: { kind: 'remote-peer', peerId: peer.id, projectId: 'shared-project' }
+    }))
+    expect(fix.sessions.steer).toHaveBeenCalledWith('agent-remote', 'next', settings, [], expect.any(Object))
+    expect(fix.sessions.queue).toHaveBeenCalledWith('agent-remote', 'later', settings, [], expect.any(Object))
+    expect(fix.sessions.interrupt).toHaveBeenCalledWith('agent-remote', true)
+    expect(fix.sessions.resume).toHaveBeenCalledWith('agent-remote', settings)
+    expect(fix.sessions.saveSettings).toHaveBeenCalledWith('agent-remote', settings)
+    expect(fix.sessions.respond).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'agent-remote', requestId: 'approval' }))
+    expect(fix.sessions.rename).toHaveBeenCalledWith('agent-remote', 'New title')
+    expect(fix.sessions.archive).toHaveBeenCalledWith('agent-remote', true)
+  })
+
+  it('rejects malformed lifecycle arguments at the host boundary', async () => {
+    await expect(fix.call('agents.cancelQueued', { ...base, promptId: 42 })).rejects.toThrow(/Invalid promptId/)
+    await expect(fix.call('agents.archive', { ...base, archived: 'yes' })).rejects.toThrow(/Invalid archived/)
+    await expect(fix.call('agents.respond', { ...base, response: null })).rejects.toThrow(/Invalid response/)
+  })
+
+  it('reads remote prompt context from the host project and never accepts controller-supplied bytes or paths', async () => {
+    await fix.call('agents.submit', {
+      ...base, prompt: 'use host notes', settings,
+      attachments: [{
+        id: 'remote-notes', kind: 'file', name: 'notes.md',
+        remoteFile: { machineId: 'host-machine', projectId: 'shared-project', path: 'notes.md' }
+      }]
+    })
+    expect(fix.sessions.submit).toHaveBeenLastCalledWith('agent-remote', 'use host notes', settings, [{
+      id: 'remote-notes', kind: 'file', name: 'notes.md', content: 'shared notes'
+    }], expect.objectContaining({ label: 'Laptop (remote)' }))
+
+    await expect(fix.call('agents.submit', {
+      ...base, prompt: 'supplied bytes', settings,
+      attachments: [{
+        id: 'bad', kind: 'file', name: 'notes.md', content: 'controller bytes',
+        remoteFile: { machineId: 'host-machine', projectId: 'shared-project', path: 'notes.md' }
+      }]
+    })).rejects.toThrow(/without supplied content/)
+    await expect(fix.call('agents.submit', {
+      ...base, prompt: 'escape', settings,
+      attachments: [{
+        id: 'bad-path', kind: 'file', name: 'secret',
+        remoteFile: { machineId: 'host-machine', projectId: 'shared-project', path: '../private/secrets.env' }
+      }]
+    })).rejects.toThrow(/outside the session workspace|Invalid workspace path/)
+  })
+
+  it('lets revocation win while host attachment bytes are being resolved', async () => {
+    const pending = fix.call('agents.submit', {
+      ...base, prompt: 'must not dispatch', settings,
+      attachments: [{
+        id: 'remote-notes', kind: 'file', name: 'notes.md',
+        remoteFile: { machineId: 'host-machine', projectId: 'shared-project', path: 'notes.md' }
+      }]
+    })
+    fix.revoke()
+    await expect(pending).rejects.toThrow(/access changed/)
+    expect(fix.sessions.submit).not.toHaveBeenCalled()
+  })
+
+  it('bounds aggregate remote attachment context by UTF-8 bytes', async () => {
+    const attachments = ['one', 'two', 'three'].map(id => ({
+      id, kind: 'file', name: 'unicode.txt',
+      remoteFile: { machineId: 'host-machine', projectId: 'shared-project', path: 'unicode.txt' }
+    }))
+    await expect(fix.call('agents.submit', {
+      ...base, prompt: 'too much context', settings, attachments
+    })).rejects.toThrow(/Total remote file context exceeds 250 KB/)
+    expect(fix.sessions.submit).not.toHaveBeenCalled()
   })
 })

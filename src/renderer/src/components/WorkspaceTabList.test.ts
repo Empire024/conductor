@@ -3,7 +3,8 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentActivityPhase, SessionRecord } from '../../../shared/models'
 import { createDefaultLayout } from '../../../shared/models'
-import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
+import type { AgentControlLink } from '../../../shared/agent-control'
+import { tabControlRole, tabRoleLabel, WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
 
 const makeSession = (): SessionRecord => {
   const layout = createDefaultLayout()
@@ -66,5 +67,23 @@ describe('WorkspaceTabList activity indicator', () => {
     const html = render(new Map([['agent-resource', 'working']]))
     expect(html.match(/tab-activity/g)).toHaveLength(1)
     expect(html).toContain('Terminal')
+  })
+})
+
+describe('persistent main/coworker roles', () => {
+  const links: AgentControlLink[] = [
+    { projectId: 'project-1', sessionId: 'workspace-1', controllerAgentSessionId: 'main-agent', targetAgentSessionId: 'worker-a', controllerTabId: 'main-tab', controlledTabId: 'worker-tab-a' },
+    { projectId: 'project-1', sessionId: 'workspace-1', controllerAgentSessionId: 'main-agent', targetAgentSessionId: 'worker-b', controllerTabId: 'main-tab', controlledTabId: 'worker-tab-b' }
+  ]
+  it('identifies one main tab by the coworkers it controls', () => {
+    expect(tabControlRole('main-tab', links)).toMatchObject({ controlledBy: undefined, controlling: [links[0], links[1]] })
+  })
+  it('identifies each coworker by its actual controller relationship', () => {
+    expect(tabControlRole('worker-tab-a', links)).toMatchObject({ controlledBy: links[0], controlling: [] })
+  })
+  it('uses one compact persistent label when a coworker also coordinates children', () => {
+    expect(tabRoleLabel({ controlledBy: links[0], controlling: [links[1]!] })).toBe('Coworker · Main')
+    expect(tabRoleLabel({ controlledBy: links[0], controlling: [] })).toBe('Coworker')
+    expect(tabRoleLabel({ controlledBy: undefined, controlling: links })).toBe('Main')
   })
 })

@@ -4,11 +4,12 @@ import { activateBrowserMention } from './CommandAutocomplete'
 describe('browser mention activation', () => {
   afterEach(() => vi.unstubAllGlobals())
 
-  it('asks the workspace to toggle its browser pane tab instead of sending anything as literal text', () => {
+  it('reveals the left browser instead of sending anything or changing tool authority', () => {
     const events: Event[] = []
     vi.stubGlobal('window', { dispatchEvent: (event: Event) => { events.push(event); return true } })
     activateBrowserMention()
-    expect(events.map(event => event.type)).toEqual(['conductor:toggle-browser-tab'])
+    expect(events.map(event => event.type)).toEqual(['conductor:sidebar-mode'])
+    expect((events[0] as CustomEvent).detail).toBe('browser')
   })
 
   it('is the same call the composer footer button makes, so both share one activation path', () => {
@@ -16,6 +17,6 @@ describe('browser mention activation', () => {
     vi.stubGlobal('window', { dispatchEvent: (event: Event) => { events.push(event); return true } })
     activateBrowserMention()
     activateBrowserMention()
-    expect(events.map(event => event.type)).toEqual(['conductor:toggle-browser-tab', 'conductor:toggle-browser-tab'])
+    expect(events.map(event => event.type)).toEqual(['conductor:sidebar-mode', 'conductor:sidebar-mode'])
   })
 })

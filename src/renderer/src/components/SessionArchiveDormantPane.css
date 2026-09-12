@@ -1,0 +1,23 @@
+.session-archive-dormant {
+  align-items: center;
+  align-self: center;
+  background: color-mix(in srgb, var(--surface-2) 88%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  margin: auto;
+  max-width: 660px;
+  padding: 22px;
+}
+.session-archive-dormant-icon { color: var(--accent); display: grid; place-items: center; }
+.session-archive-dormant small { color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+.session-archive-dormant h2 { font-size: 16px; margin: 3px 0 6px; }
+.session-archive-dormant p { color: var(--muted); line-height: 1.45; margin: 0; }
+.session-archive-dormant button { white-space: nowrap; }
+.session-archive-dormant .session-archive-dormant-error { color: var(--danger); grid-column: 2 / -1; }
+@media (max-width: 620px) {
+  .session-archive-dormant { grid-template-columns: auto minmax(0, 1fr); }
+  .session-archive-dormant button { grid-column: 2; justify-self: start; }
+}

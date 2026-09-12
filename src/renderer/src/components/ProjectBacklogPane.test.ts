@@ -154,15 +154,12 @@ describe('ProjectBacklogPane compose form image upload', () => {
     expect(html).toContain('title="Ctrl+Enter to add; Enter for a new line"')
   })
 
-  it('offers a compact priority control alongside the new task type, defaulting to normal', () => {
+  it('offers a priority slider alongside the new task type, defaulting to normal', () => {
     const html = render()
     expect(html).toContain('aria-label="New task priority"')
-    expect(html).toContain('aria-haspopup="listbox"')
-    expect(html).toContain('project-priority-trigger priority-normal')
-    expect(html).toContain('Normal priority')
-    // A themed native <select> tints every option in its popup, not just the trigger
-    // (the bug this control replaced): confirm it is a custom listbox, not a <select>.
-    expect(html).not.toContain('<select aria-label="New task priority"')
+    expect(html).toContain('type="range"')
+    expect(html).toContain('aria-valuetext="Normal"')
+    expect(html).toContain('<output>Normal</output>')
   })
 
   it('restores a queued image as a removable thumbnail chip alongside the draft title', () => {
@@ -189,13 +186,20 @@ describe('ProjectBacklogPane compose form image upload', () => {
     expect(html).toContain('<option value="bug">Bug</option>')
   })
 
-  it('offers a compact weight control alongside the new task type, defaulting to medium', () => {
+  it('offers a weight slider alongside the new task type, defaulting to medium', () => {
     const html = render()
     expect(html).toContain('aria-label="New task weight"')
-    expect(html).toContain('aria-haspopup="listbox"')
-    expect(html).toContain('project-weight-trigger weight-medium')
-    expect(html).toContain('Medium weight')
-    expect(html).not.toContain('<select aria-label="New task weight"')
+    expect(html).toContain('type="range"')
+    expect(html).toContain('aria-valuetext="Medium"')
+    expect(html).toContain('<output>Medium</output>')
+  })
+
+  it('uses an accessible icon-only submit action', () => {
+    const html = render()
+    expect(html).toContain('class="project-task-send"')
+    expect(html).toContain('title="Add task"')
+    expect(html).toContain('aria-label="Add task"')
+    expect(html).not.toContain('>Add task</button>')
   })
 
   it('lists Task alongside Bug, Feature and Idea in the type filter', () => {

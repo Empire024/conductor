@@ -29,6 +29,7 @@ const parseWeight = (value?:string):ProjectTaskWeight => {
   return lower==='heavy' || lower==='light' ? lower : 'medium'
 }
 const taskMarker = (id:string,agentId?:string|null,priority?:ProjectTaskPriority,weight?:ProjectTaskWeight):string => '<!-- conductor-task:'+id+(agentId?' agent='+agentId:'')+(priority && priority!=='normal'?' priority='+priority:'')+(weight && weight!=='medium'?' weight='+weight:'')+' -->'
+const markerCore = /<!-- conductor-task:([a-zA-Z0-9_-]+)((?:\s+[a-zA-Z0-9_-]+=[a-zA-Z0-9_-]+)*) -->/
 const sections:Record<ProjectTaskKind,{heading:string;pattern:RegExp}> = {
   task: {heading:'Tasks', pattern: /^(?:#{1,6}\s*)?(?:tasks?|task list)\s*:?\s*$/i},
   bug: {heading:'Bugs', pattern: /^(?:#{1,6}\s*)?(?:bugs?|bug list)\s*:?\s*$/i},
@@ -78,23 +79,42 @@ function taskLines(prefix:string,title:string,metadata:string):string[] {
   const [first,...rest]=title.split('\n')
   return [prefix+first+' '+metadata,...rest.map(line=>'  '+line)]
 }
+/** Change only explicitly edited marker attributes. Kind/title/status edits retain the
+ *  original marker byte-for-byte, including attributes introduced by newer Conductor builds. */
+function updatedTaskMarker(source:string,task:ProjectTask,edit:Extract<ProjectTaskEdit,{type:'update'}>,agentId:string|null|undefined,priority:ProjectTaskPriority,weight:ProjectTaskWeight):string {
+  const existing=markerCore.exec(source)?.[0]
+  if(!existing)return taskMarker(task.id,agentId,priority,weight)
+  let next=existing
+  const set=(name:string,value:string|undefined):void=> {
+    const attribute=new RegExp('\\s+'+name+'=[a-zA-Z0-9_-]+','g')
+    next=next.replace(attribute,'')
+    if(value)next=next.replace(/ -->$/,' '+name+'='+value+' -->')
+  }
+  if(edit.agentId!==undefined)set('agent',agentId??undefined)
+  if(edit.priority!==undefined)set('priority',priority==='normal'?undefined:priority)
+  if(edit.weight!==undefined)set('weight',weight==='medium'?undefined:weight)
+  return next
+}
+function insertTask(lines:string[],kind:ProjectTaskKind,added:string[]):void {
+  const section=sections[kind]
+  if(!section)throw new Error('Choose Task, Bug, Feature, or Idea')
+  let index=-1
+  for(let line=0;line<lines.length;line=taskEnd(lines,line)) {
+    if(section.pattern.test(lines[line]!.trim())) {index=line;break}
+  }
+  if(index<0)lines.push('', '## '+section.heading, '', ...added)
+  else {
+    while(index+1<lines.length && !/^\s*(?:#{1,6}\s+|(?:Bug|Feature|Idea|Task) list:)/i.test(lines[index+1]!))index=taskEnd(lines,index+1)-1
+    lines.splice(index+1,0,...added,'')
+  }
+}
 export function updateProjectTaskText(text:string,edit:ProjectTaskEdit):string {
   const ending=text.includes('\r\n')?'\r\n':'\n'
   const lines=text.split(/\r?\n/)
   if(edit.type==='add') {
-    const section=sections[edit.kind as ProjectTaskKind]
-    if(!section)throw new Error('Choose Task, Bug, Feature, or Idea')
     const title=cleanTitle(edit.title)
-    let index=-1
-    for(let line=0;line<lines.length;line=taskEnd(lines,line)) {
-      if(section.pattern.test(lines[line]!.trim())) {index=line;break}
-    }
     const added=taskLines('- [ ] ',title,taskMarker(randomUUID(),undefined,edit.priority && parsePriority(edit.priority),edit.weight && parseWeight(edit.weight)))
-    if(index<0)lines.push('', '## '+section.heading, '', ...added)
-    else {
-      while(index+1<lines.length && !/^\s*(?:#{1,6}\s+|(?:Bug|Feature|Idea|Task) list:)/i.test(lines[index+1]!))index=taskEnd(lines,index+1)-1
-      lines.splice(index+1,0,...added,'')
-    }
+    insertTask(lines,edit.kind as ProjectTaskKind,added)
     return lines.join(ending)
   }
   const task=parseProjectTasks(text).find(task=>task.id===edit.id)
@@ -108,9 +128,15 @@ export function updateProjectTaskText(text:string,edit:ProjectTaskEdit):string {
   if(agentId && !/^[a-zA-Z0-9_-]{1,160}$/.test(agentId))throw new Error('Invalid agent')
   const priority=edit.priority===undefined?task.priority:parsePriority(edit.priority)
   const weight=edit.weight===undefined?task.weight:parseWeight(edit.weight)
+  const kind=edit.kind===undefined?task.kind:edit.kind
+  if(!sections[kind as ProjectTaskKind])throw new Error('Choose Task, Bug, Feature, or Idea')
   const prefix=/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.exec(lines[task.line-1]!)?.[0]??'- '
-  const replacement=taskLines(prefix+'['+({todo:' ',doing:'~',done:'x'}[status])+'] ',edit.title===undefined?task.title:cleanTitle(edit.title),taskMarker(task.id,agentId,priority,weight))
+  const replacement=taskLines(prefix+'['+({todo:' ',doing:'~',done:'x'}[status])+'] ',edit.title===undefined?task.title:cleanTitle(edit.title),updatedTaskMarker(lines[start]!,task,edit,agentId,priority,weight))
   lines.splice(start,length,...replacement)
+  if(kind!==task.kind) {
+    lines.splice(start,replacement.length)
+    insertTask(lines,kind,replacement)
+  }
   return lines.join(ending)
 }
 function cleanTitle(value:unknown):string {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../shared/structured-agent'
-import { accountWindowMovement, describeUsageCap, evaluateUsageCap, normalizeUsageWindows, parseUsageCapSetting, shortWindow, summarizeUsageRun, weeklyWindow } from '../shared/usage-accounting'
+import { accountWindowMovement, describeUsageCap, evaluateUsageCap, normalizeUsageWindows, parseUsageCapSetting, shortWindow, summarizeUsageRun, usageWindowAppliesToModel, weeklyWindow } from '../shared/usage-accounting'
 import { activeUsageCap, parseUsageLimitReset, resolveUsageCap } from './usage-limit'
 
 describe('parseUsageLimitReset', () => {
@@ -55,13 +55,23 @@ describe('account allowance windows (provider-reported only)', () => {
     })
     expect(parsed.map(entry => [entry.key, entry.kind, entry.label])).toEqual([
       ['seven_day', 'weekly', 'Weekly'],
-      ['seven_day_overage_included', 'weekly', 'Weekly (incl. overage)'],
+      ['seven_day_overage_included', 'weekly', 'Fable weekly'],
       ['five_hour', 'short', '5 hour']
     ])
     expect(parsed[0]!.usedPercent).toBe(61)
+    expect(parsed[1]).toMatchObject({scope:'model',modelSelectors:['fable'],overage:false})
     expect(parsed[2]!.resetsAt).toBe(new Date(1789344000 * 1000).toISOString())
-    // The plan allowance wins over the overage figure for a weekly cap.
+    // A model-scoped ceiling is not treated as universal when no model was supplied.
     expect(weeklyWindow(parsed)!.key).toBe('seven_day')
+    expect(usageWindowAppliesToModel(parsed[1]!, 'claude-sonnet-4-5')).toBe(false)
+    expect(weeklyWindow(parsed, 'claude-sonnet-4-5')!.key).toBe('seven_day')
+    expect(usageWindowAppliesToModel(parsed[1]!, 'claude-fable-5-1')).toBe(true)
+    const fableLimited = normalizeUsageWindows({ rateLimits: {
+      seven_day: { usedPercent: 10, windowDurationMins: 10080 },
+      seven_day_overage_included: { usedPercent: 99, windowDurationMins: 10080 }
+    } })
+    expect(weeklyWindow(fableLimited, 'claude-fable-5-1')!.key).toBe('seven_day_overage_included')
+    expect(weeklyWindow(fableLimited, 'claude-sonnet-4-5')!.key).toBe('seven_day')
     expect(shortWindow(parsed)!.key).toBe('five_hour')
   })
 

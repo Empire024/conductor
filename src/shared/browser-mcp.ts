@@ -16,11 +16,13 @@ export interface BrowserView {
   evaluate(code: string): Promise<unknown>
   click(selector: string): Promise<Record<string, unknown>>
   type(options: { selector: string; text: string; submit: boolean }): Promise<Record<string, unknown>>
+  /** Presentation choices that do not steal the owner's current workspace selection. */
+  present(mode: 'background' | 'detached'): Promise<void>
 }
 export interface BrowserMcpHost {
-  /** Resolves — opening one when the workspace has none — the browser view belonging to this
-   *  scope. Implementations must derive the view from the caller's own project and workspace and
-   *  never from anything the caller supplies. */
+  /** Resolves the browser view belonging to this scope. Implementations must derive the view
+   *  from the caller's own project and workspace, never from anything the caller supplies, and
+   *  must not create, reveal, or focus UI as a side effect. */
   view(scope: BrowserMcpScope): Promise<BrowserView>
 }
 
@@ -80,8 +82,20 @@ const schema = (properties: Record<string, unknown>, required: string[] = []): R
  *  Anything else the agent needs it can express through browser_evaluate. */
 export const BROWSER_TOOLS: BrowserTool[] = [
   {
+    name: 'browser_present',
+    description: 'Choose how this project browser is presented without selecting a workspace tab. Background keeps it running invisibly; detached shows the same live browser in a separate window without taking focus.',
+    inputSchema: schema({ mode: { type: 'string', enum: ['background', 'detached'], description: 'The non-disruptive presentation mode.' } }, ['mode']),
+    async run(host, scope, args) {
+      const mode = text(args, 'mode', 20)
+      if (mode !== 'background' && mode !== 'detached') throw new Error('Browser presentation must be background or detached')
+      const view = await host.view(scope)
+      await view.present(mode)
+      return { text: mode === 'background' ? 'Browser kept running in the background.' : 'The same browser was detached without changing the selected workspace.', structured: { mode, tabId: view.tabId } }
+    }
+  },
+  {
     name: 'browser_navigate',
-    description: 'Open a URL in the Conductor browser view for this workspace — the same view the owner is looking at. Opens a browser tab if the workspace has none. Returns the final URL and page title.',
+    description: 'Open a URL in this project\'s Conductor browser. The same persistent view can be shown in the left pane, expanded for preview, or kept in the background. Returns the final URL and page title.',
     inputSchema: schema({ url: { type: 'string', description: 'An http:// or https:// URL.' } }, ['url']),
     async run(host, scope, args) {
       const url = browserUrl(text(args, 'url', 4000))

@@ -30,7 +30,7 @@ describe('evaluateUsageWarning', () => {
 
   it('reads a weekly-percent cap the same way evaluateUsageCap itself would', () => {
     const cap = { metric: 'weekly-percent', limit: 20, basis: 'account' } as const
-    const windows = [{ key: 'seven_day', kind: 'weekly' as const, label: 'Weekly', usedPercent: 10, overage: false, startPercent: 0, windowReset: false, samples: 1 }]
+    const windows = [{ key: 'seven_day', kind: 'weekly' as const, label: 'Weekly', usedPercent: 10, overage: false, scope: 'provider' as const, startPercent: 0, windowReset: false, samples: 1 }]
     expect(evaluateUsageWarning(report({ windows }), cap)).toBeNull()
     expect(evaluateUsageWarning(report({ windows: [{ ...windows[0]!, usedPercent: 19 }] }), cap)).toMatchObject({ level: 'high' })
   })
@@ -55,7 +55,7 @@ describe('evaluateUsageWarning', () => {
     // A configured cap is the owner's own stop rule; an uncapped dollar guess must not
     // second-guess it once one is set, even if this conversation happens to be expensive.
     const cap = { metric: 'weekly-percent', limit: 90, basis: 'account' } as const
-    const windows = [{ key: 'seven_day', kind: 'weekly' as const, label: 'Weekly', usedPercent: 5, overage: false, startPercent: 0, windowReset: false, samples: 1 }]
+    const windows = [{ key: 'seven_day', kind: 'weekly' as const, label: 'Weekly', usedPercent: 5, overage: false, scope: 'provider' as const, startPercent: 0, windowReset: false, samples: 1 }]
     expect(evaluateUsageWarning(report({ windows, costUsd: 500 }), cap)).toBeNull()
   })
 

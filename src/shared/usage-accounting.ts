@@ -73,7 +73,11 @@ export function summarizeUsage(items: TimelineItem[]): UsageSummary {
   for (const item of usage) {
     if (item.data.limits === undefined) continue
     const next = object(item.data.limits)
-    limits = { ...limits, ...next, ...(next.rateLimits && typeof next.rateLimits === 'object' && !Array.isArray(next.rateLimits) ? { rateLimits: { ...object(limits?.rateLimits), ...object(next.rateLimits) } } : {}) }
+    limits = {
+      ...limits, ...next,
+      ...(next.rateLimits && typeof next.rateLimits === 'object' && !Array.isArray(next.rateLimits) ? { rateLimits: { ...object(limits?.rateLimits), ...object(next.rateLimits) } } : {}),
+      ...(next.rateLimitsByLimitId && typeof next.rateLimitsByLimitId === 'object' && !Array.isArray(next.rateLimitsByLimitId) ? { rateLimitsByLimitId: { ...object(limits?.rateLimitsByLimitId), ...object(next.rateLimitsByLimitId) } } : {})
+    }
   }
   return {
     tokens: selected.length ? selected.length === 1 ? figures(selected[0]!.data) : sumFigures(selected) : undefined,
@@ -145,8 +149,12 @@ export interface UsageWindow {
   usedPercent: number
   /** ISO instant; absent when the provider reported no reset time. */
   resetsAt?: string
-  /** A weekly window whose figure already includes purchased overage, not the plan allowance. */
+  /** Retained for old provider snapshots; model-scoped Fable usage is not universal overage. */
   overage: boolean
+  /** Provider-wide windows apply to every model; model windows only to a reported selector. */
+  scope: 'provider' | 'model'
+  /** Provider-owned model identifiers/names. Conductor never invents a model-to-bucket table. */
+  modelSelectors?: string[]
 }
 
 const WEEKLY_MINUTES = 10_080
@@ -154,30 +162,89 @@ function windowKind(minutes: number | undefined): UsageWindowKind {
   if (minutes === undefined || minutes <= 0) return 'other'
   return minutes >= WEEKLY_MINUTES ? 'weekly' : 'short'
 }
-export function usageWindowLabel(minutes: number | undefined, overage = false): string {
+export function usageWindowLabel(minutes: number | undefined, overage = false, model?: string): string {
   const base = minutes === WEEKLY_MINUTES ? 'Weekly'
     : minutes === 1440 ? 'Daily'
     : minutes !== undefined && minutes > 0 ? (minutes % 60 === 0 ? `${minutes / 60} hour` : `${minutes} minute`)
     : 'Usage window'
+  if (model) return `${model} ${base.toLowerCase()}`
   return overage ? `${base} (incl. overage)` : base
 }
 
-/** Reads one reported snapshot. Entries without a reported percentage are dropped, never zeroed. */
-export function normalizeUsageWindows(limits: Json | undefined): UsageWindow[] {
-  const rateLimits = object(object(limits).rateLimits)
-  const windows: UsageWindow[] = []
-  for (const [key, value] of Object.entries(rateLimits)) {
-    const limit = object(value)
-    const usedPercent = number(limit.usedPercent)
-    if (usedPercent === undefined) continue
-    const windowMinutes = number(limit.windowDurationMins)
-    const overage = key.includes('overage')
-    const seconds = number(limit.resetsAt)
-    const resetsAt = seconds === undefined ? undefined : new Date(seconds * 1000)
-    windows.push({
-      key, kind: windowKind(windowMinutes), label: usageWindowLabel(windowMinutes, overage), windowMinutes, usedPercent, overage,
-      ...(resetsAt && !Number.isNaN(resetsAt.getTime()) ? { resetsAt: resetsAt.toISOString() } : {})
+const string = (value: unknown): string | undefined => typeof value === 'string' && value.trim() ? value.trim() : undefined
+const providerLimitIds = new Set(['default', 'codex', 'claude'])
+const selectorTokens = (value: string): string[] => value.toLocaleLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+
+/** A provider-owned selector must actually occur in the catalog identity. Substring guesses such
+ * as treating every "codex" model as one Codex model bucket are deliberately not allowed. */
+export function usageWindowAppliesToModel(window: UsageWindow, model: { id: string; label?: string } | string | undefined): boolean {
+  if (window.scope === 'provider') return true
+  if (!model || !window.modelSelectors?.length) return false
+  const identities = typeof model === 'string' ? [model] : [model.id, model.label ?? '']
+  const identityTokens = identities.map(selectorTokens)
+  return window.modelSelectors.some(selector => {
+    const wanted = selectorTokens(selector)
+    return wanted.length > 0 && identityTokens.some(tokens => {
+      if (wanted.length > tokens.length) return false
+      return tokens.some((_, start) => wanted.every((token, offset) => tokens[start + offset] === token))
     })
+  })
+}
+
+function normalizedWindow(key: string, value: Json, metadata: { scope: UsageWindow['scope']; modelSelectors?: string[]; label?: string; overage?: boolean }): UsageWindow | undefined {
+  const limit = object(value)
+  const usedPercent = number(limit.usedPercent)
+  if (usedPercent === undefined) return undefined
+  const windowMinutes = number(limit.windowDurationMins)
+  const seconds = number(limit.resetsAt)
+  const resetsAt = seconds === undefined ? undefined : new Date(seconds * 1000)
+  return {
+    key, kind: windowKind(windowMinutes), label: metadata.label ?? usageWindowLabel(windowMinutes, metadata.overage), windowMinutes, usedPercent,
+    overage: metadata.overage ?? false, scope: metadata.scope,
+    ...(metadata.modelSelectors?.length ? { modelSelectors: metadata.modelSelectors } : {}),
+    ...(resetsAt && !Number.isNaN(resetsAt.getTime()) ? { resetsAt: resetsAt.toISOString() } : {})
+  }
+}
+
+function snapshotWindows(bucketKey: string, value: Json): UsageWindow[] {
+  const snapshot = object(value)
+  const limitId = string(snapshot.limitId) ?? bucketKey
+  const limitName = string(snapshot.limitName)
+  const providerWide = providerLimitIds.has(limitId.toLocaleLowerCase())
+  const metadata = providerWide
+    ? { scope: 'provider' as const }
+    : { scope: 'model' as const, modelSelectors: [limitId, ...(limitName ? [limitName] : [])] }
+  return ['primary', 'secondary'].flatMap(name => {
+    const window = normalizedWindow(`${limitId}:${name}`, snapshot[name] ?? null, metadata)
+    return window ? [window] : []
+  })
+}
+
+/** Reads one reported snapshot. Entries without a reported percentage are dropped, never zeroed.
+ * Supports Claude's normalized keyed windows, Codex sparse snapshots, and Codex's full
+ * `rateLimitsByLimitId` response without guessing which model a provider-owned bucket names. */
+export function normalizeUsageWindows(limits: Json | undefined): UsageWindow[] {
+  const root = object(limits)
+  const byLimitId = object(root.rateLimitsByLimitId)
+  const rateLimits = object(root.rateLimits)
+  const windows: UsageWindow[] = []
+  if (Object.keys(byLimitId).length) {
+    for (const [key, value] of Object.entries(byLimitId)) windows.push(...snapshotWindows(key, value))
+  } else if ('primary' in rateLimits || 'secondary' in rateLimits) {
+    windows.push(...snapshotWindows('default', rateLimits))
+  } else {
+    for (const [key, value] of Object.entries(rateLimits)) {
+      const reported = object(value)
+      const fable = key === 'seven_day_overage_included'
+      const reportedSelectors = Array.isArray(reported.modelSelectors) ? reported.modelSelectors.filter((selector): selector is string => typeof selector === 'string' && Boolean(selector.trim())) : []
+      const reportedModelScope = reported.scope === 'model' && reportedSelectors.length > 0
+      const window = normalizedWindow(key, value, reportedModelScope
+        ? { scope: 'model', modelSelectors: reportedSelectors, ...(string(reported.label) ? { label: string(reported.label)! } : {}) }
+        : fable
+        ? { scope: 'model', modelSelectors: ['fable'], label: 'Fable weekly' }
+        : { scope: 'provider', overage: key.includes('overage') })
+      if (window) windows.push(window)
+    }
   }
   // Longest window first so the plan-level allowance leads; unknown durations last.
   return windows.sort((a, b) => (b.windowMinutes ?? -1) - (a.windowMinutes ?? -1))
@@ -203,10 +270,10 @@ function rootUsage(items: TimelineItem[], runtimeId?: string): UsageItem[] {
  * account-wide level, so the movement bounds this conversation's share from above: other
  * conversations on the same account move the same counter.
  */
-export function accountWindowMovement(items: TimelineItem[], runtimeId?: string): UsageWindowMovement[] {
+export function accountWindowMovement(items: TimelineItem[], runtimeId?: string, model?: string): UsageWindowMovement[] {
   const tracked = new Map<string, { first: UsageWindow; last: UsageWindow; samples: number; reset: boolean }>()
   for (const item of rootUsage(items, runtimeId)) {
-    for (const window of normalizeUsageWindows(item.data.limits)) {
+    for (const window of normalizeUsageWindows(item.data.limits).filter(window => usageWindowAppliesToModel(window, model))) {
       const previous = tracked.get(window.key)
       if (!previous) { tracked.set(window.key, { first: window, last: window, samples: 1, reset: false }); continue }
       previous.samples += 1
@@ -226,14 +293,15 @@ export function accountWindowMovement(items: TimelineItem[], runtimeId?: string)
     .sort((a, b) => (b.windowMinutes ?? -1) - (a.windowMinutes ?? -1))
 }
 
-export const weeklyWindow = <T extends UsageWindow>(windows: T[]): T | undefined =>
-  windows.find(window => window.kind === 'weekly' && !window.overage) ?? windows.find(window => window.kind === 'weekly')
-export const shortWindow = <T extends UsageWindow>(windows: T[]): T | undefined =>
-  windows.filter(window => window.kind === 'short').sort((a, b) => (a.windowMinutes ?? 0) - (b.windowMinutes ?? 0))[0]
+export const weeklyWindow = <T extends UsageWindow>(windows: T[], model?: string): T | undefined =>
+  windows.filter(window => window.kind === 'weekly' && usageWindowAppliesToModel(window, model)).sort((a, b) => b.usedPercent - a.usedPercent)[0]
+export const shortWindow = <T extends UsageWindow>(windows: T[], model?: string): T | undefined =>
+  windows.filter(window => window.kind === 'short' && usageWindowAppliesToModel(window, model)).sort((a, b) => b.usedPercent - a.usedPercent || (a.windowMinutes ?? 0) - (b.windowMinutes ?? 0))[0]
 
 export interface UsageScopeReport {
   scope: 'conversation' | 'run'
   runtimeId?: string
+  model?: string
   windows: UsageWindowMovement[]
   tokens?: TokenFigures
   tokensScope: UsageSummary['scope']
@@ -250,7 +318,7 @@ export interface UsageScopeReport {
   endedAt?: string
 }
 
-function scopeReport(items: TimelineItem[], scope: UsageScopeReport['scope'], runtimeId?: string): UsageScopeReport {
+function scopeReport(items: TimelineItem[], scope: UsageScopeReport['scope'], runtimeId?: string, model?: string): UsageScopeReport {
   const scoped = runtimeId === undefined ? items : items.filter(item => item.runtimeId === runtimeId)
   const summary = summarizeUsage(scoped)
   const ordered = [...scoped].filter(item => !item.parentId).sort((a, b) => updatedSequence(a) - updatedSequence(b))
@@ -258,8 +326,8 @@ function scopeReport(items: TimelineItem[], scope: UsageScopeReport['scope'], ru
   const start = startedAt ? Date.parse(startedAt) : NaN, end = endedAt ? Date.parse(endedAt) : NaN
   const wallMs = Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : undefined
   return {
-    scope, runtimeId,
-    windows: accountWindowMovement(scoped, runtimeId),
+    scope, runtimeId, model,
+    windows: accountWindowMovement(scoped, runtimeId, model),
     tokens: summary.tokens, tokensScope: summary.scope, tokensEstimated: summary.estimated,
     costUsd: summary.costUsd, costEstimated: summary.costEstimated,
     turns: new Set(ordered.filter(item => item.turnId).map(item => JSON.stringify([item.runtimeId, item.turnId]))).size,
@@ -285,22 +353,22 @@ export interface UsageRunReport {
 }
 
 /** The whole-run accounting behind "this conversation used N% of your weekly". */
-export function summarizeUsageRun(items: TimelineItem[], runtimeId?: string): UsageRunReport {
+export function summarizeUsageRun(items: TimelineItem[], runtimeId?: string, modelHint?: string): UsageRunReport {
   const root = items.filter(item => !item.parentId).sort((a, b) => updatedSequence(a) - updatedSequence(b))
   const runtime = runtimeId ?? root.at(-1)?.runtimeId
-  const conversation = scopeReport(items, 'conversation')
-  const run = runtime && root.some(item => item.runtimeId === runtime) ? scopeReport(items, 'run', runtime) : undefined
-  let provider: StructuredProvider | undefined, model: string | undefined, effort: string | undefined
+  let provider: StructuredProvider | undefined, model: string | undefined = modelHint, effort: string | undefined
   for (const item of root) {
     if (item.data.type !== 'session') continue
     provider = item.data.capabilities?.provider ?? provider
     const effective = object(item.data.capabilities?.effectiveSettings)
-    model = (typeof effective.model === 'string' ? effective.model : undefined) ?? item.data.settings?.model ?? model
+    if (!modelHint) model = (typeof effective.model === 'string' ? effective.model : undefined) ?? item.data.settings?.model ?? model
     effort = (typeof effective.effort === 'string' ? effective.effort : undefined) ?? item.data.settings?.effort ?? effort
   }
+  const conversation = scopeReport(items, 'conversation', undefined, model)
+  const run = runtime && root.some(item => item.runtimeId === runtime) ? scopeReport(items, 'run', runtime, model) : undefined
   const measured: string[] = [], derived: string[] = []
   if (conversation.tokens) measured.push(conversation.tokensEstimated ? 'Token counts (provider figures include estimated entries)' : 'Token counts, reported by the provider')
-  const currentWindows = normalizeUsageWindows(summarizeUsage(items).limits)
+  const currentWindows = normalizeUsageWindows(summarizeUsage(items).limits).filter(window => usageWindowAppliesToModel(window, model))
   if (currentWindows.length) measured.push('Account allowance levels, reported by the provider')
   if (conversation.costUsd !== undefined) measured.push(conversation.costEstimated ? 'Cost, estimated by the provider CLI from its own price table (not a subscription charge)' : 'Cost, reported by the provider')
   if (conversation.windows.some(window => window.consumedPercent !== undefined && window.samples > 1)) derived.push('Share consumed here: the difference between the first and latest account level reported while this conversation was open. The account counter also moves for other conversations, so this is an upper bound.')
@@ -383,7 +451,7 @@ export function evaluateUsageCap(cap: UsageCap, report: UsageScopeReport): Usage
         : `${value.toLocaleString()} of ${cap.limit.toLocaleString()} capped tokens reported for this conversation${report.tokensEstimated ? ' (includes estimated figures)' : ''}.`
     }
   }
-  const window = cap.metric === 'weekly-percent' ? weeklyWindow(report.windows) : shortWindow(report.windows)
+  const window = cap.metric === 'weekly-percent' ? weeklyWindow(report.windows, report.model) : shortWindow(report.windows, report.model)
   const name = window?.label ?? (cap.metric === 'weekly-percent' ? 'weekly' : 'short')
   if (!window) return { cap, unit: 'percent', limit: cap.limit, reached: false, detail: `The provider has not reported a ${name.toLowerCase()} allowance window, so this cap cannot be evaluated.` }
   if (cap.basis === 'account') {

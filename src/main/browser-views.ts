@@ -1,29 +1,18 @@
-import { BrowserWindow, webContents as allWebContents, type WebContents } from 'electron'
-import { pathToFileURL } from 'node:url'
+import { BrowserWindow, WebContentsView, type WebContents } from 'electron'
 import type { AgentControlTab } from '../shared/agent-control'
-import type { BrowserMcpHost, BrowserMcpScope, BrowserView } from '../shared/browser-mcp'
-import { isStructuredRendererUrl } from './structured-ipc-policy'
+import { browserUrl, type BrowserMcpHost, type BrowserMcpScope, type BrowserView } from '../shared/browser-mcp'
+import { projectBrowserViewId } from '../shared/browser-view-identity'
+import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest, BrowserSurfaceState } from '../shared/browser-surface'
 
 /** Attribute a Conductor browser pane puts on its <webview> so the main process can tell which
  *  workspace tab a guest belongs to. `data-performance-browser-tab-id` is the one the panes have
  *  carried since the tab performance popover shipped; `data-conductor-tab-id` is the name the
  *  renderer should move to, and both are read so neither half has to land first. */
-const TAB_ATTRIBUTES = ['data-conductor-tab-id', 'data-performance-browser-tab-id']
-/** Read in the workspace window's own page, which is the only place a <webview> element and its
- *  getWebContentsId() exist. Identity still comes from the database: a tab id that is not in the
- *  caller's own workspace is discarded below, so this only ever narrows the candidate set. */
-const PROBE = `(() => Array.from(document.querySelectorAll('webview')).map(element => {
-  try { return { id: element.getWebContentsId(), tabId: ${JSON.stringify(TAB_ATTRIBUTES)}.map(name => element.getAttribute(name)).find(Boolean) || '' } }
-  catch { return null }
-}).filter(entry => entry && entry.tabId))()`
 const CONSOLE_LIMIT = 500
-/** How long a pane this bridge just asked for is given to mount. */
-const ATTACH_TIMEOUT = 12_000
-/** How long a workspace whose browser tabs already exist is given, when none of them is on screen.
- *  Waiting the full attach timeout for a workspace that is simply not mounted resolves nothing and
- *  runs the probe script inside the owner's live window dozens of times to find that out. */
-const MOUNT_TIMEOUT = 2_000
 const LOAD_TIMEOUT = 10_000
+/** Background guests need a real viewport before the owner ever opens the Browser rail. Without
+ * one, Chromium lays pages out at 0x0 and MCP screenshots/DOM measurements are misleading. */
+const BACKGROUND_VIEWPORT: Electron.Rectangle = { x: 0, y: 0, width: 1440, height: 900 }
 /** A page value is JSON-encoded in the guest, sent whole across IPC, parsed in the main process and
  *  then re-encoded into the HTTP reply. Uncapped, a page returning a few hundred megabytes takes
  *  the main process — and with it every conversation, terminal and unsaved editor — down with an
@@ -35,9 +24,31 @@ interface ConsoleEntry { level: string; message: string; source?: string; line?:
 interface Deps {
   /** Every tab in the caller's own workspace, from the database. */
   tabs(scope: BrowserMcpScope): AgentControlTab[]
-  /** Opens a visible browser tab in the caller's own workspace. */
+  /** Legacy constructor dependency. Browser tools never call it: enabling tools must not alter
+   * the owner's visible layout. */
   openBrowserTab(scope: BrowserMcpScope): Promise<void>
   rendererPath: string
+  createDetachedWindow?(projectId: string, onClosed: () => void): BrowserWindow
+  publishState?(state: BrowserSurfaceState): void
+}
+
+interface OwnedBrowser {
+  projectId: string
+  view: WebContentsView
+  surface?: { id: string; window: BrowserWindow; bounds: Electron.Rectangle; visible: boolean }
+  parent?: BrowserWindow
+  parking?: BrowserWindow
+  detached?: BrowserWindow
+  presentation: BrowserPresentation
+  failure?: string
+}
+
+export function browserViewCandidates(scope: BrowserMcpScope, tabs: AgentControlTab[]): Set<string> {
+  const projectView = projectBrowserViewId(scope.projectId)
+  return new Set([
+    ...(projectView ? [projectView] : []),
+    ...tabs.filter(tab => tab.kind === 'browser').map(tab => tab.id)
+  ])
 }
 
 /** Normalizes both shapes of Electron's console-message event: the modern single details object
@@ -74,16 +85,272 @@ export class BrowserViews implements BrowserMcpHost {
   private consoles = new Map<number, ConsoleEntry[]>()
   /** Undoes one guest's listeners, so a second attach for the same guest replaces them. */
   private detach = new Map<number, () => void>()
+  private owned = new Map<string, OwnedBrowser>()
   constructor(private readonly deps: Deps) {}
+
+  private ensureOwned(projectId: string): OwnedBrowser {
+    if (!projectBrowserViewId(projectId)) throw new Error('Invalid browser project identity')
+    const existing = this.owned.get(projectId)
+    if (existing && !existing.view.webContents.isDestroyed()) return existing
+    const view = new WebContentsView({ webPreferences: { partition: `persist:conductor-browser-${projectId}`, contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false } })
+    view.setBounds(BACKGROUND_VIEWPORT)
+    view.setVisible(false)
+    const owned: OwnedBrowser = { projectId, view, presentation: 'background' }
+    this.owned.set(projectId, owned)
+    this.observe(view.webContents)
+    const changed = (): void => this.publish(owned)
+    view.webContents.on('did-start-loading', changed)
+    view.webContents.on('did-stop-loading', changed)
+    view.webContents.on('did-navigate', changed)
+    view.webContents.on('did-navigate-in-page', changed)
+    view.webContents.on('page-title-updated', changed)
+    view.webContents.on('did-fail-load', (_event, code, description, _url, mainFrame) => {
+      if (mainFrame === false || code === -3) return
+      owned.failure = description || `Navigation failed (${code})`
+      this.publish(owned)
+    })
+    view.webContents.once('destroyed', () => { if (this.owned.get(projectId) === owned) this.owned.delete(projectId) })
+    return owned
+  }
+
+  /** Renderer registration reparents an existing background guest or explicitly creates one.
+   * Authorized MCP access may already have created the same guest without a visible surface. */
+  async mount(window: BrowserWindow, request: BrowserSurfaceRequest): Promise<BrowserSurfaceState> {
+    const projectId = request.projectId.trim()
+    if (!projectBrowserViewId(projectId) || typeof request.surfaceId !== 'string' || !request.surfaceId.trim() || request.surfaceId.length > 200) throw new Error('Invalid browser surface identity')
+    const requestedBounds = this.bounds(request.bounds)
+    const bounds = requestedBounds.width > 0 && requestedBounds.height > 0 ? requestedBounds : BACKGROUND_VIEWPORT
+    const owned = this.ensureOwned(projectId)
+    if (!owned.view.webContents.getURL()) {
+      void owned.view.webContents.loadURL(browserUrl(request.initialUrl)).catch(error => {
+        if (owned.view.webContents.isDestroyed()) return
+        owned.failure = error instanceof Error ? error.message : String(error)
+        this.publish(owned)
+      })
+    }
+    if (owned.presentation === 'background' && !owned.surface) owned.presentation = 'pane'
+    owned.surface = { id: request.surfaceId, window, bounds, visible: request.visible }
+    this.emulateViewport(owned, request.viewport, bounds)
+    if (owned.presentation !== 'detached') this.attachTo(owned, window, request.visible && owned.presentation !== 'background')
+    this.layout(owned)
+    return this.state(owned)
+  }
+
+  update(window: BrowserWindow, request: BrowserSurfaceRequest): BrowserSurfaceState {
+    const owned = this.owned.get(request.projectId)
+    if (!owned || owned.surface?.id !== request.surfaceId) throw new Error('Browser surface is not mounted')
+    const requestedBounds = this.bounds(request.bounds)
+    // A retained React surface reports 0x0 while hidden. Keep the last real native viewport so
+    // background screenshots and DOM layout never collapse merely because the owner switched UI.
+    const bounds = requestedBounds.width > 0 && requestedBounds.height > 0 ? requestedBounds : owned.surface.bounds
+    owned.surface = { id: request.surfaceId, window, bounds, visible: request.visible }
+    this.emulateViewport(owned, request.viewport, bounds)
+    if (owned.presentation !== 'detached') this.attachTo(owned, window, request.visible && owned.presentation !== 'background')
+    this.layout(owned)
+    return this.state(owned)
+  }
+
+  async command(projectId: string, command: BrowserSurfaceCommand): Promise<BrowserSurfaceState> {
+    const owned = this.required(projectId), contents = owned.view.webContents
+    if (command.type === 'navigate') { owned.failure = undefined; await contents.loadURL(browserUrl(command.url)) }
+    else if (command.type === 'back' && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack()
+    else if (command.type === 'forward' && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward()
+    else if (command.type === 'reload') contents.reload()
+    else if (command.type === 'devtools') contents.openDevTools({ mode: 'detach', activate: false })
+    return this.state(owned)
+  }
+
+  present(projectId: string, presentation: BrowserPresentation): BrowserSurfaceState {
+    const owned = this.required(projectId)
+    if (!['pane', 'expanded', 'background', 'detached'].includes(presentation)) throw new Error('Invalid browser presentation')
+    owned.presentation = presentation
+    if (presentation === 'detached') {
+      if (!owned.detached || owned.detached.isDestroyed()) {
+        if (!this.deps.createDetachedWindow) throw new Error('Detached browser presentation is unavailable')
+        let detached!: BrowserWindow
+        detached = this.deps.createDetachedWindow(projectId, () => this.detachedClosed(owned, detached))
+        owned.detached = detached
+        detached.on('resize', () => { if (owned.detached === detached) this.layout(owned) })
+      }
+      this.attachTo(owned, owned.detached, true)
+      this.layout(owned)
+      if (!owned.detached.isVisible()) owned.detached.showInactive()
+    } else {
+      this.closeDetached(owned)
+      if (owned.surface && !owned.surface.window.isDestroyed()) this.attachTo(owned, owned.surface.window, presentation !== 'background' && owned.surface.visible)
+      else this.park(owned)
+      this.layout(owned)
+    }
+    const state = this.state(owned)
+    this.deps.publishState?.(state)
+    return state
+  }
+
+  /** Release a workspace host. During application shutdown no replacement parking window may be
+   * created: Electron is already closing every host, and resurrecting one prevents `will-quit`.
+   * Outside shutdown, an explicitly retained browser is parked so its project work can continue. */
+  releaseWindow(window: BrowserWindow, closingApplication = false): void {
+    for (const owned of this.owned.values()) {
+      if (owned.surface?.window === window) owned.surface = undefined
+      if (owned.parent === window) this.unparent(owned)
+      if (owned.detached === window) { owned.detached = undefined; owned.presentation = 'background'; this.publish(owned) }
+      if (!closingApplication && !owned.surface && !owned.detached && !owned.view.webContents.isDestroyed()) this.park(owned)
+    }
+  }
+
+  releaseProject(projectId: string): void {
+    const owned = this.owned.get(projectId)
+    if (!owned) return
+    this.closeDetached(owned)
+    this.unparent(owned)
+    this.closeParking(owned)
+    if (!owned.view.webContents.isDestroyed()) owned.view.webContents.close()
+    this.owned.delete(projectId)
+  }
+
+  dispose(): void { for (const projectId of [...this.owned.keys()]) this.releaseProject(projectId) }
+
+  private required(projectId: string): OwnedBrowser {
+    const owned = this.owned.get(projectId)
+    if (!owned) throw new Error('The Conductor browser for this project has not been opened. Open Browser from the left activity rail once; model tools never activate it silently.')
+    if (owned.view.webContents.isDestroyed()) { this.owned.delete(projectId); throw new Error('The browser view was closed') }
+    return owned
+  }
+
+  private bounds(value: BrowserSurfaceRequest['bounds']): Electron.Rectangle {
+    const numbers = [value?.x, value?.y, value?.width, value?.height]
+    if (numbers.some(item => typeof item !== 'number' || !Number.isFinite(item))) throw new Error('Invalid browser surface bounds')
+    return {
+      x: Math.max(0, Math.round(value.x)),
+      y: Math.max(0, Math.round(value.y)),
+      width: Math.max(0, Math.min(16_384, Math.round(value.width))),
+      height: Math.max(0, Math.min(16_384, Math.round(value.height)))
+    }
+  }
+
+  private attachTo(owned: OwnedBrowser, window: BrowserWindow, visible: boolean): void {
+    if (window.isDestroyed()) throw new Error('Browser presentation window is closed')
+    if (owned.parent !== window) {
+      this.unparent(owned)
+      window.contentView.addChildView(owned.view)
+      owned.parent = window
+      this.hosts.set(owned.view.webContents.id, window.webContents.id)
+    }
+    owned.view.setVisible(visible)
+    if (owned.parking && owned.parking !== window) this.closeParking(owned)
+  }
+
+  /** An unattached WebContentsView retains nominal bounds but Chromium gives its document a 0x0
+   * layout viewport. A hidden, non-focusable, off-desktop host keeps the guest useful for MCP
+   * before the owner ever selects this project. The host is retired as soon as the same guest is
+   * reparented into a real surface; it never becomes a workspace tab or visible desktop window. */
+  private park(owned: OwnedBrowser): void {
+    if (owned.parent && !owned.parent.isDestroyed()) return
+    let parking = owned.parking
+    if (!parking || parking.isDestroyed()) {
+      parking = new BrowserWindow({
+        show: false,
+        focusable: false,
+        skipTaskbar: true,
+        frame: false,
+        useContentSize: true,
+        x: -32_000,
+        y: -32_000,
+        width: BACKGROUND_VIEWPORT.width,
+        height: BACKGROUND_VIEWPORT.height,
+        webPreferences: { backgroundThrottling: false, contextIsolation: true, nodeIntegration: false, sandbox: true }
+      })
+      owned.parking = parking
+    }
+    this.attachTo(owned, parking, true)
+    owned.view.setBounds(BACKGROUND_VIEWPORT)
+    owned.view.setVisible(true)
+  }
+
+  private closeParking(owned: OwnedBrowser): void {
+    const parking = owned.parking
+    if (!parking) return
+    owned.parking = undefined
+    if (!parking.isDestroyed()) parking.close()
+  }
+
+  private emulateViewport(owned: OwnedBrowser, value: BrowserSurfaceRequest['viewport'], bounds: Electron.Rectangle): void {
+    if (!value) return
+    const width = Math.round(value.width), height = Math.round(value.height)
+    if (!Number.isFinite(value.width) || !Number.isFinite(value.height) || width < 240 || width > 3840 || height < 320 || height > 2160) throw new Error('Invalid browser viewport')
+    if (bounds.width <= 0 || bounds.height <= 0) return
+    const scale = Math.max(0.1, Math.min(1, bounds.width / width, bounds.height / height))
+    owned.view.webContents.enableDeviceEmulation({ screenPosition: 'desktop', screenSize: { width, height }, viewPosition: { x: 0, y: 0 }, deviceScaleFactor: 1, viewSize: { width, height }, scale })
+  }
+
+  private unparent(owned: OwnedBrowser): void {
+    if (owned.parent && !owned.parent.isDestroyed()) {
+      try { owned.parent.contentView.removeChildView(owned.view) } catch { /* The host may already be tearing down. */ }
+    }
+    owned.parent = undefined
+    owned.view.setVisible(false)
+  }
+
+  private layout(owned: OwnedBrowser): void {
+    if (owned.presentation === 'detached' && owned.detached && !owned.detached.isDestroyed()) {
+      const bounds = owned.detached.getContentBounds()
+      owned.view.setBounds({ x: 0, y: 0, width: Math.max(0, bounds.width), height: Math.max(0, bounds.height) })
+      owned.view.setVisible(true)
+      return
+    }
+    if (!owned.surface) return
+    owned.view.setBounds(owned.surface.bounds)
+    owned.view.setVisible(owned.presentation !== 'background' && owned.surface.visible)
+  }
+
+  private closeDetached(owned: OwnedBrowser): void {
+    const window = owned.detached
+    if (!window || window.isDestroyed()) { owned.detached = undefined; return }
+    if (owned.parent === window) this.unparent(owned)
+    // Retire the identity before close(): Electron may emit `closed` synchronously or much later.
+    // Its captured callback must never affect a reattached surface or a newer detached window.
+    owned.detached = undefined
+    window.close()
+  }
+
+  private detachedClosed(owned: OwnedBrowser, closedWindow: BrowserWindow): void {
+    if (owned.detached !== closedWindow) return
+    if (owned.parent === closedWindow) this.unparent(owned)
+    owned.detached = undefined
+    owned.presentation = 'background'
+    if (owned.surface && !owned.surface.window.isDestroyed()) this.attachTo(owned, owned.surface.window, false)
+    this.publish(owned)
+  }
+
+  private state(owned: OwnedBrowser): BrowserSurfaceState {
+    const contents = owned.view.webContents
+    return {
+      projectId: owned.projectId,
+      webContentsId: contents.id,
+      url: contents.getURL(),
+      title: contents.getTitle(),
+      loading: contents.isLoading(),
+      canGoBack: contents.navigationHistory.canGoBack(),
+      canGoForward: contents.navigationHistory.canGoForward(),
+      presentation: owned.presentation,
+      ...(owned.failure ? { failure: owned.failure } : {})
+    }
+  }
+
+  private publish(owned: OwnedBrowser): void { if (!owned.view.webContents.isDestroyed()) this.deps.publishState?.(this.state(owned)) }
 
   /** Called from every workspace window's did-attach-webview. */
   attach(window: BrowserWindow, guest: WebContents): void {
     const id = guest.id
-    // did-attach-webview can fire again for a guest this already watches. Without dropping the
-    // previous listeners each re-attach would add another recorder and every page message would
-    // arrive in the agent's console output as many times as the pane has attached.
-    this.detach.get(id)?.()
     this.hosts.set(id, window.webContents.id)
+    this.observe(guest)
+  }
+
+  private observe(guest: WebContents): void {
+    const id = guest.id
+    // Reparenting a main-owned view and repeated did-attach-webview events update ownership but
+    // retain exactly one console recorder and popup guard for the life of the guest.
+    if (this.detach.has(id)) return
     const buffer: ConsoleEntry[] = []
     this.consoles.set(id, buffer)
     const record = (...args: unknown[]): void => { buffer.push(consoleEntry(args)); if (buffer.length > CONSOLE_LIMIT) buffer.splice(0, buffer.length - CONSOLE_LIMIT) }
@@ -107,25 +374,11 @@ export class BrowserViews implements BrowserMcpHost {
   }
 
   async view(scope: BrowserMcpScope): Promise<BrowserView> {
-    // The candidate set is the caller's own workspace, read from the database. Nothing the agent
-    // sends takes part in choosing it, so no session can address another project's view.
-    let located = await this.probe(this.browserTabs(scope))
-    let opened = false
-    // A workspace with no browser view yet gets one, in the owner's own window, where they can
-    // watch every page the agent opens.
-    if (!located && !this.browserTabs(scope).size) { opened = true; await this.deps.openBrowserTab(scope) }
-    // Only a pane that is actually on its way is worth waiting out. A workspace that is not on
-    // screen never resolves, and polling it for the full attach timeout runs the probe script
-    // inside the owner's live renderer dozens of times to arrive at the same refusal.
-    const deadline = Date.now() + (opened ? ATTACH_TIMEOUT : MOUNT_TIMEOUT)
-    for (let pause = 100; !located && Date.now() < deadline; pause = Math.min(pause + 100, 600)) {
-      await settle(pause)
-      // The tab list is re-read each pass because the renderer persists the new layout a moment
-      // after it acknowledges the open.
-      located = await this.probe(this.browserTabs(scope))
-    }
-    if (!located) throw new Error('The Conductor browser view for this workspace is not open yet. Ask the owner to open a Browser tab, or try again in a moment.')
-    return this.page(located.guest, located.tabId)
+    // The authenticated credential supplies this scope. A hidden parked host gives a never-opened
+    // project a real viewport without selecting it or presenting anything on the owner's desktop.
+    const owned = this.ensureOwned(scope.projectId)
+    this.park(owned)
+    return this.page(owned.view.webContents, projectBrowserViewId(scope.projectId)!, mode => { this.present(scope.projectId, mode) })
   }
 
   /** loadURL settles before the guest has committed the new document, so reading the URL straight
@@ -144,33 +397,7 @@ export class BrowserViews implements BrowserMcpHost {
     })
   }
 
-  private browserTabs(scope: BrowserMcpScope): Set<string> {
-    return new Set(this.deps.tabs(scope).filter(tab => tab.kind === 'browser').map(tab => tab.id))
-  }
-
-  private async probe(wanted: Set<string>): Promise<{ guest: WebContents; tabId: string } | undefined> {
-    if (!wanted.size) return undefined
-    const trusted = process.env.ELECTRON_RENDERER_URL ?? pathToFileURL(this.deps.rendererPath).href
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (window.isDestroyed() || window.webContents.isDestroyed()) continue
-      if (!isStructuredRendererUrl(window.webContents.getURL(), trusted)) continue
-      let found: Array<{ id: number; tabId: string }>
-      try { found = await window.webContents.executeJavaScript(PROBE) as Array<{ id: number; tabId: string }> }
-      catch { continue }
-      for (const entry of found ?? []) {
-        if (!wanted.has(entry.tabId)) continue
-        // The pane element claims a tab id; the main process independently confirms that this
-        // guest attached to this very window, so a stale or mismatched id resolves to nothing.
-        if (this.hosts.get(entry.id) !== window.webContents.id) continue
-        const guest = allWebContents.fromId(entry.id)
-        if (!guest || guest.isDestroyed() || guest.getType() !== 'webview') continue
-        return { guest, tabId: entry.tabId }
-      }
-    }
-    return undefined
-  }
-
-  private page(guest: WebContents, tabId: string): BrowserView {
+  private page(guest: WebContents, tabId: string, present: (mode: 'background' | 'detached') => void = () => {}): BrowserView {
     const alive = (): WebContents => { if (guest.isDestroyed()) throw new Error('The browser view was closed'); return guest }
     const run = async (code: string, gesture = false): Promise<unknown> => {
       const raw = await alive().executeJavaScript(evaluation(code), gesture) as string
@@ -260,7 +487,8 @@ export class BrowserViews implements BrowserMcpHost {
           return { tag: element.tagName.toLowerCase() }`, true) as Record<string, unknown>
         await settle(submit ? 500 : 100)
         return { typed: true, selector, submitted: submit, ...typed, url: alive().getURL(), title: alive().getTitle() }
-      }
+      },
+      present: async mode => { present(mode) }
     }
   }
 }

@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process'
 import { dirname, resolve } from 'node:path'
 
 if (process.env.CONDUCTOR_OFFLINE_TESTS !== '1') throw new Error('Synthetic Claude UI fixture requires CONDUCTOR_OFFLINE_TESTS=1')
+const fableQuotaFixture = process.env.CONDUCTOR_TEST_CLAUDE_QUOTA === 'fable'
 const input = readline.createInterface({ input: process.stdin })
 const nativeSessionId = process.argv.includes('--resume') ? process.argv[process.argv.indexOf('--resume') + 1] : 'synthetic-claude-native-1'
 const send = (message) => process.stdout.write(JSON.stringify(message) + '\n')
@@ -70,7 +71,20 @@ for await (const line of input) {
       // Delayed metadata response exercises pressing Send during initialization.
       await new Promise(resolve => setTimeout(resolve, 800))
       initialized = true
-      success(message.request_id, { models: [{ value: 'synthetic-claude', displayName: 'Synthetic Claude fixture', supportsEffort: true, supportedEffortLevels: ['low', 'high'], defaultEffort: 'high' }], commands: [{ name: 'fixture', description: 'Synthetic discovery only' }] })
+      const models = fableQuotaFixture
+        ? [{ value: 'claude-fable-5-1', displayName: 'Claude Fable 5.1', supportsEffort: true, supportedEffortLevels: ['high'], defaultEffort: 'high' }]
+        : [{ value: 'synthetic-claude', displayName: 'Synthetic Claude fixture', supportsEffort: true, supportedEffortLevels: ['low', 'high'], defaultEffort: 'high' }]
+      success(message.request_id, { models, commands: [{ name: 'fixture', description: 'Synthetic discovery only' }] })
+      if (fableQuotaFixture) {
+        const resetsAt = Math.floor(Date.now() / 1000) + 86_400
+        // Native identity/effective model evidence, still outside any user/model turn.
+        emit({ type: 'system', subtype: 'init', model: 'claude-fable-5-1', effort: 'high', permissionMode: 'default', claude_code_version: '2.1.263' })
+        emit({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: {
+          five_hour: { utilization: 0.24, resetsAt },
+          seven_day: { utilization: 0.95, resetsAt },
+          seven_day_overage_included: { utilization: 0.99, resetsAt }
+        } } })
+      }
     } else if (kind === 'interrupt') {
       if (pending) send({ type: 'control_cancel_request', request_id: pending })
       const cancelled = [...steeringHeld.keys()]
@@ -159,13 +173,25 @@ for await (const line of input) {
       stepOutside()
       continue
     }
+    if (prompt.startsWith('SYNTHETIC BASH BACKGROUND')) {
+      const taskId = `background-bash-${turn}`
+      const toolId = `background-bash-tool-${turn}`
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
+      declare(toolId, 'Bash', { command: 'node --version', description: 'Synthetic background Bash process' })
+      emit({ type: 'system', subtype: 'task_started', task_id: taskId, tool_use_id: toolId, description: 'Synthetic background Bash process', is_backgrounded: true, task_type: 'local_bash', status: 'running' })
+      emit({ type: 'system', subtype: 'task_notification', task_id: taskId, tool_use_id: toolId, status: 'completed', summary: 'Synthetic background Bash process completed (exit code 0)' })
+      result(toolId, 'Synthetic background Bash process completed.')
+      text('Synthetic background Bash process stayed on its Bash activity row.')
+      finish()
+      continue
+    }
     if (prompt.startsWith('SYNTHETIC BACKGROUND')) {
       // A turn that hands its work to a backgrounded task and then reports its own result while
       // that child is still going, which is what Claude does whenever an agent dispatches work.
       const taskId = `background-task-${++turn}`
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
       declare(`task-tool-${turn}`, 'Task', { description: 'Synthetic background worker' })
-      emit({ type: 'system', subtype: 'task_started', task_id: taskId, tool_use_id: `task-tool-${turn}`, description: 'Synthetic background worker', is_backgrounded: true, status: 'running' })
+      emit({ type: 'system', subtype: 'task_started', task_id: taskId, tool_use_id: `task-tool-${turn}`, description: 'Synthetic background worker', is_backgrounded: true, task_type: 'local_agent', status: 'running' })
       text('Handing this to a background worker; holding here until it reports.')
       finish()
       // The child reports back long after the parent turn ended. The wait is what the caller

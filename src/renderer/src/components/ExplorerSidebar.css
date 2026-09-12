@@ -163,8 +163,21 @@
 .explorer-context-menu .context-shortcut { margin-left: auto; color: var(--text-3); font-size: 7px; }
 
 .browser-sidebar .workspace-sidebar-title { border-bottom: 0; }
+.browser-sidebar[hidden] { display: none; }
+.browser-sidebar .browser-presentation-actions { display: flex; align-items: center; gap: 2px; }
 .browser-sidebar .browser-pane { border-top: 1px solid var(--border-soft); }
 .browser-sidebar .browser-note { display: none; }
 .browser-sidebar .browser-toolbar { flex-wrap: wrap; height: auto; min-height: 61px; padding: 4px; }
 .browser-sidebar .browser-toolbar form { order: 5; flex-basis: 100%; }
 .browser-sidebar .browser-toolbar > button:last-child { margin-left: auto; }
+.browser-sidebar-expanded {
+  position: fixed;
+  inset: 39px 0 0 48px;
+  z-index: 90;
+  width: auto;
+  min-width: 0;
+  background: var(--surface-1);
+  box-shadow: 0 0 0 1px var(--border), 0 16px 48px #0009;
+}
+.browser-sidebar-expanded .browser-toolbar { flex-wrap: nowrap; min-height: 33px; padding: 0 5px; }
+.browser-sidebar-expanded .browser-toolbar form { order: initial; flex-basis: auto; }

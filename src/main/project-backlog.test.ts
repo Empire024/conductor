@@ -282,6 +282,15 @@ describe('project task priority',()=> {
     expect(updated).not.toContain('priority=urgent')
     expect(parseProjectTasks(updated)[0]).toMatchObject({priority:'normal'})
   })
+  it('retains unknown marker attributes when changing a known one',()=>{
+    const source='## Bugs\n- [~] Imported <!-- conductor-task:t1 agent=agent_A source=linear priority=low external_id=ABC_123 -->\n'
+    const updated=updateProjectTaskText(source,{type:'update',id:'t1',priority:'high'})
+    expect(updated).toContain('source=linear')
+    expect(updated).toContain('external_id=ABC_123')
+    expect(updated).toContain('agent=agent_A')
+    expect(updated).toContain('priority=high')
+    expect(updated).not.toContain('priority=low')
+  })
   it('saves an agent-set priority through the real service and keeps it after reloading',async()=>{
     const f=fixture()
     try {
@@ -309,6 +318,34 @@ describe('the neutral Task kind',()=> {
   })
   it('still rejects an unsupported kind, naming Task alongside Bug, Feature and Idea',()=>{
     expect(()=>updateProjectTaskText('## Bugs\n',{type:'add',kind:'chore' as never,title:'No'})).toThrow('Task, Bug, Feature, or Idea')
+  })
+  it('moves an edited multiline task into its new kind while preserving identity, claims, metadata and siblings',()=>{
+    const source='# Project tasks\r\n\r\n## Tasks\r\n- [~] First paragraph <!-- conductor-task:moving agent=agent_A priority=high weight=heavy source=imported -->\r\n  \r\n  Second paragraph\r\n- [ ] Task sibling <!-- conductor-task:task-sibling -->\r\n\r\n## Bugs\r\n- [ ] Bug sibling <!-- conductor-task:bug-sibling -->\r\n\r\nDelivery note stays.\r\n\r\n## Features\r\n'
+    const updated=updateProjectTaskText(source,{type:'update',id:'moving',kind:'bug',title:'First paragraph\n\nSecond paragraph\nEdited detail'})
+    const tasks=parseProjectTasks(updated)
+    expect(tasks.find(task=>task.id==='moving')).toMatchObject({title:'First paragraph\n\nSecond paragraph\nEdited detail',kind:'bug',status:'doing',agentId:'agent_A',priority:'high',weight:'heavy'})
+    expect(tasks.map(task=>task.id)).toEqual(['task-sibling','bug-sibling','moving'])
+    expect(updated).toContain('<!-- conductor-task:moving agent=agent_A priority=high weight=heavy source=imported -->')
+    expect(updated).toContain('- [ ] Task sibling <!-- conductor-task:task-sibling -->')
+    expect(updated).toContain('- [ ] Bug sibling <!-- conductor-task:bug-sibling -->')
+    expect(updated).toContain('Delivery note stays.')
+    expect(updated).not.toMatch(/## Tasks\r\n- \[~\] First paragraph/)
+  })
+  it('saves a changed kind through the service and reloads the same multiline task in its new section',async()=>{
+    const f=fixture()
+    try {
+      const path=join(f.root,'feature-list.md')
+      writeFileSync(path,'## Tasks\n- [~] Existing report <!-- conductor-task:persist agent=previous_worker origin=manual -->\n  \n  Original detail\n\n## Bugs\n- [ ] Existing bug <!-- conductor-task:bug -->\n\n## Features\n')
+      const initial=await f.service.get(f.project.id)
+      const saved=await f.service.edit(f.project.id,initial.revision,{type:'update',id:'persist',kind:'feature',title:'Existing report\n\nOriginal detail\nSaved edit'})
+      expect(saved.tasks.find(task=>task.id==='persist')).toMatchObject({kind:'feature',title:'Existing report\n\nOriginal detail\nSaved edit',status:'doing',agentId:'previous_worker'})
+      const reloaded=await f.service.get(f.project.id)
+      expect(reloaded.tasks.find(task=>task.id==='persist')).toMatchObject({kind:'feature',title:'Existing report\n\nOriginal detail\nSaved edit',status:'doing',agentId:'previous_worker'})
+      const text=readFileSync(path,'utf8')
+      expect(text).toContain('<!-- conductor-task:persist agent=previous_worker origin=manual -->')
+      expect(text.indexOf('Existing report')).toBeGreaterThan(text.indexOf('## Features'))
+      expect(text).toContain('Existing bug')
+    } finally {f.db.close()}
   })
 })
 

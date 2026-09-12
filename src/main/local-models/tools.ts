@@ -3,17 +3,30 @@ import { join, relative } from 'node:path'
 import type { ToolSpec } from './client.ts'
 import type { DockerSandbox } from './sandbox.ts'
 import { SandboxUnavailableError } from './sandbox.ts'
+import { readPublicWeb } from './web.ts'
 import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError, WorkspaceBoundaryError } from './workspace.ts'
 
 /** The complete capability set a local model is given. It is an allowlist in code, not an
  *  instruction in a prompt: a name that is not in this list cannot be dispatched at all, which
  *  is what keeps host shell tools, browser automation, connectors, credentials and every other
  *  Conductor capability out of reach of a model whose output may be prompt-injected. */
-export const LOCAL_TOOLS = ['read_file', 'list_files', 'search', 'write_file', 'edit_file', 'run_command'] as const
+export const LOCAL_TOOLS = ['read_file', 'list_files', 'search', 'write_file', 'edit_file', 'run_command', 'conductor', 'web_read'] as const
+export const LOCAL_CONTROL_METHODS = ['memory.recall', 'memory.remember', 'tasks.list', 'agents.list', 'agents.snapshot'] as const
+export type LocalControl = (method: string, args: Record<string, unknown>) => Promise<unknown>
 export type LocalToolName = (typeof LOCAL_TOOLS)[number]
 const MUTATING: ReadonlySet<string> = new Set<string>(['write_file', 'edit_file', 'run_command'])
 
 export class ToolPolicyError extends Error {}
+
+/** Reused at the trusted session boundary so an adapter cannot widen its own authority. */
+export function assertLocalControlAllowed(method: string, args: Record<string, unknown>, readOnly: boolean): void {
+  if (!(LOCAL_CONTROL_METHODS as readonly string[]).includes(method) || (readOnly && method === 'memory.remember')) throw new ToolPolicyError('Conductor method is unavailable in this mode')
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw new ToolPolicyError('args must be an object')
+  const fields = method === 'memory.remember' ? ['gist', 'kind', 'cues']
+    : method === 'memory.recall' ? ['query']
+      : method === 'agents.snapshot' ? ['agentSessionId'] : []
+  if (Object.keys(args).some(key => !fields.includes(key))) throw new ToolPolicyError('Conductor scope and unsupported arguments cannot be overridden')
+}
 
 export function assertToolAllowed(name: string, readOnly: boolean): asserts name is LocalToolName {
   if (!(LOCAL_TOOLS as readonly string[]).includes(name)) throw new ToolPolicyError(`Tool denied by policy: ${name} is not available to local models`)
@@ -25,12 +38,14 @@ const MAX_WRITE_BYTES = 1024 * 1024
 const MAX_SEARCH_HITS = 200
 const SKIP_DIRECTORIES = new Set(['node_modules', '.git', 'out', 'dist', 'release', '.venv', 'venv', '__pycache__', '.next', 'target'])
 
-export function toolSpecs(readOnly: boolean): ToolSpec[] {
+export function toolSpecs(readOnly: boolean, control = false): ToolSpec[] {
   const specs: ToolSpec[] = [
     { type: 'function', function: { name: 'read_file', description: 'Read a UTF-8 text file from the workspace.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path, for example src/main/index.ts' }, offset: { type: 'integer', description: 'First line to return (1-based).' }, limit: { type: 'integer', description: 'Maximum number of lines to return.' } }, required: ['path'] } } },
     { type: 'function', function: { name: 'list_files', description: 'List the entries of a workspace directory.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative directory; defaults to the workspace root.' } } } } },
     { type: 'function', function: { name: 'search', description: 'Search workspace file contents with a regular expression.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'JavaScript regular expression.' }, path: { type: 'string', description: 'Workspace-relative directory to search.' }, glob: { type: 'string', description: 'Only search files whose name ends with this suffix, for example .ts' } }, required: ['pattern'] } } }
   ]
+  specs.push({ type: 'function', function: { name: 'web_read', description: 'GET a public HTTPS text page for research without inherited credentials or cookies. Private/local addresses are refused; shell networking stays disabled. URL paths and queries leave this machine: never include private workspace content.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } })
+  if (control) specs.push({ type: 'function', function: { name: 'conductor', description: 'Access durable project memory or list project tasks through Conductor. Remember accepts gist, kind (semantic, episodic, procedural), cues (string array). Recall accepts query. Use this to save memory, never a filesystem path.', parameters: { type: 'object', properties: { method: { type: 'string', enum: LOCAL_CONTROL_METHODS.filter(method => !readOnly || method !== 'memory.remember') }, args: { type: 'object' } }, required: ['method', 'args'] } } })
   if (readOnly) return specs
   return [
     ...specs,
@@ -45,6 +60,8 @@ export interface ToolContext {
   readOnly: boolean
   sandbox: DockerSandbox | null
   timeoutSec: number
+  signal?: AbortSignal
+  control?: LocalControl
   beforeTool?(paths: string[]): Promise<void>
   afterTool?(paths: string[], success: boolean): Promise<void>
 }
@@ -89,8 +106,18 @@ async function walk(root: string, directory: string, visit: (path: string) => Pr
 export async function runTool(name: string, rawArguments: string, context: ToolContext): Promise<ToolOutcome> {
   try {
     assertToolAllowed(name, context.readOnly)
+    context.signal?.throwIfAborted()
     const args = argumentsOf(rawArguments)
     switch (name) {
+      case 'conductor': {
+        const method = text(args.method, 'method')
+        if (!context.control) throw new ToolPolicyError('Conductor project bridge is unavailable')
+        const input = args.args
+        if (!input || typeof input !== 'object' || Array.isArray(input)) throw new ToolPolicyError('args must be an object')
+        assertLocalControlAllowed(method, input as Record<string, unknown>, context.readOnly)
+        return { output: JSON.stringify(await context.control(method, input as Record<string, unknown>)).slice(0, 24_000), failed: false, paths: [] }
+      }
+      case 'web_read': return { output: await readPublicWeb(text(args.url, 'url'), context.signal), failed: false, paths: [] }
       case 'read_file': {
         const { path, relative: rel } = await resolveInWorkspace(context.workspace, text(args.path, 'path'))
         const info = await stat(path)
@@ -142,7 +169,9 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         if (Buffer.byteLength(content) > MAX_WRITE_BYTES) throw new ToolPolicyError('content exceeds the 1 MiB write limit')
         const { path, relative: rel } = await resolveWritablePath(context.workspace, text(args.path, 'path'))
         await context.beforeTool?.([path])
+        context.signal?.throwIfAborted()
         await mkdir(join(path, '..'), { recursive: true })
+        context.signal?.throwIfAborted()
         await writeFile(path, content, 'utf8')
         await context.afterTool?.([path], true)
         return { output: `wrote ${rel} (${content.length} characters)`, failed: false, paths: [path] }
@@ -156,6 +185,7 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         if (!occurrences) return { output: `old_text was not found in ${rel}`, failed: true, paths: [] }
         if (occurrences > 1 && args.replace_all !== true) return { output: `old_text appears ${occurrences} times in ${rel}; pass replace_all or use a longer unique snippet`, failed: true, paths: [] }
         await context.beforeTool?.([path])
+        context.signal?.throwIfAborted()
         await writeFile(path, args.replace_all === true ? before.split(oldText).join(newText) : before.replace(oldText, newText), 'utf8')
         await context.afterTool?.([path], true)
         return { output: `edited ${rel} (${occurrences} replacement${occurrences === 1 ? '' : 's'})`, failed: false, paths: [path] }
@@ -163,7 +193,7 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
       case 'run_command': {
         const command = text(args.command, 'command')
         if (!context.sandbox) throw new SandboxUnavailableError('Sandbox unavailable: command execution is disabled without the Docker sandbox')
-        const result = await context.sandbox.exec(command, Math.max(1, Math.min(integer(args.timeout_sec, context.timeoutSec), context.timeoutSec)))
+        const result = await context.sandbox.exec(command, Math.max(1, Math.min(integer(args.timeout_sec, context.timeoutSec), context.timeoutSec)), context.signal)
         const parts = [
           result.stdout.trim() ? `stdout:\n${result.stdout.trim()}` : '',
           result.stderr.trim() ? `stderr:\n${result.stderr.trim()}` : '',

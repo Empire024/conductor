@@ -23,8 +23,8 @@ describe('runFileLinkAction', () => {
     runFileLinkAction('preview', target, edit, vi.fn())
     expect(edit).not.toHaveBeenCalled()
     expect(events.map((event) => event.type)).toEqual(['conductor:open-file', 'conductor:open-file'])
-    expect(events[0]!.detail).toEqual({ projectId: 'p1', path: 'src/a.ts', mode: 'browser', line: 12, allowBinary: undefined })
-    expect(events[1]!.detail).toMatchObject({ mode: 'preview', path: 'src/a.ts' })
+    expect(events[0]!.detail).toEqual({ machineId: 'local', projectId: 'p1', path: 'src/a.ts', mode: 'browser', line: 12, allowBinary: undefined })
+    expect(events[1]!.detail).toEqual({ machineId: 'local', projectId: 'p1', path: 'src/a.ts', mode: 'preview', line: 12, allowBinary: undefined })
   })
 
   it('reveal-explorer dispatches conductor:reveal-in-explorer with the project id and relative path', () => {

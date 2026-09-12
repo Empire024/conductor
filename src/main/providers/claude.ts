@@ -37,9 +37,17 @@ export const taskLabel = (value: string | undefined): string | undefined => {
   const line = value?.split('\n').map(part => part.trim()).find(Boolean)
   return line === undefined ? undefined : line.length > 120 ? line.slice(0, 119).trimEnd() + '…' : line
 }
+export type ClaudeTaskKind = 'agent' | 'shell' | 'other'
+/** Claude's task_type identifies what is running; is_backgrounded/output_file only describe
+ * lifecycle and storage. The installed runtime reports these exact task categories. */
+export function claudeTaskKind(taskType: string | undefined): ClaudeTaskKind {
+  if (taskType === 'local_agent' || taskType === 'local_workflow' || taskType === 'remote_agent') return 'agent'
+  if (taskType === 'local_bash') return 'shell'
+  return 'other'
+}
 interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean }
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
-interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; captured?: boolean }
+interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; detached?: boolean; captured?: boolean }
 interface Block { id: string; kind: string; input: string; text: string }
 class ClaudeControlRejectedError extends Error {}
 interface Request { interaction: PendingInteraction; input: ObjectValue; toolId?: string; submitting: boolean; permissionUpdates?: Json[] }
@@ -81,8 +89,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private controls = new Map<string, { resolve(value: ObjectValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
   private tools = new Map<string, Tool>()
   private streams = new Map<string, { messageId: string; blocks: Map<number, Block>; textBlocks: number }>()
-  /** Backgrounded task id to its launch description; later events omit both facts. */
-  private backgroundTasks = new Map<string, string>()
+  /** Task starts carry identity/type/background state; later progress/completion frames may omit them. */
+  private backgroundTasks = new Map<string, { description: string; taskType?: string; toolUseId?: string; backgrounded: boolean }>()
   private taskOutputRevision = new Map<string, number>()
   private seen = new Set<string>()
   private hookRequests = new Set<string>()
@@ -475,7 +483,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.active = false
       this.expireRequests('Turn ended')
       if (failure && !this.stopRequested) this.emit({ data: { type: 'error', message: this.visibleText(array(message.errors).map(display).join('\n')) || resultText || string(message.subtype) || 'Claude turn failed' } })
-      for (const [id, tool] of this.tools) if (['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: this.stopRequested ? 'interrupted' : 'failed' })
+      for (const [id, tool] of this.tools) if (!tool.detached && ['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: this.stopRequested ? 'interrupted' : 'failed' })
       this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupted' : failure ? 'failed' : 'completed', nativeSessionId: this.nativeSessionId }, native: { method: 'result', payload: message } })
       return
     }
@@ -501,27 +509,60 @@ export class ClaudeAdapter implements ProviderAdapter {
       const status: Extract<import('../../shared/structured-agent').AgentEventData, { type: 'subagent' }>['status'] = message.status === 'failed' ? 'failed' : message.status === 'stopped' ? 'interrupted' : message.status === 'completed' ? 'completed' : 'running'
       const native = { method: `system/${String(message.subtype)}`, payload: message }
       const description = string(message.description)
-      // Only task_started carries is_backgrounded; later events for the same task are
-      // matched by id, and a completion naming an output file is backgrounded by itself.
-      if (message.is_backgrounded === true && id) this.backgroundTasks.set(id, description ?? '')
-      const backgrounded = Boolean(id && this.backgroundTasks.has(id)) || Boolean(string(message.output_file))
-      // A foreground task is the lifecycle of a tool call that is already on the timeline.
-      // Repeating it as a subagent invents children that never existed.
-      if (!backgrounded) {
+      const previous = id ? this.backgroundTasks.get(id) : undefined
+      const record = {
+        description: description ?? previous?.description ?? '',
+        taskType: string(message.task_type) ?? previous?.taskType,
+        toolUseId: string(message.tool_use_id) ?? previous?.toolUseId,
+        backgrounded: message.is_backgrounded === true || previous?.backgrounded === true || Boolean(string(message.output_file))
+      }
+      if (id) this.backgroundTasks.set(id, record)
+      const kind = claudeTaskKind(record.taskType)
+      const outputFile = string(message.output_file) || undefined
+      // A background Bash task is still real work, but it is a process/tool, not an agent.
+      // Keep its lifecycle and bounded output on the existing Bash row instead of inventing a
+      // model-called child. A missed start stays non-agent because output_file is not identity.
+      if (kind !== 'agent') {
+        if (kind === 'shell' && record.backgrounded) {
+          const toolId = record.toolUseId ?? id
+          if (toolId) {
+            if (!this.tools.has(toolId)) this.declareTool(toolId, 'Bash', record.description ? { command: record.description } : {})
+            this.updateTool(toolId, { status, detached: true }, { description: record.description || 'Background shell process' })
+            if (id && outputFile) {
+              const revision = (this.taskOutputRevision.get(id) ?? 0) + 1
+              this.taskOutputRevision.set(id, revision)
+              const output = await readClaudeTaskOutput(outputFile, id, this.nativeSessionId)
+              if (!this.disposed && this.taskOutputRevision.get(id) === revision) this.updateTool(toolId, { status }, {
+                description: record.description || 'Background shell process',
+                output: output.output ?? (output.outputError ? `Background output unavailable: ${output.outputError}` : undefined),
+                outputMode: 'snapshot'
+              })
+            }
+          }
+        }
         this.emit({ parentId: string(message.tool_use_id) ?? parentId, data: { type: 'notice', message: 'Claude task lifecycle', payload: message }, native })
+        if (id && status !== 'running') this.backgroundTasks.delete(id)
         return
       }
       // Completions carry only a summary ("... completed (exit code 0)"), so the launch
       // description is kept as the name rather than being overwritten by it. A task that
       // never reported a description falls back to the summary, and an Agent task's summary
       // is its whole final report, so every candidate is clamped to a one-line label.
-      const name = taskLabel(id ? this.backgroundTasks.get(id) : undefined) ?? taskLabel(description) ?? taskLabel(string(message.summary)) ?? 'Background activity'
-      if (id && status !== 'running') this.backgroundTasks.delete(id)
-      // Backgrounded work keeps running after the turn ends, so the roster must not
-      // treat a finished parent turn as evidence that its status went stale.
-      const outputFile = string(message.output_file) || undefined
-      const task = { itemId: id ? `task:${id}` : undefined, parentId: string(message.tool_use_id) ?? parentId, data: { type: 'subagent' as const, name, status, detached: true, outputFile }, native }
+      const name = taskLabel(record.description) ?? taskLabel(description) ?? taskLabel(string(message.summary)) ?? 'Agent'
+      // Only an explicitly backgrounded agent outlives the parent turn. A foreground Agent call
+      // remains a real subagent, but its active status becomes unverifiable when the turn ends.
+      // The native task frame points back to the Task tool that launched this agent. Keep that
+      // row synchronized too: otherwise the parent result marks an honestly detached, still-live
+      // Task failed while its child continues below it. Generic unresolved tools remain subject
+      // to the normal parent-result cleanup because only native is_backgrounded grants this bit.
+      if (record.toolUseId) {
+        if (!this.tools.has(record.toolUseId)) this.declareTool(record.toolUseId, 'Task', record.description ? { description: record.description } : {})
+        this.updateTool(record.toolUseId, { status, detached: record.backgrounded }, { description: record.description || name })
+      }
+      const task = { itemId: id ? `task:${id}` : undefined, parentId: record.toolUseId ?? parentId, data: { type: 'subagent' as const, name, status, detached: record.backgrounded, outputFile }, native }
       this.emit(task)
+      const totalTokens = number(message.total_tokens) ?? number(object(message.usage).total_tokens)
+      if (id && totalTokens !== undefined) this.emit({ itemId: `usage:task:${id}`, parentId: `task:${id}`, data: { type: 'usage', source: 'provider', scope: 'session', totalTokens } })
       if (id) {
         const revision = (this.taskOutputRevision.get(id) ?? 0) + 1
         this.taskOutputRevision.set(id, revision)
@@ -530,6 +571,7 @@ export class ClaudeAdapter implements ProviderAdapter {
           if (!this.disposed && this.taskOutputRevision.get(id) === revision) this.emit({ ...task, data: { ...task.data, ...output } })
         }
       }
+      if (id && status !== 'running') this.backgroundTasks.delete(id)
       return
     }
     this.emit({ parentId, data: { type: 'notice', message: `Claude ${type ?? 'unknown'}${message.subtype ? ` / ${String(message.subtype)}` : ''}`, payload: message }, native: { method: type ?? 'unknown', payload: message } })
@@ -620,10 +662,15 @@ export class ClaudeAdapter implements ProviderAdapter {
       const utilization = number(object(value).utilization)
       if (utilization === undefined || utilization < 0) continue
       const resetsAt = number(object(value).resetsAt)
+      // Persisted native evidence shows this bucket only on a Fable runtime while the
+      // ordinary seven_day bucket remains alongside it. It is a Fable-specific ceiling,
+      // not purchased overage that increases every Claude model's remaining allowance.
+      const fable = key === 'seven_day_overage_included'
       rateLimits[key] = {
         usedPercent: utilization * 100,
         ...(durations[key] !== undefined ? { windowDurationMins: durations[key]! } : {}),
-        ...(resetsAt !== undefined ? { resetsAt } : {})
+        ...(resetsAt !== undefined ? { resetsAt } : {}),
+        ...(fable ? { scope: 'model', modelSelectors: ['fable'], label: 'Fable weekly' } : {})
       }
     }
     if (!Object.keys(rateLimits).length) return
@@ -666,7 +713,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     const tool = { ...(this.tools.get(id) ?? { name: 'Unknown tool', input: {}, status: 'preparing' as const }), ...update }
     this.tools.set(id, tool)
     const description = string(object(tool.input).description)
-    this.emit({ itemId: id, parentId: tool.parentId, data: { type: 'tool', name: tool.name, ...(data.inputDelta !== undefined ? {} : { input: tool.input }), status: tool.status, ...(description ? { description } : {}), ...data } })
+    this.emit({ itemId: id, parentId: tool.parentId, data: { type: 'tool', name: tool.name, ...(data.inputDelta !== undefined ? {} : { input: tool.input }), status: tool.status, ...(tool.detached ? { detached: true } : {}), ...(description ? { description } : {}), ...data } })
   }
   private async runtimeRequest(message: ObjectValue): Promise<void> {
     const id = string(message.request_id), request = object(message.request)

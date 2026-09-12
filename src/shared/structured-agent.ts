@@ -38,6 +38,8 @@ export interface SessionSettings {
   temporaryPermission?: { runtimeId: string; restore: SessionSettings['permission'] }
   sandbox?: 'inherit' | 'read-only' | 'workspace-write'
   approvalPolicy?: 'inherit' | 'untrusted' | 'on-request' | 'never'
+  /** Explicit opt-in to Conductor's project browser MCP for the next provider connection. */
+  browserMcp?: boolean
   plan: boolean
 }
 /** The only real permission literals a session ever carries. Shared by the renderer's per-provider
@@ -55,10 +57,14 @@ export function settingsForRuntime(settings: SessionSettings, runtimeId?: string
 }
 export interface ContextAttachment {
   id: string
-  kind: 'file' | 'selection' | 'editor' | 'terminal' | 'diagnostics' | 'image'
+  kind: 'file' | 'selection' | 'editor' | 'terminal' | 'diagnostics' | 'image' | 'media'
   name: string
   path?: string
   content?: string
+  /** Opaque media is described by verified metadata and a workspace path; its bytes are never
+   * decoded as text or implied to be native model input. */
+  mimeType?: string
+  size?: number
   startLine?: number
   endLine?: number
 }
@@ -97,7 +103,8 @@ export interface FileChange {
 }
 /** Who actually sent a prompt. Absent means the owner typed it in this tab's composer;
  *  present means another Conductor tab dispatched it through the app control protocol. */
-export interface PromptOrigin { agentSessionId: string; label: string }
+export interface PromptDispatchAuthority { kind: 'remote-peer'; peerId: string; projectId: string }
+export interface PromptOrigin { agentSessionId: string; label: string; authority?: PromptDispatchAuthority }
 export interface QueuedPrompt { id: string; text: string; settings: SessionSettings; attachments: ContextAttachment[]; steer?: boolean; origin?: PromptOrigin }
 export interface PendingSteering extends QueuedPrompt { runtimeId: string; turnId?: string; status: 'sending' | 'accepted' | 'cancelled' | 'uncertain' }
 export type AgentEventData =
@@ -106,7 +113,9 @@ export type AgentEventData =
   | { type: 'queue'; prompt: QueuedPrompt | null; prompts?: QueuedPrompt[] }
   | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings }
   | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[]; origin?: PromptOrigin }
-  | { type: 'tool'; name: string; description?: string; input?: Json; inputDelta?: string; status: ActivityStatus; output?: string; outputMode?: 'delta' | 'snapshot'; stderr?: string; exitCode?: number; durationMs?: number; outputArtifactId?: string }
+  /** `detached` is true only for provider-confirmed background work that can outlive its parent
+   * turn. It remains a tool/process, not a subagent, but terminal parent phases must not end it. */
+  | { type: 'tool'; name: string; description?: string; input?: Json; inputDelta?: string; status: ActivityStatus; detached?: boolean; output?: string; outputMode?: 'delta' | 'snapshot'; stderr?: string; exitCode?: number; durationMs?: number; outputArtifactId?: string }
   | { type: 'changes'; changes: FileChange[] }
   | { type: 'interaction'; interaction: PendingInteraction }
   | { type: 'plan'; steps: Array<{ text: string; status: 'pending' | 'in_progress' | 'completed' }>; explanation?: string }

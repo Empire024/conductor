@@ -48,7 +48,7 @@ export function projectAgentEvent(state: SessionProjection, event: AgentEvent): 
     if (['failed', 'disconnected', 'interrupted', 'completed'].includes(next.phase)) {
       next.items = state.items.map(item => {
         if (item.data.type === 'interaction' && item.data.interaction.status === 'pending') return { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' as const } } }
-        if (item.data.type === 'tool' && ['running', 'preparing', 'awaiting_approval'].includes(item.data.status)) return { ...item, data: { ...item.data, status: 'interrupted' as const } }
+        if (item.data.type === 'tool' && !item.data.detached && ['running', 'preparing', 'awaiting_approval'].includes(item.data.status)) return { ...item, data: { ...item.data, status: 'interrupted' as const } }
         return item
       })
     }

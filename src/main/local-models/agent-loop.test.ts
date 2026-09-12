@@ -49,6 +49,39 @@ describe('local agent loop', () => {
     return root
   }
 
+  it('repairs interrupted multi-tool groups before the next turn and never executes skipped calls', async () => {
+    const stub = await stubServer([
+      [frame({ tool_calls: [
+        { index: 0, id: 'first', function: { name: 'read_file', arguments: '{"path":"src/index.ts"}' } },
+        { index: 1, id: 'skipped', function: { name: 'write_file', arguments: '{"path":"forbidden.txt","content":"late"}' } }
+      ] }, 'tool_calls')],
+      [frame({ content: 'Resumed cleanly' }, 'stop')]
+    ])
+    cleanup.push(() => stub.server.close())
+    const root = workspace(), controller = new AbortController()
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: root, sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })
+    const executed: string[] = []
+    expect((await session.run('Read and write', { toolEnd: call => { executed.push(call.name); controller.abort() } }, controller.signal)).stopReason).toBe('interrupted')
+    expect(executed).toEqual(['read_file'])
+    expect((await session.run('Continue', {})).stopReason).toBe('complete')
+    const messages = stub.requests[1]!.messages as Array<{ role: string; tool_call_id?: string; content: string }>
+    expect(messages.filter(message => message.role === 'tool').map(message => message.tool_call_id)).toEqual(['first', 'skipped'])
+    expect(messages.find(message => message.tool_call_id === 'skipped')?.content).toContain('Interrupted before execution')
+  })
+
+  it('uses the scoped memory callback and feeds its result to the real protocol shape', async () => {
+    const stub = await stubServer([
+      [frame({ tool_calls: [{ index: 0, id: 'remember', function: { name: 'conductor', arguments: '{"method":"memory.remember","args":{"gist":"Durable fixture fact","kind":"semantic"}}' } }] }, 'tool_calls')],
+      [frame({ content: 'Remembered' }, 'stop')]
+    ])
+    cleanup.push(() => stub.server.close())
+    const remembered: unknown[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768, control: async (method, args) => { remembered.push({ method, args }); return { id: 'memory-from-host' } } })
+    expect((await session.run('Remember this', {})).stopReason).toBe('complete')
+    expect(remembered).toEqual([{ method: 'memory.remember', args: { gist: 'Durable fixture fact', kind: 'semantic' } }])
+    expect(JSON.stringify(stub.requests[1]!.messages)).toContain('memory-from-host')
+  })
+
   it('streams text, runs an allowed tool and feeds the result back', async () => {
     const stub = await stubServer([
       [frame({ content: 'Looking' }), frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'read_file', arguments: '{"path":"src/index.ts"}' } }] }, 'tool_calls')],
@@ -68,7 +101,7 @@ describe('local agent loop', () => {
     const second = stub.requests[1] as { messages: Array<{ role: string; content: string }>; tools: Array<{ function: { name: string } }> }
     expect(second.messages.at(-1)).toMatchObject({ role: 'tool' })
     expect(second.messages.at(-1)!.content).toContain('export const answer = 42')
-    expect(second.tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'write_file', 'edit_file', 'run_command'])
+    expect(second.tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'run_command'])
   })
 
   it('reports a refused capability to the model instead of executing it', async () => {
@@ -89,7 +122,7 @@ describe('local agent loop', () => {
     cleanup.push(() => stub.server.close())
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
     await session.run('Summarize', {})
-    expect((stub.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search'])
+    expect((stub.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read'])
   })
 
   it('fails the turn when the local API key is rejected', async () => {

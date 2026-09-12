@@ -8,10 +8,15 @@ import { StructuredSessions } from './structured-sessions'
 import type { AgentSpec } from '../shared/models'
 import type { StructuredProvider } from '../shared/structured-agent'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
-import type { AdapterEvent, ContextAttachment, InteractionResponse, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
+import type { AdapterEvent, ContextAttachment, InteractionResponse, PromptOrigin, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
 import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
+const remoteOrigin = (projectId: string): PromptOrigin => ({
+  agentSessionId: 'remote-controller',
+  label: 'Remote owner',
+  authority: { kind: 'remote-peer', peerId: 'trusted-peer', projectId }
+})
 const roots: string[] = [], databases: ConductorDatabase[] = [], managers: StructuredSessions[] = []
 afterEach(() => {
   for (const manager of managers.splice(0)) { try { manager.dispose() } catch {} }
@@ -51,7 +56,7 @@ class FakeProvider implements ProviderAdapter {
     this.emit({ data: { type: 'session', phase: 'waiting_approval' } })
   }
 }
-function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart = true) {
+function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart = true, mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0')
   vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
   const root = mkdtempSync(join(tmpdir(), 'conductor-session-fixture-')); roots.push(root)
@@ -64,12 +69,95 @@ function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart 
   const adapters: FakeProvider[] = [], broadcast = vi.fn()
   let startGate: Promise<void> | undefined
   const factory = (_provider: StructuredProvider, options: AdapterOptions) => { const adapter = new FakeProvider(options); adapter.startGate = startGate; adapter.nativeIdentityOnStart = nativeIdentityOnStart; adapters.push(adapter); return adapter }
-  const manager = new StructuredSessions(database, () => 'synthetic-executable', broadcast, factory); managers.push(manager)
+  const manager = new StructuredSessions(database, () => 'synthetic-executable', broadcast, factory, undefined, undefined, mcp); managers.push(manager)
   manager.ensure(spec)
   return { root, workspace, databasePath, database, spec, adapters, broadcast, factory, manager, gateStart(gate: Promise<void>) { startGate = gate }, get current() { return adapters.at(-1)! } }
 }
 
 describe('backend session ownership and lifecycle — fake provider boundary', () => {
+  it.each(['claude', 'codex'] as const)('configures the project browser for %s only after explicit opt-in', async provider => {
+    const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
+    const disabled = fixture(provider, true, mcp)
+    await disabled.manager.submit(disabled.spec.id, 'Without browser', settings)
+    expect(disabled.current.options.mcpConfig).toBe('')
+    expect(mcp.configure).not.toHaveBeenCalled()
+
+    const enabled = fixture(provider, true, mcp)
+    enabled.manager.saveSettings(enabled.spec.id, { ...settings, browserMcp: true })
+    await enabled.manager.submit(enabled.spec.id, 'With browser', { ...settings, browserMcp: true })
+    expect(enabled.current.options.mcpConfig).toBe('private-browser-config.json')
+    expect(mcp.configure).toHaveBeenCalledWith(enabled.spec)
+  })
+
+  it.each(['claude', 'codex'] as const)('reconnects the same idle native %s conversation when browser tools change', async provider => {
+    const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
+    const f = fixture(provider, true, mcp)
+    await f.manager.connectSession(f.spec.id)
+    const disabled = f.current
+    const nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
+    expect(disabled.options.mcpConfig).toBe('')
+
+    f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })
+    expect(disabled.disposed).toBe(true)
+    expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('disconnected')
+    await f.manager.submit(f.spec.id, 'Browser-enabled turn', { ...settings, browserMcp: true })
+    const enabled = f.current
+    expect(enabled).not.toBe(disabled)
+    expect(enabled.options.nativeSessionId).toBe(nativeId)
+    expect(enabled.options.mcpConfig).toBe('private-browser-config.json')
+    enabled.finish()
+
+    f.manager.saveSettings(f.spec.id, settings)
+    expect(enabled.disposed).toBe(true)
+    expect(mcp.release).toHaveBeenCalledWith(f.spec.id)
+    await f.manager.submit(f.spec.id, 'Browser-disabled turn', settings)
+    expect(f.current.options.nativeSessionId).toBe(nativeId)
+    expect(f.current.options.mcpConfig).toBe('')
+  })
+
+  it.each(['claude', 'codex'] as const)('revokes browser access during an active %s turn and refreshes before the next turn', async provider => {
+    const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
+    const f = fixture(provider, true, mcp)
+    f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })
+    await f.manager.submit(f.spec.id, 'Active browser turn', { ...settings, browserMcp: true })
+    const activeRuntime = f.current
+    f.manager.saveSettings(f.spec.id, settings)
+    expect(mcp.release).toHaveBeenCalledWith(f.spec.id)
+    expect(activeRuntime.disposed).toBe(false)
+    activeRuntime.finish()
+    await f.manager.submit(f.spec.id, 'Next turn without browser', settings)
+    expect(activeRuntime.disposed).toBe(true)
+    expect(f.current.options.nativeSessionId).toBe(activeRuntime.options.nativeSessionId ?? 'native-' + activeRuntime.options.runtimeId)
+    expect(f.current.options.mcpConfig).toBe('')
+  })
+
+  it.each(['claude', 'codex'] as const)('keeps a newer browser revocation when an older queued %s message drains', async provider => {
+    const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
+    const f = fixture(provider, true, mcp)
+    const enabled = { ...settings, browserMcp: true }
+    f.manager.saveSettings(f.spec.id, enabled)
+    await f.manager.submit(f.spec.id, 'Active browser turn', enabled)
+    const firstRuntime = f.current
+    await f.manager.queue(f.spec.id, 'Captured while enabled', enabled)
+
+    f.manager.saveSettings(f.spec.id, settings)
+    firstRuntime.finish()
+    await vi.waitFor(() => expect(f.adapters.flatMap(adapter => adapter.submissions)).toHaveLength(2))
+
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBeUndefined()
+    expect(f.adapters.flatMap(adapter => adapter.submissions).at(-1)?.settings.browserMcp).toBeUndefined()
+    expect(f.current.options.mcpConfig).toBe('')
+  })
+
+  it('rejects enabling browser tools during active work without changing the saved preference', async () => {
+    const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
+    const f = fixture('claude', true, mcp)
+    await f.manager.submit(f.spec.id, 'Active turn', settings)
+    expect(() => f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })).toThrow('current turn')
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBeUndefined()
+    expect(mcp.release).not.toHaveBeenCalled()
+  })
+
   it('registration and repeated pane subscriptions launch no process; one turn has one backend runtime', async () => {
     const f = fixture()
     for (let i = 0; i < 8; i++) { f.manager.ensure(f.spec); f.database.structured.snapshot(f.spec.id); f.database.structured.events(f.spec.id) }
@@ -154,7 +242,7 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     await expect(f.manager.respond(corrected)).rejects.toThrow('already submitted')
   })
 
-  it('resumes the same native conversation explicitly and ignores stale callbacks from its old incarnation', async () => {
+  it('resumes the same native conversation for a new message, sends it once, and ignores stale callbacks', async () => {
     const f = fixture()
     writeFileSync(join(f.workspace, 'panel.mjs'), 'before\n')
     await f.manager.submit(f.spec.id, 'Synthetic turn', settings)
@@ -163,22 +251,19 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     const nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
     await previous.options.beforeTool?.('edit', ['panel.mjs'])
     previous.emit({ data: { type: 'session', phase: 'disconnected' } })
-    await expect(f.manager.submit(f.spec.id, 'No silent retry', settings)).rejects.toThrow('Resume')
-    await f.manager.resume(f.spec.id)
+    await f.manager.submit(f.spec.id, 'One new follow up', settings)
     const current = f.current
     expect(current).not.toBe(previous)
     expect(current.options.nativeSessionId).toBe(nativeId)
     expect(current.options.runtimeId).not.toBe(previous.options.runtimeId)
-    expect(current.submissions).toHaveLength(0)
+    expect(current.submissions.map(input => input.text)).toEqual(['One new follow up'])
+    expect(previous.submissions.map(input => input.text)).toEqual(['Synthetic turn'])
     const sequence = f.database.structured.snapshot(f.spec.id)!.sequence
     previous.emit({ itemId: 'stale', data: { type: 'text', role: 'assistant', text: 'late stale text', mode: 'delta' } })
     writeFileSync(join(f.workspace, 'panel.mjs'), 'after\n')
     await previous.options.afterTool?.('edit', ['panel.mjs'], true)
     expect(f.database.structured.snapshot(f.spec.id)!.sequence).toBe(sequence)
     await expect(f.manager.respond({ sessionId: f.spec.id, runtimeId: previous.options.runtimeId, requestId: 'old-request', decision: 'allow' })).rejects.toThrow('stale')
-    await f.manager.submit(f.spec.id, 'One follow up', settings)
-    expect(current.submissions).toHaveLength(1)
-    expect(previous.submissions).toHaveLength(1)
   })
 
   it('does not send a queued prompt when the backend closes during initialization', async () => {
@@ -195,7 +280,7 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(runtime.disposed).toBe(true)
   })
 
-  it('restores historical UI without launching a runtime or answering prior approvals', async () => {
+  it('restores history lazily, then resumes the same native conversation only for a new message', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'Historical synthetic turn', settings)
     f.current.approval('historical-request')
@@ -209,8 +294,12 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     restored.ensure(f.spec)
     expect(factory).not.toHaveBeenCalled()
     expect(reopened.structured.events(f.spec.id).some((entry) => entry.data.type === 'text' && entry.data.role === 'user')).toBe(true)
-    await expect(restored.submit(f.spec.id, 'retry', settings)).rejects.toThrow('Resume')
-    expect(factory).not.toHaveBeenCalled()
+    await restored.submit(f.spec.id, 'New message after restart', settings)
+    expect(factory).toHaveBeenCalledOnce()
+    const resumed = factory.mock.results[0]!.value as FakeProvider
+    expect(resumed.options.nativeSessionId).toBe(projection?.nativeSessionId)
+    expect(resumed.submissions.map(input => input.text)).toEqual(['New message after restart'])
+    expect(resumed.responses).toEqual([])
   })
 
   it('denying preserves bytes, approving edits once, Keep does not reapply, and undo preserves later work', async () => {
@@ -276,6 +365,23 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(user?.data).toMatchObject({ text: 'Inspect selected context', attachments: [{ id: 'file', name: 'context.txt' }, { id: 'editor', name: 'context.txt (unsaved)' }, { id: 'selection', startLine: 2, endLine: 3 }] })
     expect(JSON.stringify(user?.data)).not.toContain('saved content')
     expect(JSON.stringify(user?.data)).not.toContain('[Attached')
+  })
+
+  it('describes opaque media by verified workspace metadata without decoding it as text', async () => {
+    const f = fixture()
+    const bytes = Buffer.from([0, 1, 2, 3, 0xff])
+    writeFileSync(join(f.workspace, 'clip.mp4'), bytes)
+    await f.manager.submit(f.spec.id, 'Inspect media context', settings, [
+      { id: 'media', kind: 'media', name: 'clip.mp4', path: 'clip.mp4', mimeType: 'video/mp4', size: 999_999 }
+    ])
+    const submission = f.current.submissions[0]!
+    expect(submission.text).toContain('Attached opaque media: clip.mp4')
+    expect(submission.text).toContain('media type: video/mp4; 5 bytes')
+    expect(submission.text).toContain('Binary bytes were not decoded or inserted as readable text.')
+    expect(submission.attachments).toEqual([])
+    const user = f.database.structured.snapshot(f.spec.id)?.items.find(item => item.data.type === 'text' && item.data.role === 'user')
+    expect(user?.data).toMatchObject({ attachments: [{ kind: 'media', path: 'clip.mp4', mimeType: 'video/mp4', size: 5 }] })
+    expect(JSON.stringify(user?.data)).not.toContain(bytes.toString('utf8'))
   })
 
   it('refuses to dispatch once recalled memory or attachment expansion pushes the assembled prompt past the true CLI ceiling', async () => {
@@ -417,6 +523,86 @@ describe('queued messages and native CLI handoff', () => {
     expect(f.database.structured.snapshot(f.spec.id)?.queued?.text).toBe('durable queued text')
     expect(f.adapters.reduce((count, adapter) => count + adapter.submissions.length, 0)).toBe(1)
     expect(restarted.cancelQueued(f.spec.id)?.text).toBe('durable queued text')
+  })
+  it('rechecks remote authority after attachment expansion before native steering', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'active', settings)
+    f.current.capabilities.steering = true
+    writeFileSync(join(f.workspace, 'remote-context.txt'), 'captured remote context')
+    let authorized = true
+    f.manager.setPromptDispatchAuthorityGuard((authority, spec) => {
+      expect(authority).toEqual(remoteOrigin(f.spec.projectId).authority)
+      expect(spec).toEqual(f.spec)
+      if (!authorized) throw new Error('Remote prompt authority was revoked')
+    })
+
+    const dispatch = f.manager.steer(f.spec.id, 'remote followup', settings, [
+      { id: 'remote-file', kind: 'file', name: 'remote-context.txt', path: 'remote-context.txt' }
+    ], remoteOrigin(f.spec.projectId))
+    authorized = false
+
+    await expect(dispatch).rejects.toThrow('authority was revoked')
+    expect(f.current.steers).toEqual([])
+    const state = f.database.structured.snapshot(f.spec.id)!
+    expect(state.pendingSteering ?? []).toEqual([])
+    expect(state.items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text === 'remote followup')).toBe(false)
+  })
+  it('rechecks remote authority after native connection without recording an accepted prompt', async () => {
+    const f = fixture()
+    let releaseStart!: () => void
+    f.gateStart(new Promise<void>(resolve => { releaseStart = resolve }))
+    let authorized = true
+    f.manager.setPromptDispatchAuthorityGuard(() => {
+      if (!authorized) throw new Error('Remote prompt authority was revoked')
+    })
+
+    const dispatch = f.manager.submit(f.spec.id, 'remote new turn', settings, [], remoteOrigin(f.spec.projectId))
+    await vi.waitFor(() => expect(f.current.starts).toBe(1))
+    authorized = false
+    releaseStart()
+
+    await expect(dispatch).rejects.toThrow('authority was revoked')
+    expect(f.current.submissions).toEqual([])
+    const state = f.database.structured.snapshot(f.spec.id)!
+    expect(state.phase).toBe('idle')
+    expect(state.items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text === 'remote new turn')).toBe(false)
+  })
+  it('retains an authorized queued remote prompt when its authority is revoked before drain', async () => {
+    const f = fixture()
+    let authorized = true
+    f.manager.setPromptDispatchAuthorityGuard(() => {
+      if (!authorized) throw new Error('Remote prompt authority was revoked')
+    })
+    await f.manager.submit(f.spec.id, 'active', settings)
+    await f.manager.queue(f.spec.id, 'remote queued turn', settings, [], remoteOrigin(f.spec.projectId))
+    authorized = false
+    f.current.finish()
+
+    await vi.waitFor(() => expect(f.database.structured.snapshot(f.spec.id)?.items.some(item => item.data.type === 'notice' && item.data.message.includes('authority was revoked'))).toBe(true))
+    expect(f.adapters.flatMap(adapter => adapter.submissions).map(input => input.text)).toEqual(['active'])
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toMatchObject([{
+      text: 'remote queued turn',
+      origin: { authority: { kind: 'remote-peer', peerId: 'trusted-peer', projectId: f.spec.projectId } }
+    }])
+  })
+  it('fails closed after reload when a durable remote queue has no authority guard', async () => {
+    const f = fixture()
+    f.manager.setPromptDispatchAuthorityGuard(() => undefined)
+    await f.manager.submit(f.spec.id, 'active', settings)
+    await f.manager.queue(f.spec.id, 'durable remote queued turn', settings, [], remoteOrigin(f.spec.projectId))
+    f.manager.dispose()
+
+    const restarted = new StructuredSessions(f.database, () => 'synthetic-executable', f.broadcast, f.factory)
+    managers.push(restarted)
+    restarted.ensure(f.spec)
+    await restarted.resume(f.spec.id)
+
+    await vi.waitFor(() => expect(f.database.structured.snapshot(f.spec.id)?.items.some(item => item.data.type === 'notice' && item.data.message.includes('cannot be verified'))).toBe(true))
+    expect(f.adapters.flatMap(adapter => adapter.submissions).map(input => input.text)).toEqual(['active'])
+    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toMatchObject([{
+      text: 'durable remote queued turn',
+      origin: { authority: { kind: 'remote-peer', peerId: 'trusted-peer', projectId: f.spec.projectId } }
+    }])
   })
   it('imports only the CLI portion of Claude history after returning to Chat', async () => {
     const f = fixture('claude')
@@ -790,6 +976,46 @@ describe('steering receipts and Escape delivery', () => {
     expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(2)
     expect(f.current.submissions).toHaveLength(1)
   })
+  it('cancels receipt timers before disposal and keeps a late acknowledgement uncertain', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    const runtime = f.current
+    runtime.capabilities.steering = true; runtime.autoDeliver = false
+    runtime.emit({ turnId: 'original-turn', data: { type: 'session', phase: 'running', capabilities: runtime.capabilities } })
+    let release!: () => void
+    runtime.onSteer = () => new Promise<void>(resolve => { release = resolve })
+    const pending = f.manager.steerAccepted(f.spec.id, 'Assignment awaiting receipt', settings)
+    await vi.waitFor(() => expect(runtime.steerIds).toHaveLength(1))
+    f.manager.dispose()
+    await expect(pending).rejects.toThrow('backend closed before native steering acceptance')
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toMatchObject([{ status: 'uncertain' }])
+    runtime.emit({ data: { type: 'input_delivery', inputId: runtime.steerIds[0]!, status: 'accepted' } })
+    await vi.advanceTimersByTimeAsync(30_001)
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toMatchObject([{ status: 'uncertain' }])
+    release()
+    vi.useRealTimers()
+  })
+  it('does not let a retired runtime acknowledgement cross into a replacement connection', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Original', settings)
+    const retired = f.current
+    retired.capabilities.steering = true; retired.autoDeliver = false
+    retired.emit({ turnId: 'original-turn', data: { type: 'session', phase: 'running', capabilities: retired.capabilities } })
+    let release!: () => void
+    retired.onSteer = () => new Promise<void>(resolve => { release = resolve })
+    const pending = f.manager.steerAccepted(f.spec.id, 'Assignment on retiring runtime', settings)
+    await vi.waitFor(() => expect(retired.steerIds).toHaveLength(1))
+    f.manager.killWhere(spec => spec.id === f.spec.id)
+    await expect(pending).rejects.toThrow('backend closed before native steering acceptance')
+    f.manager.ensure(f.spec)
+    await f.manager.resume(f.spec.id)
+    const replacement = f.current
+    expect(replacement).not.toBe(retired)
+    retired.emit({ data: { type: 'input_delivery', inputId: retired.steerIds[0]!, status: 'accepted' } })
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toMatchObject([{ status: 'uncertain' }])
+    release()
+  })
   it.each(['receipt-first', 'completion-first'])('Escape submits the exact cancelled pending input once after both confirmations (%s)', async order => {
     const f = await pendingFixture()
     f.receipt('accepted')
@@ -916,18 +1142,34 @@ it('retains transferred input when a definite native refusal races with Stop', a
 })
 
 
-it.each([false, true])('retains explicitly queued unsupported-turn input after interrupt(expedite=%s)', async expedite => {
+it('retains explicitly queued unsupported-turn input after a normal Stop', async () => {
   const f = fixture()
   await f.manager.submit(f.spec.id, 'Original', settings)
   f.current.capabilities.steering = false
   f.current.emit({ turnId: 'non-steerable-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
   await f.manager.queue(f.spec.id, 'Explicit after-turn queue', settings)
-  await f.manager.interrupt(f.spec.id, expedite)
+  await f.manager.interrupt(f.spec.id, false)
   expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('interrupted')
   expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toMatchObject([{ text: 'Explicit after-turn queue' }])
   expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.[0]?.steer).toBeUndefined()
   expect(f.current.steers).toHaveLength(0)
   expect(f.current.submissions).toHaveLength(1)
+})
+
+it('Escape flushes every queued message in original order after interruption', async () => {
+  const f = fixture()
+  await f.manager.submit(f.spec.id, 'Original', settings)
+  f.current.capabilities.steering = false
+  f.current.emit({ turnId: 'non-steerable-turn', data: { type: 'session', phase: 'running', capabilities: f.current.capabilities } })
+  await f.manager.queue(f.spec.id, 'Queued first', settings)
+  await f.manager.queue(f.spec.id, 'Queued second', settings)
+  await f.manager.queue(f.spec.id, 'Queued third', settings)
+  f.current.capabilities.steering = true
+  await f.manager.interrupt(f.spec.id, true)
+  await vi.waitFor(() => expect(f.current.submissions.length + f.current.steers.length).toBe(4))
+  expect(f.current.submissions.map(input => input.text)).toEqual(['Original', 'Queued first'])
+  expect(f.current.steers.map(input => input.text)).toEqual(['Queued second', 'Queued third'])
+  expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toEqual([])
 })
 
 describe('composer settings persistence', () => {

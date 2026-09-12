@@ -34,6 +34,8 @@
   background: var(--text-3);
 }
 .process-status-summary-head span.process-status-summary-running { color: var(--accent-muted); }
+.process-status-summary-head span.process-status-summary-attention { margin-left: 0; color: #e2b872; }
+.process-status-summary-head span.process-status-summary-stale { margin-left: 0; color: #e2b872; font-size: 8px; font-weight: 650; text-transform: uppercase; }
 .process-status-summary-head span.process-status-summary-running i {
   background: var(--accent);
   box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 55%, transparent);

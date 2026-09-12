@@ -2,11 +2,11 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import type { AgentEventData, TimelineItem } from '../../../shared/structured-agent'
-import { StructuredUsageDetails } from './StructuredUsageDetails'
+import { StructuredUsageContent, StructuredUsageDetails } from './StructuredUsageDetails'
 
+const items = (events: AgentEventData[]): TimelineItem[] => events.map((data, index) => ({ id: String(index), runtimeId: 'synthetic', sequence: index + 1, timestamp: '2026-09-07T00:00:00Z', data }))
 function render(events: AgentEventData[]): string {
-  const items: TimelineItem[] = events.map((data, index) => ({ id: String(index), runtimeId: 'synthetic', sequence: index + 1, timestamp: '2026-09-07T00:00:00Z', data }))
-  return renderToStaticMarkup(createElement(StructuredUsageDetails, { items }))
+  return renderToStaticMarkup(createElement(StructuredUsageDetails, { items: items(events) }))
 }
 describe('opt-in usage details (synthetic, zero inference)', () => {
   it('starts collapsed and keeps missing telemetry unknown rather than zero', () => {
@@ -75,6 +75,17 @@ describe('opt-in usage details (synthetic, zero inference)', () => {
     expect(html).toContain('Limit details')
     expect(html).toContain('&lt;script&gt;')
     expect(html).not.toContain('<script>')
+  })
+  it('shows a Fable-specific allowance row only when the visible composer selected Fable', () => {
+    const events: AgentEventData[] = [{ type: 'usage', source: 'provider', limits: { rateLimits: {
+      seven_day: { usedPercent: 95, windowDurationMins: 10080 },
+      seven_day_overage_included: { usedPercent: 99, windowDurationMins: 10080, scope: 'model', modelSelectors: ['fable'], label: 'Fable weekly' }
+    } } }]
+    const fable = renderToStaticMarkup(createElement(StructuredUsageContent, { items: items(events), modelLabel: 'Claude Fable 5.1' }))
+    const sonnet = renderToStaticMarkup(createElement(StructuredUsageContent, { items: items(events), modelLabel: 'Claude Sonnet 4.5' }))
+    expect(fable).toContain('<span>Fable weekly</span><strong>99% used</strong>')
+    expect(sonnet).not.toContain('<span>Fable weekly</span><strong>99% used</strong>')
+    expect(sonnet).toContain('<span>Weekly</span><strong>95% used</strong>')
   })
 })
 

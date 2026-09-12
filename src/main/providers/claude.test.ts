@@ -85,6 +85,18 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(f.transport.sent.at(-1)).toMatchObject({ type: 'user', session_id: 'native-session', message: { content: 'Follow up' } })
   })
 
+  it('publishes fresh capabilities before learning native identity from the first turn', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    expect(f.events.at(-1)?.data).toMatchObject({ type: 'session', phase: 'idle', capabilities: { models: [{ id: 'fixture-model' }] } })
+    expect(f.projection().nativeSessionId).toBeUndefined()
+
+    await f.adapter.submit('First prompt', settings)
+    f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-after-first-turn', model: 'fixture-model', claude_code_version: '2.1.263' })
+
+    expect(f.projection()).toMatchObject({ phase: 'running', nativeSessionId: 'native-after-first-turn' })
+  })
+
   it('reconciles by message identity, preserves repeated chunks, and never calls input completion execution', async () => {
     const f = fixture()
     await f.adapter.start()
@@ -390,6 +402,7 @@ describe('Claude conversation reliability', () => {
     f.transport.receive({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: {
       five_hour: { utilization: 0.24, resetsAt: 1789416000 },
       seven_day: { utilization: 0.1 },
+      seven_day_overage_included: { utilization: 0.99, resetsAt: 1789416000 },
       model_scoped: { utilization: null }
     } } })
     const first = f.projection().items.find(item => item.nativeItemId === 'usage:account-rate-limits:first')
@@ -397,7 +410,8 @@ describe('Claude conversation reliability', () => {
     // Rescaled to the same 0-100 shape Codex reports, with Claude's fixed window durations.
     expect(first?.data).toMatchObject({ type: 'usage', source: 'provider', limits: { rateLimits: {
       five_hour: { usedPercent: 24, windowDurationMins: 300, resetsAt: 1789416000 },
-      seven_day: { usedPercent: 10, windowDurationMins: 10080 }
+      seven_day: { usedPercent: 10, windowDurationMins: 10080 },
+      seven_day_overage_included: { usedPercent: 99, windowDurationMins: 10080, resetsAt: 1789416000, scope: 'model', modelSelectors: ['fable'], label: 'Fable weekly' }
     } } })
     // An unreported utilization is dropped, never recorded as zero usage.
     expect(JSON.stringify(first?.data)).not.toContain('model_scoped')
@@ -530,7 +544,7 @@ describe('Claude mid-turn steering (synthetic, zero inference)', () => {
   })
 })
 
-describe('Claude background task reporting (payloads captured from a real session)', () => {
+describe('Claude task reporting (payloads captured from a real session)', () => {
   const subagents = (f: ReturnType<typeof fixture>) =>
     f.events.filter(event => event.data.type === 'subagent').map(event => event.data as Extract<AdapterEvent['data'], { type: 'subagent' }>)
 
@@ -544,44 +558,88 @@ describe('Claude background task reporting (payloads captured from a real sessio
     expect(f.events.some(event => event.data.type === 'notice' && event.native?.method === 'system/task_started')).toBe(true)
   })
 
-  it('reports a backgrounded task and keeps its launch description as the name', async () => {
+  it('keeps a background Bash process on its tool row instead of reporting a subagent', async () => {
     const f = fixture()
     await f.adapter.start()
     f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'b90gny9dq', tool_use_id: 'toolu_B', description: 'Run Codex on the steering implementation', is_backgrounded: true, task_type: 'local_bash' })
     f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'b90gny9dq', tool_use_id: 'toolu_B', status: 'completed', output_file: 'C:/tmp/b90gny9dq.output', summary: 'Background command "Run Codex on the steering implementation" completed (exit code 0)' })
-    const reported = subagents(f)
-    expect(reported).toHaveLength(2)
-    expect(reported[0]).toMatchObject({ name: 'Run Codex on the steering implementation', status: 'running', detached: true })
-    expect(reported[1]).toMatchObject({ name: 'Run Codex on the steering implementation', status: 'completed' })
-    expect(reported[1]?.name).not.toContain('exit code')
+    expect(subagents(f)).toHaveLength(0)
+    const tool = f.projection().items.find(item => item.data.type === 'tool' && item.nativeItemId === 'toolu_B')
+    expect(tool?.data).toMatchObject({ type: 'tool', name: 'Bash', description: 'Run Codex on the steering implementation', status: 'completed' })
   })
 
-  it('clamps a report-sized summary to a one-line roster name', async () => {
+  it('keeps a detached background Bash tool active after its parent turn completes', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Start background work', settings)
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'background-shell', tool_use_id: 'toolu_background', description: 'Long background check', is_backgrounded: true, task_type: 'local_bash' })
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, session_id: 'native', usage: {} })
+    expect(f.projection().phase).toBe('completed')
+    expect(f.projection().items.find(item => item.nativeItemId === 'toolu_background')?.data).toMatchObject({ type: 'tool', detached: true, status: 'running' })
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'background-shell', tool_use_id: 'toolu_background', status: 'completed', summary: 'Long background check completed' })
+    expect(f.projection().items.find(item => item.nativeItemId === 'toolu_background')?.data).toMatchObject({ type: 'tool', detached: true, status: 'completed' })
+    expect(f.projection().items.some(item => item.data.type === 'subagent')).toBe(false)
+  })
+
+  it('keeps an associated detached Task tool truthful while its background agent outlives the parent', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Start background agent', settings)
+    f.transport.receive(toolUse('toolu_agent', 'Task', { description: 'Investigate in background' }))
+    f.transport.receive(toolUse('ordinary_unresolved', 'Read', { file_path: 'still-missing.txt' }))
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'agent-background', tool_use_id: 'toolu_agent', description: 'Investigate in background', is_backgrounded: true, task_type: 'local_agent' })
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, session_id: 'native', usage: {} })
+
+    expect(f.projection().phase).toBe('completed')
+    expect(f.projection().items.find(item => item.nativeItemId === 'toolu_agent')?.data).toMatchObject({ type: 'tool', name: 'Task', detached: true, status: 'running' })
+    expect(f.projection().items.find(item => item.nativeItemId === 'task:agent-background')?.data).toMatchObject({ type: 'subagent', detached: true, status: 'running' })
+    const unresolved = f.projection().items.find(item => item.nativeItemId === 'ordinary_unresolved')?.data
+    expect(unresolved).toMatchObject({ type: 'tool', status: 'failed' })
+    expect(unresolved).not.toHaveProperty('detached')
+
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'agent-background', tool_use_id: 'toolu_agent', status: 'completed', summary: 'Background agent completed' })
+    expect(f.projection().items.find(item => item.nativeItemId === 'toolu_agent')?.data).toMatchObject({ type: 'tool', detached: true, status: 'completed' })
+    expect(f.projection().items.find(item => item.nativeItemId === 'task:agent-background')?.data).toMatchObject({ type: 'subagent', detached: true, status: 'completed' })
+  })
+
+  it('reports a real Agent task even when it is foreground and clamps a report-sized summary', async () => {
     const f = fixture()
     await f.adapter.start()
     const report = '## 1. `HAF_Blaze_Tax_Price_Sync` - includes/class-tax-price-sync.php ' + 'design notes and verified call sites '.repeat(400)
-    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'agent-1', tool_use_id: 'toolu_R', is_backgrounded: true, task_type: 'local_bash' })
-    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'agent-1', tool_use_id: 'toolu_R', status: 'completed', output_file: 'C:/tmp/agent-1.output', summary: report })
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'agent-1', tool_use_id: 'toolu_R', is_backgrounded: false, task_type: 'local_agent' })
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'agent-1', tool_use_id: 'toolu_R', status: 'completed', summary: report })
     const named = subagents(f).at(-1)?.name ?? ''
     expect(named.length).toBeLessThanOrEqual(120)
     expect(named).toContain('HAF_Blaze_Tax_Price_Sync')
     expect(named).not.toContain('\n')
   })
 
-  it('still reports a completion that names an output file after its start was missed', async () => {
+  it('does not infer an agent from an orphan output file', async () => {
     const f = fixture()
     await f.adapter.start()
     f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'orphan', tool_use_id: 'toolu_C', status: 'completed', output_file: 'C:/tmp/orphan.output', summary: 'Background command "Deploy" completed (exit code 0)' })
-    expect(subagents(f)).toHaveLength(1)
+    expect(subagents(f)).toHaveLength(0)
+    expect(f.events.some(event => event.native?.method === 'system/task_notification')).toBe(true)
   })
 
   it('keeps two concurrent background runs distinct', async () => {
     const f = fixture()
     await f.adapter.start()
     for (const [task, tool] of [['one', 'toolu_D'], ['two', 'toolu_E']] as const) {
-      f.transport.receive({ type: 'system', subtype: 'task_started', task_id: task, tool_use_id: tool, description: 'Run ' + task, is_backgrounded: true, task_type: 'local_bash' })
+      f.transport.receive({ type: 'system', subtype: 'task_started', task_id: task, tool_use_id: tool, description: 'Run ' + task, is_backgrounded: true, task_type: 'local_agent' })
     }
     expect(new Set(subagents(f).map(agent => agent.name)).size).toBe(2)
+  })
+
+  it.each(['local_agent', 'local_workflow', 'remote_agent'])('recognizes %s as agent work from task_type', async taskType => {
+    const f = fixture(); await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: taskType, tool_use_id: 'tool-' + taskType, description: taskType, task_type: taskType })
+    expect(subagents(f)).toEqual([expect.objectContaining({ name: taskType, status: 'running', detached: false })])
+  })
+
+  it('attaches provider-reported child token totals to a real Agent task', async () => {
+    const f = fixture(); await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'agent-usage', tool_use_id: 'tool-agent', description: 'Research', task_type: 'local_agent' })
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'agent-usage', status: 'completed', total_tokens: 1234 })
+    expect(f.projection().items).toContainEqual(expect.objectContaining({ parentId: 'task:agent-usage', data: expect.objectContaining({ type: 'usage', totalTokens: 1234 }) }))
   })
 })
 
@@ -605,15 +663,16 @@ describe('Claude visible text identity', () => {
 })
 
 
-it('attaches actual bounded background command output to its task record', async () => {
+it('attaches actual bounded background command output to its Bash tool record', async () => {
   const base = join(tmpdir(), 'claude'); mkdirSync(base, { recursive: true })
   const root = mkdtempSync(join(base, 'conductor-adapter-output-')); imageRoots.push(root)
   const taskDirectory = join(root, 'native-output-session', 'tasks'); mkdirSync(taskDirectory, { recursive: true })
   const outputFile = join(taskDirectory, 'background-1.output'); writeFileSync(outputFile, 'Native background command completed successfully')
   const f = fixture({ nativeSessionId: 'native-output-session' }); await f.adapter.start()
-  f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'background-1', is_backgrounded: true, description: 'Run checks' })
+  f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'background-1', tool_use_id: 'bash-1', is_backgrounded: true, task_type: 'local_bash', description: 'Run checks' })
   f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'background-1', status: 'completed', output_file: outputFile })
-  await vi.waitFor(() => expect(f.projection().items.find(item => item.data.type === 'subagent')?.data).toMatchObject({ name: 'Run checks', status: 'completed', detached: true, outputFile, output: 'Native background command completed successfully', outputTruncated: false }))
+  await vi.waitFor(() => expect(f.projection().items.find(item => item.data.type === 'tool' && item.nativeItemId === 'bash-1')?.data).toMatchObject({ name: 'Bash', description: 'Run checks', status: 'completed', output: 'Native background command completed successfully' }))
+  expect(f.projection().items.some(item => item.data.type === 'subagent')).toBe(false)
 })
 
 
@@ -812,6 +871,20 @@ describe('Claude native steering command lifecycle', () => {
     f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: request.request_id, response: { still_queued: [], cancelled: ['pending-input'] } } })
     await stopping
     expect(f.events.at(-1)?.data).toEqual({ type: 'input_delivery', inputId: 'pending-input', status: 'cancelled' })
+  })
+  it('does not label an ambiguous cancellation not-sent when a later input is accepted', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Original', settings)
+    await f.adapter.steer('First follow-up', settings, [], 'first-input')
+    f.transport.receive({ type: 'command_lifecycle', command_uuid: 'first-input', state: 'queued' })
+    f.transport.receive({ type: 'command_lifecycle', command_uuid: 'first-input', state: 'cancelled' })
+    await f.adapter.steer('Second follow-up', settings, [], 'second-input')
+    f.transport.receive({ type: 'command_lifecycle', command_uuid: 'second-input', state: 'queued' })
+    expect(f.events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([
+      { type: 'input_delivery', inputId: 'first-input', status: 'accepted' },
+      { type: 'input_delivery', inputId: 'first-input', status: 'uncertain' },
+      { type: 'input_delivery', inputId: 'second-input', status: 'accepted' }
+    ])
   })
   it('marks pending input uncertain on disconnect and tracks a native next command after a result', async () => {
     const f = fixture()

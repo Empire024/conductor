@@ -1,11 +1,11 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
-import { realpath } from 'node:fs/promises'
-import { relative } from 'node:path'
+import { open, readdir, realpath, stat } from 'node:fs/promises'
+import { extname, join, relative } from 'node:path'
 import type { AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
 import { makeId, type AgentSpec, type LayoutNode, type PaneTab } from '../shared/models'
-import type { PromptOrigin, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { InteractionResponse, PromptDispatchAuthority, PromptOrigin, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import { LOCAL_MACHINE_ID, type RemotePeerRecord } from '../shared/remote-control'
 import { projectTaskPriorities, type ProjectTaskPriority } from '../shared/project-backlog'
 import { workspacePath } from './agent-artifacts'
@@ -16,6 +16,8 @@ import { invalidateProjectFiles, searchProjectFiles } from './project-file-searc
 import { RemoteAccessError, type RemotePeers } from './remote-peers'
 import type { StructuredSessions } from './structured-sessions'
 import { readTextFile } from './text-files'
+import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES } from '../shared/remote-files'
+import type { ContextAttachment } from '../shared/structured-agent'
 
 type Args = Record<string, unknown>
 
@@ -23,6 +25,27 @@ const text = (args: Args, key: string, maximum = 20000): string => {
   const value = args[key]
   if (typeof value !== 'string' || !value.trim() || value.length > maximum || value.includes('\0')) throw new RemoteAccessError(`Invalid ${key}`, 400)
   return value
+}
+
+const remoteMediaTypes: Record<string, { kind: 'image' | 'video'; mimeType: string }> = {
+  '.png': { kind: 'image', mimeType: 'image/png' },
+  '.jpg': { kind: 'image', mimeType: 'image/jpeg' },
+  '.jpeg': { kind: 'image', mimeType: 'image/jpeg' },
+  '.gif': { kind: 'image', mimeType: 'image/gif' },
+  '.webp': { kind: 'image', mimeType: 'image/webp' },
+  '.avif': { kind: 'image', mimeType: 'image/avif' },
+  '.mp4': { kind: 'video', mimeType: 'video/mp4' },
+  '.webm': { kind: 'video', mimeType: 'video/webm' },
+  '.mov': { kind: 'video', mimeType: 'video/quicktime' }
+}
+
+const fileVersion = (relativePath: string, value: { size: number; mtimeMs: number; ctimeMs: number; dev: number; ino: number }): string =>
+  createHash('sha256').update([relativePath, value.size, value.mtimeMs, value.ctimeMs, value.dev, value.ino].join('\0')).digest('hex')
+
+const strictUtf8 = (bytes: Buffer): string => {
+  const content = bytes.toString('utf8')
+  if (bytes.includes(0) || !Buffer.from(content, 'utf8').equals(bytes)) throw new RemoteAccessError('Remote file attachment must be UTF-8 text.', 400)
+  return content
 }
 
 /**
@@ -41,12 +64,23 @@ export const remoteToolSignatures = {
   'agents.list': '({projectId,sessionId})',
   'agents.snapshot': '({projectId,sessionId,agentSessionId})',
   'agents.history': '({projectId,sessionId,agentSessionId,afterSequence?}) — incremental events, for mirroring the tab remotely',
-  'agents.submit': '({projectId,sessionId,agentSessionId,prompt})',
-  'agents.steer': '({projectId,sessionId,agentSessionId,prompt})',
-  'agents.interrupt': '({projectId,sessionId,agentSessionId})',
-  'files.list': '({projectId,query?}) — indexed search inside the shared project only',
+  'agents.submit': '({projectId,sessionId,agentSessionId,prompt,settings?})',
+  'agents.steer': '({projectId,sessionId,agentSessionId,prompt,settings?})',
+  'agents.queue': '({projectId,sessionId,agentSessionId,prompt,settings})',
+  'agents.cancelQueued': '({projectId,sessionId,agentSessionId,promptId?})',
+  'agents.interrupt': '({projectId,sessionId,agentSessionId,expediteSubmittedInput?})',
+  'agents.resume': '({projectId,sessionId,agentSessionId,settings?})',
+  'agents.discover': '({projectId,sessionId,agentSessionId})',
+  'agents.settings': '({projectId,sessionId,agentSessionId,settings})',
+  'agents.respond': '({projectId,sessionId,agentSessionId,response})',
+  'agents.rename': '({projectId,sessionId,agentSessionId,title})',
+  'agents.archive': '({projectId,sessionId,agentSessionId,archived})',
+  'files.list': '({projectId,path?}) — one directory inside the shared project; legacy query searches it',
+  'files.stat': '({projectId,path})',
   'files.read': '({projectId,path})',
   'files.write': '({projectId,path,content,expectedContent})',
+  'files.describe': '({projectId,path}) — safe image/video metadata and immutable version token',
+  'files.readChunk': '({projectId,path,offset,length,version}) — at most 256 KiB from that exact version',
   'files.open': '({projectId,sessionId,path})',
   'tasks.list': '({projectId})',
   'tasks.update': '({projectId,revision,id,status?,title?,priority?})'
@@ -92,6 +126,58 @@ export class RemoteControlHost {
 
   private ui(projectId: string, sessionId: string, action: AgentControlUiRequest['action'], params: Args): Promise<unknown> {
     return this.deps.ui({ projectId, sessionId, agentSessionId: '', id: randomUUID(), action, params })
+  }
+
+  private async promptAttachments(peer: RemotePeerRecord, projectId: string, raw: unknown): Promise<{
+    attachments: ContextAttachment[]
+    current(): void
+  }> {
+    const authority = this.deps.peers.captureProjectAuthority(peer, projectId)
+    const current = (): void => { this.deps.peers.requireCurrentProject(peer, projectId, authority.revision) }
+    if (raw === undefined) return { attachments: [], current }
+    if (!Array.isArray(raw) || raw.length > 20) throw new RemoteAccessError('A remote prompt can attach at most 20 host files.', 400)
+    const attachments: ContextAttachment[] = []
+    let total = 0
+    for (const rawItem of raw) {
+      const item = rawItem && typeof rawItem === 'object' && !Array.isArray(rawItem) ? rawItem as Record<string, unknown> : {}
+      const remoteFile = item.remoteFile && typeof item.remoteFile === 'object' && !Array.isArray(item.remoteFile)
+        ? item.remoteFile as Record<string, unknown> : {}
+      if (item.kind !== 'file' || typeof item.id !== 'string' || !item.id || item.id.length > 160
+        || typeof item.name !== 'string' || !item.name || item.name.length > 512
+        || Object.hasOwn(item, 'content') || Object.hasOwn(item, 'path')
+        || remoteFile.machineId !== this.deps.peers.machineId || remoteFile.projectId !== projectId || typeof remoteFile.path !== 'string') {
+        throw new RemoteAccessError('Remote attachments must name a host-project text file without supplied content.', 400)
+      }
+      const path = await workspacePath(authority.project.path, remoteFile.path, false)
+      current()
+      const relativePath = relative(await realpath(authority.project.path), path).replaceAll('\\', '/')
+      current()
+      const handle = await open(path, 'r')
+      current()
+      try {
+        const before = await handle.stat()
+        current()
+        if (!before.isFile() || before.size > 128_000) throw new RemoteAccessError('Remote file attachment exceeds 128 KB.', 400)
+        const bytes = Buffer.alloc(before.size + 1)
+        let offset = 0
+        while (offset < bytes.length) {
+          const read = await handle.read(bytes, offset, bytes.length - offset, offset)
+          current()
+          if (!read.bytesRead) break
+          offset += read.bytesRead
+        }
+        const after = await handle.stat()
+        current()
+        if (offset > before.size || fileVersion(relativePath, after) !== fileVersion(relativePath, before)) {
+          throw new RemoteAccessError('Remote file attachment changed while it was being read.', 409)
+        }
+        const content = strictUtf8(bytes.subarray(0, offset))
+        total += Buffer.byteLength(content)
+        if (total > 250_000) throw new RemoteAccessError('Total remote file context exceeds 250 KB.', 400)
+        attachments.push({ id: item.id, kind: 'file', name: item.name, content })
+      } finally { await handle.close(); current() }
+    }
+    return { attachments, current }
   }
 
   private agentTab(projectId: string, sessionId: string, agentSessionId: string): PaneTab & { uri: string } {
@@ -146,17 +232,87 @@ export class RemoteControlHost {
       return database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name, projectId: workspace.projectId }))
     }
     if (method === 'files.list') {
-      const project = this.deps.peers.requireProject(peer, args.projectId)
-      const query = typeof args.query === 'string' ? args.query.slice(0, 300) : ''
-      return (await searchProjectFiles([database.getProject(project.id)!], query, { showHidden: true })).map(file => ({ ...file, uri: conductorUri(project.id, 'file', file.path) }))
+      const authority = this.deps.peers.captureProjectAuthority(peer, args.projectId)
+      const project = authority.project
+      const current = (): void => { this.deps.peers.requireCurrentProject(peer, args.projectId, authority.revision) }
+      if (args.path === undefined && typeof args.query === 'string') {
+        const query = args.query.slice(0, 300)
+        const found = await searchProjectFiles([database.getProject(project.id)!], query, { showHidden: true })
+        current()
+        return found.map(file => ({ ...file, uri: conductorUri(project.id, 'file', file.path) }))
+      }
+      const requested = args.path === undefined || args.path === '' ? '.' : text(args, 'path', 4000)
+      const directory = await workspacePath(project.path, requested, false)
+      current()
+      const directoryStat = await stat(directory)
+      current()
+      if (!directoryStat.isDirectory()) throw new RemoteAccessError('Remote file listing requires a directory.', 400)
+      const entries = await readdir(directory, { withFileTypes: true })
+      current()
+      const root = await realpath(project.path)
+      current()
+      return entries
+        .filter(entry => !entry.isSymbolicLink() && (entry.isDirectory() || entry.isFile()) && !['.git', 'node_modules', 'out', 'dist'].includes(entry.name))
+        .slice(0, 5000)
+        .map(entry => ({
+          name: entry.name,
+          path: relative(root, join(directory, entry.name)).replaceAll('\\', '/'),
+          kind: entry.isDirectory() ? 'directory' as const : 'file' as const
+        }))
+        .sort((left, right) => left.kind === right.kind ? left.name.localeCompare(right.name) : left.kind === 'directory' ? -1 : 1)
     }
-    if (method === 'files.read' || method === 'files.write' || method === 'files.open') {
-      const project = this.deps.peers.requireProject(peer, args.projectId)
+    if (method === 'files.stat' || method === 'files.read' || method === 'files.write' || method === 'files.open'
+      || method === 'files.describe' || method === 'files.readChunk') {
+      const authority = this.deps.peers.captureProjectAuthority(peer, args.projectId)
+      const project = authority.project
+      const current = (): void => { this.deps.peers.requireCurrentProject(peer, args.projectId, authority.revision) }
       // workspacePath is the same containment check local agents get; it refuses anything that
       // resolves outside the project folder, including through symlinks and 8.3 aliases.
       const path = await workspacePath(project.path, text(args, 'path', 4000), method === 'files.write')
-      if (method !== 'files.write' && (!statSync(path).isFile() || statSync(path).size > 1024 * 1024)) throw new RemoteAccessError('Only text files up to 1 MiB are supported.', 400)
+      current()
       const relativePath = relative(await realpath(project.path), path).replaceAll('\\', '/')
+      current()
+      if (method === 'files.describe' || method === 'files.readChunk') {
+        const media = remoteMediaTypes[extname(relativePath).toLowerCase()]
+        if (!media) throw new RemoteAccessError('Only safe raster images and allowlisted video files can be previewed remotely.', 400)
+        const handle = await open(path, 'r')
+        current()
+        try {
+          const before = await handle.stat()
+          current()
+          if (!before.isFile() || before.size <= 0 || before.size > REMOTE_FILE_MAX_ASSET_BYTES) {
+            throw new RemoteAccessError(`Remote previews must be files no larger than ${REMOTE_FILE_MAX_ASSET_BYTES} bytes.`, 400)
+          }
+          const version = fileVersion(relativePath, before)
+          if (method === 'files.describe') {
+            return { path: relativePath, size: before.size, modifiedAt: before.mtime.toISOString(), version, ...media }
+          }
+          if (!Number.isSafeInteger(args.offset) || Number(args.offset) < 0 || Number(args.offset) >= before.size
+            || !Number.isSafeInteger(args.length) || Number(args.length) < 1 || Number(args.length) > REMOTE_FILE_CHUNK_BYTES
+            || typeof args.version !== 'string' || args.version !== version) {
+            throw new RemoteAccessError('The requested remote resource range or version is invalid.', 409)
+          }
+          const offset = Number(args.offset), length = Math.min(Number(args.length), before.size - offset)
+          const bytes = Buffer.allocUnsafe(length)
+          const { bytesRead } = await handle.read(bytes, 0, length, offset)
+          current()
+          const after = await handle.stat()
+          current()
+          if (fileVersion(relativePath, after) !== version || after.size !== before.size) {
+            throw new RemoteAccessError('The remote resource changed while it was being read.', 409)
+          }
+          return {
+            path: relativePath, offset, length: bytesRead, totalSize: before.size, version,
+            bytesBase64: bytes.subarray(0, bytesRead).toString('base64'), eof: offset + bytesRead >= before.size
+          }
+        } finally { await handle.close(); current() }
+      }
+      if (method === 'files.stat') {
+        const fileStat = await stat(path)
+        current()
+        return { size: fileStat.size, isFile: fileStat.isFile(), modifiedAt: fileStat.mtime.toISOString() }
+      }
+      if (method !== 'files.write' && (!statSync(path).isFile() || statSync(path).size > 1024 * 1024)) throw new RemoteAccessError('Only text files up to 1 MiB are supported.', 400)
       if (method === 'files.open') {
         const { sessionId } = this.workspace(peer, args)
         return this.ui(project.id, sessionId, 'files.open', { path: relativePath })
@@ -214,14 +370,46 @@ export class RemoteControlHost {
         const after = typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0
         return database.structured.events(agentSessionId, after).slice(0, 100)
       }
-      if (method === 'agents.interrupt') { await sessions.interrupt(agentSessionId); return { interrupted: true } }
-      if (method === 'agents.submit' || method === 'agents.steer') {
+      const requestedSettings = args.settings === undefined ? state.settings : args.settings as SessionSettings
+      if (method === 'agents.interrupt') {
+        await sessions.interrupt(agentSessionId, args.expediteSubmittedInput === true)
+        return { interrupted: true }
+      }
+      if (method === 'agents.resume') { await sessions.resume(agentSessionId, args.settings === undefined ? undefined : requestedSettings); return { resumed: true } }
+      if (method === 'agents.discover') return sessions.discover(agentSessionId)
+      if (method === 'agents.settings') { sessions.saveSettings(agentSessionId, requestedSettings); return { saved: true } }
+      if (method === 'agents.cancelQueued') {
+        if (args.promptId !== undefined && typeof args.promptId !== 'string') throw new RemoteAccessError('Invalid promptId', 400)
+        return sessions.cancelQueued(agentSessionId, args.promptId as string | undefined)
+      }
+      if (method === 'agents.respond') {
+        if (!args.response || typeof args.response !== 'object') throw new RemoteAccessError('Invalid response', 400)
+        const response = args.response as InteractionResponse
+        await sessions.respond({ ...response, sessionId: agentSessionId })
+        return { responded: true }
+      }
+      if (method === 'agents.rename') { await sessions.rename(agentSessionId, text(args, 'title', 160)); return { renamed: true } }
+      if (method === 'agents.archive') {
+        if (typeof args.archived !== 'boolean') throw new RemoteAccessError('Invalid archived', 400)
+        await sessions.archive(agentSessionId, args.archived)
+        return { archived: args.archived }
+      }
+      if (method === 'agents.submit' || method === 'agents.steer' || method === 'agents.queue') {
         const prompt = text(args, 'prompt')
+        const remoteContext = await this.promptAttachments(peer, projectId, args.attachments)
+        remoteContext.current()
         // Attributed to the peer machine, never to "You", so the owner can always tell remote
         // work apart in the transcript.
-        const origin: PromptOrigin = { agentSessionId: `remote:${peer.id}`, label: `${peer.machineName} (remote)` }
-        if (method === 'agents.submit') await sessions.submit(agentSessionId, prompt, state.settings, [], origin)
-        else await sessions.steer(agentSessionId, prompt, state.settings, [], origin)
+        // Caller-supplied origin/authority is deliberately ignored. Only the host that already
+        // authenticated this socket may stamp the durable dispatch authority.
+        const authority: PromptDispatchAuthority = { kind: 'remote-peer', peerId: peer.id, projectId }
+        const origin: PromptOrigin = {
+          agentSessionId: `remote:${peer.id}`, label: `${peer.machineName} (remote)`, authority
+        }
+        if (method === 'agents.submit') await sessions.submit(agentSessionId, prompt, requestedSettings, remoteContext.attachments, origin)
+        else if (method === 'agents.steer') await sessions.steer(agentSessionId, prompt, requestedSettings, remoteContext.attachments, origin)
+        else await sessions.queue(agentSessionId, prompt, requestedSettings, remoteContext.attachments, origin)
+        remoteContext.current()
         return { agentSessionId, tabId: tab.id, uri: tab.uri, phase: database.structured.snapshot(agentSessionId)?.phase }
       }
     }

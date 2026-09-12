@@ -251,11 +251,15 @@ describe('ConductorDatabase persistence', () => {
           state: { path: 'src/checkout.ts' }
         }
         session.layout.root.activeTabId = 'editor-tab'
+        const detached = database.createDetachedWindow(project.id, session.id, {
+          id: 'detached-editor-tab', kind: 'code', title: 'detached.ts', state: { path: 'src/detached.ts' }
+        }, session.layout)
         database.saveRecoveryCheckpoint({
           activeProjectId: project.id,
           activeSessionId: session.id,
           focusedGroupIds: { [session.id]: focusedGroupId },
           sessionIdsByProject: { [project.id]: session.id },
+          documents: [{ workspaceId: `detached:${detached.id}`, files: [], activeId: null }],
           sessions: [{
             id: session.id,
             layout: session.layout,
@@ -273,7 +277,8 @@ describe('ConductorDatabase persistence', () => {
           activeProjectId: project.id,
           activeSessionId: session.id,
           focusedGroupIds: { [session.id]: focusedGroupId },
-          sessionIdsByProject: { [project.id]: session.id }
+          sessionIdsByProject: { [project.id]: session.id },
+          documents: [{ workspaceId: `detached:${detached.id}`, files: [], activeId: null }]
         })
         const restored = database.getSession(session.id)!
         expect(restored.maximizedGroupId).toBe(focusedGroupId)
@@ -284,6 +289,35 @@ describe('ConductorDatabase persistence', () => {
       } finally {
         database?.close()
       }
+    })
+  })
+
+  it('rejects missing detached document owners and files from another project', () => {
+    withDatabasePath((path, root) => {
+      const database = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'project'), 'Project')
+        const other = database.upsertProject(join(root, 'other'), 'Other')
+        const session = database.listSessions(project.id)[0]!
+        const detached = database.createDetachedWindow(project.id, session.id, {
+          id: 'detached-code', kind: 'code', title: 'file.ts', state: { path: 'file.ts' }
+        }, session.layout)
+        const checkpoint = {
+          sessions: [], activeProjectId: project.id, activeSessionId: session.id,
+          focusedGroupIds: {}, sessionIdsByProject: { [project.id]: session.id }
+        }
+        expect(() => database.saveRecoveryCheckpoint({
+          ...checkpoint, documents: [{ workspaceId: 'detached:missing-window', files: [], activeId: null }]
+        })).toThrow('Invalid workspace document owner')
+        expect(() => database.saveRecoveryCheckpoint({
+          ...checkpoint,
+          documents: [{
+            workspaceId: `detached:${detached.id}`,
+            files: [{ id: `document:detached:${detached.id}:other`, machineId: 'local', projectId: other.id, path: 'file.ts', mode: 'editor' }],
+            activeId: `document:detached:${detached.id}:other`
+          }]
+        })).toThrow('Invalid workspace document project')
+      } finally { database.close() }
     })
   })
 

@@ -83,9 +83,9 @@ export function RemoteControlSettings(): React.JSX.Element {
       <div className="remote-card">
         {!signedIn && github?.phase !== 'awaiting-authorization' && (
           <>
-            <p className="remote-hint">Conductor uses GitHub&apos;s device flow: you approve in your own browser and Conductor never sees your password. The token is kept in this computer&apos;s credential store.</p>
-            {github && !github.secureStorageAvailable && <p className="remote-error"><ShieldAlert size={12} /> This computer has no available credential store, so the token cannot be saved. Unlock the OS keychain and try again.</p>}
-            {github && !github.clientIdConfigured && <p className="remote-error"><ShieldAlert size={12} /> No GitHub OAuth client ID is configured (CONDUCTOR_GITHUB_CLIENT_ID).</p>}
+            <p className="remote-hint">Conductor uses GitHub&apos;s device flow: you approve in your own browser and Conductor never sees your password. Expiring access and refresh credentials are rotated automatically in this computer&apos;s credential store.</p>
+            {github && !github.secureStorageAvailable && <p className="remote-error"><ShieldAlert size={12} /> This computer has no available credential store, so GitHub credentials cannot be saved. Unlock the OS keychain and try again.</p>}
+            {github && !github.clientIdConfigured && <p className="remote-error"><ShieldAlert size={12} /> GitHub sign-in is unavailable because the public OAuth client ID was explicitly disabled.</p>}
             <button className="remote-primary" disabled={busy === 'sign-in'} onClick={() => void run('sign-in', () => window.conductor.remote.signIn())}>
               <Github size={13} /> Sign in with GitHub
             </button>
@@ -112,6 +112,7 @@ export function RemoteControlSettings(): React.JSX.Element {
             <div>
               <strong>{github.identity.name || github.identity.login}</strong>
               <span>Signed in as {github.identity.login}</span>
+              <small>GitHub credentials refresh automatically in the OS credential store.</small>
               {github.deviceKeyFingerprint && <small>Device key {shortFingerprint(github.deviceKeyFingerprint)}</small>}
             </div>
             <button title="Sign out and revoke every paired machine" disabled={busy === 'sign-out'} onClick={() => void run('sign-out', () => window.conductor.remote.signOut())}>

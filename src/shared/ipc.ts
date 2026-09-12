@@ -38,10 +38,12 @@ import type { ProjectActivitySnapshot } from './project-activity'
 import type { OrchestrationBridge } from './orchestration'
 import type { AgentCollaborationBridge } from './agent-collaboration'
 import type { StructuredAgentBridge } from './structured-agent'
+import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest, BrowserSurfaceState } from './browser-surface'
 
 export interface FileSearchOptions { showHidden?: boolean; activeProjectId?: string; recentPaths?: Array<{ projectId: string; path: string }> }
 
 export interface ConductorBridge {
+  sessionArchive: import('./session-archive').SessionArchiveBridge
   agentControl: import('./agent-control').AgentControlBridge
   agentConfirm: import('./agent-confirm').AgentConfirmBridge
   remote: import('./remote-control').RemoteControlBridge
@@ -55,6 +57,13 @@ export interface ConductorBridge {
     onStatus(callback: (state: { id: string; status: string; exitCode?: number }) => void): () => void
   }
   structured: StructuredAgentBridge
+  browser: {
+    mount(request: BrowserSurfaceRequest): Promise<BrowserSurfaceState>
+    update(request: BrowserSurfaceRequest): Promise<BrowserSurfaceState>
+    command(projectId: string, command: BrowserSurfaceCommand): Promise<BrowserSurfaceState>
+    present(projectId: string, presentation: BrowserPresentation): Promise<BrowserSurfaceState>
+    onState(callback: (state: BrowserSurfaceState) => void): () => void
+  }
   orchestration: OrchestrationBridge
   collaboration: AgentCollaborationBridge
   projects: {
@@ -119,6 +128,10 @@ export interface ConductorBridge {
   files: {
     onChanged(callback: (event: import('./agent-control').AgentFileChange) => void): () => void
     importImage(projectId: string, name: string, bytes: Uint8Array): Promise<import('./structured-agent').ContextAttachment>
+    attachContext(projectId: string, relativePath: string): Promise<import('./structured-agent').ContextAttachment>
+    importContextPath(projectId: string, sourcePath: string, name: string, mimeType: string): Promise<import('./structured-agent').ContextAttachment>
+    pathForFile(file: File): string
+    moveExternalDrop(projectId: string, sourcePath: string, destinationDirectory: string): Promise<FileEntry>
     onOpenShortcut(callback: () => void): () => void
     browserUrl(projectId: string, path: string): Promise<string>
     openInBrowser(projectId: string, path: string): Promise<void>
@@ -140,9 +153,9 @@ export interface ConductorBridge {
     trash(projectId: string, relativePath: string): Promise<void>
     reveal(projectId: string, relativePath?: string): Promise<void>
     openExternal(projectId: string, relativePath: string): Promise<void>
-    getDraft(tabId: string, projectId: string, relativePath: string): Promise<EditorDraft | null>
-    checkpointDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown, baseContent?: string | null): void
-    flushDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown, baseContent?: string | null): boolean
+    getDraft(tabId: string, projectId: string, relativePath: string, machineId?: string): Promise<EditorDraft | null>
+    checkpointDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown, baseContent?: string | null, machineId?: string): void
+    flushDraft(tabId: string, projectId: string, relativePath: string, content: string, viewState: unknown, baseContent?: string | null, machineId?: string): boolean
     removeDraft(tabId: string): Promise<void>
   }
   terminals: {

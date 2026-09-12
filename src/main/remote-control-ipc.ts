@@ -1,8 +1,10 @@
 import { ipcMain } from 'electron'
 import { hostname } from 'node:os'
+import { readFileSync, writeFileSync } from 'node:fs'
 import type { AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import type { AgentProviderInfo, AgentSpec } from '../shared/models'
 import { makeId } from '../shared/models'
+import { CONDUCTOR_GITHUB_OAUTH_CLIENT_ID } from '../shared/github-oauth'
 import type {
   GitHubAuthState,
   MachineDescriptor,
@@ -11,6 +13,7 @@ import type {
   RemotePairingTicket,
   RemoteProjectSummary
 } from '../shared/remote-control'
+import type { RemoteFileDescription, RemoteFileIdentity, RemoteFileWriteRequest } from '../shared/remote-files'
 import { encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries } from '../shared/remote-control'
 import { checkRemoteProjectPlacement } from '../shared/project-identity'
 import type { ConductorDatabase } from './database'
@@ -20,11 +23,14 @@ import { projectSummary } from './project-identity'
 import type { ProjectBacklogs } from './project-backlog'
 import { RemoteControlClient } from './remote-control-client'
 import { RemoteControlHost } from './remote-control-host'
+import { RemoteFileResourceServer } from './remote-file-resources'
+import { RemoteFiles } from './remote-files'
 import { RemoteControlServer } from './remote-control-server'
 import { RemoteAccessError, RemotePeers } from './remote-peers'
 import { RemoteSessionMirror } from './remote-session-mirror'
 import { StoredSecretVault, type SecretCipher } from './secret-store'
 import type { StructuredSessions } from './structured-sessions'
+import type { PromptDispatchAuthority } from '../shared/structured-agent'
 
 export interface RemoteControlServiceDependencies {
   database: ConductorDatabase
@@ -37,14 +43,77 @@ export interface RemoteControlServiceDependencies {
   publish(channel: string, payload: unknown): void
   /** GitHub OAuth app client ID; the device flow cannot start without one. */
   clientId?: string
+  /** Main-owned native save dialog; renderer input can never choose an arbitrary destination. */
+  chooseRemoteDownloadPath?(description: RemoteFileDescription): Promise<string | null>
 }
 
 const MACHINE_NAME_SETTING = 'remote-control.machineName'
 
+/** Offline GitHub boundary for the full Electron remote-integration smoke; never enabled alone. */
+function githubFetch(): typeof globalThis.fetch {
+  if (process.env.CONDUCTOR_OFFLINE_TESTS !== '1' || process.env.CONDUCTOR_TEST_REMOTE_GITHUB !== '1') return globalThis.fetch
+  const sharedState = process.env.CONDUCTOR_TEST_REMOTE_GITHUB_STATE
+  let localKeys: Array<{ id: number; key: string; title: string }> = []
+  let rotation = 0
+  const readKeys = (): Array<{ id: number; key: string; title: string }> => {
+    if (!sharedState) return localKeys
+    try {
+      const value = JSON.parse(readFileSync(sharedState, 'utf8')) as { keys?: unknown }
+      return Array.isArray(value.keys) ? value.keys.flatMap(entry => {
+        if (!entry || typeof entry !== 'object') return []
+        const key = entry as Record<string, unknown>
+        return typeof key.id === 'number' && typeof key.key === 'string' && typeof key.title === 'string'
+          ? [{ id: key.id, key: key.key, title: key.title }] : []
+      }) : []
+    } catch { return [] }
+  }
+  const writeKeys = (keys: Array<{ id: number; key: string; title: string }>): void => {
+    if (sharedState) writeFileSync(sharedState, JSON.stringify({ keys }))
+    else localKeys = keys
+  }
+  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = String(input)
+    const request = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {}
+    if (url === 'https://github.com/login/device/code') {
+      return Response.json({ device_code: 'offline-device-fixture', user_code: 'TEST-ONLY', verification_uri: 'https://github.com/login/device', expires_in: 900, interval: 1 })
+    }
+    if (url === 'https://github.com/login/oauth/access_token') {
+      rotation++
+      return Response.json({
+        access_token: `offline-access-${rotation}`,
+        refresh_token: `offline-refresh-${rotation}`,
+        expires_in: 3600,
+        refresh_token_expires_in: 180 * 24 * 3600,
+        token_type: 'bearer'
+      })
+    }
+    if (url === 'https://api.github.com/user') {
+      return Response.json({ id: 4242, login: 'offline-remote-fixture', name: 'Offline remote fixture', avatar_url: null })
+    }
+    if (url.endsWith('/user/keys?per_page=100')) return Response.json(readKeys())
+    if (url.endsWith('/user/keys') && init?.method === 'POST') {
+      const keys = readKeys()
+      const entry = { id: Math.max(0, ...keys.map(key => key.id)) + 1, key: String(request.key ?? ''), title: String(request.title ?? '') }
+      keys.push(entry)
+      writeKeys(keys)
+      return Response.json(entry, { status: 201 })
+    }
+    if (/\/user\/keys\/\d+$/.test(url) && init?.method === 'DELETE') {
+      const keys = readKeys()
+      const id = Number(url.split('/').pop())
+      const index = keys.findIndex(key => key.id === id)
+      if (index >= 0) keys.splice(index, 1)
+      writeKeys(keys)
+      return new Response(null, { status: 204 })
+    }
+    return Response.json({ message: 'Not Found' }, { status: 404 })
+  }) as typeof globalThis.fetch
+}
+
 /**
  * Assembles GitHub identity, the peer registry, the listening server and this machine's outbound
- * connections, and exposes them to the renderer. Nothing here ever sends a token, a private key
- * or a pairing code to the renderer.
+ * connections, and exposes them to the renderer. Tokens and private keys never cross that
+ * boundary; the short-lived pairing code deliberately does, because the owner must transfer it.
  */
 export class RemoteControlService {
   readonly auth: GitHubAuth
@@ -52,6 +121,8 @@ export class RemoteControlService {
   readonly host: RemoteControlHost
   readonly server: RemoteControlServer
   readonly client: RemoteControlClient
+  readonly files: RemoteFiles
+  readonly resources: RemoteFileResourceServer
   readonly mirror: RemoteSessionMirror
   private registered = false
 
@@ -60,8 +131,10 @@ export class RemoteControlService {
     const vault = new StoredSecretVault(store, deps.cipher)
     this.auth = new GitHubAuth({
       store, vault,
-      fetch: globalThis.fetch,
-      clientId: deps.clientId ?? process.env.CONDUCTOR_GITHUB_CLIENT_ID ?? '',
+      fetch: githubFetch(),
+      // The bundled value is a public native-app identifier, not a secret. An explicit dependency
+      // or environment value still wins for development and deterministic integration fixtures.
+      clientId: deps.clientId ?? process.env.CONDUCTOR_GITHUB_CLIENT_ID ?? CONDUCTOR_GITHUB_OAUTH_CLIENT_ID,
       machineName: this.machineName(),
       changed: state => deps.publish('remote:github-changed', state),
       // Identity is the root of every peer relationship, so losing it takes them all with it.
@@ -100,6 +173,14 @@ export class RemoteControlService {
       deviceKey: () => this.auth.deviceKey(),
       changed: () => this.publishState()
     })
+    this.files = new RemoteFiles({
+      client: this.client,
+      project: projectId => {
+        const project = deps.database.getProject(projectId)
+        return project ? projectSummary(project) : null
+      }
+    })
+    this.resources = new RemoteFileResourceServer({ files: this.files, chooseDownloadPath: deps.chooseRemoteDownloadPath })
     this.mirror = new RemoteSessionMirror({
       database: store,
       call: (machineId, method, args) => this.client.call(machineId, method, args),
@@ -109,6 +190,14 @@ export class RemoteControlService {
 
   machineName(): string {
     return this.deps.database.getSetting(MACHINE_NAME_SETTING) || this.peers?.getSettings().machineName || hostname() || 'This machine'
+  }
+
+  /** Callback installed into StructuredSessions after both services exist. */
+  assertPromptDispatchAuthority(authority: PromptDispatchAuthority, spec: Pick<AgentSpec, 'projectId'>): void {
+    if (!authority || authority.kind !== 'remote-peer' || authority.projectId !== spec.projectId) {
+      throw new RemoteAccessError('Remote prompt authority does not match this session project.', 403, 'peer-revoked')
+    }
+    this.peers.requirePromptAuthority(authority.peerId, authority.projectId)
   }
 
   machines(): MachineDescriptor[] {
@@ -165,7 +254,7 @@ export class RemoteControlService {
    * when the mapping was made, so a project that was swapped, copied or moved in between stops the
    * placement instead of quietly receiving the work.
    */
-  async openRemote(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string; remoteProjectId: string; remoteSessionId: string }> {
+  async openRemote(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string; remoteProjectId: string; remoteSessionId: string; remoteCwd: string }> {
     const connection = this.client.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     const localProject = this.deps.database.getProject(request.projectId)
@@ -174,9 +263,10 @@ export class RemoteControlService {
     if (!local.identity) throw new RemoteAccessError(local.identityError || 'Conductor cannot read this project identity, so it will not place work elsewhere.', 409)
     const advertised = await this.refreshRemoteProjects(machineId)
     const grant = this.client.get(machineId)?.projectGrants.find(entry => entry.localProjectId === request.projectId)
+    const observed = advertised.find(entry => entry.id === grant?.remoteProjectId)
     const placement = checkRemoteProjectPlacement({
       grant,
-      advertised: advertised.find(entry => entry.id === grant?.remoteProjectId)?.identity,
+      advertised: observed?.identity,
       local: local.identity,
       machineName: connection.machineName
     })
@@ -192,7 +282,7 @@ export class RemoteControlService {
       ...(request.effort ? { effort: request.effort } : {}),
       ...(request.title ? { title: request.title } : {})
     }) as { id: string; resourceId?: string }
-    return { tabId: tab.id, agentSessionId: tab.resourceId, machineName: connection.machineName, remoteProjectId, remoteSessionId }
+    return { tabId: tab.id, agentSessionId: tab.resourceId, machineName: connection.machineName, remoteProjectId, remoteSessionId, remoteCwd: observed!.identity!.path }
   }
 
   /**
@@ -218,7 +308,7 @@ export class RemoteControlService {
       projectId: request.projectId,
       workspaceId: request.sessionId,
       provider,
-      cwd: project.path,
+      cwd: opened.remoteCwd,
       remoteProjectId: opened.remoteProjectId,
       remoteSessionId: opened.remoteSessionId,
       remoteAgentSessionId: opened.agentSessionId,
@@ -316,6 +406,15 @@ export class RemoteControlService {
       })
     })
     handle<boolean>('remote:release-tab', (localSessionId: string) => { this.mirror.release(String(localSessionId)); return true })
+    handle<string>('remote:session-machine', (localSessionId: string) => this.mirror.machineId(String(localSessionId)))
+    handle<{ machineId: string; cwd: string | null }>('remote:session-file-context', (localSessionId: string) => this.mirror.fileContext(String(localSessionId)))
+    handle('remote:files-list', (request: RemoteFileIdentity) => this.files.list(request))
+    handle('remote:files-stat', (request: RemoteFileIdentity) => this.files.stat(request))
+    handle('remote:files-read', (request: RemoteFileIdentity) => this.files.read(request))
+    handle('remote:files-write', (request: RemoteFileWriteRequest) => this.files.write(request))
+    handle('remote:files-preview', (request: RemoteFileIdentity) => this.resources.issue(request))
+    handle<boolean>('remote:files-revoke-preview', (url: string) => { this.resources.revoke(String(url)); return true })
+    handle('remote:files-download', (request: RemoteFileIdentity) => this.resources.download(request))
   }
 
   async dispose(): Promise<void> {
@@ -323,10 +422,12 @@ export class RemoteControlService {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
         'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
-        'remote:machines', 'remote:open-tab', 'remote:release-tab']) ipcMain.removeHandler(channel)
+        'remote:machines', 'remote:open-tab', 'remote:release-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
+        'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)
       this.registered = false
     }
     this.mirror.stop()
+    this.resources.close()
     await this.server.close()
   }
 }

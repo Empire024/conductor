@@ -5,14 +5,21 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ConductorDatabase } from './database'
 import { StructuredSessions } from './structured-sessions'
 import { ProjectBacklogs } from './project-backlog'
-import { ProjectTaskDispatcher } from './project-task-dispatch'
+import { autoFixerAllowance, ProjectTaskDispatcher } from './project-task-dispatch'
 import type { AgentControlTab, AgentControlUiRequest } from '../shared/agent-control'
 import type { AgentProviderInfo, AgentSpec, PaneTab } from '../shared/models'
 import type { ProviderCapabilities } from '../shared/structured-agent'
 
 const cleanup:Array<()=>void>=[]
 afterEach(()=>{for(const dispose of cleanup.splice(0).reverse())dispose();vi.unstubAllEnvs()})
-function fixture({fail=false,hold=false}={}) {
+type FixtureOptions = {
+  fail?:boolean
+  hold?:boolean
+  steerReceipt?:'accepted'|'uncertain'
+  quota?:false|Partial<Record<'codex'|'claude',unknown>>
+  models?:Partial<Record<'codex'|'claude',Array<{id:string;label:string;effort?:string[];defaultEffort?:string;isDefault?:boolean}>>>
+}
+function fixture({fail=false,hold=false,steerReceipt='accepted',quota={},models={}}:FixtureOptions={}) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS','0');vi.stubEnv('CONDUCTOR_OFFLINE_TESTS','0')
   const root=mkdtempSync(join(tmpdir(),'conductor-task-dispatch-'))
   cleanup.push(()=>rmSync(root,{recursive:true,force:true,maxRetries:5}))
@@ -20,9 +27,16 @@ function fixture({fail=false,hold=false}={}) {
   const project=database.upsertProject(root,'Dispatch'),workspace=database.listSessions(project.id)[0]!
   writeFileSync(join(root,'feature-list.md'),'## Bugs\n- [ ] Fix the parser <!-- conductor-task:one -->\n## Features\n- [ ] Add a tooltip <!-- conductor-task:two -->\n')
   const submissions:Array<{id:string;prompt:string;settings:unknown}>=[]
+  const steers:Array<{id:string;prompt:string;settings:unknown;inputId:string}>=[]
+  const catalogs={
+    codex:models.codex??[{id:'codex-native',label:'codex native',effort:['low','high'],defaultEffort:'low',isDefault:true}],
+    claude:models.claude??[{id:'claude-native',label:'claude native',effort:['low','high'],defaultEffort:'low',isDefault:true}]
+  }
+  const defaultQuota=(provider:'codex'|'claude')=>({rateLimits:{limitId:provider,primary:{usedPercent:10,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null}})
   const sessions=new StructuredSessions(database,()=> 'synthetic-provider',()=>{},(provider,options)=> {
-    const capabilities:ProviderCapabilities={provider,runtimeVersion:'synthetic',adapterVersion:1,authentication:'cli',textStreaming:true,steering:false,toolInputStreaming:false,toolOutputStreaming:true,approvals:true,questions:true,resume:true,fork:false,plans:false,permissions:['default','read-only'],sandboxModes:['inherit','read-only','workspace-write'],effort:['low','high'],models:[{id:provider+'-native',label:provider+' native',effort:['low','high'],defaultEffort:'low'}],limitations:['Synthetic fixture; no inference']}
-    return {provider,capabilities,start:async()=>options.emit({data:{type:'session',phase:'idle',nativeSessionId:'native-'+options.runtimeId}}),submit:async(prompt,settings)=>{submissions.push({id:options.runtimeId,prompt,settings});if(fail)throw new Error('Synthetic native dispatch rejection');if(!hold)options.emit({data:{type:'session',phase:'completed'}})},respond:async()=>{},interrupt:async()=>{},dispose:()=>{}}
+    const providerModels=provider==='local'?[]:catalogs[provider]
+    const capabilities:ProviderCapabilities={provider,runtimeVersion:'synthetic',adapterVersion:1,authentication:'cli',textStreaming:true,steering:hold,toolInputStreaming:false,toolOutputStreaming:true,approvals:true,questions:true,resume:true,fork:false,plans:false,permissions:['default','read-only'],sandboxModes:['inherit','read-only','workspace-write'],effort:['low','high'],models:providerModels,limitations:['Synthetic fixture; no inference']}
+    return {provider,capabilities,start:async()=>{options.emit({data:{type:'session',phase:'idle',nativeSessionId:'native-'+options.runtimeId}});if(quota!==false&&provider!=='local')options.emit({itemId:'account-rate-limits',data:{type:'usage',source:'provider',limits:(quota[provider]??defaultQuota(provider)) as never}})},submit:async(prompt,settings)=>{submissions.push({id:options.runtimeId,prompt,settings});if(fail)throw new Error('Synthetic native dispatch rejection');if(hold)options.emit({turnId:'active-turn',data:{type:'session',phase:'running',capabilities}});else options.emit({data:{type:'session',phase:'completed'}})},steer:async(prompt,settings,_attachments,inputId)=>{steers.push({id:options.runtimeId,prompt,settings,inputId:inputId??''});options.emit({data:{type:'input_delivery',inputId:inputId??'',status:steerReceipt}})},respond:async()=>{},interrupt:async()=>{},dispose:()=>{}}
   })
   cleanup.push(()=>sessions.dispose())
   const spec:AgentSpec={id:'existing-agent',projectId:project.id,sessionId:workspace.id,cwd:root,provider:'codex',title:'Existing Codex',model:'codex-native'}
@@ -32,11 +46,40 @@ function fixture({fail=false,hold=false}={}) {
   database.saveSession(workspace.id,{version:1,root:{type:'group',id:'group',activeTabId:first.id,tabs:[first]}},null,[])
   const control={tabs:({sessionId}:{sessionId:string})=>{const current=database.getSession(sessionId)!.layout.root;if(current.type!=='group')throw new Error('Fixture group expected');return current.tabs.map(tab=>({...tab,groupId:current.id,uri:'conductor://fixture/tab/'+tab.id})) as AgentControlTab[]}}
   const ui=vi.fn(async(request:AgentControlUiRequest)=>{const current=database.getSession(request.sessionId)!;if(current.layout.root.type!=='group')throw new Error('Fixture group expected');current.layout.root.tabs.push(request.params.tab as PaneTab);database.saveSession(request.sessionId,current.layout,null,[]);return {applied:true}})
-  const providers:AgentProviderInfo[]=(['codex','claude'] as const).map(provider=>({id:provider,displayName:provider,available:true,installUrl:'',models:[{id:provider+'-native',label:provider+' native'}],efforts:[{id:'low',label:'Low'},{id:'high',label:'High'}]}))
+  const providers:AgentProviderInfo[]=(['codex','claude'] as const).map(provider=>({id:provider,displayName:provider,available:true,installUrl:'',models:catalogs[provider],efforts:[{id:'low',label:'Low'},{id:'high',label:'High'}]}))
   const backlogs=new ProjectBacklogs(database),changed=vi.fn()
   const dispatcher=new ProjectTaskDispatcher({database,backlogs,sessions,control,ui,providers:()=>providers,changed})
-  return {root,database,project,workspace,spec,sessions,submissions,backlogs,ui,control,dispatcher,changed}
+  const addHistory=async(provider:'codex'|'claude',id='history-'+provider)=>{const history:AgentSpec={id,projectId:project.id,sessionId:workspace.id,cwd:root,provider,title:'History '+provider,model:catalogs[provider][0]!.id};sessions.ensure(history);database.structured.update(id,{title:history.title});await sessions.connectSession(id);return id}
+  return {root,database,project,workspace,spec,sessions,submissions,steers,backlogs,ui,control,dispatcher,changed,addHistory}
 }
+
+const observedWindow=(usedPercent:number,extra:Partial<Parameters<typeof autoFixerAllowance>[0][number]>={})=>({
+  key:'codex:primary',kind:'weekly' as const,label:'Weekly',scope:'provider' as const,usedPercent,windowMinutes:10_080,overage:false,
+  observedAt:new Date().toISOString(),resetsAt:new Date(Date.now()+86_400_000).toISOString(),...extra
+})
+
+describe('Auto Fixer allowance evidence',()=>{
+  it('distinguishes usable, almost exhausted, exhausted, and absent reports',()=>{
+    const model={id:'gpt-6-astra',label:'GPT-6-Astra'}
+    expect(autoFixerAllowance([observedWindow(20)],model)).toMatchObject({status:'usable',remainingPercent:80})
+    expect(autoFixerAllowance([observedWindow(95)],model)).toMatchObject({status:'low',remainingPercent:5})
+    expect(autoFixerAllowance([observedWindow(100)],model)).toMatchObject({status:'exhausted',remainingPercent:0})
+    expect(autoFixerAllowance([],model)).toEqual({status:'unknown',windows:[]})
+  })
+  it('never lets stale low usage authorize a route, even before its future reset',()=>{
+    const now=Date.parse('2026-09-12T12:00:00Z')
+    const stale=observedWindow(10,{observedAt:'2026-09-10T12:00:00Z',resetsAt:'2026-09-15T12:00:00Z'})
+    expect(autoFixerAllowance([stale],{id:'gpt-6-astra'},now).status).toBe('unknown')
+  })
+  it('keeps a stale applicable model bucket limiting beside fresh provider evidence',()=>{
+    const now=Date.parse('2026-09-12T12:00:00Z')
+    const provider=observedWindow(10,{observedAt:'2026-09-12T11:59:00Z',resetsAt:'2026-09-15T12:00:00Z'})
+    const staleModel=observedWindow(20,{key:'gpt-6-astra:primary',scope:'model',modelSelectors:['gpt-6-astra'],observedAt:'2026-09-10T12:00:00Z',resetsAt:'2026-09-15T12:00:00Z'})
+    expect(autoFixerAllowance([provider,staleModel],{id:'gpt-6-astra'},now).status).toBe('unknown')
+    expect(autoFixerAllowance([provider,staleModel],{id:'gpt-5.6-sol'},now).status).toBe('usable')
+    expect(autoFixerAllowance([provider,{...staleModel,usedPercent:99}],{id:'gpt-6-astra'},now).status).toBe('low')
+  })
+})
 
 describe('Project tasks native dispatch',()=> {
   it('lists visible native targets and runtime-reported model efforts',()=>{
@@ -59,14 +102,27 @@ describe('Project tasks native dispatch',()=> {
     expect(result.board.tasks).toEqual(expect.arrayContaining([expect.objectContaining({id:'one',status:'doing',agentId:f.spec.id,activity:expect.arrayContaining([expect.objectContaining({actor:'you'})])}),expect.objectContaining({id:'two',status:'todo'})]))
     expect(f.ui).not.toHaveBeenCalled()
   })
-  it('queues active tab assignments without interrupting or submitting another concurrent turn',async()=>{
+  it('steers an active tab and claims tasks only after its native acceptance receipt',async()=>{
     const f=fixture({hold:true})
     await f.sessions.submit(f.spec.id,'Already running',f.database.structured.snapshot(f.spec.id)!.settings)
     const board=await f.backlogs.get(f.project.id)
     const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['two'],target:{type:'existing',agentSessionId:f.spec.id}})
-    expect(result.assignments[0]?.status).toBe('queued')
+    expect(result.assignments[0]?.status).toBe('submitted')
     expect(f.submissions).toHaveLength(1)
-    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.[0]?.text).toContain('Task two (feature)')
+    expect(f.steers).toHaveLength(1)
+    expect(f.steers[0]?.prompt).toContain('Task two (feature)')
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toMatchObject([{status:'accepted'}])
+    expect(result.board.tasks.find(task=>task.id==='two')).toMatchObject({status:'doing',agentId:f.spec.id})
+  })
+  it('keeps tasks unclaimed when active-turn delivery is uncertain',async()=>{
+    const f=fixture({hold:true,steerReceipt:'uncertain'})
+    await f.sessions.submit(f.spec.id,'Already running',f.database.structured.snapshot(f.spec.id)!.settings)
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['two'],target:{type:'existing',agentSessionId:f.spec.id}})
+    expect(result.assignments[0]).toMatchObject({status:'failed',error:expect.stringContaining('uncertain')})
+    expect(f.steers).toHaveLength(1)
+    expect(result.board.tasks.find(task=>task.id==='two')).toMatchObject({status:'todo'})
+    expect(f.database.structured.snapshot(f.spec.id)?.pendingSteering).toMatchObject([{status:'uncertain'}])
   })
   it('opens a visible new provider tab and validates its selected concrete effort before submitting',async()=>{
     const f=fixture(),board=await f.backlogs.get(f.project.id)
@@ -89,6 +145,64 @@ describe('Project tasks native dispatch',()=> {
     expect(f.submissions[0]?.prompt).toContain('explicit provider, model, effort')
     expect(f.submissions[0]?.prompt).toContain('projectTaskIds')
     expect(f.submissions[0]?.prompt).toContain('Task two (feature)')
+  })
+  it('uses fresh runtime model buckets to avoid an almost exhausted Astra default when Sol has allowance',async()=>{
+    const snapshot=(limitId:string,usedPercent:number)=>({limitId,primary:{usedPercent,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null})
+    const f=fixture({
+      models:{codex:[{id:'gpt-6-astra',label:'GPT-6-Astra',effort:['high'],defaultEffort:'high',isDefault:true},{id:'gpt-5.6-sol',label:'GPT-5.6-Sol',effort:['high'],defaultEffort:'high'}]},
+      quota:{codex:{rateLimitsByLimitId:{codex:snapshot('codex',10),'gpt-6-astra':snapshot('gpt-6-astra',99)}}}
+    })
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex',model:'gpt-5.6-sol'})
+    expect(f.submissions).toHaveLength(1)
+  })
+  it('uses the durable timestamp of a repeated quota item so a current read supersedes old refusal evidence',async()=>{
+    const f=fixture({quota:false})
+    await f.sessions.connectSession(f.spec.id)
+    const report=(id:string,sequence:number,timestamp:string,usedPercent:number)=>f.database.structured.append({
+      schemaVersion:1,id,sessionId:f.spec.id,sequence,runtimeId:f.database.structured.snapshot(f.spec.id)!.runtimeId,nativeSessionId:'native-'+f.database.structured.snapshot(f.spec.id)!.runtimeId,
+      provider:'codex',projectId:f.project.id,workspaceId:f.workspace.id,cwd:f.root,itemId:'account-rate-limits',timestamp,
+      data:{type:'usage',source:'provider',limits:{rateLimits:{limitId:'codex',primary:{usedPercent,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null}}}
+    })
+    let sequence=f.database.structured.snapshot(f.spec.id)!.sequence
+    const old=new Date(Date.now()-10*60_000).toISOString(),current=new Date().toISOString()
+    report('old-quota',++sequence,old,99)
+    report('current-quota',++sequence,current,20)
+    const projected=f.database.structured.snapshot(f.spec.id)!.items.find(item=>item.nativeItemId==='account-rate-limits')!
+    expect(projected).toMatchObject({timestamp:old,updatedSequence:sequence,data:{type:'usage',limits:{rateLimits:{primary:{usedPercent:20}}}}})
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex',model:'codex-native'})
+    expect(f.submissions).toHaveLength(1)
+  })
+  it('keeps an owner-selected provider/model explicit even when its reported allowance is low',async()=>{
+    const f=fixture({quota:{codex:{rateLimits:{limitId:'codex',primary:{usedPercent:99,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null}}}})
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'new',sessionId:f.workspace.id,provider:'codex',model:'codex-native',effort:'high'}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex',model:'codex-native',effort:'high'})
+    expect(f.submissions).toHaveLength(1)
+  })
+  it('uses fresh account evidence with a configured catalog when another runtime provider is low',async()=>{
+    const limit=(provider:string,usedPercent:number)=>({rateLimits:{limitId:provider,primary:{usedPercent,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null}})
+    const f=fixture({quota:{codex:limit('codex',96),claude:limit('claude',40)},models:{claude:[{id:'claude-fable-5-1',label:'Claude Fable 5.1',effort:['high'],defaultEffort:'high',isDefault:true}]}})
+    await f.addHistory('claude')
+    expect(f.dispatcher.options(f.project.id).providers.find(provider=>provider.provider==='claude')?.source).toBe('configured')
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'claude',model:'claude-fable-5-1'})
+  })
+  it('refuses automatic submission for Codex low plus Claude 1%, all exhausted, or no quota evidence',async()=>{
+    const limit=(provider:string,usedPercent:number)=>({rateLimits:{limitId:provider,primary:{usedPercent,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null}})
+    for(const [codex,claude,message] of [[96,99,'more than 5%'],[100,100,'exhausted']] as const){
+      const f=fixture({quota:{codex:limit('codex',codex),claude:limit('claude',claude)}});await f.addHistory('claude')
+      const board=await f.backlogs.get(f.project.id)
+      await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})).rejects.toThrow(message)
+      expect(f.submissions).toHaveLength(0);expect(f.ui).not.toHaveBeenCalled()
+    }
+    const unknown=fixture({quota:false}),board=await unknown.backlogs.get(unknown.project.id)
+    await expect(unknown.dispatcher.dispatch(unknown.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:unknown.workspace.id}})).rejects.toThrow('allowance evidence')
+    expect(unknown.submissions).toHaveLength(0);expect(unknown.ui).not.toHaveBeenCalled()
   })
   it('rejects stale revisions, unavailable targets, invalid effort, and duplicate IDs before submission',async()=>{
     const f=fixture(),board=await f.backlogs.get(f.project.id),target={type:'existing' as const,agentSessionId:f.spec.id}

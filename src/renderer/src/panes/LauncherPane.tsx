@@ -11,8 +11,10 @@ import { LOCAL_MODELS } from '../../../shared/local-models'
 import type { AgentProviderId, PaneKind } from '../../../shared/models'
 import type { MachineDescriptor } from '../../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
+import { checkRemoteProjectPlacement } from '../../../shared/project-identity'
 
 interface LauncherPaneProps {
+  projectId: string
   /** The machine a new tab should run on; the caller remembers the owner's last choice. */
   machineId?: string
   /** A placement the other machine refused, shown where the choice was made. */
@@ -50,19 +52,22 @@ const choices: Array<{
  * paired but has no confirmed project pair is shown disabled with the reason, rather than hidden,
  * because "my desktop is missing from the list" is a worse puzzle than being told what to fix.
  */
-export function machinePlacementOptions(machines: MachineDescriptor[]): Array<{ machine: MachineDescriptor; reason: string }> {
+export function machinePlacementOptions(machines: MachineDescriptor[], projectId: string): Array<{ machine: MachineDescriptor; reason: string }> {
   return machines
     .filter(machine => machine.status !== 'revoked')
-    .map(machine => ({
-      machine,
-      reason: machine.kind === 'local' ? ''
-        : machine.status !== 'online' ? `${machine.name} is offline.`
-        : !machine.projects.length ? `${machine.name} has no project paired with this one yet. Pair it in Account & machines.`
-        : ''
-    }))
+    .map(machine => {
+      const link = machine.projects.find(entry => entry.grant.localProjectId === projectId)
+      const placement = checkRemoteProjectPlacement({ machineName: machine.name, grant: link?.grant, advertised: link?.observed })
+      return {
+        machine,
+        reason: machine.kind === 'local' ? ''
+          : machine.status !== 'online' ? `${machine.name} is offline.`
+          : placement.ok ? '' : placement.message
+      }
+    })
 }
 
-export function LauncherPane({ machineId, error, onSelectMachine, onOpen }: LauncherPaneProps): React.JSX.Element {
+export function LauncherPane({ projectId, machineId, error, onSelectMachine, onOpen }: LauncherPaneProps): React.JSX.Element {
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
   const selected = machineId ?? LOCAL_MACHINE_ID
 
@@ -75,7 +80,7 @@ export function LauncherPane({ machineId, error, onSelectMachine, onOpen }: Laun
     return () => { live = false; stop() }
   }, [])
 
-  const options = machinePlacementOptions(machines)
+  const options = machinePlacementOptions(machines, projectId)
   const current = options.find(option => option.machine.id === selected)
   // Placement is only worth showing once there is somewhere else to place work.
   const placeable = options.length > 1

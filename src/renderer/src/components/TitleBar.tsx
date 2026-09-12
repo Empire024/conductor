@@ -10,6 +10,7 @@ import {
   Minus,
   MoonStar,
   PanelTopOpen,
+  Save,
   Settings2,
   Sun,
   X
@@ -20,6 +21,7 @@ import { useWindowMaximized } from '../use-window-maximized'
 
 interface TitleBarProps {
   projectName?: string
+  sessionName?: string
   themeVariant: ThemeVariant
   themeAuto: boolean
   themeId?: ThemeId
@@ -28,6 +30,8 @@ interface TitleBarProps {
   onThemeVariant(variant: ThemeVariant): void
   onNewProject?(): void
   onOpenProject?(): void
+  onOpenSession?(): void
+  onSaveSession?(): void
   onOpenWorkspace?(): void
   onNewWorkspace?(): void
   onNewTab?(): void
@@ -86,6 +90,9 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
         {fileMenuOpen && (
           <div className="file-menu" role="menu">
             <header><strong>File</strong><span>Local workspace</span></header>
+            <button disabled={!props.onOpenSession} onClick={() => run(props.onOpenSession)}><FolderOpen size={16} /><span><strong>Open session…</strong><small>Replace this desk from a saved snapshot</small></span></button>
+            <button disabled={!props.onSaveSession} onClick={() => run(props.onSaveSession)}><Save size={16} /><span><strong>Save session…</strong><small>Save every loaded project and workspace</small></span></button>
+            <div className="file-menu-separator" />
             {props.onNewProject && <button onClick={() => run(props.onNewProject)}><FilePlus2 size={16} /><span><strong>New project</strong><small>Create it in the Conductor folder</small></span></button>}
             {props.onOpenProject && <button onClick={() => run(props.onOpenProject)}><FolderOpen size={16} /><span><strong>Open project folder…</strong><small>Add an existing local folder</small></span></button>}
             {(props.onNewProject || props.onOpenProject) && <div className="file-menu-separator" />}
@@ -98,7 +105,7 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
         )}
       </div>
       <div className="titlebar-drag">
-        {props.projectName ? <span className="titlebar-project">{props.projectName} <span>/</span> Local workspace</span> : <span className="titlebar-project">Local agent workspace</span>}
+        <span className="titlebar-project"><strong>{props.sessionName ?? 'Untitled session'}</strong>{props.projectName ? <> <span>/</span> {props.projectName}</> : null}</span>
       </div>
       <div className="quick-theme-menu-host" ref={themeMenuRef}>
       <button onContextMenu={(event) => { event.preventDefault(); setThemeMenuOpen((open) => !open) }} className="quick-theme-toggle" aria-label={`Switch to ${nextVariant} theme`} onClick={() => { setThemeMenuOpen(false); props.onThemeVariant(nextVariant) }} title={props.themeAuto ? `Theme follows local time. Click to use ${nextVariant} manually.` : `Theme: ${props.themeVariant}. Click for ${nextVariant}.`}>

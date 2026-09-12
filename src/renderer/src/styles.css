@@ -153,6 +153,7 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--accent-mute
 /* Left navigation */
 .left-shell { width: 280px; min-width: 280px; display: flex; border-right: 1px solid var(--border); background: #0d1014; }
 .left-shell.rail-only { width: 48px; min-width: 48px; }
+.left-shell.rail-only .sidebar { width: 0; visibility: hidden; overflow: hidden; }
 .activity-rail {
   width: 48px;
   min-width: 48px;
@@ -647,8 +648,8 @@ kbd {
 .browser-failure strong { color: var(--text-2); font-size: 10px; }
 .browser-failure button { padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-2); background: var(--surface-1); }
 .browser-note { position: absolute; right: 7px; bottom: 7px; padding: 4px 6px; border-radius: 3px; color: #59616b; background: #101419dd; font-size: 7.5px; pointer-events: none; }
-.left-shell:has(.browser-sidebar) { width: min(680px, 58vw); min-width: min(480px, 58vw); }
-.left-shell:has(.browser-sidebar) .sidebar { width: 100%; }
+.left-shell.browser-active:not(.rail-only) { width: min(680px, 58vw); min-width: min(480px, 58vw); }
+.left-shell.browser-active:not(.rail-only) .sidebar { width: 100%; }
 
 .coming-pane { flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 6px; color: #69717a; }
 .coming-pane > span { padding: 3px 7px; border: 1px solid #303740; border-radius: 3px; color: #8e986a; font-size: 8px; text-transform: uppercase; letter-spacing: .1em; }

@@ -196,6 +196,29 @@ describe('pairing a machine', () => {
     await expect(fix.peers.beginPairing(attemptFor(fix.peers, fix.owner, code, fix.now())))
       .rejects.toThrow(/not signed in to GitHub/)
   })
+
+  it.each(['disable', 'sign-out', 'account-switch', 'revoke-all'] as const)(
+    'does not create a pending pairing when the owner applies %s during GitHub verification',
+    async action => {
+      let release!: (keys: string[]) => void
+      fix.keysFn.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+      const pairing = fix.peers.beginPairing(attemptFor(fix.peers, fix.owner, fix.peers.issueTicket().code, fix.now()))
+      if (action === 'disable') fix.peers.updateSettings({ enabled: false })
+      if (action === 'sign-out') fix.setAccountId(null)
+      if (action === 'account-switch') fix.setAccountId(9999)
+      if (action === 'revoke-all') fix.peers.revokeAll('Owner revoked access')
+      release([fix.owner.publicKey])
+      await expect(pairing).rejects.toThrow()
+      expect(fix.peers.listPending()).toHaveLength(0)
+    }
+  )
+
+  it('will not approve a request after this machine switches GitHub accounts', async () => {
+    const request = await fix.peers.beginPairing(attemptFor(fix.peers, fix.owner, fix.peers.issueTicket().code, fix.now()))
+    fix.setAccountId(9999)
+    expect(() => fix.peers.approve(request.id, ['project-a'])).toThrow(/different GitHub account/)
+    expect(fix.peers.listPeers()).toHaveLength(0)
+  })
 })
 
 describe('polling for the owner answer', () => {
@@ -225,6 +248,15 @@ describe('polling for the owner answer', () => {
   it('refuses a poll nobody signed for the key it presents', () => {
     expect(() => fix.peers.verifyPairingPoll({ ...poll(generateDeviceKey('impostor'), fix.now()), publicKey: fix.owner.publicKey }))
       .toThrow(/not signed by the key it presented/)
+  })
+
+  it('stops answering pairing polls after remote control is disabled or GitHub is signed out', () => {
+    const disabled = poll(fix.owner, fix.now())
+    fix.peers.updateSettings({ enabled: false })
+    expect(() => fix.peers.verifyPairingPoll(disabled)).toThrow(/switched off/)
+    fix.peers.updateSettings({ enabled: true })
+    fix.setAccountId(null)
+    expect(() => fix.peers.verifyPairingPoll(poll(fix.owner, fix.now()))).toThrow(/not signed in/)
   })
 })
 
@@ -363,6 +395,63 @@ describe('project scope', () => {
     expect(() => fix.peers.requireProject(peer, 'project-b')).toThrow(/not shared with this machine/)
     expect(() => fix.peers.requireProject(peer, 'unknown')).toThrow(/not shared with this machine/)
     expect(() => fix.peers.requireProject(peer, undefined)).toThrow(/Name a project/)
+  })
+
+  it('reauthorizes a persisted remote prompt against the current peer, account and enabled state', async () => {
+    const current = fixture()
+    const peer = await pairAndApprove(current, current.owner, ['project-a'])
+    expect(current.peers.requirePromptAuthority(peer.id, 'project-a').id).toBe('project-a')
+
+    const disabled = fixture()
+    const disabledPeer = await pairAndApprove(disabled, disabled.owner, ['project-a'])
+    disabled.peers.updateSettings({ enabled: false })
+    expect(() => disabled.peers.requirePromptAuthority(disabledPeer.id, 'project-a')).toThrow(/switched off/)
+
+    const switched = fixture()
+    const switchedPeer = await pairAndApprove(switched, switched.owner, ['project-a'])
+    switched.setAccountId(9999)
+    expect(() => switched.peers.requirePromptAuthority(switchedPeer.id, 'project-a')).toThrow(/access changed/)
+
+    const revoked = fixture()
+    const revokedPeer = await pairAndApprove(revoked, revoked.owner, ['project-a'])
+    revoked.peers.revoke(revokedPeer.id)
+    expect(() => revoked.peers.requirePromptAuthority(revokedPeer.id, 'project-a')).toThrow(/access changed/)
+
+    const forgotten = fixture()
+    const forgottenPeer = await pairAndApprove(forgotten, forgotten.owner, ['project-a'])
+    forgotten.peers.forget(forgottenPeer.id)
+    expect(() => forgotten.peers.requirePromptAuthority(forgottenPeer.id, 'project-a')).toThrow(/no longer paired/)
+  })
+
+  it('refuses persisted prompt authority after its granted working-copy identity changes', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    const swapped = { ...PROJECTS[0]!, identity: identityOf('c'.repeat(32), '/tmp/a', 'Conductor') }
+    const reloaded = new RemotePeers({
+      store: fix.store, accountId: () => 4242, accountLogin: () => 'Empire024',
+      accountKeys: async () => [fix.owner.publicKey], projects: () => [swapped, PROJECTS[1]!]
+    })
+    expect(() => reloaded.requirePromptAuthority(peer.id, 'project-a')).toThrow(/different working copy/)
+    expect(() => reloaded.requirePromptAuthority(peer.id, 'project-b')).toThrow(/project grant changed|not shared/)
+  })
+
+  it('refuses an authenticated project snapshot after the owner revokes or disables its authority', async () => {
+    const revoked = fixture()
+    const revokedSnapshot = await pairAndApprove(revoked, revoked.owner, ['project-a'])
+    revoked.peers.revoke(revokedSnapshot.id)
+    expect(() => revoked.peers.requireCurrentProject(revokedSnapshot, 'project-a')).toThrow(/access changed/)
+
+    const disabled = fixture()
+    const disabledSnapshot = await pairAndApprove(disabled, disabled.owner, ['project-a'])
+    disabled.peers.updateSettings({ enabled: false })
+    expect(() => disabled.peers.requireCurrentProject(disabledSnapshot, 'project-a')).toThrow(/switched off/)
+
+    const cycled = fixture()
+    const cycledSnapshot = await pairAndApprove(cycled, cycled.owner, ['project-a'])
+    const authority = cycled.peers.captureProjectAuthority(cycledSnapshot, 'project-a')
+    cycled.peers.updateSettings({ enabled: false })
+    cycled.peers.updateSettings({ enabled: true })
+    expect(() => cycled.peers.requireCurrentProject(cycledSnapshot, 'project-a', authority.revision)).toThrow(/access changed/)
   })
 
   it('refuses a project that was removed from this machine after pairing', async () => {

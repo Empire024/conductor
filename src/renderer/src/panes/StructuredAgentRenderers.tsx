@@ -1,10 +1,10 @@
 import { PromptImageThumbnail } from '../components/PromptImageUpload'
-import { Children, isValidElement, memo, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { Children, createContext, isValidElement, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { DiffEditor, type DiffOnMount } from '@monaco-editor/react'
-import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, Copy, FileCode2, Link2, Maximize2, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Check, ChevronDown, ChevronRight, ChevronUp, Copy, FileCode2, Link2, Maximize2, X } from 'lucide-react'
 import type { ContextAttachment, AgentEventData, DiffArtifact, FileChange, InputQuestion, Json, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
 import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import { languageForPath, SyntaxCode } from './SyntaxCode'
@@ -13,6 +13,9 @@ import { copyText } from '../clipboard'
 import { runFileLinkAction } from '../components/file-link-actions'
 import { buildFileLinkMenuEntries, FILE_LINK_MENU_ICONS, type FileLinkMenuAction } from '../components/file-link-menu'
 import { resolveFileLinkTarget, useFileLinkProjectRoots, type ResolvedFileLink } from '../components/file-link-target'
+import { plainFileLinkRemarkPlugin, useVerifiedPlainFileLinks } from '../components/plain-file-links'
+import { isRemoteFileMachine } from '../remote-files'
+import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import './StructuredAgentActivity.css'
 import './StructuredFileLinkMenu.css'
@@ -190,7 +193,10 @@ export function safeExternalLink(href: string): boolean {
 export function safeConductorLink(href: string): boolean {
   try { const url = new URL(href); return url.protocol === 'conductor:' && Boolean(url.hostname) && !url.search && !url.hash && !url.port && !url.username && !url.password && /^\/(tab|file|workspace)\/[^/]+$/.test(url.pathname) } catch { return false }
 }
-export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, projectId, onOpenFile }: { text: string; cwd: string; projectId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
+export const AgentFileMachineContext = createContext(LOCAL_MACHINE_ID)
+export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, projectId, machineId, onOpenFile }: { text: string; cwd: string; projectId?: string; machineId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
+  const contextualMachineId = useContext(AgentFileMachineContext)
+  machineId ??= contextualMachineId
   const [linkError, setLinkError] = useState('')
   // Right-click on a link that resolves to a project file explains the modifiers the plain
   // click already understands (Click = edit, Ctrl+Click = browser preview, Ctrl+Shift+Click =
@@ -198,6 +204,8 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
   // keep their plain click-only behaviour, matching what they already do.
   const [menu, setMenu] = useState<{ target: ResolvedFileLink; x: number; y: number } | null>(null)
   const projects = useFileLinkProjectRoots()
+  const verifiedPlainFileLinks = useVerifiedPlainFileLinks(text, cwd, projectId, projects, machineId)
+  const markdownPlugins = useMemo(() => [remarkGfm, plainFileLinkRemarkPlugin(verifiedPlainFileLinks, cwd, projectId, projects, machineId)], [verifiedPlainFileLinks, cwd, projectId, projects, machineId])
   useEffect(() => {
     if (!menu) return
     const close = (): void => setMenu(null)
@@ -216,12 +224,13 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
   // in the same type-aware view the explorer would pick, so a PNG previews and a .blend is
   // described rather than loaded into the text editor.
   const editTarget = (target: ResolvedFileLink, path: string, line?: number): void => {
-    if (target.projectId && target.projectId !== projectId) openWorkspaceFile(target.projectId, path, 'auto', line)
+    if (target.projectId && target.projectId !== projectId) openWorkspaceFile(target.projectId, path, 'auto', line, undefined, machineId)
     else onOpenFile(path, line)
   }
   const runLinkAction = (action: FileLinkMenuAction, target: ResolvedFileLink): void => {
     const owner = target.projectId ?? projectId
     if (!owner) return
+    if (isRemoteFileMachine(machineId) && action !== 'edit') { setLinkError('Remote files stay on their host and open in the guarded editor only.'); return }
     runFileLinkAction(action, { projectId: owner, path: target.path, line: target.line }, (path, line) => editTarget(target, path, line), (message) => setLinkError(message))
   }
   const runMenuAction = (action: FileLinkMenuAction): void => {
@@ -230,15 +239,15 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
     setMenu(null)
     runLinkAction(action, target)
   }
-  return <div className="sa-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={(url) => safeConductorLink(url) || safeExternalLink(url) || resolveFileLinkTarget(url, cwd, projects) ? url : ''} components={{
+  return <div className="sa-markdown"><ReactMarkdown remarkPlugins={markdownPlugins} skipHtml urlTransform={(url) => safeConductorLink(url) || safeExternalLink(url) || resolveFileLinkTarget(url, cwd, projects, machineId) ? url : ''} components={{
     a: ({ href, children }) => {
       if (!href) return <span>{children}</span>
       const internal = safeConductorLink(href)
       const external = safeExternalLink(href)
-      const target = external || internal ? null : resolveFileLinkTarget(href, cwd, projects)
+      const target = external || internal ? null : resolveFileLinkTarget(href, cwd, projects, machineId)
       const sibling = Boolean(target?.projectId && target.projectId !== projectId)
       return <a href={external ? href : '#'}
-        onClick={(event) => { event.preventDefault(); if (internal) void window.conductor.agentControl.openUri(href).catch(reason => setLinkError(reason instanceof Error ? reason.message : String(reason))); else if (external) void window.conductor.system.openExternal(href); else if (target) { if (sibling) runLinkAction(event.ctrlKey || event.metaKey ? event.shiftKey ? 'default-browser' : 'live-preview' : 'edit', target); else if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, path: target.path, line: target.line, mode: event.shiftKey ? 'external' : 'browser' } })); else onOpenFile(target.path, target.line) } }}
+        onClick={(event) => { event.preventDefault(); if (internal) void window.conductor.agentControl.openUri(href).catch(reason => setLinkError(reason instanceof Error ? reason.message : String(reason))); else if (external) void window.conductor.system.openExternal(href); else if (target) { if (sibling) runLinkAction(event.ctrlKey || event.metaKey ? event.shiftKey ? 'default-browser' : 'live-preview' : 'edit', target); else if (event.ctrlKey || event.metaKey) window.dispatchEvent(new CustomEvent('conductor:agent-file', { detail: { cwd, projectId, machineId, path: target.path, line: target.line, mode: event.shiftKey ? 'external' : 'browser' } })); else onOpenFile(target.path, target.line) } }}
         onContextMenu={target && (target.projectId ?? projectId) ? (event) => showMenu(event, target) : undefined}
       >{children}</a>
     },
@@ -248,7 +257,7 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
   {menu && createPortal(
     <div className="cursor-context-menu sa-file-link-menu" role="menu" aria-label={'Actions for ' + menu.target.path} style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
       <div className="context-menu-label">{menu.target.path.split('/').pop()}</div>
-      {buildFileLinkMenuEntries().map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} role="menuitem" onClick={() => runMenuAction(entry.action)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
+      {buildFileLinkMenuEntries().filter(entry => !isRemoteFileMachine(machineId) || entry.action === 'edit').map((entry) => { const Icon = FILE_LINK_MENU_ICONS[entry.action]; return <button key={entry.action} role="menuitem" onClick={() => runMenuAction(entry.action)}><Icon size={14} /> {entry.label}{entry.shortcut && <span className="context-shortcut">{entry.shortcut}</span>}</button> })}
     </div>,
     document.body
   )}</div>
@@ -337,17 +346,21 @@ function PatchPreview({ change }: { change: FileChange }): React.JSX.Element {
 
 interface ActivityProps {
   projectId?: string
+  machineId?: string
   onInspectAttachment?(attachment: ContextAttachment): void
   item: TimelineItem
   sessionId: string
   cwd: string
   expanded: boolean
   interactive: boolean
+  dockedQuestion?: boolean
   parentLabel?: { name: string; colorIndex?: number }
   onExpand(id: string): void
   onOpenFile(path: string, line?: number): void
   onDiff(change: FileChange): void
   onRespond(item: TimelineItem, decision?: string, answers?: Record<string, string[]>): Promise<void>
+  onFocusOrigin?(origin: { agentSessionId: string; label: string }): void
+  onDockQuestion?(id: string, docked: boolean): void
 }
 /** A short, truncated head-of-output hint so a collapsed row shows a bit of what actually happened,
  *  not just the tool name. The full stream stays behind the expand toggle. */
@@ -369,7 +382,7 @@ function ToolCard({ item, expanded, onExpand, onOpenFile, sessionId, cwd }: Acti
   const outputLanguage = typeof sourcePath === 'string' ? languageForPath(sourcePath) : undefined
   return <section className={'sa-tool sa-tool-' + presentation.kind} aria-label={tool.name + ': ' + status}>
     <header><button className="sa-tool-heading" aria-expanded={expanded} onClick={() => onExpand(item.id)}>{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}<strong>{tool.name}</strong><span>{presentation.title !== tool.name ? presentation.title : ''}</span></button><small className={'sa-status status-' + status}>{status.replaceAll('_', ' ')}</small></header>
-    {preview && <p className="sa-tool-preview">{preview}</p>}
+    {preview && <p className="sa-tool-preview"><b>OUT</b> {preview}</p>}
     {expanded && <>
       <div className="sa-io"><span>IN</span><div>{presentation.cwd && <small className="sa-cwd">{presentation.cwd}</small>}{presentation.kind === 'custom' || presentation.kind === 'edit' ? <details><summary>Inspect tool input</summary>{input}</details> : input}{presentation.path && (() => { const { icon: PathIcon, colorClass } = fileTypeStyle(presentation.path!); return <button className="sa-file-link" onClick={(event) => openAgentFile(event, cwd, presentation.path!, onOpenFile)}><PathIcon size={12} className={colorClass} />{presentation.path}</button> })()}</div></div>
       <div className="sa-io sa-output"><span>OUT</span><div>{tool.output !== undefined ? <OutputPreview value={tool.output} artifactId={tool.outputArtifactId} sessionId={sessionId} language={outputLanguage} /> : <span className="sa-muted">{status === 'preparing' ? 'Preparing…' : status === 'awaiting_approval' ? 'Awaiting approval.' : status === 'running' ? 'Running…' : 'No output.'}</span>}{tool.stderr && <><small className="sa-stream-name">stderr</small><OutputPreview value={tool.stderr} sessionId={sessionId} /></>}</div></div>
@@ -405,11 +418,11 @@ export function readableAnswerValue(value: string): string {
   const lastSpace = truncated.lastIndexOf(' ')
   return (lastSpace > MAX_ANSWER_VALUE_LENGTH * 0.6 ? truncated.slice(0, lastSpace) : truncated).trimEnd() + '…'
 }
-function InteractionCard({ item, interactive, onRespond }: ActivityProps): React.JSX.Element | null {
+function InteractionCard({ item, interactive, onRespond, dockedQuestion, onDockQuestion }: ActivityProps): React.JSX.Element | null {
   const [submittedAnswers, setSubmittedAnswers] = useState<Record<string, string[]> | null>(null)
   if (item.data.type !== 'interaction') return null
   const request: PendingInteraction = item.data.interaction
-  if (request.status === 'pending' && interactive) return <PendingInteractionForm item={item} request={request} onRespond={async (target, decision, answers) => {
+  if (request.status === 'pending' && interactive) return <PendingInteractionForm item={item} request={request} docked={Boolean(dockedQuestion)} onDock={onDockQuestion} onRespond={async (target, decision, answers) => {
     if (answers) setSubmittedAnswers(answers)
     await onRespond(target, decision, answers)
   }} />
@@ -450,7 +463,7 @@ export function combinedQuestionAnswer(question: InputQuestion, selected: string
 /** A live request asks one question at a time rather than stacking them all, and pins itself to
  *  the bottom of the conversation while the pane is tall enough to still read the transcript
  *  behind it; on a short pane it stays inline where it was written. */
-function PendingInteractionForm({ item, request, onRespond }: { item: TimelineItem; request: PendingInteraction; onRespond: ActivityProps['onRespond'] }): React.JSX.Element {
+function PendingInteractionForm({ item, request, docked, onDock, onRespond }: { item: TimelineItem; request: PendingInteraction; docked: boolean; onDock?: ActivityProps['onDockQuestion']; onRespond: ActivityProps['onRespond'] }): React.JSX.Element {
   const [answers, setAnswers] = useState<Record<string, string[]>>({})
   const [custom, setCustom] = useState<Record<string, string>>({})
   const [customSelected, setCustomSelected] = useState<Record<string, boolean>>({})
@@ -487,11 +500,14 @@ function PendingInteractionForm({ item, request, onRespond }: { item: TimelineIt
     if (lastStep) { void respond(); return }
     if (answered(questions[current]!)) setStep(current + 1)
   }
+  if (docked && request.kind === 'question') return <form ref={form} className="sa-interaction sa-interaction-docked" aria-label={'Question dock: ' + request.title}>
+    <div className="sa-question-dock"><span><strong>{request.title}</strong><small>Question waiting — answers are preserved.</small></span><button type="button" aria-label="Reopen question" title="Reopen question" onClick={() => onDock?.(item.id, false)}><ChevronUp size={14} /></button></div>
+  </form>
   return <form ref={form} className={'sa-interaction needs-attention' + (pinned ? ' sa-interaction-pinned' : '')} aria-label={request.kind + ': ' + request.title} onSubmit={event => { event.preventDefault(); proceed() }} onKeyDown={event => {
     if (request.kind !== 'question' || event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing || !(event.target instanceof HTMLInputElement)) return
     event.preventDefault(); event.stopPropagation(); proceed()
   }}>
-    <header><strong>{request.title}</strong><small>{stepped ? 'Question ' + (current + 1) + ' of ' + questions.length : request.kind === 'question' ? 'Choose an answer' : 'Review and continue'}</small></header>
+    <header><strong>{request.title}</strong><small>{stepped ? 'Question ' + (current + 1) + ' of ' + questions.length : request.kind === 'question' ? 'Choose an answer' : 'Review and continue'}</small>{request.kind === 'question' && <button type="button" className="sa-question-collapse" aria-label="Collapse question to bottom dock" title="Collapse to bottom dock" onClick={() => onDock?.(item.id, true)}><X size={13} /></button>}</header>
     {stepped && <ol className="sa-question-steps" aria-hidden="true">{questions.map((question, index) => <li key={question.id} className={index === current ? 'current' : answered(question) ? 'done' : ''} />)}</ol>}
     {request.kind === 'approval' && <p className="sa-request-summary">{typeof record(request.input).description === 'string' ? String(record(request.input).description) : typeof record(request.input).command === 'string' ? commandSummary(String(record(request.input).command)) : typeof record(request.input).file_path === 'string' ? String(record(request.input).file_path) : ''}</p>}
     {(stepped ? questions.slice(current, current + 1) : questions).map((question) => <fieldset key={question.id} disabled={busy}>
@@ -539,12 +555,12 @@ export function legacyAttachedContext(text: string): { prompt: string; context: 
   if (!match || !text.slice(0, match.index).trim()) return null
   return { prompt: text.slice(0, match.index), context: text.slice(match.index).trimStart() }
 }
-function MessageText({ data, cwd, projectId, onOpenFile }: { data: Extract<AgentEventData, { type: 'text' }>; cwd: string; projectId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
+function MessageText({ data, cwd, projectId, machineId, onOpenFile }: { data: Extract<AgentEventData, { type: 'text' }>; cwd: string; projectId?: string; machineId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
   // The memory-write directive is a control instruction for Conductor, not something the user
   // asked to read; it is captured elsewhere and must never surface in the rendered reply.
   const text = data.role === 'assistant' ? stripMemoryDirectives(data.text) : data.text
   const legacy = data.role === 'user' && !data.attachments?.length ? legacyAttachedContext(data.text) : null
-  return <><StructuredMarkdown text={legacy?.prompt ?? text} cwd={cwd} projectId={projectId} onOpenFile={onOpenFile} />{legacy && <details className="sa-legacy-context"><summary>Attached context</summary><StructuredMarkdown text={legacy.context} cwd={cwd} projectId={projectId} onOpenFile={onOpenFile} /></details>}</>
+  return <><StructuredMarkdown text={legacy?.prompt ?? text} cwd={cwd} projectId={projectId} machineId={machineId} onOpenFile={onOpenFile} />{legacy && <details className="sa-legacy-context"><summary>Attached context</summary><StructuredMarkdown text={legacy.context} cwd={cwd} projectId={projectId} machineId={machineId} onOpenFile={onOpenFile} /></details>}</>
 }
 
 export const StructuredActivity = memo(function StructuredActivity(props: ActivityProps): React.JSX.Element | null {
@@ -553,7 +569,7 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
   let body: ReactNode
   switch (data.type) {
     // "You" is reserved for what the owner actually sent; a coordinated prompt names its tab.
-    case 'text': body = <>{data.role === 'user' && (data.origin ? <span className="sa-role sa-role-coordinated" title={'Sent by ' + data.origin.label + ' through Conductor app control'}><Link2 size={11} />{data.origin.label}</span> : <span className="sa-role">You</span>)}<MessageText data={data} cwd={props.cwd} projectId={props.projectId} onOpenFile={props.onOpenFile} />{Boolean(data.attachments?.length) && <div className="sa-message-attachments" aria-label="Attached context">{data.attachments?.map(attachment => attachment.kind === 'image' && props.projectId && props.onInspectAttachment ? <button key={attachment.id} className="sa-sent-image" aria-label={'View image ' + attachment.name} title={'View ' + attachment.name} onClick={() => props.onInspectAttachment?.(attachment)}><PromptImageThumbnail projectId={props.projectId} attachment={attachment} /><span>{attachment.name}</span></button> : attachment.path ? <button key={attachment.id} className="sa-file-link" title={attachment.name} onClick={event => openAgentFile(event, props.cwd, attachment.path!, props.onOpenFile)}>{attachmentIcon(attachment.name)}{attachment.name}{attachment.startLine ? ':' + attachment.startLine : ''}</button> : <span key={attachment.id}>{attachmentIcon(attachment.name)}{attachment.name}</span>)}</div>}</>; break
+    case 'text': { const origin = data.origin; body = <>{data.role === 'user' && (origin ? <button type="button" className="sa-role sa-role-coordinated" title={'Show ' + origin.label + ' tab'} aria-label={'Show ' + origin.label + ' tab'} onClick={() => props.onFocusOrigin?.(origin)}><Link2 size={11} />{origin.label}</button> : <span className="sa-role">You</span>)}<MessageText data={data} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} />{Boolean(data.attachments?.length) && <div className="sa-message-attachments" aria-label="Attached context">{data.attachments?.map(attachment => attachment.kind === 'image' && props.projectId && props.onInspectAttachment ? <button key={attachment.id} className="sa-sent-image" aria-label={'View image ' + attachment.name} title={'View ' + attachment.name} onClick={() => props.onInspectAttachment?.(attachment)}><PromptImageThumbnail projectId={props.projectId} attachment={attachment} /><span>{attachment.name}</span></button> : attachment.path ? <button key={attachment.id} className="sa-file-link" title={attachment.name} onClick={event => openAgentFile(event, props.cwd, attachment.path!, props.onOpenFile)}>{attachmentIcon(attachment.name)}{attachment.name}{attachment.startLine ? ':' + attachment.startLine : ''}</button> : <span key={attachment.id}>{attachmentIcon(attachment.name)}{attachment.name}</span>)}</div>}</>; break }
     case 'tool': body = <ToolCard {...props} />; break
     case 'interaction': body = <InteractionCard {...props} />; break
     case 'changes': body = <section className="sa-changes" aria-label="File changes">{data.changes.map((change, index) => <div className="sa-file-change" key={change.path + '-' + index}>
@@ -561,7 +577,7 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
       {change.patch && <PatchPreview change={change} />}
       {(change.patch || change.artifactId) ? <button className="sa-expand-diff" onClick={() => props.onDiff(change)}><Maximize2 size={12} /> Click to expand diff</button> : change.limitation && <details className="sa-change-limitation"><summary>Diff unavailable</summary><p>{change.limitation}</p></details>}
     </div>)}</section>; break
-    case 'plan': body = <section className="sa-plan"><strong>Plan</strong>{data.explanation && <StructuredMarkdown text={data.explanation} cwd={props.cwd} projectId={props.projectId} onOpenFile={props.onOpenFile} />}<ol>{data.steps.map((step, index) => <li key={index} className={'status-' + step.status}><span>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '●' : '○'}</span><span>{step.text}</span><small>{step.status.replace('_', ' ')}</small></li>)}</ol></section>; break
+    case 'plan': body = <section className="sa-plan"><strong>Plan</strong>{data.explanation && <StructuredMarkdown text={data.explanation} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} />}<ol>{data.steps.map((step, index) => <li key={index} className={'status-' + step.status}><span>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '●' : '○'}</span><span>{step.text}</span><small>{step.status.replace('_', ' ')}</small></li>)}</ol></section>; break
     case 'subagent': body = <section className="sa-subagent"><strong>{data.name}</strong><small>{data.status.replaceAll('_', ' ')}</small></section>; break
     case 'error': body = <p className="sa-error" role="alert">{data.message}{data.code && <small> ({data.code})</small>}</p>; break
     case 'notice': body = <div className="sa-notice">{data.message}{data.outputArtifactId && <OutputPreview sessionId={props.sessionId} artifactId={data.outputArtifactId} value="Saved terminal output from before structured integration. Native conversation identity was not recorded." />}</div>; break
@@ -569,5 +585,6 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
     case 'usage': return null
     case 'session': return null
   }
-  return <article className={'sa-activity sa-kind-' + data.type + (data.type === 'text' ? ' sa-' + data.role : '') + (props.item.parentId ? ' sa-child' : '')} data-item-id={props.item.id} data-native-item-id={props.item.nativeItemId} data-parent-id={props.item.parentId}><span className="sa-marker" aria-hidden="true" />{props.item.parentId && props.parentLabel && <small className={'sa-parent-label' + (props.parentLabel.colorIndex !== undefined ? ' sa-agent-hue-' + props.parentLabel.colorIndex : '')} title={'Nested activity reported by ' + props.parentLabel.name}>Within {props.parentLabel.name}</small>}{body}</article>
+  const occurredAt = props.item.timestamp && Number.isFinite(Date.parse(props.item.timestamp)) ? new Date(props.item.timestamp).toLocaleString() : null
+  return <article className={'sa-activity sa-kind-' + data.type + (data.type === 'text' ? ' sa-' + data.role : '') + (props.item.parentId ? ' sa-child' : '')} data-item-id={props.item.id} data-native-item-id={props.item.nativeItemId} data-parent-id={props.item.parentId}><span className="sa-marker" aria-hidden="true" />{occurredAt && <time className="sa-activity-time" dateTime={props.item.timestamp} title={occurredAt} aria-label={'Sent ' + occurredAt}>{occurredAt}</time>}{props.item.parentId && props.parentLabel && <small className={'sa-parent-label' + (props.parentLabel.colorIndex !== undefined ? ' sa-agent-hue-' + props.parentLabel.colorIndex : '')} title={'Nested activity reported by ' + props.parentLabel.name}>Within {props.parentLabel.name}</small>}{body}</article>
 })

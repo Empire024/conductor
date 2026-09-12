@@ -124,7 +124,7 @@ async function containerChecks(workspace: string, sandboxConfig: SandboxConfig):
     record('C: drive unreachable', (await run('ls "C:\\\\" 2>/dev/null | head -3')).out === '', '')
     record('ssh directory unreachable', (await run('ls ~/.ssh /root/.ssh 2>/dev/null | head -3')).out === '', '')
     // Names only; values are never printed by this suite.
-    const secrets = await run('env | grep -Ei "^(ANTHROPIC|OPENAI|AWS|AZURE|GITHUB|GH|HF|NPM|PYPI|DOCKER|SSH_AUTH)" | cut -d= -f1 | tr "\\n" " "')
+    const secrets = await run('env | grep -v "^NPM_CONFIG_CACHE=/tmp/npm$" | grep -Ei "^(ANTHROPIC|OPENAI|AWS|AZURE|GITHUB|GH|HF|NPM|PYPI|DOCKER|SSH_AUTH)" | cut -d= -f1 | tr "\\n" " "')
     record('host secret environment variables absent', secrets.out === '', secrets.out)
     record('/etc is not writable', (await run('touch /etc/conductor-test 2>&1; test -e /etc/conductor-test && echo WRITABLE || echo refused')).out.includes('refused'), '')
     record('powershell.exe unavailable', (await run('command -v powershell.exe powershell pwsh || echo missing')).out.includes('missing'), '')

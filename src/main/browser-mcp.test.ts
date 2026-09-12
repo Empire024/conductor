@@ -23,7 +23,8 @@ function fakeHost(calls: Calls, fail?: string): BrowserMcpHost {
     messages: limit => [{ level: 'error', message: 'boom', source: 'app.js', line: 12, at: '2026-09-10T00:00:00.000Z' }].slice(-limit),
     evaluate: async () => ({ ok: true }),
     click: async selector => ({ clicked: true, selector }),
-    type: async ({ selector }) => ({ typed: true, selector })
+    type: async ({ selector }) => ({ typed: true, selector }),
+    present: async () => {}
   }
   return { view: async scope => { calls.scopes.push(scope); if (fail) throw new Error(fail); return view } }
 }
@@ -43,8 +44,9 @@ const rawPost = (endpoint: string, token: string, host: string, body: unknown): 
 // configure() hands back a path so the token never rides on the CLI's command line; the inline
 // form stays readable here because a session that cannot get a file still falls back to it.
 const payload = (configuration: string): any => JSON.parse(configuration.startsWith('{') ? configuration : readFileSync(configuration, 'utf8'))
-const endpointOf = (configuration: string): string => payload(configuration).mcpServers['conductor-browser'].url as string
-const tokenOf = (configuration: string): string => (payload(configuration).mcpServers['conductor-browser'].headers.Authorization as string).replace('Bearer ', '')
+const serverEntry = (configuration: string): any => payload(configuration).mcpServers?.['conductor-browser'] ?? payload(configuration).mcp_servers?.['conductor-browser']
+const endpointOf = (configuration: string): string => serverEntry(configuration).url as string
+const tokenOf = (configuration: string): string => (serverEntry(configuration).headers?.Authorization ?? serverEntry(configuration).http_headers?.Authorization as string).replace('Bearer ', '')
 
 describe('browser MCP bridge', () => {
   let server: BrowserMcpServer
@@ -57,15 +59,16 @@ describe('browser MCP bridge', () => {
   })
   afterEach(() => { server.close(); vi.unstubAllEnvs() })
 
-  it('configures only Claude sessions, and mints one stable secret per session', () => {
+  it('configures Claude and Codex in their native shapes, and mints one stable secret per session', () => {
     const first = server.configure(spec())
     // Read now: one session keeps one configuration file, so a re-mint rewrites this same path.
     const minted = tokenOf(first)
     expect(endpointOf(first)).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/)
     expect(minted).toMatch(/^[a-f0-9]{64}$/)
     expect(tokenOf(server.configure(spec()))).toBe(minted)
-    // Codex has its own browser tooling and is never handed this configuration.
-    expect(server.configure(spec({ provider: 'codex' }))).toBe('')
+    const codex = server.configure(spec({ id: 'codex-agent', provider: 'codex' }))
+    expect(payload(codex)).toEqual({ mcp_servers: { 'conductor-browser': { url: endpointOf(codex), http_headers: { Authorization: 'Bearer ' + tokenOf(codex) } } } })
+    expect(server.configure(spec({ id: 'local-agent', provider: 'local' }))).toBe('')
     // Moving a session to another workspace invalidates the credential it was issued under.
     expect(tokenOf(server.configure(spec({ sessionId: 'workspace-2' })))).not.toBe(minted)
   })
@@ -88,7 +91,7 @@ describe('browser MCP bridge', () => {
     expect((await post(endpoint, token, { jsonrpc: '2.0', method: 'notifications/initialized' })).status).toBe(202)
     const tools = await post(endpoint, token, { jsonrpc: '2.0', id: 2, method: 'tools/list' })
     expect(tools.body.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
-      'browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_console', 'browser_click', 'browser_type', 'browser_evaluate'
+      'browser_present', 'browser_navigate', 'browser_snapshot', 'browser_screenshot', 'browser_console', 'browser_click', 'browser_type', 'browser_evaluate'
     ])
     expect(tools.body.result.tools.every((tool: { inputSchema: { type: string } }) => tool.inputSchema.type === 'object')).toBe(true)
   })

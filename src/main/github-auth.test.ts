@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { GITHUB_SCOPES, GitHubAuth, GitHubUnverifiableError } from './github-auth'
 import { keyFingerprint } from './device-key'
 import { MemoryVault, StoredSecretVault, type SecretCipher, type SecretKeyValueStore } from './secret-store'
+import { CONDUCTOR_GITHUB_OAUTH_CLIENT_ID } from '../shared/github-oauth'
 
 class MapStore implements SecretKeyValueStore {
   readonly values = new Map<string, string>()
@@ -28,6 +29,7 @@ function fixture(options: { routes?: Record<string, Route | Route[]>; vaultReady
   const queues = new Map<string, Route[]>()
   for (const [url, route] of Object.entries(options.routes ?? {})) queues.set(url, Array.isArray(route) ? [...route] : [route])
   const signedOut = vi.fn()
+  let clock = Date.parse('2026-09-12T12:00:00.000Z')
 
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input)
@@ -58,14 +60,18 @@ function fixture(options: { routes?: Record<string, Route | Route[]>; vaultReady
     store, vault, fetch: fetchMock as unknown as typeof globalThis.fetch,
     clientId: options.clientId === undefined ? 'Iv1.test-client' : options.clientId,
     machineName: 'Test Desktop',
+    now: () => clock,
     wait: async () => {},
     signedOut
   })
-  return { store, vault, auth, calls, keys, fetchMock, signedOut }
+  return { store, vault, auth, calls, keys, fetchMock, signedOut, advance: (ms: number) => { clock += ms } }
 }
 
 const DEVICE_CODE = { device_code: 'device-123', user_code: 'WXYZ-1234', verification_uri: 'https://github.com/login/device', expires_in: 900, interval: 1 }
 const USER = { id: 4242, login: 'Empire024', name: 'Owner', avatar_url: 'https://avatars/1' }
+const EXPIRING = { access_token: 'gho_access_1', refresh_token: 'ghr_refresh_1', expires_in: 3600, refresh_token_expires_in: 180 * 24 * 3600 }
+const ROTATED = { access_token: 'gho_access_2', refresh_token: 'ghr_refresh_2', expires_in: 3600, refresh_token_expires_in: 180 * 24 * 3600 }
+const NEW_SESSION = { access_token: 'gho_access_new', refresh_token: 'ghr_refresh_new', expires_in: 3600, refresh_token_expires_in: 180 * 24 * 3600 }
 const routes = (accessToken: Route[] | Route) => ({
   'https://github.com/login/device/code': { body: DEVICE_CODE },
   'https://github.com/login/oauth/access_token': accessToken,
@@ -130,6 +136,11 @@ describe('signing in with the GitHub device flow', () => {
     expect(state.message).toMatch(/client ID/)
   })
 
+  it('ships the approved public native-app client ID without treating it as a secret', () => {
+    expect(CONDUCTOR_GITHUB_OAUTH_CLIENT_ID).toBe('Ov23li7NxP175YF5HLwF')
+    expect(CONDUCTOR_GITHUB_OAUTH_CLIENT_ID).not.toMatch(/secret/i)
+  })
+
   it.each([
     ['access_denied', /denied on GitHub/],
     ['expired_token', /expired/]
@@ -153,6 +164,143 @@ describe('signing in with the GitHub device flow', () => {
     const state = fix.auth.cancelSignIn()
     expect(state.phase).toBe('signed-out')
     expect(state.message).toMatch(/cancelled/i)
+  })
+})
+
+describe('expiring GitHub credentials', () => {
+  it('rotates both tokens before expiry, revalidates the same account, and sends no client secret', async () => {
+    const renamed = { ...USER, login: 'Empire024-renamed' }
+    const fix = fixture({ routes: {
+      ...routes([{ body: EXPIRING }, { body: ROTATED }]),
+      'https://api.github.com/user': [{ body: USER }, { body: renamed }]
+    } })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+    await fix.auth.accountKeys(true)
+
+    expect(fix.auth.token()).toBe('gho_access_2')
+    expect(fix.auth.identity()).toMatchObject({ id: USER.id, login: 'Empire024-renamed' })
+    const refresh = fix.calls.find(call => call.url.endsWith('/login/oauth/access_token')
+      && (call.body as { grant_type?: string }).grant_type === 'refresh_token')
+    expect(refresh?.body).toEqual({ client_id: 'Iv1.test-client', grant_type: 'refresh_token', refresh_token: 'ghr_refresh_1' })
+    expect(refresh?.body).not.toHaveProperty('client_secret')
+    expect(fix.store.dump()).not.toContain('gho_access_2')
+    expect(fix.store.dump()).not.toContain('ghr_refresh_2')
+  })
+
+  it('serializes concurrent renewal so a rotating refresh token is used exactly once', async () => {
+    const fix = fixture({ routes: routes({ body: EXPIRING }) })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+    let release!: (response: Response) => void
+    fix.fetchMock.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+    const first = fix.auth.accountKeys(true)
+    const second = fix.auth.accountKeys(true)
+    release(new Response(JSON.stringify(ROTATED), { status: 200 }))
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2)
+    const refreshCalls = fix.fetchMock.mock.calls.filter(([, init]) => {
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {}
+      return body.grant_type === 'refresh_token'
+    })
+    expect(refreshCalls).toHaveLength(1)
+    expect(fix.auth.token()).toBe('gho_access_2')
+  })
+
+  it('keeps a still-valid access token during transient refresh backoff instead of hammering GitHub', async () => {
+    const fix = fixture({ routes: routes({ body: EXPIRING }) })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+    fix.fetchMock.mockRejectedValueOnce(new Error('offline'))
+    await expect(fix.auth.accountKeys(true)).resolves.toBeTruthy()
+    await expect(fix.auth.accountKeys(true)).resolves.toBeTruthy()
+    const refreshCalls = fix.fetchMock.mock.calls.filter(([, init]) => {
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {}
+      return body.grant_type === 'refresh_token'
+    })
+    expect(refreshCalls).toHaveLength(1)
+    expect(fix.auth.token()).toBe('gho_access_1')
+  })
+
+  it('recovers a crash-safe rotated pair after account validation was temporarily unavailable', async () => {
+    const fix = fixture({ routes: {
+      ...routes([{ body: EXPIRING }, { body: ROTATED }]),
+      'https://api.github.com/user': [{ body: USER }, { status: 502, body: {} }, { body: USER }]
+    } })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+    await expect(fix.auth.accountKeys(true)).rejects.toThrow(/revalidate/)
+    expect(fix.auth.state().phase).toBe('signed-out')
+    fix.advance(5_000)
+    await expect(fix.auth.accountKeys(true)).resolves.toBeTruthy()
+    expect(fix.auth.state().phase).toBe('signed-in')
+    expect(fix.auth.token()).toBe('gho_access_2')
+  })
+
+  it('clears credentials when GitHub rejects the refresh token', async () => {
+    const fix = fixture({ routes: routes([{ body: EXPIRING }, { status: 400, body: { error: 'bad_refresh_token' } }]) })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+    await expect(fix.auth.accountKeys(true)).rejects.toThrow(/sign in again/)
+    expect(fix.auth.token()).toBeNull()
+    expect(fix.auth.identity()).toBeNull()
+    expect(fix.signedOut).toHaveBeenCalledOnce()
+    expect(fix.store.dump()).not.toContain('ghr_refresh_1')
+  })
+
+  it('rejects a refreshed token that resolves to another account', async () => {
+    const other = { ...USER, id: 9999, login: 'someone-else' }
+    const fix = fixture({ routes: {
+      ...routes([{ body: EXPIRING }, { body: ROTATED }]),
+      'https://api.github.com/user': [{ body: USER }, { body: other }]
+    } })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+    await expect(fix.auth.accountKeys(true)).rejects.toThrow(/different account/)
+    expect(fix.auth.state().phase).toBe('signed-out')
+    expect(fix.signedOut).toHaveBeenCalledOnce()
+  })
+
+  it('does not let a refresh that finishes after sign-out restore either token', async () => {
+    const fix = fixture({ routes: routes({ body: EXPIRING }) })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+    let release!: (response: Response) => void
+    fix.fetchMock.mockImplementationOnce(() => new Promise(resolve => { release = resolve }))
+    const renewal = fix.auth.accountKeys(true)
+    const signedOut = fix.auth.signOut()
+    release(new Response(JSON.stringify(ROTATED), { status: 200 }))
+    await expect(renewal).rejects.toThrow(/session changed/)
+    await signedOut
+    expect(fix.auth.token()).toBeNull()
+    expect(fix.auth.identity()).toBeNull()
+    expect(fix.store.dump()).not.toContain('gho_access_2')
+    expect(fix.store.dump()).not.toContain('ghr_refresh_2')
+  })
+
+  it('does not let a late rejected refresh clear a newer re-signed-in session', async () => {
+    const fix = fixture({ routes: routes([{ body: EXPIRING }, { body: NEW_SESSION }]) })
+    await signedIn(fix.auth)
+    fix.advance(3_550_000)
+
+    let releaseBody!: (body: string) => void
+    const lateRejection = new Response(null, { status: 400 })
+    Object.defineProperty(lateRejection, 'text', {
+      value: () => new Promise<string>(resolve => { releaseBody = resolve })
+    })
+    fix.fetchMock.mockResolvedValueOnce(lateRejection)
+    const oldRenewal = fix.auth.accountKeys(true)
+    await vi.waitFor(() => expect(releaseBody).toBeTypeOf('function'))
+
+    await fix.auth.signOut()
+    await signedIn(fix.auth)
+    expect(fix.auth.token()).toBe('gho_access_new')
+
+    releaseBody(JSON.stringify({ error: 'bad_refresh_token' }))
+    await expect(oldRenewal).rejects.toThrow(/session changed/)
+    expect(fix.auth.state().phase).toBe('signed-in')
+    expect(fix.auth.identity()).toMatchObject({ id: USER.id, login: USER.login })
+    expect(fix.auth.token()).toBe('gho_access_new')
+    expect(fix.signedOut).toHaveBeenCalledTimes(1)
   })
 })
 

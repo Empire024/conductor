@@ -30,12 +30,12 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   const project = database.upsertProject(projectPath, 'Control project'), workspace = database.listSessions(project.id)[0]!
   const orchestration = new OrchestrationStore(path), collaboration = new AgentCollaborationStore(path)
   dispose.push(() => orchestration.close(), () => collaboration.close())
-  const submissions: Array<{ provider: StructuredProvider; prompt: string; options: AdapterOptions }> = []
+  const submissions: Array<{ provider: StructuredProvider; prompt: string; settings: import('../shared/structured-agent').SessionSettings; options: AdapterOptions }> = []
   const broadcast = vi.fn()
   const sessions = new StructuredSessions(database, () => 'synthetic-provider', broadcast, (provider, options): ProviderAdapter => {
-    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: ['inherit', 'read-only', 'workspace-write'], effort: ['low'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }], limitations: ['Zero inference fixture'] }
+    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: ['inherit', 'read-only', 'workspace-write'], effort: ['low', 'high'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }, { id: provider + '-advanced', label: provider + ' Advanced', effort: ['high'], defaultEffort: 'high' }], limitations: ['Zero inference fixture'] }
     return { provider, capabilities, start: async () => { options.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: 'native-' + options.runtimeId } }) },
-      submit: async prompt => { submissions.push({ provider, prompt, options }); options.emit({ itemId: 'result', data: { type: 'text', role: 'assistant', text: 'Native fixture result', mode: 'snapshot' } }); options.emit({ data: { type: 'session', phase: 'completed' } }) }, respond: async () => {}, interrupt: async () => {}, dispose: () => {} }
+      submit: async (prompt, settings) => { submissions.push({ provider, prompt, settings: structuredClone(settings), options }); options.emit({ itemId: 'result', data: { type: 'text', role: 'assistant', text: 'Native fixture result', mode: 'snapshot' } }); options.emit({ data: { type: 'session', phase: 'completed' } }) }, respond: async () => {}, interrupt: async () => {}, dispose: () => {} }
   })
   dispose.push(() => sessions.dispose())
   const scope = { projectId: project.id, sessionId: workspace.id, agentSessionId: 'controller' }
@@ -52,6 +52,15 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
       current.layout.root.tabs.push(tab); current.layout.root.activeTabId = tab.id
       database.saveSession(request.sessionId, current.layout, null, [])
       return { tabId: tab.id }
+    }
+    if (request.action === 'agents.configure') {
+      const current = database.getSession(request.sessionId)!
+      if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+      const tab = current.layout.root.tabs.find(candidate => candidate.id === request.params.tabId)
+      if (!tab || tab.kind !== 'agent' || tab.resourceId !== request.params.agentSessionId || tab.state?.provider !== request.params.provider) throw new Error('Synthetic configured tab changed')
+      tab.state = { ...tab.state, model: request.params.model, effort: request.params.effort ?? 'auto' }
+      database.saveSession(request.sessionId, current.layout, current.maximizedGroupId, current.closedTabs)
+      return tab
     }
     return { applied: true }
   })
@@ -72,6 +81,20 @@ const openAgentTab = (f: ReturnType<typeof fixture>, resourceId: string, tabId: 
 }
 
 describe('authorized native app control', () => {
+  it('advertises configured local models and dispatches native local coworkers within inherited read-only permissions', async () => {
+    const f = fixture(false, { local: ['accept-edits', 'read-only'] })
+    f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })
+    const catalog = await f.control.call(f.scope, 'models.list') as Array<{ provider: string; models: Array<{ id: string }> }>
+    expect(catalog.find(entry => entry.provider === 'local')?.models[0]?.id).toBe('local-synthetic')
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, permission: 'read-only', sandbox: 'read-only' } })
+    const result = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Bounded local read', prompt: 'Read one fixture file.', provider: 'local', model: 'local-synthetic' }] }) as Array<{ agentSessionId: string; accepted: boolean }>
+    expect(result[0]?.accepted).toBe(true)
+    expect(f.database.structured.snapshot(result[0]!.agentSessionId)?.settings.permission).toBe('read-only')
+    expect(f.submissions.at(-1)?.provider).toBe('local')
+    expect(f.submissions.at(-1)?.prompt).toContain('Your controller updates the orchestration task.')
+    expect(f.submissions.at(-1)?.prompt).not.toContain('orchestration.tasks.update')
+  })
   it('refuses foreign projects/workspaces, hidden sessions and closed callers', async () => {
     const f = fixture()
     const otherPath = join(f.root, 'other'); mkdirSync(otherPath)
@@ -130,6 +153,7 @@ describe('authorized native app control', () => {
     expect(f.control.tabs(f.scope).some(tab => tab.id === child.tabId && tab.resourceId === child.agentSessionId)).toBe(true)
     expect(f.submissions.map(submission => submission.provider)).toEqual(['codex', 'claude'])
     expect(f.submissions[1]?.prompt).toContain(child.taskId)
+    expect(f.submissions[1]?.prompt).toContain('Mark it done with orchestration.tasks.update only after finishing.')
     expect(f.database.structured.snapshot(child.agentSessionId)?.items).toEqual(expect.arrayContaining([expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'user' }) }), expect.objectContaining({ data: expect.objectContaining({ type: 'text', role: 'assistant', text: 'Native fixture result' }) })]))
     expect(f.control.listLinks(f.project.id, f.workspace.id)).toHaveLength(2)
     await expect(f.control.call({ ...f.scope, agentSessionId: child.agentSessionId }, 'agents.submit', { agentSessionId: f.scope.agentSessionId, prompt: 'Cycle' })).rejects.toThrow('ancestor')
@@ -139,6 +163,34 @@ describe('authorized native app control', () => {
     await expect(recovered.call(f.scope, 'agents.submit', { agentSessionId: child.agentSessionId, prompt: 'Competing owner' })).rejects.toThrow('Another agent')
     recovered.releaseByOwner(child.agentSessionId)
     expect(recovered.listLinks(f.project.id, f.workspace.id)).toHaveLength(1)
+  })
+
+  it('focuses durable coordinated-message origins in either direction, after release, and from retained history', async () => {
+    const f = fixture()
+    const worker = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Worker' }) as AgentControlTab
+    const peer = agentIn(f, f.project.id, f.workspace.id, 'peer')
+
+    // A worker message can point back to its controller, and a controller message can point to its
+    // worker; the owner UI resolves both from their concrete resource IDs, not relationship roles.
+    await f.control.focusOrigin(f.scope.agentSessionId)
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', projectId: f.project.id, sessionId: f.workspace.id, params: { tabId: f.rootTab.id } })
+    await f.control.focusOrigin(worker.resourceId!)
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', params: { tabId: worker.id } })
+    await f.control.focusOrigin(peer.agentSessionId)
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', params: { tabId: 'tab-peer' } })
+
+    // Releasing control removes authority, not a sender's retained transcript identity.
+    f.control.releaseByOwner(worker.resourceId!)
+    await f.control.focusOrigin(worker.resourceId!)
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', params: { tabId: worker.id } })
+
+    const retainedId = 'retained-origin'
+    f.sessions.ensure({ ...f.spec, id: retainedId, title: 'Retained source' })
+    const current = f.database.getSession(f.workspace.id)!
+    f.database.saveSession(f.workspace.id, current.layout, current.maximizedGroupId, [...current.closedTabs, { id: 'retained-tab', kind: 'agent', resourceId: retainedId, title: 'Retained source', state: { provider: 'codex', model: 'codex-synthetic' } }])
+    await f.control.focusOrigin(retainedId)
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus-origin', params: { agentSessionId: retainedId } })
+    await expect(f.control.focusOrigin('guessed-origin')).rejects.toThrow('no longer available')
   })
 
   it('requires owner confirmation before closing another tab and never closes the caller', async () => {
@@ -299,6 +351,63 @@ describe('authorized native app control', () => {
     await f.control.openUri(`conductor://${f.project.id}/workspace/${f.workspace.id}`)
     expect(f.requests.at(-1)?.action).toBe('workspace.focus')
     await expect(f.control.openUri(`conductor://${f.project.id}/file/${encodeURIComponent('../conductor.db')}`)).rejects.toThrow('outside')
+  })
+})
+
+describe('controlled coworker model configuration', () => {
+  const append = (f: ReturnType<typeof fixture>, id: string, data: AgentEventData): void => {
+    const state = f.database.structured.snapshot(id)!, spec = f.database.structured.spec<AgentSpec>(id)!
+    f.database.structured.append({ schemaVersion: 1, id: 'settings-event-' + (state.sequence + 1), sequence: state.sequence + 1, sessionId: id, runtimeId: state.runtimeId || 'settings-runtime', provider: spec.provider as StructuredProvider, projectId: spec.projectId, workspaceId: spec.sessionId, cwd: spec.cwd, timestamp: new Date().toISOString(), data })
+  }
+
+  it('repairs stale tab metadata, preserves authority settings, persists, and drives the next native request', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', effort: 'low' }) as AgentControlTab
+    const before = f.database.structured.snapshot(child.resourceId!)!
+    const preserved = { ...before.settings, model: 'codex-advanced', effort: 'high', permission: 'read-only' as const, sandbox: 'read-only' as const, browserMcp: false }
+    f.database.structured.update(child.resourceId!, { settings: preserved })
+
+    const changed = await f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'high' }) as Record<string, unknown>
+    expect(changed).toMatchObject({ provider: 'codex', model: 'codex-advanced', effort: 'high', effective: 'next-turn' })
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toEqual(preserved)
+    expect(f.control.tabs(f.scope).find(tab => tab.id === child.id)?.state).toMatchObject({ provider: 'codex', model: 'codex-advanced', effort: 'high', machineId: 'local' })
+    expect(f.requests.slice(-2).map(request => request.action)).toEqual(['agents.configure', 'agents.configure-confirmed'])
+    const snapshot = await f.control.call(f.scope, 'agents.snapshot', { agentSessionId: child.resourceId }) as SessionProjection
+    expect(snapshot.settings).toEqual(preserved)
+
+    const reopened = new ConductorDatabase(join(f.root, 'conductor.db'))
+    expect(reopened.structured.snapshot(child.resourceId!)?.settings).toEqual(preserved)
+    reopened.close()
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: child.resourceId, prompt: 'Use the configured model' })
+    expect(f.submissions.at(-1)?.settings).toMatchObject({ model: 'codex-advanced', effort: 'high', permission: 'read-only', sandbox: 'read-only', browserMcp: false })
+  })
+
+  it('rejects invalid or arbitrary settings and refuses active, queued, or pending work', async () => {
+    const f = fixture(), child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex' }) as AgentControlTab
+    const original = structuredClone(f.database.structured.snapshot(child.resourceId!)!.settings)
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'missing-model', effort: 'high' })).rejects.toThrow(/exact model/)
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'low' })).rejects.toThrow(/effort supported/)
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'high', permission: 'auto' })).rejects.toThrow(/accepts only/)
+    append(f, child.resourceId!, { type: 'session', phase: 'running' })
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'high' })).rejects.toThrow(/idle/)
+    append(f, child.resourceId!, { type: 'session', phase: 'completed' })
+    append(f, child.resourceId!, { type: 'queue', prompt: { id: 'queued', text: 'Already queued', settings: original, attachments: [] } })
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, model: 'codex-advanced', effort: 'high' })).rejects.toThrow(/queued or pending/)
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toEqual(original)
+    expect(f.requests.filter(request => request.action === 'agents.configure')).toHaveLength(0)
+  })
+
+  it('requires an existing direct control claim and refuses self, ancestors, released tabs, and foreign projects', async () => {
+    const f = fixture(), child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const args = { model: 'codex-advanced', effort: 'high' }
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: f.scope.agentSessionId, ...args })).rejects.toThrow(/itself|ancestor/)
+    await expect(f.control.call({ ...f.scope, agentSessionId: child.resourceId! }, 'agents.configure', { agentSessionId: f.scope.agentSessionId, ...args })).rejects.toThrow(/ancestor/)
+    const unclaimed = agentIn(f, f.project.id, f.workspace.id, 'unclaimed')
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: unclaimed.agentSessionId, ...args })).rejects.toThrow(/already controls|already controls|already controls|Configure only/)
+    const other = sibling(f, 'Foreign settings'), foreign = agentIn(f, other.project.id, other.workspace.id, 'foreign-agent')
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: foreign.agentSessionId, ...args })).rejects.toThrow(/outside this workspace/)
+    await f.control.call(f.scope, 'agents.release', { agentSessionId: child.resourceId })
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: child.resourceId, ...args })).rejects.toThrow(/Configure only/)
   })
 })
 

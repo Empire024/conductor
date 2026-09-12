@@ -29,7 +29,7 @@
 .sa-subagent-roster strong { display: block; overflow-wrap: anywhere; font-size: 12px; font-weight: 500; color: var(--text); }
 .sa-subagent-roster small { display: block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-3); font: 10px/1.5 'Cascadia Code', monospace; }
 .sa-subagent-state { flex: 0 0 auto; color: var(--text-2); font-size: 10px; }
-.sa-subagent-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); flex: 0 0 auto; }
+.sa-subagent-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); flex: 0 0 auto; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 10%, transparent); }
 .sa-subagent-dot.status-running, .sa-subagent-dot.status-preparing { background: var(--accent); }
 .sa-subagent-dot.status-awaiting_approval { background: #e2b872; }
 .sa-subagent-dot.status-completed { background: #85b866; }
@@ -68,13 +68,13 @@
 
 /* Same identity color the main timeline's "Within X" labels use for this subagent, so a
    roster row and its nested activity elsewhere read as the same colored agent. */
-.sa-subagent-identity { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--text-3); vertical-align: middle; }
-.sa-subagent-identity.sa-agent-hue-0 { background: var(--accent); }
-.sa-subagent-identity.sa-agent-hue-1 { background: var(--blue); }
-.sa-subagent-identity.sa-agent-hue-2 { background: #85b866; }
-.sa-subagent-identity.sa-agent-hue-3 { background: #e2b872; }
-.sa-subagent-identity.sa-agent-hue-4 { background: var(--danger); }
-.sa-subagent-identity.sa-agent-hue-5 { background: var(--accent-muted); }
+.sa-agent-card[class*="sa-agent-hue-"] { border-left: 2px solid var(--text-3); }
+.sa-agent-card.sa-agent-hue-0 { border-left-color: var(--accent); }
+.sa-agent-card.sa-agent-hue-1 { border-left-color: var(--blue); }
+.sa-agent-card.sa-agent-hue-2 { border-left-color: #85b866; }
+.sa-agent-card.sa-agent-hue-3 { border-left-color: #e2b872; }
+.sa-agent-card.sa-agent-hue-4 { border-left-color: var(--danger); }
+.sa-agent-card.sa-agent-hue-5 { border-left-color: var(--accent-muted); }
 .sa-subagent-model, .sa-subagent-tokens { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; padding: 2px 7px; border-radius: 999px; background: var(--surface-hover); color: var(--text-2); font-size: 9.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 
 .sa-usage-summary .sa-context-circle { flex: 0 0 auto; display: inline-flex; gap: 4px; align-items: center; color: var(--text-2); padding: 2px 4px; font-size: 10px; font-variant-numeric: tabular-nums; }

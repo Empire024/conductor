@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
+import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 
 export interface FileLinkProjectRoot { id: string; path: string }
 /** A link an agent wrote, resolved to the project that actually owns it. `projectId` is left
  *  undefined when the file belongs to the conversation's own workspace, so callers keep using
  *  the host's own project scope for the common case. */
-export interface ResolvedFileLink { path: string; line?: number; projectId?: string }
+export interface ResolvedFileLink { path: string; line?: number; projectId?: string; machineId?: string }
 
 const posix = (value: string): string => value.replaceAll('\\', '/')
 const trimRoot = (root: string): string => posix(root).replace(/\/+$/, '')
@@ -32,7 +33,7 @@ export function normalizeLinkPath(raw: string): { path: string; line?: number } 
  *  conversation's own workspace, or a sibling project open in the same session. Containment is
  *  unchanged — traversal, UNC hosts, other URL schemes and anything outside every open project
  *  are still refused here, and the main process re-checks every path it is handed. */
-export function resolveFileLinkTarget(raw: string, cwd: string, projects: FileLinkProjectRoot[] = []): ResolvedFileLink | null {
+export function resolveFileLinkTarget(raw: string, cwd: string, projects: FileLinkProjectRoot[] = [], machineId = LOCAL_MACHINE_ID): ResolvedFileLink | null {
   const normalized = normalizeLinkPath(raw)
   if (!normalized) return null
   let path = normalized.path
@@ -45,7 +46,7 @@ export function resolveFileLinkTarget(raw: string, cwd: string, projects: FileLi
   else if (/^(?:[a-z][a-z\d+.-]*:|\/)/i.test(path)) return null
   path = path.replace(/^\.\//, '')
   if (!path || path.split('/').some((part) => part === '..' || !part) || path.includes(':')) return null
-  return { path, line: normalized.line, projectId: owner?.id }
+  return { path, line: normalized.line, projectId: owner?.id, ...(machineId !== LOCAL_MACHINE_ID ? { machineId } : {}) }
 }
 
 const PROJECT_ROOT_TTL_MS = 10_000

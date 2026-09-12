@@ -1,6 +1,6 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { RuntimeProcessSummary } from '../../../shared/models'
-import { aggregateProjectProcessUsage } from './ProcessStatusSummary'
+import { aggregateProjectProcessUsage, createProcessSummaryPoller, processSummaryFreshness, projectTrackerLabel } from './ProcessStatusSummary'
 
 const process = (overrides: Partial<RuntimeProcessSummary> & Pick<RuntimeProcessSummary, 'id' | 'projectId'>): RuntimeProcessSummary => ({
   sessionId: 'workspace-1',
@@ -28,19 +28,58 @@ describe('aggregateProjectProcessUsage', () => {
     ])
     const totals = aggregateProjectProcessUsage(processes, projects, usage)
     expect(totals).toEqual([
-      { projectId: 'project-a', projectName: 'Project A', running: 1, costUsd: 0.75, totalTokens: 2000, expensiveTitles: [] },
-      { projectId: 'project-b', projectName: 'Project B', running: 0, costUsd: 0, totalTokens: 0, expensiveTitles: [] }
+      { projectId: 'project-a', projectName: 'Project A', processes: 2, running: 1, attention: 0, paused: 0, disconnected: 0, costUsd: 0.75, totalTokens: 2000, expensiveTitles: [] },
+      { projectId: 'project-b', projectName: 'Project B', processes: 1, running: 0, attention: 0, paused: 0, disconnected: 0, costUsd: 0, totalTokens: 0, expensiveTitles: [] }
     ])
   })
 
   it('does not count a process awaiting input as running', () => {
     const processes = [process({ id: 'agent-1', projectId: 'project-a', activityPhase: 'working', needsInput: true })]
-    expect(aggregateProjectProcessUsage(processes, projects, new Map())[0]!.running).toBe(0)
+    expect(aggregateProjectProcessUsage(processes, projects, new Map())[0]).toMatchObject({ running: 0, attention: 1 })
   })
 
-  it('treats a limited (rate-capped but still active) process as running', () => {
+  it('does not describe a usage-limit pause as work in progress', () => {
     const processes = [process({ id: 'agent-1', projectId: 'project-a', status: 'limited', activityPhase: 'limited' })]
-    expect(aggregateProjectProcessUsage(processes, projects, new Map())[0]!.running).toBe(1)
+    expect(aggregateProjectProcessUsage(processes, projects, new Map())[0]).toMatchObject({ running: 0, paused: 1 })
+  })
+
+  it('tracks disconnected retained conversations separately from idle adapters', () => {
+    const processes = [process({ id: 'agent-1', projectId: 'project-a', activityPhase: 'disconnected' })]
+    expect(aggregateProjectProcessUsage(processes, projects, new Map())[0]).toMatchObject({ running: 0, disconnected: 1 })
+  })
+
+  it('counts a completed runtime with a disconnected native snapshot as offline', () => {
+    const processes = [process({ id: 'agent-1', projectId: 'project-a', status: 'complete', activityPhase: 'complete' })]
+    const usage = new Map([['agent-1', { snapshotPhase: 'disconnected' as const }]])
+    expect(aggregateProjectProcessUsage(processes, projects, usage)[0]).toMatchObject({ running: 0, disconnected: 1 })
+  })
+
+  it('keeps real usage visible alongside a paused or idle state', () => {
+    expect(projectTrackerLabel({ running: 0, attention: 0, paused: 1, disconnected: 0, totalTokens: 12_400 })).toBe('1 paused · 12k tok')
+    expect(projectTrackerLabel({ running: 0, attention: 0, paused: 0, disconnected: 0, totalTokens: 800 })).toBe('idle · 800 tok')
+  })
+
+  it('marks a failed refresh as stale with its last observation and clears on recovery', () => {
+    const failed = processSummaryFreshness(true, Date.parse('2026-09-12T12:00:00.000Z'))
+    expect(failed).toMatchObject({ label: 'Stale' })
+    expect(failed?.title).toContain('showing the last complete observation')
+    expect(processSummaryFreshness(false, Date.parse('2026-09-12T12:00:04.000Z'))).toBeUndefined()
+    expect(processSummaryFreshness(true, undefined)?.title).toContain('no complete observation')
+  })
+
+  it('keeps the last complete snapshot on failure and clears stale state after a successful retry', async () => {
+    const read = vi.fn<() => Promise<string>>()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce('fresh data')
+    const commit = vi.fn()
+    const setFailed = vi.fn()
+    const poller = createProcessSummaryPoller(read, commit, setFailed, () => 42)
+    await poller.run()
+    expect(commit).not.toHaveBeenCalled()
+    expect(setFailed).toHaveBeenLastCalledWith(true)
+    await poller.run()
+    expect(commit).toHaveBeenCalledWith('fresh data', 42)
+    expect(setFailed).toHaveBeenLastCalledWith(false)
   })
 
   it('falls back to a placeholder name for a project no longer in the roster', () => {

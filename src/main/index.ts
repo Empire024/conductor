@@ -3,6 +3,8 @@ import { promises as fs } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { importPromptImage } from './prompt-images'
+import { importPromptAttachmentPath, projectPromptAttachment } from './prompt-context'
+import { moveExternalDropIntoProject, moveProjectDropWithinProject } from './file-drop-move'
 import { ProjectBacklogs } from './project-backlog'
 import { ProjectTaskDispatcher } from './project-task-dispatch'
 import { SourceControl } from './source-control'
@@ -18,7 +20,9 @@ import { safeStorageCipher } from './safe-storage-vault'
 import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { installContextMenu } from './context-menu'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, screen, shell, webContents } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, shell, webContents } from 'electron'
+import { CloseConfirmation, hasRunningWork } from './close-confirmation'
+import { readSessionArchive, writeSessionArchive } from './session-archive'
 import type {
   AgentSpec,
   AgentSoundProfile,
@@ -62,6 +66,10 @@ import { createUntitledEditorFile, EDITOR_CONFLICT_MESSAGE, readEditorFile, save
 import { readExistingTextFile, readTextFile } from './text-files'
 import { resolveUsageCap, usageCapKey } from './usage-limit'
 import { parseUsageCapSetting, type UsageCapScope, type UsageCapSnapshot } from '../shared/usage-accounting'
+import { LOCAL_MACHINE_ID } from '../shared/remote-control'
+import type { EditorDraft } from '../shared/models'
+import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest } from '../shared/browser-surface'
+import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
 
 const projectPreview = new ProjectPreviewServer()
 let database: ConductorDatabase
@@ -100,6 +108,10 @@ let latestDebugSnapshot: DebugConsoleSnapshot | null = null
 let lastDebugScreenshot: Electron.NativeImage | null = null
 let isQuitting = false
 let servicesDisposed = false
+const closeConfirmation = new CloseConfirmation()
+let archiveBusy = false
+let replacingDesk = false
+let quitRequest: Promise<void> | null = null
 
 const DEFAULT_ZOOM = 1.1
 const UPDATE_WINDOW_LAYOUT_KEY = 'updateWindowLayout'
@@ -212,17 +224,33 @@ const createWindow = (
         window.webContents.focus()
         window.webContents.send('files:open-shortcut')
       }
+      if (input.type === 'keyDown' && (input.control || input.meta) && !input.alt && !input.shift && input.key.toLowerCase() === 'w') {
+        event.preventDefault()
+        window.webContents.send('window:close-tab')
+      }
     })
   })
   installWindowStateEvents(window)
+  // Consume the native accelerator before Electron's default Close Window role can run.
+  window.webContents.on('before-input-event', (event, input) => {
+    if (input.type === 'keyDown' && (input.control || input.meta) && !input.alt && !input.shift && input.key.toLowerCase() === 'w') {
+      event.preventDefault()
+      window.webContents.send('window:close-tab')
+    }
+  })
   let closeApproved = false
   let decidingClose = false
   window.on('close', (event) => {
     if (closeApproved || isQuitting) return
     event.preventDefault()
+    if (!detachedId || !mainWindow && detachedWindows.size <= 1) { app.quit(); return }
     if (decidingClose) return
     decidingClose = true
-    void resolveUnsavedEditors(window).then((approved) => { decidingClose = false; if (approved && !window.isDestroyed()) { closeApproved = true; window.close() } })
+    const record = detachedId ? database.getDetachedWindow(detachedId) : null
+    const tabs: string[] = []
+    const collect = (node: import('../shared/models').LayoutNode): void => { if (node.type === 'split') node.children.forEach(collect); else tabs.push(...node.tabs.filter(tab => tab.kind === 'code').map(tab => tab.id)) }
+    if (record) collect(record.layout.root)
+    void resolveUnsavedEditors(window, tabs).then((approved) => { decidingClose = false; if (approved && !window.isDestroyed()) { closeApproved = true; window.close() } })
   })
 
   window.once('ready-to-show', () => {
@@ -240,13 +268,14 @@ const createWindow = (
     }, 250)
   })
   window.on('closed', () => {
+    browserViews?.releaseWindow(window, isQuitting)
     if (!detachedId) {
       if (mainWindow === window) mainWindow = null
       return
     }
 
     detachedWindows.delete(detachedId)
-    if (isQuitting) return
+    if (isQuitting || replacingDesk) return
     try {
       const floatingIds = floatingDetachedIds()
       const closed = database.closeDetachedWindow(detachedId, floatingIds.includes(detachedId))
@@ -292,6 +321,30 @@ const openDetachedWindow = (
   const window = createWindow(id, placeAtCursor, savedPlacement)
   if (floatingDetachedIds().includes(id) && !backgroundWindows) window.setAlwaysOnTop(true)
   detachedWindows.set(id, window)
+  return window
+}
+
+/** A detached project browser is only a native host for the already-running main-owned view.
+ * It has no renderer, partition or replacement page of its own, so reparenting never changes the
+ * guest identity. showInactive() is called only after the view is attached. */
+const createDetachedBrowserWindow = (projectId: string, onClosed: () => void): BrowserWindow => {
+  const project = database.getProject(projectId)
+  if (!project) throw new Error('Project not found')
+  const window = new BrowserWindow({
+    width: 1180,
+    height: 820,
+    minWidth: 480,
+    minHeight: 320,
+    show: false,
+    title: `${project.name} — Browser`,
+    autoHideMenuBar: true,
+    backgroundColor: '#0b0d10',
+    ...(backgroundWindows ? { skipTaskbar: true, ...parkedPosition() } : {}),
+    webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false }
+  })
+  if (backgroundWindows) window.webContents.setAudioMuted(true)
+  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  window.once('closed', onClosed)
   return window
 }
 
@@ -424,7 +477,7 @@ const disposeRuntimeServices = (): void => {
   if (servicesDisposed) return
   servicesDisposed = true
   const disposals: Array<[string, () => void]> = [
-    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); projectFileChanges?.close() }],
+    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
@@ -444,6 +497,7 @@ const disposeRuntimeServices = (): void => {
 }
 
 const prepareForUpdateInstall = async (): Promise<void> => {
+  if (!await confirmApplicationStop(mainWindow, 'restart')) throw Object.assign(new Error('Update restart cancelled. Running work is unchanged.'), { code: 'UPDATE_CANCELLED' })
   if (!await resolveUnsavedEditors(mainWindow)) throw Object.assign(new Error('Update restart cancelled. Your edits are still open.'), { code: 'UPDATE_CANCELLED' })
   database.setSetting(UPDATE_WINDOW_LAYOUT_KEY, JSON.stringify(captureWindowLayout()))
   database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'true')
@@ -460,32 +514,50 @@ const flushEditorWindows = async (windows: BrowserWindow[]): Promise<void> => {
     let timeout: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([
-        window.webContents.executeJavaScript("(() => { const event = new CustomEvent('conductor:flush-editors', { detail: { failed: false } }); window.dispatchEvent(event); if (event.detail.failed) throw new Error('An editor draft could not be preserved. Keep the window open and try again.'); })()"),
+        window.webContents.executeJavaScript("(() => { window.dispatchEvent(new Event('conductor:flush-session')); const event = new CustomEvent('conductor:flush-editors', { detail: { failed: false } }); window.dispatchEvent(event); if (event.detail.failed) throw new Error('An editor draft could not be preserved. Keep the window open and try again.'); })()"),
         new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('An editor window did not respond. Try again after it recovers.')), 5000) })
       ])
     } finally { clearTimeout(timeout) }
   }))
 }
 
+/** Only renderer windows own recovery/editor state. Browser presentation hosts and debug windows
+ * are BrowserWindows too, but they must never participate in a desk flush. */
+const editorWindows = (): BrowserWindow[] => {
+  const windows = [mainWindow, ...detachedWindows.values()].filter((window): window is BrowserWindow => Boolean(window && !window.isDestroyed()))
+  return [...new Set(windows)]
+}
+
 let resolvingEditors: Promise<boolean> | null = null
+const draftMachineId = (draft: Pick<EditorDraft, 'machineId'>): string => draft.machineId || LOCAL_MACHINE_ID
+const sameEditorDraft = (current: EditorDraft | null, expected: EditorDraft): boolean => Boolean(current
+  && draftMachineId(current) === draftMachineId(expected)
+  && current.content === expected.content
+  && current.baseContent === expected.baseContent)
+const readDraftFile = async (draft: EditorDraft, target?: string): Promise<string | null> => {
+  const machineId = draftMachineId(draft)
+  if (machineId === LOCAL_MACHINE_ID) return readEditorFile(target ?? await resolveEditorPath(draft.projectId, draft.path))
+  if (!remoteControl) throw new Error('Remote files are not available.')
+  return (await remoteControl.files.read({ machineId, projectId: draft.projectId, path: draft.path })).content
+}
 const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): Promise<boolean> => {
   // Serialize decisions across windows. A caller with another scope checks again afterwards.
   if (resolvingEditors) return resolvingEditors.then((ok) => ok && resolveUnsavedEditors(owner, tabIds))
   const task = (async (): Promise<boolean> => {
-    const windows = BrowserWindow.getAllWindows().filter((window) => !window.isDestroyed())
+    const windows = editorWindows()
     await flushEditorWindows(windows)
     const drafts = database.listEditorDrafts().filter((draft) => !tabIds || tabIds.includes(draft.tabId))
-    const dirty: Array<{ draft: typeof drafts[number]; target: string }> = []
+    const dirty: Array<{ draft: typeof drafts[number]; target?: string; disk: string | null }> = []
     for (const draft of drafts) {
       if (!database.getProject(draft.projectId)) continue
       // Old clean buffers must not be mistaken for user edits when disk changed.
       if (draft.content === draft.baseContent) { database.removeEditorDraft(draft.tabId); continue }
-      const target = await resolveEditorPath(draft.projectId, draft.path)
-      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path)
-      if (current?.content !== draft.content || current?.baseContent !== draft.baseContent) return false
-      const disk = readEditorFile(target)
+      const target = draftMachineId(draft) === LOCAL_MACHINE_ID ? await resolveEditorPath(draft.projectId, draft.path) : undefined
+      const disk = await readDraftFile(draft, target)
+      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path, draftMachineId(draft))
+      if (!sameEditorDraft(current, draft)) return false
       if (disk === draft.content) { database.removeEditorDraft(draft.tabId); continue }
-      dirty.push({ draft, target })
+      dirty.push({ draft, target, disk })
     }
     if (!dirty.length) return true
     const options: Electron.MessageBoxOptions = {
@@ -497,36 +569,42 @@ const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): 
     if (response === 2) return false
     // Resolve again after the dialog: a file may have moved, changed or been
     // deleted while the owner was deciding. Validate all drafts before writing.
-    for (const item of dirty) item.target = await resolveEditorPath(item.draft.projectId, item.draft.path)
+    for (const item of dirty) if (draftMachineId(item.draft) === LOCAL_MACHINE_ID) item.target = await resolveEditorPath(item.draft.projectId, item.draft.path)
     for (const { draft } of dirty) {
-      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path)
-      if (current?.content !== draft.content || current?.baseContent !== draft.baseContent) return false
+      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path, draftMachineId(draft))
+      if (!sameEditorDraft(current, draft)) return false
     }
     if (response === 0) {
       const versions = new Map<string, string>()
       for (const { draft, target } of dirty) {
-        const key = process.platform === 'win32' ? target.toLowerCase() : target
+        const rawKey = draftMachineId(draft) + '\u0000' + draft.projectId + '\u0000' + (target ?? draft.path)
+        const key = process.platform === 'win32' ? rawKey.toLowerCase() : rawKey
         if (versions.has(key) && versions.get(key) !== draft.content) throw new Error('This file has different edits in multiple workspaces: ' + draft.path + '. Save a copy from each editor to preserve both versions.')
         versions.set(key, draft.content)
-        const disk = readEditorFile(target)
+        const disk = await readDraftFile(draft, target)
+        const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path, draftMachineId(draft))
+        if (!sameEditorDraft(current, draft)) return false
         if (disk !== draft.content && (draft.baseContent === undefined || disk !== draft.baseContent)) {
           for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-conflict', { tabId: draft.tabId, message: EDITOR_CONFLICT_MESSAGE })
           throw new Error(draft.path + ': ' + EDITOR_CONFLICT_MESSAGE)
         }
       }
     }
-    for (const { draft, target } of dirty) {
+    for (const { draft, target, disk } of dirty) {
       if (response === 0) {
-        const result = writeEditorFile(target, draft.content, draft.baseContent)
+        const machineId = draftMachineId(draft)
+        const result = machineId === LOCAL_MACHINE_ID
+          ? writeEditorFile(target!, draft.content, draft.baseContent)
+          : (await remoteControl!.files.write({ machineId, projectId: draft.projectId, path: draft.path, content: draft.content, expectedContent: draft.baseContent ?? null })).result
         if (result.status === 'conflict') {
           for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-conflict', { tabId: draft.tabId, message: result.message })
           throw new Error(draft.path + ': ' + result.message)
         }
       }
-      // No awaited work between validation and commit; another editor cannot
-      // replace this draft during the decision's final main-process turn.
+      const current = database.getEditorDraft(draft.tabId, draft.projectId, draft.path, draftMachineId(draft))
+      if (!sameEditorDraft(current, draft)) return false
       database.removeEditorDraft(draft.tabId)
-      const content = response === 0 ? draft.content : readEditorFile(target)
+      const content = response === 0 ? draft.content : disk
       for (const window of windows) if (!window.isDestroyed()) window.webContents.send('files:draft-resolved', { tabId: draft.tabId, submitted: draft.content, content, saved: response === 0 })
     }
     // Let renderer resolution handlers preserve any last edits before granting
@@ -542,6 +620,158 @@ const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): 
   resolvingEditors = task
   void task.finally(() => { if (resolvingEditors === task) resolvingEditors = null })
   return task
+}
+
+const liveWindow = (owner?: BrowserWindow | null): BrowserWindow | null => owner && !owner.isDestroyed()
+  ? owner
+  : mainWindow && !mainWindow.isDestroyed() ? mainWindow : [...detachedWindows.values()].find(window => !window.isDestroyed()) ?? null
+
+const showDecision = async (owner: BrowserWindow | null, options: Electron.MessageBoxOptions): Promise<number> => {
+  const result = owner && !owner.isDestroyed() ? await dialog.showMessageBox(owner, options) : await dialog.showMessageBox(options)
+  return result.response
+}
+
+const runningWork = (): ReturnType<ConductorDatabase['listProcesses']> => database.listProcesses().filter(process =>
+  hasRunningWork(process, process.kind === 'agent' ? database.structured.snapshot(process.id) : null)
+)
+
+const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit' | 'restart'): Promise<boolean> => {
+  const active = runningWork()
+  if (!active.length && !agents.nativeCli.hasSubmittedInput()) return true
+  return closeConfirmation.request(async () => (await showDecision(liveWindow(owner), {
+    type: 'warning', title: action === 'restart' ? 'Restart Conductor?' : 'Quit Conductor?',
+    message: 'Work is still running in Conductor.',
+    detail: `${active.length ? active.slice(0, 8).map(process => process.title).join('\n') : 'A native CLI command is still running.'}\n\nStopping the application interrupts work in every project and window.`,
+    buttons: [action === 'restart' ? 'Stop work and restart' : 'Stop work and quit', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true
+  })) === 0)
+}
+
+const broadcastSessionArchive = (result: SessionArchiveResult): void => {
+  for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('session-archive:changed', result)
+}
+
+const sessionArchiveName = (): string => database.getSetting('sessionArchiveName')?.trim() || 'Untitled session'
+
+const validateArchiveProjectPaths = async (archive: SessionArchive): Promise<void> => {
+  for (const project of archive.projects) {
+    let real: string
+    try { real = await fs.realpath(project.path) }
+    catch { throw new Error(`Project folder is unavailable: ${project.path}`) }
+    if (!(await fs.stat(real)).isDirectory()) throw new Error(`Project path is not a folder: ${project.path}`)
+  }
+}
+
+const saveSessionArchive = async (owner?: BrowserWindow | null): Promise<SessionArchiveResult | null> => {
+  if (archiveBusy) throw new Error('Another session archive operation is already running.')
+  archiveBusy = true
+  try {
+    await flushEditorWindows(editorWindows())
+    const current = sessionArchiveName()
+    const options: Electron.SaveDialogOptions = {
+      title: 'Save Conductor session', buttonLabel: 'Save session',
+      defaultPath: current === 'Untitled session' ? 'Conductor session.conductor-session' : current + '.conductor-session',
+      filters: [{ name: 'Conductor session', extensions: ['conductor-session'] }]
+    }
+    const selectedOwner = liveWindow(owner)
+    const result = selectedOwner ? await dialog.showSaveDialog(selectedOwner, options) : await dialog.showSaveDialog(options)
+    if (result.canceled || !result.filePath) return null
+    const name = basename(result.filePath, extname(result.filePath)).trim().slice(0, 200) || 'Conductor session'
+    const archive = database.sessionArchive(name)
+    await writeSessionArchive(result.filePath, archive)
+    database.setSetting('sessionArchiveName', name)
+    const saved = { name, selection: archive.selection }
+    broadcastSessionArchive(saved)
+    return saved
+  } finally { archiveBusy = false }
+}
+
+const stopReplacedDesk = async (archive: SessionArchive, activeIds: Set<string>): Promise<string[]> => {
+  const failures: string[] = []
+  for (const agent of archive.agents) {
+    if (!activeIds.has(agent.spec.id) || !remoteControl?.mirror.isRemote(agent.spec.id)) continue
+    try { await remoteControl.mirror.interrupt(agent.spec.id) }
+    catch { failures.push(agent.spec.title) }
+  }
+  for (const workspace of archive.workspaces) {
+    agents.killSession(workspace.id)
+    terminals.killSession(workspace.id)
+  }
+  for (const project of archive.projects) browserViews?.releaseProject(project.id)
+  return failures
+}
+
+const openSessionArchive = async (owner?: BrowserWindow | null): Promise<SessionArchiveResult | null> => {
+  if (archiveBusy) throw new Error('Another session archive operation is already running.')
+  archiveBusy = true
+  try {
+    const selectedOwner = liveWindow(owner)
+    const options: Electron.OpenDialogOptions = { title: 'Open Conductor session', buttonLabel: 'Open session', properties: ['openFile'], filters: [{ name: 'Conductor session', extensions: ['conductor-session'] }] }
+    const selected = selectedOwner ? await dialog.showOpenDialog(selectedOwner, options) : await dialog.showOpenDialog(options)
+    if (selected.canceled || !selected.filePaths[0]) return null
+    const importedArchive = await readSessionArchive(selected.filePaths[0])
+    await validateArchiveProjectPaths(importedArchive)
+    const windows = editorWindows()
+    await flushEditorWindows(windows)
+    const dirty = database.listEditorDrafts().filter(draft => draft.content !== draft.baseContent)
+    const active = runningWork()
+    const nativeActive = agents.nativeCli.hasSubmittedInput()
+    if (dirty.length || active.length || nativeActive) {
+      const confirmed = await closeConfirmation.request(async () => (await showDecision(selectedOwner, {
+        type: 'warning', title: 'Open saved session?', message: `Replace this desk with “${importedArchive.name}”?`,
+        detail: `${dirty.length ? `${dirty.length} unsaved editor draft${dirty.length === 1 ? '' : 's'} will be kept in the recovery snapshot.\n` : ''}${active.length || nativeActive ? 'Running work in every project and window will be interrupted after the current desk is safely archived.\n' : ''}\nCancel keeps the current desk and all work unchanged.`,
+        buttons: ['Open session', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true
+      })) === 0)
+      if (!confirmed) return null
+    }
+
+    // Capture the exact current desk after the decision and preserve it before any replacement.
+    const previous = database.sessionArchive(sessionArchiveName())
+    const recoveryDirectory = join(app.getPath('userData'), 'session-recovery')
+    await fs.mkdir(recoveryDirectory, { recursive: true })
+    await writeSessionArchive(join(recoveryDirectory, 'previous.conductor-session'), previous)
+    const activeIds = new Set(runningWork().map(process => process.id))
+    const result = database.importSessionArchive(importedArchive)
+
+    const stopFailures = await stopReplacedDesk(previous, activeIds)
+    replacingDesk = true
+    try {
+      for (const window of [...detachedWindows.values()]) if (!window.isDestroyed()) window.destroy()
+      detachedWindows.clear()
+    } finally { replacingDesk = false }
+
+    const nextProjects = database.listDeskProjects()
+    const nextProjectIds = new Set(nextProjects.map(project => project.id))
+    for (const project of previous.projects) if (!nextProjectIds.has(project.id)) projectFileChanges?.forget(project.id)
+    for (const project of nextProjects) {
+      projectFileChanges?.watch(project)
+      void projectBacklogs.ensure(project.id).catch(error => console.warn('Imported project task file unavailable', error))
+    }
+    for (const record of database.listDeskDetachedWindows()) openDetachedWindow(record.id)
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.reload()
+    broadcastSessionArchive(result)
+    if (stopFailures.length) await showDecision(liveWindow(mainWindow), { type: 'warning', title: 'Some remote work could not be stopped', message: 'The saved session opened, but these remote conversations may still be running:', detail: stopFailures.join('\n'), buttons: ['OK'], defaultId: 0, cancelId: 0, noLink: true })
+    return result
+  } finally { archiveBusy = false }
+}
+
+const reportMenuError = async (reason: unknown): Promise<void> => {
+  await showDecision(liveWindow(), { type: 'error', title: 'Session operation failed', message: reason instanceof Error ? reason.message : String(reason), buttons: ['OK'], defaultId: 0, cancelId: 0, noLink: true })
+}
+
+const installApplicationMenu = (): void => {
+  const target = (): BrowserWindow | null => BrowserWindow.getFocusedWindow() ?? liveWindow()
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { label: 'File', submenu: [
+      { id: 'open-session', label: 'Open Session…', accelerator: 'CmdOrCtrl+Shift+O', click: () => { void openSessionArchive(target()).catch(reportMenuError) } },
+      { id: 'save-session', label: 'Save Session…', accelerator: 'CmdOrCtrl+Shift+S', click: () => { void saveSessionArchive(target()).catch(reportMenuError) } },
+      { type: 'separator' },
+      { id: 'close-tab', label: 'Close Tab', accelerator: 'CmdOrCtrl+W', click: () => target()?.webContents.send('window:close-tab') },
+      { type: 'separator' },
+      { label: 'Quit', accelerator: process.platform === 'darwin' ? 'Cmd+Q' : 'Alt+F4', click: () => app.quit() }
+    ] },
+    { label: 'Edit', submenu: [{ role: 'undo' }, { role: 'redo' }, { type: 'separator' }, { role: 'cut' }, { role: 'copy' }, { role: 'paste' }, { role: 'selectAll' }] },
+    { label: 'View', submenu: [{ role: 'reload' }, { role: 'toggleDevTools' }, { type: 'separator' }, { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' }] }
+  ]))
 }
 
 const folderExists = async (path: string): Promise<boolean> => {
@@ -611,8 +841,55 @@ const registerIpc = (): void => {
     const rendererUrl = process.env.ELECTRON_RENDERER_URL ?? pathToFileURL(join(__dirname, '../renderer/index.html')).href
     if (!known || owner.webContents !== event.sender || event.senderFrame !== event.sender.mainFrame || !isStructuredRendererUrl(event.senderFrame.url, rendererUrl)) throw new Error('Structured controls require the trusted Conductor document')
   }
+  const browserProject = (projectId: unknown): string => {
+    const id = structuredId(projectId)
+    if (!database.getProject(id)) throw new Error('Project not found')
+    return id
+  }
+  ipcMain.handle('session-archive:name', (event) => {
+    trustedStructured(event)
+    return sessionArchiveName()
+  })
+  ipcMain.handle('session-archive:save', (event) => {
+    trustedStructured(event)
+    return saveSessionArchive(BrowserWindow.fromWebContents(event.sender))
+  })
+  ipcMain.handle('session-archive:open', (event) => {
+    trustedStructured(event)
+    return openSessionArchive(BrowserWindow.fromWebContents(event.sender))
+  })
+  ipcMain.handle('session-archive:activate-resource', (event, kind: unknown, id: unknown) => {
+    trustedStructured(event)
+    if (kind !== 'agent' && kind !== 'terminal') throw new Error('Invalid saved resource kind')
+    database.activateImportedResource(kind, structuredId(id))
+  })
+  ipcMain.handle('browser:mount', (event, request: BrowserSurfaceRequest) => {
+    trustedStructured(event)
+    if (!request || browserProject(request.projectId) !== request.projectId) throw new Error('Invalid browser project')
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    if (!owner) throw new Error('Browser surface window is unavailable')
+    return browserViews!.mount(owner, request)
+  })
+  ipcMain.handle('browser:update', (event, request: BrowserSurfaceRequest) => {
+    trustedStructured(event)
+    if (!request || browserProject(request.projectId) !== request.projectId) throw new Error('Invalid browser project')
+    const owner = BrowserWindow.fromWebContents(event.sender)
+    if (!owner) throw new Error('Browser surface window is unavailable')
+    return browserViews!.update(owner, request)
+  })
+  ipcMain.handle('browser:command', (event, projectId: string, command: BrowserSurfaceCommand) => {
+    trustedStructured(event); return browserViews!.command(browserProject(projectId), command)
+  })
+  ipcMain.handle('browser:present', (event, projectId: string, presentation: BrowserPresentation) => {
+    trustedStructured(event); return browserViews!.present(browserProject(projectId), presentation)
+  })
   ipcMain.handle('structured:snapshot', (event, id) => { trustedStructured(event); return database.structured.snapshot(structuredId(id)) })
-  ipcMain.handle('structured:connect', (event, id) => { trustedStructured(event); return agents.structured.connectSession(structuredId(id)) })
+  ipcMain.handle('structured:connect', (event, id) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.connect(sessionId)
+    return agents.structured.connectSession(sessionId)
+  })
   ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
   ipcMain.handle('files:import-image', async (event, projectId: string, name: unknown, bytes: unknown) => {
     trustedStructured(event)
@@ -622,44 +899,133 @@ const registerIpc = (): void => {
     invalidateProjectFiles(project.path)
     return attachment
   })
-  ipcMain.handle('structured:queue', (event, id, text, settings, attachments) => { trustedStructured(event); return agents.structured.queue(structuredId(id), text, settings, attachments) })
+  ipcMain.handle('files:attach-context', async (event, projectId: string, requested: string) => {
+    trustedStructured(event)
+    const project = database.getProject(projectId)
+    if (!project) throw new Error('Project not found')
+    return projectPromptAttachment(project.path, requested)
+  })
+  ipcMain.handle('files:import-context-path', async (event, projectId: string, sourcePath: string, name: string, mimeType: string) => {
+    trustedStructured(event)
+    const project = database.getProject(projectId)
+    if (!project) throw new Error('Project not found')
+    const attachment = await importPromptAttachmentPath(project.path, sourcePath, name, mimeType)
+    invalidateProjectFiles(project.path)
+    return attachment
+  })
+  ipcMain.handle('files:move-external-drop', async (event, projectId: string, sourcePath: string, requestedDirectory: string) => {
+    trustedStructured(event)
+    const project = database.getProject(projectId)
+    if (!project) throw new Error('Project not found')
+    const moved = await moveExternalDropIntoProject(project.path, sourcePath, requestedDirectory)
+    invalidateProjectFiles(project.path)
+    return { ...moved, relativePath: relative(project.path, moved.path).replaceAll('\\', '/'), kind: 'file' as const }
+  })
+  ipcMain.handle('structured:queue', (event, id, text, settings, attachments) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.queue(sessionId, String(text), settings, attachments)
+    return agents.structured.queue(sessionId, text, settings, attachments)
+  })
   ipcMain.handle('structured:steer', (event, id, text, settings, attachments) => {
     trustedStructured(event)
-    if (remoteControl?.mirror.isRemote(structuredId(id))) return remoteControl.mirror.submit(structuredId(id), String(text), 'agents.steer')
-    return agents.structured.steer(structuredId(id), text, settings, attachments)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.submit(sessionId, String(text), 'agents.steer', settings, attachments)
+    return agents.structured.steer(sessionId, text, settings, attachments)
   })
-  ipcMain.handle('structured:cancel-queued', (event, id, promptId?: string) => { trustedStructured(event); if (promptId !== undefined && typeof promptId !== 'string') throw new Error('Invalid queued prompt'); return agents.structured.cancelQueued(structuredId(id), promptId) })
-  ipcMain.handle('native-cli:ensure', (event, id) => { trustedStructured(event); return agents.nativeCli.ensure(structuredId(id)) })
-  ipcMain.handle('native-cli:chat', (event, id) => { trustedStructured(event); return agents.nativeCli.switchToChat(structuredId(id)) })
-  ipcMain.on('native-cli:write', (event, id, data) => { try { trustedStructured(event); agents.nativeCli.write(structuredId(id), data) } catch { /* reject untrusted/invalid input */ } })
-  ipcMain.on('native-cli:resize', (event, id, cols, rows) => { try { trustedStructured(event); agents.nativeCli.resize(structuredId(id), cols, rows) } catch { /* reject untrusted/invalid input */ } })
+  ipcMain.handle('structured:cancel-queued', (event, id, promptId?: string) => {
+    trustedStructured(event)
+    if (promptId !== undefined && typeof promptId !== 'string') throw new Error('Invalid queued prompt')
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.cancelQueued(sessionId, promptId)
+    return agents.structured.cancelQueued(sessionId, promptId)
+  })
+  ipcMain.handle('native-cli:ensure', (event, id) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Native CLI handoff')
+    return agents.nativeCli.ensure(sessionId)
+  })
+  ipcMain.handle('native-cli:chat', (event, id) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Native CLI handoff')
+    return agents.nativeCli.switchToChat(sessionId)
+  })
+  ipcMain.on('native-cli:write', (event, id, data) => { try { trustedStructured(event); const sessionId = structuredId(id); if (!remoteControl?.mirror.isRemote(sessionId)) agents.nativeCli.write(sessionId, data) } catch { /* reject untrusted/invalid input */ } })
+  ipcMain.on('native-cli:resize', (event, id, cols, rows) => { try { trustedStructured(event); const sessionId = structuredId(id); if (!remoteControl?.mirror.isRemote(sessionId)) agents.nativeCli.resize(sessionId, cols, rows) } catch { /* reject untrusted/invalid input */ } })
   ipcMain.handle('structured:submit', (event, id, text, settings, attachments) => {
     trustedStructured(event)
     // A tab placed on another machine has no local runtime; the prompt belongs to that machine.
-    if (remoteControl?.mirror.isRemote(structuredId(id))) return remoteControl.mirror.submit(structuredId(id), String(text))
-    return agents.structured.submit(structuredId(id), text, settings, attachments)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.submit(sessionId, String(text), 'agents.submit', settings, attachments)
+    return agents.structured.submit(sessionId, text, settings, attachments)
   })
-  ipcMain.handle('structured:respond', (event, response) => { trustedStructured(event); return agents.structured.respond(response) })
+  ipcMain.handle('structured:respond', (event, response) => {
+    trustedStructured(event)
+    const sessionId = structuredId(response?.sessionId)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.respond({ ...response, sessionId })
+    return agents.structured.respond(response)
+  })
   ipcMain.handle('structured:interrupt', (event, id, expediteSubmittedInput?: boolean) => {
     trustedStructured(event)
     if (expediteSubmittedInput !== undefined && typeof expediteSubmittedInput !== 'boolean') throw new Error('Invalid interrupt option')
-    if (remoteControl?.mirror.isRemote(structuredId(id))) return remoteControl.mirror.interrupt(structuredId(id))
-    return agents.structured.interrupt(structuredId(id), expediteSubmittedInput === true)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.interrupt(sessionId, expediteSubmittedInput === true)
+    return agents.structured.interrupt(sessionId, expediteSubmittedInput === true)
   })
-  ipcMain.handle('structured:bind-workspace', (event, id, sessionId) => { trustedStructured(event); if (typeof sessionId !== 'string' || sessionId.length > 160) throw new Error('Invalid workspace'); return agents.structured.bindWorkspace(structuredId(id), sessionId) })
-  ipcMain.handle('structured:resume', (event, id, settings) => { trustedStructured(event); return agents.structured.resume(structuredId(id), settings) })
-  ipcMain.handle('structured:settings', (event, id, settings) => { trustedStructured(event); return agents.structured.saveSettings(structuredId(id), settings) })
-  ipcMain.handle('structured:fork', (event, id) => { trustedStructured(event); return agents.structured.fork(structuredId(id)) })
-  ipcMain.handle('structured:discover', (event, id) => { trustedStructured(event); return agents.structured.discover(structuredId(id)) })
-  ipcMain.handle('structured:rename', (event, id, title) => { trustedStructured(event); if (typeof title !== 'string' || !title.trim() || title.length > 160) throw new Error('Invalid title'); return agents.structured.rename(structuredId(id), title.trim()) })
-  ipcMain.handle('structured:archive', (event, id, archived) => { trustedStructured(event); if (typeof archived !== 'boolean') throw new Error('Invalid archive setting'); return agents.structured.archive(structuredId(id), archived) })
+  ipcMain.handle('structured:bind-workspace', (event, id, sessionId) => {
+    trustedStructured(event)
+    if (typeof sessionId !== 'string' || sessionId.length > 160) throw new Error('Invalid workspace')
+    const agentSessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(agentSessionId)) return remoteControl.mirror.bindWorkspace(agentSessionId, sessionId)
+    return agents.structured.bindWorkspace(agentSessionId, sessionId)
+  })
+  ipcMain.handle('structured:resume', (event, id, settings) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.resume(sessionId, settings)
+    return agents.structured.resume(sessionId, settings)
+  })
+  ipcMain.handle('structured:settings', (event, id, settings) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.saveSettings(sessionId, settings)
+    return agents.structured.saveSettings(sessionId, settings)
+  })
+  ipcMain.handle('structured:fork', (event, id) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Forking')
+    return agents.structured.fork(sessionId)
+  })
+  ipcMain.handle('structured:discover', (event, id) => {
+    trustedStructured(event)
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.discover(sessionId)
+    return agents.structured.discover(sessionId)
+  })
+  ipcMain.handle('structured:rename', (event, id, title) => {
+    trustedStructured(event)
+    if (typeof title !== 'string' || !title.trim() || title.length > 160) throw new Error('Invalid title')
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.rename(sessionId, title.trim())
+    return agents.structured.rename(sessionId, title.trim())
+  })
+  ipcMain.handle('structured:archive', (event, id, archived) => {
+    trustedStructured(event)
+    if (typeof archived !== 'boolean') throw new Error('Invalid archive setting')
+    const sessionId = structuredId(id)
+    if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.archive(sessionId, archived)
+    return agents.structured.archive(sessionId, archived)
+  })
   ipcMain.handle('structured:history', (event, projectId, query) => { trustedStructured(event); if (query !== undefined && (typeof query !== 'string' || query.length > 500)) throw new Error('Invalid search'); return database.structured.history(structuredId(projectId), query) })
   ipcMain.handle('structured:search-messages', (event, projectId, query, excludeId) => { trustedStructured(event); if (typeof query !== 'string' || query.length > 500) throw new Error('Invalid search'); return database.structured.searchMessages(structuredId(projectId), query, excludeId === undefined ? undefined : structuredId(excludeId)) })
-  ipcMain.handle('structured:artifact', (event, id, artifactId) => { trustedStructured(event); return database.structured.artifact(structuredId(id), structuredId(artifactId)) })
-  ipcMain.handle('structured:output', (event, id, artifactId) => { trustedStructured(event); return database.structured.output(structuredId(id), structuredId(artifactId)) })
-  ipcMain.handle('structured:review', (event, id, artifactId, action) => { trustedStructured(event); return agents.structured.review(structuredId(id), structuredId(artifactId), action) })
-  ipcMain.handle('structured:change-history', (event, id) => { trustedStructured(event); return agents.structured.changeHistory(structuredId(id)) })
-  ipcMain.handle('structured:revert-changes', (event, id, scope) => { trustedStructured(event); return agents.structured.revertChanges(structuredId(id), revertScope(scope)) })
+  ipcMain.handle('structured:artifact', (event, id, artifactId) => { trustedStructured(event); const sessionId = structuredId(id); if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Remote change artifacts'); return database.structured.artifact(sessionId, structuredId(artifactId)) })
+  ipcMain.handle('structured:output', (event, id, artifactId) => { trustedStructured(event); const sessionId = structuredId(id); if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Remote output artifacts'); return database.structured.output(sessionId, structuredId(artifactId)) })
+  ipcMain.handle('structured:review', (event, id, artifactId, action) => { trustedStructured(event); const sessionId = structuredId(id); if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Remote change review'); return agents.structured.review(sessionId, structuredId(artifactId), action) })
+  ipcMain.handle('structured:change-history', (event, id) => { trustedStructured(event); const sessionId = structuredId(id); if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Remote change history'); return agents.structured.changeHistory(sessionId) })
+  ipcMain.handle('structured:revert-changes', (event, id, scope) => { trustedStructured(event); const sessionId = structuredId(id); if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Reverting remote changes'); return agents.structured.revertChanges(sessionId, revertScope(scope)) })
   ipcMain.on('settings:get-startup', (event) => {
     event.returnValue = getAppSettings()
   })
@@ -669,7 +1035,7 @@ const registerIpc = (): void => {
   ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }); const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); return result })
   ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
   ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); return projectBacklogs.changes(projectId, taskId) })
-  ipcMain.handle('projects:list', () => database.listProjects())
+  ipcMain.handle('projects:list', () => database.listDeskProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await dialog.showOpenDialog({
       title: 'Open a project folder',
@@ -678,6 +1044,7 @@ const registerIpc = (): void => {
     if (result.canceled || !result.filePaths[0]) return null
     const path = resolve(result.filePaths[0])
     const project = database.upsertProject(path, basename(path))
+    database.includeDeskProject(project.id)
     await projectBacklogs.ensure(project.id)
     projectFileChanges?.watch(project)
     return project
@@ -694,6 +1061,7 @@ const registerIpc = (): void => {
     }
     await fs.mkdir(target)
     const project = database.upsertProject(target, basename(target))
+    database.includeDeskProject(project.id)
     await projectBacklogs.ensure(project.id)
     projectFileChanges?.watch(project)
     return project
@@ -703,6 +1071,7 @@ const registerIpc = (): void => {
     if (!project) return
     terminals.killProject(projectId)
     agents.killProject(projectId)
+    browserViews?.releaseProject(projectId)
     database.removeProject(projectId)
   })
   ipcMain.handle('projects:move', async (event, projectId: string) => {
@@ -922,7 +1291,13 @@ const registerIpc = (): void => {
   })
 
   ipcMain.handle('files:confirm-close', (event, tabIds: string[]) => { trustedStructured(event); if (!Array.isArray(tabIds) || tabIds.some((id) => typeof id !== 'string')) throw new Error('Invalid editor tabs'); return resolveUnsavedEditors(BrowserWindow.fromWebContents(event.sender), tabIds) })
-  ipcMain.handle('projects:reorder', (event, ids: string[]) => { trustedStructured(event); return database.reorderProjects(ids) })
+  ipcMain.handle('projects:reorder', (event, ids: string[]) => {
+    trustedStructured(event)
+    const visibleIds = new Set(database.listDeskProjects().map(project => project.id))
+    const hiddenIds = database.listProjects().map(project => project.id).filter(id => !visibleIds.has(id))
+    database.reorderProjects([...ids, ...hiddenIds])
+    return database.listDeskProjects()
+  })
   ipcMain.handle('sessions:reorder', (event, projectId: string, ids: string[]) => { trustedStructured(event); return database.reorderSessions(projectId, ids) })
   ipcMain.handle('files:search', async (event, projectIds: string[], query: string, options: { showHidden?: boolean; activeProjectId?: string; recentPaths?: FileSearchResult[] } = {}) => {
     trustedStructured(event)
@@ -1106,8 +1481,11 @@ const registerIpc = (): void => {
 
       const target = resolveWithinProject(project.path, join(requestedDirectory, basename(source)))
       if (target !== source) {
-        if (await folderExists(target)) throw new Error(`An item named ${basename(source)} already exists`)
-        await fs.rename(source, target)
+        if (sourceStat.isFile()) await moveProjectDropWithinProject(project.path, requested, requestedDirectory)
+        else {
+          if (await folderExists(target)) throw new Error(`An item named ${basename(source)} already exists`)
+          await fs.rename(source, target)
+        }
       }
       invalidateProjectFiles(project.path)
       database.remapEditorDrafts(projectId, requested.replaceAll('\\', '/'), relative(project.path, target).replaceAll('\\', '/'), sourceStat.isDirectory())
@@ -1135,25 +1513,26 @@ const registerIpc = (): void => {
     const error = await shell.openPath(target)
     if (error) throw new Error(error)
   })
-  ipcMain.handle('files:get-draft', (_event, tabId: string, projectId: string, requested: string) => {
+  const editorMachine = (value: unknown): string => typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : LOCAL_MACHINE_ID
+  ipcMain.handle('files:get-draft', (_event, tabId: string, projectId: string, requested: string, machineId?: string) => {
     resolveProjectPath(projectId, requested)
-    return database.getEditorDraft(tabId, projectId, requested)
+    return database.getEditorDraft(tabId, projectId, requested, editorMachine(machineId))
   })
   ipcMain.on(
     'files:checkpoint-draft',
-    (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null) => {
+    (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null, machineId?: string) => {
       trustedStructured(event)
       resolveProjectPath(projectId, requested)
-      database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent)
+      database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent, editorMachine(machineId))
     }
   )
   ipcMain.on(
     'files:flush-draft',
-    (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null) => {
+    (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null, machineId?: string) => {
       try {
         trustedStructured(event)
         resolveProjectPath(projectId, requested)
-        database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent)
+        database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent, editorMachine(machineId))
         event.returnValue = true
       } catch (error) {
         console.error(`Failed to flush editor draft ${tabId}`, error)
@@ -1173,7 +1552,11 @@ const registerIpc = (): void => {
 
   // Legacy entry points also reach the structured owner. Apply the same document
   // boundary here so an embedded or navigated web page cannot bypass its IPC.
-  ipcMain.handle('agent:ensure', (event, spec: AgentSpec) => { trustedStructured(event); return agents.ensure(spec) })
+  ipcMain.handle('agent:ensure', (event, spec: AgentSpec) => {
+    trustedStructured(event)
+    if (remoteControl?.mirror.isRemote(spec.id)) return remoteControl.mirror.mount(spec)
+    return agents.ensure(spec)
+  })
   ipcMain.handle('agent:restart', (event, spec: AgentSpec) => { trustedStructured(event); return agents.restart(spec) })
   ipcMain.handle('agent:submit', (event, id: string, message: string, mode?: 'manual' | 'edit' | 'plan' | 'auto') => {
     trustedStructured(event)
@@ -1431,11 +1814,12 @@ app.whenReady().then(async () => {
   const projectArgument = process.argv.find((argument) => argument.startsWith('--project-path='))
   if (projectArgument) {
     const projectPath = resolve(projectArgument.slice('--project-path='.length))
-    database.upsertProject(projectPath, basename(projectPath))
+    const project = database.upsertProject(projectPath, basename(projectPath))
+    database.includeDeskProject(project.id)
   }
   sourceControl = new SourceControl(database)
   projectBacklogs = new ProjectBacklogs(database, sourceControl)
-  for (const project of database.listProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
+  for (const project of database.listDeskProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
   terminals = new TerminalManager(database)
   // The browser bridge resolves views out of the caller's own workspace through AgentControl,
   // so a session can only reach the browser tabs its own project and workspace own. It is built
@@ -1443,7 +1827,9 @@ app.whenReady().then(async () => {
   browserViews = new BrowserViews({
     tabs: scope => control.tabs(scope),
     openBrowserTab: async scope => { await control.call(scope, 'tabs.open', { kind: 'browser', title: 'Browser' }) },
-    rendererPath: join(__dirname, '../renderer/index.html')
+    rendererPath: join(__dirname, '../renderer/index.html'),
+    createDetachedWindow: createDetachedBrowserWindow,
+    publishState: state => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('browser:state', state) }
   })
   browserMcp = new BrowserMcpServer(browserViews)
   agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '', browserMcp)
@@ -1462,7 +1848,7 @@ app.whenReady().then(async () => {
   }
   disposeProjectActivity = onAgentStatusChange(publishProjectActivity)
   projectFileChanges = new ProjectFileChanges(change => publish('files:changed', change))
-  for (const project of database.listProjects()) projectFileChanges.watch(project)
+  for (const project of database.listDeskProjects()) projectFileChanges.watch(project)
   agentControlUi = new AgentControlUi(join(__dirname, '../renderer/index.html'), request => {
     const tabs = control.tabs(request)
     const target = typeof request.params.tabId === 'string' ? tabs.find(tab => tab.id === request.params.tabId) : undefined
@@ -1476,8 +1862,19 @@ app.whenReady().then(async () => {
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     fileChanged: change => projectFileChanges?.changed(change),
     cipher: safeStorageCipher,
+    chooseRemoteDownloadPath: async description => {
+      const options: Electron.SaveDialogOptions = {
+        title: `Save ${basename(description.file.path)}`,
+        buttonLabel: 'Save',
+        defaultPath: basename(description.file.path)
+      }
+      const owner = liveWindow()
+      const result = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options)
+      return result.canceled || !result.filePath ? null : result.filePath
+    },
     publish: (channel, payload) => publish(channel, payload)
   })
+  agents.structured.setPromptDispatchAuthorityGuard((authority, spec) => remoteControl!.assertPromptDispatchAuthority(authority, spec))
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
   // without it the two initializers form an inference cycle.
   const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
@@ -1500,6 +1897,7 @@ app.whenReady().then(async () => {
   })
   projectTaskDispatcher = new ProjectTaskDispatcher({ database, backlogs: projectBacklogs, sessions: agents.structured, control, providers: () => agents.listProviders(), ui: agentControlUi.request, changed: projectId => { const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId, path: 'feature-list.md' }) } })
   agentControlUi.register(control)
+  agents.structured.setLocalControl((spec, method, args) => control.call({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, method, args))
   agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '')
   await agentControlServer.start()
   await browserMcp.start()
@@ -1519,6 +1917,7 @@ app.whenReady().then(async () => {
     updates.configure('')
   }
   registerIpc()
+  installApplicationMenu()
   // Local snapshots are the only pre-git safety net, so they are kept generously but not
   // forever: age them out on launch and once a day, the way the event journal is compacted.
   const pruneSnapshots = (): void => { try { pruneDiffSnapshots(database.structured.artifactDirectory) } catch (error) { console.error('Ignoring agent snapshot prune failure', error) } }
@@ -1531,7 +1930,7 @@ app.whenReady().then(async () => {
   const savedWindowLayout = restoreAfterUpdate
     ? parseSavedWindowLayout(database.getSetting(UPDATE_WINDOW_LAYOUT_KEY))
     : null
-  const detachedRecords = database.listDetachedWindows()
+  const detachedRecords = database.listDeskDetachedWindows()
   const restoreWithoutMain = Boolean(restoreAfterUpdate && savedWindowLayout && !savedWindowLayout.main && detachedRecords.length)
   mainWindow = restoreWithoutMain ? null : createWindow(undefined, false, savedWindowLayout?.main)
   for (const record of detachedRecords) {
@@ -1550,7 +1949,14 @@ app.on('window-all-closed', () => {
 app.on('before-quit', (event) => {
   if (isQuitting) return
   event.preventDefault()
-  void resolveUnsavedEditors(mainWindow).then((approved) => { if (approved) { isQuitting = true; app.quit() } })
+  if (quitRequest) return
+  const request = (async (): Promise<void> => {
+    if (!await confirmApplicationStop(mainWindow, 'quit')) return
+    if (!await resolveUnsavedEditors(mainWindow)) return
+    isQuitting = true
+    app.quit()
+  })().finally(() => { if (quitRequest === request) quitRequest = null })
+  quitRequest = request
 })
 
 app.on('will-quit', () => {

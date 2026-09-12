@@ -122,8 +122,17 @@ describe('recording which project here is which project there', () => {
 
   it('lets the owner take a mapping back, and refuses that machine again straight away', () => {
     const fixture = confirmed()
+    const before = fixture.client.authorityRevision('render-desktop')
     fixture.client.releaseProject('render-desktop', 'project-a')
+    expect(fixture.client.authorityRevision('render-desktop')).toBe(before + 1)
     expect(placement(fixture)).toMatchObject({ ok: false, reason: 'not-mapped' })
+  })
+
+  it('changes local authority generation even when an exact same mapping is confirmed again', () => {
+    const fixture = confirmed()
+    const before = fixture.client.authorityRevision('render-desktop')
+    fixture.client.confirmProject('render-desktop', { ...grant })
+    expect(fixture.client.authorityRevision('render-desktop')).toBe(before + 1)
   })
 
   it('will not record a mapping for a machine this one is not paired with', () => {

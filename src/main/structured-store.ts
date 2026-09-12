@@ -107,6 +107,13 @@ export class StructuredAgentStore {
     }
   }
   snapshot(id: string): SessionProjection | null { return this.projections.get(id) ?? null }
+  /** Called only after the archive transaction committed its validated, fresh identities. */
+  loadImported(ids: string[]): void {
+    for (const id of ids) {
+      const row = this.db.prepare('SELECT projection_json FROM structured_sessions WHERE id=?').get(id) as { projection_json: string } | undefined
+      if (row) this.projections.set(id, JSON.parse(row.projection_json) as SessionProjection)
+    }
+  }
   append(event: AgentEvent): AgentEvent {
     const state = this.snapshot(event.sessionId)
     if (!state || event.sequence !== state.sequence + 1) throw new Error('Non-contiguous provider event sequence')

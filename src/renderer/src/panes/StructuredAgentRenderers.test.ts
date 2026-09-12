@@ -1,15 +1,39 @@
-import { createElement } from 'react'
+import { createElement, type ComponentProps } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it, vi } from 'vitest'
 import type { AgentEventData, InputQuestion, PendingInteraction, TimelineItem } from '../../../shared/structured-agent'
 import { activityCoalesceTarget, coalescedEditLabel, coalescedEditSummary, combinedQuestionAnswer, commandSummary, groupConversationActivities, interactionOutcome, isAnsweredThroughInteraction, isConversationActivity, isRuntimeHeartbeat, legacyAttachedContext, parentLabelAnchors, readableAnswerValue, rendererKind, safeExternalLink, safeFileTarget, StructuredActivity, StructuredMarkdown, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
 
 const cwd = 'C:\\work\\My project'
-function renderActivity(data: AgentEventData, expanded = true): string {
+function renderActivity(data: AgentEventData, expanded = true, overrides: Partial<ComponentProps<typeof StructuredActivity>> = {}): string {
   const item: TimelineItem = { id: 'item', runtimeId: 'runtime', sequence: 1, timestamp: '2026-09-07T00:00:00Z', data }
-  return renderToStaticMarkup(createElement(StructuredActivity, { item, sessionId: 'session', cwd, expanded, interactive: true, onExpand: vi.fn(), onOpenFile: vi.fn(), onDiff: vi.fn(), onRespond: vi.fn(async () => {}) }))
+  return renderToStaticMarkup(createElement(StructuredActivity, { item, sessionId: 'session', cwd, expanded, interactive: true, onExpand: vi.fn(), onOpenFile: vi.fn(), onDiff: vi.fn(), onRespond: vi.fn(async () => {}), ...overrides }))
 }
 describe('structured renderer contracts (synthetic, zero inference)', () => {
+  it('labels collapsed command output as OUT rather than assistant prose', () => {
+    const html = renderActivity({ type: 'tool', name: 'Bash', status: 'completed', input: { command: 'echo result' }, output: 'result' }, false)
+    expect(html).toContain('OUT</b> result')
+  })
+
+  it('renders a real event timestamp as a hoverable time element', () => {
+    const html = renderActivity({ type: 'text', role: 'assistant', text: 'Done.', mode: 'snapshot' })
+    expect(html).toContain('<time')
+    expect(html).toContain('dateTime="2026-09-07T00:00:00Z"')
+  })
+
+  it('makes coordinated-agent names real tab-focus controls', () => {
+    const html = renderActivity({ type: 'text', role: 'user', text: 'Please investigate.', mode: 'snapshot', origin: { agentSessionId: 'controller', label: 'Fixer' } })
+    expect(html).toContain('aria-label="Show Fixer tab"')
+    expect(html).toContain('sa-role-coordinated')
+  })
+
+  it('keeps a pending question reachable in its compact bottom dock', () => {
+    const interaction: PendingInteraction = { id: 'q', kind: 'question', title: 'Pick a color', status: 'pending', input: {}, choices: [], questions: [{ id: 'color', question: 'Pick a color', options: [{ label: 'Blue' }] }] }
+    const html = renderActivity({ type: 'interaction', interaction }, true, { dockedQuestion: true })
+    expect(html).toContain('sa-interaction-docked')
+    expect(html).toContain('Reopen question')
+    expect(html).toContain('answers are preserved')
+  })
   it('routes native command names without renaming PowerShell as Bash', () => {
     for (const name of ['Bash', 'PowerShell', 'Command', 'commandExecution', 'exec_command']) expect(rendererKind(name)).toBe('command')
     expect(rendererKind('mcp__custom__write')).toBe('custom')

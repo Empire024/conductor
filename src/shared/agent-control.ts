@@ -1,6 +1,6 @@
 import type { PaneTab } from './models'
 
-export type AgentControlUiAction = 'tabs.list' | 'tabs.open' | 'tabs.close' | 'tabs.focus' | 'tabs.split' | 'tabs.rename' | 'tabs.detach' | 'files.open' | 'workspace.rename' | 'workspace.focus'
+export type AgentControlUiAction = 'tabs.list' | 'tabs.open' | 'tabs.close' | 'tabs.focus' | 'tabs.focus-origin' | 'tabs.split' | 'tabs.rename' | 'tabs.detach' | 'agents.configure' | 'agents.configure-confirmed' | 'files.open' | 'workspace.rename' | 'workspace.focus'
 export interface AgentControlScope { projectId: string; sessionId: string; agentSessionId: string }
 export interface AgentControlUiRequest extends AgentControlScope {
   id: string
@@ -20,6 +20,9 @@ export interface AgentControlBridge {
   links(projectId: string, sessionId: string): Promise<AgentControlLink[]>
   release(targetAgentSessionId: string): Promise<void>
   focusTab(projectId: string, sessionId: string, tabId: string): Promise<void>
+  /** Owner-facing transcript navigation only. It resolves an exact durable agent session ID; it
+   * never gives the calling agent control over that agent. */
+  focusOrigin(agentSessionId: string): Promise<void>
   onLinksChanged(callback: (scope: { projectId: string; sessionId: string }) => void): () => void
 }
 

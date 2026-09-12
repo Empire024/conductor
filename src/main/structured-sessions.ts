@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import { MAX_PROMPT_CHARS, settingsForRuntime } from '../shared/structured-agent'
-import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptDispatchAuthority, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
@@ -17,6 +17,7 @@ import { describeUsageCap, evaluateUsageCap, summarizeUsageRun, type UsageCapSta
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedPermission, rememberPermission } from './app-settings'
+import { assertLocalControlAllowed } from './local-models/tools.ts'
 
 interface LiveSession {
   spec: AgentSpec
@@ -38,6 +39,9 @@ interface LiveSession {
   submitting: boolean
   closed: boolean
   responses: Set<string>
+  nativeAcceptance?: Map<string, { timer: NodeJS.Timeout; resolve(): void; reject(reason: Error): void }>
+  /** The current provider process was launched with the previous browser-MCP preference. */
+  browserConfigStale?: boolean
   budget?: LiveRuntimeBudget
   /** Snapshot failure reasons already reported in this conversation, so an unactionable
    *  reason is stated once instead of on every tool call that hits it. */
@@ -64,6 +68,14 @@ const activityPhaseOf = (phase: SessionPhase): AgentActivityPhase =>
             : phase === 'interrupted' ? 'stopped' : 'idle'
 
 export class StructuredSessions {
+  private localControl?: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>
+  setLocalControl(handler: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>): void {
+    this.localControl = handler
+  }
+  private promptDispatchAuthorityGuard?: (authority: PromptDispatchAuthority, spec: AgentSpec) => void
+  setPromptDispatchAuthorityGuard(guard: (authority: PromptDispatchAuthority, spec: AgentSpec) => void): void {
+    this.promptDispatchAuthorityGuard = guard
+  }
   private live = new Map<string, LiveSession>()
   private pending: AgentEvent[] = []
   private flushTimer?: NodeJS.Timeout
@@ -148,7 +160,14 @@ export class StructuredSessions {
     return {
       executable: live.executable, cwd: live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
       settings: settingsForRuntime(state.settings, runtimeId),
-      mcpConfig: this.mcp?.configure(live.spec) ?? '',
+      mcpConfig: live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
+      ...(live.spec.provider === 'local' ? { localControl: async (method: string, args: Record<string, unknown>) => {
+        if (live.closed || live.runtimeId !== runtimeId || !this.localControl) throw new Error('Local Conductor bridge is unavailable for this runtime')
+        this.validateSpec(live.spec)
+        const current = this.database.structured.snapshot(id)!
+        assertLocalControlAllowed(method, args, current.settings.permission === 'read-only' || current.settings.sandbox === 'read-only' || current.settings.plan)
+        return this.localControl(live.spec, method, args)
+      } } : {}),
       newNativeSession: live.spec.provider === 'claude' && Boolean(state.nativeSessionId) && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!),
       emit: event => { if (live.runtimeId === runtimeId && !live.closed) this.emit(live, event) },
       beforeTool: async (itemId, paths) => {
@@ -225,6 +244,7 @@ export class StructuredSessions {
         this.database.setSetting('cliHandoff:' + id, JSON.stringify(handoff))
       }
       const previous = live.adapter
+      this.cancelNativeAcceptances(live, 'The runtime changed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
       live.closed = true
       try { if (previous?.stop) await previous.stop(); else previous?.dispose() } catch (reason) { live.closed = false; throw reason }
       live.adapter = undefined; live.closed = false
@@ -249,6 +269,7 @@ export class StructuredSessions {
       const handoff = JSON.parse(serialized) as { id: string; known: string[] }
       // A previous switch may have timed out while stopping its process.
       if (live.adapter) {
+        this.cancelNativeAcceptances(live, 'The runtime changed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
         live.closed = true
         try { if (live.adapter.stop) await live.adapter.stop(); else live.adapter.dispose(); live.adapter = undefined } finally { live.closed = false }
       }
@@ -285,7 +306,19 @@ export class StructuredSessions {
     const state = this.database.structured.snapshot(id)
     if (!state) throw new Error('Session not found')
     this.validateSettings(settings, state.capabilities)
+    const browserChanged = Boolean(settings.browserMcp) !== Boolean(state.settings.browserMcp)
+    if (browserChanged && settings.browserMcp && active.has(state.phase)) throw new Error('Wait for the current turn to finish before enabling browser tools')
     this.database.structured.update(id, { settings })
+    if (browserChanged) {
+      // Revocation is synchronous and precedes every later await: a disabled credential cannot
+      // finish a tool call merely because its browser lookup was already in flight.
+      this.mcp?.release(id)
+      const live = this.live.get(id)
+      if (live?.adapter) {
+        if (active.has(state.phase)) live.browserConfigStale = true
+        else this.retireBrowserTransport(live)
+      }
+    }
     // This is the one path a deliberate composer change always takes (see updateSettings in
     // StructuredAgentPane.tsx), so it is also where the owner's choice is remembered for the
     // next conversation of this provider, manual or agent-opened.
@@ -297,9 +330,38 @@ export class StructuredSessions {
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
     if (active.has(state.phase) || live.queueing) throw new Error('Session still has active work')
     if (!state.nativeSessionId) throw new Error('This history has no native conversation to resume')
-    if (settings) { this.validateSettings(settings, state.capabilities); this.database.structured.update(id, { settings }) }
-    live.closed = true; live.adapter?.dispose(); live.adapter = undefined; live.closed = false
+    if (settings) {
+      settings = this.messageSettings(state, settings)
+      this.validateSettings(settings, state.capabilities)
+      this.database.structured.update(id, { settings })
+    }
+    await this.reconnect(live)
+  }
+  /** Replace only the transport incarnation; options() keeps using the exact persisted native
+   *  conversation id, while callbacks from the disposed incarnation are closed first. */
+  private async reconnect(live: LiveSession): Promise<void> {
+    this.cancelNativeAcceptances(live, 'The runtime changed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
+    live.closed = true
+    live.adapter?.dispose()
+    live.adapter = undefined
+    live.turnId = undefined
+    live.closed = false
     await this.connect(live)
+    // connect() rebuilds the provider command from the currently persisted settings. Once it
+    // succeeds, a browser-setting retirement has reached the replacement transport even when
+    // the owner resumed explicitly instead of submitting the next message.
+    live.browserConfigStale = false
+  }
+  private retireBrowserTransport(live: LiveSession): void {
+    this.cancelNativeAcceptances(live, 'Browser tool settings changed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
+    live.closed = true
+    live.adapter?.dispose()
+    live.adapter = undefined
+    live.turnId = undefined
+    live.browserConfigStale = false
+    live.closed = false
+    const state = this.database.structured.snapshot(live.spec.id)
+    if (state?.nativeSessionId) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Browser tool settings changed. The same native conversation will reconnect before the next message.' } })
   }
   async connectSession(id: string): Promise<void> {
     if (this.get(id).handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
@@ -313,6 +375,14 @@ export class StructuredSessions {
     await this.connect(live)
     if (!live.adapter?.discover) throw new Error('Native discovery is unavailable on this adapter')
     return sanitizeDiagnostic(await live.adapter.discover()) as Json
+  }
+  async refreshUsage(id: string): Promise<boolean> {
+    const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (state.phase === 'disconnected') return false
+    await this.connect(live)
+    if (!live.adapter?.refreshUsage) return false
+    await live.adapter.refreshUsage()
+    return true
   }
   async rename(id: string, title: string): Promise<void> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
@@ -350,7 +420,12 @@ export class StructuredSessions {
   async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
     return this.followup(id, text, settings, attachments, true, undefined, origin)
   }
-  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptId?: string, origin?: PromptOrigin): Promise<void> {
+  /** Project-task ownership is transferred only after the native runtime acknowledges custody.
+   * Unlike an ordinary composer steer, this never degrades into an unbounded host-side queue. */
+  async steerAccepted(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
+    return this.followup(id, text, settings, attachments, true, undefined, origin, true)
+  }
+  private async followup(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[], steer: boolean, queuedPromptId?: string, origin?: PromptOrigin, requireNativeAcceptance = false): Promise<void> {
     const live = this.get(id), adapter = live.adapter, runtimeId = live.runtimeId, turnId = live.turnId
     const captured = structuredClone(attachments)
     settings = structuredClone(settings)
@@ -362,11 +437,16 @@ export class StructuredSessions {
       if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
       if (!live.adapter || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(state.phase)) throw new Error('There is no active turn to queue behind')
       if (typeof text !== 'string' || !text.trim() || text.length > 60000) throw new Error('Prompt must contain 1-60000 characters')
+      settings = this.messageSettings(state, settings)
       this.validateSettings(settings, state.capabilities)
       const context = await this.attachments(live, captured)
       this.assertPromptWithinLimit(text.trim().length + context.length)
       let latest = this.database.structured.snapshot(id)!
+      // Attachment validation can yield while the owner changes the browser toggle. Model and
+      // effort belong to this captured message; browser authority belongs to the current session.
+      settings = this.messageSettings(latest, settings)
       if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
+      this.assertPromptDispatchAuthority(origin, live.spec)
       let refusal = 'The current turn does not support steering'
       let maySteer = steer
       let refusedInputId: string | undefined
@@ -376,14 +456,32 @@ export class StructuredSessions {
         live.steering = true
         const inputId = randomUUID()
         this.setSteering(live, [...latest.pendingSteering ?? [], { id: inputId, text: text.trim(), settings: structuredClone(latest.settings), attachments: captured, runtimeId, turnId, status: 'sending', ...(origin ? { origin } : {}) }])
+        const acceptance = requireNativeAcceptance ? this.nativeAcceptanceWaiter(live, inputId) : undefined
         // Transfer ownership before the native attempt. An uncertain response must
         // leave only the pending record, never an automatically drainable copy.
         if (queuedPromptId) this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(input => input.id !== queuedPromptId))
+        let transport: Promise<void>
+        try { transport = Promise.resolve(adapter.steer!(text.trim() + context, settings, captured.filter(item => item.kind === 'image'), inputId)) }
+        catch (error) { transport = Promise.reject(error) }
         try {
-          await adapter.steer(text.trim() + context, settings, captured.filter(item => item.kind === 'image'), inputId)
+          if (acceptance) {
+            // Observe the receipt immediately. The CLI method is only a transport attempt and
+            // may stay pending after the native runtime has accepted (or refused) the input.
+            // Racing its rejection against the receipt bounds the public call without leaving
+            // either promise unobserved.
+            await Promise.race([acceptance.promise, transport.then(() => acceptance.promise)])
+          } else await transport
           if (live.closed || this.live.get(id) !== live || live.runtimeId !== runtimeId) throw new Error('The runtime changed after steering was sent. Check the conversation before resending; your draft was kept.')
           return
         } catch (error) {
+          acceptance?.cancel()
+          // Receipt-level cancellation/uncertainty is already durable. Never make a second,
+          // drainable copy and never authorize a Project-task handoff from it.
+          if (requireNativeAcceptance) {
+            const pending = this.database.structured.snapshot(id)?.pendingSteering?.find(input => input.id === inputId)
+            if (pending?.status === 'sending') this.reconcileInput(live, { data: { type: 'input_delivery', inputId, status: 'uncertain' } })
+            throw error
+          }
           if (!(error instanceof SteeringUnavailableError)) {
             this.reconcileInput(live, { data: { type: 'input_delivery', inputId, status: 'uncertain' } })
             throw new Error((error instanceof Error ? error.message : String(error)) + (queuedPromptId ? '. Steering was not confirmed; the pending input was retained. Check the conversation before resending.' : '. Steering was not confirmed; your draft was kept. Check the conversation before resending.'))
@@ -399,6 +497,7 @@ export class StructuredSessions {
         if (live.closed || this.live.get(id) !== live || live.handoff || this.cliOwned(id) || live.adapter !== adapter || live.runtimeId !== runtimeId || !['starting', 'running', 'waiting_input', 'waiting_approval', 'completed', 'idle'].includes(latest.phase)) throw new Error('The turn stopped before this message was queued. Your draft was kept.')
         if (queuedPromptId) refusedInputId = inputId
       }
+      if (requireNativeAcceptance) throw new Error(refusal + '. Native acceptance was not confirmed, so the selected tasks were not claimed.')
       const prompts = latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])
       if (prompts.length >= 100) throw new Error('The queue is full (100 messages)')
       this.setQueue(live, [...prompts, { id: randomUUID(), text, settings: structuredClone(settings), attachments: captured, ...(maySteer ? { steer: true } : {}), ...(origin ? { origin } : {}) }])
@@ -412,6 +511,55 @@ export class StructuredSessions {
   private setSteering(live: LiveSession, prompts: import('../shared/structured-agent').PendingSteering[], native?: AdapterEvent['native']): void {
     this.emit(live, { data: { type: 'steering', prompts }, native })
   }
+  private nativeAcceptanceWaiter(live: LiveSession, inputId: string): { promise: Promise<void>; cancel(): void } {
+    let resolve!: () => void, reject!: (reason: Error) => void
+    const promise = new Promise<void>((accepted, refused) => { resolve = accepted; reject = refused })
+    const timer = setTimeout(() => {
+      const waiter = live.nativeAcceptance?.get(inputId)
+      if (!waiter) return
+      live.nativeAcceptance!.delete(inputId)
+      const state = this.database.structured.snapshot(live.spec.id)
+      const prompts = state?.pendingSteering ?? []
+      const pending = prompts.find(input => input.id === inputId && input.runtimeId === live.runtimeId)
+      if (pending?.status === 'sending') this.setSteering(live, prompts.map(input => input.id === inputId ? { ...input, status: 'uncertain' } : input))
+      waiter.reject(new Error('Native steering acceptance was not confirmed. The pending input was retained; inspect the conversation before retrying.'))
+    }, 30_000)
+    const waiters = live.nativeAcceptance ??= new Map()
+    waiters.set(inputId, { timer, resolve, reject })
+    return { promise, cancel: () => {
+      const waiter = live.nativeAcceptance?.get(inputId)
+      if (!waiter) return
+      clearTimeout(waiter.timer)
+      live.nativeAcceptance!.delete(inputId)
+    } }
+  }
+  private settleNativeAcceptance(live: LiveSession, inputId: string, status: 'accepted' | 'delivered' | 'cancelled' | 'uncertain'): void {
+    const waiter = live.nativeAcceptance?.get(inputId)
+    if (!waiter) return
+    clearTimeout(waiter.timer)
+    live.nativeAcceptance!.delete(inputId)
+    if (status === 'accepted' || status === 'delivered') waiter.resolve()
+    else waiter.reject(new Error(status === 'cancelled'
+      ? 'The native runtime cancelled the assignment before accepting it.'
+      : 'Native steering delivery is uncertain. The pending input was retained; inspect the conversation before retrying.'))
+  }
+  /** End every receipt wait before replacing or disposing its transport. Pending ownership is
+   * retained as uncertain, so a late callback from the retired runtime cannot authorize a claim. */
+  private cancelNativeAcceptances(live: LiveSession, message: string): void {
+    const waiters = live.nativeAcceptance
+    if (!waiters?.size) return
+    const ids = new Set(waiters.keys())
+    const state = this.database.structured.snapshot(live.spec.id)
+    const prompts = state?.pendingSteering ?? []
+    if (prompts.some(input => ids.has(input.id) && input.status === 'sending')) {
+      this.setSteering(live, prompts.map(input => ids.has(input.id) && input.status === 'sending' ? { ...input, status: 'uncertain' } : input))
+    }
+    for (const waiter of waiters.values()) {
+      clearTimeout(waiter.timer)
+      waiter.reject(new Error(message))
+    }
+    waiters.clear()
+  }
   private reconcileInput(live: LiveSession, source: AdapterEvent): void {
     if (source.data.type !== 'input_delivery') return
     const { inputId, status } = source.data
@@ -419,13 +567,15 @@ export class StructuredSessions {
     const prompts = state.pendingSteering ?? []
     const input = prompts.find(prompt => prompt.id === inputId && prompt.runtimeId === live.runtimeId)
     if (!input) return
+    // A late accepted acknowledgement cannot reverse a terminal/uncertain result or authorize a
+    // Project-task handoff. Every other status settles a caller waiting for native custody.
+    if (status === 'accepted' && input.status !== 'sending') return
+    this.settleNativeAcceptance(live, inputId, status)
     if (status === 'delivered') {
       this.setSteering(live, prompts.filter(prompt => prompt.id !== inputId), source.native)
       live.expediteInput?.delete(inputId)
       this.emit(live, { turnId: input.turnId, itemId: inputId, data: { type: 'text', role: 'user', text: input.text, mode: 'snapshot', ...(input.attachments.length ? { attachments: input.attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(input.origin ? { origin: input.origin } : {}) }, native: source.native })
     } else {
-      // A delayed ACK cannot downgrade a terminal/uncertain outcome.
-      if (status === 'accepted' && input.status !== 'sending') return
       this.setSteering(live, prompts.map(prompt => prompt.id === inputId ? { ...prompt, status } : prompt), source.native)
     }
     queueMicrotask(() => { void this.drainQueue(live) })
@@ -459,7 +609,7 @@ export class StructuredSessions {
       if (recovered.length || held.length) {
         const ids = new Set(recovered.map(input => input.id))
         this.setSteering(live, (state.pendingSteering ?? []).filter(input => !ids.has(input.id)))
-        this.setQueue(live, [...recovered.map(({ runtimeId: _runtime, turnId: _turn, status: _status, ...input }) => ({ ...input, steer: true })), ...held, ...queued.filter(input => !held.includes(input))])
+        this.setQueue(live, [...recovered.map(({ runtimeId: _runtime, turnId: _turn, status: _status, ...input }) => ({ ...input, steer: true })), ...held.map(input => ({ ...input, steer: true })), ...queued.filter(input => !held.includes(input))])
         live.sendAfterInterrupt = true
         state = this.database.structured.snapshot(live.spec.id)!
       }
@@ -490,34 +640,67 @@ export class StructuredSessions {
   }
 
   async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
-    const live = this.get(id), store = this.database.structured, state = store.snapshot(id)!
+    const live = this.get(id), store = this.database.structured
+    let state = store.snapshot(id)!
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
     if (live.submitting || live.steering || active.has(state.phase)) throw new Error('A turn or request is already active in this session')
     this.assertUnderUsageCap(live)
-    if (state.phase === 'disconnected' && state.nativeSessionId) throw new Error('Execution became uncertain. Resume the native conversation explicitly before sending another turn.')
     if (typeof text !== 'string' || !text.trim() || text.length > 60_000) throw new Error('Prompt must contain 1–60000 characters')
-    settings = settingsForRuntime(settings, live.adapter ? live.runtimeId : undefined)
+    settings = this.messageSettings(state, settings)
     this.validateSettings(settings, state.capabilities)
+    // A remote-origin prompt does not authorize waking or reconnecting its retained native
+    // runtime. Reject a revoked peer before any attachment I/O or provider lifecycle work.
+    this.assertPromptDispatchAuthority(origin, live.spec)
     live.submitting = true
+    let resumedIntoActiveTurn = false
     try {
+      if (live.browserConfigStale) {
+        await this.reconnect(live)
+        this.assertPromptDispatchAuthority(origin, live.spec)
+        live.browserConfigStale = false
+        state = store.snapshot(id)!
+      }
+      if (state.phase === 'disconnected' && state.nativeSessionId) {
+        await this.reconnect(live)
+        this.assertPromptDispatchAuthority(origin, live.spec)
+        state = store.snapshot(id)!
+        // A resumed Codex thread can reveal that its turn survived the transport loss. Send this
+        // new owner message to that same turn once; never replay any earlier uncertain input.
+        if (active.has(state.phase)) {
+          resumedIntoActiveTurn = true
+          live.submitting = false
+          return await this.followup(id, text, settingsForRuntime(settings, live.runtimeId), attachments, true, undefined, origin)
+        }
+      }
+      settings = settingsForRuntime(settings, live.adapter ? live.runtimeId : undefined)
       const context = await this.attachments(live, attachments)
+      this.assertPromptDispatchAuthority(origin, live.spec)
       const userItemId = randomUUID()
       const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId) ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.assertPromptWithinLimit(submitted.length)
+      // A queued message may have captured settings before the owner revoked browser access.
+      // Never let that per-message snapshot overwrite the explicit, newer session authority.
+      state = store.snapshot(id)!
+      settings = this.messageSettings(state, settings)
+      await this.connect(live)
+      if (live.closed || this.live.get(id) !== live || !live.adapter) throw new Error('Session closed during initialization; no prompt was sent')
+      // connect/reconnect and attachment expansion can all yield to peer revocation. This final
+      // synchronous guard is adjacent to the adapter call: no accepted user/running event exists
+      // until the durable remote authority has survived every one of those boundaries.
+      this.assertPromptDispatchAuthority(origin, live.spec)
       this.reserveLive(live, settings, submitted)
       // Short and word-bounded, so history rows read the same name the tab strip auto-names
       // itself from (see conversation-tab.ts's bindConversationTab).
       store.update(id, { settings, title: state.title || deriveConversationTitle(text) })
-      await this.connect(live)
-      if (live.closed || this.live.get(id) !== live || !live.adapter) throw new Error('Session closed during initialization; no prompt was sent')
       // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
       this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(origin ? { origin } : {}) } })
       this.emit(live, { data: { type: 'session', phase: 'running' } })
       if (process.env.CONDUCTOR_LIVE_TESTS === '1') live.budget = new LiveRuntimeBudget(boundary => this.stopLive(live, boundary === 'active-runtime' ? 'Live prompt reached its 90 second active runtime allowance' : 'Live prompt reached its 30 second cumulative human-input wait allowance'))
-      await live.adapter!.submit(submitted, settings, attachments.filter(item => item.kind === 'image'))
+      const dispatch = live.adapter.submit(submitted, settings, attachments.filter(item => item.kind === 'image'))
+      await dispatch
     } catch (error) {
-      if (store.snapshot(id)?.phase === 'running') {
+      if (!resumedIntoActiveTurn && store.snapshot(id)?.phase === 'running') {
         this.emit(live, { data: { type: 'error', message: `Prompt dispatch failed: ${error instanceof Error ? error.message : 'Unknown provider error'}` } })
         this.emit(live, { data: { type: 'session', phase: 'failed' } })
       }
@@ -526,6 +709,7 @@ export class StructuredSessions {
   }
   private validateSettings(settings: SessionSettings, capabilities: import('../shared/structured-agent').ProviderCapabilities | undefined): void {
     if (!settings || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
+    if (settings.browserMcp !== undefined && typeof settings.browserMcp !== 'boolean') throw new Error('Invalid browser MCP setting')
     if (settings.temporaryPermission && (typeof settings.temporaryPermission.runtimeId !== 'string' || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.temporaryPermission.restore))) throw new Error('Invalid temporary permission scope')
     if (settings.plan && !capabilities?.plans) throw new Error('Planning is unavailable on this adapter baseline')
     if (capabilities?.permissions && !capabilities.permissions.includes(settings.permission)) throw new Error('Permission policy unsupported by this provider')
@@ -533,6 +717,24 @@ export class StructuredSessions {
     if (settings.approvalPolicy && !capabilities?.approvalPolicies?.includes(settings.approvalPolicy)) throw new Error('Approval policy unsupported by this provider')
     if (settings.model && (settings.model.length > 160 || /[\r\n\0]/.test(settings.model))) throw new Error('Invalid model')
     if (settings.effort && settings.effort !== 'auto' && !capabilities?.effort.includes(settings.effort)) throw new Error('Effort is not supported by this provider')
+  }
+  /** Browser access is an explicit session authority, not a per-message generation setting.
+   * Queued prompts, delayed attachment reads, native resume calls, and provider-emitted settings
+   * may carry an older copy; preserve their model/effort/permission while taking browserMcp only
+   * from the current durable projection. */
+  private messageSettings(state: { settings: SessionSettings }, incoming: SessionSettings): SessionSettings {
+    const { browserMcp: _capturedBrowser, ...message } = incoming
+    return state.settings.browserMcp === undefined ? message : { ...message, browserMcp: state.settings.browserMcp }
+  }
+  private assertPromptDispatchAuthority(origin: PromptOrigin | undefined, spec: AgentSpec): void {
+    const authority = origin?.authority
+    if (!authority) return
+    if (authority.kind !== 'remote-peer'
+      || typeof authority.peerId !== 'string' || !authority.peerId || authority.peerId.length > 200 || /[\r\n\0]/.test(authority.peerId)
+      || typeof authority.projectId !== 'string' || !authority.projectId || authority.projectId.length > 200 || /[\r\n\0]/.test(authority.projectId)
+      || authority.projectId !== spec.projectId) throw new Error('Remote prompt authority is invalid for this project; no message was sent')
+    if (!this.promptDispatchAuthorityGuard) throw new Error('Remote prompt authority cannot be verified on this runtime; no message was sent')
+    this.promptDispatchAuthorityGuard(authority, spec)
   }
   /** The CLI/API refuses the whole turn with an opaque error past this ceiling. Attachment and
    *  recalled-memory expansion can silently inflate a short-looking draft well past it, so the
@@ -545,7 +747,7 @@ export class StructuredSessions {
     let context = ''
     let imageBytes = 0
     for (const item of attachments) {
-      if (!item || typeof item.name !== 'string' || !['file', 'selection', 'editor', 'terminal', 'diagnostics', 'image'].includes(item.kind)) throw new Error('Invalid attachment')
+      if (!item || typeof item.name !== 'string' || !['file', 'selection', 'editor', 'terminal', 'diagnostics', 'image', 'media'].includes(item.kind)) throw new Error('Invalid attachment')
       if (item.kind === 'image') {
         if (!this.database.structured.snapshot(live.spec.id)?.capabilities?.imageAttachments) throw new Error('Image attachments are unsupported by this provider connection')
         if (!item.path || !/\.(png|jpe?g|gif|webp)$/i.test(item.path)) throw new Error('A supported local PNG, JPEG, GIF or WebP image path is required')
@@ -556,6 +758,18 @@ export class StructuredSessions {
         if (size > 10 * 1024 * 1024 || live.spec.provider === 'claude' && imageBytes > 4 * 1024 * 1024) throw new Error('Image context exceeds the provider limit (10 MiB per image; 4 MiB total for Claude JSON transport)')
         item.path = imagePath
         context += `\n\n[Attached image: ${item.name}; path: ${item.path}; ${size} bytes. Native image content is submitted separately.]`
+        continue
+      }
+      if (item.kind === 'media') {
+        if (!item.path) throw new Error('Opaque media requires a project file path')
+        const path = await workspacePath(live.spec.cwd, item.path)
+        const { lstat } = await import('node:fs/promises')
+        const stat = await lstat(path)
+        if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Opaque media must be a regular project file')
+        const mimeType = typeof item.mimeType === 'string' && /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/i.test(item.mimeType) ? item.mimeType.toLowerCase() : 'application/octet-stream'
+        item.size = stat.size
+        item.mimeType = mimeType
+        context += `\n\n[Attached opaque media: ${item.name}; workspace path: ${item.path}; media type: ${mimeType}; ${stat.size} bytes. Binary bytes were not decoded or inserted as readable text.]`
         continue
       }
       let content = item.content
@@ -616,7 +830,7 @@ export class StructuredSessions {
     // Escape expedites only already-submitted input; composer drafts never reach here.
     const pending = (state.pendingSteering ?? []).filter(input => input.runtimeId === live.runtimeId && ['sending', 'accepted'].includes(input.status))
     live.expediteInput = expediteSubmittedInput && pending.length ? new Set(pending.map(input => input.id)) : undefined
-    live.expediteQueued = expediteSubmittedInput ? new Set((state.queuedPrompts ?? []).filter(input => input.steer && input.id !== live.dispatchingPromptId).map(input => input.id)) : undefined
+    live.expediteQueued = expediteSubmittedInput ? new Set((state.queuedPrompts ?? []).filter(input => input.id !== live.dispatchingPromptId).map(input => input.id)) : undefined
     this.emit(live, { data: { type: 'session', phase: 'interrupting' } })
     const interrupted = live.adapter.interrupt()
     live.interrupting = interrupted
@@ -633,6 +847,7 @@ export class StructuredSessions {
     live.shutdownTimer = setTimeout(() => {
       live.shutdownTimer = undefined
       if (live.runtimeId !== runtimeId || live.closed || !active.has(this.database.structured.snapshot(live.spec.id)!.phase)) return
+      this.cancelNativeAcceptances(live, 'The runtime stopped before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
       live.adapter?.dispose(); live.adapter = undefined
       this.emit(live, { data: { type: 'session', phase: 'disconnected', message } })
     }, 2000)
@@ -738,6 +953,7 @@ export class StructuredSessions {
     }
     if (source.data.type === 'session' && source.turnId) live.turnId = source.turnId
     let data = source.data
+    if (data.type === 'session' && data.settings) data = { ...data, settings: this.messageSettings(state, data.settings) }
     if (data.type === 'changes') data = { ...data, changes: data.changes.map(change => this.artifacts.fromPatch(live.spec.id, change, live.spec.cwd)) }
     if (data.type === 'tool' && data.output && data.output.length > 32_000) {
       const output = data.output
@@ -815,6 +1031,7 @@ export class StructuredSessions {
   killWhere(predicate: (spec: AgentSpec) => boolean): void {
     for (const [id, live] of this.live) if (predicate(live.spec)) {
       if (live.adapter) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Backend stopped; native resume is an explicit action' } })
+      this.cancelNativeAcceptances(live, 'The backend closed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
       live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id)
     }
     this.flush()

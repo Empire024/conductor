@@ -58,6 +58,11 @@ export interface RemoteServerStatus {
  */
 export class RemoteControlServer {
   private server?: Server
+  /** Includes a socket from creation through shutdown, not only after its listen callback. */
+  private sockets = new Set<Server>()
+  private closing = new Map<Server, Promise<void>>()
+  /** Every apply/stop/close is an intent; an older continuation may close itself but never publish. */
+  private intent = 0
   private tls?: RemoteTlsIdentity
   private status: RemoteServerStatus = { listening: false, endpoint: null, fingerprint: null, message: null }
 
@@ -83,9 +88,11 @@ export class RemoteControlServer {
 
   /** Starts, restarts or stops the listener to match the owner's current settings. */
   async apply(): Promise<RemoteServerStatus> {
-    const settings = this.deps.peers.getSettings()
-    await this.stop()
-    if (!settings.enabled) { this.status = { listening: false, endpoint: null, fingerprint: null, message: null }; this.deps.changed?.(); return this.getStatus() }
+    const intent = ++this.intent
+    const settings = { ...this.deps.peers.getSettings() }
+    await this.stopSockets()
+    if (intent !== this.intent) return this.getStatus()
+    if (!settings.enabled) { this.setStopped(); return this.getStatus() }
     if (this.deps.accountLogin() === null) {
       this.status = { listening: false, endpoint: null, fingerprint: null, message: 'Sign in to GitHub before other machines can connect.' }
       this.deps.changed?.()
@@ -96,20 +103,19 @@ export class RemoteControlServer {
       this.deps.changed?.()
       return this.getStatus()
     }
+    let candidate: Server | undefined
     try {
       const tls = this.tlsIdentity()
-      this.tls = tls
-      this.deps.peers.setFingerprint(tls.fingerprint)
       const server = createServer({ cert: tls.certificatePem, key: tls.privateKeyPem, minVersion: 'TLSv1.2' }, (request, response) => { void this.handle(request, response) })
+      candidate = server
+      this.sockets.add(server)
       server.requestTimeout = 120000
       server.headersTimeout = 10000
       server.maxHeadersCount = 30
       server.maxConnections = MAX_SOCKETS
       const bindHost = resolveBindHost(settings)
-      await new Promise<void>((resolve, reject) => {
-        server.once('error', reject)
-        server.listen(settings.port, bindHost, () => { server.off('error', reject); resolve() })
-      })
+      await this.listen(server, settings.port, bindHost)
+      if (intent !== this.intent) { await this.closeSocket(server); return this.getStatus() }
       // Once listening there is no promise left to reject into, and an unhandled 'error' event on
       // a network-facing listener would take the whole app down. It is surfaced in the status the
       // owner already sees instead.
@@ -119,6 +125,8 @@ export class RemoteControlServer {
         this.deps.changed?.()
       })
       this.server = server
+      this.tls = tls
+      this.deps.peers.setFingerprint(tls.fingerprint)
       const address = server.address()
       const port = address && typeof address !== 'string' ? address.port : settings.port
       this.status = {
@@ -128,10 +136,34 @@ export class RemoteControlServer {
         message: settings.exposure === 'network' ? 'Reachable from your network. Only paired machines on your GitHub account can connect.' : null
       }
     } catch (error) {
+      if (candidate) await this.closeSocket(candidate)
+      if (intent !== this.intent) return this.getStatus()
       this.status = { listening: false, endpoint: null, fingerprint: null, message: error instanceof Error ? error.message : String(error) }
     }
     this.deps.changed?.()
     return this.getStatus()
+  }
+
+  private listen(server: Server, port: number, host: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = (): void => {
+        server.off('error', failed)
+        server.off('listening', listening)
+        server.off('close', closed)
+      }
+      const failed = (error: Error): void => { cleanup(); reject(error) }
+      const listening = (): void => { cleanup(); resolve() }
+      const closed = (): void => { cleanup(); reject(new Error('Remote control listener stopped before startup completed.')) }
+      server.once('error', failed)
+      server.once('listening', listening)
+      server.once('close', closed)
+      try { server.listen(port, host) } catch (error) { cleanup(); reject(error) }
+    })
+  }
+
+  private setStopped(): void {
+    this.status = { listening: false, endpoint: null, fingerprint: null, message: null }
+    this.deps.changed?.()
   }
 
   /** The ticket carries the address and the certificate to pin, plus a single-use pairing code. */
@@ -255,18 +287,43 @@ export class RemoteControlServer {
     return this.deps.host.call(peer, method, payload.args ?? {})
   }
 
-  async stop(): Promise<void> {
-    const server = this.server
+  private closeSocket(server: Server): Promise<void> {
+    const active = this.closing.get(server)
+    if (active) return active
+    const closing = new Promise<void>(resolve => {
+      let settled = false
+      const done = (): void => {
+        if (settled) return
+        settled = true
+        server.off('close', done)
+        resolve()
+      }
+      server.once('close', done)
+      try { server.closeAllConnections() } catch { /* a half-created listener may have no connections */ }
+      try { server.close(() => done()) } catch { done() }
+    }).finally(() => {
+      this.sockets.delete(server)
+      this.closing.delete(server)
+    })
+    this.closing.set(server, closing)
+    return closing
+  }
+
+  private async stopSockets(): Promise<void> {
     this.server = undefined
     this.tls = undefined
-    if (!server) return
-    server.closeAllConnections()
-    await new Promise<void>(resolve => server.close(() => resolve()))
+    if (this.status.listening || this.status.endpoint || this.status.fingerprint) this.setStopped()
+    await Promise.all([...this.sockets].map(server => this.closeSocket(server)))
+  }
+
+  async stop(): Promise<void> {
+    const intent = ++this.intent
+    await this.stopSockets()
+    if (intent === this.intent) this.setStopped()
   }
 
   async close(): Promise<void> {
     await this.stop()
-    this.status = { listening: false, endpoint: null, fingerprint: null, message: null }
   }
 }
 

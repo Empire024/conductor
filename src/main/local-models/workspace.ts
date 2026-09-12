@@ -1,5 +1,5 @@
 import { realpath } from 'node:fs/promises'
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 
 /** Containment refusal for anything a local model asked for outside its workspace. */
 export class WorkspaceBoundaryError extends Error {}
@@ -25,11 +25,13 @@ const SECRET_ALLOW = [/^\.env\.(example|sample|template|dist)$/i, /\.secrets?\.(
 export function isSecretPath(relativePath: string): boolean {
   const parts = relativePath.split(/[\\/]+/).filter(part => part && part !== '.')
   if (!parts.length) return false
-  for (const part of parts) if (SECRET_SEGMENTS.has(part.toLowerCase())) return true
-  const name = parts[parts.length - 1]!
-  if (SECRET_ALLOW.some(pattern => pattern.test(name))) return false
-  if (SECRET_NAMES.has(name.toLowerCase())) return true
-  return SECRET_PATTERNS.some(pattern => pattern.test(name))
+  // A withheld directory withholds its descendants too. Apply the same name policy to
+  // every ancestor, both before and after realpath resolves a public-looking alias.
+  return parts.some(name => {
+    if (SECRET_SEGMENTS.has(name.toLowerCase())) return true
+    if (SECRET_ALLOW.some(pattern => pattern.test(name))) return false
+    return SECRET_NAMES.has(name.toLowerCase()) || SECRET_PATTERNS.some(pattern => pattern.test(name))
+  })
 }
 
 /** Git metadata is readable so the agent can inspect history, but never writable: a local model
@@ -69,9 +71,19 @@ export async function resolveInWorkspace(root: string, requested: string, allowM
     path = await realpath(target)
   } catch (error) {
     if (!allowMissing || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
-    const parent = await realpath(dirname(target))
+    // New nested files need an existing ancestor, not an already-existing immediate parent.
+    // Validate each missing component against that canonical ancestor before mkdir runs.
+    let ancestor = dirname(target)
+    let parent: string
+    for (;;) {
+      try { parent = await realpath(ancestor); break }
+      catch (parentError) {
+        if ((parentError as NodeJS.ErrnoException).code !== 'ENOENT' || ancestor === dirname(ancestor)) throw parentError
+        ancestor = dirname(ancestor)
+      }
+    }
     if (!inside(canonicalRoot, parent) && parent !== canonicalRoot) throw new WorkspaceBoundaryError('Parent directory leaves the workspace')
-    path = resolve(parent, basename(target))
+    path = resolve(parent, relative(ancestor, target))
   }
   if (!inside(canonicalRoot, path) && path !== canonicalRoot) throw new WorkspaceBoundaryError('Symlink or junction leaves the workspace')
   const rel = relative(canonicalRoot, path).replace(/\\/g, '/')

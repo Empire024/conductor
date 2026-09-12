@@ -12,8 +12,10 @@ export interface AdapterOptions {
   beforeTool?(itemId: string, paths: string[]): Promise<void>
   afterTool?(itemId: string, paths: string[], success: boolean): Promise<void>
   environment?: NodeJS.ProcessEnv
-  /** Serialized `mcpServers` configuration handed to the CLI at launch, or '' for none. */
+  /** Backend-created provider-native MCP configuration file (or bounded inline fallback). */
   mcpConfig?: string
+  /** Trusted, registered-session broker for the Local runtime only. Never a bearer token. */
+  localControl?(method: string, args: Record<string, unknown>): Promise<unknown>
 }
 export interface ProviderAdapter {
   readonly provider: StructuredProvider
@@ -27,6 +29,8 @@ export interface ProviderAdapter {
   archive?(archived: boolean): Promise<void>
   rename?(title: string): Promise<void>
   discover?(): Promise<Json>
+  /** Refresh account allowance telemetry without starting or steering a model turn. */
+  refreshUsage?(): Promise<void>
   stop?(): Promise<void>
   history?(): Promise<import('../native-history').NativeHistoryItem[]>
   dispose(): void

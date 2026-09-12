@@ -88,6 +88,13 @@ function timeLabel(timestamp: string): string {
   const date = new Date(timestamp)
   return Number.isFinite(date.getTime()) ? date.toLocaleString() : 'Not reported'
 }
+export function subagentStatusTitle(status: SubagentSummary['status']): string {
+  const label = subagentStatusLabels[status]
+  if (status === 'running' || status === 'preparing') return `${label}: the provider reports this agent is active.`
+  if (status === 'awaiting_approval') return `${label}: this agent cannot continue until approval is resolved.`
+  if (status === 'unknown') return `${label}: the connection ended before a final agent status was reported.`
+  return `${label}: final status reported by the provider.`
+}
 export function SubagentExplorer({ agents, truncated = false, runtimeId, detail }: { agents: SubagentSummary[]; truncated?: boolean; runtimeId: string; detail: SubagentDetailContext }): React.JSX.Element {
   const [query, setQuery] = useState('')
   const [filter, setFilter] = useState('all')
@@ -119,13 +126,15 @@ function SubagentCard({ agent, label, colorIndex, runtimeId, detail, open, onTog
   const tools = activity.filter(item => item.data.type === 'tool')
   const modelLabel = subagentModelLabel(agent)
   const tokenLabel = subagentTokenLabel(agent)
-  return <li><article className="sa-agent-card">
-    <button type="button" className="sa-agent-card-heading" aria-expanded={open} onClick={onToggle}>
-      <span className={'sa-subagent-dot status-' + agent.status} />
-      <span><strong title={label}><span className={'sa-subagent-identity sa-agent-hue-' + colorIndex} aria-hidden="true" />{label}</strong><small>{agent.detached && <><em className="sa-subagent-detached">Background</em>{' '}</>}{agent.detached ? (agent.output !== undefined ? 'Command output available' : agent.outputFile ? 'Command output file' : 'Background command') : <>{tools.length} {tools.length === 1 ? 'tool' : 'tools'} &middot; {activity.length} activity items</>}</small></span>
+  const activityLabel = [tools.length ? `${tools.length} ${tools.length === 1 ? 'tool' : 'tools'}` : '', activity.length ? `${activity.length} activity ${activity.length === 1 ? 'item' : 'items'}` : ''].filter(Boolean).join(' · ')
+  const statusTitle = subagentStatusTitle(agent.status)
+  return <li><article className={`sa-agent-card sa-agent-hue-${colorIndex}`}>
+    <button type="button" className="sa-agent-card-heading" aria-expanded={open} title={`${label}. ${statusTitle}`} onClick={onToggle}>
+      <span className={'sa-subagent-dot status-' + agent.status} role="img" aria-label={statusTitle} title={statusTitle} />
+      <span><strong title={label}>{label}</strong><small>{agent.detached && <><em className="sa-subagent-detached">Background agent</em>{' '}</>}{activityLabel || 'Lifecycle only · child activity not reported'}</small></span>
       {modelLabel && <span className="sa-subagent-model" title={'Runs on ' + modelLabel}><ProviderIcon provider={agent.modelProvider} model={agent.model} size={11} />{modelLabel}</span>}
       {tokenLabel && <span className="sa-subagent-tokens" title="Tokens reported for this subagent">{tokenLabel}</span>}
-      <span className={'sa-subagent-state status-' + agent.status}>{subagentStatusLabels[agent.status]}</span>
+      <span className={'sa-subagent-state status-' + agent.status} title={statusTitle}>{subagentStatusLabels[agent.status]}</span>
       <ChevronDown size={14} className={open ? 'expanded' : ''} />
     </button>
     {agent.linkedProvider && <span className="sa-subagent-link"><ProviderIcon provider={agent.linkedProvider} size={12} />{agent.linkedProvider} command</span>}
@@ -134,14 +143,15 @@ function SubagentCard({ agent, label, colorIndex, runtimeId, detail, open, onTog
       <dl><dt>First reported</dt><dd>{timeLabel(agent.startedAt)}</dd><dt>Last activity</dt><dd>{timeLabel(agent.updatedAt)}</dd>{agent.nativeSessionId && <><dt>Session ID</dt><dd><code>{agent.nativeSessionId}</code></dd></>}</dl>
       {agent.status === 'unknown' && <p className="sa-detail-hint">The connection ended or changed before a final status was reported.</p>}
       {agent.task && <section><h4>Assigned task</h4><StructuredMarkdown text={agent.task} cwd={detail.cwd} projectId={detail.projectId} onOpenFile={detail.onOpenFile} /></section>}
-      {agent.outputFile && <section><h4>Command output{agent.outputTruncated ? ' (last 32 KB)' : ''}</h4><small>{agent.outputFile}</small>{agent.output !== undefined ? <pre>{agent.output || 'No output written.'}</pre> : <p className="sa-detail-hint">{agent.outputError ?? 'Reading task output…'}</p>}</section>}
-      <section><h4>Latest response</h4>{output?.data.type === 'text' ? <StructuredMarkdown text={stripMemoryDirectives(output.data.text)} cwd={detail.cwd} projectId={detail.projectId} onOpenFile={detail.onOpenFile} /> : <p className="sa-detail-hint">No response reported in the available history.</p>}</section>
-      <details className="sa-agent-activity"><summary>Activity ({activity.length})</summary>{groups.length ? groups.map(group => {
+      {agent.outputFile && <section><h4>Background output{agent.outputTruncated ? ' (last 32 KB)' : ''}</h4><small>{agent.outputFile}</small>{agent.output !== undefined ? <pre>{agent.output || 'No output written.'}</pre> : <p className="sa-detail-hint">{agent.outputError ?? 'Reading task output…'}</p>}</section>}
+      {output?.data.type === 'text' && <section><h4>Latest response</h4><StructuredMarkdown text={stripMemoryDirectives(output.data.text)} cwd={detail.cwd} projectId={detail.projectId} onOpenFile={detail.onOpenFile} /></section>}
+      {!activity.length && !agent.outputFile && <p className="sa-detail-hint">The provider reported this agent&rsquo;s lifecycle, but did not expose child activity.</p>}
+      {activity.length > 0 && <details className="sa-agent-activity"><summary>Activity ({activity.length})</summary>{groups.map(group => {
         const rows = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={detail.sessionId} projectId={detail.projectId} onInspectAttachment={detail.onInspectAttachment} cwd={detail.cwd} expanded={itemExpansion[item.id] ?? false} interactive={detail.interactive && item.runtimeId === runtimeId} onExpand={onExpand} onOpenFile={detail.onOpenFile} onDiff={detail.onDiff} onRespond={detail.onRespond} />)
         if (group.length === 1) return rows[0]
         const coalesced = coalescedEditSummary(group)
         return <details className="sa-completed-group" key={group[0]!.id}><summary>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</summary><div>{rows}</div></details>
-      }) : <p className="sa-detail-hint">No child activity reported yet.</p>}</details>
+      })}</details>}
     </div>}
   </article></li>
 }

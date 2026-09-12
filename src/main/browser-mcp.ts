@@ -79,15 +79,18 @@ export class BrowserMcpServer {
    *  bearer token of every live session in one line, and this bridge grants whoever holds a token
    *  that session's whole browser view — so the secret does not travel in argv. */
   configure(spec: Pick<AgentSpec, 'id' | 'projectId' | 'sessionId' | 'provider'>): string {
-    // Codex has its own browser_use tooling and never reads a Conductor --mcp-config.
-    if (!this.endpoint || this.disabled || spec.provider !== 'claude') return ''
+    if (!this.endpoint || this.disabled || !['claude', 'codex'].includes(spec.provider)) return ''
     let credential = this.credentials.get(spec.id)
     if (!credential || credential.scope.projectId !== spec.projectId || credential.scope.sessionId !== spec.sessionId) {
       this.discard(credential)
       credential = { token: randomBytes(32).toString('hex'), scope: { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id } }
       this.credentials.set(spec.id, credential)
     }
-    const configuration = JSON.stringify({ mcpServers: { [BROWSER_MCP_SERVER_NAME]: { type: 'http', url: this.endpoint, headers: { Authorization: `Bearer ${credential.token}` } } } })
+    // Claude consumes this file through --mcp-config. Codex reads the snake_case shape into its
+    // thread/start or thread/resume config; neither token is put on the process command line.
+    const configuration = JSON.stringify(spec.provider === 'claude'
+      ? { mcpServers: { [BROWSER_MCP_SERVER_NAME]: { type: 'http', url: this.endpoint, headers: { Authorization: `Bearer ${credential.token}` } } } }
+      : { mcp_servers: { [BROWSER_MCP_SERVER_NAME]: { url: this.endpoint, http_headers: { Authorization: `Bearer ${credential.token}` } } } })
     // Automation-profile evidence hook: a smoke run has to hold the very credential the CLI was
     // handed to prove an agent-side call drives the real view. Never reachable in a packaged app.
     const capture = process.env.CONDUCTOR_TEST_BROWSER_MCP_CAPTURE
@@ -154,10 +157,11 @@ export class BrowserMcpServer {
     } catch { reply(400, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Malformed JSON-RPC request' } }); return }
     // A notification carries no id and, per JSON-RPC, must not be answered with a body.
     if (message === null || typeof message !== 'object' || message.id === undefined || message.id === null) { reply(202, undefined); return }
-    reply(200, await this.dispatch(credential.scope, message), { 'Mcp-Session-Id': credential.scope.agentSessionId })
+    reply(200, await this.dispatch(credential, message), { 'Mcp-Session-Id': credential.scope.agentSessionId })
   }
 
-  private async dispatch(scope: BrowserMcpScope, message: Rpc): Promise<unknown> {
+  private async dispatch(credential: { token: string; scope: BrowserMcpScope }, message: Rpc): Promise<unknown> {
+    const scope = credential.scope
     const envelope = { jsonrpc: '2.0', id: message.id ?? null }
     const params = message.params && typeof message.params === 'object' ? message.params : {}
     try {
@@ -167,7 +171,7 @@ export class BrowserMcpServer {
           protocolVersion: PROTOCOL_VERSIONS.includes(requested) ? requested : PROTOCOL_VERSIONS[0],
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: BROWSER_MCP_SERVER_NAME, title: 'Conductor browser', version: '1' },
-          instructions: 'These tools drive the Conductor browser view in this workspace, which the owner is watching. Open pages in it rather than describing what you would open.'
+          instructions: 'These tools drive this project\'s isolated Conductor browser. It may be visible, detached, or running in the background; use browser_present when presentation matters.'
         } }
       }
       if (message.method === 'ping') return { ...envelope, result: {} }
@@ -179,7 +183,16 @@ export class BrowserMcpServer {
         const args = params.arguments && typeof params.arguments === 'object' ? params.arguments as Record<string, unknown> : {}
         // A failed tool is reported as a result, not a protocol error, so the agent reads the
         // reason and adapts instead of the CLI tearing the connection down.
-        try { return { ...envelope, result: this.content(await tool.run(this.host, scope, args)) } }
+        try {
+          const guardedHost: BrowserMcpHost = { view: async requestedScope => {
+            const view = await this.host.view(requestedScope)
+            if (this.credentials.get(scope.agentSessionId) !== credential) throw new Error('Browser access was revoked before the view was ready')
+            return view
+          } }
+          const result = await tool.run(guardedHost, scope, args)
+          if (this.credentials.get(scope.agentSessionId) !== credential) throw new Error('Browser access was revoked while the tool was running')
+          return { ...envelope, result: this.content(result) }
+        }
         catch (error) { return { ...envelope, result: { isError: true, content: [{ type: 'text', text: errorMessage(error) }] } } }
       }
       return { ...envelope, error: { code: -32601, message: `Method not found: ${message.method ?? '(none)'}` } }

@@ -5,6 +5,7 @@ import type { PaneTab, SessionRecord, WorkspaceLayout } from '../../shared/model
 import { makeLauncherTab } from '../../shared/models'
 import { activateTab, addTab, findGroup, listGroups, splitGroup, updateTab } from './layout/layout-operations'
 import { applyWorkspaceTabAction } from './layout/workspace-tab-actions'
+import { announceAgentControlSettings } from './agent-control-settings'
 
 export interface AgentControlHost {
   detachedId?: string
@@ -38,6 +39,15 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
   if (request.action === 'tabs.list') return groups.flatMap(group => group.tabs.map(tab => serialize(tab, group.id)))
   let group = typeof request.params.tabId === 'string' ? groups.find(candidate => candidate.tabs.some(tab => tab.id === request.params.tabId)) : groups.find(candidate => candidate.id === request.params.groupId) ?? groups[0]
   if (!group) throw new Error('The requested tab is no longer open.')
+  if (request.action === 'tabs.focus-origin') {
+    const agentSessionId = typeof request.params.agentSessionId === 'string' ? request.params.agentSessionId : ''
+    const retained = agentSessionId && [...session.closedTabs].reverse().find(candidate => candidate.kind === 'agent' && candidate.resourceId === agentSessionId)
+    if (!retained) throw new Error('The originating agent tab is no longer retained.')
+    const layout = addTab(session.layout, group.id, retained)
+    const next = { ...session, layout, maximizedGroupId: null, closedTabs: session.closedTabs.filter(candidate => candidate.id !== retained.id) }
+    await host.commit(next, group.id, true)
+    return serialize(retained, group.id)
+  }
   let tab = group.tabs.find(candidate => candidate.id === request.params.tabId) ?? group.tabs.find(candidate => candidate.id === group!.activeTabId)
   let next = session
   let focusedGroupId = group.id
@@ -49,6 +59,30 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
     await host.commit(session, group.id, true)
     host.openFile(session.projectId, path)
     return { path, uri: conductorUri(session.projectId, 'file', path) }
+  }
+  if (request.action === 'agents.configure') {
+    const agentSessionId = String(request.params.agentSessionId ?? '')
+    const provider = String(request.params.provider ?? '')
+    const model = String(request.params.model ?? '')
+    const effort = request.params.effort === undefined ? undefined : String(request.params.effort)
+    if (!tab || tab.kind !== 'agent' || tab.resourceId !== agentSessionId) throw new Error('The requested agent tab is no longer open.')
+    if (!provider || tab.state?.provider !== provider || !model || (request.params.effort !== undefined && !effort)) throw new Error('Invalid agent configuration.')
+    if (request.params.expectedModel !== undefined && (tab.state?.model !== request.params.expectedModel || (tab.state?.effort ?? 'auto') !== request.params.expectedEffort)) throw new Error('The agent tab settings changed before rollback.')
+    tab = { ...tab, state: { ...tab.state, model, effort: effort ?? 'auto' } }
+    next = { ...session, layout: updateTab(session.layout, group.id, tab.id, () => tab!) }
+    await host.commit(next, group.id, false)
+    return serialize(tab, group.id)
+  }
+  if (request.action === 'agents.configure-confirmed') {
+    const agentSessionId = String(request.params.agentSessionId ?? '')
+    const model = String(request.params.model ?? '')
+    const effort = request.params.effort === undefined ? undefined : String(request.params.effort)
+    if (!tab || tab.kind !== 'agent' || tab.resourceId !== agentSessionId || !model) throw new Error('The requested agent tab is no longer open.')
+    // The owner may have picked something newer between durable save and this renderer hop. In
+    // that case the newer layout wins and the stale confirmation never reaches React state.
+    if (tab.state?.model !== model || (tab.state.effort ?? 'auto') !== (effort ?? 'auto')) return { notified: false, superseded: true }
+    announceAgentControlSettings({ agentSessionId, model, effort })
+    return { notified: true }
   }
   if (request.action === 'workspace.rename') {
     const name = String(request.params.name ?? request.params.title ?? '').trim()

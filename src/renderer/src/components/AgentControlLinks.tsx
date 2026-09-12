@@ -1,54 +1,56 @@
 import { useEffect, useLayoutEffect, useMemo, useState } from 'react'
-import { ChevronDown, ChevronRight, Link2, Radio, Unlink } from 'lucide-react'
+import { Link2, Radio, Unlink, X } from 'lucide-react'
 import type { AgentControlLink } from '../../../shared/agent-control'
 import type { WorkspaceLayout } from '../../../shared/models'
 import { listGroups } from '../layout/layout-operations'
 import './AgentControlLinks.css'
 
 export type ControlRect = { x: number; y: number; width: number; height: number }
-export type ControlMarker = { id: string; tabId: string; role: 'controller' | 'controlled'; x: number; y: number; color: string; title: string; extra?: number }
-/** One orchestrating tab can drive a dozen others at once. Past this many badges a tab header is
- *  just a row of dots, so the last one becomes a "+N" stand-in for the rest. */
-const MAX_MARKERS_PER_TAB = 3
+export type ControlMarker = { id: string; tabId: string; role: 'controller' | 'controlled' | 'both'; x: number; y: number; color: string; title: string; count: number }
+export type ControlPopoverPosition = { left: number; top: number; width: number; maxHeight: number }
 const MARKER_PALETTE = ['--accent', '--blue', '--accent-muted']
 const hashIndex = (id: string, mod: number): number => { let hash = 0; for (let i = 0; i < id.length; i++) hash = (hash * 31 + id.charCodeAt(i)) >>> 0; return hash % mod }
-// Anchors a marker inside the tab header's own rect (top-right corner) so it always sits on tab chrome, never over pane content below it.
+// One labelled relationship marker per tab replaces the old pile of anonymous dots.
 export function computeMarkers(links: AgentControlLink[], rectFor: (id: string) => ControlRect | undefined, titleFor: (id: string, remote?: string) => string): ControlMarker[] {
-  const placed = new Map<string, number>()
-  const anchor = (rect: ControlRect, tabId: string): { x: number; y: number } => { const n = placed.get(tabId) ?? 0; placed.set(tabId, n + 1); return { x: rect.x + rect.width - 6 - n * 10, y: rect.y + 6 } }
-  const total = new Map<string, number>()
-  for (const link of links) for (const tabId of [link.controllerTabId, link.controlledTabId]) if (rectFor(tabId)) total.set(tabId, (total.get(tabId) ?? 0) + 1)
-  const used = new Map<string, number>()
-  /** Whether this end still gets its own badge, becomes the "+N" stand-in, or is folded into it. */
-  const slotFor = (tabId: string): 'badge' | 'count' | 'none' => {
-    const seen = used.get(tabId) ?? 0
-    const all = total.get(tabId) ?? 0
-    if (all <= MAX_MARKERS_PER_TAB) return 'badge'
-    if (seen < MAX_MARKERS_PER_TAB - 1) return 'badge'
-    return seen === MAX_MARKERS_PER_TAB - 1 ? 'count' : 'none'
-  }
-  const end = (tabId: string, rect: ControlRect, role: 'controller' | 'controlled', id: string, color: string, title: string): ControlMarker | null => {
-    const slot = slotFor(tabId)
-    used.set(tabId, (used.get(tabId) ?? 0) + 1)
-    if (slot === 'none') return null
-    const point = anchor(rect, tabId)
-    const rest = (total.get(tabId) ?? 0) - MAX_MARKERS_PER_TAB + 1
-    if (slot === 'count') return { id, tabId, role, x: point.x, y: point.y, color, title: rest + ' more linked tabs', extra: rest }
-    return { id, tabId, role, x: point.x, y: point.y, color, title }
-  }
-  return links.flatMap(link => {
-    const from = rectFor(link.controllerTabId), to = rectFor(link.controlledTabId)
-    const title = titleFor(link.controllerTabId, link.controllerTitle) + ' controls ' + titleFor(link.controlledTabId, link.controlledTitle)
-    const color = MARKER_PALETTE[hashIndex(link.targetAgentSessionId, MARKER_PALETTE.length)] ?? '--accent'
-    const markers: ControlMarker[] = []
-    if (from) { const marker = end(link.controllerTabId, from, 'controller', link.targetAgentSessionId + ':controller', color, title); if (marker) markers.push(marker) }
-    if (to) { const marker = end(link.controlledTabId, to, 'controlled', link.targetAgentSessionId + ':controlled', color, title); if (marker) markers.push(marker) }
-    return markers
+  const tabIds = [...new Set(links.flatMap(link => [link.controllerTabId, link.controlledTabId]))]
+  return tabIds.flatMap(tabId => {
+    const rect = rectFor(tabId)
+    if (!rect) return []
+    const controlling = links.filter(link => link.controllerTabId === tabId)
+    const controlled = links.find(link => link.controlledTabId === tabId)
+    const role = controlling.length && controlled ? 'both' as const : controlling.length ? 'controller' as const : 'controlled' as const
+    const related = controlling.length ? controlling : controlled ? [controlled] : []
+    const count = related.length
+    const names = controlling.length
+      ? controlling.map(link => titleFor(link.controlledTabId, link.controlledTitle))
+      : controlled ? [titleFor(controlled.controllerTabId, controlled.controllerTitle)] : []
+    const parentName = controlled ? titleFor(controlled.controllerTabId, controlled.controllerTitle) : undefined
+    const ownTitle = titleFor(tabId, controlling[0]?.controllerTitle ?? controlled?.controlledTitle)
+    const title = role === 'both'
+      ? `${ownTitle} is a coworker controlled by ${parentName ?? 'another coordinating tab'} and is also a main coordinator for ${count} coworker${count === 1 ? '' : 's'}: ${names.join(', ')}`
+      : role === 'controller'
+      ? `${ownTitle} is the main coordinating tab and controls ${count} coworker${count === 1 ? '' : 's'}: ${names.join(', ')}`
+      : `${ownTitle} is a coworker controlled by ${names[0] ?? 'the main coordinating tab'}`
+    const identity = related[0]?.targetAgentSessionId ?? tabId
+    return [{ id: `${tabId}:${role}`, tabId, role, x: rect.x + rect.width - 8, y: rect.y + 7, color: MARKER_PALETTE[hashIndex(identity, MARKER_PALETTE.length)] ?? '--accent', title, count }]
   })
+}
+
+/** Keep optional relationship details beside the selected tab marker, including in narrow panes. */
+export function computeControlPopoverPosition(marker: Pick<ControlMarker, 'x' | 'y'>, viewport: { width: number; height: number }): ControlPopoverPosition {
+  const gutter = 8
+  const width = Math.min(360, Math.max(220, viewport.width - gutter * 2))
+  const maxHeight = Math.min(300, Math.max(120, viewport.height - gutter * 2))
+  return {
+    left: Math.max(gutter, Math.min(marker.x - width / 2, viewport.width - width - gutter)),
+    top: Math.max(gutter, Math.min(marker.y + 14, viewport.height - maxHeight - gutter)),
+    width,
+    maxHeight
+  }
 }
 export function AgentControlLinks({ projectId, sessionId, layout }: { projectId: string; sessionId: string; layout: WorkspaceLayout }): React.JSX.Element | null {
   const [links, setLinks] = useState<AgentControlLink[]>([])
-  const [expanded, setExpanded] = useState(false)
+  const [openMarkerTabId, setOpenMarkerTabId] = useState<string | null>(null)
   const [markers, setMarkers] = useState<ControlMarker[]>([])
   const [error, setError] = useState('')
   const tabs = useMemo(() => listGroups(layout.root).flatMap(group => group.tabs), [layout])
@@ -89,22 +91,20 @@ export function AgentControlLinks({ projectId, sessionId, layout }: { projectId:
   const focus = (tabId: string): void => { void window.conductor.agentControl.focusTab(projectId, sessionId, tabId).catch(reason => setError(String(reason))) }
   const release = (id: string): void => { void window.conductor.agentControl.release(id).then(() => { setLinks(current => current.filter(link => link.targetAgentSessionId !== id)); setError('') }).catch(reason => setError(String(reason))) }
   if (!relevant.length) return null
-  // A dozen orchestrated coworkers used to stack a dozen full-width rows over the workspace. The
-  // list now collapses behind one chip naming who is driving and how many, and even opened it is
-  // bounded and scrollable rather than free to grow up the screen.
-  const controllers = new Set(relevant.map(link => titleFor(link.controllerTabId, link.controllerTitle)))
-  const collapsible = relevant.length > 1
-  const summary = controllers.size === 1
-    ? [...controllers][0] + ' controls ' + relevant.length + ' tabs'
-    : relevant.length + ' control links across ' + controllers.size + ' tabs'
+  const openMarker = markers.find(marker => marker.tabId === openMarkerTabId)
+  const openLinks = openMarker
+    ? relevant.filter(link => link.controllerTabId === openMarker.tabId || link.controlledTabId === openMarker.tabId)
+    : []
+  const popoverPosition = openMarker
+    ? computeControlPopoverPosition(openMarker, { width: window.innerWidth, height: window.innerHeight })
+    : undefined
   return <>
-    <div className="agent-control-markers" aria-hidden="true">{markers.map(marker => <span key={marker.id} className={'agent-control-marker ' + marker.role} style={{ left: marker.x, top: marker.y, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={marker.title}>{marker.extra ? <b>+{marker.extra}</b> : marker.role === 'controller' ? <Radio size={8} /> : <Link2 size={8} />}</span>)}</div>
-    <div className={'agent-control-links' + (collapsible ? ' collapsible' : '')} role="region" aria-label="Connected agent tabs">
-    {collapsible && <button type="button" className="agent-control-summary" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>
-      <Link2 size={12} aria-hidden="true" /><span>{summary}</span>{expanded ? <ChevronDown size={11} aria-hidden="true" /> : <ChevronRight size={11} aria-hidden="true" />}
-    </button>}
-    {(!collapsible || expanded) && <div className="agent-control-link-list">{relevant.map(link => <div className="agent-control-link" key={link.targetAgentSessionId}>
-      <Link2 size={12} aria-hidden="true" /><button type="button" title="Show controller tab" onClick={() => focus(link.controllerTabId)}>{titleFor(link.controllerTabId, link.controllerTitle)}</button><span>controls</span><button type="button" title="Show controlled tab" onClick={() => focus(link.controlledTabId)}>{titleFor(link.controlledTabId, link.controlledTitle)}</button><button type="button" className="agent-control-release" aria-label={'Disconnect control of ' + titleFor(link.controlledTabId, link.controlledTitle)} title="Disconnect control; running work continues" onClick={() => release(link.targetAgentSessionId)}><Unlink size={12} /></button>
-    </div>)}</div>}{error && <small role="alert">{error}</small>}</div>
+    <div className="agent-control-markers" aria-label="Agent tab relationships">{markers.map(marker => <button type="button" key={marker.id} className={'agent-control-marker ' + marker.role} style={{ left: marker.x, top: marker.y, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={`${marker.title}. Select for relationship details.`} aria-label={`${marker.title}; show relationship details`} aria-expanded={openMarkerTabId === marker.tabId} onClick={() => setOpenMarkerTabId(current => current === marker.tabId ? null : marker.tabId)}><span aria-hidden="true">{marker.role === 'controlled' ? <Link2 size={8} /> : <Radio size={8} />}</span><b>{marker.role === 'controller' ? 'MAIN' : marker.role === 'controlled' ? 'COWORKER' : 'COWORKER · MAIN'}</b>{marker.role !== 'controlled' && marker.count > 1 && <em>{marker.count}</em>}</button>)}</div>
+    {openMarker && popoverPosition && <div className="agent-control-popover" role="dialog" aria-label={`Agent tab relationships for ${titleFor(openMarker.tabId)}`} style={popoverPosition}>
+      <header><Link2 size={12} aria-hidden="true" /><strong>{openMarker.role === 'controller' ? 'Main coordinator' : openMarker.role === 'controlled' ? 'Coworker' : 'Coworker and main coordinator'}</strong><button type="button" aria-label="Close agent tab relationships" title="Close relationship details" onClick={() => setOpenMarkerTabId(null)}><X size={12} /></button></header>
+      <div className="agent-control-link-list">{openLinks.map(link => <div className="agent-control-link" key={link.targetAgentSessionId}>
+      <em>MAIN</em><button type="button" title="Show main coordinating tab" onClick={() => focus(link.controllerTabId)}>{titleFor(link.controllerTabId, link.controllerTitle)}</button><span>controls</span><em>COWORKER</em><button type="button" title="Show coworker tab" onClick={() => focus(link.controlledTabId)}>{titleFor(link.controlledTabId, link.controlledTitle)}</button><button type="button" className="agent-control-release" aria-label={'Disconnect control of ' + titleFor(link.controlledTabId, link.controlledTitle)} title="Disconnect control; running work continues" onClick={() => release(link.targetAgentSessionId)}><Unlink size={12} /></button>
+      </div>)}</div>{error && <small role="alert">{error}</small>}
+    </div>}
   </>
 }

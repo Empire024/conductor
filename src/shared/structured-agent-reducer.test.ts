@@ -54,6 +54,16 @@ describe('durable agent projection — synthetic events', () => {
     expect(state.items[1]?.data).toMatchObject({ interaction: { status: 'pending' } })
     expect(state.items[0]?.id).not.toBe(state.items[1]?.id)
   })
+  it('keeps only provider-confirmed detached tools active after the parent turn ends', () => {
+    const state = replayAgentEvents('session', [
+      event(1, { type: 'tool', name: 'Bash', status: 'running', detached: true }, { itemId: 'background' }),
+      event(2, { type: 'tool', name: 'Read', status: 'running' }, { itemId: 'foreground' }),
+      event(3, { type: 'session', phase: 'completed' }),
+      event(4, { type: 'tool', name: 'Bash', status: 'completed', detached: true, output: 'done', outputMode: 'snapshot' }, { itemId: 'background' })
+    ])
+    expect(state.items.find(item => item.nativeItemId === 'background')?.data).toMatchObject({ type: 'tool', detached: true, status: 'completed', output: 'done' })
+    expect(state.items.find(item => item.nativeItemId === 'foreground')?.data).toMatchObject({ type: 'tool', status: 'interrupted' })
+  })
   it('bounds large synthetic histories and previews while preserving real counts and statuses', () => {
     let state = emptyProjection('session')
     for (let i = 1; i <= MAX_TIMELINE_ITEMS + 100; i++) state = projectAgentEvent(state, event(i, { type: 'notice', message: `Synthetic ${i}` }))

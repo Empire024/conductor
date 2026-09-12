@@ -5,6 +5,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
+if (process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE) writeFileSync(process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE, `${process.pid}\n`)
 if (process.argv.includes('--version')) { console.log('codex-cli 0.153.4'); process.exit(0) }
 
 let initialized = false
@@ -22,7 +23,8 @@ const patch = '@@ -1,5 +1,3 @@\n export function updatePanel(el, pinned) {\n-  v
 const changes = [{ path: 'panel.mjs', kind: { type: 'update', move_path: null }, diff: patch }]
 const command = (id, status = 'inProgress', output = null, exitCode = null) => ({ type: 'commandExecution', id, command: 'pwsh.exe -NoProfile -Command "Write-Output café"', cwd: process.cwd(), source: 'agent', status, aggregatedOutput: output, exitCode, durationMs: exitCode === null ? null : 4, commandActions: [], pluginId: null, scriptPath: null, processId: null })
 const finish = (status = 'completed') => notify('turn/completed', { threadId, turn: { id: currentTurn, items: [], status, error: status === 'failed' ? { message: 'synthetic failure' } : null } })
-const defaults = () => ({ thread: { id: threadId, status: { type: 'idle' }, turns: [], cwd: process.cwd() }, model: 'synthetic-model', reasoningEffort: 'low', modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite', writableRoots: [process.cwd()], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }, instructionSources: [] })
+const usageRouting = process.env.CONDUCTOR_TEST_USAGE_ROUTING === '1'
+const defaults = () => ({ thread: { id: threadId, status: { type: 'idle' }, turns: [], cwd: process.cwd() }, model: usageRouting ? 'gpt-6-astra' : 'synthetic-model', reasoningEffort: usageRouting ? 'xhigh' : 'low', modelProvider: 'openai', approvalPolicy: 'on-request', approvalsReviewer: 'user', sandbox: { type: 'workspaceWrite', writableRoots: [process.cwd()], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }, instructionSources: [] })
 
 readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line)
@@ -85,7 +87,18 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return
   }
   if (message.method === 'model/list') {
-    send({ id: message.id, result: { data: [{ id: 'synthetic-model-id', model: 'synthetic-model', displayName: 'Synthetic model', isDefault: true, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Synthetic' }] }, ...(process.env.CONDUCTOR_TEST_MODEL_CATALOG === '1' ? [{ id: 'plain', model: 'plain-model', displayName: 'No effort model', isDefault: false, defaultReasoningEffort: 'none', supportedReasoningEfforts: [] }] : [])], nextCursor: null } })
+    const models = usageRouting
+      ? [
+          { id: 'gpt-6-astra', model: 'gpt-6-astra', displayName: 'GPT-6 Astra', isDefault: true, defaultReasoningEffort: 'xhigh', supportedReasoningEfforts: [{ reasoningEffort: 'xhigh', description: 'Synthetic routing fixture' }] },
+          { id: 'gpt-5.6-sol', model: 'gpt-5.6-sol', displayName: 'GPT-5.6 Sol', isDefault: false, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ reasoningEffort: 'high', description: 'Synthetic routing fixture' }] }
+        ]
+      : [{ id: 'synthetic-model-id', model: 'synthetic-model', displayName: 'Synthetic model', isDefault: true, defaultReasoningEffort: 'low', supportedReasoningEfforts: [{ reasoningEffort: 'low', description: 'Synthetic' }] }, ...(process.env.CONDUCTOR_TEST_MODEL_CATALOG === '1' ? [{ id: 'plain', model: 'plain-model', displayName: 'No effort model', isDefault: false, defaultReasoningEffort: 'none', supportedReasoningEfforts: [] }] : [])]
+    send({ id: message.id, result: { data: models, nextCursor: null } })
+    return
+  }
+  if (message.method === 'account/rateLimits/read') {
+    const snapshot = (limitId, usedPercent) => ({ limitId, limitName: limitId, primary: { usedPercent, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 86_400 }, secondary: null, credits: { hasCredits: false, unlimited: false, balance: '0' }, individualLimit: null, spendControlReached: null, planType: 'prolite', rateLimitReachedType: null })
+    send({ id: message.id, result: { rateLimits: snapshot('codex', 12), rateLimitsByLimitId: { codex: snapshot('codex', 12), 'gpt-6-astra': snapshot('gpt-6-astra', 99), 'gpt-5.6-sol': snapshot('gpt-5.6-sol', 20) }, rateLimitResetCredits: null, accountId: 'synthetic-account', rateLimitUpsell: null } })
     return
   }
   if (message.method === 'thread/goal/get') { send({ id: message.id, result: { goal: null } }); return }
@@ -255,7 +268,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return
   }
   if (scenario.startsWith('SYNTHETIC B')) {
-    itemEvent('item/completed', { type: 'agentMessage', id: 'ui-context', text: 'Synthetic fixture continuation: wasOpen and wasPinned were removed; the local Node test passed.', phase: null, memoryCitation: null, delivery: null, questions: null })
+    const remoteFile = scenario.startsWith('SYNTHETIC B remote integration fixture') ? ' Open `src/file-1.ts` for the remote file-routing check.' : ''
+    itemEvent('item/completed', { type: 'agentMessage', id: 'ui-context', text: 'Synthetic fixture continuation: wasOpen and wasPinned were removed; the local Node test passed.' + remoteFile, phase: null, memoryCitation: null, delivery: null, questions: null })
     finish()
     return
   }

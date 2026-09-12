@@ -51,6 +51,15 @@ describe('agent file link resolution', () => {
     expect(resolveFileLinkTarget('C:/Claude/miron/CR5.png', 'C:/Claude/other', projects)?.projectId).toBe('miron')
   })
 
+  it('retains remote machine ownership without changing local target shapes', () => {
+    expect(resolveFileLinkTarget('src/panel.mjs:42', cwd, projects, 'host-a')).toEqual({
+      path: 'src/panel.mjs', line: 42, projectId: undefined, machineId: 'host-a'
+    })
+    expect(resolveFileLinkTarget('src/panel.mjs:42', cwd, projects)).toEqual({
+      path: 'src/panel.mjs', line: 42, projectId: undefined
+    })
+  })
+
   it('normalizes every drive-path shape to one path and reads a trailing line reference', () => {
     for (const raw of ['C:\\Claude\\miron\\a b.txt', 'C:/Claude/miron/a b.txt', '/C:/Claude/miron/a b.txt', 'file:///C:/Claude/miron/a%20b.txt']) {
       expect(normalizeLinkPath(raw)).toEqual({ path: 'C:/Claude/miron/a b.txt', line: undefined })

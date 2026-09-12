@@ -15,6 +15,7 @@ import type {
   SessionRecord,
   ThemeId,
   ThemeVariant,
+  WorkspaceDocumentState,
   WorkspaceRecoveryCheckpoint,
   WorkspaceLayout
 } from '../../shared/models'
@@ -53,7 +54,6 @@ import {
 } from './layout/tab-keyboard'
 import { LOCAL_MODELS } from '../../shared/local-models'
 import { createPaneTab } from './panes/pane-factory'
-import { toggleBrowserTab } from './layout/browser-tab'
 import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
@@ -83,9 +83,36 @@ import { AgentConfirmDialog } from './components/AgentConfirmDialog'
 import { useAgentConfirm } from './use-agent-confirm'
 import { summarizeSubagents } from './panes/usage-summary'
 import { spinPhaseStyle } from './spin-sync'
+import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag } from './components/composer-file-drop'
+import type { MachineDescriptor } from '../../shared/remote-control'
+import { LOCAL_MACHINE_ID } from '../../shared/remote-control'
+import { checkRemoteProjectPlacement } from '../../shared/project-identity'
+import { readPlacement } from './layout/machine-placement'
+import { dispatchAgentContext } from './panes/StructuredAgentPane'
+
+const workspaceDocumentsSnapshot = (): WorkspaceDocumentState[] => {
+  const documents: WorkspaceDocumentState[] = []
+  for (let index = 0; index < localStorage.length; index++) {
+    const key = localStorage.key(index)
+    if (!key?.startsWith('conductor.workspaceFiles.')) continue
+    try {
+      const value = JSON.parse(localStorage.getItem(key) ?? 'null') as { files?: unknown; activeId?: unknown } | null
+      if (!value || !Array.isArray(value.files)) continue
+      documents.push({ workspaceId: key.slice('conductor.workspaceFiles.'.length), files: value.files as WorkspaceDocumentState['files'], activeId: typeof value.activeId === 'string' ? value.activeId : null })
+    } catch { /* a stale local record is ignored here and by WorkspaceFiles */ }
+  }
+  return documents
+}
+
+const restoreWorkspaceDocuments = (documents: WorkspaceDocumentState[] | undefined): void => {
+  for (const state of documents ?? []) localStorage.setItem('conductor.workspaceFiles.' + state.workspaceId, JSON.stringify({ files: state.files, activeId: state.activeId }))
+}
 
 export function App(): React.JSX.Element {
   const [projects, setProjects] = useState<ProjectRecord[]>([])
+  const [sessionName, setSessionName] = useState('Untitled session')
+  const [machines, setMachines] = useState<MachineDescriptor[]>([])
+  const [selectedMachineId, setSelectedMachineId] = useState(LOCAL_MACHINE_ID)
   const [sessions, setSessions] = useState<SessionRecord[]>([])
   const [closedWorkspaces, setClosedWorkspaces] = useState<SessionRecord[]>([])
   const workspaceRestoreBusy = useRef(false)
@@ -142,6 +169,13 @@ export function App(): React.JSX.Element {
 
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? null
   const activeSession = sessions.find((session) => session.id === activeSessionId) ?? null
+  const selectedRemoteMachine = useMemo(() => {
+    if (!activeProject || selectedMachineId === LOCAL_MACHINE_ID) return null
+    const machine = machines.find(item => item.id === selectedMachineId)
+    const link = machine?.projects.find(item => item.grant.localProjectId === activeProject.id)
+    if (!machine || machine.status !== 'online' || !checkRemoteProjectPlacement({ grant: link?.grant, advertised: link?.observed, machineName: machine.name }).ok) return null
+    return machine
+  }, [activeProject, machines, selectedMachineId])
   const activeWorkspaceGroups = useMemo(
     () => activeSession ? listGroups(activeSession.layout.root) : [],
     [activeSession]
@@ -221,6 +255,7 @@ export function App(): React.JSX.Element {
     activeSessionId: activeSessionIdRef.current,
     focusedGroupIds: { ...focusedGroupIdsRef.current },
     sessionIdsByProject: { ...sessionIdsByProjectRef.current },
+    documents: workspaceDocumentsSnapshot(),
     sessions: sessionsRef.current.map((session) => ({
       id: session.id,
       layout: session.layout,
@@ -243,6 +278,13 @@ export function App(): React.JSX.Element {
   const activeUtilityWidth = utilityWidthKey
     ? utilityWidths[utilityWidthKey] ?? (utilityWidthKey === 'automation' ? 610 : 430)
     : 430
+
+  const openDroppedProjectFile = (event: React.DragEvent): void => {
+    const dropped = decodeConductorFileDrag(event.dataTransfer.getData(CONDUCTOR_FILE_DRAG))
+    if (!dropped || dropped.kind !== 'file' || !projects.some(project => project.id === dropped.projectId)) return
+    event.preventDefault(); event.stopPropagation()
+    openWorkspaceFile(dropped.projectId, dropped.path, 'editor')
+  }
 
   const selectSession = useCallback((session: SessionRecord) => {
     debugLog('workspace', 'Selecting workspace', { sessionId: session.id, name: session.name }, 'info')
@@ -286,6 +328,7 @@ export function App(): React.JSX.Element {
     ]).then(async ([loaded, settings, recovery]) => {
       setProjects(loaded)
       setAppSettings(settings)
+      restoreWorkspaceDocuments(recovery.documents)
       if (settings.debugLogging) setDebugConsoleOpen(true)
       focusedGroupIdsRef.current = recovery.focusedGroupIds
       sessionIdsByProjectRef.current = { ...recovery.sessionIdsByProject }
@@ -298,6 +341,19 @@ export function App(): React.JSX.Element {
       setLoading(false)
     })
   }, [loadProject])
+
+  useEffect(() => {
+    void window.conductor.sessionArchive.name().then(setSessionName).catch(() => {})
+    return window.conductor.sessionArchive.onChanged(result => setSessionName(result.name))
+  }, [])
+
+  useEffect(() => {
+    const refresh = (): void => { void window.conductor.remote.machines().then(setMachines).catch(() => setMachines([])) }
+    refresh()
+    return window.conductor.remote.onState(refresh)
+  }, [])
+
+  useEffect(() => setSelectedMachineId(activeSession ? readPlacement(activeSession.id) : LOCAL_MACHINE_ID), [activeSession?.id])
 
   useEffect(() => installDebugLogging(), [])
 
@@ -498,6 +554,7 @@ export function App(): React.JSX.Element {
     }
     window.addEventListener('pagehide', flushRecovery)
     window.addEventListener('beforeunload', flushRecovery)
+    window.addEventListener('conductor:flush-session', flushRecovery)
     document.addEventListener('visibilitychange', onVisibility)
     const unsubscribeUpdate = window.conductor.updates.onPrepareInstall(({ requestId }) => {
       flushRecovery()
@@ -506,6 +563,7 @@ export function App(): React.JSX.Element {
     return () => {
       window.removeEventListener('pagehide', flushRecovery)
       window.removeEventListener('beforeunload', flushRecovery)
+      window.removeEventListener('conductor:flush-session', flushRecovery)
       document.removeEventListener('visibilitychange', onVisibility)
       unsubscribeUpdate()
       flushRecovery()
@@ -818,26 +876,25 @@ export function App(): React.JSX.Element {
     return true
   }, [activeSession, focusedGroupId, patchActiveSession])
 
-  // Shared by the composer's Browser button and the @browser mention (StructuredAgentPane.tsx,
-  // CommandAutocomplete.tsx): focus/create/close the workspace's browser pane tab, the same
-  // surface the browser MCP tools drive (they resolve a webview by pane tab id, filtered to
-  // kind 'browser'). This keeps the owner and the agent looking at one browser, not two.
-  const toggleBrowserTabAction = useCallback((): void => {
-    if (!activeSession) return
-    const result = toggleBrowserTab(activeSession.layout, focusedGroupId)
-    patchActiveSession((session) => ({
-      ...session,
-      layout: result.layout,
-      ...(result.maximizedGroupId === null ? { maximizedGroupId: null } : {}),
-      closedTabs: result.closedTab ? [...session.closedTabs, result.closedTab].slice(-20) : session.closedTabs
-    }))
-    setFocusedGroupId(result.focusedGroupId)
-  }, [activeSession, focusedGroupId, patchActiveSession])
-
   useEffect(() => {
-    window.addEventListener('conductor:toggle-browser-tab', toggleBrowserTabAction)
-    return () => window.removeEventListener('conductor:toggle-browser-tab', toggleBrowserTabAction)
-  }, [toggleBrowserTabAction])
+    const closeRequested = (): void => { closeFocusedTab() }
+    window.addEventListener('conductor:close-tab', closeRequested)
+    return () => window.removeEventListener('conductor:close-tab', closeRequested)
+  }, [closeFocusedTab])
+
+  const saveNamedSession = useCallback(async (): Promise<void> => {
+    try {
+      const result = await window.conductor.sessionArchive.save()
+      if (result) { setSessionName(result.name); setToast(`Saved ${result.name}`) }
+    } catch (reason) { setToast(reason instanceof Error ? reason.message : 'Could not save session') }
+  }, [])
+
+  const openNamedSession = useCallback(async (): Promise<void> => {
+    try {
+      const result = await window.conductor.sessionArchive.open()
+      if (result) setSessionName(result.name)
+    } catch (reason) { setToast(reason instanceof Error ? reason.message : 'Could not open session') }
+  }, [])
 
   const saveTemplate = async (name: string): Promise<void> => {
     if (!activeProject || !activeSession || !name.trim()) return
@@ -1071,7 +1128,7 @@ export function App(): React.JSX.Element {
       if (event.ctrlKey && !event.altKey && !event.shiftKey && key === 'w') {
         event.preventDefault()
         event.stopPropagation()
-        if (!closeFocusedTab() && activeSession) void closeSession(activeSession.id)
+        closeFocusedTab()
         return
       }
       if ((event.ctrlKey && event.shiftKey && key === 'p') || (event.ctrlKey && key === 'k')) {
@@ -1212,6 +1269,7 @@ export function App(): React.JSX.Element {
     <div className="app-shell">
       <TitleBar
         projectName={activeProject?.name}
+        sessionName={sessionName}
         themeVariant={resolvedThemeVariant}
         themeAuto={appSettings.themeAuto}
         themeId={appSettings.themeId}
@@ -1220,6 +1278,8 @@ export function App(): React.JSX.Element {
         onThemeVariant={(variant) => void chooseManualThemeVariant(variant)}
         onNewProject={() => void createManagedProject()}
         onOpenProject={() => void openExistingProject()}
+        onOpenSession={() => void openNamedSession()}
+        onSaveSession={() => void saveNamedSession()}
         onOpenWorkspace={activeProject ? () => window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'workspace' })) : undefined}
         onNewWorkspace={activeProject ? () => void newSession() : undefined}
         onNewTab={activeSession ? () => openInFocused('launcher') : undefined}
@@ -1270,6 +1330,13 @@ export function App(): React.JSX.Element {
           sessionActivity={sessionActivityStatuses}
           activityPhases={correctedActivityPhases}
           projectActivity={projectActivityStatuses}
+          remoteFiles={selectedRemoteMachine && activeProject ? {
+            machineId: selectedRemoteMachine.id,
+            machineName: selectedRemoteMachine.name,
+            projectId: activeProject.id,
+            onOpenFile: file => openWorkspaceFile(file.projectId, file.path, 'editor', undefined, undefined, file.machineId),
+            onAttachFile: attachment => { if (!dispatchAgentContext(activeProject.id, attachment)) setToast('Focus a conversation in this project before attaching a remote file.') }
+          } : undefined}
         />
         <div className="main-stage">
           {activeProject ? (
@@ -1304,7 +1371,7 @@ export function App(): React.JSX.Element {
                 <div className="workspace-content-main">
                   {activeSession ? (
                     <>
-                      <div className="runtime-document-stage">
+                      <div className="runtime-document-stage" onDragOver={event => { if (event.dataTransfer.types.includes(CONDUCTOR_FILE_DRAG)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' } }} onDrop={openDroppedProjectFile}>
                         <PaneWorkspace
                           key={activeSession.id}
                           layout={activeSession.layout}
@@ -1321,13 +1388,14 @@ export function App(): React.JSX.Element {
                           canReopen={activeSession.closedTabs.length > 0}
                           onReopen={reopenClosed}
                           onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(activeProject.id, path, mode ?? 'auto', line, allowBinary)}
+                          onMachinePlacement={setSelectedMachineId}
                           correctedActivityPhases={correctedActivityPhases}
                         />
                         <WorkspaceFiles key={'files:' + activeSession.id} projects={projects} projectId={activeProject.id} workspaceId={activeSession.id} showHiddenFilesDefault={appSettings.showHiddenFiles} />
                       </div>
                     </>
                   ) : (
-                    <div className="runtime-document-stage"><div className="no-workspace-state">
+                    <div className="runtime-document-stage" onDragOver={event => { if (event.dataTransfer.types.includes(CONDUCTOR_FILE_DRAG)) { event.preventDefault(); event.dataTransfer.dropEffect = 'copy' } }} onDrop={openDroppedProjectFile}><div className="no-workspace-state">
                       <div className="empty-orbit"><LayoutPanelTop size={30} /></div>
                       <strong>No workspace open</strong>
                       <button onClick={() => void newSession()}><Plus size={17} /> New workspace</button>

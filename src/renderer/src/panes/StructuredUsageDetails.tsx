@@ -153,7 +153,10 @@ export function StructuredUsageContent({ items, truncated = false, modelLabel, a
   workspaceId?: string
 }): React.JSX.Element {
   const usage = summarizeUsage(items)
-  const report = useMemo(() => summarizeUsageRun(items), [items])
+  // Timeline projections omit session events by design. The pane already resolved the owner's
+  // selected model for the composer, so pass that provider-owned label when deciding which
+  // model-scoped allowance buckets belong in this view.
+  const report = useMemo(() => summarizeUsageRun(items, undefined, modelLabel), [items, modelLabel])
   const context = summarizeContext(items)
   const providerName = report.provider ? providerNames[report.provider] : undefined
   const name = [providerName, modelLabel ?? report.model, report.effort && report.effort !== 'auto' ? `(${report.effort})` : '']

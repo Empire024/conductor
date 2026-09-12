@@ -48,4 +48,11 @@ describe('AgentControlUi window focus', () => {
     expect(window.show).toHaveBeenCalled()
     expect(window.focus).toHaveBeenCalled()
   })
+  it('raises the window to restore and focus a retained source tab', () => {
+    const window = fakeWindow()
+    const ui = new AgentControlUi('renderer/index.html', () => window as never)
+    void ui.request(request('tabs.focus-origin', { agentSessionId: 'retained-origin' }))
+    expect(window.show).toHaveBeenCalled()
+    expect(window.focus).toHaveBeenCalled()
+  })
 })

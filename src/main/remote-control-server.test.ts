@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer } from 'node:https'
 import { request as httpsRequest } from 'node:https'
+import { createServer as createNetServer } from 'node:net'
 import { encodeTicket, type RemotePeerRecord, type RemoteProjectSummary } from '../shared/remote-control'
 import { generateDeviceKey, signChallenge, type ChallengePayload } from './device-key'
 import { RemoteControlClient } from './remote-control-client'
@@ -108,6 +109,52 @@ describe('the remote control server', () => {
     expect(status.listening).toBe(false)
     expect(status.endpoint).toBeNull()
     expect(() => fix.server.ticket()).toThrow(/Switch remote control on/)
+  })
+
+  it('lets a newer enable defeat a concurrently requested disable', async () => {
+    const fix = await hostFixture()
+    fix.peers.updateSettings({ enabled: false })
+    const disabling = fix.server.apply()
+    fix.peers.updateSettings({ enabled: true })
+    const enabling = fix.server.apply()
+    await Promise.all([disabling, enabling])
+
+    const status = fix.server.getStatus()
+    expect(status).toMatchObject({ listening: true, message: null })
+    expect((await rawPost(Number(new URL(status.endpoint!).port), '/remote/call', '{}')).status).toBe(401)
+  })
+
+  it('lets an explicit stop defeat competing starts, closes the old socket, and can start cleanly again', async () => {
+    const fix = await hostFixture()
+    const oldPort = Number(new URL(fix.status.endpoint!).port)
+    const first = fix.server.apply()
+    const second = fix.server.apply()
+    const stopping = fix.server.stop()
+    await Promise.all([first, second, stopping])
+
+    expect(fix.server.getStatus()).toMatchObject({ listening: false, endpoint: null, fingerprint: null })
+    await expect(rawPost(oldPort, '/remote/call', '{}')).rejects.toBeTruthy()
+    await expect(fix.server.apply()).resolves.toMatchObject({ listening: true, message: null })
+  })
+
+  it('does not let a failed start leave stale error state or block the next listener', async () => {
+    const fix = await hostFixture()
+    const occupied = createNetServer()
+    await new Promise<void>(resolve => occupied.listen(0, '127.0.0.1', resolve))
+    cleanup.push(() => new Promise<void>(resolve => occupied.close(() => resolve())))
+    const address = occupied.address()
+    const occupiedPort = address && typeof address !== 'string' ? address.port : 0
+
+    fix.peers.updateSettings({ port: occupiedPort })
+    const failedStart = fix.server.apply()
+    await new Promise<void>(resolve => setImmediate(resolve))
+    fix.peers.updateSettings({ port: 0 })
+    const recoveredStart = fix.server.apply()
+    await Promise.all([failedStart, recoveredStart])
+
+    const status = fix.server.getStatus()
+    expect(status).toMatchObject({ listening: true, message: null })
+    expect(Number(new URL(status.endpoint!).port)).not.toBe(occupiedPort)
   })
 
   it('will not listen while this machine is signed out of GitHub', async () => {

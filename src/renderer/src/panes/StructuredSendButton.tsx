@@ -4,9 +4,9 @@ import { spinPhaseStyle } from '../spin-sync'
 import './StructuredAgentPane.css'
 
 export type SendButtonState = 'send' | 'stop' | 'resume'
-export function sendButtonIntent(input: { active: boolean; interrupting: boolean; draft: boolean; needsResume: boolean; steering: boolean; historical: boolean; canSubmit: boolean; submitting: boolean }): { state: SendButtonState; label: string; title: string; disabled: boolean } {
+export function sendButtonIntent(input: { active: boolean; interrupting: boolean; draft: boolean; needsResume: boolean; autoResumeOnSend?: boolean; steering: boolean; historical: boolean; canSubmit: boolean; submitting: boolean }): { state: SendButtonState; label: string; title: string; disabled: boolean } {
   if (input.active && !input.draft) return { state: 'stop', label: 'Stop', title: 'Stop · Esc', disabled: input.interrupting || input.historical }
-  if (input.needsResume) return { state: 'resume', label: 'Resume conversation', title: 'Resume the same conversation', disabled: false }
+  if (input.needsResume && !(input.autoResumeOnSend && input.draft)) return { state: 'resume', label: 'Resume conversation', title: 'Resume the same conversation', disabled: false }
   return { state: 'send', label: input.steering ? 'Steer' : input.active ? 'Queue message' : 'Send message', title: input.steering ? 'Send to running turn · Enter' : input.active ? 'Queue message after this turn · Enter' : 'Send message · Enter', disabled: !input.canSubmit || !input.draft || input.submitting }
 }
 /* One element for all three states: every glyph stays mounted so send/stop/resume morph in CSS instead of swapping, and only the send state submits the composer. */

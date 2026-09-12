@@ -19,6 +19,7 @@ import {
   FolderGit2,
   FolderTree,
   GitBranch,
+  Globe2,
   Gauge,
   LayoutGrid,
   ListTodo,
@@ -37,6 +38,7 @@ import type { AgentActivityPhase, FileEntry, PaneKind, ProjectRecord, SessionRec
 import { WorkspaceSidebarPanel } from './WorkspaceSidebarPanel'
 import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
+import type { RemoteFilesPaneProps } from '../panes/RemoteFilesPane'
 
 interface SidebarProps {
   projects: ProjectRecord[]
@@ -77,6 +79,7 @@ interface SidebarProps {
   sessionActivity: ReadonlyMap<string, SessionActivityStatus>
   activityPhases: ReadonlyMap<string, AgentActivityPhase>
   projectActivity: ReadonlyMap<string, ProjectActivityStatus>
+  remoteFiles?: Omit<RemoteFilesPaneProps, 'files'>
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
@@ -96,6 +99,7 @@ const railItems: Array<{
 }> = [
   { icon: LayoutGrid, label: 'Workspace', sidebar: 'workspace', group: 'primary' },
   { icon: FolderTree, label: 'Explorer', sidebar: 'explorer', group: 'primary' },
+  { icon: Globe2, label: 'Browser', sidebar: 'browser', group: 'primary' },
   { icon: ListTodo, label: 'Project tasks', utility: 'backlog', group: 'secondary' },
   { icon: Bot, label: 'Automation', utility: 'agents', group: 'secondary' },
   { icon: MemoryStick, label: 'Memory', utility: 'memory', group: 'secondary' },
@@ -251,7 +255,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
   }
 
   return (
-    <div className={`left-shell ${props.collapsed ? 'rail-only' : ''}`}>
+    <div className={`left-shell${props.collapsed ? ' rail-only' : ''}${sidebarMode === 'browser' ? ' browser-active' : ''}`}>
       {workspaceMenu && <WorkspaceSessionMenu x={workspaceMenu.x} y={workspaceMenu.y} canRestore={props.canRestoreWorkspace} onRename={() => renameSession(workspaceMenu.session)} onNew={props.onNewSession} onRestore={props.onRestoreWorkspace} onCloseWorkspace={() => props.onCloseSession(workspaceMenu.session.id)} onDismiss={() => setWorkspaceMenu(null)} />}<nav className="activity-rail" aria-label="Activity">
         <div className="rail-primary">
           {railItems.filter((item) => item.group === 'primary').map(renderRailItem)}
@@ -271,7 +275,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
         </div>
       </nav>
 
-      {!props.collapsed && <aside className="sidebar">
+      <aside className="sidebar" aria-hidden={props.collapsed || undefined}>
         <WorkspaceSidebarPanel
           mode={sidebarMode}
           projects={props.projects}
@@ -279,6 +283,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
           onOpenFile={props.onOpenFile}
           onPathChanged={props.onPathChanged}
           onPathRemoved={props.onPathRemoved}
+          remoteFiles={props.remoteFiles}
           onProjectRenamed={(project) => {
             props.onProjectRenamed?.(project)
             window.dispatchEvent(new CustomEvent('conductor:project-renamed', { detail: project }))
@@ -409,7 +414,7 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
         <ProcessStatusSummary projects={props.projects} onOpen={() => props.onUtilityPanel(props.utilityPanel === 'processes' ? null : 'processes')} />
           </>}
         />
-      </aside>}
+      </aside>
       {confirmingRemoval && <RemoveProjectDialog project={confirmingRemoval} onRemove={() => props.onRemoveProject(confirmingRemoval.id)} onDismiss={() => setConfirmingRemoval(null)} />}
       {menu && createPortal(
         <div

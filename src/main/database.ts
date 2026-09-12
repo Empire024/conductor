@@ -2,6 +2,8 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { StructuredAgentStore } from './structured-store'
+import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
+import { parseSessionArchive } from './session-archive'
 import type {
   AgentSpec,
   AgentMemory,
@@ -19,6 +21,7 @@ import type {
   TurnMemoryRecall,
   UpdateMemoryInput,
   TerminalSpec,
+  WorkspaceDocumentState,
   WorkspaceRecoveryCheckpoint,
   WorkspaceRecoveryState,
   WorkspaceLayout
@@ -38,6 +41,35 @@ import {
 } from './memory'
 
 type DbRow = Record<string, unknown>
+
+const recoveryIdentity = /^[a-zA-Z0-9_-]{1,160}$/
+const recoveryDocumentOwner = /^(?:project|detached):[a-zA-Z0-9_-]{1,160}$/
+const recoveryDocumentId = /^document:(?:(?:project|detached):)?[a-zA-Z0-9_-]{1,160}:[a-zA-Z0-9_-]{1,160}$/
+function normalizeWorkspaceDocuments(value: unknown): WorkspaceDocumentState[] {
+  if (!Array.isArray(value) || value.length > 10000) throw new Error('Invalid workspace documents')
+  const documentIds = new Set<string>()
+  return value.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Invalid workspace document state')
+    const state = item as Record<string, unknown>
+    if (typeof state.workspaceId !== 'string' || state.workspaceId.length > 340 || !(recoveryIdentity.test(state.workspaceId) || recoveryDocumentOwner.test(state.workspaceId))) throw new Error('Invalid workspace document owner')
+    if (!Array.isArray(state.files) || state.files.length > 1000) throw new Error('Invalid workspace document list')
+    const files = state.files.map(item => {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Invalid workspace document')
+      const file = item as Record<string, unknown>
+      if (typeof file.id !== 'string' || !(recoveryIdentity.test(file.id) || recoveryDocumentId.test(file.id)) || documentIds.has(file.id)) throw new Error('Invalid workspace document identity')
+      if (typeof file.machineId !== 'string' || !recoveryIdentity.test(file.machineId) || typeof file.projectId !== 'string' || !recoveryIdentity.test(file.projectId)) throw new Error('Invalid workspace document placement')
+      if (typeof file.path !== 'string' || file.path.length > 32000 || file.path.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(file.path) || file.path.replaceAll('\\', '/').split('/').includes('..') || /[\0-\x1f]/.test(file.path)) throw new Error('Invalid workspace document path')
+      if (!['editor', 'preview', 'browser'].includes(file.mode as string)) throw new Error('Invalid workspace document mode')
+      if (file.line !== undefined && (!Number.isSafeInteger(file.line) || (file.line as number) < 1)) throw new Error('Invalid workspace document line')
+      if (file.allowBinary !== undefined && typeof file.allowBinary !== 'boolean') throw new Error('Invalid workspace document setting')
+      documentIds.add(file.id)
+      return { id: file.id, machineId: file.machineId, projectId: file.projectId, path: file.path.replaceAll('\\', '/'), mode: file.mode as 'editor' | 'preview' | 'browser', ...(file.line !== undefined ? { line: file.line as number } : {}), ...(file.allowBinary !== undefined ? { allowBinary: file.allowBinary } : {}) }
+    })
+    const activeId = state.activeId === null ? null : state.activeId
+    if (activeId !== null && (typeof activeId !== 'string' || !files.some(file => file.id === activeId))) throw new Error('Invalid active workspace document')
+    return { workspaceId: state.workspaceId, files, activeId }
+  })
+}
 
 const mapTaskActivity = (row: DbRow): ProjectTaskActivity => ({
   id: row.id as string,
@@ -73,7 +105,6 @@ const parseMemoryOrigin = (value: unknown): MemoryOrigin | null => {
     }
   } catch { return null }
 }
-
 const serializeMemoryOrigin = (origin: MemoryOrigin | undefined): string | null =>
   origin && typeof origin.agentSessionId === 'string' && origin.agentSessionId
     ? JSON.stringify({
@@ -87,6 +118,168 @@ const serializeMemoryOrigin = (origin: MemoryOrigin | undefined): string | null 
 export class ConductorDatabase {
   private readonly db: DatabaseSync
   readonly structured: StructuredAgentStore
+
+  listDeskProjects(): ProjectRecord[] {
+    const projects = this.listProjects()
+    const raw = this.getSetting('sessionArchiveProjects')
+    if (!raw) return projects
+    try {
+      const ids = JSON.parse(raw) as unknown
+      if (!Array.isArray(ids) || ids.some(id => typeof id !== 'string')) return projects
+      return ids.map(id => projects.find(project => project.id === id)).filter((p): p is ProjectRecord => Boolean(p))
+    } catch { return projects }
+  }
+
+  includeDeskProject(id: string): void {
+    if (this.getSetting('sessionArchiveProjects')) this.setSetting('sessionArchiveProjects', JSON.stringify([...new Set([...this.listDeskProjects().map(p => p.id), id])]))
+  }
+
+  listDeskDetachedWindows(): DetachedWindowRecord[] {
+    const detached = this.listDetachedWindows()
+    const raw = this.getSetting('sessionArchiveDetached')
+    if (!raw) return detached
+    try {
+      const ids = JSON.parse(raw) as unknown
+      return Array.isArray(ids) && ids.every(id => typeof id === 'string')
+        ? ids.map(id => detached.find(record => record.id === id)).filter((record): record is DetachedWindowRecord => Boolean(record))
+        : detached
+    } catch { return detached }
+  }
+
+  listWorkspaceDocuments(): WorkspaceDocumentState[] {
+    try { return this.validateWorkspaceDocuments(normalizeWorkspaceDocuments(JSON.parse(this.getSetting('workspaceDocuments') ?? '[]'))) }
+    catch { return [] }
+  }
+
+  private validateWorkspaceDocuments(documents: WorkspaceDocumentState[]): WorkspaceDocumentState[] {
+    for (const state of documents) {
+      const projectId = state.workspaceId.startsWith('project:')
+        ? this.getProject(state.workspaceId.slice('project:'.length))?.id
+        : state.workspaceId.startsWith('detached:')
+          ? this.getDetachedWindow(state.workspaceId.slice('detached:'.length))?.projectId
+          : this.getSession(state.workspaceId)?.projectId
+      if (!projectId) throw new Error('Invalid workspace document owner')
+      if (state.files.some(file => file.projectId !== projectId)) throw new Error('Invalid workspace document project')
+    }
+    return documents
+  }
+
+  importedSessionMachine(id: string): string | null { return this.getSetting('sessionArchiveImported:' + id) }
+  releaseImportedSession(id: string): void { this.removeSetting('sessionArchiveImported:' + id) }
+  activateImportedResource(kind: 'agent' | 'terminal', id: string): void {
+    const key = kind === 'agent' ? 'sessionArchiveImported:' + id : 'sessionArchiveImportedTerminal:' + id
+    const placement = this.getSetting(key)
+    if (!placement) return
+    if (kind === 'agent' && placement !== 'local') throw new Error(`This saved conversation belongs to remote machine ${placement}. Its private pairing and resume grant were not exported, so it will remain offline and cannot run locally.`)
+    this.removeSetting(key)
+  }
+
+  sessionArchive(name: string): SessionArchive {
+    const projects = this.listDeskProjects()
+    const workspaces = projects.flatMap(project => this.listSessions(project.id))
+    const workspaceIds = new Set(workspaces.map(s => s.id))
+    const detached = this.listDeskDetachedWindows().filter(d => workspaceIds.has(d.sessionId))
+    const rows = this.db.prepare('SELECT * FROM agent_sessions').all() as DbRow[]
+    const agents = rows.filter(row => workspaceIds.has(row.session_id as string)).map(row => {
+      const spec = this.structured.spec<AgentSpec>(row.id as string) ?? {
+        id: row.id as string, projectId: row.project_id as string, sessionId: row.session_id as string,
+        provider: row.provider as AgentSpec['provider'], title: row.title as string, cwd: row.cwd as string,
+        ...(row.model ? { model: row.model as string } : {}), ...(row.effort ? { effort: row.effort as AgentSpec['effort'] } : {})
+      }
+      return { spec, projection: this.structured.snapshot(spec.id), transcript: row.transcript as string }
+    })
+    const terminals = (this.db.prepare('SELECT * FROM terminal_sessions').all() as DbRow[])
+      .filter(row => workspaceIds.has(row.session_id as string))
+      .map(row => ({ spec: { id: row.id as string, projectId: row.project_id as string, sessionId: row.session_id as string, title: row.title as string, cwd: row.cwd as string } satisfies TerminalSpec, transcript: row.transcript as string }))
+    const projectIds = new Set(projects.map(project => project.id))
+    const detachedProjects = new Map(detached.map(record => [record.id, record.projectId]))
+    const documents = this.listWorkspaceDocuments().flatMap(state => {
+      const detachedId = state.workspaceId.startsWith('detached:') ? state.workspaceId.slice('detached:'.length) : null
+      const included = workspaceIds.has(state.workspaceId) || state.workspaceId.startsWith('project:') && projectIds.has(state.workspaceId.slice('project:'.length)) || detachedId !== null && detachedProjects.has(detachedId)
+      if (!included) return []
+      return [state]
+    })
+    return { format: 'conductor-session', version: 1, name, savedAt: now(), projects, workspaces,
+      detached, agents, terminals, documents, drafts: this.listEditorDrafts().filter(d => projects.some(project => project.id === d.projectId)), selection: this.getWorkspaceRecoveryState() }
+  }
+
+  /** Fresh workspace/conversation identities; existing project folders and history are never overwritten. */
+  importSessionArchive(input: SessionArchive): SessionArchiveResult {
+    const archive = parseSessionArchive(JSON.stringify(input))
+    const remapping = new Map<string, string>()
+    const mapped = (id: string): string => { let value = remapping.get(id); if (!value) { value = makeId('import'); remapping.set(id, value) }; return value }
+    const existingProjects = this.listProjects()
+    for (const p of archive.projects) {
+      const existing = existingProjects.find(other => other.path.replaceAll('\\', '/').toLowerCase() === p.path.replaceAll('\\', '/').toLowerCase())
+      remapping.set(p.id, existing?.id ?? makeId('project'))
+    }
+    const mapTab = (tab: PaneTab): PaneTab => ({ ...tab, id: mapped(tab.id), ...(tab.tabGroupId ? { tabGroupId: mapped(tab.tabGroupId) } : {}), ...(['agent', 'terminal'].includes(tab.kind) && tab.resourceId ? { resourceId: mapped(tab.resourceId) } : {}) })
+    const mapLayout = (layout: WorkspaceLayout): WorkspaceLayout => {
+      const visit = (node: import('../shared/models').LayoutNode): import('../shared/models').LayoutNode => node.type === 'split'
+        ? { ...node, id: mapped(node.id), children: [visit(node.children[0]), visit(node.children[1])] }
+        : { ...node, id: mapped(node.id), tabs: node.tabs.map(mapTab), activeTabId: node.activeTabId ? mapped(node.activeTabId) : '', tabGroups: node.tabGroups?.map(g => ({ ...g, id: mapped(g.id) })) }
+      return { version: 1, root: visit(layout.root) }
+    }
+    const selection = {
+      activeProjectId: archive.selection.activeProjectId ? mapped(archive.selection.activeProjectId) : null,
+      activeSessionId: archive.selection.activeSessionId ? mapped(archive.selection.activeSessionId) : null,
+      focusedGroupIds: Object.fromEntries(Object.entries(archive.selection.focusedGroupIds).map(([s, g]) => [mapped(s), mapped(g)])),
+      sessionIdsByProject: Object.fromEntries(Object.entries(archive.selection.sessionIdsByProject).map(([p, s]) => [mapped(p), mapped(s)]))
+    }
+    const documents = (archive.documents ?? []).map(state => {
+      const workspaceId = state.workspaceId.startsWith('project:')
+        ? 'project:' + mapped(state.workspaceId.slice('project:'.length))
+        : state.workspaceId.startsWith('detached:')
+          ? 'detached:' + mapped(state.workspaceId.slice('detached:'.length))
+          : mapped(state.workspaceId)
+      const files = state.files.map(file => {
+        const id = `document:${workspaceId}:${makeId('file')}`
+        remapping.set(file.id, id)
+        return { ...file, id, projectId: mapped(file.projectId) }
+      })
+      return { workspaceId, files, activeId: state.activeId ? remapping.get(state.activeId)! : null }
+    })
+    const importedIds: string[] = []
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      // A recoverable previous desk remains in the same database, with its exact old IDs/drafts.
+      this.setSetting('sessionArchivePreviousDesk', JSON.stringify({ name: this.getSetting('sessionArchiveName') ?? '', projects: this.listDeskProjects().map(p => p.id), selection: this.getWorkspaceRecoveryState(), workspaces: this.listDeskProjects().flatMap(p => this.listSessions(p.id)).map(s => s.id), detached: this.listDeskDetachedWindows().map(d => d.id) }))
+      for (const p of this.listDeskProjects()) for (const s of this.listSessions(p.id)) this.closeSession(s.id)
+      for (const p of archive.projects) if (!existingProjects.some(existing => existing.id === mapped(p.id))) this.db.prepare('INSERT INTO projects(id,name,path,created_at,updated_at) VALUES(?,?,?,?,?)').run(mapped(p.id), p.name, p.path, p.createdAt, p.updatedAt)
+      for (const s of archive.workspaces) this.db.prepare('INSERT INTO sessions(id,project_id,name,layout_json,maximized_group_id,closed_tabs_json,continue_on_limit,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?)').run(mapped(s.id), mapped(s.projectId), s.name, JSON.stringify(mapLayout(s.layout)), s.maximizedGroupId ? mapped(s.maximizedGroupId) : null, JSON.stringify(s.closedTabs.map(mapTab)), s.createdAt, s.updatedAt)
+      for (const d of archive.detached) this.db.prepare('INSERT INTO detached_windows(id,project_id,session_id,layout_json,maximized_group_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(mapped(d.id), mapped(d.projectId), mapped(d.sessionId), JSON.stringify(mapLayout(d.layout)), d.maximizedGroupId ? mapped(d.maximizedGroupId) : null, d.createdAt, d.updatedAt)
+      for (const a of archive.agents) {
+        const spec = { ...a.spec, id: mapped(a.spec.id), projectId: mapped(a.spec.projectId), sessionId: mapped(a.spec.sessionId) }
+        this.upsertAgent(spec, 'exited', 'disconnected')
+        this.db.prepare('UPDATE agent_sessions SET transcript=? WHERE id=?').run(a.transcript, spec.id)
+        // Imported resources cannot execute on first mount, including legacy and remote tabs.
+        this.setSetting('sessionArchiveImported:' + spec.id, spec.machineId && spec.machineId !== 'local' ? spec.machineId : 'local')
+        if (a.projection) {
+          const projection = { ...a.projection, sessionId: spec.id, runtimeId: '', items: a.projection.items.map(item => ({ ...item, data: item.data.type === 'text' && item.data.origin ? { ...item.data, origin: { ...item.data.origin, agentSessionId: mapped(item.data.origin.agentSessionId) } } : item.data })) }
+          this.db.prepare('INSERT INTO structured_sessions(id,project_id,provider,spec_json,projection_json,title,archived) VALUES(?,?,?,?,?,?,?)').run(spec.id, spec.projectId, spec.provider, JSON.stringify(spec), JSON.stringify(projection), projection.title, projection.archived ? 1 : 0)
+          importedIds.push(spec.id)
+        }
+      }
+      for (const terminal of archive.terminals) {
+        const spec = { ...terminal.spec, id: mapped(terminal.spec.id), projectId: mapped(terminal.spec.projectId), sessionId: mapped(terminal.spec.sessionId), shell: undefined, startupCommand: undefined }
+        this.upsertTerminal(spec, 'exited')
+        this.db.prepare('UPDATE terminal_sessions SET transcript=? WHERE id=?').run(terminal.transcript, spec.id)
+        this.setSetting('sessionArchiveImportedTerminal:' + spec.id, 'dormant')
+      }
+      for (const d of archive.drafts) this.saveEditorDraft(mapped(d.tabId), mapped(d.projectId), d.path, d.content, d.viewState, d.baseContent, d.machineId ?? 'local')
+      this.setSetting('workspaceDocuments', JSON.stringify(documents))
+      this.setSetting('sessionArchiveName', archive.name)
+      this.setSetting('sessionArchiveProjects', JSON.stringify(archive.projects.map(p => mapped(p.id))))
+      this.setSetting('sessionArchiveDetached', JSON.stringify(archive.detached.map(d => mapped(d.id))))
+      this.setSetting('activeProjectId', selection.activeProjectId ?? '')
+      this.setSetting('activeSessionId', selection.activeSessionId ?? '')
+      this.setSetting('focusedGroupIds', JSON.stringify(selection.focusedGroupIds))
+      this.setSetting('sessionIdsByProject', JSON.stringify(selection.sessionIdsByProject))
+      this.db.exec('COMMIT')
+    } catch (error) { this.db.exec('ROLLBACK'); throw error }
+    this.structured.loadImported(importedIds)
+    return { name: archive.name, selection: { ...selection, documents } }
+  }
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true })
@@ -229,6 +422,7 @@ export class ConductorDatabase {
 
       CREATE TABLE IF NOT EXISTS editor_drafts (
         tab_id TEXT PRIMARY KEY,
+        machine_id TEXT NOT NULL DEFAULT 'local',
         project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
         path TEXT NOT NULL,
         content TEXT NOT NULL,
@@ -258,6 +452,7 @@ export class ConductorDatabase {
     `)
     this.ensureColumn('project_task_activity', 'assigned_agent_id', 'TEXT')
     this.ensureColumn('editor_drafts', 'base_content_json', 'TEXT')
+    this.ensureColumn('editor_drafts', 'machine_id', "TEXT NOT NULL DEFAULT 'local'")
     this.ensureColumn('sessions', 'continue_on_limit', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('sessions', 'closed_at', 'INTEGER')
     this.ensureColumn('agent_sessions', 'model', 'TEXT')
@@ -544,7 +739,8 @@ export class ConductorDatabase {
       activeProjectId: project?.id ?? null,
       activeSessionId: project && session?.projectId === project.id ? session.id : null,
       focusedGroupIds: this.readStringMapSetting('focusedGroupIds'),
-      sessionIdsByProject: this.readStringMapSetting('sessionIdsByProject')
+      sessionIdsByProject: this.readStringMapSetting('sessionIdsByProject'),
+      documents: this.listWorkspaceDocuments()
     }
   }
 
@@ -562,6 +758,9 @@ export class ConductorDatabase {
 
   saveRecoveryCheckpoint(checkpoint: WorkspaceRecoveryCheckpoint): void {
     const timestamp = now()
+    const documents = checkpoint.documents === undefined
+      ? undefined
+      : this.validateWorkspaceDocuments(normalizeWorkspaceDocuments(checkpoint.documents))
     const saveSession = this.db.prepare(
       `UPDATE sessions
        SET layout_json = ?, maximized_group_id = ?, closed_tabs_json = ?, updated_at = ?
@@ -586,6 +785,7 @@ export class ConductorDatabase {
       saveSetting.run('activeSessionId', checkpoint.activeSessionId && this.db.prepare('SELECT id FROM sessions WHERE id = ? AND closed_at IS NULL').get(checkpoint.activeSessionId) ? checkpoint.activeSessionId : '', timestamp)
       saveSetting.run('focusedGroupIds', JSON.stringify(checkpoint.focusedGroupIds), timestamp)
       saveSetting.run('sessionIdsByProject', JSON.stringify(checkpoint.sessionIdsByProject), timestamp)
+      if (documents !== undefined) saveSetting.run('workspaceDocuments', JSON.stringify(documents), timestamp)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -594,20 +794,20 @@ export class ConductorDatabase {
   }
 
   remapEditorDrafts(projectId: string, previousPath: string, nextPath: string, directory: boolean): void {
-    const drafts = this.listEditorDrafts().filter((draft) => draft.projectId === projectId && (draft.path === previousPath || directory && draft.path.startsWith(previousPath + '/')))
+    const drafts = this.listEditorDrafts().filter((draft) => (draft.machineId ?? 'local') === 'local' && draft.projectId === projectId && (draft.path === previousPath || directory && draft.path.startsWith(previousPath + '/')))
     this.db.exec('BEGIN IMMEDIATE')
     try { for (const draft of drafts) this.db.prepare('UPDATE editor_drafts SET path = ?, updated_at = ? WHERE tab_id = ?').run(nextPath + draft.path.slice(previousPath.length), now(), draft.tabId); this.db.exec('COMMIT') } catch (reason) { this.db.exec('ROLLBACK'); throw reason }
   }
 
   listEditorDrafts(): EditorDraft[] {
-    const rows = this.db.prepare('SELECT tab_id, project_id, path FROM editor_drafts ORDER BY updated_at ASC').all() as DbRow[]
-    return rows.map((row) => this.getEditorDraft(row.tab_id as string, row.project_id as string, row.path as string)!).filter(Boolean)
+    const rows = this.db.prepare('SELECT tab_id, machine_id, project_id, path FROM editor_drafts ORDER BY updated_at ASC').all() as DbRow[]
+    return rows.map((row) => this.getEditorDraft(row.tab_id as string, row.project_id as string, row.path as string, row.machine_id as string)!).filter(Boolean)
   }
 
-  getEditorDraft(tabId: string, projectId: string, path: string): EditorDraft | null {
+  getEditorDraft(tabId: string, projectId: string, path: string, machineId = 'local'): EditorDraft | null {
     const row = this.db
-      .prepare('SELECT * FROM editor_drafts WHERE tab_id = ? AND project_id = ? AND path = ?')
-      .get(tabId, projectId, path) as DbRow | undefined
+      .prepare('SELECT * FROM editor_drafts WHERE tab_id = ? AND machine_id = ? AND project_id = ? AND path = ?')
+      .get(tabId, machineId, projectId, path) as DbRow | undefined
     if (!row) return null
     let viewState: unknown | null = null
     try {
@@ -617,6 +817,7 @@ export class ConductorDatabase {
     }
     return {
       tabId: row.tab_id as string,
+      machineId: row.machine_id as string,
       projectId: row.project_id as string,
       path: row.path as string,
       content: row.content as string,
@@ -626,17 +827,17 @@ export class ConductorDatabase {
     }
   }
 
-  saveEditorDraft(tabId: string, projectId: string, path: string, content: string, viewState: unknown, baseContent?: string | null): void {
+  saveEditorDraft(tabId: string, projectId: string, path: string, content: string, viewState: unknown, baseContent?: string | null, machineId = 'local'): void {
     // Clean buffers can be older than disk without containing any user edits.
     if (content === baseContent || baseContent === null && content === '') { this.removeEditorDraft(tabId); return }
     this.db.prepare(
-      `INSERT INTO editor_drafts (tab_id, project_id, path, content, view_state_json, updated_at, base_content_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO editor_drafts (tab_id, machine_id, project_id, path, content, view_state_json, updated_at, base_content_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(tab_id) DO UPDATE SET
-         project_id = excluded.project_id, path = excluded.path, content = excluded.content,
+         machine_id = excluded.machine_id, project_id = excluded.project_id, path = excluded.path, content = excluded.content,
          view_state_json = excluded.view_state_json, updated_at = excluded.updated_at,
          base_content_json = excluded.base_content_json`
-    ).run(tabId, projectId, path, content, viewState ? JSON.stringify(viewState) : null, now(), baseContent === undefined ? null : JSON.stringify(baseContent))
+    ).run(tabId, machineId, projectId, path, content, viewState ? JSON.stringify(viewState) : null, now(), baseContent === undefined ? null : JSON.stringify(baseContent))
   }
 
   removeEditorDraft(tabId: string): void {

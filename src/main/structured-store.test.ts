@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { StructuredAgentStore, sanitizeDiagnostic } from './structured-store'
 import type { AgentEvent, AgentEventData } from '../shared/structured-agent'
+import { emptyProjection } from '../shared/structured-agent-reducer'
 
 const roots: string[] = [], databases: DatabaseSync[] = []
 afterEach(() => { for (const db of databases.splice(0)) { try { db.close() } catch {} } for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 }); vi.unstubAllEnvs() })
@@ -20,6 +21,16 @@ function fixture() {
 const event = (sequence: number, data: AgentEventData, overrides: Partial<AgentEvent> = {}): AgentEvent => ({ schemaVersion: 1, id: `event-${sequence}`, sequence, sessionId: 'one', runtimeId: 'runtime', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: 'fixture', timestamp: '2026-09-07T00:00:00.000Z', data, ...overrides })
 
 describe('structured SQLite journal and immutable artifacts', () => {
+  it('hydrates imported projections only after their database rows exist', () => {
+    const { db, store } = fixture()
+    const projection = { ...emptyProjection('imported'), title: 'Imported history', phase: 'disconnected' as const, nativeSessionId: 'native-imported' }
+    db.prepare("INSERT INTO agent_sessions(id) VALUES('imported')").run()
+    db.prepare('INSERT INTO structured_sessions(id,project_id,provider,spec_json,projection_json,title,archived) VALUES(?,?,?,?,?,?,0)')
+      .run('imported', 'project', 'codex', JSON.stringify({ id: 'imported' }), JSON.stringify(projection), projection.title)
+    expect(store.snapshot('imported')).toBeNull()
+    store.loadImported(['missing', 'imported'])
+    expect(store.snapshot('imported')).toEqual(projection)
+  })
   it('restores uncheckpointed events without resending work and marks lost runtime state disconnected', () => {
     const f = fixture()
     f.store.append(event(1, { type: 'text', role: 'user', text: 'Synthetic first prompt', mode: 'snapshot' }))

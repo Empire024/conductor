@@ -264,6 +264,9 @@ export class AgentManager {
           catch { /* The ledger explains a turn; it is never a precondition for sending one. */ }
         }
         const memoryContext = recalled ? `Conductor project memory (current project evidence takes precedence):\n${recalled}` : ''
+        // Local models use the scoped in-process tool bridge. Never put a bearer credential
+        // for the unrestricted app-control HTTP surface into their prompt or sandbox.
+        if (spec.provider === 'local') return [memoryContext, 'Use the conductor tool for durable project memory and tasks.list. Work only on your assigned task.'].filter(Boolean).join('\n\n')
         return [memoryContext, first ? MEMORY_PROTOCOL : '', collaboration?.briefingFor(spec.id) ?? '', projectTaskBriefing(spec), this.controlBriefing?.(spec) ?? ''].filter(Boolean).join('\n\n')
       },
       (spec, event) => {
@@ -305,7 +308,7 @@ export class AgentManager {
         available: Boolean(executable),
         executable: executable ?? undefined,
         installUrl: provider.installUrl,
-        models: provider.models,
+        models: provider.id === 'local' ? (() => { try { return Object.values(loadConfig().models).map(model => ({ id: model.id, label: model.label })) } catch { return [] } })() : provider.models,
         efforts: provider.efforts
       }
     })

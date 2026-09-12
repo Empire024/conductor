@@ -18,7 +18,10 @@ beforeEach(() => {
 
 const machine = (overrides: Partial<MachineDescriptor> = {}): MachineDescriptor => ({
   id: 'desktop', name: 'Render desktop', kind: 'peer', status: 'online', accountLogin: 'owner',
-  projects: [{ grant: {} as never, observed: null }], ...overrides
+  projects: [{
+    grant: { localProjectId: 'project', remote: { key: 'working-copy', keyCreatedAt: '2026-09-12T00:00:00.000Z', path: 'C:/remote/project' } } as never,
+    observed: { key: 'working-copy', keyCreatedAt: '2026-09-12T00:00:00.000Z', path: 'C:/remote/project' } as never
+  }], ...overrides
 })
 
 describe('choosing which machine runs a new tab', () => {
@@ -47,12 +50,17 @@ describe('choosing which machine runs a new tab', () => {
       machine({ id: 'offline-box', name: 'Old tower', status: 'offline' }),
       machine({ id: 'unpaired', name: 'Studio PC', projects: [] }),
       machine({ id: 'gone', name: 'Revoked box', status: 'revoked' })
-    ])
+    ], 'project')
     expect(options.map(option => option.machine.id)).toEqual([LOCAL_MACHINE_ID, 'desktop', 'offline-box', 'unpaired'])
     expect(options.find(option => option.machine.id === LOCAL_MACHINE_ID)!.reason).toBe('')
     expect(options.find(option => option.machine.id === 'desktop')!.reason).toBe('')
     expect(options.find(option => option.machine.id === 'offline-box')!.reason).toMatch(/offline/)
-    expect(options.find(option => option.machine.id === 'unpaired')!.reason).toMatch(/no project paired/)
+    expect(options.find(option => option.machine.id === 'unpaired')!.reason).toMatch(/has not been told/)
+  })
+
+  it('does not offer a peer that is mapped only to a different local project', () => {
+    const options = machinePlacementOptions([machine()], 'another-project')
+    expect(options[0]!.reason).toMatch(/has not been told which of its projects this one is/)
   })
 
   it('builds an ordinary local tab without asking any machine when placement is here', async () => {

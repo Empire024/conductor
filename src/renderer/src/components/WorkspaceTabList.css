@@ -1,0 +1,18 @@
+.session-tree .workspace-tab-row { display: grid; grid-template-columns: minmax(44px, 1fr) auto 23px; align-items: center; overflow: hidden; }
+.session-tree .workspace-tab-select { width: auto; min-width: 0; padding-inline: 3px; gap: 4px; overflow: hidden; }
+.session-tree .workspace-tab-select .ellipsis { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-tree .workspace-tab-more { width: 23px; min-width: 23px; }
+.session-tree .workspace-tab-role { min-width: 0; max-width: 91px; height: 19px; margin: 3px 2px 3px 0; padding: 0 4px; display: inline-flex; align-items: center; gap: 3px; overflow: hidden; border: 1px solid color-mix(in srgb, currentColor 24%, var(--border-soft)); border-radius: 5px; background: color-mix(in srgb, currentColor 6%, transparent); color: var(--text-2); font-size: 6.5px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; cursor: pointer; }
+.session-tree .workspace-tab-role.main { color: var(--accent); }
+.session-tree .workspace-tab-role.coworker { color: var(--blue); }
+.session-tree .workspace-tab-role.both { color: var(--accent-muted); }
+.session-tree .workspace-tab-role > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.session-tree .workspace-tab-role b { min-width: 11px; padding: 1px 3px; border-radius: 5px; color: var(--surface-0); background: var(--text); font-size: 6px; line-height: 1; }
+.session-tree .workspace-tab-role:hover { background: color-mix(in srgb, currentColor 12%, var(--surface-hover)); color: var(--text); }
+.session-tree .workspace-tab-role:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+@media (max-width: 620px) {
+  .session-tree .workspace-tab-row:has(.workspace-tab-role) { grid-template-columns: minmax(0, 1fr) 23px; grid-template-rows: 25px 22px; }
+  .session-tree .workspace-tab-row:has(.workspace-tab-role) .workspace-tab-select { grid-column: 1; grid-row: 1; }
+  .session-tree .workspace-tab-row:has(.workspace-tab-role) .workspace-tab-role { grid-column: 1 / -1; grid-row: 2; justify-self: start; max-width: calc(100% - 5px); margin: 0 2px 2px 3px; }
+  .session-tree .workspace-tab-row:has(.workspace-tab-role) .workspace-tab-more { grid-column: 2; grid-row: 1; }
+}

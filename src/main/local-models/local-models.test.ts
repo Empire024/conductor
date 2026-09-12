@@ -183,8 +183,8 @@ describe('tool policy', () => {
   const context = (root: string, readOnly = false) => ({ workspace: root, readOnly, sandbox: null, timeoutSec: 30 })
 
   it('offers only the sandbox-bound tools', () => {
-    expect(toolSpecs(false).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'write_file', 'edit_file', 'run_command'])
-    expect(toolSpecs(true).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search'])
+    expect(toolSpecs(false).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'run_command'])
+    expect(toolSpecs(true).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read'])
   })
 
   it('refuses tools that are not in the allowlist', async () => {

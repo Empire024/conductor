@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
@@ -21,9 +22,11 @@ import type { UserInput } from './generated/codex/v2/UserInput'
 import type { ConfigReadResponse } from './generated/codex/v2/ConfigReadResponse'
 import type { ConfigRequirementsReadResponse } from './generated/codex/v2/ConfigRequirementsReadResponse'
 import type { GetAccountResponse } from './generated/codex/v2/GetAccountResponse'
+import type { GetAccountRateLimitsResponse } from './generated/codex/v2/GetAccountRateLimitsResponse'
 import type { ThreadForkResponse } from './generated/codex/v2/ThreadForkResponse'
 import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
+import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
 
 export const CODEX_PROTOCOL_BASELINE = '0.153.4'
 type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait'>>
@@ -101,6 +104,20 @@ export function codexLiveSkillOverrides(discovered: SkillsListResponse, config: 
   }
   if (overrides.size > 2048) throw new Error('Live skill inventory exceeded the bounded preflight limit')
   return { 'skills.config': [...overrides.values()] }
+}
+
+/** Reads only the exact loopback browser configuration minted by BrowserMcpServer. This is a
+ * thread config, never a process argument, so the per-session bearer token stays out of argv. */
+export function codexBrowserMcpThreadConfig(configuration: string | undefined): Json | undefined {
+  if (!configuration) return undefined
+  const source = configuration.trim().startsWith('{') ? configuration : readFileSync(configuration, 'utf8')
+  if (source.length > 64 * 1024) throw new Error('Codex browser MCP configuration is too large')
+  let parsed: unknown
+  try { parsed = JSON.parse(source) } catch { throw new Error('Codex browser MCP configuration is malformed') }
+  if (!record(parsed) || !record(parsed.mcp_servers) || Object.keys(parsed.mcp_servers).length !== 1) throw new Error('Codex browser MCP configuration has an invalid server set')
+  const browser = parsed.mcp_servers[BROWSER_MCP_SERVER_NAME]
+  if (!record(browser) || typeof browser.url !== 'string' || !/^http:\/\/127\.0\.0\.1:\d+\/mcp$/.test(browser.url) || !record(browser.http_headers) || typeof browser.http_headers.Authorization !== 'string' || !/^Bearer [a-f0-9]{64}$/.test(browser.http_headers.Authorization)) throw new Error('Codex browser MCP configuration is not a scoped loopback credential')
+  return json(parsed)
 }
 
 /** Counts only actual unified-diff hunk lines, never headers or prose. */
@@ -182,7 +199,10 @@ export class CodexAdapter implements ProviderAdapter {
   private dispatching = false
   private interrupted = false
   private liveRetryStopped = false
-  private completedTurns = new Set<string>()
+  /** Retains both completion identity and its terminal phase. A very fast turn can complete
+   * before the turn/start response arrives; that later acknowledgement still confirms the
+   * accepted request settings, but must re-emit the exact terminal phase rather than `running`. */
+  private completedTurns = new Map<string, 'completed' | 'failed' | 'interrupted'>()
   private completedItems = new Set<string>()
   private defaults?: ThreadStartResponse
   private models: Model[] = []
@@ -229,13 +249,14 @@ export class CodexAdapter implements ProviderAdapter {
       if (!record(initialized) || typeof initialized.userAgent !== 'string') throw new Error('Malformed Codex initialize response')
       this.transport.send({ method: 'initialized' })
       const liveEnvironment = this.options.environment ?? process.env
-      let liveThreadConfig: Json | undefined
+      let threadConfig = codexBrowserMcpThreadConfig(this.options.mcpConfig)
       if (liveEnvironment.CONDUCTOR_LIVE_TESTS === '1') {
+        if (threadConfig) throw new Error('Codex live isolation cannot enable the Conductor browser MCP')
         const requirements = await this.request<ConfigRequirementsReadResponse>('configRequirements/read')
         const config = await this.request<ConfigReadResponse>('config/read', { cwd: this.options.cwd, includeLayers: true })
         validateCodexLiveConfiguration(config, requirements)
         const discoveredSkills = await this.request<SkillsListResponse>('skills/list', { cwds: [this.options.cwd], forceReload: true })
-        liveThreadConfig = codexLiveSkillOverrides(discoveredSkills, config)
+        threadConfig = codexLiveSkillOverrides(discoveredSkills, config)
         const account = await this.request<GetAccountResponse>('account/read', { refreshToken: false })
         const expectedType = liveEnvironment.CONDUCTOR_LIVE_AUTH_CODEX === 'api' ? 'apiKey' : 'chatgpt'
         if (account.account?.type !== expectedType || config.config.model_provider && config.config.model_provider !== 'openai') throw new Error('Configured Codex authentication/billing route does not match the approved live connection')
@@ -245,8 +266,8 @@ export class CodexAdapter implements ProviderAdapter {
       }
       const method = this.options.nativeSessionId ? 'thread/resume' : 'thread/start'
       const params = this.options.nativeSessionId
-        ? { threadId: this.options.nativeSessionId, cwd: this.options.cwd, excludeTurns: true, ...(liveThreadConfig ? { config: liveThreadConfig } : {}) }
-        : { cwd: this.options.cwd, ...(liveThreadConfig ? { config: liveThreadConfig } : {}), ...(liveEnvironment.CONDUCTOR_LIVE_TESTS === '1' ? { model: liveEnvironment.CONDUCTOR_LIVE_MODEL_CODEX } : this.options.settings.model ? { model: this.options.settings.model } : {}) }
+        ? { threadId: this.options.nativeSessionId, cwd: this.options.cwd, excludeTurns: true, ...(threadConfig ? { config: threadConfig } : {}) }
+        : { cwd: this.options.cwd, ...(threadConfig ? { config: threadConfig } : {}), ...(liveEnvironment.CONDUCTOR_LIVE_TESTS === '1' ? { model: liveEnvironment.CONDUCTOR_LIVE_MODEL_CODEX } : this.options.settings.model ? { model: this.options.settings.model } : {}) }
       const result = await this.request<ThreadStartResponse>(method, json(params))
       if (!record(result) || !record(result.thread) || typeof result.thread.id !== 'string') throw new Error('Malformed Codex thread response')
       this.threadId = result.thread.id
@@ -312,11 +333,12 @@ export class CodexAdapter implements ProviderAdapter {
     try {
       const result = await this.request<TurnStartResponse>('turn/start', json(params))
       if (!result.turn || typeof result.turn.id !== 'string') throw new Error('Malformed Codex turn response; execution state is uncertain')
-      if (!this.completedTurns.has(result.turn.id)) {
+      const completedPhase = this.completedTurns.get(result.turn.id)
+      this.capabilities.effectiveSettings = json({ model: params.model, effort: params.effort, approvalPolicy: params.approvalPolicy, sandbox: params.sandboxPolicy })
+      if (!completedPhase) {
         this.turnId = result.turn.id
-        this.capabilities.effectiveSettings = json({ model: params.model, effort: params.effort, approvalPolicy: params.approvalPolicy, sandbox: params.sandboxPolicy })
         this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
-      }
+      } else this.emit({ data: { type: 'session', phase: completedPhase, capabilities: this.capabilities } })
     } catch (error) {
       // A lost acknowledgement is not permission to retry or claim that nothing executed.
       this.disconnect(error instanceof Error ? error.message : 'Codex turn dispatch failed')
@@ -444,6 +466,19 @@ export class CodexAdapter implements ProviderAdapter {
     return json(Object.fromEntries(results.map((result, index) => [requests[index]!.label, result.status === 'fulfilled' ? { status: 'available', payload: result.value } : { status: 'unavailable', message: result.reason instanceof Error ? result.reason.message : 'Provider discovery failed' }])))
   }
 
+  async refreshUsage(): Promise<void> {
+    await this.start()
+    if (this.failed || this.disposed || !this.transport?.connected) throw new Error('Codex runtime is disconnected')
+    const response = await this.request<GetAccountRateLimitsResponse>('account/rateLimits/read', undefined)
+    if (!record(response) || !record(response.rateLimits)) throw new Error('Malformed Codex account rate-limit response')
+    const reportedBuckets = record(response.rateLimitsByLimitId) ? response.rateLimitsByLimitId : undefined
+    const fallbackKey = typeof response.rateLimits.limitId === 'string' && response.rateLimits.limitId ? response.rateLimits.limitId : 'default'
+    const rateLimitsByLimitId = reportedBuckets && Object.keys(reportedBuckets).length
+      ? reportedBuckets
+      : { [fallbackKey]: response.rateLimits }
+    this.emitAccountLimits({ rateLimits: response.rateLimits, rateLimitsByLimitId }, { method: 'account/rateLimits/read', payload: json(response) })
+  }
+
   async history(): Promise<import('../native-history').NativeHistoryItem[]> {
     if (!this.threadId) return []
     const result = await this.request<import('./generated/codex/v2/ThreadReadResponse').ThreadReadResponse>('thread/read', { threadId: this.threadId, includeTurns: true })
@@ -536,8 +571,9 @@ export class CodexAdapter implements ProviderAdapter {
         }
         return
       case 'turn/completed': {
-        this.completedTurns.add(params.turn.id)
-        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.values().next().value!)
+        const completedPhase = params.turn.status === 'failed' ? 'failed' : params.turn.status === 'interrupted' ? 'interrupted' : 'completed'
+        this.completedTurns.set(params.turn.id, completedPhase)
+        if (this.completedTurns.size > 128) this.completedTurns.delete(this.completedTurns.keys().next().value!)
         // Completion contains authoritative item snapshots where available.
         for (const item of params.turn.items ?? []) this.item(item, { ...context, turnId: params.turn.id }, true, native)
         this.expireRequests('Turn completed', params.threadId, params.turn.id)
@@ -547,7 +583,7 @@ export class CodexAdapter implements ProviderAdapter {
           for (const [id, turnId] of this.steeringInputs) if (turnId === params.turn.id) this.inputDelivery(id, params.turn.status === 'interrupted' ? 'cancelled' : 'uncertain', native)
           this.turnId = undefined
           if (params.turn.error) send({ type: 'error', message: params.turn.error.message })
-          send({ type: 'session', phase: params.turn.status === 'failed' ? 'failed' : params.turn.status === 'interrupted' ? 'interrupted' : 'completed' }, { turnId: params.turn.id })
+          send({ type: 'session', phase: completedPhase }, { turnId: params.turn.id })
         }
         return
       }
@@ -597,14 +633,7 @@ export class CodexAdapter implements ProviderAdapter {
         }
         return
       case 'account/rateLimits/updated':
-        // The rolling item keeps one current level per runtime; the timeline reconciles it in
-        // place. Recording the first reported level separately is what makes "this run consumed
-        // N points" a difference between two provider reports rather than an assumption.
-        if (!this.accountBaseline) {
-          this.accountBaseline = true
-          send({ type: 'usage', source: 'provider', limits: json(params) }, { itemId: 'account-rate-limits:first' })
-        }
-        send({ type: 'usage', source: 'provider', limits: json(params) }, { itemId: 'account-rate-limits' })
+        this.emitAccountLimits(params, { method, payload: json(params) })
         return
       case 'serverRequest/resolved': {
         const key = requestKey(params.requestId)
@@ -778,6 +807,16 @@ export class CodexAdapter implements ProviderAdapter {
   }
 
   private itemKey(context: Correlation): string { return JSON.stringify([context.nativeSessionId, context.turnId, context.itemId]) }
+  private emitAccountLimits(limits: unknown, native: { method: string; payload?: Json }): void {
+    // One rolling item is the current account snapshot. A separate first observation is the
+    // only baseline used for movement; a read refresh never starts a turn or changes settings.
+    if (!this.accountBaseline) {
+      this.accountBaseline = true
+      this.emit({ itemId: 'account-rate-limits:first', data: { type: 'usage', source: 'provider', limits: json(limits) }, native: { ...native, method: native.method + '/first' } })
+    }
+    this.emit({ itemId: 'account-rate-limits', data: { type: 'usage', source: 'provider', limits: json(limits) }, native })
+  }
+
   private emit(event: AdapterEvent): void { this.options.emit({ nativeSessionId: this.threadId, turnId: this.turnId, ...event, data: event.data.type === 'session' ? { ...event.data, capabilities: { ...this.capabilities } } : event.data }) }
   private unknown(method: string, payload: unknown, message = `Codex event: ${method}`): void {
     this.emit({ ...this.correlation(payload), data: { type: 'notice', message, payload: json(payload) }, native: { method, payload: json(payload) } })

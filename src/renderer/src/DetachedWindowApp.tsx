@@ -4,7 +4,7 @@ import { ListTodo } from 'lucide-react'
 import { AppVersionButton } from './components/AppVersionButton'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile } from './components/workspace-files-state'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
 import { Bot, Braces, ExternalLink, FolderGit2, Gauge, LayoutGrid, MemoryStick, PanelLeft, PanelLeftOpen, PanelRight, Workflow, X } from 'lucide-react'
 import type { AppSettings, DetachedWindowRecord, PaneKind, PaneTab, ProjectRecord, SessionRecord, WorkspaceLayout } from '../../shared/models'
@@ -21,6 +21,12 @@ import { applyAppTheme, resolveThemeVariant } from './appearance'
 import { migrateLegacyCodexModels } from './agent-models'
 import { useAppUpdates } from './use-app-updates'
 import { AppUpdateButton, isUpdateActionVisible } from './components/AppUpdateButton'
+import type { MachineDescriptor } from '../../shared/remote-control'
+import { LOCAL_MACHINE_ID } from '../../shared/remote-control'
+import { checkRemoteProjectPlacement } from '../../shared/project-identity'
+import { readPlacement } from './layout/machine-placement'
+import { RemoteFilesPane } from './panes/RemoteFilesPane'
+import { dispatchAgentContext } from './panes/StructuredAgentPane'
 
 interface DetachedBundle {
   record: DetachedWindowRecord
@@ -38,6 +44,9 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     return () => window.removeEventListener('keydown', restore, true)
   }, [])
   const [loadedProjects, setLoadedProjects] = useState<ProjectRecord[]>([])
+  const [sessionName, setSessionName] = useState('Untitled session')
+  const [machines, setMachines] = useState<MachineDescriptor[]>([])
+  const [selectedMachineId, setSelectedMachineId] = useState(LOCAL_MACHINE_ID)
   useEffect(() => { const refresh = (): void => { void window.conductor.projects.list().then(setLoadedProjects) }; refresh(); window.addEventListener('focus', refresh); return () => window.removeEventListener('focus', refresh) }, [])
   const [bundle, setBundle] = useState<DetachedBundle | null>(null)
   const [layout, setLayout] = useState<WorkspaceLayout | null>(null)
@@ -60,11 +69,17 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
   maximizedGroupIdRef.current = maximizedGroupId
 
   useEffect(() => {
+    void window.conductor.sessionArchive.name().then(setSessionName).catch(() => {})
+    return window.conductor.sessionArchive.onChanged(result => setSessionName(result.name))
+  }, [])
+
+  useEffect(() => {
     void Promise.all([window.conductor.window.getDetached(detachedId), window.conductor.settings.get()]).then(([loaded, appSettings]) => {
       setSettings(appSettings)
       if (!loaded) return
       const codingLayout = migrateLegacyCodexModels(stripWorkspaceUtilityTabs(loaded.record.layout))
       setBundle(loaded)
+      setSelectedMachineId(readPlacement(loaded.session.id))
       setLayout(codingLayout)
       setMaximizedGroupId(loaded.record.maximizedGroupId)
       setFocusedGroupId(listGroups(codingLayout.root)[0]?.id ?? '')
@@ -73,6 +88,20 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
       }
     })
   }, [detachedId])
+
+  useEffect(() => {
+    const refresh = (): void => { void window.conductor.remote.machines().then(setMachines).catch(() => setMachines([])) }
+    refresh()
+    return window.conductor.remote.onState(refresh)
+  }, [])
+
+  const selectedRemoteMachine = useMemo(() => {
+    if (!bundle || selectedMachineId === LOCAL_MACHINE_ID) return null
+    const machine = machines.find(item => item.id === selectedMachineId)
+    const link = machine?.projects.find(item => item.grant.localProjectId === bundle.project.id)
+    if (!machine || machine.status !== 'online' || !checkRemoteProjectPlacement({ grant: link?.grant, advertised: link?.observed, machineName: machine.name }).ok) return null
+    return machine
+  }, [bundle, machines, selectedMachineId])
 
   useEffect(() => {
     const apply = (): void => {
@@ -105,14 +134,6 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     }, 100)
   }, [detachedId, layout, maximizedGroupId])
 
-  // A detached window exists to hold the one tab it was created for. Once that tab leaves it -
-  // dragged back onto a workspace, dragged into another window, or simply closed - an empty
-  // floating window left behind is a ghost with nothing left to show; closing it here is what
-  // makes detach, re-attach and close symmetrical instead of only ever accumulating windows.
-  useEffect(() => {
-    if (layout && layout.root.type === 'group' && layout.root.tabs.length === 0) window.conductor.window.close()
-  }, [layout])
-
   useEffect(() => {
     const flush = (): void => {
       if (!layoutRef.current) return
@@ -127,6 +148,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     }
     window.addEventListener('pagehide', flush)
     window.addEventListener('beforeunload', flush)
+    window.addEventListener('conductor:flush-session', flush)
     document.addEventListener('visibilitychange', onVisibility)
     const unsubscribeUpdate = window.conductor.updates.onPrepareInstall(({ requestId }) => {
       flush()
@@ -135,11 +157,39 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     return () => {
       window.removeEventListener('pagehide', flush)
       window.removeEventListener('beforeunload', flush)
+      window.removeEventListener('conductor:flush-session', flush)
       document.removeEventListener('visibilitychange', onVisibility)
       unsubscribeUpdate()
       flush()
     }
   }, [detachedId])
+
+  useEffect(() => {
+    const closeRequested = (): void => {
+      const current = layoutRef.current
+      if (!current) return
+      const group = findGroup(current.root, focusedGroupId) ?? listGroups(current.root)[0]
+      const tab = group?.tabs.find(item => item.id === group.activeTabId) ?? group?.tabs[0]
+      if (!group || !tab) return
+      const result = closeTab(current, group.id, tab.id)
+      if (!result.closed) return
+      layoutRef.current = result.layout
+      setLayout(result.layout)
+      setClosedTabs(existing => [...existing, result.closed!].slice(-20))
+    }
+    window.addEventListener('conductor:close-tab', closeRequested)
+    return () => window.removeEventListener('conductor:close-tab', closeRequested)
+  }, [focusedGroupId])
+
+  const saveNamedSession = useCallback(async (): Promise<void> => {
+    const result = await window.conductor.sessionArchive.save()
+    if (result) setSessionName(result.name)
+  }, [])
+
+  const openNamedSession = useCallback(async (): Promise<void> => {
+    const result = await window.conductor.sessionArchive.open()
+    if (result) setSessionName(result.name)
+  }, [])
 
   const detachAgain = useCallback((groupId: string, tab: PaneTab, options?: { alwaysOnTop?: boolean }): void => {
     if (!bundle || !layout) return
@@ -201,6 +251,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     <div className="app-shell detached-shell">
       <TitleBar
         projectName={bundle.project.name}
+        sessionName={sessionName}
         themeVariant={resolveThemeVariant(settings)}
         themeAuto={settings.themeAuto}
         themeId={settings.themeId}
@@ -214,6 +265,8 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
           })()
         }}
         onNewTab={() => openTab('launcher')}
+        onOpenSession={() => void openNamedSession()}
+        onSaveSession={() => void saveNamedSession()}
         updateState={updateState}
       />
       <div className="detached-body">
@@ -252,6 +305,14 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               <button onClick={() => { setUtilityPanel('memory'); setContextSidebarOpen(false) }}><MemoryStick size={16} /><span><strong>Memory</strong><small>Workspace drawer</small></span></button>
               <button onClick={() => { setUtilityPanel('processes'); setContextSidebarOpen(false) }}><Gauge size={16} /><span><strong>Processes</strong><small>Workspace drawer</small></span></button>
             </div>
+            {selectedRemoteMachine && <RemoteFilesPane
+              machineId={selectedRemoteMachine.id}
+              machineName={selectedRemoteMachine.name}
+              projectId={bundle.project.id}
+              files={window.conductor.remote.files}
+              onOpenFile={file => openWorkspaceFile(file.projectId, file.path, 'editor', undefined, undefined, file.machineId)}
+              onAttachFile={attachment => { if (!dispatchAgentContext(bundle.project.id, attachment)) window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Focus a conversation in this project before attaching a remote file.' })) }}
+            />}
           </aside>
         )}
         <main className={`detached-stage workspace-content-shell utility-${utilitySide} ${utilityPanel ? 'has-utility' : ''} ${utilityDragging ? 'utility-is-dragging' : ''}`}>
@@ -270,6 +331,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               onClosed={(tab) => setClosedTabs((current) => [...current, tab].slice(-20))}
               onDetach={detachAgain}
               onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(bundle.project.id, path, mode ?? 'auto', line, allowBinary)}
+              onMachinePlacement={setSelectedMachineId}
               canReopen={closedTabs.length > 0}
               onReopen={(groupId) => {
                 const tab = closedTabs.at(-1)

@@ -41,7 +41,7 @@ export interface ProjectTaskActivity {
 export interface ProjectTask { id:string; title:string; kind:ProjectTaskKind; status:ProjectTaskStatus; agentId?:string; priority:ProjectTaskPriority; weight:ProjectTaskWeight; line:number; activity:ProjectTaskActivity[] }
 export interface ProjectTaskOwner { id:string; sessionId:string; title:string; workspace:string; provider:string; phase:string }
 export interface ProjectBacklog { projectId:string; path:string; revision:string; tasks:ProjectTask[]; owners:ProjectTaskOwner[]; sourceControl:SourceControlStatus }
-export type ProjectTaskEdit = { type:'add'; title:string; kind:ProjectTaskKind; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | { type:'update'; id:string; title?:string; status?:ProjectTaskStatus; agentId?:string|null; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | {type:'remove';id:string}
+export type ProjectTaskEdit = { type:'add'; title:string; kind:ProjectTaskKind; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | { type:'update'; id:string; title?:string; kind?:ProjectTaskKind; status?:ProjectTaskStatus; agentId?:string|null; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | {type:'remove';id:string}
 export interface ProjectBacklogBridge {
   get(projectId:string):Promise<ProjectBacklog>
   edit(projectId:string,revision:string,edit:ProjectTaskEdit):Promise<ProjectBacklog>

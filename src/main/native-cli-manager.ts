@@ -19,7 +19,28 @@ export function nativeCliArgs(provider: StructuredProvider, nativeId: string, se
     ...(settings.effort && settings.effort !== 'auto' ? ['--effort', settings.effort] : []),
     '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'plan' : settings.permission === 'auto' ? 'auto' : 'manual']
 }
-interface LiveCli { spec: AgentSpec; process: IPty; exited: boolean; transcript: string; sequence: number; stopped: Promise<void>; resolveStopped(): void }
+export interface NativeCliInputState { draft: string; submitted: boolean }
+
+/** The native TUI does not expose a turn lifecycle API. A non-empty Enter is the one reliable
+ * execution signal available; Ctrl+C and process exit are the corresponding reliable stops. */
+export function trackNativeCliInput(state: NativeCliInputState, data: string): NativeCliInputState {
+  let draft = state.draft
+  let submitted = state.submitted
+  for (const character of data) {
+    if (character === '\x03') { draft = ''; submitted = false; continue }
+    if (character === '\x15') { draft = ''; continue }
+    if (character === '\x7f' || character === '\b') { draft = draft.slice(0, -1); continue }
+    if (character === '\r' || character === '\n') {
+      if (/\S/.test(draft)) submitted = true
+      draft = ''
+      continue
+    }
+    if (character >= ' ') draft = (draft + character).slice(-600_000)
+  }
+  return { draft, submitted }
+}
+
+interface LiveCli { spec: AgentSpec; process: IPty; exited: boolean; transcript: string; sequence: number; input: NativeCliInputState; stopped: Promise<void>; resolveStopped(): void }
 export class NativeCliManager {
   private live = new Map<string, LiveCli>()
   private returning = new Map<string, Promise<void>>()
@@ -49,7 +70,7 @@ export class NativeCliManager {
       })
       let resolveStopped!: () => void
       const stopped = new Promise<void>((resolve) => { resolveStopped = resolve })
-      const live: LiveCli = { spec: handoff.spec, process: child, exited: false, transcript: '', sequence: 0, stopped, resolveStopped }
+      const live: LiveCli = { spec: handoff.spec, process: child, exited: false, transcript: '', sequence: 0, input: { draft: '', submitted: false }, stopped, resolveStopped }
       this.live.set(id, live)
       child.onData((data) => {
         if (this.live.get(id) !== live) return
@@ -57,7 +78,7 @@ export class NativeCliManager {
         this.broadcast('native-cli:data', { id, data, sequence: ++live.sequence })
       })
       child.onExit(({ exitCode }) => {
-        live.exited = true; live.resolveStopped()
+        live.exited = true; live.input = { draft: '', submitted: false }; live.resolveStopped()
         if (this.live.get(id) !== live) return
         this.broadcast('native-cli:status', { id, status: 'exited', exitCode })
       })
@@ -67,7 +88,16 @@ export class NativeCliManager {
       throw error
     }
   }
-  write(id: string, data: string): void { const live = this.live.get(id); if (live && !live.exited && typeof data === 'string' && data.length <= 1000000) live.process.write(data) }
+  write(id: string, data: string): void {
+    const live = this.live.get(id)
+    if (!live || live.exited || typeof data !== 'string' || data.length > 1000000) return
+    live.input = trackNativeCliInput(live.input, data)
+    live.process.write(data)
+  }
+  hasSubmittedInput(id?: string): boolean {
+    if (id) { const live = this.live.get(id); return Boolean(live && !live.exited && live.input.submitted) }
+    return [...this.live.values()].some(live => !live.exited && live.input.submitted)
+  }
   resize(id: string, cols: number, rows: number): void { const live = this.live.get(id); if (live && !live.exited && Number.isInteger(cols) && Number.isInteger(rows)) live.process.resize(Math.max(2, Math.min(500, cols)), Math.max(2, Math.min(300, rows))) }
   switchToChat(id: string): Promise<void> {
     const pending = this.returning.get(id)

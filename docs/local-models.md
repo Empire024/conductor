@@ -2,7 +2,8 @@
 
 Two Qwen models served by llama.cpp on this machine, driven by Conductor as `local/qwen3.5-9b`
 and `local/qwen3.6-35b-a3b`. Conductor remains the orchestrator: llama.cpp only performs
-inference, and every tool the model can use runs inside a locked-down Docker container.
+inference. Workspace file tools run through canonical host-side containment checks; commands
+run inside a locked-down Docker container. Project memory and public research use narrow brokers.
 
 ```
 Conductor (CLI or app)
@@ -29,8 +30,8 @@ Agent workspaces:
 D:\ConductorLocal\workspaces\<session>
 
 Docker internal storage:
-Docker Desktop is not installed yet; `status` reports the engine version and DockerRootDir once
-it is. Docker's own VM disk, WSL distributions and image store stay wherever Docker Desktop puts
+Docker Desktop 29.7.2 is installed under the owner's AppData/Local/Programs/DockerDesktop;
+the engine reports /var/lib/docker. Docker's own VM disk, WSL distributions and image store stay wherever Docker Desktop puts
 them - this stack never relocates them.
 ```
 
@@ -46,8 +47,10 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
 
 - **A local model never gets a host shell.** Tool dispatch is an allowlist in code
   (`src/main/local-models/tools.ts`): `read_file`, `list_files`, `search`, `write_file`,
-  `edit_file`, `run_command`. Conductor's host tools, PowerShell, browser automation, MCP
-  servers, connectors and credentials are not reachable from this provider.
+  `edit_file`, `run_command`, `web_read`, and `conductor`. The Conductor broker
+  permits only `memory.recall`, `memory.remember`, and `tasks.list`, bound to the registered
+  project/session. Read-only turns cannot remember. Caller-supplied scope, arbitrary MCP calls,
+  PowerShell, browser automation, connectors and credential access are refused.
 - **Execution fails closed.** `run_command` only ever runs `docker exec` into the sandbox. If
   Docker is stopped, missing or broken, the call is refused — it never falls back to PowerShell,
   cmd.exe, WSL or a host child process.
@@ -55,10 +58,28 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   `realpath` and re-checked against the workspace root, so `../../`, `C:\...`, UNC paths,
   symlinks and junctions are refused (`src/main/local-models/workspace.ts`).
 - **Secrets are withheld.** `.env*`, key material, `.npmrc`, `.pypirc`, credential stores and
-  similar files are refused by the file tools and masked inside the container. `.git` is mounted
+  similar files are refused by the file tools and masked inside the container. The bounded
+  recursive scan fails closed if incomplete, and changed masks recreate the container before
+  the next command. Unreadable directories (including malformed names that the host cannot
+  address), more than 200,000 entries, depth over 64, or more than 4,096 masks refuse shell
+  execution rather than exposing an unscanned tree. File tools remain independently bounded.
+  `.git` is mounted
   read-only, so a local model cannot install a hook or rewrite repository config.
 - **No network in the runtime.** The container runs with `--network none`; it cannot browse,
   upload source, reach cloud metadata or talk to other machines on the LAN.
+- **Credential-free GET research.** `web_read` retrieves public HTTPS text on port 443,
+  without inherited cookies, authorization headers or request bodies. IPv4 DNS answers must
+  all be public and the chosen address is pinned for the socket; every redirect is checked
+  again. IPv6-only destinations are refused. Requests have a 20-second budget, at most three
+  redirects, a 256 KiB response cap and a 24,000-character tool result. Results are explicitly
+  marked untrusted. Public URL paths/query strings can transmit information: this is not a
+  general source-exfiltration prevention mechanism. Do not use it for confidential research
+  queries. Credential filename policy likewise cannot identify secrets embedded in arbitrary
+  source files, or atomically guard files another host process creates during a running command.
+- **Cancellation reaches commands.** Stop removes only this conversation's Docker container
+  and waits for removal, so a Linux command cannot continue writing after its Docker client
+  disappears. Output overflow and command timeout also remove the container before returning.
+  The next command recreates the isolated container.
 - **No inherited environment.** The container gets an explicit minimal env allowlist; no
   `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, `HF_TOKEN` or agent socket.
 - **Model text is never parsed by a host shell.** Commands are passed as a single argv entry to
@@ -70,13 +91,34 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
 Moving the data to another drive changed none of this: the same containment code runs, and the
 only host directory that crosses into a container is still one specific workspace directory.
 
+## Bounded native coworkers
+
+The installed catalog contains Qwen 3.5 9B and Qwen 3.6 35B-A3B, both Q4_K_M; there is no
+3.8 model. `models.list` advertises the local provider from the installed configuration.
+Controllers may use native `router.dispatch` with `provider: "local"`, one of the model IDs
+above, and `permission: "accept-edits"` or `"read-only"`, with no effort parameter. Inherited
+controller permissions still cap the coworker's authority. Prefer small read/edit/read-back
+tasks and review the actual changed file before assigning another task. Local inference uses
+no thinking pass for these bounded jobs; a measured short workspace task took approximately
+5–7 seconds on 9B and 12 seconds on 35B-A3B on this machine. These are fixture timings, not
+a broad coding-quality benchmark. Tool rounds are capped; exhaustion is a failed turn.
+
+Local prompts receive project memory context and a token-free broker description. They do not
+receive the HTTP app-control bearer briefing or CLI MCP configuration. Memory writes run through
+Conductor's registered-session authority and SQLite, rather than attempting to write outside the
+workspace. The session layer rechecks permissions and rejects stale runtime callbacks.
+
+The old installed application's catalog is compiled in: it gains native local dispatch only
+after the coherent update is released and the installed app restarts through its updater.
+A development smoke verifies the implementation but does not update the owner's running app.
+
 ## 2. Prerequisites
 
 - **A fixed non-system drive** with at least 60 GB free. Setup picks one automatically (the first
   qualifying fixed drive), or takes `-Root <path>` / `CONDUCTOR_LOCAL_ROOT`. A root on the system
   drive is refused, and if the configured drive goes missing later, every command fails closed
   rather than recreating anything on `C:`.
-- **Docker Desktop** with Linux containers — *not installed on this machine yet*. Without it the
+- **Docker Desktop** with Linux containers — installed and verified on this machine. Without it the
   models still answer, but `run_command` is refused. Nothing here enables Hyper-V, changes Windows
   features, or touches your WSL or Docker configuration.
 - **llama.cpp with CUDA** — already installed here through winget. Setup reuses whatever is

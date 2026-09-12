@@ -16,7 +16,7 @@
     "dist:win": "npm run build && electron-builder --win nsis --x64 --publish never && node scripts/generate-update-manifest.mjs",
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run && node --test scripts/live-acceptance-guard.test.mjs scripts/local-update-package.test.mjs scripts/repair-codex-workspace-owner.test.mjs scripts/claude-permission-acceptance-guard.test.mjs",
+    "test": "vitest run && node --test scripts/live-acceptance-guard.test.mjs scripts/local-update-package.test.mjs scripts/repair-codex-workspace-owner.test.mjs scripts/claude-permission-acceptance-guard.test.mjs scripts/run-smoke-background.test.mjs",
     "update:local": "node scripts/build-local-update.mjs",
     "test:local-update-package": "node --test scripts/local-update-package.test.mjs",
     "test:update-ui": "npm run build && node scripts/smoke-local-updates.mjs",

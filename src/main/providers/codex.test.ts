@@ -176,6 +176,26 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(sent.filter(message => (message as { method?: string }).method === 'turn/start').at(-1)).toMatchObject({ params: { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'workspaceWrite' } } })
   })
 
+  it('publishes accepted settings when completion beats the turn acknowledgement without reviving the turn', async () => {
+    const { adapter, events } = create({ CONDUCTOR_TEST_MODEL_CATALOG: '1', CONDUCTOR_TEST_TURN_ACK_DELAY: '1' })
+    await adapter.start()
+    const firstTurnEvent = events.length
+
+    await adapter.submit('synthetic:context', { ...settings, model: 'plain-model', permission: 'read-only' })
+
+    const sessions = events.slice(firstTurnEvent).flatMap(event => event.data.type === 'session' ? [event.data] : [])
+    const completedIndex = sessions.findIndex(event => event.phase === 'completed')
+    expect(completedIndex).toBeGreaterThanOrEqual(0)
+    expect(sessions.slice(completedIndex + 1).some(event => event.phase === 'running')).toBe(false)
+    expect(adapter.capabilities.effectiveSettings).toMatchObject({
+      model: 'plain-model', effort: null, approvalPolicy: 'untrusted', sandbox: { type: 'readOnly', networkAccess: false }
+    })
+    expect(sessions.at(-1)).toMatchObject({
+      phase: 'completed',
+      capabilities: { effectiveSettings: { model: 'plain-model', approvalPolicy: 'untrusted', sandbox: { type: 'readOnly' } } }
+    })
+  })
+
   it('reports disconnected execution and never retries a submitted turn', async () => {
     const { adapter, events, sent } = create()
     await adapter.submit('synthetic:disconnect', settings)
@@ -210,6 +230,20 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(sent.some(message => (message as { method?: string }).method === 'turn/start')).toBe(false)
     expect(sent.some(message => (message as { method?: string }).method === 'mcpServer/tool/call')).toBe(false)
     expect(sent).toContainEqual(expect.objectContaining({ method: 'plugin/list', params: { cwds: [expect.any(String)], marketplaceKinds: ['local'], forceRefetch: false } }))
+  })
+
+  it('refreshes the full account allowance buckets without submitting a model turn or changing the selected model', async () => {
+    const { adapter, events, sent } = create()
+    await adapter.refreshUsage()
+    const usage = events.filter(event => event.data.type === 'usage' && event.itemId === 'account-rate-limits').at(-1)
+    expect(usage?.data).toMatchObject({ type: 'usage', limits: { rateLimitsByLimitId: {
+      codex: { limitId: 'codex', primary: { usedPercent: 12 } },
+      'gpt-6-astra': { limitId: 'gpt-6-astra', primary: { usedPercent: 99 } },
+      'gpt-5.6-sol': { limitId: 'gpt-5.6-sol', primary: { usedPercent: 20 } }
+    } } })
+    expect(sent).toContainEqual({ id: expect.any(Number), method: 'account/rateLimits/read' })
+    expect(sent.some(message => (message as { method?: string }).method === 'turn/start')).toBe(false)
+    expect(adapter.capabilities.effectiveSettings).toMatchObject({ model: 'synthetic-model' })
   })
 })
 
