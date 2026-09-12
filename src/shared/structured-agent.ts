@@ -40,6 +40,11 @@ export interface SessionSettings {
   approvalPolicy?: 'inherit' | 'untrusted' | 'on-request' | 'never'
   /** Explicit opt-in to Conductor's project browser MCP for the next provider connection. */
   browserMcp?: boolean
+  /** Local models only, off unless the owner grants it in this conversation: repository writes
+   *  inside the sandbox (commit and branch on local history; the container still has no network)
+   *  and a wide web research mode (a search tool and the tool rounds to use it). */
+  localGit?: boolean
+  localResearch?: boolean
   plan: boolean
 }
 /** The only real permission literals a session ever carries. Shared by the renderer's per-provider

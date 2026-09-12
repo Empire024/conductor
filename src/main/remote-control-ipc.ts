@@ -296,9 +296,11 @@ export class RemoteControlService {
     const project = this.deps.database.getProject(request.projectId)
     if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
     // Only a provider this store can journal may be mirrored; anything else would bind a tab to a
-    // conversation the local projection cannot represent.
+    // conversation the local projection cannot represent. A local model qualifies: the weights and
+    // the llama.cpp servers stay on the machine that has them, and this one only mirrors the
+    // conversation, which is the whole point of reaching another device's local stack.
     const provider = request.provider ?? 'claude'
-    if (provider !== 'claude' && provider !== 'codex') throw new RemoteAccessError(`${provider} cannot run on another machine yet.`, 400)
+    if (provider !== 'claude' && provider !== 'codex' && provider !== 'local') throw new RemoteAccessError(`${provider} cannot run on another machine yet.`, 400)
     const opened = await this.openRemote(request.machineId, request)
     if (!opened.agentSessionId) throw new RemoteAccessError(`${opened.machineName} opened a tab that runs no conversation.`, 409)
     const localSessionId = makeId('agent')
@@ -312,6 +314,7 @@ export class RemoteControlService {
       remoteProjectId: opened.remoteProjectId,
       remoteSessionId: opened.remoteSessionId,
       remoteAgentSessionId: opened.agentSessionId,
+      remoteTabId: opened.tabId,
       remoteSequence: 0
     })
     this.mirror.start()
@@ -406,6 +409,7 @@ export class RemoteControlService {
       })
     })
     handle<boolean>('remote:release-tab', (localSessionId: string) => { this.mirror.release(String(localSessionId)); return true })
+    handle<{ closed: boolean; message?: string }>('remote:close-tab', (localSessionId: string) => this.mirror.closeRemote(String(localSessionId)))
     handle<string>('remote:session-machine', (localSessionId: string) => this.mirror.machineId(String(localSessionId)))
     handle<{ machineId: string; cwd: string | null }>('remote:session-file-context', (localSessionId: string) => this.mirror.fileContext(String(localSessionId)))
     handle('remote:files-list', (request: RemoteFileIdentity) => this.files.list(request))
@@ -422,7 +426,7 @@ export class RemoteControlService {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
         'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
-        'remote:machines', 'remote:open-tab', 'remote:release-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
+        'remote:machines', 'remote:open-tab', 'remote:release-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)
       this.registered = false
     }

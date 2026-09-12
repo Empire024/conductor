@@ -7,7 +7,7 @@ import { endpointFor, loadConfig, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
 import { health, startServer } from '../local-models/llama.ts'
 import { DockerSandbox } from '../local-models/sandbox.ts'
-import { LOCAL_TOOLS } from '../local-models/tools.ts'
+import { LOCAL_TOOLS, type LocalGrants } from '../local-models/tools.ts'
 
 const readConfig = (): LocalStackConfig | null => {
   try { return loadConfig() } catch { return null }
@@ -85,6 +85,7 @@ export class LocalAdapter implements ProviderAdapter {
         `Tools are limited in code to ${LOCAL_TOOLS.join(', ')}; the Conductor bridge exposes project memory and task listing only, with no arbitrary MCP or host shell.`,
         'Commands run in a non-root Docker container with no network access; when the sandbox is unavailable, execution is refused rather than run on Windows.',
         'Nothing asks for approval: choose Read only for a turn that must not write files or run commands.',
+        'Repository writes and web search are off unless the owner turns them on for the conversation; even granted, the container has no network, so git can commit locally but never push.',
         'Conversations are not resumable: history lives with the running adapter, not in a native session store.',
         'Approvals, questions, plan mode and effort levels are not part of this runtime.'
       ]
@@ -131,14 +132,18 @@ export class LocalAdapter implements ProviderAdapter {
   private ensureSession(model: LocalModelConfig): LocalAgentSession {
     const stack = this.stack!
     const readOnly = this.settings.permission === 'read-only' || this.settings.sandbox === 'read-only' || this.settings.plan
+    const grants: LocalGrants = { git: Boolean(this.settings.localGit), research: Boolean(this.settings.localResearch) }
     // A container is only built for a turn that may actually run something, and once built
     // it is reused: a conversation that toggles back to Read only keeps it for later.
     if (!this.sandbox && !readOnly) this.sandbox = new DockerSandbox(this.options.runtimeId, this.options.cwd, stack.sandbox)
+    // The mount is decided when the container starts, so the grant is applied before the turn
+    // rather than read out of the settings at exec time.
+    this.sandbox?.setGitAccess(grants.git)
     const sandbox = readOnly ? null : this.sandbox
     if (!this.session) {
       this.session = new LocalAgentSession({
         endpoint: endpointFor(model), apiKey: this.key(), model: model.id, workspace: this.options.cwd,
-        sandbox, readOnly, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
+        sandbox, readOnly, grants, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
         control: this.options.localControl,
         beforeTool: paths => this.options.beforeTool?.(this.toolItemId, paths) ?? Promise.resolve(),
         afterTool: (paths, success) => this.options.afterTool?.(this.toolItemId, paths, success) ?? Promise.resolve()
@@ -146,7 +151,7 @@ export class LocalAdapter implements ProviderAdapter {
     } else {
       // Both of these can change between turns of one conversation. The mode change is
       // already visible in the composer; a model change is not, so only that is announced.
-      this.session.retarget({ model: model.id, endpoint: endpointFor(model), contextTokens: model.contextTokens, readOnly, sandbox })
+      this.session.retarget({ model: model.id, endpoint: endpointFor(model), contextTokens: model.contextTokens, readOnly, grants, sandbox })
       if (this.sessionModel !== model.id) this.emit({ data: { type: 'notice', message: `This conversation now uses ${localModelLabel(model.id)}.` } })
     }
     this.sessionModel = model.id

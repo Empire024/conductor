@@ -272,6 +272,10 @@ models they want
 
 - [x] agents should use the browser on the left side, that browser should have panes and should be able to be detached - agent chooses whether detached, invisible run, etc. curently they're tabs, that's wrong <!-- conductor-task:87f8310b-e91f-41fc-8b90-6b87233ec794 agent=agent_mtyem8ei_sh89unm -->
 
+- [ ] Weird white rectangle is visible (from browser possibly) going over UI. Cancellable by opening workspace/file explorer. <!-- conductor-task:16fd6bdf-2e02-4cca-891d-ceba01aa93da -->
+
+- [ ] Opening a tab, then going to other project, then going back, shows tab has removed itself (with all text we wrote to textbox already) <!-- conductor-task:819788a2-08bf-4bde-b4b8-c2d2c6bbeae5 -->
+
 Feature list:
 
 0. [Implemented] Beautify the 'send' button.
@@ -445,7 +449,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] browser icon in chatbox should allow MCP for model, not open browser. The icon for viewing browser tab it's driving should be kept though, but moved elsewhere for UI clarity. Along to the changes to the browser (like tabs) make it possible to easily expand over the entire workspace (easily hide-able again) to preview full PC layout. <!-- conductor-task:f7e72b8d-94c7-4b47-adc1-ce0005eb83d5 agent=agent_mtyem8ei_sh89unm -->
 
-- [~] Run some tests on qwen to make it really viable as a 'free' subagent running easier tasks that'd churn useless credits. Do the same for 3.8, although I personally haven't tested it. Make sure the harness is really powerful for use, currently, it's quite basic - also, the sandbox limitations seem like it tries to save memories, but can't, so I don't know if it can fully work with Conductor MCP. Make sure the sandbox is very fluid. and it has sandboxed access to a lot of stuff - even web access for local researching, scouting, etc.. The idea is to make qwen's extremely powerful local tools for smart agents like Astra. <!-- conductor-task:d7be3750-9883-4597-8f0b-339b11434a6d agent=agent_mtyb8x94_639ozf4 priority=high weight=heavy -->
+- [x] Run some tests on qwen to make it really viable as a 'free' subagent running easier tasks that'd churn useless credits. Do the same for 3.8, although I personally haven't tested it. Make sure the harness is really powerful for use, currently, it's quite basic - also, the sandbox limitations seem like it tries to save memories, but can't, so I don't know if it can fully work with Conductor MCP. Make sure the sandbox is very fluid. and it has sandboxed access to a lot of stuff - even web access for local researching, scouting, etc.. The idea is to make qwen's extremely powerful local tools for smart agents like Astra. <!-- conductor-task:d7be3750-9883-4597-8f0b-339b11434a6d priority=high weight=heavy agent=agent_mtyt6wvv_rgf2b2g -->
 
 - [x] Redesign the 'Processes' tab and mini-tab. It doesn't seem to be in sync with what's actually going on in the projects. It should be our simple, visual tracker for what's going on in projects with simple data points (especially showing usage, time running, how far it's gotten, etc.). Also, if the process still has a tab available (disconnected even, but just the chat history we can open in a tab and maybe reconnect), we should be able to access it from here. Refine it for easier access and real process & usage management. <!-- conductor-task:cbbdb1a8-60c9-47d3-9718-bef1ebe90a6e agent=agent_mtydfzvr_sxv01gz -->
 
@@ -496,3 +500,9 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [ ] add performance monitor (ram gpu cpu) for local sessions and show it somewhere on screen if local sessions are launched (or if conductor is taking more %, or if blender is activate, or something similiar - show a small summary over processes, clickable to expand) <!-- conductor-task:e1492d28-2b1b-4098-af3d-e201ee7a1b4e -->
 
 - [x] Local model turns failed with HTTP 500 and, once a tool round was left open, with an HTTP 400 no later prompt could recover; a message queued behind a failed turn was never sent. The agent loop now repairs the tool protocol and keeps the prompt inside the window before every request, retries a refused request once with a shorter, plainer one, reports what the owner can act on, and the queue drains after a failed turn as well as a completed one. <!-- conductor-task:local-request-failures agent=agent_mtyoimmx_1gg25ip -->
+
+- [x] Local models can be placed on a paired machine — the device without a local stack opens a Qwen tab that runs on the machine that has the weights, asking it for that exact model — and closing a placed tab now closes the real tab on the machine running it instead of only unbinding the mirror. <!-- conductor-task:remote-local-models-and-close agent=agent_mtypj8io_iri4sb2 -->
+
+- [x] A local model could read the task checklist but never change it, and agents.snapshot refused an absent agentSessionId without saying where one comes from. The sandboxed conductor tool now offers tasks.update (blocked in read-only turns, scope fields still off limits), the tool and method descriptions name where a revision and an agentSessionId come from, and the local system prompt states that .git is mounted read-only so commits belong to the owner on the host. <!-- conductor-task:local-tasks-update-and-contract agent=agent_mtypzaj3_p4mr46x -->
+
+- [x] Local model chats can be granted two capabilities from their own composer, both off by default: repository writes, which stops re-binding .git read-only so the sandbox can commit and branch on local history (never push — the container still has no network), and deep web research, which adds a public web_search tool and raises the tool-round budget so the model can search at length. Each grant lives on the conversation, is refused on non-local providers, and is enforced at dispatch rather than only withheld from the tool schema. <!-- conductor-task:local-git-and-research-grants agent=agent_mtypzaj3_p4mr46x -->

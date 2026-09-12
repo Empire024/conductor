@@ -61,7 +61,7 @@ const toolSignatures = {
   'tabs.detach': '({tabId})',
   'tabs.close': '({tabId}) — asks the owner to confirm; never closes the caller or its ancestors',
   'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project',
-  'agents.snapshot': '({agentSessionId}) — observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
+  'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
@@ -75,7 +75,7 @@ const toolSignatures = {
   'files.write': '({path,content,expectedContent}) — atomic compare-and-save in this project only; expectedContent:null creates a file; live views refresh. To change a sibling project, open a tab there with tabs.open({projectId}) and dispatch the work to it',
   'files.open': '({path,projectId?}) — open the file in a visible editor',
   'tasks.list': '({projectId?}) — feature-list.md bug/feature/idea tasks, their recorded owners and revision',
-  'tasks.update': '({revision,id,status?:"todo"|"doing"|"done",title?,priority?:"high"|"normal"|"low"}) — optimistic update preserving markers and other agents’ claims',
+  'tasks.update': '({revision,id,status?:"todo"|"doing"|"done",title?,priority?:"high"|"normal"|"low"}) — optimistic update preserving markers and other agents’ claims; quote the revision from the tasks.list you just read',
   'memory.recall': '({query?})',
   'memory.remember': `({gist,kind?:${MEMORY_KINDS.map(kind => JSON.stringify(kind)).join('|')},cues?:string[]}) — writes agent-owned memory`,
   'memory.forget': '({id}) — agent-owned memory only; asks the owner to confirm',
@@ -197,7 +197,7 @@ export class AgentControl {
    */
   private target(scope: AgentControlScope, id: string, mutate = false): { tab: AgentControlTab; scope: AgentControlScope } {
     const spec = this.deps.database.structured.spec<AgentSpec>(id)
-    const missing = new Error('Agent is outside this workspace or has no visible tab')
+    const missing = new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name')
     if (!spec) throw missing
     const elsewhere = spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId
     const link = this.linkFor(id)
@@ -510,6 +510,7 @@ export class AgentControl {
       return [...own, ...this.controlledElsewhere(scope).map(({ tab, scope: target }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true }))]
     }
     if (method.startsWith('agents.')) {
+      if (typeof args.agentSessionId !== 'string' || !args.agentSessionId.trim()) throw new Error(method + ' requires agentSessionId: the exact id of a visible conversation, as returned by agents.list or app.state')
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history'].includes(method)
       const { tab, scope: target } = this.target(scope, id, mutate), state = database.structured.snapshot(id)!
       if (method === 'agents.snapshot') {

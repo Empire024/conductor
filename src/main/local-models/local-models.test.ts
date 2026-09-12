@@ -99,6 +99,21 @@ describe('sandbox arguments', () => {
     expect(env.some(value => /TOKEN|KEY|SECRET|AWS|ANTHROPIC|OPENAI/i.test(value))).toBe(false)
   })
 
+  it('re-binds .git read-only unless the owner granted repository writes', () => {
+    const root = workspace()
+    mkdirSync(join(root, '.git'))
+    try {
+      const mounts = (gitWritable: boolean): string => containerRunArgs({ name: 'conductor-local-test', image: DEFAULT_SANDBOX.image, workspace: root, sandbox: DEFAULT_SANDBOX, masks: [], emptyFile: join(root, 'empty'), gitWritable }).join(' ')
+      expect(mounts(false)).toContain('/.git,target=/workspace/.git,readonly')
+      expect(mounts(false)).not.toContain('GIT_AUTHOR_NAME')
+      // Granted, the workspace bind alone covers .git, and a commit gets an identity the
+      // read-only root filesystem could not otherwise provide. The network stays off either way.
+      expect(mounts(true)).not.toContain('target=/workspace/.git')
+      expect(mounts(true)).toContain('GIT_AUTHOR_NAME=Conductor local model')
+      expect(mounts(true)).toContain('--network none')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
   it('keeps model text as a single argument to bash inside the container', () => {
     const command = 'rm -rf / ; powershell.exe -c whoami'
     const argv = execArgs('conductor-local-test', command, 30)
@@ -231,6 +246,20 @@ describe('tool policy', () => {
   it('offers only the sandbox-bound tools', () => {
     expect(toolSpecs(false).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'run_command'])
     expect(toolSpecs(true).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read'])
+  })
+
+  it('withholds web search until the owner grants research, and refuses it even if the model asks', async () => {
+    const research = { git: false, research: true }
+    expect(toolSpecs(false, false, research).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'write_file', 'edit_file', 'run_command'])
+    expect(toolSpecs(true, false, research).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read'])
+    const root = workspace()
+    try {
+      // The schema is only an offer; the grant is enforced where the call is dispatched.
+      expect((await runTool('web_search', JSON.stringify({ query: 'anything' }), context(root))).output).toMatch(/^denied: Tool denied by policy.*deep research/)
+      const described = (grants: { git: boolean; research: boolean }): string => toolSpecs(false, false, grants).find(spec => spec.function.name === 'run_command')!.function.description
+      expect(described({ git: false, research: false })).toContain('.git directory is read-only')
+      expect(described({ git: true, research: false })).toContain('commit and branch locally')
+    } finally { rmSync(root, { recursive: true, force: true }) }
   })
 
   it('refuses tools that are not in the allowlist', async () => {

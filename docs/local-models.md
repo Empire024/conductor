@@ -47,10 +47,11 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
 
 - **A local model never gets a host shell.** Tool dispatch is an allowlist in code
   (`src/main/local-models/tools.ts`): `read_file`, `list_files`, `search`, `write_file`,
-  `edit_file`, `run_command`, `web_read`, and `conductor`. The Conductor broker
-  permits only `memory.recall`, `memory.remember`, and `tasks.list`, bound to the registered
-  project/session. Read-only turns cannot remember. Caller-supplied scope, arbitrary MCP calls,
-  PowerShell, browser automation, connectors and credential access are refused.
+  `edit_file`, `run_command`, `web_read`, `web_search`, and `conductor`. The Conductor broker
+  permits only `memory.recall`, `memory.remember`, `tasks.list`, `tasks.update`, `agents.list`
+  and `agents.snapshot`, bound to the registered project/session, each with its own argument
+  allowlist. Read-only turns cannot remember or update tasks. Caller-supplied scope, arbitrary
+  MCP calls, PowerShell, browser automation, connectors and credential access are refused.
 - **Execution fails closed.** `run_command` only ever runs `docker exec` into the sandbox. If
   Docker is stopped, missing or broken, the call is refused — it never falls back to PowerShell,
   cmd.exe, WSL or a host child process.
@@ -64,10 +65,11 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   address), more than 200,000 entries, depth over 64, or more than 4,096 masks refuse shell
   execution rather than exposing an unscanned tree. File tools remain independently bounded.
   `.git` is mounted
-  read-only, so a local model cannot install a hook or rewrite repository config.
+  read-only, so a local model cannot install a hook or rewrite repository config, unless the
+  owner grants repository writes for that one conversation (see *Per-conversation grants*).
 - **No network in the runtime.** The container runs with `--network none`; it cannot browse,
   upload source, reach cloud metadata or talk to other machines on the LAN.
-- **Credential-free GET research.** `web_read` retrieves public HTTPS text on port 443,
+- **Credential-free GET research.** `web_read`, and `web_search` when granted, retrieve public HTTPS text on port 443,
   without inherited cookies, authorization headers or request bodies. IPv4 DNS answers must
   all be public and the chosen address is pinned for the socket; every redirect is checked
   again. IPv6-only destinations are refused. Requests have a 20-second budget, at most three
@@ -76,6 +78,19 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   general source-exfiltration prevention mechanism. Do not use it for confidential research
   queries. Credential filename policy likewise cannot identify secrets embedded in arbitrary
   source files, or atomically guard files another host process creates during a running command.
+- **Per-conversation grants, off by default.** Two buttons in a local conversation's composer
+  widen what that conversation may do, and nothing else changes them. *Repository writes*
+  (`localGit`) stops re-binding `.git` read-only and supplies a `Conductor local model` commit
+  identity, so the sandbox can commit, branch and stash on local history; the container still
+  runs with `--network none`, so nothing can be pushed or fetched. The mount is fixed when the
+  container starts, so the grant takes effect on the next container, and withdrawing it
+  recreates the container too. The grant is for git itself: the host file tools still refuse
+  every write under `.git` (`resolveWritablePath` takes no grant), so hooks, refs and config
+  cannot be hand-edited even while commits are allowed. *Deep research* (`localResearch`) adds the `web_search` tool and
+  raises the tool-round budget from 16 to 48. Both are refused on any provider other than
+  `local`, are held on the conversation rather than on a message — a queued prompt cannot carry
+  a grant that has since been withdrawn — and `web_search` is refused at dispatch, not merely
+  withheld from the schema.
 - **Cancellation reaches commands.** Stop removes only this conversation's Docker container
   and waits for removal, so a Linux command cannot continue writing after its Docker client
   disappears. Output overflow and command timeout also remove the container before returning.

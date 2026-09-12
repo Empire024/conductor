@@ -65,6 +65,22 @@ describe('bounded local coworker tools', () => {
     expect((await runTool('conductor', JSON.stringify({ method: 'agents.snapshot', args: { agentSessionId: 'visible-agent', mutate: true } }), ctx)).failed).toBe(true)
     expect(control).toHaveBeenCalledTimes(2)
   })
+  it('lets a writing turn update a task it has read, with the scope fields still off limits', async () => {
+    const control = vi.fn(async (method: string) => method === 'tasks.list' ? { revision: 'rev-1', tasks: [{ id: 'bug-7' }] } : { revision: 'rev-2' })
+    const ctx = { ...await context(), control }
+    expect((await runTool('conductor', JSON.stringify({ method: 'tasks.list', args: {} }), ctx)).output).toContain('rev-1')
+    expect((await runTool('conductor', JSON.stringify({ method: 'tasks.update', args: { revision: 'rev-1', id: 'bug-7', status: 'doing' } }), ctx)).output).toContain('rev-2')
+    for (const [args, readOnly] of [
+      [{ revision: 'rev-1', id: 'bug-7', status: 'doing' }, true],
+      [{ revision: 'rev-1', id: 'bug-7', agentId: 'forged' }, false],
+      [{ revision: 'rev-1', id: 'bug-7', projectId: 'foreign' }, false]
+    ] as const) expect((await runTool('conductor', JSON.stringify({ method: 'tasks.update', args }), { ...ctx, readOnly })).failed).toBe(true)
+    expect(control).toHaveBeenCalledTimes(2)
+    const offered = (readOnly: boolean): string[] => (toolSpecs(readOnly, true).find(tool => tool.function.name === 'conductor')!.function.parameters as { properties: { method: { enum: string[] } } }).properties.method.enum
+    expect(offered(false)).toContain('tasks.update')
+    expect(offered(true)).not.toContain('tasks.update')
+    expect(offered(true)).toContain('tasks.list')
+  })
   it('propagates cancellation to command execution and refuses tools after cancellation', async () => {
     const controller = new AbortController(); const exec = vi.fn(async (_command, _timeout, signal: AbortSignal) => { expect(signal).toBe(controller.signal); controller.abort(); signal.throwIfAborted() })
     const ctx = { ...await context(), signal: controller.signal, sandbox: { exec } as never }

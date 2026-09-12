@@ -186,6 +186,37 @@ describe('mirroring a conversation that runs on another machine', () => {
     await expect(restarted.submit('local-session', 'still must not run locally')).rejects.toThrow(/pairing is no longer active/)
   })
 
+  it('closes the tab on the machine that runs it when the owner closes the mirrored one', async () => {
+    const f = fixture(() => ({ closed: true }))
+    f.mirror.bind(binding({ remoteTabId: 'their-tab' }))
+    expect(await f.mirror.closeRemote('local-session')).toEqual({ closed: true })
+    expect(f.asked).toContainEqual({
+      machineId: 'desktop', method: 'tabs.close',
+      args: { projectId: 'their-project', sessionId: 'their-workspace', tabId: 'their-tab' }
+    })
+    // The tab is gone here either way, so nothing is left mirroring it.
+    expect(f.mirror.list()).toEqual([])
+  })
+
+  it('asks which tab a conversation bound before tab ids were recorded belongs to', async () => {
+    const f = fixture(method => method === 'agents.list'
+      ? [{ tabId: 'other-tab', agentSessionId: 'someone-else' }, { tabId: 'their-tab', agentSessionId: 'their-session' }]
+      : ({ closed: true }))
+    f.mirror.bind(binding())
+    expect(await f.mirror.closeRemote('local-session')).toEqual({ closed: true })
+    expect(f.asked.map(call => call.method)).toEqual(['agents.list', 'tabs.close'])
+    expect(f.asked[1]!.args).toMatchObject({ tabId: 'their-tab' })
+  })
+
+  it('reports an unreachable machine instead of holding the tab open here', async () => {
+    const f = fixture(() => { throw new Error('Render desktop is offline.') })
+    f.mirror.bind(binding({ remoteTabId: 'their-tab' }))
+    expect(await f.mirror.closeRemote('local-session')).toEqual({ closed: false, message: 'Render desktop is offline.' })
+    expect(f.mirror.list()).toEqual([])
+    // Closing a conversation that was never placed elsewhere asks nobody anything.
+    expect(await f.mirror.closeRemote('unbound-session')).toEqual({ closed: false })
+  })
+
   it('accepts only an idempotent workspace bind for an active remote conversation', () => {
     const f = fixture(() => [])
     f.mirror.bind(binding())

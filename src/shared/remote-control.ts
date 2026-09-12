@@ -215,6 +215,11 @@ export interface RemoteControlBridge {
   openTab(request: RemoteTabRequest): Promise<{ localSessionId: string; machineId: string; machineName: string }>
   /** Stops mirroring a tab the owner closed here, leaving the work itself running there. */
   releaseTab(localSessionId: string): Promise<boolean>
+  /**
+   * Closes a placed tab on the machine that runs it and stops mirroring it here. `message` says
+   * why the other machine could not be told; the tab is closed here regardless.
+   */
+  closeTab(localSessionId: string): Promise<{ closed: boolean; message?: string }>
   /** Durable execution owner for a mirrored session, including released/offline tombstones. */
   sessionMachine(localSessionId: string): Promise<string>
   /** Machine and workspace root used to resolve file links for this conversation. */

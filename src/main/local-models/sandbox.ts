@@ -110,6 +110,8 @@ export function containerRunArgs(options: {
   sandbox: SandboxConfig
   masks: Array<{ relative: string; directory: boolean }>
   emptyFile: string
+  /** Off unless the owner grants it in the conversation: see the .git mount below. */
+  gitWritable?: boolean
 }): string[] {
   if (!NAME.test(options.name)) throw new SandboxUnavailableError('Invalid sandbox container name')
   if (!IMAGE.test(options.image)) throw new SandboxUnavailableError('Invalid sandbox image reference')
@@ -140,7 +142,9 @@ export function containerRunArgs(options: {
     '--mount', `type=bind,source=${workspace},target=/workspace`,
     // Repository metadata stays readable for status and diffs but can never be rewritten, so a
     // sandboxed turn cannot install a git hook or change remotes in the owner's repository.
-    ...(existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : [])
+    // The owner can grant write access per conversation; the container still has no network, so
+    // the grant reaches local history only and never pushes anywhere.
+    ...(!options.gitWritable && existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : [])
   ]
   for (const mask of options.masks) {
     if (/[,=\r\n]/.test(mask.relative)) throw new SandboxUnavailableError('A secret path cannot be represented safely as a Docker mask')
@@ -150,6 +154,9 @@ export function containerRunArgs(options: {
   // A deliberately minimal environment. Nothing from the host is inherited, so no API key,
   // cloud credential or token can be read out of the sandbox even if the model asks for it.
   for (const variable of ['HOME=/home/agent', 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG=C.UTF-8', 'TERM=dumb', 'TMPDIR=/tmp', 'XDG_CACHE_HOME=/tmp/cache', 'NPM_CONFIG_CACHE=/tmp/npm', 'PIP_CACHE_DIR=/tmp/pip', 'CONDUCTOR_SANDBOX=1']) args.push('--env', variable)
+  // A commit needs an identity, and the read-only root filesystem has nowhere to configure one.
+  // Naming the local model in the commit itself keeps its history distinguishable from the owner's.
+  if (options.gitWritable) for (const variable of ['GIT_AUTHOR_NAME=Conductor local model', 'GIT_AUTHOR_EMAIL=local-model@conductor.invalid', 'GIT_COMMITTER_NAME=Conductor local model', 'GIT_COMMITTER_EMAIL=local-model@conductor.invalid']) args.push('--env', variable)
   args.push(options.image, 'sleep', 'infinity')
   return args
 }
@@ -171,12 +178,21 @@ export class DockerSandbox {
   private readonly sandbox: SandboxConfig
   private started = false
   private starting?: Promise<void>
-  private maskSignature?: string
+  private mountSignature?: string
+  private gitWritable = false
 
   constructor(sessionId: string, workspace: string, sandbox: SandboxConfig) {
     this.name = sandboxContainerName(sessionId)
     this.workspace = workspace
     this.sandbox = sandbox
+  }
+
+  /** The owner can grant or withdraw repository write access between turns. A running container's
+   *  bind mounts cannot change, so the grant only becomes real on the next container. */
+  setGitAccess(writable: boolean): void { this.gitWritable = writable }
+
+  private signature(masks: Array<{ relative: string; directory: boolean }>): string {
+    return JSON.stringify({ masks, git: this.gitWritable })
   }
 
   /** Bring the container up, or refuse with the specific reason. Never returns without a
@@ -198,17 +214,18 @@ export class DockerSandbox {
     const emptyFile = join(runDir(), 'masked-empty')
     if (!existsSync(emptyFile)) writeFileSync(emptyFile, '', 'utf8')
     const masks = detectSecretPaths(this.workspace)
-    this.maskSignature = JSON.stringify(masks)
-    const created = await runDocker(containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks, emptyFile }), 120_000, 256 * 1024)
+    this.mountSignature = this.signature(masks)
+    const created = await runDocker(containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks, emptyFile, gitWritable: this.gitWritable }), 120_000, 256 * 1024)
     if (created.spawnError || created.code !== 0) throw new SandboxUnavailableError(`Sandbox failed to start: ${(created.stderr || created.stdout).trim().slice(0, 400) || 'docker run failed'}`)
   }
 
   /** Run one command inside the container. Refuses closed on any sandbox problem. */
   async exec(command: string, timeoutSec = this.sandbox.timeoutSec, signal?: AbortSignal): Promise<SandboxResult> {
     signal?.throwIfAborted()
-    // Other coworkers may create credential files between commands. A running container's
-    // bind mounts cannot acquire new masks; recreate it before executing against changed masks.
-    if (this.started && JSON.stringify(detectSecretPaths(this.workspace)) !== this.maskSignature) await this.stop()
+    // Other coworkers may create credential files between commands, and the owner may have
+    // granted or withdrawn repository writes. A running container's bind mounts cannot change;
+    // recreate it before executing against a different set of them.
+    if (this.started && this.signature(detectSecretPaths(this.workspace)) !== this.mountSignature) await this.stop()
     await this.start()
     signal?.throwIfAborted()
     const started = Date.now()

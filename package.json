@@ -45,6 +45,7 @@
     "test:browser-mcp": "npm run build && node scripts/smoke-browser-mcp.mjs",
     "test:perf-streaming": "npm run build && node scripts/perf-streaming.mjs",
     "test:local-models": "npm run build && node scripts/smoke-local-models.mjs",
+    "test:local-grants": "npm run build && node scripts/smoke-local-grants.mjs",
     "local": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts",
     "local:smoke": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts smoke",
     "local:security": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts security-test"

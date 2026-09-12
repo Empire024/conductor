@@ -61,7 +61,7 @@ import {
 } from './tab-drag'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { createPaneTab } from '../panes/pane-factory'
-import { createPlacedTab, readPlacement, writePlacement } from './machine-placement'
+import { closePlacedTab, createPlacedTab, readPlacement, writePlacement } from './machine-placement'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { TerminalPane } from '../panes/TerminalPane'
 import { LauncherPane } from '../panes/LauncherPane'
@@ -435,6 +435,9 @@ function PaneGroup({
         setClosingTabIds(current => { const next = new Set(current); next.delete(tab.id); return next })
         if (result.closed) {
           currentWorkspace.onClosed(result.closed)
+          // A tab placed on another machine is closed there too; only the owner closing a tab does
+          // this, never a tab moving between groups or windows, which also goes through closeTab.
+          closePlacedTab(result.closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
           debugLog('tabs', 'Tab closed', { sessionId: requestedSessionId, groupId: requestedGroupId, tabId: tab.id }, 'info')
         }
       }

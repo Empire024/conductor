@@ -149,6 +149,14 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(f.current.options.mcpConfig).toBe('')
   })
 
+  it('refuses local sandbox grants on a provider that has no local sandbox', () => {
+    const f = fixture('claude')
+    for (const grant of [{ localGit: true }, { localResearch: true }]) expect(() => f.manager.saveSettings(f.spec.id, { ...settings, ...grant })).toThrow(/local models only/)
+    // Withdrawing one is always allowed, so a conversation can never be stuck holding a grant.
+    f.manager.saveSettings(f.spec.id, { ...settings, localGit: false, localResearch: false })
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.localGit).toBe(false)
+  })
+
   it('rejects enabling browser tools during active work without changing the saved preference', async () => {
     const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
     const f = fixture('claude', true, mcp)

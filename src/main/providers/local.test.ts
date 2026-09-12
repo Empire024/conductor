@@ -22,15 +22,17 @@ const frame = (delta: Record<string, unknown>, finish?: string): string => JSON.
 
 /** A stand-in llama.cpp server: it answers the health probe, enforces the key and replays
  *  scripted SSE frames, so the adapter can be driven end to end without a model. */
-function stubServer(frames: string[], holdMs = 0): Promise<{ port: number; server: Server; prompts: string[][] }> {
+function stubServer(frames: string[], holdMs = 0): Promise<{ port: number; server: Server; prompts: string[][]; requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> }> {
   const prompts: string[][] = []
+  const requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> = []
   const server = createServer((request, response) => {
     if (request.headers.authorization !== `Bearer ${KEY}`) { response.writeHead(401).end('{}'); return }
     if (request.url?.startsWith('/v1/models')) { response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"data":[]}'); return }
     let body = ''
     request.on('data', chunk => { body += String(chunk) })
     request.on('end', () => {
-      const parsed = JSON.parse(body) as { messages: Array<{ role: string; content: string }> }
+      const parsed = JSON.parse(body) as { messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }
+      requests.push(parsed)
       prompts.push(parsed.messages.filter(message => message.role === 'user').map(message => message.content))
       response.writeHead(200, { 'Content-Type': 'text/event-stream' })
       const write = (index: number): void => {
@@ -43,7 +45,7 @@ function stubServer(frames: string[], holdMs = 0): Promise<{ port: number; serve
   })
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
     const address = server.address()
-    resolve({ port: typeof address === 'object' && address ? address.port : 0, server, prompts })
+    resolve({ port: typeof address === 'object' && address ? address.port : 0, server, prompts, requests })
   }))
 }
 
@@ -132,6 +134,32 @@ describe('local provider adapter', () => {
     expect(texts(events, 'status')).toBe('weighing it up')
     expect(ready.small.prompts.at(-1)).toEqual(['say it'])
     expect(ready.large.prompts).toEqual([])
+  })
+
+  it('offers web search and states the git grant only when the conversation was granted them', async () => {
+    let ready: Awaited<ReturnType<typeof stack>>
+    try { ready = await stack([frame({ content: 'ok' }), frame({}, 'stop')]) } catch (reason) { return guard(reason) }
+    const plainEvents: AdapterEvent[] = []
+    const plain = adapter(ready.workspace, plainEvents)
+    await plain.start()
+    await plain.submit('research this', settings())
+    expect(await settled(plainEvents)).toBe('completed')
+    const ungranted = ready.small.requests.at(-1)!
+    expect(ungranted.tools?.map(tool => tool.function.name)).not.toContain('web_search')
+    expect(ungranted.messages[0]!.content).toContain('.git directory is mounted read-only')
+    expect(ungranted.messages[0]!.content).toContain('no web search tool')
+
+    const grantedEvents: AdapterEvent[] = []
+    const granted = adapter(ready.workspace, grantedEvents, { localGit: true, localResearch: true })
+    await granted.start()
+    await granted.submit('research this', settings({ localGit: true, localResearch: true }))
+    expect(await settled(grantedEvents)).toBe('completed')
+    const request = ready.small.requests.at(-1)!
+    expect(request.tools?.map(tool => tool.function.name)).toContain('web_search')
+    expect(request.messages[0]!.content).toContain('deep research')
+    expect(request.messages[0]!.content).toContain('granted repository writes')
+    // Granted or not, the sandbox has no network, so the model is never told it can push.
+    expect(request.messages[0]!.content).toContain('nothing can be pushed')
   })
 
   it('sends a conversation only to the model it was opened on, and keeps two sessions apart', async () => {

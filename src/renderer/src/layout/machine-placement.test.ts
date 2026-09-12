@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { LOCAL_QWEN_35B } from '../../../shared/local-models'
 import type { MachineDescriptor } from '../../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
-import { createPlacedTab, readPlacement, travels, writePlacement } from './machine-placement'
+import { closePlacedTab, createPlacedTab, readPlacement, travels, writePlacement } from './machine-placement'
 import { machinePlacementOptions } from '../panes/LauncherPane'
 
 const store = new Map<string, string>()
@@ -12,7 +13,7 @@ beforeEach(() => {
       getItem: (key: string) => store.get(key) ?? null,
       setItem: (key: string, value: string) => { store.set(key, value) }
     },
-    conductor: { remote: { openTab: vi.fn() } }
+    conductor: { remote: { openTab: vi.fn(), closeTab: vi.fn() } }
   })
 })
 
@@ -86,9 +87,43 @@ describe('choosing which machine runs a new tab', () => {
     expect(tab.title).toContain('Render desktop')
   })
 
+  it('places a local model on the machine that has the stack, asking for that exact model', async () => {
+    vi.mocked(window.conductor.remote.openTab).mockResolvedValue({ localSessionId: 'agent_mirror', machineId: 'desktop', machineName: 'Render desktop' })
+    const tab = await createPlacedTab({ kind: 'agent', provider: 'local', model: LOCAL_QWEN_35B, machineId: 'desktop', projectId: 'project', sessionId: 'workspace' })
+    expect(window.conductor.remote.openTab).toHaveBeenCalledWith({ machineId: 'desktop', projectId: 'project', sessionId: 'workspace', provider: 'local', model: LOCAL_QWEN_35B })
+    expect(tab.state).toMatchObject({ provider: 'local', model: LOCAL_QWEN_35B, machineId: 'desktop' })
+    expect(tab.title).toBe('Qwen 3.6 35B-A3B · Render desktop')
+  })
+
   it('opens no tab at all when the other machine refuses the placement', async () => {
     vi.mocked(window.conductor.remote.openTab).mockRejectedValue(new Error('Studio PC is not sharing that project.'))
     await expect(createPlacedTab({ kind: 'agent', provider: 'claude', machineId: 'desktop', projectId: 'project', sessionId: 'workspace' }))
       .rejects.toThrow(/not sharing that project/)
+  })
+})
+
+describe('closing a tab that runs on another machine', () => {
+  const tab = (state?: Record<string, unknown>): never => ({ id: 'pane', kind: 'agent', title: 'Codex · Render desktop', resourceId: 'agent_mirror', state }) as never
+
+  it('closes the real tab on the machine that runs it', () => {
+    vi.mocked(window.conductor.remote.closeTab).mockResolvedValue({ closed: true })
+    const reported: string[] = []
+    closePlacedTab(tab({ machineId: 'desktop' }), message => reported.push(message))
+    expect(window.conductor.remote.closeTab).toHaveBeenCalledWith('agent_mirror')
+    expect(reported).toEqual([])
+  })
+
+  it('leaves a tab that runs here alone', () => {
+    closePlacedTab(tab({ provider: 'codex' }), () => {})
+    closePlacedTab(tab({ machineId: LOCAL_MACHINE_ID }), () => {})
+    expect(window.conductor.remote.closeTab).not.toHaveBeenCalled()
+  })
+
+  it('says so when the other machine could not be told, rather than failing silently', async () => {
+    vi.mocked(window.conductor.remote.closeTab).mockResolvedValue({ closed: false, message: 'Render desktop is offline.' })
+    const reported: string[] = []
+    closePlacedTab(tab({ machineId: 'desktop' }), message => reported.push(message))
+    await vi.waitFor(() => expect(reported).toHaveLength(1))
+    expect(reported[0]).toMatch(/Render desktop is offline/)
   })
 })

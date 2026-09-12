@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
 import { lookup } from 'node:dns/promises'
 import { request } from 'node:https'
-import { pinnedLookup, readPublicWeb } from './web.ts'
+import { pinnedLookup, readPublicWeb, searchPublicWeb } from './web.ts'
 vi.mock('node:dns/promises', () => ({ lookup: vi.fn() }))
 vi.mock('node:https', () => ({ request: vi.fn() }))
 
@@ -46,6 +46,31 @@ describe('research transport boundary', () => {
     vi.mocked(lookup).mockResolvedValueOnce([{ address: '93.184.216.34', family: 4 }] as never).mockResolvedValueOnce([{ address: '192.168.0.1', family: 4 }] as never)
     await expect(readPublicWeb('https://public.example')).rejects.toThrow(/DNS/)
     expect(request).toHaveBeenCalledTimes(2)
+  })
+  it('turns a search into public links only, dropping the redirector and anything unreachable', async () => {
+    response(200, { 'content-type': 'text/html' }, [
+      '<a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fdocs.example%2Fguide&rut=x">Docs &amp; guide</a>',
+      '<a href="/settings">Settings</a>',
+      '<a href="https://duckduckgo.com/about">About the engine</a>',
+      '<a href="http://insecure.example/page">Insecure</a>',
+      '<a href="https://blog.example/post">Blog <b>post</b></a>',
+      '<a href="https://docs.example/guide">Docs duplicate</a>'
+    ].join('\n'))
+    const results = await searchPublicWeb('local model sandboxing')
+    expect(results).toContain('Search: local model sandboxing')
+    expect(results).toContain('1. Docs & guide\n   https://docs.example/guide')
+    expect(results).toContain('2. Blog post\n   https://blog.example/post')
+    // The engine's own pages, relative chrome, plain HTTP and a repeat of a link already listed.
+    expect(results).not.toContain('duckduckgo.com')
+    expect(results).not.toContain('Settings')
+    expect(results).not.toContain('insecure.example')
+    expect(results).not.toContain('Docs duplicate')
+    const url = vi.mocked(request).mock.calls[0]![0] as URL
+    expect(url.href).toBe('https://lite.duckduckgo.com/lite/?q=local%20model%20sandboxing')
+    response(200, { 'content-type': 'text/html' }, '<a href="/nothing">nothing</a>')
+    expect(await searchPublicWeb('no hits here')).toContain('No usable results')
+    await expect(searchPublicWeb('  ')).rejects.toThrow(/query/)
+    await expect(searchPublicWeb('x'.repeat(401))).rejects.toThrow(/400 characters/)
   })
   it('bounds response bytes and cancels even while DNS is pending', async () => {
     response(200, { 'content-type': 'text/plain' }, 'x'.repeat(256 * 1024 + 1))

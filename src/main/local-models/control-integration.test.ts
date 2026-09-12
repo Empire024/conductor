@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest'
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConductorDatabase } from '../database'
@@ -48,12 +48,21 @@ it('binds LocalAdapter control to durable project memory, live permissions and r
   expect(JSON.stringify(await broker('memory.recall', { query: 'LOCAL_INTEGRATION_DURABLE' }))).toContain('LOCAL_INTEGRATION_DURABLE')
   expect(await broker('agents.list', {})).toEqual([expect.objectContaining({ agentSessionId: spec.id })])
   expect(await broker('agents.snapshot', { agentSessionId: spec.id })).toMatchObject({ sessionId: spec.id })
+  await expect(broker('agents.snapshot', {})).rejects.toThrow()
+  // A local model claims and closes its own checklist item, quoting the revision it just read.
+  writeFileSync(join(workspace, 'feature-list.md'), '- [ ] Bounded local task <!-- conductor-task:local-1 -->\n')
+  const board = await broker('tasks.list', {}) as { revision: string }
+  const claimed = await broker('tasks.update', { revision: board.revision, id: 'local-1', status: 'doing' }) as { revision: string }
+  expect(readFileSync(join(workspace, 'feature-list.md'), 'utf8')).toContain('agent=' + spec.id)
+  await broker('tasks.update', { revision: claimed.revision, id: 'local-1', status: 'done' })
+  expect(readFileSync(join(workspace, 'feature-list.md'), 'utf8')).toMatch(/- \[x\] Bounded local task/)
   const reopened = new ConductorDatabase(path)
   try { expect(reopened.recall(project.id, 'LOCAL_INTEGRATION_DURABLE', undefined, 12).some(entry => entry.id === memory.id)).toBe(true) } finally { reopened.close() }
   for (const [method, args] of [['router.dispatch', {}], ['memory.recall', { projectId: 'foreign' }], ['memory.remember', { gist: 'x', origin: { agentSessionId: 'forged' } }]] as const) await expect(broker(method, args)).rejects.toThrow()
   const state = database.structured.snapshot(spec.id)!
   database.structured.update(spec.id, { settings: { ...state.settings, permission: 'read-only' } })
   await expect(broker('memory.remember', { gist: 'REFUSED' })).rejects.toThrow(/unavailable/)
+  await expect(broker('tasks.update', { revision: 'any', id: 'local-1', status: 'todo' })).rejects.toThrow(/unavailable/)
   expect(JSON.stringify(await broker('memory.recall', {}))).toContain('LOCAL_INTEGRATION_DURABLE')
   manager.dispose()
   await expect(broker('memory.recall', {})).rejects.toThrow(/runtime/)

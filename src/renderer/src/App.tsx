@@ -28,6 +28,7 @@ import { CommandPalette, type PaletteCommand } from './components/CommandPalette
 import { SettingsPanel } from './components/SettingsPanel'
 import { PaneWorkspace } from './layout/PaneWorkspace'
 import { applyTabGroupAction, applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
+import { closePlacedTab } from './layout/machine-placement'
 import type { TabGroupAction } from './layout/tab-groups'
 import {
   activateTab,
@@ -1011,6 +1012,8 @@ export function App(): React.JSX.Element {
     try {
       const result = applyWorkspaceTabAction(session, groupId, tabId, action)
       if (action === 'detach' || action === 'show') await window.conductor.window.detach(session.projectId, session.id, tab, result.session.layout, { alwaysOnTop: action === 'show' })
+      // Closing from the sidebar closes a placed tab where it runs, exactly as closing its chip does.
+      if (action === 'close') closePlacedTab(tab, setToast)
       setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
       if (action !== 'detach' && action !== 'show') { selectSession(result.session); setFocusedGroupId(result.focusedGroupId); setUtilityPanel(null) }
       if (action === 'show') setToast(`${tab.title} is shown in a floating window. Close it to return the tab to its workspace.`)

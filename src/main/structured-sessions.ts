@@ -719,6 +719,13 @@ export class StructuredSessions {
   private validateSettings(settings: SessionSettings, capabilities: import('../shared/structured-agent').ProviderCapabilities | undefined): void {
     if (!settings || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
     if (settings.browserMcp !== undefined && typeof settings.browserMcp !== 'boolean') throw new Error('Invalid browser MCP setting')
+    for (const key of ['localGit', 'localResearch'] as const) {
+      if (settings[key] === undefined) continue
+      if (typeof settings[key] !== 'boolean') throw new Error('Invalid local sandbox grant')
+      // These grants only mean anything to the local runtime; accepting them elsewhere would
+      // record an authority no adapter reads and no pane can explain.
+      if (settings[key] && capabilities && capabilities.provider !== 'local') throw new Error('Repository and research grants apply to local models only')
+    }
     if (settings.temporaryPermission && (typeof settings.temporaryPermission.runtimeId !== 'string' || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.temporaryPermission.restore))) throw new Error('Invalid temporary permission scope')
     if (settings.plan && !capabilities?.plans) throw new Error('Planning is unavailable on this adapter baseline')
     if (capabilities?.permissions && !capabilities.permissions.includes(settings.permission)) throw new Error('Permission policy unsupported by this provider')
@@ -732,8 +739,12 @@ export class StructuredSessions {
    * may carry an older copy; preserve their model/effort/permission while taking browserMcp only
    * from the current durable projection. */
   private messageSettings(state: { settings: SessionSettings }, incoming: SessionSettings): SessionSettings {
-    const { browserMcp: _capturedBrowser, ...message } = incoming
-    return state.settings.browserMcp === undefined ? message : { ...message, browserMcp: state.settings.browserMcp }
+    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, ...message } = incoming
+    const authority: SessionSettings = { ...message }
+    // Same rule for the local grants: a queued prompt must not carry a repository or research
+    // grant the owner has since withdrawn, nor lose one they have since given.
+    for (const key of ['browserMcp', 'localGit', 'localResearch'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
+    return authority
   }
   private assertPromptDispatchAuthority(origin: PromptOrigin | undefined, spec: AgentSpec): void {
     const authority = origin?.authority

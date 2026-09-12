@@ -30,6 +30,11 @@ export interface RemoteSessionBinding {
   remoteProjectId: string
   remoteSessionId: string
   remoteAgentSessionId: string
+  /**
+   * The tab that machine opened for this conversation, so closing the mirrored tab here can close
+   * the real one there. Bindings made before this was recorded resolve it from `agents.list`.
+   */
+  remoteTabId?: string
   /** The highest sequence already copied from that machine, so polling stays incremental. */
   remoteSequence: number
 }
@@ -59,6 +64,7 @@ export function readBindings(raw: string | undefined): RemoteSessionBinding[] {
       value.remoteProjectId, value.remoteSessionId, value.remoteAgentSessionId]
     if (strings.some(field => typeof field !== 'string' || !field)) return []
     if (typeof value.provider !== 'string') return []
+    if (value.remoteTabId !== undefined && (typeof value.remoteTabId !== 'string' || !value.remoteTabId)) return []
     return [{
       ...(value as RemoteSessionBinding),
       remoteSequence: Number.isSafeInteger(value.remoteSequence) && value.remoteSequence! >= 0 ? value.remoteSequence! : 0
@@ -325,6 +331,40 @@ export class RemoteSessionMirror {
 
   release(localSessionId: string): void {
     if (this.bindings.delete(localSessionId)) { this.invalidate(localSessionId); this.save() }
+  }
+
+  /**
+   * Closes the tab on the machine that actually runs this conversation, then stops mirroring it
+   * here. Closing a placed tab is the owner closing that work, so it must not keep a pane open on
+   * the other computer that nobody is looking at any more. The local binding is released either
+   * way: the owner already closed the tab here, and a machine that was unreachable must not leave
+   * a mirrored session bound to a tab that no longer exists.
+   */
+  async closeRemote(localSessionId: string): Promise<{ closed: boolean; message?: string }> {
+    const binding = this.bindings.get(localSessionId)
+    if (!binding) return { closed: false }
+    try {
+      const tabId = binding.remoteTabId ?? await this.remoteTabId(binding)
+      await this.deps.call(binding.machineId, 'tabs.close', {
+        projectId: binding.remoteProjectId, sessionId: binding.remoteSessionId, tabId
+      })
+      return { closed: true }
+    } catch (error) {
+      return { closed: false, message: error instanceof Error ? error.message : String(error) }
+    } finally {
+      this.release(localSessionId)
+    }
+  }
+
+  /** Bindings written before the remote tab id was recorded ask that machine which tab it is. */
+  private async remoteTabId(binding: RemoteSessionBinding): Promise<string> {
+    const raw = await this.deps.call(binding.machineId, 'agents.list', {
+      projectId: binding.remoteProjectId, sessionId: binding.remoteSessionId
+    })
+    const entry = (Array.isArray(raw) ? raw as Array<Record<string, unknown>> : [])
+      .find(candidate => candidate?.agentSessionId === binding.remoteAgentSessionId)
+    if (typeof entry?.tabId !== 'string' || !entry.tabId) throw new Error('That machine no longer has a tab open for this conversation.')
+    return entry.tabId
   }
 
   /** Drops every binding to a machine the owner just forgot or revoked. */

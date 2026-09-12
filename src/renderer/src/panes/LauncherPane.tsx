@@ -39,7 +39,7 @@ const choices: Array<{
   { kind: 'agent', provider: 'codex', icon: Bot, title: 'Codex', tone: 'green', key: 'X' },
   ...LOCAL_MODELS.map((model, index) => ({
     kind: 'agent' as PaneKind, provider: 'local' as AgentProviderId, model: model.id, icon: Bot,
-    title: model.label, detail: 'Local · runs on this machine', tone: 'cyan', key: index === 0 ? 'L' : ''
+    title: model.label, detail: 'Local model', tone: 'cyan', key: index === 0 ? 'L' : ''
   })),
   { kind: 'agent', provider: 'qwen', icon: Bot, title: 'Qwen Code', tone: 'cyan', key: 'Q' },
   { kind: 'agent', provider: 'kimi', icon: Sparkles, title: 'Kimi Code', tone: 'violet', key: 'K' },
@@ -113,9 +113,11 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
       <div className="launcher-grid" aria-label="Open runtime">
         {choices.map(({ kind, provider, model, icon: Icon, title, detail, tone, key }) => {
           // A terminal is a local process on the machine that owns it; only agent tabs travel, and
-          // only the two providers whose conversations this app can journal can be mirrored.
+          // only the providers whose conversations this app can journal can be mirrored. A local
+          // model travels as a conversation: the weights and servers stay on the machine that is
+          // asked to run it, which is how another device reaches a stack it does not have.
           const elsewhere = selected !== LOCAL_MACHINE_ID
-          const mirrorable = provider === 'claude' || provider === 'codex'
+          const mirrorable = provider === 'claude' || provider === 'codex' || provider === 'local'
           const blocked = kind !== 'agent' ? elsewhere : Boolean(current?.reason) || (elsewhere && !mirrorable)
           return (
             <button
@@ -125,7 +127,7 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
               onClick={() => onOpen(kind, provider, model)}
             >
               <span className={`launch-icon ${tone}`}>{provider ? <ProviderIcon provider={provider} size={21} /> : <Icon size={19} />}</span>
-              <span><strong>{title}</strong>{detail && <small>{detail}</small>}</span>
+              <span><strong>{title}</strong>{detail && <small>{detail}{elsewhere && mirrorable ? ` · runs on ${current?.machine.name ?? 'that machine'}` : provider === 'local' ? ' · runs on this machine' : ''}</small>}</span>
               {key && <kbd>{key}</kbd>}
               <ChevronRight className="launch-arrow" size={15} />
             </button>
