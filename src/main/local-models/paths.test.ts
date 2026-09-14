@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { LocalRootError, childEnvironment, detectDrives, driveOf, layoutFor, localRoot, onSystemDrive, sessionWorkspace, systemDrive } from './paths.ts'
+import { LocalRootError, childEnvironment, detectDrives, driveOf, layoutFor, localRoot, onSystemDrive, pointerPaths, sessionWorkspace, systemDrive } from './paths.ts'
 import { modelFilePath, defaultModelConfig, QWEN_9B } from './config.ts'
 import { migrateModelFile, moveFile, sha256File } from './provenance.ts'
 
@@ -40,8 +40,10 @@ describe('local data root', () => {
 
   it('fails closed when nothing is configured', () => {
     process.env.CONDUCTOR_LOCAL_ROOT = ' '
-    const pointers = ['.local-models/root.json'].map(name => join(process.cwd(), name))
-    if (pointers.some(existsSync)) return // A configured checkout has a pointer; nothing to assert.
+    // Every place a pointer is actually read from, not just the one beside the checkout: a machine
+    // that has run setup has one in the user profile too, and checking only the checkout made this
+    // assert against a root that was configured all along.
+    if (pointerPaths().some(existsSync)) return // Configured here; there is nothing to assert.
     expect(() => localRoot()).toThrow(LocalRootError)
   })
 

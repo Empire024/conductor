@@ -23,8 +23,20 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # Downloading a workflow log needs admin rights on the repository, so a release that stops
+      # here would otherwise say only "exit code 1". The tail of the run is re-emitted as an
+      # annotation, which is readable from the run page and the public API.
       - name: Test
-        run: npm test
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'npm-test.log'
+          npm test 2>&1 | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content -LiteralPath $log -Tail 80) -join "`n"
+            $escaped = $tail -replace '%', '%25' -replace "`r", '' -replace "`n", '%0A'
+            Write-Output "::error title=npm test failed::$escaped"
+            exit 1
+          }
       - name: Select next installed-app version
         id: version
         shell: pwsh
