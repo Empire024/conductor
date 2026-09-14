@@ -22,7 +22,11 @@ foreach ($smokePath in @($smokeTarget.FullName, $smokeScriptsRoot)) {
         throw 'A smoke script or scripts directory must not be a reparse point.'
     }
 }
-$smokeNode = (Get-Command node.exe -CommandType Application -ErrorAction Stop).Source
+# Get-Command returns every match on PATH, so a machine with more than one Node - a GitHub runner
+# has both the tool-cache one and the preinstalled one - would give .Source an array here, and the
+# two paths would be joined into a single unrunnable command. Take the first, which is the one PATH
+# resolution itself would have used.
+$smokeNode = @(Get-Command node.exe -CommandType Application -ErrorAction Stop)[0].Source
 if (-not ('ConductorSmoke.NativeErrorMode' -as [type])) {
     Add-Type -TypeDefinition @'
 using System.Runtime.InteropServices;
