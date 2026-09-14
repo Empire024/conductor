@@ -28,6 +28,26 @@ export const RELAY_SEEN_TTL_MS = 30 * 60_000
 export const RELAY_POLL_ACTIVE_MS = 1500
 export const RELAY_POLL_IDLE_MS = 15_000
 export const RELAY_CALL_TIMEOUT_MS = 90_000
+/**
+ * The deadline for a call nobody is waiting on: a reachability probe the app starts by itself.
+ *
+ * An interactive call is worth waiting 90 seconds for, because a person asked for it and is holding
+ * the answer open. A probe is not: nothing is blocked on it, and a machine that has not answered in
+ * this long is exactly the "offline" the probe was asking about. Keeping it well under the
+ * interactive deadline is what stops a probe from still occupying the relay when the next one
+ * starts - see `MACHINE_PROBE_MS`, which is derived from this.
+ */
+export const RELAY_BACKGROUND_CALL_TIMEOUT_MS = 45_000
+/**
+ * How long a background call may hold the relay at its fast cadence.
+ *
+ * The 1.5 s cadence exists so a person waiting on an answer gets it promptly. A probe to a machine
+ * that is not there would otherwise hold the whole loop there for the life of the call - and since
+ * probes repeat, for ever - which is what turned an offline peer into thousands of GitHub requests
+ * an hour. After this long with no traffic, a background call decays to the idle cadence; the
+ * answer still arrives, one idle poll later.
+ */
+export const RELAY_BACKGROUND_ACTIVE_MS = 3_000
 
 export type RelayMessageKind = 'request' | 'response'
 

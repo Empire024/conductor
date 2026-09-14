@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { LOCAL_MACHINE_ID, type RemoteConnection, type RemoteProjectSummary } from '../shared/remote-control'
 import type { ProjectIdentity, RemoteProjectGrant } from '../shared/project-identity'
-import { describeMachines, inheritMachineId, machineBriefing, machineLabel, machineRunsProject, tabMachineId } from './machines'
+import { MachineProbeSchedule, describeMachines, inheritMachineId, machineBriefing, machineLabel, machineRunsProject, tabMachineId } from './machines'
 
 const LOCAL_IDENTITY: ProjectIdentity = { key: 'a'.repeat(32), keyCreatedAt: '2026-01-01T00:00:00.000Z', path: 'C:/laptop/conductor', name: 'Conductor' }
 const REMOTE_IDENTITY: ProjectIdentity = { key: 'b'.repeat(32), keyCreatedAt: '2026-02-02T00:00:00.000Z', path: 'D:/renders/conductor', name: 'Conductor' }
@@ -180,5 +180,81 @@ describe('what an agent is told about its machine', () => {
 
   it('says nothing about other machines when there are none', () => {
     expect(machineBriefing(machines(), LOCAL_MACHINE_ID)).not.toContain('Other machines available')
+  })
+})
+
+/**
+ * How often a paired machine that is not answering is asked again. Every probe is a real call - a
+ * gist write, then a call occupying the relay until its deadline - so probing a switched-off machine
+ * once a minute for ever is what drained the account's GitHub budget.
+ */
+describe('how often a silent machine is probed again', () => {
+  const BASE = 60_000
+  const start = Date.parse('2026-03-02T09:00:00.000Z')
+
+  /** One probe that goes unanswered, at `at`. Returns how long the next one has to wait. */
+  const missed = (schedule: MachineProbeSchedule, at: number): number => {
+    expect(schedule.begin('render-desktop')).toBe(true)
+    schedule.settle('render-desktop', false, at)
+    return schedule.waitMs('render-desktop', at)
+  }
+
+  it('backs a silent machine off 60s, 2min, 5min, then 15min for ever', () => {
+    const schedule = new MachineProbeSchedule(BASE)
+    let now = start
+    const waits: number[] = []
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const wait = missed(schedule, now)
+      waits.push(wait)
+      now += wait
+    }
+    expect(waits).toEqual([60_000, 120_000, 300_000, 900_000, 900_000, 900_000])
+    // Six probes covered the first 38 minutes; at one a minute it would have been thirty-eight.
+    expect(now - start).toBe(60_000 + 120_000 + 300_000 + 900_000 + 900_000 + 900_000)
+  })
+
+  it('probes nothing before the wait is up, and probes again the moment it is', () => {
+    const schedule = new MachineProbeSchedule(BASE)
+    expect(schedule.due('render-desktop', start)).toBe(true)
+    missed(schedule, start)
+    expect(schedule.due('render-desktop', start + BASE - 1)).toBe(false)
+    expect(schedule.due('render-desktop', start + BASE)).toBe(true)
+  })
+
+  it('puts a machine back on the base interval the moment it answers', () => {
+    const schedule = new MachineProbeSchedule(BASE)
+    let now = start
+    now += missed(schedule, now)
+    now += missed(schedule, now)
+    expect(schedule.waitMs('render-desktop', now - 1)).toBe(1)
+    schedule.begin('render-desktop')
+    schedule.settle('render-desktop', true, now)
+    expect(schedule.due('render-desktop', now)).toBe(true)
+    // And the streak is forgotten, so the next silence starts again at 60s rather than at 5min.
+    expect(missed(schedule, now)).toBe(60_000)
+  })
+
+  it('probes a machine that reappeared on the relay immediately, whatever it had earned', () => {
+    const schedule = new MachineProbeSchedule(BASE)
+    let now = start
+    for (let attempt = 0; attempt < 4; attempt++) now += missed(schedule, now)
+    expect(schedule.due('render-desktop', now - 899_000)).toBe(false)
+    schedule.reappeared('render-desktop')
+    expect(schedule.due('render-desktop', now - 899_000)).toBe(true)
+  })
+
+  /**
+   * The structural half of the same bug: a 60 s timer against a 90 s call deadline meant the next
+   * probe always started while the last one was still pending, so a call was outstanding at every
+   * instant. The interval is now derived from the deadline, and this is the runtime guard for a
+   * direct socket that hangs past its own timeout anyway.
+   */
+  it('refuses to start a second probe while the first is still outstanding', () => {
+    const schedule = new MachineProbeSchedule(BASE)
+    expect(schedule.begin('render-desktop')).toBe(true)
+    expect(schedule.begin('render-desktop')).toBe(false)
+    expect(schedule.due('render-desktop', start + 10 * BASE)).toBe(false)
+    schedule.settle('render-desktop', false, start)
+    expect(schedule.begin('render-desktop')).toBe(true)
   })
 })

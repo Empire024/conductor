@@ -17,12 +17,21 @@ const REQUEST_TIMEOUT_MS = 60000
  * best part of a minute, and waiting that out before every single call would make the off-network
  * case feel broken. With no relay configured the full request timeout still applies.
  */
-const DIRECT_PROBE_TIMEOUT_MS = 8000
+export const DIRECT_PROBE_TIMEOUT_MS = 8000
+
+/** What separates a call the owner asked for from one the app made on its own behalf. */
+export interface RemoteCallOptions {
+  /**
+   * A reachability probe, not work anybody is waiting on. It is carried over the relay on a shorter
+   * deadline and never holds the relay's poll loop at its fast cadence.
+   */
+  background?: boolean
+}
 
 /** What the relay transport has to offer for this machine to reach one off its own network. */
 export interface RemoteRelayTransport {
   enabled(): boolean
-  call(machineId: string, peerDeviceKey: string, path: string, body: Buffer, headers: Record<string, string>, peerRelayKey?: string): Promise<{ status: number; body: string }>
+  call(machineId: string, peerDeviceKey: string, path: string, body: Buffer, headers: Record<string, string>, peerRelayKey?: string, options?: RemoteCallOptions): Promise<{ status: number; body: string }>
 }
 
 export interface RemoteControlClientDependencies {
@@ -248,7 +257,7 @@ export class RemoteControlClient {
    * the stored address no longer leads to that machine. A refusal the machine itself sent is an
    * answer, so it is never quietly retried over the other route.
    */
-  private async send(target: RemoteTarget, path: string, body: Buffer, headers: Record<string, string>): Promise<{ result: unknown; transport: 'direct' | 'relay' }> {
+  private async send(target: RemoteTarget, path: string, body: Buffer, headers: Record<string, string>, options: RemoteCallOptions = {}): Promise<{ result: unknown; transport: 'direct' | 'relay' }> {
     const relay = this.deps.relay
     const canRelay = Boolean(target.relayKey && target.deviceKey && relay?.enabled())
     let routeError: unknown = null
@@ -272,7 +281,7 @@ export class RemoteControlClient {
     if (!canRelay || !relay || !target.deviceKey) {
       throw routeError ?? this.unreachable(target, null)
     }
-    const answer = await relay.call(target.machineId, target.deviceKey, path, body, headers, target.relayKey)
+    const answer = await relay.call(target.machineId, target.deviceKey, path, body, headers, target.relayKey, options)
     return { result: decode(answer.status, Buffer.from(answer.body, 'base64').toString('utf8')), transport: 'relay' }
   }
 
@@ -415,7 +424,7 @@ export class RemoteControlClient {
   }
 
   /** One authenticated call to a paired machine. Every call is signed over its exact body. */
-  async call(machineId: string, method: string, args: Record<string, unknown> = {}): Promise<unknown> {
+  async call(machineId: string, method: string, args: Record<string, unknown> = {}, options: RemoteCallOptions = {}): Promise<unknown> {
     const connection = this.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     if (connection.status === 'revoked') throw new RemoteAccessError('That machine revoked this pairing.', 403)
@@ -429,7 +438,7 @@ export class RemoteControlClient {
         [NONCE_HEADER]: payload.nonce,
         [TIMESTAMP_HEADER]: String(payload.issuedAt),
         [SIGNATURE_HEADER]: signature
-      })
+      }, options)
       if (this.get(machineId) !== connection || this.authorityRevision(machineId) !== authorityRevision) {
         throw new RemoteAccessError('Remote access changed while this request was pending.', 409)
       }

@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import {
   RELAY_ACK_FILE,
+  RELAY_BACKGROUND_ACTIVE_MS,
+  RELAY_BACKGROUND_CALL_TIMEOUT_MS,
   RELAY_CALL_TIMEOUT_MS,
   RELAY_CHUNK_BYTES,
   RELAY_DIRECTORY_FILE,
@@ -73,6 +75,20 @@ interface PendingCall {
   peerMachineId: string
   /** The device key this call was addressed to; only that key may answer it. */
   peerDeviceKey: string
+  /** Nobody is waiting on this one, so it gets a shorter deadline and no claim on the fast poll. */
+  background: boolean
+  startedAt: number
+}
+
+/** What separates a call a person is waiting on from one the app started by itself. */
+export interface RelayCallOptions {
+  /**
+   * A reachability probe rather than work the owner asked for. It is given a shorter deadline and,
+   * after `RELAY_BACKGROUND_ACTIVE_MS`, stops holding the poll loop at its fast cadence - so a
+   * machine that is simply not there costs one message and then idle polling, not 1.5 s polling for
+   * as long as it stays away.
+   */
+  background?: boolean
 }
 
 interface PartialMessage {
@@ -173,10 +189,25 @@ export class RemoteRelay {
       : (t => ({ cancel: () => clearTimeout(t) }))(setTimeout(run, ms))
   }
 
-  /** Fast while a call is in flight or a message just arrived, slow when nothing is happening. */
+  /**
+   * Fast while a call is in flight or a message just arrived, slow when nothing is happening.
+   *
+   * "A call is in flight" used to mean any pending call at all, which is why one unreachable peer
+   * pinned the loop: a probe every 60 s against a 90 s deadline meant `pending` was never empty, so
+   * the relay polled GitHub every 1.5 s for ever. A background probe therefore only counts as
+   * in-flight while it is young; past that it waits at the idle cadence like everything else.
+   */
   private interval(busy: boolean): number {
-    return this.pending.size > 0 || busy ? RELAY_POLL_ACTIVE_MS : RELAY_POLL_IDLE_MS
+    if (busy) return RELAY_POLL_ACTIVE_MS
+    const now = this.now()
+    for (const call of this.pending.values()) {
+      if (!call.background || now - call.startedAt < RELAY_BACKGROUND_ACTIVE_MS) return RELAY_POLL_ACTIVE_MS
+    }
+    return RELAY_POLL_IDLE_MS
   }
+
+  /** What the loop would wait right now. Exposed so the cadence can be asserted directly. */
+  nextPollDelayMs(): number { return this.interval(false) }
 
   /** Publishes this machine's entry so another one can find and seal to it. */
   async checkIn(): Promise<void> {
@@ -274,7 +305,7 @@ export class RemoteRelay {
    * One request to a paired machine over the relay. The bytes handed in are the identical bytes the
    * direct transport would have written, so the signature in `headers` verifies unchanged there.
    */
-  async call(machineId: string, expectedDeviceKey: string, path: string, body: Buffer, headers: Record<string, string>, expectedSealKey?: string): Promise<RelayResponseBody> {
+  async call(machineId: string, expectedDeviceKey: string, path: string, body: Buffer, headers: Record<string, string>, expectedSealKey?: string, options: RelayCallOptions = {}): Promise<RelayResponseBody> {
     if (!this.deps.enabled()) throw new RemoteAccessError('The encrypted relay is switched off on this machine.', 503)
     if (body.length > RELAY_MAX_MESSAGE_BYTES) throw new RemoteAccessError('Request exceeds 3 MiB.', 413)
     const seal = this.deps.sealKey()
@@ -283,8 +314,18 @@ export class RemoteRelay {
     const id = randomUUID()
     const payload: RelayRequestBody = { path, headers, body: body.toString('base64') }
     await this.send(peer.entry, { from: this.deps.machineId(), to: machineId, id, kind: 'request', correlationId: id }, Buffer.from(JSON.stringify(payload), 'utf8'))
+    const background = options.background === true
+    const startedAt = this.now()
     const answer = new Promise<RelayResponseBody>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, expiresAt: this.now() + RELAY_CALL_TIMEOUT_MS, peerMachineId: machineId, peerDeviceKey: expectedDeviceKey })
+      this.pending.set(id, {
+        resolve,
+        reject,
+        expiresAt: startedAt + (background ? RELAY_BACKGROUND_CALL_TIMEOUT_MS : RELAY_CALL_TIMEOUT_MS),
+        peerMachineId: machineId,
+        peerDeviceKey: expectedDeviceKey,
+        background,
+        startedAt
+      })
     })
     this.start()
     this.schedule(0)

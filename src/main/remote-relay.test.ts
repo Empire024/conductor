@@ -15,9 +15,13 @@ import {
 import { RemoteRelay } from './remote-relay'
 import {
   RELAY_ACK_FILE,
+  RELAY_BACKGROUND_ACTIVE_MS,
+  RELAY_BACKGROUND_CALL_TIMEOUT_MS,
   RELAY_CALL_TIMEOUT_MS,
   RELAY_DIRECTORY_FILE,
   RELAY_GIST_DESCRIPTION,
+  RELAY_POLL_ACTIVE_MS,
+  RELAY_POLL_IDLE_MS,
   parseRelayFileName,
   relayFileName
 } from '../shared/remote-relay'
@@ -108,7 +112,7 @@ function machine(
   name: string,
   github: ReturnType<typeof fakeGitHub>,
   peers: Map<string, string>,
-  options: { fingerprint?: string; api?: FakeApi; now?: () => number } = {}
+  options: { fingerprint?: string; api?: FakeApi; now?: () => number; schedule?: (run: () => void, ms: number) => { cancel(): void } } = {}
 ): Machine {
   const device = generateDeviceKey(`conductor ${name}`)
   const seal = generateSealKey()
@@ -145,8 +149,9 @@ function machine(
     },
     enabled: () => true,
     ...(options.now ? { now: options.now } : {}),
-    // Nothing schedules itself in a test; every poll is driven explicitly.
-    schedule: () => ({ cancel: () => undefined })
+    // Nothing schedules itself in a test; every poll is driven explicitly, except where a test is
+    // about the cadence the loop picks, which is exactly what this seam records.
+    schedule: options.schedule ?? (() => ({ cancel: () => undefined }))
   })
   return self
 }
@@ -563,6 +568,93 @@ describe('relay transport', () => {
     // Answering fails, and the sweep collects that failure. `tick` chooses its wait and its status
     // phase from the error type, so it has to arrive as itself rather than as a plain Error.
     await expect(bob.relay.pollOnce()).rejects.toBeInstanceOf(RelayUnavailableError)
+  })
+
+  /**
+   * What an offline paired machine costs. The launcher re-probes every peer on a timer, and that
+   * probe is a real call, so it sits in `pending` for as long as its deadline. Reading "a call is
+   * pending" as "somebody is waiting" meant one switched-off machine held the loop at 1.5 s polling
+   * against GitHub for ever - roughly 2,400 poll cycles an hour out of a 5,000 request budget.
+   */
+  it('does not sit at the fast cadence while only a background probe to an absent machine is outstanding', async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    let clock = Date.parse('2026-03-02T09:00:00.000Z')
+    const delays: number[] = []
+    let next: (() => void) | null = null
+    const alice = machine('alice', github, peers, {
+      now: () => clock,
+      schedule: (run, ms) => { delays.push(ms); next = run; return { cancel: () => undefined } }
+    })
+    // Bob checks in once and is then switched off: his mailbox is on the account, but nothing on
+    // that machine will ever read it or answer.
+    const bob = machine('bob', github, peers)
+    peers.set('alice', alice.device.publicKey)
+    await bob.relay.checkIn()
+    await alice.relay.checkIn()
+
+    const probe = alice.relay.call('bob', bob.device.publicKey, '/remote/call', Buffer.from('{}'), {}, bob.seal.publicKey, { background: true })
+    void probe.catch(() => undefined)
+    await sent(github)
+    clock += RELAY_BACKGROUND_ACTIVE_MS + 1
+
+    const before = delays.length
+    ;(next as unknown as () => void)()
+    await vi.waitFor(() => { expect(delays.length).toBeGreaterThan(before) })
+    // The probe is still outstanding - its deadline has not passed - and the loop is idle anyway.
+    expect(alice.relay.nextPollDelayMs()).toBe(RELAY_POLL_IDLE_MS)
+    expect(delays.at(-1)).toBe(RELAY_POLL_IDLE_MS)
+  })
+
+  it('still answers a waiting owner promptly, because only a background call decays', async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    let clock = Date.parse('2026-03-02T09:00:00.000Z')
+    const delays: number[] = []
+    let next: (() => void) | null = null
+    const alice = machine('alice', github, peers, {
+      now: () => clock,
+      schedule: (run, ms) => { delays.push(ms); next = run; return { cancel: () => undefined } }
+    })
+    const bob = machine('bob', github, peers)
+    peers.set('alice', alice.device.publicKey)
+    await bob.relay.checkIn()
+    await alice.relay.checkIn()
+
+    const call = alice.relay.call('bob', bob.device.publicKey, '/remote/call', Buffer.from('{}'), {}, bob.seal.publicKey)
+    void call.catch(() => undefined)
+    await sent(github)
+    clock += RELAY_BACKGROUND_ACTIVE_MS + 1
+
+    const before = delays.length
+    ;(next as unknown as () => void)()
+    await vi.waitFor(() => { expect(delays.length).toBeGreaterThan(before) })
+    expect(delays.at(-1)).toBe(RELAY_POLL_ACTIVE_MS)
+  })
+
+  it('gives a probe a shorter deadline than a call somebody is waiting on', async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    let clock = Date.parse('2026-03-02T09:00:00.000Z')
+    const alice = machine('alice', github, peers, { now: () => clock })
+    const bob = machine('bob', github, peers)
+    peers.set('alice', alice.device.publicKey)
+    await bob.relay.checkIn()
+    await alice.relay.checkIn()
+
+    const probe = alice.relay.call('bob', bob.device.publicKey, '/remote/call', Buffer.from('{}'), {}, bob.seal.publicKey, { background: true })
+    const waited = alice.relay.call('bob', bob.device.publicKey, '/remote/call', Buffer.from('{}'), {}, bob.seal.publicKey)
+    const settled = waited.then(() => 'answered', () => 'gave up')
+    await sent(github)
+
+    clock += RELAY_BACKGROUND_CALL_TIMEOUT_MS + 1
+    await alice.relay.pollOnce()
+    await expect(probe).rejects.toThrow(/did not answer/i)
+    // The owner's own call is still open at the moment the probe has already been given up on.
+    expect(await Promise.race([settled, Promise.resolve('pending')])).toBe('pending')
+    clock += RELAY_CALL_TIMEOUT_MS
+    await alice.relay.pollOnce()
+    await expect(settled).resolves.toBe('gave up')
   })
 
   it('still ages out a timed-out call when the sweep itself fails', async () => {

@@ -18,16 +18,17 @@ import { encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries } from '../s
 import { checkRemoteProjectPlacement } from '../shared/project-identity'
 import type { ConductorDatabase } from './database'
 import { GitHubAuth, GITHUB_SCOPES } from './github-auth'
-import { describeMachines, machineBriefing, tabMachineId } from './machines'
+import { MachineProbeSchedule, describeMachines, machineBriefing, tabMachineId } from './machines'
 import { projectSummary } from './project-identity'
 import type { ProjectBacklogs } from './project-backlog'
-import { RemoteControlClient } from './remote-control-client'
+import { DIRECT_PROBE_TIMEOUT_MS, RemoteControlClient, type RemoteCallOptions } from './remote-control-client'
 import { RemoteControlHost } from './remote-control-host'
 import { RemoteFileResourceServer } from './remote-file-resources'
 import { RemoteFiles } from './remote-files'
 import { RemoteControlServer } from './remote-control-server'
 import { GitHubRelayMailbox } from './github-relay'
 import { RemoteRelay } from './remote-relay'
+import { RELAY_BACKGROUND_CALL_TIMEOUT_MS } from '../shared/remote-relay'
 import { generateSealKey, type RelaySealKeyPair } from './relay-crypto'
 import { RemoteAccessError, RemotePeers } from './remote-peers'
 import { RemoteSessionMirror } from './remote-session-mirror'
@@ -51,8 +52,19 @@ export interface RemoteControlServiceDependencies {
 }
 
 const MACHINE_NAME_SETTING = 'remote-control.machineName'
-/** How often a paired machine is re-probed so the launcher reflects what is reachable now. */
-const MACHINE_PROBE_MS = 60_000
+/**
+ * How often a paired machine is re-probed so the launcher reflects what is reachable now.
+ *
+ * Derived rather than chosen, because the two numbers are not independent: a probe that starts
+ * before the previous one can possibly have ended leaves a call pending at every instant, and the
+ * relay reads "a call is pending" as "someone is waiting", which is what pinned it to its 1.5 s
+ * cadence and spent the account's whole hourly GitHub budget on one machine being switched off.
+ * A probe is bounded by the direct attempt plus the relay's background deadline, so the interval is
+ * that sum and some slack - it cannot be tuned back into overlapping. The per-machine in-flight
+ * claim in `MachineProbeSchedule` enforces the same rule at runtime, for a direct socket that hangs
+ * past its own timeout.
+ */
+const MACHINE_PROBE_MS = DIRECT_PROBE_TIMEOUT_MS + RELAY_BACKGROUND_CALL_TIMEOUT_MS + 7_000
 /** The X25519 key relayed messages to this machine are sealed to; never leaves the credential store. */
 const RELAY_KEY_SECRET = 'remote-control.relay.sealKey'
 
@@ -193,8 +205,10 @@ export class RemoteControlService {
   private registered = false
   private seal: RelaySealKeyPair | null = null
   private heartbeat: ReturnType<typeof setInterval> | null = null
-  /** One probe at a time; a relay round trip can outlast the interval that started it. */
+  /** One scheduled sweep at a time; a relay round trip can outlast the interval that started it. */
   private probing: Promise<MachineDescriptor[]> | null = null
+  /** When each machine is next worth probing, and which probes are still outstanding. */
+  private readonly probes = new MachineProbeSchedule(MACHINE_PROBE_MS)
 
   constructor(private readonly deps: RemoteControlServiceDependencies) {
     const store = deps.database
@@ -274,8 +288,8 @@ export class RemoteControlService {
       deviceKey: () => this.auth.deviceKey(),
       relay: {
         enabled: () => this.peers.getSettings().enabled && this.peers.getSettings().relay && this.auth.identity() !== null,
-        call: (machineId, peerDeviceKey, path, body, headers, peerRelayKey) =>
-          this.relay.call(machineId, peerDeviceKey, path, body, headers, peerRelayKey)
+        call: (machineId, peerDeviceKey, path, body, headers, peerRelayKey, options) =>
+          this.relay.call(machineId, peerDeviceKey, path, body, headers, peerRelayKey, options)
       },
       changed: () => this.publishState()
     })
@@ -347,21 +361,34 @@ export class RemoteControlService {
    * that machine still advertises are the two things the launcher gates on, and a stale mapping
    * reads as exactly the same word.
    */
-  async probeMachines(): Promise<MachineDescriptor[]> {
-    if (this.probing) return await this.probing
-    const peers = this.client.list().filter(connection => connection.status !== 'revoked' && connection.peerId)
+  async probeMachines(options: { scheduled?: boolean; background?: boolean } = {}): Promise<MachineDescriptor[]> {
+    // A sweep the owner asked for is never folded into a scheduled one, because a scheduled sweep
+    // may deliberately be skipping the very machine they are asking about.
+    if (options.scheduled && this.probing) return await this.probing
+    const now = Date.now()
+    const peers = this.client.list().filter(connection =>
+      connection.status !== 'revoked' && connection.peerId &&
+      (!options.scheduled || this.probes.due(connection.machineId, now)) &&
+      this.probes.begin(connection.machineId))
     if (!peers.length) return this.machines()
-    this.probing = Promise.all(peers.map(async connection => {
+    const sweep = Promise.all(peers.map(async connection => {
       // A machine that does not answer is a result here, not a failure: call() has already recorded
       // why against the connection, and that recorded reason is what the owner is shown.
-      try { await this.refreshRemoteProjects(connection.machineId) } catch { /* recorded by call() */ }
-    })).then(() => this.machines()).finally(() => { this.probing = null })
-    return await this.probing
+      try { await this.refreshRemoteProjects(connection.machineId, options) } catch { /* recorded by call() */ }
+      // Whether it answered is what the call itself recorded - a machine that refused one request is
+      // reachable, a machine that timed out is not - so the backoff follows that, not the throw.
+      this.probes.settle(connection.machineId, this.client.get(connection.machineId)?.status === 'connected', Date.now())
+    })).then(() => this.machines())
+    if (options.scheduled) {
+      this.probing = sweep
+      void sweep.catch(() => undefined).finally(() => { if (this.probing === sweep) this.probing = null })
+    }
+    return await sweep
   }
 
   private scheduleMachineProbe(): void {
     if (this.heartbeat) return
-    this.heartbeat = setInterval(() => { void this.probeMachines().catch(() => undefined) }, MACHINE_PROBE_MS)
+    this.heartbeat = setInterval(() => { void this.probeMachines({ scheduled: true, background: true }).catch(() => undefined) }, MACHINE_PROBE_MS)
     this.heartbeat.unref?.()
   }
 
@@ -372,8 +399,13 @@ export class RemoteControlService {
    */
   private probeMachinesSeenOnRelay(): void {
     const reachable = new Set(this.relay.getStatus().reachable)
-    if (!this.client.list().some(connection => connection.status !== 'connected' && connection.status !== 'revoked' && reachable.has(connection.machineId))) return
-    void this.probeMachines().catch(() => undefined)
+    const returned = this.client.list().filter(connection =>
+      connection.status !== 'connected' && connection.status !== 'revoked' && reachable.has(connection.machineId))
+    if (!returned.length) return
+    // Proof of life outranks the backoff: whatever a machine's silent streak had earned it, it is
+    // worth one probe now. This is what makes backing a silent machine off cost no responsiveness.
+    for (const connection of returned) this.probes.reappeared(connection.machineId)
+    void this.probeMachines({ scheduled: true, background: true }).catch(() => undefined)
   }
 
   /** The sentence appended to an agent's briefing so it knows where it is running. */
@@ -391,8 +423,8 @@ export class RemoteControlService {
   }
 
   /** Asks a paired machine what it shares now and remembers the answer against the mapping. */
-  async refreshRemoteProjects(machineId: string): Promise<RemoteProjectSummary[]> {
-    return this.client.recordRemoteProjects(machineId, readRemoteProjectSummaries(await this.client.call(machineId, 'projects.list')))
+  async refreshRemoteProjects(machineId: string, options: RemoteCallOptions = {}): Promise<RemoteProjectSummary[]> {
+    return this.client.recordRemoteProjects(machineId, readRemoteProjectSummaries(await this.client.call(machineId, 'projects.list', {}, options)))
   }
 
   /**
@@ -525,7 +557,7 @@ export class RemoteControlService {
     // Paired machines are probed on a timer so a machine that blinked once does not stay marked
     // unavailable until the owner happens to make a call that succeeds.
     this.scheduleMachineProbe()
-    void this.probeMachines().catch(() => undefined)
+    void this.probeMachines({ background: true }).catch(() => undefined)
     // Tabs placed elsewhere in an earlier run keep catching up without the owner reopening them.
     if (this.mirror.list().length) this.mirror.start()
   }

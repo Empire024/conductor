@@ -73,3 +73,61 @@ export function machineBriefing(machines: MachineDescriptor[], machineId: string
   const available = others.length ? ` Other machines available: ${others.map(machine => `${machine.name} (${machine.id})`).join(', ')}; call machines.list before moving work.` : ''
   return where + inheritance + available
 }
+
+/**
+ * How much longer to wait after each consecutive silent probe, as a multiple of the base interval.
+ *
+ * With the 60 s base that gives 60 s, 2 min, 5 min, then 15 min for ever. A machine that is simply
+ * switched off costs four probes in the first eight minutes and four an hour after that, instead of
+ * sixty an hour — and every one of those probes was a GitHub write plus a relay call that held the
+ * poll loop open. Nothing is lost by waiting: a peer that comes back republishes its relay mailbox,
+ * and `probeMachinesSeenOnRelay` clears the backoff and probes it the moment that is noticed.
+ */
+export const MACHINE_PROBE_BACKOFF_STEPS = [1, 2, 5, 15] as const
+
+/**
+ * When each paired machine is next worth probing, and which probes are already in flight.
+ *
+ * The in-flight set is the half that makes the interval safe rather than merely polite: a probe's
+ * own call can outlast the timer that started it, and starting a second probe for a machine whose
+ * first has not come back is what kept a call pending at every instant — which is what held the
+ * relay at its fast poll cadence indefinitely. One probe per machine at a time, always.
+ */
+export class MachineProbeSchedule {
+  private readonly silent = new Map<string, { failures: number; nextAt: number }>()
+  private readonly inFlight = new Set<string>()
+
+  constructor(private readonly baseMs: number) {}
+
+  /** Whether a scheduled sweep should probe this machine now. */
+  due(machineId: string, now: number): boolean {
+    if (this.inFlight.has(machineId)) return false
+    const state = this.silent.get(machineId)
+    return !state || state.nextAt <= now
+  }
+
+  /** Claims this machine for one probe; false when a probe for it is still outstanding. */
+  begin(machineId: string): boolean {
+    if (this.inFlight.has(machineId)) return false
+    this.inFlight.add(machineId)
+    return true
+  }
+
+  /** Records how a probe ended. Answering at all puts the machine back on the base interval. */
+  settle(machineId: string, answered: boolean, now: number): void {
+    this.inFlight.delete(machineId)
+    if (answered) { this.silent.delete(machineId); return }
+    const failures = (this.silent.get(machineId)?.failures ?? 0) + 1
+    const step = MACHINE_PROBE_BACKOFF_STEPS[Math.min(failures, MACHINE_PROBE_BACKOFF_STEPS.length) - 1] ?? 1
+    this.silent.set(machineId, { failures, nextAt: now + this.baseMs * step })
+  }
+
+  /** A machine that republished its relay mailbox is worth trying again straight away. */
+  reappeared(machineId: string): void { this.silent.delete(machineId) }
+
+  /** How long a silent machine still has to wait, for tests and for explaining the schedule. */
+  waitMs(machineId: string, now: number): number {
+    const state = this.silent.get(machineId)
+    return state ? Math.max(0, state.nextAt - now) : 0
+  }
+}
