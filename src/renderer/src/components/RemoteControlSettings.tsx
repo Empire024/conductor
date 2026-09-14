@@ -1,11 +1,21 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Check, Copy, Github, Laptop, LogOut, MonitorSmartphone, ShieldAlert, ShieldCheck, X } from 'lucide-react'
 import type { GitHubAuthState, RemoteControlState, RemoteExposure, RemotePeerRecord } from '../../../shared/remote-control'
+import type { RelayStatus } from '../../../shared/remote-relay'
 import { checkRemoteProjectPlacement, samePath, sameWorkingCopy } from '../../../shared/project-identity'
 import './RemoteControlSettings.css'
 
 const fail = (reason: unknown): string => reason instanceof Error ? reason.message : String(reason)
 const shortFingerprint = (value: string | null): string => value ? value.replace(/:/g, '').slice(0, 16).replace(/(.{4})/g, '$1 ').trim() : ''
+
+/** The relay's own words for what it is doing, so "why can't I reach my laptop" has an answer here. */
+const relayLabel = (relay: RelayStatus): string => {
+  if (relay.phase === 'ready') return relay.reachable.length ? 'Connected' : 'Waiting for another machine'
+  if (relay.phase === 'connecting') return 'Checking in'
+  if (relay.phase === 'unavailable') return 'Paused'
+  if (relay.phase === 'error') return 'Not working'
+  return 'Off'
+}
 
 /**
  * What has become of a project this machine shares, seen from here. A folder that moved is
@@ -146,6 +156,24 @@ export function RemoteControlSettings(): React.JSX.Element {
             {settings.exposure === 'network' && (
               <p className="remote-warning"><ShieldAlert size={12} /> This machine now accepts connections from your network. Traffic is encrypted and every request must be signed by a device key registered on your GitHub account.</p>
             )}
+            <label className="remote-row">
+              <span>
+                <strong>Reach my machines anywhere</strong>
+                <small>
+                  Off your network, messages travel as ciphertext through a private gist on your own GitHub account.
+                  GitHub never holds a key that opens one, and no port is opened here.
+                </small>
+              </span>
+              <input type="checkbox" checked={settings.relay}
+                onChange={event => void run('relay', () => window.conductor.remote.setSettings({ relay: event.target.checked }))} />
+            </label>
+            {settings.relay && (
+              <div className="remote-endpoint">
+                <div><span>Encrypted relay</span><code>{relayLabel(state.relay)}</code></div>
+                {state.relay.reachable.length > 0 && <div><span>Machines checked in</span><code>{state.relay.reachable.length}</code></div>}
+              </div>
+            )}
+            {settings.relay && state.relay.message && <p className="remote-hint">{state.relay.message}</p>}
             {state.message && <p className="remote-hint">{state.message}</p>}
             {state.listening && (
               <div className="remote-endpoint">
@@ -153,7 +181,7 @@ export function RemoteControlSettings(): React.JSX.Element {
                 <div><span>Certificate</span><code>{shortFingerprint(state.fingerprint)}</code></div>
               </div>
             )}
-            {state.listening && (
+            {(state.listening || state.relay.phase === 'ready') && (
               <div className="remote-actions">
                 <button className="remote-primary" disabled={busy === 'ticket'} onClick={() => void run('ticket', async () => {
                   const created = await window.conductor.remote.createTicket()

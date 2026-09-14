@@ -42,6 +42,9 @@ export interface RemoteControlServerDependencies {
   vault: SecretVault
   machineName(): string
   accountLogin(): string | null
+  /** Published in a pairing code so the other machine can reach this one off-network. */
+  relayKey?(): string | null
+  deviceKey?(): string | null
   changed?(): void
 }
 
@@ -166,13 +169,24 @@ export class RemoteControlServer {
     this.deps.changed?.()
   }
 
-  /** The ticket carries the address and the certificate to pin, plus a single-use pairing code. */
+  /**
+   * The ticket carries the address and the certificate to pin, plus a single-use pairing code, plus
+   * the keys the encrypted relay needs. Both key fields are here for the same reason the
+   * fingerprint is: the owner moves this code between their own two machines by hand, which is the
+   * one channel an attacker who controls the network — or the account's gists — is not on.
+   */
   ticket(): RemotePairingTicket {
-    if (!this.status.listening || !this.tls) throw new RemoteAccessError('Switch remote control on before creating a pairing code.', 409)
     const settings = this.deps.peers.getSettings()
+    // Either route is enough to be paired over. A machine reachable only through the relay has no
+    // listener worth mentioning, and refusing it a code would make the off-network case unpairable.
+    if (!settings.enabled || (!this.status.listening && !settings.relay)) {
+      throw new RemoteAccessError('Switch remote control on before creating a pairing code.', 409)
+    }
     const address = this.server?.address()
     const port = address && typeof address !== 'string' ? address.port : settings.port
     const { code, expiresAt } = this.deps.peers.issueTicket()
+    const relayKey = this.deps.relayKey?.() ?? null
+    const deviceKey = this.deps.deviceKey?.() ?? null
     return {
       version: 1,
       machineId: this.deps.peers.machineId,
@@ -180,9 +194,10 @@ export class RemoteControlServer {
       accountLogin: this.deps.accountLogin() ?? '',
       host: settings.exposure === 'network' ? localAddresses()[0] ?? '127.0.0.1' : '127.0.0.1',
       port,
-      fingerprint: this.tls.fingerprint,
+      fingerprint: this.identity().fingerprint,
       code,
-      expiresAt
+      expiresAt,
+      ...(settings.relay && relayKey && deviceKey ? { relayKey, deviceKey } : {})
     }
   }
 
@@ -198,16 +213,39 @@ export class RemoteControlServer {
     return Buffer.concat(chunks)
   }
 
+  /**
+   * One remote request, independent of how it arrived. The HTTPS listener and the encrypted relay
+   * both land here with the same path, the same raw body and the same signed headers, so there is
+   * exactly one place where a peer's authority is decided and neither route can be the weaker one.
+   */
+  async handleRequest(path: string, raw: Buffer, headers: Record<string, string>): Promise<{ status: number; body: string }> {
+    const encode = (status: number, body: unknown): { status: number; body: string } => {
+      try { return { status, body: JSON.stringify(body) ?? '{}' } }
+      catch { return { status: 500, body: JSON.stringify({ error: 'That result could not be encoded for the wire.' }) } }
+    }
+    try {
+      if (raw.length > MAX_BODY) throw new RemoteAccessError('Request exceeds 3 MiB.', 413)
+      let payload: Record<string, unknown>
+      try { payload = JSON.parse(raw.toString('utf8') || '{}') as Record<string, unknown> }
+      catch { throw new RemoteAccessError('Malformed JSON body.', 400) }
+      if (path === '/remote/pair') return encode(200, { result: await this.pair(payload) })
+      if (path === '/remote/pair/status') return encode(200, { result: await this.pairStatus(payload) })
+      if (path === '/remote/call') return encode(200, { result: await this.callMethod(headers, raw, payload) })
+      throw new RemoteAccessError('Unknown remote endpoint.', 404)
+    } catch (error) {
+      const status = error instanceof RemoteAccessError ? error.status : 400
+      const code = error instanceof RemoteAccessError ? error.code : undefined
+      return encode(status, { error: error instanceof Error ? error.message : 'Remote request failed', ...(code ? { code } : {}) })
+    }
+  }
+
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     // Serialising first keeps a body that cannot be encoded from leaving a half-written response
     // that the error path would then try to write again, which would escape this handler entirely.
-    const reply = (status: number, body: unknown): void => {
+    const reply = (status: number, body: string): void => {
       if (response.destroyed || response.writableEnded || response.headersSent) return
-      let encoded: string
-      try { encoded = JSON.stringify(body) ?? '{}' }
-      catch { encoded = JSON.stringify({ error: 'That result could not be encoded for the wire.' }) }
       response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' })
-      response.end(encoded)
+      response.end(body)
     }
     try {
       // A browser is never a legitimate client here, so anything carrying an Origin is refused
@@ -217,24 +255,33 @@ export class RemoteControlServer {
       }
       const path = (request.url ?? '').split('?')[0]
       const raw = await this.body(request)
-      let payload: Record<string, unknown>
-      try { payload = JSON.parse(raw.toString('utf8') || '{}') as Record<string, unknown> }
-      catch { throw new RemoteAccessError('Malformed JSON body.', 400) }
-      if (path === '/remote/pair') { reply(200, { result: await this.pair(payload) }); return }
-      if (path === '/remote/pair/status') { reply(200, { result: await this.pairStatus(payload) }); return }
-      if (path === '/remote/call') { reply(200, { result: await this.callMethod(request, raw, payload) }); return }
-      throw new RemoteAccessError('Unknown remote endpoint.', 404)
+      const headers: Record<string, string> = {}
+      for (const [name, value] of Object.entries(request.headers)) if (typeof value === 'string') headers[name.toLowerCase()] = value
+      const answer = await this.handleRequest(path ?? '', raw, headers)
+      reply(answer.status, answer.body)
     } catch (error) {
       request.resume()
       const status = error instanceof RemoteAccessError ? error.status : 400
       const code = error instanceof RemoteAccessError ? error.code : undefined
-      reply(status, { error: error instanceof Error ? error.message : 'Remote request failed', ...(code ? { code } : {}) })
+      reply(status, JSON.stringify({ error: error instanceof Error ? error.message : 'Remote request failed', ...(code ? { code } : {}) }))
     }
   }
 
+  /**
+   * This machine's certificate, minted on first use. A challenge signature is bound to it on both
+   * transports, so the relay needs it even when the owner never opened the listener at all — the
+   * certificate is this machine's stable name here, not only what a TLS handshake presents.
+   */
+  identity(): RemoteTlsIdentity {
+    if (!this.tls) {
+      this.tls = this.tlsIdentity()
+      this.deps.peers.setFingerprint(this.tls.fingerprint)
+    }
+    return this.tls
+  }
+
   private fingerprint(): string {
-    if (!this.tls) throw new RemoteAccessError('Remote control is not listening.', 503)
-    return this.tls.fingerprint
+    return this.identity().fingerprint
   }
 
   private async pair(payload: Record<string, unknown>): Promise<{ status: 'pending'; requestId: string; keyFingerprint: string }> {
@@ -272,8 +319,8 @@ export class RemoteControlServer {
       : { status: result.status }
   }
 
-  private async callMethod(request: IncomingMessage, raw: Buffer, payload: Record<string, unknown>): Promise<unknown> {
-    const header = (name: string): string => String(request.headers[name] ?? '')
+  private async callMethod(requestHeaders: Record<string, string>, raw: Buffer, payload: Record<string, unknown>): Promise<unknown> {
+    const header = (name: string): string => String(requestHeaders[name] ?? '')
     const { peer } = await this.deps.peers.authenticate({
       peerId: header(PEER_HEADER),
       nonce: header(NONCE_HEADER),
@@ -311,7 +358,9 @@ export class RemoteControlServer {
 
   private async stopSockets(): Promise<void> {
     this.server = undefined
-    this.tls = undefined
+    // `tls` is deliberately kept. It is this machine's identity, and the relay signs against it
+    // whether or not a socket is open; dropping it here would silently invalidate every pairing the
+    // owner made while the listener happened to be running.
     if (this.status.listening || this.status.endpoint || this.status.fingerprint) this.setStopped()
     await Promise.all([...this.sockets].map(server => this.closeSocket(server)))
   }

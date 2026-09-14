@@ -1,5 +1,5 @@
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { promises as fs } from 'node:fs'
+import { promises as fs, readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { importPromptImage } from './prompt-images'
@@ -21,6 +21,8 @@ import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { installContextMenu } from './context-menu'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, shell, webContents } from 'electron'
+import { SystemMetricsSampler } from './system-metrics.ts'
+import type { SystemMetricsSnapshot } from '../shared/system-metrics.ts'
 import { CloseConfirmation, hasRunningWork } from './close-confirmation'
 import { readSessionArchive, writeSessionArchive } from './session-archive'
 import type {
@@ -72,6 +74,11 @@ import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest 
 import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
 
 const projectPreview = new ProjectPreviewServer()
+/** Host telemetry for the performance chip. Nothing is sampled until a renderer asks, and
+ *  Electron's own metrics attribute the window, GPU and utility children back to Conductor. */
+const systemMetrics = new SystemMetricsSampler({
+  appMetrics: () => app.getAppMetrics().map(metric => ({ pid: metric.pid, type: metric.type, cpuPercent: metric.cpu.percentCPUUsage, memoryBytes: (metric.memory.workingSetSize ?? 0) * 1024 }))
+})
 let database: ConductorDatabase
 let terminals: TerminalManager
 let agents: AgentManager
@@ -1569,6 +1576,13 @@ const registerIpc = (): void => {
   ipcMain.handle('agent:list-providers', () => agents.listProviders())
   ipcMain.handle('runtime:list-processes', (_event, projectId?: string) => database.listProcesses(projectId))
   ipcMain.handle('activity:projects', () => projectActivitySnapshot())
+  // A smoke run has to be able to show the chip a machine it is not on: an idle host, then a
+  // loaded one. The fixture is re-read per call so one launch can walk through both.
+  ipcMain.handle('system:metrics', () => {
+    const fixture = process.env.CONDUCTOR_TEST_SYSTEM_METRICS
+    if (fixture) return JSON.parse(readFileSync(fixture, 'utf8')) as SystemMetricsSnapshot
+    return systemMetrics.sample()
+  })
   const usageCapSnapshot = (agentSessionId: string, workspaceId: string): UsageCapSnapshot => {
     const stored = {
       tab: database.getSetting(usageCapKey('tab', agentSessionId)),

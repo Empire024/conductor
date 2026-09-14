@@ -1,9 +1,9 @@
 import { execFileSync, spawn } from 'node:child_process'
-import { createConnection } from 'node:net'
-import { existsSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createConnection, createServer } from 'node:net'
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { LocalModelConfig } from './config.ts'
-import { logsDir, modelFilePath, runDir } from './config.ts'
+import { logsDir, modelFilePath, runFile } from './config.ts'
 import { childEnvironment } from './paths.ts'
 
 /** llama.cpp is an inference engine here and nothing else. These flags would hand it tools, a
@@ -43,24 +43,32 @@ export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPa
   ]
 }
 
-export const runFile = (model: LocalModelConfig): string => join(runDir(), model.id.replace(/[^a-z0-9.-]/gi, '_') + '.json')
 export const logFile = (model: LocalModelConfig): string => join(logsDir(), model.id.replace(/[^a-z0-9.-]/gi, '_') + '.log')
 
-export interface RunRecord { pid: number; port: number; model: string; file: string; startedAt: string }
+/** `pid: null` marks a server this Conductor instance adopted rather than started: we know it is
+ *  ours (the API key and model id matched) but not which process it is, so nothing here may try
+ *  to kill it. */
+export interface RunRecord { pid: number | null; port: number; model: string; file: string; startedAt: string }
 
 export function readRunRecord(model: LocalModelConfig): RunRecord | null {
   const path = runFile(model)
   if (!existsSync(path)) return null
   try {
     const record = JSON.parse(readFileSync(path, 'utf8')) as RunRecord
-    return Number.isInteger(record.pid) && record.pid > 0 ? record : null
+    if (!Number.isInteger(record.port) || record.port <= 0) return null
+    const pidOk = record.pid === null || (Number.isInteger(record.pid) && record.pid > 0)
+    return pidOk ? record : null
   } catch { return null }
 }
 
-export const processAlive = (pid: number): boolean => {
+export const processAlive = (pid: number | null): boolean => {
+  if (pid === null) return false
   try { process.kill(pid, 0); return true } catch { return false }
 }
 
+/** "Is something listening" - the right question for "is the server I recorded actually up",
+ *  where a live connection is exactly what we want to know. Not the right question for "can I
+ *  start here": see `portBindable`. */
 export function portInUse(port: number, timeoutMs = 1500): Promise<boolean> {
   return new Promise(resolve => {
     const socket = createConnection({ host: '127.0.0.1', port })
@@ -69,6 +77,26 @@ export function portInUse(port: number, timeoutMs = 1500): Promise<boolean> {
     socket.once('connect', () => done(true))
     socket.once('timeout', () => done(false))
     socket.once('error', () => done(false))
+  })
+}
+
+/** "Can I start here." A TCP connect (`portInUse`) returns false for a port that is bound but
+ *  not yet accepting connections, and on Windows for a port a just-exited server still holds in
+ *  TIME_WAIT - yet `bind()` fails for both, so only an actual bind attempt answers this question.
+ *  The probe socket is always closed before resolving. */
+export function portBindable(port: number, host = '127.0.0.1'): Promise<boolean> {
+  return new Promise(resolve => {
+    const probe = createServer()
+    let listening = false
+    const finish = (value: boolean): void => {
+      if (listening) probe.close(() => resolve(value))
+      else resolve(value)
+    }
+    probe.once('error', (error: NodeJS.ErrnoException) => {
+      finish(!(error.code === 'EADDRINUSE' || error.code === 'EACCES'))
+    })
+    probe.once('listening', () => { listening = true; finish(true) })
+    probe.listen(port, host)
   })
 }
 
@@ -155,36 +183,144 @@ export async function resolveLlamaServer(configured?: string): Promise<{ path: s
 
 export interface StartOutcome { started: boolean; pid: number; port: number; message: string }
 
-/** Start one model server, refusing rather than duplicating: an existing healthy process for
- *  this model is reported as already running, and a port held by anything else is an error. */
-export async function startServer(executable: string, model: LocalModelConfig, apiKey: string): Promise<StartOutcome> {
+async function servedModelIds(port: number, apiKey: string): Promise<string[]> {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Authorization: `Bearer ${apiKey}` } })
+    if (!response.ok) return []
+    const body = await response.json() as { data?: Array<{ id?: unknown }> }
+    return Array.isArray(body.data) ? body.data.map(entry => String(entry?.id ?? '')) : []
+  } catch { return [] }
+}
+
+/** A port the configured server can't bind to may already hold our own orphaned llama.cpp from
+ *  an earlier Conductor run - our API key is a 32-byte secret nothing else knows, so an
+ *  authenticated health check that also lists our model id is conclusive. Adopting it beats
+ *  failing outright. Returns null when whatever is on the port isn't ours. */
+export async function adoptRunningServer(model: LocalModelConfig, apiKey: string, port: number): Promise<StartOutcome | null> {
+  if (!(await health(port, apiKey)).ok) return null
+  if (!(await servedModelIds(port, apiKey)).includes(model.id)) return null
   const existing = readRunRecord(model)
-  if (existing && processAlive(existing.pid) && await portInUse(model.port)) {
-    return { started: false, pid: existing.pid, port: model.port, message: `already running (pid ${existing.pid})` }
+  const record: RunRecord = existing && existing.port === port && processAlive(existing.pid)
+    ? existing
+    : { pid: null, port, model: model.id, file: model.file, startedAt: new Date().toISOString() }
+  writeFileSync(runFile(model), JSON.stringify(record, null, 2), 'utf8')
+  return { started: false, pid: record.pid ?? 0, port, message: 'adopted the server already running on this port' }
+}
+
+/** The configured port is held by something that isn't ours. Rather than fail, look nearby for a
+ *  free one; the caller starts there and records the port actually used so `endpointFor` (and
+ *  `health`/`serverStatus`/`stopServer` here) can still find the server. */
+/** A port the OS itself picks and hands back, which is the only way to be sure of escaping a
+ *  reserved range: Windows will never assign one it has excluded. There is a small window between
+ *  closing this probe and llama.cpp binding, which is why it is the fallback rather than the first
+ *  choice - a stable port keeps the endpoint the same across restarts. */
+function ephemeralPort(host = '127.0.0.1'): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer()
+    probe.once('error', reject)
+    probe.once('listening', () => {
+      const address = probe.address()
+      const port = address && typeof address !== 'string' ? address.port : 0
+      probe.close(() => (port ? resolve(port) : reject(new Error('The OS did not assign a port'))))
+    })
+    probe.listen(0, host)
+  })
+}
+
+/**
+ * Somewhere to start when the configured port cannot be bound. The neighbouring ports are tried
+ * first so the endpoint stays predictable, but a short scan is not enough on its own: Hyper-V, WSL
+ * and Docker reserve TCP ranges a hundred ports wide and renumber them on reboot, which is exactly
+ * how a model that worked yesterday starts reporting `couldn't bind HTTP server socket` today. A
+ * range that swallows the whole scan is normal, so the OS gets the last word.
+ */
+export async function findFreePort(model: LocalModelConfig, span = 40): Promise<number> {
+  for (let candidate = model.port + 1; candidate <= model.port + span; candidate++) {
+    if (await portBindable(candidate)) return candidate
   }
-  if (await portInUse(model.port)) throw new Error(`Port occupied: ${model.port} is already in use by another process`)
+  try { return await ephemeralPort() }
+  catch (error) {
+    throw new Error(`No free port for ${model.id}: 127.0.0.1:${model.port}-${model.port + span} are all unavailable and the OS would not assign one (${error instanceof Error ? error.message : String(error)}). On Windows, check reserved ranges with: netsh interface ipv4 show excludedportrange protocol=tcp`)
+  }
+}
+
+/** Lines a Windows-style bind failure or crash tends to leave in llama.cpp's own log, read from
+ *  at most the last 64 KiB - these files reach hundreds of MB over a server's lifetime. */
+function tailErrorLines(path: string, maxBytes = 64 * 1024, maxLines = 3): string[] {
+  try {
+    if (!existsSync(path)) return []
+    const size = statSync(path).size
+    const start = Math.max(0, size - maxBytes)
+    const length = size - start
+    if (length <= 0) return []
+    const fd = openSync(path, 'r')
+    try {
+      const buffer = Buffer.alloc(length)
+      readSync(fd, buffer, 0, length, start)
+      return buffer.toString('utf8').split(/\r?\n/)
+        .filter(line => /^\s*\S+\s+E\s/.test(line) || /error/i.test(line) || /exiting/i.test(line))
+        .map(line => line.trim())
+        .slice(-maxLines)
+    } finally { closeSync(fd) }
+  } catch { return [] }
+}
+
+/** What the generic "exited during startup" message could not say: which port, and why, lifted
+ *  from the tail of the server's own log rather than left for the owner to go find. */
+export function describeStartupFailure(model: LocalModelConfig, port: number): string {
+  const log = logFile(model)
+  const lines = tailErrorLines(log)
+  const headline = lines.some(line => /bind/i.test(line)) ? `llama.cpp could not bind 127.0.0.1:${port}` : `llama.cpp exited during startup on 127.0.0.1:${port}`
+  const detail = lines.length ? ` (${lines.join('; ')})` : ''
+  return `${headline}${detail}; see ${log}`
+}
+
+/** Start one model server, refusing rather than duplicating: an existing healthy process for
+ *  this model is reported as already running. A configured port that cannot be bound is first
+ *  checked for one of our own orphaned servers (adopted rather than duplicated) and otherwise
+ *  worked around by moving to a nearby free port - only a port occupied by someone else across
+ *  the whole scan range is an error. */
+export async function startServer(executable: string, model: LocalModelConfig, apiKey: string, opts: { pollMs?: number; timeoutMs?: number } = {}): Promise<StartOutcome> {
+  const pollMs = opts.pollMs ?? 2000
+  const timeoutMs = opts.timeoutMs ?? 300_000
+
+  const existing = readRunRecord(model)
+  if (existing && processAlive(existing.pid) && await portInUse(existing.port)) {
+    return { started: false, pid: existing.pid ?? 0, port: existing.port, message: `already running (pid ${existing.pid})` }
+  }
+
+  let port = model.port
+  if (!(await portBindable(port))) {
+    const adopted = await adoptRunningServer(model, apiKey, port)
+    if (adopted) return adopted
+    port = await findFreePort(model)
+  }
+
   const path = modelFilePath(model)
   if (!existsSync(path)) throw new Error(`Model file missing: ${path}`)
   const log = openSync(logFile(model), 'a')
   // TEMP, caches and any model-cache variable point at the local root, so the server can never
   // stage large files on the system drive.
-  const child = spawn(executable, llamaServerArgs(model, apiKey, path), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
+  const child = spawn(executable, llamaServerArgs({ ...model, port }, apiKey, path), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
   child.unref()
   if (!child.pid) throw new Error('llama.cpp server failed to start')
-  writeFileSync(runFile(model), JSON.stringify({ pid: child.pid, port: model.port, model: model.id, file: model.file, startedAt: new Date().toISOString() } satisfies RunRecord, null, 2), 'utf8')
-  const deadline = Date.now() + 300_000
+  writeFileSync(runFile(model), JSON.stringify({ pid: child.pid, port, model: model.id, file: model.file, startedAt: new Date().toISOString() } satisfies RunRecord, null, 2), 'utf8')
+  const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (!processAlive(child.pid)) throw new Error(`Server health check failed: llama.cpp exited during startup; see ${logFile(model)}`)
-    if ((await health(model.port, apiKey)).ok) return { started: true, pid: child.pid, port: model.port, message: 'healthy' }
-    await new Promise(resolve => setTimeout(resolve, 2000))
+    if (!processAlive(child.pid)) throw new Error(describeStartupFailure(model, port))
+    if ((await health(port, apiKey)).ok) return { started: true, pid: child.pid, port, message: 'healthy' }
+    await new Promise(resolve => setTimeout(resolve, pollMs))
   }
-  throw new Error(`Server health check failed: ${model.id} did not answer on 127.0.0.1:${model.port} within 5 minutes`)
+  throw new Error(`Server health check failed: ${model.id} did not answer on 127.0.0.1:${port} within 5 minutes`)
 }
 
-/** Stop only the processes this stack started, by recorded pid. */
+/** Stop only the processes this stack started, by recorded pid. A record with `pid: null` names
+ *  a server this Conductor instance adopted rather than started, so there is no pid to kill - say
+ *  so plainly rather than deleting the record and pretending the server is gone. */
 export async function stopServer(model: LocalModelConfig): Promise<string> {
   const record = readRunRecord(model)
   if (!record) return 'not running'
+  if (record.pid === null) return 'cannot stop: this Conductor instance did not start the server on this port (no recorded pid)'
   if (processAlive(record.pid)) {
     if (process.platform === 'win32') {
       await new Promise<void>(resolve => {
@@ -202,7 +338,12 @@ export interface ServerStatus { model: string; port: number; pid: number | null;
 
 export async function serverStatus(model: LocalModelConfig, apiKey: string): Promise<ServerStatus> {
   const record = readRunRecord(model)
-  const running = Boolean(record && processAlive(record.pid))
-  const probe = running ? await health(model.port, apiKey) : { ok: false, status: 0, detail: 'not running' }
-  return { model: model.id, port: model.port, pid: record?.pid ?? null, running, healthy: probe.ok, keyEnforced: probe.ok ? await rejectsAnonymous(model.port) : false, detail: probe.detail }
+  const port = record?.port ?? model.port
+  if (!record) return { model: model.id, port, pid: null, running: false, healthy: false, keyEnforced: false, detail: 'not running' }
+  const pidAlive = processAlive(record.pid)
+  // A record with pid: null names a server we adopted rather than started: there is no pid to
+  // check, so a healthy port is the only evidence of "running" we can have.
+  const probe = (pidAlive || record.pid === null) ? await health(port, apiKey) : { ok: false, status: 0, detail: 'not running' }
+  const running = record.pid === null ? probe.ok : pidAlive
+  return { model: model.id, port, pid: record.pid, running, healthy: probe.ok, keyEnforced: probe.ok ? await rejectsAnonymous(port) : false, detail: probe.detail }
 }

@@ -1,0 +1,92 @@
+/* A status-bar chip, not a dashboard: it has to read at a glance next to the version button, and
+   it is only on screen while the machine is actually doing something. */
+
+.system-performance-anchor { display: inline-flex; }
+
+.system-performance-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.system-performance-chip i {
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: .45;
+}
+.system-performance-chip:hover, .system-performance-chip.active { color: var(--text); background: var(--surface-hover); }
+.system-performance-chip:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+/* Busy is informative, hot is a warning: the owner is about to start work on a machine that has
+   no room left for it. */
+.system-performance-chip.busy { color: var(--accent-muted); }
+.system-performance-chip.hot { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); }
+
+.system-performance-popover {
+  position: fixed;
+  z-index: 60;
+  width: 330px;
+  max-height: 70vh;
+  overflow: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  background: var(--surface-1);
+  box-shadow: 0 14px 34px #0006;
+  color: var(--text-2);
+  font-size: 10px;
+}
+.system-performance-popover header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.system-performance-popover header > span { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.system-performance-popover header strong { font-size: 11px; }
+.system-performance-popover header small { display: flex; align-items: center; gap: 4px; font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+.system-performance-popover header small i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.system-performance-popover header small.calm { color: var(--text-3); }
+.system-performance-popover header small.busy { color: var(--accent-muted); }
+.system-performance-popover header small.hot { color: var(--danger); }
+
+.system-performance-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.system-performance-summary article {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-0);
+}
+.system-performance-summary article span { display: flex; flex-direction: column; min-width: 0; }
+.system-performance-summary strong { color: var(--text); font-size: 11px; font-variant-numeric: tabular-nums; }
+.system-performance-summary small { color: var(--text-3); font-size: 8.5px; }
+
+.system-performance-list { display: flex; flex-direction: column; gap: 4px; }
+.system-performance-list h4 { margin: 2px 0 0; color: var(--text-3); font-size: 8.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.system-performance-list article {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: 7px;
+  background: var(--surface-0);
+}
+.system-performance-list article.local-model { box-shadow: inset 2px 0 var(--accent-muted); }
+.system-performance-list article.conductor { box-shadow: inset 2px 0 var(--accent); }
+.system-performance-list article > span { display: flex; flex-direction: column; min-width: 0; }
+.system-performance-list strong { overflow: hidden; color: var(--text); font-size: 10px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.system-performance-list small { color: var(--text-3); font-size: 8.5px; }
+.system-performance-numbers { color: var(--text-2); font-size: 9px; font-variant-numeric: tabular-nums; text-align: right; white-space: nowrap; }
+
+.system-performance-popover footer { color: var(--text-3); font-size: 9px; line-height: 1.4; }

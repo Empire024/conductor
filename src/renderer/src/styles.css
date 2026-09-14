@@ -271,7 +271,8 @@ kbd {
 .session-tree { margin: 1px 0 6px 22px; padding-left: 8px; border-left: 1px solid var(--border); }
 .session-tree button { position: relative; color: var(--text-2); height: 27px; }
 .session-tree button.active { color: var(--text); background: var(--surface-2); }
-.session-tree button.active::before { content: ''; position: absolute; left: -10px; top: 8px; bottom: 8px; width: 2px; background: var(--accent); border-radius: 2px; }
+.session-tree button.active:not(.sidebar-session-open)::before { content: ''; position: absolute; left: -10px; top: 8px; bottom: 8px; width: 2px; background: var(--accent); border-radius: 2px; }
+.session-tree .sidebar-session-row:has(> .sidebar-session-open.active)::before { content: ''; position: absolute; left: -9px; top: 4px; bottom: 4px; width: 2px; background: var(--accent); border-radius: 2px; }
 .session-tree button.needs-attention { color: var(--text); background: color-mix(in srgb, #ecc48d 5%, transparent); box-shadow: inset 0 -1px color-mix(in srgb, #ecc48d 65%, transparent); }
 .session-number { font-family: "Cascadia Mono", Consolas, monospace; color: var(--text-2); font-size: 9px; }
 .session-tree button .ellipsis { flex: 1; }
@@ -978,7 +979,7 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 .tab-activity .tab-state-icon { width: 13px; height: 13px; overflow: visible; stroke-width: 1.9; }
 .tab-activity.failed { color: var(--danger); }
 .tab-activity.disconnected { color: #ecc48d; }
-.tab-activity.stopped { color: var(--text-3); }
+.tab-activity.stopped { color: var(--danger); }
 .tab-activity.failed .tab-state-icon { animation: activity-pop .38s cubic-bezier(.16,1.4,.25,1); }
 .pane-tab.needs-attention, .pane-tab:has(.tab-activity.failed) { color: var(--text); }
 .pane-tab:has(.tab-activity.failed) { box-shadow: inset 0 -1px color-mix(in srgb, var(--danger) 65%, transparent); }

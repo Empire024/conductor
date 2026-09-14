@@ -11,6 +11,56 @@ import { isSecretPath } from './workspace.ts'
  *  not that the command runs on Windows instead. */
 export class SandboxUnavailableError extends Error {}
 
+/** A command the sandbox refuses on policy rather than on capability, with an explanation the
+ *  model can act on. */
+export class SandboxPolicyError extends Error {}
+
+/** Refused outright: these rebuild a dependency tree, and rebuilding begins by dismantling the
+ *  one that is already there. The container has no network, so none of them can finish — `npx`
+ *  included, which reifies a tree before it runs anything. */
+const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun', 'corepack'])
+const ALWAYS_REFUSED = new Set(['npx', 'pnpx', 'bunx'])
+const INSTALLING_SUBCOMMANDS = new Set([
+  'install', 'i', 'ci', 'add', 'remove', 'rm', 'uninstall', 'un', 'prune', 'update', 'up',
+  'upgrade', 'dedupe', 'ddp', 'rebuild', 'link', 'unlink', 'exec', 'dlx', 'create', 'init', 'import'
+])
+
+const GUIDANCE = 'The sandbox has no network, so an install can only destroy the dependency tree it finds. Run the installed binary directly instead, for example `node ./node_modules/typescript/bin/tsc --noEmit` or `./node_modules/.bin/vitest run <file>`.'
+
+/** Split a shell command into the segments that each start a new program, so a package manager
+ *  cannot be hidden behind `&&`, a pipe, a subshell or a command substitution. */
+export function commandSegments(command: string): string[] {
+  return command
+    .split(/\$\(|`|\)|\||&&|\|\||;|\n/)
+    .map(segment => segment.trim())
+    .filter(Boolean)
+}
+
+/** The program a segment runs, ignoring leading environment assignments and `sudo`-style
+ *  prefixes, reduced to its base name so `/usr/bin/npm` is the same decision as `npm`. */
+export function segmentProgram(segment: string): { program: string; args: string[] } {
+  const words = segment.split(/\s+/).filter(Boolean)
+  while (words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!) || ['sudo', 'env', 'command', 'nohup', 'time', 'exec'].includes(words[0]!))) words.shift()
+  const raw = words.shift() ?? ''
+  const program = raw.split(/[\\/]/).pop()!.replace(/\.(exe|cmd|bat|ps1)$/i, '')
+  return { program, args: words }
+}
+
+/** Refuse a sandboxed command that would rewrite the owner's installed dependencies. The
+ *  read-only mounts in `containerRunArgs` make this structurally impossible as well; this layer
+ *  exists so the model is told what to run instead of watching a command fail obscurely. */
+export function assertNoPackageInstall(command: string): void {
+  for (const segment of commandSegments(command)) {
+    const { program, args } = segmentProgram(segment)
+    if (ALWAYS_REFUSED.has(program)) throw new SandboxPolicyError(`Refusing \`${program}\`: it installs a package tree before running anything. ${GUIDANCE}`)
+    if (!PACKAGE_MANAGERS.has(program)) continue
+    const subcommand = args.find(argument => !argument.startsWith('-'))?.toLowerCase()
+    if (subcommand && INSTALLING_SUBCOMMANDS.has(subcommand)) {
+      throw new SandboxPolicyError(`Refusing \`${program} ${subcommand}\`: it rewrites the workspace's installed dependencies. ${GUIDANCE}`)
+    }
+  }
+}
+
 export interface SandboxResult {
   exitCode: number
   stdout: string
@@ -98,6 +148,13 @@ export function detectSecretPaths(workspace: string, maxDepth = 64, limit = 4096
 
 const dockerPath = (value: string): string => resolve(value).replace(/\\/g, '/')
 
+/** Paths a sandboxed command may read but must never rewrite: the owner's installed dependency
+ *  tree and the lockfile that describes it. */
+export const DEPENDENCY_PATHS = ['node_modules', 'package-lock.json'] as const
+/** Writable scratch inside the read-only tree, so a build that caches next to its dependencies
+ *  still runs. */
+export const DEPENDENCY_CACHES = ['node_modules/.cache', 'node_modules/.vite'] as const
+
 /** The argv for the runtime container. Locked down deliberately and verifiably: no network, a
  *  non-root user, all capabilities dropped, no new privileges, default seccomp, a read-only
  *  root filesystem with tmpfs for the few writable areas, and hard memory/CPU/PID limits. The
@@ -144,7 +201,20 @@ export function containerRunArgs(options: {
     // sandboxed turn cannot install a git hook or change remotes in the owner's repository.
     // The owner can grant write access per conversation; the container still has no network, so
     // the grant reaches local history only and never pushes anywhere.
-    ...(!options.gitWritable && existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : [])
+    ...(!options.gitWritable && existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : []),
+    // An installed dependency tree is an input to a sandboxed command and never its output. The
+    // container has no network, so it can never repair an install — but npm and npx tear a tree
+    // down *before* they discover that, and a plain `npx tsc` in this repo removed the owner's
+    // node_modules and package-lock.json mid-run. Read-only is the only state in which those two
+    // paths are safe to expose at all.
+    ...DEPENDENCY_PATHS.flatMap(relative => existsSync(join(options.workspace, relative))
+      ? ['--mount', `type=bind,source=${workspace}/${relative},target=/workspace/${relative},readonly`]
+      : []),
+    // Build tools cache inside the tree they read. These stay writable so a sandboxed build still
+    // works, without the rest of node_modules being writable with it.
+    ...DEPENDENCY_CACHES.flatMap(relative => existsSync(join(options.workspace, 'node_modules'))
+      ? ['--tmpfs', `/workspace/${relative}:rw,nosuid,nodev,size=256m`]
+      : [])
   ]
   for (const mask of options.masks) {
     if (/[,=\r\n]/.test(mask.relative)) throw new SandboxUnavailableError('A secret path cannot be represented safely as a Docker mask')
@@ -153,7 +223,7 @@ export function containerRunArgs(options: {
   }
   // A deliberately minimal environment. Nothing from the host is inherited, so no API key,
   // cloud credential or token can be read out of the sandbox even if the model asks for it.
-  for (const variable of ['HOME=/home/agent', 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG=C.UTF-8', 'TERM=dumb', 'TMPDIR=/tmp', 'XDG_CACHE_HOME=/tmp/cache', 'NPM_CONFIG_CACHE=/tmp/npm', 'PIP_CACHE_DIR=/tmp/pip', 'CONDUCTOR_SANDBOX=1']) args.push('--env', variable)
+  for (const variable of ['HOME=/home/agent', 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG=C.UTF-8', 'TERM=dumb', 'TMPDIR=/tmp', 'XDG_CACHE_HOME=/tmp/cache', 'NPM_CONFIG_CACHE=/tmp/npm', 'NPM_CONFIG_OFFLINE=1', 'NPM_CONFIG_AUDIT=false', 'NPM_CONFIG_FUND=false', 'PIP_CACHE_DIR=/tmp/pip', 'CONDUCTOR_SANDBOX=1']) args.push('--env', variable)
   // A commit needs an identity, and the read-only root filesystem has nowhere to configure one.
   // Naming the local model in the commit itself keeps its history distinguishable from the owner's.
   if (options.gitWritable) for (const variable of ['GIT_AUTHOR_NAME=Conductor local model', 'GIT_AUTHOR_EMAIL=local-model@conductor.invalid', 'GIT_COMMITTER_NAME=Conductor local model', 'GIT_COMMITTER_EMAIL=local-model@conductor.invalid']) args.push('--env', variable)

@@ -2,7 +2,7 @@ import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import type { ToolSpec } from './client.ts'
 import type { DockerSandbox } from './sandbox.ts'
-import { SandboxUnavailableError } from './sandbox.ts'
+import { SandboxPolicyError, SandboxUnavailableError, assertNoPackageInstall } from './sandbox.ts'
 import { readPublicWeb, searchPublicWeb } from './web.ts'
 import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError, WorkspaceBoundaryError } from './workspace.ts'
 
@@ -64,7 +64,7 @@ export function toolSpecs(readOnly: boolean, control = false, grants: LocalGrant
     ...specs,
     { type: 'function', function: { name: 'write_file', description: 'Create or overwrite a workspace file.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
     { type: 'function', function: { name: 'edit_file', description: 'Replace an exact string in a workspace file.', parameters: { type: 'object', properties: { path: { type: 'string' }, old_text: { type: 'string' }, new_text: { type: 'string' }, replace_all: { type: 'boolean' } }, required: ['path', 'old_text', 'new_text'] } } },
-    { type: 'function', function: { name: 'run_command', description: 'Run a shell command inside the isolated Linux sandbox container. The workspace is mounted at /workspace. There is no network access.' + (grants.git ? ' Git is writable in this conversation: commit and branch locally as you work. Nothing can be pushed, because the container has no network.' : ' The .git directory is read-only: git log and git diff work, git commit does not.'), parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_sec: { type: 'integer' } }, required: ['command'] } } }
+    { type: 'function', function: { name: 'run_command', description: 'Run a shell command inside the isolated Linux sandbox container. The workspace is mounted at /workspace. There is no network access. npm, npx, yarn, pnpm and bun installs are refused: with no network they can only destroy the dependency tree that is already there. Run installed binaries directly instead, for example `node ./node_modules/typescript/bin/tsc --noEmit` or `./node_modules/.bin/vitest run <file>`.' + (grants.git ? ' Git is writable in this conversation: commit and branch locally as you work. Nothing can be pushed, because the container has no network.' : ' The .git directory is read-only: git log and git diff work, git commit does not.'), parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_sec: { type: 'integer' } }, required: ['command'] } } }
   ]
 }
 
@@ -207,6 +207,7 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
       }
       case 'run_command': {
         const command = text(args.command, 'command')
+        assertNoPackageInstall(command)
         if (!context.sandbox) throw new SandboxUnavailableError('Sandbox unavailable: command execution is disabled without the Docker sandbox')
         const result = await context.sandbox.exec(command, Math.max(1, Math.min(integer(args.timeout_sec, context.timeoutSec), context.timeoutSec)), context.signal)
         const parts = [
@@ -224,6 +225,7 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
   } catch (error) {
     if (error instanceof WorkspaceBoundaryError) return { output: `denied: path outside workspace (${error.message})`, failed: true, paths: [] }
     if (error instanceof SecretPathError) return { output: `denied: ${error.message}`, failed: true, paths: [] }
+    if (error instanceof SandboxPolicyError) return { output: `denied: ${error.message}`, failed: true, paths: [] }
     if (error instanceof ToolPolicyError) return { output: `denied: ${error.message}`, failed: true, paths: [] }
     if (error instanceof SandboxUnavailableError) return { output: `denied: ${error.message}`, failed: true, paths: [] }
     return { output: `error: ${error instanceof Error ? error.message : 'tool failed'}`, failed: true, paths: [] }

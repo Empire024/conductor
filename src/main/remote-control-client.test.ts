@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { RemoteProjectSummary } from '../shared/remote-control'
 import type { ProjectIdentity, RemoteProjectGrant } from '../shared/project-identity'
 import { RemoteControlClient } from './remote-control-client'
+import { generateDeviceKey } from './device-key'
 import { describeMachines, machineRunsProject } from './machines'
 import type { SecretKeyValueStore } from './secret-store'
 
@@ -142,5 +143,78 @@ describe('recording which project here is which project there', () => {
   it('ignores a stored mapping that is missing half of what makes it one', () => {
     const fixture = client([{ ...legacyConnection, projectGrants: [{ localProjectId: 'project-a', remoteProjectId: 'remote-a', local: LOCAL }, grant] }])
     expect(fixture.client.get('render-desktop')?.projectGrants).toEqual([grant])
+  })
+})
+
+/**
+ * Reaching a machine that is no longer on this network. The direct address is tried first and fails
+ * the way a stale LAN address really does; what matters is that the call still completes over the
+ * encrypted relay, and that a refusal the machine itself sent is not quietly retried there.
+ */
+describe('reaching a machine off this network', () => {
+  const device = generateDeviceKey('conductor test')
+  const paired = {
+    machineId: 'render-desktop', machineName: 'Render Desktop', accountLogin: 'Empire024',
+    // Nothing listens here, so the direct attempt fails immediately rather than on a timer.
+    host: '127.0.0.1', port: 1, fingerprint: 'AA:BB', peerId: 'peer-1',
+    relayKey: 'relay-public-key', deviceKey: 'ssh-ed25519 THEIRS',
+    projectGrants: [grant], remoteProjects: [advertised], remoteProjectsAt: null, unconfirmedRemoteProjectIds: [],
+    connectedAt: '2026-03-01T10:00:00.000Z', lastContactAt: null, status: 'connected', message: null
+  }
+
+  function relayed(stored: unknown[], answer: () => Promise<{ status: number; body: string }>) {
+    const store = new MapStore()
+    store.setSetting(CONNECTIONS, JSON.stringify(stored))
+    const calls: Array<{ machineId: string; path: string; body: string; peerDeviceKey: string; peerRelayKey?: string }> = []
+    const client = new RemoteControlClient({
+      store, machineId: () => 'this-machine', machineName: () => 'This Laptop',
+      deviceKey: () => device,
+      relay: {
+        enabled: () => true,
+        call: async (machineId, peerDeviceKey, path, body, _headers, peerRelayKey) => {
+          calls.push({ machineId, path, body: body.toString('utf8'), peerDeviceKey, peerRelayKey })
+          return await answer()
+        }
+      },
+      now: () => Date.parse('2026-03-02T09:00:00.000Z')
+    })
+    return { client, calls }
+  }
+
+  const ok = (result: unknown) => async () => ({ status: 200, body: Buffer.from(JSON.stringify({ result }), 'utf8').toString('base64') })
+
+  it('falls back to the encrypted relay when the stored address leads nowhere', async () => {
+    const fixture = relayed([paired], ok({ id: 'tab-1' }))
+    await expect(fixture.client.call('render-desktop', 'tabs.open', { projectId: 'remote-a' })).resolves.toEqual({ id: 'tab-1' })
+    expect(fixture.calls).toHaveLength(1)
+    expect(fixture.calls[0]).toMatchObject({
+      machineId: 'render-desktop', path: '/remote/call',
+      peerDeviceKey: 'ssh-ed25519 THEIRS', peerRelayKey: 'relay-public-key'
+    })
+    // The relay carries the same signed body the direct route would have, method and all.
+    expect(JSON.parse(fixture.calls[0]!.body)).toEqual({ method: 'tabs.open', args: { projectId: 'remote-a' } })
+    expect(fixture.client.get('render-desktop')).toMatchObject({ status: 'connected', transport: 'relay' })
+  })
+
+  it('reports a refusal the other machine sent, rather than treating it as an unreachable machine', async () => {
+    const fixture = relayed([paired], async () => ({
+      status: 403, body: Buffer.from(JSON.stringify({ error: 'That project is not shared with you.' }), 'utf8').toString('base64')
+    }))
+    await expect(fixture.client.call('render-desktop', 'files.read', { path: 'x' })).rejects.toThrow(/not shared with you/)
+    expect(fixture.client.get('render-desktop')).toMatchObject({ status: 'connected' })
+  })
+
+  it('says so plainly when a machine has neither a route here nor a relay key', async () => {
+    const fixture = relayed([{ ...paired, host: '', port: 0, relayKey: undefined, deviceKey: undefined }], ok(null))
+    await expect(fixture.client.call('render-desktop', 'tabs.list', {})).rejects.toThrow(/no address on this network/)
+    expect(fixture.calls).toHaveLength(0)
+  })
+
+  it('keeps a pairing made before the relay existed working over its direct address alone', () => {
+    const fixture = relayed([{ ...paired, relayKey: undefined, deviceKey: undefined }], ok(null))
+    const connection = fixture.client.list()[0]!
+    expect(connection.relayKey).toBeUndefined()
+    expect(connection.deviceKey).toBeUndefined()
+    expect(connection.status).toBe('connected')
   })
 })

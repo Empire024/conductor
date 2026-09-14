@@ -36,6 +36,7 @@
     "test:agent-live": "node scripts/live-structured-codex.mjs",
     "smoke:ui": "node scripts/smoke-ui.mjs",
     "test:backlog": "npm run build && node scripts/smoke-backlog.mjs",
+    "test:remote-relay": "npm run build && powershell -NoProfile -File scripts/run-smoke-background.ps1 -SmokeScript scripts/smoke-remote-relay.mjs",
     "test:autoscroll": "node scripts/smoke-autoscroll.mjs",
     "test:tab-groups": "node scripts/smoke-tab-groups.mjs",
     "test:background-windows": "npm run build && node scripts/smoke-background-windows.mjs",

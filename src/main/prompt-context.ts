@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, open, realpath, writeFile } from 'node:fs/promises'
-import { basename, extname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path'
 import type { ContextAttachment } from '../shared/structured-agent'
 import { workspacePath } from './agent-artifacts'
 import { looksBinary } from './text-files'
@@ -89,14 +89,24 @@ const within = (root: string, target: string): boolean => {
   return rel === '' || !isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`)
 }
 
+// A short (8.3) alias and its long-name counterpart both realpath() to the same canonical string,
+// so comparing a lexical path against its realpath() would misreport every alias-shortened ancestor
+// (e.g. a Windows temp directory) as a symlink. Walking each component's own identity by lstat sidesteps
+// alias renaming entirely and still catches a real symlink or junction anywhere along the path.
+async function assertNoLexicalSymlink(target: string): Promise<void> {
+  for (let current = target, parent = dirname(current); parent !== current; current = parent, parent = dirname(current)) {
+    if ((await lstat(current)).isSymbolicLink()) throw new Error('Symbolic-link file drops are not attached')
+  }
+}
+
 /** Resolve an OS File drop in main rather than trusting a renderer-supplied name or byte stream.
  * Project files remain direct context; external files are snapshotted into the draft/import area.
  * Symlinks and files that change identity while read are refused. */
 export async function importPromptAttachmentPath(cwd: string, sourcePath: string, nameValue?: unknown, mimeType?: unknown): Promise<ContextAttachment> {
   if (typeof sourcePath !== 'string' || !isAbsolute(sourcePath) || sourcePath.length > 32_768 || sourcePath.includes('\0')) throw new Error('The dropped file path is invalid')
   const lexical = resolve(sourcePath)
+  await assertNoLexicalSymlink(lexical)
   const [root, source] = await Promise.all([workspacePath(cwd, '.'), realpath(lexical)])
-  if ((process.platform === 'win32' ? lexical.toLocaleLowerCase() !== source.toLocaleLowerCase() : lexical !== source)) throw new Error('Symbolic-link file drops are not attached')
   if (within(root, source)) return projectPromptAttachment(cwd, relative(root, source))
   const descriptor = await open(source, 'r')
   try {

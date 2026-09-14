@@ -11,14 +11,39 @@ import type { SecretKeyValueStore } from './secret-store'
 
 const CONNECTIONS_SETTING = 'remote-control.connections'
 const REQUEST_TIMEOUT_MS = 60000
+/**
+ * How long to keep trying the direct address when there is a relay to fall back to. A machine that
+ * moved networks leaves a LAN address that either refuses instantly or swallows the SYN for the
+ * best part of a minute, and waiting that out before every single call would make the off-network
+ * case feel broken. With no relay configured the full request timeout still applies.
+ */
+const DIRECT_PROBE_TIMEOUT_MS = 8000
+
+/** What the relay transport has to offer for this machine to reach one off its own network. */
+export interface RemoteRelayTransport {
+  enabled(): boolean
+  call(machineId: string, peerDeviceKey: string, path: string, body: Buffer, headers: Record<string, string>, peerRelayKey?: string): Promise<{ status: number; body: string }>
+}
 
 export interface RemoteControlClientDependencies {
   store: SecretKeyValueStore
   machineId(): string
   machineName(): string
   deviceKey(): DeviceKeyPair | null
+  /** Absent in tests and in builds where the owner turned the off-network route off entirely. */
+  relay?: RemoteRelayTransport
   now?(): number
   changed?(): void
+}
+
+/** Where and how to reach one machine: the direct address, and the keys the relay seals to. */
+interface RemoteTarget {
+  machineId: string
+  host: string
+  port: number
+  fingerprint: string
+  relayKey?: string
+  deviceKey?: string
 }
 
 interface WireResponse { result?: unknown; error?: string; code?: string }
@@ -42,11 +67,11 @@ function readPairingResult(value: unknown): { status: string; peerId?: string; p
  * before the request is written, so a substituted certificate never sees a signed request it
  * could replay at the real machine.
  */
-async function pinnedSocket(host: string, port: number, fingerprint: string): Promise<TLSSocket> {
+async function pinnedSocket(host: string, port: number, fingerprint: string, connectTimeoutMs = REQUEST_TIMEOUT_MS): Promise<TLSSocket> {
   return new Promise((resolve, reject) => {
     const socket = tlsConnect({ host, port, rejectUnauthorized: false, servername: 'localhost', minVersion: 'TLSv1.2' })
     const fail = (error: Error): void => { socket.destroy(); reject(error) }
-    socket.setTimeout(REQUEST_TIMEOUT_MS, () => fail(new RemoteAccessError('That machine did not answer in time.', 504)))
+    socket.setTimeout(connectTimeoutMs, () => fail(new RemoteAccessError('That machine did not answer in time.', 504)))
     socket.once('error', error => fail(error instanceof Error ? error : new Error(String(error))))
     socket.once('secureConnect', () => {
       const presented = socket.getPeerCertificate()?.fingerprint256 ?? ''
@@ -60,8 +85,22 @@ async function pinnedSocket(host: string, port: number, fingerprint: string): Pr
   })
 }
 
-async function post(host: string, port: number, fingerprint: string, path: string, body: Buffer, headers: Record<string, string>): Promise<unknown> {
-  const socket = await pinnedSocket(host, port, fingerprint)
+/**
+ * Turns a remote answer into a result or the error it describes, for whichever transport carried
+ * it. Both routes speak the same JSON envelope, so this is the only place that reads it.
+ */
+function decode(status: number, text: string): unknown {
+  let payload: WireResponse = {}
+  try { payload = JSON.parse(text || '{}') as WireResponse } catch { /* reported below */ }
+  if (status >= 400 || payload.error) {
+    throw new RemoteAccessError(payload.error || `That machine refused the request (${status}).`, status,
+      payload.code === 'peer-revoked' ? 'peer-revoked' : undefined)
+  }
+  return payload.result
+}
+
+async function post(host: string, port: number, fingerprint: string, path: string, body: Buffer, headers: Record<string, string>, connectTimeoutMs?: number): Promise<unknown> {
+  const socket = await pinnedSocket(host, port, fingerprint, connectTimeoutMs)
   return new Promise((resolve, reject) => {
     let call: ReturnType<typeof httpsRequest>
     try {
@@ -74,12 +113,8 @@ async function post(host: string, port: number, fingerprint: string, path: strin
         let size = 0
         response.on('data', chunk => { size += chunk.length; if (size > 8 * 1024 * 1024) { call.destroy(); reject(new RemoteAccessError('That machine sent too much data.', 502)) } else chunks.push(chunk as Buffer) })
         response.on('end', () => {
-          let payload: WireResponse = {}
-          try { payload = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as WireResponse } catch { /* reported below */ }
-          if ((response.statusCode ?? 500) >= 400 || payload.error) {
-            reject(new RemoteAccessError(payload.error || `That machine refused the request (${response.statusCode}).`,
-              response.statusCode ?? 500, payload.code === 'peer-revoked' ? 'peer-revoked' : undefined))
-          } else resolve(payload.result)
+          try { resolve(decode(response.statusCode ?? 500, Buffer.concat(chunks).toString('utf8'))) }
+          catch (error) { reject(error) }
         })
       })
     } catch (error) {
@@ -137,6 +172,11 @@ export class RemoteControlClient {
         host: String(stored.host ?? ''),
         port: Number(stored.port) || 0,
         fingerprint: String(stored.fingerprint ?? ''),
+        // Pinned at pairing. A connection stored before the relay existed simply has neither, and
+        // keeps working over its direct address exactly as it did.
+        ...(typeof stored.relayKey === 'string' && stored.relayKey ? { relayKey: stored.relayKey } : {}),
+        ...(typeof stored.deviceKey === 'string' && stored.deviceKey ? { deviceKey: stored.deviceKey } : {}),
+        ...(stored.transport === 'direct' || stored.transport === 'relay' ? { transport: stored.transport } : {}),
         peerId: typeof stored.peerId === 'string' ? stored.peerId : '',
         connectedAt: String(stored.connectedAt ?? new Date(0).toISOString()),
         lastContactAt: typeof stored.lastContactAt === 'string' ? stored.lastContactAt : null,
@@ -169,6 +209,47 @@ export class RemoteControlClient {
     if (this.connections.some(connection => connection.machineId === machineId)) this.bumpAuthority(machineId)
     this.connections = this.connections.filter(connection => connection.machineId !== machineId)
     this.persist()
+  }
+
+  private target(source: Pick<RemoteTarget, 'machineId' | 'host' | 'port' | 'fingerprint'> & { relayKey?: string; deviceKey?: string }): RemoteTarget {
+    return {
+      machineId: source.machineId,
+      host: source.host,
+      port: source.port,
+      fingerprint: source.fingerprint,
+      ...(source.relayKey ? { relayKey: source.relayKey } : {}),
+      ...(source.deviceKey ? { deviceKey: source.deviceKey } : {})
+    }
+  }
+
+  /**
+   * One request over whichever route reaches that machine. Direct first: it is faster and never
+   * leaves the owner's own network. The encrypted relay is for when there is no route to try, or
+   * the stored address no longer leads to that machine. A refusal the machine itself sent is an
+   * answer, so it is never quietly retried over the other route.
+   */
+  private async send(target: RemoteTarget, path: string, body: Buffer, headers: Record<string, string>): Promise<{ result: unknown; transport: 'direct' | 'relay' }> {
+    const relay = this.deps.relay
+    const canRelay = Boolean(target.relayKey && target.deviceKey && relay?.enabled())
+    let routeError: unknown = null
+    if (target.host && target.port > 0) {
+      try { return { result: await post(target.host, target.port, target.fingerprint, path, body, headers, canRelay ? DIRECT_PROBE_TIMEOUT_MS : undefined), transport: 'direct' } }
+      catch (error) {
+        // 495 is "something answered at that address, but it is not that machine" — exactly what a
+        // laptop that moved networks finds at its old LAN address. That is a routing fact rather
+        // than a refusal, and the relay pins a key of its own, so trying it is safe and stopping
+        // here would strand the owner on a network they no longer share.
+        const answered = error instanceof RemoteAccessError && error.status >= 400 && error.status < 500 &&
+          error.status !== 408 && error.status !== 495 && error.status !== 504
+        if (answered || !canRelay) throw error
+        routeError = error
+      }
+    }
+    if (!canRelay || !relay || !target.deviceKey) {
+      throw routeError ?? new RemoteAccessError('That machine has no address on this network, and the encrypted relay is not available for it. Pair it again to set the relay up.', 503)
+    }
+    const answer = await relay.call(target.machineId, target.deviceKey, path, body, headers, target.relayKey)
+    return { result: decode(answer.status, Buffer.from(answer.body, 'base64').toString('utf8')), transport: 'relay' }
   }
 
   private key(): DeviceKeyPair {
@@ -207,7 +288,7 @@ export class RemoteControlClient {
       timestamp: payload.issuedAt,
       code: ticket.code
     }), 'utf8')
-    await post(ticket.host, ticket.port, ticket.fingerprint, '/remote/pair', body, {})
+    await this.send(this.target(ticket), '/remote/pair', body, {})
     const pending: RemoteConnection = {
       machineId: ticket.machineId,
       machineName: ticket.machineName,
@@ -215,6 +296,8 @@ export class RemoteControlClient {
       host: ticket.host,
       port: ticket.port,
       fingerprint: ticket.fingerprint,
+      ...(ticket.relayKey ? { relayKey: ticket.relayKey } : {}),
+      ...(ticket.deviceKey ? { deviceKey: ticket.deviceKey } : {}),
       peerId: '',
       projectGrants: [],
       remoteProjects: [],
@@ -304,7 +387,7 @@ export class RemoteControlClient {
     const key = this.key()
     const { payload, signature } = this.sign(ticket, 'pair', '')
     const body = Buffer.from(JSON.stringify({ publicKey: key.publicKey, signature, nonce: payload.nonce, timestamp: payload.issuedAt }), 'utf8')
-    return readPairingResult(await post(ticket.host, ticket.port, ticket.fingerprint, '/remote/pair/status', body, {}))
+    return readPairingResult((await this.send(this.target(ticket), '/remote/pair/status', body, {})).result)
   }
 
   /** One authenticated call to a paired machine. Every call is signed over its exact body. */
@@ -317,7 +400,7 @@ export class RemoteControlClient {
     const body = Buffer.from(JSON.stringify({ method, args }), 'utf8')
     const { payload, signature } = this.sign(connection, 'call', hashBody(body))
     try {
-      const result = await post(connection.host, connection.port, connection.fingerprint, '/remote/call', body, {
+      const { result, transport } = await this.send(this.target(connection), '/remote/call', body, {
         [PEER_HEADER]: connection.peerId,
         [NONCE_HEADER]: payload.nonce,
         [TIMESTAMP_HEADER]: String(payload.issuedAt),
@@ -326,7 +409,7 @@ export class RemoteControlClient {
       if (this.get(machineId) !== connection || this.authorityRevision(machineId) !== authorityRevision) {
         throw new RemoteAccessError('Remote access changed while this request was pending.', 409)
       }
-      this.mark(machineId, { status: 'connected', message: null, lastContactAt: new Date(this.now()).toISOString() }, connection, authorityRevision)
+      this.mark(machineId, { status: 'connected', message: null, transport, lastContactAt: new Date(this.now()).toISOString() }, connection, authorityRevision)
       return result
     } catch (error) {
       // Only a dead pairing marks the machine revoked. One call being refused — an unshared

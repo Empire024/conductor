@@ -17,7 +17,7 @@ import type { RemoteFileDescription, RemoteFileIdentity, RemoteFileWriteRequest 
 import { encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries } from '../shared/remote-control'
 import { checkRemoteProjectPlacement } from '../shared/project-identity'
 import type { ConductorDatabase } from './database'
-import { GitHubAuth } from './github-auth'
+import { GitHubAuth, GITHUB_SCOPES } from './github-auth'
 import { describeMachines, machineBriefing, tabMachineId } from './machines'
 import { projectSummary } from './project-identity'
 import type { ProjectBacklogs } from './project-backlog'
@@ -26,6 +26,9 @@ import { RemoteControlHost } from './remote-control-host'
 import { RemoteFileResourceServer } from './remote-file-resources'
 import { RemoteFiles } from './remote-files'
 import { RemoteControlServer } from './remote-control-server'
+import { GitHubRelayMailbox } from './github-relay'
+import { RemoteRelay } from './remote-relay'
+import { generateSealKey, type RelaySealKeyPair } from './relay-crypto'
 import { RemoteAccessError, RemotePeers } from './remote-peers'
 import { RemoteSessionMirror } from './remote-session-mirror'
 import { StoredSecretVault, type SecretCipher } from './secret-store'
@@ -48,29 +51,55 @@ export interface RemoteControlServiceDependencies {
 }
 
 const MACHINE_NAME_SETTING = 'remote-control.machineName'
+/** The X25519 key relayed messages to this machine are sealed to; never leaves the credential store. */
+const RELAY_KEY_SECRET = 'remote-control.relay.sealKey'
+
+interface FixtureGist { id: string; description: string; files: Record<string, string> }
+interface FixtureState { keys: Array<{ id: number; key: string; title: string }>; gists: FixtureGist[] }
 
 /** Offline GitHub boundary for the full Electron remote-integration smoke; never enabled alone. */
 function githubFetch(): typeof globalThis.fetch {
   if (process.env.CONDUCTOR_OFFLINE_TESTS !== '1' || process.env.CONDUCTOR_TEST_REMOTE_GITHUB !== '1') return globalThis.fetch
   const sharedState = process.env.CONDUCTOR_TEST_REMOTE_GITHUB_STATE
-  let localKeys: Array<{ id: number; key: string; title: string }> = []
+  let local: FixtureState = { keys: [], gists: [] }
   let rotation = 0
-  const readKeys = (): Array<{ id: number; key: string; title: string }> => {
-    if (!sharedState) return localKeys
+  const readState = (): FixtureState => {
+    if (!sharedState) return local
     try {
-      const value = JSON.parse(readFileSync(sharedState, 'utf8')) as { keys?: unknown }
-      return Array.isArray(value.keys) ? value.keys.flatMap(entry => {
-        if (!entry || typeof entry !== 'object') return []
-        const key = entry as Record<string, unknown>
-        return typeof key.id === 'number' && typeof key.key === 'string' && typeof key.title === 'string'
-          ? [{ id: key.id, key: key.key, title: key.title }] : []
-      }) : []
-    } catch { return [] }
+      const value = JSON.parse(readFileSync(sharedState, 'utf8')) as Partial<FixtureState>
+      return {
+        keys: Array.isArray(value.keys) ? value.keys.flatMap(entry => {
+          if (!entry || typeof entry !== 'object') return []
+          const key = entry as Record<string, unknown>
+          return typeof key.id === 'number' && typeof key.key === 'string' && typeof key.title === 'string'
+            ? [{ id: key.id, key: key.key, title: key.title }] : []
+        }) : [],
+        gists: Array.isArray(value.gists) ? value.gists.flatMap(entry => {
+          if (!entry || typeof entry !== 'object') return []
+          const gist = entry as { id?: unknown; description?: unknown; files?: unknown }
+          return typeof gist.id === 'string' && gist.files && typeof gist.files === 'object'
+            ? [{ id: gist.id, description: String(gist.description ?? ''), files: gist.files as Record<string, string> }] : []
+        }) : []
+      }
+    } catch { return { keys: [], gists: [] } }
   }
-  const writeKeys = (keys: Array<{ id: number; key: string; title: string }>): void => {
-    if (sharedState) writeFileSync(sharedState, JSON.stringify({ keys }))
-    else localKeys = keys
+  // Both smoke instances share one file, and each only ever mutates the gist it owns, so the state
+  // is re-read immediately before every write rather than held across one.
+  const writeState = (mutate: (state: FixtureState) => void): FixtureState => {
+    const state = readState()
+    mutate(state)
+    if (sharedState) writeFileSync(sharedState, JSON.stringify(state))
+    else local = state
+    return state
   }
+  const readKeys = (): FixtureState['keys'] => readState().keys
+  const writeKeys = (keys: FixtureState['keys']): void => { writeState(state => { state.keys = keys }) }
+  const describeGist = (gist: FixtureGist): unknown => ({
+    id: gist.id,
+    description: gist.description,
+    updated_at: new Date().toISOString(),
+    files: Object.fromEntries(Object.entries(gist.files).map(([name, content]) => [name, { filename: name, size: content.length, truncated: false, content }]))
+  })
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = String(input)
     const request = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {}
@@ -106,6 +135,40 @@ function githubFetch(): typeof globalThis.fetch {
       writeKeys(keys)
       return new Response(null, { status: 204 })
     }
+    // The relay's mailbox. Both smoke instances share one account, so each sees the other's gist
+    // exactly as it would on github.com, which is the whole point of relaying through one.
+    if (url.startsWith('https://api.github.com/gists?')) {
+      return Response.json(readState().gists.map(describeGist), { headers: { 'x-oauth-scopes': GITHUB_SCOPES.replace(/ /g, ', ') } })
+    }
+    if (url === 'https://api.github.com/gists' && init?.method === 'POST') {
+      const files = (request.files ?? {}) as Record<string, { content?: string }>
+      const created: FixtureGist = {
+        id: `fixture-gist-${Math.random().toString(36).slice(2, 10)}`,
+        description: String(request.description ?? ''),
+        files: Object.fromEntries(Object.entries(files).map(([name, file]) => [name, String(file?.content ?? '')]))
+      }
+      writeState(state => { state.gists.push(created) })
+      return Response.json(describeGist(created), { status: 201 })
+    }
+    const gistMatch = /^https:\/\/api\.github\.com\/gists\/([^/?]+)$/.exec(url)
+    if (gistMatch) {
+      const id = decodeURIComponent(gistMatch[1]!)
+      if (init?.method === 'PATCH') {
+        const patch = (request.files ?? {}) as Record<string, { content?: string } | null>
+        let found: FixtureGist | undefined
+        writeState(state => {
+          found = state.gists.find(gist => gist.id === id)
+          if (!found) return
+          for (const [name, file] of Object.entries(patch)) {
+            if (file === null) delete found.files[name]
+            else found.files[name] = String(file?.content ?? '')
+          }
+        })
+        return found ? Response.json(describeGist(found)) : Response.json({ message: 'Not Found' }, { status: 404 })
+      }
+      const gist = readState().gists.find(entry => entry.id === id)
+      return gist ? Response.json(describeGist(gist)) : Response.json({ message: 'Not Found' }, { status: 404 })
+    }
     return Response.json({ message: 'Not Found' }, { status: 404 })
   }) as typeof globalThis.fetch
 }
@@ -120,11 +183,13 @@ export class RemoteControlService {
   readonly peers: RemotePeers
   readonly host: RemoteControlHost
   readonly server: RemoteControlServer
+  readonly relay: RemoteRelay
   readonly client: RemoteControlClient
   readonly files: RemoteFiles
   readonly resources: RemoteFileResourceServer
   readonly mirror: RemoteSessionMirror
   private registered = false
+  private seal: RelaySealKeyPair | null = null
 
   constructor(private readonly deps: RemoteControlServiceDependencies) {
     const store = deps.database
@@ -143,6 +208,10 @@ export class RemoteControlService {
       signedOut: () => {
         this.peers.revokeAll('Signed out of GitHub')
         this.client.clear()
+        // The mailbox is reached with the account's own token, so signing out is what makes it
+        // unreachable; the gist left behind holds ciphertext and a signed public key and nothing else.
+        this.relay?.stop()
+        this.seal = null
         void this.server.apply().catch(error => console.warn('Remote control did not stop cleanly', error))
       }
     })
@@ -164,6 +233,33 @@ export class RemoteControlService {
       peers: this.peers, host: this.host, store, vault,
       machineName: () => this.machineName(),
       accountLogin: () => this.auth.identity()?.login ?? null,
+      relayKey: () => this.sealKey()?.publicKey ?? null,
+      deviceKey: () => this.auth.deviceKey()?.publicKey ?? null,
+      changed: () => this.publishState()
+    })
+    this.relay = new RemoteRelay({
+      mailbox: new GitHubRelayMailbox({
+        api: (path, init) => this.auth.gistApi(path, init),
+        fetchRaw: async url => {
+          // Raw gist content is ciphertext under a URL only the account can produce, and it is
+          // only ever parsed as an envelope, never executed or rendered.
+          const response = await githubFetch()(url)
+          return response.ok ? await response.text() : ''
+        },
+        getSetting: key => store.getSetting(key),
+        setSetting: (key, value) => store.setSetting(key, value)
+      }),
+      machineId: () => this.peers.machineId,
+      machineName: () => this.machineName(),
+      accountLogin: () => this.auth.identity()?.login ?? null,
+      deviceKey: () => this.auth.deviceKey(),
+      sealKey: () => this.sealKey(),
+      fingerprint: () => { try { return this.server.identity().fingerprint } catch { return null } },
+      peerDeviceKey: machineId => this.peers.listPeers().find(peer => peer.machineId === machineId && !peer.revokedAt)?.publicKey ?? null,
+      // The relay hands an inbound request to the very same handler the HTTPS listener uses, so a
+      // peer gains nothing by arriving this way instead of over the network.
+      handle: (path, body, headers) => this.server.handleRequest(path, body, headers),
+      enabled: () => this.peers.getSettings().enabled && this.peers.getSettings().relay && this.auth.identity() !== null,
       changed: () => this.publishState()
     })
     this.client = new RemoteControlClient({
@@ -171,6 +267,11 @@ export class RemoteControlService {
       machineId: () => this.peers.machineId,
       machineName: () => this.machineName(),
       deviceKey: () => this.auth.deviceKey(),
+      relay: {
+        enabled: () => this.peers.getSettings().enabled && this.peers.getSettings().relay && this.auth.identity() !== null,
+        call: (machineId, peerDeviceKey, path, body, headers, peerRelayKey) =>
+          this.relay.call(machineId, peerDeviceKey, path, body, headers, peerRelayKey)
+      },
       changed: () => this.publishState()
     })
     this.files = new RemoteFiles({
@@ -190,6 +291,31 @@ export class RemoteControlService {
 
   machineName(): string {
     return this.deps.database.getSetting(MACHINE_NAME_SETTING) || this.peers?.getSettings().machineName || hostname() || 'This machine'
+  }
+
+  /**
+   * This machine's relay key, minted once and kept in the OS credential store next to the device
+   * key. Without a credential store there is no relay: a private key for an off-network channel is
+   * exactly the thing that must not be written somewhere anyone can read.
+   */
+  private sealKey(): RelaySealKeyPair | null {
+    if (this.seal) return this.seal
+    const vault = new StoredSecretVault(this.deps.database, this.deps.cipher)
+    if (!vault.available()) return null
+    const stored = vault.read(RELAY_KEY_SECRET)
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as Partial<RelaySealKeyPair>
+        if (typeof parsed.publicKey === 'string' && typeof parsed.privateKey === 'string' && parsed.publicKey && parsed.privateKey) {
+          this.seal = { publicKey: parsed.publicKey, privateKey: parsed.privateKey }
+          return this.seal
+        }
+      } catch { /* a key that cannot be read is replaced rather than trusted */ }
+    }
+    const created = generateSealKey()
+    vault.write(RELAY_KEY_SECRET, JSON.stringify(created))
+    this.seal = created
+    return this.seal
   }
 
   /** Callback installed into StructuredSessions after both services exist. */
@@ -331,6 +457,7 @@ export class RemoteControlService {
       endpoint: status.endpoint,
       fingerprint: status.fingerprint,
       message: status.message,
+      relay: this.relay.getStatus(),
       projects: this.deps.database.listProjects().map(projectSummary),
       peers: this.peers.listPeers(),
       pending: this.peers.listPending(),
@@ -345,6 +472,10 @@ export class RemoteControlService {
 
   async start(): Promise<void> {
     await this.server.apply()
+    // The relay is what makes this machine answerable from another network, so it comes up with
+    // the listener rather than on the first call: a machine nobody has called yet still has to be
+    // found, and a peer's request has to be collected while nothing here is asking for anything.
+    this.relay.start()
     // Tabs placed elsewhere in an earlier run keep catching up without the owner reopening them.
     if (this.mirror.list().length) this.mirror.start()
   }
@@ -356,6 +487,10 @@ export class RemoteControlService {
     const before = this.peers.getSettings()
     const after = this.peers.updateSettings(patch)
     if (before.enabled !== after.enabled || before.exposure !== after.exposure || before.port !== after.port) await this.server.apply()
+    if (before.enabled !== after.enabled || before.relay !== after.relay) {
+      if (after.enabled && after.relay) this.relay.start()
+      else this.relay.stop()
+    }
     return this.state()
   }
 

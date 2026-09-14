@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -8,6 +8,11 @@ const roots: string[] = []
 const root = (): string => { const path = mkdtempSync(join(tmpdir(), 'conductor-drop-move-')); roots.push(path); return path }
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }) })
 
+// A Windows temp directory can be reached through a short (8.3) alias while the code under test
+// returns the realpath()-resolved long form; both name the identical file, so canonicalize both
+// sides with the OS-native realpath before comparing (matches scripts/repair-codex-workspace-owner.test.mjs).
+const canonicalPath = (value: string): string => realpathSync.native(value)
+
 describe('external explorer file drop move', () => {
   it('moves exact bytes once into an existing project folder', async () => {
     const base = root(), project = join(base, 'project'), outside = join(base, 'outside')
@@ -15,7 +20,8 @@ describe('external explorer file drop move', () => {
     const source = join(outside, 'clip.mp4'), bytes = Buffer.from([0, 255, 17, 32, 99])
     writeFileSync(source, bytes)
     const moved = await moveExternalDropIntoProject(project, source, 'media')
-    expect(moved).toEqual({ path: join(project, 'media', 'clip.mp4'), name: 'clip.mp4' })
+    expect(canonicalPath(moved.path)).toBe(canonicalPath(join(project, 'media', 'clip.mp4')))
+    expect(moved.name).toBe('clip.mp4')
     expect(readFileSync(moved.path)).toEqual(bytes)
     expect(() => readFileSync(source)).toThrow()
   })
@@ -56,7 +62,8 @@ describe('internal explorer file drop move', () => {
     const project = root(), source = join(project, 'draft.md'), folder = join(project, 'notes')
     mkdirSync(folder); writeFileSync(source, 'exact draft')
     const moved = await moveProjectDropWithinProject(project, 'draft.md', 'notes')
-    expect(moved).toEqual({ path: join(folder, 'draft.md'), name: 'draft.md' })
+    expect(canonicalPath(moved.path)).toBe(canonicalPath(join(folder, 'draft.md')))
+    expect(moved.name).toBe('draft.md')
     expect(readFileSync(moved.path, 'utf8')).toBe('exact draft')
     expect(() => readFileSync(source)).toThrow()
   })

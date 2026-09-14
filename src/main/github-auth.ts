@@ -13,9 +13,11 @@ const REMOTE_KEY_ID_SETTING = 'github.deviceKey.remoteId'
 /**
  * `read:user` names the account; `admin:public_key` lets Conductor register this machine's device
  * key on the account and take it back off again at sign-out. `offline_access` asks for the
- * rotating refresh token used by an expiring-token OAuth app.
+ * rotating refresh token used by an expiring-token OAuth app. `gist` is the encrypted relay's
+ * mailbox: a private gist this machine owns, holding ciphertext only, which is what lets two
+ * machines on different networks reach each other without a Conductor server in between.
  */
-export const GITHUB_SCOPES = 'read:user admin:public_key offline_access'
+export const GITHUB_SCOPES = 'read:user admin:public_key offline_access gist'
 const DEVICE_CODE_URL = 'https://github.com/login/device/code'
 const ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token'
 const API_URL = 'https://api.github.com'
@@ -474,6 +476,15 @@ export class GitHubAuth {
       this.assertEpoch(epoch)
     }
     throw new GitHubUnverifiableError('GitHub could not establish a current session.')
+  }
+
+  /**
+   * The relay's only door to GitHub. It is deliberately narrow: gist paths and nothing else, so a
+   * transport bug can never reach the account's keys, and the token itself never leaves this class.
+   */
+  async gistApi(path: string, init: { method?: string; body?: string; headers?: Record<string, string> } = {}): Promise<{ response: Response; body: unknown }> {
+    if (!/^\/gists(\/|\?|$)/.test(path)) throw new Error('The relay may only call gist endpoints.')
+    return await this.api(path, init as RequestInit)
   }
 
   private async api(path: string, init: RequestInit = {}): Promise<{ response: Response; body: Record<string, unknown> | unknown[] }> {

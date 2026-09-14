@@ -258,7 +258,7 @@ models they want
 - [x] AutoFixer was auto-called with Astra even though we barely have usage left there. Make sure it uses a provider where we still have usage.. <!-- conductor-task:215fb17f-21d2-45db-aa31-319e35589f9e agent=agent_mtyc5dtk_w02c8ok -->
 
 
-- [~] THE CHEVRON NEXT TO WORKSPACE THAT'S SELECTED GETS COVERED BY THE LINE WE HAVE ON SELECTED WORKSPACE. FIX SO THE CHEVRON DOES NOT GET IN FACT COVERED. <!-- conductor-task:d9929b6d-b0ce-444f-aec0-292026e75d46 agent=agent_mtyb3x4p_1bwzrur priority=high -->
+- [x] THE CHEVRON NEXT TO WORKSPACE THAT'S SELECTED GETS COVERED BY THE LINE WE HAVE ON SELECTED WORKSPACE. FIX SO THE CHEVRON DOES NOT GET IN FACT COVERED. <!-- conductor-task:d9929b6d-b0ce-444f-aec0-292026e75d46 agent=agent_mtyb3x4p_1bwzrur priority=high -->
   
   ![image.png](.conductor/prompt-images/35616786-2825-42dd-8b26-5a36c76ddef1.png)
 
@@ -275,6 +275,12 @@ models they want
 - [ ] Weird white rectangle is visible (from browser possibly) going over UI. Cancellable by opening workspace/file explorer. <!-- conductor-task:16fd6bdf-2e02-4cca-891d-ceba01aa93da -->
 
 - [ ] Opening a tab, then going to other project, then going back, shows tab has removed itself (with all text we wrote to textbox already) <!-- conductor-task:819788a2-08bf-4bde-b4b8-c2d2c6bbeae5 -->
+
+- [x] Agent Send button has no contrast in Night Owl: the icon is black on dark blue in night and white on white in day. Make the send/stop/resume button readable in every state and theme. <!-- conductor-task:bug-send-button-contrast agent=agent_mtytnibu_7ossaii priority=high -->
+
+- [x] A local Qwen conversation dies with HTTP 500 once its history outgrows the context: trimMessages drops the oldest messages first, which takes the only user message with it, and the Qwen chat template then raises "No user query found in messages". Never drop the most recent user message when trimming. <!-- conductor-task:bug-local-trim-drops-user-message agent=agent_mtytnibu_7ossaii priority=high -->
+
+- [x] A sandboxed local-model command destroyed the repository: `npx tsc --noEmit` inside the no-network container made npm reify the tree, which deleted node_modules and package-lock.json before it could fail. run_command now refuses package-manager installs with the command to run instead, and the container binds node_modules and package-lock.json read-only. <!-- conductor-task:bug-sandbox-destroys-node-modules agent=agent_mtytnibu_7ossaii priority=high -->
 
 Feature list:
 
@@ -408,7 +414,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] An agent in one open project could not see, read or hand work to another project open in the same window: app.state showed only its own project and there was no way to enumerate or target a sibling. projects.list now names every co-open project, files.list/files.read/files.open, tabs.list and tasks.list accept a sibling projectId, and tabs.open/router.dispatch hand a visible worker tab to a sibling project that its controller can then steer. Writes into a sibling still go through a tab opened there, and a conversation a paired machine is driving stays inside the project shared with it. <!-- conductor-task:bug-cross-project-access agent=agent_mtulo6oo_08ud6sk -->
 
-- [~] The GitHub release workflow fails on every push to main, so installed updates only come from local builds. One cause is fixed already (Get-Acl needed the on-demand Microsoft.PowerShell.Security module, which the runner offers but cannot load); what remains is that scripts/repair-codex-workspace-owner.test.mjs compares paths from os.tmpdir() (C:\Users\RUNNER~1\...) against the long names PowerShell resolves (C:\Users\runneradmin\...), failing 'diagnostic mode reads both directory owners', 'a worktree .git pointer is left untouched' and 'reads owners where the Security module cannot be loaded'. Compare real paths on both sides, then confirm the workflow publishes an installer, blockmap and latest.yml again. <!-- conductor-task:bug-release-workflow-short-paths agent=agent_mtyb900n_uktlk0e priority=low -->
+- [~] The GitHub release workflow failed on every push to main. Three causes are now fixed: Get-Acl needing the on-demand Microsoft.PowerShell.Security module; scripts/repair-codex-workspace-owner.test.mjs comparing os.tmpdir() short paths (C:\Users\RUNNER~1\...) against PowerShell's long-resolved paths (commit 64c7a02, both sides now go through fs.realpathSync.native, verified by forcing TEMP to a real 8.3 alias); and the actual blocker, a source bug - file-drop-move.ts and prompt-context.ts detected a symlink by comparing a lexical path against a realpath'd one, which false-positives on any 8.3-aliased ancestor, so the runner refused every symlink drop and vitest failed before node --test ever ran. Both now walk ancestors with lstat().isSymbolicLink(). Full npm test passes locally under normal and forced-short-alias TEMP: 171 vitest files / 1755 tests and 30 node --test. Left open until a push to main actually publishes an installer, blockmap and latest.yml again. <!-- conductor-task:bug-release-workflow-short-paths priority=low agent=agent_mu11b2lz_fr0mlqi -->
 
 ## Features
 
@@ -495,9 +501,13 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] Let Conductor's app control API change an existing coworker's model and effort, with validated model choices and visible settings that agree with the native runtime. <!-- conductor-task:api-coworker-model-effort agent=agent_mtyhyzl0_trwyf1e -->
 
-- [ ] revert stop button in chatbox to blue - red was supposed to be for 'this session has stopped' indicator (currently gray) <!-- conductor-task:ed4ec639-8f09-4048-b662-3013bd6f4a89 -->
+- [x] Local Qwen models refused to start with "Server health check failed: llama.cpp exited during startup". The real cause was never an orphan: Hyper-V had reserved TCP 51424-51623 on this machine, which covers both configured model ports and every port a neighbouring scan would try, so bind() failed and the message named neither the port nor the reason. Starting a server now decides "can I bind here" by actually binding rather than by connecting (a TCP connect succeeds against neither a reserved range nor a Windows TIME_WAIT hold), adopts a healthy server of its own it finds on the port instead of failing, moves to a neighbouring port and then to an OS-assigned one when the whole range is unavailable, records the port it really used so every client follows it, and reports the llama.cpp log lines that explain the failure. Verified against the real llama-server and the real GGUF: port 51435 unbindable, server started healthy on an OS-assigned port, key enforced, inference answering. <!-- conductor-task:local-qwen-reserved-ports agent=agent_mu10io9v_7m6gbje -->
 
-- [ ] add performance monitor (ram gpu cpu) for local sessions and show it somewhere on screen if local sessions are launched (or if conductor is taking more %, or if blender is activate, or something similiar - show a small summary over processes, clickable to expand) <!-- conductor-task:e1492d28-2b1b-4098-af3d-e201ee7a1b4e -->
+- [x] Remote control only worked between machines on the same network: a pairing code carried a LAN address, and off that network there was no route to it. Machines on the same GitHub account now also reach each other through an encrypted relay - a private gist on the owner's own account that each machine writes its own outbox into, holding nothing but ciphertext and routing ids. Messages are sealed with X25519 to a key published in a directory entry signed by the account's device key, with the routing fields authenticated so a stored message cannot be re-addressed, re-labelled or replayed; a relayed request goes through the very same handler the HTTPS listener uses, so account, approval, project scope and replay checks are identical on both routes. The direct route is still tried first and falls back after a short probe, so a laptop that moved keeps working without the owner doing anything. <!-- conductor-task:remote-control-internet-relay agent=agent_mu10io9v_7m6gbje -->
+
+- [x] revert stop button in chatbox to blue - red was supposed to be for 'this session has stopped' indicator (currently gray) <!-- conductor-task:ed4ec639-8f09-4048-b662-3013bd6f4a89 agent=agent_mu10s9pf_ebdn2iw -->
+
+- [x] add performance monitor (ram gpu cpu) for local sessions and show it somewhere on screen if local sessions are launched (or if conductor is taking more %, or if blender is activate, or something similiar - show a small summary over processes, clickable to expand) <!-- conductor-task:e1492d28-2b1b-4098-af3d-e201ee7a1b4e agent=agent_mtytnibu_7ossaii -->
 
 - [x] Local model turns failed with HTTP 500 and, once a tool round was left open, with an HTTP 400 no later prompt could recover; a message queued behind a failed turn was never sent. The agent loop now repairs the tool protocol and keeps the prompt inside the window before every request, retries a refused request once with a shorter, plainer one, reports what the owner can act on, and the queue drains after a failed turn as well as a completed one. <!-- conductor-task:local-request-failures agent=agent_mtyoimmx_1gg25ip -->
 

@@ -55,7 +55,7 @@
 .agent-voice-button, .agent-send-button { width: 31px; height: 31px; display: grid; place-items: center; border-radius: 9px; color: var(--text-3); background: transparent; }
 .agent-voice-button:not(:disabled):hover { color: var(--text); background: var(--surface-hover); }
 .agent-voice-button:disabled { opacity: .38; }
-.agent-send-button { color: #011627; background: var(--accent-muted); transition: transform 120ms ease, opacity 120ms ease; }
+.agent-send-button { color: var(--surface-0); background: var(--accent-muted); transition: transform 120ms ease, opacity 120ms ease; }
 .agent-send-button:hover:not(:disabled) { transform: translateY(-1px); }
 .agent-send-button:disabled { opacity: .28; }
 @keyframes agent-mode-menu-in { from { opacity: 0; transform: translateY(6px) scale(.98); } }

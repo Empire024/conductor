@@ -85,6 +85,30 @@ ${message.content.slice(-Math.floor(cap / 2))}` }
   }
   // A tool result whose assistant tool_call was dropped is meaningless to the server.
   while (start < rest.length && rest[start]!.role === 'tool') { total -= size(rest[start]!); start++ }
+
+  // Pin the most recent user message so trimming can never drop it entirely.
+  // If the pinned message is oversized, elide its middle the same way oversized tool
+  // results are elided above, so pinning it cannot blow the budget.
+  const anchorIndex = (() => {
+    let found = -1
+    for (let i = 0; i < rest.length; i++) { if (rest[i]!.role === 'user') found = i }
+    return found
+  })()
+  if (anchorIndex >= 0 && anchorIndex < start) {
+    const pinned = rest[anchorIndex]!
+    let fixed = pinned
+    if (size(fixed) > cap) {
+      const raw = fixed.content
+      fixed = { ...fixed, content: `${raw.slice(0, Math.floor(cap / 2))}
+[... ${raw.length - cap} characters elided to fit the local context ...]
+${raw.slice(-Math.floor(cap / 2))}` }
+    }
+    rest.splice(anchorIndex, 1)
+    const adjusted = anchorIndex < start ? start - 1 : start
+    rest.splice(adjusted, 0, fixed)
+    start = adjusted
+  }
+
   return system ? [system, ...rest.slice(start)] : rest.slice(start)
 }
 
@@ -147,6 +171,11 @@ export class LocalAgentSession {
   private async complete(events: LocalAgentEvents, tools: ToolSpec[], overheadTokens: number, signal?: AbortSignal): Promise<CompletionResult> {
     for (let attempt = 0; ; attempt++) {
       this.messages = repairToolProtocol(trimMessages(this.messages, this.options.contextTokens, overheadTokens, attempt ? 0.5 : 1))
+      // Belt-and-braces: if trimming somehow still produced a request with no user turn,
+      // append a minimal one so the chat template never refuses with "No user query found".
+      if (!this.messages.some(message => message.role === 'user')) {
+        this.messages.push({ role: 'user', content: 'Continue the current task.' })
+      }
       try {
         return await chatCompletion({
           endpoint: this.options.endpoint,

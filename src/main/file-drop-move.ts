@@ -20,6 +20,16 @@ const sameSourceVersion = (left: Stats, right: Stats): boolean => sameIdentity(l
   && left.mtimeMs === right.mtimeMs
   && left.ctimeMs === right.ctimeMs
 
+// A short (8.3) alias and its long-name counterpart both realpath() to the same canonical string,
+// so comparing a lexical path against its realpath() would misreport every alias-shortened ancestor
+// (e.g. a Windows temp directory) as a symlink. Walking each component's own identity by lstat sidesteps
+// alias renaming entirely and still catches a real symlink or junction anywhere along the path.
+async function assertNoLexicalSymlink(target: string, message: string): Promise<void> {
+  for (let current = target, parent = dirname(current); parent !== current; current = parent, parent = dirname(current)) {
+    if ((await lstat(current)).isSymbolicLink()) throw new Error(message)
+  }
+}
+
 async function unlinkOwned(path: string, expected: Pick<Stats, 'dev' | 'ino'>): Promise<boolean> {
   let current: Stats
   try { current = await lstat(path) }
@@ -177,8 +187,8 @@ async function linkThenUnlink(source: string, target: string, sourceBefore: Awai
 export async function moveExternalDropIntoProject(projectRoot: string, sourcePath: string, requestedDirectory: string): Promise<{ path: string; name: string }> {
   if (!isAbsolute(sourcePath) || !sourcePath.trim()) throw new Error('External drops require one absolute source path')
   const lexicalSource = resolve(sourcePath)
+  await assertNoLexicalSymlink(lexicalSource, 'Symbolic-link file drops are not moved')
   const [realRoot, realSource] = await Promise.all([realpath(projectRoot), realpath(lexicalSource)])
-  if (!samePath(lexicalSource, realSource)) throw new Error('Symbolic-link file drops are not moved')
   if (inside(realRoot, realSource)) throw new Error('Use the project file drag action for files already inside this project')
   const sourceBefore = await lstat(realSource)
   if (!sourceBefore.isFile() || sourceBefore.isSymbolicLink()) throw new Error('Only regular files can be dropped into the project')

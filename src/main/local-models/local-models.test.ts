@@ -1,15 +1,21 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
+import { createServer as createHttpServer, type Server } from 'node:http'
+import { createServer as createTcpServer } from 'node:net'
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError, WorkspaceBoundaryError } from './workspace.ts'
 import { containerRunArgs, detectSecretPaths, execArgs, SandboxUnavailableError, sandboxContainerName } from './sandbox.ts'
-import { llamaServerArgs, validateExtraArgs } from './llama.ts'
+import {
+  adoptRunningServer, describeStartupFailure, findFreePort, llamaServerArgs, logFile, portBindable,
+  readRunRecord, startServer, validateExtraArgs
+} from './llama.ts'
 import { StreamAccumulator } from './client.ts'
 import { repairToolProtocol, RESPONSE_RESERVE_TOKENS, trimMessages } from './agent.ts'
 import { runTool, toolSpecs } from './tools.ts'
 import { DEFAULT_SANDBOX, defaultModelConfig, QWEN_35B, QWEN_9B, validateConfig } from './config.ts'
 import type { LocalStackConfig } from './config.ts'
+import { detectDrives, systemDrive } from './paths.ts'
 
 const workspace = (): string => {
   const root = mkdtempSync(join(tmpdir(), 'conductor-local-'))
@@ -150,6 +156,155 @@ describe('llama.cpp arguments', () => {
   })
 })
 
+describe('llama.cpp server lifecycle', () => {
+  const previousRoot = process.env.CONDUCTOR_LOCAL_ROOT
+  const cleanup: Array<() => void | Promise<void>> = []
+  const key = 'a'.repeat(64)
+
+  afterEach(async () => {
+    for (const dispose of cleanup.splice(0).reverse()) await dispose()
+    if (previousRoot === undefined) delete process.env.CONDUCTOR_LOCAL_ROOT
+    else process.env.CONDUCTOR_LOCAL_ROOT = previousRoot
+  })
+
+  // The local root is refused on the system drive by design, so these tests need a real fixed
+  // second drive and skip rather than pretend otherwise.
+  const scratchRoot = (): string | null => {
+    const drive = detectDrives().find(candidate => candidate.letter !== systemDrive() && candidate.freeBytes > 256 * 1024 ** 2)
+    if (!drive) return null
+    const root = join(drive.letter + '\\', `ConductorLlamaTest-${process.pid}-${Math.random().toString(36).slice(2, 8)}`)
+    mkdirSync(join(root, 'runtime'), { recursive: true })
+    mkdirSync(join(root, 'logs'), { recursive: true })
+    cleanup.push(() => rmSync(root, { recursive: true, force: true }))
+    process.env.CONDUCTOR_LOCAL_ROOT = root
+    return root
+  }
+
+  // A stand-in llama.cpp server: answers /v1/models with the served model id once the key
+  // matches, exactly what adoptRunningServer checks for before trusting a port it didn't bind.
+  const fakeOrphan = (modelId: string): Promise<{ port: number; server: Server }> => {
+    const server = createHttpServer((request, response) => {
+      if (request.headers.authorization !== `Bearer ${key}`) { response.writeHead(401).end('{}'); return }
+      if (request.url?.startsWith('/v1/models')) {
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({ data: [{ id: modelId }] }))
+        return
+      }
+      response.writeHead(404).end()
+    })
+    cleanup.push(() => new Promise<void>(done => server.close(() => done())))
+    return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      resolve({ port: typeof address === 'object' && address ? address.port : 0, server })
+    }))
+  }
+
+  it('portBindable is false for a port held open by someone else and true once nothing holds it', async () => {
+    const holder = createTcpServer()
+    await new Promise<void>(resolve => holder.listen(0, '127.0.0.1', resolve))
+    cleanup.push(() => new Promise<void>(done => holder.close(() => done())))
+    const heldPort = (holder.address() as { port: number }).port
+
+    const prober = createTcpServer()
+    await new Promise<void>(resolve => prober.listen(0, '127.0.0.1', resolve))
+    const freePort = (prober.address() as { port: number }).port
+    await new Promise<void>(resolve => prober.close(() => resolve()))
+
+    expect(await portBindable(heldPort)).toBe(false)
+    expect(await portBindable(freePort)).toBe(true)
+  })
+
+  it('adopts an orphaned server already on the configured port instead of failing to start', async () => {
+    if (!scratchRoot()) return
+    const orphan = await fakeOrphan(QWEN_9B)
+    const model = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
+
+    expect(readRunRecord(model)).toBeNull()
+    // The executable would blow up the test if it were ever actually spawned; adoption must
+    // return before startServer gets anywhere near it.
+    const outcome = await startServer('this-executable-must-never-run', model, key)
+    expect(outcome.started).toBe(false)
+    expect(outcome.port).toBe(orphan.port)
+    expect(outcome.message).toContain('adopted')
+
+    const record = readRunRecord(model)
+    expect(record?.pid).toBeNull()
+    expect(record?.port).toBe(orphan.port)
+  })
+
+  it('does not adopt a healthy server that is not serving our model', async () => {
+    if (!scratchRoot()) return
+    const orphan = await fakeOrphan('local/someone-elses-model')
+    const model = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
+    expect(await adoptRunningServer(model, key, orphan.port)).toBeNull()
+  })
+
+  it('moves to the next free port when the configured one is held by something that is not ours', async () => {
+    if (!scratchRoot()) return
+    const blocker = createTcpServer()
+    await new Promise<void>(resolve => blocker.listen(0, '127.0.0.1', resolve))
+    cleanup.push(() => new Promise<void>(done => blocker.close(() => done())))
+    const busyPort = (blocker.address() as { port: number }).port
+
+    const model = { ...defaultModelConfig(QWEN_9B), port: busyPort }
+    const free = await findFreePort(model)
+    expect(free).toBeGreaterThan(busyPort)
+    expect(free).toBeLessThanOrEqual(busyPort + 40)
+    expect(await portBindable(free)).toBe(true)
+  })
+
+  /**
+   * The case that actually stopped the models on this machine: Hyper-V had reserved TCP
+   * 51424-51623, which covers both configured model ports and every port a neighbouring scan would
+   * try. A scan alone cannot escape a range that wide, so the OS has to be asked for a port - it
+   * will never hand back one it has excluded.
+   */
+  it('still finds a port when the whole neighbouring range is unavailable', async () => {
+    if (!scratchRoot()) return
+    const blockers: ReturnType<typeof createTcpServer>[] = []
+    const base = 41000
+    for (let port = base; port <= base + 40; port++) {
+      const server = createTcpServer()
+      await new Promise<void>(resolve => server.listen(port, '127.0.0.1', resolve))
+      blockers.push(server)
+    }
+    cleanup.push(async () => { await Promise.all(blockers.map(server => new Promise<void>(done => server.close(() => done())))) })
+    const model = { ...defaultModelConfig(QWEN_9B), port: base }
+    const free = await findFreePort(model)
+    expect(free).toBeGreaterThan(0)
+    expect(free < base || free > base + 40).toBe(true)
+    expect(await portBindable(free)).toBe(true)
+  })
+
+  it('names the port and the log tail when the child exits during startup', () => {
+    if (!scratchRoot()) return
+    const model = defaultModelConfig(QWEN_9B)
+    writeFileSync(logFile(model), [
+      '0.00.260.574 I srv          init: The UI is disabled',
+      "0.00.261.176 E srv         start: couldn't bind HTTP server socket, hostname: 127.0.0.1, port: 51435",
+      '0.00.261.180 I srv    operator(): operator(): cleaning up before exit...',
+      '0.00.261.317 E srv  llama_server: exiting due to HTTP server error'
+    ].join('\n') + '\n', 'utf8')
+
+    const message = describeStartupFailure(model, model.port)
+    expect(message).toContain(`127.0.0.1:${model.port}`)
+    expect(message).toContain("couldn't bind HTTP server socket")
+    expect(message).toContain(logFile(model))
+  })
+
+  it('reads only the last 64 KiB of a huge log, so an old error near the start is not surfaced', () => {
+    if (!scratchRoot()) return
+    const model = defaultModelConfig(QWEN_9B)
+    const earlyMarker = 'E srv start: EARLY_MARKER_SHOULD_NOT_APPEAR'
+    const filler = ('I srv noop: '.padEnd(200, 'x')) + '\n'
+    const padding = filler.repeat(Math.ceil((200 * 1024) / filler.length))
+    writeFileSync(logFile(model), earlyMarker + '\n' + padding, 'utf8')
+
+    const message = describeStartupFailure(model, model.port)
+    expect(message).not.toContain('EARLY_MARKER_SHOULD_NOT_APPEAR')
+  })
+})
+
 describe('config validation', () => {
   const base = (): LocalStackConfig => ({ version: 1, llamaServer: 'llama-server', models: { [QWEN_9B]: defaultModelConfig(QWEN_9B), [QWEN_35B]: defaultModelConfig(QWEN_35B) }, sandbox: { ...DEFAULT_SANDBOX } })
 
@@ -209,6 +364,36 @@ describe('context budget', () => {
     ], 8192)
     expect(result!.content.length).toBeLessThan(120_000)
     expect(result!.content).toContain('characters elided')
+  })
+
+  // A long tool-calling turn puts the owner's question at the oldest end of the history, which
+  // is exactly where trimming starts. Dropping it made llama.cpp answer 500 for the rest of the
+  // conversation: Qwen's chat template raises "No user query found in messages" and every later
+  // prompt failed the same way.
+  const toolHeavyTurn = (question: string): Parameters<typeof trimMessages>[0] => [
+    { role: 'system', content: 'system' },
+    { role: 'user', content: question },
+    ...Array.from({ length: 10 }, (_value, index) => [
+      { role: 'assistant' as const, content: 'x'.repeat(2000), tool_calls: [{ id: `call-${index}`, type: 'function' as const, function: { name: 'read_file', arguments: '{}' } }] },
+      { role: 'tool' as const, tool_call_id: `call-${index}`, content: 'y'.repeat(2000) }
+    ]).flat()
+  ]
+
+  it('never trims away the user turn the chat template requires', () => {
+    const question = 'Fix the composer banner'
+    const trimmed = trimMessages(toolHeavyTurn(question), 8192)
+    expect(trimmed.length).toBeLessThan(toolHeavyTurn(question).length)
+    expect(trimmed.filter(message => message.role === 'user')).toHaveLength(1)
+    expect(trimmed.find(message => message.role === 'user')?.content).toBe(question)
+  })
+
+  it('elides the middle of a pinned user turn too big to keep whole', () => {
+    const question = `START${'q'.repeat(40_000)}END`
+    const user = trimMessages(toolHeavyTurn(question), 8192).find(message => message.role === 'user')!
+    expect(user.content.length).toBeLessThan(question.length)
+    expect(user.content).toContain('characters elided')
+    expect(user.content.startsWith('START')).toBe(true)
+    expect(user.content.endsWith('END')).toBe(true)
   })
 })
 

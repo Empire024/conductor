@@ -62,6 +62,7 @@ import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile, changeWorkspacePath, workspaceFileIds } from './components/workspace-files-state'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
 import { AppVersionButton } from './components/AppVersionButton'
+import { SystemPerformanceChip } from './components/SystemPerformanceChip'
 import { applyAppTheme, resolveThemeVariant } from './appearance'
 import { DebugConsole } from './components/DebugConsole'
 import {
@@ -1514,6 +1515,7 @@ export function App(): React.JSX.Element {
           <span><HardDrive size={12} /> SQLite</span>
           <span className="accent-status"><Zap size={11} /> ready</span>
         </>}
+        <SystemPerformanceChip />
         {updateState.currentVersion && <AppVersionButton state={updateState} onCheck={checkForUpdates} />}
       </footer>
       {paletteOpen && activeSession && <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />}

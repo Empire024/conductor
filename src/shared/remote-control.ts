@@ -43,6 +43,12 @@ export interface RemoteControlSettings {
   /** 0 asks the OS for a free port; a fixed port keeps paired machines reachable after a restart. */
   port: number
   machineName: string
+  /**
+   * Reach machines that are not on this network, through an encrypted mailbox in a private gist on
+   * the owner's own GitHub account. No address is published and nothing is opened for inbound
+   * connections; the direct route is still preferred whenever it works.
+   */
+  relay: boolean
 }
 
 export interface RemoteGrant {
@@ -112,6 +118,14 @@ export interface RemotePairingTicket {
   fingerprint: string
   code: string
   expiresAt: string
+  /**
+   * Base64 X25519 public key for the encrypted relay. It travels with the certificate fingerprint
+   * for the same reason: the owner carries both out of band, so the first contact pins a key
+   * rather than trusting whatever the account's gists happen to advertise.
+   */
+  relayKey?: string
+  /** The device key that signs this machine's relay directory entry. */
+  deviceKey?: string
 }
 
 /** What a machine advertises about a project it shares, including who that working copy is. */
@@ -132,6 +146,11 @@ export interface RemoteConnection {
   port: number
   fingerprint: string
   peerId: string
+  /** Pinned at pairing: what the relay seals to, and the key whose signature vouches for it. */
+  relayKey?: string
+  deviceKey?: string
+  /** Which route last carried a call to this machine, so the owner can see how it is reached. */
+  transport?: 'direct' | 'relay'
   /** Project pairs the owner confirmed for this machine; the only way work reaches it. */
   projectGrants: RemoteProjectGrant[]
   /** What that machine last said it shares, so a swapped or moved project is noticed here. */
@@ -156,6 +175,8 @@ export interface RemoteControlState {
   endpoint: string | null
   fingerprint: string | null
   message: string | null
+  /** The encrypted off-network route: whether it is on, and which machines it can currently see. */
+  relay: import('./remote-relay').RelayStatus
   projects: RemoteProjectSummary[]
   peers: RemotePeerRecord[]
   pending: PendingPairingRequest[]
@@ -247,7 +268,10 @@ export function normalizeRemoteSettings(stored: unknown): RemoteControlSettings 
     enabled: value.enabled === true,
     exposure: value.exposure === 'network' ? 'network' : 'loopback',
     port: port === 0 || Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : DEFAULT_REMOTE_PORT,
-    machineName: machineName || 'This machine'
+    machineName: machineName || 'This machine',
+    // On by default: it publishes no address and opens no port, and without it a machine that moved
+    // off this network simply stops answering. Settings written before it existed still get it.
+    relay: value.relay !== false
   }
 }
 
@@ -328,6 +352,10 @@ export function decodeTicket(encoded: string): RemotePairingTicket {
   catch { throw new Error('That pairing code is not readable. Copy the whole code from the other machine.') }
   const ticket = parsed as Partial<RemotePairingTicket>
   const required: Array<keyof RemotePairingTicket> = ['machineId', 'machineName', 'accountLogin', 'host', 'fingerprint', 'code', 'expiresAt']
+  const optionalKeys: Array<'relayKey' | 'deviceKey'> = ['relayKey', 'deviceKey']
+  if (optionalKeys.some(key => ticket[key] !== undefined && typeof ticket[key] !== 'string')) {
+    throw new Error('That pairing code is incomplete or from an incompatible version.')
+  }
   if (ticket?.version !== 1 || required.some(key => typeof ticket[key] !== 'string' || !String(ticket[key]).trim()) || !Number.isInteger(ticket.port)) {
     throw new Error('That pairing code is incomplete or from an incompatible version.')
   }

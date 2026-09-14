@@ -35,6 +35,7 @@ import type {
   WorkspaceLayout
 } from './models'
 import type { ProjectActivitySnapshot } from './project-activity'
+import type { SystemMetricsSnapshot } from './system-metrics'
 import type { OrchestrationBridge } from './orchestration'
 import type { AgentCollaborationBridge } from './agent-collaboration'
 import type { StructuredAgentBridge } from './structured-agent'
@@ -209,6 +210,9 @@ export interface ConductorBridge {
     copyText(value: string): Promise<void>
     getDiagnostics(): Promise<AppDiagnostics>
     getPerformance(browserWebContents: Record<string, number>): Promise<AppPerformanceSnapshot>
+    /** Host CPU, memory and GPU, plus the local model servers and anything else expensive on
+     *  this machine. Sampled only while a renderer is asking. */
+    metrics(): Promise<SystemMetricsSnapshot>
   }
   debug: {
     openWindow(placeAtCursor?: boolean): Promise<void>

@@ -275,7 +275,8 @@ const bridge: ConductorBridge = {
     openExternal: (url) => ipcRenderer.invoke('system:open-external', url),
     copyText: (value) => ipcRenderer.invoke('system:copy-text', value),
     getDiagnostics: () => ipcRenderer.invoke('system:get-diagnostics'),
-    getPerformance: (browserWebContents) => ipcRenderer.invoke('system:get-performance', browserWebContents)
+    getPerformance: (browserWebContents) => ipcRenderer.invoke('system:get-performance', browserWebContents),
+    metrics: () => ipcRenderer.invoke('system:metrics')
   },
   debug: {
     openWindow: (placeAtCursor) => ipcRenderer.invoke('debug:open-window', placeAtCursor),

@@ -117,3 +117,25 @@ export function secretsMatch(a: string, b: string): boolean {
   if (left.length !== right.length || !left.length) return false
   return timingSafeEqual(left, right)
 }
+
+/**
+ * Signing for statements that are not a per-request challenge — today the relay directory entry a
+ * machine publishes about itself. The prefix keeps these signatures in their own domain, so one can
+ * never be presented as the other.
+ */
+const STATEMENT_PREFIX = 'conductor-device-statement/1\n'
+
+export function signStatement(privateKeyPem: string, kind: string, statement: string): string {
+  return sign(null, Buffer.from(STATEMENT_PREFIX + kind + '\n' + statement, 'utf8'), createPrivateKey(privateKeyPem)).toString('base64')
+}
+
+export function verifyStatement(authorizedKey: string, kind: string, statement: string, signature: string): boolean {
+  let raw: Buffer, decoded: Buffer
+  try {
+    raw = parseOpenSshEd25519(authorizedKey)
+    decoded = Buffer.from(signature, 'base64')
+  } catch { return false }
+  if (decoded.length !== 64) return false
+  const key = createPublicKey({ key: Buffer.concat([ED25519_SPKI_PREFIX, raw]), format: 'der', type: 'spki' })
+  try { return verify(null, Buffer.from(STATEMENT_PREFIX + kind + '\n' + statement, 'utf8'), key, decoded) } catch { return false }
+}

@@ -94,6 +94,11 @@ export const runDir = (): string => layout().runtime
 export const logsDir = (): string => layout().logs
 export const tempDir = (): string => layout().temp
 
+/** Path to the JSON run record for a model. Shared between llama.ts, which writes it, and
+ *  `endpointFor` below, which reads the port back out: a server that moved to a free port or was
+ *  adopted from an earlier run is still reachable only because both sides agree on this path. */
+export const runFile = (model: LocalModelConfig): string => join(runDir(), model.id.replace(/[^a-z0-9.-]/gi, '_') + '.json')
+
 export function ensureDirectories(): void {
   assertLocalRootUsable()
 }
@@ -178,4 +183,14 @@ export function saveConfig(config: LocalStackConfig): void {
 export const modelSlug = (id: string): string => id.replace(LOCAL_MODEL_PREFIX, '').replace(/[^a-z0-9._-]/gi, '-')
 export const modelDir = (model: LocalModelConfig): string => join(modelsDir(), modelSlug(model.id))
 export const modelFilePath = (model: LocalModelConfig): string => join(modelDir(model), model.file)
-export const endpointFor = (model: LocalModelConfig): string => `http://127.0.0.1:${model.port}`
+/** Prefers the port actually recorded for a running server over the configured one: startServer
+ *  may have moved to a free port, or adopted an orphaned process, once the configured port turned
+ *  out to be unbindable. Falls back to the configured port when there is no run record yet. */
+export const endpointFor = (model: LocalModelConfig): string => `http://127.0.0.1:${recordedPort(model)}`
+
+function recordedPort(model: LocalModelConfig): number {
+  try {
+    const record = JSON.parse(readFileSync(runFile(model), 'utf8')) as { port?: unknown }
+    return typeof record.port === 'number' && Number.isInteger(record.port) && record.port > 0 ? record.port : model.port
+  } catch { return model.port }
+}
