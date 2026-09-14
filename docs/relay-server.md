@@ -34,7 +34,31 @@ A machine is also its device key, on this route exactly as on the direct one: th
 second machine claiming an id that is already connected under a different key, and the app refuses
 any answer the key it called was not the one to sign.
 
-## Running it
+## Running it from Conductor
+
+Nothing here needs a terminal. In **Account & machines**, with *Reach my machines anywhere* on, turn
+on **Run the relay on this machine**. Conductor starts the relay in its own process, mints a
+certificate for it, and makes the room secret if this machine does not have one yet. The panel then
+shows the port it is on and the addresses another machine can use.
+
+That machine has to be awake for the others to meet on it, and it is reachable from the network it
+is on. To reach it from anywhere else, turn on **Let my machines reach it from anywhere**: Conductor
+asks the router to forward that port to this machine, and the panel says whether it worked.
+
+Two things commonly stop it, and the panel names both rather than reporting a generic failure:
+
+- **The router does not answer.** UPnP is switched off in most routers by default, and a host
+  firewall can also drop the reply. Turn UPnP on, or forward the port by hand - the message says
+  which port to which address.
+- **Your provider puts you behind its own network.** If the address the router reports is itself
+  private (`100.64.x.x` and friends), no port it forwards can be reached from outside, and nothing
+  Conductor does will change that. Run the relay somewhere with a public address instead.
+
+Then create a pairing code and take it to the other machine. The code carries the relay's address,
+its certificate fingerprint and the room secret, so there is nothing to type on the second machine -
+and the machine running the relay still confirms the pairing by hand before anything is shared.
+
+## Running it yourself
 
 Make a secret. Keep the output; you will paste it into each machine.
 
@@ -73,17 +97,18 @@ or let the relay serve TLS itself:
 CONDUCTOR_RELAY_SECRET=… CONDUCTOR_RELAY_TLS_KEY=/etc/ssl/relay.key CONDUCTOR_RELAY_TLS_CERT=/etc/ssl/relay.crt npm run relay
 ```
 
-A certificate no authority signed is refused by default, as it should be. There is no setting to
-ignore that in the app's own settings; it exists only as a dependency-level override for a relay on
-a LAN you control, and a public relay should never need it.
+A relay Conductor runs for you serves a certificate it signs itself, and the pairing code carries
+that certificate's fingerprint. The other machine pins it: exactly one certificate will do, which is
+stricter than trusting any certificate a public authority has signed, and it works without a domain
+name. A relay you run yourself with a certificate from an authority needs no pin, and one with a
+self-signed certificate and no pin is refused.
 
-## Pointing Conductor at it
+## Pointing Conductor at a relay somewhere else
 
-In **Account & machines**, with *Reach my machines anywhere* on, fill in **Run the relay yourself**:
-the address (`wss://relay.example.com`, or `ws://127.0.0.1:8787` while it is on this machine) and
-the room secret. The address is an ordinary setting; the secret goes into the operating system's
-credential store next to the device key and is never read back out, not by the renderer and not by
-this file's author.
+With **Run the relay on this machine** off, the panel offers an address and a room secret instead:
+`wss://relay.example.com` and the secret that relay serves. The address is an ordinary setting; the
+secret goes into the operating system's credential store next to the device key and is never read
+back out, not by the renderer and not by this file's author.
 
 The panel then shows which route is carrying the machine and how many machines have checked in.
 Leaving both boxes empty, or pressing **Back to the gist**, returns that machine to the gist
@@ -118,6 +143,7 @@ neither can drift from the other:
 | Send rate | 200 messages a second per socket, bursting to 400 |
 | Offline queue | 16 messages or 8 MiB per machine, dropped after 90 seconds |
 | Room size | 64 machines |
+| Router lease | one hour, renewed while the relay runs and handed back when it stops |
 
 The send rate is a guard against a runaway loop rather than a budget: every mirrored tab polls the
 machine that runs it about once a second, and each poll is a request and an answer, so ordinary work

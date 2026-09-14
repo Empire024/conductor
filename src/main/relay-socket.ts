@@ -35,8 +35,16 @@ export interface RelaySocketEvents {
 export interface RelaySocketOptions {
   maxMessageBytes: number
   connectTimeoutMs?: number
-  /** Test seam and a deliberate escape hatch for a relay with a self-signed certificate. */
-  rejectUnauthorized?: boolean
+  /**
+   * SHA-256 of the certificate this relay must present, carried in the pairing code.
+   *
+   * A relay an owner runs on their own machine has no domain name and no certificate authority
+   * behind it, and requiring one would mean requiring them to own a domain before they may link two
+   * computers. Pinning is the same answer the direct listener already uses: the owner carries the
+   * fingerprint across by hand, and nothing else is accepted - which is stricter than a public
+   * certificate, not weaker, because exactly one certificate will do.
+   */
+  fingerprint?: string
 }
 
 const CLOSE_NORMAL = 1000
@@ -70,8 +78,19 @@ export class RelaySocket {
     const port = Number(target.port) || (secure ? 443 : 80)
     const path = `${target.pathname || '/'}${target.search || ''}`
 
+    const pinned = this.options.fingerprint?.trim() ?? ''
+    // A relay reached at an address rather than a name has no server name to send, and sending one
+    // anyway is both meaningless and forbidden.
+    const named = !/^[\d.]+$/.test(target.hostname) && !target.hostname.includes(':')
     const socket = secure
-      ? tlsConnect({ host: target.hostname, port, servername: target.hostname, rejectUnauthorized: this.options.rejectUnauthorized !== false })
+      ? tlsConnect({
+          host: target.hostname,
+          port,
+          ...(named ? { servername: target.hostname } : {}),
+          // A pinned certificate is checked below, by its fingerprint, instead of by a chain it was
+          // never meant to have. Without a pin, the ordinary public rules apply.
+          rejectUnauthorized: !pinned
+        })
       : netConnect({ host: target.hostname, port })
     this.socket = socket as Socket
     socket.setNoDelay(true)
@@ -82,6 +101,12 @@ export class RelaySocket {
     socket.on('close', () => this.finish(this.upgraded ? CLOSE_NORMAL : 1006, this.upgraded ? '' : 'The relay closed the connection.'))
     socket.on('data', chunk => this.onData(chunk))
     socket.on(secure ? 'secureConnect' : 'connect', () => {
+      if (pinned) {
+        const presented = (socket as ReturnType<typeof tlsConnect>).getPeerCertificate()?.fingerprint256 ?? ''
+        if (!presented || presented.toUpperCase() !== pinned.toUpperCase()) {
+          return this.fail(new Error('That relay presented a different certificate than the one in the pairing code. Nothing was sent to it.'))
+        }
+      }
       const host = target.port ? `${target.hostname}:${target.port}` : target.hostname
       socket.write(
         `GET ${path} HTTP/1.1\r\n` +

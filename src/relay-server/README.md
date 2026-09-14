@@ -2,6 +2,13 @@
 
 A tiny WebSocket relay that routes sealed envelopes between your machines. It holds no database, no disk state, and never reads a plaintext message.
 
+## You may not need any of this
+
+Conductor can run this relay for you: **Account & machines → Run the relay on this machine**. It
+starts the same server in the app's own process, mints its certificate, makes the room secret and
+hands all three to your other machine inside the pairing code. Use the instructions below when you
+want the relay somewhere else - a server with a public address, or a machine that is always on.
+
 ## Prerequisites
 
 Node 24. The relay has zero npm dependencies; it runs directly from the TypeScript source.

@@ -28,6 +28,8 @@ import { RemoteFiles } from './remote-files'
 import { RemoteControlServer } from './remote-control-server'
 import { GitHubRelayMailbox } from './github-relay'
 import { ConductorRelay, relayEndpointUrl } from './conductor-relay'
+import { RelayHost } from './relay-host'
+import { generateRoomSecret } from './relay-room'
 import { RelayRoute } from './relay-route'
 import { RemoteRelay } from './remote-relay'
 import { RELAY_BACKGROUND_CALL_TIMEOUT_MS } from '../shared/remote-relay'
@@ -209,6 +211,8 @@ export class RemoteControlService {
   readonly relay: RelayRoute
   readonly githubRelay: RemoteRelay
   readonly serverRelay: ConductorRelay
+  /** The relay this machine runs for itself and its other machines, when the owner asks it to. */
+  readonly relayHost: RelayHost
   readonly client: RemoteControlClient
   readonly files: RemoteFiles
   readonly resources: RemoteFileResourceServer
@@ -267,9 +271,17 @@ export class RemoteControlService {
       relayKey: () => this.sealKey()?.publicKey ?? null,
       deviceKey: () => this.auth.deviceKey()?.publicKey ?? null,
       relayRoom: () => {
-        const endpoint = this.peers.getSettings().relayEndpoint
+        // What the other machine should dial: the address this machine's own relay can be reached
+        // at - the public one if the router opened it - or whichever relay this machine itself uses.
+        const settings = this.peers.getSettings()
+        const hosted = this.relayHost.advertisedEndpoints()
+        const endpoint = hosted[0] ?? settings.relayEndpoint
+        const alternates = hosted.length ? hosted.slice(1) : settings.relayEndpointAlternates
+        const fingerprint = hosted.length ? this.relayHost.fingerprint() : settings.relayFingerprint
         const secret = this.roomSecret()
-        return endpoint && secret ? { endpoint, secret } : null
+        return endpoint && secret
+          ? { endpoint, secret, fingerprint: fingerprint || undefined, alternates: alternates.length ? alternates : undefined }
+          : null
       },
       changed: () => this.publishState()
     })
@@ -298,8 +310,31 @@ export class RemoteControlService {
       enabled: () => this.relayEnabled() && !this.serverRelay.configured(),
       changed: () => { this.publishState(); this.probeMachinesSeenOnRelay() }
     })
+    this.relayHost = new RelayHost({
+      store,
+      vault,
+      settings: () => {
+        const settings = this.peers.getSettings()
+        return {
+          enabled: settings.enabled && settings.relay && settings.relayHosting,
+          port: settings.relayHostPort,
+          internet: settings.relayHostInternet
+        }
+      },
+      machineName: () => this.machineName(),
+      // Starting a relay is the moment a room secret is needed, so it is made here rather than
+      // asked for: an owner should not have to produce a secret before they can press a button.
+      secret: () => this.ensureRoomSecret(),
+      changed: () => { this.publishState(); this.relay?.start() }
+    })
     this.serverRelay = new ConductorRelay({
-      endpoint: () => this.peers.getSettings().relayEndpoint || null,
+      // The relay this machine runs is the one it uses, over loopback, where no certificate
+      // authority and no router is involved at all.
+      endpoint: () => this.relayHost.localEndpoint() ?? (this.peers.getSettings().relayEndpoint || null),
+      // A relay this machine runs is reached over loopback and needs no alternates; one somewhere
+      // else may answer at several addresses, and which of them works depends on where this is.
+      alternateEndpoints: () => this.relayHost.localEndpoint() ? [] : this.peers.getSettings().relayEndpointAlternates,
+      pinnedFingerprint: () => this.relayHost.localEndpoint() ? this.relayHost.fingerprint() : (this.peers.getSettings().relayFingerprint || null),
       roomSecret: () => this.roomSecret(),
       machineId: () => this.peers.machineId,
       machineName: () => this.machineName(),
@@ -314,7 +349,7 @@ export class RemoteControlService {
     this.relay = new RelayRoute({
       server: this.serverRelay,
       github: this.githubRelay,
-      endpoint: () => this.peers.getSettings().relayEndpoint || null
+      endpoint: () => this.relayHost.localEndpoint() ?? (this.peers.getSettings().relayEndpoint || null)
     })
     this.client = new RemoteControlClient({
       store,
@@ -400,6 +435,21 @@ export class RemoteControlService {
     return pinned ?? null
   }
 
+  /**
+   * A room secret for this machine, made on first use. It is the one value a relay needs, so the
+   * owner never has to produce one themselves: pressing start is enough, and pairing carries it.
+   */
+  private ensureRoomSecret(): string | null {
+    const existing = this.roomSecret()
+    if (existing) return existing
+    const vault = new StoredSecretVault(this.deps.database, this.deps.cipher)
+    if (!vault.available()) return null
+    const created = generateRoomSecret()
+    vault.write(RELAY_ROOM_SECRET, created)
+    this.room = created
+    return created
+  }
+
   /** The room secret for the owner's own relay, read once from the credential store. */
   private roomSecret(): string | null {
     if (this.room) return this.room
@@ -430,7 +480,30 @@ export class RemoteControlService {
       vault.write(RELAY_ROOM_SECRET, value)
       this.room = value || null
     }
-    this.peers.updateSettings({ relayEndpoint: trimmed })
+    // An address typed by hand replaces whatever a pairing code left behind, alternates included.
+    this.peers.updateSettings({ relayEndpoint: trimmed, relayEndpointAlternates: [] })
+    this.relay.start()
+    this.publishState()
+    return this.state()
+  }
+
+  /**
+   * Starts, stops or reconfigures the relay this machine runs.
+   *
+   * Everything a relay needs is made here rather than asked for: the room secret on first start, the
+   * certificate with it, and - if the owner asked - the router mapping that makes the address work
+   * from outside the house. What comes back is a status that says which of those succeeded.
+   */
+  private async setRelayHosting(patch: { enabled?: boolean; port?: number; internet?: boolean }): Promise<RemoteControlState> {
+    const next: Partial<RemoteControlSettings> = {}
+    if (typeof patch.enabled === 'boolean') next.relayHosting = patch.enabled
+    if (Number.isInteger(patch.port)) next.relayHostPort = Number(patch.port)
+    if (typeof patch.internet === 'boolean') next.relayHostInternet = patch.internet
+    if (patch.enabled === true && !this.ensureRoomSecret()) {
+      throw new RemoteAccessError('This machine has no credential store, so a relay secret cannot be kept safely here.', 500)
+    }
+    this.peers.updateSettings(next)
+    await this.relayHost.apply()
     this.relay.start()
     this.publishState()
     return this.state()
@@ -445,13 +518,17 @@ export class RemoteControlService {
     let ticket: RemotePairingTicket
     try { ticket = decodeTicket(encoded) } catch { return }
     if (!ticket.relayEndpoint || !ticket.relaySecret) return
-    if (this.peers.getSettings().relayEndpoint || this.roomSecret()) return
+    if (this.peers.getSettings().relayEndpoint || this.roomSecret() || this.relayHost.localEndpoint()) return
     const vault = new StoredSecretVault(this.deps.database, this.deps.cipher)
     if (!vault.available()) return
     try { relayEndpointUrl(ticket.relayEndpoint) } catch { return }
     vault.write(RELAY_ROOM_SECRET, ticket.relaySecret)
     this.room = ticket.relaySecret
-    this.peers.updateSettings({ relayEndpoint: ticket.relayEndpoint })
+    this.peers.updateSettings({
+      relayEndpoint: ticket.relayEndpoint,
+      relayEndpointAlternates: ticket.relayEndpointAlternates ?? [],
+      relayFingerprint: ticket.relayFingerprint ?? ''
+    })
     this.relay.start()
   }
 
@@ -655,6 +732,7 @@ export class RemoteControlService {
       message: status.message,
       relay: this.relay.getStatus(),
       relaySecretSet: this.roomSecret() !== null,
+      relayHost: this.relayHost.getStatus(),
       projects: this.deps.database.listProjects().map(projectSummary),
       peers: this.peers.listPeers(),
       pending: this.peers.listPending(),
@@ -669,6 +747,9 @@ export class RemoteControlService {
 
   async start(): Promise<void> {
     await this.server.apply()
+    // The relay this machine runs comes up before the client that uses it, so the first connection
+    // finds something listening instead of failing and waiting out a backoff.
+    await this.relayHost.apply()
     // The relay is what makes this machine answerable from another network, so it comes up with
     // the listener rather than on the first call: a machine nobody has called yet still has to be
     // found, and a peer's request has to be collected while nothing here is asking for anything.
@@ -688,6 +769,7 @@ export class RemoteControlService {
     const before = this.peers.getSettings()
     const after = this.peers.updateSettings(patch)
     if (before.enabled !== after.enabled || before.exposure !== after.exposure || before.port !== after.port) await this.server.apply()
+    if (before.enabled !== after.enabled || before.relay !== after.relay) await this.relayHost.apply()
     if (before.enabled !== after.enabled || before.relay !== after.relay || before.relayEndpoint !== after.relayEndpoint) {
       if (after.enabled && after.relay) this.relay.start()
       else this.relay.stop()
@@ -718,6 +800,8 @@ export class RemoteControlService {
     handle<RemoteControlState>('remote:revoke', (peerId: string) => { this.peers.revoke(String(peerId)); return this.state() })
     handle<RemoteControlState>('remote:set-relay-server', (endpoint: string, secret: string | null) =>
       this.setRelayServer(String(endpoint ?? ''), typeof secret === 'string' ? secret : null))
+    handle<RemoteControlState>('remote:set-relay-hosting', (patch: { enabled?: boolean; port?: number; internet?: boolean }) =>
+      this.setRelayHosting(patch ?? {}))
     handle<RemoteControlState>('remote:connect', async (ticket: string) => {
       // The relay has to be in place before the first pairing request goes out, or a machine that
       // is only reachable through it cannot be reached to be paired with.
@@ -768,7 +852,7 @@ export class RemoteControlService {
   async dispose(): Promise<void> {
     if (this.registered) {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
-        'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
+        'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:set-relay-hosting', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
         'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)
@@ -776,6 +860,9 @@ export class RemoteControlService {
     }
     if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null }
     this.relay.stop()
+    // The relay this machine runs goes down with it, and its router mapping is handed back rather
+    // than left to expire - a forwarded port that nothing listens on is not something to leave open.
+    await this.relayHost.stop()
     this.mirror.stop()
     this.resources.close()
     await this.server.close()

@@ -310,6 +310,25 @@ describe('the relay Conductor runs itself', () => {
     expect((await call).status).toBe(200)
   })
 
+  it('moves to the next address the relay answers on when the first one cannot be reached', async () => {
+    const secret = generateRoomSecret()
+    const endpoint = await startServer(secret)
+    const peers = new Map<string, string>()
+    // The address a machine at home would be handed for a relay behind its own router: correct from
+    // outside, unreachable from inside, with the address that does work listed after it.
+    const laptop = machine('laptop', 'ws://127.0.0.1:9/v1/socket', secret, peers, {
+      alternateEndpoints: () => [endpoint],
+      schedule: (run, ms) => {
+        const handle = setTimeout(run, Math.min(ms, 5))
+        return { cancel: () => clearTimeout(handle) }
+      }
+    })
+
+    laptop.relay.start()
+    await waitFor(() => laptop.relay.getStatus().phase === 'ready', 'the second address to answer')
+    expect(laptop.relay.getStatus().endpoint).toBe(endpoint)
+  })
+
   it('takes the relay address an owner is likely to paste', () => {
     expect(relayEndpointUrl('relay.example.com')).toBe('wss://relay.example.com/v1/socket')
     expect(relayEndpointUrl('http://127.0.0.1:8787')).toBe('ws://127.0.0.1:8787/v1/socket')

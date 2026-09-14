@@ -57,6 +57,8 @@ import type { RelayCallOptions } from './remote-relay'
 export interface ConductorRelayDependencies {
   /** ws:// or wss:// address of the owner's relay, or null when they run none. */
   endpoint(): string | null
+  /** Other addresses the same relay answers on, tried in turn when the first cannot be reached. */
+  alternateEndpoints?(): string[]
   /** The room secret both machines and the server share; never sent, only proved. */
   roomSecret(): string | null
   machineId(): string
@@ -73,8 +75,8 @@ export interface ConductorRelayDependencies {
   /** Test seams: deterministic time, deterministic reconnects, and a socket that can be faked. */
   schedule?(run: () => void, ms: number): { cancel(): void }
   createSocket?(url: string, events: RelaySocketEvents): { connect(): void; send(value: unknown): void; close(code?: number, reason?: string): void }
-  /** Accept a relay serving a certificate no authority signed, for a self-hosted one on a LAN. */
-  allowSelfSignedTls?(): boolean
+  /** The relay certificate pinned for this machine, when it is one the owner runs themselves. */
+  pinnedFingerprint?(): string | null
 }
 
 interface PendingCall {
@@ -132,6 +134,8 @@ export class ConductorRelay {
   private helloStatement = ''
   private published = ''
   private attempt = 0
+  /** Which of the relay's addresses to try next; a machine's best address depends on where it is. */
+  private address = 0
   private timer: { cancel(): void } | null = null
   private expiry: { cancel(): void } | null = null
   private heartbeat: { cancel(): void } | null = null
@@ -155,7 +159,10 @@ export class ConductorRelay {
 
   private setStatus(patch: Partial<RelayStatus>): void {
     const next = { ...this.status, ...patch }
+    // The address is part of what changed, not decoration: this machine moves between the relay's
+    // addresses, and a status that kept saying the first one would name a relay it is not on.
     if (next.phase === this.status.phase && next.message === this.status.message &&
+        next.endpoint === this.status.endpoint &&
         next.lastPollAt === this.status.lastPollAt && next.reachable.join() === this.status.reachable.join()) return
     this.status = next
     this.deps.changed?.(this.getStatus())
@@ -210,8 +217,15 @@ export class ConductorRelay {
     this.publish()
   }
 
+  /** Every address this relay is known to answer on, best first. */
+  private addresses(): string[] {
+    const primary = this.deps.endpoint()
+    return [...(primary ? [primary] : []), ...(this.deps.alternateEndpoints?.() ?? [])].filter(Boolean)
+  }
+
   private open(): void {
-    const endpoint = this.deps.endpoint()
+    const addresses = this.addresses()
+    const endpoint = addresses[this.address % Math.max(1, addresses.length)]
     if (!endpoint) return
     let url: string
     try { url = relayEndpointUrl(endpoint) }
@@ -219,7 +233,11 @@ export class ConductorRelay {
       this.setStatus({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
       return
     }
-    this.setStatus({ phase: this.attempt ? this.status.phase : 'connecting', message: this.attempt ? this.status.message : null })
+    this.setStatus({
+      phase: this.attempt ? this.status.phase : 'connecting',
+      message: this.attempt ? this.status.message : null,
+      endpoint
+    })
     const events: RelaySocketEvents = {
       open: () => { /* nothing is true yet: the challenge and the proofs decide that */ },
       frame: frame => this.onFrame(frame),
@@ -229,7 +247,7 @@ export class ConductorRelay {
       ? this.deps.createSocket(url, events)
       : new RelaySocket(url, events, {
           maxMessageBytes: RELAY_MAX_FRAME_BYTES,
-          rejectUnauthorized: this.deps.allowSelfSignedTls?.() !== true
+          ...(this.deps.pinnedFingerprint?.() ? { fingerprint: this.deps.pinnedFingerprint()! } : {})
         })
     this.socket.connect()
   }
@@ -255,6 +273,9 @@ export class ConductorRelay {
     // the backoff is what keeps a dead address from turning into a busy loop on a laptop battery.
     const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_MIN_MS * 2 ** Math.min(this.attempt, 5))
     this.attempt = wasReady ? 1 : this.attempt + 1
+    // An address that did not answer is not the address to keep trying: the next attempt takes the
+    // next one the relay is known to answer on, which is how a machine that came home finds it.
+    if (!wasReady) this.address += 1
     this.timer?.cancel()
     this.timer = this.schedule(() => { this.timer = null; this.start() }, delay)
   }

@@ -11,9 +11,10 @@ import { generateRoomSecret } from '../src/main/relay-room.ts'
  * The relay, set up the way an owner actually sets it up: by typing into Account & machines.
  *
  * smoke-conductor-relay.mjs proves the route works when the settings are set through the bridge.
- * This proves the settings are reachable at all - that the panel renders the two boxes, that the
- * button saves both, that the secret is not echoed back into the renderer, and that the panel then
- * says which relay is carrying the machine.
+ * This proves an owner can get there at all: start a relay from the panel with nothing typed, watch
+ * it mint its own certificate and secret, see the pairing code carry all three to the other machine,
+ * and - for a relay that runs somewhere else - type an address and a secret that is never handed
+ * back to the window.
  *
  * Run with: powershell -NoProfile -File scripts/run-smoke-background.ps1 -SmokeScript scripts/smoke-relay-settings.mjs
  */
@@ -66,7 +67,34 @@ try {
 
   const relayCard = panel.locator('.remote-relay-server')
   await relayCard.scrollIntoViewIfNeeded()
-  await expect(relayCard.getByText('Run the relay yourself', { exact: true })).toBeVisible()
+  await expect(relayCard.getByText('Run the relay on this machine', { exact: true })).toBeVisible()
+
+  // The whole point of this panel: a relay, started from here, with nothing typed and no terminal.
+  await relayCard.getByText('Run the relay on this machine', { exact: true }).locator('xpath=../..').locator('input[type="checkbox"]').check()
+  await expect.poll(() => page.evaluate(() => window.conductor.remote.state().then(state => state.relayHost.running)), { timeout: 30000 }).toBe(true)
+  await expect.poll(() => page.evaluate(() => window.conductor.remote.state().then(state => state.relay.phase)), { timeout: 30000 }).toBe('ready')
+  const hosted = await page.evaluate(() => window.conductor.remote.state())
+  assert.ok(hosted.relayHost.port, 'the relay it started has no port')
+  assert.ok(/^[0-9A-F]{2}(:[0-9A-F]{2})+$/.test(hosted.relayHost.fingerprint ?? ''), 'the relay it started has no certificate')
+  assert.equal(hosted.relay.route, 'server')
+  assert.equal(hosted.relaySecretSet, true, 'starting a relay did not produce a room secret')
+  await page.screenshot({ path: join(output, 'relay-hosted.png') })
+  results.screenshots.push('artifacts/relay-settings/relay-hosted.png')
+  check('a relay was started from the panel, with its own certificate and a secret it made itself')
+
+  // And the code that carries all of it to the other machine, so nothing is typed there either.
+  const code = await page.evaluate(() => window.conductor.remote.createTicket())
+  // What the other machine is told to dial is exactly what this one advertises on this network.
+  assert.equal(code.ticket.relayEndpoint, hosted.relayHost.addresses[0], 'the pairing code did not carry the relay address')
+  assert.ok(code.ticket.relaySecret, 'the pairing code did not carry the room secret')
+  assert.equal(code.ticket.relayFingerprint, hosted.relayHost.fingerprint, 'the pairing code did not carry the certificate to pin')
+  check('the pairing code carries the address, the secret and the certificate to pin')
+
+  await relayCard.getByText('Run the relay on this machine', { exact: true }).locator('xpath=../..').locator('input[type="checkbox"]').uncheck()
+  await expect.poll(() => page.evaluate(() => window.conductor.remote.state().then(state => state.relayHost.running)), { timeout: 20000 }).toBe(false)
+  await page.evaluate(() => window.conductor.remote.setRelayServer('', ''))
+  check('the relay it runs can be stopped from the same place')
+
   const address = relayCard.locator('input[type="text"]')
   const room = relayCard.locator('input[type="password"]')
   await expect(address).toBeVisible()

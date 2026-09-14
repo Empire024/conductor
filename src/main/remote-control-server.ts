@@ -1,5 +1,5 @@
 import { randomUUID, X509Certificate } from 'node:crypto'
-import { networkInterfaces } from 'node:os'
+import { localAddresses } from './network-addresses'
 import { createServer, type Server } from 'node:https'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { RemoteControlSettings, RemotePairingTicket, RemoteProjectSummary } from '../shared/remote-control'
@@ -26,14 +26,13 @@ export function resolveBindHost(settings: Pick<RemoteControlSettings, 'exposure'
   return settings.exposure === 'network' ? '0.0.0.0' : '127.0.0.1'
 }
 
-/** Addresses a peer could dial, used for the certificate's SAN list and the pairing ticket. */
-export function localAddresses(): string[] {
-  const found: string[] = []
-  for (const entries of Object.values(networkInterfaces())) {
-    for (const entry of entries ?? []) if (entry.family === 'IPv4' && !entry.internal) found.push(entry.address)
-  }
-  return found
-}
+/**
+ * Addresses a peer could dial, used for the certificate's SAN list and the pairing ticket.
+ *
+ * Re-exported rather than defined here: the relay needs the same answer, and a machine that names a
+ * virtual switch's address in its pairing code is unreachable for a reason nobody can see.
+ */
+export { localAddresses }
 
 export interface RemoteControlServerDependencies {
   peers: RemotePeers
@@ -46,7 +45,7 @@ export interface RemoteControlServerDependencies {
   relayKey?(): string | null
   deviceKey?(): string | null
   /** The owner's own relay, handed to the other machine so pairing carries the whole route. */
-  relayRoom?(): { endpoint: string; secret: string } | null
+  relayRoom?(): { endpoint: string; secret: string; fingerprint?: string; alternates?: string[] } | null
   changed?(): void
 }
 
@@ -203,7 +202,14 @@ export class RemoteControlServer {
       ...(settings.relay && relayKey && deviceKey ? { relayKey, deviceKey } : {}),
       // The machine being paired has to reach this one, and if this one is only reachable through a
       // relay the other machine has never heard of, a code that omits it is a code that cannot work.
-      ...(settings.relay && room ? { relayEndpoint: room.endpoint, relaySecret: room.secret } : {})
+      ...(settings.relay && room
+        ? {
+            relayEndpoint: room.endpoint,
+            relaySecret: room.secret,
+            ...(room.fingerprint ? { relayFingerprint: room.fingerprint } : {}),
+            ...(room.alternates?.length ? { relayEndpointAlternates: room.alternates } : {})
+          }
+        : {})
     }
   }
 

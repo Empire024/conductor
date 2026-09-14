@@ -9,8 +9,22 @@ const fail = (reason: unknown): string => reason instanceof Error ? reason.messa
 const shortFingerprint = (value: string | null): string => value ? value.replace(/:/g, '').slice(0, 16).replace(/(.{4})/g, '$1 ').trim() : ''
 
 /** Which relay is carrying this machine, in the owner's terms rather than the protocol's. */
-const relayRouteLabel = (relay: RelayStatus): string =>
-  relay.route === 'server' ? `Your own relay${relay.endpoint ? ` · ${relay.endpoint}` : ''}` : 'Private gist on your GitHub account'
+const relayRouteLabel = (relay: RelayStatus, hosting: boolean): string =>
+  relay.route !== 'server' ? 'Private gist on your GitHub account'
+    : hosting ? 'The relay on this machine'
+    : `Your own relay${relay.endpoint ? ` · ${relay.endpoint}` : ''}`
+
+/** What the relay running here is doing, said the way the owner would ask about it. */
+const hostLabel = (host: RemoteControlState['relayHost']): string =>
+  host.running ? (host.port ? `Running on port ${host.port}` : 'Running') : host.message ? 'Not running' : 'Off'
+
+/** Whether machines off this network can reach it, and - when they cannot - that it is so. */
+const internetLabel = (host: RemoteControlState['relayHost']): string => {
+  if (host.internet.state === 'open') return host.internet.address ?? 'Open'
+  if (host.internet.state === 'opening') return 'Asking your router…'
+  if (host.internet.state === 'failed') return 'Not reachable from outside'
+  return 'This network only'
+}
 
 /** The relay's own words for what it is doing, so "why can't I reach my laptop" has an answer here. */
 const relayLabel = (relay: RelayStatus): string => {
@@ -58,6 +72,7 @@ export function RemoteControlSettings(): React.JSX.Element {
   const [pairs, setPairs] = useState<Record<string, string>>({})
   const [relayAddress, setRelayAddress] = useState<string | null>(null)
   const [relaySecret, setRelaySecret] = useState('')
+  const [hostPort, setHostPort] = useState<string | null>(null)
 
   const refresh = useCallback(() => {
     void window.conductor.remote.githubState().then(setGithub).catch(reason => setError(fail(reason)))
@@ -185,7 +200,7 @@ export function RemoteControlSettings(): React.JSX.Element {
             {settings.relay && (
               <div className="remote-endpoint">
                 <div><span>Encrypted relay</span><code>{relayLabel(state.relay)}</code></div>
-                <div><span>Route</span><code>{relayRouteLabel(state.relay)}</code></div>
+                <div><span>Route</span><code>{relayRouteLabel(state.relay, settings.relayHosting)}</code></div>
                 {state.relay.reachable.length > 0 && <div><span>Machines checked in</span><code>{state.relay.reachable.length}</code></div>}
               </div>
             )}
@@ -193,36 +208,94 @@ export function RemoteControlSettings(): React.JSX.Element {
               <div className="remote-relay-server">
                 <label className="remote-row">
                   <span>
-                    <strong>Run the relay yourself</strong>
+                    <strong>Run the relay on this machine</strong>
                     <small>
-                      A relay of your own pushes messages the moment they are written and answers to nobody&apos;s rate limit.
-                      Start it with <code>npm run relay</code>, then paste its address and the secret it printed here and on
-                      your other machines. Leave both empty to fall back to the private gist.
+                      Your machines meet on a relay instead of through GitHub, so nothing is charged against an API budget
+                      and a message arrives the moment it is sent. Conductor runs it here, with a certificate and a room
+                      secret it makes for you. This machine has to be awake for the others to meet on it.
                     </small>
                   </span>
+                  <input type="checkbox" checked={settings.relayHosting} disabled={busy === 'relay-host'}
+                    onChange={event => void run('relay-host', () => window.conductor.remote.setRelayHosting({ enabled: event.target.checked }))} />
                 </label>
-                <input type="text" placeholder="wss://relay.example.com" spellCheck={false}
-                  value={relayAddress ?? settings.relayEndpoint}
-                  onChange={event => setRelayAddress(event.target.value)} />
-                <input type="password" autoComplete="off" spellCheck={false}
-                  placeholder={state.relaySecretSet ? 'Room secret — saved on this machine' : 'Room secret from npm run relay:secret'}
-                  value={relaySecret} onChange={event => setRelaySecret(event.target.value)} />
-                <div className="remote-actions">
-                  <button className="remote-primary" disabled={busy === 'relay-server'} onClick={() => void run('relay-server', async () => {
-                    // An empty box means "leave the stored secret alone", so re-saving an address
-                    // never silently wipes the secret that makes it usable.
-                    await window.conductor.remote.setRelayServer(relayAddress ?? settings.relayEndpoint, relaySecret.trim() ? relaySecret.trim() : null)
-                    setRelaySecret('')
-                    setRelayAddress(null)
-                  })}>Use this relay</button>
-                  {(settings.relayEndpoint || state.relaySecretSet) && (
-                    <button disabled={busy === 'relay-server'} onClick={() => void run('relay-server', async () => {
-                      await window.conductor.remote.setRelayServer('', '')
-                      setRelaySecret('')
-                      setRelayAddress(null)
-                    })}>Back to the gist</button>
-                  )}
-                </div>
+
+                {settings.relayHosting && (
+                  <>
+                    <div className="remote-endpoint">
+                      <div><span>Relay here</span><code>{hostLabel(state.relayHost)}</code></div>
+                      <div><span>Reachable</span><code>{internetLabel(state.relayHost)}</code></div>
+                      {state.relayHost.addresses.map(address => (
+                        <div key={address}><span>On this network</span><code>{address}</code></div>
+                      ))}
+                    </div>
+                    <label className="remote-row">
+                      <span>
+                        <strong>Let my machines reach it from anywhere</strong>
+                        <small>
+                          Asks your router to forward this port to this machine, which is what lets a laptop on another
+                          network arrive at all. Nothing is published: whoever connects still has to hold the room secret,
+                          and you still confirm every pairing here by hand.
+                        </small>
+                      </span>
+                      <input type="checkbox" checked={settings.relayHostInternet} disabled={busy === 'relay-host'}
+                        onChange={event => void run('relay-host', () => window.conductor.remote.setRelayHosting({ internet: event.target.checked }))} />
+                    </label>
+                    {state.relayHost.internet.message && <p className="remote-hint">{state.relayHost.internet.message}</p>}
+                    {state.relayHost.message && <p className="remote-error"><ShieldAlert size={12} /> {state.relayHost.message}</p>}
+                    <label className="remote-row">
+                      <span><strong>Port</strong><small>Change it only if something else on this machine already uses it.</small></span>
+                      <input type="text" inputMode="numeric" value={hostPort ?? String(settings.relayHostPort)}
+                        onChange={event => setHostPort(event.target.value.replace(/[^0-9]/g, '').slice(0, 5))}
+                        onBlur={event => {
+                          const port = Number(event.target.value)
+                          setHostPort(null)
+                          if (Number.isInteger(port) && port >= 1024 && port <= 65535 && port !== settings.relayHostPort) {
+                            void run('relay-host', () => window.conductor.remote.setRelayHosting({ port }))
+                          }
+                        }} />
+                    </label>
+                    <p className="remote-hint">
+                      Create a pairing code below and give it to your other machine. The code carries this relay&apos;s address,
+                      its certificate and the room secret, so there is nothing to type over there.
+                    </p>
+                  </>
+                )}
+
+                {!settings.relayHosting && (
+                  <>
+                    <label className="remote-row">
+                      <span>
+                        <strong>Or use a relay somewhere else</strong>
+                        <small>
+                          One you already run — on a server, from the container image, or on another of your machines.
+                          Leave both empty to fall back to the private gist.
+                        </small>
+                      </span>
+                    </label>
+                    <input type="text" placeholder="wss://relay.example.com" spellCheck={false}
+                      value={relayAddress ?? settings.relayEndpoint}
+                      onChange={event => setRelayAddress(event.target.value)} />
+                    <input type="password" autoComplete="off" spellCheck={false}
+                      placeholder={state.relaySecretSet ? 'Room secret — saved on this machine' : 'Room secret'}
+                      value={relaySecret} onChange={event => setRelaySecret(event.target.value)} />
+                    <div className="remote-actions">
+                      <button className="remote-primary" disabled={busy === 'relay-server'} onClick={() => void run('relay-server', async () => {
+                        // An empty box means "leave the stored secret alone", so re-saving an address
+                        // never silently wipes the secret that makes it usable.
+                        await window.conductor.remote.setRelayServer(relayAddress ?? settings.relayEndpoint, relaySecret.trim() ? relaySecret.trim() : null)
+                        setRelaySecret('')
+                        setRelayAddress(null)
+                      })}>Use this relay</button>
+                      {(settings.relayEndpoint || state.relaySecretSet) && (
+                        <button disabled={busy === 'relay-server'} onClick={() => void run('relay-server', async () => {
+                          await window.conductor.remote.setRelayServer('', '')
+                          setRelaySecret('')
+                          setRelayAddress(null)
+                        })}>Back to the gist</button>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
             )}
             {settings.relay && state.relay.message && <p className="remote-hint">{state.relay.message}</p>}

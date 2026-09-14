@@ -47,8 +47,10 @@ export class RelayRoute {
 
   getStatus(): RelayStatus {
     const status = this.active().getStatus()
+    // The relay reports which of its addresses it is actually on, which is not always the first one
+    // it was given, so its own answer is kept rather than overwritten with the configured address.
     return this.usingServer()
-      ? { ...status, route: 'server', endpoint: this.deps.endpoint() }
+      ? { ...status, route: 'server', endpoint: status.endpoint ?? this.deps.endpoint() }
       : { ...status, route: 'github', endpoint: null }
   }
 

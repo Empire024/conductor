@@ -56,6 +56,36 @@ export interface RemoteControlSettings {
    * should never be put back on it silently. Empty means "use the gist mailbox".
    */
   relayEndpoint: string
+  /**
+   * Other addresses the same relay answers on, tried in turn when the first one cannot be reached.
+   * A relay at home has a public address and a local one, and which of them works depends on where
+   * the machine reading this happens to be.
+   */
+  relayEndpointAlternates: string[]
+  /** SHA-256 of the certificate that relay serves, pinned exactly as the direct listener's is. */
+  relayFingerprint: string
+  /** Run the relay on this machine, so linking needs no server and no terminal. */
+  relayHosting: boolean
+  relayHostPort: number
+  /** Ask the router to forward that port, which is what makes the link work off this network. */
+  relayHostInternet: boolean
+}
+
+/** What the relay running on this machine is doing, in the terms the owner set it up in. */
+export interface RelayHostStatus {
+  running: boolean
+  port: number | null
+  fingerprint: string | null
+  /** Addresses on this network another machine can use, best first. */
+  addresses: string[]
+  /**
+   * Whether this relay can be reached from outside the network it is on. Two computers behind two
+   * routers have no route to each other, so this is the difference between linking machines in one
+   * building and linking them anywhere - and when it cannot be done, the reason is what the owner
+   * needs, not the fact.
+   */
+  internet: { state: 'off' | 'opening' | 'open' | 'failed'; address: string | null; message: string | null }
+  message: string | null
 }
 
 export interface RemoteGrant {
@@ -142,7 +172,13 @@ export interface RemotePairingTicket {
    * get it wrong. A machine that already has a relay of its own keeps it.
    */
   relayEndpoint?: string
+  /** The same relay's other addresses, so the machine being paired can use the one that works. */
+  relayEndpointAlternates?: string[]
   relaySecret?: string
+  /** The relay's certificate fingerprint, so the machine being paired pins it rather than trusting
+   *  whatever answers that address. A relay on a home machine has no certificate authority behind
+   *  it, and does not need one when the owner carries the fingerprint across by hand. */
+  relayFingerprint?: string
 }
 
 /** What a machine advertises about a project it shares, including who that working copy is. */
@@ -197,6 +233,8 @@ export interface RemoteControlState {
   /** Whether a room secret for the owner's own relay is held here. The secret itself never leaves
    *  the credential store, so the renderer is told that it exists and nothing more. */
   relaySecretSet: boolean
+  /** The relay this machine runs itself, if it runs one. */
+  relayHost: RelayHostStatus
   projects: RemoteProjectSummary[]
   peers: RemotePeerRecord[]
   pending: PendingPairingRequest[]
@@ -241,6 +279,8 @@ export interface RemoteControlBridge {
    * gist mailbox. The secret is write-only from here: nothing ever reads it back out.
    */
   setRelayServer(endpoint: string, secret: string | null): Promise<RemoteControlState>
+  /** Starts, stops or reconfigures the relay this machine runs for itself and its other machines. */
+  setRelayHosting(patch: { enabled?: boolean; port?: number; internet?: boolean }): Promise<RemoteControlState>
   createTicket(): Promise<{ ticket: RemotePairingTicket; encoded: string }>
   approve(pendingId: string, grantedProjectIds: string[]): Promise<RemoteControlState>
   /** Re-approves a shared project whose folder moved, after the owner has seen both paths. */
@@ -288,10 +328,13 @@ export interface RemoteTabRequest {
 }
 
 export const DEFAULT_REMOTE_PORT = 51840
+/** The relay's default port when Conductor runs one itself. */
+export const DEFAULT_RELAY_PORT = 8787
 
 export function normalizeRemoteSettings(stored: unknown): RemoteControlSettings {
   const value = (stored && typeof stored === 'object' ? stored : {}) as Record<string, unknown>
   const port = Number(value.port)
+  const port2 = Number(value.relayHostPort)
   const machineName = typeof value.machineName === 'string' ? value.machineName.trim().slice(0, 60) : ''
   return {
     enabled: value.enabled === true,
@@ -301,7 +344,14 @@ export function normalizeRemoteSettings(stored: unknown): RemoteControlSettings 
     // On by default: it publishes no address and opens no port, and without it a machine that moved
     // off this network simply stops answering. Settings written before it existed still get it.
     relay: value.relay !== false,
-    relayEndpoint: typeof value.relayEndpoint === 'string' ? value.relayEndpoint.trim().slice(0, 300) : ''
+    relayEndpoint: typeof value.relayEndpoint === 'string' ? value.relayEndpoint.trim().slice(0, 300) : '',
+    relayEndpointAlternates: Array.isArray(value.relayEndpointAlternates)
+      ? value.relayEndpointAlternates.filter((entry): entry is string => typeof entry === 'string' && entry.length <= 300).slice(0, 8)
+      : [],
+    relayFingerprint: typeof value.relayFingerprint === 'string' ? value.relayFingerprint.trim().slice(0, 200) : '',
+    relayHosting: value.relayHosting === true,
+    relayHostPort: Number.isInteger(port2) && port2 >= 1024 && port2 <= 65535 ? port2 : DEFAULT_RELAY_PORT,
+    relayHostInternet: value.relayHostInternet === true
   }
 }
 
@@ -382,7 +432,12 @@ export function decodeTicket(encoded: string): RemotePairingTicket {
   catch { throw new Error('That pairing code is not readable. Copy the whole code from the other machine.') }
   const ticket = parsed as Partial<RemotePairingTicket>
   const required: Array<keyof RemotePairingTicket> = ['machineId', 'machineName', 'accountLogin', 'host', 'fingerprint', 'code', 'expiresAt']
-  const optionalKeys: Array<'relayKey' | 'deviceKey' | 'relayEndpoint' | 'relaySecret'> = ['relayKey', 'deviceKey', 'relayEndpoint', 'relaySecret']
+  const optionalKeys: Array<'relayKey' | 'deviceKey' | 'relayEndpoint' | 'relaySecret' | 'relayFingerprint'> =
+    ['relayKey', 'deviceKey', 'relayEndpoint', 'relaySecret', 'relayFingerprint']
+  if (ticket.relayEndpointAlternates !== undefined &&
+      (!Array.isArray(ticket.relayEndpointAlternates) || ticket.relayEndpointAlternates.some(entry => typeof entry !== 'string'))) {
+    throw new Error('That pairing code is incomplete or from an incompatible version.')
+  }
   if (optionalKeys.some(key => ticket[key] !== undefined && typeof ticket[key] !== 'string')) {
     throw new Error('That pairing code is incomplete or from an incompatible version.')
   }
