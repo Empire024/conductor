@@ -50,9 +50,20 @@ Two things commonly stop it, and the panel names both rather than reporting a ge
 - **The router does not answer.** UPnP is switched off in most routers by default, and a host
   firewall can also drop the reply. Turn UPnP on, or forward the port by hand - the message says
   which port to which address.
-- **Your provider puts you behind its own network.** If the address the router reports is itself
-  private (`100.64.x.x` and friends), no port it forwards can be reached from outside, and nothing
-  Conductor does will change that. Run the relay somewhere with a public address instead.
+- **Your connection has no public IPv4 at all.** Providers increasingly hand out DS-Lite or
+  carrier-grade NAT, where the router itself sits behind the provider's network. There is no port to
+  forward, and a router page for forwarding one may not even exist.
+
+The second case is not the dead end it looks like, because such a connection nearly always has IPv6,
+and on IPv6 this machine already holds a public address of its own. Nothing needs forwarding: the
+router only has to stop refusing traffic to it, on a page usually called IPv6 exposure, pinholes or
+firewall rules. Those pages ask for the machine's hardware address rather than an address that can
+change, so the panel prints that too, along with the exact `wss://[…]` address the other machine
+will use. The relay listens on both families, so the same port serves either.
+
+The catch worth knowing: an IPv6-only route works only for a machine that itself has IPv6. Conductor
+hands over every address the relay answers on and tries them in turn, so a machine that has only
+IPv4 falls back to the local address when it is on the same network - and cannot reach it otherwise.
 
 Then create a pairing code and take it to the other machine. The code carries the relay's address,
 its certificate fingerprint and the room secret, so there is nothing to type on the second machine -

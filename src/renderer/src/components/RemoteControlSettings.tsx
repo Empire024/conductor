@@ -225,7 +225,12 @@ export function RemoteControlSettings(): React.JSX.Element {
                       <div><span>Relay here</span><code>{hostLabel(state.relayHost)}</code></div>
                       <div><span>Reachable</span><code>{internetLabel(state.relayHost)}</code></div>
                       {state.relayHost.addresses.map(address => (
-                        <div key={address}><span>On this network</span><code>{address}</code></div>
+                        <div key={address}>
+                          {/* A bracketed address is a public IPv6 one: reachable from anywhere that
+                              has IPv6, once the router is told to allow it. */}
+                          <span>{address.includes('[') ? 'Public IPv6' : 'On this network'}</span>
+                          <code>{address}</code>
+                        </div>
                       ))}
                     </div>
                     <label className="remote-row">

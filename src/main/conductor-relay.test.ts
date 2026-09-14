@@ -329,10 +329,25 @@ describe('the relay Conductor runs itself', () => {
     expect(laptop.relay.getStatus().endpoint).toBe(endpoint)
   })
 
+  it('reaches a relay over IPv6, which is the only way in on a connection with no public IPv4', async () => {
+    const secret = generateRoomSecret()
+    const server = new RelayServer({ secrets: [secret], port: 0, host: '::1' })
+    running.push(server)
+    const bound = await server.listen()
+    const peers = new Map<string, string>()
+    const laptop = machine('laptop', `ws://[::1]:${bound.port}/v1/socket`, secret, peers)
+
+    laptop.relay.start()
+    await waitFor(() => laptop.relay.getStatus().phase === 'ready', 'the IPv6 connection', 6000)
+    expect(laptop.relay.getStatus().phase).toBe('ready')
+  })
+
   it('takes the relay address an owner is likely to paste', () => {
     expect(relayEndpointUrl('relay.example.com')).toBe('wss://relay.example.com/v1/socket')
     expect(relayEndpointUrl('http://127.0.0.1:8787')).toBe('ws://127.0.0.1:8787/v1/socket')
     expect(relayEndpointUrl('wss://relay.example.com/custom')).toBe('wss://relay.example.com/custom')
+    // An IPv6 address keeps its brackets all the way through, or it is not an address at all.
+    expect(relayEndpointUrl('wss://[2a02:8308:29d:8800::f352]:8787')).toBe('wss://[2a02:8308:29d:8800::f352]:8787/v1/socket')
     expect(() => relayEndpointUrl('ftp://relay.example.com')).toThrow(/ws:\/\/ or wss:\/\//)
   })
 })

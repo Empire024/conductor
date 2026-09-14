@@ -38,3 +38,47 @@ export function localAddresses(): string[] {
 export function primaryAddress(): string | null {
   return localAddresses()[0] ?? null
 }
+
+/**
+ * This machine's addresses on the public IPv6 internet, stable ones first.
+ *
+ * On a connection with no public IPv4 - which is now ordinary, and is what an internet provider
+ * hands out as DS-Lite - these are the only addresses another machine can reach from outside. There
+ * is nothing to forward and no port to map: the address belongs to this machine already, and the
+ * router only has to stop refusing traffic to it.
+ *
+ * Which of them to advertise matters. Windows and macOS rotate temporary addresses for outgoing
+ * traffic, so an address picked at random may be gone tomorrow, while the one a router handed out
+ * over DHCPv6 or one built from the hardware address stays. Neither origin is visible from here, so
+ * they are ranked by what they look like: a short suffix is a router's assignment, ff:fe in the
+ * middle is built from the adapter, and anything else is assumed to rotate.
+ */
+export function globalIpv6Addresses(interfaces = networkInterfaces()): string[] {
+  const scored: Array<{ address: string; rank: number }> = []
+  for (const [name, entries] of Object.entries(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.family !== 'IPv6' || entry.internal) continue
+      const address = entry.address.toLowerCase()
+      // Link-local and unique-local addresses are not reachable from off this network.
+      if (address.startsWith('fe80:') || address.startsWith('fc') || address.startsWith('fd')) continue
+      if (VIRTUAL_ADAPTER.test(name)) continue
+      const assigned = /::[0-9a-f]{1,4}$/.test(address)
+      const hardware = address.includes('ff:fe')
+      scored.push({ address: entry.address, rank: assigned ? 0 : hardware ? 1 : 2 })
+    }
+  }
+  return scored.sort((left, right) => left.rank - right.rank).map(entry => entry.address)
+}
+
+/** The hardware address of the interface this machine is really on, which is what a router's
+ *  IPv6 exposure table asks for - it follows the device rather than whatever address it holds. */
+export function primaryMacAddress(interfaces = networkInterfaces()): string | null {
+  const primary = primaryAddress()
+  for (const [name, entries] of Object.entries(interfaces)) {
+    if (VIRTUAL_ADAPTER.test(name)) continue
+    for (const entry of entries ?? []) {
+      if (entry.address === primary && entry.mac && entry.mac !== '00:00:00:00:00:00') return entry.mac.toUpperCase()
+    }
+  }
+  return null
+}

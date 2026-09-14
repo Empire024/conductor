@@ -79,19 +79,22 @@ export class RelaySocket {
     const path = `${target.pathname || '/'}${target.search || ''}`
 
     const pinned = this.options.fingerprint?.trim() ?? ''
+    // An IPv6 address keeps its brackets in a URL and in the Host header, and must lose them to be
+    // connected to. A relay on a connection with no public IPv4 is reached this way and no other.
+    const address = target.hostname.replace(/^\[|\]$/g, '')
     // A relay reached at an address rather than a name has no server name to send, and sending one
     // anyway is both meaningless and forbidden.
-    const named = !/^[\d.]+$/.test(target.hostname) && !target.hostname.includes(':')
+    const named = !/^[\d.]+$/.test(address) && !address.includes(':')
     const socket = secure
       ? tlsConnect({
-          host: target.hostname,
+          host: address,
           port,
-          ...(named ? { servername: target.hostname } : {}),
+          ...(named ? { servername: address } : {}),
           // A pinned certificate is checked below, by its fingerprint, instead of by a chain it was
           // never meant to have. Without a pin, the ordinary public rules apply.
           rejectUnauthorized: !pinned
         })
-      : netConnect({ host: target.hostname, port })
+      : netConnect({ host: address, port })
     this.socket = socket as Socket
     socket.setNoDelay(true)
 

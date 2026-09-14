@@ -68,7 +68,7 @@ const waitFor = async (predicate: () => boolean, what: string, timeoutMs = 4000)
 
 describe('the relay Conductor runs for itself', () => {
   it('starts from a setting, with a certificate and addresses of its own', async () => {
-    const running = host(generateRoomSecret())
+    const running = host(generateRoomSecret(), { publicIpv6: () => [] })
     const status = await running.apply()
 
     expect(status.running).toBe(true)
@@ -109,9 +109,10 @@ describe('the relay Conductor runs for itself', () => {
     expect(released).not.toBeNull()
   })
 
-  it('keeps running when the router refuses, and says what to do by hand instead', async () => {
+  it('keeps running when the router refuses, and says which port to forward by hand instead', async () => {
     const running = host(generateRoomSecret(), {
-      mapPort: async () => { throw new PortMappingError('No router on this network answered.', 'no-router') }
+      mapPort: async () => { throw new PortMappingError('No router on this network answered.', 'no-router') },
+      publicIpv6: () => []
     }, { internet: true })
 
     await running.apply()
@@ -119,18 +120,39 @@ describe('the relay Conductor runs for itself', () => {
     const status = running.getStatus()
     expect(status.running).toBe(true)
     expect(status.internet.message).toContain('Forward TCP port')
-    // A machine on this network can still reach it; only the way in from outside is missing.
-    expect(status.addresses.length + 1).toBeGreaterThan(0)
+  })
+
+  it('tells a machine with no public IPv4 to allow its IPv6 address instead, and how', async () => {
+    // A connection with no public IPv4 - DS-Lite, which providers now hand out as a matter of
+    // course - has nothing to forward. What it has is this machine's own public IPv6 address, and a
+    // router page that asks for the hardware address rather than an address that can change.
+    const running = host(generateRoomSecret(), {
+      mapPort: async () => { throw new PortMappingError("This connection is behind your provider's own network (100.70.1.4).", 'carrier-nat') },
+      publicIpv6: () => ['2a02:8308:29d:8800::f352'],
+      hardwareAddress: () => 'AC:F2:3C:CB:5F:F5'
+    }, { internet: true })
+
+    const started = await running.apply()
+    await waitFor(() => running.getStatus().internet.state === 'failed', 'the carrier refusal')
+    const message = running.getStatus().internet.message ?? ''
+    expect(message).toContain('nothing needs forwarding')
+    expect(message).toContain('AC:F2:3C:CB:5F:F5')
+    expect(message).toContain(`wss://[2a02:8308:29d:8800::f352]:${started.port}/v1/socket`)
+    expect(message).not.toContain('Forward TCP port')
+    // And it is advertised, so a pairing code made here carries the address that actually works.
+    expect(running.advertisedEndpoints()[0]).toBe(`wss://[2a02:8308:29d:8800::f352]:${started.port}/v1/socket`)
   })
 
   it('says plainly when the connection is behind the provider, where no port can help', async () => {
     const running = host(generateRoomSecret(), {
-      mapPort: async () => { throw new PortMappingError("This connection is behind your provider's own network (100.70.1.4).", 'carrier-nat') }
+      mapPort: async () => { throw new PortMappingError("This connection is behind your provider's own network (100.70.1.4).", 'carrier-nat') },
+      publicIpv6: () => []
     }, { internet: true })
 
     await running.apply()
     await waitFor(() => running.getStatus().internet.state === 'failed', 'the carrier refusal')
     expect(running.getStatus().internet.message).toContain("provider's own network")
+    expect(running.getStatus().internet.message).toContain('no port to forward')
     expect(running.getStatus().internet.message).not.toContain('Forward TCP port')
   })
 

@@ -4,7 +4,7 @@ import { RELAY_SOCKET_PATH } from '../shared/relay-protocol'
 import { PortMappingError, lanAddress, releasePortMapping, requestPortMapping, PORT_MAPPING_LEASE_SECONDS, type PortMapping } from './port-mapping'
 import { RelayServer } from '../relay-server/server'
 import { createRemoteTlsIdentity, tlsIdentityUsable, type RemoteTlsIdentity } from './remote-tls'
-import { localAddresses } from './remote-control-server'
+import { globalIpv6Addresses, localAddresses, primaryMacAddress } from './network-addresses'
 import type { SecretKeyValueStore } from './secret-store'
 
 /**
@@ -47,6 +47,10 @@ export interface RelayHostDependencies {
   secret(): string | null
   changed?(): void
   now?(): number
+  /** This machine's public IPv6 addresses and hardware address; injectable so the advice the owner
+   *  is given can be exercised for a machine that has them and one that does not. */
+  publicIpv6?(): string[]
+  hardwareAddress?(): string | null
   /** Test seams: a server that does not bind, and a router that does not exist. */
   createServer?(options: { secrets: string[]; port: number; host: string; tls: { key: string; cert: string } }): RelayServer
   mapPort?(port: number): Promise<PortMapping>
@@ -84,15 +88,24 @@ export class RelayHost {
    * Every address this relay answers on, best first.
    *
    * More than one is needed because the best address is not best from everywhere: a machine out in
-   * the world needs the public one, and a machine sitting on this network usually cannot use it at
-   * all - most routers will not send a packet back in through their own public address. Handing over
-   * both lets the other machine use whichever one works from where it is.
+   * the world needs a public address, a machine sitting on this network usually cannot use one at
+   * all - most routers will not send a packet back in through their own public address - and an
+   * IPv6 address only works if the machine reading it has IPv6 too. Handing over all of them lets
+   * the other machine use whichever one works from where it is.
    */
   advertisedEndpoints(): string[] {
     if (!this.status.running) return []
     const internet = this.status.internet.address
     return internet ? [internet, ...this.status.addresses] : [...this.status.addresses]
   }
+
+  /** Whether this machine is reachable from outside at all, by any route it can see. */
+  private ipv6Endpoints(): string[] {
+    const port = this.status.port
+    return port ? this.ipv6().map(address => `wss://[${address}]:${port}${RELAY_SOCKET_PATH}`) : []
+  }
+
+  private ipv6(): string[] { return this.deps.publicIpv6?.() ?? globalIpv6Addresses() }
 
   /** What this machine itself connects to when it is the one running the relay. */
   localEndpoint(): string | null {
@@ -154,18 +167,38 @@ export class RelayHost {
     }
 
     const port = Number.isInteger(settings.port) && settings.port > 0 ? settings.port : 8787
-    const server = this.deps.createServer
-      ? this.deps.createServer({ secrets: [secret], port, host: '0.0.0.0', tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
-      : new RelayServer({ secrets: [secret], port, host: '0.0.0.0', tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
+    // Both families. On a connection with no public IPv4 - which is what a provider hands out as
+    // DS-Lite, and is now common - IPv6 is the only way in from outside, and a relay listening on
+    // 0.0.0.0 would answer nothing there however the router is configured. Binding the IPv6 wildcard
+    // takes IPv4 with it; a machine with IPv6 switched off falls back to IPv4 alone.
+    const start = async (host: string): Promise<{ server: RelayServer; port: number }> => {
+      const made = this.deps.createServer
+        ? this.deps.createServer({ secrets: [secret], port, host, tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
+        : new RelayServer({ secrets: [secret], port, host, tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
+      const bound = await made.listen()
+      return { server: made, port: bound.port }
+    }
     try {
-      const bound = await server.listen()
-      if (intent !== this.intent) { await server.close(); return this.getStatus() }
-      this.server = server
+      let started: { server: RelayServer; port: number }
+      try { started = await start('::') }
+      catch (error) {
+        if (/EADDRINUSE/.test(error instanceof Error ? error.message : String(error))) throw error
+        started = await start('0.0.0.0')
+      }
+      if (intent !== this.intent) { await started.server.close(); return this.getStatus() }
+      this.server = started.server
       this.publish({
         running: true,
-        port: bound.port,
+        port: started.port,
         fingerprint: tls.fingerprint,
-        addresses: localAddresses().map(address => `wss://${address}:${bound.port}${RELAY_SOCKET_PATH}`),
+        // A public IPv6 address goes first because it is the only one that works from both sides:
+        // a machine out in the world can reach it once the router allows it, and a machine on this
+        // network reaches it directly, with no router involved at all. Only the two most stable are
+        // carried, since the rest are temporary addresses that will have rotated by tomorrow.
+        addresses: [
+          ...this.ipv6().slice(0, 2).map(address => `wss://[${address}]:${started.port}${RELAY_SOCKET_PATH}`),
+          ...localAddresses().map(address => `wss://${address}:${started.port}${RELAY_SOCKET_PATH}`)
+        ],
         internet: { state: settings.internet ? 'opening' : 'off', address: null, message: null },
         message: null
       })
@@ -202,16 +235,20 @@ export class RelayHost {
       if (intent !== this.intent) return
       const reason = error instanceof PortMappingError ? error.reason : 'network'
       const detail = error instanceof Error ? error.message : String(error)
-      // The owner can still do by hand exactly what the router was asked to do, so the message says
-      // which port to which machine rather than only that it did not work.
-      const byHand = `Forward TCP port ${port} to ${lanAddress() ?? 'this machine'} in your router, or run the relay somewhere that already has a public address.`
-      this.publish({
-        internet: {
-          state: 'failed',
-          address: null,
-          message: reason === 'carrier-nat' ? detail : `${detail} ${byHand}`
-        }
-      })
+      // Whatever the router would not do, the owner still can - but only if they are told the right
+      // thing to do. A connection with no public IPv4 cannot forward a port at all, and telling
+      // someone to forward one is how an evening disappears. What such a connection almost always
+      // has is IPv6, where this machine already holds a public address and the router only has to
+      // stop refusing traffic to it, so that instruction is given instead whenever it applies.
+      const ipv6 = this.ipv6Endpoints()[0]
+      const mac = this.deps.hardwareAddress?.() ?? primaryMacAddress()
+      const elsewhere = 'run the relay somewhere that already has a public address.'
+      const advice = ipv6
+        ? `This machine already has a public IPv6 address, so nothing needs forwarding: allow TCP ${port} to it in your router, on the page for IPv6 exposure, pinholes or firewall rules${mac ? ` (it asks for this machine's hardware address: ${mac})` : ''}. Machines that have IPv6 then reach it at ${ipv6}. Failing that, ${elsewhere}`
+        : reason === 'carrier-nat'
+          ? `There is no port to forward on this connection, so ${elsewhere}`
+          : `Forward TCP port ${port} to ${lanAddress() ?? 'this machine'} in your router, or ${elsewhere}`
+      this.publish({ internet: { state: 'failed', address: null, message: `${detail} ${advice}` } })
     }
   }
 
