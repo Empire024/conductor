@@ -26,8 +26,8 @@ console.log(JSON.stringify({ mode: Number(child.stdout.trim()), background: proc
 process.stderr.write('probe diagnostic\\n');
 process.exit(Number(process.argv[2] || 0));`)
   return { root, wrapper, probe, cleanup() {
-    const actual = realpathSync(root)
-    assert.ok(actual.toLowerCase().startsWith(join(realpathSync(tmpdir()), 'conductor-smoke-wrapper-').toLowerCase()))
+    const actual = realpathSync.native(root)
+    assert.ok(actual.toLowerCase().startsWith(join(realpathSync.native(tmpdir()), 'conductor-smoke-wrapper-').toLowerCase()))
     rmSync(actual, { recursive: true, force: true })
   } }
 }
@@ -41,7 +41,9 @@ test('inherits all dialog suppression flags through Node, preserves arguments an
     assert.equal(child.mode & 0x8003, 0x8003)
     assert.equal(child.background, '1')
     assert.deepEqual(child.args, ['23', 'two words'])
-    assert.equal(realpathSync(child.cwd), realpathSync(f.root))
+    // realpathSync resolves links but leaves an 8.3 alias alone, while the child reports the
+    // long name its own process has; only the native call canonicalises both to one form.
+    assert.equal(realpathSync.native(child.cwd), realpathSync.native(f.root))
     assert.deepEqual(restored, { restoredMode: 2, restoredBackground: '0', restoredLocation: true, childExit: 23 })
   } finally { f.cleanup() }
 })
