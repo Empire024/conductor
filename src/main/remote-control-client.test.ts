@@ -206,8 +206,36 @@ describe('reaching a machine off this network', () => {
 
   it('says so plainly when a machine has neither a route here nor a relay key', async () => {
     const fixture = relayed([{ ...paired, host: '', port: 0, relayKey: undefined, deviceKey: undefined }], ok(null))
-    await expect(fixture.client.call('render-desktop', 'tabs.list', {})).rejects.toThrow(/no address on this network/)
+    await expect(fixture.client.call('render-desktop', 'tabs.list', {})).rejects.toThrow(/pair again to reach it from anywhere/i)
     expect(fixture.calls).toHaveLength(0)
+  })
+
+  /**
+   * The failure the owner actually hits after moving a laptop: the stored address is on a network
+   * they are no longer on, so the socket times out. What they must not be handed is the bare
+   * `connect ETIMEDOUT 192.168.x.x`, which names neither route nor remedy.
+   */
+  it('blames the missing relay key, not the dead address, for a pairing made before the relay', async () => {
+    const fixture = relayed([{ ...paired, relayKey: undefined, deviceKey: undefined }], ok(null))
+    const failure = await fixture.client.call('render-desktop', 'tabs.list', {}).catch((reason: Error) => reason)
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toMatch(/paired before the encrypted relay existed/i)
+    expect((failure as Error).message).toMatch(/pair again/i)
+    // The underlying socket failure is still carried, so a real diagnosis is not lost either.
+    expect((failure as Error).message).toMatch(/127\.0\.0\.1/)
+    expect(fixture.calls).toHaveLength(0)
+  })
+
+  it('blames the switched-off relay when the pairing does carry its keys', async () => {
+    const store = new MapStore()
+    store.setSetting(CONNECTIONS, JSON.stringify([paired]))
+    const client = new RemoteControlClient({
+      store, machineId: () => 'this-machine', machineName: () => 'This Laptop',
+      deviceKey: () => device,
+      relay: { enabled: () => false, call: async () => ({ status: 200, body: '' }) },
+      now: () => Date.parse('2026-03-02T09:00:00.000Z')
+    })
+    await expect(client.call('render-desktop', 'tabs.list', {})).rejects.toThrow(/relay is not running on this machine/i)
   })
 
   it('keeps a pairing made before the relay existed working over its direct address alone', () => {

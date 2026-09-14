@@ -223,6 +223,26 @@ export class RemoteControlClient {
   }
 
   /**
+   * Why a machine could not be reached, in terms of the thing the owner has to change. A pairing
+   * made before the relay existed pinned no relay key, and a key cannot be adopted after the fact
+   * without the owner carrying it across again — that is what makes pairing the fix rather than a
+   * setting. Everything else is the relay being switched off or signed out.
+   */
+  private unreachable(target: RemoteTarget, cause: unknown): RemoteAccessError {
+    const detail = cause instanceof Error ? ` (${cause.message})` : ''
+    const where = target.host ? `at ${target.host}` : 'on this network'
+    if (!target.relayKey || !target.deviceKey) {
+      return new RemoteAccessError(
+        `${target.machineId} answered nowhere ${where}${detail}. It was paired before the encrypted relay existed, so it can only be reached on the network it was paired on. Create a new pairing code on that machine and pair again to reach it from anywhere.`, 503)
+    }
+    if (!this.deps.relay?.enabled()) {
+      return new RemoteAccessError(
+        `${target.machineId} answered nowhere ${where}${detail}. The encrypted relay is not running on this machine, so only its address on this network was tried. Sign in to GitHub and switch remote control on here, then try again.`, 503)
+    }
+    return new RemoteAccessError(`${target.machineId} answered nowhere ${where}${detail}.`, 503)
+  }
+
+  /**
    * One request over whichever route reaches that machine. Direct first: it is faster and never
    * leaves the owner's own network. The encrypted relay is for when there is no route to try, or
    * the stored address no longer leads to that machine. A refusal the machine itself sent is an
@@ -241,12 +261,16 @@ export class RemoteControlClient {
         // here would strand the owner on a network they no longer share.
         const answered = error instanceof RemoteAccessError && error.status >= 400 && error.status < 500 &&
           error.status !== 408 && error.status !== 495 && error.status !== 504
-        if (answered || !canRelay) throw error
+        if (answered) throw error
+        // Failing on the address alone is the ordinary case for a machine that moved networks, and
+        // `connect ETIMEDOUT 192.168.x.x` tells the owner nothing they can act on. Say which of the
+        // two reachable routes was missing, because each one has a different fix.
+        if (!canRelay) throw this.unreachable(target, error)
         routeError = error
       }
     }
     if (!canRelay || !relay || !target.deviceKey) {
-      throw routeError ?? new RemoteAccessError('That machine has no address on this network, and the encrypted relay is not available for it. Pair it again to set the relay up.', 503)
+      throw routeError ?? this.unreachable(target, null)
     }
     const answer = await relay.call(target.machineId, target.deviceKey, path, body, headers, target.relayKey)
     return { result: decode(answer.status, Buffer.from(answer.body, 'base64').toString('utf8')), transport: 'relay' }

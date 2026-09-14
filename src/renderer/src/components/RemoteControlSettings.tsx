@@ -147,10 +147,19 @@ export function RemoteControlSettings(): React.JSX.Element {
                 onBlur={event => void run('name', () => window.conductor.remote.setSettings({ machineName: event.target.value }))} />
             </label>
             <label className="remote-row">
-              <span><strong>Reachable from</strong><small>{settings.exposure === 'network' ? 'Your local network can reach this machine. Only a machine paired to your GitHub account can connect, over TLS.' : 'This computer only. Nothing leaves the machine.'}</small></span>
+              <span>
+                <strong>Direct connections</strong>
+                <small>
+                  {settings.exposure === 'network'
+                    ? 'Your local network can reach this machine directly. Only a machine paired to your GitHub account can connect, over TLS.'
+                    : settings.relay
+                      ? 'No direct connection from your network. Your other machines still reach this one through the encrypted relay below, wherever they are.'
+                      : 'This computer only. With the relay off too, nothing reaches this machine from anywhere.'}
+                </small>
+              </span>
               <select value={settings.exposure} onChange={event => void run('exposure', () => window.conductor.remote.setSettings({ exposure: event.target.value as RemoteExposure }))}>
                 <option value="loopback">This computer only (recommended)</option>
-                <option value="network">My local network — deliberate exposure</option>
+                <option value="network">My local network — faster on the same network</option>
               </select>
             </label>
             {settings.exposure === 'network' && (
