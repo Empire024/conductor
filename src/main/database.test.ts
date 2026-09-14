@@ -321,6 +321,23 @@ describe('ConductorDatabase persistence', () => {
     })
   })
 
+  it('checkpoints a file tab left without a machine by an older build', () => {
+    withDatabasePath((path, root) => {
+      const database = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'project'), 'Project')
+        const session = database.listSessions(project.id)[0]!
+        const file = { id: `document:${session.id}:legacy`, projectId: project.id, path: 'file.ts', mode: 'editor' as const }
+        database.saveRecoveryCheckpoint({
+          sessions: [], activeProjectId: project.id, activeSessionId: session.id,
+          focusedGroupIds: {}, sessionIdsByProject: { [project.id]: session.id },
+          documents: [{ workspaceId: session.id, files: [file as never], activeId: file.id }]
+        })
+        expect(database.getWorkspaceRecoveryState().documents?.[0]?.files[0]?.machineId).toBe('local')
+      } finally { database.close() }
+    })
+  })
+
   it('marks runtimes left active by a machine crash as exited on the next boot', () => {
     withDatabasePath((path, root) => {
       const database = new ConductorDatabase(path)

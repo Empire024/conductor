@@ -59,7 +59,7 @@ import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
-import { openWorkspaceFile, changeWorkspacePath, workspaceFileIds } from './components/workspace-files-state'
+import { openWorkspaceFile, changeWorkspacePath, loadWorkspaceFiles, workspaceFileIds, workspaceFileMachine } from './components/workspace-files-state'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
 import { AppVersionButton } from './components/AppVersionButton'
 import { SystemPerformanceChip } from './components/SystemPerformanceChip'
@@ -97,11 +97,16 @@ const workspaceDocumentsSnapshot = (): WorkspaceDocumentState[] => {
   for (let index = 0; index < localStorage.length; index++) {
     const key = localStorage.key(index)
     if (!key?.startsWith('conductor.workspaceFiles.')) continue
-    try {
-      const value = JSON.parse(localStorage.getItem(key) ?? 'null') as { files?: unknown; activeId?: unknown } | null
-      if (!value || !Array.isArray(value.files)) continue
-      documents.push({ workspaceId: key.slice('conductor.workspaceFiles.'.length), files: value.files as WorkspaceDocumentState['files'], activeId: typeof value.activeId === 'string' ? value.activeId : null })
-    } catch { /* a stale local record is ignored here and by WorkspaceFiles */ }
+    // Load through the same migration the file tabs use, so a record left by an older
+    // build reaches the checkpoint in the shape it accepts. One malformed record used to
+    // make the main process reject the whole checkpoint, losing every workspace's autosave.
+    const workspaceId = key.slice('conductor.workspaceFiles.'.length)
+    const { files, activeId } = loadWorkspaceFiles(workspaceId)
+    documents.push({
+      workspaceId,
+      files: files.map(file => ({ ...file, machineId: workspaceFileMachine(file) })),
+      activeId: typeof activeId === 'string' && files.some(file => file.id === activeId) ? activeId : null
+    })
   }
   return documents
 }

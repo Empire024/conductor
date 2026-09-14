@@ -2,6 +2,7 @@ import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { StructuredAgentStore } from './structured-store'
+import { LOCAL_MACHINE_ID } from '../shared/remote-control'
 import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
 import { parseSessionArchive } from './session-archive'
 import type {
@@ -57,13 +58,17 @@ function normalizeWorkspaceDocuments(value: unknown): WorkspaceDocumentState[] {
       if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('Invalid workspace document')
       const file = item as Record<string, unknown>
       if (typeof file.id !== 'string' || !(recoveryIdentity.test(file.id) || recoveryDocumentId.test(file.id)) || documentIds.has(file.id)) throw new Error('Invalid workspace document identity')
-      if (typeof file.machineId !== 'string' || !recoveryIdentity.test(file.machineId) || typeof file.projectId !== 'string' || !recoveryIdentity.test(file.projectId)) throw new Error('Invalid workspace document placement')
+      // A tab opened before file tabs carried a machine belongs to this computer, the same
+      // migration loadWorkspaceFiles and the session archive apply. Rejecting it here would
+      // fail every autosave for as long as that record sat in the workspace.
+      const machineId = file.machineId === undefined ? LOCAL_MACHINE_ID : file.machineId
+      if (typeof machineId !== 'string' || !recoveryIdentity.test(machineId) || typeof file.projectId !== 'string' || !recoveryIdentity.test(file.projectId)) throw new Error('Invalid workspace document placement')
       if (typeof file.path !== 'string' || file.path.length > 32000 || file.path.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(file.path) || file.path.replaceAll('\\', '/').split('/').includes('..') || /[\0-\x1f]/.test(file.path)) throw new Error('Invalid workspace document path')
       if (!['editor', 'preview', 'browser'].includes(file.mode as string)) throw new Error('Invalid workspace document mode')
       if (file.line !== undefined && (!Number.isSafeInteger(file.line) || (file.line as number) < 1)) throw new Error('Invalid workspace document line')
       if (file.allowBinary !== undefined && typeof file.allowBinary !== 'boolean') throw new Error('Invalid workspace document setting')
       documentIds.add(file.id)
-      return { id: file.id, machineId: file.machineId, projectId: file.projectId, path: file.path.replaceAll('\\', '/'), mode: file.mode as 'editor' | 'preview' | 'browser', ...(file.line !== undefined ? { line: file.line as number } : {}), ...(file.allowBinary !== undefined ? { allowBinary: file.allowBinary } : {}) }
+      return { id: file.id, machineId, projectId: file.projectId, path: file.path.replaceAll('\\', '/'), mode: file.mode as 'editor' | 'preview' | 'browser', ...(file.line !== undefined ? { line: file.line as number } : {}), ...(file.allowBinary !== undefined ? { allowBinary: file.allowBinary } : {}) }
     })
     const activeId = state.activeId === null ? null : state.activeId
     if (activeId !== null && (typeof activeId !== 'string' || !files.some(file => file.id === activeId))) throw new Error('Invalid active workspace document')

@@ -30,7 +30,9 @@ export function loadWorkspaceFiles(workspaceId: string): { files: WorkspaceFile[
     const saved = JSON.parse(localStorage.getItem('conductor.workspaceFiles.' + workspaceId) ?? 'null')
     if (saved && Array.isArray(saved.files)) return { files: saved.files.filter((file: WorkspaceFile) => typeof file.id === 'string' && typeof file.projectId === 'string' && typeof file.path === 'string' && (!file.machineId || typeof file.machineId === 'string') && ['editor', 'preview', 'browser'].includes(file.mode)).map((file: WorkspaceFile) => ({ ...file, machineId: workspaceFileMachine(file) })), activeId: saved.activeId }
     const legacy = JSON.parse(localStorage.getItem('conductor.workspaceDocument.' + workspaceId) ?? 'null')
-    if (legacy?.path) { const id = 'document:' + workspaceId + ':' + legacy.path; return { files: [{ ...legacy, id, machineId: LOCAL_MACHINE_ID }], activeId: id } }
+    // The path is folded into the id, so strip what a document id may not carry: a raw path
+    // would be refused by the recovery checkpoint and take the whole autosave down with it.
+    if (legacy?.path) { const id = 'document:' + workspaceId + ':' + String(legacy.path).replace(/[^a-zA-Z0-9_-]+/g, '-').slice(-160); return { files: [{ ...legacy, id, machineId: LOCAL_MACHINE_ID }], activeId: id } }
   } catch { /* an invalid UI record must not prevent opening the workspace */ }
   return { files: [], activeId: null }
 }

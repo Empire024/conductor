@@ -23,6 +23,14 @@ describe('remote workspace file identity', () => {
     expect(window.dispatchEvent).toHaveBeenCalledWith(expect.objectContaining({ detail: expect.objectContaining({ machineId: 'host-a' }) }))
   })
 
+  it('keeps a migrated single-document workspace inside a persistable tab id', () => {
+    records.set('conductor.workspaceDocument.w', JSON.stringify({ projectId: 'p', path: 'src/main/index.ts', mode: 'editor' }))
+    const { files, activeId } = loadWorkspaceFiles('w')
+    expect(files[0]?.id).toBe('document:w:src-main-index-ts')
+    expect(activeId).toBe(files[0]?.id)
+    expect(files[0]?.path).toBe('src/main/index.ts')
+  })
+
   it('migrates legacy tabs to local and never remaps a host tab on a local rename', () => {
     records.set('conductor.workspaceFiles.w', JSON.stringify({ files: [
       { id: 'old', projectId: 'p', path: 'same.txt', mode: 'editor' },
