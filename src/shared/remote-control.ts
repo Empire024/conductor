@@ -230,6 +230,11 @@ export interface RemoteControlBridge {
   releaseProject(machineId: string, localProjectId: string): Promise<RemoteControlState>
   machines(): Promise<MachineDescriptor[]>
   /**
+   * Probes every paired machine and returns what is reachable now. A machine's status is otherwise
+   * only a side effect of real work, so one failed call leaves it looking offline indefinitely.
+   */
+  refreshMachines(): Promise<MachineDescriptor[]>
+  /**
    * Places a new conversation on a paired machine and mirrors it into a local tab. The returned
    * session id is the local one the tab binds to; the remote machine's own ids stay private to it.
    */

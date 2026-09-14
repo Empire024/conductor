@@ -134,6 +134,28 @@ try {
   assert.equal(machines.length, 2)
   check('nothing readable was written to the account, only sealed messages')
 
+  /**
+   * The staleness that made a reachable machine read as "unavailable" in the launcher. A paired
+   * machine's status used to be only a side effect of real work, so one failed call left it marked
+   * offline and the launcher then disabled it — which is also the one place the owner would have
+   * made the call that cleared it. A probe has to be able to recover it on its own.
+   */
+  await host.page.evaluate(() => window.conductor.remote.setSettings({ enabled: false }))
+  await controller.page.evaluate(async machineId => {
+    try { await window.conductor.remote.remoteProjects(machineId) } catch { /* expected while it is down */ }
+  }, connection.machineId)
+  await expect.poll(() => controller.page.evaluate(async id => (await window.conductor.remote.machines()).find(m => m.id === id)?.status, connection.machineId))
+    .toBe('offline')
+  check('a machine that stops answering is marked offline')
+
+  await host.page.evaluate(() => window.conductor.remote.setSettings({ enabled: true }))
+  const recovered = await expect.poll(async () => {
+    const list = await controller.page.evaluate(() => window.conductor.remote.refreshMachines())
+    return list.find(machine => machine.id === connection.machineId)?.status
+  }, { timeout: 60000 }).toBe('online').then(() => controller.page.evaluate(() => window.conductor.remote.machines()))
+  assert.equal(recovered.find(machine => machine.id === connection.machineId)?.status, 'online')
+  check('a probe alone brings a recovered machine back, with no other call to make it happen')
+
   await controller.page.evaluate(machineId => window.conductor.remote.forget(machineId), connection.machineId)
   await host.page.evaluate(peerId => window.conductor.remote.revoke(peerId), connection.peerId)
   check('the pairing was torn down from both sides')

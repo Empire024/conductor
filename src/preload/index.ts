@@ -75,6 +75,7 @@ const bridge: ConductorBridge = {
     confirmProject: (machineId, localProjectId, remoteProjectId) => ipcRenderer.invoke('remote:confirm-project', machineId, localProjectId, remoteProjectId),
     releaseProject: (machineId, localProjectId) => ipcRenderer.invoke('remote:release-project', machineId, localProjectId),
     machines: () => ipcRenderer.invoke('remote:machines'),
+    refreshMachines: () => ipcRenderer.invoke('remote:refresh-machines'),
     openTab: (request) => ipcRenderer.invoke('remote:open-tab', request),
     releaseTab: (localSessionId) => ipcRenderer.invoke('remote:release-tab', localSessionId),
     closeTab: (localSessionId) => ipcRenderer.invoke('remote:close-tab', localSessionId),

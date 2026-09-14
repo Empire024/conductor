@@ -4,6 +4,7 @@ import {
   Bot,
   ChevronRight,
   MonitorSmartphone,
+  RefreshCw,
   Sparkles,
   TerminalSquare
 } from 'lucide-react'
@@ -69,19 +70,33 @@ export function machinePlacementOptions(machines: MachineDescriptor[], projectId
 
 export function LauncherPane({ projectId, machineId, error, onSelectMachine, onOpen }: LauncherPaneProps): React.JSX.Element {
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
+  const [checking, setChecking] = useState(false)
   const selected = machineId ?? LOCAL_MACHINE_ID
 
   useEffect(() => {
     let live = true
     const read = (): void => { void window.conductor.remote.machines().then(list => { if (live) setMachines(list) }).catch(() => { if (live) setMachines([]) }) }
     read()
+    // A paired machine's status is otherwise only whatever the last real call happened to find, so
+    // opening the launcher asks what is reachable now rather than showing a machine as unavailable
+    // because of one blip that nothing has retried since.
+    void window.conductor.remote.refreshMachines().then(list => { if (live) setMachines(list) }).catch(() => undefined)
     // Pairing or a machine coming online changes what this list may offer.
     const stop = window.conductor.remote.onState(read)
     return () => { live = false; stop() }
   }, [])
 
+  const checkAgain = (): void => {
+    setChecking(true)
+    void window.conductor.remote.refreshMachines()
+      .then(setMachines)
+      .catch(() => undefined)
+      .finally(() => setChecking(false))
+  }
+
   const options = machinePlacementOptions(machines, projectId)
   const current = options.find(option => option.machine.id === selected)
+  const unavailable = options.filter(option => option.reason && option.machine.id !== selected)
   // Placement is only worth showing once there is somewhere else to place work.
   const placeable = options.length > 1
 
@@ -101,6 +116,15 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
               </option>
             ))}
           </select>
+          <button
+            type="button"
+            className="launcher-placement-recheck"
+            disabled={checking}
+            title="Ask every paired machine whether it is reachable now"
+            onClick={checkAgain}
+          >
+            <RefreshCw size={12} className={checking ? 'spinning' : undefined} /> Check again
+          </button>
           <small className={error ? 'launcher-placement-error' : undefined}>
             {error
               || current?.reason
@@ -108,6 +132,13 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
                 ? 'New tabs run here.'
                 : `New tabs run on ${current?.machine.name ?? 'that machine'}; you drive them from this window.`)}
           </small>
+          {/* A disabled option cannot be selected, so its reason would never be readable anywhere.
+              Saying "unavailable" without saying why is the puzzle this list exists to avoid. */}
+          {unavailable.length > 0 && (
+            <ul className="launcher-placement-reasons">
+              {unavailable.map(({ machine, reason }) => <li key={machine.id}>{reason}</li>)}
+            </ul>
+          )}
         </div>
       )}
       <div className="launcher-grid" aria-label="Open runtime">

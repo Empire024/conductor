@@ -51,6 +51,8 @@ export interface RemoteControlServiceDependencies {
 }
 
 const MACHINE_NAME_SETTING = 'remote-control.machineName'
+/** How often a paired machine is re-probed so the launcher reflects what is reachable now. */
+const MACHINE_PROBE_MS = 60_000
 /** The X25519 key relayed messages to this machine are sealed to; never leaves the credential store. */
 const RELAY_KEY_SECRET = 'remote-control.relay.sealKey'
 
@@ -190,6 +192,9 @@ export class RemoteControlService {
   readonly mirror: RemoteSessionMirror
   private registered = false
   private seal: RelaySealKeyPair | null = null
+  private heartbeat: ReturnType<typeof setInterval> | null = null
+  /** One probe at a time; a relay round trip can outlast the interval that started it. */
+  private probing: Promise<MachineDescriptor[]> | null = null
 
   constructor(private readonly deps: RemoteControlServiceDependencies) {
     const store = deps.database
@@ -260,7 +265,7 @@ export class RemoteControlService {
       // peer gains nothing by arriving this way instead of over the network.
       handle: (path, body, headers) => this.server.handleRequest(path, body, headers),
       enabled: () => this.peers.getSettings().enabled && this.peers.getSettings().relay && this.auth.identity() !== null,
-      changed: () => this.publishState()
+      changed: () => { this.publishState(); this.probeMachinesSeenOnRelay() }
     })
     this.client = new RemoteControlClient({
       store,
@@ -328,6 +333,47 @@ export class RemoteControlService {
 
   machines(): MachineDescriptor[] {
     return describeMachines(this.machineName(), this.client.list())
+  }
+
+  /**
+   * What is reachable now, rather than what the last call happened to find.
+   *
+   * A paired machine's status was only ever a side effect of real work: one call that failed left
+   * it marked unreachable until some later call happened to succeed. The launcher disables an
+   * offline machine, so the owner could not make that later call happen from the one place the
+   * staleness showed — a machine that blinked once stayed "unavailable" indefinitely.
+   *
+   * `projects.list` is the right probe rather than the cheapest one: reachability and the projects
+   * that machine still advertises are the two things the launcher gates on, and a stale mapping
+   * reads as exactly the same word.
+   */
+  async probeMachines(): Promise<MachineDescriptor[]> {
+    if (this.probing) return await this.probing
+    const peers = this.client.list().filter(connection => connection.status !== 'revoked' && connection.peerId)
+    if (!peers.length) return this.machines()
+    this.probing = Promise.all(peers.map(async connection => {
+      // A machine that does not answer is a result here, not a failure: call() has already recorded
+      // why against the connection, and that recorded reason is what the owner is shown.
+      try { await this.refreshRemoteProjects(connection.machineId) } catch { /* recorded by call() */ }
+    })).then(() => this.machines()).finally(() => { this.probing = null })
+    return await this.probing
+  }
+
+  private scheduleMachineProbe(): void {
+    if (this.heartbeat) return
+    this.heartbeat = setInterval(() => { void this.probeMachines().catch(() => undefined) }, MACHINE_PROBE_MS)
+    this.heartbeat.unref?.()
+  }
+
+  /**
+   * A peer republishing its relay mailbox proves it is running and signed into the same account, so
+   * a machine this one believes is offline is worth re-probing the moment it reappears there —
+   * without waiting out the heartbeat interval.
+   */
+  private probeMachinesSeenOnRelay(): void {
+    const reachable = new Set(this.relay.getStatus().reachable)
+    if (!this.client.list().some(connection => connection.status !== 'connected' && connection.status !== 'revoked' && reachable.has(connection.machineId))) return
+    void this.probeMachines().catch(() => undefined)
   }
 
   /** The sentence appended to an agent's briefing so it knows where it is running. */
@@ -476,6 +522,10 @@ export class RemoteControlService {
     // the listener rather than on the first call: a machine nobody has called yet still has to be
     // found, and a peer's request has to be collected while nothing here is asking for anything.
     this.relay.start()
+    // Paired machines are probed on a timer so a machine that blinked once does not stay marked
+    // unavailable until the owner happens to make a call that succeeds.
+    this.scheduleMachineProbe()
+    void this.probeMachines().catch(() => undefined)
     // Tabs placed elsewhere in an earlier run keep catching up without the owner reopening them.
     if (this.mirror.list().length) this.mirror.start()
   }
@@ -531,6 +581,7 @@ export class RemoteControlService {
       return this.state()
     })
     handle<MachineDescriptor[]>('remote:machines', () => this.machines())
+    handle<MachineDescriptor[]>('remote:refresh-machines', () => this.probeMachines())
     handle<{ localSessionId: string; machineId: string; machineName: string }>('remote:open-tab', (request: unknown) => {
       const args = (request ?? {}) as Record<string, unknown>
       const required = ['machineId', 'projectId', 'sessionId'] as const
@@ -561,10 +612,12 @@ export class RemoteControlService {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
         'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
-        'remote:machines', 'remote:open-tab', 'remote:release-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
+        'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:release-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)
       this.registered = false
     }
+    if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null }
+    this.relay.stop()
     this.mirror.stop()
     this.resources.close()
     await this.server.close()
