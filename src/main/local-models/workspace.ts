@@ -14,7 +14,7 @@ export const CONTAINER_WORKSPACE = '/workspace'
 /** Files that must never reach a local model or its sandbox even when they are tracked in the
  *  project. Matched per path segment and per basename, so `packages/api/.env` is covered too.
  *  Example/template envs are deliberately allowed: they exist to be read. */
-const SECRET_SEGMENTS = new Set(['.ssh', '.aws', '.azure', '.gnupg', '.gcloud', '.kube', '.docker', '.local-models', '.conductor', 'node_modules/.cache'])
+const SECRET_SEGMENTS = new Set(['.ssh', '.aws', '.azure', '.gnupg', '.gcloud', '.kube', '.docker', '.local-models', '.conductor', '.cache'])
 const SECRET_NAMES = new Set(['.npmrc', '.pypirc', '.netrc', '_netrc', '.git-credentials', '.htpasswd', 'credentials', 'credentials.json', 'secrets.json', 'secrets.yaml', 'secrets.yml', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', '.env'])
 const SECRET_PATTERNS = [/^\.env\./i, /\.pem$/i, /\.pfx$/i, /\.p12$/i, /\.kdbx$/i, /\.keystore$/i, /(^|[-_.])secret(s)?([-_.]|$)/i, /^id_(rsa|dsa|ecdsa|ed25519)/i]
 const SECRET_ALLOW = [/^\.env\.(example|sample|template|dist)$/i, /\.secrets?\.(md|txt)$/i]

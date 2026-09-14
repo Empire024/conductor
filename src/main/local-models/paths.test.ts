@@ -1,10 +1,19 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import * as os from 'node:os'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LocalRootError, childEnvironment, detectDrives, driveOf, layoutFor, localRoot, onSystemDrive, pointerPaths, sessionWorkspace, systemDrive } from './paths.ts'
 import { modelFilePath, defaultModelConfig, QWEN_9B } from './config.ts'
 import { migrateModelFile, moveFile, sha256File } from './provenance.ts'
+
+// `paths.ts` imports `homedir` by name, so it has to be mocked at the module rather than by
+// stubbing `os.homedir` on the real module (which callers would not observe). Every other test
+// in this file gets the real implementation through this passthrough.
+vi.mock('node:os', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:os')>()
+  return { ...actual, homedir: vi.fn(actual.homedir) }
+})
 
 /** A scratch root on a real fixed non-system drive, or null when this machine has none — the
  *  relocation tests then skip rather than pretending the system drive is acceptable. */
@@ -39,11 +48,20 @@ describe('local data root', () => {
   })
 
   it('fails closed when nothing is configured', () => {
+    // Deterministic regardless of the machine this runs on: a real checkout pointer or a real
+    // user-profile pointer (from having run setup here before) would otherwise make this test
+    // silently assert nothing, exactly the failure commit 8b81a98 widened the old guard to avoid
+    // without ever actually forcing the "nothing configured" case to occur.
+    const fakeHome = mkdtempSync(join(tmpdir(), 'conductor-fakehome-'))
+    const fakeCwd = mkdtempSync(join(tmpdir(), 'conductor-fakecwd-'))
+    cleanup.push(() => { rmSync(fakeHome, { recursive: true, force: true }); rmSync(fakeCwd, { recursive: true, force: true }) })
+    vi.mocked(os.homedir).mockReturnValue(fakeHome)
+    const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(fakeCwd)
+    cleanup.push(() => { cwdSpy.mockRestore(); vi.mocked(os.homedir).mockRestore() })
     process.env.CONDUCTOR_LOCAL_ROOT = ' '
-    // Every place a pointer is actually read from, not just the one beside the checkout: a machine
-    // that has run setup has one in the user profile too, and checking only the checkout made this
-    // assert against a root that was configured all along.
-    if (pointerPaths().some(existsSync)) return // Configured here; there is nothing to assert.
+    // Confirms the fixture actually produced the "nothing configured" case instead of merely
+    // hoping it did.
+    expect(pointerPaths().some(existsSync)).toBe(false)
     expect(() => localRoot()).toThrow(LocalRootError)
   })
 

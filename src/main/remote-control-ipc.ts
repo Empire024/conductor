@@ -594,7 +594,6 @@ export class RemoteControlService {
         ...(typeof args.title === 'string' ? { title: args.title } : {})
       })
     })
-    handle<boolean>('remote:release-tab', (localSessionId: string) => { this.mirror.release(String(localSessionId)); return true })
     handle<{ closed: boolean; message?: string }>('remote:close-tab', (localSessionId: string) => this.mirror.closeRemote(String(localSessionId)))
     handle<string>('remote:session-machine', (localSessionId: string) => this.mirror.machineId(String(localSessionId)))
     handle<{ machineId: string; cwd: string | null }>('remote:session-file-context', (localSessionId: string) => this.mirror.fileContext(String(localSessionId)))
@@ -612,7 +611,7 @@ export class RemoteControlService {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
         'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
-        'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:release-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
+        'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)
       this.registered = false
     }

@@ -239,8 +239,6 @@ export interface RemoteControlBridge {
    * session id is the local one the tab binds to; the remote machine's own ids stay private to it.
    */
   openTab(request: RemoteTabRequest): Promise<{ localSessionId: string; machineId: string; machineName: string }>
-  /** Stops mirroring a tab the owner closed here, leaving the work itself running there. */
-  releaseTab(localSessionId: string): Promise<boolean>
   /**
    * Closes a placed tab on the machine that runs it and stops mirroring it here. `message` says
    * why the other machine could not be told; the tab is closed here regardless.

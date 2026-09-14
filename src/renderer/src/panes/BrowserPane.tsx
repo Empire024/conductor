@@ -70,12 +70,24 @@ function ProjectBrowserPane({
   const stageRef = useRef<HTMLDivElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const mounted = useRef(false)
+  // React clears refs to unmounting DOM nodes before running this effect's cleanup (refs are
+  // detached synchronously during commit; passive-effect cleanups run later). Reading frameRef
+  // inside the unmount cleanup below would therefore see `null` and skip hiding the native view,
+  // leaving it attached with its last real bounds and no owner to paint over the UI. Caching the
+  // most recent request here means the cleanup can still tell the main process to hide it.
+  const lastPayload = useRef<BrowserSurfaceRequest | null>(null)
+  // Distinguishes leaving for good from the ordinary effect re-run that a resize or a visibility
+  // change causes. Declared before the surface effect so React runs this cleanup first.
+  const unmounting = useRef(false)
+  useEffect(() => () => { unmounting.current = true }, [])
 
   const request = useCallback((): BrowserSurfaceRequest | null => {
     const frame = frameRef.current
     if (!frame || !browserViewId) return null
     const rect = frame.getBoundingClientRect()
-    return { projectId, surfaceId: browserViewId, initialUrl: startingUrl, bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, viewport: { width: viewport.width, height: viewport.height }, visible: visible && !occluded && rect.width > 0 && rect.height > 0 }
+    const payload: BrowserSurfaceRequest = { projectId, surfaceId: browserViewId, initialUrl: startingUrl, bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height }, viewport: { width: viewport.width, height: viewport.height }, visible: visible && !occluded && rect.width > 0 && rect.height > 0 }
+    lastPayload.current = payload
+    return payload
   }, [browserViewId, occluded, projectId, startingUrl, viewport.height, viewport.width, visible])
 
   useEffect(() => {
@@ -101,8 +113,18 @@ function ProjectBrowserPane({
       if (!payload || stopped) return
       const operation = mounted.current ? window.conductor.browser.update(payload) : window.conductor.browser.mount(payload)
       void operation.then(next => {
-        if (stopped) return
-        mounted.current = true; setState(next)
+        mounted.current = true
+        if (stopped) {
+          // The pane unmounted before the mount/update round-tripped: the main process now believes
+          // this surface is visible with the bounds we sent, and nobody else will tell it otherwise.
+          // Hide it instead of leaving a stray native view painted over the UI at its last bounds.
+          // Only on a real unmount - after a mere re-run a newer update is already in flight, and
+          // hiding here would land after it and blank a browser the owner is still looking at.
+          const stale = unmounting.current ? lastPayload.current : null
+          if (stale) void window.conductor.browser.update({ ...stale, visible: false }).catch(() => {})
+          return
+        }
+        setState(next)
         if (next.url) { setInput(next.url); onUrlChange?.(next.url) }
         if (next.presentation !== presentation) void window.conductor.browser.present(projectId, presentation).catch(() => {})
       }).catch(error => { if (!stopped) setFailure(error instanceof Error ? error.message : String(error)) })
@@ -111,7 +133,10 @@ function ProjectBrowserPane({
     observer.observe(frame); window.addEventListener('resize', sync); sync()
     return () => {
       stopped = true; observer.disconnect(); window.removeEventListener('resize', sync)
-      const payload = request()
+      // frameRef.current is already null here whenever this cleanup runs because the pane is
+      // unmounting (see the comment on lastPayload above), so request() would return null and the
+      // hide would silently never be sent. Fall back to the last payload we actually delivered.
+      const payload = request() ?? lastPayload.current
       if (payload && mounted.current) void window.conductor.browser.update({ ...payload, visible: false }).catch(() => {})
     }
   }, [browserViewId, onUrlChange, presentation, projectId, request])

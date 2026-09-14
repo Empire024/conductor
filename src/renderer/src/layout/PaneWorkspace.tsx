@@ -363,7 +363,11 @@ function PaneGroup({
   const runGroupAction = (action: TabGroupAction, tab: PaneTab): void => {
     const result = applyTabGroupAction({ ...workspace.session, layout: workspace.layout }, group.id, tab.id, action)
     workspace.onLayout(result.session.layout)
-    for (const closed of result.session.closedTabs.slice(workspace.session.closedTabs.length)) workspace.onClosed(closed)
+    for (const closed of result.session.closedTabs.slice(workspace.session.closedTabs.length)) {
+      workspace.onClosed(closed)
+      // Closing a whole group closes each placed tab in it where it runs, exactly as closing one tab does.
+      closePlacedTab(closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
+    }
     if (result.tabGroupId) setPendingRename(result.tabGroupId)
   }
 

@@ -25,7 +25,9 @@ import {
   readEnvelope,
   sealMessage,
   signDirectoryEntry,
+  signMessage,
   verifyDirectoryEntry,
+  verifyMessageSignature,
   type RelayBinding,
   type RelaySealKeyPair
 } from './relay-crypto'
@@ -69,6 +71,8 @@ interface PendingCall {
   reject(error: Error): void
   expiresAt: number
   peerMachineId: string
+  /** The device key this call was addressed to; only that key may answer it. */
+  peerDeviceKey: string
 }
 
 interface PartialMessage {
@@ -94,6 +98,22 @@ const pairingKeyFromBody = (path: string, body: Buffer): string | null => {
     const parsed: unknown = JSON.parse(body.toString('utf8'))
     return isRecord(parsed) && typeof parsed.publicKey === 'string' && parsed.publicKey ? parsed.publicKey : null
   } catch { return null }
+}
+
+/**
+ * One sweep touches several mailboxes, and a failure in any of them must not lose the one thing the
+ * loop schedules on: `tick` picks its backoff and its status phase from `RelayUnavailableError`, so
+ * a rate limit or a missing gist scope is re-thrown as itself — with the longest wait any of them
+ * asked for — rather than flattened into a plain error the loop would retry in 1.5 seconds.
+ */
+const sweepFailure = (failures: unknown[]): Error => {
+  let wait: RelayUnavailableError | null = null
+  for (const failure of failures) {
+    if (failure instanceof RelayUnavailableError && (!wait || failure.retryAfterMs > wait.retryAfterMs)) wait = failure
+  }
+  if (wait) return wait
+  const first = failures[0]
+  return new Error(`The relay could not deliver ${failures.length} message(s): ${first instanceof Error ? first.message : String(first)}`)
 }
 
 export class RemoteRelay {
@@ -169,10 +189,14 @@ export class RemoteRelay {
    * each other without real time passing.
    */
   async pollOnce(): Promise<boolean> {
-    await this.publish()
-    const busy = await this.poll()
-    this.expire()
-    return busy
+    // A sweep that ends in an error still has to age out timed-out calls and half-arrived
+    // messages, or one failing poll would leave a caller waiting for ever.
+    try {
+      await this.publish()
+      return await this.poll()
+    } finally {
+      this.expire()
+    }
   }
 
   private async tick(): Promise<void> {
@@ -260,7 +284,7 @@ export class RemoteRelay {
     const payload: RelayRequestBody = { path, headers, body: body.toString('base64') }
     await this.send(peer.entry, { from: this.deps.machineId(), to: machineId, id, kind: 'request', correlationId: id }, Buffer.from(JSON.stringify(payload), 'utf8'))
     const answer = new Promise<RelayResponseBody>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, expiresAt: this.now() + RELAY_CALL_TIMEOUT_MS, peerMachineId: machineId })
+      this.pending.set(id, { resolve, reject, expiresAt: this.now() + RELAY_CALL_TIMEOUT_MS, peerMachineId: machineId, peerDeviceKey: expectedDeviceKey })
     })
     this.start()
     this.schedule(0)
@@ -268,7 +292,10 @@ export class RemoteRelay {
   }
 
   private async send(entry: RelayDirectoryEntry, binding: RelayBinding, plaintext: Buffer): Promise<void> {
+    const key = this.deps.deviceKey()
+    if (!key) throw new RemoteAccessError('This machine has no device key yet; sign in to GitHub first.', 401)
     const sealed = sealMessage(entry.sealKey, binding, plaintext)
+    const senderSignature = signMessage(key.privateKeyPem, binding, sealed)
     const encoded = sealed.ciphertext.toString('base64')
     const total = Math.max(1, Math.ceil(encoded.length / RELAY_CHUNK_BYTES))
     if (total > 64) throw new RemoteAccessError('Request exceeds 3 MiB.', 413)
@@ -288,7 +315,8 @@ export class RemoteRelay {
         nonce: sealed.nonce,
         tag: sealed.tag,
         chunk: encoded.slice(index * RELAY_CHUNK_BYTES, (index + 1) * RELAY_CHUNK_BYTES),
-        createdAt: new Date(this.now()).toISOString()
+        createdAt: new Date(this.now()).toISOString(),
+        senderSignature
       }
       const name = relayFileName(envelope)
       files[name] = JSON.stringify(envelope)
@@ -305,14 +333,17 @@ export class RemoteRelay {
     const reachable: string[] = []
     let delivered = false
     const collectedAcks: string[] = []
-    const failures: string[] = []
+    const failures: unknown[] = []
     for (const summary of listed) {
       // The list carries file names only; this is the conditional read that brings their contents,
       // and it costs nothing against the rate limit while a mailbox is unchanged.
       const gist = await this.deps.mailbox.read(summary.id)
       if (!gist) continue
       const entry = await this.directoryOf(gist)
-      if (entry) reachable.push(entry.machineId)
+      // Any gist on the account can claim to be any machine, so a claim only counts once a device
+      // key this machine already approved has signed for it.
+      const claimant = entry ? this.deps.peerDeviceKey(entry.machineId) : null
+      if (entry && claimant && verifyDirectoryEntry(entry, claimant)) reachable.push(entry.machineId)
       collectedAcks.push(...await this.readAcks(gist))
       for (const [name, file] of Object.entries(gist.files)) {
         const parsed = parseRelayFileName(name)
@@ -336,12 +367,12 @@ export class RemoteRelay {
         // One unreadable or undeliverable message must not stop the rest of the sweep, or a single
         // bad file in a mailbox would stall every conversation running through it.
         try { await this.deliver(envelope, complete, gist) }
-        catch (error) { failures.push(error instanceof Error ? error.message : String(error)) }
+        catch (error) { failures.push(error) }
       }
     }
     await this.prune(collectedAcks)
     this.setStatus({ reachable })
-    if (failures.length) throw new Error(`The relay could not deliver ${failures.length} message(s): ${failures[0]}`)
+    if (failures.length) throw sweepFailure(failures)
     return delivered
   }
 
@@ -374,6 +405,7 @@ export class RemoteRelay {
     const binding: RelayBinding = {
       from: envelope.from, to: envelope.to, id: envelope.id, kind: envelope.kind, correlationId: envelope.correlationId
     }
+    if (!this.authentic(envelope, binding)) return
     let plaintext: Buffer
     try { plaintext = openMessage(seal.privateKey, envelope, binding, ciphertext) }
     catch { return }
@@ -382,6 +414,24 @@ export class RemoteRelay {
     if (!isRecord(parsed)) return
     if (envelope.kind === 'response') { this.settle(envelope, parsed); return }
     await this.serve(envelope, parsed, gist)
+  }
+
+  /**
+   * Whether the machine this message names as its sender is the one that actually wrote it. Being
+   * sealed to this machine proves nothing about that — the seal key is published — so an answer is
+   * only accepted from the device key the call was addressed to, and a request from an established
+   * peer only from that peer's stored key. The one message whose sender is not approved yet is a
+   * first pairing request, which `handleRequest` authenticates by its own challenge and `serve`
+   * answers only into a mailbox that key signed for.
+   */
+  private authentic(envelope: RelayEnvelope, binding: RelayBinding): boolean {
+    if (envelope.kind === 'response') {
+      const call = this.pending.get(envelope.correlationId)
+      if (!call || call.peerMachineId !== envelope.from) return false
+      return verifyMessageSignature(call.peerDeviceKey, binding, envelope, envelope.senderSignature)
+    }
+    const known = this.deps.peerDeviceKey(envelope.from)
+    return !known || verifyMessageSignature(known, binding, envelope, envelope.senderSignature)
   }
 
   private settle(envelope: RelayEnvelope, parsed: Record<string, unknown>): void {

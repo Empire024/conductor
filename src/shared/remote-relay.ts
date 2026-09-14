@@ -73,6 +73,12 @@ export interface RelayEnvelope {
   /** Base64 slice of the ciphertext, `index` of `total`. */
   chunk: string
   createdAt: string
+  /**
+   * Base64 Ed25519 signature by the sender's device key over the routing fields and the seal
+   * parameters. Sealing proves only that the writer knew the recipient's published key, which is
+   * public; this is what proves who wrote the message. A message without one is refused.
+   */
+  senderSignature: string
 }
 
 /** The plaintext a sealed message carries: exactly what the direct transport puts on the wire. */

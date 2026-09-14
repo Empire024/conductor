@@ -213,8 +213,13 @@ describe('mirroring a conversation that runs on another machine', () => {
     f.mirror.bind(binding({ remoteTabId: 'their-tab' }))
     expect(await f.mirror.closeRemote('local-session')).toEqual({ closed: false, message: 'Render desktop is offline.' })
     expect(f.mirror.list()).toEqual([])
-    // Closing a conversation that was never placed elsewhere asks nobody anything.
-    expect(await f.mirror.closeRemote('unbound-session')).toEqual({ closed: false })
+    // Closing a conversation that was never placed elsewhere asks nobody anything, but the owner
+    // must still be told the other machine was never asked, rather than hearing nothing at all —
+    // otherwise a tab whose binding was already dropped by releaseMachine looks closed with no
+    // sign the remote side is still running it.
+    const result = await f.mirror.closeRemote('unbound-session')
+    expect(result.closed).toBe(false)
+    expect(result.message).toBeTruthy()
   })
 
   it('accepts only an idempotent workspace bind for an active remote conversation', () => {

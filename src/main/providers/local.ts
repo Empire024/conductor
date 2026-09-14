@@ -3,7 +3,7 @@ import type { AdapterOptions, ProviderAdapter } from './adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, localModelLabel } from '../../shared/local-models'
 import { LocalAgentSession } from '../local-models/agent.ts'
-import { endpointFor, loadConfig, readApiKey } from '../local-models/config.ts'
+import { endpointFor, loadConfig, readApiKey, recordedPort } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
 import { health, startServer } from '../local-models/llama.ts'
 import { DockerSandbox } from '../local-models/sandbox.ts'
@@ -23,7 +23,11 @@ const startingServers = new Map<string, Promise<void>>()
  *  closing must not take a server another tab is still using, and the stack's own `stop`
  *  command stays the way servers are shut down. */
 async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, apiKey: string, onStart: () => void): Promise<void> {
-  if ((await health(model.port, apiKey)).ok) return
+  // The recorded port, not the configured one: a server that had to move to a neighbouring or
+  // OS-assigned port is exactly the case the run record exists for, and probing the configured
+  // port would fail on every turn - announcing a start, and making a redundant one - for a
+  // server that is up and answering where every other client is already talking to it.
+  if ((await health(recordedPort(model), apiKey)).ok) return
   let pending = startingServers.get(model.id)
   const first = !pending
   if (!pending) {

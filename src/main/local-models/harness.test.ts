@@ -26,9 +26,9 @@ describe('bounded local coworker tools', () => {
     await runTool('write_file', '{"path":"a/b/c/d/ordinary.txt","content":"safe"}', ctx)
     const { writeFile } = await import('node:fs/promises')
     await writeFile(join(ctx.workspace, 'a/b/c/d/.env'), 'fixture')
-    expect(detectSecretPaths(ctx.workspace)).toContainEqual({ relative: 'a/b/c/d/.env', directory: false })
-    expect(() => detectSecretPaths(ctx.workspace, 1)).toThrow(/depth budget/)
-    expect(() => detectSecretPaths(ctx.workspace, 64, 0)).toThrow(/mask budget/)
+    expect(await detectSecretPaths(ctx.workspace)).toContainEqual({ relative: 'a/b/c/d/.env', directory: false })
+    await expect(detectSecretPaths(ctx.workspace, 1)).rejects.toThrow(/depth budget/)
+    await expect(detectSecretPaths(ctx.workspace, 64, 0)).rejects.toThrow(/mask budget/)
     expect(() => containerRunArgs({ name: 'test', image: DEFAULT_SANDBOX.image, workspace: ctx.workspace, sandbox: DEFAULT_SANDBOX, masks: [{ relative: 'bad,path/.env', directory: false }], emptyFile: join(ctx.workspace, 'empty') })).toThrow(/cannot be represented/)
   })
   it('withholds secret ancestors reached through a public alias while keeping safe templates readable', async () => {

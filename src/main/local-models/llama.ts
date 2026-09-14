@@ -46,7 +46,7 @@ export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPa
 export const logFile = (model: LocalModelConfig): string => join(logsDir(), model.id.replace(/[^a-z0-9.-]/gi, '_') + '.log')
 
 /** `pid: null` marks a server this Conductor instance adopted rather than started: we know it is
- *  ours (the API key and model id matched) but not which process it is, so nothing here may try
+ *  ours (it serves our model id and enforces our API key) but not which process it is, so nothing here may try
  *  to kill it. */
 export interface RunRecord { pid: number | null; port: number; model: string; file: string; startedAt: string }
 
@@ -197,21 +197,37 @@ export async function resolveLlamaServer(configured?: string): Promise<{ path: s
 export interface StartOutcome { started: boolean; pid: number; port: number; message: string }
 
 
+/** Either the orphan we adopted, or why the thing on that port is not ours - the caller moves to
+ *  a free port on a refusal and the reason is what the owner is told. */
+export interface AdoptionResult { adopted: StartOutcome | null; reason: string }
+
 /** A port the configured server can't bind to may already hold our own orphaned llama.cpp from
- *  an earlier Conductor run - our API key is a 32-byte secret nothing else knows, so an
- *  authenticated health check that also lists our model id is conclusive. Adopting it beats
- *  failing outright. Returns null when whatever is on the port isn't ours. */
-export async function adoptRunningServer(model: LocalModelConfig, apiKey: string, port: number): Promise<StartOutcome | null> {
-  const probe = await health(port, apiKey)
-  // Our API key is a 32-byte secret no other process knows, so an answer at all means this is our
-  // own server from an earlier run; the model id is what says it is the right one.
-  if (!probe.ok || !probe.models?.includes(model.id)) return null
+ *  an earlier Conductor run. Three things have to line up before we send a conversation there: it
+ *  answers our authenticated health check, it lists our model id, and - the part an answer alone
+ *  cannot show - it *refuses* the same request without the key. Ollama, LM Studio and a
+ *  `llama-server` started without `--api-key` all answer 200 to anything, so "it replied" proves
+ *  nothing about who is listening; only the anonymous refusal proves our key is enforced, which is
+ *  what makes it our server. Every probe here shares one deadline, so a process that accepts
+ *  connections and then stalls cannot hold a model start open. */
+export async function adoptRunningServer(model: LocalModelConfig, apiKey: string, port: number, timeoutMs = 4000): Promise<AdoptionResult> {
+  const address = `127.0.0.1:${port}`
+  const probe = await health(port, apiKey, timeoutMs)
+  if (!probe.ok) return { adopted: null, reason: `${address} is held by something that is not answering as one of our model servers (${probe.detail ?? `HTTP ${probe.status}`})` }
+  if (!probe.models?.includes(model.id)) {
+    const serving = probe.models?.length ? probe.models.slice(0, 3).join(', ') : 'no model it will name'
+    return { adopted: null, reason: `${address} is serving ${serving}, not ${model.id}` }
+  }
+  // The proof, not the presumption: a server that hands out models to an unauthenticated caller is
+  // some other inference server on this machine, whatever it chose to call our model id.
+  if (!await rejectsAnonymous(port, timeoutMs)) {
+    return { adopted: null, reason: `${address} answers ${model.id} without our API key, so it is another inference server rather than ours` }
+  }
   const existing = readRunRecord(model)
   const record: RunRecord = existing && existing.port === port && processAlive(existing.pid)
     ? existing
     : { pid: null, port, model: model.id, file: model.file, startedAt: new Date().toISOString() }
   writeFileSync(runFile(model), JSON.stringify(record, null, 2), 'utf8')
-  return { started: false, pid: record.pid ?? 0, port, message: 'adopted the server already running on this port' }
+  return { adopted: { started: false, pid: record.pid ?? 0, port, message: 'adopted the server already running on this port' }, reason: 'adopted' }
 }
 
 /** The configured port is held by something that isn't ours. Rather than fail, look nearby for a
@@ -297,9 +313,11 @@ export async function startServer(executable: string, model: LocalModelConfig, a
   }
 
   let port = model.port
+  let moved = ''
   if (!(await portBindable(port))) {
-    const adopted = await adoptRunningServer(model, apiKey, port)
-    if (adopted) return adopted
+    const adoption = await adoptRunningServer(model, apiKey, port)
+    if (adoption.adopted) return adoption.adopted
+    moved = adoption.reason
     port = await findFreePort(model)
   }
 
@@ -315,7 +333,7 @@ export async function startServer(executable: string, model: LocalModelConfig, a
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (!processAlive(child.pid)) throw new Error(describeStartupFailure(model, port))
-    if ((await health(port, apiKey)).ok) return { started: true, pid: child.pid, port, message: 'healthy' }
+    if ((await health(port, apiKey)).ok) return { started: true, pid: child.pid, port, message: moved ? `healthy on 127.0.0.1:${port}; ${moved}` : 'healthy' }
     await new Promise(resolve => setTimeout(resolve, pollMs))
   }
   throw new Error(`Server health check failed: ${model.id} did not answer on 127.0.0.1:${port} within 5 minutes`)

@@ -64,6 +64,14 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   the next command. Unreadable directories (including malformed names that the host cannot
   address), more than 200,000 entries, depth over 64, or more than 4,096 masks refuse shell
   execution rather than exposing an unscanned tree. File tools remain independently bounded.
+  The scan is asynchronous, never blocking the main process, and does not descend dependency
+  trees or build output (`node_modules`, `.git`, `dist`, `build`, `out`, `release`, `artifacts`,
+  `coverage`, `target`, `vendor`, `.venv`, …) — a credential *named* at that level is still
+  masked, only their interiors go unwalked. The result is cached per workspace and reused only
+  while every directory the walk read still has the mtime it had, so a credential file another
+  process drops in is masked before the next command (about 75 ms for a first scan of this
+  repository and 2-3 ms to revalidate, against ~340 ms of blocked main process per command
+  before).
   `.git` is mounted
   read-only, so a local model cannot install a hook or rewrite repository config, unless the
   owner grants repository writes for that one conversation (see *Per-conversation grants*).
@@ -86,7 +94,22 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   container starts, so the grant takes effect on the next container, and withdrawing it
   recreates the container too. The grant is for git itself: the host file tools still refuse
   every write under `.git` (`resolveWritablePath` takes no grant), so hooks, refs and config
-  cannot be hand-edited even while commits are allowed. *Deep research* (`localResearch`) adds the `web_search` tool and
+  cannot be hand-edited even while commits are allowed. **A mask is never committed as a
+  deletion.** Masking withheld paths with an empty file or an empty tmpfs is invisible to a
+  read-only `.git`, but with writes granted it would make `git commit -a` record the owner's own
+  tracked-but-withheld files — in this repository `.conductor/.gitignore`,
+  `.conductor/prompt-images/.gitignore` and `src/main/secret-store.ts` — as deleted and
+  truncated, in the owner's real history on the owner's real working tree. So when the grant is
+  on, a mask that overlaps the git index is instead a **read-only replica of exactly what git
+  already has staged** for it (`trackedMaskPlan` in `src/main/local-models/sandbox.ts`): git sees
+  no change, there is nothing for `commit -a` or `add -A` to record, and the replica cannot be
+  written to. It discloses nothing new, because `.git` is readable in both modes and `git
+  cat-file` already serves the same blob; the *worktree* copy, which may hold uncommitted secret
+  edits, stays hidden, as do untracked files inside a withheld directory. If the index cannot be
+  read, or a withheld path is tracked as a symlink or submodule (which no replica can reproduce),
+  the command is refused rather than run. What remains possible is a deliberate, targeted
+  `git rm --cached` — no different from the model deleting any other file it is allowed to touch,
+  local-only, and recoverable from the reflog. *Deep research* (`localResearch`) adds the `web_search` tool and
   raises the tool-round budget from 16 to 48. Both are refused on any provider other than
   `local`, are held on the conversation rather than on a message — a queued prompt cannot carry
   a grant that has since been withdrawn — and `web_search` is refused at dispatch, not merely
@@ -282,6 +305,12 @@ Exactly one host directory is bind-mounted, at `/workspace`. For a CLI session t
 (`--cwd`, or a project-bound conversation in the app) it is that one project directory. Never a
 drive root and never the user profile — both are refused in code. Inside the container the agent
 sees only `/workspace` and cannot tell which Windows drive backs it.
+
+A container left running from an earlier turn is adopted only when it was built from exactly the
+mounts this session would create now: it carries a signature of its mask list and `.git` grant as
+a Docker label, and `docker inspect` is asked for its real bind list and workspace source. A
+container that predates a withdrawn grant, a new secret or another workspace is removed and
+rebuilt instead of being used for one command and corrected afterwards.
 
 File reads, writes, edits and search are executed by Conductor itself under the same workspace
 containment rules, so diffs and undo still work; only `run_command` enters the container.

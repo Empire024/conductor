@@ -188,7 +188,10 @@ export const modelFilePath = (model: LocalModelConfig): string => join(modelDir(
  *  out to be unbindable. Falls back to the configured port when there is no run record yet. */
 export const endpointFor = (model: LocalModelConfig): string => `http://127.0.0.1:${recordedPort(model)}`
 
-function recordedPort(model: LocalModelConfig): number {
+/** The port a running server is actually on: the one `startServer` recorded, not the one the
+ *  config asks for. Every client - `endpointFor` and the adapter's health probe alike - has to
+ *  ask this rather than `model.port`, or a server that moved is invisible to half the app. */
+export function recordedPort(model: LocalModelConfig): number {
   try {
     const record = JSON.parse(readFileSync(runFile(model), 'utf8')) as { port?: unknown }
     return typeof record.port === 'number' && Number.isInteger(record.port) && record.port > 0 ? record.port : model.port

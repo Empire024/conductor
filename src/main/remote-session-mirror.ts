@@ -342,7 +342,7 @@ export class RemoteSessionMirror {
    */
   async closeRemote(localSessionId: string): Promise<{ closed: boolean; message?: string }> {
     const binding = this.bindings.get(localSessionId)
-    if (!binding) return { closed: false }
+    if (!binding) return { closed: false, message: 'That machine is no longer paired, so it was never told to close this tab; if it is still running there, close it on that machine directly.' }
     try {
       const tabId = binding.remoteTabId ?? await this.remoteTabId(binding)
       await this.deps.call(binding.machineId, 'tabs.close', {

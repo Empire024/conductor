@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer as createTcpServer } from 'node:net'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { LocalAdapter } from './local'
-import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B } from '../local-models/config.ts'
+import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, runFile } from '../local-models/config.ts'
+import type { LocalModelConfig } from '../local-models/config.ts'
 import { detectDrives, systemDrive } from '../local-models/paths.ts'
 import type { AdapterEvent, SessionSettings } from '../../shared/structured-agent'
 
@@ -103,6 +105,15 @@ describe('local provider adapter', () => {
 
   const guard = (reason: unknown): void => { if (!(reason instanceof Error) || reason.message !== 'skip') throw reason }
 
+  /** A port nothing is listening on: bound just long enough to be told a number, then released. */
+  const closedPort = async (): Promise<number> => {
+    const probe = createTcpServer()
+    await new Promise<void>(resolve => probe.listen(0, '127.0.0.1', resolve))
+    const port = (probe.address() as { port: number }).port
+    await new Promise<void>(resolve => probe.close(() => resolve()))
+    return port
+  }
+
   it('offers both Qwen models under their canonical ids, with no capability it cannot honour', async () => {
     let ready: Awaited<ReturnType<typeof stack>>
     try { ready = await stack([]) } catch (reason) { return guard(reason) }
@@ -190,6 +201,35 @@ describe('local provider adapter', () => {
     await instance.interrupt()
     expect(await settled(events)).toBe('interrupted')
     expect(events.some(event => event.data.type === 'error')).toBe(false)
+  })
+
+  /**
+   * The port in config is only a request: a server that could not bind it moved to a neighbouring
+   * or OS-assigned one and recorded where it landed, which is what every other client reads. If
+   * the adapter's own pre-turn health check asks the configured port instead, it fails on every
+   * single turn - announcing a start and making a redundant one - for a server that is up.
+   */
+  it('health-checks the port the running server recorded, not the one config asked for', async () => {
+    let ready: Awaited<ReturnType<typeof stack>>
+    try { ready = await stack([frame({ content: 'ok' }), frame({}, 'stop')]) } catch (reason) { return guard(reason) }
+    const root = process.env.CONDUCTOR_LOCAL_ROOT!
+    // Nothing is listening on the configured port: the server moved, exactly as a reserved range
+    // would force it to, and said so in its run record.
+    const abandoned = await closedPort()
+    const config = JSON.parse(readFileSync(join(root, 'config', 'config.json'), 'utf8')) as { models: Record<string, LocalModelConfig> }
+    config.models[QWEN_9B]!.port = abandoned
+    writeFileSync(join(root, 'config', 'config.json'), JSON.stringify(config), 'utf8')
+    mkdirSync(join(root, 'runtime'), { recursive: true })
+    writeFileSync(runFile(config.models[QWEN_9B]!), JSON.stringify({ pid: null, port: ready.small.port, model: QWEN_9B, file: 'model.gguf', startedAt: new Date().toISOString() }), 'utf8')
+
+    const events: AdapterEvent[] = []
+    const instance = adapter(ready.workspace, events, { model: QWEN_9B })
+    await instance.start()
+    await instance.submit('say it', settings({ model: QWEN_9B }))
+    expect(await settled(events)).toBe('completed')
+    // No start was announced and none was attempted: the recorded port answered.
+    expect(JSON.stringify(events)).not.toContain('Starting')
+    expect(ready.small.prompts.at(-1)).toEqual(['say it'])
   })
 
   it('reports a refused key as something the owner can act on, without echoing the key', async () => {

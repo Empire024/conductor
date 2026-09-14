@@ -1,11 +1,15 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError, WorkspaceBoundaryError } from './workspace.ts'
-import { containerRunArgs, detectSecretPaths, execArgs, SandboxUnavailableError, sandboxContainerName } from './sandbox.ts'
+import {
+  adoptableContainer, clearSecretScanCache, containerRunArgs, detectSecretPaths, execArgs, materializeMaskSources,
+  mountDigest, SandboxUnavailableError, sandboxContainerName, secretPathsFor, trackedMaskPlan, type SecretMask
+} from './sandbox.ts'
 import {
   adoptRunningServer, describeStartupFailure, findFreePort, llamaServerArgs, logFile, portBindable,
   readRunRecord, startServer, validateExtraArgs
@@ -27,15 +31,15 @@ const workspace = (): string => {
 
 describe('secret policy', () => {
   it('withholds credential material and keeps ordinary source readable', () => {
-    for (const path of ['.env', '.env.local', 'packages/api/.env', '.npmrc', '.pypirc', 'deploy/server.pem', '.ssh/config', 'id_rsa', 'config/secrets.json', '.aws/credentials'])
+    for (const path of ['.env', '.env.local', 'packages/api/.env', '.npmrc', '.pypirc', 'deploy/server.pem', '.ssh/config', 'id_rsa', 'config/secrets.json', '.aws/credentials', 'node_modules/.cache', 'node_modules/.cache/babel-loader'])
       expect(isSecretPath(path), path).toBe(true)
     for (const path of ['src/index.ts', 'docs/local-models.md', '.env.example', 'README.md', 'src/environment.ts'])
       expect(isSecretPath(path), path).toBe(false)
   })
 
-  it('lists workspace secrets for masking', () => {
+  it('lists workspace secrets for masking', async () => {
     const root = workspace()
-    try { expect(detectSecretPaths(root).map(entry => entry.relative)).toContain('.env') } finally { rmSync(root, { recursive: true, force: true }) }
+    try { expect((await detectSecretPaths(root)).map(entry => entry.relative)).toContain('.env') } finally { rmSync(root, { recursive: true, force: true }) }
   })
 })
 
@@ -136,6 +140,151 @@ describe('sandbox arguments', () => {
   })
 })
 
+/** A workspace with a real repository, holding both a tracked withheld directory and a tracked
+ *  withheld file — exactly the shape that made a granted `git commit -a` destroy them. */
+const trackedSecretRepo = (): string | null => {
+  const root = mkdtempSync(join(tmpdir(), 'conductor-local-git-'))
+  mkdirSync(join(root, '.conductor', 'prompt-images'), { recursive: true })
+  mkdirSync(join(root, 'src'), { recursive: true })
+  writeFileSync(join(root, '.conductor', '.gitignore'), 'sessions/\n', 'utf8')
+  writeFileSync(join(root, '.conductor', 'prompt-images', '.gitignore'), 'cached/\n', 'utf8')
+  writeFileSync(join(root, 'src', 'secret-store.ts'), 'export const store = 1\n', 'utf8')
+  writeFileSync(join(root, 'src', 'index.ts'), 'export const value = 1\n', 'utf8')
+  writeFileSync(join(root, '.conductor', 'session-token'), 'UNTRACKED_SECRET_CANARY', 'utf8')
+  writeFileSync(join(root, '.env'), 'TOKEN=super-secret-value\n', 'utf8')
+  const git = (...args: string[]): number | null =>
+    spawnSync('git', args, { cwd: root, encoding: 'utf8', windowsHide: true }).status
+  if (git('init', '-q') !== 0) { rmSync(root, { recursive: true, force: true }); return null }
+  git('config', 'user.email', 'owner@example.invalid'); git('config', 'user.name', 'Owner')
+  git('add', '.conductor/.gitignore', '.conductor/prompt-images/.gitignore', 'src/secret-store.ts', 'src/index.ts')
+  if (git('commit', '-qm', 'owner history') !== 0) { rmSync(root, { recursive: true, force: true }); return null }
+  return root
+}
+
+/** The worktree the container would see: the workspace with every mask applied the way
+ *  `containerRunArgs` applies it. Running the owner's real repository against this tree is how a
+ *  test can ask git itself what a sandboxed `git commit -a` would record, without Docker. */
+const maskedWorktree = (workspace: string, masks: SecretMask[]): string => {
+  const view = mkdtempSync(join(tmpdir(), 'conductor-local-view-'))
+  cpSync(workspace, view, { recursive: true, filter: source => !relative(workspace, source).split(/[\\/]/).includes('.git') })
+  for (const mask of masks) {
+    const target = join(view, mask.relative)
+    rmSync(target, { recursive: true, force: true })
+    if (mask.source) cpSync(mask.source, target, { recursive: true })
+    else if (mask.directory) mkdirSync(target, { recursive: true })
+    else writeFileSync(target, '', 'utf8')
+  }
+  return view
+}
+
+const statusAgainst = (workspace: string, view: string): string =>
+  spawnSync('git', ['--git-dir', join(workspace, '.git'), '--work-tree', view, 'status', '--porcelain'], { encoding: 'utf8', windowsHide: true }).stdout.trim()
+
+describe('masking under a repository-writes grant', () => {
+  const cleanup: string[] = []
+  afterEach(() => { for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true }); clearSecretScanCache() })
+
+  it('leaves git nothing to record for a masked path the owner tracks', async () => {
+    const root = trackedSecretRepo()
+    if (!root) return
+    cleanup.push(root)
+    const stage = mkdtempSync(join(tmpdir(), 'conductor-local-stage-')); cleanup.push(stage)
+    const scanned = await detectSecretPaths(root)
+    expect(scanned.map(mask => mask.relative)).toEqual(expect.arrayContaining(['.conductor', '.env', 'src/secret-store.ts']))
+
+    // Without the fix — an empty tmpfs over the tracked directory and an empty file over the
+    // tracked file — `git commit -a` inside the sandbox records the owner's files as deleted and
+    // truncated, into the owner's real history on the owner's real working tree.
+    const unprotected = maskedWorktree(root, scanned); cleanup.push(unprotected)
+    const before = statusAgainst(root, unprotected)
+    expect(before).toMatch(/D\s+\.conductor\/\.gitignore/)
+    expect(before).toMatch(/D\s+\.conductor\/prompt-images\/\.gitignore/)
+    expect(before).toMatch(/M\s+src\/secret-store\.ts/)
+
+    const planned = await trackedMaskPlan(root, scanned, stage)
+    await materializeMaskSources(root, planned.writes)
+    const protectedView = maskedWorktree(root, planned.masks); cleanup.push(protectedView)
+    // Nothing tracked differs any more: no deletion, no truncation, nothing for `git commit -a`
+    // to record. The empty stand-in for an untracked secret stays untracked, as it was before.
+    const tracked = statusAgainst(root, protectedView).split(/\r?\n/).filter(line => line.trim() && !line.startsWith('??'))
+    expect(tracked).toEqual([])
+
+    // The mask is still a mask: untracked credential material inside the tracked directory is
+    // absent from the replica, and the replica is mounted read-only so nothing in it can change.
+    expect(existsSync(join(protectedView, '.conductor', 'session-token'))).toBe(false)
+    const mounts = containerRunArgs({ name: 'conductor-local-test', image: DEFAULT_SANDBOX.image, workspace: root, sandbox: DEFAULT_SANDBOX, masks: planned.masks, emptyFile: join(stage, 'empty'), gitWritable: true }).join(' ')
+    expect(mounts).toContain('target=/workspace/.conductor,readonly')
+    expect(mounts).toContain('target=/workspace/src/secret-store.ts,readonly')
+    expect(mounts).not.toContain('/workspace/.conductor:rw')
+    // An untracked secret is still replaced by an empty file, not by its contents.
+    expect(planned.masks.find(mask => mask.relative === '.env')?.source).toBeUndefined()
+  })
+
+  it('refuses the grant rather than guessing when the index cannot be read', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-local-broken-')); cleanup.push(root)
+    mkdirSync(join(root, '.git'))
+    writeFileSync(join(root, '.env'), 'TOKEN=x', 'utf8')
+    await expect(trackedMaskPlan(root, await detectSecretPaths(root), root)).rejects.toBeInstanceOf(SandboxUnavailableError)
+  })
+})
+
+describe('secret scan cost and cache', () => {
+  const cleanup: string[] = []
+  afterEach(() => { for (const path of cleanup.splice(0)) rmSync(path, { recursive: true, force: true }); clearSecretScanCache() })
+
+  it('skips dependency trees and build output while still masking the workspace', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-local-scan-')); cleanup.push(root)
+    mkdirSync(join(root, 'node_modules', 'left-pad'), { recursive: true })
+    mkdirSync(join(root, 'dist'), { recursive: true })
+    mkdirSync(join(root, 'src'), { recursive: true })
+    writeFileSync(join(root, 'node_modules', 'left-pad', '.npmrc'), 'token', 'utf8')
+    writeFileSync(join(root, 'dist', '.env'), 'token', 'utf8')
+    writeFileSync(join(root, 'src', '.env'), 'token', 'utf8')
+    writeFileSync(join(root, '.npmrc'), 'token', 'utf8')
+    const masks = (await secretPathsFor(root)).map(mask => mask.relative)
+    expect(masks).toEqual(['.npmrc', 'src/.env'])
+    // The trees that are not walked are still bound read-only, and a secret named at their own
+    // level is still masked; only their interiors go unscanned.
+    expect(masks).not.toContain('node_modules/left-pad/.npmrc')
+  })
+
+  it('reuses the scan until the tree changes, without walking it again', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-local-cache-')); cleanup.push(root)
+    mkdirSync(join(root, 'src', 'deep'), { recursive: true })
+    writeFileSync(join(root, 'src', 'deep', 'ordinary.ts'), 'export const x = 1\n', 'utf8')
+    expect(await secretPathsFor(root)).toEqual([])
+    const cachedStart = performance.now()
+    expect(await secretPathsFor(root)).toEqual([])
+    const cachedMs = performance.now() - cachedStart
+    const coldStart = performance.now()
+    await detectSecretPaths(root)
+    const coldMs = performance.now() - coldStart
+    expect(cachedMs).toBeLessThanOrEqual(coldMs + 5)
+    // A credential another process drops in mid-session changes its directory's mtime, so the
+    // next command masks it rather than running against a stale scan.
+    await new Promise(done => setTimeout(done, 20))
+    writeFileSync(join(root, 'src', 'deep', '.env'), 'token', 'utf8')
+    expect((await secretPathsFor(root)).map(mask => mask.relative)).toEqual(['src/deep/.env'])
+  })
+})
+
+describe('adopting a running container', () => {
+  const inspected = (label: string, source: string): string =>
+    `true\t${label}\t${JSON.stringify([{ Type: 'bind', Source: source, Destination: '/workspace' }])}`
+  const digest = mountDigest(JSON.stringify({ masks: [], git: false }))
+
+  it('rebuilds unless the running container was built from these exact mounts', () => {
+    expect(adoptableContainer(inspected(digest, 'C:\\projects\\demo'), digest, 'C:/projects/demo')).toBe(true)
+    expect(adoptableContainer(inspected(digest, '/host_mnt/c/projects/demo'), digest, 'C:/projects/demo')).toBe(true)
+    // A container built while .git was writable, or before a secret appeared, carries a different
+    // signature; one built for another workspace binds another host path. Neither is adopted.
+    expect(adoptableContainer(inspected(mountDigest('other'), 'C:/projects/demo'), digest, 'C:/projects/demo')).toBe(false)
+    expect(adoptableContainer(inspected('<no value>', 'C:/projects/demo'), digest, 'C:/projects/demo')).toBe(false)
+    expect(adoptableContainer(inspected(digest, 'C:/projects/other'), digest, 'C:/projects/demo')).toBe(false)
+    expect(adoptableContainer(`true\t${digest}\tnot-json`, digest, 'C:/projects/demo')).toBe(false)
+  })
+})
+
 describe('llama.cpp arguments', () => {
   const model = defaultModelConfig(QWEN_9B)
   const key = 'a'.repeat(64)
@@ -199,6 +348,24 @@ describe('llama.cpp server lifecycle', () => {
     }))
   }
 
+  // The same shape of answer from a server that authenticates nothing: 200 for every caller,
+  // with or without the key. This is what Ollama and an --api-key-less llama-server look like.
+  const openServer = (modelId: string): Promise<{ port: number; server: Server }> => {
+    const server = createHttpServer((request, response) => {
+      if (request.url?.startsWith('/v1/models')) {
+        response.writeHead(200, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({ models: [{ id: modelId }] }))
+        return
+      }
+      response.writeHead(200).end('{}')
+    })
+    cleanup.push(() => new Promise<void>(done => server.close(() => done())))
+    return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
+      const address = server.address()
+      resolve({ port: typeof address === 'object' && address ? address.port : 0, server })
+    }))
+  }
+
   it('portBindable is false for a port held open by someone else and true once nothing holds it', async () => {
     const holder = createTcpServer()
     await new Promise<void>(resolve => holder.listen(0, '127.0.0.1', resolve))
@@ -236,7 +403,28 @@ describe('llama.cpp server lifecycle', () => {
     if (!scratchRoot()) return
     const orphan = await fakeOrphan('local/someone-elses-model')
     const model = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
-    expect(await adoptRunningServer(model, key, orphan.port)).toBeNull()
+    const refused = await adoptRunningServer(model, key, orphan.port)
+    expect(refused.adopted).toBeNull()
+    expect(refused.reason).toContain('local/someone-elses-model')
+  })
+
+  /**
+   * A foreign inference server - Ollama, LM Studio, or a llama-server someone started without
+   * --api-key - answers 200 to every request, including ones carrying our key, and can be serving
+   * a model under the same id. Answering is therefore no evidence of who is listening; only
+   * refusing the anonymous request proves our key is enforced. Adopting on the answer alone would
+   * quietly route a local conversation into someone else's process.
+   */
+  it('refuses to adopt a server that answers our probe but does not enforce the API key', async () => {
+    if (!scratchRoot()) return
+    const open = await openServer(QWEN_9B)
+    const model = { ...defaultModelConfig(QWEN_9B), port: open.port }
+
+    const refused = await adoptRunningServer(model, key, open.port)
+    expect(refused.adopted).toBeNull()
+    expect(refused.reason).toContain('without our API key')
+    // Nothing was recorded, so no client is pointed at the foreign server either.
+    expect(readRunRecord(model)).toBeNull()
   })
 
   it('moves to the next free port when the configured one is held by something that is not ours', async () => {

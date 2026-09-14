@@ -3,12 +3,17 @@ import type { RelayDirectoryEntry, RelayEnvelope, RelayMessageKind } from '../sh
 import { signStatement, verifyStatement } from './device-key'
 
 /**
- * The confidentiality layer for relayed messages. GitHub holds the ciphertext, so everything that
- * decides who can read a message has to be decided here: the recipient's X25519 key is published in
- * a directory entry signed by the account's device key, each message gets a fresh ephemeral key,
- * and the routing fields are authenticated as associated data so a stored message cannot be
- * re-addressed, replayed back in the other direction, or presented as the answer to a different
- * request.
+ * The confidentiality and authenticity layer for relayed messages. GitHub holds the ciphertext, so
+ * everything that decides who may read a message and who is allowed to have written it has to be
+ * decided here: the recipient's X25519 key is published in a directory entry signed by the account's
+ * device key, each message gets a fresh ephemeral key, and the routing fields are authenticated as
+ * associated data so a stored message cannot be re-addressed, replayed back in the other direction,
+ * or presented as the answer to a different request.
+ *
+ * Sealing alone says nothing about the sender: the recipient's key is public, so anything that can
+ * write a gist on the account could seal a message to it. That is what `signMessage` is for — the
+ * sender's Ed25519 device key signs the routing binding together with the seal parameters, and the
+ * receiver refuses a message that key did not sign.
  */
 
 const X25519_SPKI_PREFIX = Buffer.from('302a300506032b656e032100', 'hex')
@@ -41,10 +46,10 @@ const rawKey = (value: string, label: string): Buffer => {
   return decoded
 }
 
-export const sealPublicKey = (base64: string): ReturnType<typeof createPublicKey> =>
+const sealPublicKey = (base64: string): ReturnType<typeof createPublicKey> =>
   createPublicKey({ key: Buffer.concat([X25519_SPKI_PREFIX, rawKey(base64, 'relay public key')]), format: 'der', type: 'spki' })
 
-export const sealPrivateKey = (base64: string): ReturnType<typeof createPrivateKey> =>
+const sealPrivateKey = (base64: string): ReturnType<typeof createPrivateKey> =>
   createPrivateKey({ key: Buffer.concat([X25519_PKCS8_PREFIX, rawKey(base64, 'relay private key')]), format: 'der', type: 'pkcs8' })
 
 export interface RelayBinding {
@@ -101,6 +106,29 @@ export function openMessage(recipientPrivateKey: string, sealed: Omit<SealedMess
   return Buffer.concat([decipher.update(ciphertext), decipher.final()])
 }
 
+const MESSAGE_STATEMENT = 'relay-message'
+
+/** What the sender's device key signs: the same binding the seal authenticates, plus the seal
+ *  parameters themselves, so the signature covers one specific sealed message and cannot be lifted
+ *  onto ciphertext someone else produced. */
+const messageStatement = (binding: RelayBinding, sealed: Omit<SealedMessage, 'ciphertext'>): string =>
+  [bindingBytes(binding).toString('utf8'), sealed.ephemeralKey, sealed.nonce, sealed.tag].join('\n')
+
+export function signMessage(devicePrivateKeyPem: string, binding: RelayBinding, sealed: Omit<SealedMessage, 'ciphertext'>): string {
+  return signStatement(devicePrivateKeyPem, MESSAGE_STATEMENT, messageStatement(binding, sealed))
+}
+
+/**
+ * True only when the machine named by `binding.from` really wrote this message. The key handed in is
+ * one the owner already approved — the stored peer record, or the key pinned for an in-flight call —
+ * never one the message itself carries, so a gist written by something that stole the account's gist
+ * scope cannot pose as a paired machine.
+ */
+export function verifyMessageSignature(expectedDeviceKey: string, binding: RelayBinding, sealed: Omit<SealedMessage, 'ciphertext'>, signature: string): boolean {
+  if (!expectedDeviceKey || !signature) return false
+  return verifyStatement(expectedDeviceKey, MESSAGE_STATEMENT, messageStatement(binding, sealed), signature)
+}
+
 const DIRECTORY_STATEMENT = 'relay-directory'
 
 const directoryStatement = (entry: Omit<RelayDirectoryEntry, 'signature'>): string => [
@@ -115,7 +143,8 @@ export function signDirectoryEntry(devicePrivateKeyPem: string, entry: Omit<Rela
  * A directory entry is only ever used after this returns true, and the device key it is checked
  * against is one the owner already approved: the pairing ticket's for a first contact, the stored
  * peer record's afterwards. An entry GitHub served but nothing signed for is not an identity, so a
- * stolen gist scope can delete or corrupt a mailbox but can never redirect a message to its own key.
+ * stolen gist scope can delete or corrupt a mailbox but can never redirect a message to its own key,
+ * claim a machine is checked in, or — with `verifyMessageSignature` — answer a call in its name.
  */
 export function verifyDirectoryEntry(entry: RelayDirectoryEntry, expectedDeviceKey: string): boolean {
   if (!entry || entry.version !== 1 || typeof entry.signature !== 'string') return false
@@ -163,7 +192,10 @@ export function readEnvelope(value: unknown): RelayEnvelope | null {
     nonce: str(value.nonce, 40),
     tag: str(value.tag, 40),
     chunk: typeof value.chunk === 'string' ? value.chunk : '',
-    createdAt: str(value.createdAt, 40)
+    createdAt: str(value.createdAt, 40),
+    senderSignature: str(value.senderSignature, 200)
   }
-  return envelope.id && envelope.from && envelope.to && envelope.correlationId && envelope.ephemeralKey && envelope.nonce && envelope.tag ? envelope : null
+  // An unsigned envelope is not a message this version can attribute to anyone, so it is not read
+  // at all rather than read and trusted on its own say-so.
+  return envelope.id && envelope.from && envelope.to && envelope.correlationId && envelope.ephemeralKey && envelope.nonce && envelope.tag && envelope.senderSignature ? envelope : null
 }

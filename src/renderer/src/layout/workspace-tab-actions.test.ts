@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { SessionRecord } from '../../../shared/models'
 import { createDefaultLayout } from '../../../shared/models'
 import { addTab, listGroups } from './layout-operations'
-import { applyWorkspaceTabAction } from './workspace-tab-actions'
+import { applyTabGroupAction, applyWorkspaceTabAction } from './workspace-tab-actions'
 
 function fixture(): SessionRecord {
   const layout = createDefaultLayout()
@@ -41,5 +41,19 @@ describe('workspace tab commands', () => {
     const duplicated = applyWorkspaceTabAction(session, session.layout.root.id, 'target', 'duplicate').session
     const copy = listGroups(duplicated.layout.root)[0]!.tabs.at(-1)!
     expect(copy.id).not.toBe('target'); expect(copy.resourceId).not.toBe('runtime')
+  })
+  // Both PaneWorkspace and the sidebar walk `closedTabs` after this call to close each tab's
+  // remote counterpart; the fix for a group leaving a placed tab running elsewhere depends on
+  // every tab in the group actually landing in that list, not just the one the click started on.
+  it('reports every tab a group close removed, not just the one that was clicked', () => {
+    const session = fixture(), group = listGroups(session.layout.root)[0]!
+    const withSecond = { ...session, layout: addTab(session.layout, group.id, { id: 'second', kind: 'agent', title: 'Second', resourceId: 'runtime-2', state: { provider: 'claude', machineId: 'desktop' } }) }
+    const grouped = applyTabGroupAction(withSecond, group.id, 'target', { kind: 'new-group' })
+    const joined = applyTabGroupAction(grouped.session, group.id, 'second', { kind: 'join-group', tabGroupId: grouped.tabGroupId })
+    const closed = applyTabGroupAction(joined.session, group.id, 'target', { kind: 'close-group', tabGroupId: grouped.tabGroupId })
+    const remaining = listGroups(closed.session.layout.root).flatMap(item => item.tabs).map(tab => tab.id)
+    expect(remaining).not.toContain('target')
+    expect(remaining).not.toContain('second')
+    expect(closed.session.closedTabs.map(tab => tab.id).sort()).toEqual(['second', 'target'])
   })
 })

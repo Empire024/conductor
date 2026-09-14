@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { generateDeviceKey } from './device-key'
-import { GitHubRelayMailbox, type RelayApiResult } from './github-relay'
+import { GitHubRelayMailbox, RelayUnavailableError, type RelayApiResult } from './github-relay'
 import {
   generateSealKey,
   openMessage,
@@ -8,11 +8,19 @@ import {
   readEnvelope,
   sealMessage,
   signDirectoryEntry,
+  signMessage,
   verifyDirectoryEntry,
   type RelayBinding
 } from './relay-crypto'
 import { RemoteRelay } from './remote-relay'
-import { RELAY_ACK_FILE, RELAY_DIRECTORY_FILE, RELAY_GIST_DESCRIPTION, parseRelayFileName } from '../shared/remote-relay'
+import {
+  RELAY_ACK_FILE,
+  RELAY_CALL_TIMEOUT_MS,
+  RELAY_DIRECTORY_FILE,
+  RELAY_GIST_DESCRIPTION,
+  parseRelayFileName,
+  relayFileName
+} from '../shared/remote-relay'
 
 /**
  * A GitHub stand-in that behaves like the gist API in the ways the relay depends on: files are
@@ -44,10 +52,12 @@ function fakeGitHub(): { api(login: string): (path: string, init?: { method?: st
     api: (login: string) => async (path, init) => {
       const method = init?.method ?? 'GET'
       if (path.startsWith('/gists?') && method === 'GET') {
-        const mine = [...gists.values()].filter(gist => gist.owner === login || true)
-        const tag = `"list-${mine.map(gist => `${gist.id}:${gist.version}`).join(',')}"`
+        // Every gist here belongs to the one account both machines are signed into, which is what
+        // the real listing returns for any of them; `owner` only records which one wrote it.
+        const account = [...gists.values()]
+        const tag = `"list-${account.map(gist => `${gist.id}:${gist.version}`).join(',')}"`
         if (init?.headers?.['If-None-Match'] === tag) return reply(304, {}, { etag: tag })
-        return reply(200, mine.map(gist => describe(gist, false)), { etag: tag })
+        return reply(200, account.map(gist => describe(gist, false)), { etag: tag })
       }
       const match = /^\/gists\/([^/?]+)$/.exec(path)
       if (match) {
@@ -92,7 +102,14 @@ interface Machine {
   answer: (path: string, body: Buffer, headers: Record<string, string>) => Promise<{ status: number; body: string }>
 }
 
-function machine(name: string, github: ReturnType<typeof fakeGitHub>, peers: Map<string, string>, options: { fingerprint?: string } = {}): Machine {
+type FakeApi = (path: string, init?: { method?: string; body?: string; headers?: Record<string, string> }) => Promise<RelayApiResult>
+
+function machine(
+  name: string,
+  github: ReturnType<typeof fakeGitHub>,
+  peers: Map<string, string>,
+  options: { fingerprint?: string; api?: FakeApi; now?: () => number } = {}
+): Machine {
   const device = generateDeviceKey(`conductor ${name}`)
   const seal = generateSealKey()
   const settings = new Map<string, string>()
@@ -107,7 +124,7 @@ function machine(name: string, github: ReturnType<typeof fakeGitHub>, peers: Map
   }
   self.relay = new RemoteRelay({
     mailbox: new GitHubRelayMailbox({
-      api: github.api(name),
+      api: options.api ?? github.api(name),
       fetchRaw: async url => {
         const [, gistId, file] = /^https:\/\/raw\/([^/]+)\/(.+)$/.exec(url) ?? []
         return github.gists.get(gistId ?? '')?.files.get(file ?? '') ?? ''
@@ -127,6 +144,7 @@ function machine(name: string, github: ReturnType<typeof fakeGitHub>, peers: Map
       return await self.answer(path, body, headers)
     },
     enabled: () => true,
+    ...(options.now ? { now: options.now } : {}),
     // Nothing schedules itself in a test; every poll is driven explicitly.
     schedule: () => ({ cancel: () => undefined })
   })
@@ -266,7 +284,8 @@ describe('relay transport', () => {
         // Routing has to be readable for the mailbox to work at all; nothing else is.
         expect(envelope?.to).toBe('bob')
         expect(Object.keys(JSON.parse(content) as Record<string, unknown>).sort()).toEqual([
-          'chunk', 'correlationId', 'createdAt', 'ephemeralKey', 'from', 'id', 'index', 'kind', 'nonce', 'tag', 'to', 'total', 'version'
+          'chunk', 'correlationId', 'createdAt', 'ephemeralKey', 'from', 'id', 'index', 'kind', 'nonce',
+          'senderSignature', 'tag', 'to', 'total', 'version'
         ])
       }
     }
@@ -378,7 +397,6 @@ describe('relay transport', () => {
 
   it('publishes a directory entry and an ack file, and nothing else, before any call', async () => {
     const github = fakeGitHub()
-    const alice = machine('alice', fakeGitHub(), new Map())
     const bob = machine('bob', github, new Map())
     await bob.relay.checkIn()
     const gist = [...github.gists.values()][0]
@@ -388,6 +406,199 @@ describe('relay transport', () => {
     expect(entry?.machineId).toBe('bob')
     expect(entry?.sealKey).toBe(bob.seal.publicKey)
     expect(verifyDirectoryEntry(entry!, bob.device.publicKey)).toBe(true)
-    expect(alice.id).toBe('alice')
+  })
+
+  /**
+   * The attack this refuses: something that holds the account's gist scope — a leaked token, another
+   * app the owner authorized — writes its own mailbox gist. The correlation id is in the file name
+   * of the call in flight and the victim's seal key is published in her directory entry, so it can
+   * seal a perfectly well-formed answer in the peer's name. Only a signature by the device key the
+   * call was addressed to separates that from the real answer.
+   */
+  it("refuses a response forged by another gist on the account in the peer's name", async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    const alice = machine('alice', github, peers)
+    const bob = machine('bob', github, peers)
+    peers.set('alice', alice.device.publicKey)
+    peers.set('bob', bob.device.publicKey)
+    await alice.relay.checkIn()
+    await bob.relay.checkIn()
+
+    const call = alice.relay.call('bob', bob.device.publicKey, '/remote/call', Buffer.from('{}'), {}, bob.seal.publicKey)
+    void call.catch(() => undefined)
+    await sent(github)
+
+    const outgoing = [...github.gists.values()].flatMap(gist => [...gist.files.keys()])
+      .map(parseRelayFileName).find(parsed => parsed?.to === 'bob')!
+    const aliceGist = [...github.gists.values()].find(gist => gist.owner === 'alice')!
+    const published = readDirectoryEntry(JSON.parse(aliceGist.files.get(RELAY_DIRECTORY_FILE)!))!
+
+    const binding: RelayBinding = { from: 'bob', to: 'alice', id: 'forged-1', kind: 'response', correlationId: outgoing.id }
+    const sealed = sealMessage(published.sealKey, binding, Buffer.from(JSON.stringify({
+      status: 200, body: Buffer.from(JSON.stringify({ result: { owned: true } }), 'utf8').toString('base64')
+    }), 'utf8'))
+    const forged = {
+      version: 1, ...binding, index: 0, total: 1,
+      ephemeralKey: sealed.ephemeralKey, nonce: sealed.nonce, tag: sealed.tag,
+      chunk: sealed.ciphertext.toString('base64'), createdAt: new Date().toISOString()
+    }
+    await github.api('mallory')('/gists', {
+      method: 'POST',
+      body: JSON.stringify({
+        description: RELAY_GIST_DESCRIPTION,
+        public: false,
+        files: { [relayFileName(forged)]: { content: JSON.stringify(forged) } }
+      })
+    })
+
+    for (let round = 0; round < 3; round++) await alice.relay.pollOnce()
+    expect(await Promise.race([call, Promise.resolve('pending' as const)])).toBe('pending')
+
+    // The real peer's answer still settles the same call, so this refuses the forgery rather than
+    // the correlation id.
+    const answer = await settle(call, [bob, alice]) as { status: number; body: string }
+    expect(JSON.parse(Buffer.from(answer.body, 'base64').toString('utf8')))
+      .toEqual({ result: { echoed: '/remote/call', size: 2 } })
+  })
+
+  it('refuses a response signed by a device key other than the one the call was addressed to', async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    const alice = machine('alice', github, peers)
+    const bob = machine('bob', github, peers)
+    peers.set('bob', bob.device.publicKey)
+    await alice.relay.checkIn()
+    await bob.relay.checkIn()
+
+    const call = alice.relay.call('bob', bob.device.publicKey, '/remote/call', Buffer.from('{}'), {}, bob.seal.publicKey)
+    void call.catch(() => undefined)
+    await sent(github)
+
+    const outgoing = [...github.gists.values()].flatMap(gist => [...gist.files.keys()])
+      .map(parseRelayFileName).find(parsed => parsed?.to === 'bob')!
+    const aliceGist = [...github.gists.values()].find(gist => gist.owner === 'alice')!
+    const published = readDirectoryEntry(JSON.parse(aliceGist.files.get(RELAY_DIRECTORY_FILE)!))!
+
+    const impostor = generateDeviceKey('impostor')
+    const binding: RelayBinding = { from: 'bob', to: 'alice', id: 'forged-2', kind: 'response', correlationId: outgoing.id }
+    const sealed = sealMessage(published.sealKey, binding, Buffer.from(JSON.stringify({ status: 200, body: '' }), 'utf8'))
+    const forged = {
+      version: 1, ...binding, index: 0, total: 1,
+      ephemeralKey: sealed.ephemeralKey, nonce: sealed.nonce, tag: sealed.tag,
+      chunk: sealed.ciphertext.toString('base64'), createdAt: new Date().toISOString(),
+      senderSignature: signMessage(impostor.privateKeyPem, binding, sealed)
+    }
+    await github.api('mallory')('/gists', {
+      method: 'POST',
+      body: JSON.stringify({
+        description: RELAY_GIST_DESCRIPTION,
+        public: false,
+        files: { [relayFileName(forged)]: { content: JSON.stringify(forged) } }
+      })
+    })
+
+    for (let round = 0; round < 3; round++) await alice.relay.pollOnce()
+    expect(await Promise.race([call, Promise.resolve('pending' as const)])).toBe('pending')
+  })
+
+  it('counts a machine as checked in only when an approved device key signed its entry', async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    const alice = machine('alice', github, peers)
+    const bob = machine('bob', github, peers)
+    const carol = generateDeviceKey('carol')
+    const impostor = generateDeviceKey('impostor')
+    peers.set('bob', bob.device.publicKey)
+    peers.set('carol', carol.publicKey)
+    await alice.relay.checkIn()
+    await bob.relay.checkIn()
+
+    const claim = signDirectoryEntry(impostor.privateKeyPem, {
+      version: 1, machineId: 'carol', machineName: 'Carol', accountLogin: 'owner',
+      deviceKey: impostor.publicKey, sealKey: generateSealKey().publicKey, fingerprint: 'FP:carol',
+      updatedAt: new Date().toISOString()
+    })
+    await github.api('mallory')('/gists', {
+      method: 'POST',
+      body: JSON.stringify({
+        description: RELAY_GIST_DESCRIPTION,
+        public: false,
+        files: { [RELAY_DIRECTORY_FILE]: { content: JSON.stringify(claim) } }
+      })
+    })
+
+    await alice.relay.pollOnce()
+    expect(alice.relay.getStatus().reachable).toEqual(['bob'])
+  })
+
+  it('keeps a GitHub failure typed when the sweep collects it, so the loop backs off', async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    let blocked = false
+    const upstream = github.api('bob')
+    const alice = machine('alice', github, peers)
+    const bob = machine('bob', github, peers, {
+      api: async (path, init) => {
+        if (blocked && init?.method === 'PATCH' && (init.body ?? '').includes('"m.alice.')) {
+          return {
+            response: {
+              status: 403,
+              ok: false,
+              headers: { get: (name: string) => (name.toLowerCase() === 'x-oauth-scopes' ? 'repo' : null) }
+            },
+            body: {}
+          }
+        }
+        return await upstream(path, init)
+      }
+    })
+    peers.set('alice', alice.device.publicKey)
+    await alice.relay.checkIn()
+    await bob.relay.checkIn()
+
+    void alice.relay.call('bob', bob.device.publicKey, '/remote/call', Buffer.from('{}'), {}, bob.seal.publicKey).catch(() => undefined)
+    await sent(github)
+    blocked = true
+    // Answering fails, and the sweep collects that failure. `tick` chooses its wait and its status
+    // phase from the error type, so it has to arrive as itself rather than as a plain Error.
+    await expect(bob.relay.pollOnce()).rejects.toBeInstanceOf(RelayUnavailableError)
+  })
+
+  it('still ages out a timed-out call when the sweep itself fails', async () => {
+    const github = fakeGitHub()
+    const peers = new Map<string, string>()
+    let blocked = false
+    let clock = Date.now()
+    const upstream = github.api('bob')
+    const alice = machine('alice', github, peers)
+    const bob = machine('bob', github, peers, {
+      now: () => clock,
+      api: async (path, init) => {
+        if (blocked && path.startsWith('/gists?')) {
+          return {
+            response: {
+              status: 403,
+              ok: false,
+              headers: { get: (name: string) => (name.toLowerCase() === 'x-oauth-scopes' ? 'repo' : null) }
+            },
+            body: {}
+          }
+        }
+        return await upstream(path, init)
+      }
+    })
+    peers.set('alice', alice.device.publicKey)
+    await alice.relay.checkIn()
+    await bob.relay.checkIn()
+
+    const call = bob.relay.call('alice', alice.device.publicKey, '/remote/call', Buffer.from('{}'), {}, alice.seal.publicKey)
+    const outcome = call.then(() => 'resolved', (error: Error) => error.message)
+    await sent(github)
+    blocked = true
+    clock += RELAY_CALL_TIMEOUT_MS + 1
+
+    await expect(bob.relay.pollOnce()).rejects.toThrow()
+    await expect(outcome).resolves.toMatch(/did not answer/i)
   })
 })

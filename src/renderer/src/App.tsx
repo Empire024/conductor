@@ -299,6 +299,19 @@ export function App(): React.JSX.Element {
 
   const loadProject = useCallback(async (projectId: string, preferredSessionId?: string) => {
     if (recoveryReadyRef.current) window.conductor.recovery.flush(recoveryCheckpoint())
+    // Layout edits (a freshly opened tab, a split, a close) only live in React state until some
+    // explicit commit point writes them to the session store - most day-to-day edits never do.
+    // Leaving the project we're on would otherwise get overwritten a moment later by the stale
+    // copy `sessions.list` reads back below, so flush the outgoing project's sessions first.
+    if (activeProjectIdRef.current && activeProjectIdRef.current !== projectId) {
+      const outgoing = sessionsRef.current.filter((session) => session.projectId === activeProjectIdRef.current)
+      // A store that refuses one workspace must not strand the owner on the project they are leaving.
+      await Promise.all(outgoing.map((session) =>
+        window.conductor.sessions
+          .save(session.id, session.layout, session.maximizedGroupId, session.closedTabs)
+          .catch(() => undefined)
+      ))
+    }
     setActiveProjectId(projectId)
     setActiveSessionId(null)
     setFocusedGroupId('')
@@ -1026,6 +1039,8 @@ export function App(): React.JSX.Element {
     if (!session) return
     try {
       const result = applyTabGroupAction(session, groupId, tabId, action)
+      // Closing a group from the sidebar closes each placed tab in it where it runs, exactly as closing its chip does.
+      for (const closed of result.session.closedTabs.slice(session.closedTabs.length)) closePlacedTab(closed, setToast)
       setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
       selectSession(result.session)
       void window.conductor.sessions.save(result.session.id, result.session.layout, result.session.maximizedGroupId, result.session.closedTabs)

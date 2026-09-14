@@ -219,9 +219,6 @@ export class GitHubRelayMailbox {
     return gist
   }
 
-  /** The ETag a conditional read of this gist should carry, if one is known. */
-  etag(gistId: string): string | null { return this.cache.get(gistId)?.etag ?? null }
-
   /** This machine's own mailbox as it stands on GitHub, for collecting what it left behind. */
   async own(): Promise<GistSummary | null> {
     return await this.read(await this.ensureGist())

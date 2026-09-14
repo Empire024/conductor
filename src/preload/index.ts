@@ -77,7 +77,6 @@ const bridge: ConductorBridge = {
     machines: () => ipcRenderer.invoke('remote:machines'),
     refreshMachines: () => ipcRenderer.invoke('remote:refresh-machines'),
     openTab: (request) => ipcRenderer.invoke('remote:open-tab', request),
-    releaseTab: (localSessionId) => ipcRenderer.invoke('remote:release-tab', localSessionId),
     closeTab: (localSessionId) => ipcRenderer.invoke('remote:close-tab', localSessionId),
     sessionMachine: (localSessionId) => ipcRenderer.invoke('remote:session-machine', localSessionId),
     sessionFileContext: (localSessionId) => ipcRenderer.invoke('remote:session-file-context', localSessionId),

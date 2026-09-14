@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process'
-import { existsSync, readdirSync, writeFileSync } from 'node:fs'
-import { join, parse, relative, resolve } from 'node:path'
+import { createHash } from 'node:crypto'
+import { existsSync, writeFileSync } from 'node:fs'
+import { mkdir, readdir, stat, writeFile } from 'node:fs/promises'
+import { dirname, join, parse, relative, resolve } from 'node:path'
 import type { SandboxConfig } from './config.ts'
 import { runDir } from './config.ts'
 import { isSecretPath } from './workspace.ts'
@@ -120,30 +122,215 @@ export async function sandboxImageExists(image: string): Promise<boolean> {
   return !outcome.spawnError && outcome.code === 0
 }
 
+/** One path the container must not see as it really is, and the mount that replaces it. A mask
+ *  with a `source` is bound read-only from that host path; otherwise a directory becomes an
+ *  empty tmpfs and a file an empty read-only file. */
+export interface SecretMask {
+  relative: string
+  directory: boolean
+  /** Host path whose contents stand in for the masked path. Set only by `trackedMaskPlan`, so a
+   *  path git already has in its index keeps the content git expects. */
+  source?: string
+}
+
+/** Directories the secret scan does not descend. Dependency trees and build output are not where
+ *  the owner keeps credentials, they are re-derivable, and they are what made the scan a
+ *  multi-hundred-millisecond stall on every command. `.git` is mounted as a unit and masking
+ *  inside it would break git itself. Anything named as a secret is still masked at its own level
+ *  even when it sits directly inside one of these, because the mask decision happens before the
+ *  descent decision. */
+export const SCAN_SKIP_DIRECTORIES = new Set([
+  'node_modules', '.git', '.hg', '.svn', 'dist', 'out', 'build', 'release', 'artifacts',
+  'coverage', 'target', 'vendor', '.next', '.nuxt', '.turbo', '.venv', 'venv', '__pycache__'
+])
+
+interface SecretScan {
+  masks: SecretMask[]
+  /** Every directory the walk actually read, with the mtime it had. Revalidating those stats is
+   *  how the cache notices a credential file that appeared since the last command. */
+  directories: Array<{ path: string; mtimeMs: number }>
+}
+
 /** Files inside the workspace that policy hides from local models. Masked in the container and
  *  refused by the host-side file tools, so a secret is not merely absent from one of the two.
  *  The recursive scan is bounded and fails closed if incomplete; silently truncating a scan
- *  would expose the rest of the workspace through the command tool. */
-export function detectSecretPaths(workspace: string, maxDepth = 64, limit = 4096): Array<{ relative: string; directory: boolean }> {
-  const found: Array<{ relative: string; directory: boolean }> = []
+ *  would expose the rest of the workspace through the command tool. Asynchronous throughout:
+ *  this runs before every sandboxed command and must never block the Electron main process. */
+async function scanWorkspace(workspace: string, maxDepth: number, limit: number): Promise<SecretScan> {
+  const masks: SecretMask[] = []
+  const directories: Array<{ path: string; mtimeMs: number }> = []
   let visited = 0
-  const walk = (dir: string, depth: number): void => {
+  const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > maxDepth) throw new SandboxUnavailableError('Secret scan exceeded its depth budget; command execution refused')
     let entries: import('node:fs').Dirent[]
-    try { entries = readdirSync(dir, { withFileTypes: true }) } catch { throw new SandboxUnavailableError('Secret scan could not inspect a workspace directory; command execution refused') }
+    let info: import('node:fs').Stats
+    try { [entries, info] = await Promise.all([readdir(dir, { withFileTypes: true }), stat(dir)]) }
+    catch { throw new SandboxUnavailableError('Secret scan could not inspect a workspace directory; command execution refused') }
+    directories.push({ path: dir, mtimeMs: info.mtimeMs })
+    const descend: string[] = []
     for (const entry of entries) {
       if (++visited > 200_000) throw new SandboxUnavailableError('Secret scan exceeded its entry budget; command execution refused')
       const full = join(dir, entry.name)
       const rel = relative(workspace, full).replace(/\\/g, '/')
       if (isSecretPath(rel)) {
-        if (found.length >= limit) throw new SandboxUnavailableError('Secret scan exceeded its mask budget; command execution refused')
-        found.push({ relative: rel, directory: entry.isDirectory() }); continue
+        if (masks.length >= limit) throw new SandboxUnavailableError('Secret scan exceeded its mask budget; command execution refused')
+        masks.push({ relative: rel, directory: entry.isDirectory() }); continue
       }
-      if (entry.isDirectory()) walk(full, depth + 1)
+      if (entry.isDirectory() && !SCAN_SKIP_DIRECTORIES.has(entry.name.toLowerCase())) descend.push(full)
     }
+    for (const child of descend) await walk(child, depth + 1)
   }
-  walk(workspace, 0)
-  return found
+  await walk(workspace, 0)
+  masks.sort((left, right) => left.relative.localeCompare(right.relative))
+  return { masks, directories }
+}
+
+/** The uncached scan, kept exported so callers and tests can exercise the budgets directly. */
+export async function detectSecretPaths(workspace: string, maxDepth = 64, limit = 4096): Promise<SecretMask[]> {
+  return (await scanWorkspace(workspace, maxDepth, limit)).masks
+}
+
+const scanCache = new Map<string, SecretScan>()
+const scanInFlight = new Map<string, Promise<SecretScan>>()
+
+/** True when every directory the last scan read still has the mtime it had. Creating, renaming
+ *  or deleting a file changes its directory's mtime, so a credential file that another process
+ *  dropped into the workspace invalidates the cache and is masked before the next command. */
+async function scanStillValid(scan: SecretScan): Promise<boolean> {
+  const checks = await Promise.all(scan.directories.map(async entry => {
+    try { return (await stat(entry.path)).mtimeMs === entry.mtimeMs } catch { return false }
+  }))
+  return checks.every(Boolean)
+}
+
+/** The masks for a workspace, reusing the previous scan while the tree it walked is unchanged.
+ *  Revalidation is a few hundred parallel `stat` calls rather than a full-tree walk, and none of
+ *  it is synchronous, so `run_command` no longer freezes the main process before every command. */
+export async function secretPathsFor(workspace: string): Promise<SecretMask[]> {
+  const key = resolve(workspace)
+  const cached = scanCache.get(key)
+  if (cached && await scanStillValid(cached)) return cached.masks
+  let pending = scanInFlight.get(key)
+  if (!pending) {
+    pending = scanWorkspace(key, 64, 4096)
+      .then(scan => { scanCache.set(key, scan); return scan })
+      .finally(() => { scanInFlight.delete(key) })
+    scanInFlight.set(key, pending)
+  }
+  return (await pending).masks
+}
+
+/** Drop the cache. Tests use it; nothing in the running app needs it, because the mtime check
+ *  already notices every change the cache could be stale about. */
+export function clearSecretScanCache(): void { scanCache.clear(); scanInFlight.clear(); indexCache.clear() }
+
+interface GitProcess { code: number | null; stdout: Buffer; stderr: string; spawnError?: Error }
+
+/** Host `git`, run as a program with an explicit argv, only ever to read the index of the very
+ *  workspace that is about to be mounted. */
+function runGit(workspace: string, args: string[], maxBytes: number): Promise<GitProcess> {
+  return new Promise(resolvePromise => {
+    const chunks: Buffer[] = []
+    let stderr = '', bytes = 0, settled = false, overflowed = false
+    const child = spawn('git', args, { cwd: workspace, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const finish = (outcome: GitProcess): void => { if (settled) return; settled = true; clearTimeout(timer); resolvePromise(outcome) }
+    const timer = setTimeout(() => child.kill('SIGKILL'), 30_000)
+    child.stdout.on('data', chunk => {
+      bytes += (chunk as Buffer).length
+      if (bytes > maxBytes) { overflowed = true; child.kill('SIGKILL'); return }
+      chunks.push(chunk as Buffer)
+    })
+    child.stderr.on('data', chunk => { stderr += (chunk as Buffer).toString('utf8').slice(0, 4096) })
+    child.on('error', error => finish({ code: null, stdout: Buffer.concat(chunks), stderr, spawnError: error as Error }))
+    child.on('close', code => finish({ code: overflowed ? null : code, stdout: Buffer.concat(chunks), stderr }))
+  })
+}
+
+/** One tracked path: the blob git has in its index, and where the replica of it lives. */
+export interface TrackedMaskWrite { source: string; oid: string }
+
+/** A tracked blob larger than this refuses the command rather than being staged. */
+const MAX_TRACKED_MASK_BYTES = 8 * 1024 * 1024
+
+const stagedRoot = (stageRoot: string, key: string): string =>
+  join(stageRoot, createHash('sha256').update(key).digest('hex').slice(0, 32))
+
+interface TrackedIndex { entries: Map<string, { mode: string; oid: string }>; mtimeMs: number }
+const indexCache = new Map<string, TrackedIndex>()
+
+/** Every path in the workspace's git index, with the blob each one is staged at. Re-read only
+ *  when `.git/index` changes, because this runs before every command of a granted conversation
+ *  and a large repository's `ls-files` is not free. */
+async function trackedIndex(workspace: string): Promise<Map<string, { mode: string; oid: string }>> {
+  const key = resolve(workspace)
+  const mtimeMs = await stat(join(workspace, '.git', 'index')).then(info => info.mtimeMs, () => Number.NaN)
+  const cached = indexCache.get(key)
+  if (cached && Number.isFinite(mtimeMs) && cached.mtimeMs === mtimeMs) return cached.entries
+  const listed = await runGit(workspace, ['ls-files', '--stage', '-z'], 64 * 1024 * 1024)
+  if (listed.spawnError || listed.code !== 0) {
+    throw new SandboxUnavailableError('Repository writes were granted but the workspace index could not be read, so a masked path could be committed as a deletion; command execution refused')
+  }
+  const entries = new Map<string, { mode: string; oid: string }>()
+  for (const record of listed.stdout.toString('utf8').split('\0')) {
+    const match = /^(\d{6}) ([0-9a-f]{40,64}) \d+\t([\s\S]+)$/.exec(record)
+    if (match) entries.set(match[3]!.replace(/\\/g, '/'), { mode: match[1]!, oid: match[2]! })
+  }
+  if (Number.isFinite(mtimeMs)) indexCache.set(key, { entries, mtimeMs })
+  return entries
+}
+
+/** Masking is what keeps a credential out of the container; it is also, with repository writes
+ *  granted, what would let the model commit the deletion of every masked path that git tracks.
+ *  An empty file over a tracked file is a truncation and an empty tmpfs over a tracked directory
+ *  is a deletion of everything in it, and one `git commit -a` records both into the owner's real
+ *  history on the owner's real working tree.
+ *
+ *  So when the grant is on, a mask that overlaps the index is replaced by a read-only replica of
+ *  exactly what git already has staged for it. Git then sees no change at all: no deletion, no
+ *  truncation, nothing to commit, and the replica is read-only so the model cannot create one
+ *  either. Nothing is disclosed that the container could not already read, because `.git` is
+ *  mounted in both modes and `git cat-file` serves the same blob; the worktree copy, which may
+ *  hold uncommitted secret edits, stays hidden. Untracked masked paths keep the empty mask, and
+ *  an untracked file inside a tracked masked directory is simply absent from the replica, so the
+ *  directory stays opaque. */
+export async function trackedMaskPlan(workspace: string, masks: SecretMask[], stageRoot: string): Promise<{ masks: SecretMask[]; writes: TrackedMaskWrite[] }> {
+  if (!masks.length || !existsSync(join(workspace, '.git'))) return { masks, writes: [] }
+  const tracked = await trackedIndex(workspace)
+  if (!tracked.size) return { masks, writes: [] }
+  const writes: TrackedMaskWrite[] = []
+  const planned = masks.map(mask => {
+    const prefix = mask.relative.replace(/\/+$/, '') + '/'
+    const overlap = [...tracked.entries()].filter(([path]) => mask.directory ? path.startsWith(prefix) : path === mask.relative)
+    if (!overlap.length) return mask
+    for (const [path, entry] of overlap) {
+      // A symlink or a submodule cannot be reproduced as a plain file, and writing one as a
+      // regular file would itself be a change git would record. Refuse the grant instead.
+      if (entry.mode !== '100644' && entry.mode !== '100755') {
+        throw new SandboxUnavailableError(`Repository writes cannot be granted safely: the withheld path ${path} is tracked as a symlink or submodule. Withdraw the repository-writes grant for this conversation.`)
+      }
+    }
+    const root = stagedRoot(stageRoot, JSON.stringify([mask.relative, overlap.map(([path, entry]) => [path, entry.oid])]))
+    for (const [path, entry] of overlap) {
+      writes.push({ source: mask.directory ? join(root, path.slice(prefix.length)) : join(root, 'blob'), oid: entry.oid })
+    }
+    return { ...mask, source: mask.directory ? root : join(root, 'blob') }
+  })
+  return { masks: planned, writes }
+}
+
+/** Write the staged replicas. Content-addressed by the index blobs, so an unchanged index reuses
+ *  the files it wrote last time and a changed one produces different paths — which changes the
+ *  mount signature and therefore recreates the container. */
+export async function materializeMaskSources(workspace: string, writes: TrackedMaskWrite[]): Promise<void> {
+  for (const write of writes) {
+    if (existsSync(write.source)) continue
+    const blob = await runGit(workspace, ['cat-file', 'blob', write.oid], MAX_TRACKED_MASK_BYTES)
+    if (blob.spawnError || blob.code !== 0) {
+      throw new SandboxUnavailableError('Repository writes were granted but a tracked withheld file could not be read from the index; command execution refused')
+    }
+    await mkdir(dirname(write.source), { recursive: true })
+    await writeFile(write.source, blob.stdout)
+  }
 }
 
 const dockerPath = (value: string): string => resolve(value).replace(/\\/g, '/')
@@ -165,7 +352,7 @@ export function containerRunArgs(options: {
   image: string
   workspace: string
   sandbox: SandboxConfig
-  masks: Array<{ relative: string; directory: boolean }>
+  masks: SecretMask[]
   emptyFile: string
   /** Off unless the owner grants it in the conversation: see the .git mount below. */
   gitWritable?: boolean
@@ -218,7 +405,14 @@ export function containerRunArgs(options: {
   ]
   for (const mask of options.masks) {
     if (/[,=\r\n]/.test(mask.relative)) throw new SandboxUnavailableError('A secret path cannot be represented safely as a Docker mask')
-    if (mask.directory) args.push('--tmpfs', `/workspace/${mask.relative}:rw,nosuid,nodev,size=1m`)
+    // A mask with a replica stands in for a path git already tracks: read-only, and holding
+    // exactly the bytes in the index, so no sandboxed git command can record its deletion or
+    // truncation. See `trackedMaskPlan`.
+    if (mask.source) {
+      const source = dockerPath(mask.source)
+      if (/[,=\r\n]/.test(source)) throw new SandboxUnavailableError('A mask replica path cannot be represented safely as a Docker mount')
+      args.push('--mount', `type=bind,source=${source},target=/workspace/${mask.relative},readonly`)
+    } else if (mask.directory) args.push('--tmpfs', `/workspace/${mask.relative}:rw,nosuid,nodev,size=1m`)
     else args.push('--mount', `type=bind,source=${dockerPath(options.emptyFile)},target=/workspace/${mask.relative},readonly`)
   }
   // A deliberately minimal environment. Nothing from the host is inherited, so no API key,
@@ -242,6 +436,34 @@ export function execArgs(container: string, command: string, timeoutSec: number)
   return ['exec', '--user', '10001:10001', '--workdir', '/workspace', container, 'timeout', '--kill-after=5', String(timeoutSec), 'bash', '-lc', command]
 }
 
+/** One spelling for a host path that Docker may report as `C:\dir`, `C:/dir`, `/host_mnt/c/dir`
+ *  or `/run/desktop/mnt/host/c/dir` depending on the engine. */
+const hostPathKey = (value: string): string => value
+  .toLowerCase().replace(/\\/g, '/')
+  .replace(/^\/(host_mnt|run\/desktop\/mnt\/host)/, '')
+  .replace(/^([a-z]):/, '/$1')
+  .replace(/\/+$/, '')
+
+/** The label a container carries so a later session can tell what mounts it was built from. */
+export const MOUNT_LABEL = 'conductor.mount-signature'
+
+export const mountDigest = (signature: string): string => createHash('sha256').update(signature).digest('hex')
+
+/** Whether an already-running container may be adopted for this workspace. `docker inspect`
+ *  reports the mount signature it was labelled with and the binds it really has; both must agree
+ *  with what this session would create now, or the container is destroyed and rebuilt. Mounts
+ *  cannot be changed on a running container, so adopting a mismatched one would run a command
+ *  against a withdrawn grant or an unmasked secret. */
+export function adoptableContainer(inspected: string, digest: string, workspace: string): boolean {
+  const [, label, mounts] = inspected.trim().split('\t')
+  if (label !== digest) return false
+  let bound: Array<{ Type?: string; Source?: string; Destination?: string }>
+  try { bound = JSON.parse(mounts ?? 'null') as Array<{ Type?: string; Source?: string; Destination?: string }> } catch { return false }
+  if (!Array.isArray(bound)) return false
+  const root = bound.filter(mount => mount.Destination === '/workspace')
+  return root.length === 1 && hostPathKey(root[0]!.Source ?? '') === hostPathKey(dockerPath(workspace))
+}
+
 export class DockerSandbox {
   readonly name: string
   private readonly workspace: string
@@ -261,8 +483,17 @@ export class DockerSandbox {
    *  bind mounts cannot change, so the grant only becomes real on the next container. */
   setGitAccess(writable: boolean): void { this.gitWritable = writable }
 
-  private signature(masks: Array<{ relative: string; directory: boolean }>): string {
-    return JSON.stringify({ masks, git: this.gitWritable })
+  private signature(masks: SecretMask[]): string {
+    return JSON.stringify({ masks, git: this.gitWritable, workspace: resolve(this.workspace) })
+  }
+
+  /** The mounts this session should be running with right now: the cached secret scan, plus the
+   *  index-backed replicas that keep a granted `git` from committing a mask as a deletion. Plans
+   *  only — nothing is written to disk until the container is actually created. */
+  private async plannedMasks(): Promise<{ masks: SecretMask[]; writes: TrackedMaskWrite[] }> {
+    const masks = await secretPathsFor(this.workspace)
+    if (!this.gitWritable) return { masks, writes: [] }
+    return trackedMaskPlan(this.workspace, masks, join(runDir(), 'masked-tracked'))
   }
 
   /** Bring the container up, or refuse with the specific reason. Never returns without a
@@ -278,15 +509,29 @@ export class DockerSandbox {
     const docker = await dockerAvailable()
     if (!docker.available) throw new SandboxUnavailableError(docker.reason ?? 'Docker unavailable')
     if (!await sandboxImageExists(this.sandbox.image)) throw new SandboxUnavailableError(`Sandbox image missing: build ${this.sandbox.image} with scripts/local-models/setup.ps1`)
-    const running = await runDocker(['inspect', '--format', '{{.State.Running}}', this.name], 20_000, 16 * 1024)
-    if (running.code === 0 && running.stdout.trim() === 'true') return
-    if (running.code === 0) await runDocker(['rm', '--force', this.name], 30_000, 16 * 1024)
+    const planned = await this.plannedMasks()
+    const signature = this.signature(planned.masks)
+    const digest = mountDigest(signature)
+    const existing = await runDocker(['inspect', '--format', `{{.State.Running}}\t{{index .Config.Labels "${MOUNT_LABEL}"}}\t{{json .Mounts}}`, this.name], 20_000, 256 * 1024)
+    if (existing.code === 0) {
+      // Adopting whatever is already running would run the first command of a session against
+      // mounts that may predate a withdrawn .git grant or a credential file that appeared since.
+      // The container carries the signature of the mounts it was built from, and its real bind
+      // list is checked against this workspace, so a stale container is rebuilt, not adopted.
+      if (existing.stdout.trim().startsWith('true') && adoptableContainer(existing.stdout, digest, this.workspace)) {
+        this.mountSignature = signature
+        return
+      }
+      await runDocker(['rm', '--force', this.name], 30_000, 16 * 1024)
+    }
     const emptyFile = join(runDir(), 'masked-empty')
     if (!existsSync(emptyFile)) writeFileSync(emptyFile, '', 'utf8')
-    const masks = detectSecretPaths(this.workspace)
-    this.mountSignature = this.signature(masks)
-    const created = await runDocker(containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks, emptyFile, gitWritable: this.gitWritable }), 120_000, 256 * 1024)
+    await materializeMaskSources(this.workspace, planned.writes)
+    const args = containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks: planned.masks, emptyFile, gitWritable: this.gitWritable })
+    args.splice(args.indexOf('--label'), 0, '--label', `${MOUNT_LABEL}=${digest}`)
+    const created = await runDocker(args, 120_000, 256 * 1024)
     if (created.spawnError || created.code !== 0) throw new SandboxUnavailableError(`Sandbox failed to start: ${(created.stderr || created.stdout).trim().slice(0, 400) || 'docker run failed'}`)
+    this.mountSignature = signature
   }
 
   /** Run one command inside the container. Refuses closed on any sandbox problem. */
@@ -295,7 +540,7 @@ export class DockerSandbox {
     // Other coworkers may create credential files between commands, and the owner may have
     // granted or withdrawn repository writes. A running container's bind mounts cannot change;
     // recreate it before executing against a different set of them.
-    if (this.started && this.signature(detectSecretPaths(this.workspace)) !== this.mountSignature) await this.stop()
+    if (this.started && this.signature((await this.plannedMasks()).masks) !== this.mountSignature) await this.stop()
     await this.start()
     signal?.throwIfAborted()
     const started = Date.now()
@@ -320,6 +565,7 @@ export class DockerSandbox {
 
   async stop(): Promise<void> {
     this.started = false
+    this.mountSignature = undefined
     await runDocker(['rm', '--force', this.name], 60_000, 64 * 1024)
   }
 }

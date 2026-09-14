@@ -392,6 +392,10 @@
 
 .sa-steering-prompt { flex-wrap: wrap; }
 .sa-steering-prompt small { order: 1; flex-basis: 100%; white-space: normal; overflow-wrap: anywhere; font-size: 11px; }
+/* A retained, undelivered message is recoverable, not an error: the action that brings it back
+   is named in words rather than hidden behind a close-looking icon. */
+.sa-queue > button.sa-steering-restore { width: auto; height: auto; gap: 5px; padding: 3px 8px; border: 1px solid var(--border); color: var(--text-2); font-size: 11px; white-space: nowrap; }
+.sa-queue > button.sa-steering-restore:hover { background: var(--surface-3); color: var(--text); border-color: var(--text-3); }
 
 /* The pin occupies a non-scrolling row, so no transcript text can paint above or behind it. */
 .structured-agent-pane .sa-pinned-prompt { position: relative; z-index: 3; display: flex; flex: 0 0 auto; width: 100%; align-items: center; justify-content: flex-start; gap: 6px; margin: 0; padding: 5px 9px; border: 1px solid var(--border-soft); border-radius: 0 0 6px 6px; background: var(--surface-1); box-shadow: 0 6px 16px -10px #000a; text-align: left; font-size: 11px; }
