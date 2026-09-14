@@ -100,14 +100,27 @@ export function portBindable(port: number, host = '127.0.0.1'): Promise<boolean>
   })
 }
 
-export interface HealthResult { ok: boolean; status: number; detail?: string }
+export interface HealthResult { ok: boolean; status: number; detail?: string; models?: string[] }
 
+/**
+ * One bounded request that answers both questions a caller has: is this server up, and which model
+ * is it serving. Reading the body here rather than asking a second time matters on the adoption
+ * path - a process that accepts a connection and then never answers must not be able to hold a
+ * local model start open, and every request on this path carries the same deadline.
+ */
 export async function health(port: number, apiKey: string, timeoutMs = 4000): Promise<HealthResult> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
     const response = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Authorization: `Bearer ${apiKey}` }, signal: controller.signal })
-    return { ok: response.ok, status: response.status, detail: response.ok ? undefined : `HTTP ${response.status}` }
+    if (!response.ok) return { ok: false, status: response.status, detail: `HTTP ${response.status}` }
+    let models: string[] = []
+    try {
+      const body = await response.json() as { data?: Array<{ id?: unknown }>; models?: Array<{ id?: unknown }> }
+      const entries = Array.isArray(body.data) ? body.data : Array.isArray(body.models) ? body.models : []
+      models = entries.map(entry => String(entry?.id ?? '')).filter(Boolean)
+    } catch { /* A server that is up but answers unreadable JSON is still up; it just names nothing. */ }
+    return { ok: true, status: response.status, models }
   } catch (error) {
     return { ok: false, status: 0, detail: error instanceof Error ? error.message : 'unreachable' }
   } finally { clearTimeout(timer) }
@@ -183,22 +196,16 @@ export async function resolveLlamaServer(configured?: string): Promise<{ path: s
 
 export interface StartOutcome { started: boolean; pid: number; port: number; message: string }
 
-async function servedModelIds(port: number, apiKey: string): Promise<string[]> {
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/v1/models`, { headers: { Authorization: `Bearer ${apiKey}` } })
-    if (!response.ok) return []
-    const body = await response.json() as { data?: Array<{ id?: unknown }> }
-    return Array.isArray(body.data) ? body.data.map(entry => String(entry?.id ?? '')) : []
-  } catch { return [] }
-}
 
 /** A port the configured server can't bind to may already hold our own orphaned llama.cpp from
  *  an earlier Conductor run - our API key is a 32-byte secret nothing else knows, so an
  *  authenticated health check that also lists our model id is conclusive. Adopting it beats
  *  failing outright. Returns null when whatever is on the port isn't ours. */
 export async function adoptRunningServer(model: LocalModelConfig, apiKey: string, port: number): Promise<StartOutcome | null> {
-  if (!(await health(port, apiKey)).ok) return null
-  if (!(await servedModelIds(port, apiKey)).includes(model.id)) return null
+  const probe = await health(port, apiKey)
+  // Our API key is a 32-byte secret no other process knows, so an answer at all means this is our
+  // own server from an earlier run; the model id is what says it is the right one.
+  if (!probe.ok || !probe.models?.includes(model.id)) return null
   const existing = readRunRecord(model)
   const record: RunRecord = existing && existing.port === port && processAlive(existing.pid)
     ? existing
