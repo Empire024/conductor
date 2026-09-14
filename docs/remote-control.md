@@ -29,7 +29,9 @@ On the controlling computer, sign in to the same GitHub account, paste the code 
 
 The listener uses HTTPS with a self-signed certificate whose SHA-256 fingerprint is pinned from the single-use pairing code. Every later request is signed by an Ed25519 device key whose public half must still exist on the signed-in GitHub account. Pairing codes expire and are consumed once. Revocation, disabling remote control, signing out, switching accounts, or forgetting a peer wins even when GitHub verification was already in flight.
 
-Network exposure binds the server to local interfaces. Conductor does not provide internet discovery, relay, router configuration, or firewall changes; the two machines must already be able to reach each other.
+Network exposure binds the server to local interfaces. Conductor does not provide internet discovery, router configuration, or firewall changes.
+
+Two machines that cannot reach each other directly meet through a relay instead. By default that is an encrypted mailbox in a private gist on the owner's own account, which needs no server but is polled and is therefore charged against GitHub's rate limit - one paired machine that is switched off can spend the whole budget, after which every machine reads as offline. An owner who would rather not live in that budget runs a relay of their own: one small server, one shared secret, messages pushed instead of polled, and nothing readable to the relay. See [the relay you run yourself](./relay-server.md). Either way the relay carries ciphertext and routing ids only, and the direct route is still preferred whenever it works.
 
 ## Confirm projects and place a tab
 

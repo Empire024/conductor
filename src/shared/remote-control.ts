@@ -49,6 +49,13 @@ export interface RemoteControlSettings {
    * connections; the direct route is still preferred whenever it works.
    */
   relay: boolean
+  /**
+   * The address of a relay the owner runs themselves, which replaces the gist mailbox entirely when
+   * it is set. The gist route was only ever a way to need no server; it is also a way to live inside
+   * an API budget that one unreachable machine can spend on its own, so an owner who runs a relay
+   * should never be put back on it silently. Empty means "use the gist mailbox".
+   */
+  relayEndpoint: string
 }
 
 export interface RemoteGrant {
@@ -126,6 +133,16 @@ export interface RemotePairingTicket {
   relayKey?: string
   /** The device key that signs this machine's relay directory entry. */
   deviceKey?: string
+  /**
+   * The relay this machine uses and the room secret for it, so pairing carries the whole route.
+   *
+   * The owner already carries this code between their own two machines through a channel they
+   * trust, which is exactly the channel a shared secret needs. Making them paste the address and
+   * the secret separately on the second machine would add a step whose only effect is a chance to
+   * get it wrong. A machine that already has a relay of its own keeps it.
+   */
+  relayEndpoint?: string
+  relaySecret?: string
 }
 
 /** What a machine advertises about a project it shares, including who that working copy is. */
@@ -177,6 +194,9 @@ export interface RemoteControlState {
   message: string | null
   /** The encrypted off-network route: whether it is on, and which machines it can currently see. */
   relay: import('./remote-relay').RelayStatus
+  /** Whether a room secret for the owner's own relay is held here. The secret itself never leaves
+   *  the credential store, so the renderer is told that it exists and nothing more. */
+  relaySecretSet: boolean
   projects: RemoteProjectSummary[]
   peers: RemotePeerRecord[]
   pending: PendingPairingRequest[]
@@ -215,6 +235,12 @@ export interface RemoteControlBridge {
   onGitHubState(callback: (state: GitHubAuthState) => void): () => void
   state(): Promise<RemoteControlState>
   setSettings(patch: Partial<RemoteControlSettings>): Promise<RemoteControlState>
+  /**
+   * Points this machine at a relay of the owner's own. Passing null for the secret leaves the one
+   * already stored alone; passing an empty string clears it, which puts the machine back on the
+   * gist mailbox. The secret is write-only from here: nothing ever reads it back out.
+   */
+  setRelayServer(endpoint: string, secret: string | null): Promise<RemoteControlState>
   createTicket(): Promise<{ ticket: RemotePairingTicket; encoded: string }>
   approve(pendingId: string, grantedProjectIds: string[]): Promise<RemoteControlState>
   /** Re-approves a shared project whose folder moved, after the owner has seen both paths. */
@@ -274,7 +300,8 @@ export function normalizeRemoteSettings(stored: unknown): RemoteControlSettings 
     machineName: machineName || 'This machine',
     // On by default: it publishes no address and opens no port, and without it a machine that moved
     // off this network simply stops answering. Settings written before it existed still get it.
-    relay: value.relay !== false
+    relay: value.relay !== false,
+    relayEndpoint: typeof value.relayEndpoint === 'string' ? value.relayEndpoint.trim().slice(0, 300) : ''
   }
 }
 
@@ -355,7 +382,7 @@ export function decodeTicket(encoded: string): RemotePairingTicket {
   catch { throw new Error('That pairing code is not readable. Copy the whole code from the other machine.') }
   const ticket = parsed as Partial<RemotePairingTicket>
   const required: Array<keyof RemotePairingTicket> = ['machineId', 'machineName', 'accountLogin', 'host', 'fingerprint', 'code', 'expiresAt']
-  const optionalKeys: Array<'relayKey' | 'deviceKey'> = ['relayKey', 'deviceKey']
+  const optionalKeys: Array<'relayKey' | 'deviceKey' | 'relayEndpoint' | 'relaySecret'> = ['relayKey', 'deviceKey', 'relayEndpoint', 'relaySecret']
   if (optionalKeys.some(key => ticket[key] !== undefined && typeof ticket[key] !== 'string')) {
     throw new Error('That pairing code is incomplete or from an incompatible version.')
   }

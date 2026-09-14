@@ -8,6 +8,10 @@ import './RemoteControlSettings.css'
 const fail = (reason: unknown): string => reason instanceof Error ? reason.message : String(reason)
 const shortFingerprint = (value: string | null): string => value ? value.replace(/:/g, '').slice(0, 16).replace(/(.{4})/g, '$1 ').trim() : ''
 
+/** Which relay is carrying this machine, in the owner's terms rather than the protocol's. */
+const relayRouteLabel = (relay: RelayStatus): string =>
+  relay.route === 'server' ? `Your own relay${relay.endpoint ? ` · ${relay.endpoint}` : ''}` : 'Private gist on your GitHub account'
+
 /** The relay's own words for what it is doing, so "why can't I reach my laptop" has an answer here. */
 const relayLabel = (relay: RelayStatus): string => {
   if (relay.phase === 'ready') return relay.reachable.length ? 'Connected' : 'Waiting for another machine'
@@ -52,6 +56,8 @@ export function RemoteControlSettings(): React.JSX.Element {
   const [copied, setCopied] = useState(false)
   const [grants, setGrants] = useState<Record<string, string[]>>({})
   const [pairs, setPairs] = useState<Record<string, string>>({})
+  const [relayAddress, setRelayAddress] = useState<string | null>(null)
+  const [relaySecret, setRelaySecret] = useState('')
 
   const refresh = useCallback(() => {
     void window.conductor.remote.githubState().then(setGithub).catch(reason => setError(fail(reason)))
@@ -179,7 +185,44 @@ export function RemoteControlSettings(): React.JSX.Element {
             {settings.relay && (
               <div className="remote-endpoint">
                 <div><span>Encrypted relay</span><code>{relayLabel(state.relay)}</code></div>
+                <div><span>Route</span><code>{relayRouteLabel(state.relay)}</code></div>
                 {state.relay.reachable.length > 0 && <div><span>Machines checked in</span><code>{state.relay.reachable.length}</code></div>}
+              </div>
+            )}
+            {settings.relay && (
+              <div className="remote-relay-server">
+                <label className="remote-row">
+                  <span>
+                    <strong>Run the relay yourself</strong>
+                    <small>
+                      A relay of your own pushes messages the moment they are written and answers to nobody&apos;s rate limit.
+                      Start it with <code>npm run relay</code>, then paste its address and the secret it printed here and on
+                      your other machines. Leave both empty to fall back to the private gist.
+                    </small>
+                  </span>
+                </label>
+                <input type="text" placeholder="wss://relay.example.com" spellCheck={false}
+                  value={relayAddress ?? settings.relayEndpoint}
+                  onChange={event => setRelayAddress(event.target.value)} />
+                <input type="password" autoComplete="off" spellCheck={false}
+                  placeholder={state.relaySecretSet ? 'Room secret — saved on this machine' : 'Room secret from npm run relay:secret'}
+                  value={relaySecret} onChange={event => setRelaySecret(event.target.value)} />
+                <div className="remote-actions">
+                  <button className="remote-primary" disabled={busy === 'relay-server'} onClick={() => void run('relay-server', async () => {
+                    // An empty box means "leave the stored secret alone", so re-saving an address
+                    // never silently wipes the secret that makes it usable.
+                    await window.conductor.remote.setRelayServer(relayAddress ?? settings.relayEndpoint, relaySecret.trim() ? relaySecret.trim() : null)
+                    setRelaySecret('')
+                    setRelayAddress(null)
+                  })}>Use this relay</button>
+                  {(settings.relayEndpoint || state.relaySecretSet) && (
+                    <button disabled={busy === 'relay-server'} onClick={() => void run('relay-server', async () => {
+                      await window.conductor.remote.setRelayServer('', '')
+                      setRelaySecret('')
+                      setRelayAddress(null)
+                    })}>Back to the gist</button>
+                  )}
+                </div>
               </div>
             )}
             {settings.relay && state.relay.message && <p className="remote-hint">{state.relay.message}</p>}

@@ -123,6 +123,14 @@ export interface RelayStatus {
   reachable: string[]
   lastPollAt: string | null
   message: string | null
+  /**
+   * Which off-network route this machine is on: the relay the owner runs, or the private gist
+   * mailbox that needs no server but lives inside GitHub's rate limit. The owner chooses by
+   * configuring a relay or not, and the difference is worth showing rather than hiding.
+   */
+  route?: 'server' | 'github'
+  /** The relay address in use, so "connected" can be read as "connected to the right one". */
+  endpoint?: string | null
 }
 
 /** Machine and message ids are UUIDs, so a dash cannot separate the fields of a file name: the

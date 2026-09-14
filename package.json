@@ -37,6 +37,8 @@
     "smoke:ui": "node scripts/smoke-ui.mjs",
     "test:backlog": "npm run build && node scripts/smoke-backlog.mjs",
     "test:remote-relay": "npm run build && powershell -NoProfile -File scripts/run-smoke-background.ps1 -SmokeScript scripts/smoke-remote-relay.mjs",
+    "test:conductor-relay": "npm run build && powershell -NoProfile -File scripts/run-smoke-background.ps1 -SmokeScript scripts/smoke-conductor-relay.mjs",
+    "test:relay-settings": "npm run build && powershell -NoProfile -File scripts/run-smoke-background.ps1 -SmokeScript scripts/smoke-relay-settings.mjs",
     "test:autoscroll": "node scripts/smoke-autoscroll.mjs",
     "test:tab-groups": "node scripts/smoke-tab-groups.mjs",
     "test:background-windows": "npm run build && node scripts/smoke-background-windows.mjs",
@@ -47,6 +49,8 @@
     "test:perf-streaming": "npm run build && node scripts/perf-streaming.mjs",
     "test:local-models": "npm run build && node scripts/smoke-local-models.mjs",
     "test:local-grants": "npm run build && node scripts/smoke-local-grants.mjs",
+    "relay": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/relay-server/main.ts",
+    "relay:secret": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/relay-server/main.ts new-secret",
     "local": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts",
     "local:smoke": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts smoke",
     "local:security": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts security-test"

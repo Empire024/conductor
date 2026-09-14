@@ -45,6 +45,8 @@ export interface RemoteControlServerDependencies {
   /** Published in a pairing code so the other machine can reach this one off-network. */
   relayKey?(): string | null
   deviceKey?(): string | null
+  /** The owner's own relay, handed to the other machine so pairing carries the whole route. */
+  relayRoom?(): { endpoint: string; secret: string } | null
   changed?(): void
 }
 
@@ -187,6 +189,7 @@ export class RemoteControlServer {
     const { code, expiresAt } = this.deps.peers.issueTicket()
     const relayKey = this.deps.relayKey?.() ?? null
     const deviceKey = this.deps.deviceKey?.() ?? null
+    const room = this.deps.relayRoom?.() ?? null
     return {
       version: 1,
       machineId: this.deps.peers.machineId,
@@ -197,7 +200,10 @@ export class RemoteControlServer {
       fingerprint: this.identity().fingerprint,
       code,
       expiresAt,
-      ...(settings.relay && relayKey && deviceKey ? { relayKey, deviceKey } : {})
+      ...(settings.relay && relayKey && deviceKey ? { relayKey, deviceKey } : {}),
+      // The machine being paired has to reach this one, and if this one is only reachable through a
+      // relay the other machine has never heard of, a code that omits it is a code that cannot work.
+      ...(settings.relay && room ? { relayEndpoint: room.endpoint, relaySecret: room.secret } : {})
     }
   }
 

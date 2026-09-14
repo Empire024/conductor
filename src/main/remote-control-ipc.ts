@@ -14,7 +14,7 @@ import type {
   RemoteProjectSummary
 } from '../shared/remote-control'
 import type { RemoteFileDescription, RemoteFileIdentity, RemoteFileWriteRequest } from '../shared/remote-files'
-import { encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries } from '../shared/remote-control'
+import { decodeTicket, encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries } from '../shared/remote-control'
 import { checkRemoteProjectPlacement } from '../shared/project-identity'
 import type { ConductorDatabase } from './database'
 import { GitHubAuth, GITHUB_SCOPES } from './github-auth'
@@ -27,6 +27,8 @@ import { RemoteFileResourceServer } from './remote-file-resources'
 import { RemoteFiles } from './remote-files'
 import { RemoteControlServer } from './remote-control-server'
 import { GitHubRelayMailbox } from './github-relay'
+import { ConductorRelay, relayEndpointUrl } from './conductor-relay'
+import { RelayRoute } from './relay-route'
 import { RemoteRelay } from './remote-relay'
 import { RELAY_BACKGROUND_CALL_TIMEOUT_MS } from '../shared/remote-relay'
 import { generateSealKey, type RelaySealKeyPair } from './relay-crypto'
@@ -67,6 +69,12 @@ const MACHINE_NAME_SETTING = 'remote-control.machineName'
 const MACHINE_PROBE_MS = DIRECT_PROBE_TIMEOUT_MS + RELAY_BACKGROUND_CALL_TIMEOUT_MS + 7_000
 /** The X25519 key relayed messages to this machine are sealed to; never leaves the credential store. */
 const RELAY_KEY_SECRET = 'remote-control.relay.sealKey'
+/**
+ * The room secret for the owner's own relay. It is the one value that decides whether a machine may
+ * connect to that relay at all, so it lives where the device key lives - the OS credential store -
+ * and never in ordinary settings, a log, or anything the renderer can read.
+ */
+const RELAY_ROOM_SECRET = 'remote-control.relay.roomSecret'
 
 interface FixtureGist { id: string; description: string; files: Record<string, string> }
 interface FixtureState { keys: Array<{ id: number; key: string; title: string }>; gists: FixtureGist[] }
@@ -197,13 +205,17 @@ export class RemoteControlService {
   readonly peers: RemotePeers
   readonly host: RemoteControlHost
   readonly server: RemoteControlServer
-  readonly relay: RemoteRelay
+  /** Whichever off-network route is in use: the owner's own relay, or the gist mailbox. */
+  readonly relay: RelayRoute
+  readonly githubRelay: RemoteRelay
+  readonly serverRelay: ConductorRelay
   readonly client: RemoteControlClient
   readonly files: RemoteFiles
   readonly resources: RemoteFileResourceServer
   readonly mirror: RemoteSessionMirror
   private registered = false
   private seal: RelaySealKeyPair | null = null
+  private room: string | null = null
   private heartbeat: ReturnType<typeof setInterval> | null = null
   /** One scheduled sweep at a time; a relay round trip can outlast the interval that started it. */
   private probing: Promise<MachineDescriptor[]> | null = null
@@ -254,9 +266,14 @@ export class RemoteControlService {
       accountLogin: () => this.auth.identity()?.login ?? null,
       relayKey: () => this.sealKey()?.publicKey ?? null,
       deviceKey: () => this.auth.deviceKey()?.publicKey ?? null,
+      relayRoom: () => {
+        const endpoint = this.peers.getSettings().relayEndpoint
+        const secret = this.roomSecret()
+        return endpoint && secret ? { endpoint, secret } : null
+      },
       changed: () => this.publishState()
     })
-    this.relay = new RemoteRelay({
+    this.githubRelay = new RemoteRelay({
       mailbox: new GitHubRelayMailbox({
         api: (path, init) => this.auth.gistApi(path, init),
         fetchRaw: async url => {
@@ -274,12 +291,30 @@ export class RemoteControlService {
       deviceKey: () => this.auth.deviceKey(),
       sealKey: () => this.sealKey(),
       fingerprint: () => { try { return this.server.identity().fingerprint } catch { return null } },
-      peerDeviceKey: machineId => this.peers.listPeers().find(peer => peer.machineId === machineId && !peer.revokedAt)?.publicKey ?? null,
+      peerDeviceKey: machineId => this.peerDeviceKey(machineId),
       // The relay hands an inbound request to the very same handler the HTTPS listener uses, so a
       // peer gains nothing by arriving this way instead of over the network.
       handle: (path, body, headers) => this.server.handleRequest(path, body, headers),
-      enabled: () => this.peers.getSettings().enabled && this.peers.getSettings().relay && this.auth.identity() !== null,
+      enabled: () => this.relayEnabled() && !this.serverRelay.configured(),
       changed: () => { this.publishState(); this.probeMachinesSeenOnRelay() }
+    })
+    this.serverRelay = new ConductorRelay({
+      endpoint: () => this.peers.getSettings().relayEndpoint || null,
+      roomSecret: () => this.roomSecret(),
+      machineId: () => this.peers.machineId,
+      machineName: () => this.machineName(),
+      deviceKey: () => this.auth.deviceKey(),
+      sealKey: () => this.sealKey(),
+      fingerprint: () => { try { return this.server.identity().fingerprint } catch { return null } },
+      peerDeviceKey: machineId => this.peerDeviceKey(machineId),
+      handle: (path, body, headers) => this.server.handleRequest(path, body, headers),
+      enabled: () => this.relayEnabled(),
+      changed: () => { this.publishState(); this.probeMachinesSeenOnRelay() }
+    })
+    this.relay = new RelayRoute({
+      server: this.serverRelay,
+      github: this.githubRelay,
+      endpoint: () => this.peers.getSettings().relayEndpoint || null
     })
     this.client = new RemoteControlClient({
       store,
@@ -287,7 +322,7 @@ export class RemoteControlService {
       machineName: () => this.machineName(),
       deviceKey: () => this.auth.deviceKey(),
       relay: {
-        enabled: () => this.peers.getSettings().enabled && this.peers.getSettings().relay && this.auth.identity() !== null,
+        enabled: () => this.relayEnabled(),
         call: (machineId, peerDeviceKey, path, body, headers, peerRelayKey, options) =>
           this.relay.call(machineId, peerDeviceKey, path, body, headers, peerRelayKey, options)
       },
@@ -335,6 +370,89 @@ export class RemoteControlService {
     vault.write(RELAY_KEY_SECRET, JSON.stringify(created))
     this.seal = created
     return this.seal
+  }
+
+  /**
+   * Whether an off-network route may run at all. Being signed into GitHub still gates it, because
+   * the account is what proves a peer is the owner's own machine on either route - the relay the
+   * owner runs decides who may connect to it, not who anybody is.
+   */
+  private relayEnabled(): boolean {
+    const settings = this.peers.getSettings()
+    return settings.enabled && settings.relay && this.auth.identity() !== null
+  }
+
+  /**
+   * The device key this machine has reason to trust for another machine, from either side of a
+   * pairing: the approved peer record on the machine being controlled, or the key pinned in the
+   * pairing code on the machine doing the controlling.
+   *
+   * Only the first existed before, which made a relay mailbox unattributable on the controlling
+   * side - it holds connections, not peer records - so that machine could never count a peer as
+   * checked in, and the one place that notices a machine coming back was dead there. The pinned key
+   * is the same one every relayed answer from that machine is already required to carry, so trusting
+   * it here widens nothing: it only lets this machine recognise a signature it already demands.
+   */
+  private peerDeviceKey(machineId: string): string | null {
+    const approved = this.peers.listPeers().find(peer => peer.machineId === machineId && !peer.revokedAt)?.publicKey
+    if (approved) return approved
+    const pinned = this.client?.list().find(connection => connection.machineId === machineId && connection.status !== 'revoked')?.deviceKey
+    return pinned ?? null
+  }
+
+  /** The room secret for the owner's own relay, read once from the credential store. */
+  private roomSecret(): string | null {
+    if (this.room) return this.room
+    const vault = new StoredSecretVault(this.deps.database, this.deps.cipher)
+    if (!vault.available()) return null
+    const stored = vault.read(RELAY_ROOM_SECRET)
+    this.room = stored && stored.trim() ? stored.trim() : null
+    return this.room
+  }
+
+  /**
+   * Points this machine at a relay of the owner's own, or takes it off one.
+   *
+   * The address is an ordinary setting and the secret is not, so they are set together here and the
+   * secret goes straight into the credential store. Changing either one changes which route this
+   * machine is on, so the old one is stopped and the new one started rather than left to notice.
+   */
+  private async setRelayServer(endpoint: string, secret: string | null): Promise<RemoteControlState> {
+    const vault = new StoredSecretVault(this.deps.database, this.deps.cipher)
+    const trimmed = String(endpoint ?? '').trim()
+    if (trimmed) relayEndpointUrl(trimmed)
+    if (secret !== null) {
+      if (!vault.available()) {
+        throw new RemoteAccessError('This machine has no credential store, so a relay secret cannot be kept safely here.', 500)
+      }
+      const value = String(secret).trim()
+      if (value && value.length < 16) throw new RemoteAccessError('A relay room secret is at least 16 characters. Run `npm run relay:secret` on the relay to make one.', 400)
+      vault.write(RELAY_ROOM_SECRET, value)
+      this.room = value || null
+    }
+    this.peers.updateSettings({ relayEndpoint: trimmed })
+    this.relay.start()
+    this.publishState()
+    return this.state()
+  }
+
+  /**
+   * A pairing code from a machine that uses the owner's relay carries that relay with it, so the
+   * machine being paired can reach it at all. A machine that already has one of its own keeps it:
+   * silently moving a machine to another relay would cut every pairing it already has.
+   */
+  private adoptRelayFromTicket(encoded: string): void {
+    let ticket: RemotePairingTicket
+    try { ticket = decodeTicket(encoded) } catch { return }
+    if (!ticket.relayEndpoint || !ticket.relaySecret) return
+    if (this.peers.getSettings().relayEndpoint || this.roomSecret()) return
+    const vault = new StoredSecretVault(this.deps.database, this.deps.cipher)
+    if (!vault.available()) return
+    try { relayEndpointUrl(ticket.relayEndpoint) } catch { return }
+    vault.write(RELAY_ROOM_SECRET, ticket.relaySecret)
+    this.room = ticket.relaySecret
+    this.peers.updateSettings({ relayEndpoint: ticket.relayEndpoint })
+    this.relay.start()
   }
 
   /** Callback installed into StructuredSessions after both services exist. */
@@ -536,6 +654,7 @@ export class RemoteControlService {
       fingerprint: status.fingerprint,
       message: status.message,
       relay: this.relay.getStatus(),
+      relaySecretSet: this.roomSecret() !== null,
       projects: this.deps.database.listProjects().map(projectSummary),
       peers: this.peers.listPeers(),
       pending: this.peers.listPending(),
@@ -569,7 +688,7 @@ export class RemoteControlService {
     const before = this.peers.getSettings()
     const after = this.peers.updateSettings(patch)
     if (before.enabled !== after.enabled || before.exposure !== after.exposure || before.port !== after.port) await this.server.apply()
-    if (before.enabled !== after.enabled || before.relay !== after.relay) {
+    if (before.enabled !== after.enabled || before.relay !== after.relay || before.relayEndpoint !== after.relayEndpoint) {
       if (after.enabled && after.relay) this.relay.start()
       else this.relay.stop()
     }
@@ -597,7 +716,15 @@ export class RemoteControlService {
     })
     handle<RemoteControlState>('remote:deny', (pendingId: string) => { this.peers.deny(String(pendingId)); return this.state() })
     handle<RemoteControlState>('remote:revoke', (peerId: string) => { this.peers.revoke(String(peerId)); return this.state() })
-    handle<RemoteControlState>('remote:connect', async (ticket: string) => { await this.client.connect(String(ticket)); return this.state() })
+    handle<RemoteControlState>('remote:set-relay-server', (endpoint: string, secret: string | null) =>
+      this.setRelayServer(String(endpoint ?? ''), typeof secret === 'string' ? secret : null))
+    handle<RemoteControlState>('remote:connect', async (ticket: string) => {
+      // The relay has to be in place before the first pairing request goes out, or a machine that
+      // is only reachable through it cannot be reached to be paired with.
+      this.adoptRelayFromTicket(String(ticket))
+      await this.client.connect(String(ticket))
+      return this.state()
+    })
     handle<RemoteControlState>('remote:forget', (machineId: string) => {
       const id = String(machineId) || LOCAL_MACHINE_ID
       this.client.forget(id)
@@ -641,7 +768,7 @@ export class RemoteControlService {
   async dispose(): Promise<void> {
     if (this.registered) {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
-        'remote:state', 'remote:set-settings', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
+        'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
         'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)

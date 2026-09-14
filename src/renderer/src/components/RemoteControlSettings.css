@@ -73,10 +73,26 @@
   word-break: break-all;
 }
 
+/* The relay the owner runs: two values they paste, and the two buttons that act on them. */
+.remote-relay-server { display: flex; flex-direction: column; gap: 7px; }
+.remote-relay-server .remote-row { align-items: flex-start; }
+.remote-relay-server small code { font-size: 9.5px; padding: 0 3px; border-radius: 3px; background: var(--surface-2); }
+.remote-relay-server input {
+  width: 100%;
+  padding: 5px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-2);
+  font-size: 10.5px;
+}
+
 .remote-endpoint { display: flex; flex-direction: column; gap: 4px; }
 .remote-endpoint > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .remote-endpoint span { color: var(--text-3); font-size: 9.5px; }
 .remote-endpoint code { font-size: 10px; letter-spacing: 0.6px; }
+/* A relay address is as long as the owner's hostname, so it wraps rather than pushing the row wide. */
+.remote-endpoint code { min-width: 0; text-align: right; overflow-wrap: anywhere; }
 
 .remote-identity { display: flex; align-items: center; gap: 10px; }
 .remote-identity img { border-radius: 50%; }

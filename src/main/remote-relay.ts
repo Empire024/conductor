@@ -25,14 +25,12 @@ import {
   openMessage,
   readDirectoryEntry,
   readEnvelope,
-  sealMessage,
   signDirectoryEntry,
-  signMessage,
   verifyDirectoryEntry,
-  verifyMessageSignature,
   type RelayBinding,
   type RelaySealKeyPair
 } from './relay-crypto'
+import { bindingOf, buildEnvelopes, envelopeIsAuthentic } from './relay-envelope'
 import { RemoteAccessError } from './remote-peers'
 
 /**
@@ -335,30 +333,16 @@ export class RemoteRelay {
   private async send(entry: RelayDirectoryEntry, binding: RelayBinding, plaintext: Buffer): Promise<void> {
     const key = this.deps.deviceKey()
     if (!key) throw new RemoteAccessError('This machine has no device key yet; sign in to GitHub first.', 401)
-    const sealed = sealMessage(entry.sealKey, binding, plaintext)
-    const senderSignature = signMessage(key.privateKeyPem, binding, sealed)
-    const encoded = sealed.ciphertext.toString('base64')
-    const total = Math.max(1, Math.ceil(encoded.length / RELAY_CHUNK_BYTES))
-    if (total > 64) throw new RemoteAccessError('Request exceeds 3 MiB.', 413)
     const files: Record<string, string | null> = {}
     const names: string[] = []
-    for (let index = 0; index < total; index++) {
-      const envelope: RelayEnvelope = {
-        version: 1,
-        id: binding.id,
-        from: binding.from,
-        to: binding.to,
-        kind: binding.kind,
-        correlationId: binding.correlationId,
-        index,
-        total,
-        ephemeralKey: sealed.ephemeralKey,
-        nonce: sealed.nonce,
-        tag: sealed.tag,
-        chunk: encoded.slice(index * RELAY_CHUNK_BYTES, (index + 1) * RELAY_CHUNK_BYTES),
-        createdAt: new Date(this.now()).toISOString(),
-        senderSignature
-      }
+    for (const envelope of buildEnvelopes({
+      privateKeyPem: key.privateKeyPem,
+      recipientSealKey: entry.sealKey,
+      binding,
+      plaintext,
+      chunkBytes: RELAY_CHUNK_BYTES,
+      now: this.now()
+    })) {
       const name = relayFileName(envelope)
       files[name] = JSON.stringify(envelope)
       names.push(name)
@@ -443,9 +427,7 @@ export class RemoteRelay {
   private async deliver(envelope: RelayEnvelope, ciphertext: Buffer, gist: GistSummary): Promise<void> {
     const seal = this.deps.sealKey()
     if (!seal) return
-    const binding: RelayBinding = {
-      from: envelope.from, to: envelope.to, id: envelope.id, kind: envelope.kind, correlationId: envelope.correlationId
-    }
+    const binding = bindingOf(envelope)
     if (!this.authentic(envelope, binding)) return
     let plaintext: Buffer
     try { plaintext = openMessage(seal.privateKey, envelope, binding, ciphertext) }
@@ -466,13 +448,11 @@ export class RemoteRelay {
    * answers only into a mailbox that key signed for.
    */
   private authentic(envelope: RelayEnvelope, binding: RelayBinding): boolean {
-    if (envelope.kind === 'response') {
-      const call = this.pending.get(envelope.correlationId)
-      if (!call || call.peerMachineId !== envelope.from) return false
-      return verifyMessageSignature(call.peerDeviceKey, binding, envelope, envelope.senderSignature)
-    }
-    const known = this.deps.peerDeviceKey(envelope.from)
-    return !known || verifyMessageSignature(known, binding, envelope, envelope.senderSignature)
+    const call = this.pending.get(envelope.correlationId)
+    return envelopeIsAuthentic(envelope, binding, {
+      answeringPeer: call ? { machineId: call.peerMachineId, deviceKey: call.peerDeviceKey } : null,
+      knownPeerKey: this.deps.peerDeviceKey(envelope.from)
+    })
   }
 
   private settle(envelope: RelayEnvelope, parsed: Record<string, unknown>): void {

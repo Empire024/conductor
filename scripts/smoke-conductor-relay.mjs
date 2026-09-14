@@ -4,20 +4,24 @@ import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { cleanupFixtureApp } from './smoke-fixture-cleanup.mjs'
+import { RelayServer } from '../src/relay-server/server.ts'
+import { generateRoomSecret } from '../src/main/relay-room.ts'
 
 /**
- * Two real Conductor instances reaching each other with no route between them.
+ * Two real Conductor instances linked through a relay the owner runs, with no route between them.
  *
- * The direct transport is deliberately broken here: the pairing code's address is rewritten to a
- * port nothing listens on, which is what a laptop that moved networks actually finds when it dials
- * the address it was paired at. Everything after that has to travel through the encrypted relay,
- * over an offline stand-in for the account's gists, and the smoke asserts both that it works and
- * that nothing readable was ever written into the mailbox.
+ * This is the same shape as smoke-remote-relay.mjs - the pairing code's address is rewritten to a
+ * port nothing answers on, so the direct transport cannot be what carries anything - but the
+ * mailbox is gone. A real relay server listens, and the two machines meet on it.
  *
- * Run with: powershell -NoProfile -File scripts/run-smoke-background.ps1 -SmokeScript scripts/smoke-remote-relay.mjs
+ * The controller starts with no relay configured at all. It learns the address and the room secret
+ * from the pairing code, which is the only way an owner should have to do this: they already carry
+ * the code between their own machines through a channel they trust.
+ *
+ * Run with: powershell -NoProfile -File scripts/run-smoke-background.ps1 -SmokeScript scripts/smoke-conductor-relay.mjs
  */
-const root = await mkdtemp(join(tmpdir(), 'conductor-remote-relay-'))
-const output = resolve('artifacts/remote-relay')
+const root = await mkdtemp(join(tmpdir(), 'conductor-own-relay-'))
+const output = resolve('artifacts/conductor-relay')
 await mkdir(output, { recursive: true })
 const sharedGitHubState = join(root, 'github-state.json')
 await writeFile(sharedGitHubState, JSON.stringify({ keys: [], gists: [] }))
@@ -25,6 +29,20 @@ await writeFile(sharedGitHubState, JSON.stringify({ keys: [], gists: [] }))
 const results = { checks: [], failures: [] }
 const check = label => { results.checks.push(label); console.log('PASS ' + label) }
 const launched = []
+
+/**
+ * Normally this starts its own relay. Point CONDUCTOR_RELAY_SMOKE_ENDPOINT and
+ * CONDUCTOR_RELAY_SMOKE_SECRET at one that is already running - a container, or a deployed one -
+ * and the same checks run against that instead, which is how the packaged image is verified to be
+ * the same relay as the source.
+ */
+const external = process.env.CONDUCTOR_RELAY_SMOKE_ENDPOINT && process.env.CONDUCTOR_RELAY_SMOKE_SECRET
+const secret = external ? process.env.CONDUCTOR_RELAY_SMOKE_SECRET : generateRoomSecret()
+const relay = external ? null : new RelayServer({ secrets: [secret], port: 0, host: '127.0.0.1' })
+const bound = relay ? await relay.listen() : null
+const endpoint = external ? process.env.CONDUCTOR_RELAY_SMOKE_ENDPOINT : `ws://127.0.0.1:${bound.port}`
+const healthUrl = `${endpoint.replace(/^ws/, 'http').replace(/\/v1\/socket$/, '')}/v1/health`
+console.log(`relay at ${endpoint}${external ? ' (already running)' : ''}`)
 
 const launch = async name => {
   const env = {
@@ -58,6 +76,7 @@ const signIn = async page => {
 }
 
 const mailboxes = async () => JSON.parse(await readFile(sharedGitHubState, 'utf8')).gists ?? []
+const health = async () => await (await fetch(healthUrl)).json()
 
 let host, controller
 try {
@@ -70,52 +89,45 @@ try {
   await signIn(controller.page)
   check('both machines signed into the same account')
 
-  // Loopback exposure with the relay on: no port is published anywhere, which is the configuration
-  // a machine behind someone else's router actually runs in.
+  // Loopback exposure: no port is published anywhere, which is the configuration a machine behind
+  // someone else's router actually runs in.
   await host.page.evaluate(() => window.conductor.remote.setSettings({ enabled: true, exposure: 'loopback', port: 0, relay: true, machineName: 'Relay host' }))
   await controller.page.evaluate(() => window.conductor.remote.setSettings({ enabled: true, exposure: 'loopback', port: 0, relay: true, machineName: 'Relay controller' }))
 
-  await expect.poll(async () => (await mailboxes()).length, { timeout: 30000 }).toBe(2)
-  const published = await mailboxes()
-  for (const gist of published) {
-    assert.ok(gist.files['machine.json'], 'a mailbox published no directory entry')
-    const entry = JSON.parse(gist.files['machine.json'])
-    assert.equal(entry.version, 1)
-    assert.ok(entry.sealKey && entry.signature && entry.deviceKey, 'a directory entry is missing its keys or signature')
-  }
-  check('each machine published a signed mailbox entry on the shared account')
+  // Only the host is told about the relay. The controller has to learn it from the pairing code.
+  const configured = await host.page.evaluate(({ address, room }) => window.conductor.remote.setRelayServer(address, room), { address: endpoint, room: secret })
+  assert.equal(configured.settings.relayEndpoint, endpoint)
+  assert.equal(configured.relaySecretSet, true)
+  check('the host was pointed at a relay of its own, with the secret kept out of settings')
 
   await expect.poll(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.relay.phase)), { timeout: 30000 }).toBe('ready')
-  await expect.poll(() => controller.page.evaluate(() => window.conductor.remote.state().then(state => state.relay.phase)), { timeout: 30000 }).toBe('ready')
-  // Being on the account is not being known: a mailbox only counts as a machine once a device key
-  // this one has approved has signed for it, so before pairing neither side counts the other. This
-  // assertion used to expect the opposite, which stopped being true when the signature check was
-  // added and was not noticed because nothing re-ran this smoke.
-  assert.deepEqual(await controller.page.evaluate(() => window.conductor.remote.state().then(state => state.relay.reachable)), [])
-  check('both machines are on the relay, and neither counts an unapproved mailbox as a machine')
+  await expect.poll(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.relay.route)), { timeout: 10000 }).toBe('server')
+  await expect.poll(async () => (await health()).connections, { timeout: 15000 }).toBe(1)
+  check('the host connected to the relay and the relay says so')
 
-  // The pairing code is taken from the host and then given the address a machine that moved
-  // networks would have: a port nothing answers on. Only the relay can carry anything after this.
   const ticket = await host.page.evaluate(() => window.conductor.remote.createTicket())
-  assert.ok(ticket.ticket.relayKey, 'the pairing code carried no relay key')
-  assert.ok(ticket.ticket.deviceKey, 'the pairing code carried no device key')
+  assert.equal(ticket.ticket.relayEndpoint, endpoint, 'the pairing code did not carry the relay address')
+  assert.ok(ticket.ticket.relaySecret, 'the pairing code did not carry the room secret')
+  assert.ok(ticket.ticket.relayKey && ticket.ticket.deviceKey, 'the pairing code carried no keys')
+  // The address a machine that moved networks actually finds when it dials where it was paired.
   const stranded = Buffer.from(JSON.stringify({ ...ticket.ticket, host: '127.0.0.1', port: 9 }), 'utf8').toString('base64url')
-  check('a pairing code carries the keys needed to reach a machine off its network')
+  check('a pairing code carries the whole route: the keys, the relay and its secret')
 
   const connecting = controller.page.evaluate(encoded => window.conductor.remote.connect(encoded), stranded)
-  const pending = await expect.poll(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending)), { timeout: 40000 })
+  const pending = await expect.poll(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending)), { timeout: 60000 })
     .toHaveLength(1).then(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending[0])))
-  check('the pairing request reached the host with no route to it')
+  check('the pairing request reached a machine with no route to it')
+
+  const adopted = await controller.page.evaluate(() => window.conductor.remote.state())
+  assert.equal(adopted.settings.relayEndpoint, endpoint, 'the controller did not adopt the relay from the pairing code')
+  assert.equal(adopted.relay.route, 'server')
+  check('the controller adopted the relay from the code, with nothing else pasted')
 
   await host.page.evaluate(({ id, projectId }) => window.conductor.remote.approve(id, [projectId]), { id: pending.id, projectId: hostProject.id })
   await connecting
   const connection = (await controller.page.evaluate(() => window.conductor.remote.state())).connections[0]
   assert.equal(connection.status, 'connected')
-  check('the pairing completed entirely over the encrypted relay')
-
-  // Now that the key is approved, the same mailbox does count, with no address between them.
-  await expect.poll(() => controller.page.evaluate(() => window.conductor.remote.state().then(state => state.relay.reachable.length)), { timeout: 30000 }).toBe(1)
-  check('each machine found the other through the account once the pairing was approved')
+  check('the pairing completed entirely over the owner\'s own relay')
 
   const advertised = await controller.page.evaluate(machineId => window.conductor.remote.remoteProjects(machineId), connection.machineId)
   assert.equal(advertised.length, 1, 'the host advertised the wrong number of projects')
@@ -128,42 +140,26 @@ try {
   const files = await controller.page.evaluate(({ machineId, projectId }) => window.conductor.remote.files.list({ machineId, projectId, path: '.' }),
     { machineId: connection.machineId, projectId: controllerProject.id })
   assert.ok(Array.isArray(files), `a remote directory listing did not come back: ${JSON.stringify(files)}`)
-  check('the controller read the host filesystem with no route to the host')
-
   const transport = (await controller.page.evaluate(() => window.conductor.remote.state())).connections[0].transport
   assert.equal(transport, 'relay', `expected the relay to have carried the call, got ${transport}`)
-  check('the connection reports the relay as the route it used')
+  check('the controller read the host filesystem with no route to the host')
 
-  // The account holds the messages, so what it holds has to be unreadable.
-  const readable = (await mailboxes()).flatMap(gist => Object.entries(gist.files))
-    .filter(([name]) => /^m\./.test(name))
-    .filter(([, content]) => /projects\.list|remote\/call|Relay host project|files\.list/.test(content))
-  assert.deepEqual(readable.map(([name]) => name), [], 'a relayed message was readable in the mailbox')
-  const machines = await controller.page.evaluate(() => window.conductor.remote.machines())
-  assert.equal(machines.length, 2)
-  check('nothing readable was written to the account, only sealed messages')
+  // The whole point of running a relay is that the account is not in the path at all.
+  const written = (await mailboxes()).flatMap(gist => Object.keys(gist.files)).filter(name => /^m\./.test(name))
+  assert.deepEqual(written, [], 'a message was written to the GitHub mailbox while a relay was configured')
+  check('not one message went through the GitHub account')
 
-  /**
-   * The staleness that made a reachable machine read as "unavailable" in the launcher. A paired
-   * machine's status used to be only a side effect of real work, so one failed call left it marked
-   * offline and the launcher then disabled it — which is also the one place the owner would have
-   * made the call that cleared it. A probe has to be able to recover it on its own.
-   */
+  // Presence, not polling: switching the host off has to be visible without anybody asking.
   await host.page.evaluate(() => window.conductor.remote.setSettings({ enabled: false }))
-  await controller.page.evaluate(async machineId => {
-    try { await window.conductor.remote.remoteProjects(machineId) } catch { /* expected while it is down */ }
-  }, connection.machineId)
-  await expect.poll(() => controller.page.evaluate(async id => (await window.conductor.remote.machines()).find(m => m.id === id)?.status, connection.machineId))
-    .toBe('offline')
-  check('a machine that stops answering is marked offline')
+  await expect.poll(() => controller.page.evaluate(() => window.conductor.remote.state().then(state => state.relay.reachable.length)), { timeout: 30000 }).toBe(0)
+  check('the controller was told the host left, without probing for it')
 
   await host.page.evaluate(() => window.conductor.remote.setSettings({ enabled: true }))
-  const recovered = await expect.poll(async () => {
+  await expect.poll(async () => {
     const list = await controller.page.evaluate(() => window.conductor.remote.refreshMachines())
     return list.find(machine => machine.id === connection.machineId)?.status
-  }, { timeout: 60000 }).toBe('online').then(() => controller.page.evaluate(() => window.conductor.remote.machines()))
-  assert.equal(recovered.find(machine => machine.id === connection.machineId)?.status, 'online')
-  check('a probe alone brings a recovered machine back, with no other call to make it happen')
+  }, { timeout: 60000 }).toBe('online')
+  check('the host came back and was reachable again')
 
   await controller.page.evaluate(machineId => window.conductor.remote.forget(machineId), connection.machineId)
   await host.page.evaluate(peerId => window.conductor.remote.revoke(peerId), connection.peerId)
@@ -175,12 +171,13 @@ try {
     try { await cleanupFixtureApp(entry.app, results, `${entry.name} cleanup`) }
     catch (error) { results.failures.push(String(error?.stack ?? error)) }
   }
+  if (relay) await relay.close()
   await writeFile(join(output, 'report.json'), JSON.stringify(results, null, 2) + '\n')
 }
 
 if (results.failures.length) {
   throw results.failures.length === 1
     ? new Error(results.failures[0])
-    : new AggregateError(results.failures.map(detail => new Error(detail)), 'Remote relay smoke failed')
+    : new AggregateError(results.failures.map(detail => new Error(detail)), 'Conductor relay smoke failed')
 }
 console.log(`\n${results.checks.length} checks passed`)

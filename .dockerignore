@@ -1,0 +1,15 @@
+# The only image in this repository is the relay, which needs nothing but a little of src/.
+# Everything below would otherwise be sent to the Docker daemon as build context for no reason.
+node_modules
+out
+release
+artifacts
+build
+screenshots
+.git
+docs
+scripts
+Microsoft
+src/renderer
+src/preload
+**/*.test.ts
