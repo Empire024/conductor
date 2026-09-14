@@ -282,6 +282,11 @@ export interface RemoteControlBridge {
   /** Starts, stops or reconfigures the relay this machine runs for itself and its other machines. */
   setRelayHosting(patch: { enabled?: boolean; port?: number; internet?: boolean }): Promise<RemoteControlState>
   createTicket(): Promise<{ ticket: RemotePairingTicket; encoded: string }>
+  /**
+   * Turns everything on that linking a second device needs - remote control, a room secret, a relay
+   * on this machine if none is configured - and returns the one code that carries all of it.
+   */
+  invite(): Promise<{ ticket: RemotePairingTicket; encoded: string }>
   approve(pendingId: string, grantedProjectIds: string[]): Promise<RemoteControlState>
   /** Re-approves a shared project whose folder moved, after the owner has seen both paths. */
   reshareProject(peerId: string, projectId: string): Promise<RemoteControlState>

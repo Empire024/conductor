@@ -85,6 +85,8 @@ export class RelayServer {
   private heartbeat: NodeJS.Timeout | null = null
   private sweeper: NodeJS.Timeout | null = null
   private started = 0
+  /** Set when the relay runs inside something else, whose life it must not extend. */
+  private detached = false
 
   private readonly options: RelayServerOptions
 
@@ -110,6 +112,20 @@ export class RelayServer {
   private now(): number { return this.options.now?.() ?? Date.now() }
   private log(line: string): void { this.options.log?.(line) }
 
+  /**
+   * Stops the relay from being a reason for its host process to stay alive.
+   *
+   * On its own - `npm run relay` - the listening socket is the only thing holding the process open
+   * and must keep doing so. Inside Conductor it is the opposite: the window decides when the app
+   * lives, and a listening socket plus a handful of long-lived connections would otherwise leave
+   * the process running after the owner has closed it.
+   */
+  unref(): void {
+    this.detached = true
+    this.http.unref?.()
+    for (const connection of this.connections.values()) connection.socket.unref?.()
+  }
+
   async listen(): Promise<{ host: string; port: number }> {
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error): void => reject(error)
@@ -122,6 +138,10 @@ export class RelayServer {
     this.started = this.now()
     this.heartbeat = setInterval(() => this.beat(), RELAY_HEARTBEAT_MS)
     this.sweeper = setInterval(() => this.rooms.sweep(), RELAY_HEARTBEAT_MS)
+    // A relay's own housekeeping is not a reason for the process around it to stay alive. Inside
+    // Conductor this is the difference between the app closing and the app appearing to hang.
+    this.heartbeat.unref?.()
+    this.sweeper.unref?.()
     const address = this.http.address()
     const bound = typeof address === 'object' && address ? address : { address: this.options.host ?? '0.0.0.0', port: this.options.port ?? 8787 }
     return { host: bound.address, port: bound.port }
@@ -133,7 +153,14 @@ export class RelayServer {
     this.heartbeat = null
     this.sweeper = null
     this.rooms.closeAll('shutting-down', 'This relay is shutting down.')
-    for (const connection of [...this.connections.values()]) this.shutdown(connection, CLOSE_NORMAL, 'Relay shutting down')
+    for (const connection of [...this.connections.values()]) {
+      const socket = connection.socket
+      this.shutdown(connection, CLOSE_NORMAL, 'Relay shutting down')
+      // A relay's connections are long-lived by design, and http.close() waits for every one of
+      // them to end by itself. Asking politely has already happened; this is what makes closing
+      // finish rather than wait for peers that may be asleep.
+      socket.destroy()
+    }
     await new Promise<void>(resolve => this.http.close(() => resolve()))
   }
 

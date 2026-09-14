@@ -166,27 +166,51 @@ export class RelayHost {
       return this.getStatus()
     }
 
-    const port = Number.isInteger(settings.port) && settings.port > 0 ? settings.port : 8787
+    // Zero means "ask the operating system", exactly as it does for the direct listener. A relay
+    // usually wants a fixed port - the router rule that lets it in names one - so the setting
+    // defaults to 8787, but an owner or a test that asks for any free port gets one.
+    const wanted = settings.port
+    const port = wanted === 0 || (Number.isInteger(wanted) && wanted >= 1 && wanted <= 65535) ? wanted : 8787
     // Both families. On a connection with no public IPv4 - which is what a provider hands out as
     // DS-Lite, and is now common - IPv6 is the only way in from outside, and a relay listening on
     // 0.0.0.0 would answer nothing there however the router is configured. Binding the IPv6 wildcard
     // takes IPv4 with it; a machine with IPv6 switched off falls back to IPv4 alone.
-    const start = async (host: string): Promise<{ server: RelayServer; port: number }> => {
+    const start = async (host: string, on: number): Promise<{ server: RelayServer; port: number }> => {
       const made = this.deps.createServer
-        ? this.deps.createServer({ secrets: [secret], port, host, tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
-        : new RelayServer({ secrets: [secret], port, host, tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
+        ? this.deps.createServer({ secrets: [secret], port: on, host, tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
+        : new RelayServer({ secrets: [secret], port: on, host, tls: { key: tls.privateKeyPem, cert: tls.certificatePem } })
       const bound = await made.listen()
       return { server: made, port: bound.port }
     }
+    /**
+     * In order of what the owner would want: both families on the port they chose, then - only if
+     * the machine has no IPv6 at all - IPv4 alone on it, and failing that any free port.
+     *
+     * A port already in use deliberately does not fall through to IPv4 on the same port. Windows
+     * will often allow that bind to succeed next to the IPv6 one, leaving two relays sharing a port
+     * and traffic going to whichever the operating system feels like: worse than moving. Moving is
+     * safe because the pairing code carries whichever port it ended up on.
+     */
+    let bound = port
     try {
-      let started: { server: RelayServer; port: number }
-      try { started = await start('::') }
-      catch (error) {
-        if (/EADDRINUSE/.test(error instanceof Error ? error.message : String(error))) throw error
-        started = await start('0.0.0.0')
+      let last: unknown = null
+      const tryBind = async (host: string, on: number): Promise<{ server: RelayServer; port: number } | null> => {
+        try { return await start(host, on) }
+        catch (error) { last = error; return null }
       }
+      const inUse = (): boolean => /EADDRINUSE/.test(last instanceof Error ? last.message : String(last))
+
+      let started = await tryBind('::', port)
+      if (!started && !inUse()) started = await tryBind('0.0.0.0', port)
+      if (!started && port !== 0) started = await tryBind('::', 0) ?? await tryBind('0.0.0.0', 0)
+      if (!started) throw last ?? new Error('The relay could not listen anywhere.')
       if (intent !== this.intent) { await started.server.close(); return this.getStatus() }
       this.server = started.server
+      // Conductor's window decides when the app is over, not the relay it happens to be running.
+      started.server.unref()
+      // What the router is asked to open, and what the pairing code carries, is the port actually
+      // bound - which is not the port asked for when the owner let the operating system choose.
+      bound = started.port
       this.publish({
         running: true,
         port: started.port,
@@ -200,7 +224,11 @@ export class RelayHost {
           ...localAddresses().map(address => `wss://${address}:${started.port}${RELAY_SOCKET_PATH}`)
         ],
         internet: { state: settings.internet ? 'opening' : 'off', address: null, message: null },
-        message: null
+        // A port nobody asked for is not a failure, but it is something to know: a router rule that
+        // names the old port now points at nothing.
+        message: port !== 0 && started.port !== port
+          ? `Port ${port} was already in use on this machine, so the relay is on ${started.port} instead. If your router allows ${port} to this machine, point it at ${started.port}.`
+          : null
       })
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
@@ -213,7 +241,7 @@ export class RelayHost {
       return this.getStatus()
     }
 
-    if (settings.internet) await this.openPort(intent, port)
+    if (settings.internet) await this.openPort(intent, bound)
     return this.getStatus()
   }
 
@@ -263,7 +291,7 @@ export class RelayHost {
     }
     this.renewal = this.deps.schedule
       ? this.deps.schedule(run, wait)
-      : (handle => ({ cancel: () => clearTimeout(handle) }))(setTimeout(run, wait))
+      : (handle => { handle.unref?.(); return { cancel: () => clearTimeout(handle) } })(setTimeout(run, wait))
   }
 
   private async release(mapping: PortMapping): Promise<void> {

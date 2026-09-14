@@ -123,6 +123,15 @@ const RECONNECT_MIN_MS = 1000
 const RECONNECT_MAX_MS = 30_000
 /** How long `call` waits for a connection that is on its way up before giving the owner an answer. */
 const CONNECT_WAIT_MS = 12_000
+/**
+ * How long a relay may be unreachable before this machine stops waiting for it.
+ *
+ * Past this, the machine is stranded: the relay it was told to use cannot be reached from where it
+ * is - no IPv6 on this network, the machine running it asleep, an address that was true at home and
+ * is not here - and going on refusing every other route would mean the owner's machines simply
+ * cannot meet. Long enough that an ordinary reconnection is not mistaken for it.
+ */
+const STRANDED_AFTER_MS = 45_000
 
 export class ConductorRelay {
   private socket: { connect(): void; send(value: unknown): void; close(code?: number, reason?: string): void } | null = null
@@ -143,6 +152,9 @@ export class ConductorRelay {
   private ready = false
   /** Set while the owner has switched this off, so a closing socket cannot reconnect behind them. */
   private stopped = false
+  /** When this machine first failed to reach the relay, cleared the moment it does. */
+  private failingSince: number | null = null
+  private strandedTimer: { cancel(): void } | null = null
   private waiters: Array<{ resolve(): void; reject(error: Error): void }> = []
   private status: RelayStatus = { phase: 'off', reachable: [], lastPollAt: null, message: null, route: 'server' }
 
@@ -155,6 +167,15 @@ export class ConductorRelay {
   /** True when this machine is set up to use a relay of the owner's own at all. */
   configured(): boolean {
     return Boolean(this.deps.endpoint() && this.deps.roomSecret())
+  }
+
+  /**
+   * True when the relay has been out of reach long enough that waiting for it is no longer the
+   * right thing to do. The connection keeps being retried, so this reverses itself the moment the
+   * relay can be reached again.
+   */
+  stranded(): boolean {
+    return this.failingSince !== null && this.now() - this.failingSince >= STRANDED_AFTER_MS
   }
 
   private setStatus(patch: Partial<RelayStatus>): void {
@@ -171,6 +192,8 @@ export class ConductorRelay {
   private schedule(run: () => void, ms: number): { cancel(): void } {
     if (this.deps.schedule) return this.deps.schedule(run, ms)
     const handle = setTimeout(run, ms)
+    // A pending reconnect is not a reason to keep the app alive while it is trying to close.
+    handle.unref?.()
     return { cancel: () => clearTimeout(handle) }
   }
 
@@ -197,6 +220,9 @@ export class ConductorRelay {
     this.timer?.cancel()
     this.timer = null
     this.attempt = 0
+    this.failingSince = null
+    this.strandedTimer?.cancel()
+    this.strandedTimer = null
     this.presence.clear()
     this.published = ''
     this.failWaiters(new RemoteAccessError('The relay was switched off while this request was pending.', 503))
@@ -268,6 +294,17 @@ export class ConductorRelay {
     const reason = detail.error?.message || detail.reason || 'The relay closed the connection.'
     this.failWaiters(new RemoteAccessError(reason, 503))
     if (!this.deps.enabled() || !this.configured()) { this.setStatus({ phase: 'off', reachable: [], message: null }); return }
+    if (this.failingSince === null) {
+      this.failingSince = this.now()
+      // Being stranded is the passage of time rather than an event, and nothing else would notice
+      // it: the reconnect backoff may be longer than the threshold, and a status that repeats itself
+      // publishes nothing. So the moment is announced on its own.
+      this.strandedTimer?.cancel()
+      this.strandedTimer = this.schedule(() => {
+        this.strandedTimer = null
+        if (this.stranded()) this.deps.changed?.(this.getStatus())
+      }, STRANDED_AFTER_MS)
+    }
     this.setStatus({ phase: 'unavailable', reachable: [], message: reason })
     // A relay that is down is not a reason to stop trying, but it is a reason to stop trying hard:
     // the backoff is what keeps a dead address from turning into a busy loop on a laptop battery.
@@ -344,6 +381,9 @@ export class ConductorRelay {
     }
     this.ready = true
     this.attempt = 0
+    this.failingSince = null
+    this.strandedTimer?.cancel()
+    this.strandedTimer = null
     this.setStatus({ phase: 'ready', message: null, lastPollAt: new Date(this.now()).toISOString() })
     this.published = ''
     this.publish()

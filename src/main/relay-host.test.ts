@@ -3,6 +3,7 @@ import { ConductorRelay } from './conductor-relay.ts'
 import { generateDeviceKey } from './device-key.ts'
 import { generateSealKey } from './relay-crypto.ts'
 import { RelayHost, type RelayHostDependencies } from './relay-host.ts'
+import { RelayRoute } from './relay-route.ts'
 import { generateRoomSecret } from './relay-room.ts'
 import type { PortMapping } from './port-mapping.ts'
 import { PortMappingError } from './port-mapping.ts'
@@ -66,6 +67,61 @@ const waitFor = async (predicate: () => boolean, what: string, timeoutMs = 4000)
   throw new Error(`Timed out waiting for ${what}`)
 }
 
+describe('a relay that cannot be reached from where this machine is', () => {
+  /** A stand-in for the gist mailbox: it only has to say whether it was asked to run. */
+  const mailbox = (): { started: boolean; start(): void; stop(): void; getStatus(): { phase: string; reachable: never[]; lastPollAt: null; message: null } } => {
+    const state = {
+      started: false,
+      start(): void { state.started = true },
+      stop(): void { state.started = false },
+      getStatus: () => ({ phase: 'ready' as const, reachable: [] as never[], lastPollAt: null, message: null })
+    }
+    return state
+  }
+
+  it('hands the machine to the mailbox once waiting for the relay stops being reasonable', async () => {
+    let now = 1_000_000
+    const github = mailbox()
+    // An address nothing answers on, which is what a laptop on a network without IPv6 finds.
+    const relay = new ConductorRelay({
+      endpoint: () => 'ws://127.0.0.1:9/v1/socket',
+      roomSecret: () => generateRoomSecret(),
+      machineId: () => 'laptop',
+      machineName: () => 'laptop',
+      deviceKey: () => generateDeviceKey('laptop'),
+      sealKey: () => generateSealKey(),
+      fingerprint: () => null,
+      peerDeviceKey: () => null,
+      handle: async () => ({ status: 200, body: '{}' }),
+      enabled: () => true,
+      now: () => now,
+      schedule: (run, ms) => {
+        const handle = setTimeout(run, Math.min(ms, 5))
+        return { cancel: () => clearTimeout(handle) }
+      }
+    })
+    relays.push(relay)
+    const route = new RelayRoute({ server: relay, github: github as never, endpoint: () => 'ws://127.0.0.1:9/v1/socket' })
+
+    route.start()
+    expect(route.usingServer()).toBe(true)
+    expect(github.started).toBe(false)
+
+    await waitFor(() => relay.getStatus().phase === 'unavailable', 'the relay to be out of reach')
+    // Still the relay's job for now: a connection that drops is not a connection that is gone.
+    expect(route.usingServer()).toBe(true)
+
+    now += 46_000
+    expect(relay.stranded()).toBe(true)
+    route.start()
+    expect(route.usingServer()).toBe(false)
+    expect(github.started).toBe(true)
+    // And the panel says why, rather than reporting the mailbox as if it had been chosen.
+    expect(route.getStatus().route).toBe('github')
+    expect(route.getStatus().message).toContain('cannot be reached from here')
+  })
+})
+
 describe('the relay Conductor runs for itself', () => {
   it('starts from a setting, with a certificate and addresses of its own', async () => {
     const running = host(generateRoomSecret(), { publicIpv6: () => [] })
@@ -84,14 +140,18 @@ describe('the relay Conductor runs for itself', () => {
     expect(status.message).toContain('room secret')
   })
 
-  it('reports a port that is already in use rather than failing silently', async () => {
-    const first = host(generateRoomSecret())
-    const started = await first.apply()
-    const second = host(generateRoomSecret(), {}, { port: started.port ?? 0 })
+  it('moves to a free port when the chosen one is taken, rather than leaving the owner stuck', async () => {
+    // Another Conductor on the same machine, or anything else holding 8787, used to end the whole
+    // flow here - with nothing to do about it but go and find a port field.
+    const first = host(generateRoomSecret(), { publicIpv6: () => [] })
+    const taken = await first.apply()
+    const second = host(generateRoomSecret(), { publicIpv6: () => [] }, { port: taken.port ?? 0 })
     const status = await second.apply()
 
-    expect(status.running).toBe(false)
+    expect(status.running).toBe(true)
+    expect(status.port).not.toBe(taken.port)
     expect(status.message).toContain('already in use')
+    expect(status.message).toContain(String(status.port))
   })
 
   it('advertises the address the router opened, and hands the mapping back when it stops', async () => {

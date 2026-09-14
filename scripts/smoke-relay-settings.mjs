@@ -65,12 +65,24 @@ try {
   await expect(account).toBeVisible()
   check('the account section opened')
 
+  // The one flow that matters: a code that carries everything, made by one button.
+  await panel.getByRole('button', { name: 'Invite a device', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => window.conductor.remote.state().then(state => state.relayHost.running)), { timeout: 30000 }).toBe(true)
+  const invited = await page.evaluate(() => window.conductor.remote.state())
+  assert.equal(invited.settings.relayHosting, true, 'inviting a device did not start a relay here')
+  assert.equal(invited.relaySecretSet, true, 'inviting a device did not make a room secret')
+  await expect(panel.locator('.remote-link .remote-ticket')).not.toHaveValue('')
+  await page.screenshot({ path: join(output, 'relay-invite.png') })
+  results.screenshots.push('artifacts/relay-settings/relay-invite.png')
+  check('one button turned everything on and produced an invite that carries it')
+
+  // Everything the flow replaced is still reachable, one fold down.
+  await panel.locator('.remote-advanced > summary').click()
   const relayCard = panel.locator('.remote-relay-server')
   await relayCard.scrollIntoViewIfNeeded()
   await expect(relayCard.getByText('Run the relay on this machine', { exact: true })).toBeVisible()
 
-  // The whole point of this panel: a relay, started from here, with nothing typed and no terminal.
-  await relayCard.getByText('Run the relay on this machine', { exact: true }).locator('xpath=../..').locator('input[type="checkbox"]').check()
+  // The same relay, switched by hand for an owner who wants to see the parts.
   await expect.poll(() => page.evaluate(() => window.conductor.remote.state().then(state => state.relayHost.running)), { timeout: 30000 }).toBe(true)
   await expect.poll(() => page.evaluate(() => window.conductor.remote.state().then(state => state.relay.phase)), { timeout: 30000 }).toBe('ready')
   const hosted = await page.evaluate(() => window.conductor.remote.state())

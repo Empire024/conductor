@@ -34,12 +34,26 @@ A machine is also its device key, on this route exactly as on the direct one: th
 second machine claiming an id that is already connected under a different key, and the app refuses
 any answer the key it called was not the one to sign.
 
+## Linking two computers
+
+In **Account & machines**, press **Invite a device**. That switches on everything a link needs -
+remote control, the room secret, and a relay running here if this machine is not already pointed at
+one - and produces a single code. On the other computer, press **I have an invite** and paste it.
+The code carries the address to reach this machine, the other addresses it answers on, the
+certificate to pin and the room secret, so nothing is typed on the second machine. The first machine
+then asks its owner whether to allow the second one and which projects it may open.
+
+Everything below is what that button does, for owners who want to do it themselves or differently.
+It lives under **Advanced** in the same panel.
+
 ## Running it from Conductor
 
-Nothing here needs a terminal. In **Account & machines**, with *Reach my machines anywhere* on, turn
-on **Run the relay on this machine**. Conductor starts the relay in its own process, mints a
-certificate for it, and makes the room secret if this machine does not have one yet. The panel then
-shows the port it is on and the addresses another machine can use.
+In **Account & machines → Advanced**, with *Reach my machines anywhere* on, turn on **Run the relay
+on this machine**. Conductor starts the relay in its own process, mints a certificate for it, and
+makes the room secret if this machine does not have one yet. The panel then shows the port it is on
+and the addresses another machine can use. If that port is already taken - another Conductor on the
+same machine, anything else - the relay moves to a free one and says which, rather than refusing to
+start.
 
 That machine has to be awake for the others to meet on it, and it is reachable from the network it
 is on. To reach it from anywhere else, turn on **Let my machines reach it from anywhere**: Conductor
@@ -138,9 +152,12 @@ your own two machines through a channel you trust, which is the same channel a s
   gist route had to discover it by probing, which is what made an offline machine expensive.
 - **Cost.** An idle pair of machines costs one open socket. No API budget is involved.
 - **Failure.** If the relay is unreachable, the direct route is still tried first and still works on
-  a shared network. Conductor reports the relay as unavailable and reconnects with a backoff; it does
-  not quietly fall back to the gist, because falling back into a rate limit is how the machines
-  became unreachable in the first place.
+  a shared network. After forty-five seconds of a relay that cannot be reached - no IPv6 on this
+  network, the machine running it asleep, an address that was true at home and is not here - the
+  machines fall back to the gist mailbox so that they still meet, and the panel says that is what
+  happened. The relay keeps being retried and takes over again the moment it answers. Both machines
+  make that decision independently and land in the same place, which is the point: a machine that
+  falls back alone has only changed which empty room it waits in.
 
 ## Limits it enforces
 

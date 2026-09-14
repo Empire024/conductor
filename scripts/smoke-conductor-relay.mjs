@@ -113,6 +113,13 @@ try {
   const stranded = Buffer.from(JSON.stringify({ ...ticket.ticket, host: '127.0.0.1', port: 9 }), 'utf8').toString('base64url')
   check('a pairing code carries the whole route: the keys, the relay and its secret')
 
+  // The controller is deliberately set up wrong first: its own relay, its own room. Pasting an
+  // invite has to move it to the inviting machine's relay, or two correctly configured machines sit
+  // in different empty rooms - which is the failure this whole flow exists to remove.
+  await controller.page.evaluate(() => window.conductor.remote.setRelayHosting({ enabled: true }))
+  await expect.poll(() => controller.page.evaluate(() => window.conductor.remote.state().then(state => state.relayHost.running)), { timeout: 30000 }).toBe(true)
+  check('the controller was put on a relay of its own, in a different room')
+
   const connecting = controller.page.evaluate(encoded => window.conductor.remote.connect(encoded), stranded)
   const pending = await expect.poll(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending)), { timeout: 60000 })
     .toHaveLength(1).then(() => host.page.evaluate(() => window.conductor.remote.state().then(state => state.pending[0])))
@@ -121,7 +128,9 @@ try {
   const adopted = await controller.page.evaluate(() => window.conductor.remote.state())
   assert.equal(adopted.settings.relayEndpoint, endpoint, 'the controller did not adopt the relay from the pairing code')
   assert.equal(adopted.relay.route, 'server')
-  check('the controller adopted the relay from the code, with nothing else pasted')
+  assert.equal(adopted.settings.relayHosting, false, 'the controller kept running its own relay after joining another room')
+  assert.equal(adopted.relayHost.running, false, 'the controller kept a relay listening for a room it left')
+  check("the invite moved the controller onto the inviting machine's relay and stopped its own")
 
   await host.page.evaluate(({ id, projectId }) => window.conductor.remote.approve(id, [projectId]), { id: pending.id, projectId: hostProject.id })
   await connecting

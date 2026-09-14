@@ -67,6 +67,7 @@ const bridge: ConductorBridge = {
     setRelayServer: (endpoint, secret) => ipcRenderer.invoke('remote:set-relay-server', endpoint, secret),
     setRelayHosting: (patch) => ipcRenderer.invoke('remote:set-relay-hosting', patch),
     createTicket: () => ipcRenderer.invoke('remote:ticket'),
+    invite: () => ipcRenderer.invoke('remote:invite'),
     approve: (pendingId, grantedProjectIds) => ipcRenderer.invoke('remote:approve', pendingId, grantedProjectIds),
     reshareProject: (peerId, projectId) => ipcRenderer.invoke('remote:reshare-project', peerId, projectId),
     deny: (pendingId) => ipcRenderer.invoke('remote:deny', pendingId),

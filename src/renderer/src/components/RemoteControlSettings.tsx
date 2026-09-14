@@ -33,6 +33,32 @@ const internetLabel = (host: RemoteControlState['relayHost']): string => {
   return ipv6 ? 'Over IPv6, if your router allows this port' : 'This network only'
 }
 
+/**
+ * Where the owner stands, in one sentence: whether another computer is linked, and if one is not
+ * reaching this machine, the single reason that matters rather than five statuses to read across.
+ */
+function linkSummary(state: RemoteControlState): string {
+  const others = state.connections.filter(connection => connection.status !== 'revoked')
+  const allowed = state.peers.filter(peer => !peer.revokedAt)
+  if (!others.length && !allowed.length) {
+    return 'No other computer yet. Invite one from here, or paste an invite made on the computer you want to reach.'
+  }
+  const connected = others.filter(connection => connection.status === 'connected')
+  const waiting = others.filter(connection => connection.status === 'pending')
+  const lost = others.filter(connection => connection.status === 'unreachable')
+  const parts: string[] = []
+  if (connected.length) parts.push(`${connected.map(entry => entry.machineName).join(', ')} ${connected.length === 1 ? 'is' : 'are'} linked and reachable.`)
+  if (waiting.length) parts.push(`${waiting.map(entry => entry.machineName).join(', ')} is waiting to be allowed on that computer.`)
+  if (lost.length) {
+    const why = lost.find(entry => entry.message)?.message ?? state.relay.message
+    parts.push(`${lost.map(entry => entry.machineName).join(', ')} cannot be reached right now.${why ? ` ${why}` : ''}`)
+  }
+  if (!others.length && allowed.length) {
+    parts.push(`${allowed.map(peer => peer.machineName).join(', ')} may control this computer. Nothing here controls it back until you paste an invite from it.`)
+  }
+  return parts.join(' ')
+}
+
 /** The relay's own words for what it is doing, so "why can't I reach my laptop" has an answer here. */
 const relayLabel = (relay: RelayStatus): string => {
   if (relay.phase === 'ready') return relay.reachable.length ? 'Connected' : 'Waiting for another machine'
@@ -80,6 +106,7 @@ export function RemoteControlSettings(): React.JSX.Element {
   const [relayAddress, setRelayAddress] = useState<string | null>(null)
   const [relaySecret, setRelaySecret] = useState('')
   const [hostPort, setHostPort] = useState<string | null>(null)
+  const [linkMode, setLinkMode] = useState<'idle' | 'invited' | 'joining'>('idle')
 
   const refresh = useCallback(() => {
     void window.conductor.remote.githubState().then(setGithub).catch(reason => setError(fail(reason)))
@@ -163,6 +190,59 @@ export function RemoteControlSettings(): React.JSX.Element {
 
       {signedIn && settings && state && (
         <>
+          {/*
+            Linking two computers is one thing an owner wants, and it used to be ten settings. The
+            two buttons below are the whole flow: one machine makes an invite - which switches on
+            everything the link needs and starts a relay here if none is configured - and the other
+            pastes it. Everything those steps used to expose is still here, under Advanced, for the
+            cases that need it.
+          */}
+          <div className="remote-card remote-link">
+            <strong className="remote-card-title"><Laptop size={13} /> Link a device</strong>
+            <p className="remote-hint">{linkSummary(state)}</p>
+            <div className="remote-actions">
+              <button className="remote-primary" disabled={busy === 'invite'} onClick={() => void run('invite', async () => {
+                const created = await window.conductor.remote.invite()
+                setTicket(created.encoded)
+                setLinkMode('invited')
+              })}>Invite a device</button>
+              <button disabled={busy === 'invite'} onClick={() => { setLinkMode(linkMode === 'joining' ? 'idle' : 'joining'); setTicket('') }}>
+                I have an invite
+              </button>
+            </div>
+
+            {linkMode === 'invited' && ticket && (
+              <>
+                <p className="remote-hint">
+                  Paste this into <strong>Link a device → I have an invite</strong> on your other computer, within ten minutes.
+                  It carries the address to reach this machine, the certificate to check it against and the secret they share.
+                </p>
+                <textarea className="remote-ticket" readOnly value={ticket} rows={3} onFocus={event => event.currentTarget.select()} />
+                <div className="remote-actions">
+                  <button onClick={() => copy(ticket)}>{copied ? <Check size={13} /> : <Copy size={13} />} Copy invite</button>
+                </div>
+              </>
+            )}
+
+            {linkMode === 'joining' && (
+              <>
+                <textarea className="remote-ticket" rows={3} value={joinCode} placeholder="Paste the invite from your other computer"
+                  onChange={event => setJoinCode(event.target.value)} />
+                <div className="remote-actions">
+                  <button className="remote-primary" disabled={!joinCode.trim() || busy === 'connect'}
+                    onClick={() => void run('connect', async () => {
+                      await window.conductor.remote.connect(joinCode.trim())
+                      setJoinCode('')
+                      setLinkMode('idle')
+                    })}>Link this computer</button>
+                </div>
+                <p className="remote-hint">The other computer will ask, there, whether to allow this one and which projects it may open.</p>
+              </>
+            )}
+          </div>
+
+          <details className="remote-advanced">
+            <summary>Advanced — machine name, relay and network</summary>
           <div className="remote-card">
             <label className="remote-row">
               <span><strong>Let my other machines control this one</strong><small>Off unless you turn it on, on this machine.</small></span>
@@ -320,15 +400,16 @@ export function RemoteControlSettings(): React.JSX.Element {
             )}
             {(state.listening || state.relay.phase === 'ready') && (
               <div className="remote-actions">
-                <button className="remote-primary" disabled={busy === 'ticket'} onClick={() => void run('ticket', async () => {
+                {/* The plain code, for a machine already set up the way its owner wants it. */}
+                <button disabled={busy === 'ticket'} onClick={() => void run('ticket', async () => {
                   const created = await window.conductor.remote.createTicket()
                   setTicket(created.encoded)
-                })}>Create a pairing code</button>
-                {ticket && <button onClick={() => copy(ticket)}>{copied ? <Check size={13} /> : <Copy size={13} />} Copy code</button>}
+                  setLinkMode('invited')
+                })}>Create a pairing code without changing anything</button>
               </div>
             )}
-            {ticket && <textarea className="remote-ticket" readOnly value={ticket} rows={3} onFocus={event => event.currentTarget.select()} />}
           </div>
+          </details>
 
           {state.pending.map(request => (
             <div className="remote-card remote-approval" key={request.id}>
@@ -400,10 +481,9 @@ export function RemoteControlSettings(): React.JSX.Element {
           <div className="remote-card">
             <strong className="remote-card-title"><MonitorSmartphone size={13} /> Machines this one can use</strong>
             <p className="remote-hint">Paste a pairing code created on the other machine. A tab can then be told to run there.</p>
-            <textarea className="remote-ticket" rows={3} value={joinCode} placeholder="Paste pairing code" onChange={event => setJoinCode(event.target.value)} />
             <div className="remote-actions">
-              <button className="remote-primary" disabled={!joinCode.trim() || busy === 'connect'}
-                onClick={() => void run('connect', async () => { await window.conductor.remote.connect(joinCode.trim()); setJoinCode('') })}>
+              <button className="remote-primary" disabled={busy === 'connect'}
+                onClick={() => { setLinkMode('joining'); setTicket('') }}>
                 {busy === 'connect' ? 'Waiting for approval…' : 'Connect'}
               </button>
             </div>

@@ -344,7 +344,9 @@ export class RemoteControlService {
       peerDeviceKey: machineId => this.peerDeviceKey(machineId),
       handle: (path, body, headers) => this.server.handleRequest(path, body, headers),
       enabled: () => this.relayEnabled(),
-      changed: () => { this.publishState(); this.probeMachinesSeenOnRelay() }
+      // A relay that went out of reach, or came back, changes which route carries this machine, and
+      // the route is what has to act on it.
+      changed: () => { this.relay?.reconsider(); this.publishState(); this.probeMachinesSeenOnRelay() }
     })
     this.relay = new RelayRoute({
       server: this.serverRelay,
@@ -480,11 +482,49 @@ export class RemoteControlService {
       vault.write(RELAY_ROOM_SECRET, value)
       this.room = value || null
     }
-    // An address typed by hand replaces whatever a pairing code left behind, alternates included.
-    this.peers.updateSettings({ relayEndpoint: trimmed, relayEndpointAlternates: [] })
+    // An address typed by hand replaces whatever a pairing code left behind - the other addresses
+    // that relay answers on, and the certificate pinned for it. Keeping the old pin would measure a
+    // new relay against the last one's certificate and refuse it for the wrong reason.
+    this.peers.updateSettings({ relayEndpoint: trimmed, relayEndpointAlternates: [], relayFingerprint: '' })
     this.relay.start()
     this.publishState()
     return this.state()
+  }
+
+  /**
+   * Everything a second device needs, in one action.
+   *
+   * Linking two computers used to be a sequence: switch remote control on, leave the relay on, run
+   * a relay somewhere, produce a secret, wait for a certificate, then make a pairing code. Every one
+   * of those steps is a place to stop, and none of them is a decision the owner has any reason to
+   * make differently. So the button makes them all, in the only order that works, and hands back the
+   * one thing that has to be carried by hand.
+   *
+   * What it deliberately does not touch is the direct listener's exposure. A relay on this machine
+   * is reachable on this network already, so opening the listener to the network as well would be
+   * widening what answers from outside in exchange for nothing.
+   */
+  private async invite(): Promise<{ ticket: RemotePairingTicket; encoded: string }> {
+    const before = this.peers.getSettings()
+    const patch: Partial<RemoteControlSettings> = {}
+    if (!before.enabled) patch.enabled = true
+    if (!before.relay) patch.relay = true
+    // A machine already pointed at a relay keeps using it; one with none becomes the relay itself.
+    if (!before.relayEndpoint && !before.relayHosting) patch.relayHosting = true
+    if (Object.keys(patch).length) this.peers.updateSettings(patch)
+    if (!this.ensureRoomSecret()) {
+      throw new RemoteAccessError('This machine has no credential store, so it cannot keep the secret that links your machines.', 500)
+    }
+    await this.server.apply()
+    await this.relayHost.apply()
+    this.relay.start()
+    const host = this.relayHost.getStatus()
+    if (this.peers.getSettings().relayHosting && !host.running) {
+      throw new RemoteAccessError(host.message ?? 'The relay could not start on this machine.', 500)
+    }
+    const ticket = this.server.ticket()
+    this.publishState()
+    return { ticket, encoded: encodeTicket(ticket) }
   }
 
   /**
@@ -510,15 +550,22 @@ export class RemoteControlService {
   }
 
   /**
-   * A pairing code from a machine that uses the owner's relay carries that relay with it, so the
-   * machine being paired can reach it at all. A machine that already has one of its own keeps it:
-   * silently moving a machine to another relay would cut every pairing it already has.
+   * An invite carries the relay the inviting machine is on, and pasting one is an instruction to
+   * meet there.
+   *
+   * It therefore wins over whatever this machine was set up with, including a relay of its own. The
+   * alternative - keeping what was here - is how two machines end up each waiting in a different
+   * empty room, each correctly configured, neither reachable. A machine that was running a relay
+   * stops running it: it is joining a room whose secret it has just been given, and the relay it was
+   * running served a different one.
    */
-  private adoptRelayFromTicket(encoded: string): void {
+  private async adoptRelayFromTicket(encoded: string): Promise<void> {
     let ticket: RemotePairingTicket
     try { ticket = decodeTicket(encoded) } catch { return }
     if (!ticket.relayEndpoint || !ticket.relaySecret) return
-    if (this.peers.getSettings().relayEndpoint || this.roomSecret() || this.relayHost.localEndpoint()) return
+    const settings = this.peers.getSettings()
+    const same = settings.relayEndpoint === ticket.relayEndpoint && this.roomSecret() === ticket.relaySecret
+    if (same && !settings.relayHosting) return
     const vault = new StoredSecretVault(this.deps.database, this.deps.cipher)
     if (!vault.available()) return
     try { relayEndpointUrl(ticket.relayEndpoint) } catch { return }
@@ -527,8 +574,10 @@ export class RemoteControlService {
     this.peers.updateSettings({
       relayEndpoint: ticket.relayEndpoint,
       relayEndpointAlternates: ticket.relayEndpointAlternates ?? [],
-      relayFingerprint: ticket.relayFingerprint ?? ''
+      relayFingerprint: ticket.relayFingerprint ?? '',
+      relayHosting: false
     })
+    await this.relayHost.apply()
     this.relay.start()
   }
 
@@ -788,6 +837,7 @@ export class RemoteControlService {
     handle<RemoteControlState>('remote:state', () => this.state())
     handle<RemoteControlState>('remote:set-settings', (patch: Partial<RemoteControlSettings>) => this.setSettings(patch ?? {}))
     handle<{ ticket: RemotePairingTicket; encoded: string }>('remote:ticket', () => { const ticket = this.server.ticket(); return { ticket, encoded: encodeTicket(ticket) } })
+    handle<{ ticket: RemotePairingTicket; encoded: string }>('remote:invite', () => this.invite())
     handle<RemoteControlState>('remote:approve', (pendingId: string, projectIds: string[]) => {
       this.peers.approve(String(pendingId), Array.isArray(projectIds) ? projectIds.map(String) : [])
       return this.state()
@@ -805,7 +855,7 @@ export class RemoteControlService {
     handle<RemoteControlState>('remote:connect', async (ticket: string) => {
       // The relay has to be in place before the first pairing request goes out, or a machine that
       // is only reachable through it cannot be reached to be paired with.
-      this.adoptRelayFromTicket(String(ticket))
+      await this.adoptRelayFromTicket(String(ticket))
       await this.client.connect(String(ticket))
       return this.state()
     })
@@ -852,7 +902,7 @@ export class RemoteControlService {
   async dispose(): Promise<void> {
     if (this.registered) {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
-        'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:set-relay-hosting', 'remote:ticket', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
+        'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:set-relay-hosting', 'remote:ticket', 'remote:invite', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
         'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)

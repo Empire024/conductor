@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { connect as netConnect, type Socket } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
+import { globalIpv6Addresses } from './network-addresses'
 import {
   CLOSE_PROTOCOL_ERROR,
   FrameDecoder,
@@ -50,6 +51,33 @@ export interface RelaySocketOptions {
 const CLOSE_NORMAL = 1000
 const MAX_HTTP_HEADER_BYTES = 16 * 1024
 
+/**
+ * What a failed connection means, in words the owner can act on.
+ *
+ * The operating system's own answer - ENETUNREACH against an address with colons in it - is exactly
+ * right and says nothing to anyone: it means this machine has no IPv6 at all, which is a fact about
+ * the network it is on rather than anything to do with the relay, the router it sits behind, or the
+ * machine at the other end. Each of these failures has a different thing to do about it, and naming
+ * the wrong one costs an evening.
+ */
+function explain(error: unknown, address: string, port: number): Error {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code ?? ''
+  const where = address.includes(':') ? `[${address}]:${port}` : `${address}:${port}`
+  const ipv6 = address.includes(':')
+  if (code === 'ENETUNREACH' || code === 'EHOSTUNREACH') {
+    if (ipv6 && !globalIpv6Addresses().length) {
+      return new Error(`This machine has no IPv6 connection, so it cannot reach ${where} - that relay has an IPv6 address and nothing else. Use it from a network that has IPv6, or give the relay an address this machine can reach.`)
+    }
+    return new Error(`This network has no route to ${where}.`)
+  }
+  if (code === 'ECONNREFUSED') return new Error(`Nothing is listening at ${where}. The relay is probably switched off on that machine.`)
+  if (code === 'ETIMEDOUT') return new Error(`${where} did not answer. A firewall on that machine, or the router in front of it, is the usual reason.`)
+  if (/^(DEPTH_ZERO_SELF_SIGNED_CERT|SELF_SIGNED_CERT_IN_CHAIN|UNABLE_TO_VERIFY_LEAF_SIGNATURE|ERR_TLS_CERT_ALTNAME_INVALID|CERT_HAS_EXPIRED)$/.test(code)) {
+    return new Error(`The certificate at ${where} is not one a public authority signed. A relay Conductor runs makes its own, so that machine has to be paired with a pairing code - the code carries the certificate to pin. An address typed in by hand can only reach a relay whose certificate an authority signed.`)
+  }
+  return error instanceof Error ? error : new Error(String(error))
+}
+
 export class RelaySocket {
   private socket: Socket | null = null
   private decoder: FrameDecoder | null = null
@@ -97,10 +125,13 @@ export class RelaySocket {
       : netConnect({ host: address, port })
     this.socket = socket as Socket
     socket.setNoDelay(true)
+    // The connection to the relay is how this machine is reachable, not a reason for it to stay
+    // running: an app the owner has closed must close.
+    socket.unref?.()
 
     this.timer = setTimeout(() => this.fail(new Error('The relay did not answer in time.')), this.options.connectTimeoutMs ?? 15_000)
 
-    socket.on('error', error => this.fail(error instanceof Error ? error : new Error(String(error))))
+    socket.on('error', error => this.fail(explain(error, address, port)))
     socket.on('close', () => this.finish(this.upgraded ? CLOSE_NORMAL : 1006, this.upgraded ? '' : 'The relay closed the connection.'))
     socket.on('data', chunk => this.onData(chunk))
     socket.on(secure ? 'secureConnect' : 'connect', () => {

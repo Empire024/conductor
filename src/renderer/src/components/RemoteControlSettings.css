@@ -73,6 +73,21 @@
   word-break: break-all;
 }
 
+/* Linking two computers is what this panel is for, so that card leads and is marked as the one
+   thing to act on; everything that used to be in the way is a fold below it. */
+.remote-link { border-color: #3f6ea8; }
+.remote-advanced > summary {
+  cursor: pointer;
+  padding: 3px 0;
+  color: var(--text-3);
+  font-size: 10px;
+  list-style: none;
+}
+.remote-advanced > summary::-webkit-details-marker { display: none; }
+.remote-advanced > summary::before { content: 'B8  '; }
+.remote-advanced[open] > summary::before { content: 'BE  '; }
+.remote-advanced > summary:hover { color: var(--text); }
+
 /* The relay the owner runs: two values they paste, and the two buttons that act on them. */
 .remote-relay-server { display: flex; flex-direction: column; gap: 7px; }
 .remote-relay-server .remote-row { align-items: flex-start; }

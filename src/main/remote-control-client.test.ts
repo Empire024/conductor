@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { RemoteProjectSummary } from '../shared/remote-control'
 import type { ProjectIdentity, RemoteProjectGrant } from '../shared/project-identity'
 import { RemoteControlClient } from './remote-control-client'
+import { encodeTicket } from '../shared/remote-control'
+import { RemoteAccessError } from './remote-peers'
 import { generateDeviceKey } from './device-key'
 import { describeMachines, machineRunsProject } from './machines'
 import type { SecretKeyValueStore } from './secret-store'
@@ -143,6 +145,76 @@ describe('recording which project here is which project there', () => {
   it('ignores a stored mapping that is missing half of what makes it one', () => {
     const fixture = client([{ ...legacyConnection, projectGrants: [{ localProjectId: 'project-a', remoteProjectId: 'remote-a', local: LOCAL }, grant] }])
     expect(fixture.client.get('render-desktop')?.projectGrants).toEqual([grant])
+  })
+})
+
+/**
+ * The first pairing request, which happens while the route is still deciding what it is.
+ *
+ * A machine handed an invite may still be working out that the relay address in it cannot be reached
+ * from here, and only then hand itself to the mailbox. Failing on the first attempt would turn "give
+ * it a moment" into "pairing failed", which is how an owner concludes none of this works.
+ */
+describe('the first knock on the other machine', () => {
+  const device = generateDeviceKey('conductor pairing test')
+
+  function pairing(answers: Array<() => Promise<{ status: number; body: string }>>) {
+    const attempts: string[] = []
+    const client = new RemoteControlClient({
+      store: new MapStore(),
+      machineId: () => 'this-machine',
+      machineName: () => 'This Laptop',
+      deviceKey: () => device,
+      pairRetryMs: 1,
+      relay: {
+        enabled: () => true,
+        call: async (_machineId, _peerDeviceKey, path) => {
+          attempts.push(path)
+          const answer = answers[Math.min(attempts.length - 1, answers.length - 1)]!
+          return await answer()
+        }
+      },
+      now: () => Date.parse('2026-03-02T09:00:00.000Z')
+    })
+    const ticket = encodeTicket({
+      version: 1, machineId: 'render-desktop', machineName: 'Render Desktop', accountLogin: 'Empire024',
+      // Nothing listens on the direct address, so only the relay can carry this.
+      host: '127.0.0.1', port: 1, fingerprint: 'AA:BB', code: 'pairing-code',
+      expiresAt: '2026-03-02T09:10:00.000Z', relayKey: 'relay-public-key', deviceKey: 'ssh-ed25519 THEIRS'
+    })
+    return { client, ticket, attempts }
+  }
+
+  const unreachable = async (): Promise<{ status: number; body: string }> => { throw new RemoteAccessError('nothing carried it', 503) }
+  const approved = async (): Promise<{ status: number; body: string }> => ({
+    status: 200,
+    body: Buffer.from(JSON.stringify({ result: { status: 'approved', peerId: 'peer-9', projects: [] } }), 'utf8').toString('base64')
+  })
+
+  it('keeps knocking while the route is still settling, instead of failing on the first silence', async () => {
+    let knocks = 0
+    const fixture = pairing([async () => {
+      knocks++
+      if (knocks <= 3) throw new RemoteAccessError('nothing carried it', 503)
+      return await approved()
+    }])
+
+    const connection = await fixture.client.connect(fixture.ticket, async () => { /* no waiting between polls */ })
+    expect(connection.status).toBe('connected')
+    expect(knocks).toBeGreaterThan(3)
+  })
+
+  it('does not keep knocking at a machine that answered', async () => {
+    // An expired code says the same thing in a minute, so it is reported at once.
+    const fixture = pairing([async () => { throw new RemoteAccessError('That pairing code is not valid on this machine.', 401) }])
+    await expect(fixture.client.connect(fixture.ticket, async () => {})).rejects.toThrow(/not valid/)
+    expect(fixture.attempts).toHaveLength(1)
+  })
+
+  it('gives up when nothing carries it at all', async () => {
+    const fixture = pairing([unreachable])
+    await expect(fixture.client.connect(fixture.ticket, async () => {})).rejects.toThrow(/nothing carried it/)
+    expect(fixture.attempts.length).toBeGreaterThan(1)
   })
 })
 

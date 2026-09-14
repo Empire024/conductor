@@ -18,6 +18,17 @@ const REQUEST_TIMEOUT_MS = 60000
  * case feel broken. With no relay configured the full request timeout still applies.
  */
 export const DIRECT_PROBE_TIMEOUT_MS = 8000
+/**
+ * How long the first pairing request keeps trying before it is called a failure.
+ *
+ * It has to outlast the moment a machine needs to decide its relay is out of reach and fall back to
+ * the mailbox, or pairing would fail a few seconds before the route that would have carried it
+ * became available.
+ */
+const PAIR_REACH_MS = 75_000
+const PAIR_RETRY_MS = 6_000
+/** Bounds the wait even where time is supplied rather than passing, as it is in tests. */
+const PAIR_MAX_ATTEMPTS = 16
 
 /** What separates a call the owner asked for from one the app made on its own behalf. */
 export interface RemoteCallOptions {
@@ -42,6 +53,8 @@ export interface RemoteControlClientDependencies {
   /** Absent in tests and in builds where the owner turned the off-network route off entirely. */
   relay?: RemoteRelayTransport
   now?(): number
+  /** Test seam: how long the first pairing request waits between attempts. */
+  pairRetryMs?: number
   changed?(): void
 }
 
@@ -240,15 +253,19 @@ export class RemoteControlClient {
   private unreachable(target: RemoteTarget, cause: unknown): RemoteAccessError {
     const detail = cause instanceof Error ? ` (${cause.message})` : ''
     const where = target.host ? `at ${target.host}` : 'on this network'
+    // What went wrong underneath is kept on the error, because "nothing carried this" and "something
+    // answered and it was not that machine" are both reported this way and only the first is worth
+    // trying again.
+    const carrying = (error: RemoteAccessError): RemoteAccessError => Object.assign(error, { cause })
     if (!target.relayKey || !target.deviceKey) {
-      return new RemoteAccessError(
-        `${target.machineId} answered nowhere ${where}${detail}. It was paired before the encrypted relay existed, so it can only be reached on the network it was paired on. Create a new pairing code on that machine and pair again to reach it from anywhere.`, 503)
+      return carrying(new RemoteAccessError(
+        `${target.machineId} answered nowhere ${where}${detail}. It was paired before the encrypted relay existed, so it can only be reached on the network it was paired on. Create a new pairing code on that machine and pair again to reach it from anywhere.`, 503))
     }
     if (!this.deps.relay?.enabled()) {
-      return new RemoteAccessError(
-        `${target.machineId} answered nowhere ${where}${detail}. The encrypted relay is not running on this machine, so only its address on this network was tried. Sign in to GitHub and switch remote control on here, then try again.`, 503)
+      return carrying(new RemoteAccessError(
+        `${target.machineId} answered nowhere ${where}${detail}. The encrypted relay is not running on this machine, so only its address on this network was tried. Sign in to GitHub and switch remote control on here, then try again.`, 503))
     }
-    return new RemoteAccessError(`${target.machineId} answered nowhere ${where}${detail}.`, 503)
+    return carrying(new RemoteAccessError(`${target.machineId} answered nowhere ${where}${detail}.`, 503))
   }
 
   /**
@@ -304,6 +321,38 @@ export class RemoteControlClient {
   }
 
   /**
+   * The first knock on the other machine's door, which is the one that has to be patient.
+   *
+   * Every later call happens on a route that has already settled; this one happens while it is still
+   * settling. A machine that has just been handed an invite may still be working out that the relay
+   * address it was given cannot be reached from here, and only then hand itself to the mailbox - so
+   * failing on the first attempt would turn "give it a moment" into "pairing failed", which is how
+   * an owner concludes the feature does not work. A refusal is different from silence and is not
+   * retried: an expired code or an unapproved key will say the same thing in a minute.
+   */
+  private async reachOut(ticket: RemotePairingTicket, body: Buffer): Promise<void> {
+    const deadline = this.now() + PAIR_REACH_MS
+    const wait = this.deps.pairRetryMs ?? PAIR_RETRY_MS
+    let last: unknown = null
+    for (let attempt = 0; attempt < PAIR_MAX_ATTEMPTS; attempt++) {
+      try { return void await this.send(this.target(ticket), '/remote/pair', body, {}) }
+      catch (error) {
+        last = error
+        const status = error instanceof RemoteAccessError ? error.status : 0
+        // 503 and 504 are "nothing carried this"; anything else is an answer, and answers stand.
+        // So is a refusal underneath one of them - a machine presenting the wrong certificate will
+        // present the same one in six seconds, and retrying it only delays telling the owner.
+        const beneath = (error as { cause?: unknown }).cause
+        const answered = beneath instanceof RemoteAccessError && beneath.status >= 400 && beneath.status < 500
+        if (answered || (status !== 503 && status !== 504 && status !== 0)) throw error
+        if (this.now() >= deadline) break
+        await new Promise<void>(resolve => setTimeout(resolve, wait))
+      }
+    }
+    throw last instanceof Error ? last : new Error(String(last))
+  }
+
+  /**
    * Presents this machine's device key to the other machine and waits for its owner to approve.
    * The remote side decides whether the key really belongs to the same GitHub account.
    */
@@ -321,7 +370,7 @@ export class RemoteControlClient {
       timestamp: payload.issuedAt,
       code: ticket.code
     }), 'utf8')
-    await this.send(this.target(ticket), '/remote/pair', body, {})
+    await this.reachOut(ticket, body)
     const pending: RemoteConnection = {
       machineId: ticket.machineId,
       machineName: ticket.machineName,
