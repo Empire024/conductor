@@ -305,6 +305,7 @@ export class RemoteRelay {
     const reachable: string[] = []
     let delivered = false
     const collectedAcks: string[] = []
+    const failures: string[] = []
     for (const summary of listed) {
       // The list carries file names only; this is the conditional read that brings their contents,
       // and it costs nothing against the rate limit while a mailbox is unchanged.
@@ -325,14 +326,22 @@ export class RemoteRelay {
         if (this.seen.has(envelope.id)) { this.ack(envelope.id); continue }
         const complete = this.collect(envelope)
         if (!complete) continue
+        // Acknowledged before it is served, so a message is never served twice: the sender's
+        // signature carries a nonce that would be refused on a second attempt anyway, and a
+        // duplicate that did get through would be a duplicate action. A send that then fails costs
+        // the caller a timeout, which it can retry, rather than costing an action that ran twice.
         this.seen.set(envelope.id, this.now())
         this.ack(envelope.id)
         delivered = true
-        await this.deliver(envelope, complete, gist)
+        // One unreadable or undeliverable message must not stop the rest of the sweep, or a single
+        // bad file in a mailbox would stall every conversation running through it.
+        try { await this.deliver(envelope, complete, gist) }
+        catch (error) { failures.push(error instanceof Error ? error.message : String(error)) }
       }
     }
     await this.prune(collectedAcks)
     this.setStatus({ reachable })
+    if (failures.length) throw new Error(`The relay could not deliver ${failures.length} message(s): ${failures[0]}`)
     return delivered
   }
 
