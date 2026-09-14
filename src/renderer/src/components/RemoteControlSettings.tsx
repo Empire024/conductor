@@ -18,12 +18,19 @@ const relayRouteLabel = (relay: RelayStatus, hosting: boolean): string =>
 const hostLabel = (host: RemoteControlState['relayHost']): string =>
   host.running ? (host.port ? `Running on port ${host.port}` : 'Running') : host.message ? 'Not running' : 'Off'
 
-/** Whether machines off this network can reach it, and - when they cannot - that it is so. */
+/**
+ * Whether machines off this network can reach it, and - when they cannot - that it is so.
+ *
+ * A public IPv6 address counts, and counts without anything being forwarded: the machine already
+ * holds it, and the router only has to allow traffic to it. Saying "this network only" while such an
+ * address is listed would be false about the one thing an owner just configured.
+ */
 const internetLabel = (host: RemoteControlState['relayHost']): string => {
   if (host.internet.state === 'open') return host.internet.address ?? 'Open'
   if (host.internet.state === 'opening') return 'Asking your router…'
-  if (host.internet.state === 'failed') return 'Not reachable from outside'
-  return 'This network only'
+  const ipv6 = host.addresses.some(address => address.includes('['))
+  if (host.internet.state === 'failed') return ipv6 ? 'Over IPv6, if your router allows this port' : 'Not reachable from outside'
+  return ipv6 ? 'Over IPv6, if your router allows this port' : 'This network only'
 }
 
 /** The relay's own words for what it is doing, so "why can't I reach my laptop" has an answer here. */
