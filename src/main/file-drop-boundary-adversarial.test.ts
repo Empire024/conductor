@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, expect, it, vi } from 'vitest'
@@ -22,7 +22,12 @@ afterEach(async () => {
 })
 
 it('does not delete another writer\'s replacement when rolling back a dropped-file move', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'conductor-drop-boundary-')); roots.push(root)
+  const created = await mkdtemp(join(tmpdir(), 'conductor-drop-boundary-')); roots.push(created)
+  // The move resolves its destination before touching it, so the path it lstats is the canonical
+  // one. On a machine whose temp directory has an 8.3-aliased ancestor — the GitHub Windows runner
+  // is one — os.tmpdir() hands back the short form, and an interception keyed on that path would
+  // simply never fire, leaving this test passing for no reason.
+  const root = await realpath(created)
   const project = join(root, 'project'), folder = join(project, 'folder'), source = join(root, 'source.md')
   await mkdir(folder, { recursive: true }); await writeFile(source, 'original source')
   const target = join(folder, 'source.md')
