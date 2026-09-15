@@ -108,6 +108,11 @@ export class StructuredSessions {
     // Registration constructs no process. Views subscribe to this backend resource.
     if (!this.live.has(spec.id)) this.live.set(spec.id, { spec: previousSpec ?? spec, executable: executable ?? '', runtimeId: '', submitting: false, closed: false, responses: new Set() })
     const live = this.live.get(spec.id)!
+    // Re-resolved rather than kept from the first registration. A provider CLI installed after this
+    // session was opened - or one that was simply not on the PATH the app was launched with - left
+    // the live entry holding an empty string for ever, so every later turn failed with "Provider
+    // executable unavailable" while `ensure` itself kept reporting the session as available.
+    live.executable = executable ?? ''
     if (!previousSpec) {
       const legacy = this.database.getAgentTranscript(spec.id)
       if (legacy) {

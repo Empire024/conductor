@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Check, Copy, Github, Laptop, LogOut, MonitorSmartphone, ShieldAlert, ShieldCheck, X } from 'lucide-react'
-import type { GitHubAuthState, RemoteControlState, RemoteExposure, RemotePeerRecord } from '../../../shared/remote-control'
+import { Activity, Check, Copy, Github, Laptop, LogOut, MonitorSmartphone, Network, Plug, ShieldAlert, ShieldCheck, Unplug, X } from 'lucide-react'
+import type { GitHubAuthState, MachineDiagnostics, RemoteControlState, RemoteExposure, RemotePeerRecord } from '../../../shared/remote-control'
 import type { RelayStatus } from '../../../shared/remote-relay'
 import { checkRemoteProjectPlacement, samePath, sameWorkingCopy } from '../../../shared/project-identity'
+import { describeConnectionRecord, detachExplanationLines } from './remote-attachment-view'
+import { PEER_PAIRING_NOTE, matchTailnetPeer, peerSummary, tailnetSummary } from './tailnet-state'
+import { executionTargetSummary, failureExplanation, failureWords } from './execution-target'
 import './RemoteControlSettings.css'
 
 const fail = (reason: unknown): string => reason instanceof Error ? reason.message : String(reason)
@@ -107,6 +110,10 @@ export function RemoteControlSettings(): React.JSX.Element {
   const [relaySecret, setRelaySecret] = useState('')
   const [hostPort, setHostPort] = useState<string | null>(null)
   const [linkMode, setLinkMode] = useState<'idle' | 'invited' | 'joining'>('idle')
+  const [diagnostics, setDiagnostics] = useState<Record<string, MachineDiagnostics>>({})
+  /** The machine whose "use this computer independently" explanation is open, before confirming. */
+  const [confirmDetach, setConfirmDetach] = useState<string | null>(null)
+  const [detachOutcome, setDetachOutcome] = useState('')
 
   const refresh = useCallback(() => {
     void window.conductor.remote.githubState().then(setGithub).catch(reason => setError(fail(reason)))
@@ -131,6 +138,14 @@ export function RemoteControlSettings(): React.JSX.Element {
 
   const signedIn = github?.phase === 'signed-in'
   const settings = state?.settings
+  const tailnet = tailnetSummary(state?.tailscale ?? { installed: false, backendState: null, self: null, peers: [], message: null, checkedAt: null })
+
+  const showDiagnostics = (machineId: string): void => {
+    void run('diagnostics', async () => {
+      const result = await window.conductor.remote.diagnostics(machineId)
+      setDiagnostics(current => ({ ...current, [machineId]: result }))
+    })
+  }
   const pendingGrants = (pendingId: string): string[] => grants[pendingId] ?? state?.projects.map(project => project.id) ?? []
 
   return (
@@ -211,6 +226,37 @@ export function RemoteControlSettings(): React.JSX.Element {
               </button>
             </div>
 
+            {/*
+              The tailnet, beside the two link buttons, because "which of my computers can I even
+              see from here" is the question an owner asks immediately before pairing one. It is
+              shown next to the invite flow and not instead of it: a computer being visible here is
+              not permission to use it, and PEER_PAIRING_NOTE says so in as many words.
+            */}
+            {state.tailscale.peers.length > 0 && (
+              <div className="remote-tailnet">
+                <strong className="remote-card-title"><Network size={13} /> Hosts on your tailnet</strong>
+                <ul className="remote-tailnet-list">
+                  {state.tailscale.peers.map(peer => {
+                    const paired = state.connections.find(connection => matchTailnetPeer([peer], connection.host)?.id === peer.id)
+                    return (
+                      <li key={peer.id} data-online={peer.online}>
+                        <span>
+                          <strong>{peer.hostName}</strong>
+                          <small>{peer.addresses[0] ?? peer.dnsName}</small>
+                        </span>
+                        <code>{peerSummary(peer)}</code>
+                        <small>{paired ? `Paired as ${paired.machineName}` : 'Not paired'}</small>
+                      </li>
+                    )
+                  })}
+                </ul>
+                <p className="remote-hint">{PEER_PAIRING_NOTE}</p>
+              </div>
+            )}
+            {settings.exposure === 'tailscale' && !state.tailscale.peers.length && tailnet.usable && (
+              <p className="remote-hint">No other computers on your tailnet yet. Sign the other one into the same Tailscale account, then check again.</p>
+            )}
+
             {linkMode === 'invited' && ticket && (
               <>
                 <p className="remote-hint">
@@ -258,18 +304,42 @@ export function RemoteControlSettings(): React.JSX.Element {
               <span>
                 <strong>Direct connections</strong>
                 <small>
-                  {settings.exposure === 'network'
-                    ? 'Your local network can reach this machine directly. Only a machine paired to your GitHub account can connect, over TLS.'
-                    : settings.relay
-                      ? 'No direct connection from your network. Your other machines still reach this one through the encrypted relay below, wherever they are.'
-                      : 'This computer only. With the relay off too, nothing reaches this machine from anywhere.'}
+                  {settings.exposure === 'tailscale'
+                    ? 'This machine is reachable only at its own Tailscale address, so the only way in is through the tailnet you signed both computers into.'
+                    : settings.exposure === 'network'
+                      ? 'Your local network can reach this machine directly. Only a machine paired to your GitHub account can connect, over TLS.'
+                      : settings.relay
+                        ? 'No direct connection from your network. Your other machines still reach this one through the encrypted relay below, wherever they are.'
+                        : 'This computer only. With the relay off too, nothing reaches this machine from anywhere.'}
                 </small>
               </span>
               <select value={settings.exposure} onChange={event => void run('exposure', () => window.conductor.remote.setSettings({ exposure: event.target.value as RemoteExposure }))}>
-                <option value="loopback">This computer only (recommended)</option>
+                <option value="tailscale">Only through Tailscale — recommended</option>
+                <option value="loopback">This computer only</option>
                 <option value="network">My local network — faster on the same network</option>
               </select>
             </label>
+            {settings.exposure === 'tailscale' && (
+              <div className="remote-tailscale">
+                <div className="remote-endpoint">
+                  <div><span>Tailscale</span><code>{tailnet.status}</code></div>
+                  {tailnet.address && <div><span>This machine</span><code>{tailnet.address}</code></div>}
+                  {state.tailscale.self && <div><span>Name on the tailnet</span><code>{state.tailscale.self.dnsName || state.tailscale.self.hostName}</code></div>}
+                  {state.tailscale.self?.loginName && <div><span>Signed in as</span><code>{state.tailscale.self.loginName}</code></div>}
+                  <div><span>Checked</span><code>{tailnet.checkedAt}</code></div>
+                </div>
+                {/*
+                  In this mode the listener binds that address and nothing else. When the tailnet is
+                  not usable it does not start at all rather than widening to 0.0.0.0, a public IPv6
+                  address, the LAN or the relay - so the panel owes the owner the reason, not a
+                  vaguer version of "it works anyway".
+                */}
+                {!tailnet.usable && <p className="remote-warning"><ShieldAlert size={12} /> {tailnet.message} Until then this machine accepts no connections at all; nothing falls back to your network or the relay.</p>}
+                <div className="remote-actions">
+                  <button disabled={busy === 'tailscale'} onClick={() => void run('tailscale', () => window.conductor.remote.tailscale())}>Check the tailnet again</button>
+                </div>
+              </div>
+            )}
             {settings.exposure === 'network' && (
               <p className="remote-warning"><ShieldAlert size={12} /> This machine now accepts connections from your network. Traffic is encrypted and every request must be signed by a device key registered on your GitHub account.</p>
             )}
@@ -487,18 +557,99 @@ export function RemoteControlSettings(): React.JSX.Element {
                 {busy === 'connect' ? 'Waiting for approval…' : 'Connect'}
               </button>
             </div>
-            {state.connections.map(connection => (
+            {state.connections.map(connection => {
+              const machine = describeConnectionRecord(connection)
+              const detached = machine.state === 'detached'
+              const summary = executionTargetSummary({
+                label: '', machineId: connection.machineId, machineName: connection.machineName, local: false,
+                state: { detached: 'Detached', offline: 'Offline', connecting: 'Connecting', connected: 'Connected', reconnecting: 'Reconnecting' }[machine.state],
+                path: detached || machine.state === 'offline' ? '' : machine.path === 'direct' ? 'Direct' : machine.path === 'relayed' ? 'Relayed' : 'Unknown',
+                transport: machine.transport === 'tailscale' ? 'over Tailscale' : '',
+                failure: failureWords(machine.failure), detail: '', detached
+              })
+              const report = diagnostics[connection.machineId]
+              return (
               <div className="remote-peer-block" key={connection.machineId}>
                 <div className="remote-peer">
                   <div>
                     <strong>{connection.machineName}</strong>
-                    <small>{connection.host}:{connection.port} · {connection.status}{connection.message ? ` · ${connection.message}` : ''}</small>
+                    <small>{connection.host}:{connection.port} · {summary}{connection.message ? ` · ${connection.message}` : ''}</small>
+                    {machine.failure && <small className="remote-project-problem">{failureExplanation(machine.failure, connection.machineName)}</small>}
                   </div>
                   <div className="remote-actions">
-                    <button title="Ask that machine which projects it shares now" disabled={busy === 'refresh-projects'}
+                    <button title="Ask that machine which projects it shares now" disabled={busy === 'refresh-projects' || detached}
                       onClick={() => void run('refresh-projects', () => window.conductor.remote.remoteProjects(connection.machineId))}>Refresh projects</button>
+                    <button title="What this computer knows about that connection right now" disabled={busy === 'diagnostics'}
+                      onClick={() => showDiagnostics(connection.machineId)}><Activity size={13} /> Diagnostics</button>
+                    {/* Forgetting is a different act from detaching and from revoking, so it stays
+                        exactly where it was and keeps its own word. */}
                     <button title="Forget this machine" onClick={() => void run('forget', () => window.conductor.remote.forget(connection.machineId))}><X size={13} /> Forget</button>
                   </div>
+                </div>
+
+                {report && (
+                  <div className="remote-diagnostics">
+                    <div className="remote-endpoint">
+                      <div><span>State</span><code>{report.connection.state}</code></div>
+                      <div><span>Route</span><code>{report.connection.path}</code></div>
+                      <div><span>Transport</span><code>{report.connection.transport ?? 'none'}</code></div>
+                      <div><span>Generation</span><code>{report.connection.generation}</code></div>
+                      {report.endpoint && <div><span>Dials</span><code>{report.endpoint.host}:{report.endpoint.port}</code></div>}
+                      {report.endpoint && <div><span>Pinned certificate</span><code>{shortFingerprint(report.endpoint.fingerprint)}</code></div>}
+                      {report.tailscalePeer && <div><span>Tailnet node</span><code>{peerSummary(report.tailscalePeer)}</code></div>}
+                      <div><span>Last contact</span><code>{report.lastContactAt ? new Date(report.lastContactAt).toLocaleString() : 'never'}</code></div>
+                      <div><span>Push channel</span><code>{report.stream.open ? 'open' : 'closed'} · {report.stream.reconnects} reconnect{report.stream.reconnects === 1 ? '' : 's'}</code></div>
+                      {report.stream.lastHeardAt && <div><span>Last heard</span><code>{new Date(report.stream.lastHeardAt).toLocaleTimeString()}</code></div>}
+                      <div><span>Mirrored sessions</span><code>{report.cursors.length}</code></div>
+                    </div>
+                  </div>
+                )}
+
+                {/*
+                  The standalone action. It is prominent because it is the one thing an owner needs
+                  when MAIN is off, lost or gone - the moment they are least able to go looking for
+                  it - and it needs nothing from MAIN to work.
+                */}
+                <div className="remote-standalone" data-detached={detached}>
+                  {detached ? (
+                    <>
+                      <strong><Unplug size={13} /> Using this computer independently of {connection.machineName}</strong>
+                      <p className="remote-hint">
+                        Nothing is being sent to {connection.machineName}, nothing is being retried, and this is remembered
+                        across restarts. The pairing is still here; only you decide when to attach again.
+                      </p>
+                      <div className="remote-actions">
+                        <button className="remote-primary" disabled={busy === 'attach'}
+                          onClick={() => void run('attach', async () => {
+                            await window.conductor.remote.attach(connection.machineId)
+                            setDetachOutcome(`Attached to ${connection.machineName} again. Retained edits stay as recovery drafts; nothing was replayed.`)
+                          })}><Plug size={13} /> Attach to {connection.machineName}</button>
+                      </div>
+                    </>
+                  ) : confirmDetach === connection.machineId ? (
+                    <>
+                      <strong><Unplug size={13} /> Disconnect from {connection.machineName} and use this computer independently</strong>
+                      <ul className="remote-grants">
+                        {detachExplanationLines(connection.machineName).map(line => <li key={line}><small>{line}</small></li>)}
+                      </ul>
+                      <div className="remote-actions">
+                        <button className="remote-primary" disabled={busy === 'detach'}
+                          onClick={() => void run('detach', async () => {
+                            await window.conductor.remote.detach(connection.machineId)
+                            setConfirmDetach(null)
+                            setDetachOutcome(`This computer is now independent of ${connection.machineName}. Any unsaved edits to its files are kept here as recovery drafts.`)
+                          })}>Use this computer independently</button>
+                        <button onClick={() => setConfirmDetach(null)}>Cancel</button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="remote-actions">
+                      <button className="remote-standalone-trigger" onClick={() => { setDetachOutcome(''); setConfirmDetach(connection.machineId) }}>
+                        <Unplug size={13} /> Disconnect from {connection.machineName} and use this computer independently
+                      </button>
+                    </div>
+                  )}
+                  {detachOutcome && confirmDetach === null && <p className="remote-hint">{detachOutcome}</p>}
                 </div>
                 {connection.unconfirmedRemoteProjectIds.length > 0 && (
                   <p className="remote-warning"><ShieldAlert size={12} /> This pairing was made before projects carried an identity, so nothing here records which project on {connection.machineName} matches which project here. Confirm each pair below before work can go there.</p>
@@ -541,12 +692,26 @@ export function RemoteControlSettings(): React.JSX.Element {
                           onClick={() => void run('confirm-project', () => window.conductor.remote.confirmProject(connection.machineId, choice, project.id))}>
                           Confirm this pair
                         </button>
+                        {/*
+                          The other answer to "which project here is this?": none of them. Pairing
+                          matches two working copies the owner keeps on both machines; this opens
+                          the host's copy with no local copy at all, which is what you want for a
+                          project that only ever lived there.
+                        */}
+                        <button disabled={busy === 'open-remote-project'}
+                          onClick={() => void run('open-remote-project', async () => {
+                            await window.conductor.remote.openRemoteProject(connection.machineId, project.id)
+                            window.dispatchEvent(new CustomEvent('conductor:projects-changed'))
+                          })}>
+                          Open it from {connection.machineName} instead — no copy here
+                        </button>
                       </div>
                     </div>
                   )
                 })}
               </div>
-            ))}
+              )
+            })}
           </div>
 
           {state.activity.length > 0 && (

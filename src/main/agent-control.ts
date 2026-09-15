@@ -20,7 +20,7 @@ import { writeEditorFile } from './editor-files'
 import { readTextFile } from './text-files'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { inheritMachineId, machineRunsProject, tabMachineId } from './machines'
-import { LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
+import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -385,7 +385,7 @@ export class AgentControl {
   }
 
   private machines(): MachineDescriptor[] {
-    return this.deps.machines?.() ?? [{ id: LOCAL_MACHINE_ID, name: 'This machine', kind: 'local', status: 'online', accountLogin: null, projects: [] }]
+    return this.deps.machines?.() ?? [{ id: LOCAL_MACHINE_ID, name: 'This machine', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION }]
   }
 
   /** Where the caller itself is running; a tab it opens follows unless it says otherwise. */

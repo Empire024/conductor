@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { Maximize2, Minimize2, PanelLeftClose, PictureInPicture2 } from 'lucide-react'
+import type { ProjectRecord } from '../../../shared/models'
 import { projectBrowserViewId } from '../../../shared/browser-view-identity'
 import { BrowserPane } from '../panes/BrowserPane'
 import { persistBrowserPresentation, savedBrowserPresentation, type BrowserPresentation } from './browser-presentation'
 
-export function BrowserSidebar({ projectId, active = true }: { projectId: string | undefined; active?: boolean }): React.JSX.Element {
+export function BrowserSidebar({ project, projectId, active = true }: { project?: Pick<ProjectRecord, 'id' | 'remote'>; projectId: string | undefined; active?: boolean }): React.JSX.Element {
   const boundProjectId = projectId?.trim() ?? ''
   const [presentation, setPresentation] = useState<BrowserPresentation>(() => boundProjectId ? savedBrowserPresentation(boundProjectId) : 'pane')
   const wasActive = useRef(false)
@@ -40,6 +41,7 @@ export function BrowserSidebar({ projectId, active = true }: { projectId: string
         <button type="button" aria-label="Keep browser running in background" title="Keep running in background" onClick={() => { choosePresentation('background'); window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'workspace' })) }}><PanelLeftClose size={13} /></button>
       </span></header>
       <BrowserPane
+        project={project}
         projectId={boundProjectId}
         compact
         browserViewId={projectBrowserViewId(boundProjectId) ?? undefined}

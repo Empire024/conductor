@@ -1,3 +1,5 @@
+import type { ProjectIdentity } from './project-identity'
+
 export type PaneKind =
   | 'launcher'
   | 'agent'
@@ -126,12 +128,42 @@ export interface WorkspaceLayout {
   root: LayoutNode
 }
 
+/**
+ * Where a project actually lives when it is not on this computer.
+ *
+ * A project with this set is a window onto another machine's working copy: its files, terminals,
+ * agents and tasks all run there, `path` is that machine's path (shown, never opened here), and
+ * nothing about it is ever read from or written to this computer's disk. It is keyed by the host's
+ * machine id rather than by name, path or Git remote, because two clones of one repository are two
+ * working copies, and a local C:\project and MAIN's C:\project must never be mistaken for each other.
+ */
+export interface RemoteProjectOrigin {
+  /**
+   * The identity the host advertised when this project was opened here. It stands in for the
+   * identity file every local project has on disk: the same placement and grant checks run against
+   * it, and nothing on this computer's disk is ever consulted for a project that lives elsewhere.
+   */
+  identity?: ProjectIdentity | null
+  machineId: string
+  machineName: string
+  remoteProjectId: string
+  /**
+   * The host's own path for this working copy. It is the authoritative copy of `ProjectRecord.path`
+   * for a remote project, because the row's path column has to carry a machine-qualified key
+   * instead: MAIN's `C:\project` and this computer's `C:\project` are two different working copies
+   * and one unique path column cannot hold both.
+   */
+  path: string
+}
+
 export interface ProjectRecord {
   id: string
   name: string
   path: string
   createdAt: string
   updatedAt: string
+  /** Absent for every project that lives on this computer, which is all of them in standalone use. */
+  remote?: RemoteProjectOrigin
 }
 
 export interface AppSettings {
@@ -319,6 +351,12 @@ export interface EditorDraft {
   baseContent?: string | null
   viewState: unknown | null
   updatedAt: string
+  /**
+   * Set when the owner detached from the machine this edit was made against. The edit is kept and
+   * labelled, and from then on it is only ever read, copied or saved somewhere else by hand: it is
+   * never written to a local file of the same path, and never replayed to the host on reattach.
+   */
+  recoveredAt?: string | null
 }
 
 export type EditorFileWriteResult = { status: 'saved' } | { status: 'conflict'; message: string }

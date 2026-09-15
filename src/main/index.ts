@@ -57,6 +57,10 @@ import { OrchestrationStore } from './orchestration-store'
 import { registerOrchestrationIpc } from './orchestration-ipc'
 import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
+import { isRemoteProject, localProject, requireLocalProject } from './project-scope'
+import { electronTray, installHostLifecycle, type HostLifecycleController } from './host-lifecycle'
+import { ensureTrayIconFile } from './tray-icon'
+import type { RemoteTerminalBindings } from './remote-terminals'
 import { AgentCollaborationStore } from './agent-collaboration-store'
 import { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { registerAgentCollaborationIpc } from './agent-collaboration-ipc'
@@ -114,6 +118,8 @@ let debugSourceWindow: BrowserWindow | null = null
 let latestDebugSnapshot: DebugConsoleSnapshot | null = null
 let lastDebugScreenshot: Electron.NativeImage | null = null
 let isQuitting = false
+/** Keeps a hosting machine alive with no window, and asks before a quit would cut its peers off. */
+let hostLifecycle: HostLifecycleController | null = null
 let servicesDisposed = false
 const closeConfirmation = new CloseConfirmation()
 let archiveBusy = false
@@ -238,6 +244,7 @@ const createWindow = (
     })
   })
   installWindowStateEvents(window)
+  hostLifecycle?.windowOpened()
   // Consume the native accelerator before Electron's default Close Window role can run.
   window.webContents.on('before-input-event', (event, input) => {
     if (input.type === 'keyDown' && (input.control || input.meta) && !input.alt && !input.shift && input.key.toLowerCase() === 'w') {
@@ -557,6 +564,11 @@ const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): 
     const dirty: Array<{ draft: typeof drafts[number]; target?: string; disk: string | null }> = []
     for (const draft of drafts) {
       if (!database.getProject(draft.projectId)) continue
+      // An edit retained when the owner detached from its host is deliberately not resolved here:
+      // the host is not being talked to, and the same path on this computer is a different file,
+      // so there is nothing to compare it against and nowhere it may be written. It survives every
+      // close, is listed as a recovery draft, and only the owner saves it somewhere by hand.
+      if (draft.recoveredAt) continue
       // Old clean buffers must not be mistaken for user edits when disk changed.
       if (draft.content === draft.baseContent) { database.removeEditorDraft(draft.tabId); continue }
       const target = draftMachineId(draft) === LOCAL_MACHINE_ID ? await resolveEditorPath(draft.projectId, draft.path) : undefined
@@ -617,7 +629,7 @@ const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): 
     // Let renderer resolution handlers preserve any last edits before granting
     // close. A newer draft cancels this close without losing its original base.
     await flushEditorWindows(windows)
-    return !database.listEditorDrafts().some((draft) => !tabIds || tabIds.includes(draft.tabId))
+    return !database.listEditorDrafts().some((draft) => !draft.recoveredAt && (!tabIds || tabIds.includes(draft.tabId)))
   })().catch(async (reason: unknown) => {
     const options: Electron.MessageBoxOptions = { type: 'error', title: 'Could not close editor', message: reason instanceof Error ? reason.message : String(reason) }
     if (owner && !owner.isDestroyed()) await dialog.showMessageBox(owner, options)
@@ -801,15 +813,19 @@ const safeProjectFolderName = (name: string): string => {
   return cleaned
 }
 
-const resolveProjectPath = (projectId: string, requested = ''): string => {
-  const project = database.getProject(projectId)
-  if (!project) throw new Error('Project not found')
+/**
+ * Every path this process resolves is a path on this computer's disk, so a project that lives on
+ * another machine can never reach one. The refusal is here, at the resolver, rather than only at
+ * each of the two dozen handlers above it: a handler added later inherits the guard instead of
+ * being one review away from quietly reading this disk for MAIN's project. See project-scope.ts.
+ */
+const resolveProjectPath = (projectId: string, requested = '', feature = 'Files'): string => {
+  const project = localProject(database, projectId, feature)
   return resolveWithinProject(project.path, requested)
 }
 
-const resolveExistingProjectPath = async (projectId: string, requested = ''): Promise<string> => {
-  const project = database.getProject(projectId)
-  if (!project) throw new Error('Project not found')
+const resolveExistingProjectPath = async (projectId: string, requested = '', feature = 'Files'): Promise<string> => {
+  const project = localProject(database, projectId, feature)
   const target = resolveWithinProject(project.path, requested)
   const [realRoot, realTarget] = await Promise.all([fs.realpath(project.path), fs.realpath(target)])
   resolveWithinProject(realRoot, realTarget)
@@ -817,13 +833,13 @@ const resolveExistingProjectPath = async (projectId: string, requested = ''): Pr
 }
 
 const resolveEditorPath = async (projectId: string, requested: string): Promise<string> => {
-  const target = resolveProjectPath(projectId, requested)
+  const target = resolveProjectPath(projectId, requested, 'The code editor')
   try {
-    await resolveExistingProjectPath(projectId, requested)
+    await resolveExistingProjectPath(projectId, requested, 'The code editor')
     return await fs.realpath(target)
   } catch (reason) {
     if ((reason as NodeJS.ErrnoException).code !== 'ENOENT') throw reason
-    const parent = await resolveExistingProjectPath(projectId, dirname(requested))
+    const parent = await resolveExistingProjectPath(projectId, dirname(requested), 'The code editor')
     return join(await fs.realpath(parent), basename(target))
   }
 }
@@ -850,7 +866,10 @@ const registerIpc = (): void => {
   }
   const browserProject = (projectId: unknown): string => {
     const id = structuredId(projectId)
-    if (!database.getProject(id)) throw new Error('Project not found')
+    // The guest is an isolated view scoped by its partition, not by a folder: for a project that
+    // lives on a host it loads a loopback tunnel on this computer and reads nothing here. The
+    // genuinely local surfaces - the file preview server and "open in browser" - keep their guard.
+    if (!database.getProject(id)) throw new Error('That project is not registered on this machine.')
     return id
   }
   ipcMain.handle('session-archive:name', (event) => {
@@ -900,30 +919,26 @@ const registerIpc = (): void => {
   ipcMain.handle('structured:events', (event, id, after = 0) => { trustedStructured(event); if (!Number.isSafeInteger(after) || after < 0) throw new Error('Invalid sequence'); return database.structured.events(structuredId(id), after) })
   ipcMain.handle('files:import-image', async (event, projectId: string, name: unknown, bytes: unknown) => {
     trustedStructured(event)
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Importing an image into the project')
     const attachment = await importPromptImage(project.path, name, bytes)
     invalidateProjectFiles(project.path)
     return attachment
   })
   ipcMain.handle('files:attach-context', async (event, projectId: string, requested: string) => {
     trustedStructured(event)
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Attaching a project file')
     return projectPromptAttachment(project.path, requested)
   })
   ipcMain.handle('files:import-context-path', async (event, projectId: string, sourcePath: string, name: string, mimeType: string) => {
     trustedStructured(event)
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Importing a file into the project')
     const attachment = await importPromptAttachmentPath(project.path, sourcePath, name, mimeType)
     invalidateProjectFiles(project.path)
     return attachment
   })
   ipcMain.handle('files:move-external-drop', async (event, projectId: string, sourcePath: string, requestedDirectory: string) => {
     trustedStructured(event)
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Dropping a file into the project')
     const moved = await moveExternalDropIntoProject(project.path, sourcePath, requestedDirectory)
     invalidateProjectFiles(project.path)
     return { ...moved, relativePath: relative(project.path, moved.path).replaceAll('\\', '/'), kind: 'file' as const }
@@ -1036,12 +1051,15 @@ const registerIpc = (): void => {
   ipcMain.on('settings:get-startup', (event) => {
     event.returnValue = getAppSettings()
   })
-  ipcMain.handle('project-tasks:dispatch-options', (event, projectId) => { trustedStructured(event); return projectTaskDispatcher.options(projectId) })
-  ipcMain.handle('project-tasks:dispatch', (event, projectId, revision, request) => { trustedStructured(event); return projectTaskDispatcher.dispatch(projectId, revision, request) })
-  ipcMain.handle('project-tasks:get', (event, projectId: string) => { trustedStructured(event); return projectBacklogs.get(projectId) })
-  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }); const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); return result })
-  ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
-  ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); return projectBacklogs.changes(projectId, taskId) })
+  // The backlog is a file in the project folder and source control is git in it, so both belong to
+  // the machine that holds the working copy. The renderer routes a remote project's tasks to the
+  // host instead; reaching here with one is the mistake these guards make loud.
+  ipcMain.handle('project-tasks:dispatch-options', (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'The task list'); return projectTaskDispatcher.options(projectId) })
+  ipcMain.handle('project-tasks:dispatch', (event, projectId, revision, request) => { trustedStructured(event); requireLocalProject(database, projectId, 'Dispatching a task'); return projectTaskDispatcher.dispatch(projectId, revision, request) })
+  ipcMain.handle('project-tasks:get', (event, projectId: string) => { trustedStructured(event); requireLocalProject(database, projectId, 'The task list'); return projectBacklogs.get(projectId) })
+  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const project = localProject(database, projectId, 'Editing the task list'); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }); invalidateProjectFiles(project.path); return result })
+  ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control'); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
+  ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); requireLocalProject(database, projectId, 'Reviewing changes'); return projectBacklogs.changes(projectId, taskId) })
   ipcMain.handle('projects:list', () => database.listDeskProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await dialog.showOpenDialog({
@@ -1082,8 +1100,7 @@ const registerIpc = (): void => {
     database.removeProject(projectId)
   })
   ipcMain.handle('projects:move', async (event, projectId: string) => {
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Moving the project folder')
     const owner = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
       title: `Move ${project.name} — choose the destination folder`,
@@ -1120,8 +1137,7 @@ const registerIpc = (): void => {
     return database.updateProjectPath(projectId, target)
   })
   ipcMain.handle('projects:rename', async (_event, projectId: string, requestedName: string) => {
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Renaming the project folder')
     const name = safeEntryName(requestedName)
     const source = resolve(project.path)
     const target = join(dirname(source), name)
@@ -1273,7 +1289,13 @@ const registerIpc = (): void => {
       layout: WorkspaceLayout,
       maximizedGroupId: string | null,
       closedTabs: PaneTab[]
-      ) => database.saveSession(sessionId, layout, maximizedGroupId, closedTabs)
+      ) => {
+      const saved = database.saveSession(sessionId, layout, maximizedGroupId, closedTabs)
+      // A paired machine showing this workspace learns its tabs changed the way it learns anything.
+      const projectId = database.getSession(sessionId)?.projectId
+      if (projectId) remoteControl?.transport.host.notifyTabs(projectId, sessionId)
+      return saved
+    }
   )
   ipcMain.handle('sessions:list-templates', (_event, projectId: string) =>
     database.listLayoutTemplates(projectId)
@@ -1310,13 +1332,15 @@ const registerIpc = (): void => {
     trustedStructured(event)
     if (!Array.isArray(projectIds) || projectIds.length > 200 || typeof query !== 'string' || query.length > 512) throw new Error('Invalid file search')
     const recentPaths = Array.isArray(options.recentPaths) ? options.recentPaths.filter((file) => file && typeof file.projectId === 'string' && typeof file.path === 'string').slice(0, 500) : undefined
-    return searchProjectFiles(database.listProjects().filter((project) => projectIds.includes(project.id)), query, { showHidden: Boolean(options.showHidden), activeProjectId: typeof options.activeProjectId === 'string' ? options.activeProjectId : undefined, recentPaths })
+    // A search across projects is the one place a remote project must not throw: the owner asked
+    // about several projects at once and one of them living on MAIN is not a mistake. It is simply
+    // not searched from here, because there is nothing on this disk to search.
+    return searchProjectFiles(database.listProjects().filter((project) => projectIds.includes(project.id) && !isRemoteProject(project)), query, { showHidden: Boolean(options.showHidden), activeProjectId: typeof options.activeProjectId === 'string' ? options.activeProjectId : undefined, recentPaths })
   })
-  ipcMain.handle('files:browser-url', async (event, projectId: string, requested: string) => { trustedStructured(event); const project = database.getProject(projectId); if (!project) throw new Error('Project not found'); return projectPreview.url(project, requested) })
-  ipcMain.handle('files:open-in-browser', async (event, projectId: string, requested: string) => { trustedStructured(event); const project = database.getProject(projectId); if (!project) throw new Error('Project not found'); await shell.openExternal(await projectPreview.url(project, requested)) })
+  ipcMain.handle('files:browser-url', async (event, projectId: string, requested: string) => { trustedStructured(event); return projectPreview.url(localProject(database, projectId, 'Previewing a file'), requested) })
+  ipcMain.handle('files:open-in-browser', async (event, projectId: string, requested: string) => { trustedStructured(event); await shell.openExternal(await projectPreview.url(localProject(database, projectId, 'Opening a file in your browser'), requested)) })
   ipcMain.handle('files:list', async (_event, projectId: string, requested = '') => {
-    const root = database.getProject(projectId)
-    if (!root) throw new Error('Project not found')
+    const root = localProject(database, projectId, 'The file tree')
     const target = await resolveExistingProjectPath(projectId, requested)
     const entries = await fs.readdir(target, { withFileTypes: true })
     return entries
@@ -1387,8 +1411,7 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('files:create-untitled', async (event, projectId: string, requestedDirectory: string) => {
     trustedStructured(event)
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Creating a file')
     const directory = await resolveExistingProjectPath(projectId, requestedDirectory)
     if (!(await fs.stat(directory)).isDirectory()) throw new Error('Choose a destination folder')
     const target = createUntitledEditorFile(directory, getAppSettings().defaultNewFileExtension)
@@ -1436,8 +1459,7 @@ const registerIpc = (): void => {
   ipcMain.handle(
     'files:rename',
     async (_event, projectId: string, requested: string, requestedName: string) => {
-      const project = database.getProject(projectId)
-      if (!project) throw new Error('Project not found')
+      const project = localProject(database, projectId, 'Renaming a file')
       if (isProjectRoot(project.path, requested)) throw new Error('Use project rename for the project root')
 
       const name = safeEntryName(requestedName)
@@ -1464,8 +1486,7 @@ const registerIpc = (): void => {
   ipcMain.handle(
     'files:move',
     async (_event, projectId: string, requested: string, requestedDirectory: string) => {
-      const project = database.getProject(projectId)
-      if (!project) throw new Error('Project not found')
+      const project = localProject(database, projectId, 'Moving a file')
       if (isProjectRoot(project.path, requested)) throw new Error('The project root cannot be moved')
 
       const source = await resolveExistingProjectPath(projectId, requested)
@@ -1505,8 +1526,7 @@ const registerIpc = (): void => {
     }
   )
   ipcMain.handle('files:trash', async (_event, projectId: string, requested: string) => {
-    const project = database.getProject(projectId)
-    if (!project) throw new Error('Project not found')
+    const project = localProject(database, projectId, 'Deleting a file')
     if (isProjectRoot(project.path, requested)) throw new Error('The project root cannot be deleted')
     await shell.trashItem(await resolveExistingProjectPath(projectId, requested))
     invalidateProjectFiles(project.path)
@@ -1521,16 +1541,29 @@ const registerIpc = (): void => {
     if (error) throw new Error(error)
   })
   const editorMachine = (value: unknown): string => typeof value === 'string' && value.length > 0 && value.length <= 200 ? value : LOCAL_MACHINE_ID
+  /**
+   * An unsaved edit is the one thing about a host's file that lives on this computer, so drafts are
+   * the single project-scoped store a remote project may use. What is skipped for one is only the
+   * local containment check - there is no local root to contain it - and the draft still never
+   * becomes a write to this disk: `resolveUnsavedEditors` sends it back to the host, or, once the
+   * owner has detached, keeps it as a labelled recovery draft and saves it nowhere at all.
+   */
+  const checkDraftPath = (projectId: string, requested: string, machineId: string): void => {
+    if (machineId === LOCAL_MACHINE_ID) { resolveProjectPath(projectId, requested, 'The code editor'); return }
+    if (typeof requested !== 'string' || !requested || requested.length > 4096) throw new Error('Invalid editor path')
+  }
   ipcMain.handle('files:get-draft', (_event, tabId: string, projectId: string, requested: string, machineId?: string) => {
-    resolveProjectPath(projectId, requested)
-    return database.getEditorDraft(tabId, projectId, requested, editorMachine(machineId))
+    const machine = editorMachine(machineId)
+    checkDraftPath(projectId, requested, machine)
+    return database.getEditorDraft(tabId, projectId, requested, machine)
   })
   ipcMain.on(
     'files:checkpoint-draft',
     (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null, machineId?: string) => {
       trustedStructured(event)
-      resolveProjectPath(projectId, requested)
-      database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent, editorMachine(machineId))
+      const machine = editorMachine(machineId)
+      checkDraftPath(projectId, requested, machine)
+      database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent, machine)
     }
   )
   ipcMain.on(
@@ -1538,8 +1571,9 @@ const registerIpc = (): void => {
     (event, tabId: string, projectId: string, requested: string, content: string, viewState: unknown, baseContent?: string | null, machineId?: string) => {
       try {
         trustedStructured(event)
-        resolveProjectPath(projectId, requested)
-        database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent, editorMachine(machineId))
+        const machine = editorMachine(machineId)
+        checkDraftPath(projectId, requested, machine)
+        database.saveEditorDraft(tabId, projectId, requested, content, viewState, baseContent, machine)
         event.returnValue = true
       } catch (error) {
         console.error(`Failed to flush editor draft ${tabId}`, error)
@@ -1549,22 +1583,43 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('files:remove-draft', (_event, tabId: string) => database.removeEditorDraft(tabId))
 
-  ipcMain.handle('terminal:ensure', (_event, spec: TerminalSpec) => terminals.ensure(spec))
-  ipcMain.handle('terminal:restart', (_event, spec: TerminalSpec) => terminals.restart(spec))
-  ipcMain.handle('terminal:kill', (_event, id: string) => terminals.kill(id))
-  ipcMain.on('terminal:write', (_event, id: string, data: string) => terminals.write(id, data))
-  ipcMain.on('terminal:resize', (_event, id: string, cols: number, rows: number) =>
-    terminals.resize(id, cols, rows)
-  )
+  // A terminal id bound to a paired machine is that machine's shell: the pane speaks the same
+  // channels, and the binding carries every one of them there instead of to a PTY here.
+  const remoteTerminal = (id: string): RemoteTerminalBindings | null =>
+    remoteControl?.terminalBindings.isRemote(id) ? remoteControl.terminalBindings : null
+  ipcMain.handle('terminal:ensure', (_event, spec: TerminalSpec) => remoteTerminal(spec.id)?.ensure(spec) ?? terminals.ensure(spec))
+  ipcMain.handle('terminal:restart', (_event, spec: TerminalSpec) => {
+    const remote = remoteTerminal(spec.id)
+    if (remote) throw new Error(`Restarting a shell that runs on ${remote.get(spec.id)?.machineName || 'another machine'} is not supported yet. Close it and open a new one there.`)
+    return terminals.restart(spec)
+  })
+  ipcMain.handle('terminal:kill', async (_event, id: string) => {
+    const remote = remoteTerminal(id)
+    if (remote) await remote.kill(id)
+    else terminals.kill(id)
+  })
+  ipcMain.on('terminal:write', (_event, id: string, data: string) => {
+    const remote = remoteTerminal(id)
+    if (remote) remote.write(id, data)
+    else terminals.write(id, data)
+  })
+  ipcMain.on('terminal:resize', (_event, id: string, cols: number, rows: number) => {
+    const remote = remoteTerminal(id)
+    if (remote) remote.resize(id, cols, rows)
+    else terminals.resize(id, cols, rows)
+  })
 
   // Legacy entry points also reach the structured owner. Apply the same document
   // boundary here so an embedded or navigated web page cannot bypass its IPC.
   ipcMain.handle('agent:ensure', (event, spec: AgentSpec) => {
     trustedStructured(event)
+    // A mirrored session already runs on the host; only the local branch would start a process
+    // here, which for a project that lives on MAIN means an agent loose in the wrong folder.
     if (remoteControl?.mirror.isRemote(spec.id)) return remoteControl.mirror.mount(spec)
+    requireLocalProject(database, spec.projectId, 'Running an agent')
     return agents.ensure(spec)
   })
-  ipcMain.handle('agent:restart', (event, spec: AgentSpec) => { trustedStructured(event); return agents.restart(spec) })
+  ipcMain.handle('agent:restart', (event, spec: AgentSpec) => { trustedStructured(event); requireLocalProject(database, spec.projectId, 'Running an agent'); return agents.restart(spec) })
   ipcMain.handle('agent:submit', (event, id: string, message: string, mode?: 'manual' | 'edit' | 'plan' | 'auto') => {
     trustedStructured(event)
     return agents.submit(id, message, mode)
@@ -1632,11 +1687,15 @@ const registerIpc = (): void => {
     pending.resolve(response.allow === true)
   })
 
-  ipcMain.handle('memory:list', (_event, projectId: string, agentKey?: string) =>
-    database.listMemories(projectId, agentKey)
-  )
+  // Memory is written about a working copy by the agents that worked on it, so it belongs to the
+  // machine that runs them. A remote project's memory is MAIN's, and is read there.
+  ipcMain.handle('memory:list', (_event, projectId: string, agentKey?: string) => {
+    requireLocalProject(database, projectId, 'Memory')
+    return database.listMemories(projectId, agentKey)
+  })
   ipcMain.handle('memory:remember', (_event, input: RememberMemoryInput) => {
     if (!input || typeof input.gist !== 'string' || !isMemoryKind(input.kind)) throw new Error('A memory needs a gist and a known kind')
+    requireLocalProject(database, input.projectId, 'Memory')
     // The pane writes on the owner's behalf; only the agent control surface may claim
     // agent authorship, so provenance in the pane cannot be forged from the renderer.
     return database.remember({ ...input, source: 'human', origin: undefined })
@@ -1645,16 +1704,19 @@ const registerIpc = (): void => {
     if (!input || typeof input.id !== 'string') throw new Error('A memory id is required')
     return database.updateMemory(input)
   })
-  ipcMain.handle('memory:prune-candidates', (_event, projectId: string, limit?: number) =>
-    database.memoryPruneCandidates(projectId, limit)
-  )
+  ipcMain.handle('memory:prune-candidates', (_event, projectId: string, limit?: number) => {
+    requireLocalProject(database, projectId, 'Memory')
+    return database.memoryPruneCandidates(projectId, limit)
+  })
   ipcMain.handle('memory:turn-recalls', (_event, agentSessionId: string) =>
     database.listMemoryRecalls(agentSessionId)
   )
   ipcMain.handle(
     'memory:recall',
-    (_event, projectId: string, query: string, agentKey?: string, limit?: number) =>
-      database.recall(projectId, query, agentKey, limit)
+    (_event, projectId: string, query: string, agentKey?: string, limit?: number) => {
+      requireLocalProject(database, projectId, 'Memory')
+      return database.recall(projectId, query, agentKey, limit)
+    }
   )
   ipcMain.handle('memory:remove', (_event, id: string) => database.removeMemory(id))
   ipcMain.handle('system:open-external', (_event, url: string) => {
@@ -1849,6 +1911,24 @@ app.whenReady().then(async () => {
   agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '', browserMcp)
   const publish = (channel: string, payload: unknown): void => {
     for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload)
+    // What the windows hear about this machine's own work, a paired machine subscribed to that
+    // workspace hears as a notice - and then fetches, through the same signed calls it always used.
+    const host = remoteControl?.transport.host
+    if (!host) return
+    if (channel === 'structured:events' && Array.isArray(payload)) {
+      for (const event of payload as Array<{ projectId: string; workspaceId: string; sessionId: string; sequence: number }>) {
+        if (event?.projectId && event.workspaceId && event.sessionId) host.notifyAgents(event.projectId, event.workspaceId, event.sessionId, event.sequence)
+      }
+    } else if (channel === 'files:changed') {
+      const change = payload as { projectId?: string; path?: string; machineId?: string }
+      // A change relayed from a host is already the host's notice; only this machine's own changes go out.
+      if (change?.projectId && change.path && !change.machineId) {
+        host.notifyFiles(change.projectId, change.path)
+        if (change.path === 'feature-list.md') host.notifyTasks(change.projectId)
+      }
+    } else if (channel === 'remote:changed') {
+      hostLifecycle?.refresh()
+    }
   }
   // A phase change can land in bursts (a turn ends, its queued follow-up starts); one coalesced
   // snapshot per burst keeps every project row current without re-querying per event.
@@ -1872,7 +1952,7 @@ app.whenReady().then(async () => {
     return source?.detachedId ? detachedWindows.get(source.detachedId) ?? null : null
   })
   remoteControl = new RemoteControlService({
-    database, sessions: agents.structured, backlogs: projectBacklogs,
+    database, sessions: agents.structured, backlogs: projectBacklogs, terminals,
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     fileChanged: change => projectFileChanges?.changed(change),
     cipher: safeStorageCipher,
@@ -1889,6 +1969,27 @@ app.whenReady().then(async () => {
     publish: (channel, payload) => publish(channel, payload)
   })
   agents.structured.setPromptDispatchAuthorityGuard((authority, spec) => remoteControl!.assertPromptDispatchAuthority(authority, spec))
+  // A machine hosting its other computer keeps serving with every window closed, from the tray;
+  // quitting while a peer is attached is asked about, once, in the same flow as any other quit.
+  hostLifecycle = installHostLifecycle(app, {
+    hosting: () => {
+      const state = remoteControl!.state()
+      const streaming = new Set(remoteControl!.transport.host.connectedPeers())
+      return {
+        enabled: state.settings.enabled,
+        listening: state.listening,
+        attachedPeers: state.peers.filter(peer => !peer.revokedAt && streaming.has(peer.id)).map(peer => peer.machineName)
+      }
+    },
+    showWindow: () => {
+      const window = liveWindow(mainWindow) ?? (mainWindow = createWindow())
+      if (window.isMinimized()) window.restore()
+      window.show(); window.focus()
+    },
+    confirm: async message => (await showDecision(liveWindow(mainWindow), { type: 'question', buttons: ['Stop hosting and quit', 'Keep running'], defaultId: 1, cancelId: 1, message })) === 0,
+    quit: () => { isQuitting = true; app.quit() },
+    createTray: () => electronTray(ensureTrayIconFile(app.getPath('userData')))
+  })
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
   // without it the two initializers form an inference cycle.
   const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
@@ -1956,15 +2057,15 @@ app.whenReady().then(async () => {
   })
 })
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
-})
+// 'window-all-closed' is owned by the host lifecycle: it quits exactly as before unless this machine
+// is hosting its other computer, in which case the process stays up behind the tray.
 
 app.on('before-quit', (event) => {
   if (isQuitting) return
   event.preventDefault()
   if (quitRequest) return
   const request = (async (): Promise<void> => {
+    if (hostLifecycle && !await hostLifecycle.confirmStopHosting()) return
     if (!await confirmApplicationStop(mainWindow, 'quit')) return
     if (!await resolveUnsavedEditors(mainWindow)) return
     isQuitting = true
@@ -1974,6 +2075,7 @@ app.on('before-quit', (event) => {
 })
 
 app.on('will-quit', () => {
+  hostLifecycle?.dispose()
   void remoteControl?.dispose().catch(error => console.warn('Remote control did not shut down cleanly', error))
   if (snapshotPruneTimer) clearInterval(snapshotPruneTimer)
   projectPreview.close()

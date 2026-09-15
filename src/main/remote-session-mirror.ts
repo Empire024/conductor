@@ -12,6 +12,7 @@ import type {
 } from '../shared/structured-agent'
 import type { AgentSpec, RuntimeEnsureResult } from '../shared/models'
 import type { RemotePromptFileAttachment } from '../shared/remote-files'
+import { STREAM_RESYNC_POLL_MS } from '../shared/remote-stream'
 import type { ConductorDatabase } from './database'
 
 /**
@@ -121,6 +122,7 @@ export interface RemoteSessionMirrorDependencies {
   publish(channel: string, payload: unknown): void
   /** Injected so tests drive the poll loop instead of waiting on a timer. */
   schedule?(run: () => void, ms: number): { cancel(): void }
+  now?(): number
 }
 
 /**
@@ -141,6 +143,10 @@ export class RemoteSessionMirror {
   private settingMutations = new Map<string, Promise<void>>()
   private timer: { cancel(): void } | null = null
   private polling = false
+  /** Machines whose push channel is open right now, so the poll is only a resync for them. */
+  private readonly streaming = new Set<string>()
+  /** When each mirrored tab was last fetched, which is what the slowed cadence measures against. */
+  private readonly pulledAt = new Map<string, number>()
 
   constructor(private readonly deps: RemoteSessionMirrorDependencies) {
     this.owners = readOwners(this.deps.database.getSetting(OWNERS_SETTING) || undefined)
@@ -150,6 +156,35 @@ export class RemoteSessionMirror {
       if (!this.owners.has(binding.localSessionId)) { this.owners.set(binding.localSessionId, binding.machineId); recoveredOwner = true }
     }
     if (recoveredOwner) this.saveOwners()
+  }
+
+  private now(): number { return this.deps.now?.() ?? Date.now() }
+
+  /**
+   * Whether a machine's push channel is carrying notices at the moment.
+   *
+   * This is the only thing that slows the poll down, and it is deliberately a fact about the socket
+   * rather than a setting: while notices are arriving the poll has nothing to find, and when they
+   * stop arriving - for any reason, including a bug in the channel - the ordinary one-second sweep
+   * comes straight back. Nothing on this side is ever only known through the stream.
+   */
+  streamConnected(machineId: string, connected: boolean): void {
+    if (connected) this.streaming.add(machineId)
+    else this.streaming.delete(machineId)
+  }
+
+  /**
+   * A host saying one conversation moved on. The sequence is the host's own high-water mark, so a
+   * notice for something already copied is nothing to do; anything past the cursor is fetched now
+   * rather than at the next sweep, which is the whole point of the channel.
+   */
+  async notice(machineId: string, agentSessionId: string, sequence: number): Promise<void> {
+    for (const binding of [...this.bindings.values()]) {
+      if (binding.machineId !== machineId || binding.remoteAgentSessionId !== agentSessionId) continue
+      if (Number.isSafeInteger(sequence) && sequence <= binding.remoteSequence) continue
+      try { await this.pull(binding.localSessionId) }
+      catch (error) { console.warn('Remote session notice failed', error) }
+    }
   }
 
   list(): RemoteSessionBinding[] { return [...this.bindings.values()].map(binding => ({ ...binding })) }
@@ -330,6 +365,7 @@ export class RemoteSessionMirror {
   }
 
   release(localSessionId: string): void {
+    this.pulledAt.delete(localSessionId)
     if (this.bindings.delete(localSessionId)) { this.invalidate(localSessionId); this.save() }
   }
 
@@ -386,6 +422,7 @@ export class RemoteSessionMirror {
   async pull(localSessionId: string): Promise<AgentEvent[]> {
     const active = this.bindings.get(localSessionId)
     if (!active) return []
+    this.pulledAt.set(localSessionId, this.now())
     const captured = this.capture(localSessionId)
     const binding = captured.binding
     const raw = await this.deps.call(binding.machineId, 'agents.history', {
@@ -468,12 +505,24 @@ export class RemoteSessionMirror {
     this.deps.publish('structured:events', [event])
   }
 
-  /** One sweep over every mirrored tab; overlapping sweeps are skipped rather than queued. */
+  /**
+   * One sweep over every mirrored tab; overlapping sweeps are skipped rather than queued.
+   *
+   * A tab on a machine whose push channel is open is fetched at the slow cadence instead of every
+   * second: the notices already brought everything that changed, and polling underneath them would
+   * be spending the owner's bandwidth to learn what it has just been told. It is not switched off,
+   * because the channel is an accelerator and never a source of truth - this is the resync that
+   * closes whatever a dropped frame or a missed notice would otherwise leave behind for ever.
+   */
   async poll(): Promise<void> {
     if (this.polling) return
     this.polling = true
     try {
+      const now = this.now()
       for (const id of [...this.bindings.keys()]) {
+        const binding = this.bindings.get(id)
+        if (!binding) continue
+        if (this.streaming.has(binding.machineId) && now - (this.pulledAt.get(id) ?? 0) < STREAM_RESYNC_POLL_MS) continue
         try { await this.pull(id) }
         catch (error) { console.warn('Remote session poll failed', error) }
       }

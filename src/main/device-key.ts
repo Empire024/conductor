@@ -78,7 +78,12 @@ export interface ChallengePayload {
   audienceMachineId: string
   fingerprint: string
   nonce: string
-  purpose: 'pair' | 'call'
+  /**
+   * 'stream' opens the push channel and 'tunnel' one connection to a registered preview service;
+   * both are signed like a call, over an empty body, and a signature made for one purpose is never
+   * accepted for another.
+   */
+  purpose: 'pair' | 'call' | 'stream' | 'tunnel'
   /** SHA-256 of the request body for calls; the empty string while pairing. */
   bodyHash: string
   issuedAt: number

@@ -220,8 +220,25 @@ export function parseSessionArchive(raw: string): SessionArchive {
   const v = record(value)
   if (v.format !== 'conductor-session' || v.version !== 1) fail('unsupported format/version')
   const name = text(v.name, 200).trim(); if (!name) fail('missing name')
-  const projects = list(v.projects, 1000).map(value => { const p = record(value), name = text(p.name).trim(); if (!name) fail('project name is empty'); return { id: id(p.id), name, path: absolutePath(p.path), createdAt: timestamp(p.createdAt), updatedAt: timestamp(p.updatedAt) } })
-  unique(projects.map(p => p.id), 'project'); unique(projects.map(p => win32.normalize(p.path).toLowerCase()), 'project path')
+  const projects = list(v.projects, 1000).map(value => {
+    const p = record(value), name = text(p.name).trim()
+    if (!name) fail('project name is empty')
+    // A project that lives on another machine travels with its origin, or it arrives on the
+    // importing computer as a local folder at a path that computer does not have - with every
+    // guard in project-scope.ts switched off for it. The origin is validated like everything else
+    // here rather than trusted, because an archive is a file that came from somewhere.
+    const remote = p.remote === undefined || p.remote === null ? undefined : (() => {
+      const r = record(p.remote)
+      const machineId = machine(r.machineId)
+      if (machineId === LOCAL_MACHINE_ID) fail('a remote project cannot live on this machine')
+      return { machineId, machineName: text(r.machineName, 200), remoteProjectId: id(r.remoteProjectId), path: absolutePath(r.path ?? p.path) }
+    })()
+    return { id: id(p.id), name, path: absolutePath(p.path), createdAt: timestamp(p.createdAt), updatedAt: timestamp(p.updatedAt), ...(remote ? { remote } : {}) }
+  })
+  unique(projects.map(p => p.id), 'project')
+  // Two working copies at the same path on two different machines are two projects, so the path
+  // alone is not an identity here any more than it is in the database.
+  unique(projects.map(p => (p.remote?.machineId ?? LOCAL_MACHINE_ID) + '\u0000' + win32.normalize(p.path).toLowerCase()), 'project path')
   const tabIds: string[] = []
   const workspaceGroups = new Map<string, Set<string>>()
   const workspaces = list(v.workspaces).map(value => {

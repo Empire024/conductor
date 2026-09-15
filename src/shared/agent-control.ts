@@ -9,7 +9,16 @@ export interface AgentControlUiRequest extends AgentControlScope {
 }
 export interface AgentControlUiResponse { id: string; result?: unknown; error?: string }
 export interface AgentControlTab extends PaneTab { groupId: string; detachedId?: string; uri: string }
-export interface AgentFileChange { projectId: string; path: string; agentSessionId?: string }
+/**
+ * A file that changed, wherever it changed. `projectId` is always *this* computer's id for the
+ * project, so every existing listener keeps matching on the one field it already used. The two
+ * optional fields are set only when the change happened on a paired host: `machineId` names that
+ * host, and `remoteProjectId` is the host's own id for the project - which is what a pane opened
+ * against a host-resident project is keyed by, and is not an id this computer would otherwise
+ * recognise. A listener that ignores both still behaves exactly as it did, which is why they are
+ * additive rather than a second channel.
+ */
+export interface AgentFileChange { projectId: string; path: string; agentSessionId?: string; machineId?: string; remoteProjectId?: string }
 /** projectId/sessionId locate the controlled tab. A controller in another open project records
  *  where it sits as well, so ownership survives even though the cable is only drawn in one workspace. */
 export interface AgentControlLink { projectId: string; sessionId: string; controllerAgentSessionId: string; targetAgentSessionId: string; controllerTabId: string; controlledTabId: string; controllerProjectId?: string; controllerSessionId?: string; controllerTitle?: string; controlledTitle?: string }

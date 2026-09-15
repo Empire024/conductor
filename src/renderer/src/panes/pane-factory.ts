@@ -14,6 +14,9 @@ export const createPaneTab = (
     machineId?: string
     /** The mirrored session id minted when the tab was placed on another machine. */
     resourceId?: string
+    /** For a terminal placed on a host: that host's own id for the shell, so a reopened tab
+     *  re-attaches to it instead of leaving it running and starting a second one. */
+    remoteTerminalId?: string
   }
 ): PaneTab => {
   switch (kind) {
@@ -28,14 +31,20 @@ export const createPaneTab = (
         state: { provider, resume: Boolean(options?.resume), model: options?.model ?? 'default', effort: 'auto', ...remote }
       }
     }
-    case 'terminal':
+    case 'terminal': {
+      // A placed terminal is bound to a shell the host already owns, so its id is the binding the
+      // main process minted rather than a fresh one - inventing one here would address nothing.
+      const remote = options?.machineId && options.machineId !== LOCAL_MACHINE_ID
+        ? { machineId: options.machineId, ...(options.remoteTerminalId ? { remoteTerminalId: options.remoteTerminalId } : {}) }
+        : {}
       return {
         id: makeId('pane'),
         kind,
         title: options?.title ?? 'PowerShell',
-        resourceId: makeId('terminal'),
-        state: { shell: 'powershell' }
+        resourceId: options?.resourceId ?? makeId('terminal'),
+        state: { shell: 'powershell', ...remote }
       }
+    }
     case 'file-tree':
       return { id: makeId('pane'), kind, title: options?.title ?? 'Files' }
     case 'code': {

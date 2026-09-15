@@ -1,5 +1,5 @@
-import type { MachineDescriptor, MachineProjectLink, RemoteConnection } from '../shared/remote-control'
-import { LOCAL_MACHINE_ID } from '../shared/remote-control'
+import type { MachineConnection, MachineDescriptor, MachineProjectLink, RemoteConnection } from '../shared/remote-control'
+import { LOCAL_CONNECTION, LOCAL_MACHINE_ID } from '../shared/remote-control'
 import { checkRemoteProjectPlacement, type ProjectPlacement } from '../shared/project-identity'
 import type { PaneTab } from '../shared/models'
 
@@ -42,15 +42,35 @@ export function machineRunsProject(machine: MachineDescriptor, projectId: string
   return checkRemoteProjectPlacement({ machineName: machine.name, grant: link?.grant, advertised: link?.observed })
 }
 
-export function describeMachines(localName: string, connections: RemoteConnection[]): MachineDescriptor[] {
+/**
+ * How a paired machine is reached, from what the connection record alone can say. The transport
+ * layer overrides this with live stream state where it has it; this is the answer when it does not.
+ */
+export function describeConnection(connection: RemoteConnection, live?: Partial<MachineConnection>): MachineConnection {
+  const base: MachineConnection = connection.detached
+    ? { state: 'detached', path: 'unknown', transport: null, failure: null, detail: 'Using this computer independently.', generation: connection.generation ?? 0 }
+    : connection.status === 'revoked'
+      ? { state: 'offline', path: 'unknown', transport: null, failure: 'authorization', detail: connection.message, generation: connection.generation ?? 0 }
+      : connection.status === 'connected'
+        ? { state: 'connected', path: 'unknown', transport: connection.transport ?? null, failure: null, detail: null, generation: connection.generation ?? 0 }
+        : { state: 'offline', path: 'unknown', transport: connection.transport ?? null, failure: 'network', detail: connection.message, generation: connection.generation ?? 0 }
+  return { ...base, ...live }
+}
+
+export function describeMachines(localName: string, connections: RemoteConnection[], live?: (machineId: string) => Partial<MachineConnection> | undefined): MachineDescriptor[] {
   return [
-    { id: LOCAL_MACHINE_ID, name: localName, kind: 'local', status: 'online', accountLogin: null, projects: [] },
+    { id: LOCAL_MACHINE_ID, name: localName, kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION },
     ...connections.map((connection): MachineDescriptor => ({
       id: connection.machineId,
       name: connection.machineName,
       kind: 'peer',
-      status: connection.status === 'revoked' ? 'revoked' : connection.status === 'connected' ? 'online' : 'offline',
+      // A detached host is not offline - it may be perfectly reachable - but nothing runs there
+      // from here until the owner attaches again, and the launcher must not offer it.
+      status: connection.status === 'revoked' ? 'revoked' : connection.detached ? 'offline'
+        // A stream that is open right now outranks what the last call recorded.
+        : live?.(connection.machineId)?.state === 'connected' || connection.status === 'connected' ? 'online' : 'offline',
       accountLogin: connection.accountLogin || null,
+      connection: describeConnection(connection, live?.(connection.machineId)),
       projects: connection.projectGrants.map((grant): MachineProjectLink => ({
         grant,
         observed: connection.remoteProjects.find(project => project.id === grant.remoteProjectId)?.identity ?? null

@@ -1,15 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { randomBytes } from 'node:crypto'
 import { createServer } from 'node:https'
 import { request as httpsRequest } from 'node:https'
 import { createServer as createNetServer } from 'node:net'
-import { encodeTicket, type RemotePeerRecord, type RemoteProjectSummary } from '../shared/remote-control'
+import { connect as tlsConnect } from 'node:tls'
+import { encodeTicket, type RemotePeerRecord, type RemoteProjectSummary, type TailscaleState } from '../shared/remote-control'
 import { generateDeviceKey, signChallenge, type ChallengePayload } from './device-key'
 import { RemoteControlClient } from './remote-control-client'
 import type { RemoteControlHost } from './remote-control-host'
-import { RemoteControlServer } from './remote-control-server'
+import { RemoteControlServer, resolveBindHost, ticketRoute, type RemoteControlServerDependencies } from './remote-control-server'
 import { RemoteAccessError, RemotePeers } from './remote-peers'
 import { createRemoteTlsIdentity } from './remote-tls'
 import { StoredSecretVault, type SecretCipher, type SecretKeyValueStore } from './secret-store'
+import type { TailscaleReader } from './tailscale'
 
 class MapStore implements SecretKeyValueStore {
   readonly values = new Map<string, string>()
@@ -30,7 +33,7 @@ const PROJECTS: RemoteProjectSummary[] = [{ id: 'project-a', name: 'Conductor', 
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-async function hostFixture() {
+async function hostFixture(extra: Partial<RemoteControlServerDependencies> = {}) {
   const store = new MapStore()
   const vault = new StoredSecretVault(store, cipher)
   const ownerKey = generateDeviceKey('owner')
@@ -49,7 +52,8 @@ async function hostFixture() {
   const server = new RemoteControlServer({
     peers, host, store, vault,
     machineName: () => 'Render Desktop',
-    accountLogin: () => 'Empire024'
+    accountLogin: () => 'Empire024',
+    ...extra
   })
   const status = await server.apply()
   cleanup.push(() => server.close())
@@ -365,5 +369,165 @@ describe('certificate pinning on the controlling machine', () => {
     const client = new RemoteControlClient({ store, machineId: () => 'm', machineName: () => 'M', deviceKey: () => null })
     const fix = await hostFixture()
     await expect(client.connect(encodeTicket(fix.server.ticket()), async () => {})).rejects.toThrow(/Sign in to GitHub/)
+  })
+})
+
+/** A tailnet reading with no machine behind it, so the listener's rules can be exercised. */
+const tailnet = (state: Partial<TailscaleState>): TailscaleReader => {
+  const full: TailscaleState = { installed: false, backendState: null, self: null, peers: [], message: null, checkedAt: null, ...state }
+  return {
+    state: async () => full,
+    last: () => full,
+    selfAddress: async () => full.self?.addresses.find(address => address.startsWith('100.')) ?? null
+  }
+}
+
+/** Writes one raw WebSocket upgrade at the listener and reports the status line that came back. */
+const rawUpgrade = (port: number, path: string, headers: Record<string, string> = {}): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const socket = tlsConnect({ host: '127.0.0.1', port, rejectUnauthorized: false }, () => {
+      const lines = Object.entries({
+        Host: `127.0.0.1:${port}`,
+        Upgrade: 'websocket',
+        Connection: 'Upgrade',
+        'Sec-WebSocket-Key': randomBytes(16).toString('base64'),
+        'Sec-WebSocket-Version': '13',
+        ...headers
+      }).map(([name, value]) => `${name}: ${value}\r\n`).join('')
+      socket.write(`GET ${path} HTTP/1.1\r\n${lines}\r\n`)
+    })
+    let text = ''
+    socket.setTimeout(5000, () => { socket.destroy(); reject(new Error('the listener never answered the upgrade')) })
+    socket.on('data', chunk => {
+      text += chunk.toString('latin1')
+      if (text.includes('\r\n\r\n')) { socket.destroy(); resolve(text.split('\r\n')[0] ?? '') }
+    })
+    socket.on('error', reject)
+    socket.on('close', () => resolve(text.split('\r\n')[0] ?? ''))
+  })
+
+describe('choosing what the listener binds to', () => {
+  it('binds loopback, every interface, or the tailnet address and nothing else', () => {
+    expect(resolveBindHost({ exposure: 'loopback' })).toBe('127.0.0.1')
+    expect(resolveBindHost({ exposure: 'network' })).toBe('0.0.0.0')
+    expect(resolveBindHost({ exposure: 'tailscale' }, '100.80.1.2')).toBe('100.80.1.2')
+  })
+
+  it('answers "nowhere" rather than somewhere wider when there is no tailnet address', () => {
+    // Every one of these is a state a real machine is in: no Tailscale, signed out, or an address
+    // that is not on the tailnet at all. None of them may become 127.0.0.1, 0.0.0.0 or the LAN.
+    expect(resolveBindHost({ exposure: 'tailscale' })).toBeNull()
+    expect(resolveBindHost({ exposure: 'tailscale' }, null)).toBeNull()
+    expect(resolveBindHost({ exposure: 'tailscale' }, '')).toBeNull()
+    expect(resolveBindHost({ exposure: 'tailscale' }, '192.168.1.40')).toBeNull()
+    expect(resolveBindHost({ exposure: 'tailscale' }, '0.0.0.0')).toBeNull()
+  })
+})
+
+describe('what a pairing code says about the route', () => {
+  const relay = {
+    relayKey: 'relay-key',
+    deviceKey: 'device-key',
+    room: { endpoint: 'wss://relay.example:8787', secret: 'room-secret', fingerprint: 'DD:EE', alternates: ['wss://192.168.1.2:8787'] }
+  }
+
+  it('carries the relay when there is one, on the routes that may use it', () => {
+    const route = ticketRoute({ exposure: 'loopback', relay: true }, { exposure: 'loopback', host: '127.0.0.1' }, relay)
+    expect(route).toMatchObject({ host: '127.0.0.1', relayKey: 'relay-key', relayEndpoint: 'wss://relay.example:8787', relaySecret: 'room-secret' })
+    expect(route.transport).toBeUndefined()
+  })
+
+  it('carries the tailnet address and no relay of any kind on a Tailscale code', () => {
+    const route = ticketRoute({ exposure: 'tailscale', relay: true }, { exposure: 'tailscale', host: '100.80.1.2', dnsName: 'desktop.tail1234.ts.net' }, relay)
+    expect(route).toEqual({ host: '100.80.1.2', transport: 'tailscale', dnsName: 'desktop.tail1234.ts.net' })
+    // Spelled out rather than left to toEqual: this is the promise the whole exposure exists for,
+    // and a field added carelessly to the general branch later must fail here.
+    for (const key of ['relayKey', 'deviceKey', 'relayEndpoint', 'relayEndpointAlternates', 'relaySecret', 'relayFingerprint'] as const) {
+      expect(route[key]).toBeUndefined()
+    }
+  })
+
+  it('refuses to issue a Tailscale code before the listener is on the tailnet', () => {
+    expect(() => ticketRoute({ exposure: 'tailscale', relay: true }, null, relay)).toThrow(/not listening on its Tailscale address/)
+    expect(() => ticketRoute({ exposure: 'tailscale', relay: true }, { exposure: 'loopback', host: '127.0.0.1' }, relay)).toThrow(/Tailscale/)
+  })
+})
+
+describe('Tailscale exposure on the real listener', () => {
+  it('does not listen at all when Tailscale is not installed, and says what to do', async () => {
+    const fix = await hostFixture({ tailscale: tailnet({ installed: false, message: 'Install Tailscale from https://tailscale.com/download and sign in with your GitHub account.' }) })
+    fix.peers.updateSettings({ exposure: 'tailscale' })
+    const status = await fix.server.apply()
+    expect(status.listening).toBe(false)
+    expect(status.endpoint).toBeNull()
+    expect(status.message).toMatch(/Install Tailscale/)
+    // Nothing answers anywhere: not loopback, not the LAN address it would have used before.
+    expect(fix.server.boundHost()).toBeNull()
+    expect(() => fix.server.ticket()).toThrow(/Tailscale/)
+  })
+
+  it('does not listen when Tailscale is installed but signed out or stopped', async () => {
+    const signedOut = await hostFixture({ tailscale: tailnet({ installed: true, backendState: 'NeedsLogin', message: 'Tailscale is installed here but not signed in.' }) })
+    signedOut.peers.updateSettings({ exposure: 'tailscale' })
+    expect((await signedOut.server.apply()).message).toMatch(/not signed in/)
+
+    const stopped = await hostFixture({ tailscale: tailnet({ installed: true, backendState: 'Stopped', message: 'Tailscale is signed in but stopped on this machine.' }) })
+    stopped.peers.updateSettings({ exposure: 'tailscale' })
+    const status = await stopped.server.apply()
+    expect(status.listening).toBe(false)
+    expect(status.message).toMatch(/stopped/)
+  })
+
+  it('does not listen on a build that knows nothing about Tailscale at all', async () => {
+    const fix = await hostFixture()
+    fix.peers.updateSettings({ exposure: 'tailscale' })
+    const status = await fix.server.apply()
+    expect(status.listening).toBe(false)
+    expect(status.message).toMatch(/Install Tailscale/)
+  })
+})
+
+describe('upgrading a socket to a WebSocket', () => {
+  it('hands a registered path the socket and refuses every other one', async () => {
+    const fix = await hostFixture()
+    const seen: string[] = []
+    fix.server.onUpgrade('/v1/stream', (request, socket) => {
+      seen.push(request.url ?? '')
+      socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+    })
+    const port = Number(new URL(fix.status.endpoint ?? '').port)
+    expect(await rawUpgrade(port, '/v1/stream')).toMatch(/101/)
+    expect(seen).toEqual(['/v1/stream'])
+    expect(await rawUpgrade(port, '/v1/tunnel')).toMatch(/404/)
+  })
+
+  it('refuses an upgrade that carries an Origin, because that is a browser', async () => {
+    const fix = await hostFixture()
+    const seen: string[] = []
+    fix.server.onUpgrade('/v1/stream', request => { seen.push(request.url ?? '') })
+    const port = Number(new URL(fix.status.endpoint ?? '').port)
+    // A pinned certificate does not stop a page in the owner's browser from opening a WebSocket
+    // with the owner's network position, and no same-origin rule applies to one. Refusing before
+    // the handler ever sees it is the whole defence.
+    expect(await rawUpgrade(port, '/v1/stream', { Origin: 'https://evil.example' })).toMatch(/403/)
+    expect(seen).toEqual([])
+  })
+
+  it('refuses a version, key or extension it does not speak', async () => {
+    const fix = await hostFixture()
+    fix.server.onUpgrade('/v1/stream', (_request, socket) => { socket.end('HTTP/1.1 101 Switching Protocols\r\n\r\n') })
+    const port = Number(new URL(fix.status.endpoint ?? '').port)
+    expect(await rawUpgrade(port, '/v1/stream', { 'Sec-WebSocket-Version': '8' })).toMatch(/426/)
+    expect(await rawUpgrade(port, '/v1/stream', { 'Sec-WebSocket-Key': 'too-short' })).toMatch(/400/)
+    expect(await rawUpgrade(port, '/v1/stream', { 'Sec-WebSocket-Extensions': 'permessage-deflate' })).toMatch(/400/)
+  })
+
+  it('stops answering a path once its handler is taken away', async () => {
+    const fix = await hostFixture()
+    const remove = fix.server.onUpgrade('/v1/stream', (_request, socket) => { socket.end('HTTP/1.1 101 Switching Protocols\r\n\r\n') })
+    const port = Number(new URL(fix.status.endpoint ?? '').port)
+    expect(await rawUpgrade(port, '/v1/stream')).toMatch(/101/)
+    remove()
+    expect(await rawUpgrade(port, '/v1/stream')).toMatch(/404/)
   })
 })

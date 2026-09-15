@@ -20,6 +20,9 @@ interface SessionBarProps {
   onApplyTemplate(template: LayoutTemplateRecord): void
   continueOnLimit: boolean
   attentionIds: ReadonlySet<string>
+  /** Where work opened in this workspace will run. Shown here because it is the header the owner
+   *  is already looking at when they start something, not somewhere they would have to go. */
+  executionTarget?: React.ReactNode
   saveStatus: 'saved' | 'saving' | 'unsaved' | 'error'
   lastSavedAt: number | null
   onSave(): void
@@ -174,6 +177,7 @@ export function SessionBar(props: SessionBarProps): React.JSX.Element {
         </button>
       </div>
       <div className="session-actions">
+        {props.executionTarget}
         <div className="layout-selector" ref={layoutsRef}>
           <button onClick={() => setLayoutsOpen((value) => !value)} title="Named layouts">
             <LayoutTemplate size={13} /> Layouts

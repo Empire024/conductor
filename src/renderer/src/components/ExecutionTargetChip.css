@@ -1,0 +1,30 @@
+/* Where work opened next will run. Small and permanent: it has to be readable at a glance without
+   ever competing with the composer it sits beside. */
+.execution-target {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 3px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: var(--surface-0);
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.execution-target strong { font-weight: 600; color: var(--text); overflow: hidden; text-overflow: ellipsis; }
+.execution-target small { color: var(--text-3); font-size: 9.5px; }
+.execution-target svg { flex: none; }
+
+/* A remote target is the one worth noticing, so only it is tinted. */
+.execution-target.is-remote { border-color: color-mix(in srgb, var(--accent) 45%, var(--border-soft)); }
+.execution-target.is-remote strong { color: var(--accent); }
+
+/* Detached and offline both mean nothing is reaching that machine; they must not read as normal. */
+.execution-target.is-detached,
+.execution-target.is-offline { border-color: color-mix(in srgb, #d9a441 45%, var(--border-soft)); }
+.execution-target.is-detached strong,
+.execution-target.is-offline strong { color: #d9a441; }

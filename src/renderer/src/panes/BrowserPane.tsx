@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ArrowLeft, ArrowRight, ExternalLink, LockKeyhole, RefreshCw, RotateCw, SearchCode } from 'lucide-react'
 import type { BrowserPresentation, BrowserSurfaceCommand, BrowserSurfaceRequest, BrowserSurfaceState } from '../../../shared/browser-surface'
+import type { ProjectRecord } from '../../../shared/models'
+import type { RemoteServiceRecord } from '../../../shared/remote-services'
+import { ExecutionTargetChip } from '../components/ExecutionTargetChip'
 import { browserPartition } from './browser-partition'
+import { PreviewServices } from './PreviewServices'
+import { RemotePreviewPicker } from './RemotePreviewPicker'
+import { previewHostLost, previewOriginNote, previewTarget, viewingService as isViewingService } from './preview-services'
 
 const normalizeUrl = (requested: string): string | null => {
   const candidate = requested.trim()
@@ -14,6 +20,16 @@ const normalizeUrl = (requested: string): string | null => {
 
 interface BrowserPaneProps {
   projectId: string | undefined
+  /**
+   * The project record, when the caller has it. A project that lives on a host previews that
+   * host's registered services rather than this computer's localhost - and must say so, because
+   * the tunnel's own address is a loopback port here.
+   */
+  project?: Pick<ProjectRecord, 'id' | 'remote'>
+  /** The machine this tab is placed on, for a paired project whose work runs elsewhere. */
+  machineId?: string
+  /** That machine's name, for the copy; the chip reads the rest from remote state itself. */
+  machineName?: string
   initialUrl?: string
   compact?: boolean
   viewportStorageKey?: string
@@ -50,7 +66,7 @@ export function BrowserPane(props: BrowserPaneProps): React.JSX.Element {
 }
 
 function ProjectBrowserPane({
-  projectId = '', initialUrl = 'http://localhost:3000', compact = false,
+  projectId = '', project, machineId, machineName, initialUrl = 'http://localhost:3000', compact = false,
   viewportStorageKey = 'conductor.browserViewport', browserViewId, visible = true, presentation = 'pane', onUrlChange
 }: BrowserPaneProps): React.JSX.Element {
   const startingUrl = useMemo(() => normalizeUrl(initialUrl) ?? 'http://localhost:3000/', [initialUrl])
@@ -67,6 +83,19 @@ function ProjectBrowserPane({
     return { id: 'phone', width: 390, height: 844 }
   })
   const [scale, setScale] = useState(1)
+  const target = useMemo(() => previewTarget(project ?? (projectId ? { id: projectId } : null), machineId, machineName), [project, projectId, machineId, machineName])
+  /** The host service this pane is currently tunnelled to, so it can be closed again exactly once. */
+  const [service, setService] = useState<RemoteServiceRecord | null>(null)
+  /**
+   * The origin of that tunnel's local end. Held separately from `service` because the address bar
+   * still works: the owner can type their own localhost while a tunnel is open, and from that
+   * moment the pane is no longer showing the host. Labelling by *mode* would then say "Remote:
+   * MAIN" over the laptop's own dev server - the very confusion this label exists to prevent, just
+   * pointing the other way. So everything that names the host is tied to what is actually loaded.
+   */
+  const [serviceOrigin, setServiceOrigin] = useState('')
+  const [serviceError, setServiceError] = useState('')
+  const openedRef = useRef<{ machineId: string; projectId: string; serviceId: string } | null>(null)
   const stageRef = useRef<HTMLDivElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const mounted = useRef(false)
@@ -141,6 +170,42 @@ function ProjectBrowserPane({
     }
   }, [browserViewId, onUrlChange, presentation, projectId, request])
 
+  /**
+   * A tunnel is a real loopback listener on this computer, so leaving one open behind a closed tab
+   * would be a port nobody is watching pointing at a machine nobody is attached to. Closing is
+   * best-effort by design: after a detach the main process has already torn every tunnel down, and
+   * the only thing left to get right here is not to leave a pane pretending it still has one.
+   */
+  const releaseService = useCallback((): void => {
+    const opened = openedRef.current
+    openedRef.current = null
+    if (opened) void window.conductor.remote.services.close(opened).catch(() => {})
+  }, [])
+
+  useEffect(() => releaseService, [releaseService])
+
+  // Changing which machine or project this pane previews invalidates the tunnel it holds.
+  useEffect(() => {
+    releaseService()
+    setService(null)
+    setServiceOrigin('')
+    setServiceError('')
+  }, [releaseService, target.mode === 'controller' ? target.machineId : '', target.mode === 'controller' ? target.projectId : ''])
+
+  // A host that goes away - detached, revoked or simply gone - has already had its tunnels closed
+  // in the main process. Drop the pane's claim to one rather than leaving a dead preview labelled
+  // as live; the picker beneath it then says what to do next.
+  useEffect(() => window.conductor.remote.onState(() => {
+    if (target.mode !== 'controller' || !openedRef.current) return
+    void window.conductor.remote.machines().then(machines => {
+      if (!previewHostLost(machines, target.machineId)) return
+      openedRef.current = null
+      setService(null)
+      setServiceOrigin('')
+      setServiceError(`This preview came from ${target.machineName}, which is no longer available. Nothing is being loaded from it now.`)
+    }).catch(() => {})
+  }), [target])
+
   useEffect(() => { localStorage.setItem(viewportStorageKey, JSON.stringify(viewport)) }, [viewport, viewportStorageKey])
   useEffect(() => {
     const stage = stageRef.current
@@ -156,6 +221,12 @@ function ProjectBrowserPane({
 
   if (!browserViewId) return <div className="browser-pane browser-moved"><strong>Browser moved to the activity rail</strong><span>Use Browser on the left for the project’s persistent preview.</span></div>
 
+  /**
+   * Whether the page on screen really is the host's service. The tunnel may be open while the
+   * owner has navigated somewhere else entirely; only this decides whether the host is named.
+   */
+  const viewingService = isViewingService(state?.url ?? input, serviceOrigin)
+
   const command = (action: BrowserSurfaceCommand): void => {
     setFailure('')
     void window.conductor.browser.command(projectId, action).then(setState).catch(error => setFailure(error instanceof Error ? error.message : String(error)))
@@ -164,6 +235,30 @@ function ProjectBrowserPane({
     const url = normalizeUrl(requested)
     if (!url) { setInvalid(true); return }
     setInvalid(false); setInput(url); command({ type: 'navigate', url })
+  }
+
+  /**
+   * Opens the tunnel for one of the host's registered services and points the pane at its local
+   * end. `localUrl` is the only address this pane ever gets for a host service: there is no URL to
+   * construct, and the page it loads holds no credential - the device key that opened the tunnel
+   * stays in the main process and the guest can reach nothing but this one service.
+   */
+  const openService = (next: RemoteServiceRecord): void => {
+    if (target.mode !== 'controller') return
+    setServiceError('')
+    const scope = { machineId: target.machineId, projectId: target.projectId, serviceId: next.id }
+    const previous = openedRef.current
+    void window.conductor.remote.services.open(scope).then(({ localUrl }) => {
+      // Only once the new one is really open, so a failure leaves the owner on what they had.
+      if (previous && previous.serviceId !== next.id) void window.conductor.remote.services.close(previous).catch(() => {})
+      openedRef.current = scope
+      setService(next)
+      const url = normalizeUrl(localUrl)
+      if (!url) { setServiceError('That machine returned an address this pane cannot load.'); return }
+      setServiceOrigin(new URL(url).origin)
+      setInput(url)
+      command({ type: 'navigate', url })
+    }).catch(reason => setServiceError(reason instanceof Error ? reason.message : String(reason)))
   }
   const selectDevice = (id: DeviceId): void => {
     const preset = devices.find(device => device.id === id)!
@@ -179,7 +274,27 @@ function ProjectBrowserPane({
         <form className={invalid ? 'invalid' : ''} onSubmit={event => { event.preventDefault(); visit(input) }}><LockKeyhole size={10} /><input aria-label="Address" value={input} onChange={event => { setInvalid(false); setInput(event.target.value) }} /></form>
         {!compact && <button title="Open Chromium DevTools" onClick={() => command({ type: 'devtools' })}><SearchCode size={14} /></button>}
         <button title="Open in default browser" onClick={() => void window.conductor.system.openExternal(state?.url || input)}><ExternalLink size={13} /></button>
+        {/* The host half sits next to the address bar because that is where the owner already is
+            when they are thinking about a dev server. It is only ever offered for a project whose
+            ports are actually on this computer. */}
+        {target.mode === 'host' && projectId && <PreviewServices projectId={projectId} />}
+        {/* Whose localhost this is. A laptop looking at MAIN's dev server on a loopback address of
+            its own, next to its own dev server on a similar port, is the confusion this prevents. */}
+        {viewingService && target.mode == 'controller' && <ExecutionTargetChip machineId={target.machineId} />}
       </div>
+      {target.mode === 'controller' && (
+        <div className="browser-remote-bar">
+          <RemotePreviewPicker
+            machineId={target.machineId}
+            machineName={target.machineName}
+            projectId={target.projectId}
+            activeServiceId={service?.id ?? null}
+            onOpen={openService}
+          />
+          {viewingService && service && <p className="browser-remote-origin">{previewOriginNote(service, target.machineName)}</p>}
+          {serviceError && <p className="browser-remote-error" role="alert">{serviceError}</p>}
+        </div>
+      )}
       <div className="browser-device-toolbar" aria-label="Responsive viewport">
         <div className="browser-device-presets">{devices.map(device => <button key={device.id} className={viewport.id === device.id ? 'active' : ''} onClick={() => selectDevice(device.id)}>{device.label}</button>)}</div>
         <label><input aria-label="Viewport width" type="number" min="240" max="3840" value={viewport.width} onChange={event => setViewport({ ...viewport, width: Math.max(240, Number(event.target.value) || 240) })} /> <span>×</span> <input aria-label="Viewport height" type="number" min="320" max="2160" value={viewport.height} onChange={event => setViewport({ ...viewport, height: Math.max(320, Number(event.target.value) || 320) })} /></label>

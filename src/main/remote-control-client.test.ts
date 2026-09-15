@@ -318,3 +318,106 @@ describe('reaching a machine off this network', () => {
     expect(connection.status).toBe('connected')
   })
 })
+
+/** A pairing made over the tailnet: one route, no relay key, no room secret. */
+const tailscaleConnection = {
+  machineId: 'render-desktop', machineName: 'Render Desktop', accountLogin: 'Empire024',
+  host: '100.80.1.2', port: 51840, fingerprint: 'AA:BB', peerId: 'peer-1', transport: 'tailscale',
+  dnsName: 'render-desktop.tail1234.ts.net', generation: 2,
+  projectGrants: [], remoteProjects: [], remoteProjectsAt: null, unconfirmedRemoteProjectIds: [],
+  connectedAt: '2026-03-01T10:00:00.000Z', lastContactAt: null, status: 'connected', message: null
+}
+
+function keyed(stored: unknown[], relay?: { enabled(): boolean; call: RelayCall }) {
+  const store = new MapStore()
+  store.setSetting(CONNECTIONS, JSON.stringify(stored))
+  return {
+    store,
+    client: new RemoteControlClient({
+      store, machineId: () => 'this-machine', machineName: () => 'This Laptop',
+      deviceKey: () => generateDeviceKey('laptop'),
+      now: () => Date.parse('2026-03-02T09:00:00.000Z'),
+      ...(relay ? { relay } : {})
+    })
+  }
+}
+
+type RelayCall = (machineId: string, peerDeviceKey: string, path: string, body: Buffer, headers: Record<string, string>) => Promise<{ status: number; body: string }>
+
+const envelope = (result: unknown): { status: number; body: string } =>
+  ({ status: 200, body: Buffer.from(JSON.stringify({ result }), 'utf8').toString('base64') })
+
+describe('a pairing made over Tailscale', () => {
+  it('keeps the transport, the MagicDNS name and the generation across a restart', () => {
+    const connection = keyed([tailscaleConnection]).client.list()[0]!
+    expect(connection).toMatchObject({ transport: 'tailscale', dnsName: 'render-desktop.tail1234.ts.net', generation: 2 })
+    expect(connection.relayKey).toBeUndefined()
+    expect(connection.deviceKey).toBeUndefined()
+  })
+
+  it('refuses to dial an address that is not on the tailnet, and never reaches for the relay', async () => {
+    const calls: string[] = []
+    const fixture = keyed(
+      [{ ...tailscaleConnection, host: '192.168.1.20', relayKey: 'relay-key', deviceKey: 'device-key' }],
+      { enabled: () => true, call: async (machineId) => { calls.push(machineId); return envelope({}) } }
+    )
+    // Both fallbacks refused at once: the LAN address is not dialled, and the relay key that was
+    // somehow stored alongside it is not used either. There is one route or there is none.
+    await expect(fixture.client.call('render-desktop', 'projects.list')).rejects.toThrow(/only reached at its tailnet address/)
+    expect(calls).toEqual([])
+  })
+
+  it('explains an unreachable tailnet host in terms of Tailscale rather than the relay', async () => {
+    // A record with a tailnet address and no port: nothing to dial and, by construction, nothing
+    // else to try. The owner needs to be sent to Tailscale, not to a relay setting that this
+    // pairing deliberately does not have.
+    const fixture = keyed([{ ...tailscaleConnection, port: 0 }])
+    await expect(fixture.client.call('render-desktop', 'projects.list')).rejects.toThrow(/Tailscale is running and signed in on both computers/)
+  })
+})
+
+describe('using this computer independently of a host', () => {
+  it('sends nothing at all and says why', async () => {
+    const calls: string[] = []
+    const fixture = keyed(
+      [{ ...tailscaleConnection, host: '', relayKey: 'relay-key', deviceKey: 'device-key' }],
+      { enabled: () => true, call: async (machineId) => { calls.push(machineId); return envelope({}) } }
+    )
+    fixture.client.setDetached('render-desktop', true)
+    const refusal = await fixture.client.call('render-desktop', 'projects.list').catch((error: unknown) => error)
+    expect(refusal).toBeInstanceOf(RemoteAccessError)
+    expect((refusal as RemoteAccessError).status).toBe(409)
+    expect((refusal as RemoteAccessError).code).toBe('detached')
+    expect((refusal as RemoteAccessError).message).toMatch(/Using this computer independently of Render Desktop/)
+    // Nothing was attempted: this has to work when the host is off, lost or gone.
+    expect(calls).toEqual([])
+  })
+
+  it('bumps the generation on each detach and attach, keeps the pairing, and remembers it', () => {
+    const fixture = keyed([tailscaleConnection])
+    expect(fixture.client.setDetached('render-desktop', true).generation).toBe(3)
+    // Detaching twice is not two detaches; only a change is a change.
+    expect(fixture.client.setDetached('render-desktop', true).generation).toBe(3)
+    expect(fixture.client.setDetached('render-desktop', false).generation).toBe(4)
+    expect(fixture.client.setDetached('render-desktop', true).generation).toBe(5)
+    const reloaded = keyed(JSON.parse(fixture.store.getSetting(CONNECTIONS) ?? '[]') as unknown[])
+    // Detaching is not forgetting: the pairing, its peer id and its certificate all survive.
+    expect(reloaded.client.list()[0]).toMatchObject({ detached: true, generation: 5, peerId: 'peer-1', fingerprint: 'AA:BB' })
+  })
+
+  it('drops an answer that arrives after the owner detached instead of applying it', async () => {
+    let detach = (): void => {}
+    const fixture = keyed(
+      [{ ...tailscaleConnection, transport: 'relay', host: '', relayKey: 'relay-key', deviceKey: 'device-key' }],
+      { enabled: () => true, call: async () => { detach(); return envelope({ projects: [] }) } }
+    )
+    detach = () => { fixture.client.setDetached('render-desktop', true) }
+    const refusal = await fixture.client.call('render-desktop', 'projects.list').catch((error: unknown) => error)
+    expect(refusal).toBeInstanceOf(RemoteAccessError)
+    expect((refusal as RemoteAccessError).code).toBe('stale-generation')
+    expect((refusal as RemoteAccessError).status).toBe(409)
+    // The work on the other machine really happened; it is only this machine's copy of the world
+    // that must not be written by a reply the owner has already stopped waiting for.
+    expect(fixture.client.list()[0]).toMatchObject({ lastContactAt: null, detached: true })
+  })
+})

@@ -4,7 +4,7 @@ import { Check, ExternalLink, Eye, FilePlus2, FileWarning, LoaderCircle, Save, W
 import type { ProjectRecord } from '../../../shared/models'
 import { dispatchAgentContext } from './StructuredAgentPane'
 import { AgentDialog } from './StructuredAgentRenderers'
-import { recoverEditorDraft } from './editor-draft-state'
+import { isRecoveryDraft, recoverEditorDraft, recoveryDraftLabel, recoveryDraftNotice } from './editor-draft-state'
 import { cleanIpcError, isBinaryFileRefusal, isOverridableFileRefusal } from '../ipc-errors'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, readMachineFile, writeMachineFile } from '../remote-files'
@@ -24,6 +24,10 @@ const languageFor = (path: string): string => {
 export function CodePane({ project, tabId, path, line, allowBinary = false, autoFocus = true, machineId }: { project: ProjectRecord; tabId: string; path: string; line?: number; allowBinary?: boolean; autoFocus?: boolean; machineId?: string }): React.JSX.Element {
   const ownerMachineId = fileMachineId(machineId)
   const remote = isRemoteFileMachine(ownerMachineId)
+  // The host in the owner's words, so a recovery draft names a computer rather than an opaque id.
+  const machineName = project.remote?.machineId === ownerMachineId && project.remote.machineName
+    ? project.remote.machineName
+    : ownerMachineId
   const [wordWrap, setWordWrap] = useState(() => localStorage.getItem('conductor.editorWordWrap') !== 'off')
   const toggleWrap = (): void => setWordWrap((current) => { localStorage.setItem('conductor.editorWordWrap', current ? 'off' : 'on'); return !current })
   const [value, setValue] = useState('')
@@ -31,6 +35,8 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [recovered, setRecovered] = useState(false)
+  /** Set when this buffer is an edit kept from a machine the owner has since detached from. */
+  const [recovery, setRecovery] = useState('')
   const [error, setError] = useState('')
   const [conflict, setConflict] = useState(false)
   const [blocked, setBlocked] = useState(false)
@@ -97,6 +103,7 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
     setLoading(true)
     setSaving(false)
     setRecovered(false)
+    setRecovery('')
     setConflict(false)
     setBlocked(false)
     setReloadOpen(false)
@@ -116,7 +123,16 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
       loadedRef.current = true
       setRecovered(state.recovered)
       setConflict(state.conflict)
-      if (state.conflict) setError('The file on disk differs from this recovered draft. Both versions are preserved; save a copy or reload the file.')
+      // A retained edit from a detached machine is not a conflict to resolve against this disk:
+      // there is no host to compare with, and the local file at the same path is a different file.
+      // Saying "the file on disk differs" about it would invite exactly the overwrite that must
+      // never happen, so it gets its own notice and the ordinary save is refused instead.
+      if (isRecoveryDraft(draft)) {
+        setRecovery(recoveryDraftLabel(draft, machineName))
+        setConflict(false)
+        setError('')
+      }
+      else if (state.conflict) setError('The file on disk differs from this recovered draft. Both versions are preserved; save a copy or reload the file.')
       else if (content === null && !draft) setError('This file no longer exists on disk.')
       // Remove historical clean checkpoints, without writing anything to disk.
       flushDraft()
@@ -181,14 +197,23 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
       } catch (reason) { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) }
     }
     const unsubscribe = window.conductor.files.onChanged(change => {
-      if (remote) return
-      if (change.projectId !== project.id) return
+      // The change has to be on the machine this buffer actually reads from. A notice with no
+      // machineId is a change on this computer, and a local edit to a paired project's own copy
+      // says nothing about the host's file of the same name.
+      //
+      // `refresh` then does the right thing for either: it adopts new bytes only when the buffer is
+      // clean, and otherwise raises the existing "changed on disk" affordance with Save a copy and
+      // Reload, so an unsaved buffer is never silently replaced by the host's version.
+      if (fileMachineId(change.machineId) !== ownerMachineId) return
+      const sameProject = change.projectId === project.id
+        || Boolean(change.remoteProjectId && change.remoteProjectId === project.remote?.remoteProjectId)
+      if (!sameProject) return
       const current = normalize(path), changed = normalize(change.path)
       if (current === changed || current === normalize(project.path) + '/' + changed) void refresh()
     })
     window.addEventListener('focus', refresh)
     return () => { disposed = true; sequence++; unsubscribe(); window.removeEventListener('focus', refresh) }
-  }, [project.id, project.path, path, tabId, ownerMachineId, remote])
+  }, [project.id, project.path, project.remote?.remoteProjectId, path, tabId, ownerMachineId, remote])
 
   useEffect(() => {
     const observer = new MutationObserver(() => {
@@ -424,16 +449,22 @@ export function CodePane({ project, tabId, path, line, allowBinary = false, auto
     <div className="code-pane">
       <div className="code-toolbar">
         <span className="code-path">{path}</span>
-        {remote && <span className="code-recovered" title={ownerMachineId}>Remote · {ownerMachineId}</span>}
-        {recovered && <span className="code-recovered">Recovered draft</span>}
+        {remote && !recovery && <span className="code-recovered" title={ownerMachineId}>Remote · {ownerMachineId}</span>}
+        {recovery && <span className="code-recovered code-recovery" title={recoveryDraftNotice(machineName)}>{recovery}</span>}
+        {recovered && !recovery && <span className="code-recovered">Recovered draft</span>}
         <span className="code-language">{language}</span>
         <button aria-pressed={wordWrap} onClick={toggleWrap} title="Toggle word wrap (Alt+Z)" aria-label="Toggle word wrap"><WrapText size={14} /></button>
         <button onClick={attachContext} disabled={loading} title="Attach selected range, or current editor content, to the last focused agent"><FilePlus2 size={13} /> Attach context</button>
-        <button className={dirty ? 'dirty' : ''} disabled={!dirty || saving} onClick={() => void save()}>
-          {saving ? <LoaderCircle className="spin" size={13} /> : dirty ? <Save size={13} /> : <Check size={13} />}
-          {dirty ? 'Save' : 'Saved'}
-        </button>
+        {/* A recovery draft has nowhere it may legitimately be saved: the host is not attached and
+            the same path here is a different file. Copying it out is the honest action. */}
+        {recovery
+          ? <button onClick={() => void saveCopy()} title={recoveryDraftNotice(machineName)}><Save size={13} /> Save a copy</button>
+          : <button className={dirty ? 'dirty' : ''} disabled={!dirty || saving} onClick={() => void save()}>
+              {saving ? <LoaderCircle className="spin" size={13} /> : dirty ? <Save size={13} /> : <Check size={13} />}
+              {dirty ? 'Save' : 'Saved'}
+            </button>}
       </div>
+      {recovery && <div className="code-recovery-notice" role="note">{recoveryDraftNotice(machineName)}</div>}
       {error && loadedRef.current && <div className="code-save-error" role="alert"><span>{error}</span>{conflict && <div><button onClick={() => void saveCopy()}>Save a copy</button><button disabled={saving} onClick={() => setReloadOpen(true)}>Reload from disk</button></div>}</div>}
       {reloadOpen && <AgentDialog title="Reload from disk?" onClose={() => setReloadOpen(false)}><div className="code-reload-dialog"><p>Reloading replaces your unsaved edits with the current file. Save a copy first if you want to keep both versions.</p><footer><button onClick={() => setReloadOpen(false)}>Cancel</button><button onClick={() => void reload()}>Reload from disk</button></footer></div></AgentDialog>}
       {loading ? (

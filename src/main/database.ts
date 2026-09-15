@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs'
+import { readStoredIdentity } from '../shared/remote-control'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { StructuredAgentStore } from './structured-store'
@@ -16,6 +17,7 @@ import type {
   MemoryPruneCandidate,
   PaneTab,
   ProjectRecord,
+  RemoteProjectOrigin,
   SessionRecord,
   RememberMemoryInput,
   RuntimeProcessSummary,
@@ -42,6 +44,40 @@ import {
 } from './memory'
 
 type DbRow = Record<string, unknown>
+
+/**
+ * The value stored in `projects.path` for a project that lives on another machine.
+ *
+ * That column is UNIQUE and is what `upsertProject` looks a local folder up by, so a remote
+ * project cannot store the host's raw path there: MAIN's `C:\Claude\conductor` and this computer's
+ * `C:\Claude\conductor` would collide, and whichever won would quietly become the other. The key
+ * below can never be produced by a real local path, so opening a host project and opening a local
+ * folder of the same name are structurally different rows - which is the whole point of keying a
+ * remote project by machine id. The host's path is kept in `remote_json` and is what is displayed.
+ */
+const remoteProjectKey = (machineId: string, remoteProjectId: string): string =>
+  `conductor-remote://${encodeURIComponent(machineId)}/${encodeURIComponent(remoteProjectId)}`
+
+/** Only a whole origin is an origin; half of one would be a guess about which machine owns a project. */
+function readRemoteOrigin(stored: unknown): RemoteProjectOrigin | null {
+  // (identity is read below with readStoredIdentity, which only accepts a whole one.)
+  if (typeof stored !== 'string' || !stored) return null
+  let parsed: unknown
+  try { parsed = JSON.parse(stored) } catch { return null }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  const { machineId, machineName, remoteProjectId, path } = parsed as Partial<RemoteProjectOrigin>
+  if (typeof machineId !== 'string' || !machineId || machineId === LOCAL_MACHINE_ID) return null
+  if (typeof remoteProjectId !== 'string' || !remoteProjectId) return null
+  // Only a whole identity is kept; a partial one is not an identity and never matches.
+  const identity = readStoredIdentity((parsed as { identity?: unknown }).identity)
+  return {
+    machineId,
+    machineName: typeof machineName === 'string' ? machineName : '',
+    remoteProjectId,
+    path: typeof path === 'string' ? path : '',
+    ...(identity ? { identity } : {})
+  }
+}
 
 const recoveryIdentity = /^[a-zA-Z0-9_-]{1,160}$/
 const recoveryDocumentOwner = /^(?:project|detached):[a-zA-Z0-9_-]{1,160}$/
@@ -215,7 +251,12 @@ export class ConductorDatabase {
     const mapped = (id: string): string => { let value = remapping.get(id); if (!value) { value = makeId('import'); remapping.set(id, value) }; return value }
     const existingProjects = this.listProjects()
     for (const p of archive.projects) {
-      const existing = existingProjects.find(other => other.path.replaceAll('\\', '/').toLowerCase() === p.path.replaceAll('\\', '/').toLowerCase())
+      // A project that lives on another machine is matched by that machine and its project id
+      // there, never by path: the archive carries MAIN's path, and a local folder that happens
+      // to sit at the same path is a different working copy that must not absorb it.
+      const existing = p.remote
+        ? existingProjects.find(other => other.remote?.machineId === p.remote!.machineId && other.remote.remoteProjectId === p.remote!.remoteProjectId)
+        : existingProjects.find(other => !other.remote && other.path.replaceAll('\\', '/').toLowerCase() === p.path.replaceAll('\\', '/').toLowerCase())
       remapping.set(p.id, existing?.id ?? makeId('project'))
     }
     const mapTab = (tab: PaneTab): PaneTab => ({ ...tab, id: mapped(tab.id), ...(tab.tabGroupId ? { tabGroupId: mapped(tab.tabGroupId) } : {}), ...(['agent', 'terminal'].includes(tab.kind) && tab.resourceId ? { resourceId: mapped(tab.resourceId) } : {}) })
@@ -250,7 +291,14 @@ export class ConductorDatabase {
       // A recoverable previous desk remains in the same database, with its exact old IDs/drafts.
       this.setSetting('sessionArchivePreviousDesk', JSON.stringify({ name: this.getSetting('sessionArchiveName') ?? '', projects: this.listDeskProjects().map(p => p.id), selection: this.getWorkspaceRecoveryState(), workspaces: this.listDeskProjects().flatMap(p => this.listSessions(p.id)).map(s => s.id), detached: this.listDeskDetachedWindows().map(d => d.id) }))
       for (const p of this.listDeskProjects()) for (const s of this.listSessions(p.id)) this.closeSession(s.id)
-      for (const p of archive.projects) if (!existingProjects.some(existing => existing.id === mapped(p.id))) this.db.prepare('INSERT INTO projects(id,name,path,created_at,updated_at) VALUES(?,?,?,?,?)').run(mapped(p.id), p.name, p.path, p.createdAt, p.updatedAt)
+      // The origin travels with the row. Importing a remote project as a local one would hand
+      // this computer a project whose path points at a folder it does not have, with every
+      // guard in project-scope.ts switched off for it - the one outcome none of this may produce.
+      for (const p of archive.projects) if (!existingProjects.some(existing => existing.id === mapped(p.id))) this.db.prepare('INSERT INTO projects(id,name,path,created_at,updated_at,remote_json) VALUES(?,?,?,?,?,?)')
+        .run(mapped(p.id), p.name,
+          p.remote ? remoteProjectKey(p.remote.machineId, p.remote.remoteProjectId) : p.path,
+          p.createdAt, p.updatedAt,
+          p.remote ? JSON.stringify({ ...p.remote, path: p.remote.path || p.path }) : null)
       for (const s of archive.workspaces) this.db.prepare('INSERT INTO sessions(id,project_id,name,layout_json,maximized_group_id,closed_tabs_json,continue_on_limit,created_at,updated_at) VALUES(?,?,?,?,?,?,0,?,?)').run(mapped(s.id), mapped(s.projectId), s.name, JSON.stringify(mapLayout(s.layout)), s.maximizedGroupId ? mapped(s.maximizedGroupId) : null, JSON.stringify(s.closedTabs.map(mapTab)), s.createdAt, s.updatedAt)
       for (const d of archive.detached) this.db.prepare('INSERT INTO detached_windows(id,project_id,session_id,layout_json,maximized_group_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').run(mapped(d.id), mapped(d.projectId), mapped(d.sessionId), JSON.stringify(mapLayout(d.layout)), d.maximizedGroupId ? mapped(d.maximizedGroupId) : null, d.createdAt, d.updatedAt)
       for (const a of archive.agents) {
@@ -471,6 +519,13 @@ export class ConductorDatabase {
     // a null origin reads as "unknown" in the pane rather than pretending to a source.
     this.ensureColumn('memories', 'origin_json', 'TEXT')
     this.ensureColumn('memories', 'corrected_at', 'TEXT')
+    // Null for every project that lives on this computer, which is all of them until a host is
+    // attached. A row with this set is a window onto another machine's working copy and nothing
+    // about it is ever read from or written to this disk (see project-scope.ts).
+    this.ensureColumn('projects', 'remote_json', 'TEXT')
+    // When the owner detached from the host, so an unsaved remote edit is shown as a labelled
+    // recovery draft rather than as a live buffer over a file nothing here can reach.
+    this.ensureColumn('editor_drafts', 'recovered_at', 'TEXT')
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -527,9 +582,37 @@ export class ConductorDatabase {
     return this.getProject(id)!
   }
 
+  /**
+   * Adds a project that lives on a paired machine: a window onto that machine's working copy with
+   * no local copy at all. Deliberately a separate call from `upsertProject` rather than a flag on
+   * it, so there is no path through which a local folder acquires a remote origin or a host project
+   * acquires a local one. Opening the same host project twice returns the row already there.
+   */
+  addRemoteProject(request: { name: string; path: string; remote: RemoteProjectOrigin }): ProjectRecord {
+    const { machineId, machineName, remoteProjectId } = request.remote
+    if (!machineId || machineId === LOCAL_MACHINE_ID) throw new Error('A remote project needs the machine it lives on.')
+    if (!remoteProjectId) throw new Error('A remote project needs that machine’s own project id.')
+    const origin: RemoteProjectOrigin = { machineId, machineName, remoteProjectId, path: request.path, ...(request.remote.identity ? { identity: request.remote.identity } : {}) }
+    const key = remoteProjectKey(machineId, remoteProjectId)
+    const existing = this.db.prepare('SELECT * FROM projects WHERE path = ?').get(key) as DbRow | undefined
+    const timestamp = now()
+    if (existing) {
+      // The host may have been renamed or the folder moved there since; the pairing is the same.
+      this.db.prepare('UPDATE projects SET name = ?, remote_json = ?, updated_at = ? WHERE id = ?')
+        .run(request.name, JSON.stringify(origin), timestamp, existing.id as string)
+      return this.getProject(existing.id as string)!
+    }
+    const id = makeId('project')
+    this.db.prepare('INSERT INTO projects (id, name, path, created_at, updated_at, remote_json) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, request.name, key, timestamp, timestamp, JSON.stringify(origin))
+    this.createSession(id, 'Workspace')
+    return this.getProject(id)!
+  }
+
   updateProjectPath(projectId: string, path: string): ProjectRecord {
     const project = this.getProject(projectId)
     if (!project) throw new Error('Project not found')
+    if (project.remote) throw new Error(`This project lives on ${project.remote.machineName || 'another machine'}. Its folder is that machine’s to move.`)
     const timestamp = now()
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -568,6 +651,7 @@ export class ConductorDatabase {
   updateProjectLocation(projectId: string, path: string, name: string): ProjectRecord {
     const project = this.getProject(projectId)
     if (!project) throw new Error('Project not found')
+    if (project.remote) throw new Error(`This project lives on ${project.remote.machineName || 'another machine'}. Its folder is that machine’s to move.`)
     const timestamp = now()
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -828,7 +912,8 @@ export class ConductorDatabase {
       content: row.content as string,
       baseContent: row.base_content_json == null ? undefined : JSON.parse(row.base_content_json as string) as string | null,
       viewState,
-      updatedAt: row.updated_at as string
+      updatedAt: row.updated_at as string,
+      recoveredAt: (row.recovered_at as string | null) ?? null
     }
   }
 
@@ -847,6 +932,29 @@ export class ConductorDatabase {
 
   removeEditorDraft(tabId: string): void {
     this.db.prepare('DELETE FROM editor_drafts WHERE tab_id = ?').run(tabId)
+  }
+
+  /**
+   * Keeps every unsaved edit made against a host as a labelled recovery draft, on detach.
+   *
+   * Detaching must lose nothing the owner typed, and must also not pretend the edit is still live:
+   * after it there is no connection to compare against, nothing to save through, and the same path
+   * on this computer is a different file. So the draft is kept, marked, and from then on can only
+   * be read, copied or saved somewhere else by hand - it is never written to a local file, and it
+   * is never replayed to the host if the owner attaches again. Returns how many were retained.
+   */
+  retainRemoteDrafts(machineId: string, at = now()): number {
+    if (!machineId || machineId === LOCAL_MACHINE_ID) return 0
+    const result = this.db
+      .prepare('UPDATE editor_drafts SET recovered_at = ? WHERE machine_id = ? AND recovered_at IS NULL')
+      .run(at, machineId)
+    return Number(result.changes ?? 0)
+  }
+
+  /** Every retained edit from a host, newest last, for the recovery list. */
+  listRecoveredDrafts(machineId?: string): EditorDraft[] {
+    return this.listEditorDrafts().filter(draft =>
+      Boolean(draft.recoveredAt) && (!machineId || (draft.machineId ?? LOCAL_MACHINE_ID) === machineId))
   }
 
   reconcileInterruptedRuntimes(): void {
@@ -1406,13 +1514,19 @@ export class ConductorDatabase {
     this.db.close()
   }
 
-  private mapProject = (row: DbRow): ProjectRecord => ({
-    id: row.id as string,
-    name: row.name as string,
-    path: row.path as string,
-    createdAt: row.created_at as string,
-    updatedAt: row.updated_at as string
-  })
+  private mapProject = (row: DbRow): ProjectRecord => {
+    const remote = readRemoteOrigin(row.remote_json)
+    return {
+      id: row.id as string,
+      name: row.name as string,
+      // For a remote project the column holds the collision-proof key, not a path anyone should
+      // see; the host's own path lives in the origin and is what the owner is shown.
+      path: remote ? remote.path : row.path as string,
+      createdAt: row.created_at as string,
+      updatedAt: row.updated_at as string,
+      ...(remote ? { remote } : {})
+    }
+  }
 
   private mapSession = (row: DbRow): SessionRecord => ({
     id: row.id as string,

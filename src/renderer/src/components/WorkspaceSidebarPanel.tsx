@@ -53,7 +53,10 @@ export function WorkspaceSidebarPanel({
   }, [project, projects])
   const browsers = availableProjects
     .filter(item => mountedBrowserProjects.has(item.id) || (mode === 'browser' && item.id === project?.id))
-    .map(item => <BrowserSidebar key={`browser:${item.id}`} projectId={item.id} active={mode === 'browser' && item.id === project?.id} />)
+    // The whole record, not just the id: a project that lives on a host previews that host's
+    // registered services rather than this computer's localhost, and the pane cannot tell the
+    // difference from an id alone.
+    .map(item => <BrowserSidebar key={`browser:${item.id}`} project={item} projectId={item.id} active={mode === 'browser' && item.id === project?.id} />)
   // Every explicitly opened project browser remains one mounted guest. Hiding the sidebar or
   // selecting another project changes only presentation, so background agent work retains its
   // page, cookies, console buffer and project partition without opening a workspace tab.

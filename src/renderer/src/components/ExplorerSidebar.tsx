@@ -32,6 +32,10 @@ import {
   defaultExplorerOpenMode,
   type ExplorerOpenMode
 } from './workspace-sidebar-types'
+import { LOCAL_MACHINE_ID, type MachineDescriptor } from '../../../shared/remote-control'
+import { RemoteFilesPane } from '../panes/RemoteFilesPane'
+import { remoteExplorerView } from './remote-project-tree'
+import { openWorkspaceFile } from './workspace-files-state'
 import './ExplorerSidebar.css'
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag, encodeConductorFileDrag, isComposerFileDrag } from './composer-file-drop'
 
@@ -202,7 +206,75 @@ function ExplorerRows({
   )
 }
 
-export function ExplorerSidebar({
+/**
+ * Which tree a project row gets.
+ *
+ * A project that lives on another machine has no files on this disk, so the explorer below would
+ * ask the local lister and be refused - correctly, but as an error string, which reads as a bug
+ * rather than as "these files are on MAIN". Routing happens here, above every hook, so a local
+ * project renders through exactly the component it always did and nothing about it changes.
+ */
+export function ExplorerSidebar(props: ExplorerSidebarProps): React.JSX.Element {
+  const [machines, setMachines] = useState<MachineDescriptor[]>([])
+  const remote = Boolean(props.project.remote?.machineId)
+
+  useEffect(() => {
+    if (!remote) return
+    let live = true
+    const read = (): void => { void window.conductor.remote.machines().then(list => { if (live) setMachines(list) }).catch(() => { if (live) setMachines([]) }) }
+    read()
+    // Attaching, detaching or a host dropping all arrive as remote state, so a row never sits
+    // claiming to be browsable after the machine behind it has gone.
+    const stop = window.conductor.remote.onState(read)
+    return () => { live = false; stop() }
+  }, [remote])
+
+  if (!remote) return <LocalExplorerSidebar {...props} />
+  return <RemoteExplorerSidebar {...props} machines={machines} />
+}
+
+/**
+ * A project browsed on the machine that holds it. The tree itself is the same RemoteFilesPane the
+ * workspace uses, so it already follows the host's own file changes; what is added here is the row
+ * that names the machine and the state for when that machine is not available.
+ */
+function RemoteExplorerSidebar({ project, machines, defaultCollapsed = false }: ExplorerSidebarProps & { machines: MachineDescriptor[] }): React.JSX.Element {
+  const [collapsed, setCollapsed] = useState(defaultCollapsed)
+  const view = remoteExplorerView(project, machines)
+  if (view.kind === 'local') return <LocalExplorerSidebar project={project} defaultCollapsed={defaultCollapsed} />
+
+  return (
+    <section data-project-id={project.id} className={'workspace-sidebar-pane explorer-sidebar explorer-root explorer-remote' + (collapsed ? ' root-collapsed' : '')} aria-label={project.name}>
+      <div role="button" tabIndex={0} aria-expanded={!collapsed} className="explorer-project"
+        title={`${view.badge.title}\n${project.path} (on ${view.machineName})`}
+        onClick={() => setCollapsed(current => !current)}
+        onKeyDown={event => {
+          if ((event.key === 'Enter' || event.key === ' ') && event.target === event.currentTarget) { event.preventDefault(); setCollapsed(current => !current) }
+        }}
+      >
+        {collapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+        <FolderOpen size={14} />
+        <strong className="ellipsis">{project.name}</strong>
+        <span className={`project-remote-badge ${view.badge.unavailable ? 'unavailable' : ''}`}>{view.badge.label}</span>
+      </div>
+      {!collapsed && (view.kind === 'unavailable'
+        // Never the local lister. This computer's folder at the same path is a different working
+        // copy, and silently browsing it is the exact mistake a remote project exists to prevent.
+        ? <div className="explorer-remote-unavailable">{view.message}</div>
+        : <RemoteFilesPane
+            machineId={view.machineId}
+            machineName={view.machineName}
+            projectId={view.projectId}
+            files={window.conductor.remote.files}
+            // The document store is keyed by this computer's id for the project, and the machine is
+            // what sends the editor down the remote read/write path rather than to this disk.
+            onOpenFile={file => openWorkspaceFile(project.id, file.path, 'editor', undefined, undefined, file.machineId)}
+          />)}
+    </section>
+  )
+}
+
+function LocalExplorerSidebar({
   project,
   defaultCollapsed = false,
   onOpenFile,

@@ -14,6 +14,8 @@ import { writeEditorFile } from './editor-files'
 import type { ProjectBacklogs } from './project-backlog'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { RemoteAccessError, type RemotePeers } from './remote-peers'
+import type { RemoteServiceRegistry } from './remote-services'
+import { RemoteTerminalHost, type RemoteTerminalStream, type TerminalRuntime } from './remote-terminals'
 import type { StructuredSessions } from './structured-sessions'
 import { readTextFile } from './text-files'
 import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES } from '../shared/remote-files'
@@ -83,7 +85,16 @@ export const remoteToolSignatures = {
   'files.readChunk': '({projectId,path,offset,length,version}) — at most 256 KiB from that exact version',
   'files.open': '({projectId,sessionId,path})',
   'tasks.list': '({projectId})',
-  'tasks.update': '({projectId,revision,id,status?,title?,priority?})'
+  'tasks.update': '({projectId,revision,id,status?,title?,priority?})',
+  // A shell on this machine runs as this machine's user. docs/multi-device.md says what that
+  // means; these methods are the only door to it, and every one of them goes through the grant.
+  'terminals.list': '({projectId,sessionId}) — shells this machine is running in that workspace',
+  'terminals.open': '({projectId,sessionId,opId,title?,cols,rows}) — opens a shell here and a visible tab for it; a retry with the same opId finds the first one',
+  'terminals.attach': '({projectId,sessionId,terminalId,fromOffset}) — buffered output from an offset, with what the buffer no longer holds reported as lost',
+  'terminals.write': '({projectId,sessionId,terminalId,data}) — data base64',
+  'terminals.resize': '({projectId,sessionId,terminalId,cols,rows})',
+  'terminals.close': '({projectId,sessionId,terminalId}) — stops the shell; unsubscribing from the stream does not',
+  'services.list': '({projectId}) — preview services this machine\'s owner registered for that project'
 } as const
 
 export interface RemoteControlHostDependencies {
@@ -95,11 +106,58 @@ export interface RemoteControlHostDependencies {
   ui(request: AgentControlUiRequest): Promise<unknown>
   fileChanged(change: AgentFileChange): void
   machineName(): string
+  /** This machine's PTYs. Without it `terminals.*` is refused rather than silently unavailable. */
+  terminals?: TerminalRuntime
+  /** The push channel terminal output is fanned out over, when one is running. */
+  terminalStream?: RemoteTerminalStream
+  /** The owner's registered preview services, for `services.list`. */
+  services?: RemoteServiceRegistry
 }
 
 /** Serves one authenticated peer's calls against this machine's own projects. */
 export class RemoteControlHost {
-  constructor(private readonly deps: RemoteControlHostDependencies) {}
+  /**
+   * The terminal half, constructed here rather than passed in because it needs this host's own
+   * grant check and its own tab-opening path, and handing those out would put the trust boundary
+   * in whoever wired it up.
+   */
+  readonly terminals: RemoteTerminalHost | null
+
+  constructor(private readonly deps: RemoteControlHostDependencies) {
+    const runtime = deps.terminals
+    this.terminals = !runtime ? null : new RemoteTerminalHost({
+      terminals: runtime,
+      workspace: (peer, args) => this.workspace(peer, args),
+      // A stream subscription carries only the peer id, so the grant is re-resolved from it
+      // against the project the named shell actually belongs to.
+      authorize: (peerId, projectId) => { this.deps.peers.requirePromptAuthority(peerId, projectId) },
+      openTab: async (peer, request) => {
+        const opened = await this.open(peer, request.projectId, request.sessionId,
+          { kind: 'terminal', title: request.title, terminalId: request.terminalId }, 'terminals.open')
+        return { id: (opened as PaneTab).id }
+      },
+      closeTab: async (peer, request) => {
+        if (!this.tabs(request.projectId, request.sessionId).some(tab => tab.id === request.tabId)) return
+        await this.ui(request.projectId, request.sessionId, 'tabs.close', { tabId: request.tabId })
+      },
+      tabId: (projectId, sessionId, terminalId) => {
+        try {
+          return this.tabs(projectId, sessionId).find(tab => tab.kind === 'terminal' && tab.resourceId === terminalId)?.id ?? null
+        } catch {
+          // A workspace that has since moved or gone simply has no tab to name; the shell itself
+          // is still perfectly listable.
+          return null
+        }
+      },
+      projectPath: projectId => this.deps.database.getProject(projectId)?.path ?? null,
+      stream: deps.terminalStream
+    })
+  }
+
+  /** The stream host is built after this one, so it attaches itself here once it exists. */
+  useTerminalStream(stream: RemoteTerminalStream): void {
+    this.terminals?.useStream(stream)
+  }
 
   private workspace(peer: RemotePeerRecord, args: Args): { projectId: string; sessionId: string } {
     const project = this.deps.peers.requireProject(peer, args.projectId)
@@ -326,6 +384,14 @@ export class RemoteControlHost {
       if (saved.status === 'saved') { invalidateProjectFiles(project.path); this.deps.fileChanged({ projectId: project.id, path: relativePath }) }
       return saved
     }
+    if (method === 'services.list') {
+      if (!this.deps.services) throw new RemoteAccessError('This machine is not sharing any services.', 503)
+      return this.deps.services.list(peer, args.projectId)
+    }
+    if (method.startsWith('terminals.')) {
+      if (!this.terminals) throw new RemoteAccessError('Terminals are not available on this machine.', 503)
+      return this.terminals.call(peer, method, args)
+    }
     if (method === 'tasks.list') return backlogs.get(this.deps.peers.requireProject(peer, args.projectId).id)
     if (method === 'tasks.update') {
       const project = this.deps.peers.requireProject(peer, args.projectId)
@@ -420,14 +486,27 @@ export class RemoteControlHost {
    * Opens a real, visible tab on this machine. The remote caller never gets more autonomy than it
    * asks for and the peer's machine is stamped on the tab so the owner can see whose work it is.
    */
-  private async open(peer: RemotePeerRecord, projectId: string, sessionId: string, args: Args): Promise<unknown> {
+  private async open(peer: RemotePeerRecord, projectId: string, sessionId: string, args: Args, source: 'tabs.open' | 'terminals.open' = 'tabs.open'): Promise<unknown> {
     const kind = args.kind === undefined ? 'agent' : String(args.kind)
-    // A terminal tab is a PTY on this machine, and the approval prompt promises a peer no shell.
     // Kinds a peer may open are listed here rather than excluded, so a new tab kind is opt-in.
-    if (!['agent', 'file-tree', 'tasks', 'logs'].includes(kind)) throw new RemoteAccessError('Unsupported remote tab kind.', 400)
+    const allowed = ['agent', 'file-tree', 'tasks', 'logs']
+    // A terminal tab is a PTY on this machine. `tabs.open` may never ask for one: the only way a
+    // paired machine gets a shell here is terminals.open, which is the trust boundary
+    // docs/multi-device.md spells out - a device allowed to open a shell acts as this machine's
+    // user, reaching every file, credential and network this machine's own commands reach. That
+    // decision belongs to the operation the owner approved, with its grant, its bounded write and
+    // its ring buffer, not to a general "open me a tab" call.
+    if (source === 'terminals.open') allowed.push('terminal')
+    if (!allowed.includes(kind)) throw new RemoteAccessError('Unsupported remote tab kind.', 400)
     const project = this.deps.database.getProject(projectId)
     if (!project) throw new RemoteAccessError('That project is no longer registered on this machine.', 404)
     const tab: PaneTab = { id: makeId('tab'), kind: kind as PaneTab['kind'], title: args.title === undefined ? (kind === 'agent' ? 'Agent' : kind) : text(args, 'title', 120) }
+    if (kind === 'terminal') {
+      // The pane binds to the shell that terminals.open already started; it never spawns one, and
+      // it is stamped like a remote agent tab so the owner sees whose shell is running here.
+      tab.resourceId = text(args, 'terminalId', 160)
+      tab.state = { machineId: LOCAL_MACHINE_ID, remotePeerId: peer.id, remoteMachineName: peer.machineName }
+    }
     if (kind === 'agent') {
       const provider = String(args.provider ?? 'codex') as StructuredProvider
       const entry = this.deps.providers().find(candidate => candidate.id === provider && candidate.available)

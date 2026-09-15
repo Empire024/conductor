@@ -76,13 +76,17 @@ export class RemoteFiles {
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     if (connection.status === 'revoked') throw new RemoteAccessError('That machine revoked this pairing.', 403, 'peer-revoked')
     if (!connection.peerId) throw new RemoteAccessError('That pairing has not been approved yet.', 409)
+    // Named by this computer's id for the project or - for a project that lives on that machine -
+    // by the host's own id, which is what its origin records and what its panes are keyed by. Either
+    // way it is the confirmed grant that is used, never the name.
     const grant = connection.projectGrants.find(entry => entry.localProjectId === file.projectId)
+      ?? connection.projectGrants.find(entry => entry.remoteProjectId === file.projectId)
     if (!grant) throw new RemoteAccessError('This project is not mapped to that machine.', 409)
-    const local = this.deps.project(file.projectId)
+    const local = this.deps.project(grant.localProjectId)
     if (!local?.identity) throw new RemoteAccessError(local?.identityError || 'This project identity is unavailable.', 409)
     return {
       machineId: file.machineId,
-      localProjectId: file.projectId,
+      localProjectId: grant.localProjectId,
       connection,
       revision: this.deps.client.authorityRevision(file.machineId),
       grant,

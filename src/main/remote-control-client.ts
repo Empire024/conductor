@@ -8,6 +8,7 @@ import { signChallenge, type ChallengePayload } from './device-key'
 import type { DeviceKeyPair } from './device-key'
 import { hashBody, NONCE_HEADER, PEER_HEADER, RemoteAccessError, SIGNATURE_HEADER, TIMESTAMP_HEADER } from './remote-peers'
 import type { SecretKeyValueStore } from './secret-store'
+import { isTailscaleAddress } from './tailscale'
 
 const CONNECTIONS_SETTING = 'remote-control.connections'
 const REQUEST_TIMEOUT_MS = 60000
@@ -66,6 +67,13 @@ interface RemoteTarget {
   fingerprint: string
   relayKey?: string
   deviceKey?: string
+  /**
+   * Pinned at pairing rather than observed. 'tailscale' means this pairing has exactly one route
+   * and no fallback of any kind: no relay, no gist mailbox, and no address that is not on the
+   * tailnet. It is carried on the target so the single place that decides how a request travels
+   * can see it, instead of the rule living in each caller.
+   */
+  transport?: 'direct' | 'relay' | 'tailscale'
 }
 
 interface WireResponse { result?: unknown; error?: string; code?: string }
@@ -198,7 +206,12 @@ export class RemoteControlClient {
         // keeps working over its direct address exactly as it did.
         ...(typeof stored.relayKey === 'string' && stored.relayKey ? { relayKey: stored.relayKey } : {}),
         ...(typeof stored.deviceKey === 'string' && stored.deviceKey ? { deviceKey: stored.deviceKey } : {}),
-        ...(stored.transport === 'direct' || stored.transport === 'relay' ? { transport: stored.transport } : {}),
+        ...(stored.transport === 'direct' || stored.transport === 'relay' || stored.transport === 'tailscale' ? { transport: stored.transport } : {}),
+        ...(typeof stored.dnsName === 'string' && stored.dnsName ? { dnsName: stored.dnsName.slice(0, 300) } : {}),
+        // Detachment is the owner's own choice and outlives a restart; the generation with it, so a
+        // reply that was already in flight when they detached cannot be applied after one.
+        ...(stored.detached === true ? { detached: true } : {}),
+        generation: Number.isSafeInteger(stored.generation) && (stored.generation as number) >= 0 ? stored.generation as number : 0,
         peerId: typeof stored.peerId === 'string' ? stored.peerId : '',
         connectedAt: String(stored.connectedAt ?? new Date(0).toISOString()),
         lastContactAt: typeof stored.lastContactAt === 'string' ? stored.lastContactAt : null,
@@ -233,14 +246,15 @@ export class RemoteControlClient {
     this.persist()
   }
 
-  private target(source: Pick<RemoteTarget, 'machineId' | 'host' | 'port' | 'fingerprint'> & { relayKey?: string; deviceKey?: string }): RemoteTarget {
+  private target(source: Pick<RemoteTarget, 'machineId' | 'host' | 'port' | 'fingerprint'> & { relayKey?: string; deviceKey?: string; transport?: RemoteTarget['transport'] }): RemoteTarget {
     return {
       machineId: source.machineId,
       host: source.host,
       port: source.port,
       fingerprint: source.fingerprint,
       ...(source.relayKey ? { relayKey: source.relayKey } : {}),
-      ...(source.deviceKey ? { deviceKey: source.deviceKey } : {})
+      ...(source.deviceKey ? { deviceKey: source.deviceKey } : {}),
+      ...(source.transport ? { transport: source.transport } : {})
     }
   }
 
@@ -257,6 +271,12 @@ export class RemoteControlClient {
     // answered and it was not that machine" are both reported this way and only the first is worth
     // trying again.
     const carrying = (error: RemoteAccessError): RemoteAccessError => Object.assign(error, { cause })
+    // A Tailscale pairing has no second route by construction, so naming the relay here would send
+    // the owner to a setting that is deliberately irrelevant to this connection.
+    if (target.transport === 'tailscale') {
+      return carrying(new RemoteAccessError(
+        `${target.machineId} did not answer ${where}${detail}. Check that Tailscale is running and signed in on both computers, and that Conductor is open on that one.`, 503))
+    }
     if (!target.relayKey || !target.deviceKey) {
       return carrying(new RemoteAccessError(
         `${target.machineId} answered nowhere ${where}${detail}. It was paired before the encrypted relay existed, so it can only be reached on the network it was paired on. Create a new pairing code on that machine and pair again to reach it from anywhere.`, 503))
@@ -276,7 +296,16 @@ export class RemoteControlClient {
    */
   private async send(target: RemoteTarget, path: string, body: Buffer, headers: Record<string, string>, options: RemoteCallOptions = {}): Promise<{ result: unknown; transport: 'direct' | 'relay' }> {
     const relay = this.deps.relay
-    const canRelay = Boolean(target.relayKey && target.deviceKey && relay?.enabled())
+    // The one place the "Tailscale and nothing else" rule is enforced for RPC. A pairing made over
+    // the tailnet keeps no relay key and no room secret, so there is nothing to fall back to even
+    // by accident - and the address is checked here as well, because a stored record that somehow
+    // named a LAN address would otherwise be dialled in the clear.
+    const tailscaleOnly = target.transport === 'tailscale'
+    if (tailscaleOnly && !isTailscaleAddress(target.host)) {
+      throw new RemoteAccessError(
+        `${target.machineId} was paired over Tailscale, so it is only reached at its tailnet address; ${target.host || 'no address'} is not one. Create a new pairing code on that machine.`, 503)
+    }
+    const canRelay = !tailscaleOnly && Boolean(target.relayKey && target.deviceKey && relay?.enabled())
     let routeError: unknown = null
     if (target.host && target.port > 0) {
       try { return { result: await post(target.host, target.port, target.fingerprint, path, body, headers, canRelay ? DIRECT_PROBE_TIMEOUT_MS : undefined), transport: 'direct' } }
@@ -378,8 +407,15 @@ export class RemoteControlClient {
       host: ticket.host,
       port: ticket.port,
       fingerprint: ticket.fingerprint,
-      ...(ticket.relayKey ? { relayKey: ticket.relayKey } : {}),
-      ...(ticket.deviceKey ? { deviceKey: ticket.deviceKey } : {}),
+      ...(ticket.transport === 'tailscale' ? {} : {
+        ...(ticket.relayKey ? { relayKey: ticket.relayKey } : {}),
+        ...(ticket.deviceKey ? { deviceKey: ticket.deviceKey } : {})
+      }),
+      // A Tailscale code carries no relay key and no room secret, and the transport is recorded
+      // from the code rather than from whatever happens to carry the first call.
+      ...(ticket.transport === 'tailscale' ? { transport: 'tailscale' as const } : {}),
+      ...(ticket.dnsName ? { dnsName: ticket.dnsName } : {}),
+      generation: 0,
       peerId: '',
       projectGrants: [],
       remoteProjects: [],
@@ -472,13 +508,44 @@ export class RemoteControlClient {
     return readPairingResult((await this.send(this.target(ticket), '/remote/pair/status', body, {})).result)
   }
 
+  /**
+   * The owner's "use this computer independently", and the way back.
+   *
+   * The generation is what makes it safe rather than merely polite. Detaching cannot cancel a
+   * request the other machine has already received, so an answer to it may still be on its way;
+   * bumping the generation means that answer arrives against a number nobody is using any more and
+   * is dropped instead of writing into state the owner is now editing locally. The pairing itself
+   * is untouched, because detaching is not forgetting.
+   */
+  setDetached(machineId: string, detached: boolean): RemoteConnection {
+    const connection = this.connections.find(entry => entry.machineId === machineId)
+    if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
+    if (Boolean(connection.detached) === detached) return { ...connection }
+    connection.detached = detached
+    connection.generation = (connection.generation ?? 0) + 1
+    this.bumpAuthority(machineId)
+    this.persist()
+    return { ...connection }
+  }
+
+  generation(machineId: string): number {
+    return this.get(machineId)?.generation ?? 0
+  }
+
   /** One authenticated call to a paired machine. Every call is signed over its exact body. */
   async call(machineId: string, method: string, args: Record<string, unknown> = {}, options: RemoteCallOptions = {}): Promise<unknown> {
     const connection = this.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
+    // Nothing is sent, nothing is retried, and no reason to look at the network: the owner said to
+    // work without that host, and this has to hold when the host is off, lost or gone.
+    if (connection.detached) {
+      throw new RemoteAccessError(
+        `Using this computer independently of ${connection.machineName}, so nothing was sent to it. Attach it again to work on it from here.`, 409, 'detached')
+    }
     if (connection.status === 'revoked') throw new RemoteAccessError('That machine revoked this pairing.', 403)
     if (!connection.peerId) throw new RemoteAccessError('That pairing has not been approved yet.', 409)
     const authorityRevision = this.authorityRevision(machineId)
+    const generation = connection.generation ?? 0
     const body = Buffer.from(JSON.stringify({ method, args }), 'utf8')
     const { payload, signature } = this.sign(connection, 'call', hashBody(body))
     try {
@@ -488,10 +555,16 @@ export class RemoteControlClient {
         [TIMESTAMP_HEADER]: String(payload.issuedAt),
         [SIGNATURE_HEADER]: signature
       }, options)
+      // The answer is real and the work on the other machine happened; it is only this machine's
+      // copy of it that must not be updated, because the owner detached while it was in flight.
+      if (this.generation(machineId) !== generation) {
+        throw new RemoteAccessError(
+          `That answer came back from ${connection.machineName} after this computer was detached from it, so it was not applied here.`, 409, 'stale-generation')
+      }
       if (this.get(machineId) !== connection || this.authorityRevision(machineId) !== authorityRevision) {
         throw new RemoteAccessError('Remote access changed while this request was pending.', 409)
       }
-      this.mark(machineId, { status: 'connected', message: null, transport, lastContactAt: new Date(this.now()).toISOString() }, connection, authorityRevision)
+      this.mark(machineId, { status: 'connected', message: null, transport, lastContactAt: new Date(this.now()).toISOString() }, connection, authorityRevision, generation)
       return result
     } catch (error) {
       // Only a dead pairing marks the machine revoked. One call being refused — an unshared
@@ -502,16 +575,19 @@ export class RemoteControlClient {
       this.mark(machineId, {
         status: revoked ? 'revoked' : answered ? 'connected' : 'unreachable',
         message: error instanceof Error ? error.message : String(error)
-      }, connection, authorityRevision)
+      }, connection, authorityRevision, generation)
       throw error
     }
   }
 
-  private mark(machineId: string, patch: Partial<RemoteConnection>, expected?: RemoteConnection, revision?: number): void {
+  private mark(machineId: string, patch: Partial<RemoteConnection>, expected?: RemoteConnection, revision?: number, generation?: number): void {
     const connection = this.connections.find(entry => entry.machineId === machineId)
     if (!connection) return
     if (expected && connection !== expected) return
     if (revision !== undefined && this.authorityRevision(machineId) !== revision) return
+    // A detach that happened while this call was in flight must not be overwritten by the status
+    // the call was about to record; the owner's choice is newer than the answer.
+    if (generation !== undefined && (connection.generation ?? 0) !== generation) return
     Object.assign(connection, patch)
     this.persist()
   }

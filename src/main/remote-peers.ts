@@ -65,9 +65,18 @@ export interface AuthenticatedPeer {
   grantedProjects: RemoteGrantedProject[]
 }
 
+/**
+ * Why a remote request failed, where the difference changes what the caller does next.
+ *
+ * `peer-revoked` means the pairing itself is finished, not that this one call was denied.
+ * `detached` is the owner's own choice to use this computer independently, so nothing was even
+ * attempted. `stale-generation` means an answer came back for an attachment the owner has since
+ * ended, and applying it would let a reply from before the detach touch state they are using now.
+ */
+export type RemoteAccessCode = 'peer-revoked' | 'detached' | 'stale-generation'
+
 export class RemoteAccessError extends Error {
-  /** `peer-revoked` means the pairing itself is finished, not that this one call was denied. */
-  constructor(message: string, readonly status = 403, readonly code?: 'peer-revoked') { super(message) }
+  constructor(message: string, readonly status = 403, readonly code?: RemoteAccessCode) { super(message) }
 }
 
 /** Durable authority stamped by the authenticated host, never accepted from a remote caller. */
@@ -422,6 +431,14 @@ export class RemotePeers {
     signature: string
     body: Buffer | string
     fingerprint: string
+    /**
+     * What the signature was made for. A call signs its body; the push channel and a service
+     * tunnel sign an empty one at their upgrade. They are separated here rather than anywhere
+     * else because a signature captured from one must never open the other — the purpose is
+     * inside the signed bytes, so accepting the wrong one is a decision this method would have
+     * to make, and it never does.
+     */
+    purpose?: Extract<ChallengePayload['purpose'], 'call' | 'stream' | 'tunnel'>
   }): Promise<AuthenticatedPeer> {
     if (!this.settings.enabled) throw new RemoteAccessError('Remote control is switched off on this machine.', 503)
     const accountId = this.deps.accountId()
@@ -436,7 +453,7 @@ export class RemotePeers {
       audienceMachineId: this.machineId,
       fingerprint: input.fingerprint,
       nonce: input.nonce,
-      purpose: 'call',
+      purpose: input.purpose ?? 'call',
       bodyHash: hashBody(input.body),
       issuedAt: input.timestamp
     }

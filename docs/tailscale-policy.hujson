@@ -1,0 +1,78 @@
+// docs/tailscale-policy.hujson
+//
+// A minimal, least-privilege Tailscale ACL fragment for using Conductor
+// between two of your own machines: the one that runs your projects
+// ("MAIN") and a laptop that attaches to it as a window onto MAIN's work.
+//
+// THIS IS NOT A COMPLETE TAILNET POLICY. Do not paste this whole file over
+// the policy your tailnet already has. Open
+// https://login.tailscale.com/admin/acls in the admin console, and merge
+// just two things from here into what is already there:
+//
+//   1. The two entries under "tagOwners" below, added into your existing
+//      "tagOwners" object (create one if you don't have it yet).
+//   2. The one rule under "acls" below, appended to your existing "acls"
+//      array (create one if you don't have it yet).
+//
+// Then, from the admin console's Machines list (or with
+// `tailscale up --advertise-tags=tag:conductor-main` /
+// `--advertise-tags=tag:conductor-laptop` on each machine), tag MAIN with
+// tag:conductor-main and the laptop with tag:conductor-laptop.
+//
+// The port below, 51840, is Conductor's DEFAULT_REMOTE_PORT
+// (src/shared/remote-control.ts). An ACL rule names one port, so it is only
+// meaningful if MAIN's Conductor is set to that exact fixed port in
+// Account & machines rather than "0 / let the OS choose" - a port that can
+// change on every restart cannot be the port a policy names. If you set a
+// different fixed port in Conductor, change the number in the "dst" line
+// below to match it exactly.
+{
+  // Who may apply these two tags to a device. Replace "you@example.com" with
+  // your own login - the same account you sign into Tailscale and Conductor
+  // with. Do not list anyone else here: owning a tag is what lets a device
+  // claim it, so this line is itself part of the tailnet's security, not
+  // just bookkeeping.
+  "tagOwners": {
+    "tag:conductor-main":   ["you@example.com"],
+    "tag:conductor-laptop": ["you@example.com"],
+  },
+
+  // The one rule this setup needs: the laptop may open a TCP connection to
+  // MAIN's Conductor listener, and nothing else. No other tag, no other
+  // host, no other port, and no protocol but TCP.
+  "acls": [
+    {
+      "action": "accept",
+      "src":    ["tag:conductor-laptop"],
+      "dst":    ["tag:conductor-main:51840"],
+      "proto":  "tcp",
+    },
+  ],
+
+  // Prefer not to tag your devices? Skip "tagOwners" and the rule above
+  // entirely, and merge this into your existing "acls" array instead -
+  // Tailscale accepts a device's machine name (exactly as shown in the
+  // admin console's Machines list) as a src/dst atom, so two named devices
+  // need no tag at all:
+  //
+  // "acls": [
+  //   {
+  //     "action": "accept",
+  //     "src":    ["your-laptop.your-tailnet.ts.net"],
+  //     "dst":    ["main-pc.your-tailnet.ts.net:51840"],
+  //     "proto":  "tcp",
+  //   },
+  // ],
+
+  // Deliberately absent from this fragment, and it should stay that way for
+  // this setup - do not add any of the following on MAIN's or the laptop's
+  // account for the sake of Conductor:
+  //   - autogroup:internet in any src or dst (this grants no route to the
+  //     open internet - only laptop-to-MAIN, on one port)
+  //   - "*" as a host or a port anywhere in src or dst
+  //   - subnet routes or an exit node advertised or approved for either
+  //     machine (no "routes" or "exitNode" under autoApprovers - there is no
+  //     autoApprovers block here at all)
+  //   - Funnel or Serve (no nodeAttrs entry enabling "funnel"; Conductor's
+  //     listener is reached over the tailnet only, never exposed publicly)
+}

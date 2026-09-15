@@ -4,24 +4,31 @@ import {
   Bot,
   ChevronRight,
   MonitorSmartphone,
+  Plug,
   RefreshCw,
   Sparkles,
   TerminalSquare
 } from 'lucide-react'
 import { LOCAL_MODELS } from '../../../shared/local-models'
-import type { AgentProviderId, PaneKind } from '../../../shared/models'
+import type { AgentProviderId, PaneKind, ProjectRecord } from '../../../shared/models'
 import type { MachineDescriptor } from '../../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
+import type { RemoteTerminalSummary } from '../../../shared/remote-terminals'
 import { checkRemoteProjectPlacement } from '../../../shared/project-identity'
+import { checkProjectPlacement, requiredMachineId } from '../layout/machine-placement'
 
 interface LauncherPaneProps {
   projectId: string
+  /** The project itself, so one that lives on another machine can only be launched there. */
+  project?: Pick<ProjectRecord, 'remote'>
   /** The machine a new tab should run on; the caller remembers the owner's last choice. */
   machineId?: string
   /** A placement the other machine refused, shown where the choice was made. */
   error?: string
   onSelectMachine?(machineId: string): void
   onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
+  /** Binds a tab to a shell already running on that machine instead of starting another. */
+  onAttachTerminal?(machineId: string, remoteTerminalId: string, title: string): void
 }
 
 const choices: Array<{
@@ -52,11 +59,25 @@ const choices: Array<{
  * Only a machine that is reachable and has this project mapped can run a tab. A machine that is
  * paired but has no confirmed project pair is shown disabled with the reason, rather than hidden,
  * because "my desktop is missing from the list" is a worse puzzle than being told what to fix.
+ *
+ * A project that lives on another machine narrows this to one answer: every other machine, this
+ * computer included, is disabled with the reason. It is not a preference the owner is overruled
+ * on - the working copy is simply not here - and offering the choice would only ever end in work
+ * running against a folder this computer does not have.
  */
-export function machinePlacementOptions(machines: MachineDescriptor[], projectId: string): Array<{ machine: MachineDescriptor; reason: string }> {
+export function machinePlacementOptions(
+  machines: MachineDescriptor[],
+  projectId: string,
+  project?: Pick<ProjectRecord, 'remote'>
+): Array<{ machine: MachineDescriptor; reason: string }> {
   return machines
     .filter(machine => machine.status !== 'revoked')
     .map(machine => {
+      const scoped = checkProjectPlacement(project, machine.id)
+      if (!scoped.ok) return { machine, reason: scoped.message }
+      // A remote project's host is confirmed by the origin itself, so the identity check that
+      // guards a paired local project does not apply and must not refuse it.
+      if (requiredMachineId(project)) return { machine, reason: machine.status !== 'online' ? `${machine.name} is offline.` : '' }
       const link = machine.projects.find(entry => entry.grant.localProjectId === projectId)
       const placement = checkRemoteProjectPlacement({ machineName: machine.name, grant: link?.grant, advertised: link?.observed })
       return {
@@ -68,10 +89,13 @@ export function machinePlacementOptions(machines: MachineDescriptor[], projectId
     })
 }
 
-export function LauncherPane({ projectId, machineId, error, onSelectMachine, onOpen }: LauncherPaneProps): React.JSX.Element {
+export function LauncherPane({ projectId, project, machineId, error, onSelectMachine, onOpen, onAttachTerminal }: LauncherPaneProps): React.JSX.Element {
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
   const [checking, setChecking] = useState(false)
-  const selected = machineId ?? LOCAL_MACHINE_ID
+  const [running, setRunning] = useState<RemoteTerminalSummary[] | null>(null)
+  const [runningError, setRunningError] = useState('')
+  const host = requiredMachineId(project)
+  const selected = host ?? machineId ?? LOCAL_MACHINE_ID
 
   useEffect(() => {
     let live = true
@@ -94,11 +118,30 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
       .finally(() => setChecking(false))
   }
 
-  const options = machinePlacementOptions(machines, projectId)
+  const options = machinePlacementOptions(machines, projectId, project)
   const current = options.find(option => option.machine.id === selected)
   const unavailable = options.filter(option => option.reason && option.machine.id !== selected)
-  // Placement is only worth showing once there is somewhere else to place work.
-  const placeable = options.length > 1
+  // Placement is only worth showing once there is somewhere else to place work, or once the
+  // project's own machine is the answer and the owner should be told which one that is.
+  const placeable = options.length > 1 || Boolean(host)
+  const hostName = current?.machine.name ?? project?.remote?.machineName ?? 'that machine'
+
+  /**
+   * Which project id to name when talking to the host - the same single rule `createPlacedTab`
+   * follows, so the terminal the owner attaches to and the terminal the tab opens are scoped
+   * identically. A project *paired* between two copies is named by our id and mapped through the
+   * grant in the main process, exactly as `openTab` has always done. A project that *lives* there
+   * has no grant to map through, so it is named by the host's own id, which its origin carries.
+   */
+  const hostProjectId = project?.remote?.remoteProjectId ?? projectId
+
+  const listRunning = (): void => {
+    if (selected === LOCAL_MACHINE_ID) return
+    setRunningError('')
+    void window.conductor.remote.terminals.list({ machineId: selected, projectId: hostProjectId, sessionId: '' })
+      .then(setRunning)
+      .catch((reason: unknown) => { setRunning([]); setRunningError(reason instanceof Error ? reason.message : String(reason)) })
+  }
 
   return (
     <div className="launcher-pane">
@@ -108,6 +151,7 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
           <select
             id="launcher-machine"
             value={selected}
+            disabled={Boolean(host)}
             onChange={event => onSelectMachine?.(event.target.value)}
           >
             {options.map(({ machine, reason }) => (
@@ -128,13 +172,15 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
           <small className={error ? 'launcher-placement-error' : undefined}>
             {error
               || current?.reason
-              || (selected === LOCAL_MACHINE_ID
-                ? 'New tabs run here.'
-                : `New tabs run on ${current?.machine.name ?? 'that machine'}; you drive them from this window.`)}
+              || (host
+                ? `This project lives on ${hostName}. Everything you open here runs there.`
+                : selected === LOCAL_MACHINE_ID
+                  ? 'New tabs run here.'
+                  : `New tabs run on ${hostName}; you drive them from this window.`)}
           </small>
           {/* A disabled option cannot be selected, so its reason would never be readable anywhere.
               Saying "unavailable" without saying why is the puzzle this list exists to avoid. */}
-          {unavailable.length > 0 && (
+          {unavailable.length > 0 && !host && (
             <ul className="launcher-placement-reasons">
               {unavailable.map(({ machine, reason }) => <li key={machine.id}>{reason}</li>)}
             </ul>
@@ -143,28 +189,55 @@ export function LauncherPane({ projectId, machineId, error, onSelectMachine, onO
       )}
       <div className="launcher-grid" aria-label="Open runtime">
         {choices.map(({ kind, provider, model, icon: Icon, title, detail, tone, key }) => {
-          // A terminal is a local process on the machine that owns it; only agent tabs travel, and
-          // only the providers whose conversations this app can journal can be mirrored. A local
-          // model travels as a conversation: the weights and servers stay on the machine that is
-          // asked to run it, which is how another device reaches a stack it does not have.
+          // Agents and terminals both travel: the host owns the process and streams it here. Only
+          // the providers whose conversations this app can journal can be mirrored. A local model
+          // travels as a conversation: the weights and servers stay on the machine that is asked
+          // to run it, which is how another device reaches a stack it does not have.
           const elsewhere = selected !== LOCAL_MACHINE_ID
           const mirrorable = provider === 'claude' || provider === 'codex' || provider === 'local'
-          const blocked = kind !== 'agent' ? elsewhere : Boolean(current?.reason) || (elsewhere && !mirrorable)
+          const blocked = Boolean(current?.reason) || (elsewhere && kind === 'agent' && !mirrorable)
           return (
             <button
               key={`${kind}-${provider ?? ''}-${model ?? ''}`}
               disabled={blocked}
-              title={blocked ? (current?.reason || (kind === 'agent' ? `${title} cannot run on another machine yet.` : 'A terminal always runs on this machine.')) : undefined}
+              title={blocked ? (current?.reason || `${title} cannot run on another machine yet.`) : undefined}
               onClick={() => onOpen(kind, provider, model)}
             >
               <span className={`launch-icon ${tone}`}>{provider ? <ProviderIcon provider={provider} size={21} /> : <Icon size={19} />}</span>
-              <span><strong>{title}</strong>{detail && <small>{detail}{elsewhere && mirrorable ? ` · runs on ${current?.machine.name ?? 'that machine'}` : provider === 'local' ? ' · runs on this machine' : ''}</small>}</span>
+              <span><strong>{title}</strong>{detail && <small>{detail}{elsewhere && mirrorable ? ` · runs on ${hostName}` : provider === 'local' ? ' · runs on this machine' : ''}</small>}</span>
               {key && <kbd>{key}</kbd>}
               <ChevronRight className="launch-arrow" size={15} />
             </button>
           )
         })}
       </div>
+      {/*
+        A shell on the host outlives the tab that was watching it - closing a view is not stopping a
+        process - so after a reconnect, a restart or a closed tab there may well be one still
+        running with the owner's build in it. Without this, the only way back to it is to start a
+        second shell beside it and wonder why the first one still holds the port.
+      */}
+      {selected !== LOCAL_MACHINE_ID && !current?.reason && onAttachTerminal && (
+        <div className="launcher-attach">
+          <button type="button" onClick={listRunning}>
+            <Plug size={13} /> Attach to a terminal already running on {hostName}
+          </button>
+          {runningError && <small className="launcher-placement-error">{runningError}</small>}
+          {running !== null && running.length === 0 && !runningError && <small>No terminals are running on {hostName} for this project.</small>}
+          {running !== null && running.length > 0 && (
+            <ul className="launcher-attach-list">
+              {running.map(terminal => (
+                <li key={terminal.terminalId}>
+                  <button type="button" onClick={() => onAttachTerminal(selected, terminal.terminalId, terminal.title)}>
+                    <TerminalSquare size={13} />
+                    <span><strong>{terminal.title || 'Shell'}</strong><small>{terminal.cwd}{terminal.running ? '' : ` · exited${terminal.exitCode === null ? '' : ` (${terminal.exitCode})`}`}</small></span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
     </div>
   )
 }

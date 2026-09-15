@@ -14,7 +14,7 @@ import type {
   RemoteProjectSummary
 } from '../shared/remote-control'
 import type { RemoteFileDescription, RemoteFileIdentity, RemoteFileWriteRequest } from '../shared/remote-files'
-import { decodeTicket, encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries } from '../shared/remote-control'
+import { decodeTicket, encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries, type TailscaleState } from '../shared/remote-control'
 import { checkRemoteProjectPlacement } from '../shared/project-identity'
 import type { ConductorDatabase } from './database'
 import { GitHubAuth, GITHUB_SCOPES } from './github-auth'
@@ -38,6 +38,17 @@ import { RemoteAccessError, RemotePeers } from './remote-peers'
 import { RemoteSessionMirror } from './remote-session-mirror'
 import { StoredSecretVault, type SecretCipher } from './secret-store'
 import type { StructuredSessions } from './structured-sessions'
+import { RemoteAttachment } from './remote-attachment'
+import { RemoteServiceRegistry } from './remote-services'
+import { RemoteTerminalBindings } from './remote-terminals'
+import { RemoteTransport } from './remote-transport'
+import { TailscaleService } from './tailscale'
+import { RemoteTunnelHost } from './remote-tunnel-host'
+import { RemoteServiceTunnels } from './remote-tunnel-client'
+import type { TerminalManager } from './terminal-manager'
+import type { StreamHostFrame } from '../shared/remote-stream'
+import type { MachineDiagnostics } from '../shared/remote-control'
+import type { ProjectRecord } from '../shared/models'
 import type { PromptDispatchAuthority } from '../shared/structured-agent'
 
 export interface RemoteControlServiceDependencies {
@@ -47,6 +58,8 @@ export interface RemoteControlServiceDependencies {
   providers(): AgentProviderInfo[]
   ui(request: AgentControlUiRequest): Promise<unknown>
   fileChanged(change: AgentFileChange): void
+  /** This machine's PTYs, served to paired machines under the project grant. */
+  terminals: TerminalManager
   cipher: SecretCipher
   publish(channel: string, payload: unknown): void
   /** GitHub OAuth app client ID; the device flow cannot start without one. */
@@ -217,6 +230,15 @@ export class RemoteControlService {
   readonly files: RemoteFiles
   readonly resources: RemoteFileResourceServer
   readonly mirror: RemoteSessionMirror
+  readonly tailscale: TailscaleService
+  /** The tailnet route: the push channel this machine serves and the ones it holds to its hosts. */
+  readonly transport: RemoteTransport
+  readonly services: RemoteServiceRegistry
+  readonly terminalBindings: RemoteTerminalBindings
+  readonly attachment: RemoteAttachment
+  /** Registered preview services: served to peers here, reached on loopback ports over there. */
+  readonly tunnelHost: RemoteTunnelHost
+  readonly tunnels: RemoteServiceTunnels
   private registered = false
   private seal: RelaySealKeyPair | null = null
   private room: string | null = null
@@ -242,6 +264,11 @@ export class RemoteControlService {
       // rejection here would take the main process down during a sign-out.
       signedOut: () => {
         this.peers.revokeAll('Signed out of GitHub')
+        for (const peer of this.peers.listPeers()) {
+          this.transport?.host.closePeer(peer.id, 'Signed out of GitHub.')
+          this.host.terminals?.revokePeer(peer.id)
+          this.tunnelHost?.closePeer(peer.id)
+        }
         this.client.clear()
         // The mailbox is reached with the account's own token, so signing out is what makes it
         // unreachable; the gist left behind holds ciphertext and a signed public key and nothing else.
@@ -256,16 +283,23 @@ export class RemoteControlService {
       accountLogin: () => this.auth.identity()?.login ?? null,
       accountKeys: force => this.auth.accountKeys(force),
       projects: () => deps.database.listProjects().map(projectSummary),
-      changed: () => this.publishState(),
+      // Approving a machine adds someone who might arrive on either route, which is a reason to
+      // weigh the routes again rather than only to redraw the panel.
+      changed: () => { this.publishState(); this.relay?.reconsider() },
       activity: entry => deps.publish('remote:activity', entry)
     })
+    this.tailscale = new TailscaleService()
+    // Registered by the owner here and listed to peers under the grant; a peer never names a port.
+    this.services = new RemoteServiceRegistry({ settings: store, peers: this.peers, project: id => deps.database.getProject(id) })
     this.host = new RemoteControlHost({
       database: deps.database, sessions: deps.sessions, backlogs: deps.backlogs, peers: this.peers,
+      terminals: deps.terminals, services: this.services,
       providers: () => deps.providers().map(provider => ({ id: provider.id, available: provider.available, models: provider.models })),
       ui: deps.ui, fileChanged: deps.fileChanged, machineName: () => this.machineName()
     })
     this.server = new RemoteControlServer({
       peers: this.peers, host: this.host, store, vault,
+      tailscale: this.tailscale,
       machineName: () => this.machineName(),
       accountLogin: () => this.auth.identity()?.login ?? null,
       relayKey: () => this.sealKey()?.publicKey ?? null,
@@ -307,7 +341,11 @@ export class RemoteControlService {
       // The relay hands an inbound request to the very same handler the HTTPS listener uses, so a
       // peer gains nothing by arriving this way instead of over the network.
       handle: (path, body, headers) => this.server.handleRequest(path, body, headers),
-      enabled: () => this.relayEnabled() && !this.serverRelay.configured(),
+      // Whether the mailbox may run at all - not whether it should right now. Gating it on "no
+      // relay is configured" made the fallback in RelayRoute unreachable: a configured relay is
+      // exactly the state the fallback exists for, so a machine whose relay could not be reached
+      // refused the one route left to it. RelayRoute starts and stops this.
+      enabled: () => this.relayEnabled(),
       changed: () => { this.publishState(); this.probeMachinesSeenOnRelay() }
     })
     this.relayHost = new RelayHost({
@@ -316,7 +354,9 @@ export class RemoteControlService {
       settings: () => {
         const settings = this.peers.getSettings()
         return {
-          enabled: settings.enabled && settings.relay && settings.relayHosting,
+          // A machine reached over the tailnet only runs no relay for anyone: nothing pairs with it
+          // any other way, and a relay nobody can be pointed at is a listener for its own sake.
+          enabled: settings.enabled && settings.relay && settings.relayHosting && settings.exposure !== 'tailscale',
           port: settings.relayHostPort,
           internet: settings.relayHostInternet
         }
@@ -351,7 +391,14 @@ export class RemoteControlService {
     this.relay = new RelayRoute({
       server: this.serverRelay,
       github: this.githubRelay,
-      endpoint: () => this.relayHost.localEndpoint() ?? (this.peers.getSettings().relayEndpoint || null)
+      endpoint: () => this.relayHost.localEndpoint() ?? (this.peers.getSettings().relayEndpoint || null),
+      // Approved peers only. A machine that controls another holds a pinned pairing key rather than
+      // a peer record, so this is empty there - which is right: that side learns the relay is out of
+      // reach by failing to connect to it, and strands itself.
+      awaitedPeers: () => {
+        const present = new Set(this.serverRelay.getStatus().reachable)
+        return this.peers.listPeers().map(peer => peer.machineId).filter(machineId => machineId && !present.has(machineId))
+      }
     })
     this.client = new RemoteControlClient({
       store,
@@ -377,6 +424,61 @@ export class RemoteControlService {
       database: store,
       call: (machineId, method, args) => this.client.call(machineId, method, args),
       publish: deps.publish
+    })
+    this.transport = new RemoteTransport({
+      tailscale: this.tailscale, server: this.server, peers: this.peers,
+      connections: () => this.client.list(),
+      deviceKey: () => this.auth.deviceKey(),
+      machineId: () => this.peers.machineId,
+      machineName: () => this.machineName(),
+      onFrame: (machineId, frame) => this.onStreamFrame(machineId, frame),
+      changed: () => {
+        // The mirror polls slowly while a stream carries notices for that machine, and at its old
+        // cadence the moment the stream is gone: the poll is the resync of last resort either way.
+        for (const connection of this.client.list()) {
+          this.mirror.streamConnected(connection.machineId, this.transport.streaming(connection.machineId))
+          void this.refreshSubscriptions(connection.machineId)
+        }
+        this.publishState()
+      },
+      cursors: machineId => this.mirror.list().filter(binding => binding.machineId === machineId)
+        .map(binding => ({ localSessionId: binding.localSessionId, remoteSequence: binding.remoteSequence }))
+    })
+    // Terminal bytes leave through the same channel the notices do.
+    this.host.useTerminalStream(this.transport.host)
+    this.terminalBindings = new RemoteTerminalBindings({
+      settings: store,
+      call: (machineId, method, args) => this.client.call(machineId, method, args ?? {}),
+      subscribe: (machineId, projectId, sessionId, terminalId, fromOffset) => this.transport.terminalSubscribe(machineId, projectId, sessionId, terminalId, fromOffset),
+      unsubscribe: (machineId, terminalId) => this.transport.terminalUnsubscribe(machineId, terminalId),
+      publish: deps.publish,
+      connected: machineId => this.transport.streaming(machineId)
+    })
+    this.attachment = new RemoteAttachment({
+      connections: {
+        get: machineId => this.client.get(machineId) ?? null,
+        // The client owns the record and bumps the generation itself, so only the decision is
+        // handed to it; a generation written twice would still be one decision.
+        mark: (machineId, patch) => { if (patch.detached !== undefined) this.client.setDetached(machineId, patch.detached) }
+      },
+      transport: {
+        detach: machineId => {
+          this.transport.detach(machineId)
+          this.terminalBindings.releaseMachine(machineId)
+          void this.tunnels.closeMachine(machineId).catch(() => undefined)
+          this.applyRoutes()
+        },
+        attach: machineId => { this.transport.attach(machineId); this.applyRoutes() }
+      },
+      drafts: { retainRemote: machineId => deps.database.retainRemoteDrafts(machineId) },
+      changed: () => this.publishState()
+    })
+    this.tunnelHost = new RemoteTunnelHost({ peers: this.peers, services: this.services, fingerprint: () => this.server.identity().fingerprint })
+    this.tunnelHost.listenOn(this.server)
+    this.tunnels = new RemoteServiceTunnels({
+      deviceKey: () => this.auth.deviceKey(),
+      machineId: () => this.peers.machineId,
+      connected: machineId => !this.client.get(machineId)?.detached
     })
   }
 
@@ -416,7 +518,148 @@ export class RemoteControlService {
    */
   private relayEnabled(): boolean {
     const settings = this.peers.getSettings()
-    return settings.enabled && settings.relay && this.auth.identity() !== null
+    if (!settings.enabled || !settings.relay || this.auth.identity() === null) return false
+    // Reached over the tailnet only: no relay and no mailbox, so nothing polls the account and
+    // nothing runs beside the new route against the same workspace.
+    if (settings.exposure === 'tailscale') return false
+    // A machine whose every pairing is over the tailnet has nothing for a relay to carry either.
+    const connections = this.client.list().filter(connection => connection.status !== 'revoked')
+    if (connections.length && connections.every(connection => connection.transport === 'tailscale')) return false
+    return true
+  }
+
+  /** Re-applies which routes run after a pairing, an attachment or the exposure changed. */
+  private applyRoutes(): void {
+    if (this.relayEnabled()) this.relay.start()
+    else this.relay.stop()
+    this.transport.sync()
+    for (const connection of this.client.list()) void this.refreshSubscriptions(connection.machineId)
+  }
+
+  /** What each host has been asked to tell this machine about, keyed by the host's own ids. */
+  private readonly subscribed = new Map<string, Set<string>>()
+
+  /**
+   * Tells a host which of its workspaces this machine wants to hear about: every workspace a tab or
+   * a terminal here is bound to, and - for a shared project with nothing bound yet - one workspace
+   * of it, because a project's files and tasks are announced to anyone subscribed anywhere in it.
+   * Asked again whenever the set could have changed and whenever the stream comes up; the client
+   * keeps the set across reconnects, so asking twice costs nothing.
+   */
+  private refreshing = new Set<string>()
+  private async refreshSubscriptions(machineId: string): Promise<void> {
+    if (this.refreshing.has(machineId)) return
+    const connection = this.client.get(machineId)
+    if (!connection || connection.detached || connection.status === 'revoked' || !this.transport.streaming(machineId)) return
+    this.refreshing.add(machineId)
+    try {
+      const wanted = new Map<string, { projectId: string; sessionId: string }>()
+      const want = (projectId: string, sessionId: string): void => { if (projectId && sessionId) wanted.set(`${projectId} ${sessionId}`, { projectId, sessionId }) }
+      for (const binding of this.mirror.list()) if (binding.machineId === machineId) want(binding.remoteProjectId, binding.remoteSessionId)
+      for (const binding of this.terminalBindings.list()) if (binding.machineId === machineId) want(binding.remoteProjectId, binding.remoteSessionId)
+      for (const grant of connection.projectGrants) {
+        if ([...wanted.values()].some(entry => entry.projectId === grant.remoteProjectId)) continue
+        try {
+          const workspaces = await this.client.call(machineId, 'workspaces.list', { projectId: grant.remoteProjectId }, { background: true }) as Array<{ id: string }>
+          if (workspaces[0]?.id) want(grant.remoteProjectId, workspaces[0].id)
+        } catch { /* the next refresh asks again; the poll covers the meantime */ }
+      }
+      const current = this.subscribed.get(machineId) ?? new Set<string>()
+      for (const [key, entry] of wanted) if (!current.has(key)) this.transport.subscribe(machineId, entry.projectId, entry.sessionId)
+      for (const key of current) if (!wanted.has(key)) { const [projectId, sessionId] = key.split(' '); this.transport.unsubscribe(machineId, projectId!, sessionId!) }
+      this.subscribed.set(machineId, new Set(wanted.keys()))
+    } finally {
+      this.refreshing.delete(machineId)
+    }
+  }
+
+  /** What arrives on the push channel from one of this machine's hosts. */
+  private onStreamFrame(machineId: string, frame: StreamHostFrame): void {
+    switch (frame.type) {
+      case 'agents.changed':
+        void this.mirror.notice(machineId, frame.agentSessionId, frame.sequence).catch(error => console.warn('Remote conversation did not catch up', error))
+        return
+      case 'files.changed':
+      case 'tasks.changed': {
+        // The renderer's file tree and task list refresh on the same channel local changes use, so
+        // the remote project is named by this machine's id for it rather than the host's.
+        const connection = this.client.get(machineId)
+        const path = frame.type === 'files.changed' ? frame.path : 'feature-list.md'
+        for (const grant of connection?.projectGrants.filter(entry => entry.remoteProjectId === frame.projectId) ?? []) {
+          this.deps.publish('files:changed', { projectId: grant.localProjectId, path, machineId, remoteProjectId: frame.projectId })
+        }
+        return
+      }
+      case 'tabs.changed':
+        this.deps.publish('remote:tabs-changed', { machineId, projectId: frame.projectId, sessionId: frame.sessionId })
+        return
+      case 'terminal.data':
+      case 'terminal.gap':
+      case 'terminal.exit':
+        this.terminalBindings.onFrame(machineId, frame)
+        return
+      case 'revoked':
+        // The next call records the refusal against the connection; asking now is what makes the
+        // panel say "revoked" before the owner tries anything.
+        void this.probeMachines({ background: true }).catch(() => undefined)
+        return
+      default:
+        return
+    }
+  }
+
+  /**
+   * The host's own id for a project here, whichever way the two are linked: a confirmed pair of
+   * working copies, or a project that lives on that host and was opened here with no local copy.
+   */
+  private resolveRemoteProject(machineId: string, projectId: string): { localProjectId: string; remoteProjectId: string; machineName: string } {
+    const connection = this.client.get(machineId)
+    if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
+    if (connection.detached) throw new RemoteAccessError(`You are using this computer independently of ${connection.machineName}. Attach to it first.`, 409, 'detached')
+    // Named either way the renderer names it: by this computer's own id for the project, or - for
+    // a project that lives on that host - by the host's id, which is the one its origin records.
+    const project = this.deps.database.getProject(projectId)
+      ?? this.deps.database.listProjects().find(entry => entry.remote?.machineId === machineId && entry.remote.remoteProjectId === projectId)
+    if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
+    if (project.remote && project.remote.machineId !== machineId) throw new RemoteAccessError(`That project lives on ${project.remote.machineName || 'another machine'}, not ${connection.machineName}.`, 409)
+    const remoteProjectId = connection.projectGrants.find(entry => entry.localProjectId === project.id)?.remoteProjectId ?? project.remote?.remoteProjectId
+    if (!remoteProjectId) throw new RemoteAccessError(`${connection.machineName} has not been told which of its projects this one is. Confirm the pair of projects in Account & machines first.`, 409)
+    return { localProjectId: project.id, remoteProjectId, machineName: connection.machineName }
+  }
+
+  /** A terminal request from the renderer, named the way the host needs it named. */
+  private async terminalRequest<T extends { machineId: unknown; projectId: unknown; sessionId: unknown }>(request: T): Promise<Omit<T, 'machineId' | 'projectId' | 'sessionId'> & { machineId: string; projectId: string; sessionId: string; remoteProjectId: string; remoteSessionId: string; machineName: string }> {
+    const machineId = String(request.machineId ?? ''), projectId = String(request.projectId ?? ''), sessionId = String(request.sessionId ?? '')
+    if (!machineId || !projectId || !sessionId) throw new RemoteAccessError('A remote terminal needs a machine, a project and a workspace.', 400)
+    const { localProjectId, remoteProjectId, machineName } = this.resolveRemoteProject(machineId, projectId)
+    const workspaces = await this.client.call(machineId, 'workspaces.list', { projectId: remoteProjectId }) as Array<{ id: string }>
+    const remoteSessionId = workspaces[0]?.id
+    if (!remoteSessionId) throw new RemoteAccessError(`${machineName} has no open workspace for that project.`, 409)
+    // The binding is kept under this computer's own id for the project, whichever id it was asked by.
+    return { ...request, machineId, projectId: localProjectId, sessionId, remoteProjectId, remoteSessionId, machineName }
+  }
+
+  /**
+   * Opens a project that lives on a paired machine here, with no local copy. The record carries the
+   * identity that machine advertised, and a grant is confirmed for it at once - the project is its
+   * own confirmation - so every remote path (files, tabs, terminals, tasks) resolves it exactly as
+   * it resolves a confirmed pair of working copies.
+   */
+  async openRemoteProject(machineId: string, remoteProjectId: string): Promise<ProjectRecord> {
+    const connection = this.client.get(machineId)
+    if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
+    if (connection.detached) throw new RemoteAccessError(`You are using this computer independently of ${connection.machineName}. Attach to it first.`, 409, 'detached')
+    const summary = (await this.refreshRemoteProjects(machineId)).find(entry => entry.id === remoteProjectId)
+    if (!summary) throw new RemoteAccessError(`${connection.machineName} is not sharing that project.`, 409)
+    if (!summary.identity) throw new RemoteAccessError(summary.identityError || `${connection.machineName} cannot read that project's identity, so it cannot be opened from here.`, 409)
+    const record = this.deps.database.addRemoteProject({
+      name: summary.name, path: summary.path,
+      remote: { machineId, machineName: connection.machineName, remoteProjectId, path: summary.path, identity: summary.identity }
+    })
+    this.client.confirmProject(machineId, { localProjectId: record.id, local: summary.identity, remoteProjectId, remote: summary.identity, confirmedAt: new Date().toISOString() })
+    void this.refreshSubscriptions(machineId)
+    this.publishState()
+    return record
   }
 
   /**
@@ -508,18 +751,25 @@ export class RemoteControlService {
     const before = this.peers.getSettings()
     const patch: Partial<RemoteControlSettings> = {}
     if (!before.enabled) patch.enabled = true
-    if (!before.relay) patch.relay = true
+    // Over the tailnet there is no relay to turn on and no mailbox to fall back to: the invite is
+    // the listener's own address, and if that listener cannot start the invite is the error.
+    const tailnet = before.exposure === 'tailscale'
+    if (!before.relay && !tailnet) patch.relay = true
     // A machine already pointed at a relay keeps using it; one with none becomes the relay itself.
-    if (!before.relayEndpoint && !before.relayHosting) patch.relayHosting = true
+    if (!before.relayEndpoint && !before.relayHosting && !tailnet) patch.relayHosting = true
     if (Object.keys(patch).length) this.peers.updateSettings(patch)
-    if (!this.ensureRoomSecret()) {
+    if (!tailnet && !this.ensureRoomSecret()) {
       throw new RemoteAccessError('This machine has no credential store, so it cannot keep the secret that links your machines.', 500)
     }
     await this.server.apply()
+    if (tailnet) {
+      const listener = this.server.getStatus()
+      if (!listener.listening) throw new RemoteAccessError(listener.message ?? 'Conductor could not listen on this machine’s Tailscale address.', 503)
+    }
     await this.relayHost.apply()
-    this.relay.start()
+    this.applyRoutes()
     const host = this.relayHost.getStatus()
-    if (this.peers.getSettings().relayHosting && !host.running) {
+    if (!tailnet && this.peers.getSettings().relayHosting && !host.running) {
       throw new RemoteAccessError(host.message ?? 'The relay could not start on this machine.', 500)
     }
     const ticket = this.server.ticket()
@@ -590,7 +840,7 @@ export class RemoteControlService {
   }
 
   machines(): MachineDescriptor[] {
-    return describeMachines(this.machineName(), this.client.list())
+    return describeMachines(this.machineName(), this.client.list(), machineId => this.transport.connection(machineId))
   }
 
   /**
@@ -612,6 +862,11 @@ export class RemoteControlService {
     const now = Date.now()
     const peers = this.client.list().filter(connection =>
       connection.status !== 'revoked' && connection.peerId &&
+      // The owner said to work without that host: nothing is dialled, not even to ask if it is there.
+      !connection.detached &&
+      // An open stream is proof of life the way a probe never was; a sweep only asks machines the
+      // stream cannot vouch for. The owner's own "Check again" still asks everyone.
+      !(options.scheduled && this.transport.streaming(connection.machineId)) &&
       (!options.scheduled || this.probes.due(connection.machineId, now)) &&
       this.probes.begin(connection.machineId))
     if (!peers.length) return this.machines()
@@ -767,8 +1022,12 @@ export class RemoteControlService {
     })
     this.mirror.start()
     void this.mirror.pull(localSessionId).catch(error => console.warn('Remote session did not load', error))
+    void this.refreshSubscriptions(request.machineId)
     return { localSessionId, machineId: request.machineId, machineName: opened.machineName }
   }
+
+  /** The tailnet as last read; `remote:tailscale` re-reads it on demand. */
+  private tailscaleState(): TailscaleState { return this.tailscale.last() }
 
   state(): RemoteControlState {
     const status = this.server.getStatus()
@@ -782,6 +1041,7 @@ export class RemoteControlService {
       relay: this.relay.getStatus(),
       relaySecretSet: this.roomSecret() !== null,
       relayHost: this.relayHost.getStatus(),
+      tailscale: this.tailscaleState(),
       projects: this.deps.database.listProjects().map(projectSummary),
       peers: this.peers.listPeers(),
       pending: this.peers.listPending(),
@@ -803,6 +1063,8 @@ export class RemoteControlService {
     // the listener rather than on the first call: a machine nobody has called yet still has to be
     // found, and a peer's request has to be collected while nothing here is asking for anything.
     this.relay.start()
+    // The push channel this machine serves, and the ones it holds to its hosts.
+    this.transport.start()
     // Paired machines are probed on a timer so a machine that blinked once does not stay marked
     // unavailable until the owner happens to make a call that succeeds.
     this.scheduleMachineProbe()
@@ -823,6 +1085,7 @@ export class RemoteControlService {
       if (after.enabled && after.relay) this.relay.start()
       else this.relay.stop()
     }
+    this.applyRoutes()
     return this.state()
   }
 
@@ -847,7 +1110,15 @@ export class RemoteControlService {
       return this.state()
     })
     handle<RemoteControlState>('remote:deny', (pendingId: string) => { this.peers.deny(String(pendingId)); return this.state() })
-    handle<RemoteControlState>('remote:revoke', (peerId: string) => { this.peers.revoke(String(peerId)); return this.state() })
+    handle<RemoteControlState>('remote:revoke', (peerId: string) => {
+      const id = String(peerId)
+      this.peers.revoke(id)
+      // Refusing the next request is not enough: the stream and the shells are open now.
+      this.transport.host.closePeer(id, 'Access for this machine was revoked.')
+      this.host.terminals?.revokePeer(id)
+      this.tunnelHost.closePeer(id)
+      return this.state()
+    })
     handle<RemoteControlState>('remote:set-relay-server', (endpoint: string, secret: string | null) =>
       this.setRelayServer(String(endpoint ?? ''), typeof secret === 'string' ? secret : null))
     handle<RemoteControlState>('remote:set-relay-hosting', (patch: { enabled?: boolean; port?: number; internet?: boolean }) =>
@@ -857,6 +1128,7 @@ export class RemoteControlService {
       // is only reachable through it cannot be reached to be paired with.
       await this.adoptRelayFromTicket(String(ticket))
       await this.client.connect(String(ticket))
+      this.applyRoutes()
       return this.state()
     })
     handle<RemoteControlState>('remote:forget', (machineId: string) => {
@@ -864,6 +1136,9 @@ export class RemoteControlService {
       this.client.forget(id)
       // A tab cannot keep mirroring a machine the owner just cut loose.
       this.mirror.releaseMachine(id)
+      this.terminalBindings.releaseMachine(id)
+      void this.tunnels.closeMachine(id).catch(() => undefined)
+      this.applyRoutes()
       return this.state()
     })
     handle<RemoteProjectSummary[]>('remote:remote-projects', (machineId: string) => this.refreshRemoteProjects(String(machineId)))
@@ -897,6 +1172,61 @@ export class RemoteControlService {
     handle('remote:files-preview', (request: RemoteFileIdentity) => this.resources.issue(request))
     handle<boolean>('remote:files-revoke-preview', (url: string) => { this.resources.revoke(String(url)); return true })
     handle('remote:files-download', (request: RemoteFileIdentity) => this.resources.download(request))
+    handle<TailscaleState>('remote:tailscale', () => this.transport.tailscaleState(true))
+    handle<MachineDiagnostics>('remote:diagnostics', (machineId: string) => this.transport.diagnostics(String(machineId)))
+    handle<RemoteControlState>('remote:detach', (machineId: string) => { this.attachment.detach(String(machineId)); return this.state() })
+    handle<RemoteControlState>('remote:attach', (machineId: string) => { this.attachment.attach(String(machineId)); return this.state() })
+    handle<ProjectRecord>('remote:open-remote-project', (machineId: string, remoteProjectId: string) => this.openRemoteProject(String(machineId), String(remoteProjectId)))
+    handle('remote:terminals-list', async (request: { machineId: unknown; projectId: unknown; sessionId: unknown }) => {
+      const named = await this.terminalRequest(request ?? { machineId: '', projectId: '', sessionId: '' })
+      return this.terminalBindings.remoteList({ machineId: named.machineId, projectId: named.remoteProjectId, sessionId: named.remoteSessionId })
+    })
+    handle('remote:terminals-open', async (request: { machineId: unknown; projectId: unknown; sessionId: unknown; title?: unknown; cols?: unknown; rows?: unknown }) => {
+      const named = await this.terminalRequest(request ?? { machineId: '', projectId: '', sessionId: '' })
+      const cols = Number(named.cols), rows = Number(named.rows)
+      const opened = await this.terminalBindings.open({
+        machineId: named.machineId, projectId: named.projectId, sessionId: named.sessionId,
+        remoteProjectId: named.remoteProjectId, remoteSessionId: named.remoteSessionId, machineName: named.machineName,
+        ...(typeof named.title === 'string' ? { title: named.title.slice(0, 120) } : {}),
+        cols: Number.isInteger(cols) && cols > 0 ? cols : 80, rows: Number.isInteger(rows) && rows > 0 ? rows : 24
+      })
+      void this.refreshSubscriptions(named.machineId)
+      return opened
+    })
+    handle('remote:terminals-attach', async (request: { machineId: unknown; projectId: unknown; sessionId: unknown; remoteTerminalId?: unknown }) => {
+      const named = await this.terminalRequest(request ?? { machineId: '', projectId: '', sessionId: '' })
+      if (typeof named.remoteTerminalId !== 'string' || !named.remoteTerminalId) throw new RemoteAccessError('Attaching needs the terminal to attach to.', 400)
+      return this.terminalBindings.attach({
+        machineId: named.machineId, projectId: named.projectId, sessionId: named.sessionId, remoteTerminalId: named.remoteTerminalId,
+        remoteProjectId: named.remoteProjectId, remoteSessionId: named.remoteSessionId, machineName: named.machineName
+      })
+    })
+    handle<boolean>('remote:terminals-release', (localTerminalId: string) => { this.terminalBindings.release(String(localTerminalId)); return true })
+    handle('remote:services-registered', (projectId: string) => this.services.registered(String(projectId)))
+    handle('remote:services-register', (request: { projectId?: unknown; port?: unknown; label?: unknown }) =>
+      this.services.register({ projectId: String(request?.projectId ?? ''), port: Number(request?.port), label: String(request?.label ?? '') }))
+    handle<boolean>('remote:services-unregister', (serviceId: string) => { this.services.unregister(String(serviceId)); return true })
+    handle('remote:services-list', async (request: { machineId?: unknown; projectId?: unknown }) => {
+      const machineId = String(request?.machineId ?? ''), projectId = String(request?.projectId ?? '')
+      const { remoteProjectId } = this.resolveRemoteProject(machineId, projectId)
+      return await this.client.call(machineId, 'services.list', { projectId: remoteProjectId })
+    })
+    handle('remote:services-open', (request: { machineId?: unknown; projectId?: unknown; serviceId?: unknown }) => {
+      const machineId = String(request?.machineId ?? ''), projectId = String(request?.projectId ?? ''), serviceId = String(request?.serviceId ?? '')
+      if (!serviceId) throw new RemoteAccessError('Choose which registered service to open.', 400)
+      const { localProjectId, remoteProjectId } = this.resolveRemoteProject(machineId, projectId)
+      const connection = this.client.get(machineId)
+      if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
+      return this.tunnels.open({ machineId, projectId: localProjectId, serviceId, target: connection, remoteProjectId })
+    })
+    handle('remote:services-close', (request: { machineId?: unknown; projectId?: unknown; serviceId?: unknown }) => {
+      const machineId = String(request?.machineId ?? ''), projectId = String(request?.projectId ?? ''), serviceId = String(request?.serviceId ?? '')
+      // Closed under the same id it was opened under. Closing needs nothing from the host, so a
+      // machine that is detached or gone by now still closes whatever is open under this name.
+      let localProjectId = projectId
+      try { localProjectId = this.resolveRemoteProject(machineId, projectId).localProjectId } catch { /* see above */ }
+      return this.tunnels.close({ machineId, projectId: localProjectId, serviceId })
+    })
   }
 
   async dispose(): Promise<void> {
@@ -905,10 +1235,18 @@ export class RemoteControlService {
         'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:set-relay-hosting', 'remote:ticket', 'remote:invite', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
         'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
         'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
-        'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download']) ipcMain.removeHandler(channel)
+        'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download',
+        'remote:tailscale', 'remote:diagnostics', 'remote:detach', 'remote:attach', 'remote:open-remote-project',
+        'remote:terminals-list', 'remote:terminals-open', 'remote:terminals-attach', 'remote:terminals-release',
+        'remote:services-registered', 'remote:services-register', 'remote:services-unregister', 'remote:services-list', 'remote:services-open', 'remote:services-close']) ipcMain.removeHandler(channel)
       this.registered = false
     }
     if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null }
+    this.transport.stop()
+    this.terminalBindings.flush()
+    this.host.terminals?.dispose()
+    this.tunnelHost.dispose()
+    await this.tunnels.dispose().catch(() => undefined)
     this.relay.stop()
     // The relay this machine runs goes down with it, and its router mapping is handed back rather
     // than left to expire - a forwarded port that nothing listens on is not something to leave open.

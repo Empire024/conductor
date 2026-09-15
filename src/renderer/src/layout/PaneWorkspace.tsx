@@ -61,7 +61,10 @@ import {
 } from './tab-drag'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { createPaneTab } from '../panes/pane-factory'
-import { closePlacedTab, createPlacedTab, readPlacement, writePlacement } from './machine-placement'
+import { closePlacedTab, createPlacedTab, defaultPlacement, projectHostName, readPlacement, requiredMachineId, writePlacement } from './machine-placement'
+import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
+import { RemoteOnlyPane } from '../components/RemoteOnlyPane'
+import { RemoteFilesPane } from '../panes/RemoteFilesPane'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { TerminalPane } from '../panes/TerminalPane'
 import { LauncherPane } from '../panes/LauncherPane'
@@ -115,6 +118,16 @@ const iconFor = (tab: PaneTab): typeof Bot => {
   return FileText
 }
 
+/**
+ * The panes that mean something for a project running on another machine. Files and the editor
+ * have a remote counterpart; conversations and terminals are placed there and streamed back;
+ * tasks are read from the host; the browser previews the services the host registered, through a
+ * tunnel that ends on a loopback port of this computer. Everything else - git and diffs, memory,
+ * routines, logs, local models - is a view of this computer's state and has nothing to show about
+ * MAIN's project.
+ */
+const REMOTE_CAPABLE_PANES = new Set<PaneKind>(['launcher', 'agent', 'terminal', 'file-tree', 'code', 'tasks', 'browser'])
+
 const TAB_ANIMATION_MS = 110
 const TAB_SPOTLIGHT_MS = 1600
 
@@ -136,7 +149,8 @@ const PaneBody = ({
   onConversationChange,
   placement,
   placementError,
-  onSelectMachine
+  onSelectMachine,
+  onAttachTerminal
 }: {
   tab: PaneTab
   groupId: string
@@ -145,12 +159,19 @@ const PaneBody = ({
   placement: string
   placementError: string
   onSelectMachine(machineId: string): void
+  onAttachTerminal(machineId: string, remoteTerminalId: string, title: string): void
   onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
   onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   onUpdateTab(tabId: string, state: Record<string, unknown>): void
   onConversationChange(tabId: string, conversation: ConversationIdentity): Promise<void>
 }): React.JSX.Element => {
-  if (tab.kind === 'launcher') return <LauncherPane projectId={project.id} machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} />
+  // A project that lives on another machine has no files, git history or processes on this
+  // computer, so a pane with no remote counterpart says so and does nothing. The alternative -
+  // running it against whatever happens to be at the same path here - is the exact confusion
+  // keying a remote project by machine id exists to prevent.
+  const host = requiredMachineId(project)
+  if (host && !REMOTE_CAPABLE_PANES.has(tab.kind)) return <RemoteOnlyPane kind={tab.kind} machineName={projectHostName(project)} />
+  if (tab.kind === 'launcher') return <LauncherPane projectId={project.id} project={project} machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} onAttachTerminal={onAttachTerminal} />
   if (tab.kind === 'terminal') {
     return (
       <TerminalPane
@@ -191,15 +212,22 @@ const PaneBody = ({
       />
     )
   }
-  if (tab.kind === 'file-tree') return <FileTreePane project={project} onOpenFile={onOpenFile} />
+  // The host's tree, through the remote files bridge, keyed by that machine's own project id.
+  if (tab.kind === 'file-tree') return host
+    ? <RemoteFilesPane machineId={host} machineName={projectHostName(project)} projectId={project.remote!.remoteProjectId}
+        files={window.conductor.remote.files}
+        onOpenFile={file => onOpenFile(file.path, undefined, 'editor')} />
+    : <FileTreePane project={project} onOpenFile={onOpenFile} />
   if (tab.kind === 'tasks') return <ProjectBacklogPane project={project} />
-  if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} machineId={fileMachineId(tab.state?.machineId as string | undefined)} />
+  // Every read and write for a remote project's file goes through the host, which is what carries
+  // the revision check that turns a concurrent edit into a conflict message instead of an overwrite.
+  if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} machineId={host ?? fileMachineId(tab.state?.machineId as string | undefined)} />
   if (tab.kind === 'preview') return isRemoteFileMachine(tab.state?.machineId as string | undefined)
     ? <div className="coming-pane"><span>Remote file</span><strong>Preview is unavailable. Open this host file in the guarded editor.</strong></div>
     : <FilePreviewPane project={project} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} onOpenEditor={(path, allowBinary) => onOpenFile(path, undefined, 'editor', allowBinary)} />
   if (tab.kind === 'browser') return tab.state?.archiveDormant === true
     ? <SessionArchiveDormantPane kind="browser" title={tab.title} onActivate={() => onUpdateTab(tab.id, { ...tab.state, archiveDormant: false })} />
-    : <BrowserPane projectId={project.id} performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { ...tab.state, url })} />
+    : <BrowserPane project={project} projectId={project.id} machineId={(tab.state?.machineId as string | undefined) ?? (placement === LOCAL_MACHINE_ID ? undefined : placement)} performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { ...tab.state, url })} />
   return (
     <div className="coming-pane">
       <span>{tab.kind}</span>
@@ -225,7 +253,8 @@ function PaneGroup({
 }): React.JSX.Element {
   const groupRef = useRef<HTMLElement>(null)
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number; tabId: string } | null>(null)
-  const [placement, setPlacement] = useState(() => readPlacement(workspace.session.id))
+  // A remote project starts, and stays, on its host: there is no other machine that has it.
+  const [placement, setPlacement] = useState(() => defaultPlacement(workspace.project, workspace.session.id))
   const [placementError, setPlacementError] = useState('')
   const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; tabGroupId: string } | null>(null)
   /** A group created from the tab menu opens its name editor as soon as the chip exists,
@@ -373,19 +402,36 @@ function PaneGroup({
 
   /** Remembering the choice is what makes the next tab inherit this machine. */
   const choose = (machineId: string): void => {
+    // A project that lives elsewhere has no choice to remember, and overwriting the workspace's
+    // remembered choice with its host would move the owner's local work there next time.
+    if (requiredMachineId(workspace.project)) return
     setPlacement(machineId)
     setPlacementError('')
     writePlacement(workspace.session.id, machineId)
     workspace.onMachinePlacement?.(machineId)
   }
 
-  const open = (kind: PaneKind, provider?: AgentProviderId, model?: string): void => {
-    if (kind !== 'agent' && kind !== 'terminal') return
+  const placeTab = (request: Parameters<typeof createPlacedTab>[0]): void => {
     // Placing a tab on another machine has to reach that machine first, so the launcher stays put
     // until it answers; a refusal leaves the launcher open with the reason rather than a dead tab.
-    void createPlacedTab({ kind, provider, model, machineId: placement, projectId: workspace.project.id, sessionId: workspace.session.id })
+    void createPlacedTab(request)
       .then(tab => workspace.onLayout(replaceTab(workspace.layout, group.id, activeTab.id, tab)))
       .catch((reason: unknown) => setPlacementError(String(reason instanceof Error ? reason.message : reason)))
+  }
+
+  /** A remote project is addressed on the host by the host's own project id, never by ours. */
+  const placedProjectId = workspace.project.remote?.remoteProjectId ?? workspace.project.id
+
+  const open = (kind: PaneKind, provider?: AgentProviderId, model?: string): void => {
+    if (kind !== 'agent' && kind !== 'terminal') return
+    setPlacementError('')
+    placeTab({ kind, provider, model, machineId: placement, projectId: placedProjectId, sessionId: workspace.session.id })
+  }
+
+  /** Binds a tab to a shell the host is already running, rather than starting a second one. */
+  const attachTerminal = (machineId: string, remoteTerminalId: string): void => {
+    setPlacementError('')
+    placeTab({ kind: 'terminal', machineId, projectId: placedProjectId, sessionId: workspace.session.id, remoteTerminalId })
   }
 
   const openFile = (path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean, machineId?: string): void => {
@@ -572,7 +618,7 @@ function PaneGroup({
         {group.tabs.map((tab) => (
           <div key={tab.id} className="pane-tab-content" data-performance-tab-id={tab.id} style={{ display: tab.id === activeTab.id ? 'flex' : 'none' }}>
             <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={(path, line, mode, allowBinary) => openFile(path, line, mode, allowBinary, tab.state?.machineId as string | undefined)} onUpdateTab={setTabState} onConversationChange={changeConversation}
-              placement={placement} placementError={placementError} onSelectMachine={choose} />
+              placement={placement} placementError={placementError} onSelectMachine={choose} onAttachTerminal={attachTerminal} />
           </div>
         ))}
       </div>

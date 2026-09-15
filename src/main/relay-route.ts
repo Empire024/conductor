@@ -8,9 +8,14 @@ import type { RelayResponseBody } from '../shared/remote-relay'
  *
  * Conductor has two, and the choice is the owner's: point it at a relay of their own and every
  * message goes over a socket that is already open, or configure none and fall back to the private
- * gist mailbox, which needs no server but lives inside GitHub's rate limit. Only one runs at a time
- * - two mailboxes would mean two copies of every request and two ways to be found - so this decides,
- * once, and everything else in the app talks to whichever it picked without knowing which it was.
+ * gist mailbox, which needs no server but lives inside GitHub's rate limit. One of them carries any
+ * given message - two copies of every request would be two chances to run it twice - so this
+ * decides, and everything else in the app talks to whichever it picked without knowing which it was.
+ *
+ * Which one carries a message is a fact about the pair, not about this machine, so it is decided per
+ * peer. Listening is the opposite: a machine cannot know which route someone will come looking for
+ * it on, so while any paired machine is missing from the relay this one answers on the mailbox too.
+ * That costs nothing while every machine is on the relay, which is the case the relay exists for.
  *
  * It also decides again when it has to. A relay is an address, and an address is only true from
  * somewhere: a laptop on a network without IPv6 cannot reach a relay that has only an IPv6 address,
@@ -18,8 +23,9 @@ import type { RelayResponseBody } from '../shared/remote-relay'
  * other route in that state would leave the owner with two machines that cannot meet and a panel
  * explaining why - so after the relay has been unreachable long enough to mean it, this falls back
  * to the mailbox and says so. The relay keeps being retried, and the moment it answers, that is the
- * route again. Both machines make that decision independently and land in the same place, which is
- * what matters: a machine that falls back alone has only changed which empty room it waits in.
+ * route again. The two machines reach that point by different evidence - the stranded one by failing
+ * to connect, the one hosting the relay by noticing who never arrived - because a host dials its own
+ * relay over loopback and would otherwise wait forever in a room only it can enter.
  */
 
 export interface RelayRouteDependencies {
@@ -27,6 +33,18 @@ export interface RelayRouteDependencies {
   github: RemoteRelay
   /** The address the owner configured, for showing which relay "connected" means. */
   endpoint(): string | null
+  /**
+   * Paired machines that are not on the relay right now.
+   *
+   * A machine cannot tell whether its relay can be reached from anywhere except where it is
+   * standing, and the machine hosting the relay stands on loopback - which always answers. So the
+   * host is never stranded, never falls back, and a laptop that fell back to the mailbox would be
+   * waiting in a room the host never enters. What the host can see is who failed to arrive, and
+   * that is the signal used here: while a paired machine is missing from the relay, this one is
+   * also reachable through the mailbox, because that is where a machine that cannot reach the
+   * relay will look for it.
+   */
+  awaitedPeers(): string[]
 }
 
 export class RelayRoute {
@@ -45,8 +63,27 @@ export class RelayRoute {
     return this.deps.server.configured() && this.deps.server.stranded()
   }
 
+  /** True while the mailbox is also being listened on, so a peer that cannot reach the relay
+   *  still has somewhere to find this machine. */
+  private awaitingPeers(): boolean {
+    return this.deps.awaitedPeers().length > 0
+  }
+
   private active(): ConductorRelay | RemoteRelay {
     return this.usingServer() ? this.deps.server : this.deps.github
+  }
+
+  /**
+   * Which route carries a message to one particular machine.
+   *
+   * Being on the relay is not a property of this machine but of the pair: a peer that never
+   * arrived there cannot be reached that way however well the relay is working from here, and
+   * sending to it anyway would time out against a room with nobody in it. So presence decides,
+   * per peer, and anyone the relay does not list is addressed through the mailbox instead.
+   */
+  private routeFor(machineId: string): ConductorRelay | RemoteRelay {
+    if (!this.usingServer()) return this.deps.github
+    return this.deps.server.getStatus().reachable.includes(machineId) ? this.deps.server : this.deps.github
   }
 
   start(): void {
@@ -55,7 +92,7 @@ export class RelayRoute {
       // Kept running even while the mailbox carries this machine, because it is what notices the
       // relay coming back - and nothing else would.
       this.deps.server.start()
-      if (this.strandedFromServer()) this.deps.github.start()
+      if (this.strandedFromServer() || this.awaitingPeers()) this.deps.github.start()
       else this.deps.github.stop()
       return
     }
@@ -106,6 +143,6 @@ export class RelayRoute {
   }
 
   async call(machineId: string, peerDeviceKey: string, path: string, body: Buffer, headers: Record<string, string>, peerRelayKey?: string, options?: RelayCallOptions): Promise<RelayResponseBody> {
-    return await this.active().call(machineId, peerDeviceKey, path, body, headers, peerRelayKey, options)
+    return await this.routeFor(machineId).call(machineId, peerDeviceKey, path, body, headers, peerRelayKey, options)
   }
 }

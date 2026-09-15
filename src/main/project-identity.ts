@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from 'node:crypto'
+import type { RemoteProjectOrigin } from '../shared/models'
 import { appendFileSync, closeSync, existsSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync, type Stats } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import {
@@ -113,7 +114,19 @@ export function projectIdentity(project: { name: string; path: string }): Projec
  * is still listed, carrying the reason, so the owner sees why it cannot be paired instead of the
  * project quietly disappearing or quietly getting a new key.
  */
-export function projectSummary(project: { id: string; name: string; path: string }): RemoteProjectSummary {
+export function projectSummary(project: { id: string; name: string; path: string; remote?: RemoteProjectOrigin }): RemoteProjectSummary {
+  // A project that lives on another machine has no identity file here to read, and must never be
+  // looked for on this disk. Its identity is the one that machine advertised when it was opened.
+  if (project.remote) {
+    const identity = project.remote.identity ?? null
+    return {
+      id: project.id,
+      name: project.name,
+      path: project.remote.path || project.path,
+      identity,
+      identityError: identity ? null : `This project lives on ${project.remote.machineName || 'another machine'} and its identity was not recorded here. Open it from that machine's project list again.`
+    }
+  }
   try {
     const identity = projectIdentity(project)
     return { id: project.id, name: project.name, path: identity.path, identity, identityError: null }

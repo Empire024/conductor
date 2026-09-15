@@ -181,3 +181,18 @@
 }
 .browser-sidebar-expanded .browser-toolbar { flex-wrap: nowrap; min-height: 33px; padding: 0 5px; }
 .browser-sidebar-expanded .browser-toolbar form { order: initial; flex-basis: auto; }
+
+/* A project browsed on the machine that holds it. The row names that machine; the tree below is
+   the same remote pane the workspace uses, so it follows the host's own file changes. */
+.explorer-remote .explorer-project { display: flex; align-items: center; gap: 6px; }
+.explorer-remote .explorer-project .project-remote-badge { margin-left: auto; }
+.explorer-remote .remote-files-pane { border: 0; }
+
+/* Not an error, and never the local lister: this computer's folder at the same path is a
+   different working copy. A state the owner can act on - attach again, or wake that machine. */
+.explorer-remote-unavailable {
+  padding: 9px 11px 11px 25px;
+  color: var(--text-3);
+  font-size: 10px;
+  line-height: 1.6;
+}

@@ -2,11 +2,13 @@ import { randomUUID, X509Certificate } from 'node:crypto'
 import { localAddresses } from './network-addresses'
 import { createServer, type Server } from 'node:https'
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { Socket } from 'node:net'
 import type { RemoteControlSettings, RemotePairingTicket, RemoteProjectSummary } from '../shared/remote-control'
 import type { RemoteControlHost } from './remote-control-host'
 import { NONCE_HEADER, PEER_HEADER, RemoteAccessError, SIGNATURE_HEADER, TIMESTAMP_HEADER, type RemotePeers } from './remote-peers'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { createRemoteTlsIdentity, tlsIdentityUsable, type RemoteTlsIdentity } from './remote-tls'
+import { INSTALL_TAILSCALE_MESSAGE, isTailscaleAddress, type TailscaleReader } from './tailscale'
 
 const CERT_SETTING = 'remote-control.tls.certificate'
 const CERT_EXPIRY_SETTING = 'remote-control.tls.notAfter'
@@ -14,16 +16,97 @@ const TLS_KEY_SECRET = 'remote-control.tls.key'
 const MAX_BODY = 3 * 1024 * 1024
 /**
  * Anyone who can reach the port can open a socket, long before they can prove anything, so the
- * count is capped. Paired machines use one short-lived connection per call and never come close.
+ * count is capped. A paired machine holds one long-lived stream, one short-lived connection per
+ * call, and one tunnelled connection per open preview connection - a page opens a handful, and a
+ * peer is capped at TUNNEL_MAX_CONNECTIONS of those - so the ceiling leaves room for all of that
+ * from two machines without letting the 65th stranger's socket be the one that is silently dropped.
  */
-const MAX_SOCKETS = 64
+const MAX_SOCKETS = 192
+/** A WebSocket upgrade carries a handful of short headers; anything larger is not one of ours. */
+const MAX_UPGRADE_HEADER_BYTES = 8 * 1024
 
 /**
  * Loopback keeps the socket on this machine; 'network' is the deliberate choice that lets it be
- * reached from elsewhere. Nothing else in the server may widen the bind address.
+ * reached from elsewhere; 'tailscale' binds this machine's own tailnet address and nothing else.
+ *
+ * Null is a real answer and the important one: in Tailscale exposure with no tailnet address there
+ * is no host to bind that would still mean "only reachable over the tailnet", so the listener does
+ * not start. Widening to loopback would look like it worked and quietly be unreachable; widening to
+ * anything else would be the one promise this exposure exists to keep, broken silently. Nothing
+ * else in the server may widen the bind address.
  */
-export function resolveBindHost(settings: Pick<RemoteControlSettings, 'exposure'>): string {
+export function resolveBindHost(settings: Pick<RemoteControlSettings, 'exposure'>, tailscaleAddress?: string | null): string | null {
+  if (settings.exposure === 'tailscale') {
+    const address = String(tailscaleAddress ?? '').trim()
+    return address && isTailscaleAddress(address) ? address : null
+  }
   return settings.exposure === 'network' ? '0.0.0.0' : '127.0.0.1'
+}
+
+/** A socket that is about to be upgraded, before anything has been written to it. */
+export type UpgradeHandler = (request: IncomingMessage, socket: Socket, head: Buffer) => void
+
+/**
+ * Ends an upgrade attempt with a plain HTTP answer, without ever speaking WebSocket to it.
+ *
+ * The reason phrase is stripped of everything but printable ASCII. It often carries the message
+ * from a RemoteAccessError, which may in turn carry text from GitHub or an operating system error,
+ * and a newline in a status line is not a rude message - it is a second header this machine did not
+ * write.
+ */
+export function refuseUpgrade(socket: Socket, status: number, message: string): void {
+  const reason = String(message ?? '').replace(/[^\x20-\x7e]+/g, ' ').trim().slice(0, 120) || 'Refused'
+  try { socket.end(`HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`) }
+  catch { /* a socket already gone needs no answer */ }
+  socket.destroy()
+}
+
+/** What the open listener is, as the pairing code has to describe it. */
+export interface BoundListener {
+  exposure: RemoteControlSettings['exposure']
+  host: string
+  dnsName?: string
+}
+
+/** The relay half of a pairing code, when there is one to hand over. */
+export interface TicketRelay {
+  relayKey: string | null
+  deviceKey: string | null
+  room: { endpoint: string; secret: string; fingerprint?: string; alternates?: string[] } | null
+}
+
+/**
+ * How a pairing code says this machine is reached. Pulled out of `ticket()` so the rule can be
+ * checked without a socket - and the rule worth checking is a negative one: a Tailscale code
+ * carries no relay key, no relay address and no room secret, so a machine paired with it has
+ * nothing to fall back to and never polls a gist on the owner's account. "We simply do not send
+ * it" is only true if nothing downstream quietly adds it back, which is what this makes testable.
+ */
+export function ticketRoute(
+  settings: Pick<RemoteControlSettings, 'exposure' | 'relay'>,
+  bound: BoundListener | null,
+  relay: TicketRelay
+): Pick<RemotePairingTicket, 'host' | 'transport' | 'dnsName' | 'relayKey' | 'deviceKey' | 'relayEndpoint' | 'relayEndpointAlternates' | 'relaySecret' | 'relayFingerprint'> {
+  if (settings.exposure === 'tailscale') {
+    if (!bound || bound.exposure !== 'tailscale') {
+      throw new RemoteAccessError('This machine is not listening on its Tailscale address yet.', 409)
+    }
+    return { host: bound.host, transport: 'tailscale', ...(bound.dnsName ? { dnsName: bound.dnsName } : {}) }
+  }
+  return {
+    host: settings.exposure === 'network' ? localAddresses()[0] ?? '127.0.0.1' : '127.0.0.1',
+    ...(settings.relay && relay.relayKey && relay.deviceKey ? { relayKey: relay.relayKey, deviceKey: relay.deviceKey } : {}),
+    // The machine being paired has to reach this one, and if this one is only reachable through a
+    // relay the other machine has never heard of, a code that omits it is a code that cannot work.
+    ...(settings.relay && relay.room
+      ? {
+          relayEndpoint: relay.room.endpoint,
+          relaySecret: relay.room.secret,
+          ...(relay.room.fingerprint ? { relayFingerprint: relay.room.fingerprint } : {}),
+          ...(relay.room.alternates?.length ? { relayEndpointAlternates: relay.room.alternates } : {})
+        }
+      : {})
+  }
 }
 
 /**
@@ -46,6 +129,11 @@ export interface RemoteControlServerDependencies {
   deviceKey?(): string | null
   /** The owner's own relay, handed to the other machine so pairing carries the whole route. */
   relayRoom?(): { endpoint: string; secret: string; fingerprint?: string; alternates?: string[] } | null
+  /**
+   * The tailnet as this machine sees it. Absent on a build with no Tailscale support, which makes
+   * 'tailscale' exposure fail closed rather than fall through to something wider.
+   */
+  tailscale?: TailscaleReader
   changed?(): void
 }
 
@@ -69,8 +157,29 @@ export class RemoteControlServer {
   private intent = 0
   private tls?: RemoteTlsIdentity
   private status: RemoteServerStatus = { listening: false, endpoint: null, fingerprint: null, message: null }
+  /**
+   * What the open listener actually is, rather than what the settings say now. A request arriving
+   * on a socket that was bound under Tailscale exposure has to be judged by that bind, because the
+   * owner may have changed the setting a millisecond ago and the socket is still the old one.
+   */
+  private bound: { exposure: RemoteControlSettings['exposure']; host: string; dnsName?: string } | null = null
+  /** Paths another part of the app serves over this same pinned listener: /v1/stream, /v1/tunnel. */
+  private readonly upgrades = new Map<string, UpgradeHandler>()
 
   constructor(private readonly deps: RemoteControlServerDependencies) {}
+
+  /**
+   * Registers the one handler for a WebSocket path. There is deliberately no chain: two things
+   * answering the same upgrade would mean two answers on one socket, so a second registration for
+   * a path replaces the first and the returned function removes exactly what it added.
+   */
+  onUpgrade(path: string, handler: UpgradeHandler): () => void {
+    this.upgrades.set(path, handler)
+    return () => { if (this.upgrades.get(path) === handler) this.upgrades.delete(path) }
+  }
+
+  /** The address the listener is bound to, which in Tailscale exposure is this node's own. */
+  boundHost(): string | null { return this.bound?.host ?? null }
 
   getStatus(): RemoteServerStatus { return { ...this.status } }
 
@@ -107,6 +216,25 @@ export class RemoteControlServer {
       this.deps.changed?.()
       return this.getStatus()
     }
+    // Resolved before anything is created, because in Tailscale exposure "no address" is not a
+    // failure to recover from - it is the answer, and the listener must not exist at all.
+    let tailscaleAddress: string | null = null
+    let tailscaleDnsName = ''
+    if (settings.exposure === 'tailscale') {
+      const state = await this.deps.tailscale?.state()
+      if (intent !== this.intent) return this.getStatus()
+      tailscaleAddress = resolveBindHost(settings, state?.self?.addresses.find(isTailscaleAddress) ?? null)
+      tailscaleDnsName = state?.self?.dnsName ?? ''
+      if (!tailscaleAddress) {
+        this.bound = null
+        this.status = {
+          listening: false, endpoint: null, fingerprint: null,
+          message: state?.message ?? (state ? 'Tailscale has no address for this machine, so nothing is listening.' : INSTALL_TAILSCALE_MESSAGE)
+        }
+        this.deps.changed?.()
+        return this.getStatus()
+      }
+    }
     let candidate: Server | undefined
     try {
       const tls = this.tlsIdentity()
@@ -117,7 +245,9 @@ export class RemoteControlServer {
       server.headersTimeout = 10000
       server.maxHeadersCount = 30
       server.maxConnections = MAX_SOCKETS
-      const bindHost = resolveBindHost(settings)
+      server.on('upgrade', (request, socket, head) => this.upgrade(request, socket as Socket, head))
+      const bindHost = resolveBindHost(settings, tailscaleAddress)
+      if (!bindHost) throw new RemoteAccessError('There is no address to listen on for this exposure.', 409)
       await this.listen(server, settings.port, bindHost)
       if (intent !== this.intent) { await this.closeSocket(server); return this.getStatus() }
       // Once listening there is no promise left to reject into, and an unhandled 'error' event on
@@ -130,18 +260,24 @@ export class RemoteControlServer {
       })
       this.server = server
       this.tls = tls
+      this.bound = { exposure: settings.exposure, host: bindHost, ...(tailscaleDnsName ? { dnsName: tailscaleDnsName } : {}) }
       this.deps.peers.setFingerprint(tls.fingerprint)
       const address = server.address()
       const port = address && typeof address !== 'string' ? address.port : settings.port
       this.status = {
         listening: true,
-        endpoint: `https://${bindHost === '0.0.0.0' ? localAddresses()[0] ?? '127.0.0.1' : '127.0.0.1'}:${port}`,
+        endpoint: `https://${settings.exposure === 'tailscale' ? bindHost : bindHost === '0.0.0.0' ? localAddresses()[0] ?? '127.0.0.1' : '127.0.0.1'}:${port}`,
         fingerprint: tls.fingerprint,
-        message: settings.exposure === 'network' ? 'Reachable from your network. Only paired machines on your GitHub account can connect.' : null
+        message: settings.exposure === 'network'
+          ? 'Reachable from your network. Only paired machines on your GitHub account can connect.'
+          : settings.exposure === 'tailscale'
+            ? `Reachable over Tailscale at ${bindHost} and nowhere else. Only paired machines on your GitHub account can connect.`
+            : null
       }
     } catch (error) {
       if (candidate) await this.closeSocket(candidate)
       if (intent !== this.intent) return this.getStatus()
+      this.bound = null
       this.status = { listening: false, endpoint: null, fingerprint: null, message: error instanceof Error ? error.message : String(error) }
     }
     this.deps.changed?.()
@@ -166,15 +302,16 @@ export class RemoteControlServer {
   }
 
   private setStopped(): void {
+    this.bound = null
     this.status = { listening: false, endpoint: null, fingerprint: null, message: null }
     this.deps.changed?.()
   }
 
   /**
    * The ticket carries the address and the certificate to pin, plus a single-use pairing code, plus
-   * the keys the encrypted relay needs. Both key fields are here for the same reason the
-   * fingerprint is: the owner moves this code between their own two machines by hand, which is the
-   * one channel an attacker who controls the network — or the account's gists — is not on.
+   * whatever the route it names needs. The keys are here for the same reason the fingerprint is:
+   * the owner moves this code between their own two machines by hand, which is the one channel an
+   * attacker who controls the network — or the account's gists — is not on.
    */
   ticket(): RemotePairingTicket {
     const settings = this.deps.peers.getSettings()
@@ -185,31 +322,24 @@ export class RemoteControlServer {
     }
     const address = this.server?.address()
     const port = address && typeof address !== 'string' ? address.port : settings.port
+    // A Tailscale code names the address this listener is actually bound to, so the route is
+    // resolved before a single-use code is spent on a machine that cannot yet be reached.
+    const route = ticketRoute(settings, this.bound, {
+      relayKey: this.deps.relayKey?.() ?? null,
+      deviceKey: this.deps.deviceKey?.() ?? null,
+      room: this.deps.relayRoom?.() ?? null
+    })
     const { code, expiresAt } = this.deps.peers.issueTicket()
-    const relayKey = this.deps.relayKey?.() ?? null
-    const deviceKey = this.deps.deviceKey?.() ?? null
-    const room = this.deps.relayRoom?.() ?? null
     return {
       version: 1,
       machineId: this.deps.peers.machineId,
       machineName: this.deps.machineName(),
       accountLogin: this.deps.accountLogin() ?? '',
-      host: settings.exposure === 'network' ? localAddresses()[0] ?? '127.0.0.1' : '127.0.0.1',
       port,
       fingerprint: this.identity().fingerprint,
       code,
       expiresAt,
-      ...(settings.relay && relayKey && deviceKey ? { relayKey, deviceKey } : {}),
-      // The machine being paired has to reach this one, and if this one is only reachable through a
-      // relay the other machine has never heard of, a code that omits it is a code that cannot work.
-      ...(settings.relay && room
-        ? {
-            relayEndpoint: room.endpoint,
-            relaySecret: room.secret,
-            ...(room.fingerprint ? { relayFingerprint: room.fingerprint } : {}),
-            ...(room.alternates?.length ? { relayEndpointAlternates: room.alternates } : {})
-          }
-        : {})
+      ...route
     }
   }
 
@@ -260,6 +390,7 @@ export class RemoteControlServer {
       response.end(body)
     }
     try {
+      this.requireTailnetSocket(request.socket as Socket)
       // A browser is never a legitimate client here, so anything carrying an Origin is refused
       // before it can be used as a confused deputy.
       if (request.method !== 'POST' || request.headers.origin || !/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] ?? '')) {
@@ -277,6 +408,55 @@ export class RemoteControlServer {
       const code = error instanceof RemoteAccessError ? error.code : undefined
       reply(status, JSON.stringify({ error: error instanceof Error ? error.message : 'Remote request failed', ...(code ? { code } : {}) }))
     }
+  }
+
+  /**
+   * Defence in depth for Tailscale exposure. The listener is already bound to the tailnet address
+   * alone, so nothing off the tailnet should be able to reach it at all; this refuses it a second
+   * time from the socket's own address. It costs nothing and it covers the cases a bind cannot:
+   * a proxy or port forward somebody set up on this machine, and a future bug that widens the bind
+   * without anyone noticing that the promise in the settings panel quietly stopped being true.
+   */
+  private requireTailnetSocket(socket: Socket | undefined): void {
+    if (this.bound?.exposure !== 'tailscale') return
+    if (isTailscaleAddress(socket?.remoteAddress ?? '')) return
+    throw new RemoteAccessError('This machine only accepts connections over Tailscale.', 403)
+  }
+
+  /**
+   * The one door for every WebSocket on this listener. Whatever registered the path decides who
+   * may speak it; this decides that the thing knocking is a WebSocket client of ours at all.
+   *
+   * An Origin header is the whole check that matters here. A pinned self-signed certificate does
+   * not stop a page in the owner's browser from opening a WebSocket - the browser sends the
+   * upgrade with the owner's network position and no same-origin policy applies to WebSockets - so
+   * a request carrying an Origin is a browser, a browser is never one of ours, and it is refused
+   * before a single frame is read.
+   */
+  private upgrade(request: IncomingMessage, socket: Socket, head: Buffer): void {
+    socket.on('error', () => { /* an upgrade socket that breaks has nothing left to report */ })
+    try { this.requireTailnetSocket(socket) }
+    catch { return refuseUpgrade(socket, 403, 'Forbidden') }
+    if (request.headers.origin) return refuseUpgrade(socket, 403, 'Forbidden')
+    // rawHeaders is name/value pairs; a client that fits inside the header limit but sends a
+    // megabyte of them is still holding memory this listener never agreed to hold.
+    const headerBytes = request.rawHeaders.reduce((total, part) => total + part.length, 0)
+    if (headerBytes > MAX_UPGRADE_HEADER_BYTES) return refuseUpgrade(socket, 431, 'Request Header Fields Too Large')
+    if ((request.method ?? 'GET').toUpperCase() !== 'GET') return refuseUpgrade(socket, 405, 'Method Not Allowed')
+    if (String(request.headers['sec-websocket-version'] ?? '') !== '13') {
+      try { socket.end('HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\n\r\n') } catch { /* gone */ }
+      socket.destroy()
+      return
+    }
+    const key = request.headers['sec-websocket-key']
+    if (typeof key !== 'string' || Buffer.from(key, 'base64').length !== 16) return refuseUpgrade(socket, 400, 'Bad Request')
+    // We negotiate no extensions and no subprotocol, so a client asking for either is speaking
+    // frames this build does not read. Saying so now is better than closing mid-conversation.
+    if (request.headers['sec-websocket-extensions'] || request.headers['sec-websocket-protocol']) return refuseUpgrade(socket, 400, 'Bad Request')
+    const handler = this.upgrades.get((request.url ?? '').split('?')[0] ?? '')
+    if (!handler) return refuseUpgrade(socket, 404, 'Not Found')
+    try { handler(request, socket, head ?? Buffer.alloc(0)) }
+    catch { refuseUpgrade(socket, 500, 'Internal Server Error') }
   }
 
   /**

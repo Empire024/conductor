@@ -83,6 +83,24 @@ const bridge: ConductorBridge = {
     closeTab: (localSessionId) => ipcRenderer.invoke('remote:close-tab', localSessionId),
     sessionMachine: (localSessionId) => ipcRenderer.invoke('remote:session-machine', localSessionId),
     sessionFileContext: (localSessionId) => ipcRenderer.invoke('remote:session-file-context', localSessionId),
+    openRemoteProject: (machineId, remoteProjectId) => ipcRenderer.invoke('remote:open-remote-project', machineId, remoteProjectId),
+    tailscale: () => ipcRenderer.invoke('remote:tailscale'),
+    detach: (machineId) => ipcRenderer.invoke('remote:detach', machineId),
+    attach: (machineId) => ipcRenderer.invoke('remote:attach', machineId),
+    diagnostics: (machineId) => ipcRenderer.invoke('remote:diagnostics', machineId),
+    terminals: {
+      list: (request) => ipcRenderer.invoke('remote:terminals-list', request),
+      open: (request) => ipcRenderer.invoke('remote:terminals-open', request),
+      attach: (request) => ipcRenderer.invoke('remote:terminals-attach', request)
+    },
+    services: {
+      list: (request) => ipcRenderer.invoke('remote:services-list', request),
+      open: (request) => ipcRenderer.invoke('remote:services-open', request),
+      close: (request) => ipcRenderer.invoke('remote:services-close', request),
+      registered: (projectId) => ipcRenderer.invoke('remote:services-registered', projectId),
+      register: (request) => ipcRenderer.invoke('remote:services-register', request),
+      unregister: (serviceId) => ipcRenderer.invoke('remote:services-unregister', serviceId)
+    },
     onState: (callback) => subscribe('remote:changed', callback)
   },
   projectTasks: {

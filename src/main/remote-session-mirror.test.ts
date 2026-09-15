@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentEvent, ContextAttachment, SessionProjection } from '../shared/structured-agent'
 import type { ConductorDatabase } from './database'
+import { STREAM_RESYNC_POLL_MS } from '../shared/remote-stream'
 import { RemoteSessionMirror, readBindings, rekeyRemoteEvents, type RemoteSessionBinding } from './remote-session-mirror'
 import { StructuredAgentStore } from './structured-store'
 
@@ -36,7 +37,7 @@ const remoteSnapshot = (): SessionProjection => ({
   }
 })
 
-function fixture(calls: (method: string, args?: Record<string, unknown>) => unknown) {
+function fixture(calls: (method: string, args?: Record<string, unknown>) => unknown, now?: () => number) {
   const root = mkdtempSync(join(tmpdir(), 'conductor-mirror-')); roots.push(root)
   const db = new DatabaseSync(':memory:'); databases.push(db)
   db.exec('CREATE TABLE agent_sessions(id TEXT PRIMARY KEY)')
@@ -53,7 +54,8 @@ function fixture(calls: (method: string, args?: Record<string, unknown>) => unkn
   const mirror = new RemoteSessionMirror({
     database,
     call: async (machineId, method, args) => { asked.push({ machineId, method, args }); return calls(method, args) },
-    publish: (channel, payload) => { published.push({ channel, payload }) }
+    publish: (channel, payload) => { published.push({ channel, payload }) },
+    ...(now ? { now } : {})
   })
   return { mirror, store, settings, published, asked, database }
 }
@@ -458,5 +460,65 @@ describe('mirroring a conversation that runs on another machine', () => {
     expect(readBindings('not json')).toEqual([])
     expect(readBindings(JSON.stringify([{ localSessionId: 'a', machineId: 'desktop' }]))).toEqual([])
     expect(readBindings(JSON.stringify([{ ...binding(), remoteSequence: -4 }]))).toMatchObject([{ remoteSequence: 0 }])
+  })
+})
+
+describe('the push channel driving the mirror', () => {
+  it('pulls straight away when a host says a conversation moved past the cursor', async () => {
+    const clock = { now: Date.parse('2026-09-16T10:00:00.000Z') }
+    const f = fixture(method => (method === 'agents.history' ? [remoteEvent(1, 'one'), remoteEvent(2, 'two')] : []), () => clock.now)
+    f.mirror.bind(binding())
+    await f.mirror.notice('desktop', 'their-session', 2)
+    expect(f.asked.map(entry => entry.method)).toEqual(['agents.history'])
+    expect(f.store.snapshot('local-session')?.items.length).toBeGreaterThan(0)
+  })
+
+  it('does nothing for a notice about something already copied', async () => {
+    const clock = { now: Date.parse('2026-09-16T10:00:00.000Z') }
+    const f = fixture(() => [remoteEvent(1, 'one')], () => clock.now)
+    f.mirror.bind(binding({ remoteSequence: 7 }))
+    // The cursor is the whole protocol: a notice is a hint about a number, and a number this side
+    // has already passed is not worth a round trip.
+    await f.mirror.notice('desktop', 'their-session', 7)
+    await f.mirror.notice('desktop', 'another-session', 99)
+    await f.mirror.notice('laptop', 'their-session', 99)
+    expect(f.asked).toEqual([])
+  })
+
+  it('slows the poll to a resync while that machine is streaming, and speeds it back up when it stops', async () => {
+    const clock = { now: Date.parse('2026-09-16T10:00:00.000Z') }
+    const f = fixture(() => [], () => clock.now)
+    f.mirror.bind(binding())
+    await f.mirror.poll()
+    expect(f.asked).toHaveLength(1)
+
+    f.mirror.streamConnected('desktop', true)
+    clock.now += 1_000
+    await f.mirror.poll()
+    // Nothing asked: the notices are already telling this machine what changed, and polling
+    // underneath them spends the owner's bandwidth to learn what it has just been told.
+    expect(f.asked).toHaveLength(1)
+
+    clock.now += STREAM_RESYNC_POLL_MS
+    await f.mirror.poll()
+    // The resync of last resort still happens, so a frame that never arrived cannot be lost.
+    expect(f.asked).toHaveLength(2)
+
+    f.mirror.streamConnected('desktop', false)
+    clock.now += 1_000
+    await f.mirror.poll()
+    expect(f.asked).toHaveLength(3)
+  })
+
+  it('keeps polling a machine whose stream is down even while another one is streaming', async () => {
+    const clock = { now: Date.parse('2026-09-16T10:00:00.000Z') }
+    const f = fixture(() => [], () => clock.now)
+    f.mirror.bind(binding())
+    f.mirror.bind(binding({ localSessionId: 'other-session', machineId: 'laptop' }))
+    f.mirror.streamConnected('desktop', true)
+    await f.mirror.poll()
+    clock.now += 1_000
+    await f.mirror.poll()
+    expect(f.asked.map(entry => entry.machineId)).toEqual(['desktop', 'laptop', 'laptop'])
   })
 })

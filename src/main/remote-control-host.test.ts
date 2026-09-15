@@ -5,7 +5,10 @@ import { join } from 'node:path'
 import type { RemotePeerRecord, RemoteProjectSummary } from '../shared/remote-control'
 import type { ConductorDatabase } from './database'
 import type { ProjectBacklogs } from './project-backlog'
-import { RemoteControlHost } from './remote-control-host'
+import type { TerminalSpec } from '../shared/models'
+import type { RemoteTerminalSummary } from '../shared/remote-terminals'
+import { RemoteControlHost, type RemoteControlHostDependencies } from './remote-control-host'
+import type { TerminalRuntime } from './remote-terminals'
 import { RemoteAccessError, type RemotePeers } from './remote-peers'
 import type { StructuredSessions } from './structured-sessions'
 
@@ -37,7 +40,7 @@ const peer: RemotePeerRecord = {
   approvedAt: new Date(0).toISOString(), lastSeenAt: null, revokedAt: null
 }
 
-function fixture() {
+function fixture(extra: Partial<RemoteControlHostDependencies> = {}) {
   const opened: Array<Record<string, unknown>> = []
   const updated: Array<Record<string, unknown>> = []
   let currentAuthority = true
@@ -78,7 +81,8 @@ function fixture() {
     providers: () => [{ id: 'codex', available: true, models: [{ id: 'model-a', label: 'Model A', isDefault: true }] }],
     ui: async request => { opened.push(request as unknown as Record<string, unknown>); return { ok: true } },
     fileChanged: vi.fn(),
-    machineName: () => 'Render Desktop'
+    machineName: () => 'Render Desktop',
+    ...extra
   })
   const call = (method: string, args: Record<string, unknown>): Promise<unknown> => host.call(peer, method, args)
   const refusal = (method: string, args: Record<string, unknown>): Promise<string> =>
@@ -323,4 +327,67 @@ describe('remote structured conversation operations', () => {
     })).rejects.toThrow(/Total remote file context exceeds 250 KB/)
     expect(fix.sessions.submit).not.toHaveBeenCalled()
   })
+})
+
+describe('the one door to a shell on this machine', () => {
+  const runtime = (): { specs: Map<string, TerminalSpec>; api: TerminalRuntime } => {
+    const specs = new Map<string, TerminalSpec>()
+    const summary = (id: string): RemoteTerminalSummary | null => {
+      const found = specs.get(id)
+      return found ? { terminalId: id, tabId: null, title: found.title, cwd: found.cwd, running: true, exitCode: null, offset: 0 } : null
+    }
+    return {
+      specs,
+      api: {
+        ensure: spec => { specs.set(spec.id, spec); return { id: spec.id, available: true, status: 'running', transcript: '' } },
+        list: (projectId, sessionId) => [...specs.values()]
+          .filter(entry => entry.projectId === projectId && entry.sessionId === sessionId)
+          .map(entry => summary(entry.id)!),
+        summary,
+        spec: id => specs.get(id) ?? null,
+        attach: () => null,
+        write: vi.fn(),
+        resize: vi.fn(),
+        kill: vi.fn(),
+        running: id => specs.has(id),
+        onOutput: () => () => undefined,
+        onExit: () => () => undefined
+      }
+    }
+  }
+
+  it('refuses terminals and services outright on a machine that wired neither', async () => {
+    expect(await fix.refusal('terminals.list', { projectId: 'shared-project', sessionId: 'workspace-1' }))
+      .toMatch(/Terminals are not available/)
+    expect(await fix.refusal('services.list', { projectId: 'shared-project' }))
+      .toMatch(/not sharing any services/)
+  })
+
+  it('opens a terminal tab only through terminals.open, stamped with the machine that asked', async () => {
+    const terminals = runtime()
+    const hosting = fixture({ terminals: terminals.api })
+    await hosting.call('terminals.open', { projectId: 'shared-project', sessionId: 'workspace-1', opId: 'op-1', cols: 80, rows: 24, title: 'Build' })
+    expect([...terminals.specs.values()]).toEqual([expect.objectContaining({ projectId: 'shared-project', sessionId: 'workspace-1', cwd: shared, title: 'Build' })])
+    const request = hosting.opened.find(entry => entry.action === 'tabs.open') as { params: { tab: Record<string, unknown> } }
+    expect(request.params.tab).toMatchObject({
+      kind: 'terminal',
+      title: 'Build',
+      resourceId: [...terminals.specs.keys()][0],
+      state: { remotePeerId: 'peer-1', remoteMachineName: 'Laptop' }
+    })
+  })
+
+  it('still refuses a shell asked for as an ordinary tab, even on a machine that runs terminals', async () => {
+    const hosting = fixture({ terminals: runtime().api })
+    expect(await hosting.refusal('tabs.open', { projectId: 'shared-project', sessionId: 'workspace-1', kind: 'terminal', terminalId: 'anything' }))
+      .toMatch(/Unsupported remote tab kind/)
+    expect(hosting.opened).toHaveLength(0)
+  })
+
+  it('refuses a terminal method for a project it was not granted', async () => {
+    const hosting = fixture({ terminals: runtime().api })
+    expect(await hosting.refusal('terminals.list', { projectId: 'private-project', sessionId: 'workspace-1' }))
+      .toMatch(/not shared with this machine/)
+  })
+
 })

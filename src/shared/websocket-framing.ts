@@ -99,6 +99,9 @@ export function encodeMaskedFrame(opcode: number, payload: Buffer): Buffer {
 }
 
 export const encodeText = (text: string): Buffer => encodeFrame(OPCODE.text, Buffer.from(text, 'utf8'))
+/** A tunnelled TCP connection is bytes, not text, and a binary frame is what carries them unaltered. */
+export const encodeBinary = (payload: Buffer): Buffer => encodeFrame(OPCODE.binary, payload)
+export const encodeMaskedBinary = (payload: Buffer): Buffer => encodeMaskedFrame(OPCODE.binary, payload)
 export const encodeMaskedText = (text: string): Buffer => encodeMaskedFrame(OPCODE.text, Buffer.from(text, 'utf8'))
 export const encodeMaskedPong = (payload: Buffer): Buffer => encodeMaskedFrame(OPCODE.pong, payload)
 export const encodeMaskedPing = (payload = Buffer.alloc(0)): Buffer => encodeMaskedFrame(OPCODE.ping, payload)

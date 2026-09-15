@@ -1,5 +1,7 @@
 # Remote control between your machines
 
+If both of your machines can run [Tailscale](https://tailscale.com/), **[docs/multi-device.md](./multi-device.md) is the recommended way to use two computers with Conductor**: no home-hosted relay to run, no gist to poll, no router configuration, and a listener that binds only the tailnet address and fails closed everywhere else. This document covers the older path below - a direct LAN/internet connection, with the relay and the GitHub gist mailbox as its own fallback - which stays fully supported for an owner who cannot or would rather not run Tailscale.
+
 Conductor can run selected Claude Code or Codex tabs on another computer you own while keeping the tab and its conversation visible in the computer in front of you. Remote control is off by default. Pairing a machine does not share every project: the owner chooses projects on the host and then confirms which working copy on the controlling computer matches each remote working copy.
 
 ## Sign in with GitHub

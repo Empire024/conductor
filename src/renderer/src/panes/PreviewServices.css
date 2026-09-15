@@ -1,0 +1,67 @@
+/* The ports on this computer that paired machines may look at, registered from the browser
+   toolbar where the owner is already thinking about a dev server. */
+.preview-services { position: relative; display: inline-flex; }
+
+.preview-services > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-3);
+}
+.preview-services > button:hover { color: var(--text); }
+.preview-services > button.has-services { color: var(--accent); }
+.preview-services > button span { font-size: 9.5px; font-weight: 600; }
+
+.preview-services-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  width: 310px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 11px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-0);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.36);
+}
+.preview-services-popover > strong { font-size: 11px; font-weight: 600; color: var(--text); }
+
+/* The security model, in the owner's words. Deliberately given room rather than a tooltip: it is
+   the difference between "shared with my laptop" and "published", and that has to be readable. */
+.preview-services-note,
+.preview-services-empty { margin: 0; color: var(--text-3); font-size: 9.5px; line-height: 1.55; }
+
+.preview-services-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.preview-services-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-1);
+}
+.preview-services-list span { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.preview-services-list strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 600; }
+.preview-services-list small { color: var(--text-3); font-size: 9.5px; }
+.preview-services-list li > button { flex: none; color: var(--text-3); }
+.preview-services-list li > button:hover { color: var(--danger); }
+
+.preview-services-form { display: grid; grid-template-columns: minmax(0, 1fr) 72px auto; gap: 6px; }
+.preview-services-form input {
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--surface-1);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+}
+.preview-services-add { display: inline-flex; align-items: center; gap: 4px; padding: 0 9px; border: 1px solid var(--accent-muted); border-radius: 6px; color: var(--accent); font-size: 10.5px; font-weight: 600; }
+.preview-services-hint { color: var(--text-3); font-size: 9px; line-height: 1.5; }
+.preview-services-error { margin: 0; color: var(--danger); font-size: 9.5px; line-height: 1.5; }

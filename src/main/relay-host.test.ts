@@ -101,7 +101,7 @@ describe('a relay that cannot be reached from where this machine is', () => {
       }
     })
     relays.push(relay)
-    const route = new RelayRoute({ server: relay, github: github as never, endpoint: () => 'ws://127.0.0.1:9/v1/socket' })
+    const route = new RelayRoute({ server: relay, github: github as never, endpoint: () => 'ws://127.0.0.1:9/v1/socket', awaitedPeers: () => [] })
 
     route.start()
     expect(route.usingServer()).toBe(true)
@@ -119,6 +119,58 @@ describe('a relay that cannot be reached from where this machine is', () => {
     // And the panel says why, rather than reporting the mailbox as if it had been chosen.
     expect(route.getStatus().route).toBe('github')
     expect(route.getStatus().message).toContain('cannot be reached from here')
+  })
+})
+
+describe('a relay only the machine hosting it can reach', () => {
+  /**
+   * The host dials its own relay over loopback, so its own connection always works: `stranded` is
+   * false for ever and the fallback every other machine relies on never fires here. The only
+   * evidence a host has that a peer cannot get in is that the peer never arrives.
+   */
+  const hosted = (reachable: string[]): ConductorRelay => ({
+    configured: () => true,
+    stranded: () => false,
+    start: () => {},
+    stop: () => {},
+    getStatus: () => ({ phase: 'ready', reachable, lastPollAt: null, message: null, route: 'server' }),
+    call: async () => { throw new Error('A machine that is not on the relay must not be addressed through it') }
+  } as unknown as ConductorRelay)
+
+  const mailbox = (): { started: boolean; calls: string[]; start(): void; stop(): void; getStatus(): unknown; call(machineId: string): Promise<{ status: number; body: string }> } => {
+    const state = {
+      started: false,
+      calls: [] as string[],
+      start(): void { state.started = true },
+      stop(): void { state.started = false },
+      getStatus: () => ({ phase: 'ready' as const, reachable: [] as never[], lastPollAt: null, message: null }),
+      call: async (machineId: string) => { state.calls.push(machineId); return { status: 200, body: '' } }
+    }
+    return state
+  }
+
+  const routeTo = (github: ReturnType<typeof mailbox>, reachable: string[], awaited: string[]): RelayRoute =>
+    new RelayRoute({ server: hosted(reachable), github: github as never, endpoint: () => 'wss://127.0.0.1:8787/v1/socket', awaitedPeers: () => awaited })
+
+  it('answers in the mailbox too while a paired machine has not arrived on the relay', () => {
+    const github = mailbox()
+    routeTo(github, [], ['laptop']).start()
+    // Not stranded - loopback answered - and still has to be findable where the laptop is looking.
+    expect(github.started).toBe(true)
+  })
+
+  it('addresses a peer the relay does not list through the mailbox instead', async () => {
+    const github = mailbox()
+    const route = routeTo(github, [], ['laptop'])
+    route.start()
+    await route.call('laptop', 'device-key', '/v1/rpc', Buffer.from('{}'), {})
+    expect(github.calls).toEqual(['laptop'])
+  })
+
+  it('leaves the mailbox alone once every paired machine is on the relay', () => {
+    const github = mailbox()
+    routeTo(github, ['laptop'], []).start()
+    expect(github.started).toBe(false)
   })
 })
 

@@ -34,7 +34,78 @@ export interface GitHubAuthState {
   message: string | null
 }
 
-export type RemoteExposure = 'loopback' | 'network'
+/**
+ * Where the listener may be reached from.
+ *
+ * 'loopback' keeps it on this computer. 'network' binds every interface and is the deliberate,
+ * labelled choice to be reachable on the local network. 'tailscale' binds only this machine's own
+ * Tailscale address, so the only way in is through the tailnet the owner signed both computers into;
+ * when Tailscale is not installed, not signed in or not running, the listener does not start at all
+ * rather than widening to something else.
+ */
+export type RemoteExposure = 'loopback' | 'network' | 'tailscale'
+
+/** What the networking layer says about how this machine reaches a peer, when it says anything. */
+export type ConnectionPath = 'direct' | 'relayed' | 'unknown'
+
+/**
+ * The life of an attachment to one host, as the owner sees it.
+ *
+ * 'detached' is the owner's own decision - "use this computer independently" - and survives
+ * restarts; nothing is dialled, retried or subscribed to until they attach again. 'offline' is a
+ * host that could not be reached while the owner still wants it.
+ */
+export type ConnectionState = 'detached' | 'offline' | 'connecting' | 'connected' | 'reconnecting'
+
+/** Why a host cannot be used right now, in the four ways that each need a different fix. */
+export type ConnectionFailure = 'network' | 'host-not-running' | 'authorization' | 'protocol' | null
+
+export interface TailscalePeer {
+  id: string
+  hostName: string
+  dnsName: string
+  /** Tailscale IPv4 (100.64.0.0/10) first, then the tailnet IPv6. */
+  addresses: string[]
+  online: boolean
+  /** As reported by Tailscale itself: a current direct address means direct, a DERP region means relayed. */
+  path: ConnectionPath
+  /** The DERP region carrying a relayed connection, for the diagnostics view; null otherwise. */
+  relay: string | null
+  loginName: string | null
+}
+
+export interface TailscaleState {
+  /** Whether the CLI could be found at all. */
+  installed: boolean
+  /** Straight from `tailscale status --json`: Running, NeedsLogin, Stopped, NoState, Starting. */
+  backendState: string | null
+  /** This machine's own node, only while signed in. */
+  self: { hostName: string; dnsName: string; addresses: string[]; loginName: string | null; online: boolean } | null
+  peers: TailscalePeer[]
+  /** What to do next, in words, whenever the tailnet is not usable from here; null when it is. */
+  message: string | null
+  checkedAt: string | null
+}
+
+/** The local machine, which is always here. */
+export const LOCAL_CONNECTION: MachineConnection = { state: 'connected', path: 'direct', transport: 'direct', failure: null, detail: null, generation: 0 }
+
+/** Before the tailnet has been looked at, or on a build with no Tailscale support at all. */
+export const UNKNOWN_TAILSCALE: TailscaleState = { installed: false, backendState: null, self: null, peers: [], message: null, checkedAt: null }
+
+export interface MachineConnection {
+  state: ConnectionState
+  path: ConnectionPath
+  transport: 'direct' | 'relay' | 'tailscale' | null
+  failure: ConnectionFailure
+  detail: string | null
+  /**
+   * Bumped on every attach and detach. Every answer from the host is stamped with the generation it
+   * was asked under, and one carrying an older generation is dropped, so a reply that arrives after
+   * the owner detached cannot touch the state they are now using locally.
+   */
+  generation: number
+}
 
 export interface RemoteControlSettings {
   enabled: boolean
@@ -156,6 +227,18 @@ export interface RemotePairingTicket {
   code: string
   expiresAt: string
   /**
+   * Set when the host listens on its Tailscale address only. A machine that pairs with such a ticket
+   * reaches the host over the tailnet and nothing else: no relay key and no relay room travel with
+   * it, so there is nothing to fall back to and no gist is ever polled on its account.
+   */
+  transport?: 'tailscale'
+  /**
+   * The host's MagicDNS name, when it has one. Carried next to the address rather than instead of
+   * it: the address is what is dialled, and this is how the address is found again if Tailscale
+   * hands the host a different one before the owner pairs the machines a second time.
+   */
+  dnsName?: string
+  /**
    * Base64 X25519 public key for the encrypted relay. It travels with the certificate fingerprint
    * for the same reason: the owner carries both out of band, so the first contact pins a key
    * rather than trusting whatever the account's gists happen to advertise.
@@ -202,8 +285,20 @@ export interface RemoteConnection {
   /** Pinned at pairing: what the relay seals to, and the key whose signature vouches for it. */
   relayKey?: string
   deviceKey?: string
-  /** Which route last carried a call to this machine, so the owner can see how it is reached. */
-  transport?: 'direct' | 'relay'
+  /** Which route last carried a call to this machine, so the owner can see how it is reached.
+   *  'tailscale' is pinned at pairing rather than observed: it is the only route such a pairing
+   *  has, and nothing may quietly record another one for it. */
+  transport?: 'direct' | 'relay' | 'tailscale'
+  /** The host's MagicDNS name from its pairing code, so the tailnet peer can be found by name. */
+  dnsName?: string
+  /**
+   * The owner chose to use this computer independently of that host. Nothing is sent to it, no
+   * reconnect is attempted and no subscription is kept until they attach again; the pairing itself
+   * is kept, because detaching is not forgetting.
+   */
+  detached?: boolean
+  /** See MachineConnection.generation. Persisted so a restart cannot revive an older generation. */
+  generation?: number
   /** Project pairs the owner confirmed for this machine; the only way work reaches it. */
   projectGrants: RemoteProjectGrant[]
   /** What that machine last said it shares, so a swapped or moved project is noticed here. */
@@ -235,6 +330,8 @@ export interface RemoteControlState {
   relaySecretSet: boolean
   /** The relay this machine runs itself, if it runs one. */
   relayHost: RelayHostStatus
+  /** The tailnet as seen from this machine; the same answer whether or not exposure uses it. */
+  tailscale: TailscaleState
   projects: RemoteProjectSummary[]
   peers: RemotePeerRecord[]
   pending: PendingPairingRequest[]
@@ -261,6 +358,24 @@ export interface MachineDescriptor {
   accountLogin: string | null
   /** Confirmed project pairs; empty for the local machine, which runs all of its own projects. */
   projects: MachineProjectLink[]
+  /** How this machine is reached right now. The local machine is always 'connected' and 'direct'. */
+  connection: MachineConnection
+}
+
+/** Everything the compact diagnostics view shows about one host, gathered in one call. */
+export interface MachineDiagnostics {
+  machineId: string
+  machineName: string
+  connection: MachineConnection
+  /** The address and port this machine dials, and the certificate fingerprint it pins. */
+  endpoint: { host: string; port: number; fingerprint: string } | null
+  /** The Tailscale peer this host resolves to, when the tailnet knows it. */
+  tailscalePeer: TailscalePeer | null
+  lastContactAt: string | null
+  /** Highest event cursor mirrored per attached session, so a resync gap is visible. */
+  cursors: Array<{ localSessionId: string; remoteSequence: number }>
+  /** Push channel: whether it is open, when it last heard the host, and how many reconnects so far. */
+  stream: { open: boolean; lastHeardAt: string | null; reconnects: number }
 }
 
 export interface RemoteControlBridge {
@@ -298,6 +413,23 @@ export interface RemoteControlBridge {
   remoteProjects(machineId: string): Promise<RemoteProjectSummary[]>
   /** Records that this project here is that project there. Nothing is placed remotely without it. */
   confirmProject(machineId: string, localProjectId: string, remoteProjectId: string): Promise<RemoteControlState>
+  /**
+   * Adds a project that lives on that machine to this computer's project list with no local copy at
+   * all: a window onto the host's working copy, marked as such everywhere it appears.
+   */
+  openRemoteProject(machineId: string, remoteProjectId: string): Promise<import('./models').ProjectRecord>
+  /** The tailnet as seen from here, re-read now. */
+  tailscale(): Promise<TailscaleState>
+  /**
+   * Use this computer independently of that host. Needs nothing from the host - it works when the
+   * host is off, lost or gone - and is remembered across restarts. The pairing is kept.
+   */
+  detach(machineId: string): Promise<RemoteControlState>
+  /** The explicit way back. Nothing reattaches on its own, not even when the host reappears. */
+  attach(machineId: string): Promise<RemoteControlState>
+  diagnostics(machineId: string): Promise<MachineDiagnostics>
+  terminals: import('./remote-terminals').RemoteTerminalsBridge
+  services: import('./remote-services').RemoteServicesBridge
   releaseProject(machineId: string, localProjectId: string): Promise<RemoteControlState>
   machines(): Promise<MachineDescriptor[]>
   /**
@@ -343,7 +475,7 @@ export function normalizeRemoteSettings(stored: unknown): RemoteControlSettings 
   const machineName = typeof value.machineName === 'string' ? value.machineName.trim().slice(0, 60) : ''
   return {
     enabled: value.enabled === true,
-    exposure: value.exposure === 'network' ? 'network' : 'loopback',
+    exposure: value.exposure === 'network' ? 'network' : value.exposure === 'tailscale' ? 'tailscale' : 'loopback',
     port: port === 0 || Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : DEFAULT_REMOTE_PORT,
     machineName: machineName || 'This machine',
     // On by default: it publishes no address and opens no port, and without it a machine that moved
@@ -437,8 +569,8 @@ export function decodeTicket(encoded: string): RemotePairingTicket {
   catch { throw new Error('That pairing code is not readable. Copy the whole code from the other machine.') }
   const ticket = parsed as Partial<RemotePairingTicket>
   const required: Array<keyof RemotePairingTicket> = ['machineId', 'machineName', 'accountLogin', 'host', 'fingerprint', 'code', 'expiresAt']
-  const optionalKeys: Array<'relayKey' | 'deviceKey' | 'relayEndpoint' | 'relaySecret' | 'relayFingerprint'> =
-    ['relayKey', 'deviceKey', 'relayEndpoint', 'relaySecret', 'relayFingerprint']
+  const optionalKeys: Array<'relayKey' | 'deviceKey' | 'relayEndpoint' | 'relaySecret' | 'relayFingerprint' | 'transport' | 'dnsName'> =
+    ['relayKey', 'deviceKey', 'relayEndpoint', 'relaySecret', 'relayFingerprint', 'transport', 'dnsName']
   if (ticket.relayEndpointAlternates !== undefined &&
       (!Array.isArray(ticket.relayEndpointAlternates) || ticket.relayEndpointAlternates.some(entry => typeof entry !== 'string'))) {
     throw new Error('That pairing code is incomplete or from an incompatible version.')
@@ -448,6 +580,11 @@ export function decodeTicket(encoded: string): RemotePairingTicket {
   }
   if (ticket?.version !== 1 || required.some(key => typeof ticket[key] !== 'string' || !String(ticket[key]).trim()) || !Number.isInteger(ticket.port)) {
     throw new Error('That pairing code is incomplete or from an incompatible version.')
+  }
+  // The only transport a code may name today. Anything else came from a newer build, and guessing
+  // at it would mean falling back to a route that build deliberately did not offer.
+  if (ticket.transport !== undefined && ticket.transport !== 'tailscale') {
+    throw new Error('That pairing code names a connection this version does not know. Update Conductor on both computers.')
   }
   return ticket as RemotePairingTicket
 }

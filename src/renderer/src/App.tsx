@@ -22,6 +22,8 @@ import type {
 import { makeLauncherTab } from '../../shared/models'
 import { TitleBar } from './components/TitleBar'
 import { Sidebar, type WorkspacePanel } from './components/Sidebar'
+import { ExecutionTargetChip } from './components/ExecutionTargetChip'
+import { requiredMachineId } from './layout/machine-placement'
 import { SessionBar } from './components/SessionBar'
 import { EmptyState } from './components/EmptyState'
 import { CommandPalette, type PaletteCommand } from './components/CommandPalette'
@@ -183,6 +185,14 @@ export function App(): React.JSX.Element {
     if (!machine || machine.status !== 'online' || !checkRemoteProjectPlacement({ grant: link?.grant, advertised: link?.observed, machineName: machine.name }).ok) return null
     return machine
   }, [activeProject, machines, selectedMachineId])
+  /**
+   * The machine the chip beside the workspace header names. A project that lives on another
+   * machine always runs there, whatever the owner last chose for a local workspace, so the chip
+   * has to read the project before the preference - otherwise it would say "Local" over a
+   * workspace in which nothing local can happen.
+   */
+  const executionMachineId = requiredMachineId(activeProject) ?? selectedMachineId
+  const localMachineName = machines.find(machine => machine.id === LOCAL_MACHINE_ID)?.name
   const activeWorkspaceGroups = useMemo(
     () => activeSession ? listGroups(activeSession.layout.root) : [],
     [activeSession]
@@ -339,6 +349,17 @@ export function App(): React.JSX.Element {
       ?? loaded[0]
     if (next) selectSession(next)
   }, [selectSession])
+
+  /**
+   * Opening a project that lives on another machine adds a project row here, so the list has to be
+   * re-read when it happens. The settings panel is a different subtree with no path back to this
+   * state, and a window event is what the rest of this file already uses for exactly that.
+   */
+  useEffect(() => {
+    const reload = (): void => { void window.conductor.projects.list().then(setProjects).catch(() => undefined) }
+    window.addEventListener('conductor:projects-changed', reload)
+    return () => window.removeEventListener('conductor:projects-changed', reload)
+  }, [])
 
   useEffect(() => {
     void Promise.all([
@@ -1354,6 +1375,7 @@ export function App(): React.JSX.Element {
           sessionActivity={sessionActivityStatuses}
           activityPhases={correctedActivityPhases}
           projectActivity={projectActivityStatuses}
+          machines={machines}
           remoteFiles={selectedRemoteMachine && activeProject ? {
             machineId: selectedRemoteMachine.id,
             machineName: selectedRemoteMachine.name,
@@ -1366,6 +1388,7 @@ export function App(): React.JSX.Element {
           {activeProject ? (
             <>
               <SessionBar
+                executionTarget={<ExecutionTargetChip machineId={executionMachineId} localName={localMachineName} />}
                 sessions={sessions}
                 activeId={activeSession?.id ?? ''}
                 canReopen={Boolean(activeSession?.closedTabs.length)}

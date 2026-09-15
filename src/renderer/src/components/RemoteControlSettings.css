@@ -153,3 +153,46 @@
 .remote-activity span { font-weight: 600; }
 .remote-activity code { overflow-wrap: anywhere; }
 .remote-activity small { grid-column: 1 / -1; color: var(--text-3); }
+
+/* Tailscale: what this machine is on the tailnet, and what it can see there. */
+.remote-tailscale { display: flex; flex-direction: column; gap: 8px; }
+
+.remote-tailnet { display: flex; flex-direction: column; gap: 7px; margin-top: 4px; padding-top: 9px; border-top: 1px solid var(--border-soft); }
+.remote-tailnet-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.remote-tailnet-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 9px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-1);
+}
+.remote-tailnet-list li > span { display: flex; flex-direction: column; min-width: 0; gap: 1px; }
+.remote-tailnet-list strong { font-size: 11px; font-weight: 600; }
+.remote-tailnet-list small { color: var(--text-3); font-size: 9.5px; }
+.remote-tailnet-list code { color: var(--text-2); font-size: 9.5px; }
+/* An offline tailnet host is dimmed rather than hidden: "where did my desktop go" is worse. */
+.remote-tailnet-list li[data-online="false"] { opacity: 0.6; }
+
+.remote-diagnostics { margin-top: 2px; }
+
+/*
+  "Use this computer independently" is the action an owner needs precisely when MAIN is off or
+  gone, so it is a block of its own rather than one more button in a row of five.
+*/
+.remote-standalone {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  background: var(--surface-1);
+}
+.remote-standalone strong { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--text); }
+.remote-standalone[data-detached="true"] { border-color: color-mix(in srgb, #d9a441 45%, var(--border-soft)); }
+.remote-standalone[data-detached="true"] strong { color: #d9a441; }
+.remote-standalone-trigger { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }

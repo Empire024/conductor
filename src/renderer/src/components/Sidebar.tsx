@@ -24,6 +24,7 @@ import {
   LayoutGrid,
   ListTodo,
   MemoryStick,
+  MonitorSmartphone,
   MoreHorizontal,
   MoveRight,
   Plus,
@@ -37,11 +38,15 @@ import {
 import type { AgentActivityPhase, FileEntry, PaneKind, ProjectRecord, SessionRecord } from '../../../shared/models'
 import { WorkspaceSidebarPanel } from './WorkspaceSidebarPanel'
 import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
+import type { MachineDescriptor } from '../../../shared/remote-control'
+import { remoteProjectBadge } from './execution-target'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
 import type { RemoteFilesPaneProps } from '../panes/RemoteFilesPane'
 
 interface SidebarProps {
   projects: ProjectRecord[]
+  /** Paired machines, so a project that lives on one can say whether that one is reachable. */
+  machines?: MachineDescriptor[]
   sessions: SessionRecord[]
   activeProjectId: string | null
   activeSessionId: string | null
@@ -316,6 +321,10 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
               const active = project.id === props.activeProjectId
               const expanded = active && !collapsedProjectIds.has(project.id)
               const projectStatus = props.projectActivity.get(project.id) ?? 'idle'
+              // A project that lives on another machine is labelled with that machine, and - the
+              // part that matters - stops looking like a working local project the moment that
+              // machine is detached or unreachable.
+              const badge = remoteProjectBadge(project, props.machines ?? [])
               return (
                 <div key={project.id} onContextMenu={(event) => showProjectMenu(event, project)}>
                   <div className={`project-row-wrap ${active ? 'active' : ''}`} draggable={editingProjectId !== project.id}
@@ -356,10 +365,12 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
                         onClick={() => { if (!active) props.onSelectProject(project.id) }}
                         onDoubleClick={(event) => { event.preventDefault(); beginProjectRename(project) }}
                         onKeyDown={(event) => { if (event.key === 'F2') { event.preventDefault(); beginProjectRename(project) } }}
-                        title={project.path}
+                        title={badge ? `${badge.title}
+${project.path} (on ${project.remote!.machineName})` : project.path}
                       >
-                        <span className="project-glyph"><FolderGit2 size={14} /></span>
+                        <span className="project-glyph">{badge ? <MonitorSmartphone size={14} /> : <FolderGit2 size={14} />}</span>
                         <span className="ellipsis">{project.name}</span>
+                        {badge && <span className={`project-remote-badge ${badge.unavailable ? 'unavailable' : ''}`} title={badge.title}>{badge.label}</span>}
                         {projectStatus === 'attention' && <span className="session-attention-badge" title="An agent in this project needs your attention"><Bell size={11} strokeWidth={1.7} /></span>}
                         {projectStatus !== 'attention' && projectStatus !== 'idle' && <span className={`session-activity-dot ${projectStatus}`} title={projectStatus === 'working' ? 'Actively working' : projectStatus === 'waiting' ? 'Waiting on you' : 'Finished working'} />}
                       </button>

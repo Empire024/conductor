@@ -10,3 +10,23 @@
 .editor-blocked > div { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 7px; justify-content: center; }
 .editor-blocked button { padding: 6px 10px; display: flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 8px; color: var(--text-2); background: var(--surface-1); font-size: 9px; }
 .editor-blocked button:hover { color: var(--text); background: var(--surface-hover); }
+
+/* An unsaved edit kept from a machine this computer detached from. Its label is longer than the
+   other toolbar chips on purpose: it names the machine and the file, because that is the only way
+   to tell it apart from the local file of the same name that it must never be written to. */
+.code-recovered.code-recovery {
+  max-width: 44ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-color: color-mix(in srgb, #d9a441 45%, var(--border-soft));
+  color: #d9a441;
+}
+.code-recovery-notice {
+  padding: 7px 11px;
+  border-bottom: 1px solid var(--border-soft);
+  background: color-mix(in srgb, #d9a441 8%, var(--surface-1));
+  color: var(--text-2);
+  font-size: 10.5px;
+  line-height: 1.55;
+}
