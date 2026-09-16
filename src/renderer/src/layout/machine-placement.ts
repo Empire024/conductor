@@ -3,29 +3,6 @@ import { localModelLabel } from '../../../shared/local-models'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import { createPaneTab } from '../panes/pane-factory'
 
-const KEY = 'conductor.machine-placement'
-
-/**
- * The owner's last placement choice, per workspace. This is the renderer half of the same
- * inheritance rule the agents follow: work opened next stays on the machine the previous work was
- * put on, until the owner says otherwise. It is remembered per workspace rather than globally so
- * a laptop workspace and a render workspace do not keep overwriting each other's choice.
- */
-export function readPlacement(sessionId: string): string {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(KEY) ?? '{}') as Record<string, unknown>
-    const value = stored[sessionId]
-    return typeof value === 'string' && value ? value : LOCAL_MACHINE_ID
-  } catch { return LOCAL_MACHINE_ID }
-}
-
-export function writePlacement(sessionId: string, machineId: string): void {
-  try {
-    const stored = JSON.parse(window.localStorage.getItem(KEY) ?? '{}') as Record<string, unknown>
-    window.localStorage.setItem(KEY, JSON.stringify({ ...stored, [sessionId]: machineId }))
-  } catch { /* placement is a convenience; losing it must never block opening a tab */ }
-}
-
 /**
  * Which kinds of tab can run somewhere other than the window showing them.
  *
@@ -73,19 +50,32 @@ export function projectHostName(project: Pick<ProjectRecord, 'remote'> | null | 
  */
 export function checkProjectPlacement(
   project: Pick<ProjectRecord, 'remote'> | null | undefined,
-  machineId: string
+  machineId: string,
+  machineName = 'that machine'
 ): { ok: boolean; message: string } {
   const required = requiredMachineId(project)
-  if (!required || machineId === required) return { ok: true, message: '' }
-  const host = projectHostName(project)
-  return machineId === LOCAL_MACHINE_ID
-    ? { ok: false, message: `This project lives on ${host}. Its work runs there; this computer has no copy of it.` }
-    : { ok: false, message: `This project lives on ${host}, so it cannot be run on another machine from here.` }
+  if (required) {
+    if (machineId === required) return { ok: true, message: '' }
+    const host = projectHostName(project)
+    return machineId === LOCAL_MACHINE_ID
+      ? { ok: false, message: `This project lives on ${host}. Its work runs there; this computer has no copy of it.` }
+      : { ok: false, message: `This project lives on ${host}, so it cannot be run on another machine from here.` }
+  }
+  // The other half of the same rule, and the one that used to have an answer the owner had to
+  // configure: a project of this computer's runs on this computer. A paired machine's projects are
+  // in the same list under that machine's name, and that is where work meant for it goes.
+  if (machineId === LOCAL_MACHINE_ID) return { ok: true, message: '' }
+  return { ok: false, message: `This project is on this computer, so its work runs here. Open one of ${machineName}'s own projects to run work on ${machineName}.` }
 }
 
-/** The placement a workspace should start from: the host for a remote project, the remembered choice otherwise. */
-export function defaultPlacement(project: Pick<ProjectRecord, 'remote'> | null | undefined, sessionId: string): string {
-  return requiredMachineId(project) ?? readPlacement(sessionId)
+/**
+ * Where a workspace's work runs: the host for a project that lives on one, this computer for a
+ * project of this computer's. It was once the owner's remembered choice per workspace; a project
+ * now belongs to exactly one machine, so there is nothing left to remember and nothing that could
+ * make a workspace of a local project open work somewhere else.
+ */
+export function defaultPlacement(project: Pick<ProjectRecord, 'remote'> | null | undefined): string {
+  return requiredMachineId(project) ?? LOCAL_MACHINE_ID
 }
 
 /**

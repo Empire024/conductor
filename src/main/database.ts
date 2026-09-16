@@ -583,6 +583,47 @@ export class ConductorDatabase {
   }
 
   /**
+   * The host projects the owner took off this computer's list.
+   *
+   * A paired machine's projects are adopted automatically — that is what "its projects show up in
+   * my Projects" means — so without a record of the ones the owner removed, the very next probe
+   * would put them straight back. This is that record, and it is the only thing standing between
+   * "I closed that" and a list that argues with them.
+   */
+  listDismissedRemoteProjects(): Array<{ machineId: string; remoteProjectId: string }> {
+    try {
+      const raw = JSON.parse(this.getSetting('remoteProjectsDismissed') ?? '[]') as unknown
+      if (!Array.isArray(raw)) return []
+      return raw.flatMap(entry => {
+        const value = (entry ?? {}) as { machineId?: unknown; remoteProjectId?: unknown }
+        return typeof value.machineId === 'string' && value.machineId && typeof value.remoteProjectId === 'string' && value.remoteProjectId
+          ? [{ machineId: value.machineId, remoteProjectId: value.remoteProjectId }] : []
+      })
+    } catch { return [] }
+  }
+
+  isRemoteProjectDismissed(machineId: string, remoteProjectId: string): boolean {
+    return this.listDismissedRemoteProjects().some(entry => entry.machineId === machineId && entry.remoteProjectId === remoteProjectId)
+  }
+
+  dismissRemoteProject(machineId: string, remoteProjectId: string): void {
+    if (!machineId || !remoteProjectId) return
+    const kept = this.listDismissedRemoteProjects().filter(entry => entry.machineId !== machineId || entry.remoteProjectId !== remoteProjectId)
+    this.setSetting('remoteProjectsDismissed', JSON.stringify([...kept, { machineId, remoteProjectId }]))
+  }
+
+  /** The owner asking for a host project back; the next refresh adopts it again. */
+  restoreRemoteProject(machineId: string, remoteProjectId: string): void {
+    const kept = this.listDismissedRemoteProjects().filter(entry => entry.machineId !== machineId || entry.remoteProjectId !== remoteProjectId)
+    this.setSetting('remoteProjectsDismissed', JSON.stringify(kept))
+  }
+
+  /** Forgetting a machine forgets what the owner had hidden of it; nothing of it is listed any more. */
+  forgetDismissedRemoteProjects(machineId: string): void {
+    this.setSetting('remoteProjectsDismissed', JSON.stringify(this.listDismissedRemoteProjects().filter(entry => entry.machineId !== machineId)))
+  }
+
+  /**
    * Adds a project that lives on a paired machine: a window onto that machine's working copy with
    * no local copy at all. Deliberately a separate call from `upsertProject` rather than a flag on
    * it, so there is no path through which a local folder acquires a remote origin or a host project

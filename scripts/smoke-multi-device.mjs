@@ -214,7 +214,16 @@ try {
   // ---- 4. a project that lives on the host, with no local copy ----------------------------------
   const controllerProjectsRoot = join(root, 'controller-projects')
   const before = existsSync(controllerProjectsRoot) ? readdirSync(controllerProjectsRoot) : []
+  // Linking the machines joins their project lists: the host's projects are here as the host's,
+  // with nothing to map and nothing to confirm. This is the whole of the strict split, so it is
+  // asserted before anything is opened by hand.
+  const adopted = (await controller.page.evaluate(() => window.conductor.projects.list()))
+    .find(project => project.remote?.machineId === machineId && project.remote.remoteProjectId === hostProject.id)
+  assert.ok(adopted, 'the host project did not appear in the controller list when the two machines were linked')
+  assert.ok(adopted.remote.machineName, 'the adopted project does not name the machine it lives on')
+  check('the host’s projects appeared in the controller list as the host’s, with nothing to pair')
   remoteProject = await controller.page.evaluate(({ id, remoteId }) => window.conductor.remote.openRemoteProject(id, remoteId), { id: machineId, remoteId: hostProject.id })
+  assert.equal(remoteProject.id, adopted.id, 'opening a host project made a second row instead of finding the adopted one')
   assert.equal(remoteProject.remote?.machineId, machineId, 'the opened project does not name the machine it lives on')
   assert.equal(remoteProject.remote?.remoteProjectId, hostProject.id)
   const listed = await controller.page.evaluate(() => window.conductor.projects.list())
@@ -227,6 +236,25 @@ try {
   assert.equal(after.includes(basename(hostProject.path)), false, 'the controller made its own copy of the host project folder')
   note('remoteProjectLocalCopy', { controllerProjectsRoot, entries: after, hostFolder: basename(hostProject.path) })
   check('the controller opened the host project with no local copy of it anywhere on its own side')
+
+  // ---- 4b. a project made on the host from here ------------------------------------------------
+  // The other half of the strict split: adding a project while two machines are linked asks which
+  // computer it lives on, and choosing the other one makes it *there*. Nothing is created here.
+  const madeOnHost = await controller.page.evaluate(id => window.conductor.remote.createRemoteProject(id, 'Made from the laptop'), machineId)
+  assert.equal(madeOnHost.remote?.machineId, machineId, 'a project made on the host is not marked as living there')
+  assert.ok(madeOnHost.path.startsWith(join(root, 'host-projects')), `the project was not created in the host's own projects folder: ${madeOnHost.path}`)
+  assert.equal(existsSync(madeOnHost.path), true, 'the host did not create the project folder')
+  assert.deepEqual(existsSync(controllerProjectsRoot) ? readdirSync(controllerProjectsRoot) : [], before,
+    'the controller created a local folder for a project that lives on the host')
+  const hostSees = await host.page.evaluate(() => window.conductor.projects.list())
+  assert.ok(hostSees.some(project => project.id === madeOnHost.remote.remoteProjectId && !project.remote),
+    'the project the laptop asked for is not a local project on the host')
+  // It is usable straight away, which is what "shared back" has to mean.
+  const madeListing = await controller.page.evaluate(id => window.conductor.remote.files.list({ ...id, path: '.' }),
+    { machineId, projectId: madeOnHost.id })
+  assert.ok(Array.isArray(madeListing), `the new host project could not be listed: ${JSON.stringify(madeListing)}`)
+  note('projectMadeOnHost', { path: madeOnHost.path, remoteProjectId: madeOnHost.remote.remoteProjectId })
+  check('a project added from the controller was created on the host, shared back and usable at once, with nothing made here')
 
   // ---- 5. files through the grant, with revision checks -----------------------------------------
   await watchRuntime(controller.page)

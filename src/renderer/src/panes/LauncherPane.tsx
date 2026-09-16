@@ -56,14 +56,16 @@ const choices: Array<{
 ]
 
 /**
- * Only a machine that is reachable and has this project mapped can run a tab. A machine that is
- * paired but has no confirmed project pair is shown disabled with the reason, rather than hidden,
- * because "my desktop is missing from the list" is a worse puzzle than being told what to fix.
+ * Where a tab in this project can run, and why not, machine by machine.
  *
- * A project that lives on another machine narrows this to one answer: every other machine, this
- * computer included, is disabled with the reason. It is not a preference the owner is overruled
- * on - the working copy is simply not here - and offering the choice would only ever end in work
- * running against a folder this computer does not have.
+ * There is one rule and it is not a preference: a project belongs to the computer whose disk holds
+ * it. A project of this computer's runs here; a project that lives on a paired machine runs there
+ * and nowhere else. Every other machine is listed disabled with the reason rather than hidden,
+ * because "my desktop is missing from the list" is a worse puzzle than being told why.
+ *
+ * What used to be here - a project here mapped onto a project there, so both were offered and the
+ * owner had to remember which mapping they confirmed - is gone. Both machines' projects are in the
+ * one list, each marked with the machine it is on, so the choice is made by opening a project.
  */
 export function machinePlacementOptions(
   machines: MachineDescriptor[],
@@ -73,19 +75,16 @@ export function machinePlacementOptions(
   return machines
     .filter(machine => machine.status !== 'revoked')
     .map(machine => {
-      const scoped = checkProjectPlacement(project, machine.id)
+      const scoped = checkProjectPlacement(project, machine.id, machine.name)
       if (!scoped.ok) return { machine, reason: scoped.message }
-      // A remote project's host is confirmed by the origin itself, so the identity check that
-      // guards a paired local project does not apply and must not refuse it.
-      if (requiredMachineId(project)) return { machine, reason: machine.status !== 'online' ? `${machine.name} is offline.` : '' }
+      if (machine.kind === 'local') return { machine, reason: '' }
+      if (machine.status !== 'online') return { machine, reason: `${machine.name} is offline.` }
+      // The host of a project that lives there still has to be the machine still sharing it: a
+      // project swapped, moved or unshared over there must stop work going to it, not silently
+      // land in whatever now sits at that id.
       const link = machine.projects.find(entry => entry.grant.localProjectId === projectId)
       const placement = checkRemoteProjectPlacement({ machineName: machine.name, grant: link?.grant, advertised: link?.observed })
-      return {
-        machine,
-        reason: machine.kind === 'local' ? ''
-          : machine.status !== 'online' ? `${machine.name} is offline.`
-          : placement.ok ? '' : placement.message
-      }
+      return { machine, reason: placement.ok ? '' : placement.message }
     })
 }
 
@@ -121,6 +120,9 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
   const options = machinePlacementOptions(machines, projectId, project)
   const current = options.find(option => option.machine.id === selected)
   const unavailable = options.filter(option => option.reason && option.machine.id !== selected)
+  // A project belongs to one machine, so there is usually exactly one answer here and the picker
+  // states it rather than offering a list of options that cannot be chosen.
+  const settled = options.filter(option => !option.reason).length <= 1
   // Placement is only worth showing once there is somewhere else to place work, or once the
   // project's own machine is the answer and the owner should be told which one that is.
   const placeable = options.length > 1 || Boolean(host)
@@ -151,7 +153,7 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
           <select
             id="launcher-machine"
             value={selected}
-            disabled={Boolean(host)}
+            disabled={Boolean(host) || settled}
             onChange={event => onSelectMachine?.(event.target.value)}
           >
             {options.map(({ machine, reason }) => (
@@ -175,12 +177,14 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
               || (host
                 ? `This project lives on ${hostName}. Everything you open here runs there.`
                 : selected === LOCAL_MACHINE_ID
-                  ? 'New tabs run here.'
+                  ? settled && options.length > 1
+                    ? 'This project is on this computer, so new tabs run here. Another machine’s projects are in your project list under its name.'
+                    : 'New tabs run here.'
                   : `New tabs run on ${hostName}; you drive them from this window.`)}
           </small>
           {/* A disabled option cannot be selected, so its reason would never be readable anywhere.
               Saying "unavailable" without saying why is the puzzle this list exists to avoid. */}
-          {unavailable.length > 0 && !host && (
+          {unavailable.length > 0 && !host && !settled && (
             <ul className="launcher-placement-reasons">
               {unavailable.map(({ machine, reason }) => <li key={machine.id}>{reason}</li>)}
             </ul>

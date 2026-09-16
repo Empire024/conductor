@@ -31,6 +31,7 @@ import type {
   AppSettings,
   DebugConsoleSnapshot,
   PaneTab,
+  ProjectRecord,
   RememberMemoryInput,
   TerminalSpec,
   ThemeId,
@@ -814,6 +815,32 @@ const safeProjectFolderName = (name: string): string => {
 }
 
 /**
+ * A new project on this computer's disk, from the owner's own "New project" and from a paired
+ * machine's `projects.create` alike. One path for both, so a project the laptop asks MAIN to make
+ * is the same kind of project as one made on MAIN - same folder, same backlog, same watcher - and
+ * so a project made here reaches the machines already linked to this one instead of being
+ * invisible on them.
+ */
+const addLocalProject = async (name: string): Promise<ProjectRecord> => {
+  const settings = getAppSettings()
+  const folderName = safeProjectFolderName(name)
+  await fs.mkdir(settings.projectsRoot, { recursive: true })
+  let target = join(settings.projectsRoot, folderName)
+  let suffix = 2
+  while (await folderExists(target)) {
+    target = join(settings.projectsRoot, `${folderName} ${suffix}`)
+    suffix += 1
+  }
+  await fs.mkdir(target)
+  const project = database.upsertProject(target, basename(target))
+  database.includeDeskProject(project.id)
+  await projectBacklogs.ensure(project.id)
+  projectFileChanges?.watch(project)
+  remoteControl?.shareNewProject(project.id)
+  return project
+}
+
+/**
  * Every path this process resolves is a path on this computer's disk, so a project that lives on
  * another machine can never reach one. The refusal is here, at the resolver, rather than only at
  * each of the two dozen handlers above it: a handler added later inherits the guard instead of
@@ -1072,31 +1099,20 @@ const registerIpc = (): void => {
     database.includeDeskProject(project.id)
     await projectBacklogs.ensure(project.id)
     projectFileChanges?.watch(project)
+    remoteControl?.shareNewProject(project.id)
     return project
   })
-  ipcMain.handle('projects:create', async (_event, name: string) => {
-    const settings = getAppSettings()
-    const folderName = safeProjectFolderName(name)
-    await fs.mkdir(settings.projectsRoot, { recursive: true })
-    let target = join(settings.projectsRoot, folderName)
-    let suffix = 2
-    while (await folderExists(target)) {
-      target = join(settings.projectsRoot, `${folderName} ${suffix}`)
-      suffix += 1
-    }
-    await fs.mkdir(target)
-    const project = database.upsertProject(target, basename(target))
-    database.includeDeskProject(project.id)
-    await projectBacklogs.ensure(project.id)
-    projectFileChanges?.watch(project)
-    return project
-  })
+  ipcMain.handle('projects:create', async (_event, name: string) => addLocalProject(name))
   ipcMain.handle('projects:remove', (_event, projectId: string) => {
     const project = database.getProject(projectId)
     if (!project) return
     terminals.killProject(projectId)
     agents.killProject(projectId)
     browserViews?.releaseProject(projectId)
+    // A project that lives on a paired machine is adopted back from that machine on its next
+    // probe, so removing the row is only half of removing it: the other half is remembering that
+    // the owner does not want it here.
+    if (project.remote) remoteControl?.forgetRemoteProject(project)
     database.removeProject(projectId)
   })
   ipcMain.handle('projects:move', async (event, projectId: string) => {
@@ -1956,6 +1972,9 @@ app.whenReady().then(async () => {
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     fileChanged: change => projectFileChanges?.changed(change),
     cipher: safeStorageCipher,
+    // What a paired machine's "New project on this machine" actually runs. It is this machine's
+    // own project creation, so the folder lands where this machine's owner said projects go.
+    createProject: name => addLocalProject(name),
     chooseRemoteDownloadPath: async description => {
       const options: Electron.SaveDialogOptions = {
         title: `Save ${basename(description.file.path)}`,

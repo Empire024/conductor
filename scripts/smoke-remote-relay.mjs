@@ -122,11 +122,15 @@ try {
   assert.equal(advertised[0].name, 'Relay host project')
   check('a real remote call answered across the relay')
 
-  await controller.page.evaluate(({ machineId, localId, remoteId }) => window.conductor.remote.confirmProject(machineId, localId, remoteId), {
-    machineId: connection.machineId, localId: controllerProject.id, remoteId: advertised[0].id
-  })
+  // The host's projects are adopted into this machine's own list as that machine's projects. There
+  // is no pairing of a project here with a project there any more, so the id to read files by is
+  // the adopted row's - never the controller's own project, which is a different project entirely.
+  const adopted = (await controller.page.evaluate(() => window.conductor.projects.list()))
+    .find(project => project.remote?.machineId === connection.machineId && project.remote.remoteProjectId === advertised[0].id)
+  assert.ok(adopted, 'the host project was not adopted into the controller\'s project list')
+  assert.notEqual(adopted.id, controllerProject.id, 'a host project must never be listed as this machine\'s own')
   const files = await controller.page.evaluate(({ machineId, projectId }) => window.conductor.remote.files.list({ machineId, projectId, path: '.' }),
-    { machineId: connection.machineId, projectId: controllerProject.id })
+    { machineId: connection.machineId, projectId: adopted.id })
   assert.ok(Array.isArray(files), `a remote directory listing did not come back: ${JSON.stringify(files)}`)
   check('the controller read the host filesystem with no route to the host')
 

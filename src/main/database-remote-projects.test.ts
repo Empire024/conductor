@@ -91,6 +91,36 @@ describe('a project that lives on another machine', () => {
     })
   })
 
+  /**
+   * A paired machine's projects are adopted into this list automatically, so "remove" has to mean
+   * something that survives the next probe a minute later - otherwise the row the owner just took
+   * off their list walks straight back onto it.
+   */
+  it('stays removed once the owner removes it, per machine and per project', () => {
+    withDatabase(db => {
+      expect(db.isRemoteProjectDismissed('main-box', 'project_9')).toBe(false)
+      db.dismissRemoteProject('main-box', 'project_9')
+      expect(db.isRemoteProjectDismissed('main-box', 'project_9')).toBe(true)
+      // Another project on the same machine, and the same project id on another machine, are
+      // untouched: ids are private to each machine and mean nothing across one.
+      expect(db.isRemoteProjectDismissed('main-box', 'project_7')).toBe(false)
+      expect(db.isRemoteProjectDismissed('studio', 'project_9')).toBe(false)
+      db.dismissRemoteProject('main-box', 'project_9')
+      expect(db.listDismissedRemoteProjects()).toEqual([{ machineId: 'main-box', remoteProjectId: 'project_9' }])
+      db.restoreRemoteProject('main-box', 'project_9')
+      expect(db.listDismissedRemoteProjects()).toEqual([])
+    })
+  })
+
+  it('forgets what was hidden of a machine the owner unpaired, so re-pairing starts from everything it shares', () => {
+    withDatabase(db => {
+      db.dismissRemoteProject('main-box', 'project_9')
+      db.dismissRemoteProject('studio', 'project_2')
+      db.forgetDismissedRemoteProjects('main-box')
+      expect(db.listDismissedRemoteProjects()).toEqual([{ machineId: 'studio', remoteProjectId: 'project_2' }])
+    })
+  })
+
   it('survives a restart with its origin intact, so it is never mistaken for a local folder', () => {
     const root = mkdtempSync(join(tmpdir(), 'conductor-remote-restart-'))
     const path = join(root, 'conductor.db')

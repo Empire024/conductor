@@ -29,6 +29,13 @@ interface TitleBarProps {
   onThemeAuto?(enabled: boolean): void
   onThemeVariant(variant: ThemeVariant): void
   onNewProject?(): void
+  /**
+   * Creates the project on a paired machine instead. Listed here for the same reason it is listed
+   * in the sidebar: which computer a project lives on is decided when it is made and never after.
+   */
+  onNewProjectOn?(machineId: string): void
+  /** The other computers this one is linked to, for that choice. Empty when none are. */
+  linkedMachines?: Array<{ id: string; name: string; online: boolean }>
   onOpenProject?(): void
   onOpenSession?(): void
   onSaveSession?(): void
@@ -93,7 +100,18 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
             <button disabled={!props.onOpenSession} onClick={() => run(props.onOpenSession)}><FolderOpen size={16} /><span><strong>Open session…</strong><small>Replace this desk from a saved snapshot</small></span></button>
             <button disabled={!props.onSaveSession} onClick={() => run(props.onSaveSession)}><Save size={16} /><span><strong>Save session…</strong><small>Save every loaded project and workspace</small></span></button>
             <div className="file-menu-separator" />
-            {props.onNewProject && <button onClick={() => run(props.onNewProject)}><FilePlus2 size={16} /><span><strong>New project</strong><small>Create it in the Conductor folder</small></span></button>}
+            {props.onNewProject && <button onClick={() => run(props.onNewProject)}><FilePlus2 size={16} /><span>
+              <strong>{props.linkedMachines?.length ? 'New project on this computer' : 'New project'}</strong>
+              <small>Create it in the Conductor folder</small>
+            </span></button>}
+            {props.onNewProjectOn && props.linkedMachines?.map(machine => (
+              <button key={machine.id} disabled={!machine.online} onClick={() => run(() => props.onNewProjectOn?.(machine.id))}>
+                <Laptop size={16} /><span>
+                  <strong>New project on {machine.name}</strong>
+                  <small>{machine.online ? `Created in ${machine.name}'s own projects folder` : `${machine.name} cannot be reached right now`}</small>
+                </span>
+              </button>
+            ))}
             {props.onOpenProject && <button onClick={() => run(props.onOpenProject)}><FolderOpen size={16} /><span><strong>Open project folder…</strong><small>Add an existing local folder</small></span></button>}
             {(props.onNewProject || props.onOpenProject) && <div className="file-menu-separator" />}
             <button disabled={!props.onOpenWorkspace} onClick={() => run(props.onOpenWorkspace)}><FolderOpen size={16} /><span><strong>Open workspace</strong><small>Show project sessions and layouts</small></span></button>

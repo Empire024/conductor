@@ -409,13 +409,19 @@ export interface RemoteControlBridge {
   revoke(peerId: string): Promise<RemoteControlState>
   connect(ticket: string): Promise<RemoteControlState>
   forget(machineId: string): Promise<RemoteControlState>
-  /** Asks a paired machine which projects it shares, so the owner can confirm a pair. */
+  /** Asks a paired machine which projects it shares, and lists them here as that machine's. */
   remoteProjects(machineId: string): Promise<RemoteProjectSummary[]>
-  /** Records that this project here is that project there. Nothing is placed remotely without it. */
-  confirmProject(machineId: string, localProjectId: string, remoteProjectId: string): Promise<RemoteControlState>
   /**
-   * Adds a project that lives on that machine to this computer's project list with no local copy at
-   * all: a window onto the host's working copy, marked as such everywhere it appears.
+   * Creates a project on a paired machine - in that machine's own projects folder - and lists it
+   * here as that machine's. The answer to "which computer is this project on" is given once, when
+   * it is made; there is no later mapping of a project here onto a project there.
+   */
+  createRemoteProject(machineId: string, name: string): Promise<import('./models').ProjectRecord>
+  /** Stops sharing one of this machine's projects with a paired machine, without revoking it. */
+  unshareProject(peerId: string, projectId: string): Promise<RemoteControlState>
+  /**
+   * Puts a project of that machine's back in this computer's list after the owner removed it.
+   * Everything it shares is listed automatically; this is the way back for the one that was hidden.
    */
   openRemoteProject(machineId: string, remoteProjectId: string): Promise<import('./models').ProjectRecord>
   /** The tailnet as seen from here, re-read now. */
@@ -430,7 +436,6 @@ export interface RemoteControlBridge {
   diagnostics(machineId: string): Promise<MachineDiagnostics>
   terminals: import('./remote-terminals').RemoteTerminalsBridge
   services: import('./remote-services').RemoteServicesBridge
-  releaseProject(machineId: string, localProjectId: string): Promise<RemoteControlState>
   machines(): Promise<MachineDescriptor[]>
   /**
    * Probes every paired machine and returns what is reachable now. A machine's status is otherwise

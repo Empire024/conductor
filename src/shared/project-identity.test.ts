@@ -76,7 +76,7 @@ describe('placing work on a project the owner mapped to another machine', () => 
   it('refuses a different key: that machine is sharing a different project now', () => {
     const placement = check({ ...REMOTE, key: 'c'.repeat(32) })
     expect(placement).toMatchObject({ ok: false, reason: 'different-project' })
-    expect(placement.ok === false && placement.message).toContain('now sharing a different project')
+    expect(placement.ok === false && placement.message).toContain('now has a different project where this one was')
   })
 
   it('refuses the confirmed key with a different creation time, which is a copy of the project', () => {

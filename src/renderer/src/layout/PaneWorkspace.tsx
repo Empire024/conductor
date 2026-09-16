@@ -61,7 +61,7 @@ import {
 } from './tab-drag'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { createPaneTab } from '../panes/pane-factory'
-import { closePlacedTab, createPlacedTab, defaultPlacement, projectHostName, readPlacement, requiredMachineId, writePlacement } from './machine-placement'
+import { checkProjectPlacement, closePlacedTab, createPlacedTab, defaultPlacement, projectHostName, requiredMachineId } from './machine-placement'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import { RemoteOnlyPane } from '../components/RemoteOnlyPane'
 import { RemoteFilesPane } from '../panes/RemoteFilesPane'
@@ -253,8 +253,8 @@ function PaneGroup({
 }): React.JSX.Element {
   const groupRef = useRef<HTMLElement>(null)
   const [menuPosition, setMenuPosition] = useState<{ x: number; y: number; tabId: string } | null>(null)
-  // A remote project starts, and stays, on its host: there is no other machine that has it.
-  const [placement, setPlacement] = useState(() => defaultPlacement(workspace.project, workspace.session.id))
+  // A project's machine is the project's: a remote project runs on its host, a local one here.
+  const [placement, setPlacement] = useState(() => defaultPlacement(workspace.project))
   const [placementError, setPlacementError] = useState('')
   const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; tabGroupId: string } | null>(null)
   /** A group created from the tab menu opens its name editor as soon as the chip exists,
@@ -400,14 +400,15 @@ function PaneGroup({
     if (result.tabGroupId) setPendingRename(result.tabGroupId)
   }
 
-  /** Remembering the choice is what makes the next tab inherit this machine. */
+  /**
+   * The picker states where this project's work runs rather than offering a choice, so this only
+   * ever re-affirms that machine. Anything else is refused here as well as in the main process:
+   * work in a project never runs on a computer that does not hold it.
+   */
   const choose = (machineId: string): void => {
-    // A project that lives elsewhere has no choice to remember, and overwriting the workspace's
-    // remembered choice with its host would move the owner's local work there next time.
-    if (requiredMachineId(workspace.project)) return
+    if (!checkProjectPlacement(workspace.project, machineId).ok) return
     setPlacement(machineId)
     setPlacementError('')
-    writePlacement(workspace.session.id, machineId)
     workspace.onMachinePlacement?.(machineId)
   }
 

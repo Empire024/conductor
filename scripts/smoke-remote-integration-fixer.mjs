@@ -271,19 +271,36 @@ const deterministicRemote = async () => {
     assert.ok(connection?.machineId)
     const advertised = await controller.page.evaluate(machineId => window.conductor.remote.remoteProjects(machineId), connection.machineId)
     assert.equal(advertised.length, 1)
-    await controller.page.evaluate(({ machineId, localId, remoteId }) => window.conductor.remote.confirmProject(machineId, localId, remoteId), {
-      machineId: connection.machineId, localId: localProject.id, remoteId: hostProject.id
-    })
+    // The host's project is adopted into this machine's list as the host's own project. Nothing
+    // pairs it with the controller's local copy: that copy stays a separate local project, and it
+    // is the decoy every "the host's bytes, not this machine's" assertion below is measured against.
+    const remoteProject = (await controller.page.evaluate(() => window.conductor.projects.list()))
+      .find(project => project.remote?.machineId === connection.machineId && project.remote.remoteProjectId === hostProject.id)
+    assert.ok(remoteProject, 'the host project was not adopted into the controller\'s project list')
+    assert.notEqual(remoteProject.id, localProject.id)
+    assert.equal(remoteProject.remote.machineName, 'Host fixture')
     const machines = await controller.page.evaluate(() => window.conductor.remote.machines())
-    assert.equal(machines.find(machine => machine.id === connection.machineId)?.projects[0]?.grant.localProjectId, localProject.id)
-    check('Both working-copy identities are explicitly confirmed before placement')
+    assert.equal(machines.find(machine => machine.id === connection.machineId)?.projects[0]?.grant.localProjectId, remoteProject.id)
+    check('The host\'s projects are listed here as the host\'s, with no project on this machine standing in for them')
 
-    step('place the remote agent on the selected machine')
-    await openProject(controller.page, localProject.name)
+    step('refuse to place work from a project of this machine on the host')
+    const refusedPlacement = await controller.page.evaluate(async ({ machineId, projectId }) => {
+      try {
+        const workspace = (await window.conductor.sessions.list(projectId))[0]
+        await window.conductor.remote.openTab({ machineId, projectId, sessionId: workspace.id, provider: 'codex' })
+        return ''
+      } catch (error) { return error instanceof Error ? error.message : String(error) }
+    }, { machineId: connection.machineId, projectId: remoteProject.id })
+    assert.match(refusedPlacement, /is a project on this computer/)
+    check('A project of this computer never runs on the other machine, whatever the two folders hold')
+
+    step('place the remote agent in the project that lives on that machine')
+    await openProject(controller.page, remoteProject.name)
     const chooser = controller.page.locator('#launcher-machine')
     await expect(chooser).toBeVisible()
-    await chooser.selectOption(connection.machineId)
+    // The project lives there, so the machine is not a choice to make: it is stated and locked.
     await expect(chooser).toHaveValue(connection.machineId)
+    await expect(chooser).toBeDisabled()
     await controller.page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
     await expect(controller.page.locator('.structured-agent-pane')).toBeVisible({ timeout: 20000 })
     await expect(controller.page.getByText('Codex · Host fixture', { exact: true }).first()).toBeVisible()
@@ -295,17 +312,17 @@ const deterministicRemote = async () => {
       const visit = node => node.type === 'split' ? node.children.forEach(visit) : node.tabs.forEach(tab => { if (tab.resourceId === resourceId) found.push(tab) })
       for (const workspace of await window.conductor.sessions.list(projectId)) visit(workspace.layout.root)
       return found[0] ?? null
-    }, { projectId: localProject.id, resourceId: localSessionId })).not.toBeNull().then(() => controller.page.evaluate(async ({ projectId, resourceId }) => {
+    }, { projectId: remoteProject.id, resourceId: localSessionId })).not.toBeNull().then(() => controller.page.evaluate(async ({ projectId, resourceId }) => {
       const found = []
       const visit = node => node.type === 'split' ? node.children.forEach(visit) : node.tabs.forEach(tab => { if (tab.resourceId === resourceId) found.push(tab) })
       for (const workspace of await window.conductor.sessions.list(projectId)) visit(workspace.layout.root)
       return found[0]
-    }, { projectId: localProject.id, resourceId: localSessionId }))
+    }, { projectId: remoteProject.id, resourceId: localSessionId }))
     assert.equal(placedTab.state?.machineId, connection.machineId)
     const localWorkspaceId = await controller.page.evaluate(async ({ projectId, tabId }) => {
       const contains = node => node.type === 'split' ? node.children.some(contains) : node.tabs.some(tab => tab.id === tabId)
       return (await window.conductor.sessions.list(projectId)).find(workspace => contains(workspace.layout.root))?.id ?? null
-    }, { projectId: localProject.id, tabId: placedTab.id })
+    }, { projectId: remoteProject.id, tabId: placedTab.id })
     assert.ok(localWorkspaceId)
     const controllerProfile = join(root, 'controller-profile')
     step('close controller before stale-layout restart')
@@ -315,9 +332,9 @@ const deterministicRemote = async () => {
     removePersistedTabMachine(controllerProfile, localWorkspaceId, localSessionId)
     controller = await launch({ name: 'controller', fixture: true, sharedGitHubState, providerPromptCapture: controllerPromptCapture, providerStartCapture: controllerStartCapture })
     controller.page.on('pageerror', error => pageErrors.push('controller-stale-restart: ' + error.message))
-    await expect(controller.page.locator('.project-row').filter({ hasText: localProject.name })).toBeVisible()
+    await expect(controller.page.locator('.project-row').filter({ hasText: remoteProject.name })).toBeVisible()
     await controller.page.evaluate(({ projectId, workspaceId, tabId }) => window.conductor.agentControl.focusTab(projectId, workspaceId, tabId), {
-      projectId: localProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
+      projectId: remoteProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
     })
     const staleRemotePane = controller.page.locator(`[data-structured-session="${localSessionId}"]`)
     await expect(staleRemotePane).toBeVisible()
@@ -328,7 +345,7 @@ const deterministicRemote = async () => {
       const visit = node => node.type === 'split' ? node.children.forEach(visit) : tabs.push(...node.tabs)
       visit(workspace.layout.root)
       return tabs.find(tab => tab.resourceId === resourceId)
-    }, { projectId: localProject.id, workspaceId: localWorkspaceId, resourceId: localSessionId })
+    }, { projectId: remoteProject.id, workspaceId: localWorkspaceId, resourceId: localSessionId })
     assert.equal(staleTab.state?.machineId, undefined)
     await assert.rejects(readFile(hostStartCapture, 'utf8'), error => error?.code === 'ENOENT')
     await assert.rejects(readFile(controllerStartCapture, 'utf8'), error => error?.code === 'ENOENT')
@@ -375,7 +392,7 @@ const deterministicRemote = async () => {
       // Keep the remote conversation mounted while the owner browses its host through the Explorer
       // side panel. This exercises the actual renderer bridge rather than reading through hostControl.
       await controller.page.evaluate(({ projectId, workspaceId, tabId }) => window.conductor.agentControl.focusTab(projectId, workspaceId, tabId), {
-        projectId: localProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
+        projectId: remoteProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
       })
       await expect(staleRemotePane).toBeVisible()
       await composer.click()
@@ -462,7 +479,7 @@ const deterministicRemote = async () => {
     assert.equal(await readFile(join(localProject.path, 'src', 'file-1.ts'), 'utf8'), 'export const owner = "CONTROLLER LOCAL BYTES"\n')
     const offlineRead = await controller.page.evaluate(async ({ machineId, projectId }) => {
       try { await window.conductor.remote.files.read({ machineId, projectId, path: 'src/file-1.ts' }); return false } catch { return true }
-    }, { machineId: connection.machineId, projectId: localProject.id })
+    }, { machineId: connection.machineId, projectId: remoteProject.id })
     assert.equal(offlineRead, true)
     await remoteEditor.locator('.monaco-editor').click()
     await controller.page.keyboard.press('Control+A')
@@ -478,7 +495,7 @@ const deterministicRemote = async () => {
     await expect(controller.page.locator('#launcher-machine')).toHaveValue(connection.machineId)
     await expect(controller.page.locator('.launcher-placement small')).toContainText('Host fixture is offline.')
     await controller.page.evaluate(({ projectId, workspaceId, tabId }) => window.conductor.agentControl.focusTab(projectId, workspaceId, tabId), {
-      projectId: localProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
+      projectId: remoteProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
     })
     await expect(controller.page.locator(`[data-structured-session="${localSessionId}"]`)).toBeVisible()
     await expect(controller.page.locator('.sa-timeline')).toContainText('Synthetic fixture continuation')
@@ -505,7 +522,7 @@ const deterministicRemote = async () => {
     assert.equal(refusedAfterRevoke, true)
     const revokedFileRead = await controller.page.evaluate(async ({ machineId, projectId }) => {
       try { await window.conductor.remote.files.read({ machineId, projectId, path: 'src/file-1.ts' }); return false } catch { return true }
-    }, { machineId: connection.machineId, projectId: localProject.id })
+    }, { machineId: connection.machineId, projectId: remoteProject.id })
     assert.equal(revokedFileRead, true)
     await expect.poll(() => controller.page.evaluate(() => window.conductor.remote.machines()))
       .toContainEqual(expect.objectContaining({ id: connection.machineId, status: 'revoked' }))
@@ -524,9 +541,9 @@ const deterministicRemote = async () => {
     controller = await launch({ name: 'controller', fixture: true, sharedGitHubState, providerPromptCapture: controllerPromptCapture, providerStartCapture: controllerStartCapture })
     controller.page.on('pageerror', error => pageErrors.push('controller-restart: ' + error.message))
     await controller.page.reload()
-    await controller.page.locator('.project-row').filter({ hasText: localProject.name }).click()
+    await controller.page.locator('.project-row').filter({ hasText: remoteProject.name }).click()
     await controller.page.evaluate(({ projectId, workspaceId, tabId }) => window.conductor.agentControl.focusTab(projectId, workspaceId, tabId), {
-      projectId: localProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
+      projectId: remoteProject.id, workspaceId: localWorkspaceId, tabId: placedTab.id
     })
     await expect(controller.page.locator(`[data-structured-session="${localSessionId}"]`)).toBeVisible()
     await expect(controller.page.locator('.sa-timeline')).toContainText('Synthetic fixture continuation')

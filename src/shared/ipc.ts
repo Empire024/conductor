@@ -73,6 +73,11 @@ export interface ConductorBridge {
     openFolder(): Promise<ProjectRecord | null>
     create(name: string): Promise<ProjectRecord>
     remove(projectId: string): Promise<void>
+    /**
+     * The list changed without this window asking - which is what happens when a paired machine's
+     * projects arrive, since those are adopted by the main process rather than opened by hand.
+     */
+    onChanged(callback: (projects: ProjectRecord[]) => void): () => void
     rename(projectId: string, name: string): Promise<ProjectRecord>
     move(projectId: string): Promise<ProjectRecord | null>
     reveal(path: string): Promise<void>

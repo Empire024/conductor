@@ -16,6 +16,7 @@ import type {
 import type { RemoteFileDescription, RemoteFileIdentity, RemoteFileWriteRequest } from '../shared/remote-files'
 import { decodeTicket, encodeTicket, LOCAL_MACHINE_ID, readRemoteProjectSummaries, type TailscaleState } from '../shared/remote-control'
 import { checkRemoteProjectPlacement } from '../shared/project-identity'
+import { adoptRemoteProject, adoptRemoteProjects, type RemoteProjectAdoptionDependencies } from './remote-project-adoption'
 import type { ConductorDatabase } from './database'
 import { GitHubAuth, GITHUB_SCOPES } from './github-auth'
 import { MachineProbeSchedule, describeMachines, machineBriefing, tabMachineId } from './machines'
@@ -66,6 +67,12 @@ export interface RemoteControlServiceDependencies {
   clientId?: string
   /** Main-owned native save dialog; renderer input can never choose an arbitrary destination. */
   chooseRemoteDownloadPath?(description: RemoteFileDescription): Promise<string | null>
+  /**
+   * Creates a project on this machine exactly as the owner's own "New project" does. It is what
+   * serves `projects.create` for a paired machine, so a project made from the laptop is the same
+   * kind of project as one made here - folder, backlog, watchers and all.
+   */
+  createProject?(name: string): Promise<ProjectRecord>
 }
 
 const MACHINE_NAME_SETTING = 'remote-control.machineName'
@@ -295,7 +302,8 @@ export class RemoteControlService {
       database: deps.database, sessions: deps.sessions, backlogs: deps.backlogs, peers: this.peers,
       terminals: deps.terminals, services: this.services,
       providers: () => deps.providers().map(provider => ({ id: provider.id, available: provider.available, models: provider.models })),
-      ui: deps.ui, fileChanged: deps.fileChanged, machineName: () => this.machineName()
+      ui: deps.ui, fileChanged: deps.fileChanged, machineName: () => this.machineName(),
+      ...(deps.createProject ? { createProject: (name: string) => deps.createProject!(name) } : {})
     })
     this.server = new RemoteControlServer({
       peers: this.peers, host: this.host, store, vault,
@@ -621,9 +629,9 @@ export class RemoteControlService {
     const project = this.deps.database.getProject(projectId)
       ?? this.deps.database.listProjects().find(entry => entry.remote?.machineId === machineId && entry.remote.remoteProjectId === projectId)
     if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
-    if (project.remote && project.remote.machineId !== machineId) throw new RemoteAccessError(`That project lives on ${project.remote.machineName || 'another machine'}, not ${connection.machineName}.`, 409)
+    this.requirePlacedOn(project, machineId, connection.machineName)
     const remoteProjectId = connection.projectGrants.find(entry => entry.localProjectId === project.id)?.remoteProjectId ?? project.remote?.remoteProjectId
-    if (!remoteProjectId) throw new RemoteAccessError(`${connection.machineName} has not been told which of its projects this one is. Confirm the pair of projects in Account & machines first.`, 409)
+    if (!remoteProjectId) throw new RemoteAccessError(`${connection.machineName} is not sharing that project any more.`, 409)
     return { localProjectId: project.id, remoteProjectId, machineName: connection.machineName }
   }
 
@@ -640,26 +648,105 @@ export class RemoteControlService {
   }
 
   /**
-   * Opens a project that lives on a paired machine here, with no local copy. The record carries the
-   * identity that machine advertised, and a grant is confirmed for it at once - the project is its
-   * own confirmation - so every remote path (files, tabs, terminals, tasks) resolves it exactly as
-   * it resolves a confirmed pair of working copies.
+   * Puts one of a paired machine's projects back in this computer's list after the owner removed
+   * it. Adoption does the same thing for everything that machine shares; this is the way back for
+   * the one they hid, and it is why removing a remote project is not a decision they are stuck with.
    */
   async openRemoteProject(machineId: string, remoteProjectId: string): Promise<ProjectRecord> {
     const connection = this.client.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     if (connection.detached) throw new RemoteAccessError(`You are using this computer independently of ${connection.machineName}. Attach to it first.`, 409, 'detached')
+    // Asking for it back outranks having hidden it, or the button would do nothing the second time.
+    this.deps.database.restoreRemoteProject(machineId, remoteProjectId)
     const summary = (await this.refreshRemoteProjects(machineId)).find(entry => entry.id === remoteProjectId)
     if (!summary) throw new RemoteAccessError(`${connection.machineName} is not sharing that project.`, 409)
     if (!summary.identity) throw new RemoteAccessError(summary.identityError || `${connection.machineName} cannot read that project's identity, so it cannot be opened from here.`, 409)
-    const record = this.deps.database.addRemoteProject({
-      name: summary.name, path: summary.path,
-      remote: { machineId, machineName: connection.machineName, remoteProjectId, path: summary.path, identity: summary.identity }
-    })
-    this.client.confirmProject(machineId, { localProjectId: record.id, local: summary.identity, remoteProjectId, remote: summary.identity, confirmedAt: new Date().toISOString() })
+    const record = this.adoptRemoteProject(machineId, connection.machineName, summary)
+    if (!record) throw new RemoteAccessError(`${connection.machineName} could not be asked for that project.`, 409)
     void this.refreshSubscriptions(machineId)
     this.publishState()
+    this.publishProjects()
     return record
+  }
+
+  /** What `remote-project-adoption.ts` needs of this machine: its project list and its grants. */
+  private adoption(): RemoteProjectAdoptionDependencies {
+    return {
+      listProjects: () => this.deps.database.listProjects(),
+      addRemoteProject: request => this.deps.database.addRemoteProject(request),
+      includeInDesk: projectId => this.deps.database.includeDeskProject(projectId),
+      isDismissed: (machineId, remoteProjectId) => this.deps.database.isRemoteProjectDismissed(machineId, remoteProjectId),
+      grantFor: (machineId, localProjectId) => this.client.get(machineId)?.projectGrants.find(entry => entry.localProjectId === localProjectId),
+      confirmProject: (machineId, grant) => { this.client.confirmProject(machineId, grant) }
+    }
+  }
+
+  /** One project of a paired machine, as a project of this computer's own list. */
+  private adoptRemoteProject(machineId: string, machineName: string, summary: RemoteProjectSummary): ProjectRecord | null {
+    return adoptRemoteProject(this.adoption(), machineId, machineName, summary)
+  }
+
+  /**
+   * Every project a paired machine shares, in this computer's project list, marked as that
+   * machine's. This is the whole of "linking two machines": no pairs to confirm, no project here
+   * standing in for a project there - the machines' lists are joined, and each project keeps the
+   * one machine it actually lives on.
+   */
+  private adoptRemoteProjects(machineId: string, summaries: RemoteProjectSummary[]): void {
+    const connection = this.client.get(machineId)
+    if (!connection || connection.status === 'revoked' || connection.detached) return
+    if (adoptRemoteProjects(this.adoption(), machineId, connection.machineName, summaries).changed) this.publishProjects()
+  }
+
+  /**
+   * The owner taking a paired machine's project off this computer's list. It is remembered, or the
+   * next probe would adopt it again a minute later; it is not a decision about that machine's
+   * files, which stay exactly where they are.
+   */
+  forgetRemoteProject(project: Pick<ProjectRecord, 'id' | 'remote'>): void {
+    const origin = project.remote
+    if (!origin?.machineId) return
+    this.deps.database.dismissRemoteProject(origin.machineId, origin.remoteProjectId)
+    this.client.releaseProject(origin.machineId, project.id)
+    void this.refreshSubscriptions(origin.machineId)
+    this.publishState()
+  }
+
+  /**
+   * Creates a project on a paired machine and lists it here as that machine's. The host makes the
+   * folder in its own projects folder and shares it back, so the answer to "where does this
+   * project live" is decided once, when it is made, and never revisited.
+   */
+  async createRemoteProject(machineId: string, name: string): Promise<ProjectRecord> {
+    const connection = this.client.get(machineId)
+    if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
+    if (connection.detached) throw new RemoteAccessError(`You are using this computer independently of ${connection.machineName}. Attach to it first.`, 409, 'detached')
+    const requested = name.trim().slice(0, 120)
+    if (!requested) throw new RemoteAccessError('Name the project to create.', 400)
+    const created = readRemoteProjectSummaries([await this.client.call(machineId, 'projects.create', { name: requested })])[0]
+    if (!created?.identity) throw new RemoteAccessError(`${connection.machineName} created the project but did not report a usable identity for it.`, 502)
+    this.deps.database.restoreRemoteProject(machineId, created.id)
+    await this.refreshRemoteProjects(machineId).catch(() => undefined)
+    const record = this.adoptRemoteProject(machineId, connection.machineName, created)
+    if (!record) throw new RemoteAccessError(`${connection.machineName} created the project but it could not be added here.`, 502)
+    void this.refreshSubscriptions(machineId)
+    this.publishState()
+    this.publishProjects()
+    return record
+  }
+
+  /**
+   * A project made on this machine, offered to the machines already linked to it. Pairing shares a
+   * set of projects; without this, every project made afterwards would be invisible on the other
+   * computer, which is exactly the "why can't my laptop see it" the strict split has to avoid. It
+   * is recorded in the activity log and can be stopped per project in Account & machines.
+   */
+  shareNewProject(projectId: string): void {
+    let shared = false
+    for (const peer of this.peers.activePeers()) {
+      if (this.peers.shareProject(peer, projectId, 'made on this machine while they were linked')) shared = true
+    }
+    if (shared) this.publishState()
   }
 
   /**
@@ -864,7 +951,14 @@ export class RemoteControlService {
     let adopted = false
     for (const connection of this.client.list()) {
       if (connection.peerId || connection.detached || connection.status === 'revoked') continue
-      try { if (await this.client.adoptApproval(connection.machineId)) adopted = true } catch { /* asked again next time */ }
+      try {
+        if (await this.client.adoptApproval(connection.machineId)) {
+          adopted = true
+          // A pairing approved after this machine stopped waiting still joins the two project
+          // lists; the approval is what carries that machine's projects, so they are taken here.
+          this.adoptRemoteProjects(connection.machineId, this.client.remoteProjects(connection.machineId))
+        }
+      } catch { /* asked again next time */ }
     }
     if (adopted) this.applyRoutes()
     const now = Date.now()
@@ -929,47 +1023,55 @@ export class RemoteControlService {
     return machineBriefing(this.machines(), tabMachineId(tab))
   }
 
-  /** Asks a paired machine what it shares now and remembers the answer against the mapping. */
-  async refreshRemoteProjects(machineId: string, options: RemoteCallOptions = {}): Promise<RemoteProjectSummary[]> {
-    return this.client.recordRemoteProjects(machineId, readRemoteProjectSummaries(await this.client.call(machineId, 'projects.list', {}, options)))
-  }
-
   /**
-   * The owner confirming that this project here is that project there. Both identities are read
-   * fresh — the local one off disk, the remote one from that machine right now — so what is stored
-   * is what the owner was actually looking at when they said yes.
+   * Asks a paired machine what it shares now, remembers it, and lists it. The answer is not just
+   * recorded any more: a machine's projects are this computer's projects too, so the same call
+   * that notices a machine is reachable is what puts its projects in the owner's list and keeps
+   * their names and folders current there.
    */
-  async confirmProject(machineId: string, localProjectId: string, remoteProjectId: string): Promise<RemoteControlState> {
-    const connection = this.client.get(machineId)
-    if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
-    const project = this.deps.database.getProject(localProjectId)
-    if (!project) throw new RemoteAccessError('This project is not registered on this machine.', 404)
-    const local = projectSummary(project)
-    if (!local.identity) throw new RemoteAccessError(local.identityError || 'Conductor cannot read this project identity, so it will not pair it.', 409)
-    const remote = (await this.refreshRemoteProjects(machineId)).find(entry => entry.id === remoteProjectId)
-    if (!remote) throw new RemoteAccessError(`${connection.machineName} is not sharing that project.`, 409)
-    if (!remote.identity) throw new RemoteAccessError(remote.identityError || `${connection.machineName} cannot read that project identity, so it cannot be paired.`, 409)
-    this.client.confirmProject(machineId, {
-      localProjectId,
-      local: local.identity,
-      remoteProjectId,
-      remote: remote.identity,
-      confirmedAt: new Date().toISOString()
-    })
-    return this.state()
+  async refreshRemoteProjects(machineId: string, options: RemoteCallOptions = {}): Promise<RemoteProjectSummary[]> {
+    const summaries = this.client.recordRemoteProjects(machineId, readRemoteProjectSummaries(await this.client.call(machineId, 'projects.list', {}, options)))
+    this.adoptRemoteProjects(machineId, summaries)
+    return summaries
   }
 
   /**
-   * Places a tab on a paired machine, in the project the owner mapped to this one. The mapping is
-   * checked against what that machine advertises at this moment, not against what it advertised
-   * when the mapping was made, so a project that was swapped, copied or moved in between stops the
-   * placement instead of quietly receiving the work.
+   * The strict split, enforced where it can actually stop work going to the wrong computer.
+   *
+   * A project belongs to exactly one machine: the one whose disk holds it. Work in a project of
+   * this computer's runs here, and work meant for a paired machine belongs in that machine's own
+   * project - which is in the same list, marked with its name. There is no mapping between the two
+   * any more, so there is no case where both answers are defensible and the owner has to remember
+   * which one they picked in a settings panel months ago.
+   */
+  private requirePlacedOn(project: ProjectRecord, machineId: string, machineName: string): void {
+    const origin = project.remote
+    if (!origin?.machineId) {
+      throw new RemoteAccessError(
+        `“${project.name}” is a project on this computer, so its work runs here. ${machineName}'s own projects are in your project list — open one of those to run work on ${machineName}.`, 409)
+    }
+    if (origin.machineId !== machineId) {
+      throw new RemoteAccessError(
+        `“${project.name}” lives on ${origin.machineName || 'another machine'}, so it cannot be run on ${machineName}.`, 409)
+    }
+  }
+
+  /**
+   * Places a tab in a project that lives on a paired machine. What the host advertises right now is
+   * checked against the project this row was adopted from, not against what it advertised when the
+   * row was made, so a project that was swapped, copied or moved in between stops the placement
+   * instead of quietly receiving the work.
+   *
+   * A project of this computer's own is refused here, and that refusal is the feature: a local
+   * project is local, and work in it runs where its files are. The other machine's projects are in
+   * the same list, one row away, and that is where work meant for that machine belongs.
    */
   async openRemote(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string; remoteProjectId: string; remoteSessionId: string; remoteCwd: string }> {
     const connection = this.client.get(machineId)
     if (!connection) throw new RemoteAccessError('This machine is not paired with that one.', 404)
     const localProject = this.deps.database.getProject(request.projectId)
     if (!localProject) throw new RemoteAccessError('This project is not registered on this machine.', 404)
+    this.requirePlacedOn(localProject, machineId, connection.machineName)
     const local = projectSummary(localProject)
     if (!local.identity) throw new RemoteAccessError(local.identityError || 'Conductor cannot read this project identity, so it will not place work elsewhere.', 409)
     const advertised = await this.refreshRemoteProjects(machineId)
@@ -1062,6 +1164,16 @@ export class RemoteControlService {
     try { this.deps.publish('remote:changed', this.state()) } catch { /* the window may be closing */ }
   }
 
+  /**
+   * The project list changed without the renderer asking for it - a paired machine's projects
+   * arriving is the only thing that does that - so the window is told to re-read it. Publishing
+   * only when something actually changed is what keeps a probe every minute from redrawing the
+   * sidebar for ever.
+   */
+  private publishProjects(): void {
+    try { this.deps.publish('projects:changed', this.deps.database.listDeskProjects()) } catch { /* the window may be closing */ }
+  }
+
   async start(): Promise<void> {
     await this.server.apply()
     // The relay this machine runs comes up before the client that uses it, so the first connection
@@ -1135,13 +1247,20 @@ export class RemoteControlService {
       // The relay has to be in place before the first pairing request goes out, or a machine that
       // is only reachable through it cannot be reached to be paired with.
       await this.adoptRelayFromTicket(String(ticket))
-      await this.client.connect(String(ticket))
+      const connection = await this.client.connect(String(ticket))
       this.applyRoutes()
+      // Linking two machines joins their project lists, so the other machine's projects are here
+      // the moment the link is made rather than whenever the next probe happens to come round.
+      this.adoptRemoteProjects(connection.machineId, connection.remoteProjects)
       return this.state()
     })
     handle<RemoteControlState>('remote:forget', (machineId: string) => {
       const id = String(machineId) || LOCAL_MACHINE_ID
       this.client.forget(id)
+      // Its projects stay in the list, marked unreachable, because they hold workspaces the owner
+      // may still want to read. What is dropped is what they had *hidden* of that machine: pairing
+      // with it again starts from everything it shares, not from choices made about an old link.
+      this.deps.database.forgetDismissedRemoteProjects(id)
       // A tab cannot keep mirroring a machine the owner just cut loose.
       this.mirror.releaseMachine(id)
       this.terminalBindings.releaseMachine(id)
@@ -1150,10 +1269,10 @@ export class RemoteControlService {
       return this.state()
     })
     handle<RemoteProjectSummary[]>('remote:remote-projects', (machineId: string) => this.refreshRemoteProjects(String(machineId)))
-    handle<RemoteControlState>('remote:confirm-project', (machineId: string, localProjectId: string, remoteProjectId: string) =>
-      this.confirmProject(String(machineId), String(localProjectId), String(remoteProjectId)))
-    handle<RemoteControlState>('remote:release-project', (machineId: string, localProjectId: string) => {
-      this.client.releaseProject(String(machineId), String(localProjectId))
+    handle<ProjectRecord>('remote:create-remote-project', (machineId: string, name: string) =>
+      this.createRemoteProject(String(machineId), String(name ?? '')))
+    handle<RemoteControlState>('remote:unshare-project', (peerId: string, projectId: string) => {
+      this.peers.unshareProject(String(peerId), String(projectId))
       return this.state()
     })
     handle<MachineDescriptor[]>('remote:machines', () => this.machines())
@@ -1241,7 +1360,7 @@ export class RemoteControlService {
     if (this.registered) {
       for (const channel of ['remote:github-state', 'remote:github-sign-in', 'remote:github-cancel', 'remote:github-sign-out',
         'remote:state', 'remote:set-settings', 'remote:set-relay-server', 'remote:set-relay-hosting', 'remote:ticket', 'remote:invite', 'remote:approve', 'remote:reshare-project', 'remote:deny', 'remote:revoke',
-        'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:confirm-project', 'remote:release-project',
+        'remote:connect', 'remote:forget', 'remote:remote-projects', 'remote:create-remote-project', 'remote:unshare-project',
         'remote:machines', 'remote:refresh-machines', 'remote:open-tab', 'remote:close-tab', 'remote:session-machine', 'remote:session-file-context', 'remote:files-list', 'remote:files-stat', 'remote:files-read',
         'remote:files-write', 'remote:files-preview', 'remote:files-revoke-preview', 'remote:files-download',
         'remote:tailscale', 'remote:diagnostics', 'remote:detach', 'remote:attach', 'remote:open-remote-project',

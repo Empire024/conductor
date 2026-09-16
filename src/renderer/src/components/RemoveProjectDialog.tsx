@@ -19,7 +19,14 @@ export function RemoveProjectDialog({ project, onRemove, onDismiss }: { project:
       }
     }}>
       <header><FolderOpen size={18} /><strong id="remove-project-title">Remove {project.name}?</strong><button aria-label="Cancel removal" disabled={busy} onClick={onDismiss}><X size={15} /></button></header>
-      <p id="remove-project-description">Remove this project and its workspaces from Conductor. Your files stay on disk and you can open the folder again later.</p>
+      {/*
+        A project that lives on another machine is removed from this computer's list only. Saying
+        "your files stay on disk" would be about the wrong disk, and the way back is not "open the
+        folder again" - that folder is not here - so it names where it is and how to get it back.
+      */}
+      <p id="remove-project-description">{project.remote
+        ? `Remove this project from your list on this computer. It stays on ${project.remote.machineName || 'the machine it lives on'}, untouched, and Account & machines can show it here again.`
+        : 'Remove this project and its workspaces from Conductor. Your files stay on disk and you can open the folder again later.'}</p>
       <code>{project.path}</code>
       {error && <p className="dialog-error" role="alert">{error}</p>}
       <footer><button disabled={busy} onClick={onDismiss}>Cancel</button><button className="danger" disabled={busy} onClick={() => {

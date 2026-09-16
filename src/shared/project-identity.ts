@@ -102,13 +102,13 @@ export function checkRemoteProjectPlacement(input: {
   const machine = input.machineName ? `“${input.machineName}”` : 'That machine'
   const { grant, advertised } = input
   if (!grant) {
-    return { ok: false, reason: 'not-mapped', message: `${machine} has not been told which of its projects this one is. Confirm the pair of projects in Account & machines before placing work there.` }
+    return { ok: false, reason: 'not-mapped', message: `This project is not one of ${machine}'s, so its work does not run there. That machine's own projects are in your project list under its name.` }
   }
   if (!advertised) {
-    return { ok: false, reason: 'not-advertised', message: `${machine} is not sharing the project this one was mapped to any more.` }
+    return { ok: false, reason: 'not-advertised', message: `${machine} is not sharing this project any more.` }
   }
   if (advertised.key !== grant.remote.key) {
-    return { ok: false, reason: 'different-project', message: `${machine} is now sharing a different project under that mapping, so work was not placed there. Confirm the pair of projects again.` }
+    return { ok: false, reason: 'different-project', message: `${machine} now has a different project where this one was, so work was not placed there.` }
   }
   if (advertised.keyCreatedAt !== grant.remote.keyCreatedAt) {
     return {
@@ -121,13 +121,13 @@ export function checkRemoteProjectPlacement(input: {
     return {
       ok: false,
       reason: 'project-moved',
-      message: `The project on ${machine} moved from ${grant.remote.path} to ${advertised.path}. Confirm the new location before work goes there.`,
+      message: `The project on ${machine} moved from ${grant.remote.path} to ${advertised.path}. It is picked up again the next time that machine is reached; try once more in a moment.`,
       recordedPath: grant.remote.path,
       currentPath: advertised.path
     }
   }
   if (input.local && !sameWorkingCopy(input.local, grant.local)) {
-    return { ok: false, reason: 'local-changed', message: `This project folder no longer holds the working copy that was mapped to ${machine}. Confirm the pair of projects again.` }
+    return { ok: false, reason: 'local-changed', message: `This project is no longer the working copy ${machine} was sharing under it.` }
   }
   return { ok: true, grant }
 }

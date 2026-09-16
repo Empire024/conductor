@@ -119,14 +119,14 @@ describe('whether a machine may run a tab for this project', () => {
   it('refuses a project that was never mapped to that machine', () => {
     const placement = machineRunsProject(peerFor(), 'project-b')
     expect(placement).toMatchObject({ ok: false, reason: 'not-mapped' })
-    expect(placement.ok === false && placement.message).toMatch(/has not been told which of its projects this one is/)
+    expect(placement.ok === false && placement.message).toMatch(/is not one of .Render Desktop/)
   })
 
   it('refuses when that machine is sharing a different project under the mapping', () => {
     const swapped = { ...REMOTE_IDENTITY, key: 'c'.repeat(32) }
     const placement = machineRunsProject(peerFor({ remoteProjects: [advertise(swapped)] }), 'project-a')
     expect(placement).toMatchObject({ ok: false, reason: 'different-project' })
-    expect(placement.ok === false && placement.message).toMatch(/now sharing a different project/)
+    expect(placement.ok === false && placement.message).toMatch(/now has a different project where this one was/)
   })
 
   it('refuses a key that reappears with a different creation time, which is a copy, not the project', () => {

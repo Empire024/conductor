@@ -80,6 +80,11 @@ not its model keys, not its provider tokens. The laptop keeps its own.
 - **Attachment and decoupling** (`remote-attachment.ts`, `RemoteControlSettings.tsx`, sidebar and
   launcher): remote projects as first-class entries (`ProjectRecord.remote`), the execution target
   shown everywhere, detach/attach with generations, recovery drafts for unsaved remote edits.
+- **One machine per project** (`remote-project-adoption.ts`): a paired machine's projects are
+  adopted into this computer's list as that machine's the moment it is reached, with the grant
+  mapping the adopted row onto the host's own project rather than onto a working copy here. Removal
+  is remembered (`remoteProjectsDismissed`) so the next probe does not undo it, and `projects.create`
+  makes a project on the other machine rather than pairing two folders.
 - **Existing and reused**: pairing (single-use ticket → per-device Ed25519 key → approval with
   project grants → revocation), remote files with revision checks, the session mirror with its
   sequence cursors, tab placement and inheritance.
@@ -120,9 +125,24 @@ registry that pairing verifies against is built on. Doing one does not do the ot
    reach MAIN over the tailnet and nothing else - no relay key and no relay room travel with it.
 5. On the laptop, in Conductor: sign in to the same GitHub account, press **I have an invite**, and
    paste the code.
-6. Back on MAIN, approve the request and choose which projects it may open.
-7. On the laptop, open the project MAIN shared - it appears as a remote entry (`Remote: MAIN`) - or
-   place a new tab on it with **Run on**.
+6. Back on MAIN, approve the request and choose which projects it may open. Projects made on MAIN
+   later are shared with the laptop too; any single one can be unshared from the machine's card.
+7. On the laptop, MAIN's projects are already in the project list, each marked `Remote: MAIN`. Open
+   one and everything in it - files, terminals, agents, tasks - runs on MAIN.
+
+### Which computer a project is on
+
+A project belongs to exactly one computer: the one whose disk holds it. There is no pairing of a
+project here with a project there, and no setting that links them - the two machines' lists are
+joined, each project keeps the machine it lives on, and work opened in it runs on that machine.
+
+- A project of this computer's runs here. The launcher's **Run on** states that rather than offering
+  the other machine.
+- A project that lives on MAIN runs on MAIN, from either window.
+- Adding a project while a machine is linked asks where it should live: this computer, or MAIN. A
+  project made on MAIN is created in MAIN's own projects folder and appears here as MAIN's.
+- Removing one of MAIN's projects from this list removes it from the list only - MAIN keeps it, and
+  **Account & machines** can show it here again.
 
 To see whether a session is Direct or Relayed, open that machine's diagnostics: the value comes
 straight from `tailscale status --json` on this machine (`TailscalePeer.path` in

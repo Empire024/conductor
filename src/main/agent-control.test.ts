@@ -564,7 +564,7 @@ describe('which machine a controlled tab runs on', () => {
       { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION },
       { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: 'Empire024', projects: [link('some-other-project')], connection: LOCAL_CONNECTION }
     ] })
-    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/has not been told which of its projects this one is/)
+    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/is not one of .Render Desktop/)
     expect(openRemote).not.toHaveBeenCalled()
   })
 
@@ -576,7 +576,7 @@ describe('which machine a controlled tab runs on', () => {
       { id: 'local', name: 'This Laptop', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION },
       { id: 'render-desktop', name: 'Render Desktop', kind: 'peer', status: 'online', accountLogin: 'Empire024', projects: [{ ...mapped, observed: { ...mapped.grant.remote, key: 'c'.repeat(32) } }], connection: LOCAL_CONNECTION }
     ] })
-    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/sharing a different project/)
+    await expect(control.call(f.scope, 'tabs.open', { machineId: 'render-desktop' })).rejects.toThrow(/now has a different project where this one was/)
     expect(openRemote).not.toHaveBeenCalled()
   })
 

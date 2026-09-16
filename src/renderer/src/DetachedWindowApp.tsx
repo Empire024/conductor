@@ -23,8 +23,7 @@ import { useAppUpdates } from './use-app-updates'
 import { AppUpdateButton, isUpdateActionVisible } from './components/AppUpdateButton'
 import type { MachineDescriptor } from '../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../shared/remote-control'
-import { checkRemoteProjectPlacement } from '../../shared/project-identity'
-import { readPlacement } from './layout/machine-placement'
+import { requiredMachineId } from './layout/machine-placement'
 import { RemoteFilesPane } from './panes/RemoteFilesPane'
 import { dispatchAgentContext } from './panes/StructuredAgentPane'
 
@@ -46,7 +45,6 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
   const [loadedProjects, setLoadedProjects] = useState<ProjectRecord[]>([])
   const [sessionName, setSessionName] = useState('Untitled session')
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
-  const [selectedMachineId, setSelectedMachineId] = useState(LOCAL_MACHINE_ID)
   useEffect(() => { const refresh = (): void => { void window.conductor.projects.list().then(setLoadedProjects) }; refresh(); window.addEventListener('focus', refresh); return () => window.removeEventListener('focus', refresh) }, [])
   const [bundle, setBundle] = useState<DetachedBundle | null>(null)
   const [layout, setLayout] = useState<WorkspaceLayout | null>(null)
@@ -79,7 +77,6 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
       if (!loaded) return
       const codingLayout = migrateLegacyCodexModels(stripWorkspaceUtilityTabs(loaded.record.layout))
       setBundle(loaded)
-      setSelectedMachineId(readPlacement(loaded.session.id))
       setLayout(codingLayout)
       setMaximizedGroupId(loaded.record.maximizedGroupId)
       setFocusedGroupId(listGroups(codingLayout.root)[0]?.id ?? '')
@@ -95,13 +92,17 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     return window.conductor.remote.onState(refresh)
   }, [])
 
-  const selectedRemoteMachine = useMemo(() => {
-    if (!bundle || selectedMachineId === LOCAL_MACHINE_ID) return null
-    const machine = machines.find(item => item.id === selectedMachineId)
-    const link = machine?.projects.find(item => item.grant.localProjectId === bundle.project.id)
-    if (!machine || machine.status !== 'online' || !checkRemoteProjectPlacement({ grant: link?.grant, advertised: link?.observed, machineName: machine.name }).ok) return null
-    return machine
-  }, [bundle, machines, selectedMachineId])
+  /**
+   * The machine this window's project lives on, when it lives on one. It is read off the project
+   * rather than off a placement the owner chose, because a project belongs to exactly one computer
+   * and its files are browsed on that computer or not at all.
+   */
+  const projectMachine = useMemo(() => {
+    const machineId = requiredMachineId(bundle?.project)
+    if (!machineId) return null
+    const machine = machines.find(item => item.id === machineId)
+    return machine && machine.status === 'online' ? machine : null
+  }, [bundle, machines])
 
   useEffect(() => {
     const apply = (): void => {
@@ -305,9 +306,9 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               <button onClick={() => { setUtilityPanel('memory'); setContextSidebarOpen(false) }}><MemoryStick size={16} /><span><strong>Memory</strong><small>Workspace drawer</small></span></button>
               <button onClick={() => { setUtilityPanel('processes'); setContextSidebarOpen(false) }}><Gauge size={16} /><span><strong>Processes</strong><small>Workspace drawer</small></span></button>
             </div>
-            {selectedRemoteMachine && <RemoteFilesPane
-              machineId={selectedRemoteMachine.id}
-              machineName={selectedRemoteMachine.name}
+            {projectMachine && <RemoteFilesPane
+              machineId={projectMachine.id}
+              machineName={projectMachine.name}
               projectId={bundle.project.id}
               files={window.conductor.remote.files}
               onOpenFile={file => openWorkspaceFile(file.projectId, file.path, 'editor', undefined, undefined, file.machineId)}
@@ -331,7 +332,6 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               onClosed={(tab) => setClosedTabs((current) => [...current, tab].slice(-20))}
               onDetach={detachAgain}
               onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(bundle.project.id, path, mode ?? 'auto', line, allowBinary)}
-              onMachinePlacement={setSelectedMachineId}
               canReopen={closedTabs.length > 0}
               onReopen={(groupId) => {
                 const tab = closedTabs.at(-1)

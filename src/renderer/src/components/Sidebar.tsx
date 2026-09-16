@@ -41,7 +41,6 @@ import { WorkspaceSessionMenu } from './WorkspaceSessionMenu'
 import type { MachineDescriptor } from '../../../shared/remote-control'
 import { remoteProjectBadge } from './execution-target'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
-import type { RemoteFilesPaneProps } from '../panes/RemoteFilesPane'
 
 interface SidebarProps {
   projects: ProjectRecord[]
@@ -53,6 +52,12 @@ interface SidebarProps {
   onSelectProject(id: string): void
   onSelectSession(id: string): void
   onCreateProject(): void
+  /**
+   * Creates a project on a paired machine instead of this one. Where a project lives is decided
+   * here, once, because it is the one thing about it that can never be changed afterwards - and
+   * the owner is only asked at all when there is another machine to put it on.
+   */
+  onCreateProjectOn?(machineId: string): void
   renameProjectId?: string | null
   onRenameProject(id: string, name: string): Promise<void>
   onProjectRenameComplete(): void
@@ -84,7 +89,6 @@ interface SidebarProps {
   sessionActivity: ReadonlyMap<string, SessionActivityStatus>
   activityPhases: ReadonlyMap<string, AgentActivityPhase>
   projectActivity: ReadonlyMap<string, ProjectActivityStatus>
-  remoteFiles?: Omit<RemoteFilesPaneProps, 'files'>
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
@@ -125,6 +129,9 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     | null
   >(null)
   const [workspaceMenu, setWorkspaceMenu] = useState<{ session: SessionRecord; x: number; y: number } | null>(null)
+  // The other computers this one is linked to. A revoked pairing is not one of them, and a machine
+  // that is merely offline still is - it is listed with the reason rather than quietly missing.
+  const linkedMachines = (props.machines ?? []).filter((machine) => machine.kind === 'peer' && machine.status !== 'revoked')
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null)
   const [sessionName, setSessionName] = useState('')
   const renameSession = (session: SessionRecord): void => { setEditingSessionId(session.id); setSessionName(session.name) }
@@ -288,7 +295,6 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
           onOpenFile={props.onOpenFile}
           onPathChanged={props.onPathChanged}
           onPathRemoved={props.onPathRemoved}
-          remoteFiles={props.remoteFiles}
           onProjectRenamed={(project) => {
             props.onProjectRenamed?.(project)
             window.dispatchEvent(new CustomEvent('conductor:project-renamed', { detail: project }))
@@ -304,7 +310,21 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
           <div className="sidebar-heading">
             <span>Projects</span>
             <div className="heading-actions">
-              <button onClick={props.onCreateProject} title="Create new project"><Plus size={14} /></button>
+              {/*
+                With no other machine linked there is nothing to ask, so this still makes the
+                project straight away. With one linked, where the project lives is a real question
+                with no undo, so the same button asks it - in the menu that already holds the other
+                ways to add a project - instead of guessing "this computer".
+              */}
+              <button
+                title={linkedMachines.length ? 'Add a project' : 'Create new project'}
+                onClick={(event) => {
+                  if (!linkedMachines.length) { props.onCreateProject(); return }
+                  event.stopPropagation()
+                  const rect = event.currentTarget.getBoundingClientRect()
+                  setMenu((current) => current?.kind === 'projects' ? null : { kind: 'projects', x: Math.min(rect.right - 8, window.innerWidth - 240), y: rect.bottom + 3 })
+                }}
+              ><Plus size={14} /></button>
               <button
                 data-project-menu-trigger
                 title="More project actions"
@@ -435,8 +455,23 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
         >
           {menu.kind === 'projects' ? (
             <>
-              <button onClick={() => { setMenu(null); props.onCreateProject() }}><Plus size={14} /> Create new project</button>
+              <button onClick={() => { setMenu(null); props.onCreateProject() }}>
+                <Plus size={14} /> {linkedMachines.length ? 'New project on this computer' : 'Create new project'}
+              </button>
               <button onClick={() => { setMenu(null); props.onOpenExistingProject() }}><FolderInput size={14} /> Open existing folder</button>
+              {/*
+                A project on the other machine is made *there*, in that machine's own projects
+                folder, and appears here as that machine's. Nothing is copied and nothing is
+                linked: this is the only moment the question is asked, and the answer is final.
+              */}
+              {linkedMachines.map((machine) => (
+                <button
+                  key={machine.id}
+                  disabled={machine.status !== 'online'}
+                  title={machine.status === 'online' ? `Created in ${machine.name}'s own projects folder` : `${machine.name} cannot be reached right now.`}
+                  onClick={() => { setMenu(null); props.onCreateProjectOn?.(machine.id) }}
+                ><MonitorSmartphone size={14} /> New project on {machine.name}{machine.status === 'online' ? '' : ' — unavailable'}</button>
+              ))}
               <div />
               <button onClick={() => { setMenu(null); props.onOpenSettings() }}><Settings2 size={14} /> Project settings</button>
             </>

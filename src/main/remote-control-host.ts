@@ -58,6 +58,7 @@ const strictUtf8 = (bytes: Buffer): string => {
 export const remoteToolSignatures = {
   'machine.describe': '() — this machine, the projects it shares with you and the tabs it is running',
   'projects.list': '() — only the projects this machine shared with you',
+  'projects.create': '({name}) — creates a project folder on this machine, in its own projects folder, and shares it with you',
   'workspaces.list': '({projectId})',
   'tabs.list': '({projectId,sessionId})',
   'tabs.open': '({projectId,sessionId,kind?,provider?,model?,effort?,title?,permission?}) — opens a visible tab on this machine',
@@ -112,6 +113,12 @@ export interface RemoteControlHostDependencies {
   terminalStream?: RemoteTerminalStream
   /** The owner's registered preview services, for `services.list`. */
   services?: RemoteServiceRegistry
+  /**
+   * Creates a project on this machine, the same way the owner's own "New project" does — same
+   * folder, same backlog, same watchers. Without it `projects.create` is refused rather than
+   * half-served, because a project row with no folder behind it is worse than no project.
+   */
+  createProject?(name: string): Promise<{ id: string }>
 }
 
 /** Serves one authenticated peer's calls against this machine's own projects. */
@@ -285,6 +292,21 @@ export class RemoteControlHost {
       }
     }
     if (method === 'projects.list') return this.deps.peers.sharedProjects(peer)
+    /*
+     * A project the owner asked for from their other machine. It is the one write outside a
+     * granted project that exists, and it is bounded on purpose: a folder named from the request
+     * but sanitised here, created inside this machine's own projects folder and nowhere else, and
+     * shared with the peer that asked for it only. The alternative — pairing a folder made here
+     * with a folder made there — is the mapping this whole feature exists to be rid of.
+     */
+    if (method === 'projects.create') {
+      const create = this.deps.createProject
+      if (!create) throw new RemoteAccessError('This machine cannot create projects for a paired machine.', 501)
+      const created = await create(text(args, 'name', 120))
+      const shared = this.deps.peers.shareProject(peer, created.id, `created from ${peer.machineName}`)
+      if (!shared) throw new RemoteAccessError('This machine created the project but could not share it back.', 500)
+      return shared
+    }
     if (method === 'workspaces.list') {
       const project = this.deps.peers.requireProject(peer, args.projectId)
       return database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name, projectId: workspace.projectId }))

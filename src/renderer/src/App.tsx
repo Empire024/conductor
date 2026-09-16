@@ -90,9 +90,6 @@ import { spinPhaseStyle } from './spin-sync'
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag } from './components/composer-file-drop'
 import type { MachineDescriptor } from '../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../shared/remote-control'
-import { checkRemoteProjectPlacement } from '../../shared/project-identity'
-import { readPlacement } from './layout/machine-placement'
-import { dispatchAgentContext } from './panes/StructuredAgentPane'
 
 const workspaceDocumentsSnapshot = (): WorkspaceDocumentState[] => {
   const documents: WorkspaceDocumentState[] = []
@@ -121,7 +118,6 @@ export function App(): React.JSX.Element {
   const [projects, setProjects] = useState<ProjectRecord[]>([])
   const [sessionName, setSessionName] = useState('Untitled session')
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
-  const [selectedMachineId, setSelectedMachineId] = useState(LOCAL_MACHINE_ID)
   const [sessions, setSessions] = useState<SessionRecord[]>([])
   const [closedWorkspaces, setClosedWorkspaces] = useState<SessionRecord[]>([])
   const workspaceRestoreBusy = useRef(false)
@@ -178,20 +174,13 @@ export function App(): React.JSX.Element {
 
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? null
   const activeSession = sessions.find((session) => session.id === activeSessionId) ?? null
-  const selectedRemoteMachine = useMemo(() => {
-    if (!activeProject || selectedMachineId === LOCAL_MACHINE_ID) return null
-    const machine = machines.find(item => item.id === selectedMachineId)
-    const link = machine?.projects.find(item => item.grant.localProjectId === activeProject.id)
-    if (!machine || machine.status !== 'online' || !checkRemoteProjectPlacement({ grant: link?.grant, advertised: link?.observed, machineName: machine.name }).ok) return null
-    return machine
-  }, [activeProject, machines, selectedMachineId])
   /**
    * The machine the chip beside the workspace header names. A project that lives on another
    * machine always runs there, whatever the owner last chose for a local workspace, so the chip
    * has to read the project before the preference - otherwise it would say "Local" over a
    * workspace in which nothing local can happen.
    */
-  const executionMachineId = requiredMachineId(activeProject) ?? selectedMachineId
+  const executionMachineId = requiredMachineId(activeProject) ?? LOCAL_MACHINE_ID
   const localMachineName = machines.find(machine => machine.id === LOCAL_MACHINE_ID)?.name
   const activeWorkspaceGroups = useMemo(
     () => activeSession ? listGroups(activeSession.layout.root) : [],
@@ -351,14 +340,18 @@ export function App(): React.JSX.Element {
   }, [selectSession])
 
   /**
-   * Opening a project that lives on another machine adds a project row here, so the list has to be
-   * re-read when it happens. The settings panel is a different subtree with no path back to this
-   * state, and a window event is what the rest of this file already uses for exactly that.
+   * A project that lives on another machine can appear without this window doing anything: a
+   * paired machine's projects are adopted by the main process the moment that machine is reached,
+   * which is what makes them show up in this list at all. So the list is re-read both when the
+   * main process says it changed and when another subtree here says so - the settings panel is a
+   * different subtree with no path back to this state, and a window event is what the rest of this
+   * file already uses for exactly that.
    */
   useEffect(() => {
     const reload = (): void => { void window.conductor.projects.list().then(setProjects).catch(() => undefined) }
     window.addEventListener('conductor:projects-changed', reload)
-    return () => window.removeEventListener('conductor:projects-changed', reload)
+    const stop = window.conductor.projects.onChanged(reload)
+    return () => { window.removeEventListener('conductor:projects-changed', reload); stop() }
   }, [])
 
   useEffect(() => {
@@ -393,8 +386,6 @@ export function App(): React.JSX.Element {
     refresh()
     return window.conductor.remote.onState(refresh)
   }, [])
-
-  useEffect(() => setSelectedMachineId(activeSession ? readPlacement(activeSession.id) : LOCAL_MACHINE_ID), [activeSession?.id])
 
   useEffect(() => installDebugLogging(), [])
 
@@ -669,6 +660,24 @@ export function App(): React.JSX.Element {
     await loadProject(project.id)
     setToast(`Created ${project.name}`)
     setRenameProjectId(project.id)
+  }
+
+  /**
+   * A project made on a paired machine. It is created there, in that machine's own projects
+   * folder, and appears here as that machine's project - there is no copy on this computer and
+   * nothing linking it to one. Renaming it afterwards would rename a folder on that machine, which
+   * is that machine's to do, so unlike a local project it is not dropped into inline rename here.
+   */
+  const createProjectOnMachine = async (machineId: string, name = 'Untitled project'): Promise<void> => {
+    try {
+      const project = await window.conductor.remote.createRemoteProject(machineId, name)
+      setProjects((current) => [project, ...current.filter((item) => item.id !== project.id)])
+      await loadProject(project.id)
+      setToast(`Created ${project.name} on ${project.remote?.machineName ?? 'that machine'}`)
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason)
+      setToast(message.replace(/^Error invoking remote method '[^']+': Error: /, ''))
+    }
   }
 
   const renameProject = async (projectId: string, name: string): Promise<void> => {
@@ -1322,6 +1331,9 @@ export function App(): React.JSX.Element {
         onThemeAuto={(enabled) => void window.conductor.settings.setThemeAuto(enabled).then(setAppSettings)}
         onThemeVariant={(variant) => void chooseManualThemeVariant(variant)}
         onNewProject={() => void createManagedProject()}
+        onNewProjectOn={(machineId) => void createProjectOnMachine(machineId)}
+        linkedMachines={machines.filter((machine) => machine.kind === 'peer' && machine.status !== 'revoked')
+          .map((machine) => ({ id: machine.id, name: machine.name, online: machine.status === 'online' }))}
         onOpenProject={() => void openExistingProject()}
         onOpenSession={() => void openNamedSession()}
         onSaveSession={() => void saveNamedSession()}
@@ -1341,6 +1353,7 @@ export function App(): React.JSX.Element {
           onSelectProject={(id) => void loadProject(id)}
           onSelectSession={(id) => { const session = sessions.find((item) => item.id === id); if (session) selectSession(session) }}
           onCreateProject={() => void createManagedProject()}
+          onCreateProjectOn={(machineId) => void createProjectOnMachine(machineId)}
           renameProjectId={renameProjectId}
           onRenameProject={renameProject}
           onProjectRenameComplete={() => setRenameProjectId(null)}
@@ -1376,13 +1389,6 @@ export function App(): React.JSX.Element {
           activityPhases={correctedActivityPhases}
           projectActivity={projectActivityStatuses}
           machines={machines}
-          remoteFiles={selectedRemoteMachine && activeProject ? {
-            machineId: selectedRemoteMachine.id,
-            machineName: selectedRemoteMachine.name,
-            projectId: activeProject.id,
-            onOpenFile: file => openWorkspaceFile(file.projectId, file.path, 'editor', undefined, undefined, file.machineId),
-            onAttachFile: attachment => { if (!dispatchAgentContext(activeProject.id, attachment)) setToast('Focus a conversation in this project before attaching a remote file.') }
-          } : undefined}
         />
         <div className="main-stage">
           {activeProject ? (
@@ -1435,7 +1441,6 @@ export function App(): React.JSX.Element {
                           canReopen={activeSession.closedTabs.length > 0}
                           onReopen={reopenClosed}
                           onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(activeProject.id, path, mode ?? 'auto', line, allowBinary)}
-                          onMachinePlacement={setSelectedMachineId}
                           correctedActivityPhases={correctedActivityPhases}
                         />
                         <WorkspaceFiles key={'files:' + activeSession.id} projects={projects} projectId={activeProject.id} workspaceId={activeSession.id} showHiddenFilesDefault={appSettings.showHiddenFiles} />

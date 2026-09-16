@@ -34,6 +34,7 @@ import {
 } from './workspace-sidebar-types'
 import { LOCAL_MACHINE_ID, type MachineDescriptor } from '../../../shared/remote-control'
 import { RemoteFilesPane } from '../panes/RemoteFilesPane'
+import { dispatchAgentContext } from '../panes/StructuredAgentPane'
 import { remoteExplorerView } from './remote-project-tree'
 import { openWorkspaceFile } from './workspace-files-state'
 import './ExplorerSidebar.css'
@@ -269,6 +270,13 @@ function RemoteExplorerSidebar({ project, machines, defaultCollapsed = false }: 
             // The document store is keyed by this computer's id for the project, and the machine is
             // what sends the editor down the remote read/write path rather than to this disk.
             onOpenFile={file => openWorkspaceFile(project.id, file.path, 'editor', undefined, undefined, file.machineId)}
+            // Attaching a host file to a conversation in this project belongs here too: this is now
+            // the only explorer a project that lives elsewhere is ever browsed through.
+            onAttachFile={attachment => {
+              if (!dispatchAgentContext(project.id, attachment)) {
+                window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Focus a conversation in this project before attaching a remote file.' }))
+              }
+            }}
           />)}
     </section>
   )

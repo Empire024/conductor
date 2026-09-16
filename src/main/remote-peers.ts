@@ -575,6 +575,48 @@ export class RemotePeers {
   }
 
   /**
+   * Shares a project with a paired machine after pairing, which is what strict separation needs:
+   * a machine's projects are its own and appear on the other machine as that machine's, so a
+   * project made here after the link exists has to reach the peer or the two lists silently drift.
+   *
+   * It is deliberately narrow. Only a project that exists here and whose identity is readable is
+   * shared, an already-granted project is left exactly as it was rather than re-approved under a
+   * new identity, and every share is recorded in the activity log the owner reads. Revoking the
+   * machine, or stopping this project's sharing, still ends it — this widens who sees new work on
+   * an account's own machines, not what a peer may do with it.
+   */
+  shareProject(peer: Pick<RemotePeerRecord, 'id'>, projectId: string, reason: string): RemoteProjectSummary | null {
+    const current = this.peers.find(entry => entry.id === peer.id)
+    if (!current || current.revokedAt) return null
+    const project = this.deps.projects().find(entry => entry.id === projectId)
+    if (!project?.identity) return null
+    if (current.grantedProjects.some(entry => entry.projectId === projectId)) return project
+    this.authorityRevision++
+    current.grantedProjects = [...current.grantedProjects, { projectId, identity: project.identity }]
+    this.persist()
+    this.record(current, 'peer.share', projectId, `Shared ${project.name} with ${current.machineName} — ${reason}`, 'allowed')
+    this.deps.changed?.()
+    return project
+  }
+
+  /** Every machine this one is linked to, for sharing a project that did not exist at pairing time. */
+  activePeers(): RemotePeerRecord[] {
+    return this.peers.filter(peer => !peer.revokedAt).map(peer => ({ ...peer, grantedProjects: peer.grantedProjects.map(granted => ({ ...granted })) }))
+  }
+
+  /** The owner taking a project back off a paired machine, without revoking the machine itself. */
+  unshareProject(peerId: string, projectId: string): RemotePeerRecord {
+    const peer = this.peers.find(entry => entry.id === peerId)
+    if (!peer) throw new RemoteAccessError('This machine does not know that peer.', 404)
+    const project = this.deps.projects().find(entry => entry.id === projectId)
+    this.authorityRevision++
+    peer.grantedProjects = peer.grantedProjects.filter(entry => entry.projectId !== projectId)
+    this.persist()
+    this.record(peer, 'peer.unshare', projectId, `Stopped sharing ${project?.name ?? projectId} with ${peer.machineName}`, 'allowed')
+    return { ...peer, grantedProjects: peer.grantedProjects.map(entry => ({ ...entry })) }
+  }
+
+  /**
    * The owner confirming, on this machine, that a shared project's new location is the same
    * project. Only a move is confirmable: a folder that now holds a different working copy has to
    * go through pairing again rather than inherit an approval given to something else.

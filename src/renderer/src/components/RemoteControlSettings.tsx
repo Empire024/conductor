@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Activity, Check, Copy, Github, Laptop, LogOut, MonitorSmartphone, Network, Plug, ShieldAlert, ShieldCheck, Unplug, X } from 'lucide-react'
 import type { GitHubAuthState, MachineDiagnostics, RemoteControlState, RemoteExposure, RemotePeerRecord } from '../../../shared/remote-control'
+import type { ProjectRecord } from '../../../shared/models'
 import type { RelayStatus } from '../../../shared/remote-relay'
-import { checkRemoteProjectPlacement, samePath, sameWorkingCopy } from '../../../shared/project-identity'
+import { samePath, sameWorkingCopy } from '../../../shared/project-identity'
 import { describeConnectionRecord, detachExplanationLines } from './remote-attachment-view'
 import { PEER_PAIRING_NOTE, matchTailnetPeer, peerSummary, tailnetSummary } from './tailnet-state'
 import { executionTargetSummary, failureExplanation, failureWords } from './execution-target'
@@ -105,7 +106,6 @@ export function RemoteControlSettings(): React.JSX.Element {
   const [joinCode, setJoinCode] = useState('')
   const [copied, setCopied] = useState(false)
   const [grants, setGrants] = useState<Record<string, string[]>>({})
-  const [pairs, setPairs] = useState<Record<string, string>>({})
   const [relayAddress, setRelayAddress] = useState<string | null>(null)
   const [relaySecret, setRelaySecret] = useState('')
   const [hostPort, setHostPort] = useState<string | null>(null)
@@ -114,17 +114,24 @@ export function RemoteControlSettings(): React.JSX.Element {
   /** The machine whose "use this computer independently" explanation is open, before confirming. */
   const [confirmDetach, setConfirmDetach] = useState<string | null>(null)
   const [detachOutcome, setDetachOutcome] = useState('')
+  /** This computer's project list, including the paired machines' projects that were adopted into it. */
+  const [listed, setListed] = useState<ProjectRecord[]>([])
 
   const refresh = useCallback(() => {
     void window.conductor.remote.githubState().then(setGithub).catch(reason => setError(fail(reason)))
     void window.conductor.remote.state().then(setState).catch(reason => setError(fail(reason)))
+    // This computer's project list, which is where a paired machine's projects now live. It is the
+    // only thing that can answer "is that one still shown here", because a project the owner
+    // removed is absent from it and nowhere else.
+    void window.conductor.projects.list().then(setListed).catch(() => undefined)
   }, [])
 
   useEffect(() => {
     refresh()
     const stopGithub = window.conductor.remote.onGitHubState(setGithub)
     const stopState = window.conductor.remote.onState(setState)
-    return () => { stopGithub(); stopState() }
+    const stopProjects = window.conductor.projects.onChanged(setListed)
+    return () => { stopGithub(); stopState(); stopProjects() }
   }, [refresh])
 
   const run = async (label: string, action: () => Promise<unknown>): Promise<void> => {
@@ -489,7 +496,7 @@ export function RemoteControlSettings(): React.JSX.Element {
                 {request.grants.map(grant => <li key={grant.label}><span>{grant.label}</span><small>{grant.detail}</small></li>)}
               </ul>
               <fieldset className="remote-projects">
-                <legend>Share these projects — check the folder, not just the name</legend>
+                <legend>Share these projects — check the folder, not just the name. Projects you make here later are shared with this machine too, and can be unshared one by one.</legend>
                 {state.projects.map(project => (
                   <label key={project.id}>
                     <input type="checkbox" checked={pendingGrants(request.id).includes(project.id)} disabled={!project.identity}
@@ -517,6 +524,12 @@ export function RemoteControlSettings(): React.JSX.Element {
           <div className="remote-card">
             <strong className="remote-card-title"><Laptop size={13} /> Machines allowed to control this one</strong>
             {!state.peers.length && <p className="remote-hint">None yet. Create a pairing code and enter it on your other machine.</p>}
+            {state.peers.some(peer => !peer.revokedAt) && (
+              <p className="remote-hint">
+                A project you make on this computer while a machine is linked is shared with it, so both
+                computers see the same list. Stop sharing any single project below, or revoke the machine.
+              </p>
+            )}
             {state.peers.map(peer => (
               <div className="remote-peer-block" key={peer.id}>
                 <div className="remote-peer">
@@ -534,13 +547,17 @@ export function RemoteControlSettings(): React.JSX.Element {
                       <strong>{project?.name ?? granted.projectId}</strong>
                       <small>{shared.detail}</small>
                       {shared.warning && <small className="remote-project-problem">{shared.warning}</small>}
-                      {shared.moved && (
-                        <div className="remote-actions">
+                      <div className="remote-actions">
+                        {shared.moved && (
                           <button className="remote-primary" onClick={() => void run('reshare', () => window.conductor.remote.reshareProject(peer.id, granted.projectId))}>
                             Confirm the new location
                           </button>
-                        </div>
-                      )}
+                        )}
+                        <button disabled={busy === 'unshare'} title={`${peer.machineName} stops seeing this project`}
+                          onClick={() => void run('unshare', () => window.conductor.remote.unshareProject(peer.id, granted.projectId))}>
+                          Stop sharing
+                        </button>
+                      </div>
                     </div>
                   )
                 })}
@@ -651,61 +668,40 @@ export function RemoteControlSettings(): React.JSX.Element {
                   )}
                   {detachOutcome && confirmDetach === null && <p className="remote-hint">{detachOutcome}</p>}
                 </div>
-                {connection.unconfirmedRemoteProjectIds.length > 0 && (
-                  <p className="remote-warning"><ShieldAlert size={12} /> This pairing was made before projects carried an identity, so nothing here records which project on {connection.machineName} matches which project here. Confirm each pair below before work can go there.</p>
+                {/*
+                  What this machine's projects are, and nothing to decide about them. Projects are
+                  not linked across machines any more: every project belongs to the computer whose
+                  disk holds it, and this machine's are already in the project list marked with its
+                  name. The only choice left here is whether to keep showing one of them, which is
+                  about this window, not about that machine's files.
+                */}
+                <p className="remote-hint">
+                  These are {connection.machineName}'s own projects. They are in your project list marked
+                  “Remote: {connection.machineName}”, and everything opened in one runs there. Nothing here is
+                  paired with a project on this computer.
+                </p>
+                {!connection.remoteProjects.length && (
+                  <p className="remote-hint">{connection.machineName} has not shared any project yet, or has not been reached since it was linked.</p>
                 )}
-                {connection.projectGrants.map(grant => {
-                  const advertised = connection.remoteProjects.find(project => project.id === grant.remoteProjectId)?.identity ?? null
-                  const placement = checkRemoteProjectPlacement({ grant, advertised, machineName: connection.machineName })
-                  const local = state.projects.find(project => project.id === grant.localProjectId)
-                  return (
-                    <div className="remote-mapping" key={grant.remoteProjectId}>
-                      <strong>{local?.name ?? grant.local.name} ↔ {grant.remote.name} on {connection.machineName}</strong>
-                      <small>Here: {grant.local.path}</small>
-                      <small>There: {grant.remote.path}</small>
-                      {!placement.ok && <small className="remote-project-problem">{placement.message}</small>}
-                      <div className="remote-actions">
-                        {!placement.ok && placement.reason === 'project-moved' && (
-                          <button className="remote-primary" onClick={() => void run('confirm-project', () => window.conductor.remote.confirmProject(connection.machineId, grant.localProjectId, grant.remoteProjectId))}>
-                            Confirm the new location
-                          </button>
-                        )}
-                        <button onClick={() => void run('release-project', () => window.conductor.remote.releaseProject(connection.machineId, grant.localProjectId))}>Remove this pair</button>
-                      </div>
-                    </div>
-                  )
-                })}
-                {connection.remoteProjects.filter(project => !connection.projectGrants.some(grant => grant.remoteProjectId === project.id)).map(project => {
-                  const choice = pairs[connection.machineId + ':' + project.id] ?? ''
+                {connection.remoteProjects.map(project => {
+                  const shown = listed.some(entry => entry.remote?.machineId === connection.machineId && entry.remote.remoteProjectId === project.id)
                   return (
                     <div className="remote-mapping" key={project.id}>
                       <strong>{project.name} on {connection.machineName}</strong>
                       <small>There: {project.path}</small>
                       {project.identityError && <small className="remote-project-problem">{project.identityError}</small>}
-                      <div className="remote-actions">
-                        <select value={choice} disabled={!project.identity}
-                          onChange={event => setPairs({ ...pairs, [connection.machineId + ':' + project.id]: event.target.value })}>
-                          <option value="">Which project here is this?</option>
-                          {state.projects.map(candidate => <option key={candidate.id} value={candidate.id}>{candidate.name} — {candidate.path}</option>)}
-                        </select>
-                        <button className="remote-primary" disabled={!choice || busy === 'confirm-project'}
-                          onClick={() => void run('confirm-project', () => window.conductor.remote.confirmProject(connection.machineId, choice, project.id))}>
-                          Confirm this pair
-                        </button>
-                        {/*
-                          The other answer to "which project here is this?": none of them. Pairing
-                          matches two working copies the owner keeps on both machines; this opens
-                          the host's copy with no local copy at all, which is what you want for a
-                          project that only ever lived there.
-                        */}
-                        <button disabled={busy === 'open-remote-project'}
-                          onClick={() => void run('open-remote-project', async () => {
-                            await window.conductor.remote.openRemoteProject(connection.machineId, project.id)
-                            window.dispatchEvent(new CustomEvent('conductor:projects-changed'))
-                          })}>
-                          Open it from {connection.machineName} instead — no copy here
-                        </button>
-                      </div>
+                      {!project.identityError && <small>{shown ? 'In your project list.' : 'Removed from your project list.'}</small>}
+                      {!shown && !project.identityError && (
+                        <div className="remote-actions">
+                          <button disabled={busy === 'open-remote-project'}
+                            onClick={() => void run('open-remote-project', async () => {
+                              await window.conductor.remote.openRemoteProject(connection.machineId, project.id)
+                              window.dispatchEvent(new CustomEvent('conductor:projects-changed'))
+                            })}>
+                            Show it in my projects again
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )
                 })}

@@ -5,7 +5,7 @@ import type { MachineDescriptor } from '../../../shared/remote-control'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import {
   checkProjectPlacement, closePlacedTab, createPlacedTab, defaultPlacement, reattachPlacedTerminal,
-  readPlacement, requiredMachineId, tabRemoteTerminalId, travels, writePlacement
+  requiredMachineId, tabRemoteTerminalId, travels
 } from './machine-placement'
 import { machinePlacementOptions } from '../panes/LauncherPane'
 
@@ -37,17 +37,10 @@ const remoteProject: ProjectRecord = {
 }
 
 describe('choosing which machine runs a new tab', () => {
-  it('defaults to this machine and remembers a choice per workspace', () => {
-    expect(readPlacement('workspace-1')).toBe(LOCAL_MACHINE_ID)
-    writePlacement('workspace-1', 'desktop')
-    expect(readPlacement('workspace-1')).toBe('desktop')
-    // A second workspace keeps its own placement rather than inheriting the first one's.
-    expect(readPlacement('workspace-2')).toBe(LOCAL_MACHINE_ID)
-  })
-
-  it('falls back to this machine when the stored choice is unreadable', () => {
-    store.set('conductor.machine-placement', 'not json')
-    expect(readPlacement('workspace-1')).toBe(LOCAL_MACHINE_ID)
+  it('runs a project’s work on the project’s own machine, with nothing remembered to override it', () => {
+    expect(defaultPlacement(localProject)).toBe(LOCAL_MACHINE_ID)
+    expect(defaultPlacement(remoteProject)).toBe('desktop')
+    expect(defaultPlacement(null)).toBe(LOCAL_MACHINE_ID)
   })
 
   it('lets a terminal travel now that a host can own the shell behind it', () => {
@@ -57,7 +50,7 @@ describe('choosing which machine runs a new tab', () => {
     expect(travels('diff')).toBe(false)
   })
 
-  it('explains why an unusable machine cannot take work instead of hiding it', () => {
+  it('keeps a project of this computer on this computer, whatever the other machines say', () => {
     const options = machinePlacementOptions([
       machine({ id: LOCAL_MACHINE_ID, name: 'This laptop', kind: 'local', projects: [] }),
       machine(),
@@ -67,14 +60,13 @@ describe('choosing which machine runs a new tab', () => {
     ], 'project')
     expect(options.map(option => option.machine.id)).toEqual([LOCAL_MACHINE_ID, 'desktop', 'offline-box', 'unpaired'])
     expect(options.find(option => option.machine.id === LOCAL_MACHINE_ID)!.reason).toBe('')
-    expect(options.find(option => option.machine.id === 'desktop')!.reason).toBe('')
-    expect(options.find(option => option.machine.id === 'offline-box')!.reason).toMatch(/offline/)
-    expect(options.find(option => option.machine.id === 'unpaired')!.reason).toMatch(/has not been told/)
-  })
-
-  it('does not offer a peer that is mapped only to a different local project', () => {
-    const options = machinePlacementOptions([machine()], 'another-project')
-    expect(options[0]!.reason).toMatch(/has not been told which of its projects this one is/)
+    // A peer that once had this project "mapped" to one of its own is no longer a place this
+    // project can run: the two are separate projects on separate computers, and the refusal says
+    // where work meant for that machine belongs instead.
+    for (const id of ['desktop', 'offline-box', 'unpaired']) {
+      expect(options.find(option => option.machine.id === id)!.reason).toMatch(/is on this computer/)
+    }
+    expect(options.find(option => option.machine.id === 'desktop')!.reason).toMatch(/Render desktop's own projects/)
   })
 
   it('builds an ordinary local tab without asking any machine when placement is here', async () => {
@@ -181,12 +173,9 @@ describe('a project that lives on another machine', () => {
     expect(refusal.message).toMatch(/cannot be run on another machine from here/)
   })
 
-  it('starts on its host and ignores whatever the workspace last chose', () => {
-    writePlacement('workspace', LOCAL_MACHINE_ID)
-    expect(defaultPlacement(remoteProject, 'workspace')).toBe('desktop')
-    // A local project still follows the owner's remembered choice.
-    writePlacement('workspace', 'desktop')
-    expect(defaultPlacement(localProject, 'workspace')).toBe('desktop')
+  it('starts on its host, and a local workspace can never be started anywhere but here', () => {
+    expect(defaultPlacement(remoteProject)).toBe('desktop')
+    expect(defaultPlacement(localProject)).toBe(LOCAL_MACHINE_ID)
   })
 
   it('leaves every local placement option disabled in the launcher, with the reason on it', () => {
@@ -198,6 +187,16 @@ describe('a project that lives on another machine', () => {
     expect(options.find(option => option.machine.id === LOCAL_MACHINE_ID)!.reason).toMatch(/lives on MAIN/)
     expect(options.find(option => option.machine.id === 'studio')!.reason).toMatch(/lives on MAIN/)
     expect(options.find(option => option.machine.id === 'desktop')!.reason).toBe('')
+  })
+
+  it('stops work going to its host when that host stopped sharing it', () => {
+    const options = machinePlacementOptions([machine({ projects: [] })], 'remote-project', remoteProject)
+    expect(options[0]!.reason).toMatch(/not one of .*'s|not sharing/)
+  })
+
+  it('says the host is offline rather than blaming the project', () => {
+    const options = machinePlacementOptions([machine({ status: 'offline' })], 'project', remoteProject)
+    expect(options[0]!.reason).toMatch(/offline/)
   })
 })
 

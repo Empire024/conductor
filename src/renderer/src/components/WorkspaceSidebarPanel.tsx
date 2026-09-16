@@ -4,7 +4,6 @@ import { BrowserSidebar } from './BrowserSidebar'
 import { ExplorerSidebar } from './ExplorerSidebar'
 import type { ExplorerOpenMode, WorkspaceSidebarMode } from './workspace-sidebar-types'
 import { persistMountedBrowserProjects, savedMountedBrowserProjects } from './browser-presentation'
-import { RemoteFilesPane, type RemoteFilesPaneProps } from '../panes/RemoteFilesPane'
 
 interface WorkspaceSidebarPanelProps {
   mode: WorkspaceSidebarMode
@@ -15,7 +14,6 @@ interface WorkspaceSidebarPanelProps {
   onProjectRenamed?(project: ProjectRecord): void
   onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind'], projectId?: string): void
   onPathRemoved?(relativePath: string, kind: FileEntry['kind'], projectId?: string): void
-  remoteFiles?: Omit<RemoteFilesPaneProps, 'files'>
 }
 
 /**
@@ -30,8 +28,7 @@ export function WorkspaceSidebarPanel({
   onOpenFile,
   onProjectRenamed,
   onPathChanged,
-  onPathRemoved,
-  remoteFiles
+  onPathRemoved
 }: WorkspaceSidebarPanelProps): React.JSX.Element {
   const [mountedBrowserProjects, setMountedBrowserProjects] = useState<Set<string>>(() => {
     const mounted = savedMountedBrowserProjects()
@@ -62,7 +59,6 @@ export function WorkspaceSidebarPanel({
   // page, cookies, console buffer and project partition without opening a workspace tab.
   if (mode === 'workspace') return <>{workspace}{browsers}</>
   if (mode === 'browser') return <>{browsers}</>
-  if (remoteFiles) return <><RemoteFilesPane {...remoteFiles} files={window.conductor.remote.files} />{browsers}</>
   if (projects?.length || project) {
     return <><section className="workspace-sidebar-pane" aria-label="Explorer">
       <header className="workspace-sidebar-title"><span>Explorer</span></header>

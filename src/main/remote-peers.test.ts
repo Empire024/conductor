@@ -387,6 +387,52 @@ describe('authenticating each remote call', () => {
   })
 })
 
+/**
+ * Sharing after pairing. Two machines linked to one account keep one list of projects between
+ * them, so a project made on this one has to reach the other; what must not happen is that
+ * reaching widening into anything the owner cannot see or stop.
+ */
+describe('sharing a project made after the link', () => {
+  it('grants a project this machine holds, and says so in the activity the owner reads', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    expect(() => fix.peers.requireProject(peer, 'project-b')).toThrow(/not shared/)
+    const shared = fix.peers.shareProject(peer, 'project-b', 'made on this machine while they were linked')
+    expect(shared?.id).toBe('project-b')
+    const current = fix.peers.listPeers().find(entry => entry.id === peer.id)!
+    expect(current.grantedProjects.map(entry => entry.projectId)).toEqual(['project-a', 'project-b'])
+    expect(fix.peers.requireProject(current, 'project-b').name).toBe('Renders')
+    expect(fix.activity).toHaveBeenCalledWith(expect.objectContaining({ method: 'peer.share', projectId: 'project-b' }))
+  })
+
+  it('shares nothing for a project this machine does not have, and nothing with a revoked machine', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    expect(fix.peers.shareProject(peer, 'not-here', 'made here')).toBeNull()
+    fix.peers.revoke(peer.id)
+    expect(fix.peers.shareProject(peer, 'project-b', 'made here')).toBeNull()
+  })
+
+  it('is reversible per project, without revoking the machine', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a', 'project-b'])
+    const after = fix.peers.unshareProject(peer.id, 'project-b')
+    expect(after.grantedProjects.map(entry => entry.projectId)).toEqual(['project-a'])
+    expect(() => fix.peers.requireProject(after, 'project-b')).toThrow(/not shared/)
+    expect(fix.peers.requireProject(after, 'project-a').id).toBe('project-a')
+    // Unsharing has to invalidate calls already in flight under the old grant, exactly as revoking does.
+    expect(() => fix.peers.requireCurrentProject(peer, 'project-b')).toThrow(/grant changed|not shared/)
+  })
+
+  it('lists the machines a new project should reach, and never a revoked one', async () => {
+    const fix = fixture()
+    const peer = await pairAndApprove(fix, fix.owner, ['project-a'])
+    expect(fix.peers.activePeers().map(entry => entry.id)).toEqual([peer.id])
+    fix.peers.revoke(peer.id)
+    expect(fix.peers.activePeers()).toEqual([])
+  })
+})
+
 describe('project scope', () => {
   it('only allows projects that are both registered here and granted to that peer', async () => {
     const fix = fixture()

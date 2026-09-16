@@ -33,6 +33,8 @@ afterAll(() => { rmSync(root, { recursive: true, force: true }) })
 
 const sharedIdentity = { key: 'a'.repeat(32), keyCreatedAt: '2026-01-01T00:00:00.000Z', path: shared, name: 'Shared' }
 const PROJECTS: RemoteProjectSummary[] = [{ id: 'shared-project', name: 'Shared', path: shared, identity: sharedIdentity, identityError: null }]
+/** Projects this machine has made for the peer during a test, as `projects.create` would. */
+const MADE: RemoteProjectSummary[] = []
 
 const peer: RemotePeerRecord = {
   id: 'peer-1', machineId: 'laptop', machineName: 'Laptop', accountId: 4242, accountLogin: 'Empire024',
@@ -59,6 +61,9 @@ function fixture(extra: Partial<RemoteControlHostDependencies> = {}) {
     },
     captureProjectAuthority: (subject: RemotePeerRecord, projectId: unknown) => ({ project: requireProject(subject, projectId), revision: authorityRevision }),
     sharedProjects: (subject: RemotePeerRecord) => PROJECTS.filter(project => subject.grantedProjects.some(granted => granted.projectId === project.id)),
+    // What the real RemotePeers does once a project has been created for this peer: grants it and
+    // hands back the summary the host answers with. Null is "this machine would not share it".
+    shareProject: vi.fn((_subject: RemotePeerRecord, projectId: string) => MADE.find(entry => entry.id === projectId) ?? null),
     record: vi.fn()
   } as unknown as RemotePeers
   const database = {
@@ -89,6 +94,7 @@ function fixture(extra: Partial<RemoteControlHostDependencies> = {}) {
     call(method, args).then(() => 'ALLOWED', error => (error as Error).message)
   return {
     host, call, refusal, opened, updated, sessions,
+    shareProject: peers.shareProject as unknown as ReturnType<typeof vi.fn>,
     revoke: () => { currentAuthority = false; authorityRevision++ },
     cycleAuthority: () => { authorityRevision++ }
   }
@@ -256,6 +262,39 @@ describe('which method names reach the host at all', () => {
     const listed = await fix.call('tools.list', {}) as Record<string, string>
     expect(Object.keys(listed)).not.toContain('terminal.write')
     expect(await fix.refusal('shell.exec', { projectId: 'shared-project' })).toMatch(/Unknown remote method/)
+  })
+})
+
+/**
+ * The owner's other computer making a project here. It is the one write this host does outside a
+ * granted project, so what it may and may not do is worth pinning down rather than assuming.
+ */
+describe('a project made here from the other machine', () => {
+  const created = { id: 'made-here', name: 'Made here', path: join(root, 'made-here'), identity: { key: 'b'.repeat(32), keyCreatedAt: '2026-02-02T00:00:00.000Z', path: join(root, 'made-here'), name: 'Made here' }, identityError: null }
+
+  it('creates it on this machine and shares it back, so it can be opened from there at once', async () => {
+    MADE.splice(0, MADE.length, created)
+    const createProject = vi.fn(async () => ({ id: created.id }))
+    const local = fixture({ createProject })
+    await expect(local.call('projects.create', { name: 'Made here' })).resolves.toMatchObject({ id: 'made-here', identity: { key: 'b'.repeat(32) } })
+    expect(createProject).toHaveBeenCalledWith('Made here')
+    expect(local.shareProject).toHaveBeenCalledWith(peer, 'made-here', expect.stringContaining('Laptop'))
+  })
+
+  it('refuses a nameless request rather than making a folder out of whatever arrived', async () => {
+    const local = fixture({ createProject: vi.fn(async () => ({ id: created.id })) })
+    expect(await local.refusal('projects.create', {})).toMatch(/Invalid name/)
+    expect(await local.refusal('projects.create', { name: '   ' })).toMatch(/Invalid name/)
+  })
+
+  it('says so rather than leaving a project the other machine cannot see', async () => {
+    MADE.splice(0, MADE.length)
+    const local = fixture({ createProject: vi.fn(async () => ({ id: created.id })) })
+    expect(await local.refusal('projects.create', { name: 'Made here' })).toMatch(/could not share it back/)
+  })
+
+  it('is refused outright on a machine that cannot make projects, rather than half-served', async () => {
+    expect(await fix.refusal('projects.create', { name: 'Made here' })).toMatch(/cannot create projects/)
   })
 })
 

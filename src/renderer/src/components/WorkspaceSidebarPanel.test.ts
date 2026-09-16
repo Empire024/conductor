@@ -54,11 +54,19 @@ describe('persistent project browser sidebar', () => {
     expect((html.match(/browser-sidebar[^>]+hidden=""/g) ?? [])).toHaveLength(1)
   })
 
-  it('shows the selected remote tree while preserving the mounted browser guest', () => {
+  /**
+   * A project that lives on another machine is browsed through the ordinary Explorer now, as one
+   * more row in the list, because that is where it appears: the machines' project lists are joined
+   * and each project keeps the machine it is on. What must never happen is the local lister
+   * standing in for it - this computer's folder at the same path is a different working copy.
+   */
+  it('browses a project that lives on another machine as that machine\u2019s, never as a local folder', () => {
     vi.stubGlobal('localStorage', { getItem: vi.fn((key: string) => key === 'conductor.browserMountedProjects' ? '["project-a"]' : null), setItem: vi.fn() })
     vi.stubGlobal('window', {
       conductor: {
         remote: {
+          machines: vi.fn(() => new Promise(() => {})),
+          onState: vi.fn(() => () => {}),
           files: {
             list: vi.fn(() => new Promise(() => {})),
             preview: vi.fn(),
@@ -68,21 +76,15 @@ describe('persistent project browser sidebar', () => {
         }
       }
     })
-    const html = renderToStaticMarkup(createElement(WorkspaceSidebarPanel, {
-      mode: 'explorer',
-      project: { id: 'project-a', name: 'A', path: 'C:/a', createdAt: 'now', updatedAt: 'now' },
-      projects: [],
-      workspace: null,
-      remoteFiles: {
-        machineId: 'host-a',
-        machineName: 'Remote host',
-        projectId: 'project-a',
-        onOpenFile: vi.fn()
-      }
-    }))
-    expect(html).toContain('class="remote-files-pane"')
-    expect(html).toContain('data-machine-id="host-a"')
-    expect(html).not.toContain('all-project-explorer')
+    const project = {
+      id: 'project-a', name: 'A', path: 'C:/a', createdAt: 'now', updatedAt: 'now',
+      remote: { machineId: 'host-a', machineName: 'MAIN', remoteProjectId: 'p9', path: 'C:/on-main/a' }
+    }
+    const html = renderToStaticMarkup(createElement(WorkspaceSidebarPanel, { mode: 'explorer', project, projects: [project], workspace: null }))
+    expect(html).toContain('explorer-remote')
+    expect(html).toContain('MAIN')
+    // The local lister is what this must never fall back to, in any state of that machine.
+    expect(html).not.toContain('explorer-file')
     expect(html).toMatch(/<section[^>]+browser-sidebar[^>]+hidden=""/)
     expect((html.match(/browser-owned-surface/g) ?? [])).toHaveLength(1)
   })
