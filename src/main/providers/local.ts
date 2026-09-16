@@ -89,7 +89,7 @@ export class LocalAdapter implements ProviderAdapter {
         `Tools are limited in code to ${LOCAL_TOOLS.join(', ')}; the Conductor bridge exposes project memory and task listing only, with no arbitrary MCP or host shell.`,
         'Commands run in a non-root Docker container with no network access; when the sandbox is unavailable, execution is refused rather than run on Windows.',
         'Nothing asks for approval: choose Read only for a turn that must not write files or run commands.',
-        'Repository writes and web search are off unless the owner turns them on for the conversation; even granted, the container has no network, so git can commit locally but never push.',
+        'Repository writes and web search are off unless the owner turns them on for the conversation. The container has no network even when granted: it commits locally, and a plain push of the checked-out branch to an existing remote is run on the host for it.',
         'Conversations are not resumable: history lives with the running adapter, not in a native session store.',
         'Approvals, questions, plan mode and effort levels are not part of this runtime.'
       ]

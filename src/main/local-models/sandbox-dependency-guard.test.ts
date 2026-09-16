@@ -56,7 +56,7 @@ describe('sandbox dependency guard', () => {
   it('binds the dependency tree and lockfile into the container read-only', () => {
     const workspace = mkdtempSync(join(tmpdir(), 'sandbox-guard-'))
     try {
-      mkdirSync(join(workspace, 'node_modules'))
+      mkdirSync(join(workspace, 'node_modules', '.cache'), { recursive: true })
       writeFileSync(join(workspace, 'package-lock.json'), '{}')
       const args = containerRunArgs({ name: 'conductor-local-test', image: 'conductor-local-sandbox:1', workspace, sandbox: { image: 'conductor-local-sandbox:1', memory: '4g', cpus: '4', pids: 256, timeoutSec: 120, maxOutputBytes: 1024, tmpfsSizeMb: 512 }, masks: [], emptyFile: join(workspace, 'package-lock.json') })
       const mounts = args.filter((_argument, index) => args[index - 1] === '--mount')
@@ -65,6 +65,9 @@ describe('sandbox dependency guard', () => {
       // A build that caches beside its dependencies still has somewhere to write.
       const tmpfs = args.filter((_argument, index) => args[index - 1] === '--tmpfs')
       expect(tmpfs.some(mount => mount.startsWith('/workspace/node_modules/.cache'))).toBe(true)
+      // The mountpoint for a cache directory that does not exist would have to be created inside
+      // the read-only node_modules bind: Docker refuses, and the container never starts at all.
+      expect(tmpfs.some(mount => mount.startsWith('/workspace/node_modules/.vite'))).toBe(false)
     } finally { rmSync(workspace, { recursive: true, force: true }) }
   })
 })

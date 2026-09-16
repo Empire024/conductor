@@ -387,7 +387,8 @@ export function containerRunArgs(options: {
     // Repository metadata stays readable for status and diffs but can never be rewritten, so a
     // sandboxed turn cannot install a git hook or change remotes in the owner's repository.
     // The owner can grant write access per conversation; the container still has no network, so
-    // the grant reaches local history only and never pushes anywhere.
+    // the grant reaches local history only. A push under that grant is brokered on the host
+    // instead, under the checks in git-push.ts — nothing in here ever reaches a remote.
     ...(!options.gitWritable && existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : []),
     // An installed dependency tree is an input to a sandboxed command and never its output. The
     // container has no network, so it can never repair an install — but npm and npx tear a tree
@@ -398,8 +399,10 @@ export function containerRunArgs(options: {
       ? ['--mount', `type=bind,source=${workspace}/${relative},target=/workspace/${relative},readonly`]
       : []),
     // Build tools cache inside the tree they read. These stay writable so a sandboxed build still
-    // works, without the rest of node_modules being writable with it.
-    ...DEPENDENCY_CACHES.flatMap(relative => existsSync(join(options.workspace, 'node_modules'))
+    // works, without the rest of node_modules being writable with it. Only a cache directory that
+    // already exists is mounted: the mountpoint would have to be created inside the read-only
+    // node_modules bind, which Docker cannot do, and the whole container then fails to start.
+    ...DEPENDENCY_CACHES.flatMap(relative => existsSync(join(options.workspace, relative))
       ? ['--tmpfs', `/workspace/${relative}:rw,nosuid,nodev,size=256m`]
       : [])
   ]

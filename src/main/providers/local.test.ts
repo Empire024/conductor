@@ -169,8 +169,9 @@ describe('local provider adapter', () => {
     expect(request.tools?.map(tool => tool.function.name)).toContain('web_search')
     expect(request.messages[0]!.content).toContain('deep research')
     expect(request.messages[0]!.content).toContain('granted repository writes')
-    // Granted or not, the sandbox has no network, so the model is never told it can push.
-    expect(request.messages[0]!.content).toContain('nothing can be pushed')
+    // The sandbox still has no network; the grant tells the model the push runs on the host.
+    expect(request.messages[0]!.content).toContain('brokered for you on the host')
+    expect(ungranted.messages[0]!.content).not.toContain('brokered for you on the host')
   })
 
   it('sends a conversation only to the model it was opened on, and keeps two sessions apart', async () => {

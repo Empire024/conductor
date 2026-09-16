@@ -9,7 +9,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
   DEFAULT_CONTEXT_TOKENS, DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, configPath, defaultModelConfig, endpointFor,
-  ensureApiKey, loadConfig, logsDir, modelDir, modelFilePath, readApiKey, saveConfig, tempDir
+  ensureApiKey, loadConfig, logsDir, modelDir, modelFilePath, readApiKey, recordedPort, saveConfig, tempDir
 } from '../../src/main/local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../../src/main/local-models/config.ts'
 import {
@@ -237,7 +237,7 @@ async function smoke(): Promise<void> {
   const apiKey = readApiKey()
   let failures = 0
   for (const model of modelsOf(config, flag('model'))) {
-    const probe = await health(model.port, apiKey)
+    const probe = await health(recordedPort(model), apiKey)
     if (!probe.ok) { log(`FAIL ${model.id}: server health check failed (${probe.detail})`); failures++; continue }
     let completion: CompletionResult
     try {
@@ -273,12 +273,16 @@ async function run(): Promise<void> {
   const session = flag('session') ?? `cli-${process.pid}`
   const workspace = flag('cwd') ?? sessionWorkspace(session)
   const readOnly = has('read-only')
-  const probe = await health(model.port, apiKey)
+  const probe = await health(recordedPort(model), apiKey)
   if (!probe.ok) return void fail(`Server health check failed for ${model.id} (${probe.detail}); run scripts/local-models/start.ps1`)
   log(`workspace: ${workspace}`)
+  // The same two per-conversation grants the composer offers, so the CLI exercises the granted
+  // path — writable .git in the container, and a push brokered on the host — not just the default one.
+  const grants = { git: has('git'), research: has('research') }
   const sandbox = readOnly ? null : new DockerSandbox(session, workspace, config.sandbox)
+  sandbox?.setGitAccess(grants.git)
   const agent = new LocalAgentSession({
-    endpoint: endpointFor(model), apiKey, model: model.id, workspace, sandbox, readOnly,
+    endpoint: endpointFor(model), apiKey, model: model.id, workspace, sandbox, readOnly, grants,
     timeoutSec: config.sandbox.timeoutSec, contextTokens: model.contextTokens,
     maxIterations: Number(flag('max-iterations') ?? 16)
   })
