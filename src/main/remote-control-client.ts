@@ -30,6 +30,13 @@ const PAIR_REACH_MS = 75_000
 const PAIR_RETRY_MS = 6_000
 /** Bounds the wait even where time is supplied rather than passing, as it is in tests. */
 const PAIR_MAX_ATTEMPTS = 16
+/**
+ * How many times, two seconds apart, to ask whether the owner has approved yet - bounded by the
+ * code's own lifetime, which is ten minutes. Approving means finding the request on the other
+ * machine, and a fixed two minutes was not always enough; a record this gives up on is still not a
+ * dead end, because adoptApproval picks a late approval up from it.
+ */
+const PAIR_APPROVAL_MAX_POLLS = 300
 
 /** What separates a call the owner asked for from one the app made on its own behalf. */
 export interface RemoteCallOptions {
@@ -429,7 +436,8 @@ export class RemoteControlClient {
     this.bumpAuthority(ticket.machineId)
     this.connections = [...this.connections.filter(entry => entry.machineId !== ticket.machineId), pending]
     this.persist()
-    for (let attempt = 0; attempt < 60; attempt++) {
+    const expires = Date.parse(ticket.expiresAt)
+    for (let attempt = 0; attempt < PAIR_APPROVAL_MAX_POLLS && this.now() < expires; attempt++) {
       await (poll ? poll(attempt) : new Promise<void>(resolve => setTimeout(resolve, 2000)))
       const status = await this.pollPairing(ticket)
       if (status.status === 'approved' && status.peerId) {
@@ -454,7 +462,34 @@ export class RemoteControlClient {
         throw new RemoteAccessError('The other machine declined this pairing request.', 403)
       }
     }
-    throw new RemoteAccessError('The other machine did not approve in time. Try pairing again.', 408)
+    throw new RemoteAccessError('The other machine did not approve in time. Approve it there and this machine will pick it up on its next check, or pair again.', 408)
+  }
+
+  /**
+   * A pairing the other machine approved after this one stopped waiting for it.
+   *
+   * The approval lives on that machine, and asking about it is signed with this device key alone -
+   * no pairing code is involved - so a record left pending is asked about again on the next call,
+   * probe or stream dial, and adopted the moment the answer is "approved". Without this the owner
+   * who took three minutes to find the request would be told they were refused.
+   */
+  async adoptApproval(machineId: string): Promise<boolean> {
+    const connection = this.get(machineId)
+    if (!connection) return false
+    if (connection.peerId) return true
+    if (connection.detached || connection.status === 'revoked') return false
+    let status: { status: string; peerId?: string; projects: RemoteProjectSummary[] }
+    try { status = await this.pollPairing(connection) } catch { return false }
+    const now = new Date(this.now()).toISOString()
+    if (status.status === 'approved' && status.peerId) {
+      this.bumpAuthority(machineId)
+      this.mark(machineId, { peerId: status.peerId, remoteProjects: status.projects, remoteProjectsAt: now, status: 'connected', message: null, lastContactAt: now })
+      return true
+    }
+    if (status.status === 'denied') {
+      this.mark(machineId, { status: 'unreachable', message: `${connection.machineName} has no pairing request from this computer any more. Create a new pairing code there.` })
+    }
+    return false
   }
 
   /** What that machine said it shares at the last refresh, for the owner to map against. */
@@ -501,7 +536,7 @@ export class RemoteControlClient {
     this.persist()
   }
 
-  private async pollPairing(ticket: RemotePairingTicket): Promise<{ status: string; peerId?: string; projects: RemoteProjectSummary[] }> {
+  private async pollPairing(ticket: Pick<RemotePairingTicket, 'machineId' | 'host' | 'port' | 'fingerprint'> & { relayKey?: string; deviceKey?: string }): Promise<{ status: string; peerId?: string; projects: RemoteProjectSummary[] }> {
     const key = this.key()
     const { payload, signature } = this.sign(ticket, 'pair', '')
     const body = Buffer.from(JSON.stringify({ publicKey: key.publicKey, signature, nonce: payload.nonce, timestamp: payload.issuedAt }), 'utf8')
@@ -543,7 +578,11 @@ export class RemoteControlClient {
         `Using this computer independently of ${connection.machineName}, so nothing was sent to it. Attach it again to work on it from here.`, 409, 'detached')
     }
     if (connection.status === 'revoked') throw new RemoteAccessError('That machine revoked this pairing.', 403)
-    if (!connection.peerId) throw new RemoteAccessError('That pairing has not been approved yet.', 409)
+    if (!connection.peerId) {
+      // Not approved when this machine last looked is not the same as not approved now.
+      if (await this.adoptApproval(machineId)) return await this.call(machineId, method, args, options)
+      throw new RemoteAccessError(`${connection.machineName} has not approved this computer yet. Approve the request there, then try again.`, 409)
+    }
     const authorityRevision = this.authorityRevision(machineId)
     const generation = connection.generation ?? 0
     const body = Buffer.from(JSON.stringify({ method, args }), 'utf8')

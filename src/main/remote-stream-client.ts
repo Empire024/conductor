@@ -206,7 +206,12 @@ export class RemoteStreamClient {
     if (!connection) return this.settle('offline', 'network', 'This machine is not paired with that one.', { fatal: true })
     if (connection.detached) return this.settle('detached', null, 'Using this computer independently.', { fatal: true })
     if (connection.status === 'revoked') return this.settle('offline', 'authorization', connection.message ?? 'That machine revoked this pairing.', { fatal: true })
-    if (!connection.peerId) return this.settle('offline', 'authorization', 'That pairing has not been approved yet.', { fatal: true })
+    if (!connection.peerId) {
+      // Not approved yet is not refused: the other machine may approve any moment, and the record
+      // is adopted by the next probe or call. Waited for, the way a host that is down is waited for.
+      this.scheduleRetry()
+      return this.settle('offline', null, 'Waiting for approval on the other machine.')
+    }
     // The whole promise of a Tailscale pairing in one line: this connection has exactly one route,
     // and a stored address that is not on the tailnet is not it. Dialling it anyway would send the
     // owner's signed request somewhere their tailnet does not reach and their firewall does not

@@ -859,6 +859,14 @@ export class RemoteControlService {
     // A sweep the owner asked for is never folded into a scheduled one, because a scheduled sweep
     // may deliberately be skipping the very machine they are asking about.
     if (options.scheduled && this.probing) return await this.probing
+    // A pairing the other machine approved after this one stopped waiting is adopted first, so the
+    // probe that follows is a real call rather than a certain refusal.
+    let adopted = false
+    for (const connection of this.client.list()) {
+      if (connection.peerId || connection.detached || connection.status === 'revoked') continue
+      try { if (await this.client.adoptApproval(connection.machineId)) adopted = true } catch { /* asked again next time */ }
+    }
+    if (adopted) this.applyRoutes()
     const now = Date.now()
     const peers = this.client.list().filter(connection =>
       connection.status !== 'revoked' && connection.peerId &&

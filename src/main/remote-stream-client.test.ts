@@ -147,6 +147,17 @@ describe('opening the push channel from the controlling machine', () => {
     expect(fix.retries()).toEqual([])
   })
 
+  it('waits for an approval instead of calling it a refusal', () => {
+    // A record still pending has no peer id to sign as. That is the owner not having pressed
+    // approve yet, not a refusal, so nothing is dialled and nothing is given up on.
+    const fix = fixture({ ...connection(), peerId: '' })
+    fix.client.start()
+    expect(fix.sockets).toHaveLength(0)
+    expect(fix.client.snapshot()).toMatchObject({ state: 'offline', failure: null })
+    expect(fix.client.snapshot().detail).toMatch(/approval/)
+    expect(fix.retries()).toHaveLength(1)
+  })
+
   it('never dials a host the owner detached from', () => {
     const fix = fixture(connection({ detached: true }))
     fix.client.start()

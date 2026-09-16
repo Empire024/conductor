@@ -185,6 +185,46 @@ describe('the first knock on the other machine', () => {
     return { client, ticket, attempts }
   }
 
+  it('adopts an approval that arrived after it stopped waiting', async () => {
+    // Every poll while connect() waits says "pending" and the code runs out; the owner approves
+    // only after that. The record left pending is asked about again by the next call, and adopted.
+    let clock = Date.parse('2026-03-02T09:00:00.000Z')
+    let approvedYet = false
+    const paths: string[] = []
+    const client = new RemoteControlClient({
+      store: new MapStore(),
+      machineId: () => 'this-machine',
+      machineName: () => 'This Laptop',
+      deviceKey: () => device,
+      pairRetryMs: 1,
+      relay: {
+        enabled: () => true,
+        call: async (_machineId, _peerDeviceKey, path) => {
+          paths.push(path)
+          const result = path === '/remote/pair/status'
+            ? (approvedYet ? { status: 'approved', peerId: 'peer-late', projects: [] } : { status: 'pending', projects: [] })
+            : path === '/remote/call' ? { echoed: true } : { accepted: true }
+          return { status: 200, body: Buffer.from(JSON.stringify({ result }), 'utf8').toString('base64') }
+        }
+      },
+      now: () => clock
+    })
+    const ticket = encodeTicket({
+      version: 1, machineId: 'render-desktop', machineName: 'Render Desktop', accountLogin: 'Empire024',
+      host: '127.0.0.1', port: 1, fingerprint: 'AA:BB', code: 'pairing-code',
+      expiresAt: '2026-03-02T09:10:00.000Z', relayKey: 'relay-public-key', deviceKey: 'ssh-ed25519 THEIRS'
+    })
+    // Each wait for the owner takes five minutes here, so the code expires after two polls.
+    await expect(client.connect(ticket, async () => { clock += 5 * 60_000 })).rejects.toMatchObject({ status: 408 })
+    expect(client.get('render-desktop')).toMatchObject({ status: 'pending', peerId: '' })
+    expect(paths.filter(path => path === '/remote/pair/status')).toHaveLength(2)
+
+    approvedYet = true
+    expect(await client.call('render-desktop', 'projects.list')).toEqual({ echoed: true })
+    expect(client.get('render-desktop')).toMatchObject({ status: 'connected', peerId: 'peer-late' })
+    expect(paths.filter(path => path === '/remote/pair/status')).toHaveLength(3)
+  })
+
   const unreachable = async (): Promise<{ status: number; body: string }> => { throw new RemoteAccessError('nothing carried it', 503) }
   const approved = async (): Promise<{ status: number; body: string }> => ({
     status: 200,
