@@ -210,6 +210,29 @@ describe('what a paired machine may open', () => {
     expect(fix.updated[0]).toMatchObject({ settings: { permission: 'default' } })
   })
 
+  it('keeps the mode a runtime with no neutral default opened on, rather than forcing one it cannot honour', async () => {
+    // The local models never ask for anything, so 'default' is not a mode they offer; a tab forced
+    // onto it refused its first message as unsupported. It opens the way a local tab here does.
+    const updated: Array<Record<string, unknown>> = []
+    const local = fixture({
+      providers: () => [{ id: 'local', available: true, models: [{ id: 'local/qwen', label: 'Qwen', isDefault: true }] }],
+      database: {
+        getProject: (id: string) => PROJECTS.find(entry => entry.id === id) ?? null,
+        getSession: (id: string) => id === 'workspace-1' ? { id, projectId: 'shared-project', layout: { version: 1, root: { type: 'group', id: 'group-1', activeTabId: 'agent-tab', tabs: [] } } } : null,
+        listSessions: () => [{ id: 'workspace-1', projectId: 'shared-project', name: 'Main' }],
+        listDetachedWindows: () => [],
+        structured: {
+          snapshot: () => ({ sessionId: 'agent-local', runtimeId: '', settings: { model: 'local/qwen', permission: 'accept-edits', plan: false }, capabilities: { permissions: ['accept-edits', 'read-only'] }, phase: 'idle', items: [], sequence: 0, title: '', archived: false, truncated: false }),
+          events: () => [],
+          update: (id: string, patch: Record<string, unknown>) => { updated.push({ id, ...patch }) }
+        }
+      } as unknown as ConductorDatabase
+    })
+    await local.call('tabs.open', { projectId: 'shared-project', sessionId: 'workspace-1', provider: 'local' })
+      .catch(() => { /* the stub UI adds no tab; the settings write is the point */ })
+    expect(updated[0]).toMatchObject({ settings: { permission: 'accept-edits' } })
+  })
+
   it('refuses to spawn a terminal, which the approval prompt promises it cannot', async () => {
     expect(await fix.refusal('tabs.open', { projectId: 'shared-project', sessionId: 'workspace-1', kind: 'terminal' }))
       .toMatch(/Unsupported remote tab kind/)

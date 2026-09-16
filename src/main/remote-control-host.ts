@@ -523,8 +523,13 @@ export class RemoteControlHost {
       if (!created.available) throw new RemoteAccessError(created.message || 'Provider unavailable on this machine.', 409)
       const snapshot = this.deps.database.structured.snapshot(spec.id)!
       // A remote caller cannot hand itself more permission than the owner granted; anything
-      // beyond the default has to be chosen on this machine.
-      const settings: SessionSettings = { ...snapshot.settings, model: model.id, permission: 'default' }
+      // beyond the default has to be chosen on this machine. A runtime with no neutral default at
+      // all - the local models never ask, so 'default' is a mode they cannot honour - keeps the
+      // mode ensure() opened it on, the same one a tab opened on this machine gets: forcing
+      // 'default' there produced a conversation that refused its first message as unsupported.
+      const offered = snapshot.capabilities?.permissions
+      const permission = !offered?.length || offered.includes('default') ? 'default' : snapshot.settings.permission
+      const settings: SessionSettings = { ...snapshot.settings, model: model.id, permission }
       this.deps.database.structured.update(spec.id, { settings })
     }
     await this.ui(projectId, sessionId, 'tabs.open', { tab })
