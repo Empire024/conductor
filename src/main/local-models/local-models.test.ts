@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
@@ -7,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError, WorkspaceBoundaryError } from './workspace.ts'
 import {
-  adoptableContainer, clearSecretScanCache, containerRunArgs, detectSecretPaths, execArgs, materializeMaskSources,
+  adoptableContainer, clearSecretScanCache, containerRunArgs, detectSecretPaths, execArgs, hostAutocrlf, materializeMaskSources,
   mountDigest, SandboxUnavailableError, sandboxContainerName, secretPathsFor, trackedMaskPlan, type SecretMask
 } from './sandbox.ts'
 import {
@@ -121,6 +122,27 @@ describe('sandbox arguments', () => {
       expect(mounts(true)).not.toContain('target=/workspace/.git')
       expect(mounts(true)).toContain('GIT_AUTHOR_NAME=Conductor local model')
       expect(mounts(true)).toContain('--network none')
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  it('mirrors the host line-ending translation into a granted container', async () => {
+    const root = workspace()
+    mkdirSync(join(root, '.git'))
+    try {
+      const withSetting = (gitAutocrlf: string | undefined): string => containerRunArgs({ name: 'conductor-local-test', image: DEFAULT_SANDBOX.image, workspace: root, sandbox: DEFAULT_SANDBOX, masks: [], emptyFile: join(root, 'empty'), gitWritable: true, gitAutocrlf }).join(' ')
+      // Without it, a Linux container commits this repository's CRLF working tree as content and
+      // one `git add -A` rewrites every untouched file.
+      expect(withSetting('input')).toContain('GIT_CONFIG_VALUE_0=input')
+      expect(withSetting(undefined)).not.toContain('core.autocrlf')
+      // What the container is told comes from the repository itself, whichever way it is set.
+      const repository = workspace()
+      try {
+        execFileSync('git', ['init', '--quiet', repository])
+        execFileSync('git', ['config', 'core.autocrlf', 'false'], { cwd: repository })
+        expect(await hostAutocrlf(repository)).toBe('false')
+        execFileSync('git', ['config', 'core.autocrlf', 'true'], { cwd: repository })
+        expect(await hostAutocrlf(repository)).toBe('input')
+      } finally { rmSync(repository, { recursive: true, force: true }) }
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
 

@@ -356,6 +356,8 @@ export function containerRunArgs(options: {
   emptyFile: string
   /** Off unless the owner grants it in the conversation: see the .git mount below. */
   gitWritable?: boolean
+  /** The host repository's own `core.autocrlf`, mirrored into a granted container: see below. */
+  gitAutocrlf?: string
 }): string[] {
   if (!NAME.test(options.name)) throw new SandboxUnavailableError('Invalid sandbox container name')
   if (!IMAGE.test(options.image)) throw new SandboxUnavailableError('Invalid sandbox image reference')
@@ -424,6 +426,11 @@ export function containerRunArgs(options: {
   // A commit needs an identity, and the read-only root filesystem has nowhere to configure one.
   // Naming the local model in the commit itself keeps its history distinguishable from the owner's.
   if (options.gitWritable) for (const variable of ['GIT_AUTHOR_NAME=Conductor local model', 'GIT_AUTHOR_EMAIL=local-model@conductor.invalid', 'GIT_COMMITTER_NAME=Conductor local model', 'GIT_COMMITTER_EMAIL=local-model@conductor.invalid']) args.push('--env', variable)
+  // The container is Linux and the workspace is a Windows checkout, so git in here sees a
+  // CRLF working tree with none of the host's translation configured: a `git add -A` would
+  // rewrite every untouched file in the repository as a line-ending change. Mirroring the
+  // host's own setting keeps a sandboxed commit recording the same bytes the host would.
+  if (options.gitWritable && options.gitAutocrlf) for (const variable of ['GIT_CONFIG_COUNT=1', 'GIT_CONFIG_KEY_0=core.autocrlf', `GIT_CONFIG_VALUE_0=${options.gitAutocrlf}`]) args.push('--env', variable)
   args.push(options.image, 'sleep', 'infinity')
   return args
 }
@@ -467,6 +474,15 @@ export function adoptableContainer(inspected: string, digest: string, workspace:
   return root.length === 1 && hostPathKey(root[0]!.Source ?? '') === hostPathKey(dockerPath(workspace))
 }
 
+/** What the host would do with line endings in this repository, as the container should do it:
+ *  a host that translates on checkout (`true`) stores LF, which is `input` for a Linux container
+ *  that already has LF files on disk; anything else records the bytes as they are. */
+export async function hostAutocrlf(workspace: string): Promise<string> {
+  const configured = await runGit(workspace, ['config', '--get', 'core.autocrlf'], 4096)
+  const value = configured.code === 0 ? configured.stdout.toString('utf8').trim().toLowerCase() : ''
+  return value === 'true' || value === 'input' ? 'input' : 'false'
+}
+
 export class DockerSandbox {
   readonly name: string
   private readonly workspace: string
@@ -475,6 +491,7 @@ export class DockerSandbox {
   private starting?: Promise<void>
   private mountSignature?: string
   private gitWritable = false
+  private gitAutocrlf?: string
 
   constructor(sessionId: string, workspace: string, sandbox: SandboxConfig) {
     this.name = sandboxContainerName(sessionId)
@@ -487,7 +504,7 @@ export class DockerSandbox {
   setGitAccess(writable: boolean): void { this.gitWritable = writable }
 
   private signature(masks: SecretMask[]): string {
-    return JSON.stringify({ masks, git: this.gitWritable, workspace: resolve(this.workspace) })
+    return JSON.stringify({ masks, git: this.gitWritable, autocrlf: this.gitAutocrlf ?? null, workspace: resolve(this.workspace) })
   }
 
   /** The mounts this session should be running with right now: the cached secret scan, plus the
@@ -496,6 +513,7 @@ export class DockerSandbox {
   private async plannedMasks(): Promise<{ masks: SecretMask[]; writes: TrackedMaskWrite[] }> {
     const masks = await secretPathsFor(this.workspace)
     if (!this.gitWritable) return { masks, writes: [] }
+    this.gitAutocrlf = await hostAutocrlf(this.workspace)
     return trackedMaskPlan(this.workspace, masks, join(runDir(), 'masked-tracked'))
   }
 
@@ -530,7 +548,7 @@ export class DockerSandbox {
     const emptyFile = join(runDir(), 'masked-empty')
     if (!existsSync(emptyFile)) writeFileSync(emptyFile, '', 'utf8')
     await materializeMaskSources(this.workspace, planned.writes)
-    const args = containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks: planned.masks, emptyFile, gitWritable: this.gitWritable })
+    const args = containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks: planned.masks, emptyFile, gitWritable: this.gitWritable, gitAutocrlf: this.gitAutocrlf })
     args.splice(args.indexOf('--label'), 0, '--label', `${MOUNT_LABEL}=${digest}`)
     const created = await runDocker(args, 120_000, 256 * 1024)
     if (created.spawnError || created.code !== 0) throw new SandboxUnavailableError(`Sandbox failed to start: ${(created.stderr || created.stdout).trim().slice(0, 400) || 'docker run failed'}`)

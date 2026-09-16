@@ -90,7 +90,16 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   widen what that conversation may do, and nothing else changes them. *Repository writes*
   (`localGit`) stops re-binding `.git` read-only and supplies a `Conductor local model` commit
   identity, so the sandbox can commit, branch and stash on local history; the container still
-  runs with `--network none`, so nothing can be pushed or fetched. The mount is fixed when the
+  runs with `--network none`, so nothing can be fetched and no push leaves it. A push under the
+  grant is instead brokered on the host by `src/main/local-models/git-push.ts`: only a plain
+  `git push`, at most an existing remote and the branch that is actually checked out, optionally
+  `-u`; the host re-reads HEAD and the remote list rather than trusting the model, runs git as
+  argv with `GIT_TERMINAL_PROMPT=0`, and refuses force, delete, mirror, arbitrary refspecs, push
+  options, a push hidden in a compound command line, and any push at all without the grant. A
+  rejected push is reported to the model, never retried with force. The container is also given
+  the host repository's own `core.autocrlf` (as `input` wherever the host translates), because a
+  Linux container looking at a CRLF Windows checkout would otherwise record every untouched file
+  in the repository as a line-ending change on the first `git add -A`. The mount is fixed when the
   container starts, so the grant takes effect on the next container, and withdrawing it
   recreates the container too. The grant is for git itself: the host file tools still refuse
   every write under `.git` (`resolveWritablePath` takes no grant), so hooks, refs and config
