@@ -87,7 +87,11 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   queries. Credential filename policy likewise cannot identify secrets embedded in arbitrary
   source files, or atomically guard files another host process creates during a running command.
 - **Per-conversation grants, off by default.** Two buttons in a local conversation's composer
-  widen what that conversation may do, and nothing else changes them. *Repository writes*
+  widen what that conversation may do. The one other way to change them is a non-local coworker
+  on the app control protocol — `agents.grant`, or `repository`/`research` on `tabs.open` and
+  `router.dispatch` tasks (`docs/agent-control.md`) — which writes the same durable settings, so
+  the buttons show it and dispatch enforces it unchanged; a local model can never call that
+  method, so a sandboxed conversation cannot widen itself or another one. *Repository writes*
   (`localGit`) stops re-binding `.git` read-only and supplies a `Conductor local model` commit
   identity, so the sandbox can commit, branch and stash on local history; the container still
   runs with `--network none`, so nothing can be fetched and no push leaves it. A push under the

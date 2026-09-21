@@ -1,6 +1,6 @@
 import type { PaneTab } from './models'
 
-export type AgentControlUiAction = 'tabs.list' | 'tabs.open' | 'tabs.close' | 'tabs.focus' | 'tabs.focus-origin' | 'tabs.split' | 'tabs.rename' | 'tabs.detach' | 'agents.configure' | 'agents.configure-confirmed' | 'files.open' | 'workspace.rename' | 'workspace.focus'
+export type AgentControlUiAction = 'tabs.list' | 'tabs.open' | 'tabs.close' | 'tabs.focus' | 'tabs.focus-origin' | 'tabs.split' | 'tabs.rename' | 'tabs.detach' | 'agents.configure' | 'agents.configure-confirmed' | 'agents.grant-confirmed' | 'files.open' | 'workspace.rename' | 'workspace.focus'
 export interface AgentControlScope { projectId: string; sessionId: string; agentSessionId: string }
 export interface AgentControlUiRequest extends AgentControlScope {
   id: string

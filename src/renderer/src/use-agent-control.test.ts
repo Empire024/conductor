@@ -74,6 +74,24 @@ describe('visible agent control', () => {
     expect(host.commit).not.toHaveBeenCalled()
     vi.unstubAllGlobals()
   })
+  it('announces a confirmed grant change only for the open local tab it names', async () => {
+    class TestCustomEvent<T = unknown> extends Event { detail: T; constructor(type: string, init: CustomEventInit<T>) { super(type); this.detail = init.detail as T } }
+    vi.stubGlobal('window', new EventTarget())
+    vi.stubGlobal('CustomEvent', TestCustomEvent)
+    const { host, request, current } = fixture()
+    const group = listGroups(current().layout.root)[0]!
+    const tab = { id: 'local-tab', kind: 'agent' as const, title: 'Local', resourceId: 'local-worker', state: { provider: 'local', model: 'local-synthetic' } }
+    current().layout = { ...current().layout, root: { ...group, tabs: [...group.tabs, tab] } }
+    const changes: unknown[] = []
+    const listener = (event: Event): void => { changes.push((event as CustomEvent).detail) }
+    window.addEventListener('conductor:agent-control-grants-changed', listener)
+    await expect(handleAgentControlRequest(request('agents.grant-confirmed', { tabId: tab.id, agentSessionId: 'local-worker', repository: true, research: false }), host)).resolves.toEqual({ notified: true })
+    await expect(handleAgentControlRequest(request('agents.grant-confirmed', { tabId: tab.id, agentSessionId: 'someone-else', repository: true }), host)).rejects.toThrow('no longer open')
+    window.removeEventListener('conductor:agent-control-grants-changed', listener)
+    expect(changes).toEqual([{ agentSessionId: 'local-worker', repository: true, research: false }])
+    expect(host.commit).not.toHaveBeenCalled()
+    vi.unstubAllGlobals()
+  })
   it('splits into a visible new group and identifies detached tabs in list results', async () => {
     const { host, request, current } = fixture()
     host.detachedId = 'floating'

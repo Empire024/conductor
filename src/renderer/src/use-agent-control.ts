@@ -5,7 +5,7 @@ import type { PaneTab, SessionRecord, WorkspaceLayout } from '../../shared/model
 import { makeLauncherTab } from '../../shared/models'
 import { activateTab, addTab, findGroup, listGroups, splitGroup, updateTab } from './layout/layout-operations'
 import { applyWorkspaceTabAction } from './layout/workspace-tab-actions'
-import { announceAgentControlSettings } from './agent-control-settings'
+import { announceAgentControlGrants, announceAgentControlSettings } from './agent-control-settings'
 
 export interface AgentControlHost {
   detachedId?: string
@@ -82,6 +82,14 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
     // that case the newer layout wins and the stale confirmation never reaches React state.
     if (tab.state?.model !== model || (tab.state.effort ?? 'auto') !== (effort ?? 'auto')) return { notified: false, superseded: true }
     announceAgentControlSettings({ agentSessionId, model, effort })
+    return { notified: true }
+  }
+  if (request.action === 'agents.grant-confirmed') {
+    const agentSessionId = String(request.params.agentSessionId ?? '')
+    if (!tab || tab.kind !== 'agent' || tab.resourceId !== agentSessionId) throw new Error('The requested agent tab is no longer open.')
+    // Main already saved the grants durably; this only tells the mounted pane so its composer
+    // toggles show them without a remount. Nothing in the layout changes.
+    announceAgentControlGrants({ agentSessionId, repository: request.params.repository === true, research: request.params.research === true })
     return { notified: true }
   }
   if (request.action === 'workspace.rename') {

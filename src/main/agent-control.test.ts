@@ -818,3 +818,107 @@ describe('context handoff to a fresh tab', () => {
     expect(tools['agents.handoff']).toContain('no agentSessionId')
   })
 })
+
+describe('local-model grants through app control', () => {
+  const withLocal = () => {
+    const f = fixture(false, { local: ['default', 'accept-edits', 'read-only'] })
+    f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })
+    return f
+  }
+  const grantsOf = (f: ReturnType<typeof fixture>, id: string) => {
+    const settings = f.database.structured.snapshot(id)!.settings
+    return { repository: Boolean(settings.localGit), research: Boolean(settings.localResearch) }
+  }
+  /** A local conversation the owner opened by hand: visible, provider local, controlled by nobody. */
+  const openOwnersLocalTab = (f: ReturnType<typeof fixture>, id: string): AgentControlScope => {
+    f.sessions.ensure({ ...f.spec, id, provider: 'local', title: id, model: 'local-synthetic' })
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    current.layout.root.tabs.push({ id: id + '-tab', kind: 'agent', resourceId: id, title: id, state: { provider: 'local', model: 'local-synthetic' } })
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+    return { ...f.scope, agentSessionId: id }
+  }
+
+  it('lets a non-local controller grant and revoke repository writes and research on a local tab it opened, durably and visibly', async () => {
+    const f = withLocal()
+    const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic' }) as AgentControlTab
+    const id = tab.resourceId!
+    expect(grantsOf(f, id)).toEqual({ repository: false, research: false })
+    expect(await f.control.call(f.scope, 'agents.grant', { agentSessionId: id, repository: true })).toMatchObject({ agentSessionId: id, tabId: tab.id, provider: 'local', grants: { repository: true, research: false }, effective: 'next-turn', paneNotified: true, grantedBy: f.spec.id })
+    // The same durable settings the composer writes, so the tab's toggles and dispatch read it.
+    expect(grantsOf(f, id)).toEqual({ repository: true, research: false })
+    expect((await f.control.call(f.scope, 'agents.snapshot', { agentSessionId: id }) as SessionProjection).settings).toMatchObject({ localGit: true })
+    // The mounted pane is told, so its composer buttons show the change without a remount.
+    expect(f.requests.at(-1)).toMatchObject({ action: 'agents.grant-confirmed', sessionId: f.workspace.id, params: { tabId: tab.id, agentSessionId: id, repository: true, research: false } })
+    // An omitted field is left alone; false revokes.
+    expect(await f.control.call(f.scope, 'agents.grant', { agentSessionId: id, research: true })).toMatchObject({ grants: { repository: true, research: true } })
+    expect(await f.control.call(f.scope, 'agents.grant', { agentSessionId: id, repository: false })).toMatchObject({ grants: { repository: false, research: true } })
+    expect(grantsOf(f, id)).toEqual({ repository: false, research: true })
+    // Naming nothing changes nothing and reports the current state without telling the pane.
+    const before = f.requests.length
+    expect(await f.control.call(f.scope, 'agents.grant', { agentSessionId: id })).toMatchObject({ grants: { repository: false, research: true }, paneNotified: false })
+    expect(f.requests).toHaveLength(before)
+    // A dispatched turn carries the conversation's current grants, not a copy from earlier.
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Push the finished commit.' })
+    expect(f.submissions.at(-1)?.settings).toMatchObject({ localGit: false, localResearch: true })
+    // Unknown keys and non-boolean values are refused before anything changes.
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: id, repository: true, network: true })).rejects.toThrow('accepts only agentSessionId, repository and research')
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: id, repository: 'yes' })).rejects.toThrow('repository must be true or false')
+    expect(grantsOf(f, id)).toEqual({ repository: false, research: true })
+    expect((await f.control.call(f.scope, 'tools.list') as Record<string, string>)['agents.grant']).toContain('({agentSessionId,repository?,research?})')
+  })
+
+  it('refuses a non-local target, a local caller, itself, a tab the caller does not control, and a conversation a paired machine drives', async () => {
+    const f = withLocal()
+    const claude = await f.control.call(f.scope, 'tabs.open', { provider: 'claude' }) as AgentControlTab
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: claude.resourceId, repository: true })).rejects.toThrow('local models only')
+    expect(f.database.structured.snapshot(claude.resourceId!)?.settings.localGit).toBeUndefined()
+    // A sandboxed local conversation never widens another one, and nobody widens itself.
+    const unclaimed = openOwnersLocalTab(f, 'owners-local')
+    const localCaller = openOwnersLocalTab(f, 'local-caller')
+    await expect(f.control.call(localCaller, 'agents.grant', { agentSessionId: unclaimed.agentSessionId, repository: true })).rejects.toThrow('sandboxed')
+    await expect(f.control.call(localCaller, 'agents.grant', { agentSessionId: localCaller.agentSessionId, repository: true })).rejects.toThrow('itself')
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: f.spec.id, repository: true })).rejects.toThrow('itself')
+    // Authority outlives a prompt, so a tab this caller merely could steer is not enough: it has
+    // to control it already, and a tab another controller holds is off limits as everywhere.
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: unclaimed.agentSessionId, repository: true })).rejects.toThrow('already controls')
+    openAgentTab(f, 'other-controller', 'other-controller-tab')
+    f.database.setSetting('agentControlParent:' + unclaimed.agentSessionId, JSON.stringify({ projectId: f.project.id, sessionId: f.workspace.id, controllerAgentSessionId: 'other-controller', targetAgentSessionId: unclaimed.agentSessionId, controllerTabId: 'other-controller-tab', controlledTabId: 'owners-local-tab' }))
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: unclaimed.agentSessionId, repository: true })).rejects.toThrow('already controls')
+    expect(grantsOf(f, unclaimed.agentSessionId)).toEqual({ repository: false, research: false })
+    // A conversation a paired machine is driving keeps the authority that pairing gave it.
+    const driven = await f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic' }) as AgentControlTab
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    const drivenTab = current.layout.root.tabs.find(candidate => candidate.id === driven.id)!
+    drivenTab.state = { ...drivenTab.state, remotePeerId: 'peer' }
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: driven.resourceId, repository: true })).rejects.toThrow('paired machine')
+    // A read-only or planning caller cannot widen a coworker it could not dispatch into.
+    f.database.structured.update(f.spec.id, { settings: { ...f.database.structured.snapshot(f.spec.id)!.settings, permission: 'read-only' } })
+    await expect(f.control.call(f.scope, 'agents.grant', { agentSessionId: claude.resourceId, repository: true })).rejects.toThrow('read-only')
+  })
+
+  it('accepts the grants when the tab is created, through tabs.open and router.dispatch, under the same rules', async () => {
+    const f = withLocal()
+    const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic', repository: true }) as AgentControlTab & { grants?: unknown }
+    expect(tab.grants).toEqual({ repository: true, research: false })
+    expect(grantsOf(f, tab.resourceId!)).toEqual({ repository: true, research: false })
+    const plain = await f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic' }) as AgentControlTab & { grants?: unknown }
+    expect(plain.grants).toBeUndefined()
+    const dispatched = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Research', prompt: 'Look it up.', provider: 'local', model: 'local-synthetic', research: true }] }) as Array<{ agentSessionId: string; accepted: boolean }>
+    expect(dispatched[0]?.accepted).toBe(true)
+    expect(grantsOf(f, dispatched[0]!.agentSessionId)).toEqual({ repository: false, research: true })
+    expect(f.submissions.at(-1)?.settings).toMatchObject({ localResearch: true })
+    // Never on another provider, never a non-boolean, never from a sandboxed or read-only caller —
+    // and a refused ask registers no conversation at all.
+    const registered = () => f.database.structured.history(f.project.id).length
+    const count = registered()
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', repository: true })).rejects.toThrow('local models only')
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic', research: 'please' })).rejects.toThrow('research must be true or false')
+    await expect(f.control.call({ ...f.scope, agentSessionId: tab.resourceId! }, 'tabs.open', { provider: 'local', model: 'local-synthetic', repository: true })).rejects.toThrow('sandboxed')
+    f.database.structured.update(f.spec.id, { settings: { ...f.database.structured.snapshot(f.spec.id)!.settings, permission: 'read-only' } })
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic', repository: true })).rejects.toThrow('read-only')
+    expect(registered()).toBe(count)
+  })
+})

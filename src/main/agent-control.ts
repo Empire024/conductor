@@ -85,7 +85,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,title?,machineId?,projectId?,workspaceId?}) — visible tab; agent default kind, provider/model must be available; a new agent tab opens on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode — always clamped to the controller’s autonomy and to what the target provider offers; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,title?,machineId?,projectId?,workspaceId?,repository?,research?}) — visible tab; agent default kind, provider/model must be available; a new agent tab opens on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode — always clamped to the controller’s autonomy and to what the target provider offers; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules',
   'tabs.focus': '({tabId})',
   'tabs.rename': '({tabId,title})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
@@ -95,6 +95,7 @@ const toolSignatures = {
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
+  'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
   'agents.steer': '({agentSessionId,prompt}) — same steering/queue behavior as the user composer',
   'agents.interrupt': '({agentSessionId})',
@@ -117,7 +118,7 @@ const toolSignatures = {
   'orchestration.routines.save': '({id?,name,description?,steps:[{title,instructions?,assignedAgentId?}]})',
   'workspace.rename': '({title})',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does'
 } as const
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
@@ -281,6 +282,62 @@ export class AgentControl {
     return { previous: structuredClone(state.settings), next: { ...state.settings, model, effort }, model, effort }
   }
 
+  /** The per-conversation grants a caller asked for, by the names the protocol uses. Only parsed
+   *  here; whether the caller may hand them out is grantAuthority, so tabs.open, router.dispatch
+   *  and agents.grant read them under one rule. */
+  private grantArguments(args: Args): Partial<Pick<SessionSettings, 'localGit' | 'localResearch'>> {
+    const requested: Partial<Pick<SessionSettings, 'localGit' | 'localResearch'>> = {}
+    for (const [key, setting] of [['repository', 'localGit'], ['research', 'localResearch']] as const) {
+      if (args[key] === undefined) continue
+      if (typeof args[key] !== 'boolean') throw new Error(`${key} must be true or false`)
+      requested[setting] = args[key]
+    }
+    return requested
+  }
+
+  /**
+   * Whether this caller may hand out a local model's grants at all. A sandboxed local
+   * conversation never may: one that could widen another local tab could widen one it opened and
+   * hand its own work to it, which is the sandbox escaped one step removed. A read-only or
+   * planning caller may not either, for the same reason it cannot dispatch into a writable
+   * conversation, and a conversation a paired machine is driving stays inside what that pairing
+   * granted, as everywhere else.
+   */
+  private grantAuthority(scope: AgentControlScope, source: AgentSpec): void {
+    if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot grant repository writes or research, to itself or to any other conversation. A non-local coworker grants them with agents.grant, or the owner toggles them in that tab’s composer.')
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and cannot widen a local model')
+  }
+
+  /**
+   * Switches a local coworker's repository-writes and deep-research grants from outside it.
+   * Modelled on app.update.authorize — the same kind of caller, the same "never itself" rule, the
+   * same strictness about arguments — with one deliberate difference: an update clearance lives
+   * in memory, but these grants are the conversation's durable settings, written through exactly
+   * the path its composer uses (StructuredSessions.saveSettings). That is what makes the tab's
+   * own toggles show the change, keeps the local runtime's dispatch-time enforcement unchanged,
+   * and means a queued prompt cannot carry a grant that was withdrawn in the meantime. Authority
+   * is more durable than a prompt, so ownership follows agents.configure rather than steering:
+   * only a coworker this caller already controls, running on this machine.
+   */
+  private async grant(scope: AgentControlScope, source: AgentSpec, id: string, args: Args): Promise<unknown> {
+    if (Object.keys(args).some(key => !['agentSessionId', 'repository', 'research'].includes(key))) throw new Error('agents.grant accepts only agentSessionId, repository and research')
+    this.grantAuthority(scope, source)
+    const { tab, scope: target } = this.configuredTarget(scope, id)
+    if (tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; its grants belong to that machine')
+    if (this.deps.database.structured.spec<AgentSpec>(id)?.provider !== 'local' || tab.state?.provider !== 'local') throw new Error('Repository and research grants apply to local models only')
+    const requested = this.grantArguments(args)
+    const changing = Object.keys(requested).length > 0
+    if (changing) this.deps.sessions.saveSettings(id, { ...this.deps.database.structured.snapshot(id)!.settings, ...requested })
+    const saved = this.deps.database.structured.snapshot(id)!.settings
+    const grants = { repository: Boolean(saved.localGit), research: Boolean(saved.localResearch) }
+    // The mounted pane keeps its own copy of the settings, so it is told. The durable state is
+    // already the truth; a pane that missed the note reads it again when it mounts.
+    let paneNotified = false
+    if (changing) await this.ui(target, 'agents.grant-confirmed', { tabId: tab.id, agentSessionId: id, ...grants }).then(() => { paneNotified = true }, () => undefined)
+    return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: target.projectId, workspaceId: target.sessionId, provider: 'local', grants, effective: 'next-turn', paneNotified, grantedBy: scope.agentSessionId, note: 'Repository writes let the sandbox commit and branch, and run a plain git push for it on the host; research adds web_search and a larger tool-round budget. Both apply from that conversation’s next turn.' }
+  }
+
   /**
    * Who controls this tab, wherever that controller sits. A link only binds while the controller
    * still has an open tab of its own; otherwise a closed or crashed controller would hold the tab
@@ -425,7 +482,7 @@ export class AgentControl {
     return tabMachineId(this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId))
   }
 
-  private async open(scope: AgentControlScope, args: Args): Promise<AgentControlTab & { projectId: string; workspaceId: string }> {
+  private async open(scope: AgentControlScope, args: Args): Promise<AgentControlTab & { projectId: string; workspaceId: string; grants?: { repository: boolean; research: boolean } }> {
     const kind = (args.kind ?? 'agent') as PaneKind
     const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs']
     if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
@@ -437,6 +494,7 @@ export class AgentControl {
     if (machineId !== LOCAL_MACHINE_ID) return this.openOnMachine(scope, target, machineId, machines, args) as Promise<AgentControlTab & { projectId: string; workspaceId: string }>
     const title = args.title === undefined ? kind === 'agent' ? 'Agent' : kind : text(args, 'title', 120)
     const tab: PaneTab = { id: makeId('tab'), kind, title }
+    let grants: { repository: boolean; research: boolean } | undefined
     if (kind === 'agent') {
       const source = this.authorize(scope)
       const catalog = this.catalog(scope)
@@ -449,6 +507,13 @@ export class AgentControl {
       if (effort && !model.effort?.includes(effort)) throw new Error('Choose an effort supported by this model')
       if (args.permission !== undefined && !isSessionPermission(args.permission)) throw new Error('Invalid permission mode')
       const explicitPermission = args.permission as SessionSettings['permission'] | undefined
+      // Grants are checked before the session exists, so a refused ask leaves no orphaned
+      // conversation behind; the rules are the ones agents.grant applies later.
+      const requestedGrants = this.grantArguments(args)
+      if (Object.keys(requestedGrants).length) {
+        this.grantAuthority(scope, source)
+        if (provider !== 'local') throw new Error('Repository and research grants apply to local models only')
+      }
       tab.resourceId = makeId('agent')
       tab.title = args.title === undefined ? model.label : title
       tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual', machineId }
@@ -466,8 +531,9 @@ export class AgentControl {
       // still capped by the controller's own autonomy and by what this provider actually offers.
       const requested = explicitPermission ?? rememberedPermission(key => this.deps.database.getSetting(key), provider)
       const permission = inheritedPermission(sourceSettings, created.capabilities?.permissions, requested)
-      const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(permission === 'read-only' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude' }
+      const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(permission === 'read-only' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude', ...requestedGrants }
       this.deps.database.structured.update(spec.id, { settings })
+      if (Object.keys(requestedGrants).length) grants = { repository: Boolean(settings.localGit), research: Boolean(settings.localResearch) }
     } else {
       if (kind === 'terminal') tab.resourceId = makeId('terminal')
       tab.state = { ...tab.state, machineId }
@@ -475,7 +541,7 @@ export class AgentControl {
     await this.ui(target, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
     const opened = this.tab(target, tab.id)
     if (kind === 'agent') this.relationship(scope, target, opened, 'attached')
-    return { ...opened, projectId: target.projectId, workspaceId: target.sessionId }
+    return { ...opened, projectId: target.projectId, workspaceId: target.sessionId, ...(grants ? { grants } : {}) }
   }
 
   /**
@@ -491,6 +557,9 @@ export class AgentControl {
     if (!placement.ok) throw new Error(placement.message)
     if (!this.deps.openRemote) throw new Error('Remote machine placement is unavailable in this window')
     if (args.kind !== undefined && args.kind !== 'agent') throw new Error('Only agent tabs can be opened on another machine')
+    // The grants are settings of the conversation where it runs; silently dropping them here
+    // would hand that machine a job the tab cannot finish.
+    if (args.repository !== undefined || args.research !== undefined) throw new Error('Repository and research grants are set on the machine that runs the tab; open it there without them and grant through that machine')
     const created = await this.deps.openRemote(machineId, {
       projectId: target.projectId,
       sessionId: target.sessionId,
@@ -586,6 +655,7 @@ export class AgentControl {
         const saved = database.structured.snapshot(id)!
         return { agentSessionId: id, tabId: configured.tab.id, uri: configured.tab.uri, projectId: configured.scope.projectId, workspaceId: configured.scope.sessionId, provider, model: saved.settings.model, effort: saved.settings.effort ?? null, effective: 'next-turn', phase: saved.phase }
       }
+      if (method === 'agents.grant') return this.grant(scope, source, id, args)
       if (method === 'agents.resume' || method === 'agents.fork') {
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot resume or fork a writable conversation')
         if (method === 'agents.resume') { await sessions.resume(id, state.settings); return { agentSessionId: id, phase: database.structured.snapshot(id)?.phase } }

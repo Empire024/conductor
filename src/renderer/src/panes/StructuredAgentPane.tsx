@@ -35,7 +35,7 @@ import { initialPermission, rememberPermission } from './permission-memory'
 import { bannerAbsorbsError, runtimeBanner } from './runtime-banner'
 import { cleanIpcError } from '../ipc-errors'
 import { copyText } from '../clipboard'
-import { onAgentControlSettings } from '../agent-control-settings'
+import { onAgentControlGrants, onAgentControlSettings } from '../agent-control-settings'
 import './StructuredAgentPane.css'
 
 let focusedAgent: { sessionId: string; projectId: string } | null = null
@@ -87,6 +87,15 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   useEffect(() => onAgentControlSettings(activeId, change => {
     setSettings(current => {
       const next = { ...current, model: change.model, effort: change.effort }
+      settingsRef.current = next
+      return next
+    })
+  }), [activeId])
+  // A controller may switch this local conversation's grants through agents.grant; the toggles
+  // below read the same settings, so they follow the durable change without a remount.
+  useEffect(() => onAgentControlGrants(activeId, change => {
+    setSettings(current => {
+      const next = { ...current, localGit: change.repository, localResearch: change.research }
       settingsRef.current = next
       return next
     })
