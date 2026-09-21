@@ -246,21 +246,31 @@ export const MEMORY_PROTOCOL = [
   'Write the corrected sentence to fix a memory you now know to be wrong.'
 ].join('\n')
 
+const memoryLine = (memory: Pick<AgentMemory, 'kind' | 'gist'>): string =>
+  `- [${memory.kind}] ${memory.gist.replace(/\s+/g, ' ').trim().slice(0, 520)}`
+
+/** The leading run of `memories` that fits the prompt budget, so what is recorded as sent is
+ *  exactly what was sent. */
+export const fitRecalledMemories = <T extends Pick<AgentMemory, 'kind' | 'gist'>>(
+  memories: readonly T[],
+  budget = 3_500
+): T[] => {
+  const kept: T[] = []
+  let used = 0
+  for (const memory of memories) {
+    const length = memoryLine(memory).length
+    if (used + length > budget) break
+    kept.push(memory)
+    used += length
+  }
+  return kept
+}
+
 /** Renders recalled memories as prompt context, most useful first. */
 export const formatRecalledMemories = (
   memories: readonly Pick<AgentMemory, 'kind' | 'gist'>[],
   budget = 3_500
-): string => {
-  const lines: string[] = []
-  let used = 0
-  for (const memory of memories) {
-    const line = `- [${memory.kind}] ${memory.gist.replace(/\s+/g, ' ').trim().slice(0, 520)}`
-    if (used + line.length > budget) break
-    lines.push(line)
-    used += line.length
-  }
-  return lines.join('\n')
-}
+): string => fitRecalledMemories(memories, budget).map(memoryLine).join('\n')
 
 /** Assistant snapshots are re-emitted as the message grows, so the same sentinel arrives many
  *  times in one turn. Re-remembering it would inflate its strength for free and distort recall. */

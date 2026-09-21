@@ -219,3 +219,31 @@ describe('collaboration path and conflict helpers', () => {
     expect(conflictSeverity('delete', 'edit')).toBe('blocking')
   })
 })
+
+describe('coworker briefing as a prompt delta', () => {
+  it('drops view-only intents, sends only records after the watermark, and repeats guidance only when asked', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-21T10:00:00.000Z'))
+    withCollaboration(({ store, projectId, first, second }) => {
+      const post = (kind: 'intent' | 'handoff', body: string, paths: string[]) =>
+        store.postMessage({ projectId, sessionId: first.sessionId, agentSessionId: first.id, kind, body, paths })
+      post('intent', 'view src/a.ts, view src/b.ts', ['src/a.ts', 'src/b.ts'])
+      post('intent', 'view src/a.ts, edit src/c.ts', ['src/a.ts', 'src/c.ts'])
+      // The full log, as the collaboration pane shows it, is unchanged.
+      expect(store.buildBriefing(second.id)).toContain('view src/a.ts, view src/b.ts')
+      const work = store.buildBriefing(second.id, 1800, { workOnly: true })
+      expect(work).not.toContain('view src/b.ts')
+      expect(work).toContain('view src/a.ts, edit src/c.ts')
+      expect(work).toContain('Coordinate before overlapping edits')
+      const watermark = new Date().toISOString()
+      expect(store.buildBriefing(second.id, 1800, { since: watermark, workOnly: true, guidance: false })).toBe('')
+      vi.setSystemTime(new Date('2026-09-21T10:05:00.000Z'))
+      post('handoff', 'Release notes are ready', [])
+      const delta = store.buildBriefing(second.id, 1800, { since: watermark, workOnly: true, guidance: false })
+      expect(delta).toContain('[Conductor coworker briefing')
+      expect(delta).toContain('Release notes are ready')
+      expect(delta).not.toContain('edit src/c.ts')
+      expect(delta).not.toContain('Coordinate before overlapping edits')
+    })
+  })
+})

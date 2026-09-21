@@ -674,6 +674,9 @@ export class CodexAdapter implements ProviderAdapter {
       if (item.type === 'contextCompaction') { this.turnKind = complete ? undefined : 'compact'; this.emitPhase(true) }
     }
     const correlation = { ...context, itemId: item.id }
+    // The compacted thread keeps a summary of what Conductor told it, not the text; the host
+    // restates its briefing with the next message when it sees this marker.
+    if (item.type === 'contextCompaction' && complete && context.nativeSessionId === this.threadId) this.emit({ ...correlation, data: { type: 'notice', message: 'Codex compacted this conversation; Conductor restates its briefing with the next message.', payload: { contextReset: true } }, native })
     if (complete) {
       if (this.completedItems.size >= 2048) this.completedItems.delete(this.completedItems.values().next().value!)
       this.completedItems.add(this.itemKey(correlation))

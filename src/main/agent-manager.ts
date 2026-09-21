@@ -15,12 +15,12 @@ import type { ConductorDatabase } from './database'
 import { parseUsageLimitReset } from './usage-limit'
 import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSignalAgentOutput } from './agent-activity'
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
-import { captureMemories, capturedMemoryKey, formatRecalledMemories, MEMORY_PROTOCOL } from './memory'
+import { captureMemories, capturedMemoryKey } from './memory'
 import { LOCAL_MODELS } from '../shared/local-models'
 import { NativeCliManager } from './native-cli-manager'
 import { loadConfig } from './local-models/config.ts'
 import { StructuredSessions } from './structured-sessions'
-import { projectTaskBriefing } from './project-backlog'
+import { TurnBriefings } from './turn-briefing'
 
 export { parseUsageLimitReset } from './usage-limit'
 
@@ -244,9 +244,9 @@ export class AgentManager {
   readonly nativeCli: NativeCliManager
   private readonly agents = new Map<string, LiveAgent>()
   private readonly continuationTimers = new Map<string, NodeJS.Timeout>()
-  // Per-session, not persisted: the protocol is handed over once per run, and a repeated
-  // assistant snapshot must not bank the same claim twice within that run.
-  private readonly memoryBriefed = new Set<string>()
+  // Per-session, not persisted: what each conversation's runtime has already been told, and
+  // which memory claims a repeated assistant snapshot must not bank twice within a run.
+  private readonly briefings: TurnBriefings
   private readonly memoryCaptures = new Map<string, Set<string>>()
   private disposing = false
 
@@ -256,32 +256,14 @@ export class AgentManager {
     private readonly controlBriefing?: (spec: AgentSpec) => string,
     private readonly mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
   ) {
+    // Everything static in the briefing is sent once per native runtime, a memory once per
+    // runtime, the coworker log as a delta; see turn-briefing.ts for why and for the numbers.
+    this.briefings = new TurnBriefings({ database, coworkers: collaboration ? (id, options) => collaboration.briefingFor(id, options) : undefined, control: controlBriefing })
     this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
       undefined,
-      (spec, prompt, itemId) => {
-        // The write half of the contract is a once-per-session cost: it competes with the
-        // user's actual request for attention, and repeating it every turn buys nothing.
-        const first = !this.memoryBriefed.has(spec.id)
-        if (first) {
-          this.memoryBriefed.add(spec.id)
-          try { database.forgetStaleMemories(spec.projectId) } catch { /* Pruning is opportunistic; recall works without it. */ }
-        }
-        const memories = database.recall(spec.projectId, prompt, spec.provider, 8)
-        const recalled = formatRecalledMemories(memories)
-        // Recall that reached the prompt is recorded against the user message it travelled
-        // with, so a memory steering the turn is visible in the conversation instead of
-        // being an invisible edit to the prompt.
-        if (recalled) {
-          try { database.recordMemoryRecall({ projectId: spec.projectId, agentSessionId: spec.id, itemId, prompt, memoryIds: memories.map(memory => memory.id) }) }
-          catch { /* The ledger explains a turn; it is never a precondition for sending one. */ }
-        }
-        const memoryContext = recalled ? `Conductor project memory (current project evidence takes precedence):\n${recalled}` : ''
-        // Local models use the scoped in-process tool bridge. Never put a bearer credential
-        // for the unrestricted app-control HTTP surface into their prompt or sandbox.
-        if (spec.provider === 'local') return [memoryContext, 'Use the conductor tool for durable project memory and tasks.list. Work only on your assigned task.'].filter(Boolean).join('\n\n')
-        return [memoryContext, first ? MEMORY_PROTOCOL : '', collaboration?.briefingFor(spec.id) ?? '', projectTaskBriefing(spec), this.controlBriefing?.(spec) ?? ''].filter(Boolean).join('\n\n')
-      },
+      (spec, prompt, itemId, runtimeId) => this.briefings.compose(spec, prompt, itemId, runtimeId),
       (spec, event) => {
+        this.briefings.observe(spec, event)
         if (event.data.type === 'text' && event.data.role === 'assistant' && event.data.mode === 'snapshot') this.bankMemories(spec, event.itemId, event.data.text)
         if (event.data.type !== 'tool' && event.data.type !== 'changes') return
         try { collaboration?.observeEvent(spec, { id: event.id, agentSessionId: spec.id, type: event.data.type === 'changes' ? 'file_change' : 'tool_call', message: event.data.type === 'tool' ? event.data.name : event.data.changes.map(change => change.path).join(', '), metadata: { structured: true, itemId: event.itemId, input: event.data.type === 'tool' ? event.data.input : undefined }, createdAt: event.timestamp }) } catch { /* Coordination remains advisory. */ }

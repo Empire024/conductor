@@ -422,3 +422,12 @@ describe('native steering delivery receipts', () => {
     expect(events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([{ type: 'input_delivery', inputId: 'client-pending', status: 'accepted' }, { type: 'input_delivery', inputId: 'client-pending', status: 'cancelled' }])
   })
 })
+
+it('marks a completed compaction so the host restates its briefing', async () => {
+  const { adapter, events } = create()
+  await adapter.submit('synthetic:compact-complete', settings)
+  await waitFor(() => completed(events))
+  const resets = events.filter(event => event.data.type === 'notice' && (event.data.payload as { contextReset?: boolean } | undefined)?.contextReset === true)
+  expect(resets).toHaveLength(1)
+  expect(resets[0]).toMatchObject({ nativeSessionId: 'synthetic-thread-1', data: { type: 'notice', payload: { contextReset: true } } })
+})

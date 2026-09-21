@@ -898,3 +898,15 @@ describe('Claude native steering command lifecycle', () => {
     expect(f.events.filter(event => event.data.type === 'input_delivery').map(event => event.data)).toEqual([{ type: 'input_delivery', inputId: 'next-input', status: 'delivered' }, { type: 'input_delivery', inputId: 'unconfirmed-input', status: 'uncertain' }])
   })
 })
+
+it('marks a compaction so the host restates its briefing', async () => {
+  const f = fixture()
+  await f.adapter.start()
+  f.transport.receive({ type: 'system', subtype: 'compact_boundary', compact_metadata: { trigger: 'auto', pre_tokens: 150000 } })
+  const resets = () => f.events.filter(event => event.data.type === 'notice' && (event.data.payload as { contextReset?: boolean } | undefined)?.contextReset === true)
+  expect(resets()).toHaveLength(1)
+  expect(resets()[0]).toMatchObject({ native: { method: 'system/compact_boundary' } })
+  // A subagent compacting its own context does not touch what the main conversation was told.
+  f.transport.receive({ type: 'system', subtype: 'compact_boundary', parent_tool_use_id: 'child' })
+  expect(resets()).toHaveLength(1)
+})

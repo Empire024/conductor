@@ -1,6 +1,6 @@
 import type { AgentSpec, NormalizedAgentEvent } from '../shared/models'
 import type { FileWorkIntent } from '../shared/agent-collaboration'
-import type { AgentCollaborationStore } from './agent-collaboration-store'
+import type { AgentCollaborationStore, CoworkerBriefingOptions } from './agent-collaboration-store'
 import { normalizeCollaborationPath } from './agent-collaboration-store'
 
 export interface ExtractedFileWorkSignal {
@@ -178,8 +178,8 @@ export class AgentCollaborationRuntime {
     })
   }
 
-  briefingFor(agentSessionId: string): string {
-    return this.store.buildBriefing(agentSessionId)
+  briefingFor(agentSessionId: string, options?: CoworkerBriefingOptions): string {
+    return this.store.buildBriefing(agentSessionId, undefined, options)
   }
 
   releaseAgent(agentSessionId: string): void {

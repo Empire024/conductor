@@ -69,6 +69,21 @@ export const conflictSeverity = (
 }
 
 /** Durable live-agent messages and expiring file work leases in conductor.db. */
+/** How much of the coworker log one prompt should carry. */
+export interface CoworkerBriefingOptions {
+  /** Only records created after this time; active leases are live state and are always included. */
+  since?: string
+  /** Leave out intents that only say a file was looked at: they are the bulk of the log and
+   *  coordinate nothing. An edit, create, delete or execute intent is always kept. */
+  workOnly?: boolean
+  /** Whether to include the two standing guidance lines; a runtime that has read them once
+   *  does not need them again. */
+  guidance?: boolean
+}
+
+const viewOnlyIntent = (message: AgentCollaborationMessage): boolean =>
+  message.kind === 'intent' && message.body.split(', ').every((part) => part.startsWith('view '))
+
 export class AgentCollaborationStore {
   private readonly db: DatabaseSync
 
@@ -294,7 +309,7 @@ export class AgentCollaborationStore {
     ).run(timestamp, timestamp, timestamp, agentSessionId)
   }
 
-  buildBriefing(agentSessionId: string, maxCharacters = 1800): string {
+  buildBriefing(agentSessionId: string, maxCharacters = 1800, options: CoworkerBriefingOptions = {}): string {
     const scope = this.requireAgentScope(agentSessionId)
     const presence = this.listPresence({ projectId: scope.projectId, includeIdle: false })
       .filter((item) => item.agentSessionId !== agentSessionId && item.state === 'active')
@@ -302,17 +317,20 @@ export class AgentCollaborationStore {
       projectId: scope.projectId,
       agentSessionId,
       limit: 30
-    }).filter((message) => message.agentSessionId !== agentSessionId).slice(-10)
+    }).filter((message) => message.agentSessionId !== agentSessionId)
+      .filter((message) => !options.since || message.createdAt > options.since)
+      .filter((message) => !options.workOnly || !viewOnlyIntent(message))
+      .slice(-10)
     if (presence.length === 0 && messages.length === 0) return ''
 
     const agents = this.agentLabels(scope.projectId), tabs = this.agentTabs(scope.projectId)
     const location = (workspaceId: string, id: string): string =>
       `${workspaceId === scope.sessionId ? 'this workspace' : 'another workspace'}=${workspaceId}; agent=${id}; tab=${tabs.get(workspaceId + ':' + id)?.join(',') ?? 'none'}`
-    const lines = [
-      `[Conductor coworker briefing — project-wide; generated ${now()}; other workspaces are included]`,
+    const lines = [`[Conductor coworker briefing — project-wide; generated ${now()}; other workspaces are included]`]
+    if (options.guidance !== false) lines.push(
       '- Recorded coordination, not live execution evidence. Refresh app.state, agents.list and agents.snapshot for current phase and results; old intents may be stale.',
       '- Coordinate before overlapping edits. Treat active exclusive file work as owned until its lease expires or is released.'
-    ]
+    )
     for (const item of presence) {
       lines.push(`- Active ${item.intent} lease from ${agents.get(item.agentSessionId) ?? item.agentSessionId}: ${item.path} (${location(item.sessionId, item.agentSessionId)}; heartbeat=${item.heartbeatAt}; expires=${item.expiresAt}).`)
     }

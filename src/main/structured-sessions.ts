@@ -88,8 +88,10 @@ export class StructuredSessions {
     private broadcast: (channel: string, payload: unknown) => void,
     private factory: Factory = createProviderAdapter,
     // `itemId` is the user message this context rides along with: recall is recorded against
-    // it so the conversation can show which memories reached the turn.
-    private context?: (spec: AgentSpec, prompt: string, itemId: string) => string,
+    // it so the conversation can show which memories reached the turn. `runtimeId` names the
+    // adapter the message will reach, or is '' when dispatching it is what creates the adapter,
+    // so the caller can tell a runtime that has already been briefed from a new one.
+    private context?: (spec: AgentSpec, prompt: string, itemId: string, runtimeId: string) => string,
     private observe?: (spec: AgentSpec, event: AgentEvent) => void,
     // Conductor-owned MCP servers for one session, serialized for the CLI's --mcp-config. Bound
     // at launch because a running conversation cannot be handed a new server later.
@@ -690,7 +692,7 @@ export class StructuredSessions {
       const context = await this.attachments(live, attachments)
       this.assertPromptDispatchAuthority(origin, live.spec)
       const userItemId = randomUUID()
-      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId) ?? ''
+      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '') ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.assertPromptWithinLimit(submitted.length)
       // A queued message may have captured settings before the owner revoked browser access.

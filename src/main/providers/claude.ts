@@ -494,6 +494,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (type === 'system' && message.subtype === 'compact_boundary' && !parentId) {
       this.contextTokens = undefined
       this.emitContext()
+      // The compacted conversation keeps a summary of what Conductor told it, not the text; the
+      // host restates its briefing with the next message when it sees this marker.
+      this.emit({ data: { type: 'notice', message: 'Claude Code compacted this conversation; Conductor restates its briefing with the next message.', payload: { contextReset: true } }, native: { method: 'system/compact_boundary', payload: message } })
       return
     }
     if (type === 'system' && message.subtype === 'init') {

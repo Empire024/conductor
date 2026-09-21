@@ -147,6 +147,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     if (scenario === 'synthetic:steer-compact') itemEvent('item/started', { type: 'contextCompaction', id: 'compact' })
     return
   }
+  if (scenario === 'synthetic:compact-complete') {
+    itemEvent('item/started', { type: 'contextCompaction', id: 'compact' })
+    itemEvent('item/completed', { type: 'contextCompaction', id: 'compact' })
+    itemEvent('item/completed', { type: 'agentMessage', id: 'after-compact', text: 'Compacted and continuing.', phase: null, memoryCitation: null, delivery: null, questions: null })
+    finish(); return
+  }
   if (scenario === 'synthetic:activity-groups') {
     itemEvent('item/completed', { type: 'agentMessage', id: 'activity-intro', text: 'I will inspect the files and preserve useful results.', phase: null, memoryCitation: null, delivery: null, questions: null })
     for (let index = 1; index <= 8; index++) {
