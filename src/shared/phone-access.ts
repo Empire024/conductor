@@ -1,0 +1,290 @@
+/**
+ * Phone access: the owner's phones as thin controllers of this Conductor.
+ *
+ * One HTTPS listener on this machine serves a small installable web app and a JSON API. A phone
+ * pairs once with a short code the desktop shows, holds a bearer token from then on, and can watch
+ * every conversation, answer questions and approvals, send follow-ups, start a task on any machine
+ * that can run the project, and read the machine's own load. Push notifications tell it when a
+ * conversation finishes or needs a decision, whether or not the app is open.
+ *
+ * Everything the desktop settings panel, the main process and the phone web app agree on lives in
+ * this file. The phone app is plain JavaScript and cannot import it, so the wire shapes below are
+ * the contract it is written against; keep the comments on them honest.
+ */
+
+import type { AgentActivityPhase, AgentProviderId, RuntimeProcessSummary } from './models'
+import type { PendingInteraction, SessionPhase, StructuredProvider, TimelineItem } from './structured-agent'
+import type { SystemMetricsSnapshot } from './system-metrics'
+
+/** Fixed rather than 0 so a phone bookmark and a QR code stay valid across restarts. */
+export const DEFAULT_PHONE_PORT = 51841
+
+/** How long a pairing code shown on the desktop stays redeemable. */
+export const PHONE_PAIRING_TTL_MS = 10 * 60 * 1000
+
+/**
+ * 'network' listens on every interface of this machine so a phone on the same Wi-Fi can reach it;
+ * 'tailscale' binds only this machine's tailnet address and fails closed when there is none, the
+ * same rule remote control follows.
+ */
+export type PhoneExposure = 'network' | 'tailscale'
+
+export interface PhoneAccessSettings {
+  enabled: boolean
+  exposure: PhoneExposure
+  port: number
+  /** Master switch for push notifications; each phone still opts in from its own settings. */
+  notifications: boolean
+  /**
+   * Ask Tailscale for a publicly trusted certificate for this machine's MagicDNS name, so a phone
+   * on the tailnet needs no certificate installed. Off by default because the request publishes
+   * the machine name to public certificate-transparency logs, which is the owner's call to make.
+   */
+  tailscaleCertificate: boolean
+}
+
+export const DEFAULT_PHONE_SETTINGS: PhoneAccessSettings = {
+  enabled: false,
+  exposure: 'network',
+  port: DEFAULT_PHONE_PORT,
+  notifications: true,
+  tailscaleCertificate: false
+}
+
+/** A paired phone as the desktop lists it. The token itself is never returned. */
+export interface PhoneDevice {
+  id: string
+  name: string
+  createdAt: string
+  lastSeenAt: string | null
+  userAgent: string
+  /** The phone registered a push subscription and notifications are on for it. */
+  pushEnabled: boolean
+  /** Consecutive push deliveries the push service rejected; cleared on the next success. */
+  pushFailures: number
+  /** A live stream from that phone is open right now. */
+  connected: boolean
+}
+
+export interface PhonePairingOffer {
+  code: string
+  /** The address to open on the phone; the code rides in the fragment so the QR does both. */
+  url: string
+  expiresAt: string
+}
+
+export interface PhoneAccessState {
+  settings: PhoneAccessSettings
+  listening: boolean
+  /** Every https origin this listener answers on, best first: LAN address, tailnet address, MagicDNS name. */
+  endpoints: string[]
+  /** What the QR code and pairing URL name; null while not listening. */
+  primaryEndpoint: string | null
+  message: string | null
+  /** SHA-256 of the certificate authority a phone installs once; colon-separated uppercase hex. */
+  caFingerprint: string | null
+  devices: PhoneDevice[]
+  pairing: PhonePairingOffer | null
+  /** False when the OS credential store is unavailable, in which case nothing can be served. */
+  secureStorage: boolean
+  tailscale: {
+    address: string | null
+    dnsName: string | null
+    /** Whether a Let's Encrypt certificate from Tailscale is serving the MagicDNS name. */
+    certificate: 'off' | 'pending' | 'active' | 'failed'
+    message: string | null
+  }
+  /** Whether push keys exist, so the panel can say why a test notification cannot go out. */
+  pushConfigured: boolean
+}
+
+/** What the renderer may ask the main process, exposed as window.conductor.phone. */
+export interface PhoneAccessBridge {
+  state(): Promise<PhoneAccessState>
+  setSettings(patch: Partial<PhoneAccessSettings>): Promise<PhoneAccessState>
+  /** Creates (or refreshes) the single active pairing code and returns it in the state. */
+  pair(): Promise<PhoneAccessState>
+  cancelPairing(): Promise<PhoneAccessState>
+  revoke(deviceId: string): Promise<PhoneAccessState>
+  rename(deviceId: string, name: string): Promise<PhoneAccessState>
+  /** Saves the CA certificate through a native save dialog; null when the owner cancelled. */
+  saveCertificate(): Promise<string | null>
+  /** Sends a test push to one phone or to every phone with notifications on. */
+  testNotification(deviceId?: string): Promise<{ sent: number; message: string | null }>
+  onChanged(callback: (state: PhoneAccessState) => void): () => void
+}
+
+/* ------------------------------------------------------------------------- *
+ * Wire contract for the phone web app.
+ *
+ * Every /api route except POST /api/pair requires `Authorization: Bearer <token>`; the token is
+ * handed out once by pairing and stored by the app. A 401 means the token is no longer valid and
+ * the app must go back to pairing. Bodies and replies are JSON; failures reply { error: string }.
+ *
+ *   POST /api/pair                        { code, name }            -> { token, device: PhoneSelf }
+ *   GET  /api/me                                                    -> PhoneSelf
+ *   POST /api/me                          { name }                  -> PhoneSelf
+ *   POST /api/unpair                                                -> { ok: true }
+ *   GET  /api/state                                                 -> PhoneState
+ *   GET  /api/stream                      text/event-stream: `state` (PhoneState), `session`
+ *                                         ({ id, sequence, phase }), `notification`
+ *                                         (PhoneNotification), `ping`
+ *   GET  /api/sessions/:id                                          -> PhoneConversation
+ *   POST /api/sessions/:id/message        { text, mode? }           -> { phase, mode }
+ *   POST /api/sessions/:id/respond        { requestId, decision?, answers? } -> { phase }
+ *   POST /api/sessions/:id/interrupt                                -> { phase }
+ *   POST /api/sessions/:id/resume                                   -> { phase }
+ *   POST /api/tabs/open                   PhoneOpenTabRequest       -> PhoneOpenTabResult
+ *   GET  /api/metrics                                               -> PhoneMetrics
+ *   POST /api/push/subscribe              { subscription }          -> { ok: true }
+ *   POST /api/push/unsubscribe                                      -> { ok: true }
+ *   POST /api/push/test                                             -> { ok: true }
+ *   GET  /ca.crt                          the CA certificate, PEM, no auth
+ * ------------------------------------------------------------------------- */
+
+/** The phone's own record, as the app shows it in its settings. */
+export interface PhoneSelf {
+  id: string
+  name: string
+  machineName: string
+  /** Base64url uncompressed P-256 public key for PushManager.subscribe, or null when push is off. */
+  vapidPublicKey: string | null
+  pushEnabled: boolean
+  /** The desktop's master notification switch; the app explains itself when it is off. */
+  notificationsAllowed: boolean
+  version: string
+}
+
+/** The one word the list badge, the filter chips and a push notification all key on. */
+export type PhoneSessionState = 'attention' | 'working' | 'limited' | 'failed' | 'disconnected' | 'stopped' | 'done' | 'idle'
+
+export interface PhoneSessionSummary {
+  id: string
+  projectId: string
+  projectName: string
+  workspaceId: string
+  workspaceName: string
+  /** Null when the conversation is only in history, with no open tab. */
+  tabId: string | null
+  title: string
+  provider: AgentProviderId
+  model?: string
+  effort?: string
+  machineId: string
+  machineName: string
+  phase: SessionPhase
+  activity: AgentActivityPhase
+  state: PhoneSessionState
+  /** What an 'attention' state is waiting for. */
+  needs: 'approval' | 'question' | null
+  /** The pending interaction's id, so a second question in a row still reads as new. */
+  pendingId?: string
+  pendingTitle?: string
+  updatedAt: string
+  /** The owner's most recent prompt in the running turn, for an elapsed-time label. */
+  turnStartedAt?: string
+  lastText?: string
+  lastRole?: 'user' | 'assistant'
+  limitResumeAt?: string
+  backgroundTasks?: number
+  queued: number
+  archived: boolean
+  usage?: { totalTokens?: number; costUsd?: number; estimated: boolean }
+}
+
+export interface PhoneUsageWindow {
+  provider: StructuredProvider
+  model?: string
+  label: string
+  kind: 'weekly' | 'short' | 'other'
+  usedPercent: number
+  resetsAt?: string
+  reportedAt: string
+}
+
+export interface PhoneState {
+  observedAt: string
+  machineName: string
+  projects: Array<{ id: string; name: string; machineId: string; workspaces: Array<{ id: string; name: string }> }>
+  machines: Array<{ id: string; name: string; kind: 'local' | 'peer'; status: 'online' | 'offline' | 'revoked'; projectIds: string[] }>
+  providers: Array<{ id: StructuredProvider; displayName: string; available: boolean; models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }> }>
+  sessions: PhoneSessionSummary[]
+  usage: PhoneUsageWindow[]
+  counts: { attention: number; working: number }
+}
+
+/** A timeline item as the phone shows it: same shape as the desktop's, with long text trimmed. */
+export type PhoneTimelineItem = Pick<TimelineItem, 'id' | 'sequence' | 'timestamp' | 'parentId' | 'data'>
+
+export interface PhoneConversation {
+  summary: PhoneSessionSummary
+  sequence: number
+  items: PhoneTimelineItem[]
+  pending: PendingInteraction[]
+  queued: Array<{ id: string; text: string }>
+  truncated: boolean
+  /** The provider accepts a message into the running turn (Steer); otherwise it queues. */
+  canSteer: boolean
+  /** The conversation must be resumed before it takes a message. */
+  needsResume: boolean
+}
+
+export type PhoneMessageMode = 'auto' | 'submit' | 'steer' | 'queue'
+
+export interface PhoneOpenTabRequest {
+  projectId: string
+  workspaceId: string
+  machineId: string
+  provider: StructuredProvider
+  model: string
+  effort?: string
+  title?: string
+  /** Sent as the first message once the tab is open; omitted, the tab opens idle. */
+  prompt?: string
+}
+
+export interface PhoneOpenTabResult {
+  sessionId: string
+  tabId: string
+  machineId: string
+  machineName: string
+}
+
+export interface PhoneRuntimeProcess extends RuntimeProcessSummary {
+  projectName: string
+  workspaceName: string
+}
+
+export interface PhoneMetrics {
+  system: SystemMetricsSnapshot
+  runtimes: PhoneRuntimeProcess[]
+}
+
+export type PhoneNotificationKind = 'attention' | 'done' | 'failed' | 'limited' | 'test'
+
+export interface PhoneNotification {
+  id: string
+  kind: PhoneNotificationKind
+  sessionId: string | null
+  title: string
+  body: string
+  at: string
+  /** Where a tap should land: the conversation, or the session list. */
+  url: string
+}
+
+/** What PushSubscription.toJSON() gives the app, stored per phone. */
+export interface PhonePushSubscription {
+  endpoint: string
+  expirationTime?: number | null
+  keys: { p256dh: string; auth: string }
+}
+
+export const PHONE_STATE_LIMITS = {
+  /** Root timeline items a conversation reply carries; older ones are dropped, never trimmed mid-turn. */
+  items: 120,
+  textChars: 6000,
+  toolOutputChars: 1200,
+  toolInputChars: 800,
+  previewChars: 200
+} as const

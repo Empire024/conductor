@@ -215,11 +215,23 @@ export const onAgentStatusChange = (listener: () => void): (() => void) => {
   return () => { statusListeners.delete(listener) }
 }
 
+const broadcastListeners = new Set<(channel: string, payload: unknown) => void>()
+
+/** Everything the windows are told, for a main-process service that mirrors what a window sees -
+ *  phone access streams the same session events and phase changes to the owner's phone. */
+export const onBroadcast = (listener: (channel: string, payload: unknown) => void): (() => void) => {
+  broadcastListeners.add(listener)
+  return () => { broadcastListeners.delete(listener) }
+}
+
 const broadcast = (channel: string, payload: unknown): void => {
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.isDestroyed()) window.webContents.send(channel, payload)
   }
   if (channel === 'agent:status') for (const listener of [...statusListeners]) listener()
+  for (const listener of [...broadcastListeners]) {
+    try { listener(channel, payload) } catch (error) { console.warn('Broadcast listener failed', error) }
+  }
 }
 
 const stripAnsi = (value: string): string =>

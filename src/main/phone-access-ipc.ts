@@ -1,0 +1,41 @@
+import { writeFile } from 'node:fs/promises'
+import type { BrowserWindow, IpcMain, SaveDialogOptions } from 'electron'
+import type { PhoneAccessSettings, PhoneAccessState } from '../shared/phone-access'
+import type { PhoneAccessService } from './phone-access'
+import type { PhoneAccessServer } from './phone-access-server'
+
+export interface PhoneAccessIpcDependencies {
+  ipcMain: Pick<IpcMain, 'handle' | 'removeHandler'>
+  service: PhoneAccessService
+  server: PhoneAccessServer
+  window(): BrowserWindow | null
+  showSaveDialog(window: BrowserWindow | null, options: SaveDialogOptions): Promise<{ canceled: boolean; filePath?: string }>
+}
+
+const CHANNELS = ['phone:state', 'phone:set-settings', 'phone:pair', 'phone:cancel-pairing', 'phone:revoke', 'phone:rename', 'phone:save-certificate', 'phone:test-notification'] as const
+
+/** The desktop panel's side of phone access: every handler answers with the whole panel state. */
+export function registerPhoneAccessIpc(deps: PhoneAccessIpcDependencies): () => void {
+  const { ipcMain, service, server } = deps
+  const state = (): PhoneAccessState => service.desktopState()
+  const handle = <T>(channel: (typeof CHANNELS)[number], run: (...args: never[]) => Promise<T> | T): void => { ipcMain.handle(channel, (_event, ...args) => run(...args as never[])) }
+  handle('phone:state', () => state())
+  handle('phone:set-settings', async (patch: Partial<PhoneAccessSettings>) => {
+    service.updateSettings(patch && typeof patch === 'object' ? patch : {})
+    await server.apply()
+    return state()
+  })
+  handle('phone:pair', () => { service.createPairing(); return state() })
+  handle('phone:cancel-pairing', () => { service.cancelPairing(); return state() })
+  handle('phone:revoke', (deviceId: string) => { service.revoke(String(deviceId)); return state() })
+  handle('phone:rename', (deviceId: string, name: string) => { service.rename(String(deviceId), name); return state() })
+  handle('phone:save-certificate', async () => {
+    const authority = service.certificateAuthority()
+    const result = await deps.showSaveDialog(deps.window(), { title: 'Save the Conductor phone certificate', defaultPath: 'conductor-phone-ca.crt', filters: [{ name: 'Certificate', extensions: ['crt', 'cer', 'pem'] }] })
+    if (result.canceled || !result.filePath) return null
+    await writeFile(result.filePath, authority.certificatePem, 'utf8')
+    return result.filePath
+  })
+  handle('phone:test-notification', (deviceId?: string) => service.testNotification(typeof deviceId === 'string' && deviceId ? deviceId : undefined))
+  return () => { for (const channel of CHANNELS) ipcMain.removeHandler(channel) }
+}

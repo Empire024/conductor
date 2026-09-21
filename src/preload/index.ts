@@ -47,6 +47,17 @@ const bridge: ConductorBridge = {
     onRequest: callback => subscribe('agent-confirm:request', callback),
     respond: response => ipcRenderer.send('agent-confirm:response', response)
   },
+  phone: {
+    state: () => ipcRenderer.invoke('phone:state'),
+    setSettings: (patch) => ipcRenderer.invoke('phone:set-settings', patch),
+    pair: () => ipcRenderer.invoke('phone:pair'),
+    cancelPairing: () => ipcRenderer.invoke('phone:cancel-pairing'),
+    revoke: (deviceId) => ipcRenderer.invoke('phone:revoke', deviceId),
+    rename: (deviceId, name) => ipcRenderer.invoke('phone:rename', deviceId, name),
+    saveCertificate: () => ipcRenderer.invoke('phone:save-certificate'),
+    testNotification: (deviceId) => ipcRenderer.invoke('phone:test-notification', deviceId),
+    onChanged: (callback) => subscribe('phone:changed', callback)
+  },
   remote: {
     files: {
       list: (request) => ipcRenderer.invoke('remote:files-list', request),

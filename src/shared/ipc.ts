@@ -48,6 +48,7 @@ export interface ConductorBridge {
   agentControl: import('./agent-control').AgentControlBridge
   agentConfirm: import('./agent-confirm').AgentConfirmBridge
   remote: import('./remote-control').RemoteControlBridge
+  phone: import('./phone-access').PhoneAccessBridge
   projectTasks: import('./project-backlog').ProjectBacklogBridge
   nativeCli: {
     ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }>

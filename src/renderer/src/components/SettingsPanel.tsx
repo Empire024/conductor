@@ -5,6 +5,7 @@ import { THEME_OPTIONS } from '../../../shared/models'
 import { playAgentSound } from '../agent-sounds'
 import { UsageCapDefaultSetting } from './UsageCapDefaultSetting'
 import { RemoteControlSettings } from './RemoteControlSettings'
+import { PhoneAccessSettings } from './PhoneAccessSettings'
 
 export function SettingsPanel({
   settings,
@@ -156,6 +157,8 @@ export function SettingsPanel({
         <UsageCapDefaultSetting />
 
         <RemoteControlSettings />
+
+        <PhoneAccessSettings />
 
         <section>
           <div className="settings-section-title"><Bug size={14} /><div><strong>Debug tools</strong><span>Capture local UI events, warnings, and errors for troubleshooting.</span></div></div>

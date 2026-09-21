@@ -1,0 +1,153 @@
+/* Phone access sits beside the machines section in the settings drawer, so it borrows that
+   section's rhythm exactly rather than introducing a third visual language for the same kind of
+   pairing work. The rules are copied rather than shared: the two sections are free to drift, and
+   a surprise restyle of one from an edit to the other would be worse than the duplication. */
+.phone-access-settings { padding: 19px 17px; border-bottom: 1px solid #272e35; }
+
+.phone-card {
+  margin-top: 10px;
+  padding: 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-0);
+}
+
+.phone-card-title { display: flex; align-items: center; gap: 6px; font-size: 11px; font-weight: 600; color: var(--text); }
+.phone-hint { margin: 0; color: var(--text-3); font-size: 10px; line-height: 1.5; }
+.phone-error, .phone-warning, .phone-status {
+  margin: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.phone-error { color: var(--danger); }
+.phone-warning { color: #d9a441; }
+.phone-status { color: var(--text-2); }
+.phone-status code { overflow-wrap: anywhere; }
+
+.phone-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; }
+.phone-row > span { display: flex; flex-direction: column; gap: 2px; }
+.phone-row strong { font-size: 11px; font-weight: 600; }
+.phone-row small { color: var(--text-3); font-size: 9.5px; line-height: 1.4; }
+.phone-row input[type="text"], .phone-row select {
+  min-width: 172px;
+  padding: 5px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-2);
+  font-size: 10.5px;
+}
+
+.phone-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.phone-actions button, .phone-code button, .phone-url button, .phone-device button, .phone-card > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-2);
+  font-size: 10px;
+  cursor: pointer;
+}
+.phone-actions button:hover, .phone-device button:hover, .phone-url button:hover { border-color: #4a545f; }
+.phone-primary { border-color: #3f6ea8 !important; background: #24405f !important; }
+.phone-actions button:disabled { opacity: 0.55; cursor: default; }
+
+.phone-endpoint { display: flex; flex-direction: column; gap: 4px; }
+.phone-endpoint > div { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.phone-endpoint span { color: var(--text-3); font-size: 9.5px; }
+/* An address carries a hostname the owner chose, so it wraps rather than pushing the row wide. */
+.phone-endpoint code { min-width: 0; text-align: right; font-size: 10px; letter-spacing: 0.6px; overflow-wrap: anywhere; }
+
+.phone-tailscale { display: flex; flex-direction: column; gap: 8px; }
+
+/* Pairing is the one thing to act on in this section, so that card is marked the way linking a
+   computer is marked in the machines section. */
+.phone-link { border-color: #3f6ea8; }
+.phone-pairing { display: flex; align-items: flex-start; gap: 13px; flex-wrap: wrap; }
+/* Fixed box for the code: the encoder sizes its own modules, and a QR that reflows as the drawer
+   resizes is a QR a camera keeps losing. */
+.phone-qr {
+  flex: 0 0 auto;
+  width: 168px;
+  height: 168px;
+  padding: 6px;
+  border-radius: 8px;
+  background: #ffffff;
+}
+.phone-qr svg { display: block; width: 100%; height: 100%; }
+.phone-pairing-detail { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1 1 200px; }
+
+.phone-code { display: flex; align-items: center; gap: 9px; }
+.phone-code code {
+  padding: 7px 12px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 8px;
+  font-size: 17px;
+  letter-spacing: 3px;
+  font-weight: 600;
+}
+
+.phone-url { display: flex; align-items: center; gap: 7px; min-width: 0; }
+/* The address is meant to be selected and typed on a phone, so it stays selectable text. */
+.phone-url code {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  color: var(--text-2);
+  background: var(--surface-2);
+  font-size: 9.5px;
+  user-select: text;
+  overflow-wrap: anywhere;
+}
+.phone-countdown { color: var(--text-3); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+
+.phone-steps { margin: 0; padding-left: 15px; display: flex; flex-direction: column; gap: 3px; color: var(--text-3); font-size: 10px; line-height: 1.5; }
+
+.phone-saved { color: var(--text-3); font-size: 9.5px; overflow-wrap: anywhere; }
+
+.phone-advanced > summary {
+  cursor: pointer;
+  padding: 3px 0;
+  color: var(--text-3);
+  font-size: 10px;
+  list-style: none;
+}
+.phone-advanced > summary::-webkit-details-marker { display: none; }
+.phone-advanced > summary::before { content: '\25B8\A0\A0'; }
+.phone-advanced[open] > summary::before { content: '\25BE\A0\A0'; }
+.phone-advanced > summary:hover { color: var(--text); }
+.phone-platform { display: flex; flex-direction: column; gap: 5px; padding: 6px 0 2px 2px; }
+.phone-platform strong { font-size: 10.5px; font-weight: 600; }
+.phone-platform ol { margin: 0 0 4px; padding-left: 15px; display: flex; flex-direction: column; gap: 3px; color: var(--text-3); font-size: 9.5px; line-height: 1.5; }
+
+.phone-device { display: flex; flex-direction: column; gap: 4px; padding-top: 7px; border-top: 1px solid var(--border-soft); }
+.phone-device:first-of-type { border-top: 0; padding-top: 0; }
+.phone-device > small { color: var(--text-3); font-size: 9.5px; overflow-wrap: anywhere; }
+.phone-device-head { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.phone-device-head > strong { font-size: 10.5px; overflow-wrap: anywhere; cursor: text; }
+.phone-device .phone-actions { margin-top: 3px; }
+.phone-icon { padding: 3px 5px !important; color: var(--text-3) !important; }
+.phone-rename {
+  flex: 0 1 180px;
+  padding: 3px 6px;
+  border: 1px solid #3f6ea8;
+  border-radius: 6px;
+  color: var(--text);
+  background: var(--surface-2);
+  font-size: 10.5px;
+}
+/* A phone with a live stream open is the one the owner is holding; the dot says so without a word. */
+.phone-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: #69717a; }
+.phone-dot[data-connected="true"] { background: var(--accent); box-shadow: 0 0 7px #d6ff7366; }
+.phone-problem { color: #d9a441 !important; font-size: 9.5px; line-height: 1.4; }

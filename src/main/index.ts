@@ -44,7 +44,7 @@ import { AGENT_SOUND_PROFILES, isMemoryKind, THEME_IDS, THEME_VARIANTS } from '.
 import type { AgentConfirmResponse } from '../shared/agent-confirm'
 import { ConductorDatabase } from './database'
 import { TerminalManager } from './terminal-manager'
-import { AgentManager, onAgentStatusChange } from './agent-manager'
+import { AgentManager, onAgentStatusChange, onBroadcast } from './agent-manager'
 import { aggregateProjectActivity } from './project-activity'
 import type { ProjectActivitySnapshot } from '../shared/project-activity'
 import {
@@ -61,6 +61,10 @@ import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-pa
 import { isRemoteProject, localProject, requireLocalProject } from './project-scope'
 import { electronTray, installHostLifecycle, type HostLifecycleController } from './host-lifecycle'
 import { ensureTrayIconFile } from './tray-icon'
+import { PhoneAccessService } from './phone-access'
+import { PhoneAccessServer, requestTailscaleCertificate } from './phone-access-server'
+import { registerPhoneAccessIpc } from './phone-access-ipc'
+import { StoredSecretVault } from './secret-store'
 import type { RemoteTerminalBindings } from './remote-terminals'
 import { AgentCollaborationStore } from './agent-collaboration-store'
 import { AgentCollaborationRuntime } from './agent-collaboration-runtime'
@@ -99,6 +103,10 @@ let sourceControl: SourceControl
 let snapshotPruneTimer: NodeJS.Timeout | undefined
 let agentControlServer: AgentControlServer | undefined
 let remoteControl: RemoteControlService | undefined
+let phoneAccess: PhoneAccessService | undefined
+let phoneServer: PhoneAccessServer | undefined
+let disposePhoneIpc: (() => void) | undefined
+let disposePhoneBroadcast: (() => void) | undefined
 let agentControlUi: AgentControlUi | undefined
 let browserMcp: BrowserMcpServer | undefined
 let browserViews: BrowserViews | undefined
@@ -1925,10 +1933,20 @@ app.whenReady().then(async () => {
   })
   browserMcp = new BrowserMcpServer(browserViews)
   agents = new AgentManager(database, new AgentCollaborationRuntime(collaboration), spec => agentControlServer?.briefing(spec) ?? '', browserMcp)
+  // What a window is told about a conversation, the owner's phone is told too: session events
+  // and phase changes come from the agent manager's own broadcast, mirrored-machine events and
+  // structural changes through publish below.
+  const phoneObserve = (channel: string, payload: unknown): void => {
+    if (channel === 'structured:events' && Array.isArray(payload)) phoneAccess?.observeEvents(payload as Array<{ sessionId: string; sequence: number; data: { type: string } }>)
+    else if (channel === 'agent:status' && payload && typeof payload === 'object' && typeof (payload as { id?: unknown }).id === 'string') phoneAccess?.noteActivity((payload as { id: string }).id)
+    else if (channel === 'projects:changed' || channel === 'remote:changed') phoneAccess?.refresh()
+  }
+  disposePhoneBroadcast = onBroadcast(phoneObserve)
   const publish = (channel: string, payload: unknown): void => {
     for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload)
     // What the windows hear about this machine's own work, a paired machine subscribed to that
     // workspace hears as a notice - and then fetches, through the same signed calls it always used.
+    phoneObserve(channel, payload)
     const host = remoteControl?.transport.host
     if (!host) return
     if (channel === 'structured:events' && Array.isArray(payload)) {
@@ -1994,10 +2012,11 @@ app.whenReady().then(async () => {
     hosting: () => {
       const state = remoteControl!.state()
       const streaming = new Set(remoteControl!.transport.host.connectedPeers())
+      const phone = phoneAccess?.listenerStatus()
       return {
-        enabled: state.settings.enabled,
-        listening: state.listening,
-        attachedPeers: state.peers.filter(peer => !peer.revokedAt && streaming.has(peer.id)).map(peer => peer.machineName)
+        enabled: state.settings.enabled || Boolean(phoneAccess?.getSettings().enabled),
+        listening: state.listening || Boolean(phone?.listening),
+        attachedPeers: [...state.peers.filter(peer => !peer.revokedAt && streaming.has(peer.id)).map(peer => peer.machineName), ...(phoneAccess?.connectedDeviceNames() ?? [])]
       }
     },
     showWindow: () => {
@@ -2037,6 +2056,43 @@ app.whenReady().then(async () => {
   await browserMcp.start()
   remoteControl.registerIpc()
   await remoteControl.start()
+  // Phones reach this Conductor through their own listener, built on the same stores and the
+  // same tab-opening path an agent uses; a conversation on a paired machine is driven through
+  // that machine's mirror, exactly as the window drives it.
+  phoneAccess = new PhoneAccessService({
+    store: database,
+    vault: new StoredSecretVault(database, safeStorageCipher),
+    database,
+    sessions: agents.structured,
+    remote: {
+      isRemote: id => remoteControl!.mirror.isRemote(id),
+      openTab: request => remoteControl!.openRemoteTab(request),
+      connect: id => remoteControl!.mirror.connect(id),
+      submit: (id, prompt, method, settings) => remoteControl!.mirror.submit(id, prompt, method, settings),
+      queue: (id, prompt, settings) => remoteControl!.mirror.queue(id, prompt, settings),
+      respond: response => remoteControl!.mirror.respond(response),
+      interrupt: (id, expedite) => remoteControl!.mirror.interrupt(id, expedite),
+      resume: (id, settings) => remoteControl!.mirror.resume(id, settings)
+    },
+    providers: () => agents.listProviders(),
+    machines: () => remoteControl!.machines(),
+    machineName: () => remoteControl!.machineName(),
+    version: app.getVersion(),
+    ui: agentControlUi.request,
+    metrics: () => systemMetrics.sample(),
+    changed: () => { publish('phone:changed', phoneAccess!.desktopState()); hostLifecycle?.refresh() }
+  })
+  phoneServer = new PhoneAccessServer({
+    service: phoneAccess,
+    tailscale: remoteControl.tailscale,
+    tailscaleCert: dnsName => {
+      const executable = remoteControl!.tailscale.locate()
+      if (!executable) throw new Error('Tailscale is not installed on this machine.')
+      return requestTailscaleCertificate(executable, dnsName, join(app.getPath('userData'), 'phone-access'))
+    }
+  })
+  disposePhoneIpc = registerPhoneAccessIpc({ ipcMain, service: phoneAccess, server: phoneServer, window: () => liveWindow(mainWindow), showSaveDialog: (owner, options) => owner ? dialog.showSaveDialog(owner, options) : dialog.showSaveDialog(options) })
+  void phoneServer.apply().catch(error => console.warn('Phone access did not start', error))
   updates = new UpdateManager({
     currentVersion: app.getVersion(),
     isPackaged: app.isPackaged,
@@ -2096,6 +2152,10 @@ app.on('before-quit', (event) => {
 app.on('will-quit', () => {
   hostLifecycle?.dispose()
   void remoteControl?.dispose().catch(error => console.warn('Remote control did not shut down cleanly', error))
+  disposePhoneIpc?.()
+  disposePhoneBroadcast?.()
+  phoneAccess?.dispose()
+  void phoneServer?.dispose().catch(error => console.warn('Phone access did not shut down cleanly', error))
   if (snapshotPruneTimer) clearInterval(snapshotPruneTimer)
   projectPreview.close()
   updates?.dispose()
