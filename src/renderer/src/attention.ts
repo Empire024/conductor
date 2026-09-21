@@ -33,7 +33,7 @@ const statusForPhase = (phase: AgentActivityPhase): SessionActivityStatus | null
   // 'stalled' it never speaks for a workspace or project with work still running in it.
   if (phase === 'waiting_input' || phase === 'failed') return 'waiting'
   if (phase === 'disconnected') return 'stalled'
-  if (phase === 'working' || phase === 'limited') return 'working'
+  if (phase === 'working' || phase === 'limited' || phase === 'waiting_background') return 'working'
   if (phase === 'complete') return 'done'
   return null
 }

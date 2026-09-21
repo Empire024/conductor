@@ -1,5 +1,6 @@
 import { ipcRenderer } from 'electron'
 import type { OrchestrationBridge } from '../shared/orchestration'
+import { schedulesBridge } from './schedules'
 
 /** Add this object as `orchestration` on the existing context-bridge payload. */
 export const orchestrationBridge: OrchestrationBridge = {
@@ -17,5 +18,6 @@ export const orchestrationBridge: OrchestrationBridge = {
     save: (input) => ipcRenderer.invoke('orchestration:routines:save', input),
     remove: (id) => ipcRenderer.invoke('orchestration:routines:remove', id),
     start: (id) => ipcRenderer.invoke('orchestration:routines:start', id)
-  }
+  },
+  schedules: schedulesBridge
 }

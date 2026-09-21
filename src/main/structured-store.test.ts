@@ -55,6 +55,26 @@ describe('structured SQLite journal and immutable artifacts', () => {
     expect(store.events('one').map((entry) => entry.data)).toEqual([{ type: 'notice', message: 'one' }])
     expect(store.events('two').map((entry) => entry.data)).toEqual([{ type: 'notice', message: 'two' }])
   })
+  it('reads the dedicated usage journal without the history or event page caps and omits transcript text', () => {
+    const { store } = fixture()
+    store.append(event(1, { type: 'text', role: 'user', text: 'do not scan me', mode: 'snapshot' }))
+    store.append(event(2, { type: 'session', phase: 'running', settings: { permission: 'default', plan: false, model: 'claude-sonnet' } }))
+    store.append(event(3, { type: 'usage', scope: 'turn', source: 'provider', inputTokens: 10, outputTokens: 2 }, { turnId: 'turn' }))
+    expect(store.usageJournal()).toEqual([expect.objectContaining({
+      sessionId: 'one', provider: 'claude',
+      truncated: false,
+      runtimeStarts: { runtime: '2026-09-07T00:00:00.000Z' },
+      events: [expect.objectContaining({ sequence: 2, data: expect.objectContaining({ type: 'session' }) }), expect.objectContaining({ sequence: 3, data: expect.objectContaining({ type: 'usage' }) })]
+    })])
+  })
+  it('marks usage coverage truncated from the true earliest durable event rather than the first filtered event', () => {
+    const { store, db } = fixture()
+    store.append(event(1, { type: 'text', role: 'user', text: 'first', mode: 'snapshot' }))
+    store.append(event(2, { type: 'usage', scope: 'session', source: 'provider', totalTokens: 50 }))
+    expect(store.usageJournal()[0]?.truncated).toBe(false)
+    db.prepare('DELETE FROM structured_events WHERE session_id=? AND sequence=?').run('one', 1)
+    expect(store.usageJournal()[0]?.truncated).toBe(true)
+  })
   it('redacts diagnostics while preserving private immutable bytes and session authorization', () => {
     const { store } = fixture()
     const secret = 'sk-ant-' + 'SYNTHETIC'.repeat(4)
@@ -74,7 +94,7 @@ describe('structured SQLite journal and immutable artifacts', () => {
     expect(store.snapshot('one')).toMatchObject({ items: [], title: '' })
     expect(store.history('project')).toEqual([])
     store.append(event(1, { type: 'text', role: 'user', text: 'First real message', mode: 'snapshot' }))
-    expect(store.history('project')).toEqual([{ id: 'one', title: 'First real message', provider: 'claude', archived: false, phase: 'idle' }])
+    expect(store.history('project')).toEqual([{ id: 'one', title: 'First real message', provider: 'claude', archived: false, phase: 'idle', updatedAt: '2026-09-07T00:00:00.000Z', updatedSequence: 1, snippet: 'First real message', lastRole: 'user' }])
     expect(store.history('project').some((item) => item.id === 'two')).toBe(false)
   })
   it('surfaces an untouched session once it is only titled, without requiring timeline items', () => {
@@ -88,7 +108,7 @@ describe('structured SQLite journal and immutable artifacts', () => {
     const f = fixture()
     f.store.append(event(1, { type: 'text', role: 'assistant', text: 'Find searchable Unicode: 日本語', mode: 'snapshot' }))
     f.store.update('one', { title: 'Renamed', archived: true, settings: { permission: 'accept-edits', plan: false } })
-    expect(f.store.history('project', '日本語')).toEqual([{ id: 'one', title: 'Renamed', archived: true, provider: 'claude', phase: 'idle' }])
+    expect(f.store.history('project', '日本語')).toEqual([{ id: 'one', title: 'Renamed', archived: true, provider: 'claude', phase: 'idle', updatedAt: '2026-09-07T00:00:00.000Z', updatedSequence: 1, snippet: 'Find searchable Unicode: 日本語', lastRole: 'assistant' }])
     expect(f.store.history('another-project')).toEqual([])
     f.db.close()
     const reopened = new DatabaseSync(f.path); databases.push(reopened)

@@ -1,0 +1,31 @@
+.schedules-pane { padding: 14px; overflow: auto; height: 100%; color: var(--text-2); }
+.schedules-intro { display: grid; gap: 10px; margin-bottom: 12px; }
+.schedules-intro p, .schedule-review-note { margin: 0; font-size: 11px; line-height: 1.5; }
+.schedules-pane button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-2); color: var(--text); padding: 6px 9px; cursor: pointer; }
+.schedules-pane button:hover:not(:disabled) { border-color: var(--accent-muted); }
+.schedules-pane button:disabled { opacity: .55; cursor: default; }
+.schedules-error { color: var(--danger); font-size: 11px; }
+.schedule-card { border: 1px solid var(--border); background: var(--surface-1); border-radius: 8px; padding: 12px; display: grid; gap: 12px; }
+.schedule-card > header { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.schedule-card > header > div { display: grid; gap: 3px; }
+.schedule-card strong { color: var(--text); font-size: 13px; }
+.schedule-card small { color: var(--text-3); font-family: ui-monospace, monospace; }
+.schedule-toggle, .schedule-controls label, .schedule-interval { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.schedule-controls { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.schedule-controls input[type=number] { width: 76px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-0); color: var(--text); padding: 5px; }
+.schedule-facts { display: grid; grid-template-columns: 1fr 1fr; margin: 0; gap: 8px; }
+.schedule-facts div { background: var(--surface-0); border-radius: 5px; padding: 7px; }
+.schedule-facts dt { color: var(--text-3); font-size: 9px; text-transform: uppercase; }
+.schedule-facts dd { margin: 3px 0 0; font-size: 11px; }
+.schedule-history h4 { margin: 0 0 6px; color: var(--text); font-size: 11px; }
+.schedule-history article { border-top: 1px solid var(--border-soft); padding: 8px 0; }
+.schedule-history article > div { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; font-size: 9px; }
+.schedule-history article p { white-space: pre-wrap; margin: 6px 0; font-size: 10px; line-height: 1.45; color: var(--text-2); }
+.schedule-outcome { text-transform: capitalize; color: var(--text); }
+.outcome-failed, .schedule-stale { color: var(--danger); }
+.outcome-changed { color: var(--accent); }
+.outcome-unchanged { color: var(--text-3); }
+.schedule-history code { color: var(--blue); }
+.schedule-history details code { display: block; margin-top: 5px; word-break: break-all; }
+.schedule-evidence { font-size: 10px; padding: 4px 7px !important; }
+.schedule-review-note { color: var(--text-3); }

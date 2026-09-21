@@ -292,7 +292,7 @@ describe('ConductorDatabase persistence', () => {
     })
   })
 
-  it('rejects missing detached document owners and files from another project', () => {
+  it('ignores stale document owners without losing valid checkpoints and rejects cross-project files', () => {
     withDatabasePath((path, root) => {
       const database = new ConductorDatabase(path)
       try {
@@ -306,9 +306,17 @@ describe('ConductorDatabase persistence', () => {
           sessions: [], activeProjectId: project.id, activeSessionId: session.id,
           focusedGroupIds: {}, sessionIdsByProject: { [project.id]: session.id }
         }
-        expect(() => database.saveRecoveryCheckpoint({
-          ...checkpoint, documents: [{ workspaceId: 'detached:missing-window', files: [], activeId: null }]
-        })).toThrow('Invalid workspace document owner')
+        database.saveRecoveryCheckpoint({
+          ...checkpoint, documents: [
+            { workspaceId: 'detached:missing-window', files: [], activeId: null },
+            { workspaceId: 'project:removed-project', files: [], activeId: null },
+            { workspaceId: 'deleted-session', files: [], activeId: null },
+            { workspaceId: session.id, files: [], activeId: null }
+          ]
+        })
+        expect(database.getWorkspaceRecoveryState().documents).toEqual([
+          { workspaceId: session.id, files: [], activeId: null }
+        ])
         expect(() => database.saveRecoveryCheckpoint({
           ...checkpoint,
           documents: [{

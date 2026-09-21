@@ -3,14 +3,15 @@ import type { AgentControlUiRequest } from '../shared/agent-control'
 import { makeId, type AgentProviderInfo, type AgentSpec, type DetachedWindowRecord, type LayoutNode, type PaneTab, type ProjectRecord, type RuntimeEnsureResult, type RuntimeProcessSummary, type SessionRecord } from '../shared/models'
 import type { MachineDescriptor } from '../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../shared/remote-control'
+import { PROJECT_TASK_MAX_LENGTH, projectTaskKinds, projectTaskPriorities, projectTaskWeights, type ProjectTaskKind, type ProjectTaskPriority, type ProjectTaskWeight } from '../shared/project-backlog'
 import type { ContextAttachment, InteractionResponse, PromptOrigin, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
 import { settingsForRuntime } from '../shared/structured-agent'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics'
-import { normalizeUsageWindows, summarizeUsage, updatedSequence, type UsageWindow } from '../shared/usage-accounting'
+import { normalizeUsageWindows, summarizeUsage, updatedSequence, usageWindowAppliesToModel, type UsageWindow } from '../shared/usage-accounting'
 import {
   DEFAULT_PHONE_SETTINGS, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
   type PhoneAccessSettings, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
-  type PhoneNotification, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhonePushSubscription,
+  type PhoneNotification, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
   type PhoneSelf, type PhoneSessionSummary, type PhoneState, type PhoneTimelineItem, type PhoneUsageWindow
 } from '../shared/phone-access'
 import { rememberedPermission } from './app-settings'
@@ -20,6 +21,7 @@ import { describeTransition, lastMessage, pendingInteraction, phoneSessionState,
 import { createCertificateAuthority, issueServerCertificate, tlsIdentityUsable, type CertificateAuthority } from './remote-tls'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
+import type { WeeklyModelUsageReport } from '../shared/weekly-model-usage'
 
 const SETTINGS_KEY = 'phone-access.settings'
 const DEVICES_KEY = 'phone-access.devices'
@@ -97,6 +99,10 @@ export interface PhoneRemoteSessions {
   resume(localSessionId: string, settings?: SessionSettings): Promise<void>
 }
 
+export interface PhoneProjectTasks {
+  create(project: ProjectRecord, input: { title: string; kind: ProjectTaskKind; priority: ProjectTaskPriority; weight: ProjectTaskWeight }): Promise<PhoneProjectTaskResult>
+}
+
 /** What the listener reports about itself, kept here so the desktop state is one object. */
 export interface PhoneListenerStatus {
   listening: boolean
@@ -114,6 +120,8 @@ export interface PhoneAccessDependencies {
   database: PhoneDatabase
   sessions: PhoneSessions
   remote?: PhoneRemoteSessions
+  projectTasks?: PhoneProjectTasks
+  weeklyUsage?: { read(): WeeklyModelUsageReport }
   providers(): AgentProviderInfo[]
   machines(): MachineDescriptor[]
   machineName(): string
@@ -560,6 +568,7 @@ export class PhoneAccessService {
     const processes = new Map(this.deps.database.listProcesses().map(process => [process.id, process]))
     const sessions: PhoneSessionSummary[] = []
     const usage = new Map<string, PhoneUsageWindow>()
+    const providers = this.catalog()
     for (const project of projects) {
       const workspaces = this.deps.database.listSessions(project.id)
       const open = new Set<string>()
@@ -570,7 +579,7 @@ export class PhoneAccessService {
           open.add(tab.resourceId)
           const projection = this.deps.database.structured.snapshot(tab.resourceId)
           sessions.push(this.summarize(tab.resourceId, project, workspace, tab, projection, activity.get(tab.resourceId), processes.get(tab.resourceId), machines))
-          if (projection) this.collectUsage(tab.resourceId, projection, usage)
+          if (projection) this.collectUsage(tab.resourceId, projection, usage, providers)
         }
       }
       let history: ReturnType<PhoneDatabase['structured']['history']> = []
@@ -583,7 +592,6 @@ export class PhoneAccessService {
         sessions.push(this.summarize(entry.id, project, workspace, null, this.deps.database.structured.snapshot(entry.id), activity.get(entry.id), processes.get(entry.id), machines))
       }
     }
-    sessions.sort((a, b) => rank(a.state) - rank(b.state) || b.updatedAt.localeCompare(a.updatedAt))
     return {
       observedAt: new Date(this.now()).toISOString(),
       machineName: this.deps.machineName(),
@@ -592,14 +600,16 @@ export class PhoneAccessService {
         id: machine.id, name: machine.name, kind: machine.kind, status: machine.status,
         projectIds: projects.filter(project => (project.remote?.machineId ?? LOCAL_MACHINE_ID) === machine.id).map(project => project.id)
       })),
-      providers: this.catalog(),
+      providers,
       sessions,
       usage: [...usage.values()].sort((a, b) => a.provider.localeCompare(b.provider) || windowOrder.indexOf(a.kind) - windowOrder.indexOf(b.kind) || a.label.localeCompare(b.label)),
+      weeklyUsage: this.deps.weeklyUsage?.read() ?? { since: new Date(this.now() - 7 * 24 * 60 * 60 * 1000).toISOString(), through: new Date(this.now()).toISOString(), days: 7, models: [], coverage: { complete: false, notes: ['Weekly usage service is not connected.'], conversationsScanned: 0, conversationsWithUsage: 0, truncatedConversations: 0, countersWithoutBaseline: 0, nestedReportsExcluded: 0 } },
+      projectTaskMaxLength: PROJECT_TASK_MAX_LENGTH,
       counts: { attention: sessions.filter(session => session.tabId && session.state === 'attention').length, working: sessions.filter(session => session.tabId && session.state === 'working').length }
     }
   }
 
-  private collectUsage(id: string, projection: SessionProjection, into: Map<string, PhoneUsageWindow>): void {
+  private collectUsage(id: string, projection: SessionProjection, into: Map<string, PhoneUsageWindow>, providers = this.catalog()): void {
     const provider = projection.capabilities?.provider
     if (!provider) return
     let cached = this.usageCache.get(id)
@@ -619,7 +629,11 @@ export class PhoneAccessService {
       const key = `${provider}|${window.key}`
       const existing = into.get(key)
       if (existing && existing.reportedAt >= cached.reportedAt) continue
-      into.set(key, { provider, ...(window.scope === 'model' && projection.settings.model ? { model: projection.settings.model } : {}), label: window.label, kind: window.kind, usedPercent: window.usedPercent, ...(window.resetsAt ? { resetsAt: window.resetsAt } : {}), reportedAt: cached.reportedAt })
+      const catalog = providers.find(entry => entry.id === provider)
+      const matched = window.scope === 'model' ? catalog?.models.filter(model => usageWindowAppliesToModel(window, model)) ?? [] : []
+      const reportedModel = window.scope === 'model' ? window.modelSelectors?.at(-1) : undefined
+      const model = matched.length === 1 ? matched[0]!.label : reportedModel
+      into.set(key, { provider, ...(model ? { model } : {}), label: window.label, kind: window.kind, usedPercent: window.usedPercent, ...(window.resetsAt ? { resetsAt: window.resetsAt } : {}), reportedAt: cached.reportedAt })
     }
   }
 
@@ -658,6 +672,7 @@ export class PhoneAccessService {
       ...(extra.backgroundTasks ? { backgroundTasks: extra.backgroundTasks } : {}),
       queued: projection?.queuedPrompts?.length ?? (projection?.queued ? 1 : 0),
       archived: projection?.archived ?? false,
+      ...(this.controllerId(id) ? { controllerId: this.controllerId(id)! } : {}),
       ...(usage ? { usage } : {})
     }
   }
@@ -665,6 +680,12 @@ export class PhoneAccessService {
   private usageSummary(id: string, projection: SessionProjection): PhoneSessionSummary['usage'] {
     this.collectUsage(id, projection, new Map())
     return this.usageCache.get(id)?.summary
+  }
+
+  private controllerId(id: string): string | undefined {
+    const link = parseJson<{ controllerAgentSessionId?: unknown } | null>(this.deps.store.getSetting(`agentControlParent:${id}`), null)
+    return typeof link?.controllerAgentSessionId === 'string' && link.controllerAgentSessionId && link.controllerAgentSessionId !== id
+      ? link.controllerAgentSessionId : undefined
   }
 
   private located(id: string): { project: ProjectRecord; workspace: SessionRecord; tab: PaneTab | null; projection: SessionProjection | null } {
@@ -830,6 +851,26 @@ export class PhoneAccessService {
     }
     this.refresh()
     return { sessionId: spec.id, tabId: tab.id, machineId: LOCAL_MACHINE_ID, machineName: this.deps.machineName() }
+  }
+
+  async createProjectTask(projectId: unknown, input: PhoneProjectTaskRequest): Promise<PhoneProjectTaskResult> {
+    if (typeof projectId !== 'string' || !projectId || projectId.length > 160) throw new PhoneAccessError('Choose a project that is open in Conductor.', 404)
+    const project = this.deps.database.getProject(projectId)
+    if (!project) throw new PhoneAccessError('Choose a project that is open in Conductor.', 404)
+    if (!this.deps.projectTasks) throw new PhoneAccessError('Project tasks are unavailable in this Conductor.', 503)
+    const raw = input && typeof input === 'object' ? input as unknown as Record<string, unknown> : {}
+    if (typeof raw.title !== 'string' || !raw.title.trim()) throw new PhoneAccessError('Write the project task first.')
+    const title = raw.title.replace(/\r\n?/g, '\n').trim()
+    if (title.length > PROJECT_TASK_MAX_LENGTH) throw new PhoneAccessError(`Keep the project task under ${PROJECT_TASK_MAX_LENGTH.toLocaleString()} characters.`)
+    if (/\0|<!--\s*conductor-task\s*:/i.test(title)) throw new PhoneAccessError('Project tasks cannot contain task markers.')
+    if (!projectTaskKinds.includes(raw.kind as ProjectTaskKind)) throw new PhoneAccessError('Choose task, bug, feature, or idea.')
+    const priority = raw.priority === undefined ? 'normal' : raw.priority
+    if (!projectTaskPriorities.includes(priority as ProjectTaskPriority)) throw new PhoneAccessError('Choose a valid project task priority.')
+    const weight = raw.weight === undefined ? 'medium' : raw.weight
+    if (!projectTaskWeights.includes(weight as ProjectTaskWeight)) throw new PhoneAccessError('Choose a valid project task weight.')
+    const result = await this.deps.projectTasks.create(project, { title, kind: raw.kind as ProjectTaskKind, priority: priority as ProjectTaskPriority, weight: weight as ProjectTaskWeight })
+    this.refresh()
+    return result
   }
 
   dispose(): void {

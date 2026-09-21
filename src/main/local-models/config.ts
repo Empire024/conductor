@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { LOCAL_QWEN_35B, LOCAL_QWEN_9B } from '../../shared/local-models.ts'
+import { LOCAL_ORNITH_9B, LOCAL_QWEN_35B, LOCAL_QWEN_9B } from '../../shared/local-models.ts'
 import { assertLocalRootUsable, layout, localRoot } from './paths.ts'
 
 /** One locally served model: which GGUF it is, where it came from, and how its llama.cpp
@@ -48,11 +48,15 @@ export const LOCAL_MODEL_PREFIX = 'local/'
  *  model by id and nothing else, so the id cannot be allowed to drift between the two. */
 export const QWEN_9B = LOCAL_QWEN_9B
 export const QWEN_35B = LOCAL_QWEN_35B
+export const ORNITH_9B = LOCAL_ORNITH_9B
 
 /** Upstream facts pinned at review time (Hugging Face model API, blobs=true). A download that
  *  does not match these bytes is rejected: a repository that later serves different content
  *  under the same filename is exactly the supply-chain case this guards against. */
 export const PINNED_MODELS: Record<string, Array<Omit<LocalModelConfig, 'port' | 'contextTokens' | 'gpuLayers' | 'extraArgs'>>> = {
+  [ORNITH_9B]: [
+    { id: ORNITH_9B, label: 'Ornith 1.5 9B (local)', repo: 'ornith-ai/Ornith-1.5-9B-GGUF', revision: 'abdd624b12ebf020b767fff532ff44fe552b28c3', file: 'Ornith-1.5-9B-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 5780090816, sha256: '70c112196e0b7023803c9762752e46d29e612a92c83f995bc3ba1ceb07e8fab6' }
+  ],
   [QWEN_9B]: [
     { id: QWEN_9B, label: 'Qwen3.5 9B (local)', repo: 'lmstudio-community/Qwen3.5-9B-GGUF', revision: '1379f25c6b505a3fc737bd7818cb09389cf807c1', file: 'Qwen3.5-9B-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 5627044256, sha256: 'cd76ec205963b3b33350093e6904d9de16c4e666fd104e1f632d25c7f15f2a13' },
     { id: QWEN_9B, label: 'Qwen3.5 9B (local)', repo: 'lmstudio-community/Qwen3.5-9B-GGUF', revision: '1379f25c6b505a3fc737bd7818cb09389cf807c1', file: 'Qwen3.5-9B-Q6_K.gguf', quant: 'Q6_K', sizeBytes: 7359259040, sha256: 'b2ccc477f0a2449de299bef560b63e498cae94a2f3a3bae13df01168d77773e6' }
@@ -66,8 +70,8 @@ export const PINNED_MODELS: Record<string, Array<Omit<LocalModelConfig, 'port' |
  * full GGUF residency, context/KV growth, offload and desktop reserves before spawning.
  * The 35B MoE keeps most weights in RAM; its active parameter count is not its size. */
 export const DEFAULT_CONTEXT_TOKENS = 32768
-export const DEFAULT_PORTS: Record<string, number> = { [QWEN_9B]: 51435, [QWEN_35B]: 51436 }
-export const DEFAULT_GPU_LAYERS: Record<string, number> = { [QWEN_9B]: 999, [QWEN_35B]: 10 }
+export const DEFAULT_PORTS: Record<string, number> = { [ORNITH_9B]: 51435, [QWEN_9B]: 51437, [QWEN_35B]: 51436 }
+export const DEFAULT_GPU_LAYERS: Record<string, number> = { [ORNITH_9B]: 999, [QWEN_9B]: 999, [QWEN_35B]: 10 }
 
 export const DEFAULT_SANDBOX: SandboxConfig = {
   image: 'conductor-local-sandbox:1',

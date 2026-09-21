@@ -20,7 +20,8 @@ export function processTrackerState(process: RuntimeProcessSummary, snapshot?: P
   if (process.status === 'limited' || process.activityPhase === 'limited') return 'paused'
   if (process.activityPhase === 'disconnected') return 'disconnected'
   if (['complete', 'exited', 'error', 'unavailable'].includes(process.status) || ['complete', 'failed', 'stopped'].includes(process.activityPhase ?? '')) return 'finished'
-  if (process.status === 'starting' || process.activityPhase === 'working') return 'working'
+  // Background work the runtime will wake this conversation for is not the adapter sitting idle.
+  if (process.status === 'starting' || process.activityPhase === 'working' || process.activityPhase === 'waiting_background') return 'working'
   return 'ready'
 }
 

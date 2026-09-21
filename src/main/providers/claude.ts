@@ -118,6 +118,31 @@ export class ClaudeAdapter implements ProviderAdapter {
     return this.providerCapabilities
   }
 
+  /** Backgrounded tasks still outstanding. A Bash call that backgrounds its command returns
+   *  immediately and its turn reports 'result' straight after, so neither the tool row nor the
+   *  turn lifecycle can say that a multi-hour render is still going; only this inventory can.
+   *  Foreground tasks are tracked here too, for their descriptions, and are not counted. */
+  backgroundWork(): number {
+    let outstanding = 0
+    for (const task of this.backgroundTasks.values()) if (task.backgrounded) outstanding++
+    return outstanding
+  }
+
+  /** A turn the runtime starts by itself - a background task reporting, a watcher firing - has
+   *  no input of ours to mark its start, so the session would keep saying 'idle' while the model
+   *  is demonstrably streaming text and calling tools. The first main-conversation frame of such
+   *  a turn opens it; the ordinary 'result' handler closes it like any other. Subagent frames
+   *  carry a parent tool id and never open one, and neither does anything arriving after an
+   *  interrupt: a trailing frame of the turn the owner stopped must not resurrect it, and
+   *  nothing else would close a turn opened from one. */
+  private beginProviderTurn(): void {
+    if (this.active || this.stopRequested || this.disposed || !this.ready) return
+    this.turnId = randomUUID()
+    this.active = true
+    this.hasAssistantText = false
+    this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
+  }
+
   async start(): Promise<void> {
     if (this.transport || this.disposed) throw new Error('Claude runtime already started or disposed')
     this.validateSettings(this.settings)
@@ -416,6 +441,8 @@ export class ClaudeAdapter implements ProviderAdapter {
       else if (message.state === 'completed' || message.state === 'cancelled' && !this.stopRequested) this.inputDelivery(inputId, 'uncertain', native)
       return
     }
+    // Output on the main conversation is the only announcement a runtime-started turn makes.
+    if (!parentId && ['stream_event', 'assistant', 'tool_progress'].includes(type ?? '')) this.beginProviderTurn()
     if (type === 'stream_event') return this.stream(message, parentId)
     if (type === 'assistant' || type === 'user') {
       const body = object(message.message), messageId = string(body.id) ?? uuid
@@ -532,7 +559,10 @@ export class ClaudeAdapter implements ProviderAdapter {
         toolUseId: string(message.tool_use_id) ?? previous?.toolUseId,
         backgrounded: message.is_backgrounded === true || previous?.backgrounded === true || Boolean(string(message.output_file))
       }
-      if (id) this.backgroundTasks.set(id, record)
+      // Retire a finished task before announcing it rather than after. The host reads this
+      // inventory when the event reaches it, and a task dropped afterwards would leave the
+      // conversation waiting on work that has already reported, with no later event to correct it.
+      if (id) { if (status === 'running') this.backgroundTasks.set(id, record); else this.backgroundTasks.delete(id) }
       const kind = claudeTaskKind(record.taskType)
       const outputFile = string(message.output_file) || undefined
       // A background Bash task is still real work, but it is a process/tool, not an agent.
@@ -557,7 +587,6 @@ export class ClaudeAdapter implements ProviderAdapter {
           }
         }
         this.emit({ parentId: string(message.tool_use_id) ?? parentId, data: { type: 'notice', message: 'Claude task lifecycle', payload: message }, native })
-        if (id && status !== 'running') this.backgroundTasks.delete(id)
         return
       }
       // Completions carry only a summary ("... completed (exit code 0)"), so the launch
@@ -587,8 +616,28 @@ export class ClaudeAdapter implements ProviderAdapter {
           if (!this.disposed && this.taskOutputRevision.get(id) === revision) this.emit({ ...task, data: { ...task.data, ...output } })
         }
       }
-      if (id && status !== 'running') this.backgroundTasks.delete(id)
       return
+    }
+    // The runtime's own statement of what is still running in the background. It is the only
+    // source for tasks this process never saw start - a resumed conversation inherits a render
+    // launched before it - and the only one that can correct a start frame we never got an end
+    // for. Foreground tasks are left alone: they are tracked here for their descriptions and
+    // this frame does not speak for them.
+    if (type === 'system' && message.subtype === 'background_tasks_changed' && !parentId) {
+      const reported = new Map(array(message.tasks).map(value => object(value)).flatMap(task => {
+        const id = string(task.task_id) ?? string(task.tool_use_id)
+        return id ? [[id, task] as const] : []
+      }))
+      for (const [id, task] of this.backgroundTasks) if (task.backgrounded && !reported.has(id)) this.backgroundTasks.delete(id)
+      for (const [id, task] of reported) {
+        const existing = this.backgroundTasks.get(id)
+        this.backgroundTasks.set(id, {
+          description: string(task.description) ?? existing?.description ?? '',
+          taskType: string(task.task_type) ?? existing?.taskType,
+          toolUseId: string(task.tool_use_id) ?? existing?.toolUseId,
+          backgrounded: true
+        })
+      }
     }
     this.emit({ parentId, data: { type: 'notice', message: `Claude ${type ?? 'unknown'}${message.subtype ? ` / ${String(message.subtype)}` : ''}`, payload: message }, native: { method: type ?? 'unknown', payload: message } })
   }

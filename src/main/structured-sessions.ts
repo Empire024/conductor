@@ -18,6 +18,7 @@ import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedPermission, rememberPermission } from './app-settings'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
+import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 
 interface LiveSession {
   spec: AgentSpec
@@ -50,14 +51,21 @@ interface LiveSession {
   snapshotNotices?: Set<string>
   shutdownTimer?: NodeJS.Timeout
   activityPhase?: AgentActivityPhase
+  /** The background-task count this conversation last reported, so a change in the provider's
+   *  inventory between turns can be noticed and restated. */
+  backgroundTasks?: number
   /** The cap decision that stopped this conversation; cleared when the owner changes the cap. */
   capStop?: { reason: string; capKey: string }
   capTimer?: NodeJS.Timeout
+  /** Set while the provider's own usage window is closed; the moment it reopens, in ISO. */
+  limitResumeAt?: string
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
-/** Activity states a conversation can be cut off in; anything else has already settled. */
-const inFlight = new Set<AgentActivityPhase>(['working', 'waiting_input'])
+/** Activity states a conversation can be cut off in; anything else has already settled. A
+ *  conversation waiting on background work is one of them: that work belongs to the runtime
+ *  process, so losing the connection ends it rather than leaving it running somewhere. */
+const inFlight = new Set<AgentActivityPhase>(['working', 'waiting_input', 'waiting_background'])
 /** A subagent in one of these has not produced its result yet, whatever its parent turn says. */
 const runningSubagent = new Set<ActivityStatus>(['preparing', 'running', 'awaiting_approval'])
 /** The runtime's own lifecycle vocabulary, in the terms every activity indicator speaks. */
@@ -68,6 +76,13 @@ const activityPhaseOf = (phase: SessionPhase): AgentActivityPhase =>
         : phase === 'failed' ? 'failed'
           : phase === 'disconnected' ? 'disconnected'
             : phase === 'interrupted' ? 'stopped' : 'idle'
+
+/** Only a public, renderer-understood error code crosses the adapter boundary. Provider errors
+ *  can carry arbitrary fields, so never project an unrecognised value into durable history. */
+const safeErrorCode = (error: unknown): string | undefined =>
+  error instanceof Error && 'code' in error && error.code === LOCAL_MODEL_SETUP_ERROR_CODE
+    ? LOCAL_MODEL_SETUP_ERROR_CODE
+    : undefined
 
 export class StructuredSessions {
   private localControl?: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>
@@ -82,6 +97,7 @@ export class StructuredSessions {
   private pending: AgentEvent[] = []
   private flushTimer?: NodeJS.Timeout
   private artifacts: AgentArtifacts
+  private continuationTimers = new Map<string, NodeJS.Timeout>()
   constructor(
     private database: ConductorDatabase,
     private resolveExecutable: (provider: StructuredProvider) => string | null,
@@ -104,6 +120,9 @@ export class StructuredSessions {
     const previousSpec = store.spec<AgentSpec>(spec.id)
     if (previousSpec && (previousSpec.projectId !== spec.projectId || previousSpec.provider !== spec.provider || realpathSync(previousSpec.cwd) !== realpathSync(spec.cwd))) throw new Error('A session cannot be rebound to a different provider or workspace')
     const executable = process.env.CONDUCTOR_OFFLINE_TESTS === '1' ? process.execPath : this.resolveExecutable(spec.provider as StructuredProvider)
+    // Local is an internal adapter, not an external CLI. Its setup is validated by start(),
+    // which emits the actionable local-setup-required error when config or weights are absent.
+    const available = spec.provider === 'local' || Boolean(executable)
     if (!store.snapshot(spec.id)) this.database.upsertAgent(spec, 'running', 'idle')
     const state = store.register(spec.id, spec.projectId, spec.provider as StructuredProvider, spec)
     if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: concreteModel(spec.provider, spec.model, state.capabilities), effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined } })
@@ -115,6 +134,18 @@ export class StructuredSessions {
     // the live entry holding an empty string for ever, so every later turn failed with "Provider
     // executable unavailable" while `ensure` itself kept reporting the session as available.
     live.executable = executable ?? ''
+    // The registered spec is otherwise frozen at first registration, so a conversation opened
+    // before the owner switched limit continuation on kept answering `false` for ever. This is
+    // the one field the owner can still change, so every `ensure` carries the current answer.
+    if (Boolean(live.spec.continueOnLimit) !== Boolean(spec.continueOnLimit)) {
+      live.spec = { ...live.spec, continueOnLimit: Boolean(spec.continueOnLimit) }
+      store.setContinueOnLimit(spec.id, Boolean(spec.continueOnLimit))
+      this.database.setAgentContinueOnLimit(spec.id, Boolean(spec.continueOnLimit))
+      if (!spec.continueOnLimit) this.cancelContinuation(spec.id)
+    }
+    // A wait that outlives the app, a closed tab, or a backend restart is only re-armed here:
+    // the timer lives in this process, the reset time lives in SQLite.
+    this.armPersistedContinuation(live)
     if (!previousSpec) {
       const legacy = this.database.getAgentTranscript(spec.id)
       if (legacy) {
@@ -123,7 +154,7 @@ export class StructuredSessions {
         this.emit(live, { data: { type: 'notice', message: 'Saved pre-upgrade terminal history. Native conversation identity was not recorded; sending a message here starts a new conversation.', outputArtifactId } })
       }
     }
-    if (!state.capabilities && executable) {
+    if (!state.capabilities && available) {
       const adapter = this.factory(spec.provider as StructuredProvider, this.options(live, randomUUID()))
       const projection = store.snapshot(spec.id)!
       projection.capabilities = adapter.capabilities
@@ -145,7 +176,7 @@ export class StructuredSessions {
           : undefined
       if (opening) store.update(spec.id, { settings: { ...store.snapshot(spec.id)!.settings, permission: opening } })
     }
-    return { id: spec.id, available: Boolean(executable), status: executable ? 'running' : 'unavailable', transcript: '', executable: executable ?? undefined, model: state.settings.model ?? spec.model ?? 'default', message: executable ? undefined : 'Provider CLI not found. Configure its executable before connecting.' }
+    return { id: spec.id, available, status: available ? 'running' : 'unavailable', transcript: '', executable: executable ?? undefined, model: state.settings.model ?? spec.model ?? 'default', message: available ? undefined : 'Provider CLI not found. Configure its executable before connecting.' }
   }
   private validateSpec(spec: AgentSpec): void {
     if (!spec || !/^[a-zA-Z0-9_-]{1,160}$/.test(spec.id) || !['claude', 'codex', 'local'].includes(spec.provider)) throw new Error('Invalid structured agent session')
@@ -207,13 +238,13 @@ export class StructuredSessions {
     if (live.starting) return live.starting
     if (live.adapter) return
     this.validateSpec(live.spec)
-    if (!live.executable) throw new Error('Provider executable unavailable')
+    if (!live.executable && live.spec.provider !== 'local') throw new Error('Provider executable unavailable')
     live.runtimeId = randomUUID(); live.closed = false; live.responses.clear()
     const options = this.options(live, live.runtimeId)
     live.adapter = this.factory(live.spec.provider as StructuredProvider, options)
     this.emit(live, { data: { type: 'session', phase: 'starting', capabilities: live.adapter.capabilities, settings: options.settings } })
     live.starting = live.adapter.start().catch(error => {
-      this.emit(live, { data: { type: 'error', message: error instanceof Error ? error.message : 'Provider initialization failed' } })
+      this.emit(live, { data: { type: 'error', message: error instanceof Error ? error.message : 'Provider initialization failed', code: safeErrorCode(error) } })
       this.emit(live, { data: { type: 'session', phase: 'disconnected' } })
       live.adapter?.dispose(); live.adapter = undefined
       throw error
@@ -667,6 +698,9 @@ export class StructuredSessions {
     // A remote-origin prompt does not authorize waking or reconnecting its retained native
     // runtime. Reject a revoked peer before any attachment I/O or provider lifecycle work.
     this.assertPromptDispatchAuthority(origin, live.spec)
+    // Any new turn ends the wait, whether Conductor sent it on the timer or the owner got there
+    // first. Leaving the record pending would relabel the next settled turn as limited.
+    if (live.limitResumeAt) this.clearUsageLimit(live)
     live.submitting = true
     let resumedIntoActiveTurn = false
     try {
@@ -720,7 +754,7 @@ export class StructuredSessions {
       await dispatch
     } catch (error) {
       if (!resumedIntoActiveTurn && store.snapshot(id)?.phase === 'running') {
-        this.emit(live, { data: { type: 'error', message: `Prompt dispatch failed: ${error instanceof Error ? error.message : 'Unknown provider error'}` } })
+        this.emit(live, { data: { type: 'error', message: `Prompt dispatch failed: ${error instanceof Error ? error.message : 'Unknown provider error'}`, code: safeErrorCode(error) } })
         this.emit(live, { data: { type: 'session', phase: 'failed' } })
       }
       throw error
@@ -883,6 +917,91 @@ export class StructuredSessions {
     }, 2000)
   }
 
+  /* --- Provider usage limits -------------------------------------------- *
+   * A provider window that has closed is not a failure to recover from, it is
+   * a wait with a known end. The reset time is persisted so the wait survives
+   * a closed tab, a backend restart, or a quit; the timer that acts on it only
+   * ever lives in this process, and is re-armed from SQLite by `ensure`.
+   * ---------------------------------------------------------------------- */
+
+  /** Recognize the provider's own "you are out of quota until X" message and turn it into a
+   *  durable wait. Read only from `error` events: a tool's output or a page the agent fetched
+   *  can quote the same sentence without this conversation being limited at all. */
+  private noteUsageLimit(live: LiveSession, message: string): void {
+    if (live.limitResumeAt || live.closed) return
+    const reset = parseUsageLimitReset(message)
+    if (!reset) return
+    live.limitResumeAt = reset.toISOString()
+    this.database.saveContinuation(live.spec.id, live.spec.projectId, live.spec.sessionId, live.limitResumeAt)
+    // Deliberately payload-free: a notice carrying a payload is classed as diagnostics and hidden
+    // from the conversation, and this one exists precisely for the owner to read.
+    this.emit(live, { data: {
+      type: 'notice',
+      message: live.spec.continueOnLimit
+        ? `Usage limit reached. Conductor will send "continue" automatically at ${reset.toLocaleString()}.`
+        : `Usage limit reached. The window reopens at ${reset.toLocaleString()}; turn on limit continuation for this workspace to resume automatically.`
+    } })
+    // Claude reports the limit mid-turn and settles immediately afterwards, and that settling
+    // event carries the wait. An adapter that reports it after settling has no such event left,
+    // so restate the phase it is already in rather than leaving the tab reading "failed".
+    const phase = this.database.structured.snapshot(live.spec.id)?.phase
+    if (phase && !active.has(phase)) this.emit(live, { data: { type: 'session', phase } })
+    if (live.spec.continueOnLimit) this.scheduleContinuation(live, reset)
+  }
+
+  /** Re-arm a wait recorded before this process existed, or before this tab was reopened. */
+  private armPersistedContinuation(live: LiveSession): void {
+    const pending = this.database.getContinuation(live.spec.id)
+    if (pending?.status !== 'pending') return
+    const reset = new Date(pending.resumeAt)
+    if (Number.isNaN(reset.getTime())) { this.database.clearContinuation(live.spec.id); return }
+    live.limitResumeAt = reset.toISOString()
+    if (live.spec.continueOnLimit) this.scheduleContinuation(live, reset)
+  }
+
+  private cancelContinuation(id: string): void {
+    const timer = this.continuationTimers.get(id)
+    if (timer) clearTimeout(timer)
+    this.continuationTimers.delete(id)
+  }
+
+  private scheduleContinuation(live: LiveSession, resumeAt: Date): void {
+    this.cancelContinuation(live.spec.id)
+    const delay = Math.max(0, resumeAt.getTime() - Date.now())
+    // A long wait is re-checked against the wall clock rather than trusted outright: a timer
+    // armed for hours away is the one thing a suspended laptop is guaranteed to get wrong.
+    const timer = setTimeout(() => {
+      this.continuationTimers.delete(live.spec.id)
+      if (this.live.get(live.spec.id) !== live || live.closed || !live.spec.continueOnLimit) return
+      if (resumeAt.getTime() > Date.now() + 1000) { this.scheduleContinuation(live, resumeAt); return }
+      void this.runContinuation(live)
+    }, Math.min(delay, 2_147_000_000))
+    this.continuationTimers.set(live.spec.id, timer)
+  }
+
+  /** The window has reopened: say "continue" the way the owner would have. */
+  private async runContinuation(live: LiveSession): Promise<void> {
+    const state = this.database.structured.snapshot(live.spec.id)
+    if (!state || live.closed) return
+    // Someone got there first — the owner typed into this conversation while it waited.
+    if (active.has(state.phase)) { this.clearUsageLimit(live); return }
+    this.clearUsageLimit(live)
+    this.emit(live, { data: { type: 'notice', message: 'Usage window reopened; Conductor asked this conversation to continue.' } })
+    this.flush()
+    try {
+      await this.submit(live.spec.id, 'continue', state.settings)
+    } catch (error) {
+      this.emit(live, { data: { type: 'notice', message: `Automatic continuation could not be sent: ${error instanceof Error ? error.message : String(error)}` } })
+      this.flush()
+    }
+  }
+
+  private clearUsageLimit(live: LiveSession): void {
+    live.limitResumeAt = undefined
+    this.cancelContinuation(live.spec.id)
+    this.database.completeContinuation(live.spec.id)
+  }
+
   /* --- Usage caps ------------------------------------------------------- *
    * The cap is the owner's own stop rule. It reads the same provider-reported
    * figures the usage panel shows and never estimates a percentage the provider
@@ -956,18 +1075,29 @@ export class StructuredSessions {
     }
     return [...latest.values()].some(status => runningSubagent.has(status))
   }
+  /** Whether the runtime still owns background work it will be woken by - a backgrounded shell
+   *  process, an armed watcher. The tool call that started it returned immediately and the turn
+   *  reported its result straight after, so only the live process' own inventory knows. */
+  private ownsBackgroundWork(live: LiveSession): boolean {
+    if (!live.adapter || live.closed) return false
+    return (live.adapter.backgroundWork?.() ?? 0) > 0
+  }
   /** A finished turn that still owns running subagent work is not finished: reporting 'complete'
    *  turns the tab's loader into a checkmark and rolls its project up green while output is still
-   *  streaming in. Every other phase speaks for itself. */
+   *  streaming in. Background work the runtime will wake this conversation for is the same lie
+   *  told a turn later, and it also covers the quiet gap between wakes, where the conversation
+   *  reports 'idle'. Every other phase speaks for itself. */
   private owningActivityPhase(live: LiveSession, reported: AgentActivityPhase): AgentActivityPhase {
-    return reported === 'complete' && this.ownsActiveSubagent(live) ? 'working' : reported
+    if (reported === 'complete' && this.ownsActiveSubagent(live)) return 'working'
+    if ((reported === 'complete' || reported === 'idle') && this.ownsBackgroundWork(live)) return 'waiting_background'
+    return reported
   }
   /** The one writer of the phase every project rolls up and every tab indicator follows. */
   private recordActivityPhase(live: LiveSession, phase: AgentActivityPhase): void {
     live.activityPhase = phase
     // AgentRecord.status is a coarser union than the phase, so the unhappy phases collapse
     // back onto its own vocabulary here rather than leaking new values into stored rows.
-    const status = phase === 'working' || phase === 'idle' ? 'running' : phase === 'failed' || phase === 'disconnected' ? 'error' : phase === 'stopped' ? 'exited' : phase
+    const status = phase === 'working' || phase === 'idle' || phase === 'waiting_background' ? 'running' : phase === 'failed' || phase === 'disconnected' ? 'error' : phase === 'stopped' ? 'exited' : phase
     this.database.setAgentStatus(live.spec.id, status, phase)
     this.broadcast('agent:status', { id: live.spec.id, status, phase })
   }
@@ -984,6 +1114,13 @@ export class StructuredSessions {
     if (source.data.type === 'session' && source.turnId) live.turnId = source.turnId
     let data = source.data
     if (data.type === 'session' && data.settings) data = { ...data, settings: this.messageSettings(state, data.settings) }
+    // Every lifecycle event restates the wait rather than relying on one event the renderer
+    // might have missed, so a reconnecting or replaying view never shows a stale reset time.
+    if (data.type === 'session' && data.limitResumeAt === undefined) data = { ...data, limitResumeAt: live.limitResumeAt ?? null }
+    // Restated on every lifecycle event for the same reason: the renderer derives the tab's own
+    // phase from the projection, so a conversation whose turn settled while a render runs on has
+    // to carry that fact forward rather than depend on the one event that announced it.
+    if (data.type === 'session' && data.backgroundTasks === undefined) data = { ...data, backgroundTasks: live.adapter?.backgroundWork?.() ?? 0 }
     if (data.type === 'changes') data = { ...data, changes: data.changes.map(change => this.artifacts.fromPatch(live.spec.id, change, live.spec.cwd)) }
     if (data.type === 'tool' && data.output && data.output.length > 32_000) {
       const output = data.output
@@ -1002,6 +1139,11 @@ export class StructuredSessions {
       try { this.enforceUsageCap(live) } catch { /* A cap never breaks the event pipeline it observes. */ }
     }, 250)
     if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), 32)
+    // The provider announces a closed usage window as an ordinary turn failure. Read it here,
+    // between appending the error and recording the phase it produces, so the phase below can
+    // report the wait rather than a dead end. `noteUsageLimit` re-enters `emit` for its own
+    // notice; `live.limitResumeAt` is set first, so that pass is inert.
+    if (data.type === 'error') this.noteUsageLimit(live, data.message)
     if (data.type === 'session') queueMicrotask(() => { void this.drainQueue(live) })
     if (data.type === 'session') {
       const reported = activityPhaseOf(data.phase)
@@ -1009,7 +1151,11 @@ export class StructuredSessions {
       // conversation that was still in flight reports as disconnected; one that had already
       // settled keeps the state it settled in rather than turning its project into a warning.
       const settled = live.activityPhase ?? 'idle'
-      const phase: AgentActivityPhase = reported === 'disconnected' && !inFlight.has(settled) ? settled : reported
+      let phase: AgentActivityPhase = reported === 'disconnected' && !inFlight.has(settled) ? settled : reported
+      // A turn that ended only because the quota ran out is waiting, not broken: say so, so the
+      // tab and its project roll up as limited instead of raising a failure nobody can act on.
+      if (live.limitResumeAt && (phase === 'failed' || phase === 'complete' || phase === 'idle')) phase = 'limited'
+      live.backgroundTasks = data.backgroundTasks ?? 0
       this.recordActivityPhase(live, this.owningActivityPhase(live, phase))
       live.budget?.setPhase(data.phase)
       if (['disconnected', 'failed', 'interrupted', 'completed'].includes(data.phase)) this.artifacts.discardSession(live.spec.id)
@@ -1024,9 +1170,18 @@ export class StructuredSessions {
       const phase = this.owningActivityPhase(live, activityPhaseOf(state.phase))
       if (phase !== live.activityPhase) this.recordActivityPhase(live, phase)
     }
+    // The same trap one level out: the runtime's background inventory moves between turns - a
+    // watcher re-arms, a backgrounded render finally reports - and none of those frames is a
+    // lifecycle event, so nothing would re-decide the phase and the tab would keep whatever the
+    // last turn said for hours. Restating it as a session event is what carries the change to
+    // the renderer's own projection as well as to this phase.
     if (data.type === 'usage' && data.costUsd && process.env.CONDUCTOR_LIVE_TESTS === '1') {
       store.addLiveCost(process.env.CONDUCTOR_LIVE_SUITE_ID!, live.spec.provider as StructuredProvider, data.costUsd)
       for (const session of this.live.values()) if (store.liveCostExceeded(process.env.CONDUCTOR_LIVE_SUITE_ID!, session.spec.provider as StructuredProvider)) this.stopLive(session, 'Live suite observed cost threshold reached')
+    }
+    if (data.type !== 'session' && live.adapter && !live.closed) {
+      const outstanding = live.adapter.backgroundWork?.() ?? 0
+      if (outstanding !== (live.backgroundTasks ?? 0)) this.emit(live, { data: { type: 'session', phase: state.phase, backgroundTasks: outstanding } })
     }
   }
   async review(id: string, artifactId: string, action: 'keep' | 'undo'): Promise<{ outcome: 'kept' | 'reverted' | 'conflict'; message?: string }> {
@@ -1062,6 +1217,9 @@ export class StructuredSessions {
     for (const [id, live] of this.live) if (predicate(live.spec)) {
       if (live.adapter) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Backend stopped; native resume is an explicit action' } })
       this.cancelNativeAcceptances(live, 'The backend closed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
+      // The pending continuation itself stays in SQLite: only this process's timer goes.
+      // Reopening the conversation re-arms it, and a wait must not be lost to a backend restart.
+      this.cancelContinuation(id)
       live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id)
     }
     this.flush()

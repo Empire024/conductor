@@ -25,7 +25,7 @@ const text = (content) => {
   emit({ type: 'stream_event', event: { type: 'message_stop' } })
   emit({ type: 'assistant', message: { id: messageId, content: [{ type: 'text', text: content }] } })
 }
-const finish = (failed = false) => emit({ type: 'result', subtype: failed ? 'error_during_execution' : 'success', is_error: failed, usage: {} })
+const finish = (failed = false) => emit({ type: 'result', subtype: failed ? 'error_during_execution' : 'success', is_error: failed, usage: process.env.CONDUCTOR_TEST_CLAUDE_USAGE === '1' ? { input_tokens: 100, output_tokens: 20 } : {} })
 const oldDeclarations = "  var wasOpen = el.classList.contains('is-open');\n  var wasPinned = pinned;\n"
 const editInput = { file_path: 'panel.mjs', old_string: oldDeclarations, new_string: '', description: 'Remove the two unused declarations (synthetic fixture)' }
 let initialized = false
@@ -171,6 +171,31 @@ for await (const line of input) {
       text('**Synthetic Claude activity:** writing a memory file, a sibling project file and one file in this workspace.')
       outsideIndex = 0
       stepOutside()
+      continue
+    }
+    if (prompt.startsWith('SYNTHETIC BASH WAIT')) {
+      // A command handed to the background: the Bash call returns at once, the turn result follows
+      // immediately behind it, and the work itself runs on. Nothing in that sequence says the
+      // conversation is still busy except the runtime's background inventory. When the task finally
+      // reports, the runtime resumes the conversation with a turn nobody typed.
+      const taskId = `background-wait-${turn}`
+      const toolId = `background-wait-tool-${turn}`
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
+      declare(toolId, 'Bash', { command: 'node --version', description: 'Synthetic long background render' })
+      emit({ type: 'system', subtype: 'task_started', task_id: taskId, tool_use_id: toolId, description: 'Synthetic long background render', is_backgrounded: true, task_type: 'local_bash', status: 'running' })
+      emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: taskId, tool_use_id: toolId, task_type: 'local_bash', description: 'Synthetic long background render' }] })
+      result(toolId, `Command running in the background (task ${taskId})`)
+      text('Started the render in the background; holding here until it reports.')
+      finish()
+      const timer = setTimeout(() => {
+        steeringTimers.delete(timer)
+        emit({ type: 'system', subtype: 'task_notification', task_id: taskId, tool_use_id: toolId, status: 'completed', summary: 'Synthetic long background render completed (exit code 0)' })
+        emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [] })
+        text('The render reported back; nothing is left running.')
+        const closing = setTimeout(() => { steeringTimers.delete(closing); finish() }, 2000)
+        steeringTimers.add(closing)
+      }, Number(process.env.CONDUCTOR_SMOKE_BACKGROUND_MS ?? 6000))
+      steeringTimers.add(timer)
       continue
     }
     if (prompt.startsWith('SYNTHETIC BASH BACKGROUND')) {

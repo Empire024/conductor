@@ -10,6 +10,8 @@ import type { StructuredProvider } from '../shared/structured-agent'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, PromptOrigin, ProviderCapabilities, SessionSettings } from '../shared/structured-agent'
 import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
+import { LocalSetupError } from './providers/local'
+import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../shared/local-models'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
 const remoteOrigin = (projectId: string): PromptOrigin => ({
@@ -23,6 +25,7 @@ afterEach(() => {
   for (const db of databases.splice(0)) { try { db.close() } catch {} }
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 })
   vi.unstubAllEnvs()
+  vi.useRealTimers()
 })
 class FakeProvider implements ProviderAdapter {
   readonly provider = 'claude' as const
@@ -46,6 +49,10 @@ class FakeProvider implements ProviderAdapter {
   async submit(text: string, settings: SessionSettings, attachments?: ContextAttachment[]): Promise<void> { if (this.disposed) throw new Error('Fake runtime disposed'); this.submissions.push({ text, settings, attachments }) }
   async respond(response: InteractionResponse): Promise<void> { this.responses.push(response); await this.responseGate; await this.onResponse?.(response) }
   async interrupt(): Promise<void> { this.emit({ data: { type: 'session', phase: 'interrupted' } }) }
+  /** Work the runtime backgrounded and will wake this conversation for; only the live process
+   *  can answer, exactly as the real adapters report it. */
+  background = 0
+  backgroundWork(): number { return this.background }
   async fork(): Promise<string> { return `forked-${this.options.nativeSessionId ?? this.options.runtimeId}` }
   async rename(): Promise<void> { await this.renameGate }
   dispose(): void { this.disposed = true }
@@ -73,6 +80,33 @@ function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart 
   manager.ensure(spec)
   return { root, workspace, databasePath, database, spec, adapters, broadcast, factory, manager, gateStart(gate: Promise<void>) { startGate = gate }, get current() { return adapters.at(-1)! } }
 }
+
+describe('internal local adapter availability', () => {
+  it('reaches actionable local setup when no external executable or local config exists', async () => {
+    const f = fixture()
+    const localSpec: AgentSpec = { ...f.spec, id: 'local-session', provider: 'local', title: 'Local model' }
+    const factory = vi.fn((_provider: StructuredProvider, options: AdapterOptions) => {
+      const adapter = new FakeProvider(options)
+      adapter.start = async () => { throw new LocalSetupError('Local models are not configured.') }
+      return adapter
+    })
+    const manager = new StructuredSessions(f.database, () => null, f.broadcast, factory)
+    managers.push(manager)
+
+    expect(manager.ensure(localSpec)).toMatchObject({ available: true, status: 'running', executable: undefined, message: undefined })
+    await expect(manager.submit(localSpec.id, 'Use the local model', settings)).rejects.toMatchObject({ code: LOCAL_MODEL_SETUP_ERROR_CODE, actionUrl: LOCAL_MODEL_SETUP_URL })
+
+    const setupError = f.database.structured.snapshot(localSpec.id)?.items
+      .map(item => item.data)
+      .find(data => data.type === 'error')
+    expect(setupError).toMatchObject({
+      type: 'error',
+      code: LOCAL_MODEL_SETUP_ERROR_CODE,
+      message: expect.stringContaining(LOCAL_MODEL_SETUP_URL)
+    })
+    expect(factory).toHaveBeenCalledWith('local', expect.objectContaining({ executable: '' }))
+  })
+})
 
 describe('backend session ownership and lifecycle — fake provider boundary', () => {
   it.each(['claude', 'codex'] as const)('configures the project browser for %s only after explicit opt-in', async provider => {
@@ -1291,5 +1325,162 @@ describe('activity reported while subagent work outlives its turn', () => {
     await f.manager.resume(f.spec.id)
     f.current.emit({ data: { type: 'session', phase: 'completed' } })
     expect(activityPhase(f)).toBe('complete')
+  })
+})
+
+describe('activity reported while background work outlives its turn', () => {
+  const activityPhase = (f: ReturnType<typeof fixture>) =>
+    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  const tick = (f: ReturnType<typeof fixture>) => f.current.emit({ data: { type: 'notice', message: 'Claude task lifecycle' } })
+
+  it('keeps a conversation waiting while work it backgrounded runs past the end of its turn', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Relaunch the showcase render', settings)
+    expect(activityPhase(f)).toBe('working')
+    f.current.background = 1
+    // The turn result lands the moment the command is backgrounded; the render runs for hours.
+    f.current.finish()
+    expect(activityPhase(f)).toBe('waiting_background')
+    expect(f.database.structured.snapshot(f.spec.id)?.backgroundTasks).toBe(1)
+    // A wake between turns settles back to the same wait, never to a checkmark.
+    f.current.emit({ data: { type: 'session', phase: 'idle' } })
+    expect(activityPhase(f)).toBe('waiting_background')
+  })
+
+  it('turns the tab green the moment the inventory drains, without waiting for another turn', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Relaunch the showcase render', settings)
+    f.current.background = 1
+    f.current.finish()
+    expect(activityPhase(f)).toBe('waiting_background')
+    // Nothing about a task reporting is a lifecycle event, so the change itself has to re-decide.
+    f.current.background = 0
+    tick(f)
+    expect(activityPhase(f)).toBe('complete')
+    expect(f.database.structured.snapshot(f.spec.id)?.backgroundTasks).toBe(0)
+  })
+
+  it('starts waiting as soon as the runtime reports work it backgrounded mid-turn', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Relaunch the showcase render', settings)
+    f.current.background = 1
+    tick(f)
+    // The turn itself is still running: that wins, and the count rides along for the renderer.
+    expect(activityPhase(f)).toBe('working')
+    expect(f.database.structured.snapshot(f.spec.id)?.backgroundTasks).toBe(1)
+  })
+
+  it('never masks a turn that was interrupted, failed, or lost its runtime', async () => {
+    for (const phase of ['interrupted', 'failed', 'disconnected'] as const) {
+      const f = fixture()
+      await f.manager.submit(f.spec.id, 'Relaunch the showcase render', settings)
+      f.current.background = 1
+      f.current.emit({ data: { type: 'session', phase } })
+      expect(activityPhase(f)).toBe(phase === 'interrupted' ? 'stopped' : phase === 'failed' ? 'failed' : 'disconnected')
+    }
+  })
+
+  it('reports a connection lost while waiting on background work, which dies with the process', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Relaunch the showcase render', settings)
+    f.current.background = 1
+    f.current.finish()
+    expect(activityPhase(f)).toBe('waiting_background')
+    f.current.emit({ data: { type: 'session', phase: 'disconnected' } })
+    expect(activityPhase(f)).toBe('disconnected')
+  })
+
+  it('leaves a conversation whose inventory was empty all along exactly as it was', async () => {
+    const f = fixture('codex')
+    await f.manager.submit(f.spec.id, 'Ordinary turn', settings)
+    f.current.finish()
+    expect(activityPhase(f)).toBe('complete')
+    tick(f)
+    expect(activityPhase(f)).toBe('complete')
+  })
+})
+
+describe('provider usage limits and automatic continuation', () => {
+  const limited = "You've hit your session limit · resets in 2 hours"
+  const activityPhase = (f: ReturnType<typeof fixture>) =>
+    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  /** How a provider reports an exhausted quota: an ordinary failed turn whose text names a time. */
+  const hitLimit = (f: ReturnType<typeof fixture>): void => {
+    f.current.emit({ data: { type: 'error', message: limited } })
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+  }
+
+  it('waits out the provider window and continues the conversation itself', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    f.manager.ensure({ ...f.spec, continueOnLimit: true })
+    await f.manager.submit(f.spec.id, 'Long running work', settings)
+    hitLimit(f)
+
+    expect(f.database.getContinuation(f.spec.id)).toMatchObject({ status: 'pending' })
+    // A closed window is a wait with a known end, not a failure the owner has to notice.
+    expect(activityPhase(f)).toBe('limited')
+    expect(f.current.submissions).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60_000)
+    expect(f.current.submissions.at(-1)?.text).toBe('continue')
+    expect(f.database.getContinuation(f.spec.id)).toMatchObject({ status: 'resumed' })
+    expect(activityPhase(f)).toBe('working')
+  })
+
+  it('records the wait but sends nothing when the workspace has not opted in', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Long running work', settings)
+    hitLimit(f)
+
+    expect(f.database.getContinuation(f.spec.id)).toMatchObject({ status: 'pending' })
+    await vi.advanceTimersByTimeAsync(4 * 60 * 60_000)
+    expect(f.current.submissions.map(submission => submission.text)).toEqual(['Long running work'])
+  })
+
+  it('follows the toggle after registration and arms the wait it was turned on for', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Long running work', settings)
+    hitLimit(f)
+    // Turned on while the conversation is already waiting: the spec was registered without it.
+    f.manager.ensure({ ...f.spec, continueOnLimit: true })
+
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60_000)
+    expect(f.current.submissions.at(-1)?.text).toBe('continue')
+  })
+
+  it('stops waiting when the owner continues the conversation first', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    f.manager.ensure({ ...f.spec, continueOnLimit: true })
+    await f.manager.submit(f.spec.id, 'Long running work', settings)
+    hitLimit(f)
+
+    await f.manager.submit(f.spec.id, 'continue', settings)
+    f.current.emit({ data: { type: 'session', phase: 'completed' } })
+    expect(f.database.getContinuation(f.spec.id)).toMatchObject({ status: 'resumed' })
+    // The turn the owner sent settled normally; nothing relabels it as still limited.
+    expect(activityPhase(f)).toBe('complete')
+
+    await vi.advanceTimersByTimeAsync(4 * 60 * 60_000)
+    expect(f.current.submissions.map(submission => submission.text)).toEqual(['Long running work', 'continue'])
+  })
+
+  it('re-arms a wait that outlived the backend that recorded it', async () => {
+    vi.useFakeTimers()
+    const f = fixture()
+    f.manager.ensure({ ...f.spec, continueOnLimit: true })
+    await f.manager.submit(f.spec.id, 'Long running work', settings)
+    hitLimit(f)
+    // Closing the project drops this process's timer; the reset time lives in SQLite.
+    f.manager.killWhere(spec => spec.id === f.spec.id)
+
+    const reopened = new StructuredSessions(f.database, () => 'synthetic-executable', f.broadcast, f.factory)
+    managers.push(reopened)
+    reopened.ensure({ ...f.spec, continueOnLimit: true })
+    await vi.advanceTimersByTimeAsync(2 * 60 * 60_000)
+    expect(f.current.submissions.at(-1)?.text).toBe('continue')
   })
 })

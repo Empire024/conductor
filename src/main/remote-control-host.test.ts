@@ -118,6 +118,22 @@ const escapes: Array<[string, string]> = [
 ]
 
 describe('what a paired machine may read and write', () => {
+  it('creates a project task only in the exact granted project with an optimistic revision', async () => {
+    const get = vi.fn(async () => ({ revision: 'rev-1', tasks: [] }))
+    const edit = vi.fn(async (_projectId, revision, change) => {
+      if (revision !== 'rev-1') throw new Error('stale revision')
+      return { tasks: [{ id: 'remote-task', title: change.title, kind: change.kind, priority: change.priority, weight: change.weight }] }
+    })
+    const fileChanged = vi.fn()
+    fix = fixture({ backlogs: { get, edit } as unknown as ProjectBacklogs, fileChanged })
+    await expect(fix.call('tasks.create', { projectId: 'shared-project', revision: 'rev-1', title: 'From phone', kind: 'feature', priority: 'high', weight: 'heavy' }))
+      .resolves.toMatchObject({ id: 'remote-task', title: 'From phone', kind: 'feature' })
+    expect(edit).toHaveBeenCalledWith('shared-project', 'rev-1', { type: 'add', title: 'From phone', kind: 'feature', priority: 'high', weight: 'heavy' }, { actor: 'you' })
+    expect(fileChanged).toHaveBeenCalledWith({ projectId: 'shared-project', path: 'feature-list.md' })
+    await expect(fix.call('tasks.create', { projectId: 'private-project', revision: 'rev-1', title: 'No', kind: 'task' })).rejects.toThrow(/not shared/)
+    await expect(fix.call('tasks.create', { projectId: 'shared-project', revision: 'stale', title: 'No', kind: 'task' })).rejects.toThrow(/stale/)
+  })
+
   it('reads a file inside the project it was granted', async () => {
     await expect(fix.call('files.read', { projectId: 'shared-project', path: 'notes.md' }))
       .resolves.toMatchObject({ path: 'notes.md', content: 'shared notes' })

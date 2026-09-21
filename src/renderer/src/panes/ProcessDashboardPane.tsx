@@ -8,6 +8,7 @@ import { evaluateUsageWarning, type UsageWarningLevel } from '../../../shared/us
 import { processModelLabel } from '../agent-models'
 import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, type ProcessTrackerState } from './ProcessDashboardPane.helpers'
 import './ProcessDashboardPane.css'
+import { WeeklyUsage } from '../components/WeeklyUsage'
 
 interface ProcessFacts {
   snapshot?: SessionProjection
@@ -125,6 +126,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
       <span><b>{totalUsage.cost ? `$${totalUsage.cost < 10 ? totalUsage.cost.toFixed(2) : totalUsage.cost.toFixed(0)}` : '—'}</b><small>Estimated cost</small></span>
     </section>
 
+    <WeeklyUsage />
     {error && <p className="pd-error" role="alert">{error}</p>}
     <div className="pd-table" role="table" aria-label="Project runtimes">
       <div className="pd-table-head" role="row"><span>Runtime</span><span>State</span><span>Progress</span><span>Usage</span><span>Activity</span><span /></div>

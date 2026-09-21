@@ -8,7 +8,7 @@ import { execFile, spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
-  DEFAULT_CONTEXT_TOKENS, DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, configPath, defaultModelConfig, endpointFor,
+  DEFAULT_CONTEXT_TOKENS, DEFAULT_SANDBOX, ORNITH_9B, QWEN_35B, QWEN_9B, configPath, defaultModelConfig, endpointFor,
   ensureApiKey, loadConfig, logsDir, modelDir, modelFilePath, readApiKey, recordedPort, saveConfig, tempDir
 } from '../../src/main/local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../../src/main/local-models/config.ts'
@@ -97,6 +97,7 @@ async function setup(): Promise<void> {
     llamaServer: resolved.path,
     llamaVersion: resolved.version,
     models: {
+      [ORNITH_9B]: { ...(existing?.models[ORNITH_9B] ?? defaultModelConfig(ORNITH_9B)), ...defaultModelConfig(ORNITH_9B), contextTokens: context },
       [QWEN_9B]: { ...(existing?.models[QWEN_9B] ?? defaultModelConfig(QWEN_9B, quant9b)), ...defaultModelConfig(QWEN_9B, quant9b), contextTokens: context },
       [QWEN_35B]: { ...(existing?.models[QWEN_35B] ?? defaultModelConfig(QWEN_35B)), ...defaultModelConfig(QWEN_35B), contextTokens: context }
     },

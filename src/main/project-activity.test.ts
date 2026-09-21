@@ -58,6 +58,9 @@ describe('aggregateProjectActivity', () => {
     expect(aggregateProjectActivity(['project-a'], workspaces, [agent('agent-1', 'project-a', 'workspace-1', 'failed')])['project-a']).toBe('waiting')
     expect(aggregateProjectActivity(['project-a'], workspaces, [agent('agent-1', 'project-a', 'workspace-1', 'disconnected')])['project-a']).toBe('waiting')
     expect(aggregateProjectActivity(['project-a'], workspaces, [agent('agent-1', 'project-a', 'workspace-1', 'limited')])['project-a']).toBe('working')
+    // A project whose only agent settled its turn while a render it backgrounded carries on has
+    // not finished; rolling it up green is the same lie the tab's own checkmark used to tell.
+    expect(aggregateProjectActivity(['project-a'], workspaces, [agent('agent-1', 'project-a', 'workspace-1', 'waiting_background')])['project-a']).toBe('working')
   })
 
   it('does not let a settled tab that lost its connection paint over a project that already finished', () => {

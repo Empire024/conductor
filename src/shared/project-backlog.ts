@@ -1,5 +1,8 @@
 import type { SourceControlChangeSet, SourceControlStatus } from './source-control'
 
+/** Large enough for a complete diagnostic report; shared by every task entry point. */
+export const PROJECT_TASK_MAX_LENGTH = 200_000
+
 export type ProjectTaskStatus = 'todo' | 'doing' | 'done'
 export type ProjectTaskKind = 'task' | 'bug' | 'feature' | 'idea'
 export const projectTaskKinds: ProjectTaskKind[] = ['task', 'bug', 'feature', 'idea']
@@ -60,7 +63,7 @@ export interface ProjectTaskDispatchOptions {
 /** `new`/`auto` register a fresh native session, which opens on the owner's remembered permission
  *  for its provider (see structured-sessions.ts ensure()); an explicit `permission` on `new`
  *  overrides that inherited default instead of leaving the choice to whatever was last remembered. */
-export type ProjectTaskDispatchTarget = {type:'existing';agentSessionId:string} | {type:'new';sessionId:string;provider:'codex'|'claude';model:string;effort?:string;permission?:string} | {type:'auto';sessionId:string}
+export type ProjectTaskDispatchTarget = {type:'existing';agentSessionId:string} | {type:'new';sessionId:string;provider:'codex'|'claude';model:string;effort?:string;permission?:string} | {type:'auto';sessionId?:string}
 export interface ProjectTaskDispatchRequest {taskIds:string[];target:ProjectTaskDispatchTarget;prompt?:string}
 export interface ProjectTaskDispatchAssignment {taskIds:string[];agentSessionId:string;tabId:string;sessionId:string;provider:'codex'|'claude';model:string;effort?:string;permission?:string;status:'submitted'|'queued'|'failed';error?:string}
 export interface ProjectTaskDispatchResult {board:ProjectBacklog;assignments:ProjectTaskDispatchAssignment[]}

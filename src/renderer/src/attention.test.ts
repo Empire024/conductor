@@ -60,6 +60,9 @@ describe('session activity status', () => {
     ['failed', 'waiting'],
     ['working', 'working'],
     ['limited', 'working'],
+    // Work the runtime backgrounded still belongs to this workspace; rolling it up as done
+    // would turn the project green with a render of its own still going.
+    ['waiting_background', 'working'],
     ['complete', 'done'],
     ['idle', undefined],
     // Stopped is a deliberate halt, so it does not pull the workspace into the waiting list.

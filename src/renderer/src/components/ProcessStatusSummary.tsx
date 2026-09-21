@@ -6,6 +6,7 @@ import { summarizeUsageRun, type UsageCapSetting, type UsageScopeReport } from '
 import { evaluateUsageWarning, type UsageWarningLevel } from '../../../shared/usage-warning'
 import { createSerialPoller, processTrackerState, type SerialPoller } from '../panes/ProcessDashboardPane.helpers'
 import './ProcessStatusSummary.css'
+import { WeeklyUsage } from './WeeklyUsage'
 
 export interface ProcessUsage { costUsd?: number; totalTokens?: number; warning?: UsageWarningLevel; snapshotPhase?: SessionProjection['phase'] }
 export interface ProcessSummaryFreshness { label: 'Stale'; title: string }
@@ -62,7 +63,7 @@ export function aggregateProjectProcessUsage(
     if (state === 'disconnected') entry.disconnected += 1
     entry.costUsd += usage?.costUsd ?? 0
     entry.totalTokens += usage?.totalTokens ?? 0
-    if (usage?.warning) { entry.warning = strongerWarning(entry.warning, usage.warning); entry.expensiveTitles.push(process.title) }
+    if (state === 'working' && (!usage?.snapshotPhase || usage.snapshotPhase === 'running') && usage?.warning) { entry.warning = strongerWarning(entry.warning, usage.warning); entry.expensiveTitles.push(process.title) }
     totals.set(process.projectId, entry)
   }
   // A project with an expensive tab leads regardless of its raw totals -- that is the one
@@ -205,6 +206,7 @@ export function ProcessStatusSummary({ projects, onOpen }: { projects: ProjectRe
         </div>
       )}
       {visible.length === 0 && <div className="process-status-summary-rows"><div className="process-status-summary-row process-status-summary-empty"><span>No retained processes</span></div></div>}
+      <WeeklyUsage compact />
     </div>
   )
 }

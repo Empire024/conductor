@@ -1,3 +1,4 @@
+import { createPortal } from 'react-dom'
 import { useEffect, useLayoutEffect, useMemo, useState } from 'react'
 import { Link2, Radio, Unlink, X } from 'lucide-react'
 import type { AgentControlLink } from '../../../shared/agent-control'
@@ -99,7 +100,13 @@ export function AgentControlLinks({ projectId, sessionId, layout }: { projectId:
     ? computeControlPopoverPosition(openMarker, { width: window.innerWidth, height: window.innerHeight })
     : undefined
   return <>
-    <div className="agent-control-markers" aria-label="Agent tab relationships">{markers.map(marker => <button type="button" key={marker.id} className={'agent-control-marker ' + marker.role} style={{ left: marker.x, top: marker.y, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={`${marker.title}. Select for relationship details.`} aria-label={`${marker.title}; show relationship details`} aria-expanded={openMarkerTabId === marker.tabId} onClick={() => setOpenMarkerTabId(current => current === marker.tabId ? null : marker.tabId)}><span aria-hidden="true">{marker.role === 'controlled' ? <Link2 size={8} /> : <Radio size={8} />}</span><b>{marker.role === 'controller' ? 'MAIN' : marker.role === 'controlled' ? 'COWORKER' : 'COWORKER · MAIN'}</b>{marker.role !== 'controlled' && marker.count > 1 && <em>{marker.count}</em>}</button>)}</div>
+    {markers.map(marker => {
+      const header = [...document.querySelectorAll<HTMLElement>('[data-control-tab-id]')].find(node => node.dataset.controlTabId === marker.tabId)
+      const container = header?.closest<HTMLElement>('.pane-tabs')
+      if (!container) return null
+      const bounds = container.getBoundingClientRect()
+      return createPortal(<button type="button" key={marker.id} className={'agent-control-marker ' + marker.role} style={{ left: marker.x - bounds.left + container.scrollLeft, top: marker.y - bounds.top + container.scrollTop, color: 'var(' + marker.color + ')', borderColor: 'var(' + marker.color + ')' }} title={`${marker.title}. Select for relationship details.`} aria-label={`${marker.title}; show relationship details`} aria-expanded={openMarkerTabId === marker.tabId} onClick={() => setOpenMarkerTabId(current => current === marker.tabId ? null : marker.tabId)}><span aria-hidden="true">{marker.role === 'controlled' ? <Link2 size={8} /> : <Radio size={8} />}</span><b>{marker.role === 'controller' ? 'MAIN' : marker.role === 'controlled' ? 'COWORKER' : 'COWORKER · MAIN'}</b>{marker.role !== 'controlled' && marker.count > 1 && <em>{marker.count}</em>}</button>, container, marker.id)
+    })}
     {openMarker && popoverPosition && <div className="agent-control-popover" role="dialog" aria-label={`Agent tab relationships for ${titleFor(openMarker.tabId)}`} style={popoverPosition}>
       <header><Link2 size={12} aria-hidden="true" /><strong>{openMarker.role === 'controller' ? 'Main coordinator' : openMarker.role === 'controlled' ? 'Coworker' : 'Coworker and main coordinator'}</strong><button type="button" aria-label="Close agent tab relationships" title="Close relationship details" onClick={() => setOpenMarkerTabId(null)}><X size={12} /></button></header>
       <div className="agent-control-link-list">{openLinks.map(link => <div className="agent-control-link" key={link.targetAgentSessionId}>

@@ -47,6 +47,10 @@ export type ThemeMode = 'dark' | 'light' | 'auto'
 export type AgentActivityPhase =
   | 'idle'
   | 'working'
+  /** The turn itself settled, but provider-tracked background work it started - a backgrounded
+   * shell process, an armed watcher - is still outstanding, and the runtime will wake the
+   * conversation again when that work reports. Not finished, and not a state to act on. */
+  | 'waiting_background'
   | 'waiting_input'
   | 'limited'
   | 'complete'

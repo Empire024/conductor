@@ -16,6 +16,7 @@ import { resolveFileLinkTarget, useFileLinkProjectRoots, type ResolvedFileLink }
 import { plainFileLinkRemarkPlugin, useVerifiedPlainFileLinks } from '../components/plain-file-links'
 import { isRemoteFileMachine } from '../remote-files'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
+import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../../../shared/local-models'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import './StructuredAgentActivity.css'
 import './StructuredFileLinkMenu.css'
@@ -579,7 +580,7 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
     </div>)}</section>; break
     case 'plan': body = <section className="sa-plan"><strong>Plan</strong>{data.explanation && <StructuredMarkdown text={data.explanation} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} />}<ol>{data.steps.map((step, index) => <li key={index} className={'status-' + step.status}><span>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '●' : '○'}</span><span>{step.text}</span><small>{step.status.replace('_', ' ')}</small></li>)}</ol></section>; break
     case 'subagent': body = <section className="sa-subagent"><strong>{data.name}</strong><small>{data.status.replaceAll('_', ' ')}</small></section>; break
-    case 'error': body = <p className="sa-error" role="alert">{data.message}{data.code && <small> ({data.code})</small>}</p>; break
+    case 'error': body = <p className="sa-error" role="alert">{data.message}{data.code && data.code !== LOCAL_MODEL_SETUP_ERROR_CODE && <small> ({data.code})</small>}{data.code === LOCAL_MODEL_SETUP_ERROR_CODE && <button type="button" onClick={() => void window.conductor.system.openExternal(LOCAL_MODEL_SETUP_URL)}>Download / set up local model</button>}</p>; break
     case 'notice': body = <div className="sa-notice">{data.message}{data.outputArtifactId && <OutputPreview sessionId={props.sessionId} artifactId={data.outputArtifactId} value="Saved terminal output from before structured integration. Native conversation identity was not recorded." />}</div>; break
     case 'review': body = <p className="sa-muted">{data.outcome === 'kept' ? 'Edit marked reviewed.' : 'Edit reverted.'}</p>; break
     case 'usage': return null

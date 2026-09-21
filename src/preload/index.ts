@@ -291,6 +291,7 @@ const bridge: ConductorBridge = {
     read: (agentSessionId, workspaceId) => ipcRenderer.invoke('usage-cap:read', agentSessionId, workspaceId),
     write: (scope, id, setting) => ipcRenderer.invoke('usage-cap:write', scope, id, setting)
   },
+  usage: { weekly: () => ipcRenderer.invoke('usage:weekly') },
   activity: {
     projects: () => ipcRenderer.invoke('activity:projects'),
     onProjectsChanged: (callback) => subscribe('activity:projects', callback)

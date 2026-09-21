@@ -1,3 +1,4 @@
+import { WeeklyUsageSummaryService } from './weekly-usage-summary'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs, readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
@@ -56,12 +57,17 @@ import {
 } from './window-geometry'
 import { OrchestrationStore } from './orchestration-store'
 import { registerOrchestrationIpc } from './orchestration-ipc'
+import { ScheduleStore } from './schedule-store'
+import { ScheduleRunner } from './schedule-runner'
+import { LatestModelsJob } from './schedule-jobs/latest-models'
+import { registerScheduleIpc } from './schedule-ipc'
 import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
 import { isRemoteProject, localProject, requireLocalProject } from './project-scope'
 import { electronTray, installHostLifecycle, type HostLifecycleController } from './host-lifecycle'
 import { ensureTrayIconFile } from './tray-icon'
 import { PhoneAccessService } from './phone-access'
+import { PhoneProjectTasks } from './phone-project-tasks'
 import { PhoneAccessServer, requestTailscaleCertificate } from './phone-access-server'
 import { registerPhoneAccessIpc } from './phone-access-ipc'
 import { StoredSecretVault } from './secret-store'
@@ -88,11 +94,15 @@ const projectPreview = new ProjectPreviewServer()
 const systemMetrics = new SystemMetricsSampler({
   appMetrics: () => app.getAppMetrics().map(metric => ({ pid: metric.pid, type: metric.type, cpuPercent: metric.cpu.percentCPUUsage, memoryBytes: (metric.memory.workingSetSize ?? 0) * 1024 }))
 })
+let weeklyUsage: WeeklyUsageSummaryService
 let database: ConductorDatabase
 let terminals: TerminalManager
 let agents: AgentManager
 let orchestration: OrchestrationStore
 let disposeOrchestrationIpc: (() => void) | undefined
+let schedules: ScheduleStore
+let scheduleRunner: ScheduleRunner
+let disposeScheduleIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
 let disposeProjectActivity: (() => void) | undefined
@@ -503,11 +513,14 @@ const disposeRuntimeServices = (): void => {
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
+    ['schedule runner', () => scheduleRunner?.stop()],
+    ['schedule IPC', () => disposeScheduleIpc?.()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
     ['collaboration IPC', () => disposeCollaborationIpc?.()],
     ['project activity', () => { disposeProjectActivity?.(); if (projectActivityTimer) clearTimeout(projectActivityTimer); projectActivityTimer = null }],
     ['collaboration store', () => collaboration?.close()],
     ['orchestration store', () => orchestration?.close()],
+    ['schedule store', () => schedules?.close()],
     ['workspace database', () => database?.close()]
   ]
   for (const [name, dispose] of disposals) {
@@ -1095,6 +1108,9 @@ const registerIpc = (): void => {
   ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const project = localProject(database, projectId, 'Editing the task list'); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }); invalidateProjectFiles(project.path); return result })
   ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control'); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
   ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); requireLocalProject(database, projectId, 'Reviewing changes'); return projectBacklogs.changes(projectId, taskId) })
+  disposeScheduleIpc = registerScheduleIpc({ store: schedules, runner: scheduleRunner,
+    authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Schedules') },
+    reveal: path => shell.showItemInFolder(path) })
   ipcMain.handle('projects:list', () => database.listDeskProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await dialog.showOpenDialog({
@@ -1654,6 +1670,7 @@ const registerIpc = (): void => {
   ipcMain.handle('agent:list-events', (_event, id: string) => database.listAgentEvents(id))
   ipcMain.handle('agent:list-providers', () => agents.listProviders())
   ipcMain.handle('runtime:list-processes', (_event, projectId?: string) => database.listProcesses(projectId))
+  ipcMain.handle('usage:weekly', () => weeklyUsage.read())
   ipcMain.handle('activity:projects', () => projectActivitySnapshot())
   // A smoke run has to be able to show the chip a machine it is not on: an idle host, then a
   // loaded one. The fixture is re-read per call so one launch can walk through both.
@@ -1901,6 +1918,7 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('io.conductor.desktop')
   const databasePath = join(app.getPath('userData'), 'conductor.db')
   database = new ConductorDatabase(databasePath)
+  weeklyUsage = new WeeklyUsageSummaryService(database)
   database.reconcileInterruptedRuntimes()
   // v1 could mistake Codex's "usage limit resets available" credit notice for
   // an exhausted quota. Clear those persisted waits once; a genuinely limited
@@ -1910,6 +1928,7 @@ app.whenReady().then(async () => {
     database.setSetting(USAGE_LIMIT_DETECTION_VERSION_KEY, '2')
   }
   orchestration = new OrchestrationStore(databasePath)
+  schedules = new ScheduleStore(databasePath)
   collaboration = new AgentCollaborationStore(databasePath)
   const projectArgument = process.argv.find((argument) => argument.startsWith('--project-path='))
   if (projectArgument) {
@@ -1917,6 +1936,10 @@ app.whenReady().then(async () => {
     const project = database.upsertProject(projectPath, basename(projectPath))
     database.includeDeskProject(project.id)
   }
+  const conductorProject = database.listProjects().find(project => {
+    try { return (JSON.parse(readFileSync(join(project.path, 'package.json'), 'utf8')) as {name?:string}).name === 'conductor-desktop' } catch { return false }
+  })
+  if (conductorProject) schedules.ensureLatestModelsSchedule(conductorProject.id)
   sourceControl = new SourceControl(database)
   projectBacklogs = new ProjectBacklogs(database, sourceControl)
   for (const project of database.listDeskProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
@@ -2048,7 +2071,9 @@ app.whenReady().then(async () => {
     fileChanged: change => projectFileChanges?.changed(change),
     linksChanged: scope => publish('agent-control:links-changed', { projectId: scope.projectId, sessionId: scope.sessionId })
   })
-  projectTaskDispatcher = new ProjectTaskDispatcher({ database, backlogs: projectBacklogs, sessions: agents.structured, control, providers: () => agents.listProviders(), ui: agentControlUi.request, changed: projectId => { const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId, path: 'feature-list.md' }) } })
+  projectTaskDispatcher = new ProjectTaskDispatcher({ database, backlogs: projectBacklogs, sessions: agents.structured, control, providers: () => agents.listProviders(), ui: agentControlUi.request, workspaceCreated: session => publish('sessions:restored', session), changed: projectId => { const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId, path: 'feature-list.md' }) } })
+  const latestModelsJob = new LatestModelsJob({ store: schedules, artifactDirectory: join(app.getPath('userData'), 'schedule-evidence'), catalog: projectId => projectTaskDispatcher.options(projectId) })
+  scheduleRunner = new ScheduleRunner({ store: schedules, jobs: { 'latest-models-methods': context => latestModelsJob.run(context) }, changed: projectId => publish('schedules:changed', projectId) })
   agentControlUi.register(control)
   agents.structured.setLocalControl((spec, method, args) => control.call({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, method, args))
   agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '')
@@ -2080,6 +2105,12 @@ app.whenReady().then(async () => {
     version: app.getVersion(),
     ui: agentControlUi.request,
     metrics: () => systemMetrics.sample(),
+    weeklyUsage,
+    projectTasks: new PhoneProjectTasks({
+      backlogs: projectBacklogs,
+      remote: remoteControl.client,
+      changed: project => { if (!project.remote) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId: project.id, path: 'feature-list.md' }) }
+    }),
     changed: () => { publish('phone:changed', phoneAccess!.desktopState()); hostLifecycle?.refresh() }
   })
   phoneServer = new PhoneAccessServer({
@@ -2115,6 +2146,7 @@ app.whenReady().then(async () => {
   snapshotPruneTimer = setInterval(pruneSnapshots, 24 * 60 * 60 * 1000)
   snapshotPruneTimer.unref?.()
   disposeOrchestrationIpc = registerOrchestrationIpc(orchestration)
+  scheduleRunner.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate

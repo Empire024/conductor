@@ -1,4 +1,5 @@
 import type { AgentProviderId } from './models'
+import type { SchedulesBridge } from './schedules'
 
 export type OrchestrationAgentStatus = 'active' | 'paused' | 'archived'
 
@@ -9,9 +10,10 @@ export const DISPATCHED_COWORKER_ROLE = 'Routed coworker'
 export const AUTO_FIXER_INSTRUCTIONS = [
   'You are the visible Project tasks Fixer. You coordinate; you do not implement everything yourself.',
   'Start by reading models.list and app.state through Conductor app control, and read feature-list.md and AGENTS.md before dispatching anything.',
+  'Read docs/token-thrift-policy.md. Keep yourself on the strongest suitable coordinator with high reasoning when supported, but send bounded, cheaply checkable churn to local or cheap native workers first. Prefer a bounded Opus coordinator pass over Fable; do not choose the expensive Fable route unless the owner explicitly opts in. Use at most one corrective retry, report every failed local attempt, and escalate instead of looping. Never start an expensive review turn automatically; the owner must explicitly request one.',
   '',
-  'Dispatching. Delegate through router.dispatch with an explicit provider, model, effort (when the model supports it), and projectTaskIds holding the exact task IDs. At most four coworkers per call; use further batches for the rest, and refill a slot as soon as one finishes rather than waiting for the whole batch. Those calls open visible native coworker tabs and transfer only your selected claims. Never launch nested CLI agents, another router, or work nobody asked for.',
-  'Choose the model from the work, not the task count: a top model at high or xhigh effort for root-cause debugging, security-sensitive code, and anything touching persistence or a protocol; a cheaper model for scoped, visual, or mechanical work. State the choice deliberately; do not send everything to the largest model.',
+  'Dispatching. Delegate through router.dispatch with an explicit provider, model, effort (when the model supports it), and projectTaskIds holding the exact task IDs. Never exceed four active native coworkers total; use further batches for the rest, and refill a slot as soon as one finishes rather than waiting for the whole batch. Those calls open visible native coworker tabs and transfer only your selected claims. Never launch nested CLI agents, another router, or work nobody asked for.',
+  'Choose the model from the work, not the task count: prefer local or cheap native models for scoped, deterministic, visual, or mechanical work whose acceptance check can reject a bad result; use a top model at high effort for root-cause debugging, security-sensitive code, and anything touching persistence or a protocol. State the choice deliberately; do not send everything to the largest model.',
   '',
   'Partition the working tree before you dispatch. Every coworker edits the same checkout at the same time, so give each one a file area no other agent is touching, and say in each prompt which areas other agents own. If two selected tasks live in the same file, give both to one coworker instead of racing them. If a task needs a file an active agent already owns, hold it and dispatch it when that agent finishes; a held task is cheaper than a lost edit.',
   '',
@@ -181,4 +183,5 @@ export interface OrchestrationBridge {
     remove(id: string): Promise<void>
     start(id: string): Promise<RoutineStartResult>
   }
+  schedules: SchedulesBridge
 }

@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { ConductorDatabase } from './database'
 import { StructuredSessions } from './structured-sessions'
@@ -47,10 +48,10 @@ function fixture({fail=false,hold=false,steerReceipt='accepted',quota={},models=
   const control={tabs:({sessionId}:{sessionId:string})=>{const current=database.getSession(sessionId)!.layout.root;if(current.type!=='group')throw new Error('Fixture group expected');return current.tabs.map(tab=>({...tab,groupId:current.id,uri:'conductor://fixture/tab/'+tab.id})) as AgentControlTab[]}}
   const ui=vi.fn(async(request:AgentControlUiRequest)=>{const current=database.getSession(request.sessionId)!;if(current.layout.root.type!=='group')throw new Error('Fixture group expected');current.layout.root.tabs.push(request.params.tab as PaneTab);database.saveSession(request.sessionId,current.layout,null,[]);return {applied:true}})
   const providers:AgentProviderInfo[]=(['codex','claude'] as const).map(provider=>({id:provider,displayName:provider,available:true,installUrl:'',models:catalogs[provider],efforts:[{id:'low',label:'Low'},{id:'high',label:'High'}]}))
-  const backlogs=new ProjectBacklogs(database),changed=vi.fn()
-  const dispatcher=new ProjectTaskDispatcher({database,backlogs,sessions,control,ui,providers:()=>providers,changed})
+  const backlogs=new ProjectBacklogs(database),changed=vi.fn(),workspaceCreated=vi.fn()
+  const dispatcher=new ProjectTaskDispatcher({database,backlogs,sessions,control,ui,providers:()=>providers,changed,workspaceCreated})
   const addHistory=async(provider:'codex'|'claude',id='history-'+provider)=>{const history:AgentSpec={id,projectId:project.id,sessionId:workspace.id,cwd:root,provider,title:'History '+provider,model:catalogs[provider][0]!.id};sessions.ensure(history);database.structured.update(id,{title:history.title});await sessions.connectSession(id);return id}
-  return {root,database,project,workspace,spec,sessions,submissions,steers,backlogs,ui,control,dispatcher,changed,addHistory}
+  return {root,database,project,workspace,spec,sessions,submissions,steers,backlogs,ui,control,dispatcher,changed,workspaceCreated,addHistory}
 }
 
 const observedWindow=(usedPercent:number,extra:Partial<Parameters<typeof autoFixerAllowance>[0][number]>={})=>({
@@ -144,6 +145,9 @@ describe('Project tasks native dispatch',()=> {
     expect(f.submissions[0]?.prompt).toContain('models.list and app.state')
     expect(f.submissions[0]?.prompt).toContain('explicit provider, model, effort')
     expect(f.submissions[0]?.prompt).toContain('projectTaskIds')
+    expect(f.submissions[0]?.prompt).toContain('docs/token-thrift-policy.md')
+    expect(f.submissions[0]?.prompt).toContain('four active native coworkers')
+    expect(f.submissions[0]?.prompt).toContain('report every failed local attempt')
     expect(f.submissions[0]?.prompt).toContain('Task two (feature)')
   })
   it('uses fresh runtime model buckets to avoid an almost exhausted Astra default when Sol has allowance',async()=>{
@@ -156,6 +160,57 @@ describe('Project tasks native dispatch',()=> {
     const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})
     expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex',model:'gpt-5.6-sol'})
     expect(f.submissions).toHaveLength(1)
+  })
+  it('ranks coordinator capability before free quota and requests high reasoning when supported',async()=>{
+    const snapshot=(limitId:string,usedPercent:number)=>({limitId,primary:{usedPercent,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null})
+    const f=fixture({models:{codex:[{id:'gpt-6-astra',label:'Astra',effort:['low','high'],defaultEffort:'low'},{id:'gpt-5.6-sol',label:'Sol',effort:['high'],defaultEffort:'high'}]},quota:{codex:{rateLimitsByLimitId:{codex:snapshot('codex',10),'gpt-6-astra':snapshot('gpt-6-astra',80),'gpt-5.6-sol':snapshot('gpt-5.6-sol',10)}}}})
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',model:'gpt-6-astra',effort:'high'})
+  })
+  it('bootstraps Codex allowance without a tab, then creates exactly one Automation workspace after evidence succeeds',async()=>{
+    const f=fixture()
+    f.database.closeSession(f.workspace.id)
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto'}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex'})
+    expect(f.database.listSessions(f.project.id)).toHaveLength(1)
+    expect(f.database.listSessions(f.project.id)[0]?.name).toBe('Automation')
+    expect(f.workspaceCreated).toHaveBeenCalledOnce()
+    expect(f.submissions).toHaveLength(1)
+    const probe=f.database.structured.history(f.project.id).find(entry=>entry.id.startsWith('allowance-probe'))!
+    expect(f.database.structured.events(probe.id).some(event=>event.data.type==='usage')).toBe(true)
+    expect(f.database.structured.snapshot(probe.id)?.phase).toBe('disconnected')
+  })
+  it('does not leave an empty workspace when allowance bootstrap produces no evidence',async()=>{
+    const f=fixture({quota:false})
+    f.database.closeSession(f.workspace.id)
+    const board=await f.backlogs.get(f.project.id)
+    await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto'}})).rejects.toThrow('allowance evidence')
+    expect(f.database.listSessions(f.project.id)).toHaveLength(0)
+    expect(f.workspaceCreated).not.toHaveBeenCalled()
+    expect(f.submissions).toHaveLength(0)
+  })
+  it('uses an invisible disposable bootstrap when the project has no open or closed workspace',async()=>{
+    const f=fixture()
+    f.sessions.killWhere(spec=>spec.id===f.spec.id)
+    f.database.deleteSession(f.workspace.id)
+    expect(f.database.listSessions(f.project.id)).toHaveLength(0)
+    expect(f.database.listClosedSessions().filter(session=>session.projectId===f.project.id)).toHaveLength(0)
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto'}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex'})
+    expect(f.database.listSessions(f.project.id)).toEqual([expect.objectContaining({name:'Automation'})])
+    expect(f.workspaceCreated).toHaveBeenCalledOnce()
+
+    const failed=fixture({quota:false})
+    failed.sessions.killWhere(spec=>spec.id===failed.spec.id)
+    failed.database.deleteSession(failed.workspace.id)
+    const failedBoard=await failed.backlogs.get(failed.project.id)
+    await expect(failed.dispatcher.dispatch(failed.project.id,failedBoard.revision,{taskIds:['one'],target:{type:'auto'}})).rejects.toThrow('allowance evidence')
+    expect(failed.database.listSessions(failed.project.id)).toHaveLength(0)
+    expect(failed.database.listClosedSessions().filter(session=>session.projectId===failed.project.id)).toHaveLength(0)
+    expect(failed.workspaceCreated).not.toHaveBeenCalled()
   })
   it('uses the durable timestamp of a repeated quota item so a current read supersedes old refusal evidence',async()=>{
     const f=fixture({quota:false})
@@ -175,6 +230,27 @@ describe('Project tasks native dispatch',()=> {
     const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})
     expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex',model:'codex-native'})
     expect(f.submissions).toHaveLength(1)
+  })
+  it('reads the uncapped durable usage journal when current allowance is outside the UI history page',async()=>{
+    const f=fixture()
+    await f.sessions.connectSession(f.spec.id)
+    // Keep the fixture durable while avoiding 205 separate SQLite commits in the full suite.
+    const sqlite=(f.database as unknown as {db:DatabaseSync}).db
+    sqlite.exec('BEGIN')
+    try {
+      for(let index=0;index<205;index++) {
+        const id=`later-history-${index}`,spec:AgentSpec={id,projectId:f.project.id,sessionId:f.workspace.id,cwd:f.root,provider:'codex',title:`Later ${index}`,model:'codex-native'}
+        f.sessions.ensure(spec);f.database.structured.update(id,{title:spec.title})
+        const state=f.database.structured.snapshot(id)!
+        f.database.structured.append({schemaVersion:1,id:`later-event-${index}`,sessionId:id,sequence:state.sequence+1,runtimeId:state.runtimeId,
+          provider:'codex',projectId:f.project.id,workspaceId:f.workspace.id,cwd:f.root,timestamp:new Date(Date.now()+index+1_000).toISOString(),data:{type:'notice',message:'Later history fixture'}})
+      }
+      sqlite.exec('COMMIT')
+    } catch(error) { sqlite.exec('ROLLBACK'); throw error }
+    expect(f.database.structured.history(f.project.id).some(entry=>entry.id===f.spec.id)).toBe(false)
+    const board=await f.backlogs.get(f.project.id)
+    const result=await f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'auto',sessionId:f.workspace.id}})
+    expect(result.assignments[0]).toMatchObject({status:'submitted',provider:'codex'})
   })
   it('keeps an owner-selected provider/model explicit even when its reported allowance is low',async()=>{
     const f=fixture({quota:{codex:{rateLimits:{limitId:'codex',primary:{usedPercent:99,windowDurationMins:10_080,resetsAt:Math.floor(Date.now()/1000)+86_400},secondary:null}}}})
@@ -256,6 +332,20 @@ describe('Project tasks native dispatch',()=> {
     const f=fixture(),board=await f.backlogs.get(f.project.id)
     await expect(f.dispatcher.dispatch(f.project.id,board.revision,{taskIds:['one'],target:{type:'existing',agentSessionId:f.spec.id},prompt:'x'.repeat(4001)})).rejects.toThrow('4000 characters')
     expect(f.submissions).toHaveLength(0)
+  })
+  it('dispatches a single report above the former 50k ceiling and rejects only an over-combined native prompt',async()=>{
+    const accepted=fixture(),longReport='R'.repeat(52_000)
+    writeFileSync(join(accepted.root,'feature-list.md'),`## Bugs\n- [ ] ${longReport} <!-- conductor-task:large-report -->\n`)
+    const board=await accepted.backlogs.get(accepted.project.id)
+    const result=await accepted.dispatcher.dispatch(accepted.project.id,board.revision,{taskIds:['large-report'],target:{type:'existing',agentSessionId:accepted.spec.id}})
+    expect(result.assignments[0]?.status).toBe('submitted')
+    expect(accepted.submissions[0]?.prompt.length).toBeGreaterThan(50_000)
+
+    const rejected=fixture(),reports=Array.from({length:4},(_,index)=>`- [ ] ${String.fromCharCode(65+index).repeat(160_000)} <!-- conductor-task:large-${index} -->`).join('\n')
+    writeFileSync(join(rejected.root,'feature-list.md'),`## Bugs\n${reports}\n`)
+    const tooLarge=await rejected.backlogs.get(rejected.project.id)
+    await expect(rejected.dispatcher.dispatch(rejected.project.id,tooLarge.revision,{taskIds:['large-0','large-1','large-2','large-3'],target:{type:'existing',agentSessionId:rejected.spec.id}})).rejects.toThrow('combined assignment')
+    expect(rejected.submissions).toHaveLength(0)
   })
   it('keeps tasks unchanged on native failure, retains the visible tab, and never retries the prompt',async()=>{
     const f=fixture({fail:true}),board=await f.backlogs.get(f.project.id),before=readFileSync(join(f.root,'feature-list.md'),'utf8')

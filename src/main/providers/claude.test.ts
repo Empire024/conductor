@@ -656,6 +656,109 @@ describe('Claude task reporting (payloads captured from a real session)', () => 
   })
 })
 
+describe('Claude background work outliving the turn that started it', () => {
+  it('still counts a backgrounded command after its tool call and its whole turn have returned', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Relaunch the showcase render', settings)
+    f.transport.receive(toolUse('toolu_render', 'Bash', { command: 'blender -b scene.blend', run_in_background: true }))
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'render', tool_use_id: 'toolu_render', description: 'Relaunch the final showcase render', is_backgrounded: true, task_type: 'local_bash' })
+    // The trap: backgrounding the command returns the tool call at once, and the turn result
+    // follows immediately behind it. Neither says anything about the hours of work still to come.
+    f.transport.receive({ type: 'user', uuid: 'render-result', parent_tool_use_id: null, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_render', content: 'Command running in the background' }] } })
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, session_id: 'native', usage: {} })
+    await flush()
+    expect(f.projection().phase).toBe('completed')
+    expect(f.projection().items.find(item => item.nativeItemId === 'toolu_render')?.data).toMatchObject({ type: 'tool', status: 'completed' })
+    expect(f.adapter.backgroundWork()).toBe(1)
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'render', tool_use_id: 'toolu_render', status: 'completed', summary: 'Background command completed (exit code 0)' })
+    await flush()
+    expect(f.adapter.backgroundWork()).toBe(0)
+  })
+
+  it('counts an armed watcher, and a foreground task never at all', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'watch', tool_use_id: 'toolu_monitor', description: 'render progress', is_backgrounded: true })
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'typecheck', tool_use_id: 'toolu_check', description: 'Typecheck', is_backgrounded: false, task_type: 'local_bash' })
+    await flush()
+    expect(f.adapter.backgroundWork()).toBe(1)
+    // A watcher that expires without firing still ends its task.
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'watch', tool_use_id: 'toolu_monitor', status: 'stopped', summary: 'render progress' })
+    await flush()
+    expect(f.adapter.backgroundWork()).toBe(0)
+  })
+
+  it('retires a finished task before the frame announcing it reaches the host', async () => {
+    // The host reads this inventory when the event arrives, so a task dropped afterwards would
+    // leave the conversation waiting on work that already reported, with nothing to correct it.
+    const observed: Array<{ method?: string; outstanding: number }> = []
+    let adapter!: ClaudeAdapter
+    const f = fixture({ emit: event => observed.push({ method: event.native?.method, outstanding: adapter.backgroundWork() }) })
+    adapter = f.adapter
+    await adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'render', tool_use_id: 'toolu_render', description: 'Render', is_backgrounded: true, task_type: 'local_bash' })
+    await flush()
+    expect(observed.filter(entry => entry.method === 'system/task_started').at(-1)?.outstanding).toBe(1)
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'render', tool_use_id: 'toolu_render', status: 'completed', summary: 'Render completed' })
+    await flush()
+    expect(observed.filter(entry => entry.method === 'system/task_notification').at(-1)?.outstanding).toBe(0)
+  })
+
+  it('takes the runtime\'s own background inventory as authoritative without disturbing foreground tasks', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    // A resumed conversation inherits work it never saw start; this frame is the only source.
+    f.transport.receive({ type: 'system', subtype: 'background_tasks_changed', tasks: [
+      { task_id: 'render', task_type: 'local_bash', description: 'Relaunch the final showcase render' },
+      { task_id: 'watch', description: 'final showcase render progress' }
+    ] })
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'review', tool_use_id: 'toolu_review', description: 'Review the diff', task_type: 'local_agent' })
+    await flush()
+    expect(f.adapter.backgroundWork()).toBe(2)
+    f.transport.receive({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'render', task_type: 'local_bash', description: 'Relaunch the final showcase render' }] })
+    await flush()
+    expect(f.adapter.backgroundWork()).toBe(1)
+    f.transport.receive({ type: 'system', subtype: 'background_tasks_changed', tasks: [] })
+    await flush()
+    expect(f.adapter.backgroundWork()).toBe(0)
+    // The foreground agent is tracked for its description, not as background work, so the
+    // inventory frame must not have forgotten it.
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'review', tool_use_id: 'toolu_review', status: 'completed', summary: 'Agent completed (exit code 0)' })
+    await flush()
+    expect(f.events.filter(event => event.data.type === 'subagent').at(-1)?.data).toMatchObject({ name: 'Review the diff', status: 'completed' })
+  })
+
+  it('opens the turn the runtime starts by itself rather than streaming into an idle session', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    const phases = (): string[] => f.events.flatMap(event => event.data.type === 'session' ? [event.data.phase] : [])
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'render', status: 'completed', summary: 'Background command completed (exit code 0)' })
+    await flush()
+    expect(phases()).not.toContain('running')
+    // Nothing of ours delivered this turn; its first frame of output is its only announcement.
+    f.transport.receive({ type: 'assistant', uuid: 'wake-1', parent_tool_use_id: null, session_id: 'native', message: { id: 'native-wake-1', model: 'fixture-model', content: [{ type: 'text', text: 'Render finished at frame 1251.' }] } })
+    await flush()
+    expect(f.projection().phase).toBe('running')
+    expect(f.adapter.capabilities.steering).toBe(true)
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, session_id: 'native', usage: {} })
+    await flush()
+    expect(f.projection().phase).toBe('completed')
+    expect(f.adapter.capabilities.steering).toBe(false)
+  })
+
+  it('never opens a turn from a detached child still streaming under a finished one', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Dispatch the wave', settings)
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, session_id: 'native', usage: {} })
+    await flush()
+    expect(f.projection().phase).toBe('completed')
+    f.transport.receive({ type: 'assistant', uuid: 'child-1', parent_tool_use_id: 'toolu_task', session_id: 'native', message: { id: 'native-child-1', content: [{ type: 'text', text: 'Child still reporting.' }] } })
+    await flush()
+    expect(f.projection().phase).toBe('completed')
+    expect(f.adapter.capabilities.steering).toBe(false)
+  })
+})
+
 
 describe('Claude visible text identity', () => {
   it('reconciles text after hidden thinking when final blocks are renumbered, including multiple identical visible blocks', async () => {

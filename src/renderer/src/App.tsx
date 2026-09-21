@@ -2,7 +2,7 @@ import { useAgentControl } from './use-agent-control'
 import { ListTodo } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import { Bot, Brain, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
+import { Bot, Brain, Clock3, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
 import type {
   AgentActivityPhase,
   AgentProviderId,
@@ -21,7 +21,7 @@ import type {
 } from '../../shared/models'
 import { makeLauncherTab } from '../../shared/models'
 import { TitleBar } from './components/TitleBar'
-import { Sidebar, type WorkspacePanel } from './components/Sidebar'
+import { Sidebar, type SidebarUtilityPanel } from './components/Sidebar'
 import { ExecutionTargetChip } from './components/ExecutionTargetChip'
 import { requiredMachineId } from './layout/machine-placement'
 import { SessionBar } from './components/SessionBar'
@@ -60,6 +60,7 @@ import { createPaneTab } from './panes/pane-factory'
 import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
+import { SchedulesPane } from './components/SchedulesPane'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile, changeWorkspacePath, loadWorkspaceFiles, workspaceFileIds, workspaceFileMachine } from './components/workspace-files-state'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
@@ -134,10 +135,10 @@ export function App(): React.JSX.Element {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [renameProjectId, setRenameProjectId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [utilityPanel, setUtilityPanel] = useState<WorkspacePanel | null>(() => {
+  const [utilityPanel, setUtilityPanel] = useState<SidebarUtilityPanel | null>(() => {
     const saved = localStorage.getItem('conductor.utilityPanel')
-    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog'].includes(saved ?? '')
-      ? saved as WorkspacePanel
+    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules'].includes(saved ?? '')
+      ? saved as SidebarUtilityPanel
       : null
   })
   const [utilitySide, setUtilitySide] = useState<'left' | 'right'>(() =>
@@ -275,6 +276,8 @@ export function App(): React.JSX.Element {
     ? { label: 'Project memory', aria: 'Project memory', icon: Brain }
     : utilityPanel === 'processes'
       ? { label: 'Processes', aria: 'Process dashboard', icon: Gauge }
+      : utilityPanel === 'schedules'
+        ? { label: 'Schedules', aria: 'Smart schedules and run history', icon: Clock3 }
       : utilityPanel === 'routines'
         ? { label: 'Automation', aria: 'Project automation', icon: Workflow }
       : { label: 'Automation', aria: 'Agents, tasks, and routines', icon: Bot }
@@ -1500,6 +1503,8 @@ export function App(): React.JSX.Element {
                         ? <MemoryPane project={activeProject} />
                         : utilityPanel === 'processes'
                           ? <ProcessDashboardPane project={activeProject} />
+                          : utilityPanel === 'schedules'
+                            ? <SchedulesPane projectId={activeProject.id} />
                           : <OrchestrationHub
                               key={utilityPanel}
                               projectId={activeProject.id}

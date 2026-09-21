@@ -354,6 +354,8 @@ export class PhoneAccessServer {
     if (path === '/api/state' && get) return service.phoneState()
     if (path === '/api/metrics' && get) return service.metrics()
     if (path === '/api/tabs/open' && post) return service.openTab(body as never)
+    const projectTasks = path.match(/^\/api\/projects\/([^/]+)\/tasks$/)
+    if (projectTasks && post) return service.createProjectTask(decodeURIComponent(projectTasks[1]!), body as never)
     if (path === '/api/push/subscribe' && post) { service.setSubscription(device.id, body.subscription); return { ok: true } }
     if (path === '/api/push/unsubscribe' && post) { service.setSubscription(device.id, null); return { ok: true } }
     if (path === '/api/push/test' && post) return { ok: true, ...await service.testNotification(device.id) }

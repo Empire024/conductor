@@ -116,7 +116,12 @@ export type AgentEventData =
   | { type: 'steering'; prompts: PendingSteering[] }
   | { type: 'input_delivery'; inputId: string; status: 'accepted' | 'delivered' | 'cancelled' | 'uncertain' }
   | { type: 'queue'; prompt: QueuedPrompt | null; prompts?: QueuedPrompt[] }
-  | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings }
+  /** `limitResumeAt` reports the provider usage window this conversation is waiting on: an ISO
+   * instant while it is closed, explicit null once it reopens. Absent means "unchanged".
+   * `backgroundTasks` counts the provider-tracked work that outlives the turn which started it -
+   * a backgrounded shell process, an armed watcher - so a settled turn can still say it is
+   * waiting rather than finished. Restated on every session event; absent means "unchanged". */
+  | { type: 'session'; phase: SessionPhase; view?: 'visual' | 'cli'; nativeSessionId?: string; message?: string; capabilities?: ProviderCapabilities; title?: string; archived?: boolean; settings?: SessionSettings; limitResumeAt?: string | null; backgroundTasks?: number }
   | { type: 'text'; role: 'user' | 'assistant' | 'status'; text: string; mode: 'delta' | 'snapshot'; attachments?: Omit<ContextAttachment, 'content'>[]; origin?: PromptOrigin }
   /** `detached` is true only for provider-confirmed background work that can outlive its parent
    * turn. It remains a tool/process, not a subagent, but terminal parent phases must not end it. */
@@ -180,6 +185,11 @@ export interface SessionProjection {
   title: string
   archived: boolean
   truncated: boolean
+  /** Set while a provider usage limit has this conversation waiting; the ISO reset instant. */
+  limitResumeAt?: string
+  /** Provider-tracked background work still outstanding for this conversation (a backgrounded
+   *  shell process, an armed watcher). Absent once the inventory is empty. */
+  backgroundTasks?: number
 }
 export interface DiffArtifact {
   id: string
@@ -215,6 +225,19 @@ export interface ConversationSearchGroup {
   hits: ConversationSearchHit[]
 }
 export interface ConversationSearchResult { groups: ConversationSearchGroup[]; truncated: boolean }
+export interface ConversationHistoryEntry {
+  id: string
+  title: string
+  provider: StructuredProvider
+  archived: boolean
+  phase: SessionPhase
+  /** Latest durable event time; projection item timestamps intentionally keep first-seen time. */
+  updatedAt?: string
+  updatedSequence?: number
+  model?: string
+  snippet?: string
+  lastRole?: 'user' | 'assistant' | 'status'
+}
 export interface InteractionResponse {
   sessionId: string
   runtimeId: string
@@ -239,7 +262,7 @@ export interface StructuredAgentBridge {
   discover(id: string): Promise<Json>
   rename(id: string, title: string): Promise<void>
   archive(id: string, archived: boolean): Promise<void>
-  history(projectId: string, query?: string): Promise<Array<{ id: string; title: string; provider: StructuredProvider; archived: boolean; phase: SessionPhase }>>
+  history(projectId: string, query?: string): Promise<ConversationHistoryEntry[]>
   /** Message-level find across every conversation of a workspace, answered from the main
    *  process so no other conversation's projection is ever shipped to the renderer. */
   searchMessages(projectId: string, query: string, excludeId?: string): Promise<ConversationSearchResult>

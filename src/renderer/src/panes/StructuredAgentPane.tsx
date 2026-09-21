@@ -52,6 +52,19 @@ function storedExpansion(id: string): Record<string, boolean> {
 }
 const activePhases = new Set(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 const displayPhase = (phase: string): string => phase === 'waiting_approval' ? 'Waiting for approval' : phase === 'waiting_input' ? 'Waiting for your answer' : phase.replaceAll('_', ' ')
+const historyTime = (timestamp?: string): string => {
+  if (!timestamp) return 'No activity recorded'
+  const time = Date.parse(timestamp)
+  if (!Number.isFinite(time)) return timestamp
+  const seconds = Math.round((time - Date.now()) / 1000)
+  const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
+  if (Math.abs(seconds) < 90) return formatter.format(seconds, 'second')
+  const minutes = Math.round(seconds / 60)
+  if (Math.abs(minutes) < 90) return formatter.format(minutes, 'minute')
+  const hours = Math.round(minutes / 60)
+  if (Math.abs(hours) < 36) return formatter.format(hours, 'hour')
+  return formatter.format(Math.round(hours / 24), 'day')
+}
 type PinnedPrompt = { id: string; text: string; sequence: number; origin?: PromptOrigin }
 
 export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Element {
@@ -243,10 +256,27 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return () => { disposed = true; off(); if (frame) cancelAnimationFrame(frame) }
   }, [activeId, provider])
 
+  // The spec only reaches main when a conversation mounts, so a workspace whose limit-continuation
+  // toggle was flipped afterwards left every open conversation registered with the old answer —
+  // and a conversation that then hit its limit waited for a continuation nobody had armed.
   useEffect(() => {
-    const phase: AgentActivityPhase = projection.phase === 'waiting_approval' || projection.phase === 'waiting_input' ? 'waiting_input' : projection.phase === 'running' || projection.phase === 'starting' || projection.phase === 'interrupting' ? 'working' : projection.phase === 'failed' ? 'failed' : projection.phase === 'disconnected' ? 'disconnected' : projection.phase === 'interrupted' ? 'stopped' : projection.phase === 'completed' ? 'complete' : 'idle'
+    if (!ready || historical || activeId !== props.resourceId) return
+    const current = propsRef.current
+    const spec: AgentSpec = { id: activeId, projectId: current.project.id, sessionId: current.session.id, title: current.title, cwd: current.project.path, provider, model: current.model ?? 'default', effort: current.effort ?? 'auto', continueOnLimit: current.continueOnLimit }
+    void window.conductor.agents.ensure(spec).catch(() => { /* The next mount re-states it; a preference is never worth failing a pane over. */ })
+  }, [activeId, historical, props.continueOnLimit, props.resourceId, provider, ready])
+
+  useEffect(() => {
+    const settled: AgentActivityPhase = projection.phase === 'waiting_approval' || projection.phase === 'waiting_input' ? 'waiting_input' : projection.phase === 'running' || projection.phase === 'starting' || projection.phase === 'interrupting' ? 'working' : projection.phase === 'failed' ? 'failed' : projection.phase === 'disconnected' ? 'disconnected' : projection.phase === 'interrupted' ? 'stopped' : projection.phase === 'completed' ? 'complete' : 'idle'
+    // A turn that ended because the provider's window closed is waiting on a known time, not
+    // broken. Main records that as 'limited'; report the same thing rather than overwriting it.
+    const limited: AgentActivityPhase = projection.limitResumeAt && ['failed', 'complete', 'idle'].includes(settled) ? 'limited' : settled
+    // The runtime's turn can settle while work it backgrounded runs on for hours and wakes it
+    // again when it reports. Main already corrects its own record; this pane is the later writer
+    // of the same phase, so without the same correction it would paint the checkmark back on.
+    const phase: AgentActivityPhase = (projection.backgroundTasks ?? 0) > 0 && ['complete', 'idle'].includes(limited) ? 'waiting_background' : limited
     window.dispatchEvent(new CustomEvent('conductor:agent-activity', { detail: { id: activeId, phase } }))
-  }, [activeId, projection.phase])
+  }, [activeId, projection.phase, projection.limitResumeAt, projection.backgroundTasks])
 
   useLayoutEffect(() => {
     const next = projection.items.filter(isConversationActivity)
@@ -844,7 +874,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {changesOpen && <AgentChangeHistoryView sessionId={activeId} title={projection.title || props.title} busy={activePhases.has(projection.phase)} onOpenFile={onOpenFile} onClose={() => setChangesOpen(false)} />}
     {inspectAttachment && <AgentDialog title={'Context · ' + inspectAttachment.name} onClose={() => setInspectAttachment(null)}><p className="sa-notice">{inspectAttachment.kind === 'image' ? 'This attached image stays available when you switch projects or reopen the conversation.' : inspectAttachment.kind === 'media' ? 'This is opaque media. Conductor sends its verified workspace path, type and size; binary bytes are not presented as readable text.' : 'This content will be submitted with your message. File content is captured when attached.'}</p>{inspectAttachment.kind === 'image' && imagePreviews[inspectAttachment.id] && <img className="sa-context-image" alt={inspectAttachment.name} src={imagePreviews[inspectAttachment.id]} />}{inspectAttachment.kind === 'media' ? <pre className="sa-expanded-output">{JSON.stringify({ path: inspectAttachment.path, mimeType: inspectAttachment.mimeType, size: inspectAttachment.size }, null, 2)}</pre> : inspectAttachment.kind !== 'image' && <pre className="sa-expanded-output">{inspectAttachment.content ?? inspectAttachment.path ?? 'No content'}</pre>}</AgentDialog>}
     {eventsOpen && <AgentDialog title="Event log" onClose={() => setEventsOpen(false)}><p className="sa-notice">Diagnostics only. Showing the latest {rawEvents.length} events.</p><div className="sa-diff-toolbar"><button onClick={() => void copyText(JSON.stringify(rawEvents, null, 2))}>Copy events</button><button onClick={() => void window.conductor.structured.events(activeId).then((events) => setRawEvents(events.slice(-200)))}>Refresh</button></div><div className="sa-event-list">{rawEvents.map((event) => <details key={event.id}><summary>#{event.sequence} · {event.data.type} · {event.native?.method ?? event.itemId ?? event.requestId ?? ''}</summary><pre>{JSON.stringify(event, null, 2)}</pre></details>)}</div></AgentDialog>}
-    {historyOpen && <AgentDialog title="Conversation history" onClose={() => setHistoryOpen(false)}><input className="sa-history-search" aria-label="Search conversation history" placeholder="Search conversations" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} /><p className="sa-history-help">Choose a conversation to preview its messages, then resume when you are ready to continue.</p>{historyLoading && <p className="sa-history-loading" role="status"><LoaderCircle size={13} className="spin" /> Loading conversations...</p>}<div className="sa-history-list" aria-busy={historyLoading}>{historyItems.map((item) => <button key={item.id} title="Preview saved conversation" onClick={() => { if (item.id !== activeId) setReady(false); setActiveId(item.id); setHistorical(item.id !== props.resourceId); setHistoryOpen(false) }}><strong>{item.title || 'Untitled conversation'}</strong><small>{item.provider} · {displayPhase(item.phase)}{item.archived ? ' · archived' : ''}</small></button>)}{!historyLoading && !historyItems.length && <p>No saved conversations match.</p>}</div></AgentDialog>}
+    {historyOpen && <AgentDialog title="Conversation history" onClose={() => setHistoryOpen(false)}><input className="sa-history-search" aria-label="Search conversation history" placeholder="Search conversations" value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} /><p className="sa-history-help">Choose a conversation to preview its messages, then resume when you are ready to continue.</p>{historyLoading && <p className="sa-history-loading" role="status"><LoaderCircle size={13} className="spin" /> Loading conversations...</p>}<div className="sa-history-list" aria-busy={historyLoading}>{historyItems.map((item) => <button key={item.id} title="Preview saved conversation" onClick={() => { if (item.id !== activeId) setReady(false); setActiveId(item.id); setHistorical(item.id !== props.resourceId); setHistoryOpen(false) }}><ProviderIcon provider={item.provider} size={15} /><span className="sa-history-copy"><strong>{item.title || 'Untitled conversation'}</strong><small><span className={`sa-history-phase phase-${item.phase}`}>{displayPhase(item.phase)}</span>{item.model && <> · {item.model}</>}{item.archived ? ' · archived' : ''}</small>{item.snippet && <em>{item.lastRole === 'user' ? 'You: ' : item.lastRole === 'assistant' ? 'Assistant: ' : ''}{item.snippet}</em>}</span><time dateTime={item.updatedAt} title={item.updatedAt ? new Date(item.updatedAt).toLocaleString() : undefined}>{historyTime(item.updatedAt)}</time></button>)}{!historyLoading && !historyItems.length && <p>No saved conversations match.</p>}</div></AgentDialog>}
     {discovery !== undefined && <AgentDialog title={name + ' configuration'} onClose={() => setDiscovery(undefined)}><p className="sa-notice">Read-only details of configured skills, commands and connections. Nothing here runs a command or changes your configuration.</p><div className="sa-event-list">{discovery && typeof discovery === 'object' && !Array.isArray(discovery) ? Object.entries(discovery).map(([category, value]) => <details key={category}><summary>{category.replaceAll('_', ' ')}</summary><pre>{typeof value === 'string' ? value : JSON.stringify(value, null, 2)}</pre></details>) : <pre>{JSON.stringify(discovery, null, 2)}</pre>}</div></AgentDialog>}
     {rename !== null && <AgentDialog title="Rename conversation" onClose={() => setRename(null)}><form className="sa-rename" onSubmit={(event) => { event.preventDefault(); const title = rename.trim(); if (!title) return; void window.conductor.structured.rename(activeId, title).then(() => { setProjection((current) => ({ ...current, title })); return propsRef.current.onConversationChange?.({ ...conversationIdentity(projection, provider), title, manual: true }) }).then(() => setRename(null)).catch((reason: unknown) => setError(String(reason))) }}><input autoFocus aria-label="Conversation title" maxLength={160} value={rename} onChange={(event) => setRename(event.target.value)} /><button type="submit">Save name</button></form></AgentDialog>}
   </section></AgentFileMachineContext.Provider>

@@ -71,14 +71,14 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
   const hasCompleted = tasks.some(task => task.status === 'done')
   const valid = Boolean(options && tasks.length > 0 && tasks.length <= 50 && !hasCompleted && (mode === 'existing'
     ? chosenAgent
-    : workspace && (mode === 'auto'
+    : (mode === 'auto' || workspace) && (mode === 'auto'
       ? options.providers.some(item => item.available && item.models.length > 0)
       : catalog?.available && chosenModel && (!chosenModel.effort?.length || chosenModel.effort.includes(effort)))))
   const submit = async (): Promise<void> => {
     if (!valid || busy || submitted) return
     setBusy(true); setSubmitted(true); setError('')
     const target: ProjectTaskDispatchTarget = mode === 'existing' ? { type: 'existing', agentSessionId: agent }
-      : mode === 'auto' ? { type: 'auto', sessionId: workspace }
+      : mode === 'auto' ? { type: 'auto', ...(workspace ? { sessionId: workspace } : {}) }
         : { type: 'new', sessionId: workspace, provider, model, ...(chosenModel?.effort?.length ? { effort } : {}), ...(permission ? { permission } : {}) }
     try { setDelivered([]); setResult(await onDispatch(target, prompt.trim() || undefined)) }
     catch (reason) { setError(String(reason)) }
@@ -119,8 +119,8 @@ export function ProjectTaskAssignment({ project, tasks, mode, onDispatch, onClos
           </select></label>
           <p className="project-task-assignment-note">The selected tasks go to this conversation together. If it is busy, they wait in its queue.</p>
         </> : <>
-          <label>Workspace<select aria-label="Assignment workspace" value={workspace} disabled={busy || !options.workspaces.length} onChange={event => setWorkspace(event.target.value)}>
-            {!options.workspaces.length && <option value="">No workspace available</option>}
+          <label>Workspace<select aria-label="Assignment workspace" value={workspace} disabled={busy || (mode === 'new' && !options.workspaces.length)} onChange={event => setWorkspace(event.target.value)}>
+            {!options.workspaces.length && <option value="">{mode === 'auto' ? 'Create Automation workspace' : 'No workspace available'}</option>}
             {options.workspaces.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select></label>
           {mode === 'new' ? <>

@@ -13,8 +13,10 @@
  */
 
 import type { AgentActivityPhase, AgentProviderId, RuntimeProcessSummary } from './models'
+import type { ProjectTaskKind, ProjectTaskPriority, ProjectTaskWeight } from './project-backlog'
 import type { PendingInteraction, SessionPhase, StructuredProvider, TimelineItem } from './structured-agent'
 import type { SystemMetricsSnapshot } from './system-metrics'
+import type { WeeklyModelUsageReport } from './weekly-model-usage'
 
 /** Fixed rather than 0 so a phone bookmark and a QR code stay valid across restarts. */
 export const DEFAULT_PHONE_PORT = 51841
@@ -135,6 +137,7 @@ export interface PhoneAccessBridge {
  *   POST /api/sessions/:id/interrupt                                -> { phase }
  *   POST /api/sessions/:id/resume                                   -> { phase }
  *   POST /api/tabs/open                   PhoneOpenTabRequest       -> PhoneOpenTabResult
+ *   POST /api/projects/:id/tasks          PhoneProjectTaskRequest   -> PhoneProjectTaskResult
  *   GET  /api/metrics                                               -> PhoneMetrics
  *   POST /api/push/subscribe              { subscription }          -> { ok: true }
  *   POST /api/push/unsubscribe                                      -> { ok: true }
@@ -189,6 +192,8 @@ export interface PhoneSessionSummary {
   backgroundTasks?: number
   queued: number
   archived: boolean
+  /** Present when this conversation was opened and is controlled by another visible agent. */
+  controllerId?: string
   usage?: { totalTokens?: number; costUsd?: number; estimated: boolean }
 }
 
@@ -210,6 +215,9 @@ export interface PhoneState {
   providers: Array<{ id: StructuredProvider; displayName: string; available: boolean; models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }> }>
   sessions: PhoneSessionSummary[]
   usage: PhoneUsageWindow[]
+  /** Durable provider token reports from the rolling last seven days, grouped by exact model. */
+  weeklyUsage: WeeklyModelUsageReport
+  projectTaskMaxLength: number
   counts: { attention: number; working: number }
 }
 
@@ -248,6 +256,22 @@ export interface PhoneOpenTabResult {
   tabId: string
   machineId: string
   machineName: string
+}
+
+export interface PhoneProjectTaskRequest {
+  title: string
+  kind: ProjectTaskKind
+  priority?: ProjectTaskPriority
+  weight?: ProjectTaskWeight
+}
+
+export interface PhoneProjectTaskResult {
+  id: string
+  projectId: string
+  title: string
+  kind: ProjectTaskKind
+  priority: ProjectTaskPriority
+  weight: ProjectTaskWeight
 }
 
 export interface PhoneRuntimeProcess extends RuntimeProcessSummary {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
+import { createHash } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -82,6 +83,45 @@ describe('local agent loop', () => {
     expect(requests).toBe(2)
     expect(reviewed[0]).toContain(raw)
     expect(reviewed[0]!.length).toBeGreaterThan(32000)
+  })
+
+  it('keeps every result from a large parallel read group in the next request', async () => {
+    const root = workspace()
+    const paths = Array.from({ length: 5 }, (_value, index) => `large-${index}.txt`)
+    for (const [index, path] of paths.entries()) writeFileSync(join(root, path), `FILE_${index}\n${String(index).repeat(24_000)}\nEND_${index}`)
+    let requests = 0
+    let secondOutbound: Array<{ role: string; toolCallId?: string; chars: number; digest: string }> = []
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', chunk => { body += chunk })
+      request.on('end', () => {
+        requests++
+        const sent = JSON.parse(body) as { messages: Array<{ role: string; content: string; tool_call_id?: string }> }
+        if (requests === 2) secondOutbound = sent.messages.map(message => ({
+          role: message.role,
+          ...(message.tool_call_id ? { toolCallId: message.tool_call_id } : {}),
+          chars: message.content.length,
+          digest: createHash('sha256').update(message.content).digest('hex').slice(0, 12)
+        }))
+        const results = sent.messages.filter(message => message.role === 'tool')
+        const complete = paths.every((_path, index) => results.some(result => result.tool_call_id === `read-${index}` && result.content.includes(`FILE_${index}`)))
+        const reply = requests === 1
+          ? frame({ tool_calls: paths.map((path, index) => ({ index, id: `read-${index}`, function: { name: 'read_file', arguments: JSON.stringify({ path }) } })) }, 'tool_calls')
+          : frame({ content: complete ? 'ALL_RESULTS_REACHED_MODEL' : 'RESULTS_DROPPED' }, 'stop')
+        response.writeHead(200, { 'Content-Type': 'text/event-stream' }).end(`data: ${reply}\n\ndata: [DONE]\n\n`)
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    cleanup.push(() => server.close())
+    const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+    const session = new LocalAgentSession({ endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: root, sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768, maxIterations: 2 })
+
+    expect(await session.run('Read all five files once, then report completion', {})).toEqual({ text: 'ALL_RESULTS_REACHED_MODEL', stopReason: 'complete' })
+    expect(requests).toBe(2)
+    expect(secondOutbound.map(message => message.role)).toEqual(['system', 'user', 'assistant', 'tool', 'tool', 'tool', 'tool', 'tool'])
+    expect(secondOutbound.filter(message => message.role === 'tool').map(message => message.toolCallId)).toEqual(paths.map((_path, index) => `read-${index}`))
+    expect(new Set(secondOutbound.filter(message => message.role === 'tool').map(message => message.digest)).size).toBe(5)
+    expect(secondOutbound.filter(message => message.role === 'tool').every(message => message.chars > 1_000 && message.chars < 20_000)).toBe(true)
   })
 
   it('reports read ranges and validates positive line offsets without changing schema order', async () => {

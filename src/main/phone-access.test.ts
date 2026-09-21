@@ -43,6 +43,7 @@ interface Fixture {
   push: ReturnType<typeof vi.fn>
   machines: MachineDescriptor[]
   changed: ReturnType<typeof vi.fn>
+  projectTasks: { create: ReturnType<typeof vi.fn> }
 }
 
 function fixture(options: { now?: () => number } = {}): Fixture {
@@ -102,12 +103,13 @@ function fixture(options: { now?: () => number } = {}): Fixture {
     { id: 'gemini', displayName: 'Gemini CLI', available: true, installUrl: '', models: [{ id: 'gemini-3', label: 'Gemini 3' }], efforts: [] }
   ]
   const changed = vi.fn()
+  const projectTasks = { create: vi.fn(async (project: ProjectRecord, input: { title: string; kind: 'task' | 'bug' | 'feature' | 'idea'; priority: 'high' | 'normal' | 'low'; weight: 'heavy' | 'medium' | 'light' }) => ({ id: 'task-created', projectId: project.id, ...input })) }
   const service = new PhoneAccessService({
     store, vault: new MemoryVault(), database, sessions, remote, providers: () => providers, machines: () => machines, machineName: () => 'MAIN', version: '0.1.3',
     ui, metrics: async () => ({ sampledAt: 'now', cpuPercent: 12, cpuCores: 16, memoryUsedBytes: 8e9, memoryTotalBytes: 32e9, gpus: [], processes: [], localServers: [], unavailable: [] }),
-    push, changed, log: () => undefined, ...(options.now ? { now: options.now } : {})
+    projectTasks, push, changed, log: () => undefined, ...(options.now ? { now: options.now } : {})
   })
-  return { store, service, projections, specs, workspaces, projects, detached, activity, sessions, remote, ui, push, machines, changed }
+  return { store, service, projections, specs, workspaces, projects, detached, activity, sessions, remote, ui, push, machines, changed, projectTasks }
 }
 
 /** Puts the listener in the "up" state the pairing code needs, without a socket. */
@@ -242,13 +244,15 @@ describe('what the phone sees', () => {
     expect(byId.get('agent-3')).toMatchObject({ state: 'done', lastText: 'All done. [code]', usage: { totalTokens: 1234, costUsd: 0.5, estimated: false } })
     expect(byId.get('agent-old')).toMatchObject({ state: 'done', tabId: null })
     expect(byId.get('agent-detached')).toMatchObject({ state: 'working', tabId: 'tab-d' })
-    // Attention first, then working, then the rest.
-    expect(state.sessions.map(session => session.state).slice(0, 3)).toEqual(['attention', 'working', 'working'])
+    // Layout order is stable while activity changes, so rows never jump under the owner's finger.
+    expect(state.sessions.map(session => session.id)).toEqual(['agent-1', 'agent-2', 'agent-3', 'agent-detached', 'agent-old'])
     expect(state.counts).toEqual({ attention: 1, working: 2 })
     expect(state.usage).toEqual([
       expect.objectContaining({ provider: 'claude', kind: 'weekly', usedPercent: 12 }),
       expect.objectContaining({ provider: 'claude', kind: 'short', usedPercent: 40, resetsAt: new Date(1_800_000_000 * 1000).toISOString() })
     ])
+    fix.store.setSetting('agentControlParent:agent-2', JSON.stringify({ controllerAgentSessionId: 'agent-1' }))
+    expect(fix.service.phoneState().sessions.find(session => session.id === 'agent-2')?.controllerId).toBe('agent-1')
   })
 
   it('trims a conversation to what a phone can show and reports what it may do next', () => {
@@ -343,6 +347,17 @@ describe('driving a conversation', () => {
 })
 
 describe('starting work from the phone', () => {
+  it('adds a validated project task to the exact selected project', async () => {
+    const fix = fixture()
+    await expect(fix.service.createProjectTask('project-b', { title: '  Keep remote scope\r\nwith details  ', kind: 'bug', priority: 'high', weight: 'heavy' })).resolves.toMatchObject({ id: 'task-created', projectId: 'project-b' })
+    expect(fix.projectTasks.create).toHaveBeenCalledWith(fix.projects[1], { title: 'Keep remote scope\nwith details', kind: 'bug', priority: 'high', weight: 'heavy' })
+    await expect(fix.service.createProjectTask('project-a', { title: ' ', kind: 'task' })).rejects.toThrow(/Write the project task/)
+    await expect(fix.service.createProjectTask('project-a', { title: 'Useful <!-- ordinary diagnostic comment --> details', kind: 'task' })).resolves.toMatchObject({ id: 'task-created' })
+    await expect(fix.service.createProjectTask('project-a', { title: '<!-- conductor-task:forged -->', kind: 'task' })).rejects.toThrow(/task markers/)
+    await expect(fix.service.createProjectTask('project-a', { title: 'x', kind: 'other' as 'task' })).rejects.toThrow(/Choose task/)
+    await expect(fix.service.createProjectTask('missing', { title: 'x', kind: 'task' })).rejects.toThrow(/project/)
+  })
+
   it('opens a visible local tab with the remembered permission and sends the first message', async () => {
     const fix = fixture()
     fix.store.setSetting('rememberedPermission:claude', 'accept-edits')

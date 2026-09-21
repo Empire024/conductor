@@ -28,11 +28,21 @@ describe('tab activity indicator', () => {
   })
 
   it('keeps the shared ring for the phases of a run still in progress', () => {
-    for (const phase of ['working', 'complete', 'limited'] as const) expect(render(phase)).toContain('viewBox="0 0 18 18"')
+    for (const phase of ['working', 'waiting_background', 'complete', 'limited'] as const) expect(render(phase)).toContain('viewBox="0 0 18 18"')
+  })
+
+  /** The checkmark is reserved for a conversation with nothing left running. A turn that settled
+   *  while a render it backgrounded carries on is neither finished nor streaming, so it says so
+   *  in its own words rather than borrowing either one's. */
+  it('separates waiting on background work from both working and finished', () => {
+    const markup = render('waiting_background')
+    expect(markup).toContain('tab-activity waiting_background')
+    expect(markup).toContain(ACTIVITY_LABEL.waiting_background)
+    expect(new Set([ACTIVITY_LABEL.waiting_background, ACTIVITY_LABEL.working, ACTIVITY_LABEL.complete]).size).toBe(3)
   })
 
   it('describes every phase', () => {
-    const phases: AgentActivityPhase[] = ['idle', 'working', 'waiting_input', 'limited', 'complete', 'stopped', 'disconnected', 'failed']
+    const phases: AgentActivityPhase[] = ['idle', 'working', 'waiting_background', 'waiting_input', 'limited', 'complete', 'stopped', 'disconnected', 'failed']
     for (const phase of phases) expect(ACTIVITY_LABEL[phase]).toBeTruthy()
   })
 

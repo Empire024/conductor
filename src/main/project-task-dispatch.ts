@@ -3,22 +3,25 @@ import { makeId, type AgentProviderInfo, type AgentSpec, type PaneTab } from '..
 import type { AgentControl, } from './agent-control'
 import type { AgentControlScope, AgentControlUiRequest } from '../shared/agent-control'
 import type { ProjectTask, ProjectTaskDispatchAssignment, ProjectTaskDispatchOptions, ProjectTaskDispatchRequest, ProjectTaskDispatchResult } from '../shared/project-backlog'
-import type { SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import { MAX_PROMPT_CHARS, type SessionSettings, type StructuredProvider } from '../shared/structured-agent'
 import { AUTO_FIXER_INSTRUCTIONS } from '../shared/orchestration'
 import { resolveEffortChoice } from '../shared/model-effort'
 import { normalizeUsageWindows, usageWindowAppliesToModel, type UsageWindow } from '../shared/usage-accounting'
 import type { ConductorDatabase } from './database'
 import type { ProjectBacklogs } from './project-backlog'
 import type { StructuredSessions } from './structured-sessions'
+import { AllowanceProbe } from './allowance-probe'
+import { capabilityRank, coordinatorEffort } from '../shared/model-routing'
 
 type Dependencies = {
   database:ConductorDatabase
   backlogs:ProjectBacklogs
-  sessions:Pick<StructuredSessions,'ensure'|'connectSession'|'refreshUsage'|'submit'|'steerAccepted'>
+  sessions:Pick<StructuredSessions,'ensure'|'connectSession'|'refreshUsage'|'submit'|'steerAccepted'|'killWhere'>
   control:Pick<AgentControl,'tabs'>
   providers():AgentProviderInfo[]
   ui(request:AgentControlUiRequest):Promise<unknown>
   changed(projectId:string):void
+  workspaceCreated?(session:ReturnType<ConductorDatabase['createSession']>):void
 }
 const active = new Set(['starting','running','waiting_input','waiting_approval'])
 const AUTO_FIXER_MIN_REMAINING_PERCENT = 5
@@ -71,7 +74,8 @@ export const projectTaskPrompt = (tasks:ProjectTask[],fixer=false,extra?:string)
 /** Owner-triggered dispatch. Uses the same visible tabs and native session manager as app control. */
 export class ProjectTaskDispatcher {
   private dispatching=new Set<string>()
-  constructor(private deps:Dependencies){}
+  private allowanceProbe:AllowanceProbe
+  constructor(private deps:Dependencies){this.allowanceProbe=new AllowanceProbe(deps.sessions)}
   options(projectId:string):ProjectTaskDispatchOptions {
     const {database,control}=this.deps
     if(!validId(projectId) || !database.getProject(projectId))throw new Error('Project not found')
@@ -104,16 +108,28 @@ export class ProjectTaskDispatcher {
     const tasks=request.taskIds.map(id=> {const task=board.tasks.find(task=>task.id===id);if(!task)throw new Error('A selected task no longer exists');if(task.status==='done')throw new Error('Reopen completed tasks before assigning them');return task})
     const target=request.target
     if(!target||!['existing','new','auto'].includes(target.type))throw new Error('Choose an assignment destination')
+    if(target.type==='auto'&&target.sessionId!==undefined&&(!validId(target.sessionId)||!options.workspaces.some(workspace=>workspace.id===target.sessionId)))throw new Error('Choose an open workspace in this project')
+    let scratchWorkspaceId:string|undefined
     if(target.type==='auto') {
       // Connecting an already visible runtime performs only its native handshake/account reads;
       // it neither starts nor steers a model turn. Refresh failures leave evidence unknown.
       const refreshTargets=new Map<'codex'|'claude',string>()
       for(const item of options.targets)if(!['disconnected','failed'].includes(item.phase)&&!refreshTargets.has(item.provider))refreshTargets.set(item.provider,item.agentSessionId)
       await Promise.allSettled([...refreshTargets.values()].map(id=>sessions.refreshUsage(id)))
+      if(!refreshTargets.has('codex')) {
+        const codex=options.providers.find(provider=>provider.provider==='codex'&&provider.available&&provider.models.length)
+        const project=database.getProject(projectId)!
+        let probeWorkspace=options.workspaces[0]?.id??database.listClosedSessions().find(session=>session.projectId===projectId)?.id
+        if(codex&&!probeWorkspace) {
+          const scratch=database.createSession(projectId,'Automation bootstrap')
+          scratchWorkspaceId=scratch.id;probeWorkspace=scratch.id
+        }
+        if(codex&&probeWorkspace) try {await this.allowanceProbe.codex({projectId,workspaceId:probeWorkspace,cwd:project.path,model:codex.models[0]!.id})} catch { /* unknown evidence remains a safe refusal */ }
+      }
       options=this.options(projectId)
     }
     const prompt=projectTaskPrompt(tasks,target.type==='auto',request.prompt)
-    if(prompt.length>50_000)throw new Error('These task descriptions are too large for one assignment. Select fewer tasks.')
+    if(prompt.length>MAX_PROMPT_CHARS)throw new Error('The combined assignment is too large for one native prompt. Select fewer tasks.')
     let assignment:ProjectTaskDispatchAssignment
     if(target.type==='existing') {
       const existing=options.targets.find(item=>item.agentSessionId===target.agentSessionId)
@@ -123,25 +139,42 @@ export class ProjectTaskDispatcher {
       if(state.phase==='disconnected'||state.phase==='failed')throw new Error('Resume the selected conversation explicitly before assigning tasks; its previous execution may be uncertain')
       assignment={...existing,taskIds:request.taskIds,model:state.settings.model??'',effort:state.settings.effort,status:'failed'}
     }else {
-      if(!validId(target.sessionId)||!options.workspaces.some(workspace=>workspace.id===target.sessionId))throw new Error('Choose an open workspace in this project')
-      const selected=target.type==='new'?undefined:this.autoTarget(options)
+      let selected:ReturnType<ProjectTaskDispatcher['autoTarget']>|undefined
+      try {selected=target.type==='new'?undefined:this.autoTarget(options)}
+      catch(error) {if(scratchWorkspaceId)database.deleteSession(scratchWorkspaceId);throw error}
       const catalog=target.type==='new'?options.providers.find(provider=>provider.provider===target.provider&&provider.available):selected?.catalog
       if(!catalog)throw new Error('No supported native provider is available')
       const model=target.type==='new'?catalog.models.find(model=>model.id===target.model):selected?.model
       if(!model)throw new Error('Choose a model from the available provider catalog')
-      const effort=target.type==='new'?target.effort:resolveEffortChoice(model.effort??[],model.defaultEffort)
+      const effort=target.type==='new'?target.effort:coordinatorEffort(model.effort,resolveEffortChoice(model.effort??[],model.defaultEffort))
       if(effort!==undefined&&(!validId(effort)||!model.effort?.includes(effort)))throw new Error('Choose an effort supported by the selected model')
       const permission=target.type==='new'?target.permission:undefined
       if(permission!==undefined&&(!validId(permission)||!catalog.permissions.includes(permission)))throw new Error('Choose a permission mode supported by the selected model')
+      let sessionId=target.sessionId
+      if(target.type==='auto'&&!sessionId) {
+        if(scratchWorkspaceId) {
+          database.renameSession(scratchWorkspaceId,'Automation')
+          sessionId=scratchWorkspaceId
+          this.deps.workspaceCreated?.(database.getSession(scratchWorkspaceId)!)
+          scratchWorkspaceId=undefined
+        }else if(options.workspaces[0])sessionId=options.workspaces[0].id
+        else {
+          const created=database.createSession(projectId,'Automation')
+          this.deps.workspaceCreated?.(created)
+          options=this.options(projectId)
+          sessionId=created.id
+        }
+      }
+      if(!validId(sessionId)||!options.workspaces.some(workspace=>workspace.id===sessionId))throw new Error('Choose an open workspace in this project')
       const tab:PaneTab={id:makeId('tab'),kind:'agent',resourceId:makeId('agent'),title:target.type==='auto'?'Project tasks Fixer':tasks.length===1?tasks[0]!.title.replace(/\s+/g,' ').slice(0,100):`${tasks.length} project tasks`,state:{provider:catalog.provider,model:model.id,effort:effort??'auto',...(permission?{permission}:{}),viewMode:'visual'}}
-      const spec:AgentSpec={id:tab.resourceId!,projectId,sessionId:target.sessionId,provider:catalog.provider,model:model.id,title:tab.title,cwd:database.getProject(projectId)!.path}
+      const spec:AgentSpec={id:tab.resourceId!,projectId,sessionId,provider:catalog.provider,model:model.id,title:tab.title,cwd:database.getProject(projectId)!.path}
       const ensured=sessions.ensure(spec)
       if(!ensured.available)throw new Error(ensured.message||'Provider unavailable')
       database.structured.update(spec.id,{settings:{...database.structured.snapshot(spec.id)!.settings,model:model.id,effort,...(permission?{permission:permission as SessionSettings['permission']}:{})}})
-      const scope:AgentControlScope={projectId,sessionId:target.sessionId,agentSessionId:''}
+      const scope:AgentControlScope={projectId,sessionId,agentSessionId:''}
       await this.deps.ui({...scope,id:randomUUID(),action:'tabs.open',params:{tab,focus:false}})
       if(!this.deps.control.tabs(scope).some(current=>current.id===tab.id&&current.resourceId===spec.id))throw new Error('The new native tab was not acknowledged. Inspect the workspace before retrying.')
-      assignment={taskIds:request.taskIds,agentSessionId:spec.id,tabId:tab.id,sessionId:target.sessionId,provider:catalog.provider,model:model.id,effort,...(permission?{permission}:{}),status:'failed'}
+      assignment={taskIds:request.taskIds,agentSessionId:spec.id,tabId:tab.id,sessionId,provider:catalog.provider,model:model.id,effort,...(permission?{permission}:{}),status:'failed'}
     }
     try {
       let state=database.structured.snapshot(assignment.agentSessionId)!
@@ -174,16 +207,15 @@ export class ProjectTaskDispatcher {
 
   private autoTarget(options:ProjectTaskDispatchOptions):{catalog:ProjectTaskDispatchOptions['providers'][number];model:ProjectTaskDispatchOptions['providers'][number]['models'][number]} {
     const evidence=new Map<'codex'|'claude',Map<string,ObservedUsageWindow>>()
-    for(const project of this.deps.database.listProjects())for(const entry of this.deps.database.structured.history(project.id)) {
-      const spec=this.deps.database.structured.spec<AgentSpec>(entry.id)
-      if(!spec||!['codex','claude'].includes(spec.provider))continue
-      const provider=spec.provider as 'codex'|'claude'
+    for(const conversation of this.deps.database.structured.usageJournal()) {
+      if(!['codex','claude'].includes(conversation.provider))continue
+      const provider=conversation.provider as 'codex'|'claude'
       const reported=evidence.get(provider)??new Map<string,ObservedUsageWindow>()
       // Timeline item timestamps intentionally remain the item's first-seen time. Quota
       // routing instead reads the durable event journal, where every update has its own
       // timestamp and sequence. This also keeps a stale model bucket visible beside a newer
       // sparse provider-wide update rather than losing it to item reconciliation.
-      for(const event of this.deps.database.structured.events(entry.id)) {
+      for(const event of conversation.events) {
         if(event.parentId||event.data.type!=='usage'||!event.data.limits)continue
         for(const window of normalizeUsageWindows(event.data.limits)) {
           const observed={...window,observedAt:event.timestamp}
@@ -195,9 +227,11 @@ export class ProjectTaskDispatcher {
     }
     const candidates=options.providers.filter(catalog=>catalog.available).flatMap(catalog=>catalog.models.map(model=>({catalog,model,allowance:autoFixerAllowance([...(evidence.get(catalog.provider)?.values()??[])],model)})))
     const usable=candidates.filter(candidate=>candidate.allowance.status==='usable').sort((a,b)=>
-      (b.allowance.remainingPercent??0)-(a.allowance.remainingPercent??0)
+      capabilityRank(b.catalog.provider,b.model.id)-capabilityRank(a.catalog.provider,a.model.id)
+      || Number(/fable/i.test(a.model.id))-Number(/fable/i.test(b.model.id))
+      || (b.allowance.remainingPercent??0)-(a.allowance.remainingPercent??0)
       || Number(b.catalog.source==='runtime')-Number(a.catalog.source==='runtime')
-      || Number(a.model.isDefault)-Number(b.model.isDefault))
+      || Number(Boolean(b.model.isDefault))-Number(Boolean(a.model.isDefault)))
     if(usable[0])return usable[0]
     if(!candidates.length)throw new Error('No supported native provider is available')
     if(candidates.every(candidate=>candidate.allowance.status==='exhausted'))throw new Error('Every supported Auto Fixer provider/model has exhausted its reported allowance.')

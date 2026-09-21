@@ -64,6 +64,19 @@ describe('durable agent projection — synthetic events', () => {
     expect(state.items.find(item => item.nativeItemId === 'background')?.data).toMatchObject({ type: 'tool', detached: true, status: 'completed', output: 'done' })
     expect(state.items.find(item => item.nativeItemId === 'foreground')?.data).toMatchObject({ type: 'tool', status: 'interrupted' })
   })
+  it('carries the background-task count forward until a lifecycle event reports it drained', () => {
+    const waiting = replayAgentEvents('session', [
+      event(1, { type: 'session', phase: 'running', backgroundTasks: 0 }),
+      event(2, { type: 'session', phase: 'completed', backgroundTasks: 2 }),
+      // An ordinary lifecycle event that does not restate the count must not erase it.
+      event(3, { type: 'session', phase: 'idle' })
+    ])
+    expect(waiting.backgroundTasks).toBe(2)
+    expect(replayAgentEvents('session', [
+      event(1, { type: 'session', phase: 'completed', backgroundTasks: 2 }),
+      event(2, { type: 'session', phase: 'completed', backgroundTasks: 0 })
+    ]).backgroundTasks).toBe(0)
+  })
   it('bounds large synthetic histories and previews while preserving real counts and statuses', () => {
     let state = emptyProjection('session')
     for (let i = 1; i <= MAX_TIMELINE_ITEMS + 100; i++) state = projectAgentEvent(state, event(i, { type: 'notice', message: `Synthetic ${i}` }))

@@ -193,16 +193,19 @@ export class ConductorDatabase {
   }
 
   private validateWorkspaceDocuments(documents: WorkspaceDocumentState[]): WorkspaceDocumentState[] {
-    for (const state of documents) {
+    return documents.filter(state => {
       const projectId = state.workspaceId.startsWith('project:')
         ? this.getProject(state.workspaceId.slice('project:'.length))?.id
         : state.workspaceId.startsWith('detached:')
           ? this.getDetachedWindow(state.workspaceId.slice('detached:'.length))?.projectId
           : this.getSession(state.workspaceId)?.projectId
-      if (!projectId) throw new Error('Invalid workspace document owner')
+      // File-tab localStorage outlives deleted projects and detached windows. A stale
+      // owner must not cancel the checkpoint for every still-open workspace. Keep
+      // placement validation strict for owners that do exist; drafts live separately.
+      if (!projectId) return false
       if (state.files.some(file => file.projectId !== projectId)) throw new Error('Invalid workspace document project')
-    }
-    return documents
+      return true
+    })
   }
 
   importedSessionMachine(id: string): string | null { return this.getSetting('sessionArchiveImported:' + id) }
@@ -1223,6 +1226,13 @@ export class ConductorDatabase {
         now()
       )
     return this.getAgentTranscript(spec.id)
+  }
+
+  /** Narrower than `upsertAgent` on purpose: the owner flips this toggle on a live conversation,
+   *  and rewriting the whole row for it would overwrite the status its runtime is reporting. */
+  setAgentContinueOnLimit(id: string, continueOnLimit: boolean): void {
+    this.db.prepare('UPDATE agent_sessions SET continue_on_limit = ?, updated_at = ? WHERE id = ?')
+      .run(continueOnLimit ? 1 : 0, now(), id)
   }
 
   setAgentStatus(id: string, status: string, activityPhase?: string): void {

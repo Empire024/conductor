@@ -45,6 +45,11 @@ export function projectAgentEvent(state: SessionProjection, event: AgentEvent): 
     next.title = event.data.title ?? next.title
     next.archived = event.data.archived ?? next.archived
     next.settings = event.data.settings ?? next.settings
+    // Explicit null is the "window reopened" signal, so absent and null differ here.
+    if (event.data.limitResumeAt !== undefined) next.limitResumeAt = event.data.limitResumeAt ?? undefined
+    // Zero is the "the last background task drained" signal; absent leaves the count alone so a
+    // provider that never reports one cannot erase another's.
+    if (event.data.backgroundTasks !== undefined) next.backgroundTasks = event.data.backgroundTasks
     if (['failed', 'disconnected', 'interrupted', 'completed'].includes(next.phase)) {
       next.items = state.items.map(item => {
         if (item.data.type === 'interaction' && item.data.interaction.status === 'pending') return { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' as const } } }

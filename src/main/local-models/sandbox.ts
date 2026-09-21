@@ -109,12 +109,75 @@ function runDocker(args: string[], timeoutMs: number, maxBytes: number): Promise
   })
 }
 
-export async function dockerAvailable(): Promise<{ available: boolean; version?: string; reason?: string }> {
+export interface DockerAvailability { available: boolean; version?: string; reason?: string; kind?: 'cli-missing' | 'engine-stopped' }
+
+export async function dockerAvailable(): Promise<DockerAvailability> {
   const outcome = await runDocker(['version', '--format', '{{.Server.Version}}'], 20_000, 64 * 1024)
-  if (outcome.spawnError) return { available: false, reason: 'Docker unavailable: the docker CLI was not found. Install Docker Desktop (Linux containers).' }
-  if (outcome.code !== 0) return { available: false, reason: 'Docker unavailable: the Docker engine is not responding. Start Docker Desktop.' }
+  if (outcome.spawnError) return { available: false, kind: 'cli-missing', reason: 'Docker unavailable: the docker CLI was not found. Install Docker Desktop (Linux containers).' }
+  if (outcome.code !== 0) return { available: false, kind: 'engine-stopped', reason: 'Docker unavailable: the Docker engine is not responding. Start Docker Desktop.' }
   return { available: true, version: outcome.stdout.trim() }
 }
+
+/** Known per-machine installs. Merely finding one does not start it; this list is consulted only
+ * when an edit-capable local turn actually attempts its first sandbox command. */
+export function dockerDesktopCandidates(environment: NodeJS.ProcessEnv = process.env): string[] {
+  const candidates = [
+    environment.CONDUCTOR_DOCKER_DESKTOP_PATH,
+    environment.ProgramFiles ? join(environment.ProgramFiles, 'Docker', 'Docker', 'Docker Desktop.exe') : undefined,
+    environment.LOCALAPPDATA ? join(environment.LOCALAPPDATA, 'Docker', 'Docker Desktop.exe') : undefined
+  ]
+  return [...new Set(candidates.filter((candidate): candidate is string => Boolean(candidate?.trim())).map(candidate => candidate.trim()))]
+}
+
+export interface DockerStartupDependencies {
+  platform: NodeJS.Platform
+  check(): Promise<DockerAvailability>
+  exists(path: string): boolean
+  launch(path: string): Promise<boolean>
+  wait(ms: number): Promise<void>
+  candidates(): string[]
+}
+
+const defaultDockerStartup: DockerStartupDependencies = {
+  platform: process.platform,
+  check: dockerAvailable,
+  exists: existsSync,
+  launch: path => new Promise(resolvePromise => {
+    const child = spawn(path, ['--minimized'], { shell: false, windowsHide: true, detached: true, stdio: 'ignore' })
+    let settled = false
+    const finish = (value: boolean): void => { if (settled) return; settled = true; resolvePromise(value) }
+    child.once('error', () => finish(false))
+    child.once('spawn', () => { child.unref(); finish(true) })
+  }),
+  wait: ms => new Promise(resolvePromise => setTimeout(resolvePromise, ms)),
+  candidates: dockerDesktopCandidates
+}
+
+let dockerDesktopStartup: Promise<DockerAvailability> | undefined
+
+/** Start an installed Docker Desktop once and wait for its engine. Concurrent sandboxes share
+ * this promise. Missing software remains an actionable setup refusal; nothing is installed. */
+export async function ensureDockerAvailable(options: { timeoutMs?: number; pollMs?: number } = {}, dependencies: DockerStartupDependencies = defaultDockerStartup): Promise<DockerAvailability> {
+  const initial = await dependencies.check()
+  if (initial.available || initial.kind === 'cli-missing' || dependencies.platform !== 'win32') return initial
+  if (!dockerDesktopStartup) {
+    dockerDesktopStartup = (async (): Promise<DockerAvailability> => {
+      const executable = dependencies.candidates().find(candidate => dependencies.exists(candidate))
+      if (!executable) return initial
+      if (!await dependencies.launch(executable)) return { available: false, kind: 'engine-stopped', reason: 'Docker unavailable: Docker Desktop is installed but could not be started.' }
+      const deadline = Date.now() + (options.timeoutMs ?? 120_000)
+      while (Date.now() < deadline) {
+        await dependencies.wait(options.pollMs ?? 2_000)
+        const state = await dependencies.check()
+        if (state.available) return state
+      }
+      return { available: false, kind: 'engine-stopped', reason: 'Docker Desktop started but its engine did not become ready within 2 minutes.' }
+    })().finally(() => { dockerDesktopStartup = undefined })
+  }
+  return dockerDesktopStartup!
+}
+
+export function resetDockerDesktopStartupForTests(): void { dockerDesktopStartup = undefined }
 
 export async function sandboxImageExists(image: string): Promise<boolean> {
   if (!IMAGE.test(image)) throw new SandboxUnavailableError('Invalid sandbox image reference')
@@ -527,7 +590,7 @@ export class DockerSandbox {
   }
 
   private async launch(): Promise<void> {
-    const docker = await dockerAvailable()
+    const docker = await ensureDockerAvailable()
     if (!docker.available) throw new SandboxUnavailableError(docker.reason ?? 'Docker unavailable')
     if (!await sandboxImageExists(this.sandbox.image)) throw new SandboxUnavailableError(`Sandbox image missing: build ${this.sandbox.image} with scripts/local-models/setup.ps1`)
     const planned = await this.plannedMasks()

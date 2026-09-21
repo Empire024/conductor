@@ -1,0 +1,8 @@
+.coworker-tab-group { display: flex; align-items: stretch; min-width: 0; }
+.coworker-tab-group.collapsed { flex: 0 0 auto; border-radius: 5px; background: color-mix(in srgb, var(--blue) 7%, transparent); }
+.coworker-tab-group.collapsed .pane-tab { max-width: 150px; }
+.coworker-tab-group.collapsed .pane-tab.active { max-width: 175px; }
+.coworker-tab-toggle { flex: 0 0 auto; min-width: 27px; padding: 0 4px; display: inline-flex; align-items: center; justify-content: center; gap: 1px; border: 0; border-right: 1px solid var(--border-soft); background: transparent; color: var(--text-2); font-size: 9px; cursor: pointer; }
+.coworker-tab-toggle:hover, .coworker-tab-toggle:focus-visible { color: var(--text); background: var(--surface-hover); }
+.coworker-tab-toggle:focus-visible { outline: 1px solid var(--accent); outline-offset: -2px; }
+.coworker-tab-group.has-active-coworker.collapsed .coworker-tab-toggle { color: var(--blue); }

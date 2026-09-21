@@ -83,8 +83,8 @@ interface SidebarProps {
   onProjectRenamed?(project: ProjectRecord): void
   onPathChanged?(previousPath: string, nextPath: string, kind: FileEntry['kind'], projectId?: string): void
   onPathRemoved?(relativePath: string, kind: FileEntry['kind'], projectId?: string): void
-  utilityPanel: WorkspacePanel | null
-  onUtilityPanel(panel: WorkspacePanel | null): void
+  utilityPanel: SidebarUtilityPanel | null
+  onUtilityPanel(panel: SidebarUtilityPanel | null): void
   attentionIds: ReadonlySet<string>
   sessionActivity: ReadonlyMap<string, SessionActivityStatus>
   activityPhases: ReadonlyMap<string, AgentActivityPhase>
@@ -92,9 +92,10 @@ interface SidebarProps {
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
+export type SidebarUtilityPanel = WorkspacePanel | 'schedules'
 
 // "Workspace" and "Explorer" are the primary destinations. The rest are real, working
-// panels too, except Source control and Schedules, which have no kind/sidebar/utility
+// panels too, except Source control, which has no kind/sidebar/utility
 // wired up yet - clicking them does nothing today, so they're pinned to the bottom and
 // rendered disabled rather than opening a dead button.
 const railItems: Array<{
@@ -102,7 +103,7 @@ const railItems: Array<{
   label: string
   kind?: PaneKind
   sidebar?: WorkspaceSidebarMode
-  utility?: WorkspacePanel
+  utility?: SidebarUtilityPanel
   group: 'primary' | 'secondary'
   unfinished?: boolean
 }> = [
@@ -114,7 +115,7 @@ const railItems: Array<{
   { icon: MemoryStick, label: 'Memory', utility: 'memory', group: 'secondary' },
   { icon: Gauge, label: 'Processes', utility: 'processes', group: 'secondary' },
   { icon: GitBranch, label: 'Source control', group: 'secondary', unfinished: true },
-  { icon: Clock3, label: 'Schedules', group: 'secondary', unfinished: true }
+  { icon: Clock3, label: 'Schedules', utility: 'schedules', group: 'secondary' }
 ]
 
 export function Sidebar(props: SidebarProps): React.JSX.Element {

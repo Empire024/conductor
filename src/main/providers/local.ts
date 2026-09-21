@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import type { AdapterOptions, ProviderAdapter } from './adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
-import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, localModelLabel } from '../../shared/local-models'
+import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL, localModelLabel } from '../../shared/local-models'
 import { LocalAgentSession, RESPONSE_RESERVE_TOKENS } from '../local-models/agent.ts'
-import { endpointFor, loadConfig, readApiKey } from '../local-models/config.ts'
+import { endpointFor, loadConfig, modelFilePath, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
 import { inspectAdmission, startServer } from '../local-models/llama.ts'
 import { DockerSandbox } from '../local-models/sandbox.ts'
@@ -11,6 +12,17 @@ import { LOCAL_TOOLS, type LocalGrants } from '../local-models/tools.ts'
 
 const readConfig = (): LocalStackConfig | null => {
   try { return loadConfig() } catch { return null }
+}
+
+/** StructuredSessions preserves this code for the renderer. The URL is public setup guidance;
+ * no local path, key or config value is attached to the error. */
+export class LocalSetupError extends Error {
+  readonly code = LOCAL_MODEL_SETUP_ERROR_CODE
+  readonly actionUrl = LOCAL_MODEL_SETUP_URL
+  constructor(detail: string) {
+    super(`${detail} Download or set up the local model: ${LOCAL_MODEL_SETUP_URL}`)
+    this.name = 'LocalSetupError'
+  }
 }
 
 /** One llama.cpp process per model, shared by every conversation that asked for it. Two tabs
@@ -41,6 +53,7 @@ async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, ap
   try { await pending }
   catch (error) {
     const detail = error instanceof Error ? error.message : 'unknown reason'
+    if (/Model file missing:/i.test(detail)) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
     throw new Error(first ? `Local model failed to start: ${detail}` : `Local model failed to start in another conversation: ${detail}`)
   }
 }
@@ -102,10 +115,10 @@ export class LocalAdapter implements ProviderAdapter {
 
   private model(): LocalModelConfig {
     const stack = this.stack
-    if (!stack) throw new Error('Local model stack is not set up; run scripts/local-models/setup.ps1')
+    if (!stack) throw new LocalSetupError('Local models are not configured.')
     const requested = this.settings.model && stack.models[this.settings.model] ? this.settings.model : stack.models[DEFAULT_LOCAL_MODEL] ? DEFAULT_LOCAL_MODEL : Object.keys(stack.models)[0]
     const model = requested ? stack.models[requested] : undefined
-    if (!model) throw new Error('No local model is configured')
+    if (!model) throw new LocalSetupError('No local model is configured.')
     return model
   }
 
@@ -121,6 +134,7 @@ export class LocalAdapter implements ProviderAdapter {
    *  crashed between messages is brought back rather than failing the turn. */
   private async ready(turnId?: string): Promise<LocalModelConfig> {
     const model = this.model()
+    if (!existsSync(modelFilePath(model))) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
     let announced = false
     await ensureServer(this.stack!, model, this.key(), () => {
       announced = true
@@ -131,7 +145,11 @@ export class LocalAdapter implements ProviderAdapter {
   }
 
   async start(): Promise<void> {
-    await this.ready()
+    // Connecting a tab validates setup but does not load model weights. The first actual dispatch
+    // calls ready(), so an unused local conversation consumes no GPU, RAM or server process.
+    const model = this.model()
+    this.key()
+    if (!existsSync(modelFilePath(model))) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
     this.emit({ data: { type: 'session', phase: 'idle', capabilities: this.providerCapabilities } })
   }
 

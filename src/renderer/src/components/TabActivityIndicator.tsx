@@ -8,6 +8,7 @@ import { spinPhaseStyle } from '../spin-sync'
 export const ACTIVITY_LABEL: Record<AgentActivityPhase, string> = {
   idle: 'Idle',
   working: 'Working',
+  waiting_background: 'Waiting on background work',
   waiting_input: 'Needs your attention',
   limited: 'Paused - usage limit reached',
   complete: 'Finished',

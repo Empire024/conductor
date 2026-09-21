@@ -456,6 +456,18 @@ textarea.input { resize: none; line-height: 1.45; }
   text-overflow: ellipsis;
 }
 .session > .chev { align-self: center; }
+.coworker-toggle {
+  display: grid; grid-template-columns: 1fr auto auto; align-items: center; gap: 8px;
+  width: calc(100% - 18px); margin: -2px 0 0 18px; padding: 6px 9px;
+  border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-0);
+  color: var(--text-3); text-align: left; font-size: 11.5px;
+}
+.coworker-toggle-state { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.coworker-list { display: flex; flex-direction: column; gap: 6px; margin-left: 18px; padding-left: 9px; border-left: 1px solid var(--border); }
+.session.coworker-session { min-height: 48px; padding: 8px 9px; background: var(--surface-0); }
+.session.coworker-session .session-title { font-size: 13px; }
+.session.coworker-session .session-preview { display: none; }
+.new-modes { margin: -2px 0 0; }
 
 .closed-group { border-top: 1px solid var(--border-soft); padding-top: 10px; }
 .closed-toggle {

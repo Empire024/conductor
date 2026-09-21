@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process'
 import { createServer } from 'node:net'
 import { freemem } from 'node:os'
 import type { LocalModelConfig } from './config.ts'
-import { PINNED_MODELS, QWEN_35B, QWEN_9B } from './config.ts'
+import { ORNITH_9B, PINNED_MODELS, QWEN_35B, QWEN_9B } from './config.ts'
 
 const GiB = 1024 ** 3
 // Machine-wide (not per checkout/root). The OS releases this mutex even on a crash;
@@ -59,9 +59,13 @@ export function measureResources(): ResourceSnapshot {
  * These are admission estimates, not assertions about actual allocations. */
 export function resourceRequirements(model: LocalModelConfig): { ramBytes: number; vramBytes: number } {
   const pinned = PINNED_MODELS[model.id]?.find(p => p.file === model.file && p.sizeBytes === model.sizeBytes)
-  if (!pinned || ![QWEN_9B, QWEN_35B].includes(model.id) || model.extraArgs.length) throw new Error(`No reviewed memory envelope for ${model.id} with these weights/extra arguments; no server started. Review GGUF size, context, offload and runtime buffers first.`)
-  const kv = model.contextTokens / 8192 * GiB
-  const layers = model.id === QWEN_9B ? 32 : 40
+  if (!pinned || ![QWEN_9B, QWEN_35B, ORNITH_9B].includes(model.id) || model.extraArgs.length) throw new Error(`No reviewed memory envelope for ${model.id} with these weights/extra arguments; no server started. Review GGUF size, context, offload and runtime buffers first.`)
+  // Reviewed hybrid attention geometry (docs/local-model-shortlist.md): the 9B models
+  // cache 8 layers × 4 KV heads; the 35B caches 10 × 2. Head size 256, K+V, fp16.
+  // Compute/linear-attention buffers remain covered by the separate reserves below.
+  const small = model.id !== QWEN_35B
+  const kv = model.contextTokens * (small ? 8 * 4 : 10 * 2) * 256 * 2 * 2
+  const layers = small ? 32 : 40
   // Partial offload is uneven (especially MoE tensors); add 25% to the layer share.
   const gpuWeights = model.sizeBytes * Math.min(1, model.gpuLayers >= layers ? 1 : 1.25 * model.gpuLayers / layers)
   return { ramBytes: model.sizeBytes + kv + 2 * GiB + 8 * GiB, vramBytes: model.gpuLayers ? gpuWeights + kv + 1.75 * GiB : 0 }

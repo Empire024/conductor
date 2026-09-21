@@ -4,6 +4,7 @@ import { realpath } from 'node:fs/promises'
 import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
+import { hasSessionWork } from './close-confirmation'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type LayoutNode, type PaneKind, type PaneTab } from '../shared/models'
 import type { PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import { isSessionPermission, settingsForRuntime } from '../shared/structured-agent'
@@ -14,7 +15,7 @@ import type { StructuredSessions } from './structured-sessions'
 import type { OrchestrationStore } from './orchestration-store'
 import type { AgentCollaborationStore } from './agent-collaboration-store'
 import type { ProjectBacklogs } from './project-backlog'
-import { projectTaskPriorities, type ProjectTaskPriority } from '../shared/project-backlog'
+import { PROJECT_TASK_MAX_LENGTH, projectTaskPriorities, type ProjectTaskPriority } from '../shared/project-backlog'
 import { workspacePath } from './agent-artifacts'
 import { writeEditorFile } from './editor-files'
 import { readTextFile } from './text-files'
@@ -90,7 +91,7 @@ const toolSignatures = {
   'tabs.rename': '({tabId,title})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
   'tabs.detach': '({tabId})',
-  'tabs.close': '({tabId}) — asks the owner to confirm; never closes the caller or its ancestors',
+  'tabs.close': '({tabId}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors',
   'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
@@ -596,7 +597,8 @@ export class AgentControl {
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
       if (method === 'tabs.rename') text(args, 'title', 120)
       if (method === 'tabs.split' && !['horizontal', 'vertical'].includes(String(args.direction))) throw new Error('Invalid split direction')
-      if (method === 'tabs.close' && !await this.deps.confirm(scope, `${source.title} wants to close the tab “${tab.title}”.`)) throw new Error('The owner declined to close this tab')
+      const closingState = method === 'tabs.close' && tab.kind === 'agent' ? database.structured.snapshot(tab.resourceId!) : undefined
+      if (method === 'tabs.close' && (!closingState || hasSessionWork(closingState)) && !await this.deps.confirm(scope, `${source.title} wants to close the tab “${tab.title}”.`)) throw new Error('The owner declined to close this tab')
       this.authorize(scope); this.tab(scope, tab.id)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
       const result = await this.ui(scope, method as AgentControlUiRequest['action'], args)
@@ -722,7 +724,7 @@ export class AgentControl {
       if (!['todo', 'doing', 'done'].includes(String(status))) throw new Error('Invalid task status')
       // parsePriority would quietly degrade a typo to 'normal'; an agent deserves to hear that its edit did nothing.
       if (args.priority !== undefined && !projectTaskPriorities.includes(args.priority as ProjectTaskPriority)) throw new Error('Invalid task priority')
-      const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', 8000) }), ...(args.priority === undefined ? {} : { priority: args.priority as ProjectTaskPriority }), agentId: scope.agentSessionId }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
+      const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', PROJECT_TASK_MAX_LENGTH) }), ...(args.priority === undefined ? {} : { priority: args.priority as ProjectTaskPriority }), agentId: scope.agentSessionId }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
       this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
       return updated
     }

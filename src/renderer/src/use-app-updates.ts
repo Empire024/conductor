@@ -15,7 +15,7 @@ type UpdatesBridge = typeof window.conductor.updates
  *  at the keyboard: quitting now would abandon that work, so it counts as "still running"
  *  for the one-click restart gate below. A tab the user already stopped, or one that never
  *  started, does not. */
-const STILL_RUNNING_PHASES: ReadonlySet<AgentActivityPhase> = new Set(['working', 'limited', 'waiting_input'])
+const STILL_RUNNING_PHASES: ReadonlySet<AgentActivityPhase> = new Set(['working', 'limited', 'waiting_input', 'waiting_background'])
 
 const defaultLookupTitle = async (id: string): Promise<string | undefined> => {
   const projection = await window.conductor.structured.snapshot(id).catch(() => null)

@@ -16,19 +16,21 @@ class MapStore implements SecretKeyValueStore {
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: ReturnType<typeof vi.fn> } {
+function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: ReturnType<typeof vi.fn>; createTask: ReturnType<typeof vi.fn> } {
   const store = new MapStore()
   const ui = vi.fn(async () => ({}))
+  const project = { id: 'project-a', name: 'Conductor', path: 'C:\\work\\conductor', createdAt: 't', updatedAt: 't' }
+  const createTask = vi.fn(async (_project, input) => ({ id: 'phone-task', projectId: 'project-a', ...input }))
   const service = new PhoneAccessService({
     store, vault: new MemoryVault(),
-    database: { listProjects: () => [], getProject: () => null, listSessions: () => [], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, spec: () => null, history: () => [], update: () => undefined } },
+    database: { listProjects: () => [project], getProject: id => id === project.id ? project : null, listSessions: () => [], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, spec: () => null, history: () => [], update: () => undefined } },
     sessions: { ensure: () => ({ id: 'x', available: false, status: 'unavailable', transcript: '' }), connectSession: async () => undefined, submit: async () => undefined, steer: async () => undefined, queue: async () => undefined, respond: async () => undefined, interrupt: async () => undefined, resume: async () => undefined },
     providers: () => [], machines: () => [{ id: LOCAL_MACHINE_ID, name: 'MAIN', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION }],
-    machineName: () => 'MAIN', version: '0.1.3', ui,
+    machineName: () => 'MAIN', version: '0.1.3', ui, projectTasks: { create: createTask },
     metrics: async () => ({ sampledAt: 'now', cpuPercent: 1, cpuCores: 4, memoryUsedBytes: 1, memoryTotalBytes: 2, gpus: [], processes: [], localServers: [], unavailable: [] }),
     push: vi.fn(async () => ({ status: 201, gone: false, retryAfter: null, body: '' })), log: () => undefined
   })
-  return { service, store, ui }
+  return { service, store, ui, createTask }
 }
 
 interface Reply { status: number; headers: IncomingMessage['headers']; body: string; raw: Buffer }
@@ -124,6 +126,10 @@ describe('the phone listener', () => {
     expect((await call(port, '/api/me', { ca, method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: '{not json' })).status).toBe(400)
     expect((await call(port, '/api/me', { ca, method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'x'.repeat(1024 * 1024 + 100) }) })).status).toBe(413)
     expect((await call(port, '/api/sessions/missing', { ca, headers: { authorization: `Bearer ${token}` } })).status).toBe(404)
+    expect((await call(port, '/api/projects/project-a/tasks', { ca, method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Unauthenticated', kind: 'task' }) })).status).toBe(401)
+    const task = await call(port, '/api/projects/project-a/tasks', { ca, method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ title: 'From phone', kind: 'feature', priority: 'high', weight: 'heavy' }) })
+    expect(task.status).toBe(200)
+    expect(JSON.parse(task.body)).toMatchObject({ id: 'phone-task', projectId: 'project-a', title: 'From phone', kind: 'feature' })
     expect((await call(port, '/api/whatever', { ca, headers: { authorization: `Bearer ${token}` } })).status).toBe(404)
     const metrics = await call(port, '/api/metrics', { ca, headers: { authorization: `Bearer ${token}` } })
     expect(JSON.parse(metrics.body)).toMatchObject({ system: { cpuCores: 4 }, runtimes: [] })

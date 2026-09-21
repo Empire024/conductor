@@ -1,0 +1,13 @@
+.weekly-usage { padding: 10px 14px; color: var(--text-2); font-size: 10px; }
+.weekly-usage-heading { display: flex; gap: 8px; align-items: baseline; }
+.weekly-usage-heading strong { margin-left: auto; color: var(--text); font-weight: 600; }
+.weekly-usage-heading small { color: var(--text-3); }
+.weekly-usage-bar { display: flex; height: 4px; overflow: hidden; border-radius: 4px; background: var(--border-soft); margin-top: 6px; gap: 1px; }
+.weekly-usage-bar > span { min-width: 2px; transition: width .2s ease; }
+.weekly-usage-models { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-top: 8px; }
+.weekly-usage-models > span { display: inline-flex; align-items: center; gap: 5px; }
+.weekly-usage-models i { width: 6px; height: 6px; border-radius: 2px; }
+.weekly-usage-models b { font-weight: 400; }
+.weekly-usage-note { display: block; margin-top: 6px; color: var(--text-3); }
+.weekly-usage.compact { padding: 5px 0 0; font-size: 9px; }
+@media (prefers-reduced-motion: reduce) { .weekly-usage-bar > span { transition: none; } }

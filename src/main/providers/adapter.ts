@@ -31,6 +31,11 @@ export interface ProviderAdapter {
   discover?(): Promise<Json>
   /** Refresh account allowance telemetry without starting or steering a model turn. */
   refreshUsage?(): Promise<void>
+  /** How much provider-tracked work is outstanding that deliberately outlives the turn which
+   *  started it - a backgrounded shell process, an armed watcher. A turn result says nothing
+   *  about it: the tool call returned the moment the work was handed to the background. Only
+   *  the runtime that reported the work can answer, so this is the live process' own count. */
+  backgroundWork?(): number
   stop?(): Promise<void>
   history?(): Promise<import('../native-history').NativeHistoryItem[]>
   dispose(): void

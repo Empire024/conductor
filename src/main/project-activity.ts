@@ -22,6 +22,7 @@ const STATUS_FOR_PHASE: Partial<Record<AgentActivityPhase, ActivityRollupStatus>
   disconnected: 'stalled',
   working: 'working',
   limited: 'working',
+  waiting_background: 'working',
   complete: 'done'
 }
 

@@ -4,7 +4,7 @@ import { createServer } from 'node:net'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defaultModelConfig, QWEN_9B, QWEN_35B } from './config.ts'
+import { defaultModelConfig, ORNITH_9B, QWEN_9B, QWEN_35B } from './config.ts'
 import { admissionRefusal, assertResourceHeadroom, resourceRequirements, withAdmissionLock } from './resource-guard.ts'
 
 const GiB = 1024 ** 3
@@ -12,11 +12,19 @@ describe('local model admission resources', () => {
   it('budgets total MoE weights, KV context and reserves rather than active parameters', () => {
     const small = defaultModelConfig(QWEN_9B)
     const large = defaultModelConfig(QWEN_35B)
-    expect(resourceRequirements(large).ramBytes).toBeGreaterThan(32 * GiB)
-    expect(resourceRequirements(small).ramBytes).toBeGreaterThan(19 * GiB)
-    expect(resourceRequirements({ ...small, contextTokens: 65536 }).vramBytes - resourceRequirements(small).vramBytes).toBe(4 * GiB)
+    expect(resourceRequirements(large).ramBytes).toBeGreaterThan(29 * GiB)
+    expect(resourceRequirements(small).ramBytes).toBeGreaterThan(16 * GiB)
+    expect(resourceRequirements({ ...small, contextTokens: 65536 }).vramBytes - resourceRequirements(small).vramBytes).toBe(GiB)
     expect(() => assertResourceHeadroom(small, { ramFreeBytes: 32 * GiB, vramFreeBytes: 4 * GiB })).toThrow('Not enough memory')
     expect(() => assertResourceHeadroom(small, { ramFreeBytes: 32 * GiB, vramFreeBytes: 12 * GiB })).not.toThrow()
+  })
+  it('admits pinned Ornith at the measured 32k machine budget but refuses excessive context or changed weights', () => {
+    const model = defaultModelConfig(ORNITH_9B)
+    const available = { ramFreeBytes: 30 * GiB, vramFreeBytes: 10 * GiB }
+    expect(() => assertResourceHeadroom(model, available)).not.toThrow()
+    expect(() => assertResourceHeadroom({ ...model, contextTokens: 131072 }, available)).toThrow('Not enough memory')
+    expect(() => assertResourceHeadroom({ ...model, sizeBytes: model.sizeBytes + 1 }, available)).toThrow('No reviewed memory envelope')
+    expect(resourceRequirements(model).vramBytes).toBeGreaterThan(8 * GiB)
   })
   it('fails closed for unreadable telemetry and unreviewed runtime flags', () => {
     const model = defaultModelConfig(QWEN_9B)

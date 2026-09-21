@@ -136,6 +136,7 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
       expect(JSON.stringify(data)).toBe(before)
     }
     expect(renderActivity({ type: 'error', message: 'Turn failed' })).toContain('role="alert"')
+    expect(renderActivity({ type: 'error', message: 'Local model is not installed.', code: 'local-setup-required' })).toContain('Download / set up local model')
     expect(renderActivity({ type: 'notice', message: 'Snapshot unavailable: file is too large' })).toContain('Snapshot unavailable')
     expect(renderActivity({ type: 'notice', message: 'Unsupported Claude control request: new_permission', payload: {} })).toContain('Unsupported Claude control request')
     expect(renderActivity({ type: 'notice', message: 'Saved terminal history', outputArtifactId: 'legacy-output' })).toContain('Expand output')

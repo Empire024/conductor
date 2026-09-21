@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import type { AgentSpec } from '../shared/models'
 import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskEdit, ProjectTaskKind, ProjectTaskOwner, ProjectTaskPriority, ProjectTaskWeight } from '../shared/project-backlog'
+import { PROJECT_TASK_MAX_LENGTH } from '../shared/project-backlog'
 import type { SourceControlChangeSet } from '../shared/source-control'
 import type { ConductorDatabase } from './database'
 import type { SourceControl } from './source-control'
@@ -59,7 +60,7 @@ export function parseProjectTasks(text:string):ProjectTask[] {
     const metadata=[...source.matchAll(marker)][0]
     const end=taskEnd(lines,line)
     const title=[item[2]!.replace(marker,'').trim(),...lines.slice(line+1,end).map(value=>value.slice(2))].join('\n')
-    if(!title || title.startsWith('<!--'))continue
+    if(!title || title.startsWith('<!--') && !metadata)continue
     const hash=digest(kind+'\n'+title).slice(0,20), count=duplicates.get(hash)??0
     duplicates.set(hash,count+1)
     const status=/^(x|implemented|done)$/i.test(item[1]??'')?'done':/^(~|in progress|working)$/i.test(item[1]??'')?'doing':'todo'
@@ -140,7 +141,7 @@ export function updateProjectTaskText(text:string,edit:ProjectTaskEdit):string {
   return lines.join(ending)
 }
 function cleanTitle(value:unknown):string {
-  if(typeof value!=='string' || !value.trim() || value.length>8000 || /\0|<!--|-->/.test(value))throw new Error('Enter a task of up to 8000 characters without task markers')
+  if(typeof value!=='string' || !value.trim() || value.length>PROJECT_TASK_MAX_LENGTH || /\0|<!--\s*conductor-task\s*:/i.test(value))throw new Error(`Enter a task of up to ${PROJECT_TASK_MAX_LENGTH.toLocaleString('en-US')} characters without task markers`)
   return value.replace(/\r\n?/g,'\n').trim()
 }
 export class ProjectBacklogs {

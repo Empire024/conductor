@@ -72,31 +72,71 @@ export function trimMessages(messages: ChatMessage[], contextTokens: number, ove
   // dropping older turns fixes that, so the middle of an oversized result is elided. Only tool
   // output is cut: the owner's own message is theirs, and losing part of it silently is worse.
   const cap = Math.floor(budget / 2)
-  const clamped = messages.map(message => message.role === 'tool' && message.content.length > cap
+  let clamped = messages.map(message => message.role === 'tool' && message.content.length > cap
     ? { ...message, content: `${message.content.slice(0, Math.floor(cap / 2))}
 [... ${message.content.length - cap} characters elided to fit the local context ...]
 ${message.content.slice(-Math.floor(cap / 2))}` }
     : message)
   const [system, ...rest] = clamped
   let total = rest.reduce((sum, message) => sum + size(message), 0) + (system ? size(system) : 0)
+  if (total <= budget) return clamped
+
+  // A model can request several large reads in one assistant message. Dropping that newest
+  // assistant/tool group makes the next request indistinguishable from the request that asked
+  // for the reads, so a cached model repeats the exact calls until the round limit. Keep the
+  // complete newest group and divide the available result space between all of its calls.
+  let groupStart = -1
+  for (let index = rest.length - 1; index >= 0; index--) {
+    if (rest[index]!.role === 'assistant' && rest[index]!.tool_calls?.length) { groupStart = index; break }
+  }
+  if (groupStart >= 0) {
+    let groupEnd = groupStart + 1
+    while (groupEnd < rest.length && rest[groupEnd]!.role === 'tool') groupEnd++
+    let latestUser = -1
+    for (let index = rest.length - 1; index >= 0; index--) {
+      if (rest[index]!.role === 'user') { latestUser = index; break }
+    }
+    const selected = [
+      ...(latestUser >= 0 && latestUser < groupStart ? [rest[latestUser]!] : []),
+      ...rest.slice(groupStart, groupEnd),
+      ...rest.slice(groupEnd)
+    ]
+    const results = selected.filter(message => message.role === 'tool')
+    const fixed = (system ? size(system) : 0) + selected.reduce((sum, message) => sum + size(message) - (message.role === 'tool' ? message.content.length : 0), 0)
+    // `size` is deliberately cheap, while the final client guard counts JSON quoting, message
+    // metadata and chat-template padding. Leave enough room for that exact check rather than
+    // producing a compacted group that misses the wire limit by a few hundred tokens.
+    const wireMargin = 4096
+    const perResult = results.length ? Math.max(256, Math.floor(Math.max(0, budget - fixed - wireMargin) / results.length)) : 0
+    const compacted = selected.map(message => message.role === 'tool' && message.content.length > perResult
+      ? { ...message, content: boundedToolResult(message.content, perResult) }
+      : message)
+    clamped = system ? [system, ...compacted] : compacted
+    total = clamped.reduce((sum, message) => sum + size(message), 0)
+    if (total <= budget) return clamped
+  }
+
+  const [, ...fallback] = clamped
+  const fallbackSystem = system
+  total = fallback.reduce((sum, message) => sum + size(message), 0) + (fallbackSystem ? size(fallbackSystem) : 0)
   let start = 0
-  while (total > budget && start < rest.length - 2) {
-    total -= size(rest[start]!)
+  while (total > budget && start < fallback.length - 2) {
+    total -= size(fallback[start]!)
     start++
   }
   // A tool result whose assistant tool_call was dropped is meaningless to the server.
-  while (start < rest.length && rest[start]!.role === 'tool') { total -= size(rest[start]!); start++ }
+  while (start < fallback.length && fallback[start]!.role === 'tool') { total -= size(fallback[start]!); start++ }
 
   // Pin the most recent user message so trimming can never drop it entirely.
   // If the pinned message is oversized, elide its middle the same way oversized tool
   // results are elided above, so pinning it cannot blow the budget.
   const anchorIndex = (() => {
     let found = -1
-    for (let i = 0; i < rest.length; i++) { if (rest[i]!.role === 'user') found = i }
+    for (let i = 0; i < fallback.length; i++) { if (fallback[i]!.role === 'user') found = i }
     return found
   })()
   if (anchorIndex >= 0 && anchorIndex < start) {
-    const pinned = rest[anchorIndex]!
+    const pinned = fallback[anchorIndex]!
     let fixed = pinned
     if (size(fixed) > cap) {
       const raw = fixed.content
@@ -104,13 +144,13 @@ ${message.content.slice(-Math.floor(cap / 2))}` }
 [... ${raw.length - cap} characters elided to fit the local context ...]
 ${raw.slice(-Math.floor(cap / 2))}` }
     }
-    rest.splice(anchorIndex, 1)
+    fallback.splice(anchorIndex, 1)
     const adjusted = anchorIndex < start ? start - 1 : start
-    rest.splice(adjusted, 0, fixed)
+    fallback.splice(adjusted, 0, fixed)
     start = adjusted
   }
 
-  return system ? [system, ...rest.slice(start)] : rest.slice(start)
+  return fallbackSystem ? [fallbackSystem, ...fallback.slice(start)] : fallback.slice(start)
 }
 
 /** Make the history renderable again. A chat template rejects a tool result that answers no

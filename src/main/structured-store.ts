@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import type { AgentEvent, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, StructuredProvider, TimelineItem } from '../shared/structured-agent'
+import type { AgentEvent, ConversationHistoryEntry, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, StructuredProvider, TimelineItem } from '../shared/structured-agent'
+import type { WeeklyUsageConversation } from '../shared/weekly-model-usage'
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
 import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
 
@@ -100,6 +101,14 @@ export class StructuredAgentStore {
     if (!spec) throw new Error('Session not found')
     this.db.prepare('UPDATE structured_sessions SET spec_json=? WHERE id=?').run(JSON.stringify({ ...spec, sessionId }), id)
   }
+  /** The limit-continuation choice is a live workspace preference, not part of the conversation's
+   *  identity the way provider and cwd are: the owner flips it long after registration, and the
+   *  registered spec has to follow or the conversation waits on a flag nobody can change. */
+  setContinueOnLimit(id: string, continueOnLimit: boolean): void {
+    const spec = this.spec<Record<string, unknown>>(id)
+    if (!spec) return
+    this.db.prepare('UPDATE structured_sessions SET spec_json=? WHERE id=?').run(JSON.stringify({ ...spec, continueOnLimit }), id)
+  }
   rebindProject(projectId: string, cwd: string): void {
     for (const row of this.db.prepare('SELECT id,spec_json FROM structured_sessions WHERE project_id=?').all(projectId) as Array<{ id: string; spec_json: string }>) {
       const spec = JSON.parse(row.spec_json) as Record<string, unknown>
@@ -150,11 +159,66 @@ export class StructuredAgentStore {
   events(id: string, after = 0): AgentEvent[] {
     return (this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent)
   }
-  history(projectId: string, query = ''): Array<{ id: string; title: string; provider: StructuredProvider; archived: boolean; phase: SessionProjection['phase'] }> {
-    const ids = this.db.prepare('SELECT id, provider FROM structured_sessions WHERE project_id=? ORDER BY rowid DESC').all(projectId) as Array<{ id: string; provider: StructuredProvider }>
+  /** A narrow durable journal for shared weekly accounting. It bypasses history()'s UI cap and
+   * events()'s page cap, and parses only usage plus session metadata needed for model attribution. */
+  usageJournal(): WeeklyUsageConversation[] {
+    const sessions = this.db.prepare('SELECT id,provider,spec_json FROM structured_sessions ORDER BY rowid').all() as Array<{ id: string; provider: StructuredProvider; spec_json: string }>
+    const durable = this.db.prepare(`
+      SELECT session_id,MIN(sequence) AS first_sequence,
+        json_extract(event_json,'$.runtimeId') AS runtime_id,
+        MIN(json_extract(event_json,'$.timestamp')) AS started_at
+      FROM structured_events GROUP BY session_id,runtime_id
+    `).all() as Array<{ session_id: string; first_sequence: number; runtime_id: string; started_at: string }>
+    const rows = this.db.prepare(`
+      SELECT session_id,sequence,event_json FROM structured_events
+      WHERE json_extract(event_json,'$.data.type') IN ('usage','session')
+      ORDER BY session_id,sequence
+    `).all() as Array<{ session_id: string; sequence: number; event_json: string }>
+    const bySession = new Map<string, AgentEvent[]>()
+    for (const row of rows) {
+      const group = bySession.get(row.session_id) ?? []
+      group.push(JSON.parse(row.event_json) as AgentEvent)
+      bySession.set(row.session_id, group)
+    }
+    return sessions.flatMap(session => {
+      const group = bySession.get(session.id)
+      if (!group) return []
+      const metadata = durable.filter(row => row.session_id === session.id)
+      const runtimeStarts = Object.fromEntries(metadata.filter(row => row.runtime_id && row.started_at).map(row => [row.runtime_id, row.started_at]))
+      const firstSequence = metadata.reduce((first, row) => Math.min(first, row.first_sequence), Number.POSITIVE_INFINITY)
+      let model: string | undefined
+      try { const spec = JSON.parse(session.spec_json) as { model?: unknown }; if (typeof spec.model === 'string') model = spec.model } catch { /* malformed legacy spec: session events may still name it */ }
+      return [{ sessionId: session.id, provider: session.provider, ...(model ? { model } : {}), events: group, runtimeStarts, truncated: firstSequence > 1 }]
+    })
+  }
+  history(projectId: string, query = ''): ConversationHistoryEntry[] {
+    const ids = this.db.prepare(`
+      SELECT sessions.id,sessions.provider,
+        (SELECT event_json FROM structured_events WHERE session_id=sessions.id ORDER BY sequence DESC LIMIT 1) AS latest_event
+      FROM structured_sessions AS sessions WHERE project_id=? ORDER BY sessions.rowid DESC
+    `).all(projectId) as Array<{ id: string; provider: StructuredProvider; latest_event: string | null }>
     const needle = query.toLocaleLowerCase()
     // An untouched session (no items ever sent/received, never titled) is a bookkeeping row, not history.
-    return ids.flatMap(row => { const state = this.snapshot(row.id); return state && (state.items.length || state.title) && (!needle || JSON.stringify(state.items).toLocaleLowerCase().includes(needle) || state.title.toLocaleLowerCase().includes(needle)) ? [{ id: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, phase: state.phase }] : [] }).slice(0, 200)
+    const entries: Array<ConversationHistoryEntry & { _rowIndex: number }> = ids.flatMap((row, rowIndex) => {
+      const state = this.snapshot(row.id)
+      if (!state || (!state.items.length && !state.title) || (needle && !JSON.stringify(state.items).toLocaleLowerCase().includes(needle) && !state.title.toLocaleLowerCase().includes(needle))) return []
+      let latest: AgentEvent | undefined
+      try { if (row.latest_event) latest = JSON.parse(row.latest_event) as AgentEvent } catch { /* malformed legacy event has no activity metadata */ }
+      const message = [...state.items].reverse().find(item => item.data.type === 'text' && item.data.text.trim())
+      const messageData = message?.data.type === 'text' ? message.data : undefined
+      const text = messageData?.text.replace(/\s+/g, ' ').trim().slice(0, 180)
+      return [{
+        id: row.id, title: state.title || 'New conversation', provider: row.provider, archived: state.archived, phase: state.phase,
+        ...(latest ? { updatedAt: latest.timestamp, updatedSequence: latest.sequence } : {}),
+        ...(state.settings.model ? { model: state.settings.model } : {}),
+        ...(text && messageData ? { snippet: text, lastRole: messageData.role } : {}),
+        _rowIndex: rowIndex
+      }]
+    })
+    return entries.sort((a, b) => {
+      const time = (b.updatedAt ? Date.parse(b.updatedAt) : 0) - (a.updatedAt ? Date.parse(a.updatedAt) : 0)
+      return time || (b.updatedSequence ?? 0) - (a.updatedSequence ?? 0) || a._rowIndex - b._rowIndex
+    }).slice(0, 200).map(({ _rowIndex: _ignored, ...entry }) => entry)
   }
   /** Message find across a whole workspace. Projections are already resident, so this is a bounded
    *  in-memory scan; only snippets cross the IPC boundary, never another conversation's items. */

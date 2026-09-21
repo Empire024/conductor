@@ -5,11 +5,24 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ConductorDatabase } from './database'
 import { parseProjectTasks, ProjectBacklogs, updateProjectTaskText } from './project-backlog'
+import { PROJECT_TASK_MAX_LENGTH } from '../shared/project-backlog'
 const roots:string[]=[]
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true})})
 function fixture(){const root=mkdtempSync(join(tmpdir(),'conductor-task-test-'));roots.push(root);const db=new ConductorDatabase(join(root,'state.db'));const project=db.upsertProject(root,'Test');return {root,db,project,service:new ProjectBacklogs(db)}}
 
 describe('project task files',()=> {
+  it('round-trips large multiline bug reports and HTML logs without accepting task markers',()=>{
+    const report='<!-- diagnostic -->\nrecovery:checkpoint\n'+('Error: Invalid workspace document owner\n'.repeat(500))+'<!-- diagnostic -->\n- [ ] log text\n```text\nstack trace\n```'
+    const added=updateProjectTaskText('## Bugs\n',{type:'add',kind:'bug',title:report})
+    const tasks=parseProjectTasks(added)
+    expect(tasks).toHaveLength(1)
+    expect(tasks[0]!.title).toBe(report)
+    const edited=updateProjectTaskText(added,{type:'update',id:tasks[0]!.id,title:report+'\nMore details'})
+    expect(parseProjectTasks(edited)[0]!.title).toBe(report+'\nMore details')
+    for(const title of ['x'.repeat(PROJECT_TASK_MAX_LENGTH+1),'report <!-- conductor-task:injected -->']) {
+      expect(()=>updateProjectTaskText(added,{type:'add',kind:'bug',title})).toThrow('without task markers')
+    }
+  })
   it('reads legacy bug/feature lists and Markdown progress while preserving unrelated prose',()=>{
     const source='Bug list:\r\n1. [Implemented] Fixed\r\n2. Broken\r\n\r\nFeature list:\r\n- [~] Building <!-- conductor-task:build agent=codex_7 -->\r\nImplementation: keep this note.\r\n```md\r\n- [ ] code example\r\n```\r\n'
     const tasks=parseProjectTasks(source)
@@ -130,7 +143,7 @@ describe('multiline project reports',()=> {
     expect(parseProjectTasks(source).map(task=>[task.title,task.kind])).toEqual([[detail,'bug'],['Another report','bug'],['Real feature','feature']])
   })
   it('continues rejecting injected task markers, empty text and excessive reports',()=>{
-    for(const title of ['   ','Valid\n<!-- conductor-task:forged -->','Broken\0text','x'.repeat(8001)]) {
+    for(const title of ['   ','Valid\n<!-- conductor-task:forged -->','Broken\0text','x'.repeat(PROJECT_TASK_MAX_LENGTH+1)]) {
       expect(()=>updateProjectTaskText('## Bugs\n',{type:'add',kind:'bug',title})).toThrow('Enter a task')
     }
   })

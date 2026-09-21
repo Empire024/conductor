@@ -10,6 +10,10 @@
 .session-tree .workspace-tab-role b { min-width: 11px; padding: 1px 3px; border-radius: 5px; color: var(--surface-0); background: var(--text); font-size: 6px; line-height: 1; }
 .session-tree .workspace-tab-role:hover { background: color-mix(in srgb, currentColor 12%, var(--surface-hover)); color: var(--text); }
 .session-tree .workspace-tab-role:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.session-tree .workspace-coworker-group { min-width: 0; }
+.session-tree .workspace-coworker-toggle { width: calc(100% - 22px); height: 18px; margin: 0 0 1px 17px; padding: 0 4px; display: flex; align-items: center; gap: 3px; border: 0; border-left: 1px solid color-mix(in srgb, var(--blue) 35%, var(--border-soft)); background: transparent; color: var(--text-3); font-size: 9px; text-align: left; cursor: pointer; }
+.session-tree .workspace-coworker-toggle:hover, .session-tree .workspace-coworker-toggle:focus-visible { color: var(--text); background: var(--surface-hover); }
+.session-tree .workspace-tab-row.coworker-child { margin-left: 17px; width: calc(100% - 17px); border-left: 1px solid color-mix(in srgb, var(--blue) 35%, var(--border-soft)); }
 @media (max-width: 620px) {
   .session-tree .workspace-tab-row:has(.workspace-tab-role) { grid-template-columns: minmax(0, 1fr) 23px; grid-template-rows: 25px 22px; }
   .session-tree .workspace-tab-row:has(.workspace-tab-role) .workspace-tab-select { grid-column: 1; grid-row: 1; }

@@ -67,6 +67,7 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   const confirm = vi.fn(async () => false), fileChanged = vi.fn()
   const providers: AgentProviderInfo[] = (['codex', 'claude'] as const).map(id => ({ id, displayName: id, available: true, installUrl: '', models: [{ id: id + '-synthetic', label: id + ' Synthetic' }], efforts: [{ id: 'low', label: 'Low' }] }))
   const backlogs = new ProjectBacklogs(database)
+  const idleUpdate = { state: 'idle' as const, workspace: null, startedAt: null, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'No local update has been built.', log: [] as string[] }
   const deps = { database, sessions, orchestration, collaboration, backlogs, ui, confirm, fileChanged, providers: () => providers }
   const control = new AgentControl(deps)
   return { root, project, workspace, database, sessions, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, control, deps }
@@ -193,14 +194,24 @@ describe('authorized native app control', () => {
     await expect(f.control.focusOrigin('guessed-origin')).rejects.toThrow('no longer available')
   })
 
-  it('requires owner confirmation before closing another tab and never closes the caller', async () => {
+  it('requires owner confirmation before closing an active tab and never closes the caller', async () => {
     const f = fixture(), target = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    f.database.structured.append({ schemaVersion: 1, id: 'close-running', sequence: f.database.structured.snapshot(target.resourceId!)!.sequence + 1, sessionId: target.resourceId!, runtimeId: 'close-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase: 'running' } })
     await expect(f.control.call(f.scope, 'tabs.close', { tabId: f.rootTab.id })).rejects.toThrow('itself')
     await expect(f.control.call(f.scope, 'tabs.close', { tabId: target.id })).rejects.toThrow('declined')
     expect(f.requests.filter(request => request.action === 'tabs.close')).toHaveLength(0)
     f.confirm.mockResolvedValue(true)
     await f.control.call(f.scope, 'tabs.close', { tabId: target.id })
     expect(f.requests.filter(request => request.action === 'tabs.close')).toHaveLength(1)
+  })
+
+  it('closes a settled agent tab without a prompt and retains its conversation', async () => {
+    const f = fixture(), target = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    f.database.structured.append({ schemaVersion: 1, id: 'close-interrupted', sequence: f.database.structured.snapshot(target.resourceId!)!.sequence + 1, sessionId: target.resourceId!, runtimeId: 'close-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase: 'interrupted' } })
+    await f.control.call(f.scope, 'tabs.close', { tabId: target.id })
+    expect(f.confirm).not.toHaveBeenCalled()
+    expect(f.requests.at(-1)?.action).toBe('tabs.close')
+    expect(f.database.structured.snapshot(target.resourceId!)).toBeTruthy()
   })
 
   it.each([false, true])('compares file versions, announces live changes and rejects escapes and competing leases (aliased root: %s)', async aliasedRoot => {

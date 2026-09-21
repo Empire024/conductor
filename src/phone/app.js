@@ -81,6 +81,8 @@
     drafts: {},
     /* Tool rows the owner opened, by timeline item id. */
     expanded: {},
+    /* Coworker groups are compact by default; expansion is a local viewing choice. */
+    expandedCoworkers: {},
     /* In-progress answers per pending interaction id, same reason as drafts. */
     answers: {},
     form: null
@@ -266,6 +268,7 @@
   }
 
   const formatPercent = value => Math.round(Math.max(0, Math.min(100, Number(value) || 0))) + '%'
+  const formatNumber = value => Math.max(0, Number(value) || 0).toLocaleString()
 
   const providerWord = provider => PROVIDER_WORDS[provider] || (provider ? String(provider) : '')
 
@@ -725,8 +728,8 @@
     return session.state === state.filter
   }
 
-  const sessionRow = session => {
-    const node = button('session', null, () => go('#/session/' + encodeURIComponent(session.id)))
+  const sessionRow = (session, compact) => {
+    const node = button('session' + (compact ? ' coworker-session' : ''), null, () => go('#/session/' + encodeURIComponent(session.id)))
     node.appendChild(badge(session.state))
 
     const main = el('div', 'session-main')
@@ -795,7 +798,36 @@
         const single = project.workspaces.length === 1 && workspace.name === project.name
         if (!single) group.appendChild(el('h3', 'group-workspace', workspace.name || 'Workspace'))
         const list = el('div', 'list')
-        for (const session of workspace.sessions) list.appendChild(sessionRow(session))
+        const byId = {}
+        for (const session of workspace.sessions) byId[session.id] = session
+        const rootId = session => {
+          let current = session, seen = {}
+          while (current.controllerId && byId[current.controllerId] && !seen[current.controllerId]) {
+            seen[current.id] = true
+            current = byId[current.controllerId]
+          }
+          return current.id
+        }
+        const roots = workspace.sessions.filter(session => rootId(session) === session.id)
+        for (const root of roots) {
+          list.appendChild(sessionRow(root, false))
+          const coworkers = workspace.sessions.filter(session => session.id !== root.id && rootId(session) === root.id)
+          if (!coworkers.length) continue
+          const expanded = state.expandedCoworkers[root.id] === true
+          const working = coworkers.filter(session => session.state === 'working').length
+          const waiting = coworkers.filter(session => session.state === 'attention').length
+          const toggle = button('coworker-toggle', null, () => { state.expandedCoworkers[root.id] = !expanded; render() })
+          toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
+          toggle.appendChild(el('span', 'coworker-toggle-label', coworkers.length + (coworkers.length === 1 ? ' coworker' : ' coworkers')))
+          toggle.appendChild(el('span', 'coworker-toggle-state', dotRow([waiting ? waiting + ' waiting' : '', working ? working + ' working' : ''])))
+          toggle.appendChild(el('span', 'chev' + (expanded ? ' down' : ''), 'â€º'))
+          list.appendChild(toggle)
+          if (expanded) {
+            const children = el('div', 'coworker-list')
+            for (const coworker of coworkers) children.appendChild(sessionRow(coworker, true))
+            list.appendChild(children)
+          }
+        }
         group.appendChild(list)
       }
       host.appendChild(group)
@@ -1508,7 +1540,7 @@
   const reconcileForm = () => {
     const phone = state.phone
     if (!phone) return
-    const form = state.form || (state.form = { projectId: '', workspaceId: '', machineId: '', provider: '', model: '', effort: '', title: '', prompt: '' })
+    const form = state.form || (state.form = { mode: 'agent', projectId: '', workspaceId: '', machineId: '', provider: '', model: '', effort: '', title: '', prompt: '', taskTitle: '', taskKind: 'task', taskPriority: 'normal', taskWeight: 'medium' })
     const projects = phone.projects || []
     if (!projectById(form.projectId)) form.projectId = projects.length ? projects[0].id : ''
     const project = projectById(form.projectId)
@@ -1539,7 +1571,7 @@
     const scroll = scroller()
     root.appendChild(header)
     root.appendChild(scroll)
-    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'New task')]))
+    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'New')]))
 
     let busy = false
 
@@ -1558,11 +1590,51 @@
       const model = models.filter(entry => entry.id === form.model)[0] || null
       const body = el('div', 'form')
 
+      const modes = el('div', 'chips new-modes')
+      for (const entry of [{ id: 'agent', label: 'Conversation' }, { id: 'project', label: 'Project task' }]) {
+        const choice = button('chip' + (form.mode === entry.id ? ' selected' : ''), entry.label, () => { form.mode = entry.id; draw() })
+        choice.setAttribute('aria-pressed', form.mode === entry.id ? 'true' : 'false')
+        modes.appendChild(choice)
+      }
+      body.appendChild(modes)
+
       body.appendChild(field('Project', select(
         (phone.projects || []).map(entry => ({ value: entry.id, label: entry.name })),
         form.projectId,
         value => { form.projectId = value; form.workspaceId = ''; form.machineId = ''; draw() }
       )))
+
+      if (form.mode === 'project') {
+        const report = el('textarea', 'input prompt')
+        report.rows = 7
+        report.placeholder = 'Describe the task, bug, feature, or idea'
+        report.maxLength = phone.projectTaskMaxLength || 200000
+        report.value = form.taskTitle
+        report.addEventListener('input', () => { form.taskTitle = report.value; paintTask() })
+        body.appendChild(field('Task', report, 'Saved to this project\'s feature-list.md.'))
+        body.appendChild(field('Type', select(['task', 'bug', 'feature', 'idea'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskKind, value => { form.taskKind = value })))
+        body.appendChild(field('Priority', select(['high', 'normal', 'low'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskPriority, value => { form.taskPriority = value })))
+        body.appendChild(field('Weight', select(['heavy', 'medium', 'light'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskWeight, value => { form.taskWeight = value })))
+        const problem = el('p', 'pending-error'); problem.hidden = true
+        const add = button('primary wide', 'Add project task', async () => {
+          if (busy || !form.taskTitle.trim()) return
+          busy = true; add.disabled = true; add.textContent = 'Addingâ€¦'; problem.hidden = true
+          try {
+            const created = await api('/api/projects/' + encodeURIComponent(form.projectId) + '/tasks', { method: 'POST', body: { title: form.taskTitle, kind: form.taskKind, priority: form.taskPriority, weight: form.taskWeight } })
+            form.taskTitle = ''; busy = false
+            showToast({ kind: 'done', title: 'Project task added', body: created && created.title, url: '#/' })
+            go('#/')
+          } catch (error) {
+            busy = false; problem.textContent = errorMessage(error); problem.hidden = false; add.textContent = 'Add project task'; paintTask()
+          }
+        })
+        const reason = el('p', 'field-hint reason')
+        const paintTask = () => {
+          const blocker = !form.projectId ? 'Add a project on the computer first.' : !form.taskTitle.trim() ? 'Write the task first.' : ''
+          add.disabled = busy || Boolean(blocker); reason.textContent = blocker; reason.hidden = !blocker
+        }
+        paintTask(); body.appendChild(add); body.appendChild(reason); body.appendChild(problem); scroll.appendChild(body); return
+      }
 
       const workspaces = project ? project.workspaces || [] : []
       body.appendChild(field('Workspace', select(
@@ -1786,14 +1858,34 @@
         scroll.appendChild(card)
       }
 
+      const weekly = state.phone && state.phone.weeklyUsage
+      if (weekly && weekly.models && weekly.models.length) {
+        const card = el('section', 'card')
+        card.appendChild(el('h2', 'card-title', 'Last 7 days by model'))
+        for (const modelUsage of weekly.models) {
+          const row = el('div', 'runtime')
+          row.appendChild(el('span', 'runtime-title', modelUsage.model || 'Model not reported'))
+          row.appendChild(el('span', 'runtime-meta', dotRow([
+            providerWord(modelUsage.provider),
+            formatNumber(modelUsage.totalTokens || 0) + ' tokens',
+            modelUsage.conversations + (modelUsage.conversations === 1 ? ' conversation' : ' conversations'),
+            modelUsage.estimated ? 'includes estimates' : ''
+          ])))
+          card.appendChild(row)
+        }
+        const coverage = weekly.coverage || {}
+        if (coverage.countersWithoutBaseline || coverage.truncatedConversations) card.appendChild(el('p', 'card-note', 'Only usage that can be placed inside this seven-day window is counted.'))
+        scroll.appendChild(card)
+      }
+
       const usage = (state.phone && state.phone.usage) || []
       if (usage.length) {
         const card = el('section', 'card')
-        card.appendChild(el('h2', 'card-title', 'Usage'))
+        card.appendChild(el('h2', 'card-title', 'Allowance windows'))
         for (const window_ of usage) {
           const row = el('div', 'meter')
           const head = el('div', 'meter-head')
-          head.appendChild(el('span', 'meter-label', dotRow([providerWord(window_.provider), window_.label])))
+          head.appendChild(el('span', 'meter-label', dotRow([providerWord(window_.provider), window_.model, window_.label])))
           head.appendChild(el('span', 'meter-value', formatPercent(window_.usedPercent)))
           row.appendChild(head)
           const bar = el('div', 'bar')

@@ -20,9 +20,9 @@ describe('close confirmation', () => {
   })
   it('protects provider-confirmed detached shell work after its parent turn completes', () => {
     const item = { id: 'shell', runtimeId: 'runtime', sequence: 1, timestamp: '2026-09-12T15:00:00Z', data: { type: 'tool' as const, name: 'Bash', detached: true, status: 'running' as const } }
-    expect(hasRunningWork(process, { ...emptyProjection('agent'), phase: 'completed', items: [item] })).toBe(true)
-    expect(hasRunningWork(process, { ...emptyProjection('agent'), phase: 'completed', items: [{ ...item, data: { ...item.data, status: 'completed' as const } }] })).toBe(false)
-    expect(hasRunningWork(process, { ...emptyProjection('agent'), phase: 'completed', items: [{ ...item, data: { ...item.data, detached: false } }] })).toBe(false)
+    expect(hasRunningWork(process, { ...emptyProjection('agent'), runtimeId: 'runtime', phase: 'completed', items: [item] })).toBe(true)
+    expect(hasRunningWork(process, { ...emptyProjection('agent'), runtimeId: 'runtime', phase: 'completed', items: [{ ...item, data: { ...item.data, status: 'completed' as const } }] })).toBe(false)
+    expect(hasRunningWork(process, { ...emptyProjection('agent'), runtimeId: 'runtime', phase: 'completed', items: [{ ...item, data: { ...item.data, detached: false } }] })).toBe(false)
   })
   it('shares one pending decision and cancellation allows a fresh request', async () => {
     const guard = new CloseConfirmation()
@@ -35,5 +35,12 @@ describe('close confirmation', () => {
     answer(false)
     expect(await one).toBe(false); expect(await two).toBe(false)
     expect(await guard.request(async () => true)).toBe(true)
+  })
+  it('ignores old runtime rows and stopped tools but protects real background inventory', () => {
+    const state = { ...emptyProjection('agent'), runtimeId: 'new', phase: 'completed' as const, items: [{ id: 'old', runtimeId: 'old', sequence: 1, timestamp: '', data: { type: 'tool' as const, name: 'Bash', detached: true, status: 'running' as const } }] }
+    expect(hasRunningWork(process, state)).toBe(false)
+    expect(hasRunningWork(process, { ...state, runtimeId: 'old', phase: 'interrupted' })).toBe(false)
+    expect(hasRunningWork(process, { ...state, backgroundTasks: 1 })).toBe(true)
+    expect(hasRunningWork(process, { ...state, runtimeId: 'old', backgroundTasks: 0 })).toBe(false)
   })
 })

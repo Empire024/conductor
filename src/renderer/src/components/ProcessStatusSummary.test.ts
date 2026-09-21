@@ -99,8 +99,8 @@ describe('aggregateProjectProcessUsage', () => {
 
   it('surfaces the highest warning level among a project\'s processes and names which tab(s)', () => {
     const processes = [
-      process({ id: 'agent-1', projectId: 'project-a', title: 'Refactor pass' }),
-      process({ id: 'agent-2', projectId: 'project-a', title: 'Docs pass' })
+      process({ activityPhase: 'working', id: 'agent-1', projectId: 'project-a', title: 'Refactor pass' }),
+      process({ activityPhase: 'working', id: 'agent-2', projectId: 'project-a', title: 'Docs pass' })
     ]
     const usage = new Map([
       ['agent-1', { costUsd: 1, totalTokens: 100, warning: 'approaching' as const }],
@@ -112,7 +112,7 @@ describe('aggregateProjectProcessUsage', () => {
   })
 
   it('leaves a project without any expensive process unflagged', () => {
-    const processes = [process({ id: 'agent-1', projectId: 'project-a' })]
+    const processes = [process({ activityPhase: 'working', id: 'agent-1', projectId: 'project-a' })]
     const usage = new Map([['agent-1', { costUsd: 0.1, totalTokens: 10 }]])
     const [entry] = aggregateProjectProcessUsage(processes, projects, usage)
     expect(entry!.warning).toBeUndefined()
@@ -121,8 +121,8 @@ describe('aggregateProjectProcessUsage', () => {
 
   it('puts a flagged project first even when another project has a bigger raw spend', () => {
     const processes = [
-      process({ id: 'agent-1', projectId: 'project-b' }),
-      process({ id: 'agent-2', projectId: 'project-a' })
+      process({ activityPhase: 'working', id: 'agent-1', projectId: 'project-b' }),
+      process({ activityPhase: 'working', id: 'agent-2', projectId: 'project-a' })
     ]
     const usage = new Map([
       ['agent-1', { costUsd: 50, totalTokens: 100_000 }],
@@ -134,8 +134,8 @@ describe('aggregateProjectProcessUsage', () => {
 
   it('ranks a high warning ahead of a merely approaching one across projects', () => {
     const processes = [
-      process({ id: 'agent-1', projectId: 'project-a' }),
-      process({ id: 'agent-2', projectId: 'project-b' })
+      process({ activityPhase: 'working', id: 'agent-1', projectId: 'project-a' }),
+      process({ activityPhase: 'working', id: 'agent-2', projectId: 'project-b' })
     ]
     const usage = new Map([
       ['agent-1', { costUsd: 1, totalTokens: 100, warning: 'approaching' as const }],
@@ -144,4 +144,14 @@ describe('aggregateProjectProcessUsage', () => {
     const totals = aggregateProjectProcessUsage(processes, projects, usage)
     expect(totals[0]!.projectId).toBe('project-b')
   })
+  it('keeps idle spend but clears its flame warning', () => {
+    const [entry] = aggregateProjectProcessUsage([process({ id: 'idle', projectId: 'project-a', activityPhase: 'idle' })], projects, new Map([['idle', { costUsd: 9, totalTokens: 12000, warning: 'high' as const }]]))
+    expect(entry).toMatchObject({ costUsd: 9, totalTokens: 12000, expensiveTitles: [] })
+    expect(entry!.warning).toBeUndefined()
+  })
+  it('uses the settled native phase to suppress a stale working-process warning', () => {
+    const [entry] = aggregateProjectProcessUsage([process({ id: 'settled', projectId: 'project-a', activityPhase: 'working' })], projects, new Map([['settled', { snapshotPhase: 'completed' as const, warning: 'high' as const }]]))
+    expect(entry!.warning).toBeUndefined()
+  })
+
 })

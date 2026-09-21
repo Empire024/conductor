@@ -7,7 +7,7 @@ import { conductorUri } from '../shared/agent-control'
 import { makeId, type AgentSpec, type LayoutNode, type PaneTab } from '../shared/models'
 import type { InteractionResponse, PromptDispatchAuthority, PromptOrigin, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import { LOCAL_MACHINE_ID, type RemotePeerRecord } from '../shared/remote-control'
-import { projectTaskPriorities, type ProjectTaskPriority } from '../shared/project-backlog'
+import { PROJECT_TASK_MAX_LENGTH, projectTaskKinds, projectTaskPriorities, projectTaskWeights, type ProjectTaskKind, type ProjectTaskPriority, type ProjectTaskWeight } from '../shared/project-backlog'
 import { workspacePath } from './agent-artifacts'
 import type { ConductorDatabase } from './database'
 import { writeEditorFile } from './editor-files'
@@ -86,6 +86,7 @@ export const remoteToolSignatures = {
   'files.readChunk': '({projectId,path,offset,length,version}) — at most 256 KiB from that exact version',
   'files.open': '({projectId,sessionId,path})',
   'tasks.list': '({projectId})',
+  'tasks.create': '({projectId,revision,title,kind,priority?,weight?})',
   'tasks.update': '({projectId,revision,id,status?,title?,priority?})',
   // A shell on this machine runs as this machine's user. docs/multi-device.md says what that
   // means; these methods are the only door to it, and every one of them goes through the grant.
@@ -415,6 +416,23 @@ export class RemoteControlHost {
       return this.terminals.call(peer, method, args)
     }
     if (method === 'tasks.list') return backlogs.get(this.deps.peers.requireProject(peer, args.projectId).id)
+    if (method === 'tasks.create') {
+      const project = this.deps.peers.requireProject(peer, args.projectId)
+      const board = await backlogs.get(project.id)
+      const revision = text(args, 'revision', 100)
+      const title = text(args, 'title', PROJECT_TASK_MAX_LENGTH)
+      const kind = args.kind
+      const priority = args.priority ?? 'normal', weight = args.weight ?? 'medium'
+      if (!projectTaskKinds.includes(kind as ProjectTaskKind)) throw new RemoteAccessError('Invalid task kind.', 400)
+      if (!projectTaskPriorities.includes(priority as ProjectTaskPriority)) throw new RemoteAccessError('Invalid task priority.', 400)
+      if (!projectTaskWeights.includes(weight as ProjectTaskWeight)) throw new RemoteAccessError('Invalid task weight.', 400)
+      const before = new Set(board.tasks.map(task => task.id))
+      const updated = await backlogs.edit(project.id, revision, { type: 'add', title, kind: kind as ProjectTaskKind, priority: priority as ProjectTaskPriority, weight: weight as ProjectTaskWeight }, { actor: 'you' })
+      const added = updated.tasks.find(task => !before.has(task.id))
+      if (!added) throw new RemoteAccessError('The task was not added.', 409)
+      this.deps.fileChanged({ projectId: project.id, path: 'feature-list.md' })
+      return added
+    }
     if (method === 'tasks.update') {
       const project = this.deps.peers.requireProject(peer, args.projectId)
       const board = await backlogs.get(project.id), id = text(args, 'id', 160)
@@ -425,7 +443,7 @@ export class RemoteControlHost {
       if (args.priority !== undefined && !projectTaskPriorities.includes(args.priority as ProjectTaskPriority)) throw new RemoteAccessError('Invalid task priority.', 400)
       const updated = await backlogs.edit(project.id, text(args, 'revision', 100), {
         type: 'update', id, status: status as 'todo' | 'doing' | 'done',
-        ...(args.title === undefined ? {} : { title: text(args, 'title', 8000) }),
+        ...(args.title === undefined ? {} : { title: text(args, 'title', PROJECT_TASK_MAX_LENGTH) }),
         ...(args.priority === undefined ? {} : { priority: args.priority as ProjectTaskPriority })
       })
       this.deps.fileChanged({ projectId: project.id, path: 'feature-list.md' })

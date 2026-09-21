@@ -1,5 +1,6 @@
 import { bindConversationTab, type ConversationIdentity } from '../panes/conversation-tab'
 import { AgentControlLinks } from '../components/AgentControlLinks'
+import { useAgentControlLinks } from '../components/useAgentControlLinks'
 import { ProjectBacklogPane } from '../components/ProjectBacklogPane'
 import '../navigation.css'
 import { ProviderIcon } from '../components/ProviderIcon'
@@ -33,6 +34,7 @@ import type {
   SessionRecord,
   WorkspaceLayout
 } from '../../../shared/models'
+import type { AgentControlLink } from '../../../shared/agent-control'
 import { makeLauncherTab } from '../../../shared/models'
 import {
   activateTab,
@@ -75,6 +77,8 @@ import { SessionArchiveDormantPane } from '../components/SessionArchiveDormantPa
 import { debugLog } from '../debug-log'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
+import { coworkerTabGroups } from './coworker-tab-groups'
+import './coworker-tab-groups.css'
 
 interface PaneWorkspaceProps {
   layout: WorkspaceLayout
@@ -239,6 +243,7 @@ const PaneBody = ({
 function PaneGroup({
   group,
   workspace,
+  controlLinks,
   dragActions,
   dragging,
   dropTarget,
@@ -246,6 +251,7 @@ function PaneGroup({
 }: {
   group: PaneGroupNode
   workspace: PaneWorkspaceProps
+  controlLinks: readonly AgentControlLink[]
   dragActions: PaneDragActions
   dragging: TabDragState | null
   dropTarget: TabDropTarget | null
@@ -267,6 +273,7 @@ function PaneGroup({
   const [closingTabIds, setClosingTabIds] = useState<Set<string>>(() => new Set())
   const [openingTabIds, setOpeningTabIds] = useState<Set<string>>(() => new Set())
   const [spotlight, setSpotlight] = useState<{ tabId: string; key: number } | null>(null)
+  const [expandedCoworkers, setExpandedCoworkers] = useState<Set<string>>(() => new Set())
   const knownTabIdsRef = useRef(new Set(group.tabs.map((tab) => tab.id)))
   const closeTimersRef = useRef(new Map<string, number>())
   const workspaceRef = useRef(workspace)
@@ -502,7 +509,7 @@ function PaneGroup({
   /** One tab button. `gapHere` opens the drag insertion gap in front of it; for the first tab
    * of a group the gap belongs on the group wrapper instead, so the tab never detaches from
    * its own chip mid-drag. */
-  const renderTab = (tab: PaneTab, gapHere: boolean): React.JSX.Element => {
+  const renderTab = (tab: PaneTab, gapHere: boolean, dropSlot = true): React.JSX.Element => {
     const Icon = iconFor(tab)
     const rawPhase = activity[tab.id] ?? 'idle'
     const correctedPhase = tab.resourceId ? workspace.correctedActivityPhases?.get(tab.resourceId) : undefined
@@ -512,7 +519,7 @@ function PaneGroup({
         key={tab.id}
         data-control-tab-id={tab.id}
         data-control-agent-id={tab.resourceId}
-        data-drop-slot-id={tab.id}
+        {...(dropSlot ? { 'data-drop-slot-id': tab.id } : {})}
         className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
         style={{ marginLeft: gapHere ? dragging!.width : undefined }}
         onClick={() => workspace.onLayout(activateTab(workspace.layout, group.id, tab.id))}
@@ -543,6 +550,8 @@ function PaneGroup({
     )
   }
 
+  const coworkerPresentation = coworkerTabGroups(group.tabs, controlLinks)
+
   return (
     <>
     <section
@@ -569,7 +578,40 @@ function PaneGroup({
       >
         <div className="pane-tabs">
           {tabStripSlots(group).map((slot) => {
-            if (slot.kind === 'tab') return renderTab(slot.tab, gapBeforeId === slot.tab.id)
+            if (slot.kind === 'tab') {
+              const coworkerGroup = coworkerPresentation.groupByTabId.get(slot.tab.id)
+              if (!coworkerGroup) return renderTab(slot.tab, gapBeforeId === slot.tab.id)
+              if (coworkerGroup.insertionTabId !== slot.tab.id) return null
+              const expanded = expandedCoworkers.has(coworkerGroup.controller.id)
+              const activeCoworker = coworkerGroup.coworkers.find(tab => tab.id === activeTab.id)
+              const visibleCoworkers = expanded ? coworkerGroup.coworkers : activeCoworker ? [activeCoworker] : []
+              const allCount = coworkerGroup.coworkers.length + 1
+              return <div
+                key={`coworkers:${coworkerGroup.controller.id}`}
+                className={`coworker-tab-group ${expanded ? 'expanded' : 'collapsed'} ${activeCoworker ? 'has-active-coworker' : ''}`}
+                data-drop-slot-id={!expanded ? coworkerGroup.controller.id : undefined}
+                data-drop-span={!expanded ? allCount : undefined}
+                style={{ marginLeft: gapBeforeId === coworkerGroup.insertionTabId ? dragging!.width : undefined }}
+              >
+                {renderTab(coworkerGroup.controller, false, expanded)}
+                <button
+                  type="button"
+                  className="coworker-tab-toggle"
+                  aria-expanded={expanded}
+                  title={`${expanded ? 'Collapse' : 'Show'} ${coworkerGroup.coworkers.length} coworker tab${coworkerGroup.coworkers.length === 1 ? '' : 's'}`}
+                  onClick={() => setExpandedCoworkers(current => {
+                    const next = new Set(current)
+                    if (next.has(coworkerGroup.controller.id)) next.delete(coworkerGroup.controller.id)
+                    else next.add(coworkerGroup.controller.id)
+                    return next
+                  })}
+                >
+                  <span>{coworkerGroup.coworkers.length}</span>
+                  {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                </button>
+                {visibleCoworkers.map(tab => renderTab(tab, false, expanded))}
+              </div>
+            }
             // The gap in front of a group's first tab opens before its chip, so a tab dropped
             // at the head of a run lands outside the group's outline rather than inside it.
             const runFirstId = slot.tabs[0]!.id
@@ -650,6 +692,7 @@ function PaneGroup({
 function SplitView({
   node,
   workspace,
+  controlLinks,
   dragActions,
   dragging,
   dropTarget,
@@ -657,6 +700,7 @@ function SplitView({
 }: {
   node: LayoutNode
   workspace: PaneWorkspaceProps
+  controlLinks: readonly AgentControlLink[]
   dragActions: PaneDragActions
   dragging: TabDragState | null
   dropTarget: TabDropTarget | null
@@ -696,6 +740,7 @@ function SplitView({
         key={`${workspace.session.id}:${node.id}`}
         group={node}
         workspace={workspace}
+        controlLinks={controlLinks}
         dragActions={dragActions}
         dragging={dragging}
         dropTarget={dropTarget}
@@ -768,8 +813,8 @@ function SplitView({
   }
 
   const renderChild = (side: 0 | 1): React.JSX.Element | null => {
-    if (split) return <SplitView node={split.children[side]} workspace={workspace} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
-    if (side === remnant!.survivorSide) return <SplitView node={node} workspace={workspace} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
+    if (split) return <SplitView node={split.children[side]} workspace={workspace} controlLinks={controlLinks} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
+    if (side === remnant!.survivorSide) return <SplitView node={node} workspace={workspace} controlLinks={controlLinks} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
     return null
   }
 
@@ -857,6 +902,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   propsRef.current = props
   const maximized = props.maximizedGroupId ? findGroup(props.layout.root, props.maximizedGroupId) : null
   const emptyGroup = props.layout.root.type === 'group' && props.layout.root.tabs.length === 0
+  const controlLinks = useAgentControlLinks(props.project.id, props.session.id, !emptyGroup)
 
   useEffect(() => {
     let foreignStaleTimer = 0
@@ -1003,7 +1049,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
           <button disabled={!props.canReopen} onClick={() => props.onReopen(props.layout.root.id)}><Undo2 size={14} /> Reopen</button>
         </div>
       ) : (
-        <SplitView node={maximized ?? props.layout.root} workspace={props} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
+        <SplitView node={maximized ?? props.layout.root} workspace={props} controlLinks={controlLinks} dragActions={dragActions} dragging={dragging} dropTarget={dropTarget} snapArrival={snapArrival} />
       )}
       {maximized && <div className="maximized-badge">MAXIMIZED</div>}
       {dragging && createPortal(

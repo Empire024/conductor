@@ -1,4 +1,5 @@
 import type { UsageCapScope, UsageCapSetting, UsageCapSnapshot } from './usage-accounting'
+import type { WeeklyModelUsageReport } from './weekly-model-usage'
 import type {
   AppSettings,
   AgentSoundProfile,
@@ -197,6 +198,7 @@ export interface ConductorBridge {
     read(agentSessionId?: string, workspaceId?: string): Promise<UsageCapSnapshot>
     write(scope: UsageCapScope, id: string | null, setting: UsageCapSetting | null): Promise<void>
   }
+  usage: { weekly(): Promise<WeeklyModelUsageReport> }
   /** Agent activity for every project, including those whose panes are not mounted. */
   activity: {
     projects(): Promise<ProjectActivitySnapshot>

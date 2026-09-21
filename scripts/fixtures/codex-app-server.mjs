@@ -279,6 +279,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     finish()
     return
   }
+  // A quota that has run out, exactly as Codex reports it: a failed turn whose error names a
+  // reset time. Seconds rather than hours so the smoke run can actually wait for the reopening.
+  if (scenario === 'synthetic:usage-limit') {
+    notify('turn/completed', { threadId, turn: { id: currentTurn, items: [], status: 'failed', error: { message: "You've hit your session limit · resets in 3 seconds" } } })
+    return
+  }
   if (scenario === 'synthetic:disconnect') { process.exit(7); return }
   if (scenario === 'synthetic:question') {
     approval = { id: 501, question: true }

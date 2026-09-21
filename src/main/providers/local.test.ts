@@ -4,8 +4,8 @@ import { createServer as createTcpServer } from 'node:net'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { LocalAdapter } from './local'
-import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, runFile } from '../local-models/config.ts'
+import { LocalAdapter, LocalSetupError } from './local'
+import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, modelDir, runFile } from '../local-models/config.ts'
 import type { LocalModelConfig } from '../local-models/config.ts'
 import * as localPaths from '../local-models/paths.ts'
 import type { AdapterEvent, SessionSettings } from '../../shared/structured-agent'
@@ -84,6 +84,11 @@ describe('local provider adapter', () => {
       sandbox: DEFAULT_SANDBOX
     }), 'utf8')
     process.env.CONDUCTOR_LOCAL_ROOT = root
+    for (const id of [QWEN_9B, QWEN_35B]) {
+      const configured = model(id, id === QWEN_9B ? small.port : large.port) as unknown as LocalModelConfig
+      mkdirSync(modelDir(configured), { recursive: true })
+      writeFileSync(join(modelDir(configured), configured.file), 'fixture', 'utf8')
+    }
     const workspace = mkdtempSync(join(root, 'ws-'))
     return { small, large, workspace }
   }
@@ -104,12 +109,21 @@ describe('local provider adapter', () => {
   const texts = (events: AdapterEvent[], role: 'assistant' | 'status'): string =>
     events.filter(event => event.data.type === 'text' && event.data.role === role).map(event => event.data.type === 'text' ? event.data.text : '').join('')
 
+  it('carries an actionable setup code and public guide without local configuration details', () => {
+    const error = new LocalSetupError('Qwen 3.5 9B is not installed.')
+    expect(error).toMatchObject({ code: 'local-setup-required', actionUrl: 'https://github.com/Empire024/conductor/blob/main/docs/local-models.md' })
+    expect(error.message).toContain('Download or set up the local model')
+  })
+
   it('refuses a foreign healthy server before sending any conversation', async () => {
     const ready = await stack([frame({ content: 'must not receive a prompt' }, 'stop')])
     ready.small.identity.model = 'local/foreign-model'
     const events: AdapterEvent[] = []
     const instance = adapter(ready.workspace, events, { model: QWEN_9B })
-    await expect(instance.start()).rejects.toThrow('Cannot start')
+    await instance.start()
+    await instance.submit('must not send', settings({ model: QWEN_9B }))
+    expect(await settled(events)).toBe('failed')
+    expect(events.some(event => event.data.type === 'error' && /Cannot start/.test(event.data.message))).toBe(true)
     expect(ready.small.requests).toHaveLength(0)
     expect(ready.large.requests).toHaveLength(0)
   })
@@ -117,8 +131,12 @@ describe('local provider adapter', () => {
   it('refuses a server impersonating the requested id without enforcing the key', async () => {
     const ready = await stack([frame({ content: 'must not receive a prompt' }, 'stop')])
     ready.small.identity.anonymous = true
-    const instance = adapter(ready.workspace, [], { model: QWEN_9B })
-    await expect(instance.start()).rejects.toThrow('Cannot start')
+    const events: AdapterEvent[] = []
+    const instance = adapter(ready.workspace, events, { model: QWEN_9B })
+    await instance.start()
+    await instance.submit('must not send', settings({ model: QWEN_9B }))
+    expect(await settled(events)).toBe('failed')
+    expect(events.some(event => event.data.type === 'error' && /Cannot start/.test(event.data.message))).toBe(true)
     expect(ready.small.requests).toHaveLength(0)
   })
 
@@ -271,7 +289,10 @@ describe('local provider adapter', () => {
     writeFileSync(join(process.env.CONDUCTOR_LOCAL_ROOT!, 'config', 'api-key'), 'c'.repeat(64) + '\n', 'utf8')
     const events: AdapterEvent[] = []
     const instance = adapter(ready.workspace, events)
-    await expect(instance.start()).rejects.toThrow(/Local model failed to start|not answering|llama/i)
+    await instance.start()
+    await instance.submit('must not send', settings())
+    expect(await settled(events)).toBe('failed')
+    expect(events.some(event => event.data.type === 'error' && /Local model failed to start|not answering|llama/i.test(event.data.message))).toBe(true)
     expect(JSON.stringify(events)).not.toContain(KEY)
   })
 })
