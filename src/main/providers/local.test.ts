@@ -130,6 +130,9 @@ describe('local provider adapter', () => {
     await instance.submit('answer', settings())
     expect(await settled(events)).toBe('completed')
     expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { inputTokens: 2100, cachedTokens: 2000, outputTokens: 3, totalTokens: 2103 }, native: { method: 'llama.cpp/timings', payload: { cache_n: 2000, prompt_n: 100, prompt_ms: 90, predicted_ms: 30 } } })
+    // Context figures the ring and "Model context window" read, as the CLIs report them: the
+    // configured 32,768-token window, capacity once the 4,096-token answer reserve is held back.
+    expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { limits: { contextUsedTokens: 2103, contextCapacityTokens: 32768 - 4096, modelContextWindow: 32768 } } })
   })
 
   const guard = (reason: unknown): void => { if (!(reason instanceof Error) || reason.message !== 'skip') throw reason }

@@ -172,7 +172,9 @@ export class CodexAdapter implements ProviderAdapter {
   private readonly providerCapabilities: ProviderCapabilities = {
     provider: 'codex', runtimeVersion: 'unknown', adapterVersion: 1, authentication: 'cli',
     steering: false, textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true,
-    approvals: true, questions: true, resume: true, fork: true, plans: false, imageAttachments: true, effort: ['minimal', 'low', 'medium', 'high', 'xhigh'], models: [], permissions: ['default', 'read-only', 'accept-edits'],
+    // Pre-discovery ladder: the union the installed CLI advertised on 2026-09-21 (no model offers
+    // `minimal`); model/list replaces it per model once the thread starts.
+    approvals: true, questions: true, resume: true, fork: true, plans: false, imageAttachments: true, effort: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], models: [], permissions: ['default', 'read-only', 'accept-edits'],
     sandboxModes: ['inherit', 'read-only', 'workspace-write'], approvalPolicies: ['inherit', 'untrusted', 'on-request', 'never'],
     limitations: [
       'Command output combines stdout and stderr in the App Server item protocol.',
@@ -676,7 +678,9 @@ export class CodexAdapter implements ProviderAdapter {
     const correlation = { ...context, itemId: item.id }
     // The compacted thread keeps a summary of what Conductor told it, not the text; the host
     // restates its briefing with the next message when it sees this marker.
-    if (item.type === 'contextCompaction' && complete && context.nativeSessionId === this.threadId) this.emit({ ...correlation, data: { type: 'notice', message: 'Codex compacted this conversation; Conductor restates its briefing with the next message.', payload: { contextReset: true } }, native })
+    // Under its own item id: the generic `Codex contextCompaction` notice below shares item.id,
+    // and the projection keeps one event per item id, so the owner would otherwise never see this one.
+    if (item.type === 'contextCompaction' && complete && context.nativeSessionId === this.threadId) this.emit({ ...correlation, itemId: `${item.id}:compacted`, data: { type: 'notice', message: 'Codex compacted this conversation; Conductor restates its briefing with the next message.', payload: { contextReset: true } }, native })
     if (complete) {
       if (this.completedItems.size >= 2048) this.completedItems.delete(this.completedItems.values().next().value!)
       this.completedItems.add(this.itemKey(correlation))

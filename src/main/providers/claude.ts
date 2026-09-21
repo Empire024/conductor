@@ -8,8 +8,10 @@ import { JsonLineTransport, type TransportOptions } from './transport'
 import { settingsForRuntime } from '../../shared/structured-agent'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
-/** The local CLI bridge is checked against the official CLI/extension 2.1.263. */
-export const CLAUDE_COMPATIBILITY = '2.1.263'
+/** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
+ *  capability sweep verified discovery, four one-word turns, usage and rate-limit frames on it
+ *  (docs/conductor-provider-parity.md, "Live turns"); 2.1.263 was the previous fixture baseline. */
+export const CLAUDE_COMPATIBILITY = '2.1.278'
 const parseClaudeVersion = (value: string): [number, number, number] | undefined => {
   const parts = /^(\d+)\.(\d+)\.(\d+)$/.exec(value.trim())
   return parts ? [Number(parts[1]), Number(parts[2]), Number(parts[3])] : undefined
@@ -464,9 +466,20 @@ export class ClaudeAdapter implements ProviderAdapter {
       const usage = object(message.usage)
       this.usage(usage, `usage:turn:${this.turnId ?? uuid ?? randomUUID()}`, 'turn', parentId)
       if (!parentId) {
+        // modelUsage is keyed by the configured name (`claude-opus-5[1m]`, as system/init reports
+        // it) while the message frames name the API model without the suffix (`claude-opus-5`),
+        // so the message model alone misses the 1M entries. It is also cumulative across every
+        // model the session used, so the current turn's model is matched before the configured one.
         const model = string(object(this.capabilities.effectiveSettings).model)
+        const configured = this.settings.model && this.settings.model !== 'default' ? this.settings.model : string(object(this.configurationMetadata).model)
         const models = object(message.modelUsage)
-        const metadata = object(model ? models[model] : Object.keys(models).length === 1 ? Object.values(models)[0] : undefined)
+        const names = Object.keys(models)
+        const key = model === undefined ? undefined
+          : (configured?.endsWith('[1m]') ? names.find(name => name === `${model}[1m]`) : undefined)
+            ?? names.find(name => name === model)
+            ?? names.find(name => name === configured)
+            ?? names.find(name => name.replace(/\[1m\]$/, '') === model)
+        const metadata = object(key ? models[key] : names.length === 1 ? Object.values(models)[0] : undefined)
         this.contextWindow = number(metadata.contextWindow) ?? this.contextWindow
         this.maxOutputTokens = number(metadata.maxOutputTokens) ?? this.maxOutputTokens
         this.emitContext()

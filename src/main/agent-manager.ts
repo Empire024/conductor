@@ -16,7 +16,7 @@ import { parseUsageLimitReset } from './usage-limit'
 import { extendResizeActivitySuppression, normalizeAgentOutputSignal, shouldSignalAgentOutput } from './agent-activity'
 import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { captureMemories, capturedMemoryKey } from './memory'
-import { LOCAL_MODELS } from '../shared/local-models'
+import { LOCAL_MODELS, localModelLabel } from '../shared/local-models'
 import { NativeCliManager } from './native-cli-manager'
 import { loadConfig } from './local-models/config.ts'
 import { StructuredSessions } from './structured-sessions'
@@ -44,27 +44,44 @@ const modelArg = (spec: AgentSpec): string[] => spec.model && spec.model !== 'de
   ? ['--model', spec.model]
   : []
 
+/** The ladder the installed Codex CLI advertised on 2026-09-21 (`model/list`): every visible
+ *  model except GPT-5.5 offers `max` and `ultra`, none offers `minimal`. Structured sessions
+ *  send these per turn; the legacy PTY launch keeps its own guard (see LEGACY_PTY_EFFORTS). */
 export const CODEX_EFFORTS: Array<{ id: AgentEffort; label: string }> = [
   { id: 'auto', label: 'Automatic' },
   { id: 'low', label: 'Low' },
   { id: 'medium', label: 'Medium' },
   { id: 'high', label: 'High' },
-  { id: 'xhigh', label: 'Extra high' }
+  { id: 'xhigh', label: 'Extra high' },
+  { id: 'max', label: 'Maximum' },
+  { id: 'ultra', label: 'Ultra (delegating)' }
 ]
+/** Efforts the legacy PTY launch may pass as `model_reasoning_effort`. `max` once made the CLI
+ *  exit at startup and `ultra` has not been tried through the PTY; neither is re-verified, so
+ *  only structured sessions (per-turn `effort` on `turn/start`) use them. */
+const LEGACY_PTY_EFFORTS: ReadonlySet<AgentEffort> = new Set(['low', 'medium', 'high', 'xhigh'])
 
-const standardEfforts: Array<{ id: AgentEffort; label: string }> = [
-  ...CODEX_EFFORTS,
-  { id: 'max', label: 'Maximum' }
-]
+const standardEfforts: Array<{ id: AgentEffort; label: string }> = CODEX_EFFORTS.filter(({ id }) => id !== 'ultra')
 
 const claudeEfforts: Array<{ id: AgentEffort; label: string }> = [...standardEfforts]
 
+/** Labels are the CLI's own `displayName`s from `model/list` (0.153.4, 2026-09-21), so the
+ *  pre-discovery picker and the discovered one read the same. GPT-5.5 (retires 2026-10-14) is
+ *  deliberately left to discovery. */
 export const CODEX_MODELS = [
   { id: 'default', label: 'Default for account' },
-  { id: 'gpt-6-astra', label: 'GPT-6 Astra' },
-  { id: 'gpt-5.6-sol', label: 'GPT-5.6 Sol' },
-  { id: 'gpt-5.6-terra', label: 'GPT-5.6 Terra' },
-  { id: 'gpt-5.6-luna', label: 'GPT-5.6 Luna' }
+  { id: 'gpt-6-astra', label: 'GPT-6-Astra' },
+  { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol' },
+  { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra' },
+  { id: 'gpt-5.6-luna', label: 'GPT-5.6-Luna' }
+]
+
+export const CLAUDE_MODELS = [
+  { id: 'default', label: 'Default for account' },
+  { id: 'opus[1m]', label: 'Claude Opus (1M context)' },
+  { id: 'claude-fable-5-1[1m]', label: 'Claude Fable' },
+  { id: 'sonnet', label: 'Claude Sonnet' },
+  { id: 'haiku', label: 'Claude Haiku' }
 ]
 
 const findOnPath = (command: string, configured?: string): string | null => {
@@ -85,15 +102,14 @@ const providers: Record<AgentProviderId, AgentProvider> = {
     resolveExecutable: () => findOnPath('codex', process.env.CONDUCTOR_CODEX_PATH),
     installUrl: 'https://developers.openai.com/codex/cli/',
     models: CODEX_MODELS,
-    // Codex config currently accepts minimal/low/medium/high/xhigh. `max` is
-    // intentionally not offered here: passing it as model_reasoning_effort
-    // makes the CLI exit and leaves its pane looking broken.
     efforts: CODEX_EFFORTS,
     launch: (spec, executable) => ({
       executable,
       args: [
         ...modelArg(spec),
-        ...(CODEX_EFFORTS.some(({ id }) => id === spec.effort) && spec.effort !== 'auto'
+        // Only the PTY-verified levels reach model_reasoning_effort: `max` used to make the CLI
+        // exit and leave its pane looking broken, and `ultra` is untried on this path.
+        ...(spec.effort && LEGACY_PTY_EFFORTS.has(spec.effort)
           ? ['-c', `model_reasoning_effort="${spec.effort}"`]
           : []),
         ...(spec.resume ? ['resume', '--last'] : [])
@@ -105,13 +121,9 @@ const providers: Record<AgentProviderId, AgentProvider> = {
     displayName: 'Claude Code',
     resolveExecutable: () => findOnPath('claude', process.env.CONDUCTOR_CLAUDE_PATH),
     installUrl: 'https://docs.anthropic.com/en/docs/claude-code/setup',
-    models: [
-      { id: 'default', label: 'Default for account' },
-      { id: 'opus', label: 'Claude Opus' },
-      { id: 'sonnet', label: 'Claude Sonnet' },
-      { id: 'haiku', label: 'Claude Haiku' },
-      { id: 'fable', label: 'Claude Fable' }
-    ],
+    // Mirrors the ids the installed Claude Code 2.1.278 advertised on 2026-09-21 (`initialize.models`):
+    // the account default resolves to Opus with the 1M window, and the only Opus entry is `opus[1m]`.
+    models: CLAUDE_MODELS,
     efforts: claudeEfforts,
     launch: (spec, executable) => ({
       executable,
@@ -307,7 +319,9 @@ export class AgentManager {
         available: Boolean(executable),
         executable: executable ?? undefined,
         installUrl: provider.installUrl,
-        models: provider.id === 'local' ? (() => { try { return Object.values(loadConfig().models).map(model => ({ id: model.id, label: model.label })) } catch { return [] } })() : provider.models,
+        // The shared label is what the launcher tiles, the composer and models.list show; the
+        // config file's own label would give the router and task assignment a second name.
+        models: provider.id === 'local' ? (() => { try { return Object.values(loadConfig().models).map(model => ({ id: model.id, label: localModelLabel(model.id) })) } catch { return [] } })() : provider.models,
         efforts: provider.efforts
       }
     })

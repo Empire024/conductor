@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { AdapterOptions, ProviderAdapter } from './adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, localModelLabel } from '../../shared/local-models'
-import { LocalAgentSession } from '../local-models/agent.ts'
+import { LocalAgentSession, RESPONSE_RESERVE_TOKENS } from '../local-models/agent.ts'
 import { endpointFor, loadConfig, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
 import { inspectAdmission, startServer } from '../local-models/llama.ts'
@@ -207,7 +207,10 @@ export class LocalAdapter implements ProviderAdapter {
           this.emit({ turnId, itemId: call.id, data: { type: 'tool', name: call.name, status: call.failed ? 'failed' : 'completed', output: call.output, outputMode: 'snapshot', durationMs: call.durationMs } })
           round++
         },
-        usage: usage => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider' }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
+        // The context figures give the composer ring and "Model context window" the same data the
+        // CLIs report: the configured window, the room left once the answer reserve is held back.
+        usage: usage => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider',
+          limits: { contextUsedTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0), contextCapacityTokens: model.contextTokens - RESPONSE_RESERVE_TOKENS, modelContextWindow: model.contextTokens } }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
         notice: message => this.emit({ turnId, data: { type: 'notice', message } })
       }, controller.signal)
       this.emit({ turnId, data: { type: 'session', phase: outcome.stopReason === 'interrupted' ? 'interrupted' : outcome.stopReason === 'iteration_limit' ? 'failed' : 'completed' } })

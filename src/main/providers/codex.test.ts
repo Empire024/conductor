@@ -5,7 +5,8 @@ import path from 'node:path'
 import { CodexAdapter, CODEX_PROTOCOL_BASELINE, codexChanges, codexDiffCounts, codexInput, codexLaunchArguments, validateCodexLiveConfiguration, codexLiveSkillOverrides } from './codex'
 import { JsonLineTransport } from './transport'
 import { SteeringUnavailableError } from './adapter'
-import type { AdapterEvent, Json, SessionSettings } from '../../shared/structured-agent'
+import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
+import { replayAgentEvents } from '../../shared/structured-agent-reducer'
 import type { ConfigReadResponse } from './generated/codex/v2/ConfigReadResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 
@@ -430,4 +431,14 @@ it('marks a completed compaction so the host restates its briefing', async () =>
   const resets = events.filter(event => event.data.type === 'notice' && (event.data.payload as { contextReset?: boolean } | undefined)?.contextReset === true)
   expect(resets).toHaveLength(1)
   expect(resets[0]).toMatchObject({ nativeSessionId: 'synthetic-thread-1', data: { type: 'notice', payload: { contextReset: true } } })
+  // The reset notice and the item's generic `Codex contextCompaction` notice must not share an
+  // item id: the projection keeps one event per item, and the owner never saw "compacted".
+  const generic = events.filter(event => event.data.type === 'notice' && event.data.message === 'Codex contextCompaction')
+  expect(generic.length).toBeGreaterThan(0)
+  expect(resets[0]!.itemId).toBeDefined()
+  expect(generic.every(event => event.itemId !== resets[0]!.itemId)).toBe(true)
+  const projected = replayAgentEvents('session', events.map((event, i): AgentEvent => ({ schemaVersion: 1, id: `event-${i}`, sequence: i + 1, sessionId: 'session', runtimeId: 'runtime-1', provider: 'codex', projectId: 'project', workspaceId: 'workspace', cwd: process.cwd(), timestamp: '2026-09-21T00:00:00.000Z', ...event })))
+  const notices = projected.items.filter(item => item.data.type === 'notice').map(item => item.data.type === 'notice' ? item.data.message : '')
+  expect(notices).toContain('Codex compacted this conversation; Conductor restates its briefing with the next message.')
+  expect(notices).toContain('Codex contextCompaction')
 })

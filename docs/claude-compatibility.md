@@ -4,14 +4,15 @@ Recorded 2026-09-07. This file records implementation and verification separatel
 
 ## Local reference and authentication
 
-- Installed `claude --version`: **2.1.263 (Claude Code)**.
+- Installed `claude --version`: **2.1.263 (Claude Code)** on 2026-09-07; **2.1.278** on 2026-09-21.
 - Installed official VS Code extension: **anthropic.claude-code-2.1.263-win32-x64**.
+- **Baseline raised to 2.1.278 on 2026-09-21** (`CLAUDE_COMPATIBILITY` in `src/main/providers/claude.ts`, repair R9 in `conductor-provider-parity.md`): the capability sweep verified discovery (`initialize`), four one-word turns, `system/init`, usage, `modelUsage` and `rate_limit_event` frames on 2.1.278 through the real UI. 2.1.263 is now below the gate and is refused; a newer 2.x connects with the "newer than the fixture-verified 2.1.278 baseline" limitation. The offline factory reports the constant itself, so the fixtures stay verified.
 - Executable discovery returned the native Windows `.exe`; the adapter uses argument arrays, `shell: false`, an explicit cwd, and separate stdout/stderr.
 - No separately installed Agent SDK dependency was found in Conductor. The official extension contains the SDK bridge implementation matching its packaged CLI.
 - Connection mode is **local CLI**, using the owner's existing CLI authentication/configuration. Conductor neither reads OAuth tokens nor creates an API client. The inherited CLI can itself be configured for subscription login, an API key, or a supported enterprise provider; the adapter does not switch that route or infer it from dollar telemetry.
 - **Live verification blocked:** the owner reported that Claude usage allowance is exhausted. No Claude inference was submitted during this implementation; neither acceptance prompt A nor B ran. This is not a green live test.
 
-`ClaudeAdapter` explicitly requires the tested **2.1.263** baseline. An untested executable version is rejected before any prompt is sent. Broadening this gate requires updating the baseline, checking the installed bridge, and rerunning the contracts. The application should expose unsupported controls as unavailable capabilities, not as working GUI parity.
+`ClaudeAdapter` explicitly requires the tested baseline (**2.1.263** when this was recorded, **2.1.278** since 2026-09-21). An executable below it is rejected before any prompt is sent. Broadening this gate requires updating the baseline, checking the installed bridge, and rerunning the contracts. The application should expose unsupported controls as unavailable capabilities, not as working GUI parity.
 
 ## Supported integration and evidence
 

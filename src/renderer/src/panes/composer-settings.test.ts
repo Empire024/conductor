@@ -1,16 +1,45 @@
 import { describe, expect, it } from 'vitest'
-import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
+import { composerChildKey, composerSendBlock, modelDisplayName, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
 import { MAX_PROMPT_CHARS } from '../../../shared/structured-agent'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 const settings = (model: string): SessionSettings => ({ permission: 'default', plan: false, model })
 const capabilities = (model: string, effort: string): ProviderCapabilities => ({ provider: 'claude', models: [{ id: 'opus', label: 'Opus' }, { id: 'sonnet', label: 'Sonnet' }], effectiveSettings: { model, effort } } as unknown as ProviderCapabilities)
 describe('resolved composer settings', () => {
   it('uses the effective effort when Claude resolves a configured alias to its concrete model', () => {
-    expect(resolvedComposerSettings(settings('opus'), capabilities('claude-opus-4-6', 'high'))).toEqual({ model: 'opus', label: 'claude-opus-4-6', effort: 'high' })
+    // The saved alias is what the catalog names; the runtime's resolved name is offered for the tooltip.
+    expect(resolvedComposerSettings(settings('opus'), capabilities('claude-opus-4-6', 'high'))).toEqual({ model: 'opus', label: 'Opus', effort: 'high', resolvedModel: 'claude-opus-4-6' })
   })
   it('does not carry effort from a different effective model into a new selection', () => {
     expect(resolvedComposerSettings(settings('sonnet'), capabilities('claude-opus-4-6', 'high')).effort).toBeUndefined()
     expect(resolvedComposerSettings({ ...settings('opus'), effort: 'low' }, capabilities('claude-opus-4-6', 'high')).effort).toBe('low')
+  })
+  it('labels a resolved alias by its catalog entry instead of the raw runtime id (live turns 3 and 4 of the 2026-09-21 sweep)', () => {
+    const live = { provider: 'claude', models: [{ id: 'sonnet', label: 'Sonnet' }, { id: 'haiku', label: 'Haiku' }, { id: 'opus[1m]', label: 'Opus (1M context)' }] } as unknown as ProviderCapabilities
+    expect(resolvedComposerSettings(settings('sonnet'), { ...live, effectiveSettings: { model: 'claude-sonnet-5', effort: 'low' } })).toEqual({ model: 'sonnet', label: 'Sonnet', effort: 'low', resolvedModel: 'claude-sonnet-5' })
+    expect(resolvedComposerSettings(settings('haiku'), { ...live, effectiveSettings: { model: 'claude-haiku-4-5-20251001', effort: null } })).toEqual({ model: 'haiku', label: 'Haiku', resolvedModel: 'claude-haiku-4-5-20251001' })
+    expect(resolvedComposerSettings(settings('opus[1m]'), { ...live, effectiveSettings: { model: 'claude-opus-5', effort: 'low' } })).toEqual({ model: 'opus[1m]', label: 'Opus (1M context)', effort: 'low', resolvedModel: 'claude-opus-5' })
+  })
+  it('calls the pre-discovery Claude stand-in "Account default" and a discovered or chosen model by its name', () => {
+    const undiscovered = { provider: 'claude', models: [], effort: ['low', 'medium', 'high', 'xhigh', 'max'] } as unknown as ProviderCapabilities
+    expect(resolvedComposerSettings({ permission: 'default', plan: false }, undiscovered)).toEqual({ model: 'opus[1m]', label: 'Account default' })
+    expect(resolvedComposerSettings(settings('opus[1m]'), undiscovered).label).toBe('Account default')
+    expect(resolvedComposerSettings(settings('sonnet'), undiscovered).label).toBe('sonnet')
+    expect(resolvedComposerSettings({ permission: 'default', plan: false }, { ...undiscovered, effectiveSettings: { model: 'claude-opus-5[1m]' } }).label).toBe('claude-opus-5[1m]')
+    expect(resolvedComposerSettings({ permission: 'default', plan: false }, undefined)).toEqual({ model: 'gpt-6-astra', label: 'GPT-6-Astra' })
+    // Before the pane has any capabilities the provider is unknown here; the stand-in id is Claude's alone.
+    expect(resolvedComposerSettings(settings('opus[1m]'), undefined)).toEqual({ model: 'opus[1m]', label: 'Account default' })
+  })
+})
+
+describe('model display names', () => {
+  it('formats a bare Codex id the way the CLI displays it and leaves CLI labels and other ids verbatim', () => {
+    expect(modelDisplayName('gpt-6-astra')).toBe('GPT-6-Astra')
+    expect(modelDisplayName('gpt-5.6-sol')).toBe('GPT-5.6-Sol')
+    expect(modelDisplayName('gpt-5.5')).toBe('GPT-5.5')
+    expect(modelDisplayName('GPT-6-Astra')).toBe('GPT-6-Astra')
+    expect(modelDisplayName('GPT 6 Astra')).toBe('GPT 6 Astra')
+    expect(modelDisplayName('claude-sonnet-5')).toBe('claude-sonnet-5')
+    expect(modelDisplayName('Qwen 3.5 9B')).toBe('Qwen 3.5 9B')
   })
 })
 

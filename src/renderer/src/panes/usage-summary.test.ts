@@ -262,7 +262,7 @@ describe('subagent model, effort and token reporting', () => {
   })
 
   it('formats a subagent model label using the same display convention as the composer, or nothing when unreported', () => {
-    expect(subagentModelLabel({ model: 'gpt-5-high', effort: 'high' })).toBe('GPT 5 High · high')
+    expect(subagentModelLabel({ model: 'gpt-5-high', effort: 'high' })).toBe('GPT-5-High · high')
     expect(subagentModelLabel({ model: undefined, effort: 'high' })).toBeUndefined()
   })
 })

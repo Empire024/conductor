@@ -21,9 +21,11 @@ export function supportedEffortChoices(capabilities: ProviderCapabilities | unde
   return (ladder ?? []).filter(effort => effort && effort !== 'auto')
 }
 
-/** Conductor always sends a concrete effort, so a conversation never runs on 'not reported'. */
+/** The effort Conductor sends: the owner's saved choice or the catalog/runtime default when it is
+ *  one of the reported choices, otherwise nothing. Claude's `initialize` reports no default effort,
+ *  and guessing `medium` there launched every new conversation below the CLI's own `high` and the
+ *  owner's saved `xhigh`; with no effort sent the runtime applies its configured level. */
 export function resolveEffortChoice(choices: string[], preferred?: string): string | undefined {
   if (!choices.length) return undefined
-  if (preferred && choices.includes(preferred)) return preferred
-  return choices.find(choice => choice === 'medium') ?? choices[Math.floor((choices.length - 1) / 2)]
+  return preferred && choices.includes(preferred) ? preferred : undefined
 }

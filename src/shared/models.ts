@@ -15,7 +15,7 @@ export type PaneKind =
   | 'logs'
 
 export type AgentProviderId = 'codex' | 'claude' | 'gemini' | 'qwen' | 'kimi' | 'local'
-export type AgentEffort = 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type AgentEffort = 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 
 export const THEME_IDS = ['night-owl', 'obsidian', 'nord'] as const
 export type ThemeId = (typeof THEME_IDS)[number]

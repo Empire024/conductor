@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { ConductorDatabase } from '../database'
 import { StructuredSessions } from '../structured-sessions'
-import { ClaudeAdapter } from './claude'
+import { ClaudeAdapter, CLAUDE_COMPATIBILITY } from './claude'
 import { JsonLineTransport } from './transport'
 import type { AgentSpec } from '../../shared/models'
 
@@ -28,7 +28,7 @@ function fixture() {
   const project = database.upsertProject(workspace, 'Synthetic raw Claude fixture')
   const spec: AgentSpec = { id: 'synthetic-claude', title: 'Synthetic Claude', projectId: project.id, sessionId: database.listSessions(project.id)[0]!.id, provider: 'claude', cwd: workspace }
   const manager = new StructuredSessions(database, () => process.execPath, vi.fn(), (_provider, options) => new ClaudeAdapter(options, {
-    version: async () => '2.1.263', createTransport: (transport) => new JsonLineTransport({ ...transport, executable: process.execPath, args: [resolve('scripts/fixtures/fake-claude.mjs'), ...transport.args], environment: { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1' } })
+    version: async () => CLAUDE_COMPATIBILITY, createTransport: (transport) => new JsonLineTransport({ ...transport, executable: process.execPath, args: [resolve('scripts/fixtures/fake-claude.mjs'), ...transport.args], environment: { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1' } })
   })); managers.push(manager)
   manager.ensure(spec)
   return { database, manager, spec, workspace, snapshot: () => database.structured.snapshot(spec.id)! }

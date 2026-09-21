@@ -31,10 +31,14 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const supportedEfforts = modelEfforts(capabilities, settings.model)
   const efforts = supportedEffortChoices(capabilities, settings.model)
   const unavailableEffort = Boolean(capabilities && settings.effort && settings.effort !== 'auto' && !efforts.includes(settings.effort))
+  // Undefined when neither the owner's saved effort, the runtime's reported effort nor a catalog
+  // default applies: the runtime then runs on its own configured level and the slider says so.
   const effort = resolveEffortChoice(efforts, resolved.effort)
-  const effortIndex = Math.max(0, efforts.indexOf(effort ?? ''))
-  const effortProgress = efforts.length > 1 ? Math.round(effortIndex / (efforts.length - 1) * 100) : 100
-  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : (effort ?? '').replace(/^./, char => char.toUpperCase())
+  const effortIndex = effort ? efforts.indexOf(effort) : -1
+  const sliderPosition = effortIndex < 0 ? Math.floor((efforts.length - 1) / 2) : effortIndex
+  const effortProgress = effortIndex < 0 ? 0 : efforts.length > 1 ? Math.round(effortIndex / (efforts.length - 1) * 100) : 100
+  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : effort ? effort.replace(/^./, char => char.toUpperCase()) : 'Account default'
+  const modelTitle = label + (resolved.resolvedModel ? ' (' + resolved.resolvedModel + ')' : '') + (resolved.effort ? ' · ' + resolved.effort : '')
   const close = (): void => { setOpen(false); setQuery(''); trigger.current?.focus() }
   const chooseModel = (id: string): void => {
     const supported = modelEfforts(capabilities, id)
@@ -69,7 +73,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   return <>
     {modes.length > 1 && <ConversationModeControl modes={modes} value={mode} disabled={disabled} onChange={onChange} />}
     <div className="sa-model-control" ref={host}>
-      <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title={label + (resolved.effort ? ' · ' + resolved.effort : '')} onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><ProviderIcon provider={capabilities?.provider} model={model} size={14} /><span>{label}</span><ChevronDown size={12} /></button>
+      <button ref={trigger} type="button" role="combobox" aria-label="Model" aria-controls={listId} aria-haspopup="listbox" aria-expanded={open} disabled={disabled} className="sa-model-trigger" title={modelTitle} onClick={() => void show()} onKeyDown={event => { if (event.key === 'ArrowDown' && !open) { event.preventDefault(); void show() } }}><ProviderIcon provider={capabilities?.provider} model={model} size={14} /><span>{label}</span><ChevronDown size={12} /></button>
       {open && <div className="sa-model-menu" onKeyDown={event => {
         if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close() }
         if (event.key === 'Enter' && event.target instanceof HTMLInputElement) {
@@ -97,7 +101,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
       <span className="agent-effort-heading"><span>Effort</span><output>{effortLabel}</output></span>
       <span className="agent-effort-slider" style={{ '--effort-progress': `${effortProgress}%` } as React.CSSProperties}>
         <span className="agent-effort-ticks" aria-hidden="true">{efforts.map((effort, index) => <i key={effort} className={index <= effortIndex ? 'active' : ''} />)}</span>
-        <input type="range" min={0} max={efforts.length - 1} step={1} value={effortIndex} disabled={disabled} aria-label="Reasoning effort" aria-valuetext={effortLabel} onChange={event => onChange({ effort: efforts[Number(event.target.value)] ?? effort })} />
+        <input type="range" min={0} max={efforts.length - 1} step={1} value={sliderPosition} disabled={disabled} aria-label="Reasoning effort" aria-valuetext={effortLabel} onChange={event => onChange({ effort: efforts[Number(event.target.value)] ?? effort })} />
       </span>
     </label>}
   </>

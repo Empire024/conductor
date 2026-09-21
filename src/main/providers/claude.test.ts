@@ -28,7 +28,7 @@ class FakeTransport {
 const adapters: ClaudeAdapter[] = []
 const imageRoots: string[] = []
 afterEach(() => { for (const adapter of adapters.splice(0)) adapter.dispose(); for (const root of imageRoots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 }) })
-function fixture(overrides: Partial<AdapterOptions> = {}, autoInitialize = true, runtimeVersion = '2.1.263') {
+function fixture(overrides: Partial<AdapterOptions> = {}, autoInitialize = true, runtimeVersion = CLAUDE_COMPATIBILITY) {
   const events: AdapterEvent[] = []
   let transport!: FakeTransport
   const adapter = new ClaudeAdapter({ executable: 'synthetic-claude', cwd: process.cwd(), runtimeId: 'incarnation-A', settings, emit: (event) => events.push(event), ...overrides }, {
@@ -50,12 +50,12 @@ function hook(requestId: string, callback: string, toolId: string, name: string,
 describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
   it('connects to patch and minor releases at or above the baseline, recording the unverified gap', async () => {
     expect(claudeCompatibility(CLAUDE_COMPATIBILITY)).toEqual({ supported: true, verified: true })
-    expect(claudeCompatibility('2.1.265')).toEqual({ supported: true, verified: false })
+    expect(claudeCompatibility('2.1.280')).toEqual({ supported: true, verified: false })
     expect(claudeCompatibility('2.2.0')).toEqual({ supported: true, verified: false })
-    const f = fixture({}, true, '2.1.265')
+    const f = fixture({}, true, '2.1.280')
     await f.adapter.start()
-    expect(f.adapter.capabilities.runtimeVersion).toBe('2.1.265')
-    expect(f.adapter.capabilities.limitations.some(limitation => limitation.includes('2.1.265') && limitation.includes('fixture-verified'))).toBe(true)
+    expect(f.adapter.capabilities.runtimeVersion).toBe('2.1.280')
+    expect(f.adapter.capabilities.limitations.some(limitation => limitation.includes('2.1.280') && limitation.includes('fixture-verified'))).toBe(true)
   })
 
   it('refuses a CLI below the baseline, a different major, and an unreadable version', async () => {
@@ -63,7 +63,8 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     expect(claudeCompatibility('2.0.999').supported).toBe(false)
     expect(claudeCompatibility('3.0.0').supported).toBe(false)
     expect(claudeCompatibility('unknown').supported).toBe(false)
-    await expect(fixture({}, true, '2.1.262').adapter.start()).rejects.toThrow('below the tested 2.1.263 bridge baseline')
+    // 2.1.263 was the previous baseline; since the 2026-09-21 sweep verified 2.1.278 it is below it.
+    await expect(fixture({}, true, '2.1.263').adapter.start()).rejects.toThrow('below the tested 2.1.278 bridge baseline')
   })
 
   it('awaits initialize and keeps user configuration/native coding prompt and resume identity', async () => {
@@ -243,7 +244,7 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
   it('drives an actual fake process through handshake, approval, hook and result round trips', async () => {
     const events: AdapterEvent[] = []
     const adapter = new ClaudeAdapter({ executable: process.execPath, cwd: process.cwd(), runtimeId: 'fake-process-runtime', settings, emit: (event) => events.push(event) }, {
-      version: async () => '2.1.263', createTransport: (options) => new JsonLineTransport({ ...options, args: [resolve('scripts/fixtures/claude-runtime.mjs')] })
+      version: async () => CLAUDE_COMPATIBILITY, createTransport: (options) => new JsonLineTransport({ ...options, args: [resolve('scripts/fixtures/claude-runtime.mjs')] })
     })
     adapters.push(adapter)
     await adapter.start()
@@ -277,7 +278,7 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     await f.adapter.start()
     f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native', tools: ['Bash', 'Edit'], mcp_servers: [] })
     const sent = f.transport.sent.length
-    expect(await f.adapter.discover()).toMatchObject({ connection: 'local-cli', runtimeVersion: '2.1.263', configuration: { tools: ['Bash', 'Edit'], mcp_servers: [] } })
+    expect(await f.adapter.discover()).toMatchObject({ connection: 'local-cli', runtimeVersion: CLAUDE_COMPATIBILITY, configuration: { tools: ['Bash', 'Edit'], mcp_servers: [] } })
     expect(f.transport.sent).toHaveLength(sent)
   })
 
@@ -472,6 +473,18 @@ it('matches VS Code context accounting, reserves output and compaction space, an
   expect(latest()).toMatchObject({ limits: { contextUsedTokens: 2030, contextCapacityTokens: 155000 } })
   f.transport.receive({ type: 'assistant', message: { id: 'new-model', model: 'claude-other', usage: { input_tokens: 1000, output_tokens: 20 }, content: [] } })
   expect(latest()).toMatchObject({ limits: { contextUsedTokens: 1020, contextCapacityTokens: null } })
+  // The 1M variants, as observed live on 2.1.278 (parity ledger R14): system/init names the
+  // configured model with its suffix, the message frames name the API model without it, and
+  // modelUsage is keyed by the configured name and accumulates every model the session used.
+  f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-1m', model: 'claude-opus-5[1m]', claude_code_version: CLAUDE_COMPATIBILITY })
+  f.transport.receive({ type: 'assistant', message: { id: 'opus-1m', model: 'claude-opus-5', usage: { input_tokens: 4, cache_read_input_tokens: 28000, output_tokens: 17 }, content: [] } })
+  f.transport.receive({ type: 'result', subtype: 'success', modelUsage: { 'claude-other': { contextWindow: 200000, maxOutputTokens: 32000 }, 'claude-opus-5[1m]': { contextWindow: 1000000, maxOutputTokens: 64000 } }, usage: { input_tokens: 4, output_tokens: 17 } })
+  expect(latest()).toMatchObject({ limits: { contextUsedTokens: 28021, contextCapacityTokens: 923000, modelContextWindow: 1000000 } })
+  // A saved [1m] alias prefers the suffixed entry even when the session also used the bare model.
+  await f.adapter.submit('Saved alias', { ...settings, model: 'opus[1m]' })
+  f.transport.receive({ type: 'assistant', message: { id: 'opus-1m-again', model: 'claude-opus-5', usage: { input_tokens: 4, cache_read_input_tokens: 30000, output_tokens: 10 }, content: [] } })
+  f.transport.receive({ type: 'result', subtype: 'success', modelUsage: { 'claude-opus-5': { contextWindow: 200000, maxOutputTokens: 32000 }, 'claude-opus-5[1m]': { contextWindow: 1000000, maxOutputTokens: 64000 } }, usage: { input_tokens: 4, output_tokens: 10 } })
+  expect(latest()).toMatchObject({ limits: { contextUsedTokens: 30014, contextCapacityTokens: 923000, modelContextWindow: 1000000 } })
 })
 
 

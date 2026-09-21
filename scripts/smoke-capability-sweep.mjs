@@ -13,12 +13,15 @@
 //                                                           inference on the owner's accounts)
 //   --local                                                 also open the default local model tab,
 //                                                           only when its server already answers
+//   --local-turn                                            with --local: one one-word prompt to the
+//                                                           running local model (real local inference,
+//                                                           one request) to record its context figures
 //
-// The offline run builds a temporary copy of `out/` next to a fixtures folder that holds the two
-// swarm-capabilities fixtures under the names the production factory resolves, so the production
-// adapters, store and renderer run unchanged and no protected file is edited.
+// The offline run points the production factory (CONDUCTOR_TEST_FIXTURE_DIR) at a temporary folder
+// that holds the two swarm-capabilities fixtures under the names it resolves, so the production
+// adapters, store and renderer run unchanged from the repository's own `out/`.
 import { _electron as electron, expect } from '@playwright/test'
-import { cpSync, existsSync, mkdirSync, symlinkSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync } from 'node:fs'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -28,6 +31,7 @@ const args = Object.fromEntries(process.argv.slice(2).map(arg => { const m = /^-
 const live = Boolean(args.live)
 const turns = live && Boolean(args.turns)
 const includeLocal = Boolean(args.local)
+const localTurn = includeLocal && Boolean(args['local-turn'])
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const mode = live ? (turns ? 'live-turns' : 'live') : 'offline'
 const output = resolve(String(args.out ?? 'artifacts/swarm-2026-09-21/capabilities'), 'smoke-' + mode)
@@ -35,19 +39,15 @@ mkdirSync(output, { recursive: true })
 if (!existsSync(join(repo, 'out/main/index.js'))) throw new Error('Run npm.cmd run build first')
 
 const root = await mkdtemp(join(tmpdir(), 'conductor-capability-sweep-'))
-let entry = join(repo, 'out/main/index.js')
-if (!live) {
-  // Production factory resolves fixtures at out/main/../../scripts/fixtures/fake-<provider>.mjs.
-  const tree = join(root, 'app')
-  cpSync(join(repo, 'out'), join(tree, 'out'), { recursive: true })
-  cpSync(join(repo, 'package.json'), join(tree, 'package.json'))
-  mkdirSync(join(tree, 'scripts/fixtures'), { recursive: true })
-  cpSync(join(repo, 'scripts/fixtures/swarm-capabilities-claude.mjs'), join(tree, 'scripts/fixtures/fake-claude.mjs'))
-  cpSync(join(repo, 'scripts/fixtures/swarm-capabilities-codex.mjs'), join(tree, 'scripts/fixtures/fake-codex.mjs'))
-  symlinkSync(join(repo, 'node_modules'), join(tree, 'node_modules'), 'junction')
-  entry = join(tree, 'out/main/index.js')
-}
+const entry = join(repo, 'out/main/index.js')
 const env = { ...process.env, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
+if (!live) {
+  const fixtures = join(root, 'fixtures')
+  mkdirSync(fixtures, { recursive: true })
+  cpSync(join(repo, 'scripts/fixtures/swarm-capabilities-claude.mjs'), join(fixtures, 'fake-claude.mjs'))
+  cpSync(join(repo, 'scripts/fixtures/swarm-capabilities-codex.mjs'), join(fixtures, 'fake-codex.mjs'))
+  env.CONDUCTOR_TEST_FIXTURE_DIR = fixtures
+}
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS
 if (live) delete env.CONDUCTOR_OFFLINE_TESTS; else env.CONDUCTOR_OFFLINE_TESTS = '1'
 
@@ -123,7 +123,7 @@ async function chooseModel(pane, query) {
   await expect(combobox).toBeFocused()
   return true
 }
-async function sendTurn(id, prompt, settings, viaComposer = false) {
+async function sendTurn(id, prompt, settings, viaComposer = false, timeout = live ? 300_000 : 30_000) {
   const before = await snapshot(id)
   if (viaComposer) {
     const pane = page.locator(`.structured-agent-pane[data-structured-session="${id}"]`)
@@ -136,7 +136,7 @@ async function sendTurn(id, prompt, settings, viaComposer = false) {
     await window.conductor.structured.saveSettings(id, { ...state.settings, ...settings })
     await window.conductor.structured.submit(id, prompt, { ...state.settings, ...settings }, [])
   }, { id, prompt, settings })
-  await expect.poll(async () => (await snapshot(id)).phase, { timeout: live ? 300_000 : 30_000, intervals: [300, 1000, 2000] }).toMatch(/^(completed|failed|disconnected)$/)
+  await expect.poll(async () => (await snapshot(id)).phase, { timeout, intervals: [300, 1000, 2000] }).toMatch(/^(completed|failed|disconnected)$/)
   const after = await snapshot(id)
   const items = after.items.filter(item => (item.updatedSequence ?? item.sequence) > before.sequence && !item.parentId)
   const usage = items.filter(item => item.data.type === 'usage')
@@ -158,10 +158,13 @@ async function sweepProvider(provider) {
   const report = { models: [], turns: [] }
   results.providers[provider] = report
   const { id, pane } = await openTab(provider, PROVIDER_LABEL[provider])
+  // The pane reads its projection (static capabilities, saved settings) once after mounting; both
+  // CLI providers declare a static effort ladder, so the slider marks that read as complete.
+  await expect(pane.getByRole('slider', { name: 'Reasoning effort', exact: true })).toBeVisible()
   report.beforeDiscovery = await readControls(pane)
   report.beforeDiscoveryCapabilities = (await snapshot(id)).capabilities ?? null
   await shot(`${provider}-00-before-discovery`)
-  check(`${provider}: before discovery the composer shows "${report.beforeDiscovery.label}" with ${report.beforeDiscovery.effortControl ? 'an effort control' : 'no effort control'} (no runtime was started)`)
+  check(`${provider}: before discovery the composer shows "${report.beforeDiscovery.label}" with ${report.beforeDiscovery.effortControl ? `an effort control of ${report.beforeDiscovery.effortControl.positions} positions at "${report.beforeDiscovery.effortControl.value}"` : 'no effort control'} (no runtime was started)`)
   // Opening the picker is what triggers metadata discovery: initialize for Claude, thread/start +
   // model/list for Codex. Neither sends a prompt.
   await pane.getByRole('combobox', { name: 'Model', exact: true }).click()
@@ -173,7 +176,13 @@ async function sweepProvider(provider) {
   const state = await snapshot(id)
   report.capabilities = state.capabilities
   report.runtimeVersion = state.capabilities?.runtimeVersion ?? null
+  report.limitations = state.capabilities?.limitations ?? []
   check(`${provider}: discovery reported ${state.capabilities.models.length} models, runtime ${report.runtimeVersion}, without a prompt`)
+  // The adapter baselines: Codex 0.153.4 exactly, Claude 2.1.278 since the 2026-09-21 sweep (R9).
+  // A runtime on the baseline must not carry the "newer than the fixture-verified" limitation.
+  const unverified = report.limitations.filter(text => /newer than the fixture-verified|unverified/i.test(text))
+  if (live && ((provider === 'claude' && report.runtimeVersion === '2.1.278') || (provider === 'codex' && /0\.153\.4/.test(report.runtimeVersion ?? '')))) expect(unverified).toEqual([])
+  check(`${provider}: runtime ${report.runtimeVersion} carries ${unverified.length ? 'the limitation "' + unverified.join('; ') + '"' : 'no version limitation'}`)
   for (const model of state.capabilities.models) {
     if (model.id === 'default') continue
     const chosen = await chooseModel(pane, model.id)
@@ -228,20 +237,42 @@ try {
   // ----------------------------------------------------------------------------------- Claude
   const claude = await sweepProvider('claude')
   if (!live) {
+    // R7/R4: nothing has chosen an effort, so the runtime was launched without --effort (the CLI
+    // applies its own configured level) and the composer says "Account default" instead of a
+    // guessed "Medium"; the model stand-in before discovery is the 1M Opus the account defaults to.
+    expect(claude.report.beforeDiscovery.label).toBe('Account default')
+    expect(claude.report.beforeDiscovery.effortControl?.value).toBe('Account default')
+    expect((await snapshot(claude.id)).settings.effort).toBeUndefined()
+    const discovered = await page.evaluate(id => window.conductor.structured.discover(id), claude.id)
+    const launchArgs = discovered?.initialize?.swarm_launch_args ?? []
+    expect(launchArgs).not.toContain('--effort')
+    expect(launchArgs[launchArgs.indexOf('--model') + 1]).toBe('opus[1m]')
+    claude.report.launchArgs = launchArgs
+    check(`claude: before discovery the composer read "Account default" for model and effort, no effort was saved, and the runtime was launched with "${launchArgs.filter((arg, i) => /^--(model|effort)$/.test(launchArgs[i - 1]) || /^--(model|effort)$/.test(arg)).join(' ')}" (no --effort)`)
     // Context window learned from the first result, the ring against usable capacity, then a
-    // compaction boundary that clears the old figure. Sonnet: 1M window in the fixture.
-    let turn = await sendTurn(claude.id, 'SYNTHETIC CONTEXT 700000', { model: 'sonnet', effort: 'low' })
+    // compaction boundary that clears the old figure. Sonnet: 1M window in the fixture. The model
+    // is chosen through the picker the way the owner does it, so the composer state is what the
+    // owner would see after the turn (R15: the alias's catalog label, the resolved name as tooltip).
+    await chooseModel(claude.pane, 'sonnet')
+    let turn = await sendTurn(claude.id, 'SYNTHETIC CONTEXT 700000', {}, true)
     claude.report.turns.push({ prompt: 'SYNTHETIC CONTEXT 700000', model: 'sonnet', ...turn })
     expect(turn.limits?.modelContextWindow).toBe(1_000_000)
     expect(turn.limits?.contextCapacityTokens).toBe(1_000_000 - 64_000 - 13_000)
     await expect(claude.pane.locator('.sa-context-circle')).toHaveAttribute('aria-label', 'Context 75% used')
     let controls = await readControls(claude.pane)
     expect(controls.contextRing?.level).toBe('warning')
+    expect(controls.label).toBe('Sonnet')
+    expect(controls.title).toContain('Sonnet (claude-sonnet-5)')
+    expect(turn.effectiveSettings?.model).toBe('claude-sonnet-5')
     await shot('claude-10-context-75')
     let usage = await readUsage(claude.pane, 'claude-11-usage-sonnet-1m')
     expect(usage.contextWindow).toBe('1,000,000 tokens')
-    check(`claude: after one turn on Sonnet the ring shows ${controls.contextRing.label} and View usage shows a 1,000,000-token window (${usage.context})`)
-    turn = await sendTurn(claude.id, 'SYNTHETIC COMPACT', { model: 'sonnet', effort: 'low' })
+    expect(usage.model).toContain('Sonnet')
+    check(`claude: after one turn on Sonnet the ring shows ${controls.contextRing.label}, the composer reads "${controls.label}" (tooltip "${controls.title}") although the runtime resolved ${turn.effectiveSettings?.model}, and View usage shows "${usage.model}" with a 1,000,000-token window (${usage.context})`)
+    // Every Claude turn goes through the composer: a settings write over IPC is not seen by the
+    // mounted composer (its state is read once at mount), so the controls read afterwards would
+    // describe a different model than the turn ran on.
+    turn = await sendTurn(claude.id, 'SYNTHETIC COMPACT', {}, true)
     claude.report.turns.push({ prompt: 'SYNTHETIC COMPACT', model: 'sonnet', ...turn })
     expect(turn.notices.some(text => /compacted/i.test(text))).toBe(true)
     await expect(claude.pane.locator('.sa-context-circle')).toHaveCount(0)
@@ -249,7 +280,8 @@ try {
     await shot('claude-12-after-compaction')
     usage = await readUsage(claude.pane, 'claude-13-usage-after-compaction')
     check(`claude: the compaction boundary raised the reset notice, cleared the ring and View usage now shows ${usage.context}`)
-    turn = await sendTurn(claude.id, 'SYNTHETIC CONTEXT 150000', { model: 'haiku', effort: undefined })
+    await chooseModel(claude.pane, 'haiku')
+    turn = await sendTurn(claude.id, 'SYNTHETIC CONTEXT 150000', {}, true)
     claude.report.turns.push({ prompt: 'SYNTHETIC CONTEXT 150000', model: 'haiku', ...turn })
     expect(turn.limits?.modelContextWindow).toBe(200_000)
     await expect(claude.pane.locator('.sa-context-circle')).toHaveAttribute('aria-label', 'Context 100% used')
@@ -260,12 +292,24 @@ try {
     expect(usage.contextWindow).toBe('200,000 tokens')
     check(`claude: switching to Haiku reset the window to 200,000, the ring is ${controls.contextRing.label} (${controls.contextRing.level}) and there is no effort control`)
     // The account default: the fixture answers the way the live CLI did (message model without
-    // the [1m] suffix, modelUsage keyed with it). Recorded, not asserted: today the window is not
-    // learned (parity ledger R14); once repaired this line reports 1,000,000.
-    turn = await sendTurn(claude.id, 'SYNTHETIC CONTEXT 100000', { model: 'opus[1m]', effort: 'low' })
-    claude.report.turns.push({ prompt: 'SYNTHETIC CONTEXT 100000', model: 'opus[1m]', ...turn })
+    // the [1m] suffix, modelUsage keyed with it). R14: the adapter now resolves the suffixed entry,
+    // so the window, the capacity and the ring appear on opus[1m] as they do on the other models.
+    await chooseModel(claude.pane, 'opus[1m]')
+    const opusSlider = claude.pane.getByRole('slider', { name: 'Reasoning effort', exact: true })
+    await opusSlider.press('Home'); await expect(opusSlider).toHaveAttribute('aria-valuetext', 'Low')
+    turn = await sendTurn(claude.id, 'SYNTHETIC CONTEXT 100000', {}, true)
+    claude.report.turns.push({ prompt: 'SYNTHETIC CONTEXT 100000', model: 'opus[1m]', effort: 'low', ...turn })
+    expect(turn.effectiveSettings?.effort).toBe('low')
+    expect(turn.limits?.modelContextWindow).toBe(1_000_000)
+    expect(turn.limits?.contextCapacityTokens).toBe(1_000_000 - 64_000 - 13_000)
+    expect(turn.limits?.contextUsedTokens).toBe(100_001)
+    controls = await readControls(claude.pane)
     await shot('claude-17-opus-1m-window', claude.pane.locator('.sa-composer'))
-    check(`claude: on opus[1m] the adapter learned a context window of ${turn.limits?.modelContextWindow ?? 'nothing (R14: message model lacks the [1m] suffix the modelUsage key carries)'}`)
+    usage = await readUsage(claude.pane, 'claude-18-usage-opus-1m')
+    expect(usage.contextWindow).toBe('1,000,000 tokens')
+    expect(usage.context).toContain('100,001 / 923,000')
+    // The composer ring only paints once usage reaches its warning band; at 11% View usage is the evidence.
+    check(`claude: on opus[1m] (message model ${turn.effectiveSettings?.model}, modelUsage keyed claude-opus-5[1m]) the adapter learned a ${turn.limits.modelContextWindow.toLocaleString('en-US')}-token window with ${turn.limits.contextCapacityTokens.toLocaleString('en-US')} usable; View usage shows ${usage.contextWindow} (${usage.context}); composer ring ${controls.contextRing ? controls.contextRing.label : 'not painted below the warning band'}`)
     await chooseModel(claude.pane, 'swarm-unknown-model')
     controls = await readControls(claude.pane)
     await shot('claude-16-unknown-metadata', claude.pane.locator('.sa-composer'))
@@ -278,6 +322,15 @@ try {
   // ------------------------------------------------------------------------------------ Codex
   const codex = await sweepProvider('codex')
   if (!live) {
+    // R12: the static label and the discovered display name read the same ("GPT-6-Astra", as
+    // model/list names it), never re-spaced. R1/R2: the pre-discovery ladder is the CLI's union
+    // (low … ultra, six positions, no minimal) and Astra's discovered ladder matches it.
+    expect(codex.report.beforeDiscovery.label).toBe('GPT-6-Astra')
+    expect(codex.report.beforeDiscovery.effortControl?.positions).toBe(6)
+    expect(codex.report.pickerOptions).toEqual(expect.arrayContaining(['GPT-6-Astra', 'GPT-5.6-Sol', 'GPT-5.6-Terra', 'GPT-5.6-Luna', 'GPT-5.5']))
+    expect(codex.report.models.find(model => model.id === 'gpt-6-astra')?.shown?.label).toBe('GPT-6-Astra')
+    expect(codex.report.beforeDiscoveryCapabilities?.effort).toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+    check(`codex: the composer read "${codex.report.beforeDiscovery.label}" with ${codex.report.beforeDiscovery.effortControl?.positions} effort positions before discovery and "${codex.report.models.find(model => model.id === 'gpt-6-astra')?.shown?.label}" after it; the picker lists ${codex.report.pickerOptions.join(', ')}`)
     let turn = await sendTurn(codex.id, 'synthetic:context 300000', { model: 'gpt-6-astra', effort: 'low' })
     codex.report.turns.push({ prompt: 'synthetic:context 300000', model: 'gpt-6-astra', ...turn })
     expect(turn.limits?.modelContextWindow).toBe(400_000)
@@ -289,16 +342,16 @@ try {
     check(`codex: after one turn the ring shows ${controls.contextRing.label}; View usage shows ${usage.contextWindow} and account limits ${usage.accountLimits}`)
     turn = await sendTurn(codex.id, 'synthetic:compact', { model: 'gpt-6-astra', effort: 'low' })
     codex.report.turns.push({ prompt: 'synthetic:compact', model: 'gpt-6-astra', ...turn })
-    // The adapter emits its "compacted" reset notice and the item's generic notice under the same
-    // item id, so the timeline keeps whichever arrived last; either text proves the item reached
-    // the projection. The recorded notice texts show which one survived.
-    expect(turn.notices.some(text => /compact/i.test(text))).toBe(true)
+    // R11: the "compacted" reset notice and the item's generic notice carry different item ids
+    // now, so both survive in the projection and the owner sees that a compaction happened.
+    expect(turn.notices).toContain('Codex compacted this conversation; Conductor restates its briefing with the next message.')
+    expect(turn.notices).toContain('Codex contextCompaction')
     codex.report.compactionNotices = turn.notices
     await expect(codex.pane.locator('.sa-context-circle')).toHaveCount(0)
     controls = await readControls(codex.pane)
     await shot('codex-12-after-compaction')
     usage = await readUsage(codex.pane, 'codex-13-usage-after-compaction')
-    check(`codex: compaction raised the reset notice, cleared the ring; View usage shows ${usage.context}`)
+    check(`codex: compaction raised both notices (${turn.notices.filter(text => /compact/i.test(text)).map(text => JSON.stringify(text)).join(' and ')}), cleared the ring; View usage shows ${usage.context}`)
     await chooseModel(codex.pane, 'swarm-plain')
     controls = await readControls(codex.pane)
     expect(controls.effortControl).toBeNull()
@@ -327,8 +380,28 @@ try {
       const state = await snapshot(id)
       const usage = await readUsage(pane, 'local-usage')
       await shot('local-composer', pane.locator('.sa-composer'))
-      results.providers.local = { model: model.id, shown: controls, capabilities: state.capabilities, usage: { contextWindow: usage.contextWindow, context: usage.context, accountLimits: usage.accountLimits } }
-      check(`local: the composer shows "${controls.label}" with ${controls.effortControl ? 'an effort control' : 'no effort control'}; View usage reports ${usage.contextWindow ?? 'no context window'}`)
+      // R8: the router and task assignment (agents.listProviders) name a local model the way the
+      // launcher tile, the composer and models.list do, from the shared catalog.
+      const providers = await page.evaluate(async () => { const api = window.conductor; const list = api.agents?.listProviders ?? api.listProviders ?? api.runtimes?.listProviders; return list ? await list() : null }).catch(() => null)
+      const providerLabels = providers?.find(provider => provider.id === 'local')?.models?.map(entry => entry.label) ?? null
+      if (providerLabels) expect(providerLabels).toContain(controls.label)
+      results.providers.local = { model: model.id, shown: controls, providerLabels, capabilities: state.capabilities, usage: { contextWindow: usage.contextWindow, context: usage.context, accountLimits: usage.accountLimits } }
+      check(`local: the composer shows "${controls.label}" with ${controls.effortControl ? 'an effort control' : 'no effort control'}; agents.listProviders names the local models ${providerLabels ? providerLabels.map(label => JSON.stringify(label)).join(', ') : '(not exposed to the renderer)'}; View usage reports ${usage.contextWindow ?? 'no context window'} before a turn`)
+      if (localTurn) {
+        // R10: one real local request. The window is the configured contextTokens and the capacity
+        // holds back the answer reserve, so the ring and "Model context window" work as for the CLIs.
+        results.inferenceTurns++
+        const turn = await sendTurn(id, 'OK', {}, true, 300_000)
+        const after = await readControls(pane)
+        const afterUsage = await readUsage(pane, 'local-usage-after-turn')
+        await shot('local-composer-after-turn', pane.locator('.sa-composer'))
+        expect(turn.limits?.modelContextWindow).toBe(model.contextTokens)
+        expect(turn.limits?.contextCapacityTokens).toBe(model.contextTokens - 4096)
+        expect(afterUsage.contextWindow).toBe(model.contextTokens.toLocaleString('en-US') + ' tokens')
+        results.providers.local.turn = { prompt: 'OK', ...turn, shown: after, usage: { contextWindow: afterUsage.contextWindow, context: afterUsage.context } }
+        // The composer ring only paints once usage reaches its warning band; View usage is the evidence.
+        check(`local: after one turn (${turn.phase}, ${turn.limits.contextUsedTokens.toLocaleString('en-US')} tokens used) the adapter reported a ${turn.limits.modelContextWindow.toLocaleString('en-US')}-token window with ${turn.limits.contextCapacityTokens.toLocaleString('en-US')} usable; View usage shows ${afterUsage.contextWindow} (${afterUsage.context}); composer ring ${after.contextRing ? after.contextRing.label : 'not painted below the warning band'}`)
+      }
     }
   }
   if (errors.length) throw new Error('Renderer errors: ' + errors.join('\n'))

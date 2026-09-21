@@ -62,7 +62,9 @@ for await (const line of input) {
   if (message.type === 'control_request') {
     const kind = message.request.subtype
     if (kind === 'initialize') {
-      success(message.request_id, { commands: [], agents: [], output_style: 'default', models: CLAUDE_MODELS, account: { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }, current_permission_mode: permissionMode, hooks_applied: true, fast_mode_state: 'off', fast_mode_disabled_reason: 'sdk_opt_in_required', session_state: 'idle' })
+      // `swarm_launch_args` is the fixture's own addition (the real CLI reports no such field): the
+      // arguments Conductor launched it with, so the sweep can prove no --effort was sent (R7).
+      success(message.request_id, { commands: [], agents: [], output_style: 'default', models: CLAUDE_MODELS, account: { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }, current_permission_mode: permissionMode, hooks_applied: true, fast_mode_state: 'off', fast_mode_disabled_reason: 'sdk_opt_in_required', session_state: 'idle', swarm_launch_args: process.argv.slice(2) })
       const resetsAt = Math.floor(Date.now() / 1000) + 3600
       emit({ type: 'rate_limit_event', rate_limit_info: { unifiedWindows: { five_hour: { utilization: 0.16, resetsAt }, seven_day: { utilization: 0.12, resetsAt: resetsAt + 86_400 }, seven_day_fable: { utilization: 0.19, resetsAt: resetsAt + 86_400 } } } })
     } else if (kind === 'set_model') { model = message.request.model ?? 'default'; success(message.request_id) }
