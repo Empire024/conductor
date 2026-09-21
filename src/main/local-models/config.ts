@@ -19,7 +19,7 @@ export interface LocalModelConfig {
   port: number
   contextTokens: number
   /** Layers pushed onto the RTX 5070. The 35B MoE deliberately keeps most weights in the
-   *  64 GB of system RAM so both servers can stay resident on a 12 GB card. */
+   *  64 GB of system RAM. Only one model server may be resident at a time. */
   gpuLayers: number
   extraArgs: string[]
 }
@@ -62,11 +62,9 @@ export const PINNED_MODELS: Record<string, Array<Omit<LocalModelConfig, 'port' |
   ]
 }
 
-/** Defaults for a 12 GB RTX 5070 with 64 GB of system RAM, both servers resident at once: the
- *  9B is fully offloaded at Q4_K_M (about 5.6 GB plus KV cache), which leaves roughly 4 GB for a
- *  partial offload of the 35B MoE. Q6_K for the 9B is offered by setup but does not leave room
- *  for the 35B on the same card, so it is not the default. Context starts at 32K rather than the
- *  advertised maximum, and every value here stays editable in <local root>/config/config.json. */
+/** Defaults for MAIN: 12 GB VRAM, 63 GB RAM, one server at a time. Admission checks
+ * full GGUF residency, context/KV growth, offload and desktop reserves before spawning.
+ * The 35B MoE keeps most weights in RAM; its active parameter count is not its size. */
 export const DEFAULT_CONTEXT_TOKENS = 32768
 export const DEFAULT_PORTS: Record<string, number> = { [QWEN_9B]: 51435, [QWEN_35B]: 51436 }
 export const DEFAULT_GPU_LAYERS: Record<string, number> = { [QWEN_9B]: 999, [QWEN_35B]: 10 }

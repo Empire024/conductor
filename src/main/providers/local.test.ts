@@ -1,21 +1,21 @@
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { LocalAdapter } from './local'
 import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, runFile } from '../local-models/config.ts'
 import type { LocalModelConfig } from '../local-models/config.ts'
-import { detectDrives, systemDrive } from '../local-models/paths.ts'
+import * as localPaths from '../local-models/paths.ts'
 import type { AdapterEvent, SessionSettings } from '../../shared/structured-agent'
 
-/** The local root is refused on the system drive by design, so these tests need a real fixed
- *  second drive and skip rather than pretend otherwise. */
+/** Synthetic server state needs no model disk or writable secondary drive. */
 function scratchRoot(): string | null {
-  const drive = detectDrives().find(candidate => candidate.letter !== systemDrive() && candidate.freeBytes > 1024 ** 3)
-  if (!drive) return null
-  const root = join(drive.letter + '\\', `ConductorAdapterTest-${process.pid}-${Math.random().toString(36).slice(2, 8)}`)
+  const root = mkdtempSync(join(tmpdir(), 'ConductorAdapterTest-'))
   mkdirSync(join(root, 'config'), { recursive: true })
+  mkdirSync(join(root, 'runtime'))
+  vi.spyOn(localPaths, 'layout').mockReturnValue(localPaths.layoutFor(root))
   return root
 }
 
@@ -24,12 +24,12 @@ const frame = (delta: Record<string, unknown>, finish?: string): string => JSON.
 
 /** A stand-in llama.cpp server: it answers the health probe, enforces the key and replays
  *  scripted SSE frames, so the adapter can be driven end to end without a model. */
-function stubServer(frames: string[], holdMs = 0): Promise<{ port: number; server: Server; prompts: string[][]; requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> }> {
+function stubServer(frames: string[], holdMs = 0, identity = { model: QWEN_9B, anonymous: false }): Promise<{ port: number; server: Server; identity: typeof identity; prompts: string[][]; requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> }> {
   const prompts: string[][] = []
   const requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> = []
   const server = createServer((request, response) => {
-    if (request.headers.authorization !== `Bearer ${KEY}`) { response.writeHead(401).end('{}'); return }
-    if (request.url?.startsWith('/v1/models')) { response.writeHead(200, { 'Content-Type': 'application/json' }).end('{"data":[]}'); return }
+    if (!identity.anonymous && request.headers.authorization !== `Bearer ${KEY}`) { response.writeHead(401).end('{}'); return }
+    if (request.url?.startsWith('/v1/models')) { response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data: [{ id: identity.model }] })); return }
     let body = ''
     request.on('data', chunk => { body += String(chunk) })
     request.on('end', () => {
@@ -47,7 +47,7 @@ function stubServer(frames: string[], holdMs = 0): Promise<{ port: number; serve
   })
   return new Promise(resolve => server.listen(0, '127.0.0.1', () => {
     const address = server.address()
-    resolve({ port: typeof address === 'object' && address ? address.port : 0, server, prompts, requests })
+    resolve({ port: typeof address === 'object' && address ? address.port : 0, server, identity, prompts, requests })
   }))
 }
 
@@ -63,6 +63,7 @@ describe('local provider adapter', () => {
   const cleanup: Array<() => void | Promise<void>> = []
   afterEach(async () => {
     for (const dispose of cleanup.splice(0).reverse()) await dispose()
+    vi.restoreAllMocks()
     if (previous === undefined) delete process.env.CONDUCTOR_LOCAL_ROOT
     else process.env.CONDUCTOR_LOCAL_ROOT = previous
   })
@@ -73,7 +74,7 @@ describe('local provider adapter', () => {
     if (!root) throw new Error('skip')
     cleanup.push(() => rmSync(root, { recursive: true, force: true }))
     const small = await stubServer(frames, holdMs)
-    const large = await stubServer(frames, holdMs)
+    const large = await stubServer(frames, holdMs, { model: QWEN_35B, anonymous: false })
     cleanup.push(() => new Promise<void>(done => small.server.close(() => done())))
     cleanup.push(() => new Promise<void>(done => large.server.close(() => done())))
     writeFileSync(join(root, 'config', 'api-key'), KEY + '\n', 'utf8')
@@ -102,6 +103,34 @@ describe('local provider adapter', () => {
   }
   const texts = (events: AdapterEvent[], role: 'assistant' | 'status'): string =>
     events.filter(event => event.data.type === 'text' && event.data.role === role).map(event => event.data.type === 'text' ? event.data.text : '').join('')
+
+  it('refuses a foreign healthy server before sending any conversation', async () => {
+    const ready = await stack([frame({ content: 'must not receive a prompt' }, 'stop')])
+    ready.small.identity.model = 'local/foreign-model'
+    const events: AdapterEvent[] = []
+    const instance = adapter(ready.workspace, events, { model: QWEN_9B })
+    await expect(instance.start()).rejects.toThrow('Cannot start')
+    expect(ready.small.requests).toHaveLength(0)
+    expect(ready.large.requests).toHaveLength(0)
+  })
+
+  it('refuses a server impersonating the requested id without enforcing the key', async () => {
+    const ready = await stack([frame({ content: 'must not receive a prompt' }, 'stop')])
+    ready.small.identity.anonymous = true
+    const instance = adapter(ready.workspace, [], { model: QWEN_9B })
+    await expect(instance.start()).rejects.toThrow('Cannot start')
+    expect(ready.small.requests).toHaveLength(0)
+  })
+
+  it('emits full prompt and cache usage with server timing telemetry', async () => {
+    const ready = await stack([frame({ content: 'ok' }, 'stop'), JSON.stringify({ choices: [], usage: { prompt_tokens: 2100, completion_tokens: 3, total_tokens: 2103, prompt_tokens_details: { cached_tokens: 2000 } }, timings: { cache_n: 2000, prompt_n: 100, prompt_ms: 90, predicted_ms: 30 } })])
+    const events: AdapterEvent[] = []
+    const instance = adapter(ready.workspace, events)
+    await instance.start()
+    await instance.submit('answer', settings())
+    expect(await settled(events)).toBe('completed')
+    expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { inputTokens: 2100, cachedTokens: 2000, outputTokens: 3, totalTokens: 2103 }, native: { method: 'llama.cpp/timings', payload: { cache_n: 2000, prompt_n: 100, prompt_ms: 90, predicted_ms: 30 } } })
+  })
 
   const guard = (reason: unknown): void => { if (!(reason instanceof Error) || reason.message !== 'skip') throw reason }
 

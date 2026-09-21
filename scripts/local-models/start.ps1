@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-Verify the local model stack and start both llama.cpp servers on 127.0.0.1.
+Verify the local model stack and start one llama.cpp server (9B by default) on 127.0.0.1.
 #>
 param([string]$Model, [switch]$Fast)
 $ErrorActionPreference = 'Stop'
@@ -9,5 +9,5 @@ $cliArgs = @('start')
 if ($Model) { $cliArgs += @('--model', $Model) }
 if ($Fast) { $cliArgs += '--fast' }
 Push-Location $repo
-try { & node '--disable-warning=MODULE_TYPELESS_PACKAGE_JSON' (Join-Path $PSScriptRoot 'cli.ts') @cliArgs } finally { Pop-Location }
+try { & node '--experimental-transform-types' '--disable-warning=MODULE_TYPELESS_PACKAGE_JSON' (Join-Path $PSScriptRoot 'cli.ts') @cliArgs } finally { Pop-Location }
 exit $LASTEXITCODE

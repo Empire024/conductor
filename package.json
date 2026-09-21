@@ -55,9 +55,9 @@
     "test:local-grants": "npm run build && node scripts/smoke-local-grants.mjs",
     "relay": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/relay-server/main.ts",
     "relay:secret": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/relay-server/main.ts new-secret",
-    "local": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts",
-    "local:smoke": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts smoke",
-    "local:security": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts security-test"
+    "local": "node --experimental-transform-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts",
+    "local:smoke": "node --experimental-transform-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts smoke",
+    "local:security": "node --experimental-transform-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/cli.ts security-test"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

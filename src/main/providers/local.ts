@@ -3,9 +3,9 @@ import type { AdapterOptions, ProviderAdapter } from './adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, localModelLabel } from '../../shared/local-models'
 import { LocalAgentSession } from '../local-models/agent.ts'
-import { endpointFor, loadConfig, readApiKey, recordedPort } from '../local-models/config.ts'
+import { endpointFor, loadConfig, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
-import { health, startServer } from '../local-models/llama.ts'
+import { inspectAdmission, startServer } from '../local-models/llama.ts'
 import { DockerSandbox } from '../local-models/sandbox.ts'
 import { LOCAL_TOOLS, type LocalGrants } from '../local-models/tools.ts'
 
@@ -23,11 +23,13 @@ const startingServers = new Map<string, Promise<void>>()
  *  closing must not take a server another tab is still using, and the stack's own `stop`
  *  command stays the way servers are shut down. */
 async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, apiKey: string, onStart: () => void): Promise<void> {
-  // The recorded port, not the configured one: a server that had to move to a neighbouring or
-  // OS-assigned port is exactly the case the run record exists for, and probing the configured
-  // port would fail on every turn - announcing a start, and making a redundant one - for a
-  // server that is up and answering where every other client is already talking to it.
-  if ((await health(recordedPort(model), apiKey)).ok) return
+  // Reuse must pass the same model identity and anonymous-key-refusal checks as startup.
+  // Only startServer may allocate; it repeats admission under the cross-process lock.
+  if (!startingServers.has(model.id)) {
+    try { if (await inspectAdmission(model, apiKey)) return }
+    catch { /* A concurrent process may still be loading. Locked startup waits/rechecks and
+               reports the definitive refusal; this optimistic probe never permits a spawn. */ }
+  }
   let pending = startingServers.get(model.id)
   const first = !pending
   if (!pending) {
@@ -205,7 +207,7 @@ export class LocalAdapter implements ProviderAdapter {
           this.emit({ turnId, itemId: call.id, data: { type: 'tool', name: call.name, status: call.failed ? 'failed' : 'completed', output: call.output, outputMode: 'snapshot', durationMs: call.durationMs } })
           round++
         },
-        usage: usage => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider' } }),
+        usage: usage => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider' }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
         notice: message => this.emit({ turnId, data: { type: 'notice', message } })
       }, controller.signal)
       this.emit({ turnId, data: { type: 'session', phase: outcome.stopReason === 'interrupted' ? 'interrupted' : outcome.stopReason === 'iteration_limit' ? 'failed' : 'completed' } })

@@ -42,7 +42,8 @@ describe('bounded local coworker tools', () => {
     }
     expect((await runTool('write_file', '{"path":"public-alias/new/ordinary.txt","content":"bad"}', ctx)).failed).toBe(true)
     await writeFile(join(ctx.workspace, '.env.example'), 'PUBLIC_TEMPLATE')
-    expect((await runTool('read_file', '{"path":".env.example"}', ctx)).output).toBe('PUBLIC_TEMPLATE')
+    // read_file now leads with a metadata line (total lines, range, truncation); the template itself must still be readable.
+    expect((await runTool('read_file', '{"path":".env.example"}', ctx)).output).toContain('PUBLIC_TEMPLATE')
   })
   it('passes memory to a trusted callback with no caller-controlled scope', async () => {
     const control = vi.fn(async () => ({ id: 'durable-memory' })); const ctx = { ...await context(), control }

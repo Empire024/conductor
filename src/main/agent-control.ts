@@ -47,6 +47,37 @@ const object = (value: unknown): Args => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected an object')
   return value as Args
 }
+/** The sections docs/token-thrift-policy.md requires of a bounded handoff, in the order it
+ *  states them. A receiver that opens on a handoff has no other context, so a missing section is
+ *  refused by name rather than half-understood: "Owned files" absent is a worker about to edit
+ *  another coworker's area, and "Verified findings" absent is one about to re-derive them. */
+const handoffSections = ['Objective', 'Constraints', 'Owned files', 'Verified findings', 'Remaining work', 'Artifact references'] as const
+const HANDOFF_MINIMUM = 200, HANDOFF_MAXIMUM = 12000
+
+/** A heading is a line that is only that heading, however the model chose to mark it up: bare,
+ *  as a Markdown heading, bolded, or with a trailing colon. A sentence that happens to mention
+ *  "Remaining work" is prose, not a section, and must not satisfy the check. */
+const handoffHeading = (line: string): string =>
+  line.trim().replace(/^#{1,6}\s*/, '').replace(/^\*\*/, '').replace(/\*\*$/, '').replace(/:$/, '').trim().toLowerCase()
+
+/** Validates the text of a handoff and returns it. Order is part of the format, so each heading
+ *  is looked for only after the one before it: sections out of order read as a different document
+ *  and are the same mistake as a missing one. */
+function handoffText(args: Args): string {
+  const value = args.handoff
+  if (typeof value !== 'string' || value.includes('\0')) throw new Error('agents.handoff requires handoff: the bounded handoff text described in docs/token-thrift-policy.md')
+  const handoff = value.trim()
+  if (handoff.length < HANDOFF_MINIMUM || handoff.length > HANDOFF_MAXIMUM) throw new Error(`A handoff is between ${HANDOFF_MINIMUM} and ${HANDOFF_MAXIMUM} characters; this one is ${handoff.length}. Summarize the remaining work and reference long output by repository path instead of pasting it.`)
+  const lines = handoff.split(/\r?\n/).map(handoffHeading)
+  let cursor = 0
+  for (const heading of handoffSections) {
+    const found = lines.indexOf(heading.toLowerCase(), cursor)
+    if (found < 0) throw new Error(`The handoff has no “${heading}” section on its own line${cursor ? ' after “' + handoffSections[handoffSections.indexOf(heading) - 1] + '”' : ''}. Use the six sections from docs/token-thrift-policy.md in order: ${handoffSections.join(', ')}.`)
+    cursor = found + 1
+  }
+  return handoff
+}
+
 const toolSignatures = {
   'tools.list': '() — discover these methods and arguments',
   'app.state': '() — current project, workspace, tabs, relationships, the machine each tab runs on, and the other projects open in this Conductor',
@@ -70,6 +101,7 @@ const toolSignatures = {
   'agents.resume': '({agentSessionId}) ? reconnect an idle/disconnected native conversation with its existing settings',
   'agents.fork': '({agentSessionId,title?}) ? fork supported idle native history into a visible linked tab',
   'agents.release': '({agentSessionId}) — release this controller relationship',
+  'agents.handoff': `({handoff,title?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
   'files.write': '({path,content,expectedContent}) — atomic compare-and-save in this project only; expectedContent:null creates a file; live views refresh. To change a sibling project, open a tab there with tabs.open({projectId}) and dispatch the work to it',
@@ -502,6 +534,7 @@ export class AgentControl {
       if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, scope, tab, 'detached')
       return result
     }
+    if (method === 'agents.handoff') return this.handoff(scope, args)
     if (method === 'agents.list') {
       const observedAt = new Date().toISOString()
       const own = this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
@@ -747,4 +780,55 @@ export class AgentControl {
     }
     return results
   }
+
+  /**
+   * Hands the caller's own remaining work to a fresh conversation. This is the other half of the
+   * context-cost nudge: a long session pays for its whole transcript on every call, and a bounded
+   * handoff into a new tab buys back that history at the price of writing it down once.
+   *
+   * Only ever the caller. A method that could hand off *another* tab would be a way to empty a
+   * coworker's context from outside it, and nobody but a conversation knows what its own
+   * remaining work is. The caller keeps its tab, its history and its steering rights over what it
+   * opened; nothing here interrupts or closes it, because a turn cut off mid-step loses exactly
+   * the state the handoff is supposed to carry.
+   */
+  private async handoff(scope: AgentControlScope, args: Args): Promise<unknown> {
+    const { database } = this.deps
+    const spec = this.authorize(scope)
+    if (args.agentSessionId !== undefined) throw new Error('agents.handoff always hands off the calling conversation and takes no agentSessionId. To give work to a different tab, use agents.submit.')
+    const handoff = handoffText(args)
+    const settings = settingsForRuntime(database.structured.snapshot(scope.agentSessionId)!.settings)
+    const source = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)
+    // The receiver is this conversation continued, so it is named after it. Kept short enough
+    // that a repeated handoff cannot grow an unbounded tab title.
+    const title = args.title === undefined ? (source?.title ?? spec.title).slice(0, 100).replace(/ \(continued\)$/, '') + ' (continued)' : text(args, 'title', 120)
+    // Deliberately the ordinary tabs.open path: same catalog check, same machine inheritance,
+    // same permission clamping. Provider is inherited by omission; model, effort and permission
+    // are named so the receiver continues on this conversation's settings rather than on the
+    // provider default or the owner's remembered mode. A read-only or planning caller therefore
+    // hands off to a read-only or planning receiver, which is why it is allowed to hand off at all.
+    const tab = await this.open(scope, {
+      kind: 'agent', title, model: settings.model ?? spec.model, permission: settings.permission,
+      ...(settings.effort ? { effort: settings.effort } : {})
+    })
+    // A tab placed on a paired machine comes back in the remote shape, which names the session
+    // differently and may not be steerable from here at all.
+    const agentSessionId = tab.resourceId ?? (tab as { agentSessionId?: string }).agentSessionId
+    if (!agentSessionId) throw new Error(`The handoff tab “${title}” opened, but this machine cannot deliver a prompt to it. Submit the handoff to it yourself with agents.submit before you stop.`)
+    try { await this.call(scope, 'agents.submit', { agentSessionId, prompt: handoff }) }
+    catch (error) {
+      // The tab exists but holds no work. Say so plainly: the caller must not read a failure here
+      // as permission to stop.
+      throw new Error(`The handoff tab “${title}” opened but would not accept the handoff, so nothing was handed over — keep working in this conversation: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    // The audit trail for a context handoff, alongside the control link tabs.open recorded.
+    this.deps.collaboration.postMessage({ projectId: scope.projectId, sessionId: scope.sessionId, agentSessionId: scope.agentSessionId, toAgentSessionId: agentSessionId, kind: 'handoff', body: `Handed the remaining work to “${tab.title ?? title}”. This conversation finishes its current step and stops.`, metadata: { handoff: 'context', fromTabId: source?.id, toTabId: tab.id, characters: handoff.length } })
+    const created = database.structured.snapshot(agentSessionId)
+    return {
+      handedOff: true, tabId: tab.id, agentSessionId, uri: tab.uri, projectId: tab.projectId, workspaceId: tab.workspaceId,
+      title: tab.title ?? title, provider: spec.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
+      note: 'The remaining work now belongs to that tab, which has the handoff as its first prompt. Finish only the step you are already in, report it, and stop — do not carry on with the handed-over work here in parallel. Your tab stays open and you may still steer the new one with agents.*.'
+    }
+  }
+
 }

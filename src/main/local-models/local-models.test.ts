@@ -1,8 +1,8 @@
 import { execFileSync } from 'node:child_process'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
@@ -13,14 +13,15 @@ import {
 } from './sandbox.ts'
 import {
   adoptRunningServer, describeStartupFailure, findFreePort, llamaServerArgs, logFile, portBindable,
-  readRunRecord, startServer, validateExtraArgs
+  inspectAdmission, readRunRecord, startServer, validateExtraArgs
 } from './llama.ts'
 import { StreamAccumulator } from './client.ts'
 import { repairToolProtocol, RESPONSE_RESERVE_TOKENS, trimMessages } from './agent.ts'
 import { runTool, toolSpecs } from './tools.ts'
-import { DEFAULT_SANDBOX, defaultModelConfig, QWEN_35B, QWEN_9B, validateConfig } from './config.ts'
+import { DEFAULT_SANDBOX, defaultModelConfig, QWEN_35B, QWEN_9B, runFile, validateConfig } from './config.ts'
 import type { LocalStackConfig } from './config.ts'
-import { detectDrives, systemDrive } from './paths.ts'
+import * as localPaths from './paths.ts'
+import * as resources from './resource-guard.ts'
 
 const workspace = (): string => {
   const root = mkdtempSync(join(tmpdir(), 'conductor-local-'))
@@ -334,20 +335,20 @@ describe('llama.cpp server lifecycle', () => {
 
   afterEach(async () => {
     for (const dispose of cleanup.splice(0).reverse()) await dispose()
+    vi.restoreAllMocks()
     if (previousRoot === undefined) delete process.env.CONDUCTOR_LOCAL_ROOT
     else process.env.CONDUCTOR_LOCAL_ROOT = previousRoot
   })
 
-  // The local root is refused on the system drive by design, so these tests need a real fixed
-  // second drive and skip rather than pretend otherwise.
+  // These are synthetic server records, not model data. Mock only the storage layout so
+  // lifecycle tests run in sandbox-writable scratch without a real second drive.
   const scratchRoot = (): string | null => {
-    const drive = detectDrives().find(candidate => candidate.letter !== systemDrive() && candidate.freeBytes > 256 * 1024 ** 2)
-    if (!drive) return null
-    const root = join(drive.letter + '\\', `ConductorLlamaTest-${process.pid}-${Math.random().toString(36).slice(2, 8)}`)
+    const root = mkdtempSync(join(tmpdir(), 'ConductorLlamaTest-'))
     mkdirSync(join(root, 'runtime'), { recursive: true })
     mkdirSync(join(root, 'logs'), { recursive: true })
     cleanup.push(() => rmSync(root, { recursive: true, force: true }))
     process.env.CONDUCTOR_LOCAL_ROOT = root
+    vi.spyOn(localPaths, 'layout').mockReturnValue(localPaths.layoutFor(root))
     return root
   }
 
@@ -428,6 +429,39 @@ describe('llama.cpp server lifecycle', () => {
     const refused = await adoptRunningServer(model, key, orphan.port)
     expect(refused.adopted).toBeNull()
     expect(refused.reason).toContain('local/someone-elses-model')
+  })
+
+  it('refuses a second model, preserves the owner server and ignores the dead 35B record', async () => {
+    scratchRoot()
+    const orphan = await fakeOrphan(QWEN_9B)
+    const small = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
+    const large = { ...defaultModelConfig(QWEN_35B), port: await findFreePort(small) }
+    writeFileSync(runFile(small), JSON.stringify({ pid: null, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21' }))
+    writeFileSync(runFile(large), JSON.stringify({ pid: 2147483647, port: large.port, model: large.id, file: large.file, startedAt: '2026-09-14' }))
+    const before = readFileSync(runFile(small), 'utf8')
+    await expect(startServer('must-never-spawn', large, key)).rejects.toThrow(`${QWEN_9B} is already running`)
+    expect(readFileSync(runFile(small), 'utf8')).toBe(before)
+    expect((await startServer('must-never-spawn', small, key)).started).toBe(false)
+    expect(orphan.server.listening).toBe(true)
+  })
+
+  it('ignores dead records, refuses unrecorded processes and fails closed on unreadable inventory', async () => {
+    scratchRoot()
+    const model = { ...defaultModelConfig(QWEN_35B), port: 59861 }
+    writeFileSync(runFile(model), JSON.stringify({ pid: 2147483647, port: model.port, model: model.id, file: model.file, startedAt: '2026-09-14' }))
+    const inventory = vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
+    await expect(inspectAdmission(model, key)).resolves.toBeNull()
+    inventory.mockReturnValue([{ pid: 123, model: QWEN_9B }])
+    await expect(inspectAdmission(model, key)).rejects.toThrow(QWEN_9B)
+    inventory.mockImplementation(() => { throw new Error('Cannot read process inventory') })
+    await expect(inspectAdmission(model, key)).rejects.toThrow('Cannot read process inventory')
+  })
+
+  it('never treats a corrupt run record as permission to start another server', async () => {
+    scratchRoot()
+    const model = { ...defaultModelConfig(QWEN_35B), port: 59861 }
+    writeFileSync(runFile(model), '{partially written')
+    await expect(startServer('must-never-spawn', model, key)).rejects.toThrow('Cannot read local server record')
   })
 
   /**

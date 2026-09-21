@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 2,
+  "reproduce": "node scripts/measure-context-churn.mjs --since=2026-09-07T18:55:00.000Z --until=2026-09-21T18:55:00.000Z --json",
+  "generatedAt": "2026-09-21T18:55:00.000Z",
+  "window": { "days": 14, "since": "2026-09-07T18:55:00.000Z", "changeAt": "2026-09-21T16:30:00.000Z" },
+  "privacy": "Sanitized aggregates only; no prompt text, credentials, absolute log paths, or full session identifiers.",
+  "ingestion": { "sessions": 484, "userTurns": 3131, "apiCalls": 34392, "duplicateUsageEventsDiscarded": 26812, "compactionBoundaries": 29 },
+  "providers": {
+    "claude": { "userTurns": 1096, "apiCalls": 26172, "callsPerUserTurn": 23.88, "inputTokens": 5163638178, "cachedInputTokens": 5080221215, "uncachedInputTokens": 83416963, "cacheRatio": 0.9838, "inputPerCall": { "p50": 165933, "p90": 376371, "mean": 197296 } },
+    "codex": { "userTurns": 2035, "apiCalls": 8220, "callsPerUserTurn": 4.04, "inputTokens": 964787982, "cachedInputTokens": 932323072, "uncachedInputTokens": 32464910, "cacheRatio": 0.9664, "inputPerCall": { "p50": 115045, "p90": 197084, "mean": 117371 } }
+  },
+  "periods": {
+    "beforeV0136": { "apiCalls": 34112, "inputPerCall": { "p50": 149629, "p90": 341014, "mean": 178497 }, "cacheRatio": 0.9814 },
+    "afterV0136": { "apiCalls": 280, "inputPerCall": { "p50": 120986, "p90": 217453, "mean": 141217 }, "cacheRatio": 0.9347 }
+  },
+  "roles": {
+    "parent": { "apiCalls": 28118, "inputTokens": 5343815278, "cachedInputTokens": 5262855504, "uncachedInputTokens": 80959774 },
+    "sidechain": { "apiCalls": 4733, "inputTokens": 628564268, "cachedInputTokens": 608637135, "uncachedInputTokens": 19927133 },
+    "guardian": { "apiCalls": 1541, "inputTokens": 156046614, "cachedInputTokens": 141051648, "uncachedInputTokens": 14994966 },
+    "allChildren": { "apiCalls": 6274, "inputTokens": 784610882, "cachedInputTokens": 749688783, "uncachedInputTokens": 34922099 }
+  },
+  "strategySensitivity": {
+    "label": "ESTIMATE, not a measured product saving",
+    "assumptions": { "cachedInputPriceMultiplier": 0.1, "outputToInputMultiplier": 3, "boundedHandoffTokens": 1200, "sharedFreshPrefixCachedTokens": 18904, "freshPrefixUncachedTokens": 8600, "reorientationTokens": 2500, "verificationTokens": 4000, "escalationProbability": 0.15, "escalationTokensWhenNeeded": 6000 },
+    "paybackCallsAt90PercentCache": [
+      { "model": "claude-fable-5-1", "observedContextP50": 391655, "compact": 2, "freshHandoff": 2 },
+      { "model": "claude-sonnet-5", "observedContextP50": 197205, "compact": 2, "freshHandoff": 2 },
+      { "model": "claude-opus-5", "observedContextP50": 166726, "compact": 2, "freshHandoff": 3 },
+      { "model": "gpt-6-astra", "observedContextP50": 115411, "compact": 2, "freshHandoff": 3 },
+      { "model": "gpt-5.6-sol", "observedContextP50": 131018, "compact": 2, "freshHandoff": 3 },
+      { "model": "gpt-5.6-terra", "observedContextP50": 126076, "compact": 2, "freshHandoff": 3 },
+      { "model": "gpt-5.6-luna", "observedContextP50": 32019, "compact": 3, "freshHandoff": 14 },
+      { "model": "claude-haiku-4-5-20251001", "observedContextP50": 25703, "compact": 4, "freshHandoff": 28 }
+    ],
+    "limitation": "Static replay estimate. Only a paired accepted-task experiment can establish product savings."
+  }
+}

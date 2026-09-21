@@ -24,7 +24,7 @@ page.setDefaultTimeout(15000)
 const errors = [], checks = [], prompts = []
 page.on('pageerror', error => { if (error.message !== 'Canceled') errors.push(error.message) })
 const check = label => { checks.push(label); console.log('PASS ' + label) }
-const STATIC = ['Conductor keeps durable, project-scoped memory', 'Conductor project tasks: feature-list.md', 'Conductor app control: a first-party']
+const STATIC = ['Conductor keeps durable, project-scoped memory', 'Conductor project tasks: feature-list.md', 'Machine limits (this computer', 'Conductor app control: a first-party']
 const MEMORY = 'The synthetic panel fixture keeps its wasOpen flag in panel.mjs'
 const snapshot = id => page.evaluate(id => window.conductor.structured.snapshot(id), id)
 const turn = async (id, text) => {

@@ -694,3 +694,127 @@ describe('a conversation a paired machine is driving', () => {
     await expect(f.control.call(f.scope, 'tabs.list', { projectId: f.project.id })).resolves.toBeTruthy()
   })
 })
+
+/** A handoff in the shape docs/token-thrift-policy.md asks for. `omit` drops one section and
+ *  `swap` exchanges two, so a test can name exactly which rule it is exercising. */
+function handoff(options: { omit?: string; swap?: [string, string]; pad?: number } = {}): string {
+  const sections: Array<[string, string]> = [
+    ['Objective', '- Land the agents.handoff control method with tests and a parked smoke.'],
+    ['Constraints', '- Additive edits only; the controller commits and publishes the batch.'],
+    ['Owned files', '- src/main/agent-control.ts, its test file, docs/agent-control.md.'],
+    ['Verified findings', '- npx tsc --noEmit is clean on this working tree (run 2026-09-21).'],
+    ['Remaining work', '- Append the smoke script, run it once parked, record the report.'],
+    ['Artifact references', '- artifacts/swarm-2026-09-21/handoff/report.json']
+  ]
+  const kept = sections.filter(([heading]) => heading !== options.omit)
+  if (options.swap) {
+    const [left, right] = options.swap.map(heading => kept.findIndex(([name]) => name === heading))
+    const held = kept[left!]!; kept[left!] = kept[right!]!; kept[right!] = held
+  }
+  const body = kept.map(([heading, line]) => heading + '\n' + line).join('\n\n')
+  return options.pad ? body + '\n' + 'x'.repeat(options.pad) : body
+}
+
+describe('context handoff to a fresh tab', () => {
+  it('refuses a handoff that is not the bounded six-section format, naming what is wrong', async () => {
+    const f = fixture()
+    await expect(f.control.call(f.scope, 'agents.handoff', {})).rejects.toThrow('requires handoff')
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: 42 })).rejects.toThrow('requires handoff')
+    // Too small to carry a task, and too large to be the cheap thing it exists to be.
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: 'Objective\nConstraints\nOwned files\nVerified findings\nRemaining work\nArtifact references' })).rejects.toThrow('between 200 and 12000 characters')
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff({ pad: 12000 }) })).rejects.toThrow('between 200 and 12000 characters')
+    // A missing section is named, because the receiver cannot ask for it later.
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff({ omit: 'Owned files' }) })).rejects.toThrow('no “Owned files” section')
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff({ omit: 'Objective' }) })).rejects.toThrow('no “Objective” section')
+    // Order is part of the format: findings that arrive after the work they justify read as a
+    // different document, so this is refused the same way a missing section is.
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff({ swap: ['Verified findings', 'Remaining work'] }) })).rejects.toThrow('no “Remaining work” section on its own line after “Verified findings”')
+    // A heading mentioned inside a sentence is prose, not a section.
+    const prose = handoff({ omit: 'Artifact references' }) + '\n\nThe Artifact references are listed in the report.'
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: prose })).rejects.toThrow('no “Artifact references” section')
+    // Nothing was opened by any of those refusals.
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(1)
+    expect(f.submissions).toHaveLength(0)
+  })
+
+  it('accepts the headings however the model marked them up, as long as each stands on its own line', async () => {
+    const f = fixture()
+    const marked = handoff()
+      .replace(/^(Objective|Owned files)$/gm, '## $1')
+      .replace(/^(Constraints|Remaining work)$/gm, '**$1**')
+      .replace(/^(Verified findings)$/gm, '$1:')
+    expect(await f.control.call(f.scope, 'agents.handoff', { handoff: marked })).toMatchObject({ handedOff: true })
+  })
+
+  it('opens a fresh tab on the caller’s own provider, model, effort and mode and gives it the handoff as its first prompt', async () => {
+    const f = fixture()
+    f.database.structured.update(f.spec.id, { settings: { model: 'codex-advanced', effort: 'high', permission: 'accept-edits', plan: false } })
+    const body = handoff()
+    const result = await f.control.call(f.scope, 'agents.handoff', { handoff: body }) as { handedOff: boolean; agentSessionId: string; tabId: string; uri: string; title: string; note: string }
+    expect(result).toMatchObject({ handedOff: true, provider: 'codex', model: 'codex-advanced', effort: 'high', permission: 'accept-edits', projectId: f.project.id, workspaceId: f.workspace.id })
+    expect(result.uri).toContain(encodeURIComponent(result.tabId))
+    // The receiver continues this conversation, so it is named after it rather than after the model.
+    expect(result.title).toBe('Controller (continued)')
+    // The visible tab exists and holds the new native session.
+    const opened = f.control.tabs(f.scope).find(tab => tab.id === result.tabId)
+    expect(opened).toMatchObject({ kind: 'agent', resourceId: result.agentSessionId, title: 'Controller (continued)' })
+    expect(opened?.state).toMatchObject({ provider: 'codex', model: 'codex-advanced', effort: 'high' })
+    expect(f.database.structured.snapshot(result.agentSessionId)?.settings).toMatchObject({ model: 'codex-advanced', effort: 'high', permission: 'accept-edits' })
+    // The handoff itself is the first prompt, unaltered, through the ordinary submit path.
+    expect(f.submissions).toHaveLength(1)
+    expect(f.submissions[0]!.prompt).toBe(body)
+    const items = f.database.structured.snapshot(result.agentSessionId)!.items
+    expect(items.find(item => item.data.type === 'text' && item.data.role === 'user')?.data).toMatchObject({ text: body })
+    // Recorded as a handoff from the caller, naming the tab that took the work over.
+    const recorded = f.collaboration.listMessages({ projectId: f.project.id, sessionId: f.workspace.id }).filter(message => message.metadata?.handoff === 'context')
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0]).toMatchObject({ kind: 'handoff', agentSessionId: f.spec.id, toAgentSessionId: result.agentSessionId })
+    expect(recorded[0]!.body).toContain('Controller (continued)')
+    expect(recorded[0]!.metadata).toMatchObject({ fromTabId: f.rootTab.id, toTabId: result.tabId, characters: body.length })
+    // The caller keeps its own tab and is told to stop rather than run the work in parallel.
+    expect(f.control.tabs(f.scope).some(tab => tab.resourceId === f.spec.id)).toBe(true)
+    expect(f.database.structured.snapshot(f.spec.id)?.phase).not.toBe('interrupted')
+    expect(result.note).toMatch(/stop/)
+    // And it may still steer what it opened, exactly as with tabs.open.
+    await expect(f.control.call(f.scope, 'agents.submit', { agentSessionId: result.agentSessionId, prompt: 'A follow-up from the caller' })).resolves.toBeTruthy()
+  })
+
+  it('hands off only the calling conversation, never another tab', async () => {
+    const f = fixture()
+    const other = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), agentSessionId: other.resourceId })).rejects.toThrow('takes no agentSessionId')
+    // Refused before anything is opened: the tab it made with tabs.open is still the only extra one.
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(2)
+    expect(f.submissions).toHaveLength(0)
+    // The caller may of course hand off itself, and the tab it opened may hand off its own work.
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), title: 'Named by the caller' })).resolves.toMatchObject({ title: 'Named by the caller' })
+    await expect(f.control.call({ ...f.scope, agentSessionId: other.resourceId! }, 'agents.handoff', { handoff: handoff() })).resolves.toMatchObject({ handedOff: true })
+  })
+
+  it('lets a read-only or planning conversation hand off, because the receiver inherits the same mode', async () => {
+    const f = fixture()
+    f.database.structured.update(f.spec.id, { settings: { permission: 'default', plan: true } })
+    const planned = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff() }) as { agentSessionId: string }
+    // Clamped by the same rule tabs.open uses, so the receiver cannot outrank the conversation
+    // that handed to it - which is exactly why handing off at all is allowed here.
+    expect(f.database.structured.snapshot(planned.agentSessionId)?.settings).toMatchObject({ permission: 'read-only', sandbox: 'read-only' })
+    expect(f.submissions).toHaveLength(1)
+    // The same clamp applies to a caller that is merely read-only rather than planning.
+    const readOnly = fixture()
+    readOnly.database.structured.update(readOnly.spec.id, { settings: { permission: 'read-only', plan: false } })
+    const handed = await readOnly.control.call(readOnly.scope, 'agents.handoff', { handoff: handoff() }) as { agentSessionId: string }
+    expect(readOnly.database.structured.snapshot(handed.agentSessionId)?.settings).toMatchObject({ permission: 'read-only', sandbox: 'read-only' })
+    expect(readOnly.submissions).toHaveLength(1)
+    // Planning mode on Claude specifically is not exercised here: this fixture adapter advertises
+    // plans: false, so a synthetic Claude tab opened from a restricted caller is a state the
+    // fixture itself rejects. handoff adds nothing to that path beyond what tabs.open already
+    // does, and the tabs.open cases above cover it.
+  })
+
+  it('advertises itself in tools.list with the six sections a caller has to write', async () => {
+    const f = fixture()
+    const tools = await f.control.call(f.scope, 'tools.list') as Record<string, string>
+    expect(tools['agents.handoff']).toContain('Objective, Constraints, Owned files, Verified findings, Remaining work, Artifact references')
+    expect(tools['agents.handoff']).toContain('no agentSessionId')
+  })
+})

@@ -176,12 +176,13 @@ async function start(): Promise<void> {
   const docker = await dockerAvailable()
   log(docker.available ? `docker: ${docker.version}` : `docker: unavailable (${docker.reason}) - tool execution will be refused, never run on the host`)
   if (docker.available && !await sandboxImageExists(config.sandbox.image)) log(`sandbox image missing: ${config.sandbox.image} (run setup)`)
-  for (const model of modelsOf(config, flag('model'))) {
+  // MAIN admits one resident model. An omitted selector starts the default 9B only.
+  for (const model of modelsOf(config, flag('model') ?? QWEN_9B)) {
     log(`verifying ${model.file} (${mode}) ...`)
     const verified = await verifyModel(model, mode)
     if (!verified.ok) fail(verified.reason ?? 'GGUF verification failed')
     const outcome = await startServer(config.llamaServer, model, apiKey)
-    log(`${model.id}: ${outcome.message} on 127.0.0.1:${model.port} (ctx ${model.contextTokens}, gpu layers ${model.gpuLayers})`)
+    log(`${model.id}: ${outcome.message} on 127.0.0.1:${outcome.port} (ctx ${model.contextTokens}, gpu layers ${model.gpuLayers})`)
   }
   await status()
 }

@@ -21,6 +21,7 @@ import { NativeCliManager } from './native-cli-manager'
 import { loadConfig } from './local-models/config.ts'
 import { StructuredSessions } from './structured-sessions'
 import { TurnBriefings } from './turn-briefing'
+import { baseMachineFacts, describeMachine, detectMachine } from './machine-policy'
 
 export { parseUsageLimitReset } from './usage-limit'
 
@@ -258,10 +259,14 @@ export class AgentManager {
   ) {
     // Everything static in the briefing is sent once per native runtime, a memory once per
     // runtime, the coworker log as a delta; see turn-briefing.ts for why and for the numbers.
-    this.briefings = new TurnBriefings({ database, coworkers: collaboration ? (id, options) => collaboration.briefingFor(id, options) : undefined, control: controlBriefing })
+    // What this computer can carry, stated once per runtime so no project's agent overloads it.
+    // CPU and RAM are known at once; the GPU line arrives when nvidia-smi has answered.
+    let machine = describeMachine(baseMachineFacts())
+    void detectMachine().then(facts => { machine = describeMachine(facts) }).catch(() => { /* CPU and RAM alone still say enough. */ })
+    this.briefings = new TurnBriefings({ database, coworkers: collaboration ? (id, options) => collaboration.briefingFor(id, options) : undefined, control: controlBriefing, machine: () => machine })
     this.structured = new StructuredSessions(database, (provider) => providers[provider].resolveExecutable(), broadcast,
       undefined,
-      (spec, prompt, itemId, runtimeId) => this.briefings.compose(spec, prompt, itemId, runtimeId),
+      (spec, prompt, itemId, runtimeId, context) => this.briefings.compose(spec, prompt, itemId, runtimeId, context),
       (spec, event) => {
         this.briefings.observe(spec, event)
         if (event.data.type === 'text' && event.data.role === 'assistant' && event.data.mode === 'snapshot') this.bankMemories(spec, event.itemId, event.data.text)

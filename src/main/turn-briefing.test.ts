@@ -6,7 +6,7 @@ import type { AgentSpec } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
-import { CONTEXT_RESET, LOCAL_BRIEFING, MEMORY_HEADING, TurnBriefings } from './turn-briefing'
+import { CONTEXT_RESET, LOCAL_BRIEFING, MEMORY_HEADING, TurnBriefings, handoffNudge } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -24,13 +24,14 @@ function fixture(provider: AgentSpec['provider'] = 'claude') {
   const remember = (gist: string, cues: string[]) => database.remember({ projectId: project.id, kind: 'semantic', gist, cues, source: 'human' })
   const coworkers = vi.fn((_id: string, options: CoworkerBriefingOptions) => options.guidance ? 'COWORKERS with guidance' : 'COWORKERS delta')
   const control = vi.fn((target: AgentSpec) => `CONTROL for ${target.id}`)
+  const machine = vi.fn(() => 'MACHINE limits: one local model server at a time')
   let tick = 0
-  const briefings = new TurnBriefings({ database, coworkers, control, now: () => new Date(Date.UTC(2026, 8, 21, 12, 0, tick++)).toISOString() })
+  const briefings = new TurnBriefings({ database, coworkers, control, machine, now: () => new Date(Date.UTC(2026, 8, 21, 12, 0, tick++)).toISOString() })
   const starting = (runtimeId: string) => briefings.observe(spec, { runtimeId, data: { type: 'session', phase: 'starting' } })
   return { database, project, spec, remember, coworkers, control, briefings, starting }
 }
 
-const STATIC = [MEMORY_PROTOCOL, 'Conductor project tasks: feature-list.md', 'CONTROL for agent-one']
+const STATIC = [MEMORY_PROTOCOL, 'Conductor project tasks: feature-list.md', 'MACHINE limits: one local model server at a time', 'CONTROL for agent-one']
 
 describe('what a native runtime is told, and how often', () => {
   it('sends the static briefing once per runtime, then only what is new', () => {
@@ -111,6 +112,26 @@ describe('what a native runtime is told, and how often', () => {
     // The caller names a different runtime without a lifecycle event in between.
     const rebriefed = f.briefings.compose(f.spec, 'Keep going', 'item-3', 'runtime-9')
     for (const block of STATIC) expect(rebriefed).toContain(block)
+  })
+
+  it('nudges a conversation to hand off once per context band per runtime', () => {
+    const f = fixture()
+    f.briefings.compose(f.spec, 'Start the work', 'item-1', 'runtime-1', { percent: 12 })
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-2', 'runtime-1', { percent: 31 })).toBe('COWORKERS delta')
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-3', 'runtime-1', { percent: 62.4 })).toBe(`COWORKERS delta\n\n${handoffNudge(62)}`)
+    expect(handoffNudge(62)).toContain('agents.handoff')
+    // The same band is not repeated; the next band is said once too.
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-4', 'runtime-1', { percent: 71 })).toBe('COWORKERS delta')
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-5', 'runtime-1', { percent: 88 })).toBe(`COWORKERS delta\n\n${handoffNudge(88)}`)
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-6', 'runtime-1', { percent: 93 })).toBe('COWORKERS delta')
+    // Compaction or a new process empties the context the bands measure.
+    f.briefings.observe(f.spec, { runtimeId: 'runtime-1', data: { type: 'notice', message: 'compacted', payload: { [CONTEXT_RESET]: true } } })
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-7', 'runtime-1', { percent: 61 })).toContain(handoffNudge(61))
+    // No usage report, no nudge; a local model has no handoff to call.
+    expect(f.briefings.compose(f.spec, 'Keep going', 'item-8', 'runtime-1')).toBe('COWORKERS delta')
+    const local = fixture('local')
+    local.briefings.compose(local.spec, 'Start', 'item-1', 'runtime-1', { percent: 90 })
+    expect(local.briefings.compose(local.spec, 'Keep going', 'item-2', 'runtime-1', { percent: 95 })).toBe('')
   })
 
   it('gives a local model its memory and one instruction, never a control credential', () => {

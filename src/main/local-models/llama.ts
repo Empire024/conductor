@@ -3,8 +3,9 @@ import { createConnection, createServer } from 'node:net'
 import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { LocalModelConfig } from './config.ts'
-import { logsDir, modelFilePath, runFile } from './config.ts'
+import { configPath, loadConfig, logsDir, modelFilePath, runDir, runFile } from './config.ts'
 import { childEnvironment } from './paths.ts'
+import { admissionRefusal, assertResourceHeadroom, runningLlamaProcesses, withAdmissionLock } from './resource-guard.ts'
 
 /** llama.cpp is an inference engine here and nothing else. These flags would hand it tools, a
  *  network surface or an agent runtime of its own, so they are refused wherever extra arguments
@@ -304,13 +305,62 @@ export function describeStartupFailure(model: LocalModelConfig, port: number): s
  *  worked around by moving to a nearby free port - only a port occupied by someone else across
  *  the whole scan range is an error. */
 export async function startServer(executable: string, model: LocalModelConfig, apiKey: string, opts: { pollMs?: number; timeoutMs?: number } = {}): Promise<StartOutcome> {
+  return withAdmissionLock(() => startAdmittedServer(executable, model, apiKey, opts))
+}
+
+/** Must run inside the machine-wide admission lock, through record publication and health.
+ * Stale records are evidence to investigate, never evidence to kill a process or to reuse it. */
+export async function inspectAdmission(model: LocalModelConfig, apiKey: string): Promise<StartOutcome | null> {
+  const configured = existsSync(configPath()) ? Object.values(loadConfig().models) : [model]
+  const candidates = new Map<number, { model: string; pid: number | null }>()
+  for (const entry of configured) candidates.set(entry.port, { model: entry.id, pid: null })
+  candidates.set(model.port, { model: model.id, pid: null })
+  for (const file of readdirSync(runDir()).filter(name => name.endsWith('.json'))) {
+    let record: RunRecord
+    try { record = JSON.parse(readFileSync(join(runDir(), file), 'utf8')) as RunRecord } catch { throw new Error(`Cannot read local server record ${file}; no second server started. Review the runtime records before retrying.`) }
+    if (!Number.isInteger(record.port) || record.port < 1 || record.port > 65535 || typeof record.model !== 'string' || !(record.pid === null || (Number.isInteger(record.pid) && record.pid > 0))) throw new Error(`Invalid local server record ${file}; no second server started`)
+    candidates.set(record.port, { model: record.model, pid: record.pid })
+  }
+  let reusable: StartOutcome | null = null
+  let occupied: string | null = null
+  for (const [port, candidate] of candidates) {
+    const listening = await portInUse(port, 300)
+    const alive = processAlive(candidate.pid)
+    if (!listening && !alive) continue // includes the old 35B record with a dead pid
+    const probe = listening ? await health(port, apiKey, 1500) : null
+    if (probe?.ok && probe.models?.includes(model.id) && await rejectsAnonymous(port, 1500)) {
+      // Remember, but finish the inventory before mutating any record.
+      reusable = { started: false, pid: candidate.model === model.id && alive ? candidate.pid! : 0, port, message: `reusing ${model.id} already running on 127.0.0.1:${port}` }
+    } else occupied = probe?.models?.join(', ') || `${candidate.model} on port ${port} (identity or health unverified)`
+  }
+  // Reusing does not allocate another model, even if the owner started multiple servers manually.
+  if (reusable) {
+    const record = readRunRecord(model)
+    if (!record || record.port !== reusable.port || record.pid !== (reusable.pid || null)) writeFileSync(runFile(model), JSON.stringify({ pid: reusable.pid || null, port: reusable.port, model: model.id, file: model.file, startedAt: new Date().toISOString() } satisfies RunRecord, null, 2), 'utf8')
+    return { ...reusable, message: reusable.pid ? reusable.message : `adopted; ${reusable.message}` }
+  }
+  if (occupied) throw admissionRefusal(model.id, occupied)
+  const processes = runningLlamaProcesses()
+  for (const entry of processes) {
+    // Unrecorded servers may have moved ports or live under another data root.
+    if (entry.port) {
+      const probe = await health(entry.port, apiKey, 1500)
+      if (probe.ok && probe.models?.includes(model.id)) {
+        const adoption = await adoptRunningServer(model, apiKey, entry.port, 1500)
+        if (adoption.adopted) return adoption.adopted
+      }
+    }
+    throw admissionRefusal(model.id, entry.model)
+  }
+  return null
+}
+
+async function startAdmittedServer(executable: string, model: LocalModelConfig, apiKey: string, opts: { pollMs?: number; timeoutMs?: number }): Promise<StartOutcome> {
   const pollMs = opts.pollMs ?? 2000
   const timeoutMs = opts.timeoutMs ?? 300_000
 
-  const existing = readRunRecord(model)
-  if (existing && processAlive(existing.pid) && await portInUse(existing.port)) {
-    return { started: false, pid: existing.pid ?? 0, port: existing.port, message: `already running (pid ${existing.pid})` }
-  }
+  const existing = await inspectAdmission(model, apiKey)
+  if (existing) return existing
 
   let port = model.port
   let moved = ''
@@ -323,16 +373,20 @@ export async function startServer(executable: string, model: LocalModelConfig, a
 
   const path = modelFilePath(model)
   if (!existsSync(path)) throw new Error(`Model file missing: ${path}`)
+  assertResourceHeadroom(model)
   const log = openSync(logFile(model), 'a')
   // TEMP, caches and any model-cache variable point at the local root, so the server can never
   // stage large files on the system drive.
   const child = spawn(executable, llamaServerArgs({ ...model, port }, apiKey, path), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
+  closeSync(log)
+  let spawnError = ''
+  child.on('error', error => { spawnError = error.message })
   child.unref()
   if (!child.pid) throw new Error('llama.cpp server failed to start')
   writeFileSync(runFile(model), JSON.stringify({ pid: child.pid, port, model: model.id, file: model.file, startedAt: new Date().toISOString() } satisfies RunRecord, null, 2), 'utf8')
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (!processAlive(child.pid)) throw new Error(describeStartupFailure(model, port))
+    if (spawnError || !processAlive(child.pid)) throw new Error(spawnError || describeStartupFailure(model, port))
     if ((await health(port, apiKey)).ok) return { started: true, pid: child.pid, port, message: moved ? `healthy on 127.0.0.1:${port}; ${moved}` : 'healthy' }
     await new Promise(resolve => setTimeout(resolve, pollMs))
   }

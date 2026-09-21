@@ -4,6 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LocalAgentSession } from './agent.ts'
+import { runTool } from './tools.ts'
+import type { Usage } from './client.ts'
 
 /** A stand-in for llama.cpp's OpenAI-compatible endpoint: it checks the API key, records the
  *  requests, and replays scripted SSE frames. Enough to exercise streaming, tool dispatch and
@@ -52,6 +54,69 @@ describe('local agent loop', () => {
     cleanup.push(() => rmSync(root, { recursive: true, force: true }))
     return root
   }
+
+  it('reaches a tail answer within two requests and keeps the full output for review', async () => {
+    const raw = 'HEAD\n' + 'payload '.repeat(6000) + '\nTAIL_ANSWER=7319\n'
+    const root = workspace()
+    writeFileSync(join(root, 'long.txt'), raw)
+    let requests = 0
+    const server = createServer((request, response) => {
+      let body = ''
+      request.on('data', chunk => { body += chunk })
+      request.on('end', () => {
+        requests++
+        const sent = JSON.parse(body) as { messages: Array<{ role: string; content: string }> }
+        const result = sent.messages.find(message => message.role === 'tool')
+        const reply = result
+          ? frame({ content: result.content.includes('TAIL_ANSWER=7319') ? '7319' : 'TAIL_MISSING' }, 'stop')
+          : frame({ tool_calls: [{ index: 0, id: 'tail', function: { name: 'read_file', arguments: '{"path":"long.txt"}' } }] }, 'tool_calls')
+        response.writeHead(200, { 'Content-Type': 'text/event-stream' }).end(`data: ${reply}\n\ndata: [DONE]\n\n`)
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    cleanup.push(() => server.close())
+    const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`
+    const session = new LocalAgentSession({ endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: root, sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768, maxIterations: 2 })
+    const reviewed: string[] = []
+    expect(await session.run('Read long.txt and answer with the tail marker', { toolEnd: call => reviewed.push(call.output) })).toEqual({ text: '7319', stopReason: 'complete' })
+    expect(requests).toBe(2)
+    expect(reviewed[0]).toContain(raw)
+    expect(reviewed[0]!.length).toBeGreaterThan(32000)
+  })
+
+  it('reports read ranges and validates positive line offsets without changing schema order', async () => {
+    const root = workspace()
+    writeFileSync(join(root, 'lines.txt'), 'one\ntwo\nthree\n')
+    const context = { workspace: root, readOnly: true, sandbox: null, timeoutSec: 30 }
+    const read = (args: Record<string, unknown>) => runTool('read_file', JSON.stringify({ path: 'lines.txt', ...args }), context)
+    expect((await read({ offset: 2, limit: 1 })).output).toContain('total_lines=3; returned_lines=2-2; truncated=true')
+    expect((await read({ offset: 2, limit: 1 })).output.endsWith('\ntwo')).toBe(true)
+    expect((await read({})).output).toContain('returned_lines=1-3; truncated=false')
+    expect((await read({ offset: 5 })).output).toContain('returned_lines=0-0; truncated=true')
+    for (const offset of [-1, 0, 1.5, '2']) {
+      expect(await read({ offset })).toMatchObject({ failed: true })
+      expect((await read({ offset })).output).toContain('positive 1-based line number')
+    }
+    writeFileSync(join(root, 'lines.txt'), '')
+    expect((await read({})).output).toContain('total_lines=0; returned_lines=0-0; truncated=false')
+  })
+
+  it('retains full prompt occupancy, cached tokens and timing-only SSE frames in telemetry', async () => {
+    const stub = await stubServer([[frame({ content: 'ok' }, 'stop'), JSON.stringify({ choices: [], timings: { cache_n: 1950, prompt_n: 50, prompt_ms: 100, predicted_n: 2, predicted_ms: 20, unexpected: 'discard', prompt_per_second: -1 } }), JSON.stringify({ choices: [], usage: { prompt_tokens: 2000, completion_tokens: 2, total_tokens: 2002, prompt_tokens_details: { cached_tokens: 1950 } } })]])
+    cleanup.push(() => stub.server.close())
+    const usage: Usage[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
+    await session.run('answer', { usage: value => usage.push(value) })
+    expect(usage).toEqual([{ inputTokens: 2000, outputTokens: 2, totalTokens: 2002, cachedTokens: 1950, timings: { cache_n: 1950, prompt_n: 50, prompt_ms: 100, predicted_n: 2, predicted_ms: 20 } }])
+  })
+
+  it('refuses final overflow after trimming and repair without issuing HTTP or a retry', async () => {
+    const stub = await stubServer([[frame({ content: 'must not be requested' }, 'stop')]])
+    cleanup.push(() => stub.server.close())
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 8192 })
+    await expect(session.run('x'.repeat(30000), {})).rejects.toThrow('No request was sent')
+    expect(stub.requests).toHaveLength(0)
+  })
 
   it('repairs interrupted multi-tool groups before the next turn and never executes skipped calls', async () => {
     const stub = await stubServer([

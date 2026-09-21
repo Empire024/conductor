@@ -349,3 +349,13 @@ loopback — the container never needs to reach the model servers.
   pressure causes instability, lower the 9B quantization or context first, then `gpuLayers` for
   the 35B.
 - Startup verification re-hashes ~26 GB by default; use `-Fast` when that is too slow.
+
+## 13. One server at a time (2026-09-21)
+
+MAIN admits one llama.cpp server at a time (see `docs/machine-profile.md`). `scripts/local-models/start.ps1` starts the default 9B model; `-Model local/qwen3.6-35b-a3b` selects the other model explicitly. CLI and app startup share a machine-wide admission mutex on loopback port 51434 (`src/main/local-models/resource-guard.ts`). A matching, authenticated running model is reused; another model is refused with the running model's name, in the app and in the CLI alike. Conductor never evicts the running model automatically: finish its work and stop it explicitly before switching.
+
+Admission checks the configured and recorded ports, including moved and adopted servers, and inventories running `llama-server` processes before allocating another model. A dead PID with an unused port is a stale run record: no process is killed and the stale record does not count as residency. An unreadable record, an unknown listener, an inaccessible process inventory, unavailable RAM or VRAM telemetry, or unreviewed extra server arguments all fail closed. A process crash releases the mutex automatically; a slow startup never loses it to a timer.
+
+Memory admission uses the pinned GGUF sizes, context and KV growth, GPU offload and runtime and desktop reserves. These are conservative estimates, not allocation measurements. An existing authenticated server stays reusable even when measurement tools are unavailable. The inventory is implemented for Windows; a new start on another platform is refused until one exists there.
+
+Measured on 2026-09-21 against the running 9B (build `b10901-28ff09582`, one slot, 32k context): default chat-completion requests already reuse the prompt/KV cache within a conversation and across two alternating conversations (about 99% of the prompt reused on a return), with no cache flag, restart or slot change. `node --experimental-transform-types --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/local-models/measure-thrift.ts` reproduces the bounded measurement against the running 9B only and never starts or stops a server; `scripts/smoke-local-admission.mjs` is the parked app smoke for the refusal. Details: `artifacts/swarm-2026-09-21/local/findings.md`.

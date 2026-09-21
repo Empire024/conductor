@@ -30,6 +30,17 @@ export const LOCAL_BRIEFING = 'Use the conductor tool for durable project memory
 
 export const MEMORY_HEADING = 'Conductor project memory (current project evidence takes precedence):'
 
+/** Context bands at which a conversation is told, once each per runtime, to hand its remaining
+ *  work to a fresh tab. Two bands, not one threshold: docs/token-thrift-policy.md shows the
+ *  payback varies by model and cache ratio, so the first is a prompt to plan and the second a
+ *  prompt to act. */
+export const HANDOFF_BANDS = [60, 85] as const
+
+/** The nudge itself, kept short: it names the bounded handoff format and the control method
+ *  that opens the fresh tab, and nothing the policy document does not say. */
+export const handoffNudge = (percent: number): string =>
+  `Conductor: this conversation's context is at ${percent}% of its window. Finish the current step, then write a bounded handoff (Objective, Constraints, Owned files, Verified findings, Remaining work, Artifact references; at most about 1,200 tokens, with paths instead of pasted output) and call agents.handoff with it through Conductor app control to continue in a fresh tab. The owner sees both tabs; do not continue the work in parallel afterwards.`
+
 interface Ledger {
   /** The runtime this ledger describes. Empty while the first prompt of a conversation is
    *  composed, because its process does not exist until the prompt is dispatched. */
@@ -39,12 +50,16 @@ interface Ledger {
   memoryIds: Set<string>
   /** Coworker records up to this time have been sent. */
   coworkerSince?: string
+  /** The highest context band this runtime has already been nudged at. */
+  nudgedBand: number
 }
 
 export interface TurnBriefingDependencies {
   database: Pick<ConductorDatabase, 'recall' | 'recordMemoryRecall' | 'forgetStaleMemories'>
   coworkers?: (agentSessionId: string, options: CoworkerBriefingOptions) => string
   control?: (spec: AgentSpec) => string
+  /** One line on what this computer can carry, so no project's agent overloads it. */
+  machine?: () => string
   now?: () => string
 }
 
@@ -54,7 +69,7 @@ export class TurnBriefings {
 
   /** Composes the context appended to one user message. `runtimeId` is the adapter the message
    *  will reach, or '' when dispatching it is what creates the adapter. */
-  compose(spec: AgentSpec, prompt: string, itemId: string, runtimeId: string): string {
+  compose(spec: AgentSpec, prompt: string, itemId: string, runtimeId: string, context?: { percent: number }): string {
     const ledger = this.ledger(spec.id, runtimeId)
     const staticDue = !ledger.staticSent
     if (staticDue) {
@@ -66,7 +81,17 @@ export class TurnBriefings {
     // unrestricted app-control HTTP surface into their prompt or sandbox.
     if (spec.provider === 'local') return [memory, staticDue ? LOCAL_BRIEFING : ''].filter(Boolean).join('\n\n')
     const coworkers = this.coworkers(spec, ledger)
-    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? this.deps.control?.(spec) ?? '' : ''].filter(Boolean).join('\n\n')
+    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? this.deps.machine?.() ?? '' : '', staticDue ? this.deps.control?.(spec) ?? '' : '', this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+  }
+
+  /** Once per band per runtime; a compaction or a new process starts the count again, since
+   *  the context it measures is gone with them. */
+  private nudge(ledger: Ledger, context?: { percent: number }): string {
+    if (!context || !Number.isFinite(context.percent)) return ''
+    const band = [...HANDOFF_BANDS].reverse().find(edge => context.percent >= edge)
+    if (!band || band <= ledger.nudgedBand) return ''
+    ledger.nudgedBand = band
+    return handoffNudge(Math.round(context.percent))
   }
 
   /** Watches a conversation for the two moments its runtime forgets. */
@@ -87,7 +112,7 @@ export class TurnBriefings {
 
   private ledger(id: string, runtimeId: string): Ledger {
     let ledger = this.ledgers.get(id)
-    if (!ledger) { ledger = { runtimeId, staticSent: false, guidanceSent: false, memoryIds: new Set() }; this.ledgers.set(id, ledger) }
+    if (!ledger) { ledger = { runtimeId, staticSent: false, guidanceSent: false, memoryIds: new Set(), nudgedBand: 0 }; this.ledgers.set(id, ledger) }
     else if (runtimeId && ledger.runtimeId && ledger.runtimeId !== runtimeId) this.reset(ledger, runtimeId)
     else if (runtimeId) ledger.runtimeId = runtimeId
     return ledger
@@ -99,6 +124,7 @@ export class TurnBriefings {
     ledger.guidanceSent = false
     ledger.memoryIds.clear()
     ledger.coworkerSince = undefined
+    ledger.nudgedBand = 0
   }
 
   private memory(spec: AgentSpec, prompt: string, itemId: string, ledger: Ledger): string {

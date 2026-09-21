@@ -2,6 +2,7 @@
  *  this protocol shape to other providers, so nothing new is invented here: one streaming chat
  *  completion endpoint, tool calls in the standard function-call form, and the local API key on
  *  every request. */
+import { assertRequestBudget } from './context-budget.ts'
 
 export interface ToolCall { id: string; name: string; arguments: string }
 
@@ -17,7 +18,11 @@ export interface ToolSpec {
   function: { name: string; description: string; parameters: Record<string, unknown> }
 }
 
-export interface Usage { inputTokens?: number; outputTokens?: number; totalTokens?: number }
+export interface LlamaTimings {
+  cache_n?: number; prompt_n?: number; prompt_ms?: number; prompt_per_token_ms?: number; prompt_per_second?: number
+  predicted_n?: number; predicted_ms?: number; predicted_per_token_ms?: number; predicted_per_second?: number
+}
+export interface Usage { inputTokens?: number; outputTokens?: number; totalTokens?: number; cachedTokens?: number; timings?: LlamaTimings }
 
 export interface CompletionResult {
   content: string
@@ -90,6 +95,8 @@ export interface CompletionRequest {
   tools?: ToolSpec[]
   temperature?: number
   maxTokens?: number
+  /** Local slot capacity; checked against the final messages/schemas immediately before send. */
+  contextTokens?: number
   /** Passed through to llama.cpp as `reasoning_effort`. 'none' makes the model answer without a
    *  thinking pass, which is what the smoke probe wants: a tiny token budget spent on the answer
    *  rather than on reasoning it never gets to finish. Left unset for real sessions. */
@@ -131,12 +138,24 @@ async function readErrorType(response: Response): Promise<string | undefined> {
 }
 
 const readUsage = (value: unknown): Usage | undefined => {
-  const usage = value as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined
+  const usage = value as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } | undefined
   if (!usage || typeof usage !== 'object') return undefined
-  return { inputTokens: usage.prompt_tokens, outputTokens: usage.completion_tokens, totalTokens: usage.total_tokens }
+  return { inputTokens: count(usage.prompt_tokens), outputTokens: count(usage.completion_tokens), totalTokens: count(usage.total_tokens), cachedTokens: count(usage.prompt_tokens_details?.cached_tokens) }
+}
+
+const count = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+function readTimings(value: unknown): LlamaTimings | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const timings: LlamaTimings = {}
+  for (const key of ['cache_n', 'prompt_n', 'prompt_ms', 'prompt_per_token_ms', 'prompt_per_second', 'predicted_n', 'predicted_ms', 'predicted_per_token_ms', 'predicted_per_second'] as const) {
+    const valid = count((value as Record<string, unknown>)[key])
+    if (valid !== undefined) timings[key] = valid
+  }
+  return Object.keys(timings).length ? timings : undefined
 }
 
 export async function chatCompletion(request: CompletionRequest): Promise<CompletionResult> {
+  if (request.contextTokens !== undefined) assertRequestBudget(request.messages, request.tools ?? [], request.contextTokens, request.maxTokens ?? 4096)
   const response = await fetch(`${request.endpoint}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${request.apiKey}` },
@@ -166,10 +185,12 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
       if (!line.startsWith('data:')) continue
       const payload = line.slice(5).trim()
       if (!payload || payload === '[DONE]') continue
-      let event: { choices?: Array<{ delta?: Delta; finish_reason?: string | null }>; usage?: unknown }
+      let event: { choices?: Array<{ delta?: Delta; finish_reason?: string | null }>; usage?: unknown; timings?: unknown }
       try { event = JSON.parse(payload) } catch { accumulator.malformed++; continue }
       const usage = readUsage(event.usage)
-      if (usage) accumulator.usage = usage
+      if (usage) accumulator.usage = { ...accumulator.usage, ...usage }
+      const timings = readTimings(event.timings)
+      if (timings) accumulator.usage = { ...accumulator.usage, timings: { ...accumulator.usage?.timings, ...timings } }
       for (const choice of event.choices ?? []) {
         const emitted = accumulator.push(choice.delta, choice.finish_reason)
         if (emitted.text) request.onText?.(emitted.text)

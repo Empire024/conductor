@@ -140,10 +140,18 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         if (!info.isFile()) return { output: `${rel} is not a file`, failed: true, paths: [] }
         if (info.size > MAX_READ_BYTES) return { output: `${rel} is ${info.size} bytes; read a smaller file or use search`, failed: true, paths: [] }
         const content = await readFile(path, 'utf8')
+        // Offset is positive and 1-based (not a byte position or negative tail index).
+        // Document this in results/errors without changing the cache-stable tool schema.
+        if (args.offset !== undefined && (!Number.isSafeInteger(args.offset) || Number(args.offset) < 1)) throw new ToolPolicyError('offset must be a positive 1-based line number; negative offsets are not supported')
         const offset = Math.max(1, integer(args.offset, 1))
         const limit = Math.max(1, Math.min(integer(args.limit, 2000), 4000))
         const lines = content.split('\n').slice(offset - 1, offset - 1 + limit)
-        return { output: lines.join('\n') || '(empty file)', failed: false, paths: [path] }
+        const totalLines = content === '' ? 0 : content.split('\n').length - (content.endsWith('\n') ? 1 : 0)
+        const first = offset <= totalLines ? offset : 0
+        const last = first ? Math.min(totalLines, offset + limit - 1) : 0
+        const truncated = totalLines > 0 && (first !== 1 || last !== totalLines)
+        const metadata = `[read_file: total_lines=${totalLines}; returned_lines=${first}-${last}; truncated=${truncated}; offset is a positive 1-based line number]\n`
+        return { output: metadata + (lines.join('\n') || (totalLines ? '(no lines in requested range)' : '(empty file)')), failed: false, paths: [path] }
       }
       case 'list_files': {
         const { path, relative: rel } = await resolveInWorkspace(context.workspace, args.path === undefined ? '.' : text(args.path, 'path'))

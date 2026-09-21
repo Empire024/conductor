@@ -12,8 +12,8 @@ import { AgentArtifacts, workspacePath } from './agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import { createProviderAdapter } from './providers/factory'
 import { validateLiveTurn } from './live-test-policy'
-import { activeUsageCap, usageCapKey } from './usage-limit'
-import { describeUsageCap, evaluateUsageCap, summarizeUsageRun, type UsageCapStatus } from '../shared/usage-accounting'
+import { activeUsageCap, parseUsageLimitReset, usageCapKey } from './usage-limit'
+import { describeUsageCap, evaluateUsageCap, summarizeContext, summarizeUsageRun, type UsageCapStatus } from '../shared/usage-accounting'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedPermission, rememberPermission } from './app-settings'
@@ -91,7 +91,7 @@ export class StructuredSessions {
     // it so the conversation can show which memories reached the turn. `runtimeId` names the
     // adapter the message will reach, or is '' when dispatching it is what creates the adapter,
     // so the caller can tell a runtime that has already been briefed from a new one.
-    private context?: (spec: AgentSpec, prompt: string, itemId: string, runtimeId: string) => string,
+    private context?: (spec: AgentSpec, prompt: string, itemId: string, runtimeId: string, context?: { percent: number }) => string,
     private observe?: (spec: AgentSpec, event: AgentEvent) => void,
     // Conductor-owned MCP servers for one session, serialized for the CLI's --mcp-config. Bound
     // at launch because a running conversation cannot be handed a new server later.
@@ -692,7 +692,10 @@ export class StructuredSessions {
       const context = await this.attachments(live, attachments)
       this.assertPromptDispatchAuthority(origin, live.spec)
       const userItemId = randomUUID()
-      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '') ?? ''
+      // How full the runtime's window is, from its own last usage report, so the briefing can
+      // say once per band when the remaining work belongs in a fresh tab.
+      const share = summarizeContext(state.items, live.adapter ? live.runtimeId : undefined)
+      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', share ? { percent: share.percent } : undefined) ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.assertPromptWithinLimit(submitted.length)
       // A queued message may have captured settings before the owner revoked browser access.

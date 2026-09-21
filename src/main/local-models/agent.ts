@@ -2,6 +2,7 @@ import type { ChatMessage, CompletionResult, ToolCall, ToolSpec, Usage } from '.
 import { chatCompletion, LocalRequestError } from './client.ts'
 import type { DockerSandbox } from './sandbox.ts'
 import { runTool, toolSpecs, NO_GRANTS, type LocalControl, type LocalGrants } from './tools.ts'
+import { boundedToolResult } from './context-budget.ts'
 
 /** The whole agent loop for a local model. Conductor stays the orchestrator: llama.cpp only
  *  produces tokens, this loop decides what may run, and every capability it can offer is the
@@ -183,6 +184,8 @@ export class LocalAgentSession {
           model: this.options.model,
           messages: this.messages,
           tools,
+          contextTokens: this.options.contextTokens,
+          maxTokens: RESPONSE_RESERVE_TOKENS,
           // Thinking is left to the model on a first attempt; a retry also gives up the
           // parameter itself, since an unknown one is refused by some builds with the same 400.
           ...(attempt ? {} : { reasoningEffort: 'none' as const }),
@@ -272,7 +275,7 @@ export class LocalAgentSession {
           outcome = { output: `failed: ${error instanceof Error ? error.message : 'the tool could not run'}`, failed: true }
         }
         events.toolEnd?.({ id: call.id, name: call.name, output: outcome.output, failed: outcome.failed, durationMs: Date.now() - started })
-        this.messages.push({ role: 'tool', tool_call_id: call.id, content: outcome.output.slice(0, 32_000) })
+        this.messages.push({ role: 'tool', tool_call_id: call.id, content: boundedToolResult(outcome.output) })
       }
       if (signal?.aborted) return { text: finalText, stopReason: 'interrupted' }
     }
