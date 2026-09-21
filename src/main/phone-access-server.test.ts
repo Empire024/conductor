@@ -158,6 +158,22 @@ describe('the phone listener', () => {
     expect(service.desktopState().devices[0]?.connected).toBe(false)
   })
 
+  it('names the Wi-Fi address first under network exposure and the tailnet address first under Tailscale exposure', { timeout: 20_000 }, async () => {
+    const tailnet = { state: async () => ({ installed: true, backendState: 'Running', self: { hostName: 'e-box', dnsName: 'e-box.tail8216c8.ts.net.', addresses: ['100.72.193.87', 'fd7a:115c:a1e0::e138:c158'], loginName: null, online: true }, peers: [], message: null, checkedAt: null }), last: () => ({ installed: true, backendState: null, self: null, peers: [], message: null, checkedAt: null }), selfAddress: async () => '100.72.193.87' }
+    const { service } = serviceFixture()
+    service.updateSettings({ enabled: true, port: 0 })
+    const server = new PhoneAccessServer({ service, tailscale: tailnet, localAddresses: () => ['100.72.193.87', '192.168.0.205', '169.254.60.169', '172.24.224.1'], hostname: () => 'MAIN', assets: { 'index.html': 'x' }, log: () => undefined })
+    cleanup.push(() => server.dispose())
+    const status = await server.apply()
+    expect(status.listening).toBe(true)
+    const port = new URL(status.endpoints[0]!).port
+    expect(status.endpoints).toEqual([`https://192.168.0.205:${port}`, `https://172.24.224.1:${port}`, `https://100.72.193.87:${port}`, `https://e-box.tail8216c8.ts.net:${port}`])
+    expect(status.tailscaleAddress).toBe('100.72.193.87')
+    expect(status.tailscaleDnsName).toBe('e-box.tail8216c8.ts.net')
+    // The certificate still names every address, tailnet and LAN alike.
+    expect(service.serverIdentity(['192.168.0.205', '100.72.193.87', 'fd7a:115c:a1e0::e138:c158', 'e-box.tail8216c8.ts.net', 'MAIN']).hosts).toContain('fd7a:115c:a1e0::e138:c158')
+  })
+
   it('refuses to start in Tailscale exposure without a tailnet address, and names the port when it is taken', { timeout: 20_000 }, async () => {
     const first = await listening()
     const { service } = serviceFixture()

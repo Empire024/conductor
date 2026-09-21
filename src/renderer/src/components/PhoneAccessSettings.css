@@ -58,7 +58,8 @@
   cursor: pointer;
 }
 .phone-actions button:hover, .phone-device button:hover, .phone-url button:hover { border-color: #4a545f; }
-.phone-primary { border-color: #3f6ea8 !important; background: #24405f !important; }
+/* The dark blue stays in every theme, so the label must not follow the theme text color. */
+.phone-primary { border-color: #3f6ea8 !important; background: #24405f !important; color: #eef3fa !important; }
 .phone-actions button:disabled { opacity: 0.55; cursor: default; }
 
 .phone-endpoint { display: flex; flex-direction: column; gap: 4px; }

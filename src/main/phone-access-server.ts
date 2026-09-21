@@ -132,7 +132,11 @@ export class PhoneAccessServer {
       this.publish(stopped(tailnet?.message ?? (tailnet ? 'Tailscale has no address for this machine, so nothing is listening.' : INSTALL_TAILSCALE_MESSAGE), { tailscaleAddress, tailscaleDnsName: dnsName || null }))
       return this.getStatus()
     }
-    const lan = (this.deps.localAddresses ?? localAddresses)()
+    // The tailnet adapter looks like any other interface to the OS, so it is taken out of the LAN
+    // group here: under network exposure a phone on the Wi-Fi is the common case, and the code it
+    // scans must name an address that phone can reach without Tailscale. Link-local addresses are
+    // adapters with no network at all and are never worth naming.
+    const lan = (this.deps.localAddresses ?? localAddresses)().filter(address => !isTailscaleAddress(address) && !address.startsWith('169.254.'))
     const hostName = (this.deps.hostname ?? osHostname)()
     const hosts = [...lan, ...(tailscaleAddress ? [tailscaleAddress] : []), ...(tailscaleIpv6 ? [tailscaleIpv6] : []), ...(dnsName ? [dnsName] : []), ...(hostName ? [hostName] : [])]
     let candidate: Server | undefined
