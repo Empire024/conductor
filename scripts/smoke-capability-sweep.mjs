@@ -178,10 +178,10 @@ async function sweepProvider(provider) {
   report.runtimeVersion = state.capabilities?.runtimeVersion ?? null
   report.limitations = state.capabilities?.limitations ?? []
   check(`${provider}: discovery reported ${state.capabilities.models.length} models, runtime ${report.runtimeVersion}, without a prompt`)
-  // The adapter baselines: Codex 0.153.4 exactly, Claude 2.1.278 since the 2026-09-21 sweep (R9).
+  // The adapter baselines: Codex 0.155.1 exactly, Claude 2.1.278 since the 2026-09-21 sweep (R9).
   // A runtime on the baseline must not carry the "newer than the fixture-verified" limitation.
   const unverified = report.limitations.filter(text => /newer than the fixture-verified|unverified/i.test(text))
-  if (live && ((provider === 'claude' && report.runtimeVersion === '2.1.278') || (provider === 'codex' && /0\.153\.4/.test(report.runtimeVersion ?? '')))) expect(unverified).toEqual([])
+  if (live && ((provider === 'claude' && report.runtimeVersion === '2.1.278') || (provider === 'codex' && /0\.155\.1/.test(report.runtimeVersion ?? '')))) expect(unverified).toEqual([])
   check(`${provider}: runtime ${report.runtimeVersion} carries ${unverified.length ? 'the limitation "' + unverified.join('; ') + '"' : 'no version limitation'}`)
   for (const model of state.capabilities.models) {
     if (model.id === 'default') continue

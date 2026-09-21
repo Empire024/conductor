@@ -1,12 +1,12 @@
 // SYNTHETIC OFFLINE FIXTURE. No provider executable, network, credentials, or inference.
-// Raw JSONL messages mirror the generated codex-cli 0.153.4 App Server protocol.
+// Raw JSONL messages mirror the generated codex-cli 0.155.1 App Server protocol.
 import readline from 'node:readline'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 
 if (process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE) writeFileSync(process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE, `${process.pid}\n`)
-if (process.argv.includes('--version')) { console.log('codex-cli 0.153.4'); process.exit(0) }
+if (process.argv.includes('--version')) { console.log('codex-cli 0.155.1'); process.exit(0) }
 
 let initialized = false
 let acknowledged = false
@@ -69,7 +69,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     if (initialized) throw new Error('duplicate initialization')
     setTimeout(() => {
       initialized = true
-      send({ id: message.id, result: { userAgent: 'codex/0.153.4 synthetic', codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
+      send({ id: message.id, result: { userAgent: 'codex/0.155.1 synthetic', codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
     }, 12)
     return
   }
@@ -97,8 +97,8 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return
   }
   if (message.method === 'account/rateLimits/read') {
-    const snapshot = (limitId, usedPercent) => ({ limitId, limitName: limitId, primary: { usedPercent, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 86_400 }, secondary: null, credits: { hasCredits: false, unlimited: false, balance: '0' }, individualLimit: null, spendControlReached: null, planType: 'prolite', rateLimitReachedType: null })
-    send({ id: message.id, result: { rateLimits: snapshot('codex', 12), rateLimitsByLimitId: { codex: snapshot('codex', 12), 'gpt-6-astra': snapshot('gpt-6-astra', 99), 'gpt-5.6-sol': snapshot('gpt-5.6-sol', 20) }, rateLimitResetCredits: null, accountId: 'synthetic-account', rateLimitUpsell: null } })
+    const snapshot = (limitId, usedPercent) => ({ limitId, limitName: limitId, normalModelSlug: null, primary: { usedPercent, windowDurationMins: 10080, resetsAt: Math.floor(Date.now() / 1000) + 86_400 }, secondary: null, credits: { hasCredits: false, unlimited: false, balance: '0' }, individualLimit: null, spendControlReached: null, planType: 'prolite', rateLimitReachedType: null })
+    send({ id: message.id, result: { ordinaryUsageAllowed: true, rateLimits: snapshot('codex', 12), rateLimitsByLimitId: { codex: snapshot('codex', 12), 'gpt-6-astra': snapshot('gpt-6-astra', 99), 'gpt-5.6-sol': snapshot('gpt-5.6-sol', 20) }, rateLimitResetCredits: null, accountId: 'synthetic-account', rateLimitUpsell: null } })
     return
   }
   if (message.method === 'thread/goal/get') { send({ id: message.id, result: { goal: null } }); return }

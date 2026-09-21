@@ -28,7 +28,7 @@ import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetRe
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
 
-export const CODEX_PROTOCOL_BASELINE = '0.153.4'
+export const CODEX_PROTOCOL_BASELINE = '0.155.1'
 type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait'>>
 /** Injectable only in backend contract tests; no renderer can supply a transport. */
 export interface CodexAdapterDependencies {
@@ -243,7 +243,7 @@ export class CodexAdapter implements ProviderAdapter {
         execFile(this.options.executable, ['--version'], { cwd: this.options.cwd, env: this.options.environment ?? process.env, windowsHide: true, timeout: 10_000, maxBuffer: 4096 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim()))
       }))
       this.capabilities.runtimeVersion = version.replace(/^codex-cli\s+/, '')
-      if (!/^0\.153\./.test(this.capabilities.runtimeVersion)) throw new Error(`Codex ${this.capabilities.runtimeVersion} is outside the tested 0.153.x protocol baseline; regenerate and verify the adapter before connecting`)
+      if (!/^0\.155\./.test(this.capabilities.runtimeVersion)) throw new Error(`Codex ${this.capabilities.runtimeVersion} is outside the tested 0.155.x protocol baseline; regenerate and verify the adapter before connecting`)
       if (this.capabilities.runtimeVersion !== CODEX_PROTOCOL_BASELINE) this.capabilities.limitations.push(`Runtime ${this.capabilities.runtimeVersion} is not fixture-verified; baseline is ${CODEX_PROTOCOL_BASELINE}. Experimental features are disabled.`)
       this.experimental = (this.options.environment ?? process.env).CONDUCTOR_CODEX_EXPERIMENTAL === '1' && this.capabilities.runtimeVersion === CODEX_PROTOCOL_BASELINE
       this.capabilities.plans = this.experimental

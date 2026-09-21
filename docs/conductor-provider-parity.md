@@ -146,7 +146,7 @@ Compatibility baseline inspected 2026-09-07. This ledger separates implementatio
 | Provider | Installed runtime | Reference extension | Connection/authentication |
 | --- | --- | --- | --- |
 | Claude Code | 2.1.263 on 2026-09-07; 2.1.278 on 2026-09-21 (adapter baseline still 2.1.263, see R9) | Local `anthropic.claude-code-2.1.263-win32-x64` | Native local CLI, inherited user-managed authentication; no SDK/API client or OAuth-token extraction. Version gate: at or above the baseline, newer releases connect with an unverified-version limitation. |
-| Codex | codex-cli 0.153.4 (unchanged on 2026-09-21) | Official Codex IDE documentation; extension not installed in the inspected VS Code profile | Native local App Server over stdio. `codex login status` reports ChatGPT. Generated 0.153.4 protocol checked in; compatible 0.153.x accepted with unverified-version notice. |
+| Codex | codex-cli 0.153.4 at the sweep; rebaselined to 0.155.1 later on 2026-09-21 (`docs/codex-compatibility.md`) | Official Codex IDE documentation; extension not installed in the inspected VS Code profile | Native local App Server over stdio. `codex login status` reports ChatGPT. Generated 0.155.1 protocol checked in; compatible 0.155.x accepted with unverified-version notice. |
 
 The actual stack is Electron 37, React 19, TypeScript, Node SQLite (`node:sqlite`, WAL), Monaco, xterm/node-pty, Git, Vite, Vitest, and newly added Playwright. Existing `AgentManager` owns structured controllers as well as the remaining providers' PTYs. No second process is launched by an event inspector, pane subscription, or history restoration. Qwen/Kimi/Gemini and PowerShell retain their existing terminal interfaces.
 

@@ -48,7 +48,7 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(sent.map(message => (message as { method: string }).method)).toEqual(['initialize', 'initialized', 'thread/start', 'model/list'])
     expect(adapter.capabilities.models).toEqual([{ id: 'synthetic-model', label: 'Synthetic model', effort: ['low'], defaultEffort: 'low', isDefault: true }])
     expect(adapter.capabilities.plans).toBe(false)
-    expect(adapter.capabilities.runtimeVersion).toBe('0.153.4')
+    expect(adapter.capabilities.runtimeVersion).toBe('0.155.1')
   })
 
   it('keeps real tool results and child activity while excluding root self-status noise', async () => {

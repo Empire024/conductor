@@ -2,7 +2,7 @@ import { resolve } from 'node:path'
 import type { StructuredProvider } from '../../shared/structured-agent'
 import type { AdapterOptions, ProviderAdapter } from './adapter'
 import { ClaudeAdapter, CLAUDE_COMPATIBILITY } from './claude'
-import { CodexAdapter } from './codex'
+import { CodexAdapter, CODEX_PROTOCOL_BASELINE } from './codex'
 import { LocalAdapter } from './local'
 import { JsonLineTransport, type TransportOptions } from './transport'
 
@@ -24,5 +24,5 @@ export function createProviderAdapter(provider: StructuredProvider, options: Ada
   const transport = (settings: TransportOptions): JsonLineTransport => new JsonLineTransport({ ...settings, executable: process.execPath, args: [fixture, ...settings.args], environment: { ...process.env, ELECTRON_RUN_AS_NODE: '1' } })
   // The offline runtime reports the fixture-verified baseline itself, so raising the baseline never
   // turns the fixtures into an "unverified" or refused runtime.
-  return provider === 'claude' ? new ClaudeAdapter(options, { version: async () => CLAUDE_COMPATIBILITY, createTransport: transport }) : new CodexAdapter(options, { version: async () => '0.153.4', transport })
+  return provider === 'claude' ? new ClaudeAdapter(options, { version: async () => CLAUDE_COMPATIBILITY, createTransport: transport }) : new CodexAdapter(options, { version: async () => CODEX_PROTOCOL_BASELINE, transport })
 }

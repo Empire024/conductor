@@ -3,11 +3,12 @@
 // account on 2026-09-21 (captured by scripts/probe-capability-sweep.mjs: ids, display names,
 // effort ladders, defaults, service tiers, hidden entries verbatim) plus one effort-less model,
 // and explicitly synthetic turns answer with the token-usage and compaction frames the
-// production adapter reads. Context-window figures here are fixture values.
+// production adapter reads. Context-window figures here are fixture values. The same five
+// models and ladders came back from the 0.155.1 metadata inspection on 2026-09-21.
 import readline from 'node:readline'
 
 if (process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE) { const { writeFileSync } = await import('node:fs'); writeFileSync(process.env.CONDUCTOR_TEST_PROVIDER_START_CAPTURE, `${process.pid}\n`) }
-if (process.argv.includes('--version')) { console.log('codex-cli 0.153.4'); process.exit(0) }
+if (process.argv.includes('--version')) { console.log('codex-cli 0.155.1'); process.exit(0) }
 
 const efforts = (...levels) => levels.map(reasoningEffort => ({ reasoningEffort, description: `${reasoningEffort} reasoning (synthetic copy of the CLI description)` }))
 const tier = [{ id: 'priority', name: 'Fast', description: '2x speed, increased usage' }]
@@ -52,7 +53,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (message.method === 'initialize') {
     if (initialized) throw new Error('duplicate initialization')
     initialized = true
-    send({ id: message.id, result: { userAgent: 'codex/0.153.4 synthetic capability fixture', codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
+    send({ id: message.id, result: { userAgent: 'codex/0.155.1 synthetic capability fixture', codexHome: '/synthetic/not-read', platformFamily: 'windows', platformOs: 'windows' } })
     return
   }
   if (message.method === 'initialized') { if (!initialized) throw new Error('initialized before initialize response'); acknowledged = true; return }
