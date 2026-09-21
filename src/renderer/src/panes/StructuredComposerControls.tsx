@@ -27,7 +27,7 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const choices = models.filter(option => option.id !== 'default').map(option => ({ ...option, label: modelDisplayName(option.label) }))
     .filter(option => (option.label + ' ' + option.id).toLowerCase().includes(query.toLowerCase()))
   const modes = conversationModes(capabilities)
-  const mode = settings.plan ? 'plan' : capabilities?.provider === 'codex' ? 'edit' : settings.permission
+  const mode = settings.plan ? 'plan' : settings.permission
   const supportedEfforts = modelEfforts(capabilities, settings.model)
   const efforts = supportedEffortChoices(capabilities, settings.model)
   const unavailableEffort = Boolean(capabilities && settings.effort && settings.effort !== 'auto' && !efforts.includes(settings.effort))

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { composerChildKey, composerSendBlock, modelDisplayName, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
+import { composerChildKey, composerSendBlock, conversationModes, modelDisplayName, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
 import { MAX_PROMPT_CHARS } from '../../../shared/structured-agent'
 import type { ProviderCapabilities, SessionSettings } from '../../../shared/structured-agent'
 const settings = (model: string): SessionSettings => ({ permission: 'default', plan: false, model })
@@ -52,6 +52,31 @@ describe('composer setting changes', () => {
     const granted: SessionSettings = { permission: 'accept-edits', plan: false, temporaryPermission: { runtimeId: 'runtime-1', restore: 'default' } }
     expect(nextComposerSettings(granted, { permission: 'auto', plan: false })).toEqual({ permission: 'auto', plan: false })
     expect(nextComposerSettings(granted, { effort: 'high' })).toEqual({ ...granted, effort: 'high' })
+  })
+})
+
+describe('conversation modes', () => {
+  const codex = (permissions?: SessionSettings['permission'][], plans = false): ProviderCapabilities =>
+    ({ provider: 'codex', permissions, plans } as unknown as ProviderCapabilities)
+  it('offers Codex the same permission presets its own /permissions command does', () => {
+    const modes = conversationModes(codex(['default', 'read-only', 'accept-edits', 'auto']))
+    expect(modes.map(mode => [mode.id, mode.label])).toEqual([['default', 'Ask'], ['read-only', 'Read only'], ['accept-edits', 'Edit'], ['auto', 'Auto']])
+    // Every Codex mode explains itself in Codex's terms, never in Claude's.
+    expect(modes.every(mode => Boolean(mode.description))).toBe(true)
+    expect(modes.find(mode => mode.id === 'auto')?.description).toContain('Never ask')
+    expect(modes.find(mode => mode.id === 'auto')?.change).toEqual({ permission: 'auto', plan: false })
+  })
+  it('adds the gated Codex plan mode to the permission presets instead of replacing them', () => {
+    expect(conversationModes(codex(['default', 'auto'], true)).map(mode => mode.id)).toEqual(['default', 'auto', 'plan'])
+    // A runtime that reported no permissions at all still only offers what it did report.
+    expect(conversationModes(codex(undefined, true)).map(mode => mode.id)).toEqual(['plan'])
+    expect(conversationModes(codex(undefined))).toEqual([])
+    expect(conversationModes(undefined)).toEqual([])
+  })
+  it('leaves the Claude modes carrying the shared wording', () => {
+    const modes = conversationModes({ provider: 'claude', permissions: ['default', 'accept-edits', 'auto'], plans: true } as unknown as ProviderCapabilities)
+    expect(modes.map(mode => mode.id)).toEqual(['default', 'accept-edits', 'auto', 'plan'])
+    expect(modes.every(mode => mode.description === undefined)).toBe(true)
   })
 })
 

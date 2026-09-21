@@ -55,11 +55,23 @@ export function nextComposerSettings(current: SessionSettings, change: Partial<S
  *  so each child namespaces the conversation it belongs to. */
 export const composerChildKey = (child: string, conversationId: string): string => child + ':' + conversationId
 
-export function conversationModes(capabilities?: ProviderCapabilities): Array<{ id: string; label: string; change: Partial<SessionSettings> }> {
+/** What a Codex mode actually does, in the terms its own `/permissions` presets use. The picker
+ *  has to say this: Edit and Auto differ by whether Codex interrupts at all, and only the owner
+ *  can decide that an uninterrupted conversation may also reach the network. */
+const codexModeDescriptions: Record<string, string> = {
+  default: 'Approve requests the way your Codex CLI is configured to.',
+  'read-only': 'Inspect the workspace without making changes.',
+  'accept-edits': 'Edit files and run workspace commands; ask before leaving the workspace.',
+  auto: 'Never ask: workspace edits, commands and network run without approval.'
+}
+export function conversationModes(capabilities?: ProviderCapabilities): Array<{ id: string; label: string; description?: string; change: Partial<SessionSettings> }> {
   if (!capabilities) return []
-  if (capabilities.provider === 'codex') return capabilities.plans ? [{ id: 'edit', label: 'Edit', change: { plan: false } }, { id: 'plan', label: 'Plan', change: { plan: true } }] : []
   const labels: Record<SessionSettings['permission'], string> = { default: 'Ask', auto: 'Auto', 'accept-edits': 'Edit', 'read-only': 'Read only' }
-  const modes = (capabilities.permissions ?? []).map(permission => ({ id: permission as string, label: labels[permission], change: { permission, plan: false } as Partial<SessionSettings> }))
+  const modes = (capabilities.permissions ?? []).map(permission => ({
+    id: permission as string, label: labels[permission],
+    ...(capabilities.provider === 'codex' ? { description: codexModeDescriptions[permission] } : {}),
+    change: { permission, plan: false } as Partial<SessionSettings>
+  }))
   if (capabilities.plans) modes.push({ id: 'plan', label: 'Plan', change: { plan: true } })
   return modes
 }

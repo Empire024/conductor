@@ -9,7 +9,7 @@ const settings: SessionSettings = { permission: 'default', plan: false }
 const capabilities: ProviderCapabilities = {
   provider: 'codex', runtimeVersion: 'synthetic-offline', adapterVersion: 1, authentication: 'cli',
   steering: false, textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true, approvals: true,
-  questions: true, resume: true, fork: true, plans: true,
+  questions: true, resume: true, fork: true, plans: true, permissions: ['default', 'read-only', 'accept-edits', 'auto'],
   models: [{ id: 'model-one', label: 'Model One', isDefault: true, effort: ['minimal', 'low', 'medium', 'high'] }, { id: 'model-two', label: 'Model Two', effort: [] }],
   effort: ['minimal', 'low', 'medium', 'high'], limitations: []
 }
@@ -128,7 +128,20 @@ it('offers only modes reported by the provider in the bottom controls', () => {
   expect(claude).toContain('aria-haspopup="menu"')
   expect(claude).toContain('Ask</span>')
   expect(claude).not.toContain('<select')
-  expect(render({ capabilities: { ...capabilities, plans: false } }).html).not.toContain('Conversation mode')
+  // A runtime that reported neither permission modes nor planning has nothing to pick between.
+  expect(render({ capabilities: { ...capabilities, plans: false, permissions: undefined } }).html).not.toContain('Conversation mode')
+})
+
+it('shows a Codex conversation its own permission mode, so Auto is reachable without the settings dialog', () => {
+  const codex = { ...capabilities, plans: false }
+  const ask = render({ capabilities: codex }).html
+  expect(ask).toContain('aria-label="Conversation mode"')
+  expect(ask).toContain('Ask</span>')
+  expect(ask).toContain('title="Approve requests the way your Codex CLI is configured to."')
+  const auto = render({ capabilities: codex, settings: { ...settings, permission: 'auto' } }).html
+  expect(auto).toContain('Auto</span>')
+  expect(auto).toContain('Never ask')
+  expect(auto).not.toContain('Edit</span>')
 })
 
 

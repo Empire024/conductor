@@ -51,6 +51,20 @@ const requestKey = (id: string | number): string => `${typeof id}:${id}`
 const textOutput = (value: unknown): string => typeof value === 'string' ? value : JSON.stringify(value, null, 2)
 const isId = (id: unknown): id is string | number => typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id))
 const statusFor = (status: string, complete: boolean): ActivityStatus => status === 'failed' ? 'failed' : status === 'declined' ? 'rejected' : status === 'interrupted' ? 'interrupted' : complete ? 'completed' : status === 'inProgress' ? 'running' : 'preparing'
+/**
+ * Codex's own `/permissions` presets, expressed in the modes the composer offers. Ask leaves the
+ * installed CLI's configuration alone; Read only inspects; Edit is the CLI's "Auto" — workspace
+ * work runs unprompted and leaving the workspace is an approval request; Auto is the mode that
+ * never interrupts, so it also carries the network those unattended commands need. Writes stay
+ * inside the workspace in every mode: Conductor has no equivalent of `danger-full-access`.
+ */
+const PERMISSION_PRESETS: Record<SessionSettings['permission'], { sandbox: NonNullable<SessionSettings['sandbox']>; approvalPolicy: NonNullable<SessionSettings['approvalPolicy']>; network: boolean }> = {
+  default: { sandbox: 'inherit', approvalPolicy: 'inherit', network: false },
+  'read-only': { sandbox: 'read-only', approvalPolicy: 'untrusted', network: false },
+  'accept-edits': { sandbox: 'workspace-write', approvalPolicy: 'on-request', network: false },
+  auto: { sandbox: 'workspace-write', approvalPolicy: 'never', network: true }
+}
+
 const LIVE_DISABLED_FEATURES = ['hooks', 'plugins', 'apps', 'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'computer_use', 'memories', 'unbounded_connection_retries'] as const
 
 /** Process-local CLI overrides; never writes the user's configuration or changes authentication. */
@@ -174,7 +188,7 @@ export class CodexAdapter implements ProviderAdapter {
     steering: false, textStreaming: true, toolInputStreaming: false, toolOutputStreaming: true,
     // Pre-discovery ladder: the union the installed CLI advertised on 2026-09-21 (no model offers
     // `minimal`); model/list replaces it per model once the thread starts.
-    approvals: true, questions: true, resume: true, fork: true, plans: false, imageAttachments: true, effort: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], models: [], permissions: ['default', 'read-only', 'accept-edits'],
+    approvals: true, questions: true, resume: true, fork: true, plans: false, imageAttachments: true, effort: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], models: [], permissions: ['default', 'read-only', 'accept-edits', 'auto'],
     sandboxModes: ['inherit', 'read-only', 'workspace-write'], approvalPolicies: ['inherit', 'untrusted', 'on-request', 'never'],
     limitations: [
       'Command output combines stdout and stderr in the App Server item protocol.',
@@ -309,8 +323,15 @@ export class CodexAdapter implements ProviderAdapter {
     const modelInfo = this.models.find(candidate => candidate.model === model)
     if (settings.effort && modelInfo && !modelInfo.supportedReasoningEfforts.some(option => option.reasoningEffort === settings.effort)) throw new Error(`Reasoning effort ${settings.effort} is not offered for ${model}`)
     if (settings.effort && !['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(settings.effort)) throw new Error('Unsupported Codex reasoning effort')
-    const sandbox = settings.sandbox ?? (settings.permission === 'default' ? 'inherit' : settings.permission === 'read-only' ? 'read-only' : 'workspace-write')
-    const approvalPolicy = settings.approvalPolicy ?? (settings.permission === 'default' ? 'inherit' : settings.permission === 'read-only' ? 'untrusted' : 'on-request')
+    const preset = PERMISSION_PRESETS[settings.permission] ?? PERMISSION_PRESETS.default
+    // The conversation's mode is what the composer's picker sets. A per-conversation override in
+    // the settings dialog still wins over it; `inherit` there is not an override but "whatever
+    // this mode asks for", which under Ask is the installed CLI's own configuration.
+    const sandbox = settings.sandbox && settings.sandbox !== 'inherit' ? settings.sandbox : preset.sandbox
+    const approvalPolicy = settings.approvalPolicy && settings.approvalPolicy !== 'inherit' ? settings.approvalPolicy : preset.approvalPolicy
+    // Network comes only with the mode that also stops asking; overriding approvals back to a
+    // prompting policy means Codex requests it per command again instead of holding it silently.
+    const networkAccess = preset.network && approvalPolicy === 'never'
     if (!this.capabilities.sandboxModes!.includes(sandbox) || !this.capabilities.approvalPolicies!.includes(approvalPolicy)) throw new Error('Unsupported Codex sandbox or approval policy')
     const params: TurnStartParams = {
       threadId: this.threadId, input: codexInput(text, attachments), cwd: this.options.cwd, model,
@@ -318,7 +339,7 @@ export class CodexAdapter implements ProviderAdapter {
       approvalPolicy: approvalPolicy === 'inherit' ? this.defaults.approvalPolicy : approvalPolicy,
       sandboxPolicy: sandbox === 'inherit' ? this.defaults.sandbox : sandbox === 'read-only'
         ? { type: 'readOnly', networkAccess: false }
-        : { type: 'workspaceWrite', writableRoots: [this.options.cwd], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
+        : { type: 'workspaceWrite', writableRoots: [this.options.cwd], networkAccess, excludeTmpdirEnvVar: false, excludeSlashTmp: false }
     }
     // Native collaboration mode survives adapter reconstruction/resume. Always
     // apply the selected mode when this version-gated surface is enabled.

@@ -59,17 +59,35 @@ try {
   results.checks.push('A second, manually opened Claude tab remembers the owner\'s last chosen mode without asking again')
   await page.screenshot({ path: join(output, 'second-claude-tab-auto.png'), fullPage: true })
 
-  // A Codex tab must never inherit a Claude-only mode it cannot honour. Codex has no Auto/Edit
-  // mode picker at all (its real capabilities report plans:false), so there is no menu to assert
-  // against; the underlying settings are the only thing that could leak the remembered mode.
+  // A Codex tab must never inherit a Claude mode: the memory is per provider. Codex has its own
+  // mode picker now, carrying its own /permissions presets, and it opens on its own Ask.
   await page.locator('.pane-add-tab').click()
   await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
   await activePane().waitFor()
   const codexId = await activePane().getAttribute('data-structured-session')
   assert.notEqual(codexId, secondId)
-  await expect(modeButton()).toHaveCount(0)
+  await expect(modeButton()).toHaveText('Ask')
   assert.equal((await snapshot(codexId)).settings.permission, 'default')
-  results.checks.push('A Codex tab never inherits Claude\'s remembered Auto mode, which it cannot offer')
+  results.checks.push('A Codex tab never inherits the remembered Claude mode; it opens on its own Ask')
+
+  // The point of the Codex picker: Auto is one menu choice away, with no settings dialog left to
+  // find and no per-command approval left to answer.
+  await modeButton().click()
+  await activePane().getByRole('menuitemradio', { name: /Auto/ }).click()
+  await expect.poll(async () => (await snapshot(codexId)).settings.permission).toBe('auto')
+  await expect(modeButton()).toHaveText('Auto')
+  await page.screenshot({ path: join(output, 'codex-tab-auto.png'), fullPage: true })
+  results.checks.push('A Codex tab reaches Auto permissions from the composer selector, the way the Codex CLI /permissions command does')
+
+  // Per provider, still: a second Codex tab opens on the Codex choice, Claude keeps its own.
+  await page.locator('.pane-add-tab').click()
+  await page.locator('.launcher-grid button').filter({ hasText: 'Codex' }).click()
+  await activePane().waitFor()
+  const secondCodexId = await activePane().getAttribute('data-structured-session')
+  assert.notEqual(secondCodexId, codexId)
+  await expect(modeButton()).toHaveText('Auto')
+  assert.equal((await snapshot(secondCodexId)).settings.permission, 'auto')
+  results.checks.push('A newly opened Codex tab remembers the mode the owner chose for Codex')
 
   // Reopening the app (a fresh renderer/main process against the same profile) must still open a
   // brand-new Claude tab on Auto: the preference is durable, not merely an in-memory carryover.

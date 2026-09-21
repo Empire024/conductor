@@ -159,6 +159,26 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(last).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite' }, collaborationMode: { mode: 'default' } } })
   })
 
+  it('carries each composer mode into the Codex approval preset it names, and only Auto stops asking', async () => {
+    const { adapter, events, sent } = create()
+    const starts = (): Json[] => sent.filter(message => (message as { method?: string }).method === 'turn/start')
+    const turn = async (settings: SessionSettings): Promise<Json | undefined> => {
+      const before = events.length
+      await adapter.submit('synthetic:stream', settings)
+      await waitFor(() => completed(events.slice(before)))
+      return starts().at(-1)
+    }
+    // Edit is the CLI's own "Auto": workspace work runs unprompted, leaving the workspace is a request.
+    expect(await turn({ ...settings, permission: 'accept-edits' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false } } })
+    // Auto is the mode that never interrupts, so the commands it runs unattended get the network.
+    expect(await turn({ ...settings, permission: 'auto' })).toMatchObject({ params: { approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
+    // An approvals override back to a prompting policy takes the silent network grant with it.
+    expect(await turn({ ...settings, permission: 'auto', approvalPolicy: 'on-request' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false } } })
+    // 'inherit' in the settings dialog is not an override: the chosen mode still decides.
+    expect(await turn({ ...settings, permission: 'auto', sandbox: 'inherit', approvalPolicy: 'inherit' })).toMatchObject({ params: { approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
+    expect(adapter.capabilities.permissions).toContain('auto')
+  })
+
   it('explicitly clears a native plan mode after resume into a fresh experimental adapter', async () => {
     const { adapter, sent } = create({ CONDUCTOR_CODEX_EXPERIMENTAL: '1' }, 'synthetic-thread-1')
     await adapter.start()
