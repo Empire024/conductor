@@ -32,9 +32,23 @@ jobs:
           $log = Join-Path $env:RUNNER_TEMP 'npm-test.log'
           npm test 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) {
-            $tail = (Get-Content -LiteralPath $log -Tail 80) -join "`n"
-            $escaped = $tail -replace '%', '%25' -replace "`r", '' -replace "`n", '%0A'
-            Write-Output "::error title=npm test failed::$escaped"
+            # One annotation holds about 4,000 characters, so a plain 80-line tail was cut off
+            # before the failing test. Emit the lines that explain a failure first, then the
+            # last lines, each split into annotations small enough to survive whole.
+            $clean = Get-Content -LiteralPath $log | ForEach-Object { $_ -replace "`e\[[0-9;]*[A-Za-z]", '' }
+            $failing = @($clean | Where-Object { $_ -match 'FAIL|×|✗|AssertionError|Error:|Timeout|not ok|Test Files|Tests |fail [1-9]' } | Select-Object -Last 60)
+            $tail = @($clean | Select-Object -Last 25)
+            $emit = {
+              param($title, $lines)
+              $body = ($lines -join "`n")
+              for ($i = 0; $i -lt $body.Length; $i += 3600) {
+                $chunk = $body.Substring($i, [Math]::Min(3600, $body.Length - $i))
+                $escaped = $chunk -replace '%', '%25' -replace "`r", '' -replace "`n", '%0A'
+                Write-Output "::error title=$title $([int]($i / 3600) + 1)::$escaped"
+              }
+            }
+            & $emit 'npm test failures' $failing
+            & $emit 'npm test tail' $tail
             exit 1
           }
       - name: Select next installed-app version
