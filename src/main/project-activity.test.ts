@@ -213,4 +213,40 @@ describe('cross-project activity from the database', () => {
       }
     })
   })
+
+  it('reports a project as working after a relaunch when one of its workspaces resumes while a sibling stays disconnected', () => {
+    withDatabasePath((path, root) => {
+      let database: ConductorDatabase | null = new ConductorDatabase(path)
+      try {
+        const project = database.upsertProject(join(root, 'proj'), 'Proj')
+        const workspaceA = database.listSessions(project.id)[0]!
+        const workspaceB = database.createSession(project.id, 'Workspace B')
+        const spec = (id: string, sessionId: string): AgentSpec => ({
+          id, projectId: project.id, sessionId, provider: 'claude', title: 'Claude', cwd: project.path, continueOnLimit: false
+        })
+        database.upsertAgent(spec('agent-a', workspaceA.id), 'running')
+        database.upsertAgent(spec('agent-b', workspaceB.id), 'running')
+        database.saveSession(workspaceA.id, layoutWith('agent-a'), null, [])
+        database.saveSession(workspaceB.id, layoutWith('agent-b'), null, [])
+
+        // agent-b's connection drops mid-turn; its DB row already reads as the 'error' status a
+        // lost connection persists as, unlike the plain in-flight statuses a relaunch reconciles.
+        database.setAgentStatus('agent-b', 'error', 'disconnected')
+
+        database.close()
+        database = new ConductorDatabase(path)
+        database.reconcileInterruptedRuntimes()
+        // agent-a was still in flight when the owner quit, so the relaunch first resets it to
+        // idle like any interrupted runtime, then it reconnects and resumes its turn.
+        expect(snapshot(database)).toEqual({ [project.id]: 'waiting' })
+        database.setAgentStatus('agent-a', 'running', 'working')
+
+        // The owner can watch agent-a working, so the project must read as working even though
+        // agent-b - in a workspace the owner has not reopened this launch - is still disconnected.
+        expect(snapshot(database)).toEqual({ [project.id]: 'working' })
+      } finally {
+        database?.close()
+      }
+    })
+  })
 })
