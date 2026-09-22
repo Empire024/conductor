@@ -31,7 +31,25 @@ jobs:
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'npm-test.log'
           npm test 2>&1 | Tee-Object -FilePath $log
-          if ($LASTEXITCODE -ne 0) {
+          $testExit = $LASTEXITCODE
+          if ($testExit -ne 0) {
+            # On a starved hosted runner a Vitest worker can time out reporting progress to the main
+            # thread ("[vitest-worker]: Timeout calling onTaskUpdate") after every test has passed;
+            # Vitest then exits 1 on that transport error alone. Only that exact shape is forgiven:
+            # all files and tests passed, nothing failed, and every unhandled error is a worker RPC
+            # timeout. The node script tests, which `npm test` skipped, still have to pass.
+            $plain = (Get-Content -LiteralPath $log) -replace "`e\[[0-9;]*[A-Za-z]", ''
+            $files = $plain | Where-Object { $_ -match '^\s*Test Files\s' } | Select-Object -Last 1
+            $tests = $plain | Where-Object { $_ -match '^\s*Tests\s' } | Select-Object -Last 1
+            $errors = @($plain | Where-Object { $_ -match '^(\w*Error|Error):' })
+            $rpcOnly = $errors.Count -gt 0 -and @($errors | Where-Object { $_ -notmatch '^Error: \[vitest-worker\]: Timeout calling "' }).Count -eq 0
+            if ($files -match 'passed' -and $files -notmatch 'failed' -and $tests -match 'passed' -and $tests -notmatch 'failed' -and $rpcOnly) {
+              Write-Output "::warning title=Vitest worker RPC timeout::All tests passed; forgiving $($errors.Count) worker RPC timeout(s) on the hosted runner."
+              npm run test:scripts 2>&1 | Tee-Object -FilePath $log -Append
+              $testExit = $LASTEXITCODE
+            }
+          }
+          if ($testExit -ne 0) {
             # One annotation holds about 4,000 characters, so a plain 80-line tail was cut off
             # before the failing test. Emit the lines that explain a failure first, then the
             # last lines, each split into annotations small enough to survive whole.
