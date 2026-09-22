@@ -1,5 +1,5 @@
 import { conversationModes, modelDisplayName, resolvedComposerSettings } from './composer-settings'
-import { modelEfforts, resolveEffortChoice, supportedEffortChoices } from '../../../shared/model-effort'
+import { documentedDefaultEffort, modelEfforts, resolveEffortChoice, supportedEffortChoices } from '../../../shared/model-effort'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { useEffect, useId, useRef, useState } from 'react'
 import { Check, ChevronDown, LoaderCircle, Search } from 'lucide-react'
@@ -32,13 +32,17 @@ export function StructuredComposerControls({ settings, capabilities, disabled, o
   const efforts = supportedEffortChoices(capabilities, settings.model)
   const unavailableEffort = Boolean(capabilities && settings.effort && settings.effort !== 'auto' && !efforts.includes(settings.effort))
   // Undefined when neither the owner's saved effort, the runtime's reported effort nor a catalog
-  // default applies: the runtime then runs on its own configured level and the slider says so.
+  // default applies: the runtime then runs on its own configured level, so this is never sent —
+  // but the owner still gets a concrete level to look at, via the account-default guess below.
   const effort = resolveEffortChoice(efforts, resolved.effort)
-  const effortIndex = effort ? efforts.indexOf(effort) : -1
+  const guessedEffort = effort ? undefined : documentedDefaultEffort(efforts)
+  const displayEffort = effort ?? guessedEffort
+  const effortIndex = displayEffort ? efforts.indexOf(displayEffort) : -1
   const sliderPosition = effortIndex < 0 ? Math.floor((efforts.length - 1) / 2) : effortIndex
   const effortProgress = effortIndex < 0 ? 0 : efforts.length > 1 ? Math.round(effortIndex / (efforts.length - 1) * 100) : 100
-  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : effort ? effort.replace(/^./, char => char.toUpperCase()) : 'Account default'
-  const modelTitle = label + (resolved.resolvedModel ? ' (' + resolved.resolvedModel + ')' : '') + (resolved.effort ? ' · ' + resolved.effort : '')
+  const capitalize = (value: string): string => value.replace(/^./, char => char.toUpperCase())
+  const effortLabel = unavailableEffort ? 'Unavailable: ' + settings.effort : effort ? capitalize(effort) : guessedEffort ? capitalize(guessedEffort) + ' (account default)' : 'Account default'
+  const modelTitle = label + (resolved.resolvedModel ? ' (' + resolved.resolvedModel + ')' : '') + (displayEffort ? ' · ' + displayEffort + (effort ? '' : ' (account default)') : '')
   const close = (): void => { setOpen(false); setQuery(''); trigger.current?.focus() }
   const chooseModel = (id: string): void => {
     const supported = modelEfforts(capabilities, id)

@@ -1,12 +1,15 @@
 import type { ProviderCapabilities } from './structured-agent'
 
-/** Undefined means the runtime has not reported this model's capabilities. */
-export function modelEfforts(capabilities: ProviderCapabilities | undefined, model?: string): string[] | undefined {
+function selectedModelInfo(capabilities: ProviderCapabilities | undefined, model?: string): ProviderCapabilities['models'][number] | undefined {
   const effective = capabilities?.effectiveSettings
   const defaultModel = effective && typeof effective === 'object' && !Array.isArray(effective) && typeof effective.model === 'string' ? effective.model : undefined
   const selected = model && model !== 'default' ? model : defaultModel
-  const info = capabilities?.models.find(option => option.id === selected) ?? (!model || model === 'default' ? capabilities?.models.find(option => option.isDefault || option.id === 'default') : undefined)
-  return info?.effort
+  return capabilities?.models.find(option => option.id === selected) ?? (!model || model === 'default' ? capabilities?.models.find(option => option.isDefault || option.id === 'default') : undefined)
+}
+
+/** Undefined means the runtime has not reported this model's capabilities. */
+export function modelEfforts(capabilities: ProviderCapabilities | undefined, model?: string): string[] | undefined {
+  return selectedModelInfo(capabilities, model)?.effort
 }
 
 /** Slider positions: real, reported efforts only. Auto is a placeholder, not a choice.
@@ -28,4 +31,15 @@ export function supportedEffortChoices(capabilities: ProviderCapabilities | unde
 export function resolveEffortChoice(choices: string[], preferred?: string): string | undefined {
   if (!choices.length) return undefined
   return preferred && choices.includes(preferred) ? preferred : undefined
+}
+
+/** What "Account default" is shown as when nothing else names a level: never sent to the
+ *  runtime, so it carries none of the risk `resolveEffortChoice` above guards against. The
+ *  owner's own Claude Code settings recommend "medium effort for most tasks" (the CLI's
+ *  `tengu_grey_step2` nudge, global settings.json, 2026-09-23), and Codex/OpenAI document the
+ *  same middle tier as their reasoning default — used only when the model's ladder offers it,
+ *  else the middle position of whatever ladder remains. */
+export function documentedDefaultEffort(choices: string[]): string | undefined {
+  if (!choices.length) return undefined
+  return choices.includes('medium') ? 'medium' : choices[Math.floor((choices.length - 1) / 2)]
 }

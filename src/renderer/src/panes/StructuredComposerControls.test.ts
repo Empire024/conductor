@@ -44,21 +44,23 @@ describe('compact composer controls (synthetic, zero inference)', () => {
     expect(render({ capabilities: { ...capabilities, models: [] } }).html).toContain('type="range"')
     expect(render({ capabilities, settings: { ...settings, model: 'model-two', effort: 'high' } }).html).not.toContain('type="range"')
   })
-  it('places supported effort values at their real slider positions and names the account default when none applies', () => {
+  it('places supported effort values at their real slider positions and names a concrete account default when none applies', () => {
     const html = render({ capabilities, settings: { ...settings, effort: 'medium' } }).html
     expect(html).toContain('aria-label="Reasoning effort"')
     expect(html).toContain('aria-valuetext="Medium"')
     expect(html).toContain('type="range" min="0" max="3" step="1"')
     expect(html).toContain('value="2"')
     expect(html).toContain('--effort-progress:67%')
-    // No saved effort, no runtime-reported effort, no catalog default: nothing is guessed (the
-    // runtime keeps its configured level) and the slider says so instead of claiming "Medium".
+    // No saved effort, no runtime-reported effort, no catalog default: nothing is committed (the
+    // runtime keeps its configured level), but the owner still sees a concrete level instead of
+    // the bare, uninformative "Account default".
     for (const missing of [render({ capabilities }), render({ capabilities, settings: { ...settings, effort: 'auto' } })]) {
-      expect(missing.html).toContain('aria-valuetext="Account default"')
-      expect(missing.html).toContain('<output>Account default</output>')
-      expect(missing.html).toContain('--effort-progress:0%')
-      expect(missing.html).not.toContain('class="active"')
+      expect(missing.html).toContain('aria-valuetext="Medium (account default)"')
+      expect(missing.html).toContain('<output>Medium (account default)</output>')
+      expect(missing.html).toContain('--effort-progress:67%')
+      expect(missing.html).toContain('class="active"')
       expect(missing.html).not.toContain('Not reported')
+      expect(missing.html).not.toContain('>Account default<')
       expect(missing.onChange).not.toHaveBeenCalled()
     }
     const filtered = render({ capabilities: { ...capabilities, models: [{ id: 'model-one', label: 'Model One', isDefault: true, effort: ['', 'auto', 'low', 'high'] }] }, settings: { ...settings, effort: 'high' } }).html
@@ -174,14 +176,15 @@ it('keeps default alias effort metadata when Claude reports a concrete runtime m
   expect(html).toContain('value="1"')
 })
 
-it('shows the effort ladder for a fresh Claude session before the model catalog loads, without guessing a level', () => {
-  // Claude's initialize reports no default effort, so nothing is sent: the CLI applies its own
-  // configured level (the owner's saved xhigh on 2026-09-21), and the slider says "Account default".
+it('names a concrete account-default level for a fresh Claude session before the model catalog loads, instead of leaving Account default unexplained', () => {
+  // Claude's initialize reports no default effort, so nothing is committed: the CLI applies its
+  // own configured level (the owner's saved xhigh on 2026-09-21). The slider still has to show
+  // something concrete, so it names the documented default for the ladder instead.
   const claude: ProviderCapabilities = { ...capabilities, provider: 'claude', models: [], effort: ['low', 'medium', 'high', 'xhigh', 'max'] }
   const { html, onChange } = render({ capabilities: claude, settings: { permission: 'default', plan: false } })
   expect(html).toContain('aria-label="Reasoning effort"')
-  expect(html).toContain('aria-valuetext="Account default"')
-  expect(html).not.toContain('aria-valuetext="Medium"')
+  expect(html).toContain('aria-valuetext="Medium (account default)"')
+  expect(html).not.toContain('<output>Account default</output>')
   expect(html).toContain('type="range"')
   expect(onChange).not.toHaveBeenCalled()
   // Once the runtime reports an effort (system/init or a turn), the slider shows that level.

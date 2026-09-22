@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { modelEfforts, resolveEffortChoice, supportedEffortChoices } from './model-effort'
+import { documentedDefaultEffort, modelEfforts, resolveEffortChoice, supportedEffortChoices } from './model-effort'
 import type { ProviderCapabilities } from './structured-agent'
 
 /** The catalog Claude Code 2.1.278 advertised on 2026-09-21: effort ladders per model, but no
@@ -36,5 +36,20 @@ describe('effort resolution (synthetic catalogs, zero inference)', () => {
     expect(resolveEffortChoice(supportedEffortChoices(claude, 'opus[1m]'), 'ultra')).toBeUndefined()
     expect(supportedEffortChoices(claude, 'haiku')).toEqual([])
     expect(resolveEffortChoice(supportedEffortChoices(claude, 'haiku'), 'high')).toBeUndefined()
+  })
+})
+
+describe('documented default effort (display-only guess, never committed by resolveEffortChoice)', () => {
+  it('names medium for a ladder that offers it, on either provider', () => {
+    expect(documentedDefaultEffort(supportedEffortChoices(claude, 'opus[1m]'))).toBe('medium')
+    expect(documentedDefaultEffort(supportedEffortChoices(codex, 'gpt-6-astra'))).toBe('medium')
+  })
+  it('falls to the middle of the ladder when medium is not offered', () => {
+    expect(documentedDefaultEffort(['low', 'high'])).toBe('low')
+    expect(documentedDefaultEffort(['high'])).toBe('high')
+  })
+  it('names nothing for an effort-less model', () => {
+    expect(documentedDefaultEffort(supportedEffortChoices(claude, 'haiku'))).toBeUndefined()
+    expect(documentedDefaultEffort([])).toBeUndefined()
   })
 })
