@@ -71,7 +71,7 @@ All rows were recorded against CLI protocol 0.153.4 and re-verified against the 
 | Attachments | Native localImage plus exact text context fragments; removable composer chips | Deterministic test verifies images, CRLF selection content and Unicode/spaced paths. No implicit repository attachment |
 | Usage/limits | `thread/tokenUsage/updated`, `account/rateLimits/updated`; usage activity | Token mapping fixture-verified. Missing dollar cost/quotas remain unknown; no conversion of subscription quota to dollars |
 | Nested agents | `collabAgentToolCall` and `subAgentActivity`; parent-correlated nested activity | Native mapping implemented, no live evidence. Mapping retention bounded |
-| MCP/custom tools | Native MCP/dynamic item declarations/results; safe registry fallback | Mapping implemented; no host re-execution. MCP elicitation and delegated dynamic tool execution are unsupported and return explicit JSON-RPC errors |
+| MCP/custom tools | Native MCP/dynamic item declarations/results; safe registry fallback; in Auto the thread starts with every enabled, unset MCP server's `default_tools_approval_mode = auto` | Mapping implemented; no host re-execution. MCP approval under Auto live-verified 2026-09-22 (section below). MCP elicitation and delegated dynamic tool execution are unsupported and return explicit JSON-RPC errors |
 | Unknown events | Native method/payload retained as inspectable notice | Fixture-verified unknown event and late output retention; late chunks do not append after authoritative completion |
 | Session fork/rename/archive | Native `thread/fork`, `thread/name/set`, archive/unarchive; session controls | Fixture-verified: distinct fork identity, no user turn, child unsubscribed for explicit resume. Active turns and native goals block a history-only fork; no filesystem restore occurs |
 | Checkpoints/rollback | Public methods exist in schema | Native GUI gap: local history display does not rewind native context |
@@ -93,3 +93,19 @@ Live isolation is explicit and process-local. The installed CLI exposes `--disab
 ## Add a mapping safely
 
 Use the generated `ServerNotification`, `ServerRequest`, and `ThreadItem` discriminants in `codex.ts`. Preserve native thread/turn/item/request IDs in the event envelope and keep provider payloads inspectable. A complete item must emit a snapshot using the same identity as its deltas. A server request must reserve its response before sending and offer only supported answers. Add raw messages to the explicit synthetic process and assert the adapter event or outgoing response. Never execute a provider-owned tool in the renderer or host merely because its declaration arrived.
+
+## MCP tool approval under Auto (2026-09-22)
+
+codex-cli 0.155 gates every MCP tool call on the server's `default_tools_approval_mode` (or the tool's own `approval_mode`; the values are `auto | prompt | writes | approve`). Left unset, the call "requires approval", and under `approval_policy = never` Codex does not ask, it refuses: `MCP tool call requires approval, but approval policy is never`. Conductor's Auto is exactly `never` (plus workspace-write and network), so after the 0.155 rebaseline every Auto conversation lost its MCP tools — the Conductor browser, chrome-devtools, node_repl — while Edit (`on-request`) kept them.
+
+Live probe against the installed CLI: one stub loopback MCP server with a single read-only tool, model gpt-5.6-sol at low effort, read-only sandbox, one turn each.
+
+| Thread config | Turn policy | Result |
+| --- | --- | --- |
+| server unset | `never` | the model reports the tool as unavailable; no call reaches the server |
+| server `default_tools_approval_mode = "auto"` | `never` | the tool call runs and its result is returned verbatim |
+| server unset | `on-request` | the read-only tool runs without any approval request |
+
+Also verified: a nested `{ mcp_servers: { name: {…} } }` entry in `thread/start.config` merges with the CLI's own `mcp_servers` table (chrome-devtools and node_repl stayed listed by `mcpServerStatus/list` next to the added server), and the dotted key form is accepted too.
+
+The adapter therefore reads `config/read` once before `thread/start` or `thread/resume` when the persisted mode resolves to `never`, and passes `default_tools_approval_mode = "auto"` for every enabled server the owner left unset plus the Conductor browser; a server or tool mode written in config.toml is kept, and nothing is written to the CLI configuration. Because this is thread configuration, structured-sessions reconnects the same native conversation when the owner's mode crosses the never-asks boundary in either direction, exactly as it does for the browser toggle, and the adapter says so when a `never` turn reaches a thread that was connected in an asking mode. `effectiveSettings.mcpToolApproval` shows which way the current thread was started. Bundled Codex plugins (`codex_apps`, `cua_repl`) are not in `mcp_servers` and keep their own signed approval templates.

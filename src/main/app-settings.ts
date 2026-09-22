@@ -47,6 +47,23 @@ export function rememberPermission(setSetting: (key: string, value: string) => v
   setSetting(REMEMBERED_PERMISSION_PREFIX + provider, permission)
 }
 
+const REMEMBERED_BROWSER_TOOLS_PREFIX = 'rememberedBrowserTools:'
+/**
+ * The owner's last deliberate browser-tools choice, per provider. Enabling the project browser is
+ * an explicit session authority (structured-sessions.ts messageSettings), so it is remembered only
+ * from the composer's own toggle and replayed onto brand-new conversations of that provider,
+ * whether the owner or a coworker opened them. Local models have no browser; nothing is stored.
+ */
+export function rememberedBrowserTools(getSetting: (key: string) => string | null, provider: string | undefined): boolean | undefined {
+  if (provider !== 'claude' && provider !== 'codex') return undefined
+  const value = getSetting(REMEMBERED_BROWSER_TOOLS_PREFIX + provider)
+  return value === 'true' ? true : value === 'false' ? false : undefined
+}
+export function rememberBrowserTools(setSetting: (key: string, value: string) => void, provider: string | undefined, enabled: boolean): void {
+  if (provider !== 'claude' && provider !== 'codex') return
+  setSetting(REMEMBERED_BROWSER_TOOLS_PREFIX + provider, enabled ? 'true' : 'false')
+}
+
 /** A filename suffix, never a path. Multiple suffixes such as test.ts are valid. */
 export function normalizeNewFileExtension(value: unknown): string | null {
   if (typeof value !== 'string') return null

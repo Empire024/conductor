@@ -16,7 +16,8 @@ import { activeUsageCap, parseUsageLimitReset, usageCapKey } from './usage-limit
 import { describeUsageCap, evaluateUsageCap, summarizeContext, summarizeUsageRun, type UsageCapStatus } from '../shared/usage-accounting'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
-import { rememberedPermission, rememberPermission } from './app-settings'
+import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
+import { codexNeverAsks } from './providers/codex'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 
@@ -125,7 +126,10 @@ export class StructuredSessions {
     const available = spec.provider === 'local' || Boolean(executable)
     if (!store.snapshot(spec.id)) this.database.upsertAgent(spec, 'running', 'idle')
     const state = store.register(spec.id, spec.projectId, spec.provider as StructuredProvider, spec)
-    if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: concreteModel(spec.provider, spec.model, state.capabilities), effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined } })
+    // A brand-new conversation also opens with the browser tools the owner last chose for this
+    // provider (saveSettings remembers the composer's toggle), whoever opened it: an owner tab, a
+    // coworker a controller opened, or a router task. An existing conversation keeps its own choice.
+    if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: concreteModel(spec.provider, spec.model, state.capabilities), effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined, ...(rememberedBrowserTools(key => this.database.getSetting(key), spec.provider as StructuredProvider) ? { browserMcp: true } : {}) } })
     // Registration constructs no process. Views subscribe to this backend resource.
     if (!this.live.has(spec.id)) this.live.set(spec.id, { spec: previousSpec ?? spec, executable: executable ?? '', runtimeId: '', submitting: false, closed: false, responses: new Set() })
     const live = this.live.get(spec.id)!
@@ -348,16 +352,23 @@ export class StructuredSessions {
     this.validateSettings(settings, state.capabilities)
     const browserChanged = Boolean(settings.browserMcp) !== Boolean(state.settings.browserMcp)
     if (browserChanged && settings.browserMcp && active.has(state.phase)) throw new Error('Wait for the current turn to finish before enabling browser tools')
+    const live = this.live.get(id)
+    const provider = this.database.structured.spec<AgentSpec>(id)?.provider
+    // Codex starts a thread differently for the one mode that never asks (its MCP servers are
+    // cleared to run unasked, see codexMcpApprovalOverrides), so crossing that boundary in either
+    // direction is a transport change like the browser toggle: the same native conversation
+    // reconnects with the configuration the new mode needs, and MCP tools keep working.
+    const approvalChanged = provider === 'codex' && codexNeverAsks(settingsForRuntime(settings, live?.runtimeId)) !== codexNeverAsks(settingsForRuntime(state.settings, live?.runtimeId))
     this.database.structured.update(id, { settings })
     if (browserChanged) {
       // Revocation is synchronous and precedes every later await: a disabled credential cannot
       // finish a tool call merely because its browser lookup was already in flight.
       this.mcp?.release(id)
-      const live = this.live.get(id)
-      if (live?.adapter) {
-        if (active.has(state.phase)) live.browserConfigStale = true
-        else this.retireBrowserTransport(live)
-      }
+      rememberBrowserTools((key, value) => this.database.setSetting(key, value), provider, Boolean(settings.browserMcp))
+    }
+    if ((browserChanged || approvalChanged) && live?.adapter) {
+      if (active.has(state.phase)) live.browserConfigStale = true
+      else this.retireBrowserTransport(live, browserChanged ? 'Browser tool settings changed.' : 'The permission mode changed.')
     }
     // This is the one path a deliberate composer change always takes (see updateSettings in
     // StructuredAgentPane.tsx), so it is also where the owner's choice is remembered for the
@@ -392,8 +403,8 @@ export class StructuredSessions {
     // the owner resumed explicitly instead of submitting the next message.
     live.browserConfigStale = false
   }
-  private retireBrowserTransport(live: LiveSession): void {
-    this.cancelNativeAcceptances(live, 'Browser tool settings changed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
+  private retireBrowserTransport(live: LiveSession, reason = 'Browser tool settings changed.'): void {
+    this.cancelNativeAcceptances(live, reason.replace(/\.$/, '') + ' before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
     live.closed = true
     live.adapter?.dispose()
     live.adapter = undefined
@@ -401,7 +412,7 @@ export class StructuredSessions {
     live.browserConfigStale = false
     live.closed = false
     const state = this.database.structured.snapshot(live.spec.id)
-    if (state?.nativeSessionId) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Browser tool settings changed. The same native conversation will reconnect before the next message.' } })
+    if (state?.nativeSessionId) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: reason + ' The same native conversation will reconnect before the next message.' } })
   }
   async connectSession(id: string): Promise<void> {
     if (this.get(id).handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')

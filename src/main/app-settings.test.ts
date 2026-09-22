@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { normalizeNewFileExtension, normalizeThemeSettings, rememberedPermission, rememberPermission } from './app-settings'
+import { normalizeNewFileExtension, normalizeThemeSettings, rememberBrowserTools, rememberedBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
 import type { ProviderCapabilities } from '../shared/structured-agent'
 
 function fakeStore(seed: Record<string, string> = {}) {
@@ -72,5 +72,25 @@ describe('main-process remembered permission (mirrors renderer permission-memory
     rememberPermission(store.setSetting, 'codex', 'read-only', undefined)
     expect(rememberedPermission(store.getSetting, 'claude')).toBe('auto')
     expect(rememberedPermission(store.getSetting, 'codex')).toBe('read-only')
+  })
+})
+
+describe('main-process remembered browser tools', () => {
+  it('replays the owner\'s last deliberate choice per provider and never for a local model', () => {
+    const store = fakeStore()
+    expect(rememberedBrowserTools(store.getSetting, 'codex')).toBeUndefined()
+    rememberBrowserTools(store.setSetting, 'codex', true)
+    expect(rememberedBrowserTools(store.getSetting, 'codex')).toBe(true)
+    expect(rememberedBrowserTools(store.getSetting, 'claude')).toBeUndefined()
+    rememberBrowserTools(store.setSetting, 'codex', false)
+    expect(rememberedBrowserTools(store.getSetting, 'codex')).toBe(false)
+    rememberBrowserTools(store.setSetting, 'local', true)
+    rememberBrowserTools(store.setSetting, undefined, true)
+    expect(rememberedBrowserTools(store.getSetting, 'local')).toBeUndefined()
+    expect([...store.rows.keys()]).toEqual(['rememberedBrowserTools:codex'])
+  })
+  it('ignores a stored value that is not a boolean literal', () => {
+    const store = fakeStore({ 'rememberedBrowserTools:claude': 'yes' })
+    expect(rememberedBrowserTools(store.getSetting, 'claude')).toBeUndefined()
   })
 })

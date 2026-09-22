@@ -82,6 +82,16 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (message.method === 'thread/name/set') { materialized = true; if (process.env.CONDUCTOR_TEST_EMPTY_HISTORY === '1') writeFileSync(materializedPath, 'Synthetic empty history metadata') }
   if (message.method === 'thread/read' && !materialized && process.env.CONDUCTOR_TEST_EMPTY_HISTORY === '1') { send({ id: message.id, error: { code: -32603, message: 'list_turns is not supported yet' } }); return }
   if (message.method === 'thread/read') { send({ id: message.id, result: { thread: defaults().thread } }); return }
+  if (message.method === 'config/read') {
+    // The CLI's own configuration: one server left unset, one the owner made prompting, one disabled.
+    if (process.env.CONDUCTOR_TEST_CONFIG_READ_UNAVAILABLE === '1') { send({ id: message.id, error: { code: -32603, message: 'synthetic configuration unavailable' } }); return }
+    send({ id: message.id, result: { config: { approval_policy: null, mcp_servers: {
+      'fixture-tools': { command: process.execPath, args: [], enabled: true, default_tools_approval_mode: null },
+      'fixture-prompting': { command: process.execPath, args: [], enabled: true, default_tools_approval_mode: 'prompt' },
+      'fixture-disabled': { command: process.execPath, args: [], enabled: false, default_tools_approval_mode: null }
+    } }, layers: [] } })
+    return
+  }
   if (message.method === 'thread/start' || message.method === 'thread/resume') {
     send({ id: message.id, result: defaults() })
     return
@@ -145,6 +155,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (scenario.startsWith('synthetic:steer')) {
     if (scenario === 'synthetic:steer-review') itemEvent('item/started', { type: 'enteredReviewMode', id: 'review', review: 'Synthetic review' })
     if (scenario === 'synthetic:steer-compact') itemEvent('item/started', { type: 'contextCompaction', id: 'compact' })
+    return
+  }
+  if (scenario === 'synthetic:sandbox-helper-failure') {
+    // What codex-cli reports when its Windows sandbox helper could not refresh before the command.
+    itemEvent('item/completed', command('sandbox-1', 'failed', 'Failed to create unified exec process: helper_unknown_error: setup refresh had errors', 1))
+    itemEvent('item/completed', command('sandbox-2', 'failed', 'Failed to create unified exec process: helper_unknown_error: setup refresh had errors', 1))
+    finish()
     return
   }
   if (scenario === 'synthetic:compact-complete') {

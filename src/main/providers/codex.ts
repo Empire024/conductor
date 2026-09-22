@@ -65,6 +65,49 @@ const PERMISSION_PRESETS: Record<SessionSettings['permission'], { sandbox: NonNu
   auto: { sandbox: 'workspace-write', approvalPolicy: 'never', network: true }
 }
 
+/** The approval policy a turn in this mode requests: the settings dialog's explicit override wins,
+ *  otherwise the composer mode's preset. `inherit` means the installed CLI's own configuration. */
+export function codexApprovalPolicy(settings: Pick<SessionSettings, 'permission' | 'approvalPolicy'>): NonNullable<SessionSettings['approvalPolicy']> {
+  const preset = PERMISSION_PRESETS[settings.permission] ?? PERMISSION_PRESETS.default
+  return settings.approvalPolicy && settings.approvalPolicy !== 'inherit' ? settings.approvalPolicy : preset.approvalPolicy
+}
+/** True for the one mode that never interrupts. Codex refuses an MCP tool call outright under
+ *  `never` unless the server's tools are configured to run without approval, so this is also the
+ *  mode whose thread must be started with those overrides (codexMcpApprovalOverrides), and the
+ *  boundary a conversation has to reconnect across when the owner changes mode. */
+export const codexNeverAsks = (settings: Pick<SessionSettings, 'permission' | 'approvalPolicy'>): boolean => codexApprovalPolicy(settings) === 'never'
+
+/** What a failed Codex command says when the CLI's Windows sandbox helper could not refresh the
+ *  sandbox before the command ran. Nothing in the conversation's permission mode causes it. */
+const CODEX_SANDBOX_SETUP_FAILURE = /helper_unknown_error|setup refresh had errors/
+
+/**
+ * Thread config that lets the mode which never asks actually use MCP tools. Codex 0.155 gates every
+ * MCP tool call on the server's `default_tools_approval_mode` (or the tool's own `approval_mode`);
+ * left unset, the call "requires approval", and under `approval_policy = never` Codex rejects it
+ * with "MCP tool call requires approval, but approval policy is never" rather than asking. Auto is
+ * the owner's explicit choice not to be asked, so for this thread only, every server the CLI
+ * configuration enables and leaves unset gets `auto`; a mode the owner wrote into config.toml, on
+ * a server or on a tool, is kept. The Conductor browser is Conductor's own scoped server and is
+ * always cleared. A nested `mcp_servers` override merges with the CLI's own table (verified
+ * against codex-cli 0.155.1); nothing is written to the owner's configuration.
+ */
+export function codexMcpApprovalOverrides(configured: unknown, browser: Json | undefined): Json | undefined {
+  const servers: Record<string, Json> = {}
+  if (record(configured)) {
+    for (const [name, server] of Object.entries(configured)) {
+      if (!record(server) || server.enabled === false || !/^[a-zA-Z0-9_-]{1,128}$/.test(name)) continue
+      if (server.default_tools_approval_mode !== null && server.default_tools_approval_mode !== undefined) continue
+      servers[name] = { default_tools_approval_mode: 'auto' }
+    }
+  }
+  if (record(browser) && record(browser.mcp_servers)) {
+    for (const [name, server] of Object.entries(browser.mcp_servers)) servers[name] = { ...(record(server) ? server : {}), default_tools_approval_mode: 'auto' }
+  }
+  if (!Object.keys(servers).length) return browser
+  return json({ ...(record(browser) ? browser : {}), mcp_servers: servers })
+}
+
 const LIVE_DISABLED_FEATURES = ['hooks', 'plugins', 'apps', 'multi_agent', 'multi_agent_v2', 'browser_use', 'browser_use_external', 'computer_use', 'memories', 'unbounded_connection_retries'] as const
 
 /** Process-local CLI overrides; never writes the user's configuration or changes authentication. */
@@ -223,6 +266,9 @@ export class CodexAdapter implements ProviderAdapter {
   private defaults?: ThreadStartResponse
   private models: Model[] = []
   private experimental = false
+  /** Whether this thread was started with its MCP servers cleared to run unasked (Auto). */
+  private mcpToolApproval: 'auto' | 'provider' = 'provider'
+  private sandboxSetupNoticed = false
 
   constructor(private options: AdapterOptions, private dependencies: CodexAdapterDependencies = {}) {}
 
@@ -279,6 +325,19 @@ export class CodexAdapter implements ProviderAdapter {
         const catalog = await this.request<ModelListResponse>('model/list', { limit: 100, includeHidden: false })
         if (!catalog.data.some(model => model.model === liveEnvironment.CONDUCTOR_LIVE_MODEL_CODEX && model.supportedReasoningEfforts.some(effort => effort.reasoningEffort === 'low'))) throw new Error('The approved Codex live model with low effort is unavailable; no substitution is allowed')
         this.emit({ data: { type: 'notice', message: 'Codex live fixture isolation verified before thread creation', payload: { authentication: expectedType, model: liveEnvironment.CONDUCTOR_LIVE_MODEL_CODEX!, disabledOptionalFeatures: [...LIVE_DISABLED_FEATURES] } } })
+      } else if (codexNeverAsks(this.options.settings)) {
+        // Auto: the owner chose not to be asked, and under `never` Codex would otherwise refuse
+        // every MCP tool (the project browser, Chrome, …) instead of asking. The CLI's own
+        // configuration is read to learn which servers it enables; it is never written.
+        let configured: unknown
+        try {
+          const response = await this.request<ConfigReadResponse>('config/read', { cwd: this.options.cwd, includeLayers: false })
+          configured = record(response.config) ? response.config.mcp_servers : undefined
+        } catch (error) {
+          this.emit({ data: { type: 'notice', message: 'Codex configuration could not be read, so only the Conductor browser is cleared to run without approval in Auto; other MCP tools may be refused until the next connection.', payload: { error: error instanceof Error ? error.message : String(error) } }, native: { method: 'config/read' } })
+        }
+        threadConfig = codexMcpApprovalOverrides(configured, threadConfig)
+        this.mcpToolApproval = 'auto'
       }
       const method = this.options.nativeSessionId ? 'thread/resume' : 'thread/start'
       const params = this.options.nativeSessionId
@@ -288,7 +347,7 @@ export class CodexAdapter implements ProviderAdapter {
       if (!record(result) || !record(result.thread) || typeof result.thread.id !== 'string') throw new Error('Malformed Codex thread response')
       this.threadId = result.thread.id
       this.defaults = result
-      this.capabilities.effectiveSettings = json({ model: result.model, effort: result.reasoningEffort, approvalPolicy: result.approvalPolicy, sandbox: result.sandbox })
+      this.capabilities.effectiveSettings = json({ model: result.model, effort: result.reasoningEffort, approvalPolicy: result.approvalPolicy, sandbox: result.sandbox, mcpToolApproval: this.mcpToolApproval })
       // Historical hydration belongs to durable local replay. Never replay old items as new work.
       const active = result.thread.turns?.find(turn => turn.status === 'inProgress')
       if (active) {
@@ -333,6 +392,10 @@ export class CodexAdapter implements ProviderAdapter {
     // prompting policy means Codex requests it per command again instead of holding it silently.
     const networkAccess = preset.network && approvalPolicy === 'never'
     if (!this.capabilities.sandboxModes!.includes(sandbox) || !this.capabilities.approvalPolicies!.includes(approvalPolicy)) throw new Error('Unsupported Codex sandbox or approval policy')
+    // The thread's MCP servers were cleared to run unasked only when this runtime connected in the
+    // mode that never asks (structured-sessions reconnects across that boundary); a turn that
+    // arrives here otherwise would have Codex refuse its MCP tools instead of asking. Say so.
+    if (approvalPolicy === 'never' && this.mcpToolApproval !== 'auto') this.emit({ data: { type: 'notice', message: 'This Codex connection was made in a mode that asks, so its MCP tools (the project browser, Chrome, …) will be refused under Auto until the conversation reconnects. Changing the mode from the composer reconnects it before the next message.' } })
     const params: TurnStartParams = {
       threadId: this.threadId, input: codexInput(text, attachments), cwd: this.options.cwd, model,
       effort: (settings.effort as ReasoningEffort | undefined) ?? (modelInfo ? modelInfo.supportedReasoningEfforts.length ? modelInfo.defaultReasoningEffort : null : model === this.defaults.model ? this.defaults.reasoningEffort : null),
@@ -357,7 +420,7 @@ export class CodexAdapter implements ProviderAdapter {
       const result = await this.request<TurnStartResponse>('turn/start', json(params))
       if (!result.turn || typeof result.turn.id !== 'string') throw new Error('Malformed Codex turn response; execution state is uncertain')
       const completedPhase = this.completedTurns.get(result.turn.id)
-      this.capabilities.effectiveSettings = json({ model: params.model, effort: params.effort, approvalPolicy: params.approvalPolicy, sandbox: params.sandboxPolicy })
+      this.capabilities.effectiveSettings = json({ model: params.model, effort: params.effort, approvalPolicy: params.approvalPolicy, sandbox: params.sandboxPolicy, mcpToolApproval: this.mcpToolApproval })
       if (!completedPhase) {
         this.turnId = result.turn.id
         this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
@@ -605,7 +668,7 @@ export class CodexAdapter implements ProviderAdapter {
           // snapshots above reconcile any input already consumed before cancellation.
           for (const [id, turnId] of this.steeringInputs) if (turnId === params.turn.id) this.inputDelivery(id, params.turn.status === 'interrupted' ? 'cancelled' : 'uncertain', native)
           this.turnId = undefined
-          if (params.turn.error) send({ type: 'error', message: params.turn.error.message })
+          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send({ type: 'error', message: params.turn.error.message }) }
           send({ type: 'session', phase: completedPhase }, { turnId: params.turn.id })
         }
         return
@@ -650,7 +713,7 @@ export class CodexAdapter implements ProviderAdapter {
       case 'thread/settings/updated':
         if (params.threadId === this.threadId) {
           const settings = params.threadSettings
-          this.capabilities.effectiveSettings = json({ model: settings.model, effort: settings.effort, approvalPolicy: settings.approvalPolicy, sandbox: settings.sandboxPolicy })
+          this.capabilities.effectiveSettings = json({ model: settings.model, effort: settings.effort, approvalPolicy: settings.approvalPolicy, sandbox: settings.sandboxPolicy, mcpToolApproval: this.mcpToolApproval })
           send({ type: 'notice', message: 'Native Codex settings updated', payload: this.capabilities.effectiveSettings })
           this.emitPhase(true)
         }
@@ -672,6 +735,7 @@ export class CodexAdapter implements ProviderAdapter {
         send({ type: 'tool', name: this.items.get(this.itemKey(context))?.name ?? 'MCP tool', status: 'running', output: params.message, outputMode: 'delta' })
         return
       case 'error':
+        this.sandboxSetupNotice(params.error.message, context)
         send({ type: 'error', message: params.error.message })
         if (params.willRetry && (this.options.environment ?? process.env).CONDUCTOR_LIVE_TESTS === '1' && !this.liveRetryStopped) {
           this.liveRetryStopped = true
@@ -731,6 +795,7 @@ export class CodexAdapter implements ProviderAdapter {
         const action = actions[0]
         const description = action?.type === 'read' ? `Read ${action.name}` : action?.type === 'search' ? `Search ${action.query ?? action.path ?? ''}` : `Run ${item.command.split(/\r?\n/, 1)[0]!.slice(0, 120)}`
         const status = item.exitCode !== null && item.exitCode !== undefined && item.exitCode !== 0 ? 'failed' : !complete && item.status === 'inProgress' && !item.processId && !item.aggregatedOutput ? 'preparing' : statusFor(item.status, complete)
+        if (status === 'failed') this.sandboxSetupNotice(item.aggregatedOutput, correlation)
         tool(name, { description, input: json({ command: item.command, cwd: item.cwd, actions }), status, ...(item.aggregatedOutput !== null && item.aggregatedOutput !== undefined ? { output: item.aggregatedOutput, outputMode: 'snapshot' as const } : {}), ...(item.exitCode !== null && item.exitCode !== undefined ? { exitCode: item.exitCode } : {}), ...(item.durationMs !== null && item.durationMs !== undefined ? { durationMs: item.durationMs } : {}) })
         return
       }
@@ -802,6 +867,15 @@ export class CodexAdapter implements ProviderAdapter {
     this.emitInteraction(request, interaction)
     if (!isQuestion) this.emit({ ...this.correlation(params), data: { type: 'tool', name: this.items.get(this.itemKey(this.correlation(params)))?.name ?? (request.method.includes('fileChange') ? 'File change' : 'Command'), status: 'awaiting_approval' } })
     this.emitPhase()
+  }
+
+  /** Once per runtime: a command that failed before it ran because Codex's Windows sandbox helper
+   *  could not refresh the sandbox is a CLI/host condition, not a conversation setting. The bare
+   *  failed command would otherwise send the owner looking at permission modes. */
+  private sandboxSetupNotice(text: string | null | undefined, correlation: Correlation): void {
+    if (this.sandboxSetupNoticed || !text || !CODEX_SANDBOX_SETUP_FAILURE.test(text)) return
+    this.sandboxSetupNoticed = true
+    this.emit({ ...correlation, itemId: 'codex-sandbox-setup', data: { type: 'notice', message: 'Codex could not refresh its Windows sandbox (helper_unknown_error: setup refresh had errors), so its shell and file tools fail before they run. This is the Codex CLI\'s sandbox helper, not this conversation\'s permission mode. The precise cause is logged in %USERPROFILE%\\.codex\\.sandbox\\sandbox.<date>.log; see docs/codex-windows-sandbox-repair.md.' } })
   }
 
   private emitInteraction(request: ServerRequest, interaction: PendingInteraction): void {

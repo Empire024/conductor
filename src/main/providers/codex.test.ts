@@ -16,12 +16,12 @@ const settings: SessionSettings = { permission: 'default', plan: false }
 const cleanup: Array<() => Promise<void>> = []
 afterEach(async () => { for (const clean of cleanup.splice(0)) await clean() })
 
-function create(extraEnvironment: NodeJS.ProcessEnv = {}, nativeSessionId?: string, requestTimeoutMs = 3000) {
+function create(extraEnvironment: NodeJS.ProcessEnv = {}, nativeSessionId?: string, requestTimeoutMs = 3000, sessionSettings: SessionSettings = settings, mcpConfig?: string) {
   const cwd = mkdtempSync(path.join(tmpdir(), 'conductor-codex-'))
   const events: AdapterEvent[] = []
   const sent: Json[] = []
   let closed = true
-  const adapter = new CodexAdapter({ executable: 'not-a-real-provider', cwd, runtimeId: 'runtime-1', settings, nativeSessionId, environment: { ...process.env, ...extraEnvironment }, emit: event => events.push(event) }, {
+  const adapter = new CodexAdapter({ executable: 'not-a-real-provider', cwd, runtimeId: 'runtime-1', settings: sessionSettings, nativeSessionId, ...(mcpConfig ? { mcpConfig } : {}), environment: { ...process.env, ...extraEnvironment }, emit: event => events.push(event) }, {
     version: async () => `codex-cli ${CODEX_PROTOCOL_BASELINE}`,
     requestTimeoutMs,
     transport: options => {
@@ -177,6 +177,60 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     // 'inherit' in the settings dialog is not an override: the chosen mode still decides.
     expect(await turn({ ...settings, permission: 'auto', sandbox: 'inherit', approvalPolicy: 'inherit' })).toMatchObject({ params: { approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
     expect(adapter.capabilities.permissions).toContain('auto')
+  })
+
+  it('starts the thread with its MCP servers cleared to run unasked only for the mode that never asks', async () => {
+    const methods = (sent: Json[]): string[] => sent.map(message => (message as { method: string }).method)
+    const startConfig = (sent: Json[]): unknown => (sent.find(message => (message as { method?: string }).method === 'thread/start') as { params: { config?: unknown } }).params.config
+    const auto = create({}, undefined, 3000, { ...settings, permission: 'auto' })
+    await auto.adapter.start()
+    expect(methods(auto.sent)).toEqual(['initialize', 'initialized', 'config/read', 'thread/start', 'model/list'])
+    // The server the owner left unset is cleared; the one they made prompting and the disabled one are left alone.
+    expect(startConfig(auto.sent)).toEqual({ mcp_servers: { 'fixture-tools': { default_tools_approval_mode: 'auto' } } })
+    expect(auto.adapter.capabilities.effectiveSettings).toMatchObject({ mcpToolApproval: 'auto' })
+
+    const edit = create({}, undefined, 3000, { ...settings, permission: 'accept-edits' })
+    await edit.adapter.start()
+    expect(methods(edit.sent)).toEqual(['initialize', 'initialized', 'thread/start', 'model/list'])
+    expect(startConfig(edit.sent)).toBeUndefined()
+    expect(edit.adapter.capabilities.effectiveSettings).toMatchObject({ mcpToolApproval: 'provider' })
+    // A turn that never asks on a thread connected in a mode that asks is told why its MCP tools would be refused.
+    await edit.adapter.submit('synthetic:stream', { ...settings, permission: 'auto' })
+    await waitFor(() => completed(edit.events))
+    expect(edit.events.some(event => event.data.type === 'notice' && /refused under Auto/.test(event.data.message))).toBe(true)
+    expect(auto.events.some(event => event.data.type === 'notice' && /refused under Auto/.test(event.data.message))).toBe(false)
+
+    // The settings dialog's explicit approvals override decides, not the composer mode alone.
+    const overridden = create({}, undefined, 3000, { ...settings, permission: 'auto', approvalPolicy: 'on-request' })
+    await overridden.adapter.start()
+    expect(methods(overridden.sent)).not.toContain('config/read')
+    const forced = create({}, undefined, 3000, { ...settings, permission: 'accept-edits', approvalPolicy: 'never' })
+    await forced.adapter.start()
+    expect(startConfig(forced.sent)).toEqual({ mcp_servers: { 'fixture-tools': { default_tools_approval_mode: 'auto' } } })
+  })
+
+  it('keeps the Conductor browser cleared in Auto even when the CLI configuration cannot be read', async () => {
+    const browser = { url: 'http://127.0.0.1:43123/mcp', http_headers: { Authorization: `Bearer ${'a'.repeat(64)}` } }
+    const { adapter, events, sent } = create({ CONDUCTOR_TEST_CONFIG_READ_UNAVAILABLE: '1' }, undefined, 3000, { ...settings, permission: 'auto' }, JSON.stringify({ mcp_servers: { 'conductor-browser': browser } }))
+    await adapter.start()
+    const start = sent.find(message => (message as { method?: string }).method === 'thread/start') as { params: { config?: unknown } }
+    expect(start.params.config).toEqual({ mcp_servers: { 'conductor-browser': { ...browser, default_tools_approval_mode: 'auto' } } })
+    expect(events.some(event => event.data.type === 'notice' && /could not be read/.test(event.data.message))).toBe(true)
+    // With a readable configuration the browser and the owner's unset servers are cleared together, on resume too.
+    const resumed = create({}, 'synthetic-thread-1', 3000, { ...settings, permission: 'auto' }, JSON.stringify({ mcp_servers: { 'conductor-browser': browser } }))
+    await resumed.adapter.start()
+    const resume = resumed.sent.find(message => (message as { method?: string }).method === 'thread/resume') as { params: { config?: unknown } }
+    expect(resume.params.config).toEqual({ mcp_servers: { 'fixture-tools': { default_tools_approval_mode: 'auto' }, 'conductor-browser': { ...browser, default_tools_approval_mode: 'auto' } } })
+  })
+
+  it('explains a Codex Windows sandbox setup failure once instead of leaving bare failed commands', async () => {
+    const { adapter, events } = create()
+    await adapter.submit('synthetic:sandbox-helper-failure', settings)
+    await waitFor(() => completed(events))
+    expect(events.filter(event => event.data.type === 'tool' && event.data.status === 'failed')).toHaveLength(2)
+    const notices = events.filter(event => event.data.type === 'notice' && /helper_unknown_error/.test(event.data.message))
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.data).toMatchObject({ message: expect.stringContaining('codex-windows-sandbox-repair.md') })
   })
 
   it('explicitly clears a native plan mode after resume into a fresh experimental adapter', async () => {

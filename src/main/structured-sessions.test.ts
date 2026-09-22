@@ -63,7 +63,7 @@ class FakeProvider implements ProviderAdapter {
     this.emit({ data: { type: 'session', phase: 'waiting_approval' } })
   }
 }
-function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart = true, mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }) {
+function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart = true, mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }, permissions?: ProviderCapabilities['permissions']) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0')
   vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
   const root = mkdtempSync(join(tmpdir(), 'conductor-session-fixture-')); roots.push(root)
@@ -75,7 +75,7 @@ function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart 
   const spec: AgentSpec = { id: 'agent-session', projectId: project.id, sessionId: session.id, provider, title: 'Synthetic Claude', cwd: workspace }
   const adapters: FakeProvider[] = [], broadcast = vi.fn()
   let startGate: Promise<void> | undefined
-  const factory = (_provider: StructuredProvider, options: AdapterOptions) => { const adapter = new FakeProvider(options); adapter.startGate = startGate; adapter.nativeIdentityOnStart = nativeIdentityOnStart; adapters.push(adapter); return adapter }
+  const factory = (_provider: StructuredProvider, options: AdapterOptions) => { const adapter = new FakeProvider(options); if (permissions) adapter.capabilities.permissions = permissions; adapter.startGate = startGate; adapter.nativeIdentityOnStart = nativeIdentityOnStart; adapters.push(adapter); return adapter }
   const manager = new StructuredSessions(database, () => 'synthetic-executable', broadcast, factory, undefined, undefined, mcp); managers.push(manager)
   manager.ensure(spec)
   return { root, workspace, databasePath, database, spec, adapters, broadcast, factory, manager, gateStart(gate: Promise<void>) { startGate = gate }, get current() { return adapters.at(-1)! } }
@@ -181,6 +181,72 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBeUndefined()
     expect(f.adapters.flatMap(adapter => adapter.submissions).at(-1)?.settings.browserMcp).toBeUndefined()
     expect(f.current.options.mcpConfig).toBe('')
+  })
+
+  it.each(['claude', 'codex'] as const)('remembers the owner\'s browser choice for the next %s conversation, whoever opens it', async provider => {
+    const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
+    const f = fixture(provider, true, mcp)
+    f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })
+    const next: AgentSpec = { ...f.spec, id: 'next-session', title: 'Next' }
+    f.manager.ensure(next)
+    expect(f.database.structured.snapshot(next.id)?.settings.browserMcp).toBe(true)
+    await f.manager.submit(next.id, 'Opens with the browser', f.database.structured.snapshot(next.id)!.settings)
+    expect(f.current.options.mcpConfig).toBe('private-browser-config.json')
+    expect(mcp.configure).toHaveBeenCalledWith(next)
+    // Another provider and a local model are not touched by this provider's choice.
+    const other: AgentSpec = { ...f.spec, id: 'other-provider', provider: provider === 'claude' ? 'codex' : 'claude', title: 'Other' }
+    f.manager.ensure(other)
+    expect(f.database.structured.snapshot(other.id)?.settings.browserMcp).toBeUndefined()
+    const local: AgentSpec = { ...f.spec, id: 'local-session', provider: 'local', title: 'Local' }
+    f.manager.ensure(local)
+    expect(f.database.structured.snapshot(local.id)?.settings.browserMcp).toBeUndefined()
+    // Switching it off is remembered the same way; conversations that already exist keep their own choice.
+    f.manager.saveSettings(next.id, settings)
+    const later: AgentSpec = { ...f.spec, id: 'later-session', title: 'Later' }
+    f.manager.ensure(later)
+    expect(f.database.structured.snapshot(later.id)?.settings.browserMcp).toBeUndefined()
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBe(true)
+    // Re-registering an existing conversation (every pane mount does) never rewrites its choice.
+    f.manager.ensure(f.spec)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBe(true)
+  })
+
+  it('reconnects an idle Codex conversation only when the mode crosses the boundary that stops asking', async () => {
+    const f = fixture('codex', true, undefined, ['default', 'read-only', 'accept-edits', 'auto'])
+    await f.manager.connectSession(f.spec.id)
+    const asking = f.current
+    const nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
+    // Ask → Edit: both modes ask, so the connection stands.
+    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'accept-edits' })
+    expect(asking.disposed).toBe(false)
+    // Edit → Auto: the thread has to be started with its MCP servers cleared to run unasked.
+    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'auto' })
+    expect(asking.disposed).toBe(true)
+    expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ phase: 'disconnected', settings: { permission: 'auto' } })
+    await f.manager.submit(f.spec.id, 'Auto turn', { ...settings, permission: 'auto' })
+    const silent = f.current
+    expect(silent).not.toBe(asking)
+    expect(silent.options.nativeSessionId).toBe(nativeId)
+    expect(silent.options.settings.permission).toBe('auto')
+    // Auto → Edit during a turn waits for the turn, then reconnects before the next message.
+    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'accept-edits' })
+    expect(silent.disposed).toBe(false)
+    silent.finish()
+    await f.manager.submit(f.spec.id, 'Edit turn', { ...settings, permission: 'accept-edits' })
+    expect(silent.disposed).toBe(true)
+    expect(f.current).not.toBe(silent)
+    expect(f.current.options.nativeSessionId).toBe(nativeId)
+    expect(f.current.options.settings.permission).toBe('accept-edits')
+  })
+
+  it('never reconnects a Claude conversation for a mode change', async () => {
+    const f = fixture('claude', true, undefined, ['default', 'accept-edits', 'auto'])
+    await f.manager.connectSession(f.spec.id)
+    const runtime = f.current
+    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'auto' })
+    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'accept-edits' })
+    expect(runtime.disposed).toBe(false)
+    expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('idle')
   })
 
   it('refuses local sandbox grants on a provider that has no local sandbox', () => {
