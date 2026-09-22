@@ -18,7 +18,7 @@ export const LOCAL_TOOLS = ['read_file', 'list_files', 'search', 'write_file', '
  *  single fetch tool to a search-and-read loop with room to actually use it. */
 export interface LocalGrants { git: boolean; research: boolean }
 export const NO_GRANTS: LocalGrants = { git: false, research: false }
-export const LOCAL_CONTROL_METHODS = ['memory.recall', 'memory.remember', 'tasks.list', 'tasks.update', 'agents.list', 'agents.snapshot'] as const
+export const LOCAL_CONTROL_METHODS = ['memory.recall', 'memory.remember', 'tasks.list', 'tasks.update', 'agents.list', 'agents.snapshot', 'app.update', 'app.update.status'] as const
 export type LocalControl = (method: string, args: Record<string, unknown>) => Promise<unknown>
 export type LocalToolName = (typeof LOCAL_TOOLS)[number]
 const MUTATING: ReadonlySet<string> = new Set<string>(['write_file', 'edit_file', 'run_command'])
@@ -26,7 +26,7 @@ const MUTATING: ReadonlySet<string> = new Set<string>(['write_file', 'edit_file'
 export class ToolPolicyError extends Error {}
 
 /** Methods that write something durable, so a read-only turn must not reach them. */
-const MUTATING_CONTROL: ReadonlySet<string> = new Set<string>(['memory.remember', 'tasks.update'])
+const MUTATING_CONTROL: ReadonlySet<string> = new Set<string>(['memory.remember', 'tasks.update', 'app.update'])
 
 /** Reused at the trusted session boundary so an adapter cannot widen its own authority. */
 export function assertLocalControlAllowed(method: string, args: Record<string, unknown>, readOnly: boolean): void {
@@ -59,7 +59,7 @@ export function toolSpecs(readOnly: boolean, control = false, grants: LocalGrant
   ]
   if (grants.research) specs.push({ type: 'function', function: { name: 'web_search', description: 'Search the public web and get back a numbered list of result titles and HTTPS links. Read the promising ones with web_read. Search as many times as the question needs, with different wordings; only the query text leaves this machine, so never put private workspace content in it.', parameters: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer', description: 'How many results to return, 1 to 25. Defaults to 10.' } }, required: ['query'] } } })
   specs.push({ type: 'function', function: { name: 'web_read', description: 'GET a public HTTPS text page for research without inherited credentials or cookies. Private/local addresses are refused; shell networking stays disabled. URL paths and queries leave this machine: never include private workspace content.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } })
-  if (control) specs.push({ type: 'function', function: { name: 'conductor', description: 'Access durable project memory, the project task checklist, and the other visible conversations through Conductor. memory.remember accepts gist, kind (semantic, episodic, procedural), cues (string array); memory.recall accepts query; use these to save memory, never a filesystem path. tasks.list takes no arguments and returns the tasks plus the revision to quote back. tasks.update accepts revision (from the tasks.list you just read), id, and any of status (todo, doing, done), title, priority (high, normal, low). agents.list takes no arguments and returns the agentSessionId of every visible conversation; agents.snapshot requires one of those exact agentSessionId values and returns that conversation\'s state.', parameters: { type: 'object', properties: { method: { type: 'string', enum: LOCAL_CONTROL_METHODS.filter(method => !readOnly || !MUTATING_CONTROL.has(method)) }, args: { type: 'object' } }, required: ['method', 'args'] } } })
+  if (control) specs.push({ type: 'function', function: { name: 'conductor', description: 'Access durable project memory, the project task checklist, and the other visible conversations through Conductor. memory.remember accepts gist, kind (semantic, episodic, procedural), cues (string array); memory.recall accepts query; use these to save memory, never a filesystem path. tasks.list takes no arguments and returns the tasks plus the revision to quote back. tasks.update accepts revision (from the tasks.list you just read), id, and any of status (todo, doing, done), title, priority (high, normal, low). agents.list takes no arguments and returns the agentSessionId of every visible conversation; agents.snapshot requires one of those exact agentSessionId values and returns that conversation\'s state. app.update takes no arguments and builds this checkout into a local update the installed Conductor then offers as "Update pending" — use it when the owner asks to update the app via the updater; the owner confirms the build unless another coworker already authorized this conversation, and it returns immediately, so poll app.update.status (no arguments) every minute or so until it is no longer running. Nothing is installed for the owner.', parameters: { type: 'object', properties: { method: { type: 'string', enum: LOCAL_CONTROL_METHODS.filter(method => !readOnly || !MUTATING_CONTROL.has(method)) }, args: { type: 'object' } }, required: ['method', 'args'] } } })
   if (readOnly) return specs
   return [
     ...specs,

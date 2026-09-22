@@ -19,6 +19,7 @@ import { sanitizeDiagnostic } from './structured-store'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
+import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-review-gate'
 
 interface LiveSession {
   spec: AgentSpec
@@ -85,6 +86,11 @@ const safeErrorCode = (error: unknown): string | undefined =>
     : undefined
 
 export class StructuredSessions {
+  private approvalGate: ApprovalReviewGate
+  private reviewRouting?: ApprovalReviewRouting
+  setApprovalReviewRouting(routing: ApprovalReviewRouting): void { this.reviewRouting = routing; this.approvalGate.routing = routing }
+  markApprovalReviewer(id: string): void { this.database.setSetting('approval-reviewer:' + id, 'true') }
+  isApprovalReviewer(id: string): boolean { return this.database.getSetting('approval-reviewer:' + id) === 'true' }
   private localControl?: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>
   setLocalControl(handler: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>): void {
     this.localControl = handler
@@ -112,7 +118,12 @@ export class StructuredSessions {
     // Conductor-owned MCP servers for one session, serialized for the CLI's --mcp-config. Bound
     // at launch because a running conversation cannot be handed a new server later.
     private mcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
-  ) { this.artifacts = new AgentArtifacts(database.structured) }
+  ) {
+    this.artifacts = new AgentArtifacts(database.structured)
+    this.approvalGate = new ApprovalReviewGate(database, id => database.structured.snapshot(id)?.settings,
+      (id, runtimeId, source) => { const live = this.live.get(id); if (live && live.runtimeId === runtimeId && !live.closed) this.emit(live, source, true) },
+      response => this.respond(response, true))
+  }
 
   ensure(spec: AgentSpec): RuntimeEnsureResult {
     this.validateSpec(spec)
@@ -205,7 +216,10 @@ export class StructuredSessions {
     return {
       executable: live.executable, cwd: live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
       settings: settingsForRuntime(state.settings, runtimeId),
-      mcpConfig: live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
+      mcpConfig: this.isApprovalReviewer(id) || live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
+      approvalReviewer: this.isApprovalReviewer(id),
+      reviewApprovals: Boolean(this.reviewRouting?.enabled(live.spec)),
+      authorizeTool: (name, input) => this.approvalGate.guardTool(live.spec, name, input),
       ...(live.spec.provider === 'local' ? { localControl: async (method: string, args: Record<string, unknown>) => {
         if (live.closed || live.runtimeId !== runtimeId || !this.localControl) throw new Error('Local Conductor bridge is unavailable for this runtime')
         this.validateSpec(live.spec)
@@ -736,7 +750,7 @@ export class StructuredSessions {
       // How full the runtime's window is, from its own last usage report, so the briefing can
       // say once per band when the remaining work belongs in a fresh tab.
       const share = summarizeContext(state.items, live.adapter ? live.runtimeId : undefined)
-      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', share ? { percent: share.percent } : undefined) ?? ''
+      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' || this.isApprovalReviewer(id) ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', share ? { percent: share.percent } : undefined) ?? ''
       const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.assertPromptWithinLimit(submitted.length)
       // A queued message may have captured settings before the owner revoked browser access.
@@ -768,6 +782,7 @@ export class StructuredSessions {
     } finally { live.submitting = false; void this.drainQueue(live) }
   }
   private validateSettings(settings: SessionSettings, capabilities: import('../shared/structured-agent').ProviderCapabilities | undefined): void {
+    if (settings.reviewDelegatedActions !== undefined && typeof settings.reviewDelegatedActions !== 'boolean') throw new Error('Invalid delegated review setting')
     if (!settings || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
     if (settings.browserMcp !== undefined && typeof settings.browserMcp !== 'boolean') throw new Error('Invalid browser MCP setting')
     for (const key of ['localGit', 'localResearch'] as const) {
@@ -790,11 +805,11 @@ export class StructuredSessions {
    * may carry an older copy; preserve their model/effort/permission while taking browserMcp only
    * from the current durable projection. */
   private messageSettings(state: { settings: SessionSettings }, incoming: SessionSettings): SessionSettings {
-    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, ...message } = incoming
+    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, reviewDelegatedActions: _capturedReview, ...message } = incoming
     const authority: SessionSettings = { ...message }
     // Same rule for the local grants: a queued prompt must not carry a repository or research
     // grant the owner has since withdrawn, nor lose one they have since given.
-    for (const key of ['browserMcp', 'localGit', 'localResearch'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
+    for (const key of ['browserMcp', 'localGit', 'localResearch', 'reviewDelegatedActions'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
     return authority
   }
   private assertPromptDispatchAuthority(origin: PromptOrigin | undefined, spec: AgentSpec): void {
@@ -862,14 +877,14 @@ export class StructuredSessions {
     const allowed = validateLiveTurn(live.spec.provider as StructuredProvider, live.spec.cwd, text, settings)
     this.database.structured.reserveLive(allowed.suiteId, live.spec.provider as StructuredProvider, 2, 4, allowed.prompt)
   }
-  async respond(response: InteractionResponse): Promise<void> {
+  async respond(response: InteractionResponse, reviewedAutomatically = false): Promise<void> {
     if (!response || typeof response.requestId !== 'string' || typeof response.runtimeId !== 'string') throw new Error('Invalid response')
     const live = this.get(response.sessionId), state = this.database.structured.snapshot(response.sessionId)!
     if (!live.adapter || live.runtimeId !== response.runtimeId || state.runtimeId !== response.runtimeId || live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
     const item = state.items.find(item => item.runtimeId === response.runtimeId && item.data.type === 'interaction' && item.data.interaction.id === response.requestId && item.data.interaction.status === 'pending')
     if (!item || item.data.type !== 'interaction') throw new Error('Request is no longer pending')
     const interaction = item.data.interaction
-    if (interaction.kind === 'approval' && !interaction.choices.some(choice => choice.id === response.decision && !choice.disabled)) throw new Error('Unsupported approval scope')
+    if (interaction.kind === 'approval' && !interaction.choices.some(choice => choice.id === response.decision && (!choice.disabled || reviewedAutomatically && interaction.review))) throw new Error('Unsupported approval scope')
     if (interaction.kind === 'question') {
       if (!response.answers || Object.keys(response.answers).some(key => !interaction.questions?.some(question => question.id === key))) throw new Error('Invalid question answers')
       for (const question of interaction.questions ?? []) {
@@ -879,12 +894,18 @@ export class StructuredSessions {
         if (question.allowCustom === false && values.some(value => !question.options.some(option => option.label === value))) throw new Error('Choose one of the answers offered by this question')
       }
     }
+    const review = interaction.kind === 'approval' ? await this.approvalGate.reserve(response, reviewedAutomatically, Boolean(interaction.review || this.reviewRouting?.enabled(live.spec))) : undefined
+    // The asynchronous target/authority recheck must not race another owner response or restart.
+    if (live.runtimeId !== response.runtimeId || live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
+    if (interaction.review && !review) throw new Error('Recovered review has no live action binding; response is blocked')
     live.responses.add(response.requestId)
     try {
       await live.adapter.respond(response)
+      if (review) this.approvalGate.finish(review, true)
       const current = this.database.structured.snapshot(response.sessionId)?.items.find(entry => entry.runtimeId === response.runtimeId && entry.data.type === 'interaction' && entry.data.interaction.id === response.requestId)
       if (current?.data.type === 'interaction' && current.data.interaction.status === 'pending') this.emit(live, { requestId: response.requestId, itemId: item.nativeItemId, data: { type: 'interaction', interaction: { ...interaction, status: 'resolved', outcome: response.decision ?? 'answered' } } })
     } catch (error) {
+      if (review) this.approvalGate.finish(review, false)
       if (error instanceof InteractionResponseRejectedError) {
         live.responses.delete(response.requestId)
         throw error
@@ -1108,9 +1129,10 @@ export class StructuredSessions {
     this.database.setAgentStatus(live.spec.id, status, phase)
     this.broadcast('agent:status', { id: live.spec.id, status, phase })
   }
-  private emit(live: LiveSession, source: AdapterEvent): void {
+  private emit(live: LiveSession, source: AdapterEvent, reviewProjection = false): void {
     const store = this.database.structured, state = store.snapshot(live.spec.id)
     if (!state || live.closed) return
+    if (!reviewProjection) source = this.approvalGate.intercept(live.spec, live.runtimeId, source)
     if (source.data.type === 'input_delivery') { this.reconcileInput(live, source); return }
     // Host lifecycle hooks retain the exact tool identity; recover its recorded turn,
     // never associate output with a tool by its displayed name or position alone.

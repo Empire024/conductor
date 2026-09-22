@@ -68,9 +68,14 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   const providers: AgentProviderInfo[] = (['codex', 'claude'] as const).map(id => ({ id, displayName: id, available: true, installUrl: '', models: [{ id: id + '-synthetic', label: id + ' Synthetic' }], efforts: [{ id: 'low', label: 'Low' }] }))
   const backlogs = new ProjectBacklogs(database)
   const idleUpdate = { state: 'idle' as const, workspace: null, startedAt: null, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'No local update has been built.', log: [] as string[] }
-  const deps = { database, sessions, orchestration, collaboration, backlogs, ui, confirm, fileChanged, providers: () => providers }
+  const localUpdates = {
+    unsupported: vi.fn((): string | null => null),
+    status: vi.fn(() => idleUpdate),
+    start: vi.fn((target: string) => ({ ...idleUpdate, state: 'running' as const, workspace: target }))
+  }
+  const deps = { database, sessions, orchestration, collaboration, backlogs, ui, confirm, fileChanged, localUpdates, providers: () => providers }
   const control = new AgentControl(deps)
-  return { root, project, workspace, database, sessions, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, control, deps }
+  return { root, project, workspace, database, sessions, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, localUpdates, control, deps }
 }
 
 /** Give an agent session a visible tab, so its checklist claims count as live. */
@@ -82,6 +87,35 @@ const openAgentTab = (f: ReturnType<typeof fixture>, resourceId: string, tabId: 
 }
 
 describe('authorized native app control', () => {
+  it('builds a local app update only for the owner’s confirmation or a non-sandboxed coworker’s standing grant', async () => {
+    const f = fixture()
+    const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker' }
+    f.sessions.ensure(local)
+    openAgentTab(f, local.id, 'local-tab')
+    const localScope = { ...f.scope, agentSessionId: local.id }
+    // Asked, and a refusal builds nothing.
+    await expect(f.control.call(localScope, 'app.update')).rejects.toThrow('declined')
+    expect(f.localUpdates.start).not.toHaveBeenCalled()
+    // A sandboxed conversation cannot clear itself, and nobody clears itself.
+    await expect(f.control.call(localScope, 'app.update.authorize', { agentSessionId: f.spec.id })).rejects.toThrow('sandboxed')
+    await expect(f.control.call(f.scope, 'app.update.authorize', { agentSessionId: f.spec.id })).rejects.toThrow('itself')
+    expect(await f.control.call(f.scope, 'app.update.authorize', { agentSessionId: local.id })).toMatchObject({ authorized: true })
+    expect(await f.control.call(localScope, 'app.update')).toMatchObject({ state: 'running', workspace: f.project.path, authorizedBy: f.spec.id })
+    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path)
+    expect(f.confirm).toHaveBeenCalledTimes(1)
+    // A project that cannot build Conductor says so instead of spawning anything.
+    f.localUpdates.unsupported.mockReturnValueOnce('This project is not the Conductor desktop app, so it cannot build a Conductor update.')
+    await expect(f.control.call(localScope, 'app.update')).rejects.toThrow('not the Conductor desktop app')
+    // The clearance lapses with the tab that issued it.
+    f.database.saveSession(f.workspace.id, { version: 1, root: { type: 'group', id: 'group', activeTabId: 'local-tab', tabs: [{ id: 'local-tab', kind: 'agent', resourceId: local.id, title: 'Local', state: { provider: 'local', model: 'local-synthetic' } }] } }, null, [])
+    await expect(f.control.call(localScope, 'app.update')).rejects.toThrow('declined')
+    // Status stays readable in a read-only turn; starting a build does not.
+    const state = f.database.structured.snapshot(local.id)!
+    f.database.structured.update(local.id, { settings: { ...state.settings, permission: 'read-only' } })
+    expect(await f.control.call(localScope, 'app.update.status')).toMatchObject({ state: 'idle' })
+    await expect(f.control.call(localScope, 'app.update')).rejects.toThrow('read-only')
+    expect(f.localUpdates.start).toHaveBeenCalledTimes(1)
+  })
   it('advertises configured local models and dispatches native local coworkers within inherited read-only permissions', async () => {
     const f = fixture(false, { local: ['accept-edits', 'read-only'] })
     f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })

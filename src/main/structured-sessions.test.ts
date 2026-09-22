@@ -82,6 +82,28 @@ function fixture(provider: 'claude' | 'codex' = 'claude', nativeIdentityOnStart 
 }
 
 describe('internal local adapter availability', () => {
+  it('enforces stronger review before owner IPC can answer and never retries uncertain delivery', async () => {
+    const f = fixture()
+    let release!: (value: import('./approval-review').ReviewResult) => void, digest = ''
+    f.manager.setApprovalReviewRouting({ enabled: () => true, supportsExactExecution: () => true,
+      authorization: () => ({ id: 'owner-task', text: 'Owner authorized this workspace file write' }),
+      run: async (_spec, _action, value) => { digest = value; return new Promise(resolve => { release = resolve }) } })
+    await f.manager.submit(f.spec.id, 'Write panel.mjs', settings)
+    const request = (id: string): AdapterEvent => ({ requestId: id, itemId: 'write-' + id,
+      data: { type: 'interaction', interaction: { id, kind: 'approval', status: 'pending', title: 'Write?', input: { file_path: 'panel.mjs', content: 'one' }, choices: [{ id: 'allow', label: 'Allow' }, { id: 'deny', label: 'Deny' }] } },
+      native: { method: 'can_use_tool', payload: { tool_name: 'Write', subtype: 'can_use_tool', input: { file_path: 'panel.mjs', content: 'one' } } } })
+    f.current.emit(request('first'))
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    const runtimeId = f.database.structured.snapshot(f.spec.id)!.runtimeId!
+    await expect(f.manager.respond({ sessionId: f.spec.id, runtimeId, requestId: 'first', decision: 'allow' })).rejects.toThrow('Unsupported approval scope')
+    f.current.onResponse = async () => { throw new Error('Transport timed out after possible delivery') }
+    release({ digest, decision: 'allow', rationale: 'Authorized fixture', reviewerId: 'reviewer', model: 'claude-opus-fixture', turnId: 'review-turn' })
+    await vi.waitFor(() => expect(f.current.responses).toHaveLength(1))
+    await new Promise(resolve => setTimeout(resolve, 10))
+    f.current.emit(request('replacement'))
+    await vi.waitFor(() => expect(f.database.structured.snapshot(f.spec.id)!.items.some(item => item.data.type === 'interaction' && item.data.interaction.id === 'replacement' && item.data.interaction.review?.phase === 'blocked')).toBe(true))
+    expect(f.current.responses).toHaveLength(1)
+  })
   it('reaches actionable local setup when no external executable or local config exists', async () => {
     const f = fixture()
     const localSpec: AgentSpec = { ...f.spec, id: 'local-session', provider: 'local', title: 'Local model' }

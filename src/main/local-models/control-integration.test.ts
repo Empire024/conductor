@@ -35,7 +35,9 @@ it('binds LocalAdapter control to durable project memory, live permissions and r
   cleanup.push(() => manager.dispose())
   const orchestration = new OrchestrationStore(path), collaboration = new AgentCollaborationStore(path)
   cleanup.push(() => orchestration.close(), () => collaboration.close())
-  const control = new AgentControl({ database, sessions: manager, orchestration, collaboration, backlogs: new ProjectBacklogs(database), providers: () => [], ui: async () => ({}), confirm: async () => false, fileChanged: () => {} })
+  const idleUpdate = { state: 'idle' as const, workspace: null, startedAt: null, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'idle', log: [] }
+  const localUpdates = { unsupported: () => null, status: () => idleUpdate, start: vi.fn((target: string) => ({ ...idleUpdate, state: 'running' as const, workspace: target })) }
+  const control = new AgentControl({ database, sessions: manager, orchestration, collaboration, backlogs: new ProjectBacklogs(database), localUpdates, providers: () => [], ui: async () => ({}), confirm: async () => false, fileChanged: () => {} })
   manager.setLocalControl((bound, method, args) => control.call({ projectId: bound.projectId, sessionId: bound.sessionId, agentSessionId: bound.id }, method, args))
   manager.ensure(spec)
   database.saveSession(session.id, { version: 1, root: { type: 'group', id: 'group', activeTabId: 'local-tab', tabs: [{ id: 'local-tab', kind: 'agent', resourceId: spec.id, title: 'Local', state: { provider: 'local' } }] } }, null, [])
@@ -59,6 +61,13 @@ it('binds LocalAdapter control to durable project memory, live permissions and r
   const reopened = new ConductorDatabase(path)
   try { expect(reopened.recall(project.id, 'LOCAL_INTEGRATION_DURABLE', undefined, 12).some(entry => entry.id === memory.id)).toBe(true) } finally { reopened.close() }
   for (const [method, args] of [['router.dispatch', {}], ['memory.recall', { projectId: 'foreign' }], ['memory.remember', { gist: 'x', origin: { agentSessionId: 'forged' } }]] as const) await expect(broker(method, args)).rejects.toThrow()
+  // The updater is reachable from a local conversation, but only through the owner's dialog —
+  // this fixture declines — and it cannot be aimed anywhere but the authorized project.
+  expect(await broker('app.update.status', {})).toMatchObject({ state: 'idle' })
+  await expect(broker('app.update', {})).rejects.toThrow(/declined/)
+  await expect(broker('app.update', { workspace: 'C:/elsewhere' })).rejects.toThrow(/cannot be overridden/)
+  await expect(broker('app.update.authorize', { agentSessionId: spec.id })).rejects.toThrow(/unavailable in this mode/)
+  expect(localUpdates.start).not.toHaveBeenCalled()
   const state = database.structured.snapshot(spec.id)!
   database.structured.update(spec.id, { settings: { ...state.settings, permission: 'read-only' } })
   await expect(broker('memory.remember', { gist: 'REFUSED' })).rejects.toThrow(/unavailable/)

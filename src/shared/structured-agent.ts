@@ -26,6 +26,7 @@ export interface ProviderCapabilities {
   sandboxModes?: NonNullable<SessionSettings['sandbox']>[]
   approvalPolicies?: NonNullable<SessionSettings['approvalPolicy']>[]
   effectiveSettings?: Json
+  approvalRouting?: 'stronger-review' | 'isolated-reviewer'
   effort: string[]
   models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }>
   limitations: string[]
@@ -45,6 +46,8 @@ export interface SessionSettings {
    *  and a wide web research mode (a search tool and the tool rounds to use it). */
   localGit?: boolean
   localResearch?: boolean
+  /** Owner opt-in: bounded stronger review of this controller's delegated approval requests. */
+  reviewDelegatedActions?: boolean
   plan: boolean
 }
 /** The only real permission literals a session ever carries. Shared by the renderer's per-provider
@@ -91,6 +94,7 @@ export interface PendingInteraction {
   questions?: InputQuestion[]
   status: 'pending' | 'resolved' | 'expired'
   outcome?: string
+  review?: { id: string; digest: string; phase: string; rationale: string; reviewerModel?: string }
   /** What the owner actually answered, kept on the resolved interaction so a conversation
    *  reloaded from history still shows the answer rather than only that one was given. */
   answers?: Record<string, string | string[]>

@@ -22,7 +22,7 @@ function fixture() {
   const saveSettings = vi.fn((id: string, settings: unknown) => { states[id].settings = settings })
   const deps = {
     database: { structured: { spec: (id: string) => specs[id], snapshot: (id: string) => states[id] }, getSession: () => workspace, listSessions: () => [workspace], listDetachedWindows: () => [], getSetting: (key: string) => bindings.get(key) ?? null },
-    sessions: { saveSettings }, ui
+    sessions: { saveSettings, setApprovalReviewRouting: () => {}, isApprovalReviewer: () => false }, ui
   } as unknown as AgentControlDependencies
   return { control: new AgentControl(deps), scope, specs, states, tabs, bindings, ui, saveSettings, afterUi: (callback: () => void) => { afterUi = callback } }
 }

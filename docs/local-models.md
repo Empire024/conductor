@@ -48,9 +48,14 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
 - **A local model never gets a host shell.** Tool dispatch is an allowlist in code
   (`src/main/local-models/tools.ts`): `read_file`, `list_files`, `search`, `write_file`,
   `edit_file`, `run_command`, `web_read`, `web_search`, and `conductor`. The Conductor broker
-  permits only `memory.recall`, `memory.remember`, `tasks.list`, `tasks.update`, `agents.list`
-  and `agents.snapshot`, bound to the registered project/session, each with its own argument
-  allowlist. Read-only turns cannot remember or update tasks. Caller-supplied scope, arbitrary
+  permits only `memory.recall`, `memory.remember`, `tasks.list`, `tasks.update`, `agents.list`,
+  `agents.snapshot`, `app.update` and `app.update.status`, bound to the registered
+  project/session, each with its own argument allowlist. Read-only turns cannot remember, update
+  tasks or start a build. `app.update` is the one capability that reaches host code — it runs the
+  existing local-update build for the owner — and it never runs unasked: either the owner
+  confirms that build in the app, or a non-sandboxed coworker cleared this conversation for it
+  with `app.update.authorize`, which a local model itself can never call. The build publishes an
+  update the owner still has to accept; nothing is installed for them. Caller-supplied scope, arbitrary
   MCP calls, PowerShell, browser automation, connectors and credential access are refused.
 - **Execution fails closed.** `run_command` only ever runs `docker exec` into the sandbox. If
   Docker is stopped, missing or broken, the call is refused — it never falls back to PowerShell,

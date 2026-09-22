@@ -1069,6 +1069,11 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 .tab-activity .tab-ring circle { fill: none; stroke: var(--text-3); stroke-width: 1.5; stroke-dasharray: 28 12; transform-origin: 9px 9px; opacity: .45; transition: stroke .35s ease, fill .35s ease, opacity .35s ease; }
 .tab-activity .tab-ring path { fill: none; stroke: #011627; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 12; stroke-dashoffset: 12; transition: stroke-dashoffset .36s cubic-bezier(.2,.8,.2,1) .08s; }
 .tab-activity.working .tab-ring circle { stroke: var(--accent); opacity: 1; animation: spin var(--spin-duration) linear infinite; }
+/* Work the runtime backgrounded is still this conversation's work, so it keeps the turning accent
+ * ring rather than the finished checkmark, dimmed because nothing is streaming into the tab while
+ * it waits to be woken. The shared duration is what keeps every ring in step (see spin-sync), so
+ * only the opacity differs; the churning tab background below stays with 'working' alone. */
+.tab-activity.waiting_background .tab-ring circle { stroke: var(--accent); opacity: .7; animation: spin var(--spin-duration) linear infinite; }
 .tab-activity.complete .tab-ring circle { fill: #22c57a; stroke: #22c57a; stroke-dasharray: 40; opacity: 1; animation: activity-pop .38s cubic-bezier(.16,1.4,.25,1); }
 .tab-activity.complete .tab-ring path { stroke-dashoffset: 0; }
 .tab-activity.waiting_input .tab-ring circle { stroke: #ecc48d; opacity: .8; }

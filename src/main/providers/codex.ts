@@ -27,6 +27,7 @@ import type { ThreadForkResponse } from './generated/codex/v2/ThreadForkResponse
 import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
+import { canonicalAction } from '../approval-review'
 
 export const CODEX_PROTOCOL_BASELINE = '0.155.1'
 type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait'>>
@@ -55,14 +56,14 @@ const statusFor = (status: string, complete: boolean): ActivityStatus => status 
  * Codex's own `/permissions` presets, expressed in the modes the composer offers; the composer
  * mode is the one place a conversation's Codex permissions are chosen. Ask leaves the installed
  * CLI's configuration alone; Read only inspects; Edit runs workspace work unprompted and asks
- * before leaving the workspace; Auto never interrupts the owner: Codex asks the same way it does
- * under Edit (`on-request`, the policy its own automatic mode uses) and Conductor answers every
- * request itself — MCP tools such as the project browser and Chrome are allowed, anything that
- * would leave the workspace sandbox is declined — and the unattended commands get the network.
+ * before leaving the workspace; Auto asks the same way it does under Edit (`on-request`, the
+ * policy its own automatic mode uses). Enabled MCP tools are allowed automatically; native
+ * command/file/permission requests remain pending for an explicit decision, and unattended
+ * commands get the network. A policy's inability to approve is not an owner denial.
  * `never` is deliberately not used: under it Codex refuses, rather than asks about, any MCP tool
  * not annotated read-only (verified against codex-cli 0.155.1), which is how Auto lost every
- * browser tool. Writes stay inside the workspace in every mode: Conductor has no equivalent of
- * `danger-full-access`.
+ * browser tool. Conductor has no blanket `danger-full-access` preset; native escalation still
+ * requires the provider's genuine approval response.
  */
 const PERMISSION_PRESETS: Record<SessionSettings['permission'], { sandbox: NonNullable<SessionSettings['sandbox']>; approvalPolicy: NonNullable<SessionSettings['approvalPolicy']>; network: boolean; unattended: boolean }> = {
   default: { sandbox: 'inherit', approvalPolicy: 'inherit', network: false, unattended: false },
@@ -251,8 +252,10 @@ export class CodexAdapter implements ProviderAdapter {
   private defaults?: ThreadStartResponse
   private models: Model[] = []
   private experimental = false
-  /** Auto: Conductor answers Codex's approval requests itself instead of asking the owner. */
+  /** Auto answers enabled MCP requests; other native approvals remain pending. */
   private unattended = false
+  /** A changed payload cannot reuse its old card identity again in this runtime. */
+  private invalidApprovalRequests = new Set<string>()
   private sandboxSetupNoticed = false
   /** MCP servers Codex reported for this thread and their latest startup state. */
   private mcpStartup = new Map<string, string>()
@@ -456,7 +459,7 @@ export class CodexAdapter implements ProviderAdapter {
   async respond(response: InteractionResponse): Promise<void> {
     if (response.runtimeId !== this.options.runtimeId || this.failed || this.disposed || !this.transport?.connected) throw new Error('This Codex interaction belongs to a stale runtime')
     const pending = this.pending.get(response.requestId)
-    if (!pending) throw new Error('Codex interaction has expired or was already answered')
+    if (!pending || this.invalidApprovalRequests.has(response.requestId)) throw new Error('Codex interaction has expired or was already answered')
     const { request, interaction } = pending
     let result: Json
     if (request.method === 'item/tool/requestUserInput') {
@@ -839,7 +842,18 @@ export class CodexAdapter implements ProviderAdapter {
       return
     }
     const id = requestKey(request.id)
-    if (this.pending.has(id)) throw new Error('Duplicate provider request ID')
+    if (this.invalidApprovalRequests.has(id) || this.invalidApprovalRequests.size >= 128) throw new Error('Provider approval identity was invalidated; a fresh native request is required')
+    const previous = this.pending.get(id)
+    if (previous) {
+      // Repeated delivery of the same live request needs neither a second card nor a response.
+      if (previous.request.method === request.method && canonicalAction(previous.request.params) === canonicalAction(params)) return
+      // An old view must not approve a replacement action under the same request identity.
+      this.pending.delete(id)
+      this.invalidApprovalRequests.add(id)
+      this.emitInteraction(previous.request, { ...previous.interaction, status: 'expired', outcome: 'Native approval arguments changed; the old choice is invalid. A fresh request is required.' })
+      this.emitPhase()
+      throw new Error('Provider approval identity was reused with changed arguments')
+    }
     if (this.pending.size >= 128) throw new Error('Too many pending provider requests')
     let choices = [{ id: 'accept', label: 'Allow once' }, { id: 'acceptForSession', label: 'Allow for this session' }, { id: 'decline', label: 'Deny' }, { id: 'cancel', label: 'Cancel turn' }]
     let title = 'Approve file changes'
@@ -854,15 +868,17 @@ export class CodexAdapter implements ProviderAdapter {
       choices = [{ id: 'accept', label: 'Allow once' }, ...(mcpApproval.persist.includes('session') ? [{ id: 'acceptForSession', label: 'Allow for this session' }] : []), { id: 'decline', label: 'Deny' }]
     }
     const isQuestion = request.method === 'item/tool/requestUserInput'
-    // Auto never interrupts the owner: Conductor answers approvals itself. MCP tools are what the
-    // owner switched on (the project browser, Chrome, …), so they are allowed; every other request
-    // under a prompting policy asks to leave the workspace sandbox, which stays declined exactly as
-    // Codex's `never` would. Questions are not approvals and still reach the owner.
-    if (this.unattended && !isQuestion) {
-      const decision = mcpApproval ? (mcpApproval.persist.includes('session') ? 'acceptForSession' : 'accept') : choices.some(choice => choice.id === 'decline') ? 'decline' : 'cancel'
+    // Preserve the existing host review gate. A native escalation Auto cannot approve must
+    // become a pending interaction, never a synthetic owner denial or a turn cancellation.
+    if (this.unattended && mcpApproval && !this.options.reviewApprovals && !this.options.approvalReviewer) {
+      const decision = mcpApproval.persist.includes('session') ? 'acceptForSession' : 'accept'
       this.transport?.send({ id: request.id, result: this.decisionResult(request, decision) })
-      this.emit({ ...this.correlation(params), data: { type: 'notice', message: mcpApproval ? `Auto allowed ${mcpApproval.serverName}/${mcpApproval.tool} without asking.` : `Auto declined “${title}” to keep the workspace sandbox.` }, native: { method: request.method, payload: json(params) } })
+      this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto allowed ${mcpApproval.serverName}/${mcpApproval.tool} without asking.` }, native: { method: request.method, payload: json(params) } })
       return
+    }
+    if (this.unattended && !isQuestion && !mcpApproval) {
+      choices = choices.filter(choice => choice.id !== 'acceptForSession')
+      if (!this.options.reviewApprovals) this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto could not approve “${title}”. The native request is pending; review it and choose an offered action.` } })
     }
     const interaction: PendingInteraction = {
       id, kind: isQuestion ? 'question' : 'approval', title: isQuestion ? 'Codex needs your input' : title,

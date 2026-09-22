@@ -14,6 +14,12 @@ export interface AdapterOptions {
   environment?: NodeJS.ProcessEnv
   /** Backend-created provider-native MCP configuration file (or bounded inline fallback). */
   mcpConfig?: string
+  /** Host-only reviewer isolation; never accepted from worker settings or app-control input. */
+  approvalReviewer?: boolean
+  /** Delegated native approval events must pass the host reviewer gate, including Auto mode. */
+  reviewApprovals?: boolean
+  /** Host denial fence, including tools which native remembered rules would otherwise allow. */
+  authorizeTool?(name: string, input: Json): Promise<string | undefined>
   /** Trusted, registered-session broker for the Local runtime only. Never a bearer token. */
   localControl?(method: string, args: Record<string, unknown>): Promise<unknown>
 }

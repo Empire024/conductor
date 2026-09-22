@@ -78,6 +78,7 @@ import { registerAgentCollaborationIpc } from './agent-collaboration-ipc'
 import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
+import { LocalUpdateBuilder } from './local-update-build'
 import { normalizeUpdateFeedUrl } from './update-config'
 import { createUntitledEditorFile, EDITOR_CONFLICT_MESSAGE, readEditorFile, saveEditorCopy, writeEditorFile } from './editor-files'
 import { readExistingTextFile, readTextFile } from './text-files'
@@ -121,6 +122,7 @@ let agentControlUi: AgentControlUi | undefined
 let browserMcp: BrowserMcpServer | undefined
 let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
+const localUpdateBuilder = new LocalUpdateBuilder()
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
 const detachedWindows = new Map<string, BrowserWindow>()
@@ -2054,6 +2056,7 @@ app.whenReady().then(async () => {
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
   // without it the two initializers form an inference cycle.
   const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
+    localUpdates: localUpdateBuilder,
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),

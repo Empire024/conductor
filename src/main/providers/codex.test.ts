@@ -159,7 +159,7 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(last).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite' }, collaborationMode: { mode: 'default' } } })
   })
 
-  it('carries each composer mode into the Codex approval preset it names, and only Auto stops asking', async () => {
+  it('carries each composer mode into the Codex approval preset it names', async () => {
     const { adapter, events, sent } = create()
     const starts = (): Json[] => sent.filter(message => (message as { method?: string }).method === 'turn/start')
     const turn = async (settings: SessionSettings): Promise<Json | undefined> => {
@@ -171,7 +171,7 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     // Edit: workspace work runs unprompted; leaving the workspace is a request the owner answers.
     expect(await turn({ ...settings, permission: 'accept-edits' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false } } })
     expect((starts().at(-1) as { params: Record<string, unknown> }).params.approvalsReviewer).toBeUndefined()
-    // Auto asks Codex the same way, routes every request to Conductor (which answers it) and carries the network.
+    // Auto routes requests to Conductor's native approval path and carries the network.
     expect(await turn({ ...settings, permission: 'auto' })).toMatchObject({ params: { approvalPolicy: 'on-request', approvalsReviewer: 'user', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
     // The composer mode is the only place permissions are chosen: overrides stored by earlier versions change nothing.
     expect(await turn({ ...settings, permission: 'auto', approvalPolicy: 'untrusted', sandbox: 'read-only' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
@@ -200,14 +200,18 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     expect(auto.events.some(event => event.data.type === 'tool' && event.data.name === 'conductor-browser/browser_snapshot' && event.data.status === 'completed')).toBe(true)
   })
 
-  it('declines a request to leave the workspace sandbox itself in Auto, and still asks the owner questions', async () => {
+  it('keeps a native sandbox escalation pending in Auto until the owner answers, and still asks questions', async () => {
     const auto = create({}, undefined, 3000, { ...settings, permission: 'auto' })
     await auto.adapter.submit('synthetic:approval', { ...settings, permission: 'auto' })
+    await waitFor(() => Boolean(pendingId(auto.events)))
+    expect(auto.sent.find(message => (message as { id?: unknown }).id === 500)).toBeUndefined()
+    expect(auto.events.some(event => event.data.type === 'notice' && /^Auto could not approve/.test(event.data.message))).toBe(true)
+    expect(auto.events.at(-1)?.data).toMatchObject({ type: 'session', phase: 'waiting_approval' })
+    expect(auto.sent.some(message => (message as { method?: string }).method === 'turn/interrupt')).toBe(false)
+    await auto.adapter.respond({ sessionId: 's', runtimeId: 'runtime-1', requestId: pendingId(auto.events)!, decision: 'accept' })
     await waitFor(() => completed(auto.events))
-    expect(auto.events.some(event => event.data.type === 'interaction')).toBe(false)
-    expect(auto.sent.find(message => (message as { id?: unknown }).id === 500)).toEqual({ id: 500, result: { decision: 'decline' } })
-    expect(auto.events.some(event => event.data.type === 'notice' && /^Auto declined/.test(event.data.message))).toBe(true)
-    expect(auto.events.some(event => event.data.type === 'tool' && event.data.status === 'rejected')).toBe(true)
+    expect(auto.sent.filter(message => (message as { id?: unknown }).id === 500)).toEqual([{ id: 500, result: { decision: 'accept' } }])
+    expect(auto.events.some(event => event.data.type === 'tool' && event.data.status === 'completed')).toBe(true)
     const asked = create({}, undefined, 3000, { ...settings, permission: 'auto' })
     await asked.adapter.submit('synthetic:question', { ...settings, permission: 'auto' })
     await waitFor(() => Boolean(pendingId(asked.events)))

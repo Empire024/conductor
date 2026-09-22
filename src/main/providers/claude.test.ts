@@ -48,6 +48,68 @@ function hook(requestId: string, callback: string, toolId: string, name: string,
 }
 
 describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
+  it('isolates a host reviewer before startup and refuses a resumed reviewer', async () => {
+    const f = fixture({ approvalReviewer: true, mcpConfig: '{"mcpServers":{"unwanted":{}}}' })
+    await f.adapter.start()
+    const args = f.transport.options.args
+    expect(args).toContain('--bare')
+    expect(args).toContain('--strict-mcp-config')
+    expect(args[args.indexOf('--tools') + 1]).toBe('')
+    expect(args[args.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}')
+    expect(f.adapter.capabilities.approvalRouting).toBe('isolated-reviewer')
+    await expect(fixture({ approvalReviewer: true, nativeSessionId: 'old-native' }).adapter.start()).rejects.toThrow('fresh isolated')
+  })
+
+  it('routes managed Auto workers through native manual approval without changing their configured mode', async () => {
+    const f = fixture({ reviewApprovals: true, settings: { permission: 'auto', plan: false } })
+    await f.adapter.start()
+    expect(f.transport.options.args[f.transport.options.args.indexOf('--permission-mode') + 1]).toBe('manual')
+    expect(f.adapter.capabilities.approvalRouting).toBe('stronger-review')
+    await f.adapter.submit('Work', { permission: 'auto', plan: false })
+    expect(f.projection().settings.permission).toBe('auto')
+  })
+
+  it('does not replay a cached allow after the native request changes arguments', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    await f.adapter.submit('Edit', settings)
+    f.transport.receive(permission('same-id', 'write', 'Write', { file_path: 'a.txt', content: 'one' }))
+    await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'same-id', decision: 'allow' })
+    f.transport.receive(permission('same-id', 'write', 'Write', { file_path: 'a.txt', content: 'two' }))
+    await flush()
+    expect(JSON.stringify(f.transport.sent.at(-1))).toContain('changed arguments')
+    expect(JSON.stringify(f.transport.sent.at(-1))).not.toContain('"behavior":"allow"')
+  })
+
+  it('returns native PreToolUse denial even for a tool remembered as allowed by the CLI', async () => {
+    const beforeTool = vi.fn(), f = fixture({ authorizeTool: async () => 'Persistent owner denial', beforeTool })
+    await f.adapter.start()
+    f.transport.receive(hook('fence', 'conductor_before', 'tool', 'Write', { file_path: 'a.txt', content: 'x' }))
+    await flush()
+    expect(f.transport.sent).toContainEqual(expect.objectContaining({ response: expect.objectContaining({ response: { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Persistent owner denial' } } }) }))
+    expect(beforeTool).not.toHaveBeenCalled()
+  })
+
+  it('refuses to send a turn after a successful control reply reports a different effective permission', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    f.transport.autoControlResponses = false
+    const submitted = f.adapter.submit('Auto work', { ...settings, permission: 'auto' })
+    await flush()
+    const control = f.transport.sent.at(-1) as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: control.request_id, response: { permissionMode: 'default' } } })
+    await expect(submitted).rejects.toThrow('native mode remains default')
+    expect(f.projection().capabilities?.effectiveSettings).toMatchObject({ permissionMode: 'default' })
+    expect(f.transport.sent.some(item => (item as { type?: string }).type === 'user')).toBe(false)
+  })
+
+  it('does not repeatedly reset a native resolved model alias or equivalent default permission', async () => {
+    const f = fixture({ settings: { ...settings, model: 'haiku' } })
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'init', model: 'claude-haiku-4-5-20251001', permissionMode: 'default' })
+    await f.adapter.submit('Continue', { ...settings, model: 'haiku' })
+    expect(f.transport.sent.some(item => /set_model|set_permission_mode/.test(JSON.stringify(item)))).toBe(false)
+  })
   it('connects to patch and minor releases at or above the baseline, recording the unverified gap', async () => {
     expect(claudeCompatibility(CLAUDE_COMPATIBILITY)).toEqual({ supported: true, verified: true })
     expect(claudeCompatibility('2.1.280')).toEqual({ supported: true, verified: false })
@@ -96,6 +158,43 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     f.transport.receive({ type: 'system', subtype: 'init', session_id: 'native-after-first-turn', model: 'fixture-model', claude_code_version: '2.1.263' })
 
     expect(f.projection()).toMatchObject({ phase: 'running', nativeSessionId: 'native-after-first-turn' })
+  })
+
+  it('keeps native permission drift authoritative across startup and resume', async () => {
+    const f = fixture({ settings: { ...settings, permission: 'auto' } })
+    await f.adapter.start()
+    f.transport.receive({ type: 'system', subtype: 'init', model: 'fixture-model', permissionMode: 'auto' })
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ permissionMode: 'auto' })
+    await f.adapter.submit('Already auto', { ...settings, permission: 'auto' })
+    expect(f.transport.sent.filter(value => JSON.stringify(value).includes('set_permission_mode'))).toHaveLength(0)
+
+    f.transport.receive({ type: 'result', subtype: 'success', usage: {} })
+    f.transport.receive({ type: 'system', subtype: 'init', model: 'fixture-model', permissionMode: 'manual' })
+    await f.adapter.submit('Restore auto', { ...settings, permission: 'auto' })
+    expect(f.transport.sent).toContainEqual(expect.objectContaining({ request: { subtype: 'set_permission_mode', mode: 'auto' } }))
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ permissionMode: 'auto' })
+  })
+
+  it('reports an acknowledged native setting without replacing the configured settings', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    await f.adapter.submit('Switch mode', { ...settings, permission: 'accept-edits', effort: 'high' })
+    expect(f.projection().settings).toMatchObject({ permission: 'accept-edits', effort: 'high' })
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ permissionMode: 'acceptEdits', effort: 'high' })
+    expect(f.events.some(event => event.data.type === 'notice' && event.data.message.includes('acknowledged'))).toBe(true)
+  })
+
+  it('reports a rejected native setting and preserves the prior effective mode', async () => {
+    const f = fixture()
+    await f.adapter.start()
+    f.transport.autoControlResponses = false
+    const pending = f.adapter.submit('Rejected mode', { ...settings, permission: 'auto' })
+    await flush()
+    const request = f.transport.sent.find(value => (value as { type?: string; request?: { subtype?: string } }).request?.subtype === 'set_permission_mode') as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: 'error', request_id: request.request_id, error: 'managed policy denied auto' } })
+    await expect(pending).rejects.toThrow('managed policy denied auto')
+    expect((f.adapter.capabilities.effectiveSettings as Record<string, Json>)?.permissionMode).not.toBe('auto')
+    expect(f.events).toContainEqual(expect.objectContaining({ data: { type: 'error', message: 'managed policy denied auto' } }))
   })
 
   it('reconciles by message identity, preserves repeated chunks, and never calls input completion execution', async () => {

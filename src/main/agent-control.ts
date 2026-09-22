@@ -21,7 +21,9 @@ import { writeEditorFile } from './editor-files'
 import { readTextFile } from './text-files'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { inheritMachineId, machineRunsProject, tabMachineId } from './machines'
+import type { LocalUpdateBuildService } from './local-update-build'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
+import { createApprovalRouting } from './approval-review-routing'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -118,6 +120,9 @@ const toolSignatures = {
   'orchestration.tasks.update': '({id,title?,description?,priority?,status?,assignedAgentId?})',
   'orchestration.routines.save': '({id?,name,description?,steps:[{title,instructions?,assignedAgentId?}]})',
   'workspace.rename': '({title})',
+  'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. The owner confirms each build, unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner accepts it',
+  'app.update.status': '() — state, version, log tail and result of the local update build',
+  'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
   'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does'
 } as const
@@ -132,6 +137,8 @@ export interface AgentControlDependencies {
   orchestration: OrchestrationStore
   collaboration: AgentCollaborationStore
   backlogs: ProjectBacklogs
+  /** Builds and publishes a local app update on the host; absent where that is not available. */
+  localUpdates?: LocalUpdateBuildService
   providers(): AgentProviderInfo[]
   /** This machine plus any paired machines a tab may be placed on. */
   machines?(): MachineDescriptor[]
@@ -145,9 +152,27 @@ export interface AgentControlDependencies {
 
 /** A facade over the app's native state. Callers cannot supply or change their authority. */
 export class AgentControl {
-  constructor(private readonly deps: AgentControlDependencies) {}
+  constructor(private readonly deps: AgentControlDependencies) {
+    deps.sessions.setApprovalReviewRouting(createApprovalRouting(deps, {
+      controller: id => this.linkFor(id)?.controllerAgentSessionId,
+      localAndOpen: spec => {
+        const tab = this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }).find(tab => tab.resourceId === spec.id)
+        return Boolean(tab && !tab.state?.remotePeerId && tabMachineId(tab) === LOCAL_MACHINE_ID)
+      },
+      discoveredOpus: spec => {
+        const entry = this.catalog({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }).find(provider => provider.provider === 'claude' && provider.available && provider.source === 'runtime')
+        return entry?.models.find(model => model.id === 'opus[1m]')?.id ?? entry?.models.find(model => model.id === 'opus')?.id
+      },
+      open: async (spec, model) => (await this.open({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, { provider: 'claude', model, title: 'Stronger approval review', permission: 'default', focus: false }, true)).resourceId!
+    }))
+  }
+
+  /** Conversations a non-local coworker cleared to build a local update without asking the owner
+   *  again. Deliberately in memory only: the clearance dies with this Conductor process. */
+  private readonly updateGrants = new Map<string, { controllerAgentSessionId: string; projectId: string; grantedAt: string }>()
 
   authorize(scope: AgentControlScope): AgentSpec {
+    if (this.deps.sessions.isApprovalReviewer(scope.agentSessionId)) throw new Error('Approval reviewers have no app-control or delegation authority')
     const { database } = this.deps
     const spec = database.structured.spec<AgentSpec>(scope.agentSessionId)
     const workspace = database.getSession(scope.sessionId)
@@ -483,7 +508,7 @@ export class AgentControl {
     return tabMachineId(this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId))
   }
 
-  private async open(scope: AgentControlScope, args: Args): Promise<AgentControlTab & { projectId: string; workspaceId: string; grants?: { repository: boolean; research: boolean } }> {
+  private async open(scope: AgentControlScope, args: Args, approvalReviewer = false): Promise<AgentControlTab & { projectId: string; workspaceId: string; grants?: { repository: boolean; research: boolean } }> {
     const kind = (args.kind ?? 'agent') as PaneKind
     const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs']
     if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
@@ -516,6 +541,7 @@ export class AgentControl {
         if (provider !== 'local') throw new Error('Repository and research grants apply to local models only')
       }
       tab.resourceId = makeId('agent')
+      if (approvalReviewer) this.deps.sessions.markApprovalReviewer(tab.resourceId)
       tab.title = args.title === undefined ? model.label : title
       tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual', machineId }
       // A tab handed to a sibling project belongs to that project and works in its folder, not in
@@ -757,10 +783,52 @@ export class AgentControl {
       if (!Array.isArray(args.steps) || args.steps.length > 100) throw new Error('Invalid routine steps')
       return orchestration.saveRoutine({ ...args, projectId: scope.projectId, name: text(args, 'name', 200) } as unknown as SaveRoutineInput)
     }
+    if (method.startsWith('app.update')) return this.localUpdate(scope, source, method, args)
     if (method === 'workspace.rename') return this.ui(scope, 'workspace.rename', { title: text(args, 'title', 120) })
     if (method === 'router.start') return this.startRouter(scope, args)
     if (method === 'router.dispatch') return this.dispatchRouter(scope, args)
     throw new Error('Unknown control method; use tools.list')
+  }
+
+  /**
+   * Building the installed app from this working tree runs host code, which is exactly what a
+   * sandboxed local model is otherwise kept away from — so the build is never something a
+   * conversation decides on its own. Either the owner confirms this one, or a coworker that is
+   * not itself sandboxed authorized this conversation for it beforehand and still has its tab
+   * open. The build only publishes into the local feed; accepting the update stays a click the
+   * owner makes in the app.
+   */
+  private async localUpdate(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const builder = this.deps.localUpdates
+    if (!builder) throw new Error('Local update builds are unavailable in this Conductor')
+    if (method === 'app.update.status') return builder.status()
+    if (method === 'app.update.authorize') {
+      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot authorize app.update. The owner confirms it, or a non-local coworker grants it.')
+      const id = text(args, 'agentSessionId', 160)
+      if (Object.keys(args).some(key => !['agentSessionId', 'allowed'].includes(key))) throw new Error('app.update.authorize accepts only agentSessionId and allowed')
+      if (args.allowed !== undefined && typeof args.allowed !== 'boolean') throw new Error('allowed must be true or false')
+      // Ownership is the same rule steering uses: a tab this caller may drive, never itself.
+      this.target(scope, id, true)
+      if (args.allowed === false) { this.updateGrants.delete(id); return { agentSessionId: id, authorized: false } }
+      this.updateGrants.set(id, { controllerAgentSessionId: scope.agentSessionId, projectId: scope.projectId, grantedAt: new Date().toISOString() })
+      return { agentSessionId: id, authorized: true, grantedBy: scope.agentSessionId, note: 'That conversation can now run app.update without the owner dialog while this tab stays open and Conductor keeps running.' }
+    }
+    if (method !== 'app.update') throw new Error('Unknown control method; use tools.list')
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    const unsupported = builder.unsupported(source.cwd)
+    if (unsupported) throw new Error(unsupported)
+    const running = builder.status()
+    if (running.state === 'running') return { ...running, note: 'A local update build is already running; poll app.update.status.' }
+    const grant = this.updateGrants.get(scope.agentSessionId)
+    // A grant lapses with the tab that issued it: nobody is left to answer for the build.
+    const granted = Boolean(grant && this.claimHolderIsOpen(grant.projectId, grant.controllerAgentSessionId))
+    if (!granted) {
+      this.updateGrants.delete(scope.agentSessionId)
+      if (!await this.deps.confirm(scope, `${source.title} wants to build Conductor from this working tree and publish it as a local update.`)) throw new Error('The owner declined to build a local update')
+    }
+    this.authorize(scope)
+    return { ...builder.start(source.cwd), authorizedBy: granted ? grant!.controllerAgentSessionId : 'owner' }
   }
 
   private router(scope: AgentControlScope, provider: StructuredProvider, model: string) {

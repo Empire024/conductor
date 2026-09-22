@@ -1,6 +1,6 @@
 import { readClaudeTaskOutput } from './claude-task-output'
 import { execFile } from 'node:child_process'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { workspacePath } from '../agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
@@ -109,6 +109,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   private maxOutputTokens?: number
 
   constructor(private options: AdapterOptions, private dependencies: Dependencies = {}) {
+    if (options.approvalReviewer || options.reviewApprovals) this.providerCapabilities.approvalRouting = options.approvalReviewer ? 'isolated-reviewer' : 'stronger-review'
     this.nativeSessionId = options.nativeSessionId
     this.settings = { ...settingsForRuntime(options.settings, options.runtimeId) }
   }
@@ -157,11 +158,17 @@ export class ClaudeAdapter implements ProviderAdapter {
       '--forward-subagent-text', '--permission-mode', this.permissionMode(this.settings)]
     if (this.settings.model) args.push('--model', this.settings.model)
     if (this.settings.effort) args.push('--effort', this.settings.effort)
+    if (this.options.approvalReviewer) {
+      // Host-only role: no tools, plugins/hooks/project instructions or MCP, before any model
+      // turn starts. OAuth remains the normal native authentication path; no bypass flags.
+      if (this.nativeSessionId) throw new Error('Approval reviewers must start a fresh isolated native session')
+      args.push('--bare', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}')
+    }
     // Conductor's own MCP servers (currently the browser view) are attached at launch so the
     // tools are simply present: there is no way to hand a running conversation a new server, and
     // the owner should never have to restart one to get them. --mcp-config is additive, so the
     // owner's own MCP configuration is untouched; --strict-mcp-config is deliberately not sent.
-    if (this.options.mcpConfig) args.push('--mcp-config', this.options.mcpConfig)
+    if (!this.options.approvalReviewer && this.options.mcpConfig) args.push('--mcp-config', this.options.mcpConfig)
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // No --bare, --system-prompt, --setting-sources, or environment auth mutation:
     // CLI defaults retain the coding-agent prompt, user/project/local configuration and policy.
@@ -206,18 +213,46 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.validateSettings(settings)
     const messageId = randomUUID()
     const message = await this.userMessage(text, attachments, messageId)
-    if (settings.effort !== this.settings.effort) await this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: settings.effort ?? null } })
-    if (settings.model !== this.settings.model) await this.control({ subtype: 'set_model', model: settings.model ?? null })
-    if (this.permissionMode(settings) !== this.permissionMode(this.settings)) await this.control({ subtype: 'set_permission_mode', mode: this.permissionMode(settings) })
+    try {
+      const effective = object(this.capabilities.effectiveSettings)
+      // Before the first native init frame, retain the launch configuration as the
+      // provisional effective state. Once native reports a value, it remains authoritative.
+      this.capabilities.effectiveSettings = {
+        ...effective,
+        ...(effective.effort === undefined ? { effort: this.settings.effort ?? null } : {}),
+        ...(effective.permissionMode === undefined ? { permissionMode: this.permissionMode(this.settings) } : {})
+      }
+      if (settings.effort !== this.settings.effort) {
+        const response = await this.control({ subtype: 'apply_flag_settings', settings: { effortLevel: settings.effort ?? null } })
+        this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), effort: string(response.effortLevel) ?? settings.effort ?? null }
+      }
+      if (settings.model !== this.settings.model) {
+        const response = await this.control({ subtype: 'set_model', model: settings.model ?? null })
+        this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), model: string(response.model) ?? settings.model ?? null }
+      }
+      const requestedMode = this.permissionMode(settings)
+      const nativeMode = string(effective.permissionMode) ?? this.permissionMode(this.settings)
+      if (requestedMode !== (nativeMode === 'default' ? 'manual' : nativeMode)) {
+        const response = await this.control({ subtype: 'set_permission_mode', mode: requestedMode })
+        this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), permissionMode: string(response.permissionMode) ?? string(response.mode) ?? requestedMode }
+        const applied = string(object(this.capabilities.effectiveSettings).permissionMode)
+        if ((applied === 'default' ? 'manual' : applied) !== requestedMode) throw new Error(`Claude did not apply permission mode ${requestedMode}; native mode remains ${applied}`)
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Claude setting update failed'
+      this.emit({ data: { type: 'error', message } })
+      this.emit({ data: { type: 'session', phase: 'idle', capabilities: this.capabilities } })
+      throw error
+    }
     this.settings = { ...settings }
-    this.capabilities.effectiveSettings = { ...object(this.capabilities.effectiveSettings), ...(settings.model ? { model: settings.model } : {}), effort: settings.effort ?? null, permissionMode: this.permissionMode(settings) }
+    this.emit({ data: { type: 'notice', message: 'Claude settings acknowledged by native runtime', payload: this.capabilities.effectiveSettings } })
     this.turnId = messageId
     this.hasAssistantText = false
     this.stopRequested = false
     this.active = true
     try {
       this.transport.send(message)
-      this.emit({ data: { type: 'session', phase: 'running', capabilities: this.capabilities } })
+      this.emit({ data: { type: 'session', phase: 'running', settings: { ...this.settings }, capabilities: this.capabilities } })
     } catch (error) { this.active = false; throw error }
   }
 
@@ -351,7 +386,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (settings.permission === 'read-only') throw new Error('Claude CLI has no Conductor read-only sandbox; use explicit permissions or plan mode')
     if (settings.effort && !this.capabilities.effort.includes(settings.effort)) throw new Error('Unsupported Claude effort level')
   }
-  private permissionMode(settings: SessionSettings): string { return settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
+  private permissionMode(settings: SessionSettings): string { return settings.plan ? 'plan' : this.options.reviewApprovals || this.options.approvalReviewer ? 'manual' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
   private async imageInput(attachment: ContextAttachment): Promise<Json> {
     if (!attachment.path) throw new Error('Claude image attachment requires a local workspace path')
     const path = await workspacePath(this.options.cwd, attachment.path)
@@ -542,7 +577,14 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (type === 'system' && message.subtype === 'init') {
       this.configurationMetadata = message
       if (typeof message.model === 'string') this.resetContextForModel(message.model)
-      if (typeof message.model === 'string') this.capabilities.effectiveSettings = { model: message.model, effort: this.settings.effort ?? string(message.effort) ?? null, permissionMode: string(message.permissionMode) ?? this.permissionMode(this.settings) }
+      if (typeof message.model === 'string' || typeof message.effort === 'string' || typeof message.permissionMode === 'string' || typeof message.permission_mode === 'string') {
+        this.capabilities.effectiveSettings = {
+          ...object(this.capabilities.effectiveSettings),
+          ...(typeof message.model === 'string' ? { model: message.model } : {}),
+          ...(typeof message.effort === 'string' ? { effort: message.effort } : {}),
+          ...((typeof message.permissionMode === 'string' || typeof message.permission_mode === 'string') ? { permissionMode: string(message.permissionMode) ?? string(message.permission_mode) } : {})
+        }
+      }
       if (typeof message.claude_code_version === 'string') this.capabilities.runtimeVersion = message.claude_code_version
       this.emit({ data: { type: 'session', phase: this.active ? 'running' : 'idle', nativeSessionId: this.nativeSessionId, capabilities: this.capabilities }, native: { method: 'system/init', payload: message } })
       return
@@ -780,15 +822,21 @@ export class ClaudeAdapter implements ProviderAdapter {
     const description = string(object(tool.input).description)
     this.emit({ itemId: id, parentId: tool.parentId, data: { type: 'tool', name: tool.name, ...(data.inputDelta !== undefined ? {} : { input: tool.input }), status: tool.status, ...(tool.detached ? { detached: true } : {}), ...(description ? { description } : {}), ...data } })
   }
+  private requestDigests = new Map<string, string>()
   private async runtimeRequest(message: ObjectValue): Promise<void> {
     const id = string(message.request_id), request = object(message.request)
     if (!id) throw new Error('Malformed Claude control request without identity')
+    const digest = createHash('sha256').update(JSON.stringify(request)).digest('hex')
+    const previous = this.requestDigests.get(id)
+    if (previous && previous !== digest) { this.replyError(id, 'Native request identity was reused with changed arguments; prior approval was not replayed'); return }
+    this.requestDigests.set(id, digest)
+    if (this.options.approvalReviewer && request.subtype === 'can_use_tool') { this.replyError(id, 'Isolated approval reviewers cannot use tools'); return }
     const replied = this.replies.get(id)
     if (replied) { this.reply(id, replied); return }
     if (this.requests.has(id) || this.hookRequests.has(id)) return
     if (request.subtype === 'hook_callback') {
       this.hookRequests.add(id)
-      try { await this.hook(request); if (!this.disposed && this.transport?.connected) this.reply(id, {}) }
+      try { const result = await this.hook(request); if (!this.disposed && this.transport?.connected) this.reply(id, result ?? {}) }
       catch (error) { if (this.transport?.connected) this.replyError(id, error instanceof Error ? error.message : 'Conductor hook failed') }
       finally { this.hookRequests.delete(id) }
       return
@@ -844,7 +892,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.emit({ requestId: id, itemId: toolId, data: { type: 'interaction', interaction }, native: { method: 'can_use_tool', payload: request } })
     this.emitWaiting()
   }
-  private async hook(request: ObjectValue): Promise<void> {
+  private async hook(request: ObjectValue): Promise<ObjectValue | undefined> {
     const input = object(request.input), callback = string(request.callback_id)
     const id = string(request.tool_use_id) ?? string(input.tool_use_id)
     const name = string(input.tool_name) ?? 'Unknown tool', args = object(input.tool_input)
@@ -852,6 +900,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (!this.tools.has(id)) this.declareTool(id, name, args)
     const paths = ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'].includes(name) ? [string(args.file_path) ?? string(args.notebook_path)].filter((path): path is string => Boolean(path)) : []
     if (callback === 'conductor_before') {
+      const denied = this.options.authorizeTool ? await this.options.authorizeTool(name, args) : undefined
+      if (denied) {
+        this.updateTool(id, { status: 'rejected' })
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: denied } }
+      }
       // PreToolUse also runs on automatically allowed operations, before execution.
       if (paths.length && !this.tools.get(id)?.captured) {
         await this.options.beforeTool?.(id, paths)
