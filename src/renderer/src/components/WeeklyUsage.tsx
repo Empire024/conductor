@@ -19,7 +19,10 @@ export function WeeklyUsage({ compact = false }: { compact?: boolean }): React.J
       finally { pending = false }
     }
     void refresh()
-    const timer = window.setInterval(() => { if (!document.hidden) void refresh() }, 30_000)
+    // A rolling seven-day total does not move visibly in half a minute, and every read is a
+    // synchronous journal scan on the main process. This widget is mounted in the always-present
+    // sidebar summary, so its interval is what the app pays, not what the pane pays.
+    const timer = window.setInterval(() => { if (!document.hidden) void refresh() }, 5 * 60_000)
     return () => { disposed = true; clearInterval(timer) }
   }, [])
   const models = report?.models.filter(model => (model.totalTokens ?? 0) > 0) ?? []

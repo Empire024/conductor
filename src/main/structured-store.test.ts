@@ -75,6 +75,49 @@ describe('structured SQLite journal and immutable artifacts', () => {
     db.prepare('DELETE FROM structured_events WHERE session_id=? AND sequence=?').run('one', 1)
     expect(store.usageJournal()[0]?.truncated).toBe(true)
   })
+  it('bounds the journal to the window without dragging the whole transcript through the main process', () => {
+    const { store, db } = fixture()
+    const at = (day: number): string => `2026-09-${String(day).padStart(2, '0')}T00:00:00.000Z`
+    store.append(event(1, { type: 'session', phase: 'running', settings: { permission: 'default', plan: false, model: 'claude-old' } }, { timestamp: at(1) }))
+    store.append(event(2, { type: 'usage', scope: 'session', source: 'provider', totalTokens: 100 }, { timestamp: at(2) }))
+    store.append(event(3, { type: 'usage', scope: 'turn', source: 'provider', totalTokens: 7 }, { timestamp: at(3), turnId: 'stale-turn' }))
+    store.append(event(4, { type: 'usage', scope: 'session', source: 'provider', totalTokens: 400 }, { timestamp: at(9) }))
+    const window = store.usageJournal(at(1), at(8))[0]!
+    // Inside the lookback: the cumulative baseline and the carried model survive. The superseded
+    // turn report from before the window - the bulk of any real journal - is never read.
+    expect(window.events.map(entry => entry.sequence)).toEqual([1, 2, 4])
+    expect(window.events[0]?.data).toEqual({ type: 'session', phase: 'running', settings: { model: 'claude-old' } })
+    expect(store.usageJournal(at(6), at(8))[0]?.events.map(entry => entry.sequence)).toEqual([4])
+    // Every scanned row is a projection, so no message or tool body is in what crosses the boundary.
+    store.append(event(5, { type: 'text', role: 'user', text: 'do not scan me', mode: 'snapshot' }, { timestamp: at(9) }))
+    expect(JSON.stringify(store.usageJournal(at(1), at(1)))).not.toContain('do not scan me')
+    expect((db.prepare("SELECT COUNT(*) AS rows FROM structured_events WHERE event_kind='usage'").get() as { rows: number }).rows).toBe(3)
+  })
+  it('keeps a runtime that predates the window distinguishable from one that started inside it', () => {
+    const { store } = fixture()
+    const at = (day: number): string => `2026-09-${String(day).padStart(2, '0')}T00:00:00.000Z`
+    store.append(event(1, { type: 'notice', message: 'runtime up' }, { timestamp: at(2), runtimeId: 'old' }))
+    store.append(event(2, { type: 'usage', scope: 'session', source: 'provider', totalTokens: 10 }, { timestamp: at(9), runtimeId: 'old' }))
+    store.append(event(1, { type: 'usage', scope: 'session', source: 'provider', totalTokens: 10 }, { timestamp: at(9), runtimeId: 'new', sessionId: 'two', provider: 'codex' }))
+    // The old runtime's only in-window row is a usage report, yet its start is still the notice
+    // that opened it - that is what stops a lifetime counter being read as seven days of traffic.
+    expect(store.usageJournal(at(8), at(8))[0]?.runtimeStarts).toEqual({ old: at(2) })
+    expect(store.usageJournal(at(8), at(8))[1]?.runtimeStarts).toEqual({ new: at(9) })
+  })
+  it('reads only the newest reported allowance windows for the provider that asked', () => {
+    const { store } = fixture()
+    const limits = (usedPercent: number) => ({ rateLimits: { primary: { usedPercent, windowDurationMins: 10_080 } } })
+    store.append(event(1, { type: 'usage', source: 'provider', limits: limits(10) }, { timestamp: '2026-09-08T00:00:00.000Z' }))
+    store.append(event(2, { type: 'usage', source: 'provider', limits: limits(60) }, { timestamp: '2026-09-09T00:00:00.000Z' }))
+    store.append(event(3, { type: 'usage', source: 'provider', limits: limits(99) }, { timestamp: '2026-09-09T12:00:00.000Z', parentId: 'nested' }))
+    store.append(event(1, { type: 'usage', source: 'provider', limits: limits(5) }, { timestamp: '2026-09-09T06:00:00.000Z', sessionId: 'two', provider: 'codex' }))
+    expect(store.recentUsageLimits('claude', '2026-09-01T00:00:00.000Z')).toEqual([
+      { observedAt: '2026-09-09T00:00:00.000Z', limits: limits(60) },
+      { observedAt: '2026-09-08T00:00:00.000Z', limits: limits(10) }
+    ])
+    expect(store.recentUsageLimits('codex', '2026-09-01T00:00:00.000Z')).toEqual([{ observedAt: '2026-09-09T06:00:00.000Z', limits: limits(5) }])
+    expect(store.recentUsageLimits('claude', '2026-09-09T00:00:00.000Z', 1)).toEqual([{ observedAt: '2026-09-09T00:00:00.000Z', limits: limits(60) }])
+  })
   it('redacts diagnostics while preserving private immutable bytes and session authorization', () => {
     const { store } = fixture()
     const secret = 'sk-ant-' + 'SYNTHETIC'.repeat(4)

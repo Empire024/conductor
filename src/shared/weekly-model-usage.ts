@@ -1,7 +1,25 @@
-import type { AgentEvent, StructuredProvider } from './structured-agent'
+import type { AgentEvent, AgentEventData, StructuredProvider } from './structured-agent'
 
 export const WEEKLY_USAGE_DAYS = 7
 const DAY_MS = 24 * 60 * 60 * 1000
+
+/**
+ * The envelope fields weekly accounting actually reads. A durable `AgentEvent` satisfies it, and
+ * so does a row the store projects straight out of SQLite: a seven-day total must never require
+ * pulling whole transcript bodies - tool output and message text - back through the main process.
+ */
+export interface WeeklyUsageEvent {
+  id: string
+  sequence: number
+  timestamp: string
+  runtimeId: string
+  provider?: StructuredProvider
+  nativeSessionId?: string
+  turnId?: string
+  itemId?: string
+  parentId?: string
+  data: AgentEventData
+}
 const tokenFields = ['inputTokens', 'outputTokens', 'cachedTokens', 'cacheCreationTokens', 'reasoningTokens', 'totalTokens'] as const
 type TokenField = typeof tokenFields[number]
 
@@ -9,7 +27,7 @@ export interface WeeklyUsageConversation {
   sessionId: string
   provider: StructuredProvider
   model?: string
-  events: AgentEvent[]
+  events: WeeklyUsageEvent[]
   /** Earliest durable event timestamp for each runtime, read without parsing transcript bodies. */
   runtimeStarts?: Record<string, string>
   /** True when the durable journal hit its read cap, so older baselines may be missing. */
@@ -65,7 +83,7 @@ function values(data: Extract<AgentEvent['data'], { type: 'usage' }>): Sample['v
   return result
 }
 
-function sessionModel(event: AgentEvent): string | undefined {
+function sessionModel(event: WeeklyUsageEvent): string | undefined {
   if (event.data.type !== 'session') return undefined
   const effective = event.data.capabilities?.effectiveSettings
   const fromEffective = effective && typeof effective === 'object' && !Array.isArray(effective) && typeof effective.model === 'string' ? effective.model : undefined

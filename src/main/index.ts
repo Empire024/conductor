@@ -1670,7 +1670,7 @@ const registerIpc = (): void => {
   ipcMain.handle('agent:list-events', (_event, id: string) => database.listAgentEvents(id))
   ipcMain.handle('agent:list-providers', () => agents.listProviders())
   ipcMain.handle('runtime:list-processes', (_event, projectId?: string) => database.listProcesses(projectId))
-  ipcMain.handle('usage:weekly', () => weeklyUsage.read())
+  ipcMain.handle('usage:weekly', () => weeklyUsage.readAsync())
   ipcMain.handle('activity:projects', () => projectActivitySnapshot())
   // A smoke run has to be able to show the chip a machine it is not on: an idle host, then a
   // loaded one. The fixture is re-read per call so one launch can walk through both.

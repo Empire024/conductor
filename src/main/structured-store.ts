@@ -3,8 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import type { AgentEvent, ConversationHistoryEntry, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, StructuredProvider, TimelineItem } from '../shared/structured-agent'
-import type { WeeklyUsageConversation } from '../shared/weekly-model-usage'
+import type { AgentEvent, AgentEventData, ConversationHistoryEntry, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
+import type { WeeklyUsageConversation, WeeklyUsageEvent } from '../shared/weekly-model-usage'
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
 import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
 
@@ -33,6 +33,32 @@ export function messageSnippet(text: string, index: number, length: number, radi
 }
 const MAX_SEARCH_GROUPS = 20, MAX_SEARCH_HITS = 5, MIN_SEARCH_QUERY = 2
 
+/** The envelope fields weekly accounting reads, projected out of the event blob by SQLite so the
+ *  transcript body each blob carries never crosses into the main process. */
+const SESSION_MODEL = `COALESCE(json_extract(event_json,'$.data.capabilities.effectiveSettings.model'),json_extract(event_json,'$.data.settings.model'))`
+const ACCOUNTING_COLUMNS = `event_kind,sequence,event_at AS timestamp,
+  json_extract(event_json,'$.id') AS id, json_extract(event_json,'$.runtimeId') AS runtimeId,
+  json_extract(event_json,'$.provider') AS provider, json_extract(event_json,'$.nativeSessionId') AS nativeSessionId,
+  json_extract(event_json,'$.turnId') AS turnId, json_extract(event_json,'$.itemId') AS itemId,
+  json_extract(event_json,'$.parentId') AS parentId,
+  json_extract(event_json,'$.data.scope') AS scope, json_extract(event_json,'$.data.source') AS source,
+  json_extract(event_json,'$.data.phase') AS phase, ${SESSION_MODEL} AS model,
+  json_extract(event_json,'$.data.inputTokens') AS inputTokens, json_extract(event_json,'$.data.outputTokens') AS outputTokens,
+  json_extract(event_json,'$.data.cachedTokens') AS cachedTokens, json_extract(event_json,'$.data.cacheCreationTokens') AS cacheCreationTokens,
+  json_extract(event_json,'$.data.reasoningTokens') AS reasoningTokens, json_extract(event_json,'$.data.totalTokens') AS totalTokens`
+const TOKEN_FIELDS = ['inputTokens', 'outputTokens', 'cachedTokens', 'cacheCreationTokens', 'reasoningTokens', 'totalTokens'] as const
+const text = (value: unknown): string | undefined => typeof value === 'string' && value ? value : undefined
+function usageEvent(row: Record<string, unknown>, data: AgentEventData): WeeklyUsageEvent {
+  const event: WeeklyUsageEvent = { id: text(row.id) ?? '', sequence: Number(row.sequence), timestamp: text(row.timestamp) ?? '', runtimeId: text(row.runtimeId) ?? '', data }
+  const provider = text(row.provider), nativeSessionId = text(row.nativeSessionId), turnId = text(row.turnId), itemId = text(row.itemId), parentId = text(row.parentId)
+  if (provider) event.provider = provider as StructuredProvider
+  if (nativeSessionId) event.nativeSessionId = nativeSessionId
+  if (turnId) event.turnId = turnId
+  if (itemId) event.itemId = itemId
+  if (parentId) event.parentId = parentId
+  return event
+}
+
 export class StructuredAgentStore {
   private artifactBytes = 0
   private projections = new Map<string, SessionProjection>()
@@ -50,6 +76,12 @@ export class StructuredAgentStore {
       CREATE TABLE IF NOT EXISTS structured_events (
         session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
         sequence INTEGER NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY(session_id, sequence)
+      );
+      CREATE TABLE IF NOT EXISTS structured_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS structured_runtimes (
+        session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
+        runtime_id TEXT NOT NULL, started_at TEXT NOT NULL, first_sequence INTEGER NOT NULL,
+        PRIMARY KEY(session_id, runtime_id)
       );
       CREATE TABLE IF NOT EXISTS structured_artifacts (
         id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
@@ -70,6 +102,7 @@ export class StructuredAgentStore {
         authorized_at TEXT NOT NULL
       );
     `)
+    this.ensureAccountingSchema()
     // Historical projection is independent of reconnect. Never retry uncertain execution.
     const rows = db.prepare('SELECT id, provider, projection_json FROM structured_sessions').all() as Array<{ id: string; provider: string; projection_json: string }>
     for (const row of rows) {
@@ -83,6 +116,40 @@ export class StructuredAgentStore {
       if (row.provider === 'claude') restored.items = recoverClaudeMessageDuplicates(restored.items)
       this.projections.set(row.id, restored)
     }
+  }
+  /**
+   * Accounting reads must never scan the transcript. `structured_events` stores one opaque JSON
+   * blob per event, so without these the only way to find the few usage rows in a journal of
+   * millions was a full-table `json_extract` scan - seconds of blocked main process per read, and
+   * a whole transcript's worth of strings parsed to total seven days of tokens. The generated
+   * columns are virtual (no table rewrite, no stored duplication) and the indexes are partial, so
+   * they cover only the usage and session rows accounting actually reads.
+   */
+  private ensureAccountingSchema(): void {
+    // Generated columns are hidden, so only `table_xinfo` reports one that already exists.
+    const columns = this.db.prepare('PRAGMA table_xinfo(structured_events)').all() as Array<{ name: string }>
+    const missing = (name: string): boolean => !columns.some(column => column.name === name)
+    if (missing('event_kind')) this.db.exec(`ALTER TABLE structured_events ADD COLUMN event_kind TEXT GENERATED ALWAYS AS (json_extract(event_json,'$.data.type')) VIRTUAL`)
+    if (missing('event_at')) this.db.exec(`ALTER TABLE structured_events ADD COLUMN event_at TEXT GENERATED ALWAYS AS (json_extract(event_json,'$.timestamp')) VIRTUAL`)
+    // Building an index over this table is one scan of every event body no matter how narrow the
+    // result, so accounting gets exactly one: conversation first, because every read is scoped to
+    // a conversation, and both kinds together, because splitting them by kind in JavaScript is
+    // free and a second index is another full scan of a multi-gigabyte journal.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS structured_events_accounting ON structured_events(session_id,event_at) WHERE event_kind IN ('usage','session')`)
+    // Runtime starts decide whether a cumulative counter predates the reporting window. `append`
+    // records them exactly from here on; this backfill only has to cover runtimes that already
+    // existed, and it reads them through the index just built rather than scanning again. A
+    // runtime's first accounting row can trail its true first event by seconds, which matters only
+    // if a window boundary lands in that gap - and those runtimes leave the window within a week.
+    if (this.db.prepare("SELECT value FROM structured_meta WHERE key='runtimes_backfilled'").get()) return
+    this.db.exec(`
+      INSERT OR IGNORE INTO structured_runtimes(session_id,runtime_id,started_at,first_sequence)
+      SELECT session_id, json_extract(event_json,'$.runtimeId'), MIN(event_at), MIN(sequence)
+      FROM structured_events
+      WHERE event_kind IN ('usage','session') AND json_extract(event_json,'$.runtimeId') IS NOT NULL AND event_at IS NOT NULL
+      GROUP BY session_id, json_extract(event_json,'$.runtimeId')
+    `)
+    this.db.prepare("INSERT INTO structured_meta(key,value) VALUES('runtimes_backfilled',?)").run(new Date().toISOString())
   }
   register(id: string, projectId: string, provider: StructuredProvider, spec: unknown): SessionProjection {
     const existing = this.snapshot(id)
@@ -128,6 +195,9 @@ export class StructuredAgentStore {
     if (!state || event.sequence !== state.sequence + 1) throw new Error('Non-contiguous provider event sequence')
     const safe = sanitizeDiagnostic(event) as AgentEvent
     this.db.prepare('INSERT INTO structured_events(session_id,sequence,event_json) VALUES(?,?,?)').run(event.sessionId, event.sequence, JSON.stringify(safe))
+    // Sequence is assigned monotonically, so the first row wins and remains the runtime's start
+    // even after `checkpoint` compacts the events it was read from.
+    if (safe.runtimeId && safe.timestamp) this.db.prepare('INSERT OR IGNORE INTO structured_runtimes(session_id,runtime_id,started_at,first_sequence) VALUES(?,?,?,?)').run(safe.sessionId, safe.runtimeId, safe.timestamp, safe.sequence)
     this.projections.set(event.sessionId, projectAgentEvent(state, safe))
     return safe
   }
@@ -159,36 +229,92 @@ export class StructuredAgentStore {
   events(id: string, after = 0): AgentEvent[] {
     return (this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent)
   }
-  /** A narrow durable journal for shared weekly accounting. It bypasses history()'s UI cap and
-   * events()'s page cap, and parses only usage plus session metadata needed for model attribution. */
-  usageJournal(): WeeklyUsageConversation[] {
-    const sessions = this.db.prepare('SELECT id,provider,spec_json FROM structured_sessions ORDER BY rowid').all() as Array<{ id: string; provider: StructuredProvider; spec_json: string }>
-    const durable = this.db.prepare(`
-      SELECT session_id,MIN(sequence) AS first_sequence,
-        json_extract(event_json,'$.runtimeId') AS runtime_id,
-        MIN(json_extract(event_json,'$.timestamp')) AS started_at
-      FROM structured_events GROUP BY session_id,runtime_id
-    `).all() as Array<{ session_id: string; first_sequence: number; runtime_id: string; started_at: string }>
+  /**
+   * A narrow durable journal for shared weekly accounting. It bypasses history()'s UI cap and
+   * events()'s page cap, and reads only the envelope and token fields accounting needs - never
+   * `event_json` itself, because the usage rows of a long-lived journal carry hundreds of
+   * megabytes of transcript alongside the few numbers a seven-day total is made of.
+   *
+   * `since` opens the reporting window and `from` the baseline lookback before it. Only the two
+   * kinds of pre-window row the summary can still act on are read: a cumulative session counter,
+   * which is the baseline its first in-window report is measured against, and the model a
+   * conversation was last set to. Counters whose baseline falls outside `from` are reported as
+   * excluded rather than counted whole - `runtimeStarts` stays exact, so a runtime that predates
+   * the window can never be mistaken for one that began inside it.
+   */
+  usageJournal(from = '', since = from): WeeklyUsageConversation[] {
+    return this.usageSessions().flatMap(id => this.usageConversation(id, from, since) ?? [])
+  }
+  /** Conversation ids in journal order, so a caller can read the window one conversation at a
+   *  time and yield the main process between them instead of blocking it for the whole scan. */
+  usageSessions(): string[] {
+    return (this.db.prepare('SELECT id FROM structured_sessions ORDER BY rowid').all() as Array<{ id: string }>).map(row => row.id)
+  }
+  /** One conversation's slice of {@link usageJournal}. Every read is a range scan of the partial
+   *  accounting indexes over this conversation alone, so no single call is a long block. */
+  usageConversation(sessionId: string, from: string, since: string): WeeklyUsageConversation | null {
+    const session = this.db.prepare('SELECT provider,spec_json FROM structured_sessions WHERE id=?').get(sessionId) as { provider: StructuredProvider; spec_json: string } | undefined
+    if (!session) return null
+    // Inside the window both kinds are read in full. Before it, only the two rows the summary can
+    // still act on: a cumulative session counter, which is the baseline its first in-window report
+    // is measured against, and the model the conversation was last set to.
     const rows = this.db.prepare(`
-      SELECT session_id,sequence,event_json FROM structured_events
-      WHERE json_extract(event_json,'$.data.type') IN ('usage','session')
-      ORDER BY session_id,sequence
-    `).all() as Array<{ session_id: string; sequence: number; event_json: string }>
-    const bySession = new Map<string, AgentEvent[]>()
+      SELECT ${ACCOUNTING_COLUMNS} FROM structured_events
+      WHERE session_id=? AND event_kind IN ('usage','session') AND event_at>=?
+        AND (event_at>=?
+          OR (event_kind='usage' AND json_extract(event_json,'$.data.scope')='session')
+          OR (event_kind='session' AND ${SESSION_MODEL} IS NOT NULL))
+      ORDER BY sequence
+    `).all(sessionId, from, since) as Array<Record<string, unknown>>
+    if (!rows.length) return null
+    const events: WeeklyUsageEvent[] = []
+    let carried: WeeklyUsageEvent | null = null
     for (const row of rows) {
-      const group = bySession.get(row.session_id) ?? []
-      group.push(JSON.parse(row.event_json) as AgentEvent)
-      bySession.set(row.session_id, group)
+      if (row.event_kind === 'usage') {
+        const data: AgentEventData = { type: 'usage', source: row.source === 'estimate' ? 'estimate' : 'provider' }
+        if (row.scope === 'session' || row.scope === 'turn' || row.scope === 'message') data.scope = row.scope
+        for (const field of TOKEN_FIELDS) {
+          const value = row[field]
+          if (typeof value === 'number' && Number.isFinite(value)) data[field] = value
+        }
+        events.push(usageEvent(row, data))
+        continue
+      }
+      // Only the resolved model is read back from a session event, so the rest of its payload -
+      // capabilities, titles, provider messages - never leaves SQLite.
+      const named = text(row.model)
+      const event = usageEvent(row, { type: 'session', phase: (text(row.phase) ?? 'idle') as SessionProjection['phase'], ...(named ? { settings: { model: named } as SessionSettings } : {}) })
+      // Pre-window session events are read only to carry a model forward, and the last one wins.
+      if (text(row.timestamp)! < since) carried = event
+      else events.push(event)
     }
-    return sessions.flatMap(session => {
-      const group = bySession.get(session.id)
-      if (!group) return []
-      const metadata = durable.filter(row => row.session_id === session.id)
-      const runtimeStarts = Object.fromEntries(metadata.filter(row => row.runtime_id && row.started_at).map(row => [row.runtime_id, row.started_at]))
-      const firstSequence = metadata.reduce((first, row) => Math.min(first, row.first_sequence), Number.POSITIVE_INFINITY)
-      let model: string | undefined
-      try { const spec = JSON.parse(session.spec_json) as { model?: unknown }; if (typeof spec.model === 'string') model = spec.model } catch { /* malformed legacy spec: session events may still name it */ }
-      return [{ sessionId: session.id, provider: session.provider, ...(model ? { model } : {}), events: group, runtimeStarts, truncated: firstSequence > 1 }]
+    if (carried) events.push(carried)
+    if (!events.length) return null
+    events.sort((a, b) => a.sequence - b.sequence)
+    const runtimeStarts = Object.fromEntries((this.db.prepare('SELECT runtime_id,started_at FROM structured_runtimes WHERE session_id=?').all(sessionId) as Array<{ runtime_id: string; started_at: string }>).map(row => [row.runtime_id, row.started_at]))
+    const first = this.db.prepare('SELECT sequence FROM structured_events WHERE session_id=? ORDER BY sequence LIMIT 1').get(sessionId) as { sequence: number } | undefined
+    let model: string | undefined
+    try { const spec = JSON.parse(session.spec_json) as { model?: unknown }; if (typeof spec.model === 'string') model = spec.model } catch { /* malformed legacy spec: session events may still name it */ }
+    return { sessionId, provider: session.provider, ...(model ? { model } : {}), events, runtimeStarts, truncated: (first?.sequence ?? 1) > 1 }
+  }
+  /**
+   * The newest reported allowance windows for one provider. Auto Fixer keeps only the latest
+   * observation per window key, so it never needed the whole journal: a window that has not been
+   * reported inside `from` is either already reset or too stale to authorize anything.
+   */
+  recentUsageLimits(provider: StructuredProvider, from: string, perConversation = 20): Array<{ observedAt: string; limits: unknown }> {
+    const sessions = this.db.prepare('SELECT id FROM structured_sessions WHERE provider=?').all(provider) as Array<{ id: string }>
+    const newest = this.db.prepare(`
+      SELECT event_at AS observedAt, json_extract(event_json,'$.data.limits') AS limits
+      FROM structured_events
+      WHERE session_id=? AND event_kind IN ('usage','session') AND event_at>=? AND event_kind='usage'
+        AND json_extract(event_json,'$.parentId') IS NULL
+        AND json_extract(event_json,'$.data.limits') IS NOT NULL
+      ORDER BY event_at DESC LIMIT ?
+    `)
+    const rows = sessions.flatMap(session => newest.all(session.id, from, perConversation) as Array<{ observedAt: string; limits: string }>)
+    return rows.sort((a, b) => b.observedAt.localeCompare(a.observedAt)).flatMap(row => {
+      try { return [{ observedAt: row.observedAt, limits: JSON.parse(row.limits) as unknown }] } catch { return [] }
     })
   }
   history(projectId: string, query = ''): ConversationHistoryEntry[] {

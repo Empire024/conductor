@@ -26,6 +26,9 @@ type Dependencies = {
 const active = new Set(['starting','running','waiting_input','waiting_approval'])
 const AUTO_FIXER_MIN_REMAINING_PERCENT = 5
 const FRESH_ALLOWANCE_OBSERVATION_MS = 5 * 60_000
+/** Reported allowance windows are five-hourly or weekly, so an observation older than this has
+ *  either reset already or is far too stale to authorize a dispatch. */
+const ALLOWANCE_EVIDENCE_DAYS = 14
 const validId = (value:unknown):value is string => typeof value==='string' && Boolean(value.trim()) && value.length<=160 && !value.includes('\0')
 type ObservedUsageWindow = UsageWindow & {observedAt:string}
 export type AutoFixerAllowance = {status:'usable'|'low'|'exhausted'|'unknown';remainingPercent?:number;windows:ObservedUsageWindow[]}
@@ -207,22 +210,17 @@ export class ProjectTaskDispatcher {
 
   private autoTarget(options:ProjectTaskDispatchOptions):{catalog:ProjectTaskDispatchOptions['providers'][number];model:ProjectTaskDispatchOptions['providers'][number]['models'][number]} {
     const evidence=new Map<'codex'|'claude',Map<string,ObservedUsageWindow>>()
-    for(const conversation of this.deps.database.structured.usageJournal()) {
-      if(!['codex','claude'].includes(conversation.provider))continue
-      const provider=conversation.provider as 'codex'|'claude'
-      const reported=evidence.get(provider)??new Map<string,ObservedUsageWindow>()
+    const from=new Date(Date.now()-ALLOWANCE_EVIDENCE_DAYS*24*60*60_000).toISOString()
+    for(const provider of ['codex','claude'] as const) {
+      const reported=new Map<string,ObservedUsageWindow>()
       // Timeline item timestamps intentionally remain the item's first-seen time. Quota
       // routing instead reads the durable event journal, where every update has its own
       // timestamp and sequence. This also keeps a stale model bucket visible beside a newer
       // sparse provider-wide update rather than losing it to item reconciliation.
-      for(const event of conversation.events) {
-        if(event.parentId||event.data.type!=='usage'||!event.data.limits)continue
-        for(const window of normalizeUsageWindows(event.data.limits)) {
-          const observed={...window,observedAt:event.timestamp}
-          const previous=reported.get(window.key)
-          if(!previous||Date.parse(observed.observedAt)>=Date.parse(previous.observedAt))reported.set(window.key,observed)
-        }
-      }
+      // The rows arrive newest first, so the first observation of a key is the latest one.
+      for(const row of this.deps.database.structured.recentUsageLimits(provider,from))
+        for(const window of normalizeUsageWindows(row.limits as Parameters<typeof normalizeUsageWindows>[0]))
+          if(!reported.has(window.key))reported.set(window.key,{...window,observedAt:row.observedAt})
       evidence.set(provider,reported)
     }
     const candidates=options.providers.filter(catalog=>catalog.available).flatMap(catalog=>catalog.models.map(model=>({catalog,model,allowance:autoFixerAllowance([...(evidence.get(catalog.provider)?.values()??[])],model)})))
