@@ -59,6 +59,7 @@ import { LOCAL_MODELS } from '../../shared/local-models'
 import { createPaneTab } from './panes/pane-factory'
 import { MemoryPane } from './panes/MemoryPane'
 import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
+import { SourceControlPane } from './components/SourceControlPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
 import { SchedulesPane } from './components/SchedulesPane'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
@@ -137,7 +138,7 @@ export function App(): React.JSX.Element {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [utilityPanel, setUtilityPanel] = useState<SidebarUtilityPanel | null>(() => {
     const saved = localStorage.getItem('conductor.utilityPanel')
-    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules'].includes(saved ?? '')
+    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules', 'source-control'].includes(saved ?? '')
       ? saved as SidebarUtilityPanel
       : null
   })
@@ -278,6 +279,8 @@ export function App(): React.JSX.Element {
       ? { label: 'Processes', aria: 'Process dashboard', icon: Gauge }
       : utilityPanel === 'schedules'
         ? { label: 'Schedules', aria: 'Smart schedules and run history', icon: Clock3 }
+      : utilityPanel === 'source-control'
+        ? { label: 'Source control', aria: 'Repository status and delivery', icon: GitBranch }
       : utilityPanel === 'routines'
         ? { label: 'Automation', aria: 'Project automation', icon: Workflow }
       : { label: 'Automation', aria: 'Agents, tasks, and routines', icon: Bot }
@@ -1505,6 +1508,8 @@ export function App(): React.JSX.Element {
                           ? <ProcessDashboardPane project={activeProject} />
                           : utilityPanel === 'schedules'
                             ? <SchedulesPane projectId={activeProject.id} />
+                          : utilityPanel === 'source-control'
+                            ? <SourceControlPane key={activeProject.id} project={activeProject} />
                           : <OrchestrationHub
                               key={utilityPanel}
                               projectId={activeProject.id}

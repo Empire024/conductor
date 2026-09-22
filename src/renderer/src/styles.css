@@ -1903,3 +1903,83 @@ body.autoscrolling * { cursor: all-scroll !important; }
 :root[data-theme="light"] [data-tab-group-color="purple"] { --tab-group-color: #9334e6; }
 :root[data-theme="light"] [data-tab-group-color="cyan"] { --tab-group-color: #007b83; }
 :root[data-theme="light"] [data-tab-group-color="orange"] { --tab-group-color: #e8710a; }
+/* Source control panel */
+.source-control-pane { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; padding: 12px; overflow: auto; color: var(--text-2); background: var(--surface-0); font-size: 10px; }
+.scp-header { display: grid; gap: 6px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-1); }
+.scp-branch { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--accent); }
+.scp-branch strong { min-width: 0; overflow: hidden; color: var(--text); font-size: 12px; font-weight: 560; text-overflow: ellipsis; white-space: nowrap; }
+.scp-sync { display: inline-flex; align-items: center; gap: 2px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 999px; color: var(--text-2); font-size: 9px; font-variant-numeric: tabular-nums; }
+.scp-sync svg:nth-of-type(2) { margin-left: 4px; }
+.scp-icon-button { margin-left: auto; width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 7px; color: var(--text-3); background: transparent; cursor: pointer; }
+.scp-icon-button:hover:not(:disabled) { border-color: var(--border); color: var(--text); background: var(--surface-hover); }
+.scp-facts { display: grid; gap: 3px; color: var(--text-3); font-size: 9px; }
+.scp-facts > span { min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.scp-facts svg { flex: none; }
+.scp-facts code { color: var(--text-2); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.scp-facts .scp-release-on { color: var(--accent-muted); }
+.scp-facts .scp-warn { color: #e2b872; }
+.scp-unavailable { margin: 0; display: flex; align-items: flex-start; gap: 8px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 11px; color: var(--text-2); background: var(--surface-1); line-height: 1.45; }
+.scp-unavailable svg { flex: none; margin-top: 1px; color: #e2b872; }
+.scp-error { margin: 0; padding: 7px 9px; border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border)); border-radius: 8px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, transparent); line-height: 1.4; }
+.scp-run { display: grid; gap: 7px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-1); }
+.scp-run.tone-delivered { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+.scp-run.tone-failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); }
+.scp-banner { display: flex; align-items: flex-start; gap: 9px; }
+.scp-banner-icon { flex: none; width: 26px; height: 26px; display: grid; place-items: center; border-radius: 8px; color: var(--text-2); background: var(--surface-2); }
+.tone-running .scp-banner-icon { color: var(--blue); }
+.tone-delivered .scp-banner-icon { color: var(--accent); background: var(--accent-bg); }
+.tone-failed .scp-banner-icon { color: var(--danger); background: color-mix(in srgb, var(--danger) 12%, transparent); }
+.scp-banner-text { min-width: 0; flex: 1; display: grid; gap: 2px; }
+.scp-banner-text strong { color: var(--text); font-size: 11.5px; font-weight: 560; }
+.scp-banner-text small { color: var(--text-3); font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
+.scp-banner-text .scp-banner-error { color: var(--danger); font-size: 10px; }
+.scp-cancel, .scp-section-head button { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 7px; color: var(--text-2); background: var(--surface-2); font-size: 9px; cursor: pointer; }
+.scp-cancel:hover { border-color: color-mix(in srgb, var(--danger) 45%, var(--border)); color: var(--danger); }
+.scp-section-head button:hover:not(:disabled) { color: var(--text); }
+.scp-section-head button:disabled { opacity: .5; cursor: default; }
+.scp-run-meta { display: flex; align-items: center; gap: 5px; color: var(--text-3); font-size: 9px; }
+.scp-run-message { margin: 0; overflow: hidden; color: var(--text-2); text-overflow: ellipsis; white-space: nowrap; }
+.scp-links { display: flex; flex-wrap: wrap; gap: 10px; }
+.scp-links a { display: inline-flex; align-items: center; gap: 4px; color: var(--blue); font-size: 9.5px; text-decoration: none; }
+.scp-links a:hover { text-decoration: underline; }
+.scp-stages { margin: 0; padding: 0; display: grid; gap: 1px; list-style: none; }
+.scp-stage { display: grid; }
+.scp-stage-row { width: 100%; min-height: 24px; display: flex; align-items: center; gap: 7px; padding: 2px 4px; border: 0; border-radius: 6px; color: var(--text-2); background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.scp-stage-row:hover:not(:disabled) { background: var(--surface-hover); }
+.scp-stage-row:disabled { cursor: default; }
+.scp-stage-icon { flex: none; width: 16px; display: grid; place-items: center; color: var(--text-3); }
+.scp-stage.state-running .scp-stage-icon { color: var(--blue); }
+.scp-stage.state-passed .scp-stage-icon { color: var(--accent); }
+.scp-stage.state-failed .scp-stage-icon, .scp-stage.state-failed .scp-stage-label { color: var(--danger); }
+.scp-stage.state-pending .scp-stage-label, .scp-stage.state-skipped .scp-stage-label { color: var(--text-3); }
+.scp-stage.state-running .scp-stage-label { color: var(--text); }
+.scp-stage-label { flex: 1; min-width: 0; }
+.scp-stage-time { color: var(--text-3); font-size: 9px; font-variant-numeric: tabular-nums; }
+.scp-stage-detail { margin: 0 4px 2px 27px; color: var(--text-3); font-size: 9px; line-height: 1.4; overflow-wrap: anywhere; }
+.scp-stage.state-failed .scp-stage-detail { color: color-mix(in srgb, var(--danger) 80%, var(--text-2)); }
+.scp-log { max-height: 180px; margin: 2px 4px 4px 27px; padding: 6px 8px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 7px; color: var(--text-2); background: var(--surface-0); font: 9px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.scp-changes { display: grid; gap: 6px; padding: 10px 11px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface-1); }
+.scp-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.scp-section-head strong { color: var(--text); font-size: 10.5px; font-weight: 540; }
+.scp-section-head > span { display: flex; gap: 4px; }
+.scp-group { display: grid; gap: 1px; }
+.scp-group > small { margin: 3px 0 2px; color: var(--text-3); font-size: 7.5px; letter-spacing: .07em; text-transform: uppercase; }
+.scp-file { min-width: 0; min-height: 22px; display: flex; align-items: center; gap: 6px; padding: 1px 4px; border-radius: 6px; cursor: pointer; }
+.scp-file:hover { background: var(--surface-hover); }
+.scp-file input { flex: none; margin: 0; accent-color: var(--accent); }
+.scp-file-name { flex: none; max-width: 60%; overflow: hidden; color: var(--text); text-overflow: ellipsis; white-space: nowrap; }
+.scp-file-dir { flex: 1; min-width: 0; overflow: hidden; color: var(--text-3); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.scp-badge { flex: none; width: 15px; margin-left: auto; color: var(--text-3); font: 600 9px ui-monospace, SFMono-Regular, Consolas, monospace; text-align: center; }
+.scp-badge.badge-m { color: #e2b872; }
+.scp-badge.badge-a, .scp-badge.badge-untracked { color: var(--accent-muted); }
+.scp-badge.badge-d, .scp-badge.badge-u { color: var(--danger); }
+.scp-badge.badge-r, .scp-badge.badge-c { color: var(--blue); }
+.scp-hint { margin: 2px 0 0; color: var(--text-3); font-size: 9px; line-height: 1.4; }
+.scp-compose { display: grid; gap: 7px; }
+.scp-compose textarea { width: 100%; box-sizing: border-box; min-height: 58px; padding: 7px 9px; resize: vertical; border: 1px solid var(--border); border-radius: 9px; outline: none; color: var(--text); background: var(--surface-1); font: inherit; font-size: 10.5px; line-height: 1.45; }
+.scp-compose textarea:focus { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.scp-ship-row { display: flex; align-items: center; gap: 9px; }
+.scp-ship { flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px; border: 1px solid transparent; border-radius: 8px; color: var(--bg); background: var(--accent); font-size: 10.5px; font-weight: 600; cursor: pointer; }
+.scp-ship:hover:not(:disabled) { filter: brightness(1.08); }
+.scp-ship:disabled { border-color: var(--border); color: var(--text-3); background: var(--surface-2); cursor: default; }
+.scp-ship-reason { min-width: 0; color: var(--text-3); font-size: 9px; line-height: 1.35; }

@@ -3,6 +3,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { promises as fs, readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { randomUUID } from 'node:crypto'
+import { homedir } from 'node:os'
 import { importPromptImage } from './prompt-images'
 import { importPromptAttachmentPath, projectPromptAttachment } from './prompt-context'
 import { moveExternalDropIntoProject, moveProjectDropWithinProject } from './file-drop-move'
@@ -79,6 +80,9 @@ import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
 import { LocalUpdateBuilder } from './local-update-build'
+import { DeliveryService } from './delivery'
+import { registerDeliveryIpc } from './delivery-ipc'
+import { gitHubCredential } from './github-credential'
 import { normalizeUpdateFeedUrl } from './update-config'
 import { createUntitledEditorFile, EDITOR_CONFLICT_MESSAGE, readEditorFile, saveEditorCopy, writeEditorFile } from './editor-files'
 import { readExistingTextFile, readTextFile } from './text-files'
@@ -104,6 +108,7 @@ let disposeOrchestrationIpc: (() => void) | undefined
 let schedules: ScheduleStore
 let scheduleRunner: ScheduleRunner
 let disposeScheduleIpc: (() => void) | undefined
+let disposeDeliveryIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
 let disposeProjectActivity: (() => void) | undefined
@@ -123,6 +128,7 @@ let browserMcp: BrowserMcpServer | undefined
 let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
 const localUpdateBuilder = new LocalUpdateBuilder()
+const delivery = new DeliveryService({ githubToken: () => gitHubCredential(homedir()) })
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
 const detachedWindows = new Map<string, BrowserWindow>()
@@ -517,6 +523,7 @@ const disposeRuntimeServices = (): void => {
     ['agents', () => agents?.dispose()],
     ['schedule runner', () => scheduleRunner?.stop()],
     ['schedule IPC', () => disposeScheduleIpc?.()],
+    ['delivery IPC', () => disposeDeliveryIpc?.()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
     ['collaboration IPC', () => disposeCollaborationIpc?.()],
     ['project activity', () => { disposeProjectActivity?.(); if (projectActivityTimer) clearTimeout(projectActivityTimer); projectActivityTimer = null }],
@@ -1113,6 +1120,9 @@ const registerIpc = (): void => {
   disposeScheduleIpc = registerScheduleIpc({ store: schedules, runner: scheduleRunner,
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Schedules') },
     reveal: path => shell.showItemInFolder(path) })
+  disposeDeliveryIpc = registerDeliveryIpc({ service: delivery,
+    authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control') },
+    projectPath: projectId => localProject(database, projectId, 'Source control').path })
   ipcMain.handle('projects:list', () => database.listDeskProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await dialog.showOpenDialog({
@@ -2053,10 +2063,12 @@ app.whenReady().then(async () => {
     quit: () => { isQuitting = true; app.quit() },
     createTray: () => electronTray(ensureTrayIconFile(app.getPath('userData')))
   })
+  delivery.onChanged(run => publish('delivery:changed', run))
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
   // without it the two initializers form an inference cycle.
   const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
     localUpdates: localUpdateBuilder,
+    delivery,
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),

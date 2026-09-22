@@ -73,9 +73,16 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
     status: vi.fn(() => idleUpdate),
     start: vi.fn((target: string) => ({ ...idleUpdate, state: 'running' as const, workspace: target }))
   }
-  const deps = { database, sessions, orchestration, collaboration, backlogs, ui, confirm, fileChanged, localUpdates, providers: () => providers }
+  const shipped = { id: 'run-1', projectId: project.id, state: 'running' as const, requestedBy: { kind: 'owner' as const }, message: '', paths: null, startedAt: '', finishedAt: null, commit: null, releaseTag: null, releaseUrl: null, workflowRunUrl: null, stages: [], error: null }
+  const delivery = {
+    status: vi.fn(async (projectId: string) => ({ projectId, available: true, reason: null, branch: 'main', upstream: 'origin/main', ahead: 0, behind: 0, head: null, headSubject: null, files: [], github: null, releaseWorkflow: false, checkedAt: '' })),
+    current: vi.fn((): typeof shipped | null => null),
+    ship: vi.fn((projectId: string, _cwd: string, request: { message: string; paths?: string[] }) => ({ ...shipped, projectId, message: request.message, paths: request.paths ?? null })),
+    wait: vi.fn(async () => ({ ...shipped, state: 'delivered' as const, releaseTag: 'v1.0.1' }))
+  }
+  const deps = { database, sessions, orchestration, collaboration, backlogs, ui, confirm, fileChanged, localUpdates, delivery, providers: () => providers }
   const control = new AgentControl(deps)
-  return { root, project, workspace, database, sessions, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, localUpdates, control, deps }
+  return { root, project, workspace, database, sessions, orchestration, collaboration, submissions, scope, spec, rootTab, requests, ui, confirm, fileChanged, localUpdates, delivery, control, deps }
 }
 
 /** Give an agent session a visible tab, so its checklist claims count as live. */
@@ -115,6 +122,27 @@ describe('authorized native app control', () => {
     expect(await f.control.call(localScope, 'app.update.status')).toMatchObject({ state: 'idle' })
     await expect(f.control.call(localScope, 'app.update')).rejects.toThrow('read-only')
     expect(f.localUpdates.start).toHaveBeenCalledTimes(1)
+  })
+  it('ships a cloud coworker’s work on the host in one call, asks the owner for a local model, and refuses read-only turns', async () => {
+    const f = fixture()
+    expect(await f.control.call(f.scope, 'git.status')).toMatchObject({ branch: 'main', available: true })
+    expect(await f.control.call(f.scope, 'git.ship', { message: 'Fix it', paths: ['src/a.ts'] })).toMatchObject({ state: 'running', paths: ['src/a.ts'] })
+    expect(f.delivery.ship).toHaveBeenCalledWith(f.project.id, f.project.path, { message: 'Fix it', paths: ['src/a.ts'] }, { kind: 'agent', agentSessionId: f.spec.id, title: f.spec.title })
+    expect(f.confirm).not.toHaveBeenCalled()
+    // Waiting long-polls the run, capped below the control server's request timeout.
+    expect(await f.control.call(f.scope, 'git.ship', { message: 'Again', waitSeconds: 500 })).toMatchObject({ state: 'delivered', releaseTag: 'v1.0.1' })
+    expect(f.delivery.wait).toHaveBeenCalledWith(f.project.id, 'run-1', 100_000)
+    expect(await f.control.call(f.scope, 'git.ship.status')).toMatchObject({ state: 'idle' })
+    await expect(f.control.call(f.scope, 'git.ship', { message: 'x', paths: [] })).rejects.toThrow('paths')
+    await expect(f.control.call(f.scope, 'git.ship', { message: 'x', force: true })).rejects.toThrow('accepts only')
+    const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker' }
+    f.sessions.ensure(local)
+    openAgentTab(f, local.id, 'local-tab')
+    await expect(f.control.call({ ...f.scope, agentSessionId: local.id }, 'git.ship', { message: 'Local' })).rejects.toThrow('declined')
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, permission: 'read-only' } })
+    await expect(f.control.call(f.scope, 'git.ship', { message: 'Read only' })).rejects.toThrow('read-only')
+    expect(f.delivery.ship).toHaveBeenCalledTimes(2)
   })
   it('advertises configured local models and dispatches native local coworkers within inherited read-only permissions', async () => {
     const f = fixture(false, { local: ['accept-edits', 'read-only'] })

@@ -22,6 +22,7 @@ import { readTextFile } from './text-files'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { inheritMachineId, machineRunsProject, tabMachineId } from './machines'
 import type { LocalUpdateBuildService } from './local-update-build'
+import type { DeliveryRequester, DeliveryRun, RepositoryStatus } from '../shared/delivery'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import { createApprovalRouting } from './approval-review-routing'
 
@@ -122,6 +123,9 @@ const toolSignatures = {
   'workspace.rename': '({title})',
   'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. The owner confirms each build, unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner accepts it',
   'app.update.status': '() — state, version, log tail and result of the local update build',
+  'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
+  'git.ship': '({message,paths?,waitSeconds?}) — deliver finished work in one call. Conductor runs it on the host with the owner’s own Git credentials and network: tests, build, commit (only paths if given, verified in an isolated copy when other work is also in the tree), push, then it waits for the release the push triggers and checks its assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
+  'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
   'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does'
@@ -131,6 +135,13 @@ const toolSignatures = {
  *  stay out: a change to a sibling project is made by a tab that lives there and shows its work. */
 const crossProjectMethods: string[] = ['tabs.list', 'tabs.open', 'files.list', 'files.read', 'files.open', 'tasks.list']
 
+export interface DeliveryControl {
+  status(projectId: string, cwd: string): Promise<RepositoryStatus>
+  current(projectId: string): DeliveryRun | null
+  ship(projectId: string, cwd: string, request: { message: string; paths?: string[] }, requestedBy: DeliveryRequester): DeliveryRun
+  wait(projectId: string, runId: string, timeoutMs: number): Promise<DeliveryRun>
+}
+
 export interface AgentControlDependencies {
   database: ConductorDatabase
   sessions: StructuredSessions
@@ -139,6 +150,8 @@ export interface AgentControlDependencies {
   backlogs: ProjectBacklogs
   /** Builds and publishes a local app update on the host; absent where that is not available. */
   localUpdates?: LocalUpdateBuildService
+  /** Host-side test, build, commit, push and release verification; absent where unavailable. */
+  delivery?: DeliveryControl
   providers(): AgentProviderInfo[]
   /** This machine plus any paired machines a tab may be placed on. */
   machines?(): MachineDescriptor[]
@@ -784,10 +797,48 @@ export class AgentControl {
       return orchestration.saveRoutine({ ...args, projectId: scope.projectId, name: text(args, 'name', 200) } as unknown as SaveRoutineInput)
     }
     if (method.startsWith('app.update')) return this.localUpdate(scope, source, method, args)
+    if (method.startsWith('git.')) return this.deliver(scope, source, method, args)
     if (method === 'workspace.rename') return this.ui(scope, 'workspace.rename', { title: text(args, 'title', 120) })
     if (method === 'router.start') return this.startRouter(scope, args)
     if (method === 'router.dispatch') return this.dispatchRouter(scope, args)
     throw new Error('Unknown control method; use tools.list')
+  }
+
+  /**
+   * Delivery runs on the host because a sandboxed conversation cannot reach GitHub, and asking
+   * to leave the sandbox for every git call is what made finishing a task a chore. A cloud
+   * coworker is already bound by the project's delivery contract to commit and push, so it ships
+   * without a dialog; a sandboxed local model runs host code only when the owner confirms.
+   */
+  private async deliver(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const delivery = this.deps.delivery
+    if (!delivery) throw new Error('Delivery is unavailable in this Conductor')
+    const wait = (): number => {
+      if (args.waitSeconds === undefined) return 0
+      if (typeof args.waitSeconds !== 'number' || !Number.isFinite(args.waitSeconds) || args.waitSeconds < 0) throw new Error('waitSeconds must be a number of seconds')
+      return Math.min(args.waitSeconds, 100) * 1000
+    }
+    const settle = async (run: DeliveryRun | null): Promise<DeliveryRun | null> => run && run.state === 'running' && wait() ? delivery.wait(scope.projectId, run.id, wait()) : run
+    if (method === 'git.status') return delivery.status(scope.projectId, source.cwd)
+    if (method === 'git.ship.status') {
+      if (Object.keys(args).some(key => !['runId', 'waitSeconds'].includes(key))) throw new Error('git.ship.status accepts only runId and waitSeconds')
+      const run = delivery.current(scope.projectId)
+      if (args.runId !== undefined && run?.id !== text(args, 'runId', 160)) throw new Error('That delivery is no longer the latest one for this project')
+      return await settle(run) ?? { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
+    }
+    if (method !== 'git.ship') throw new Error('Unknown control method; use tools.list')
+    if (Object.keys(args).some(key => !['message', 'paths', 'waitSeconds'].includes(key))) throw new Error('git.ship accepts only message, paths and waitSeconds')
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    const message = text(args, 'message', 5000)
+    let paths: string[] | undefined
+    if (args.paths !== undefined) {
+      if (!Array.isArray(args.paths) || !args.paths.length || args.paths.length > 500 || args.paths.some(path => typeof path !== 'string' || !path)) throw new Error('paths must be a non-empty list of repository paths')
+      paths = args.paths as string[]
+    }
+    if (source.provider === 'local' && !await this.deps.confirm(scope, `${source.title} wants to test, build, commit and push this project and publish its release.`)) throw new Error('The owner declined this delivery')
+    this.authorize(scope)
+    const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}) }, { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title })
+    return settle(run)
   }
 
   /**

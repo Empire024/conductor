@@ -5,6 +5,7 @@ Conductor is a local desktop application for its owner. GitHub is used only as t
 ## Definition of done
 
 - A completed task is not done when it only exists in the working tree or in a local build.
+- **Deliver with one call:** app-control `git.ship({message, paths})` (then `git.ship.status({waitSeconds: 100})` until it settles). Conductor runs the tests, build, commit, push and release verification below on the host with the owner's Git credentials, and returns the release tag or the exact failure. Pass `paths` for your own files when other agents have work in the tree; it is then verified in an isolated copy. Do not ask to escalate the sandbox for `git`/`gh`, and do not do these steps by hand unless app control is unavailable. The owner can do the same from the Source control panel.
 - Before reporting completion, run the relevant tests and `npm.cmd run build`, commit the finished change, and push `main` to `origin`.
 - Every push to `main` automatically creates the next patch release through `.github/workflows/release.yml`. Do not manually edit the package version or create a release tag for routine task delivery.
 - Verify that the release workflow completed and that its GitHub release contains the installer, blockmap, and `latest.yml`. If publishing is blocked, say that the task is not yet delivered.

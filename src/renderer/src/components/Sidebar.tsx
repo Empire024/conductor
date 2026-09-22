@@ -92,12 +92,11 @@ interface SidebarProps {
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
-export type SidebarUtilityPanel = WorkspacePanel | 'schedules'
+export type SidebarUtilityPanel = WorkspacePanel | 'schedules' | 'source-control'
 
-// "Workspace" and "Explorer" are the primary destinations. The rest are real, working
-// panels too, except Source control, which has no kind/sidebar/utility
-// wired up yet - clicking them does nothing today, so they're pinned to the bottom and
-// rendered disabled rather than opening a dead button.
+// "Workspace", "Explorer" and "Browser" are the primary destinations; the rest open utility
+// panels beside the workspace. An item marked `unfinished` has nothing wired up yet, so it is
+// pinned to the bottom and rendered disabled rather than opening a dead button.
 const railItems: Array<{
   icon: typeof LayoutGrid
   label: string
@@ -114,7 +113,7 @@ const railItems: Array<{
   { icon: Bot, label: 'Automation', utility: 'agents', group: 'secondary' },
   { icon: MemoryStick, label: 'Memory', utility: 'memory', group: 'secondary' },
   { icon: Gauge, label: 'Processes', utility: 'processes', group: 'secondary' },
-  { icon: GitBranch, label: 'Source control', group: 'secondary', unfinished: true },
+  { icon: GitBranch, label: 'Source control', utility: 'source-control', group: 'secondary' },
   { icon: Clock3, label: 'Schedules', utility: 'schedules', group: 'secondary' }
 ]
 
