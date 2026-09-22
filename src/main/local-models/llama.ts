@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import type { LocalModelConfig } from './config.ts'
 import { configPath, loadConfig, logsDir, modelFilePath, runDir, runFile } from './config.ts'
 import { childEnvironment } from './paths.ts'
-import { admissionRefusal, assertResourceHeadroom, runningLlamaProcesses, withAdmissionLock } from './resource-guard.ts'
+import { AdmissionRefusal, admissionRefusal, assertResourceHeadroom, runningLlamaProcesses, withAdmissionLock, type BlockingServer, type ServerProcess } from './resource-guard.ts'
 
 /** llama.cpp is an inference engine here and nothing else. These flags would hand it tools, a
  *  network surface or an agent runtime of its own, so they are refused wherever extra arguments
@@ -304,7 +304,7 @@ export function describeStartupFailure(model: LocalModelConfig, port: number): s
  *  checked for one of our own orphaned servers (adopted rather than duplicated) and otherwise
  *  worked around by moving to a nearby free port - only a port occupied by someone else across
  *  the whole scan range is an error. */
-export async function startServer(executable: string, model: LocalModelConfig, apiKey: string, opts: { pollMs?: number; timeoutMs?: number } = {}): Promise<StartOutcome> {
+export async function startServer(executable: string, model: LocalModelConfig, apiKey: string, opts: StartOptions = {}): Promise<StartOutcome> {
   return withAdmissionLock(() => startAdmittedServer(executable, model, apiKey, opts))
 }
 
@@ -323,15 +323,25 @@ export async function inspectAdmission(model: LocalModelConfig, apiKey: string):
   }
   let reusable: StartOutcome | null = null
   let occupied: string | null = null
+  let blocker: BlockingServer | null = null
+  let inventory: ServerProcess[] | undefined
+  const processes = (): ServerProcess[] => inventory ??= runningLlamaProcesses()
   for (const [port, candidate] of candidates) {
     const listening = await portInUse(port, 300)
-    const alive = processAlive(candidate.pid)
+    let alive = processAlive(candidate.pid)
+    // A recorded pid that is alive but not listening is either a server still loading or a stale
+    // record whose pid the OS has since handed to an unrelated process. Only the inventory tells,
+    // and a stale record must not keep every other model off the machine for good.
+    if (alive && !listening) alive = processes().some(entry => entry.pid === candidate.pid)
     if (!listening && !alive) continue // includes the old 35B record with a dead pid
     const probe = listening ? await health(port, apiKey, 1500) : null
     if (probe?.ok && probe.models?.includes(model.id) && await rejectsAnonymous(port, 1500)) {
       // Remember, but finish the inventory before mutating any record.
       reusable = { started: false, pid: candidate.model === model.id && alive ? candidate.pid! : 0, port, message: `reusing ${model.id} already running on 127.0.0.1:${port}` }
-    } else occupied = probe?.models?.join(', ') || `${candidate.model} on port ${port} (identity or health unverified)`
+    } else {
+      occupied = probe?.models?.join(', ') || `${candidate.model} on port ${port} (identity or health unverified)`
+      blocker = { model: probe?.models?.[0] ?? candidate.model, port, pid: alive ? candidate.pid : null, ours: alive && candidate.pid !== null }
+    }
   }
   // Reusing does not allocate another model, even if the owner started multiple servers manually.
   if (reusable) {
@@ -339,9 +349,8 @@ export async function inspectAdmission(model: LocalModelConfig, apiKey: string):
     if (!record || record.port !== reusable.port || record.pid !== (reusable.pid || null)) writeFileSync(runFile(model), JSON.stringify({ pid: reusable.pid || null, port: reusable.port, model: model.id, file: model.file, startedAt: new Date().toISOString() } satisfies RunRecord, null, 2), 'utf8')
     return { ...reusable, message: reusable.pid ? reusable.message : `adopted; ${reusable.message}` }
   }
-  if (occupied) throw admissionRefusal(model.id, occupied)
-  const processes = runningLlamaProcesses()
-  for (const entry of processes) {
+  if (occupied) throw admissionRefusal(model.id, occupied, blocker ?? undefined)
+  for (const entry of processes()) {
     // Unrecorded servers may have moved ports or live under another data root.
     if (entry.port) {
       const probe = await health(entry.port, apiKey, 1500)
@@ -350,16 +359,80 @@ export async function inspectAdmission(model: LocalModelConfig, apiKey: string):
         if (adoption.adopted) return adoption.adopted
       }
     }
-    throw admissionRefusal(model.id, entry.model)
+    throw admissionRefusal(model.id, entry.model, { model: entry.model, port: entry.port, pid: entry.pid, ours: false })
   }
   return null
 }
 
-async function startAdmittedServer(executable: string, model: LocalModelConfig, apiKey: string, opts: { pollMs?: number; timeoutMs?: number }): Promise<StartOutcome> {
+export interface StartOptions {
+  pollMs?: number
+  timeoutMs?: number
+  /** Consulted before an idle server of another model, one this Conductor started, is stopped to
+   *  make room. `'idle'` lets the switch happen; any other string is the reason the running server
+   *  is busy and becomes the refusal. Without it, another running model is refused as before,
+   *  which is what the CLI and the tests expect. */
+  release?: (running: BlockingServer) => Promise<'idle' | string>
+}
+
+/** One llama.cpp server at a time is a VRAM rule, not a claim on the owner's attention: a server
+ *  this Conductor started and that nothing is using gives way to the model that was asked for. A
+ *  server started elsewhere is never touched, and a busy one is named with what keeps it busy. */
+async function makeRoom(model: LocalModelConfig, running: BlockingServer, release: NonNullable<StartOptions['release']>): Promise<string> {
+  const rule = 'This machine runs one llama.cpp server at a time (12 GB VRAM).'
+  if (!running.ours || running.pid === null) throw new Error(`Cannot start ${model.id}: ${running.model} is running on this machine but was not started by this Conductor, so it is left alone. ${rule} Use ${running.model}, or stop it yourself before switching.`)
+  const verdict = await release(running)
+  if (verdict !== 'idle') throw new Error(`Cannot start ${model.id}: ${running.model} is busy (${verdict}). ${rule} Wait for that work to finish, or use ${running.model} instead. Conductor has not stopped it.`)
+  await stopRecordedServer(running)
+  return `stopped idle ${running.model} to make room`
+}
+
+async function killProcess(pid: number): Promise<void> {
+  if (process.platform === 'win32') {
+    await new Promise<void>(resolve => {
+      const killer = spawn('taskkill.exe', ['/pid', String(pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore' })
+      killer.on('error', () => resolve())
+      killer.on('close', () => resolve())
+    })
+  } else { try { process.kill(pid, 'SIGTERM') } catch { /* already gone */ } }
+}
+
+/** Stops a server by the pid its run record holds, waits until the process and its port are gone,
+ *  and drops the record that now describes nothing. */
+async function stopRecordedServer(running: BlockingServer): Promise<void> {
+  const pid = running.pid!
+  await killProcess(pid)
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline && (processAlive(pid) || (running.port !== undefined && await portInUse(running.port, 300)))) await new Promise(resolve => setTimeout(resolve, 250))
+  if (processAlive(pid)) throw new Error(`Could not stop ${running.model} (pid ${pid}) to make room; no second server was started`)
+  for (const file of readdirSync(runDir()).filter(name => name.endsWith('.json'))) {
+    try {
+      const record = JSON.parse(readFileSync(join(runDir(), file), 'utf8')) as RunRecord
+      if (record.model === running.model && record.pid === pid) rmSync(join(runDir(), file), { force: true })
+    } catch { /* An unreadable record is reported by the next admission pass, not hidden here. */ }
+  }
+}
+
+/** Freed VRAM takes a moment to show up in nvidia-smi after a server exits; a start right after a
+ *  switch would otherwise be refused for memory that is already free. */
+async function waitForHeadroom(model: LocalModelConfig, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try { assertResourceHeadroom(model); return } catch { await new Promise(resolve => setTimeout(resolve, 500)) }
+  }
+}
+
+async function startAdmittedServer(executable: string, model: LocalModelConfig, apiKey: string, opts: StartOptions): Promise<StartOutcome> {
   const pollMs = opts.pollMs ?? 2000
   const timeoutMs = opts.timeoutMs ?? 300_000
 
-  const existing = await inspectAdmission(model, apiKey)
+  let existing: StartOutcome | null
+  let switched = ''
+  try { existing = await inspectAdmission(model, apiKey) }
+  catch (error) {
+    if (!(error instanceof AdmissionRefusal) || !opts.release) throw error
+    switched = await makeRoom(model, error.running, opts.release)
+    existing = await inspectAdmission(model, apiKey)
+  }
   if (existing) return existing
 
   let port = model.port
@@ -373,6 +446,7 @@ async function startAdmittedServer(executable: string, model: LocalModelConfig, 
 
   const path = modelFilePath(model)
   if (!existsSync(path)) throw new Error(`Model file missing: ${path}`)
+  if (switched) await waitForHeadroom(model)
   assertResourceHeadroom(model)
   const log = openSync(logFile(model), 'a')
   // TEMP, caches and any model-cache variable point at the local root, so the server can never
@@ -387,7 +461,7 @@ async function startAdmittedServer(executable: string, model: LocalModelConfig, 
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (spawnError || !processAlive(child.pid)) throw new Error(spawnError || describeStartupFailure(model, port))
-    if ((await health(port, apiKey)).ok) return { started: true, pid: child.pid, port, message: moved ? `healthy on 127.0.0.1:${port}; ${moved}` : 'healthy' }
+    if ((await health(port, apiKey)).ok) return { started: true, pid: child.pid, port, message: [moved ? `healthy on 127.0.0.1:${port}; ${moved}` : 'healthy', switched].filter(Boolean).join('; ') }
     await new Promise(resolve => setTimeout(resolve, pollMs))
   }
   throw new Error(`Server health check failed: ${model.id} did not answer on 127.0.0.1:${port} within 5 minutes`)
@@ -400,15 +474,7 @@ export async function stopServer(model: LocalModelConfig): Promise<string> {
   const record = readRunRecord(model)
   if (!record) return 'not running'
   if (record.pid === null) return 'cannot stop: this Conductor instance did not start the server on this port (no recorded pid)'
-  if (processAlive(record.pid)) {
-    if (process.platform === 'win32') {
-      await new Promise<void>(resolve => {
-        const killer = spawn('taskkill.exe', ['/pid', String(record.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore' })
-        killer.on('error', () => resolve())
-        killer.on('close', () => resolve())
-      })
-    } else { try { process.kill(record.pid, 'SIGTERM') } catch { /* already gone */ } }
-  }
+  if (processAlive(record.pid)) await killProcess(record.pid)
   rmSync(runFile(model), { force: true })
   return `stopped (pid ${record.pid})`
 }

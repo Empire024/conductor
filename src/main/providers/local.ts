@@ -7,6 +7,7 @@ import { LocalAgentSession, RESPONSE_RESERVE_TOKENS } from '../local-models/agen
 import { endpointFor, loadConfig, modelFilePath, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
 import { inspectAdmission, startServer } from '../local-models/llama.ts'
+import { AdmissionRefusal, type BlockingServer } from '../local-models/resource-guard.ts'
 import { DockerSandbox } from '../local-models/sandbox.ts'
 import { LOCAL_TOOLS, type LocalGrants } from '../local-models/tools.ts'
 
@@ -31,9 +32,69 @@ export class LocalSetupError extends Error {
  *  duplicate an already-healthy process, which covers a server this app did not start. */
 const startingServers = new Map<string, Promise<void>>()
 
-/** Bring one model's server up if it is not already answering. Never stops anything: a tab
- *  closing must not take a server another tab is still using, and the stack's own `stop`
- *  command stays the way servers are shut down. */
+/** Conversations with a turn in flight, by model id. The release policy consults this before an
+ *  idle server gives way to another model, so a switch never lands in the middle of a turn that
+ *  this process is running. */
+const turnsInFlight = new Map<string, Set<string>>()
+function markTurn(modelId: string, runtimeId: string): () => void {
+  const set = turnsInFlight.get(modelId) ?? new Set<string>()
+  set.add(runtimeId)
+  turnsInFlight.set(modelId, set)
+  return () => { set.delete(runtimeId); if (!set.size && turnsInFlight.get(modelId) === set) turnsInFlight.delete(modelId) }
+}
+
+/** Whether the server on `port` is generating right now, from llama.cpp's own /slots. Another
+ *  Conductor process or the CLI could be mid-request without this process knowing; the slot
+ *  state is the one place that shows it. A server without /slots reports nothing. */
+export async function slotsProcessing(port: number, apiKey: string, timeoutMs = 2000): Promise<boolean> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/slots`, { headers: { Authorization: `Bearer ${apiKey}` }, signal: controller.signal })
+    if (!response.ok) return false
+    const body = await response.json() as unknown
+    return Array.isArray(body) && body.some(slot => slot && typeof slot === 'object' && (slot as { is_processing?: unknown }).is_processing === true)
+  } catch { return false }
+  finally { clearTimeout(timer) }
+}
+
+/** Whether the running server may give way: 'idle' when no conversation here is mid-turn on it
+ *  and its slots are quiet, otherwise the reason it is busy, worded for the refusal. */
+export async function releaseVerdict(running: BlockingServer, apiKey: string, probes: { inFlight: Map<string, Set<string>>; slots: typeof slotsProcessing } = { inFlight: turnsInFlight, slots: slotsProcessing }): Promise<'idle' | string> {
+  const users = probes.inFlight.get(running.model)
+  if (users?.size) return `${users.size} conversation${users.size === 1 ? ' is' : 's are'} mid-turn on it in this Conductor`
+  if (running.port !== undefined && await probes.slots(running.port, apiKey)) return 'it is generating for another client right now'
+  return 'idle'
+}
+
+/** Whether a conversation on this model could start its server now, for callers that open tabs
+ *  and dispatch work: a refusal is given before a tab exists, with the reason, rather than as the
+ *  first turn's failure inside a tab that then sits there. A snapshot only; the start itself
+ *  decides again under the admission lock. */
+export async function localModelAvailability(modelId: string): Promise<{ available: true; note?: string } | { available: false; reason: string }> {
+  const stack = readConfig()
+  const model = stack?.models[modelId]
+  if (!model) return { available: false, reason: `${localModelLabel(modelId)} is not configured on this machine` }
+  let apiKey: string
+  try { apiKey = readApiKey() } catch { return { available: false, reason: 'Local model credentials are missing; run scripts/local-models/setup.ps1 to regenerate them' } }
+  try {
+    const running = await inspectAdmission(model, apiKey)
+    return running ? { available: true, note: `${localModelLabel(modelId)} is already running` } : { available: true }
+  } catch (error) {
+    if (!(error instanceof AdmissionRefusal)) return { available: false, reason: error instanceof Error ? error.message : String(error) }
+    const running = error.running
+    const rule = 'This machine runs one llama.cpp server at a time.'
+    if (!running.ours) return { available: false, reason: `${localModelLabel(running.model)} (${running.model}) is running on this machine but was not started by this Conductor, so it is left alone. ${rule} Use ${running.model} for this task, or stop that server yourself before switching.` }
+    const verdict = await releaseVerdict(running, apiKey)
+    if (verdict === 'idle') return { available: true, note: `${localModelLabel(running.model)} is idle and will be stopped to make room for ${localModelLabel(modelId)}` }
+    return { available: false, reason: `${localModelLabel(running.model)} (${running.model}) is busy: ${verdict}. ${rule} Wait for that work to finish and try again, or use ${running.model} for this task instead.` }
+  }
+}
+
+/** Bring one model's server up if it is not already answering. A tab closing never takes a server
+ *  another tab is still using, and the stack's own `stop` command stays the way servers are shut
+ *  down by hand; the one thing a start may stop is an idle server of another model that this
+ *  Conductor started, because the machine holds one model at a time. */
 async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, apiKey: string, onStart: () => void): Promise<void> {
   // Reuse must pass the same model identity and anonymous-key-refusal checks as startup.
   // Only startServer may allocate; it repeats admission under the cross-process lock.
@@ -45,7 +106,7 @@ async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, ap
   let pending = startingServers.get(model.id)
   const first = !pending
   if (!pending) {
-    pending = startServer(stack.llamaServer, model, apiKey).then(() => undefined)
+    pending = startServer(stack.llamaServer, model, apiKey, { release: running => releaseVerdict(running, apiKey) }).then(() => undefined)
     startingServers.set(model.id, pending)
     void pending.catch(() => { /* Reported to whoever awaited it. */ }).finally(() => { if (startingServers.get(model.id) === pending) startingServers.delete(model.id) })
   }
@@ -205,7 +266,11 @@ export class LocalAdapter implements ProviderAdapter {
     let round = 0
     const textItem = (): string => `${turnId}:text:${round}`
     const reasoningItem = (): string => `${turnId}:reasoning:${round}`
+    let releaseTurn = (): void => {}
     try {
+      // Claimed before the server is even checked, so a switch decided in another conversation
+      // between this check and the first request cannot take the server out from under it.
+      releaseTurn = markTurn(this.model().id, this.options.runtimeId)
       const model = await this.ready(turnId)
       controller.signal.throwIfAborted()
       const session = this.ensureSession(model)
@@ -237,6 +302,7 @@ export class LocalAdapter implements ProviderAdapter {
       this.emit({ turnId, data: { type: 'error', message: error instanceof Error ? error.message : 'Local model request failed' } })
       this.emit({ turnId, data: { type: 'session', phase: 'failed' } })
     } finally {
+      releaseTurn()
       if (this.controller === controller) this.controller = undefined
     }
   }

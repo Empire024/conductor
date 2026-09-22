@@ -4,10 +4,11 @@ import { createServer as createTcpServer } from 'node:net'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { LocalAdapter, LocalSetupError } from './local'
+import { LocalAdapter, LocalSetupError, localModelAvailability, releaseVerdict } from './local'
 import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, modelDir, runFile } from '../local-models/config.ts'
 import type { LocalModelConfig } from '../local-models/config.ts'
 import * as localPaths from '../local-models/paths.ts'
+import * as resources from '../local-models/resource-guard.ts'
 import type { AdapterEvent, SessionSettings } from '../../shared/structured-agent'
 
 /** Synthetic server state needs no model disk or writable secondary drive. */
@@ -30,6 +31,8 @@ function stubServer(frames: string[], holdMs = 0, identity = { model: QWEN_9B, a
   const server = createServer((request, response) => {
     if (!identity.anonymous && request.headers.authorization !== `Bearer ${KEY}`) { response.writeHead(401).end('{}'); return }
     if (request.url?.startsWith('/v1/models')) { response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data: [{ id: identity.model }] })); return }
+    // No /slots here, like a server built without it: the release policy then relies on what this process knows.
+    if (request.method === 'GET') { response.writeHead(404).end(); return }
     let body = ''
     request.on('data', chunk => { body += String(chunk) })
     request.on('end', () => {
@@ -108,6 +111,30 @@ describe('local provider adapter', () => {
   }
   const texts = (events: AdapterEvent[], role: 'assistant' | 'status'): string =>
     events.filter(event => event.data.type === 'text' && event.data.role === role).map(event => event.data.type === 'text' ? event.data.text : '').join('')
+
+  it('says whether a local model can start now: an idle server of ours gives way, a mid-turn one is named', async () => {
+    const { small, large, workspace } = await stack([frame({ content: 'ok' }, 'stop')], 600)
+    vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
+    // Only the small model's server is up, recorded as started by this process.
+    await new Promise<void>(done => large.server.close(() => done()))
+    writeFileSync(runFile(model(QWEN_9B, small.port) as unknown as LocalModelConfig), JSON.stringify({ pid: process.pid, port: small.port, model: QWEN_9B, file: 'model.gguf', startedAt: '2026-09-22' }), 'utf8')
+    expect(await localModelAvailability(QWEN_9B)).toMatchObject({ available: true, note: expect.stringContaining('already running') })
+    expect(await localModelAvailability(QWEN_35B)).toMatchObject({ available: true, note: expect.stringContaining('idle') })
+    expect(await localModelAvailability('local/not-configured')).toMatchObject({ available: false, reason: expect.stringContaining('not configured') })
+    const events: AdapterEvent[] = []
+    const instance = adapter(workspace, events)
+    await instance.submit('hello', settings())
+    await vi.waitFor(async () => expect(await localModelAvailability(QWEN_35B)).toMatchObject({ available: false, reason: expect.stringContaining('mid-turn') }))
+    expect(await settled(events)).toBe('completed')
+    expect(await localModelAvailability(QWEN_35B)).toMatchObject({ available: true })
+  })
+
+  it('lets an idle server go and names a mid-turn conversation or a busy slot', async () => {
+    const running = { model: QWEN_9B, port: 1, pid: 1, ours: true }
+    expect(await releaseVerdict(running, KEY, { inFlight: new Map(), slots: async () => false })).toBe('idle')
+    expect(await releaseVerdict(running, KEY, { inFlight: new Map([[QWEN_9B, new Set(['a'])]]), slots: async () => false })).toContain('mid-turn')
+    expect(await releaseVerdict(running, KEY, { inFlight: new Map(), slots: async () => true })).toContain('generating')
+  })
 
   it('carries an actionable setup code and public guide without local configuration details', () => {
     const error = new LocalSetupError('Qwen 3.5 9B is not installed.')

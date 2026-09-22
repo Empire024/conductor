@@ -78,6 +78,19 @@ export function assertResourceHeadroom(model: LocalModelConfig, measured = measu
   if (measured.ramFreeBytes < required.ramBytes || (required.vramBytes > 0 && measured.vramFreeBytes! < required.vramBytes)) throw new Error(`Not enough memory to safely start ${model.id}: requires ${(required.ramBytes / GiB).toFixed(1)} GiB free RAM and ${(required.vramBytes / GiB).toFixed(1)} GiB free VRAM including reserves; available ${(measured.ramFreeBytes / GiB).toFixed(1)} GiB RAM and ${measured.vramFreeBytes === null ? 'unknown' : (measured.vramFreeBytes / GiB).toFixed(1)} GiB VRAM. No server was stopped or started.`)
 }
 
-export function admissionRefusal(requested: string, running: string): Error {
-  return new Error(`Cannot start ${requested}: ${running} is already running or starting. This machine allows one llama.cpp server at a time (12 GB VRAM). Use the running model, or stop it explicitly when its work is finished before switching models. Conductor has not stopped it.`)
+/** The server that holds the machine when another model is asked for. `ours` means this Conductor
+ *  started it and recorded its process, which is the only kind it may ever stop to make room. */
+export interface BlockingServer { model: string; port?: number; pid: number | null; ours: boolean }
+
+/** Thrown by admission so the caller can tell "another model holds the machine" apart from every
+ *  other reason a start fails, and knows which server that is. */
+export class AdmissionRefusal extends Error {
+  // Declared rather than a constructor parameter property: this module is also loaded by plain
+  // `node` with type stripping (the admission race test), which erases types but no such sugar.
+  readonly running: BlockingServer
+  constructor(message: string, running: BlockingServer) { super(message); this.name = 'AdmissionRefusal'; this.running = running }
+}
+
+export function admissionRefusal(requested: string, running: string, blocker: BlockingServer = { model: running, pid: null, ours: false }): AdmissionRefusal {
+  return new AdmissionRefusal(`Cannot start ${requested}: ${running} is already running or starting. This machine allows one llama.cpp server at a time (12 GB VRAM). Use the running model, or stop it explicitly when its work is finished before switching models. Conductor has not stopped it.`, blocker)
 }

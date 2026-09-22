@@ -897,7 +897,7 @@ export class StructuredSessions {
     const review = interaction.kind === 'approval' ? await this.approvalGate.reserve(response, reviewedAutomatically, Boolean(interaction.review || this.reviewRouting?.enabled(live.spec))) : undefined
     // The asynchronous target/authority recheck must not race another owner response or restart.
     if (live.runtimeId !== response.runtimeId || live.responses.has(response.requestId)) throw new Error('This request is stale or already submitted')
-    if (interaction.review && !review) throw new Error('Recovered review has no live action binding; response is blocked')
+    if (reviewedAutomatically && !review) throw new Error('Automatic review response has no live action binding; response is blocked')
     live.responses.add(response.requestId)
     try {
       await live.adapter.respond(response)

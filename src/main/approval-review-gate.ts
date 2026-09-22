@@ -15,8 +15,10 @@ export interface ApprovalReviewRouting {
    * No current production adapter establishes atomic preconditions/cross-route fencing. */
   supportsExactExecution?(spec: AgentSpec): boolean
 }
-type Binding = { spec: AgentSpec; runtimeId: string; source: AdapterEvent; interaction: PendingInteraction; action?: ReviewAction; record?: ReviewRecord }
+type Binding = { spec: AgentSpec; runtimeId: string; source: AdapterEvent; interaction: PendingInteraction; action?: ReviewAction; record?: ReviewRecord; settled?: 'owner' }
 const object = (value: unknown): Record<string, Json> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, Json> : {}
+/** Phases after which a record carries a response intent; an owner answer no longer changes them. */
+const SETTLED_PHASES = ['responding', 'responded', 'execution-unknown', 'executed', 'execution-failed']
 
 /** Intercepts before actionable UI publication and is also checked by the single response API. */
 export class ApprovalReviewGate {
@@ -39,13 +41,14 @@ export class ApprovalReviewGate {
     }
     return 'A durable approval denial protects this project target. This tool route cannot retry or bypass it.'
   }
+  /** What the owner sees while the review runs or after it stopped. The owner's own choices are
+   *  never taken away: a reviewer may answer for the owner, but no review state, least of all a
+   *  review that could not run, may lock the owner out of a request the runtime is waiting on. */
   private projection(binding: Binding): AdapterEvent {
     const record = binding.record
     const review = record ? { id: record.id, digest: record.digest, phase: record.phase, rationale: record.rationale, reviewerModel: record.reviewerModel } : { id: '', digest: '', phase: 'reviewing', rationale: 'Preparing exact action and authorization for review' }
-    const owner = record?.phase === 'owner'
-    return { ...binding.source, data: { type: 'interaction', interaction: { ...binding.interaction, review,
-      title: owner ? `Owner decision: ${binding.interaction.title}` : record?.phase === 'blocked' ? 'Approval boundary blocked' : record?.phase === 'paused' ? 'Approval review paused' : 'Pending stronger-model review',
-      choices: binding.interaction.choices.map(choice => ({ ...choice, disabled: !owner || !['allow', 'deny', 'accept', 'decline'].includes(choice.id) || choice.disabled })) } } }
+    const title = record?.phase === 'owner' ? `Owner decision: ${binding.interaction.title}` : !record || record.phase === 'reviewing' ? 'Pending stronger-model review' : binding.interaction.title
+    return { ...binding.source, data: { type: 'interaction', interaction: { ...binding.interaction, review, title } } }
   }
   intercept(spec: AgentSpec, runtimeId: string, source: AdapterEvent): AdapterEvent {
     if (source.data.type === 'tool' && ['completed', 'failed', 'rejected'].includes(source.data.status)) {
@@ -70,10 +73,13 @@ export class ApprovalReviewGate {
     return this.projection(binding)
   }
   private update(binding: Binding, record: ReviewRecord): void { binding.record = record; this.publish(binding.spec.id, binding.runtimeId, this.projection(binding)) }
+  /** The review stopped without a decision. The request stays a normal owner approval, with the
+   *  reason shown; nothing about the owner's choices changes. */
   private pause(binding: Binding, error: unknown): void {
+    if (binding.settled) return
     const reason = String(sanitizeDiagnostic(error instanceof Error ? error.message : 'Review unavailable'))
     if (binding.record) this.update(binding, this.journal.transition(this.journal.get(binding.record.projectId, binding.record.id)!, 'paused', reason))
-    else this.publish(binding.spec.id, binding.runtimeId, { ...binding.source, data: { type: 'interaction', interaction: { ...binding.interaction, title: 'Approval review paused', review: { id: '', digest: '', phase: 'paused', rationale: reason }, choices: binding.interaction.choices.map(choice => ({ ...choice, disabled: true })) } } })
+    else this.publish(binding.spec.id, binding.runtimeId, { ...binding.source, data: { type: 'interaction', interaction: { ...binding.interaction, review: { id: '', digest: '', phase: 'paused', rationale: reason } } } })
   }
   private async action(binding: Binding): Promise<ReviewAction> {
     if (!this.routing?.enabled(binding.spec)) throw new Error('Owner review authorization is absent or was revoked')
@@ -109,7 +115,9 @@ export class ApprovalReviewGate {
   }
   private async prepare(binding: Binding): Promise<void> {
     binding.action = await this.action(binding)
-    const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => this.update(binding, record))
+    const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => { if (!binding.settled) this.update(binding, record) })
+    // An owner who answered meanwhile has already settled the record; the reviewer's late word is not used.
+    if (binding.settled) return
     this.update(binding, record)
     if (this.bindings.get(this.key(binding.spec.id, binding.runtimeId, binding.interaction.id)) !== binding) return
     if (record.phase === 'approved' || record.phase === 'denied') {
@@ -118,17 +126,38 @@ export class ApprovalReviewGate {
       await this.respond({ sessionId: binding.spec.id, runtimeId: binding.runtimeId, requestId: binding.interaction.id, decision })
     }
   }
+  /** The automatic path is strict: an exact, unchanged action and a matching reviewer decision, or
+   *  nothing is sent. The owner's path always passes. A review that never reached a record, one
+   *  that paused or was blocked, one still running: none of them may hold back the answer of the
+   *  person the review was standing in for. An answer given after the reviewer's explicit
+   *  escalation keeps its journaled meaning, so a denial there still fences the target. */
   async reserve(response: InteractionResponse, automatic: boolean, required = false): Promise<ReviewRecord | undefined> {
     const binding = this.bindings.get(this.key(response.sessionId, response.runtimeId, response.requestId))
-    if (!binding) { if (required) throw new Error('Required stronger review has no live action binding'); return undefined }
-    if (!binding.action || !binding.record) throw new Error('Stronger-model review has not completed')
-    const current = await this.action(binding)
-    if (actionDigest(current) !== actionDigest(binding.action)) { this.update(binding, this.journal.transition(binding.record, 'blocked', 'Arguments, target contents or owner authorization changed during review; fresh review is required')); throw new Error('Reviewed action has changed') }
-    if (!['allow', 'deny'].includes(response.decision ?? '')) throw new Error('Only the exact one-action decision is supported by review routing')
-    if (automatic && (response.decision === 'allow' ? binding.record.phase !== 'approved' : binding.record.phase !== 'denied')) throw new Error('The reviewer did not authorize this decision')
-    const record = this.journal.reserve(current, automatic ? undefined : response.decision as 'allow' | 'deny')
-    binding.record = record
-    return record
+    if (!binding) { if (automatic && required) throw new Error('Required stronger review has no live action binding'); return undefined }
+    const decision = response.decision ?? ''
+    const record = binding.record && this.journal.get(binding.record.projectId, binding.record.id)
+    if (automatic) {
+      if (!binding.action || !record) throw new Error('Stronger-model review has not completed')
+      if (binding.settled) throw new Error('The owner already answered this request')
+      const current = await this.action(binding)
+      if (actionDigest(current) !== actionDigest(binding.action)) { this.update(binding, this.journal.transition(record, 'blocked', 'Arguments, target contents or owner authorization changed during review; fresh review is required')); throw new Error('Reviewed action has changed') }
+      if (!['allow', 'deny'].includes(decision)) throw new Error('Only the exact one-action decision is supported by review routing')
+      if (decision === 'allow' ? record.phase !== 'approved' : record.phase !== 'denied') throw new Error('The reviewer did not authorize this decision')
+      binding.record = this.journal.reserve(current)
+      return binding.record
+    }
+    binding.settled = 'owner'
+    if (record?.phase === 'owner' && binding.action && (decision === 'allow' || decision === 'deny')) {
+      try {
+        const current = await this.action(binding)
+        if (actionDigest(current) === actionDigest(binding.action)) { binding.record = this.journal.reserve(current, decision); return binding.record }
+      } catch { /* The exact-action grant cannot be journaled; the owner's answer still goes through below. */ }
+    }
+    if (record && !SETTLED_PHASES.includes(record.phase)) {
+      binding.record = this.journal.transition(record, 'responding', `Owner answered while the review was ${record.phase}; the reviewer's result is not used`, decision === 'allow' || decision === 'deny' ? { ownerAnswer: decision } : {})
+      return binding.record
+    }
+    return undefined
   }
   finish(record: ReviewRecord, delivered: boolean): void {
     const latest = this.journal.get(record.projectId, record.id)!

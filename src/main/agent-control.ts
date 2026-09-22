@@ -152,6 +152,8 @@ export interface AgentControlDependencies {
   localUpdates?: LocalUpdateBuildService
   /** Host-side test, build, commit, push and release verification; absent where unavailable. */
   delivery?: DeliveryControl
+  /** Whether a local model could start its server now; absent where the local runtime is not wired. */
+  localModels?: { availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }> }
   providers(): AgentProviderInfo[]
   /** This machine plus any paired machines a tab may be placed on. */
   machines?(): MachineDescriptor[]
@@ -552,6 +554,13 @@ export class AgentControl {
       if (Object.keys(requestedGrants).length) {
         this.grantAuthority(scope, source)
         if (provider !== 'local') throw new Error('Repository and research grants apply to local models only')
+      }
+      // A local model whose server cannot start right now (another model is busy on the one
+      // slot this machine has) is refused here, with the reason, rather than as the failure of the
+      // first turn inside a tab that then sits there.
+      if (provider === 'local' && this.deps.localModels) {
+        const availability = await this.deps.localModels.availability(model.id)
+        if (!availability.available) throw new Error(availability.reason ?? 'This local model cannot start right now')
       }
       tab.resourceId = makeId('agent')
       if (approvalReviewer) this.deps.sessions.markApprovalReviewer(tab.resourceId)

@@ -105,7 +105,11 @@ export class ApprovalReviews {
         if (current.phase !== 'reviewing') return current
         const phase = result.decision === 'deny' ? 'denied' : result.decision === 'escalate' ? 'owner' : action.boundary === 'workspace-write' ? 'approved' : 'blocked'
         record = this.transition(current, phase, phase === 'blocked' ? 'The reviewer cannot approve this native owner boundary. Explicit escalation is required. ' + result.rationale : result.rationale, { reviewerId: result.reviewerId, reviewerModel: result.model, reviewerTurnId: result.turnId, reviewerElapsedMs: result.elapsedMs, reviewerUsage: result.usage })
-      } catch (error) { record = this.transition(this.get(record.projectId, record.id)!, 'paused', error instanceof Error ? error.message : 'Reviewer failed', error instanceof ReviewRunError ? error.evidence : {}) }
+      } catch (error) {
+        // A record the owner has since answered keeps that answer; only a review still waiting pauses.
+        const current = this.get(record.projectId, record.id)!
+        record = current.phase === 'reviewing' ? this.transition(current, 'paused', error instanceof Error ? error.message : 'Reviewer failed', error instanceof ReviewRunError ? error.evidence : {}) : current
+      }
       return record
     })()
     this.inFlight.set(key, promise)

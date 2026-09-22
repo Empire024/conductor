@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer as createHttpServer, type Server } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
@@ -13,7 +13,7 @@ import {
 } from './sandbox.ts'
 import {
   adoptRunningServer, describeStartupFailure, findFreePort, llamaServerArgs, logFile, portBindable,
-  inspectAdmission, readRunRecord, startServer, validateExtraArgs
+  inspectAdmission, processAlive, readRunRecord, startServer, validateExtraArgs
 } from './llama.ts'
 import { StreamAccumulator } from './client.ts'
 import { repairToolProtocol, RESPONSE_RESERVE_TOKENS, trimMessages } from './agent.ts'
@@ -443,6 +443,56 @@ describe('llama.cpp server lifecycle', () => {
     expect(readFileSync(runFile(small), 'utf8')).toBe(before)
     expect((await startServer('must-never-spawn', small, key)).started).toBe(false)
     expect(orphan.server.listening).toBe(true)
+  })
+
+  it('stops an idle server this Conductor started to make room for the requested model', async () => {
+    scratchRoot()
+    vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
+    // Stands in for the llama-server process the record points at; killing it is the switch.
+    const sleeper = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore', windowsHide: true })
+    await new Promise<void>((resolve, reject) => { sleeper.once('spawn', () => resolve()); sleeper.once('error', reject) })
+    cleanup.push(() => { try { sleeper.kill() } catch { /* stopped by the switch */ } })
+    const orphan = await fakeOrphan(QWEN_9B)
+    const small = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
+    const large = { ...defaultModelConfig(QWEN_35B), port: await findFreePort(small) }
+    writeFileSync(runFile(small), JSON.stringify({ pid: sleeper.pid, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21' }))
+    const asked: string[] = []
+    const release = async (running: resources.BlockingServer): Promise<'idle'> => {
+      asked.push(`${running.model}:${running.pid}:${running.ours}`)
+      await new Promise<void>(done => orphan.server.close(() => done()))
+      return 'idle'
+    }
+    // With the room made, the start goes on to the model file, which this scratch root does not have.
+    await expect(startServer('must-never-spawn', large, key, { release })).rejects.toThrow('Model file missing')
+    expect(asked).toEqual([`${QWEN_9B}:${sleeper.pid}:true`])
+    expect(processAlive(sleeper.pid!)).toBe(false)
+    expect(readRunRecord(small)).toBeNull()
+  })
+
+  it('refuses to stop a server that is busy or that it did not start, and says why', async () => {
+    scratchRoot()
+    vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
+    const orphan = await fakeOrphan(QWEN_9B)
+    const small = { ...defaultModelConfig(QWEN_9B), port: orphan.port }
+    const large = { ...defaultModelConfig(QWEN_35B), port: await findFreePort(small) }
+    writeFileSync(runFile(small), JSON.stringify({ pid: process.pid, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21' }))
+    await expect(startServer('must-never-spawn', large, key, { release: async () => '1 conversation is mid-turn on it' })).rejects.toThrow('is busy (1 conversation is mid-turn on it)')
+    expect(orphan.server.listening).toBe(true)
+    expect(readRunRecord(small)?.pid).toBe(process.pid)
+    // Adopted rather than started: there is no process of ours to stop, and nobody is even asked.
+    writeFileSync(runFile(small), JSON.stringify({ pid: null, port: orphan.port, model: small.id, file: small.file, startedAt: '2026-09-21' }))
+    const release = vi.fn(async () => 'idle' as const)
+    await expect(startServer('must-never-spawn', large, key, { release })).rejects.toThrow('was not started by this Conductor')
+    expect(release).not.toHaveBeenCalled()
+    expect(orphan.server.listening).toBe(true)
+  })
+
+  it('does not let a stale record whose pid now belongs to something else keep every model off the machine', async () => {
+    scratchRoot()
+    vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
+    const stale = { ...defaultModelConfig(QWEN_9B), port: await findFreePort({ ...defaultModelConfig(QWEN_9B), port: 52100 }) }
+    writeFileSync(runFile(stale), JSON.stringify({ pid: process.pid, port: stale.port, model: stale.id, file: stale.file, startedAt: '2026-09-14' }))
+    await expect(inspectAdmission({ ...defaultModelConfig(QWEN_35B), port: await findFreePort(stale) }, key)).resolves.toBeNull()
   })
 
   it('ignores dead records, refuses unrecorded processes and fails closed on unreadable inventory', async () => {

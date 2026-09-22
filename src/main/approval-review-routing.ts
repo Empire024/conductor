@@ -16,9 +16,25 @@ export interface ReviewRoutingHost {
 /** Owner opt-in, explicit model policy, one isolated native turn, no model-selected fallback. */
 export function createApprovalRouting(deps: AgentControlDependencies, host: ReviewRoutingHost): ApprovalReviewRouting {
   let busy = false
+  /** Whether review authority could be established at all: the worker and every controller above
+   *  it have an open tab on this machine, in the worker's own project. A chain that fails this is
+   *  simply not reviewed, and the worker keeps the permission mode it was given, instead of being
+   *  made to ask for approvals that a review could never answer. */
+  const supported = (spec: AgentSpec): boolean => {
+    let current: AgentSpec | undefined = spec
+    const seen = new Set<string>()
+    while (current && !seen.has(current.id) && seen.size < 8) {
+      seen.add(current.id)
+      if (!host.localAndOpen(current) || current.projectId !== spec.projectId) return false
+      const parent = host.controller(current.id)
+      if (!parent) return true
+      current = deps.database.structured.spec<AgentSpec>(parent) ?? undefined
+    }
+    return false
+  }
   const enabled = (spec: AgentSpec) => {
     const parent = host.controller(spec.id)
-    return !deps.sessions.isApprovalReviewer(spec.id) && Boolean(parent && deps.database.structured.snapshot(parent)?.settings.reviewDelegatedActions)
+    return !deps.sessions.isApprovalReviewer(spec.id) && Boolean(parent && deps.database.structured.snapshot(parent)?.settings.reviewDelegatedActions) && supported(spec)
   }
   const authorization = (spec: AgentSpec) => {
     let current = spec

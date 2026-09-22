@@ -80,6 +80,7 @@ import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
 import { LocalUpdateBuilder } from './local-update-build'
+import { localModelAvailability } from './providers/local'
 import { DeliveryService } from './delivery'
 import { registerDeliveryIpc } from './delivery-ipc'
 import { gitHubCredential } from './github-credential'
@@ -2069,6 +2070,7 @@ app.whenReady().then(async () => {
   const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
     localUpdates: localUpdateBuilder,
     delivery,
+    localModels: { availability: localModelAvailability },
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),

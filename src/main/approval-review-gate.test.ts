@@ -45,18 +45,19 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     expect(f.responses).toHaveLength(0)
   })
 
-  it('refuses a required response whose live action binding was lost on reconnect', async () => {
+  it('refuses an automatic response whose live action binding was lost on reconnect, but never the owner', async () => {
     const f = fixture()
-    await expect(f.gate.reserve({ sessionId: 'worker', runtimeId: 'lost-runtime', requestId: 'missing', decision: 'allow' }, false, true)).rejects.toThrow('no live action binding')
+    await expect(f.gate.reserve({ sessionId: 'worker', runtimeId: 'lost-runtime', requestId: 'missing', decision: 'allow' }, true, true)).rejects.toThrow('no live action binding')
+    await expect(f.gate.reserve({ sessionId: 'worker', runtimeId: 'lost-runtime', requestId: 'missing', decision: 'allow' }, false, true)).resolves.toBeUndefined()
   })
-  it('hides owner actions before an actual review and sends one exact workspace Write response', async () => {
+  it("keeps the owner's choices open during the review and sends one exact workspace Write response", async () => {
     const f = fixture()
     let release!: (result: ReviewResult) => void, digest = ''
     f.setDecision(async (_action, actual) => { digest = actual; return new Promise(resolve => { release = resolve }) })
     const visible = f.gate.intercept(f.spec, 'runtime', f.request())
-    expect(visible.data).toMatchObject({ type: 'interaction', interaction: { review: { phase: 'reviewing' }, choices: expect.arrayContaining([expect.objectContaining({ id: 'allow', disabled: true })]) } })
+    expect(visible.data).toMatchObject({ type: 'interaction', interaction: { review: { phase: 'reviewing' }, title: 'Pending stronger-model review' } })
+    if (visible.data.type === 'interaction') expect(visible.data.interaction.choices.every(choice => !choice.disabled)).toBe(true)
     await vi.waitFor(() => expect(f.run).toHaveBeenCalledOnce())
-    await expect(f.gate.reserve({ sessionId: 'worker', runtimeId: 'runtime', requestId: 'request', decision: 'allow' }, false)).rejects.toThrow('only after explicit reviewer escalation')
     release({ digest, decision: 'allow', rationale: 'Authorized file', reviewerId: 'reviewer', model: 'claude-opus-test', turnId: 'turn' })
     await vi.waitFor(() => expect(f.responses).toHaveLength(1))
     f.gate.intercept(f.spec, 'runtime', f.request())
@@ -65,12 +66,13 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     expect(f.run).toHaveBeenCalledOnce()
     expect(f.run.mock.calls[0]![1]).toMatchObject({ tool: 'Write', arguments: { file_path: 'panel.txt', content: 'hello' }, machineId: 'local', ownerEvidence: expect.stringContaining('No deployment') })
   })
-  it('shows owner choices only after escalation and persists denial across runtime/worker/tool routes', async () => {
+  it('journals an owner answer given after escalation and persists that denial across runtime/worker/tool routes', async () => {
     const f = fixture()
     f.setDecision(async (_action, digest) => ({ digest, decision: 'escalate', rationale: 'Needs owner permission', reviewerId: 'reviewer', model: 'claude-opus-test', turnId: 'turn' }))
     f.gate.intercept(f.spec, 'runtime', f.request())
     await f.waitPhase('owner')
-    expect(f.last().choices.find(choice => choice.id === 'allow-session')?.disabled).toBe(true)
+    expect(f.last().title).toBe('Owner decision: Allow Write?')
+    expect(f.last().choices.every(choice => !choice.disabled)).toBe(true)
     const record = await f.gate.reserve({ sessionId: 'worker', runtimeId: 'runtime', requestId: 'request', decision: 'deny' }, false)
     expect(record?.denied).toBe(true)
     f.restart()
@@ -87,13 +89,14 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     expect(f.responses).toHaveLength(0)
     expect(f.last().review?.rationale).toContain('changed')
   })
-  it('blocks unsupported native requests without presenting owner approval or running a reviewer', async () => {
+  it('blocks unsupported native requests from automatic approval without running a reviewer, leaving them to the owner', async () => {
     const f = fixture()
     f.gate.intercept({ ...f.spec, provider: 'codex' }, 'runtime', f.request('command', { command: 'outside write' }, 'Bash'))
     await f.waitPhase('blocked')
     expect(f.last().review?.rationale).toContain('no implemented exact-action')
     expect(f.run).not.toHaveBeenCalled()
-    expect(f.last().choices.every(choice => choice.disabled)).toBe(true)
+    expect(f.last().title).toBe('Allow Bash?')
+    expect(f.last().choices.every(choice => !choice.disabled)).toBe(true)
   })
   it('never replaces mandatory native approval with a reviewer allow', async () => {
     const f = fixture()
@@ -102,17 +105,40 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     expect(f.responses).toHaveLength(0)
     expect(f.last().review?.rationale).toContain('native owner boundary')
   })
-  it('preserves an outage as paused and never falls back to owner or another model', async () => {
+  it('preserves an outage as paused, leaves the decision with the owner and never falls back to another model', async () => {
     const f = fixture()
     f.setDecision(async () => { throw new Error('Reviewer budget exhausted') })
     f.gate.intercept(f.spec, 'runtime', f.request())
     await f.waitPhase('paused')
     expect(f.responses).toHaveLength(0)
-    expect(f.last().choices.every(choice => choice.disabled)).toBe(true)
+    expect(f.last().choices.every(choice => !choice.disabled)).toBe(true)
     f.restart()
     f.gate.intercept(f.spec, 'runtime', f.request())
     await f.waitPhase('paused')
     expect(f.run).toHaveBeenCalledOnce()
+  })
+  it('lets the owner answer during a review or after it stalled, and never uses the late reviewer result', async () => {
+    const f = fixture()
+    let release!: (result: ReviewResult) => void, digest = ''
+    f.setDecision(async (_action, actual) => { digest = actual; return new Promise(resolve => { release = resolve }) })
+    f.gate.intercept(f.spec, 'runtime', f.request())
+    await vi.waitFor(() => expect(f.run).toHaveBeenCalledOnce())
+    const record = await f.gate.reserve({ sessionId: 'worker', runtimeId: 'runtime', requestId: 'request', decision: 'allow-session' }, false)
+    expect(record?.phase).toBe('responding')
+    f.gate.finish(record!, true)
+    release({ digest, decision: 'deny', rationale: 'Late and unused', reviewerId: 'reviewer', model: 'claude-opus-test', turnId: 'turn' })
+    await tick(); await tick()
+    expect(f.responses).toHaveLength(0)
+    expect(f.gate.journal.hasDenials('project')).toBe(false)
+    expect(f.gate.journal.get('project', record!.id)?.phase).toBe('responded')
+    // A review that could not even bind an action still leaves a normal approval for the owner.
+    f.gate.routing!.authorization = () => { throw new Error('Remote, detached or cross-project review authority is unsupported') }
+    f.gate.intercept(f.spec, 'runtime', f.request('second'))
+    await f.waitPhase('paused')
+    expect(f.last().title).toBe('Allow Write?')
+    expect(f.last().review?.rationale).toContain('cross-project')
+    expect(f.last().choices.every(choice => !choice.disabled)).toBe(true)
+    await expect(f.gate.reserve({ sessionId: 'worker', runtimeId: 'runtime', requestId: 'second', decision: 'allow' }, false)).resolves.toBeUndefined()
   })
   it('does not review a plan-mode mutation or a protected settings path', async () => {
     const f = fixture()
