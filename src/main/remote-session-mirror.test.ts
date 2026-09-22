@@ -431,6 +431,18 @@ describe('mirroring a conversation that runs on another machine', () => {
     expect(() => f.mirror.unsupported('local-session', 'Native CLI handoff')).toThrow(/not supported.*another machine/)
   })
 
+  it('forwards composer-pasted text with its content, but never a path on it', async () => {
+    const f = fixture(() => [])
+    f.mirror.bind(binding())
+    const paste: ContextAttachment = { id: 'pasted-text:one', kind: 'selection', name: 'Pasted text #1: 2 lines', content: 'one\ntwo' }
+    await f.mirror.submit('local-session', 'see [Pasted text #1: 2 lines]', 'agents.submit', remoteSnapshot().settings, [paste])
+    expect(f.asked.find(call => call.method === 'agents.submit')?.args).toMatchObject({ attachments: [paste] })
+    await expect(f.mirror.submit('local-session', 'path', 'agents.submit', remoteSnapshot().settings, [{ ...paste, path: 'C:/controller/notes.md' }]))
+      .rejects.toThrow(/carry their text and no path/)
+    await expect(f.mirror.submit('local-session', 'plain selection', 'agents.submit', remoteSnapshot().settings, [{ ...paste, id: 'selection-1' }]))
+      .rejects.toThrow(/controller paths and content are refused/)
+  })
+
   it('refuses to forward a prompt for a session that is not mirrored', async () => {
     const f = fixture(() => [])
     await expect(f.mirror.submit('not-mirrored', 'hello')).rejects.toThrow(/not running on another machine/)

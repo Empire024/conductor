@@ -89,6 +89,13 @@ export type RemotePromptFileAttachment = Pick<ContextAttachment, 'id' | 'name'> 
   kind: 'file'
   remoteFile: RemoteFileIdentity
 }
+/** Text the owner pasted into the composer (see shared/pasted-text.ts) is message content, not a
+ *  host file, so it is the one attachment a controller supplies bytes for. */
+export type RemotePromptTextAttachment = Pick<ContextAttachment, 'id' | 'name'> & {
+  kind: 'selection'
+  content: string
+}
+export type RemotePromptAttachment = RemotePromptFileAttachment | RemotePromptTextAttachment
 
 /** Host/controller transport; never expose raw chunk iteration directly to untrusted web content. */
 export interface RemoteFileResourceTransport {

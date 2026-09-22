@@ -11,6 +11,7 @@ import { RemoteControlHost, type RemoteControlHostDependencies } from './remote-
 import type { TerminalRuntime } from './remote-terminals'
 import { RemoteAccessError, type RemotePeers } from './remote-peers'
 import type { StructuredSessions } from './structured-sessions'
+import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
 
 /**
  * The host is where an authenticated peer's calls meet this machine's disk and its tabs, so these
@@ -393,6 +394,24 @@ describe('remote structured conversation operations', () => {
     fix.revoke()
     await expect(pending).rejects.toThrow(/access changed/)
     expect(fix.sessions.submit).not.toHaveBeenCalled()
+  })
+
+  it('accepts a long prompt up to the provider ceiling and names the real limit past it', async () => {
+    const pasted = 'x'.repeat(31_000)
+    await fix.call('agents.submit', { ...base, prompt: pasted, settings })
+    expect(fix.sessions.submit).toHaveBeenLastCalledWith('agent-remote', pasted, settings, [], expect.any(Object))
+    await expect(fix.call('agents.submit', { ...base, prompt: 'x'.repeat(MAX_PROMPT_CHARS + 1), settings }))
+      .rejects.toThrow('The prompt is 600,001 characters; the limit is 600,000.')
+  })
+
+  it('carries composer-pasted text as context and refuses a pasted attachment that names a path', async () => {
+    const paste = { id: 'pasted-text:one', kind: 'selection', name: 'Pasted text #1: 2 lines', content: 'one\ntwo' }
+    await fix.call('agents.submit', { ...base, prompt: 'see [Pasted text #1: 2 lines]', settings, attachments: [paste] })
+    expect(fix.sessions.submit).toHaveBeenLastCalledWith('agent-remote', 'see [Pasted text #1: 2 lines]', settings, [paste], expect.any(Object))
+    await expect(fix.call('agents.submit', { ...base, prompt: 'escape', settings, attachments: [{ ...paste, path: '../secrets.env' }] }))
+      .rejects.toThrow(/must carry only its text/)
+    await expect(fix.call('agents.submit', { ...base, prompt: 'not pasted', settings, attachments: [{ ...paste, id: 'selection-1' }] }))
+      .rejects.toThrow(/without supplied content/)
   })
 
   it('bounds aggregate remote attachment context by UTF-8 bytes', async () => {

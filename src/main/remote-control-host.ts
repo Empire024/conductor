@@ -19,13 +19,15 @@ import { RemoteTerminalHost, type RemoteTerminalStream, type TerminalRuntime } f
 import type { StructuredSessions } from './structured-sessions'
 import { readTextFile } from './text-files'
 import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES } from '../shared/remote-files'
-import type { ContextAttachment } from '../shared/structured-agent'
+import { MAX_PROMPT_CHARS, type ContextAttachment } from '../shared/structured-agent'
+import { isPastedText, PASTED_TEXT_MAX_CHARS } from '../shared/pasted-text'
 
 type Args = Record<string, unknown>
 
 const text = (args: Args, key: string, maximum = 20000): string => {
   const value = args[key]
-  if (typeof value !== 'string' || !value.trim() || value.length > maximum || value.includes('\0')) throw new RemoteAccessError(`Invalid ${key}`, 400)
+  if (typeof value === 'string' && value.length > maximum) throw new RemoteAccessError(`The ${key} is ${value.length.toLocaleString('en-US')} characters; the limit is ${maximum.toLocaleString('en-US')}.`, 400)
+  if (typeof value !== 'string' || !value.trim() || value.includes('\0')) throw new RemoteAccessError(`Invalid ${key}`, 400)
   return value
 }
 
@@ -206,6 +208,17 @@ export class RemoteControlHost {
     let total = 0
     for (const rawItem of raw) {
       const item = rawItem && typeof rawItem === 'object' && !Array.isArray(rawItem) ? rawItem as Record<string, unknown> : {}
+      // Pasted composer text is message content the peer could have typed inline, never a path.
+      if (typeof item.id === 'string' && item.kind === 'selection' && isPastedText({ id: item.id, kind: 'selection' })) {
+        if (item.id.length > 160 || typeof item.name !== 'string' || !item.name || item.name.length > 512 || Object.hasOwn(item, 'path') || Object.hasOwn(item, 'remoteFile')
+          || typeof item.content !== 'string' || item.content.length > PASTED_TEXT_MAX_CHARS || item.content.includes('\0')) {
+          throw new RemoteAccessError('A pasted text attachment must carry only its text.', 400)
+        }
+        total += Buffer.byteLength(item.content)
+        if (total > 250_000) throw new RemoteAccessError('Total remote file context exceeds 250 KB.', 400)
+        attachments.push({ id: item.id, kind: 'selection', name: item.name, content: item.content })
+        continue
+      }
       const remoteFile = item.remoteFile && typeof item.remoteFile === 'object' && !Array.isArray(item.remoteFile)
         ? item.remoteFile as Record<string, unknown> : {}
       if (item.kind !== 'file' || typeof item.id !== 'string' || !item.id || item.id.length > 160
@@ -501,7 +514,8 @@ export class RemoteControlHost {
         return { archived: args.archived }
       }
       if (method === 'agents.submit' || method === 'agents.steer' || method === 'agents.queue') {
-        const prompt = text(args, 'prompt')
+        // The prompt ceiling is the provider's own; the session reports its per-message limit by name.
+        const prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
         const remoteContext = await this.promptAttachments(peer, projectId, args.attachments)
         remoteContext.current()
         // Attributed to the peer machine, never to "You", so the owner can always tell remote

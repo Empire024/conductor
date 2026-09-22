@@ -22,6 +22,8 @@ export function useComposerDraft(projectId: string, sessionId: string) {
   const setAttachments = useCallback((value: SetStateAction<ContextAttachment[]>) => drafts.update(key, current => ({
     ...current, attachments: typeof value === 'function' ? value(current.attachments) : value
   })), [key])
+  /** One revision for an edit that changes both, such as folding a paste into an attachment. */
+  const setDraft = useCallback((message: string, attachments: ContextAttachment[]) => drafts.update(key, () => ({ message, attachments })), [key])
   const clearSubmitted = useCallback((revision: string) => drafts.clearSubmitted(key, revision), [key])
-  return { draft, setMessage, setAttachments, clearSubmitted }
+  return { draft, setMessage, setAttachments, setDraft, clearSubmitted }
 }

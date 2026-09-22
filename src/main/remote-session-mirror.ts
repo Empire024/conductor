@@ -11,7 +11,8 @@ import type {
   StructuredProvider
 } from '../shared/structured-agent'
 import type { AgentSpec, RuntimeEnsureResult } from '../shared/models'
-import type { RemotePromptFileAttachment } from '../shared/remote-files'
+import type { RemotePromptAttachment, RemotePromptFileAttachment } from '../shared/remote-files'
+import { isPastedText, PASTED_TEXT_MAX_CHARS } from '../shared/pasted-text'
 import { STREAM_RESYNC_POLL_MS } from '../shared/remote-stream'
 import type { ConductorDatabase } from './database'
 
@@ -302,10 +303,15 @@ export class RemoteSessionMirror {
     }
   }
 
-  private remoteAttachments(binding: RemoteSessionBinding, attachments: ContextAttachment[] | undefined): RemotePromptFileAttachment[] {
+  private remoteAttachments(binding: RemoteSessionBinding, attachments: ContextAttachment[] | undefined): RemotePromptAttachment[] {
     if (!attachments?.length) return []
     if (!Array.isArray(attachments) || attachments.length > 20) throw new Error('A remote prompt can attach at most 20 host files.')
-    return attachments.map(item => {
+    return attachments.map((item): RemotePromptAttachment => {
+      if (item && typeof item.id === 'string' && isPastedText(item)) {
+        if (item.id.length > 160 || typeof item.name !== 'string' || !item.name || item.name.length > 512 || Object.hasOwn(item, 'path')
+          || typeof item.content !== 'string' || item.content.length > PASTED_TEXT_MAX_CHARS) throw new Error('Pasted text attachments must carry their text and no path.')
+        return { id: item.id, kind: 'selection', name: item.name, content: item.content }
+      }
       const attachment = item as ContextAttachment & Partial<RemotePromptFileAttachment>
       const file = attachment.remoteFile
       const path = typeof file?.path === 'string' ? file.path.replaceAll('\\', '/') : ''
