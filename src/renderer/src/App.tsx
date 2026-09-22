@@ -78,6 +78,7 @@ import {
   type IssueReportContext
 } from './debug-log'
 import { getAttentionSessionIds, getProjectActivityStatuses, getSessionActivityStatuses, hasActiveSubagent, mergeProjectActivity, resolveActivityPhases, retainVisibleAttentionResources } from './attention'
+import { autoModeDenialOf } from '../../shared/auto-mode-denial'
 import type { ProjectActivitySnapshot } from '../../shared/project-activity'
 import { migrateLegacyCodexModels, migrateLegacyCodexTab } from './agent-models'
 import { useAppUpdates } from './use-app-updates'
@@ -160,7 +161,14 @@ export function App(): React.JSX.Element {
   const [toast, setToast] = useState('')
   const [loading, setLoading] = useState(true)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem('conductor.sidebarCollapsed') === 'true')
-  const [attentionResourceIds, setAttentionResourceIds] = useState<Set<string>>(() => new Set())
+  const [phaseAttentionResourceIds, setPhaseAttentionResourceIds] = useState<Set<string>>(() => new Set())
+  // A tool the claude CLI's auto-mode classifier refused changes no phase, so it holds the tab's
+  // attention on its own until the owner has that tab in front of them.
+  const [denialAttentionResourceIds, setDenialAttentionResourceIds] = useState<Set<string>>(() => new Set())
+  const attentionResourceIds = useMemo(
+    () => denialAttentionResourceIds.size ? new Set([...phaseAttentionResourceIds, ...denialAttentionResourceIds]) : phaseAttentionResourceIds,
+    [denialAttentionResourceIds, phaseAttentionResourceIds]
+  )
   const [activityPhases, setActivityPhases] = useState<Map<string, AgentActivityPhase>>(() => new Map())
   // Resources whose subagents (Task-tool children) are still running, preparing, or awaiting
   // approval even though the resource's own turn already reported 'complete'.
@@ -439,9 +447,23 @@ export function App(): React.JSX.Element {
       recentAttentionSounds.set(event.agentSessionId, Date.now())
       play(event.agentSessionId, /waiting for input/i.test(event.message) ? 'input' : 'question')
     })
+    // A classifier denial is the same "needs you" moment as a question, without a phase behind it.
+    const announcedDenials = new Set<string>()
+    const offDenials = window.conductor.structured.onEvents((events) => {
+      for (const event of events) {
+        const denial = autoModeDenialOf(event.data)
+        const key = denial ? event.sessionId + ':' + denial.toolUseId : ''
+        if (!denial || announcedDenials.has(key)) continue
+        announcedDenials.add(key)
+        if (announcedDenials.size > 512) announcedDenials.delete(announcedDenials.values().next().value!)
+        recentAttentionSounds.set(event.sessionId, Date.now())
+        play(event.sessionId, 'input')
+      }
+    })
     return () => {
       offStatus()
       offEvent()
+      offDenials()
       for (const timer of pendingInputSounds.values()) window.clearTimeout(timer)
     }
   }, [])
@@ -452,7 +474,7 @@ export function App(): React.JSX.Element {
       if (phases.get(id) === phase) return
       phases.set(id, phase)
       debugLog('agent', `Activity changed to ${phase}`, { resourceId: id })
-      setAttentionResourceIds((current) => {
+      setPhaseAttentionResourceIds((current) => {
         const next = new Set(current)
         if (phase === 'waiting_input') next.add(id)
         else next.delete(id)
@@ -512,11 +534,36 @@ export function App(): React.JSX.Element {
   }, [])
 
   useEffect(() => {
-    setAttentionResourceIds((current) => {
+    const retain = (current: Set<string>): Set<string> => {
       const next = retainVisibleAttentionResources(sessions, current)
       return next.size === current.size ? current : next
-    })
+    }
+    setPhaseAttentionResourceIds(retain)
+    setDenialAttentionResourceIds(retain)
   }, [sessions])
+
+  // The tabs the owner has in front of them: the active tab of every group in the active workspace.
+  const viewedResourceIds = useMemo(
+    () => new Set(activeWorkspaceGroups.flatMap((group) => { const tab = group.tabs.find((item) => item.id === group.activeTabId); return tab?.resourceId ? [tab.resourceId] : [] })),
+    [activeWorkspaceGroups]
+  )
+  const viewedResourceIdsRef = useRef(viewedResourceIds)
+  viewedResourceIdsRef.current = viewedResourceIds
+  useEffect(() => window.conductor.structured.onEvents((events) => {
+    // A denial the owner is already looking at needs no bell; one in a tab they are not keeps it lit.
+    const denied = events.filter((event) => autoModeDenialOf(event.data) && !viewedResourceIdsRef.current.has(event.sessionId)).map((event) => event.sessionId)
+    if (!denied.length) return
+    setDenialAttentionResourceIds((current) => {
+      if (denied.every((id) => current.has(id))) return current
+      return new Set([...current, ...denied])
+    })
+  }), [])
+  useEffect(() => {
+    setDenialAttentionResourceIds((current) => {
+      if (![...current].some((id) => viewedResourceIds.has(id))) return current
+      return new Set([...current].filter((id) => !viewedResourceIds.has(id)))
+    })
+  }, [viewedResourceIds])
 
   const refreshProjectActivity = useCallback((): void => {
     void window.conductor.activity.projects().then(setBackendProjectActivity).catch(() => {})

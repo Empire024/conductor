@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AdapterEvent, AgentEvent, Json, SessionSettings } from '../../shared/structured-agent'
 import { replayAgentEvents } from '../../shared/structured-agent-reducer'
+import { autoModeDenialOf } from '../../shared/auto-mode-denial'
 import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility } from './claude'
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
@@ -1124,4 +1125,51 @@ it('marks a compaction so the host restates its briefing', async () => {
   // A subagent compacting its own context does not touch what the main conversation was told.
   f.transport.receive({ type: 'system', subtype: 'compact_boundary', parent_tool_use_id: 'child' })
   expect(resets()).toHaveLength(1)
+})
+
+describe('claude auto-mode classifier denials', () => {
+  // Live-observed 2026-09-22 (claude 2.1.280): in Auto the CLI's classifier refuses a tool without any
+  // can_use_tool request; the only trace is this tool_result, and the result frame's permission_denials.
+  const DENIED = "Permission for this action was denied by the Claude Code auto mode classifier. Reason: [Security Weaken]. If you have other tasks that don't depend on this action, continue working on those."
+
+  it('keeps the tool failed and adds one notice card per denial, which the result frame then confirms', async () => {
+    const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    f.transport.receive(toolUse('toolu_denied', 'Edit', { file_path: 'C:/Windows/System32/drivers/etc/hosts', old_string: 'a', new_string: 'b' }))
+    f.transport.receive({ type: 'user', uuid: 'denied-result', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_denied', is_error: true, content: DENIED }] } })
+    // An ordinary failure and a repeated delivery are not denials.
+    f.transport.receive(toolUse('toolu_plain', 'Bash', { command: 'node missing.js' }))
+    f.transport.receive({ type: 'user', uuid: 'plain-result', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_plain', is_error: true, content: 'Error: Cannot find module' }] } })
+    f.transport.receive({ type: 'user', uuid: 'denied-result-again', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_denied', is_error: true, content: DENIED }] } })
+    await flush()
+    let items = f.projection().items
+    expect(items.find(item => item.data.type === 'tool' && item.nativeItemId === 'toolu_denied')?.data).toMatchObject({ status: 'failed' })
+    expect(items.find(item => item.data.type === 'tool' && item.nativeItemId === 'toolu_plain')?.data).toMatchObject({ status: 'failed' })
+    const notices = items.filter(item => item.data.type === 'notice' && autoModeDenialOf(item.data))
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.nativeItemId).toBe('auto-denial:toolu_denied')
+    expect(notices[0]!.data).toMatchObject({ type: 'notice', payload: { autoModeDenial: { tool: 'Edit', reason: 'Security Weaken', toolUseId: 'toolu_denied' } } })
+    expect(notices[0]!.data.type === 'notice' ? notices[0]!.data.message : '').toBe("Auto mode refused Edit (Security Weaken). The claude CLI's own classifier decided this, so Conductor could not show you a card. Switch this conversation to Edit to get an Allow card for such actions, or add a permission rule.")
+    expect(f.events.some(event => event.native?.method === 'tool_result/auto_mode_denial')).toBe(true)
+    // Nothing was asked of the owner through the approval channel, because the CLI never asked Conductor.
+    expect(items.some(item => item.data.type === 'interaction')).toBe(false)
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, result: 'Done', usage: {}, modelUsage: {}, permission_denials: [{ tool_name: 'Edit', tool_input: { file_path: 'C:/Windows/System32/drivers/etc/hosts' }, tool_use_id: 'toolu_denied' }] })
+    await flush()
+    items = f.projection().items
+    expect(items.filter(item => item.nativeItemId === 'auto-denial:toolu_denied')).toHaveLength(1)
+    expect(items.find(item => item.nativeItemId === 'auto-denial:toolu_denied')?.data).toMatchObject({ payload: { autoModeDenial: { tool: 'Edit', confirmed: true } } })
+    expect(f.projection().phase).toBe('completed')
+  })
+
+  it('does not mistake the owner\'s own denial, delivered through the approval channel, for a classifier denial', async () => {
+    const f = fixture(); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    const input = { command: 'node --version' }
+    f.transport.receive(permission('decision', 'shell', 'Bash', input))
+    await f.adapter.respond({ sessionId: 'session', runtimeId: 'incarnation-A', requestId: 'decision', decision: 'deny' })
+    f.transport.receive({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'shell', content: 'Permission for this action has been denied. Reason: the user rejected it', is_error: true }] } })
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, result: 'Stopped', usage: {}, modelUsage: {}, permission_denials: [{ tool_name: 'Bash', tool_input: input, tool_use_id: 'shell' }] })
+    await flush()
+    const items = f.projection().items
+    expect(items.find(item => item.data.type === 'tool' && item.nativeItemId === 'shell')?.data).toMatchObject({ status: 'rejected' })
+    expect(items.some(item => item.data.type === 'notice' && autoModeDenialOf(item.data))).toBe(false)
+  })
 })

@@ -7,6 +7,7 @@ import type { AgentEventData, SessionProjection, TimelineItem } from '../shared/
 import type { PhoneNotification } from '../shared/phone-access'
 import { normalizePairingCode, normalizePhoneSettings, PhoneAccessError, PhoneAccessService, trimItem, type PhoneDatabase, type PhoneRemoteSessions, type PhoneSessions } from './phone-access'
 import { describeTransition, phoneSessionState } from './phone-notifications'
+import { autoModeDenialMessage, autoModeDenialPayload } from '../shared/auto-mode-denial'
 import { MemoryVault, type SecretKeyValueStore } from './secret-store'
 
 class MapStore implements SecretKeyValueStore {
@@ -458,6 +459,34 @@ describe('notifications', () => {
     expect((fix.push.mock.calls[1] as [unknown, string, { urgency: string }])[2].urgency).toBe('high')
     unsubscribe()
     expect(fix.service.streamCount()).toBe(0)
+  })
+
+  it('pushes once per claude auto-mode classifier denial while the turn keeps working, and never repeats it', async () => {
+    const fix = fixture()
+    const phone = pairPhone(fix.service)
+    fix.service.setSubscription(phone.id, { endpoint: 'https://push.example/sub', keys: { p256dh: 'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } })
+    openConversation(fix, 'agent-1', { phase: 'running' })
+    fix.activity.set('agent-1', 'working')
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 1, data: { type: 'session' } }])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(fix.push).not.toHaveBeenCalled()
+    // The classifier refused a tool mid-turn: no interaction, no phase change, only the notice item.
+    const denial = { tool: 'Edit', reason: 'Security Weaken', toolUseId: 'toolu_1' }
+    const denied = item(2, { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload(denial) }, { id: 'auto-denial:toolu_1', nativeItemId: 'auto-denial:toolu_1' })
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'running', items: [denied] }))
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 2, data: { type: 'notice' } }])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(fix.push).toHaveBeenCalledTimes(1)
+    const [, payload, options] = fix.push.mock.calls[0] as [unknown, string, { urgency: string }]
+    expect(JSON.parse(payload) as PhoneNotification).toMatchObject({ kind: 'attention', sessionId: 'agent-1', title: 'Needs you: Tab tab-agent-1', body: 'Auto mode refused Edit: Security Weaken' })
+    expect(options.urgency).toBe('high')
+    expect(fix.service.phoneState().sessions.find(session => session.id === 'agent-1')).toMatchObject({ state: 'working', autoModeDenials: [{ id: 'auto-denial:toolu_1', tool: 'Edit', reason: 'Security Weaken' }] })
+    // The result frame confirms the same item and the turn finishes: the finish is announced, the denial is not repeated.
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'completed', items: [{ ...denied, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload(denial, true) } }] }))
+    fix.activity.set('agent-1', 'complete')
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 3, data: { type: 'notice' } }])
+    await vi.advanceTimersByTimeAsync(500)
+    expect(fix.push.mock.calls.map(call => (JSON.parse(call[1] as string) as PhoneNotification).kind)).toEqual(['attention', 'done'])
   })
 
   it('drops a subscription the push service says is gone and respects the master switch', async () => {

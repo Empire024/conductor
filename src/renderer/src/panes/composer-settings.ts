@@ -62,7 +62,7 @@ const codexModeDescriptions: Record<string, string> = {
   default: 'Approve requests the way your Codex CLI is configured to.',
   'read-only': 'Inspect the workspace without making changes.',
   'accept-edits': 'Edit files and run workspace commands; ask before leaving the workspace.',
-  auto: 'Never ask: workspace edits, commands and network run without approval, MCP tools such as the project browser are allowed for you, and anything that would leave the workspace sandbox is declined.'
+  auto: 'Never ask: workspace edits, commands and network run without approval, MCP tools such as the project browser are allowed for you, and a command or file change that has to leave the workspace sandbox is allowed once when Codex asks, unless it reaches Windows system files, the registry, elevation, services, the firewall, credentials, disks or a recursive delete, which stay yours. Questions always reach you.'
 }
 export function conversationModes(capabilities?: ProviderCapabilities): Array<{ id: string; label: string; description?: string; change: Partial<SessionSettings> }> {
   if (!capabilities) return []

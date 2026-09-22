@@ -1,5 +1,6 @@
 import type { AgentActivityPhase } from '../shared/models'
-import type { PhoneNotification, PhoneSessionState, PhoneSessionSummary } from '../shared/phone-access'
+import type { PhoneAutoModeDenial, PhoneNotification, PhoneSessionState, PhoneSessionSummary } from '../shared/phone-access'
+import { autoModeDenialOf, autoModeDenialSummary } from '../shared/auto-mode-denial'
 import type { PendingInteraction, SessionPhase, TimelineItem } from '../shared/structured-agent'
 
 /** The projection fields the state word needs. Declared here rather than as a Pick so the rule
@@ -37,6 +38,33 @@ export function pendingInteraction(items: readonly TimelineItem[]): PendingInter
     if (data.type === 'interaction' && data.interaction.status === 'pending') return data.interaction
   }
   return undefined
+}
+
+/** The claude auto-mode classifier denials a conversation recorded, oldest first, the last 20. A
+ *  confirmed re-emission updates the same timeline item, so one denial is one entry. */
+export function autoModeDenials(items: readonly TimelineItem[]): PhoneAutoModeDenial[] {
+  const denials: PhoneAutoModeDenial[] = []
+  for (const item of items) {
+    const denial = autoModeDenialOf(item.data)
+    if (denial && !denials.some(entry => entry.id === item.id)) denials.push({ id: item.id, tool: denial.tool, reason: denial.reason })
+  }
+  return denials.slice(-20)
+}
+
+/**
+ * A classifier denial is a "needs you" moment with no phase behind it: the turn keeps running,
+ * so the state word never says 'attention'. Each denial is announced exactly once, on the way in,
+ * and never for a conversation seen for the first time - the phone was not waiting on it.
+ */
+export function describeDenials(previous: Pick<PhoneSessionSummary, 'autoModeDenials'> | undefined, next: PhoneSessionSummary, at: string, nextId: () => string): PhoneNotification[] {
+  if (!previous) return []
+  const known = new Set((previous.autoModeDenials ?? []).map(denial => denial.id))
+  const url = `/#/session/${encodeURIComponent(next.id)}`
+  return (next.autoModeDenials ?? []).filter(denial => !known.has(denial.id)).map(denial => ({
+    id: nextId(), kind: 'attention', sessionId: next.id, at, url,
+    title: `Needs you: ${next.title || 'Conversation'}`,
+    body: previewText(autoModeDenialSummary(denial), 160)
+  }))
 }
 
 /** Collapses whitespace and trims to a preview that fits a notification or a list row. */

@@ -44,7 +44,7 @@ class CodexRpcError extends Error {
 type PendingRpc = { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }
 type PendingRequest = { request: ServerRequest; interaction: PendingInteraction; blocking: boolean }
 type Correlation = Pick<AdapterEvent, 'nativeSessionId' | 'turnId' | 'itemId' | 'parentId'>
-type CachedItem = { name: string; status: ActivityStatus }
+type CachedItem = { name: string; status: ActivityStatus; paths?: string[] }
 
 const record = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value))
 const json = (value: unknown): Json => JSON.parse(JSON.stringify(value ?? null)) as Json
@@ -56,14 +56,16 @@ const statusFor = (status: string, complete: boolean): ActivityStatus => status 
  * Codex's own `/permissions` presets, expressed in the modes the composer offers; the composer
  * mode is the one place a conversation's Codex permissions are chosen. Ask leaves the installed
  * CLI's configuration alone; Read only inspects; Edit runs workspace work unprompted and asks
- * before leaving the workspace; Auto asks the same way it does under Edit (`on-request`, the
- * policy its own automatic mode uses). Enabled MCP tools are allowed automatically; native
- * command/file/permission requests remain pending for an explicit decision, and unattended
- * commands get the network. A policy's inability to approve is not an owner denial.
+ * before leaving the workspace; Auto asks Codex-side the same way (`on-request`, the policy its
+ * own automatic mode uses) and Conductor answers for the owner: enabled MCP tools are allowed,
+ * a command, file change or permission grant that has to leave the workspace sandbox is allowed
+ * once unless it reaches an owner-only boundary (OWNER_ONLY_ESCALATIONS), unattended commands
+ * get the network, and questions always reach the owner. Under a "Review coworkers" controller
+ * the same requests are review cards instead, and an isolated reviewer never executes.
  * `never` is deliberately not used: under it Codex refuses, rather than asks about, any MCP tool
  * not annotated read-only (verified against codex-cli 0.155.1), which is how Auto lost every
- * browser tool. Conductor has no blanket `danger-full-access` preset; native escalation still
- * requires the provider's genuine approval response.
+ * browser tool. `danger-full-access` is not used either: the sandbox still fails a command first,
+ * so every escalation is Codex's own justified request, answered on the record one at a time.
  */
 const PERMISSION_PRESETS: Record<SessionSettings['permission'], { sandbox: NonNullable<SessionSettings['sandbox']>; approvalPolicy: NonNullable<SessionSettings['approvalPolicy']>; network: boolean; unattended: boolean }> = {
   default: { sandbox: 'inherit', approvalPolicy: 'inherit', network: false, unattended: false },
@@ -74,6 +76,34 @@ const PERMISSION_PRESETS: Record<SessionSettings['permission'], { sandbox: NonNu
 /** The Codex preset a composer mode maps to. Stored per-conversation sandbox/approval overrides
  *  from earlier versions are ignored rather than silently changing what the mode says. */
 export const codexPreset = (settings: Pick<SessionSettings, 'permission'>): (typeof PERMISSION_PRESETS)[SessionSettings['permission']] => PERMISSION_PRESETS[settings.permission] ?? PERMISSION_PRESETS.default
+
+/** Where Auto never answers for the owner, however Codex justifies the request. A native
+ *  escalation whose command, paths or permission profile reach one of these stays an owner card;
+ *  everything else that has to leave the workspace sandbox — a shortcut on the desktop, a file in
+ *  the profile, a process or port query — is allowed once. The test is where an action reaches,
+ *  not how it is worded, and a request that names nothing Auto can check is left to the owner. */
+const OWNER_ONLY_ESCALATIONS: ReadonlyArray<readonly [string, RegExp]> = [
+  ['the registry', /\bhk(?:lm|cu|cr|u|cc)\b|hkey_|\breg(?:\.exe)?\s+(?:add|delete|import|restore|load|unload|copy)\b|regedit|registry::/i],
+  ['elevation', /-verb\s+runas|\bsudo\b|\bgsudo\b|\brunas(?:\.exe)?\b|start-process\b[^|;\n]*-verb\b/i],
+  ['services, scheduled tasks or startup', /\bsc(?:\.exe)?\s+(?:create|config|delete|start|stop|failure)\b|\b(?:new|set|remove|start|stop|restart|suspend)-service\b|schtasks|scheduledtask|[\\/]startup\b|winlogon|\bwmic\b/i],
+  ['the firewall, network configuration or Defender', /\bnetsh\b|netfirewall|new-netroute|set-dnsclient|add-mppreference|set-mppreference|\bmpcmdrun\b|\bdefender\b|\broute\s+(?:add|delete)\b/i],
+  ['a credential or key store', /\.ssh\b|\.gnupg\b|\.gpg\b|\.aws\b|\.azure\b|\.kube\b|\.docker[\\/]config|\.config[\\/]gh\b|\.git-credentials|credential|\.npmrc|\.pypirc|\.netrc|_netrc|\bcmdkey\b|\bvault\b|keychain|\bdpapi\b|\bcertutil\b|\bcertmgr\b|\bcert:\\/i],
+  ['disks, boot, accounts or permissions', /\bformat(?:\.com)?\s|\bdiskpart\b|\bbcdedit\b|\bshutdown\b|restart-computer|stop-computer|clear-disk|remove-partition|initialize-disk|\bcipher\s+\/w|\bnet\s+(?:user|localgroup|accounts)\b|(?:new|remove|set|enable|disable)-localuser|add-localgroupmember|\bicacls\b|\btakeown\b|set-acl/i],
+  ['recursive deletion', /remove-item\b[^|;\n]*-rec|\brm\s+-[a-z]*r|\brd\s+\/s|\brmdir\s+\/s|\bdel\s+\/s|\bri\s+[^|;\n]*-rec|\|\s*remove-item\b/i],
+  // Last on purpose: registry paths such as HKLM\Software\Microsoft\Windows\CurrentVersion\Run contain
+  // "\Windows\", and the more specific boundary above must be the one the owner is told about.
+  ['a Windows system directory or the hosts file', /[\\/:](?:windows|winnt)[\\/]|system32|syswow64|drivers[\\/]etc|\bhosts\b|program files|programdata|\$env:(?:windir|systemroot|programfiles|programw6432|programdata|allusersprofile)\b|%(?:windir|systemroot|programfiles|programw6432|programdata|allusersprofile)%/i]
+]
+/** The owner-only boundary a native escalation reaches, if any, judged on where it acts. */
+export const ownerOnlyEscalation = (reach: string): string | undefined => {
+  // Codex on Windows wraps every command as `"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command '…'`
+  // (live-observed 2026-09-22, codex-cli 0.155.1; availableDecisions accept / acceptWithExecpolicyAmendment / cancel).
+  // The interpreter's own path would trip the system-directory rule and hold the owner's desktop-shortcut command,
+  // so an absolute interpreter path is reduced to its bare name before matching; what the command itself reaches
+  // is still judged in full.
+  const acted = reach.replace(/"?[a-z]:\\(?:[^"\\\s]+\\)*(powershell|pwsh|cmd|bash|sh|zsh|node|python3?)(\.exe)?"?/gi, '$1')
+  return OWNER_ONLY_ESCALATIONS.find(([, pattern]) => pattern.test(acted))?.[0]
+}
 
 /** What a failed Codex command says when the CLI's Windows sandbox helper could not refresh the
  *  sandbox before the command ran. Nothing in the conversation's permission mode causes it. */
@@ -256,6 +286,9 @@ export class CodexAdapter implements ProviderAdapter {
   private unattended = false
   /** A changed payload cannot reuse its old card identity again in this runtime. */
   private invalidApprovalRequests = new Set<string>()
+  /** Requests Auto answered itself, by canonical arguments: a repeated delivery gets no second
+   *  response, and a reused identity with other arguments is refused like a reused card. */
+  private autoAnswered = new Map<string, string>()
   private sandboxSetupNoticed = false
   /** MCP servers Codex reported for this thread and their latest startup state. */
   private mcpStartup = new Map<string, string>()
@@ -764,7 +797,7 @@ export class CodexAdapter implements ProviderAdapter {
     const send = (data: AdapterEvent['data'], extra: Partial<AdapterEvent> = {}): void => this.emit({ ...correlation, data, native, ...extra })
     const tool = (name: string, data: Omit<Extract<AdapterEvent['data'], { type: 'tool' }>, 'type' | 'name'>): void => {
       if (this.items.size >= 2048) this.items.delete(this.items.keys().next().value!)
-      this.items.set(this.itemKey(correlation), { name, status: data.status })
+      this.items.set(this.itemKey(correlation), { name, status: data.status, ...(item.type === 'fileChange' ? { paths: item.changes.map(change => change.path) } : {}) })
       send({ type: 'tool', name, ...data })
     }
     switch (item.type) {
@@ -868,18 +901,33 @@ export class CodexAdapter implements ProviderAdapter {
       choices = [{ id: 'accept', label: 'Allow once' }, ...(mcpApproval.persist.includes('session') ? [{ id: 'acceptForSession', label: 'Allow for this session' }] : []), { id: 'decline', label: 'Deny' }]
     }
     const isQuestion = request.method === 'item/tool/requestUserInput'
-    // Preserve the existing host review gate. A native escalation Auto cannot approve must
-    // become a pending interaction, never a synthetic owner denial or a turn cancellation.
-    if (this.unattended && mcpApproval && !this.options.reviewApprovals && !this.options.approvalReviewer) {
-      const decision = mcpApproval.persist.includes('session') ? 'acceptForSession' : 'accept'
-      this.transport?.send({ id: request.id, result: this.decisionResult(request, decision) })
-      this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto allowed ${mcpApproval.serverName}/${mcpApproval.tool} without asking.` }, native: { method: request.method, payload: json(params) } })
-      return
+    if (this.unattended && !isQuestion && !this.options.reviewApprovals && !this.options.approvalReviewer) {
+      // Auto answers for the owner: an enabled MCP tool for the session when Codex offers that,
+      // and a command, file change or permission grant that has to leave the workspace sandbox
+      // once, for this request only, unless it reaches an owner-only boundary. The host review
+      // gate and an isolated reviewer keep their pending cards, and so does a request that
+      // offers no plain accept. Nothing here is an owner denial or a turn cancellation.
+      const decision = mcpApproval?.persist.includes('session') ? 'acceptForSession' : 'accept'
+      const held = mcpApproval ? undefined : this.ownerOnlyEscalation(request)
+      if (!choices.some(choice => choice.id === decision)) this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto could not approve “${title}”: Codex offered no plain accept for it. The native request is pending; review it and choose an offered action.` } })
+      else if (held) this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto left “${title}” to you: ${held}. The native request is pending; review it and choose an offered action.` } })
+      else {
+        const answered = this.autoAnswered.get(id), action = canonicalAction(params)
+        if (answered === action) return
+        if (answered !== undefined) { this.autoAnswered.delete(id); this.invalidApprovalRequests.add(id); throw new Error('Provider approval identity was reused with changed arguments') }
+        if (this.autoAnswered.size >= 128) this.autoAnswered.delete(this.autoAnswered.keys().next().value!)
+        this.autoAnswered.set(id, action)
+        this.transport?.send({ id: request.id, result: this.decisionResult(request, decision) })
+        const subject = mcpApproval ? `${mcpApproval.serverName}/${mcpApproval.tool}`
+          : request.method === 'item/commandExecution/requestApproval' && request.params.networkApprovalContext ? `network access to ${request.params.networkApprovalContext.host}`
+            : request.method === 'item/fileChange/requestApproval' ? 'file changes outside the workspace sandbox'
+              : request.method === 'item/permissions/requestApproval' ? `the requested permissions for this turn (${title})` : `“${title}” outside the workspace sandbox`
+        this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto allowed ${subject} without asking.` }, native: { method: request.method, payload: json(params) } })
+        return
+      }
     }
-    if (this.unattended && !isQuestion && !mcpApproval) {
-      choices = choices.filter(choice => choice.id !== 'acceptForSession')
-      if (!this.options.reviewApprovals) this.emit({ ...this.correlation(params), data: { type: 'notice', message: `Auto could not approve “${title}”. The native request is pending; review it and choose an offered action.` } })
-    }
+    // A reviewed, isolated-reviewer or owner-held Auto request is one exact action, never a session grant.
+    if (this.unattended && !isQuestion && !mcpApproval) choices = choices.filter(choice => choice.id !== 'acceptForSession')
     const interaction: PendingInteraction = {
       id, kind: isQuestion ? 'question' : 'approval', title: isQuestion ? 'Codex needs your input' : title,
       input: json(params), choices: isQuestion ? [] : choices, status: 'pending',
@@ -889,6 +937,23 @@ export class CodexAdapter implements ProviderAdapter {
     this.emitInteraction(request, interaction)
     if (!isQuestion && !mcpApproval) this.emit({ ...this.correlation(params), data: { type: 'tool', name: this.items.get(this.itemKey(this.correlation(params)))?.name ?? (request.method.includes('fileChange') ? 'File change' : 'Command'), status: 'awaiting_approval' } })
     this.emitPhase()
+  }
+
+  /** Why Auto leaves a native escalation to the owner, or undefined when it may answer it: the
+   *  request must name what it reaches, and none of it may be an owner-only boundary. */
+  private ownerOnlyEscalation(request: ServerRequest): string | undefined {
+    let reach: string
+    if (request.method === 'item/commandExecution/requestApproval') {
+      if (!request.params.command) return 'it names no command Auto can check'
+      reach = [request.params.command, request.params.cwd ?? '', request.params.networkApprovalContext?.host ?? ''].join('\n')
+    } else if (request.method === 'item/fileChange/requestApproval') {
+      const paths = [...(request.params.grantRoot ? [request.params.grantRoot] : []), ...(this.items.get(this.itemKey(this.correlation(request.params)))?.paths ?? [])]
+      if (!paths.length) return 'it names no paths Auto can check'
+      reach = paths.join('\n')
+    } else if (request.method === 'item/permissions/requestApproval') reach = JSON.stringify(request.params.permissions)
+    else return 'it is not a request Auto answers'
+    const boundary = ownerOnlyEscalation(reach)
+    return boundary ? `it reaches ${boundary}` : undefined
   }
 
   /** The exact response Codex expects for a decision on this request. */

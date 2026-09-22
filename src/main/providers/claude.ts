@@ -6,6 +6,7 @@ import { workspacePath } from '../agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
 import { settingsForRuntime } from '../../shared/structured-agent'
+import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, parseAutoModeDenialReason } from '../../shared/auto-mode-denial'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -90,6 +91,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private requests = new Map<string, Request>()
   private controls = new Map<string, { resolve(value: ObjectValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
   private tools = new Map<string, Tool>()
+  /** Tool calls the CLI's own auto-mode classifier refused, by tool_use_id (../../shared/auto-mode-denial.ts). */
+  private autoModeDenials = new Map<string, { tool: string; reason: string; parentId?: string; confirmed?: boolean }>()
   private streams = new Map<string, { messageId: string; blocks: Map<number, Block>; textBlocks: number }>()
   /** Task starts carry identity/type/background state; later progress/completion frames may omit them. */
   private backgroundTasks = new Map<string, { description: string; taskType?: string; toolUseId?: string; backgrounded: boolean }>()
@@ -507,6 +510,7 @@ export class ClaudeAdapter implements ProviderAdapter {
             output: string(details.stdout) ?? output, outputMode: 'snapshot', ...(typeof details.stderr === 'string' ? { stderr: details.stderr } : {}),
             ...(number(details.exitCode) !== undefined ? { exitCode: number(details.exitCode) } : {})
           })
+          if (block.is_error === true) this.noteAutoModeDenial(id, output)
         }
         // Hidden thinking/signatures are intentionally not presented as readable reasoning.
       }
@@ -557,6 +561,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       }
       this.active = false
       this.expireRequests('Turn ended')
+      this.confirmAutoModeDenials(array(message.permission_denials))
       if (failure && !this.stopRequested) this.emit({ data: { type: 'error', message: this.visibleText(array(message.errors).map(display).join('\n')) || resultText || string(message.subtype) || 'Claude turn failed' } })
       for (const [id, tool] of this.tools) if (!tool.detached && ['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: this.stopRequested ? 'interrupted' : 'failed' })
       this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupted' : failure ? 'failed' : 'completed', nativeSessionId: this.nativeSessionId }, native: { method: 'result', payload: message } })
@@ -821,6 +826,33 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.tools.set(id, tool)
     const description = string(object(tool.input).description)
     this.emit({ itemId: id, parentId: tool.parentId, data: { type: 'tool', name: tool.name, ...(data.inputDelta !== undefined ? {} : { input: tool.input }), status: tool.status, ...(tool.detached ? { detached: true } : {}), ...(description ? { description } : {}), ...data } })
+  }
+  /** In Auto the CLI's classifier can refuse a tool without ever sending can_use_tool, so no card
+   *  exists and the only trace is the tool_result's wording. The tool stays failed; the conversation
+   *  also gets one notice item per denial that names the actual decider, which the renderer shows
+   *  as a needs-attention card, the tab counts as attention until viewed, and the phone announces. */
+  private noteAutoModeDenial(toolUseId: string, output: string): void {
+    const reason = parseAutoModeDenialReason(output)
+    if (!reason || this.autoModeDenials.has(toolUseId)) return
+    const tool = this.tools.get(toolUseId)
+    const denial = { tool: tool?.name ?? 'a tool', reason, ...(tool?.parentId ? { parentId: tool.parentId } : {}) }
+    if (this.autoModeDenials.size >= 256) this.autoModeDenials.delete(this.autoModeDenials.keys().next().value!)
+    this.autoModeDenials.set(toolUseId, denial)
+    this.emit({ itemId: autoModeDenialItemId(toolUseId), parentId: denial.parentId, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload({ ...denial, toolUseId }) }, native: { method: 'tool_result/auto_mode_denial', payload: { tool_use_id: toolUseId, reason } } })
+  }
+  /** The result frame's permission_denials (claude 2.1.280: [{ tool_name, tool_input, tool_use_id }])
+   *  is the runtime's record of every denial in the turn, the owner's own included, so it confirms a
+   *  classifier denial rather than defining one: the notice is re-emitted as confirmed, under the
+   *  same item, with the tool name the runtime recorded. */
+  private confirmAutoModeDenials(denials: Json[]): void {
+    for (const entry of denials) {
+      const record = object(entry), toolUseId = string(record.tool_use_id)
+      const denial = toolUseId ? this.autoModeDenials.get(toolUseId) : undefined
+      if (!toolUseId || !denial || denial.confirmed) continue
+      denial.confirmed = true
+      denial.tool = string(record.tool_name) ?? denial.tool
+      this.emit({ itemId: autoModeDenialItemId(toolUseId), parentId: denial.parentId, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload({ ...denial, toolUseId }, true) }, native: { method: 'result/permission_denials', payload: { tool_use_id: toolUseId } } })
+    }
   }
   private requestDigests = new Map<string, string>()
   private async runtimeRequest(message: ObjectValue): Promise<void> {

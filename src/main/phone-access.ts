@@ -17,7 +17,7 @@ import {
 import { rememberedPermission } from './app-settings'
 import type { AgentActivityRow } from './project-activity'
 import { tabMachineId } from './machines'
-import { describeTransition, lastMessage, pendingInteraction, phoneSessionState, previewText, type PhoneActivity } from './phone-notifications'
+import { autoModeDenials, describeDenials, describeTransition, lastMessage, pendingInteraction, phoneSessionState, previewText, type PhoneActivity } from './phone-notifications'
 import { createCertificateAuthority, issueServerCertificate, tlsIdentityUsable, type CertificateAuthority } from './remote-tls'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
@@ -183,7 +183,7 @@ export class PhoneAccessService {
   private streams = new Set<Stream>()
   private listener: PhoneListenerStatus = { listening: false, endpoints: [], message: null, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null }
   /** The last state each conversation was seen in, which is what a transition is measured from. */
-  private known = new Map<string, Pick<PhoneSessionSummary, 'state' | 'pendingId'>>()
+  private known = new Map<string, Pick<PhoneSessionSummary, 'state' | 'pendingId' | 'autoModeDenials'>>()
   private seeded = false
   private refreshTimer: ReturnType<typeof setTimeout> | null = null
   private touched = new Set<string>()
@@ -521,8 +521,9 @@ export class PhoneAccessService {
       if (summary.tabId) {
         const transition = this.seeded ? describeTransition(this.known.get(summary.id), summary, at, randomUUID()) : null
         if (transition) notifications.push(transition)
+        if (this.seeded) notifications.push(...describeDenials(this.known.get(summary.id), summary, at, randomUUID))
       }
-      this.known.set(summary.id, { state: summary.state, pendingId: summary.pendingId })
+      this.known.set(summary.id, { state: summary.state, pendingId: summary.pendingId, autoModeDenials: summary.autoModeDenials })
     }
     for (const id of [...this.known.keys()]) if (!seen.has(id)) this.known.delete(id)
     this.seeded = true
@@ -644,6 +645,7 @@ export class PhoneAccessService {
     const extra = (projection ?? {}) as { limitResumeAt?: string | null; backgroundTasks?: number }
     const items = projection?.items ?? []
     const pending = pendingInteraction(items)
+    const denials = autoModeDenials(items)
     const last = lastMessage(items)
     const machineId = tab ? tabMachineId(tab) : spec?.machineId ?? project.remote?.machineId ?? LOCAL_MACHINE_ID
     const provider = (typeof tab?.state?.provider === 'string' ? tab.state.provider : spec?.provider ?? process?.provider ?? 'claude') as PhoneSessionSummary['provider']
@@ -665,6 +667,7 @@ export class PhoneAccessService {
       state: phoneSessionState(projection, activity),
       needs: pending ? pending.kind === 'approval' ? 'approval' : 'question' : null,
       ...(pending ? { pendingId: pending.id, pendingTitle: previewText(pending.title, 160) } : {}),
+      ...(denials.length ? { autoModeDenials: denials } : {}),
       updatedAt: latest ?? process?.updatedAt ?? new Date(this.now()).toISOString(),
       ...(turnStartedAt ? { turnStartedAt } : {}),
       ...(last ? { lastText: previewText(last.text, PHONE_STATE_LIMITS.previewChars), lastRole: last.role } : {}),

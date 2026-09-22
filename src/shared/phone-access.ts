@@ -161,6 +161,9 @@ export interface PhoneSelf {
 /** The one word the list badge, the filter chips and a push notification all key on. */
 export type PhoneSessionState = 'attention' | 'working' | 'limited' | 'failed' | 'disconnected' | 'stopped' | 'done' | 'idle'
 
+/** A tool call the claude CLI's own auto-mode classifier refused: attention without a phase behind it. */
+export interface PhoneAutoModeDenial { id: string; tool: string; reason: string }
+
 export interface PhoneSessionSummary {
   id: string
   projectId: string
@@ -183,6 +186,8 @@ export interface PhoneSessionSummary {
   /** The pending interaction's id, so a second question in a row still reads as new. */
   pendingId?: string
   pendingTitle?: string
+  /** Classifier denials recorded in the conversation, oldest first; each is announced once. */
+  autoModeDenials?: PhoneAutoModeDenial[]
   updatedAt: string
   /** The owner's most recent prompt in the running turn, for an elapsed-time label. */
   turnStartedAt?: string
