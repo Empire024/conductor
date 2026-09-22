@@ -21,4 +21,5 @@ export function rememberPermission(provider: StructuredProvider, permission: unk
   if (capabilities?.permissions && !capabilities.permissions.includes(permission)) return
   try { store.setItem(KEY, JSON.stringify({ ...read(store), [provider]: permission })) } catch { /* storage quota or a blocked origin */ }
 }
-export const initialPermission = (provider: StructuredProvider, store = browserStore()): Permission => rememberedPermission(provider, store) ?? 'default'
+/** A new conversation is autonomous until the owner ever chooses otherwise for that provider. */
+export const initialPermission = (provider: StructuredProvider, store = browserStore()): Permission => rememberedPermission(provider, store) ?? 'auto'

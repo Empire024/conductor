@@ -38,6 +38,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
       finish()
       return
     }
+    if (pending.mcp) {
+      const allowed = message.result?.action === 'accept'
+      itemEvent('item/completed', { type: 'mcpToolCall', id: 'mcp-1', server: 'conductor-browser', tool: 'browser_snapshot', arguments: {}, status: allowed ? 'completed' : 'failed', result: allowed ? { content: [{ type: 'text', text: 'synthetic snapshot' }], structuredContent: null } : null, error: allowed ? null : { message: 'user rejected MCP tool call' }, durationMs: 3 })
+      itemEvent('item/completed', { type: 'agentMessage', id: 'mcp-answer', text: JSON.stringify(message.result), phase: null, memoryCitation: null, delivery: null, questions: null })
+      finish()
+      return
+    }
     const accepted = ['accept', 'acceptForSession'].includes(message.result?.decision)
     if (accepted && pending.edit) {
       const path = join(process.cwd(), 'panel.mjs')
@@ -93,7 +100,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     return
   }
   if (message.method === 'thread/start' || message.method === 'thread/resume') {
+    if (message.method === 'thread/resume' && process.env.CONDUCTOR_TEST_RESUME_NO_ROLLOUT === '1') { send({ id: message.id, error: { code: -32600, message: `no rollout found for thread id ${message.params.threadId}` } }); return }
     send({ id: message.id, result: defaults() })
+    if (process.env.CONDUCTOR_TEST_MCP_STARTUP === '1') {
+      notify('mcpServer/startupStatus/updated', { threadId, name: 'fixture-tools', status: 'starting', error: null, failureReason: null })
+      setTimeout(() => notify('mcpServer/startupStatus/updated', { threadId, name: 'fixture-tools', status: 'ready', error: null, failureReason: null }), 300)
+    }
     return
   }
   if (message.method === 'model/list') {
@@ -306,6 +318,12 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (scenario === 'synthetic:question') {
     approval = { id: 501, question: true }
     send({ id: 501, method: 'item/tool/requestUserInput', params: { threadId, turnId: currentTurn, itemId: 'question-1', questions: [{ id: 'flavor', header: 'Flavor', question: 'Choose a synthetic option', isOther: false, isSecret: false, options: [{ label: 'Vanilla', description: 'Option one' }, { label: 'Café', description: 'Option two' }] }], isBlocking: true, autoResolutionMs: null } })
+    return
+  }
+  if (scenario === 'synthetic:mcp-approval') {
+    // Exactly what codex-cli 0.155.1 sends for an MCP tool that is not annotated read-only under on-request.
+    approval = { id: 502, mcp: true }
+    send({ id: 502, method: 'mcpServer/elicitation/request', params: { threadId, turnId: currentTurn, serverName: 'conductor-browser', mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'], tool_description: 'Read the page', tool_params: { maxChars: 1000 } }, message: 'Allow the conductor-browser MCP server to run tool "browser_snapshot"?', requestedSchema: { type: 'object', properties: {} } } })
     return
   }
   if (scenario.startsWith('synthetic:approval') || scenario.startsWith('SYNTHETIC A')) {

@@ -73,6 +73,9 @@ export interface BrowserTool {
   name: string
   description: string
   inputSchema: Record<string, unknown>
+  /** MCP tool annotations. Codex lets an annotated read-only tool run without an approval prompt
+   *  in the modes that ask, so the tools that only look at the page say so. */
+  annotations?: { readOnlyHint?: boolean }
   run(host: BrowserMcpHost, scope: BrowserMcpScope, args: Record<string, unknown>): Promise<BrowserToolResult>
 }
 const schema = (properties: Record<string, unknown>, required: string[] = []): Record<string, unknown> =>
@@ -109,6 +112,7 @@ export const BROWSER_TOOLS: BrowserTool[] = [
   },
   {
     name: 'browser_snapshot',
+    annotations: { readOnlyHint: true },
     description: 'Read the current page in the Conductor browser view: URL, title, visible text, headings, links and form fields. Use this instead of guessing what rendered.',
     inputSchema: schema({
       selector: { type: 'string', description: 'Optional CSS selector to read instead of the whole document.' },
@@ -123,6 +127,7 @@ export const BROWSER_TOOLS: BrowserTool[] = [
   },
   {
     name: 'browser_screenshot',
+    annotations: { readOnlyHint: true },
     description: 'Capture what the Conductor browser view is showing right now, as a PNG image.',
     inputSchema: schema({}),
     async run(host, scope) {
@@ -133,6 +138,7 @@ export const BROWSER_TOOLS: BrowserTool[] = [
   },
   {
     name: 'browser_console',
+    annotations: { readOnlyHint: true },
     description: 'Recent console messages and page errors from the Conductor browser view, newest last. The first place to look when a page misbehaves.',
     inputSchema: schema({ limit: { type: 'number', description: 'How many messages to return (default 50).' } }),
     async run(host, scope, args) {

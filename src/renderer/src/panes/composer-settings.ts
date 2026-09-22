@@ -62,7 +62,7 @@ const codexModeDescriptions: Record<string, string> = {
   default: 'Approve requests the way your Codex CLI is configured to.',
   'read-only': 'Inspect the workspace without making changes.',
   'accept-edits': 'Edit files and run workspace commands; ask before leaving the workspace.',
-  auto: 'Never ask: workspace edits, commands, network and MCP tools such as the project browser run without approval.'
+  auto: 'Never ask: workspace edits, commands and network run without approval, MCP tools such as the project browser are allowed for you, and anything that would leave the workspace sandbox is declined.'
 }
 export function conversationModes(capabilities?: ProviderCapabilities): Array<{ id: string; label: string; description?: string; change: Partial<SessionSettings> }> {
   if (!capabilities) return []

@@ -168,59 +168,69 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
       await waitFor(() => completed(events.slice(before)))
       return starts().at(-1)
     }
-    // Edit is the CLI's own "Auto": workspace work runs unprompted, leaving the workspace is a request.
+    // Edit: workspace work runs unprompted; leaving the workspace is a request the owner answers.
     expect(await turn({ ...settings, permission: 'accept-edits' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false } } })
-    // Auto is the mode that never interrupts, so the commands it runs unattended get the network.
-    expect(await turn({ ...settings, permission: 'auto' })).toMatchObject({ params: { approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
-    // An approvals override back to a prompting policy takes the silent network grant with it.
-    expect(await turn({ ...settings, permission: 'auto', approvalPolicy: 'on-request' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: false } } })
-    // 'inherit' in the settings dialog is not an override: the chosen mode still decides.
-    expect(await turn({ ...settings, permission: 'auto', sandbox: 'inherit', approvalPolicy: 'inherit' })).toMatchObject({ params: { approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
+    expect((starts().at(-1) as { params: Record<string, unknown> }).params.approvalsReviewer).toBeUndefined()
+    // Auto asks Codex the same way, routes every request to Conductor (which answers it) and carries the network.
+    expect(await turn({ ...settings, permission: 'auto' })).toMatchObject({ params: { approvalPolicy: 'on-request', approvalsReviewer: 'user', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
+    // The composer mode is the only place permissions are chosen: overrides stored by earlier versions change nothing.
+    expect(await turn({ ...settings, permission: 'auto', approvalPolicy: 'untrusted', sandbox: 'read-only' })).toMatchObject({ params: { approvalPolicy: 'on-request', sandboxPolicy: { type: 'workspaceWrite', networkAccess: true } } })
+    expect(await turn({ ...settings, permission: 'read-only' })).toMatchObject({ params: { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'readOnly' } } })
     expect(adapter.capabilities.permissions).toContain('auto')
   })
 
-  it('starts the thread with its MCP servers cleared to run unasked only for the mode that never asks', async () => {
-    const methods = (sent: Json[]): string[] => sent.map(message => (message as { method: string }).method)
-    const startConfig = (sent: Json[]): unknown => (sent.find(message => (message as { method?: string }).method === 'thread/start') as { params: { config?: unknown } }).params.config
-    const auto = create({}, undefined, 3000, { ...settings, permission: 'auto' })
-    await auto.adapter.start()
-    expect(methods(auto.sent)).toEqual(['initialize', 'initialized', 'config/read', 'thread/start', 'model/list'])
-    // The server the owner left unset is cleared; the one they made prompting and the disabled one are left alone.
-    expect(startConfig(auto.sent)).toEqual({ mcp_servers: { 'fixture-tools': { default_tools_approval_mode: 'auto' } } })
-    expect(auto.adapter.capabilities.effectiveSettings).toMatchObject({ mcpToolApproval: 'auto' })
-
+  it('surfaces an MCP tool approval as a real card in Edit and answers it itself in Auto', async () => {
     const edit = create({}, undefined, 3000, { ...settings, permission: 'accept-edits' })
-    await edit.adapter.start()
-    expect(methods(edit.sent)).toEqual(['initialize', 'initialized', 'thread/start', 'model/list'])
-    expect(startConfig(edit.sent)).toBeUndefined()
-    expect(edit.adapter.capabilities.effectiveSettings).toMatchObject({ mcpToolApproval: 'provider' })
-    // A turn that never asks on a thread connected in a mode that asks is told why its MCP tools would be refused.
-    await edit.adapter.submit('synthetic:stream', { ...settings, permission: 'auto' })
+    await edit.adapter.submit('synthetic:mcp-approval', { ...settings, permission: 'accept-edits' })
+    await waitFor(() => Boolean(pendingId(edit.events)))
+    const card = edit.events.filter(event => event.data.type === 'interaction').at(-1)!.data as Extract<AdapterEvent['data'], { type: 'interaction' }>
+    expect(card.interaction.title).toBe('Allow the conductor-browser MCP server to run tool "browser_snapshot"?')
+    expect(card.interaction.choices.map(choice => choice.id)).toEqual(['accept', 'acceptForSession', 'decline'])
+    await edit.adapter.respond({ sessionId: 's', runtimeId: 'runtime-1', requestId: pendingId(edit.events)!, decision: 'acceptForSession' })
     await waitFor(() => completed(edit.events))
-    expect(edit.events.some(event => event.data.type === 'notice' && /refused under Auto/.test(event.data.message))).toBe(true)
-    expect(auto.events.some(event => event.data.type === 'notice' && /refused under Auto/.test(event.data.message))).toBe(false)
+    expect(edit.sent.find(message => (message as { id?: unknown }).id === 502)).toEqual({ id: 502, result: { action: 'accept', content: {}, _meta: { persist: 'session' } } })
+    expect(edit.events.some(event => event.data.type === 'tool' && event.data.name === 'conductor-browser/browser_snapshot' && event.data.status === 'completed')).toBe(true)
 
-    // The settings dialog's explicit approvals override decides, not the composer mode alone.
-    const overridden = create({}, undefined, 3000, { ...settings, permission: 'auto', approvalPolicy: 'on-request' })
-    await overridden.adapter.start()
-    expect(methods(overridden.sent)).not.toContain('config/read')
-    const forced = create({}, undefined, 3000, { ...settings, permission: 'accept-edits', approvalPolicy: 'never' })
-    await forced.adapter.start()
-    expect(startConfig(forced.sent)).toEqual({ mcp_servers: { 'fixture-tools': { default_tools_approval_mode: 'auto' } } })
+    const auto = create({}, undefined, 3000, { ...settings, permission: 'auto' })
+    await auto.adapter.submit('synthetic:mcp-approval', { ...settings, permission: 'auto' })
+    await waitFor(() => completed(auto.events))
+    expect(auto.events.some(event => event.data.type === 'interaction')).toBe(false)
+    expect(auto.sent.find(message => (message as { id?: unknown }).id === 502)).toEqual({ id: 502, result: { action: 'accept', content: {}, _meta: { persist: 'session' } } })
+    expect(auto.events.some(event => event.data.type === 'notice' && event.data.message === 'Auto allowed conductor-browser/browser_snapshot without asking.')).toBe(true)
+    expect(auto.events.some(event => event.data.type === 'tool' && event.data.name === 'conductor-browser/browser_snapshot' && event.data.status === 'completed')).toBe(true)
   })
 
-  it('keeps the Conductor browser cleared in Auto even when the CLI configuration cannot be read', async () => {
-    const browser = { url: 'http://127.0.0.1:43123/mcp', http_headers: { Authorization: `Bearer ${'a'.repeat(64)}` } }
-    const { adapter, events, sent } = create({ CONDUCTOR_TEST_CONFIG_READ_UNAVAILABLE: '1' }, undefined, 3000, { ...settings, permission: 'auto' }, JSON.stringify({ mcp_servers: { 'conductor-browser': browser } }))
+  it('declines a request to leave the workspace sandbox itself in Auto, and still asks the owner questions', async () => {
+    const auto = create({}, undefined, 3000, { ...settings, permission: 'auto' })
+    await auto.adapter.submit('synthetic:approval', { ...settings, permission: 'auto' })
+    await waitFor(() => completed(auto.events))
+    expect(auto.events.some(event => event.data.type === 'interaction')).toBe(false)
+    expect(auto.sent.find(message => (message as { id?: unknown }).id === 500)).toEqual({ id: 500, result: { decision: 'decline' } })
+    expect(auto.events.some(event => event.data.type === 'notice' && /^Auto declined/.test(event.data.message))).toBe(true)
+    expect(auto.events.some(event => event.data.type === 'tool' && event.data.status === 'rejected')).toBe(true)
+    const asked = create({}, undefined, 3000, { ...settings, permission: 'auto' })
+    await asked.adapter.submit('synthetic:question', { ...settings, permission: 'auto' })
+    await waitFor(() => Boolean(pendingId(asked.events)))
+    expect(asked.events.filter(event => event.data.type === 'interaction').at(-1)!.data).toMatchObject({ interaction: { kind: 'question', status: 'pending' } })
+  })
+
+  it('starts a new native thread when the one to resume has no saved history', async () => {
+    const { adapter, events, sent } = create({ CONDUCTOR_TEST_RESUME_NO_ROLLOUT: '1' }, 'synthetic-thread-gone')
     await adapter.start()
-    const start = sent.find(message => (message as { method?: string }).method === 'thread/start') as { params: { config?: unknown } }
-    expect(start.params.config).toEqual({ mcp_servers: { 'conductor-browser': { ...browser, default_tools_approval_mode: 'auto' } } })
-    expect(events.some(event => event.data.type === 'notice' && /could not be read/.test(event.data.message))).toBe(true)
-    // With a readable configuration the browser and the owner's unset servers are cleared together, on resume too.
-    const resumed = create({}, 'synthetic-thread-1', 3000, { ...settings, permission: 'auto' }, JSON.stringify({ mcp_servers: { 'conductor-browser': browser } }))
-    await resumed.adapter.start()
-    const resume = resumed.sent.find(message => (message as { method?: string }).method === 'thread/resume') as { params: { config?: unknown } }
-    expect(resume.params.config).toEqual({ mcp_servers: { 'fixture-tools': { default_tools_approval_mode: 'auto' }, 'conductor-browser': { ...browser, default_tools_approval_mode: 'auto' } } })
+    expect(sent.map(message => (message as { method?: string }).method).slice(0, 5)).toEqual(['initialize', 'initialized', 'thread/resume', 'thread/start', 'model/list'])
+    expect(events.some(event => event.data.type === 'notice' && /no saved history/.test(event.data.message))).toBe(true)
+    expect(events.some(event => event.data.type === 'session' && event.data.phase === 'idle' && event.data.nativeSessionId === 'synthetic-thread-1')).toBe(true)
+  })
+
+  it('waits for the thread\'s MCP servers before reporting idle, and briefly at most for a thread without any', async () => {
+    const started = Date.now()
+    const waited = create({ CONDUCTOR_TEST_MCP_STARTUP: '1' })
+    await waited.adapter.start()
+    expect(Date.now() - started).toBeGreaterThanOrEqual(280)
+    const before = Date.now()
+    const plain = create()
+    await plain.adapter.start()
+    expect(Date.now() - before).toBeLessThan(2500)
   })
 
   it('explains a Codex Windows sandbox setup failure once instead of leaving bare failed commands', async () => {
@@ -243,12 +253,13 @@ describe('Codex App Server raw synthetic process contract (zero inference)', () 
     ])
   })
 
-  it('keeps sandbox scope independent of approval policy and exposes the native effective defaults', async () => {
+  it('exposes the native effective defaults and lets only the composer mode decide sandbox and approvals', async () => {
     const { adapter, sent } = create()
     await adapter.start()
-    expect(adapter.capabilities.effectiveSettings).toMatchObject({ model: 'synthetic-model', effort: 'low', approvalPolicy: 'on-request', sandbox: { type: 'workspaceWrite' } })
-    await adapter.submit('synthetic:stream', { ...settings, permission: 'read-only', sandbox: 'workspace-write', approvalPolicy: 'untrusted' })
-    expect(sent.filter(message => (message as { method?: string }).method === 'turn/start').at(-1)).toMatchObject({ params: { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'workspaceWrite' } } })
+    expect(adapter.capabilities.effectiveSettings).toMatchObject({ model: 'synthetic-model', effort: 'low', approvalPolicy: 'on-request', sandbox: { type: 'workspaceWrite' }, unattended: false })
+    // Overrides stored by earlier versions' settings dialog no longer take part: Read only stays read only.
+    await adapter.submit('synthetic:stream', { ...settings, permission: 'read-only', sandbox: 'workspace-write', approvalPolicy: 'never' })
+    expect(sent.filter(message => (message as { method?: string }).method === 'turn/start').at(-1)).toMatchObject({ params: { approvalPolicy: 'untrusted', sandboxPolicy: { type: 'readOnly' } } })
   })
 
   it('publishes accepted settings when completion beats the turn acknowledgement without reviving the turn', async () => {

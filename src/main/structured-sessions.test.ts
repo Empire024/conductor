@@ -109,44 +109,46 @@ describe('internal local adapter availability', () => {
 })
 
 describe('backend session ownership and lifecycle — fake provider boundary', () => {
-  it.each(['claude', 'codex'] as const)('configures the project browser for %s only after explicit opt-in', async provider => {
+  it.each(['claude', 'codex'] as const)('configures the project browser for %s unless the owner switched it off', async provider => {
     const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
+    const enabled = fixture(provider, true, mcp)
+    await enabled.manager.submit(enabled.spec.id, 'With browser', enabled.database.structured.snapshot(enabled.spec.id)!.settings)
+    expect(enabled.current.options.mcpConfig).toBe('private-browser-config.json')
+    expect(mcp.configure).toHaveBeenCalledWith(enabled.spec)
+    mcp.configure.mockClear()
+
     const disabled = fixture(provider, true, mcp)
+    disabled.manager.saveSettings(disabled.spec.id, settings)
+    mcp.configure.mockClear()
     await disabled.manager.submit(disabled.spec.id, 'Without browser', settings)
     expect(disabled.current.options.mcpConfig).toBe('')
     expect(mcp.configure).not.toHaveBeenCalled()
-
-    const enabled = fixture(provider, true, mcp)
-    enabled.manager.saveSettings(enabled.spec.id, { ...settings, browserMcp: true })
-    await enabled.manager.submit(enabled.spec.id, 'With browser', { ...settings, browserMcp: true })
-    expect(enabled.current.options.mcpConfig).toBe('private-browser-config.json')
-    expect(mcp.configure).toHaveBeenCalledWith(enabled.spec)
   })
 
   it.each(['claude', 'codex'] as const)('reconnects the same idle native %s conversation when browser tools change', async provider => {
     const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
     const f = fixture(provider, true, mcp)
     await f.manager.connectSession(f.spec.id)
-    const disabled = f.current
-    const nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
-    expect(disabled.options.mcpConfig).toBe('')
-
-    f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })
-    expect(disabled.disposed).toBe(true)
-    expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('disconnected')
-    await f.manager.submit(f.spec.id, 'Browser-enabled turn', { ...settings, browserMcp: true })
     const enabled = f.current
-    expect(enabled).not.toBe(disabled)
-    expect(enabled.options.nativeSessionId).toBe(nativeId)
+    const nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
     expect(enabled.options.mcpConfig).toBe('private-browser-config.json')
-    enabled.finish()
 
     f.manager.saveSettings(f.spec.id, settings)
     expect(enabled.disposed).toBe(true)
     expect(mcp.release).toHaveBeenCalledWith(f.spec.id)
+    expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('disconnected')
     await f.manager.submit(f.spec.id, 'Browser-disabled turn', settings)
+    const disabled = f.current
+    expect(disabled).not.toBe(enabled)
+    expect(disabled.options.nativeSessionId).toBe(nativeId)
+    expect(disabled.options.mcpConfig).toBe('')
+    disabled.finish()
+
+    f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })
+    expect(disabled.disposed).toBe(true)
+    await f.manager.submit(f.spec.id, 'Browser-enabled turn', { ...settings, browserMcp: true })
     expect(f.current.options.nativeSessionId).toBe(nativeId)
-    expect(f.current.options.mcpConfig).toBe('')
+    expect(f.current.options.mcpConfig).toBe('private-browser-config.json')
   })
 
   it.each(['claude', 'codex'] as const)('revokes browser access during an active %s turn and refreshes before the next turn', async provider => {
@@ -183,70 +185,46 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(f.current.options.mcpConfig).toBe('')
   })
 
-  it.each(['claude', 'codex'] as const)('remembers the owner\'s browser choice for the next %s conversation, whoever opens it', async provider => {
+  it.each(['claude', 'codex'] as const)('opens every new %s conversation with browser tools on until the owner switches them off, whoever opens it', async provider => {
     const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
     const f = fixture(provider, true, mcp)
-    f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })
-    const next: AgentSpec = { ...f.spec, id: 'next-session', title: 'Next' }
-    f.manager.ensure(next)
-    expect(f.database.structured.snapshot(next.id)?.settings.browserMcp).toBe(true)
-    await f.manager.submit(next.id, 'Opens with the browser', f.database.structured.snapshot(next.id)!.settings)
+    // On by default, so the first connection is configured with the browser.
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBe(true)
+    await f.manager.submit(f.spec.id, 'Opens with the browser', f.database.structured.snapshot(f.spec.id)!.settings)
     expect(f.current.options.mcpConfig).toBe('private-browser-config.json')
-    expect(mcp.configure).toHaveBeenCalledWith(next)
-    // Another provider and a local model are not touched by this provider's choice.
-    const other: AgentSpec = { ...f.spec, id: 'other-provider', provider: provider === 'claude' ? 'codex' : 'claude', title: 'Other' }
-    f.manager.ensure(other)
-    expect(f.database.structured.snapshot(other.id)?.settings.browserMcp).toBeUndefined()
+    f.current.finish()
+    // A local model never gets a browser.
     const local: AgentSpec = { ...f.spec, id: 'local-session', provider: 'local', title: 'Local' }
     f.manager.ensure(local)
     expect(f.database.structured.snapshot(local.id)?.settings.browserMcp).toBeUndefined()
-    // Switching it off is remembered the same way; conversations that already exist keep their own choice.
-    f.manager.saveSettings(next.id, settings)
+    // Switching it off is the new default for this provider's next conversations, and only this provider's.
+    f.manager.saveSettings(f.spec.id, settings)
+    const next: AgentSpec = { ...f.spec, id: 'next-session', title: 'Next' }
+    f.manager.ensure(next)
+    expect(f.database.structured.snapshot(next.id)?.settings.browserMcp).toBeUndefined()
+    const other: AgentSpec = { ...f.spec, id: 'other-provider', provider: provider === 'claude' ? 'codex' : 'claude', title: 'Other' }
+    f.manager.ensure(other)
+    expect(f.database.structured.snapshot(other.id)?.settings.browserMcp).toBe(true)
+    // Switching it back on is remembered the same way; existing conversations keep their own choice.
+    f.manager.saveSettings(next.id, { ...settings, browserMcp: true })
     const later: AgentSpec = { ...f.spec, id: 'later-session', title: 'Later' }
     f.manager.ensure(later)
-    expect(f.database.structured.snapshot(later.id)?.settings.browserMcp).toBeUndefined()
-    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBe(true)
-    // Re-registering an existing conversation (every pane mount does) never rewrites its choice.
+    expect(f.database.structured.snapshot(later.id)?.settings.browserMcp).toBe(true)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBeUndefined()
     f.manager.ensure(f.spec)
-    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBe(true)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBeUndefined()
   })
 
-  it('reconnects an idle Codex conversation only when the mode crosses the boundary that stops asking', async () => {
-    const f = fixture('codex', true, undefined, ['default', 'read-only', 'accept-edits', 'auto'])
-    await f.manager.connectSession(f.spec.id)
-    const asking = f.current
-    const nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
-    // Ask → Edit: both modes ask, so the connection stands.
+  it('opens a new conversation on Auto until the owner chooses another mode for that provider', () => {
+    const f = fixture('claude', true, undefined, ['default', 'read-only', 'accept-edits', 'auto'])
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.permission).toBe('auto')
     f.manager.saveSettings(f.spec.id, { ...settings, permission: 'accept-edits' })
-    expect(asking.disposed).toBe(false)
-    // Edit → Auto: the thread has to be started with its MCP servers cleared to run unasked.
-    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'auto' })
-    expect(asking.disposed).toBe(true)
-    expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ phase: 'disconnected', settings: { permission: 'auto' } })
-    await f.manager.submit(f.spec.id, 'Auto turn', { ...settings, permission: 'auto' })
-    const silent = f.current
-    expect(silent).not.toBe(asking)
-    expect(silent.options.nativeSessionId).toBe(nativeId)
-    expect(silent.options.settings.permission).toBe('auto')
-    // Auto → Edit during a turn waits for the turn, then reconnects before the next message.
-    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'accept-edits' })
-    expect(silent.disposed).toBe(false)
-    silent.finish()
-    await f.manager.submit(f.spec.id, 'Edit turn', { ...settings, permission: 'accept-edits' })
-    expect(silent.disposed).toBe(true)
-    expect(f.current).not.toBe(silent)
-    expect(f.current.options.nativeSessionId).toBe(nativeId)
-    expect(f.current.options.settings.permission).toBe('accept-edits')
-  })
-
-  it('never reconnects a Claude conversation for a mode change', async () => {
-    const f = fixture('claude', true, undefined, ['default', 'accept-edits', 'auto'])
-    await f.manager.connectSession(f.spec.id)
-    const runtime = f.current
-    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'auto' })
-    f.manager.saveSettings(f.spec.id, { ...settings, permission: 'accept-edits' })
-    expect(runtime.disposed).toBe(false)
-    expect(f.database.structured.snapshot(f.spec.id)?.phase).toBe('idle')
+    const next: AgentSpec = { ...f.spec, id: 'next-session', title: 'Next' }
+    f.manager.ensure(next)
+    expect(f.database.structured.snapshot(next.id)?.settings.permission).toBe('accept-edits')
+    // A provider that does not offer Auto opens on its own neutral mode instead.
+    const limited = fixture('claude', true, undefined, ['default', 'accept-edits'])
+    expect(limited.database.structured.snapshot(limited.spec.id)?.settings.permission).toBe('default')
   })
 
   it('refuses local sandbox grants on a provider that has no local sandbox', () => {
@@ -260,6 +238,8 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
   it('rejects enabling browser tools during active work without changing the saved preference', async () => {
     const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
     const f = fixture('claude', true, mcp)
+    f.manager.saveSettings(f.spec.id, settings)
+    mcp.release.mockClear()
     await f.manager.submit(f.spec.id, 'Active turn', settings)
     expect(() => f.manager.saveSettings(f.spec.id, { ...settings, browserMcp: true })).toThrow('current turn')
     expect(f.database.structured.snapshot(f.spec.id)?.settings.browserMcp).toBeUndefined()
@@ -574,7 +554,7 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     await f.manager.submit(f.spec.id, 'First effort-selected synthetic turn', selected)
     expect(f.current).toBe(original)
     expect(original.disposed).toBe(false)
-    expect(original.submissions).toEqual([{ text: 'First effort-selected synthetic turn', settings: selected, attachments: [] }])
+    expect(original.submissions).toEqual([{ text: 'First effort-selected synthetic turn', settings: { ...selected, browserMcp: true }, attachments: [] }])
     expect(f.adapters.reduce((sum, adapter) => sum + adapter.starts, 0)).toBe(1)
   })
   it('does not change runtime settings when context validation fails', async () => {
@@ -859,7 +839,7 @@ describe('mid-turn steering and input retention', () => {
     f.current.emit({ turnId: 'active-turn', data: { type: 'session', phase, capabilities: f.current.capabilities } })
     await f.manager.queue(f.spec.id, 'Explicitly queued', settings)
     await f.manager.steer(f.spec.id, 'More data', settings, [{ id: 'selection', kind: 'selection', name: 'Selected lines', content: 'Exact context' }])
-    expect(f.current.steers).toEqual([{ text: expect.stringContaining('More data'), settings, attachments: [] }])
+    expect(f.current.steers).toEqual([{ text: expect.stringContaining('More data'), settings: { ...settings, browserMcp: true }, attachments: [] }])
     expect(f.current.steers[0]?.text).toContain('Exact context')
     expect(f.current.submissions).toHaveLength(1)
     const state = f.database.structured.snapshot(f.spec.id)

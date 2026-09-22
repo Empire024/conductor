@@ -17,7 +17,6 @@ import { describeUsageCap, evaluateUsageCap, summarizeContext, summarizeUsageRun
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
-import { codexNeverAsks } from './providers/codex'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 
@@ -126,10 +125,12 @@ export class StructuredSessions {
     const available = spec.provider === 'local' || Boolean(executable)
     if (!store.snapshot(spec.id)) this.database.upsertAgent(spec, 'running', 'idle')
     const state = store.register(spec.id, spec.projectId, spec.provider as StructuredProvider, spec)
-    // A brand-new conversation also opens with the browser tools the owner last chose for this
-    // provider (saveSettings remembers the composer's toggle), whoever opened it: an owner tab, a
-    // coworker a controller opened, or a router task. An existing conversation keeps its own choice.
-    if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: concreteModel(spec.provider, spec.model, state.capabilities), effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined, ...(rememberedBrowserTools(key => this.database.getSetting(key), spec.provider as StructuredProvider) ? { browserMcp: true } : {}) } })
+    // A brand-new conversation opens with the browser tools on — unless the owner last switched
+    // them off for this provider (saveSettings remembers the composer's toggle) — whoever opened
+    // it: an owner tab, a coworker a controller opened, or a router task. An existing conversation
+    // keeps its own choice, and local models have no browser.
+    const browserOn = (spec.provider === 'claude' || spec.provider === 'codex') && (rememberedBrowserTools(key => this.database.getSetting(key), spec.provider) ?? true)
+    if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: concreteModel(spec.provider, spec.model, state.capabilities), effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined, ...(browserOn ? { browserMcp: true } : {}) } })
     // Registration constructs no process. Views subscribe to this backend resource.
     if (!this.live.has(spec.id)) this.live.set(spec.id, { spec: previousSpec ?? spec, executable: executable ?? '', runtimeId: '', submitting: false, closed: false, responses: new Set() })
     const live = this.live.get(spec.id)!
@@ -164,12 +165,12 @@ export class StructuredSessions {
       projection.capabilities = adapter.capabilities
       store.checkpoint(spec.id)
     }
-    // A brand-new conversation opens on the owner's remembered mode for this provider, the same
-    // preference a manually opened renderer tab seeds from localStorage (permission-memory.ts);
-    // an already-registered session keeps whatever permission its own history carries, and only a
-    // mode this runtime just advertised as supported is ever applied.
+    // A brand-new conversation opens on the owner's remembered mode for this provider — Auto until
+    // they ever choose otherwise — the same preference a manually opened renderer tab seeds from
+    // localStorage (permission-memory.ts); an already-registered session keeps whatever permission
+    // its own history carries, and only a mode this runtime just advertised as supported is applied.
     if (!previousSpec) {
-      const remembered = rememberedPermission(key => this.database.getSetting(key), spec.provider as StructuredProvider)
+      const remembered = rememberedPermission(key => this.database.getSetting(key), spec.provider as StructuredProvider) ?? 'auto'
       const capabilities = store.snapshot(spec.id)?.capabilities
       const offered = capabilities?.permissions
       // A runtime that does not offer the neutral default at all (the local models never ask
@@ -352,23 +353,18 @@ export class StructuredSessions {
     this.validateSettings(settings, state.capabilities)
     const browserChanged = Boolean(settings.browserMcp) !== Boolean(state.settings.browserMcp)
     if (browserChanged && settings.browserMcp && active.has(state.phase)) throw new Error('Wait for the current turn to finish before enabling browser tools')
-    const live = this.live.get(id)
-    const provider = this.database.structured.spec<AgentSpec>(id)?.provider
-    // Codex starts a thread differently for the one mode that never asks (its MCP servers are
-    // cleared to run unasked, see codexMcpApprovalOverrides), so crossing that boundary in either
-    // direction is a transport change like the browser toggle: the same native conversation
-    // reconnects with the configuration the new mode needs, and MCP tools keep working.
-    const approvalChanged = provider === 'codex' && codexNeverAsks(settingsForRuntime(settings, live?.runtimeId)) !== codexNeverAsks(settingsForRuntime(state.settings, live?.runtimeId))
     this.database.structured.update(id, { settings })
     if (browserChanged) {
       // Revocation is synchronous and precedes every later await: a disabled credential cannot
       // finish a tool call merely because its browser lookup was already in flight.
       this.mcp?.release(id)
-      rememberBrowserTools((key, value) => this.database.setSetting(key, value), provider, Boolean(settings.browserMcp))
-    }
-    if ((browserChanged || approvalChanged) && live?.adapter) {
-      if (active.has(state.phase)) live.browserConfigStale = true
-      else this.retireBrowserTransport(live, browserChanged ? 'Browser tool settings changed.' : 'The permission mode changed.')
+      // The owner's deliberate toggle is the default for this provider's next conversations.
+      rememberBrowserTools((key, value) => this.database.setSetting(key, value), this.database.structured.spec<AgentSpec>(id)?.provider, Boolean(settings.browserMcp))
+      const live = this.live.get(id)
+      if (live?.adapter) {
+        if (active.has(state.phase)) live.browserConfigStale = true
+        else this.retireBrowserTransport(live)
+      }
     }
     // This is the one path a deliberate composer change always takes (see updateSettings in
     // StructuredAgentPane.tsx), so it is also where the owner's choice is remembered for the

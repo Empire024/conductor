@@ -780,11 +780,6 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {settingsOpen && <AgentDialog title="Conversation settings" onClose={() => setSettingsOpen(false)}>
       <div className="sa-settings">
         <p className="sa-detail-hint">Changes apply to your next message.</p>
-        <section className="sa-settings-section"><h3>Permissions</h3>
-          {Boolean(capabilities?.sandboxModes?.length) && <label>Workspace access<select aria-label="Execution sandbox" value={settings.sandbox ?? 'inherit'} onChange={event => updateSettings({ sandbox: event.target.value as SessionSettings['sandbox'] })}>{capabilities?.sandboxModes?.map(mode => <option key={mode} value={mode}>{mode === 'inherit' ? 'Use saved settings' : mode === 'workspace-write' ? 'Workspace files' : 'Read only'}</option>)}</select></label>}
-          {Boolean(capabilities?.approvalPolicies?.length) && <label>Approvals<select aria-label="Approval policy" value={settings.approvalPolicy ?? 'inherit'} onChange={event => updateSettings({ approvalPolicy: event.target.value as SessionSettings['approvalPolicy'] })}>{capabilities?.approvalPolicies?.map(policy => <option key={policy} value={policy}>{policy === 'inherit' ? 'Use saved settings' : policy === 'untrusted' ? 'Ask before commands' : policy === 'on-request' ? 'Ask when needed' : 'Never ask'}</option>)}</select></label>}
-          {!capabilities && <p className="sa-detail-hint">Choose a model or start typing to load available settings.</p>}
-        </section>
         <section className="sa-settings-section"><h3>Conversation</h3><div className="sa-detail-actions">
           <button onClick={() => { setSettingsOpen(false); setRename(projection.title || props.title) }}>Rename</button>
           {capabilities?.fork && <button disabled={activePhases.has(projection.phase)} onClick={() => void fork()}>Fork conversation</button>}

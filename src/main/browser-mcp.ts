@@ -175,7 +175,7 @@ export class BrowserMcpServer {
         } }
       }
       if (message.method === 'ping') return { ...envelope, result: {} }
-      if (message.method === 'tools/list') return { ...envelope, result: { tools: BROWSER_TOOLS.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })) } }
+      if (message.method === 'tools/list') return { ...envelope, result: { tools: BROWSER_TOOLS.map(tool => ({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema, ...(tool.annotations ? { annotations: tool.annotations } : {}) })) } }
       if (message.method === 'tools/call') {
         const name = typeof params.name === 'string' ? params.name : ''
         const tool = BROWSER_TOOLS.find(candidate => candidate.name === name)

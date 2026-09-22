@@ -15,7 +15,7 @@ const claude = (permissions: ProviderCapabilities['permissions']): ProviderCapab
 describe('remembered conversation permission', () => {
   it('pre-selects the last chosen mode for the next session of the same provider', () => {
     const disk = box()
-    expect(initialPermission('claude', disk)).toBe('default')
+    expect(initialPermission('claude', disk)).toBe('auto')
     rememberPermission('claude', 'auto', claude(['default', 'auto', 'accept-edits']), disk)
     expect(rememberedPermission('claude', disk)).toBe('auto')
     expect(initialPermission('claude', disk)).toBe('auto')
@@ -25,7 +25,7 @@ describe('remembered conversation permission', () => {
   it('keeps providers independent instead of leaking one adapter choice into another', () => {
     const disk = box()
     rememberPermission('claude', 'auto', claude(['default', 'auto']), disk)
-    expect(initialPermission('codex', disk)).toBe('default')
+    expect(initialPermission('codex', disk)).toBe('auto')
     rememberPermission('codex', 'read-only', undefined, disk)
     expect(initialPermission('codex', disk)).toBe('read-only')
     expect(initialPermission('claude', disk)).toBe('auto')
@@ -34,7 +34,7 @@ describe('remembered conversation permission', () => {
     const disk = box()
     rememberPermission('claude', 'auto', claude(['default', 'accept-edits']), disk)
     expect(rememberedPermission('claude', disk)).toBeUndefined()
-    expect(initialPermission('claude', disk)).toBe('default')
+    expect(initialPermission('claude', disk)).toBe('auto')
   })
   it('ignores capabilities reported by a different provider', () => {
     const disk = box()
@@ -45,20 +45,20 @@ describe('remembered conversation permission', () => {
     const disk = box()
     for (const value of [undefined, null, '', 'plan', 'Auto', 42, { permission: 'auto' }]) rememberPermission('claude', value, undefined, disk)
     expect(disk.read()).toBeNull()
-    expect(initialPermission('claude', disk)).toBe('default')
+    expect(initialPermission('claude', disk)).toBe('auto')
   })
-  it('falls back to Ask on a missing, corrupt or non-object store without throwing', () => {
-    expect(initialPermission('claude', box('not json at all'))).toBe('default')
-    expect(initialPermission('claude', box('["auto"]'))).toBe('default')
-    expect(initialPermission('claude', box('{"claude":"nonsense"}'))).toBe('default')
-    expect(initialPermission('claude', box('null'))).toBe('default')
-    expect(initialPermission('claude', undefined)).toBe('default')
+  it('falls back to Auto on a missing, corrupt or non-object store without throwing', () => {
+    expect(initialPermission('claude', box('not json at all'))).toBe('auto')
+    expect(initialPermission('claude', box('["auto"]'))).toBe('auto')
+    expect(initialPermission('claude', box('{"claude":"nonsense"}'))).toBe('auto')
+    expect(initialPermission('claude', box('null'))).toBe('auto')
+    expect(initialPermission('claude', undefined)).toBe('auto')
     expect(rememberedPermission('claude', undefined)).toBeUndefined()
   })
   it('survives a blocked or full store instead of breaking the mode picker', () => {
     const blocked: PermissionStore = { getItem: () => { throw new Error('blocked') }, setItem: () => { throw new Error('quota') } }
     expect(() => rememberPermission('claude', 'auto', undefined, blocked)).not.toThrow()
-    expect(initialPermission('claude', blocked)).toBe('default')
+    expect(initialPermission('claude', blocked)).toBe('auto')
     expect(() => rememberPermission('claude', 'auto', undefined, undefined)).not.toThrow()
   })
   it('preserves the other provider entry when overwriting one', () => {
