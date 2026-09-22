@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createHash } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { LocalAgentSession } from './agent.ts'
+import { LocalAgentSession, repairToolProtocol } from './agent.ts'
 import { runTool } from './tools.ts'
 import type { Usage } from './client.ts'
 
@@ -247,6 +247,45 @@ describe('local agent loop', () => {
     // the same status as a history the template cannot render.
     expect(stub.requests[1]!.reasoning_effort).toBeUndefined()
     expect(notices.join(' ')).toContain('HTTP 400')
+  })
+
+  it('keeps a write_file cut off at the output limit from poisoning the history', async () => {
+    // The owner-reported failure: a 9B model streamed a whole translations file into one
+    // write_file, the output limit cut the JSON arguments mid-string, and llama.cpp then answered
+    // HTTP 500 to every request, because its template parses stored tool-call arguments.
+    const cut = '{"path":"public/translations.js","content":"export const translations = { cs: { \\"Save\\": \\"Ulo'
+    const stub = await stubServer([
+      [frame({ content: 'Writing it.' }), frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'write_file', arguments: cut } }] }, 'length')],
+      [frame({ tool_calls: [{ index: 0, id: 'call_2', function: { name: 'write_file', arguments: '{"path":"out.js","content":"a"}' } }] }, 'tool_calls')],
+      [frame({ tool_calls: [{ index: 0, id: 'call_3', function: { name: 'write_file', arguments: '{"path":"out.js","content":"b","append":true}' } }] }, 'tool_calls')],
+      [frame({ content: 'Written in parts.' }, 'stop')]
+    ])
+    cleanup.push(() => stub.server.close())
+    const root = workspace()
+    const notices: string[] = []
+    const tools: string[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/ornith1.5-9b', workspace: root, sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })
+    const outcome = await session.run('Create the translations file', { notice: message => notices.push(message), toolEnd: call => tools.push(`${call.name}:${call.failed ? 'failed' : 'ok'}`) })
+
+    expect(outcome).toMatchObject({ stopReason: 'complete', text: 'Written in parts.' })
+    expect(tools).toEqual(['write_file:failed', 'write_file:ok', 'write_file:ok'])
+    expect(notices.join(' ')).toContain('output limit')
+    const second = stub.requests[1] as { messages: Array<{ role: string; content: string; tool_calls?: Array<{ function: { arguments: string } }> }> }
+    // Every stored call must be parseable, or the next render fails on the server.
+    for (const message of second.messages) for (const call of message.tool_calls ?? []) expect(() => JSON.parse(call.function.arguments)).not.toThrow()
+    expect(second.messages.at(-1)!.content).toMatch(/cut off at the local output limit.*append: true/)
+    expect(readFileSync(join(root, 'out.js'), 'utf8')).toBe('ab')
+  })
+
+  it('repairs a stored history that already holds unparseable tool-call arguments', () => {
+    const repaired = repairToolProtocol([
+      { role: 'system', content: 's' },
+      { role: 'user', content: 'u' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'write_file', arguments: '{"path":"x","content":"unterminated' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'denied: Tool arguments must be a JSON object' }
+    ])
+    expect(repaired[2]!.tool_calls![0]!.function.arguments).toBe('{}')
+    expect(repaired[3]).toMatchObject({ role: 'tool', tool_call_id: 'c1' })
   })
 
   it('names the context window when neither the first request nor the shorter retry fits', async () => {

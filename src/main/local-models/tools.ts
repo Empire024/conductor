@@ -1,4 +1,4 @@
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import type { ToolSpec } from './client.ts'
 import { brokeredGitPush, mentionsGitPush } from './git-push.ts'
@@ -63,7 +63,7 @@ export function toolSpecs(readOnly: boolean, control = false, grants: LocalGrant
   if (readOnly) return specs
   return [
     ...specs,
-    { type: 'function', function: { name: 'write_file', description: 'Create or overwrite a workspace file.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' } }, required: ['path', 'content'] } } },
+    { type: 'function', function: { name: 'write_file', description: 'Create or overwrite a workspace file. With append: true the content is added to the end of the file instead, creating it if needed. One call can only carry a few thousand tokens, so write a large file in parts: the first part plainly, then each further part with append: true.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, append: { type: 'boolean' } }, required: ['path', 'content'] } } },
     { type: 'function', function: { name: 'edit_file', description: 'Replace an exact string in a workspace file.', parameters: { type: 'object', properties: { path: { type: 'string' }, old_text: { type: 'string' }, new_text: { type: 'string' }, replace_all: { type: 'boolean' } }, required: ['path', 'old_text', 'new_text'] } } },
     { type: 'function', function: { name: 'run_command', description: 'Run a shell command inside the isolated Linux sandbox container. The workspace is mounted at /workspace. There is no network access. npm, npx, yarn, pnpm and bun installs are refused: with no network they can only destroy the dependency tree that is already there. Run installed binaries directly instead, for example `node ./node_modules/typescript/bin/tsc --noEmit` or `./node_modules/.bin/vitest run <file>`.' + (grants.git ? ' Git is writable in this conversation: commit and branch locally as you work. `git push` works too, but it is run for you on the host, because the container has no network: send it as a command of its own, with at most an existing remote and the branch you are on. Force, delete and other push flags stay refused.' : ' The .git directory is read-only: git log and git diff work, git commit does not.'), parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_sec: { type: 'integer' } }, required: ['command'] } } }
   ]
@@ -196,9 +196,13 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         context.signal?.throwIfAborted()
         await mkdir(join(path, '..'), { recursive: true })
         context.signal?.throwIfAborted()
-        await writeFile(path, content, 'utf8')
+        if (args.append === true) {
+          const existing = await stat(path).then(info => info.size, () => 0)
+          if (existing + Buffer.byteLength(content) > MAX_WRITE_BYTES) throw new ToolPolicyError('the file would exceed the 1 MiB write limit')
+          await appendFile(path, content, 'utf8')
+        } else await writeFile(path, content, 'utf8')
         await context.afterTool?.([path], true)
-        return { output: `wrote ${rel} (${content.length} characters)`, failed: false, paths: [path] }
+        return { output: `${args.append === true ? 'appended to' : 'wrote'} ${rel} (${content.length} characters)`, failed: false, paths: [path] }
       }
       case 'edit_file': {
         const oldText = text(args.old_text, 'old_text')

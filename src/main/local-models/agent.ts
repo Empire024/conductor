@@ -153,6 +153,32 @@ ${raw.slice(-Math.floor(cap / 2))}` }
   return fallbackSystem ? [fallbackSystem, ...fallback.slice(start)] : fallback.slice(start)
 }
 
+/** Whether a tool call's arguments are the JSON object every tool schema promises. A call cut
+ *  off at the output limit carries half a JSON string, and llama.cpp's chat templates parse
+ *  stored tool-call arguments when they render the history: one such call left in the
+ *  conversation turns every later request into an HTTP 500, retry included. */
+export const argumentsAreObject = (raw: string): boolean => {
+  if (!raw?.trim()) return true
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)
+  } catch { return false }
+}
+
+/** What the history keeps in place of arguments that are not a JSON object. */
+export const UNPARSEABLE_ARGUMENTS = '{}'
+
+/** The model is told why its call did not run and how to succeed next time, in the terms it
+ *  controls: a smaller call. */
+export function malformedCallResult(name: string, raw: string, truncated: boolean): string {
+  const size = `${raw.length} characters`
+  if (!truncated) return `failed: the ${name} arguments were not a JSON object (${size}), so nothing ran. Send the call again with valid JSON arguments.`
+  const parts = name === 'write_file'
+    ? ' Write a large file in parts: write_file the first part, then write_file with append: true for each further part, keeping every call under about 6000 characters of content.'
+    : ' Split the work into smaller calls.'
+  return `failed: the ${name} call was cut off at the local output limit of ${RESPONSE_RESERVE_TOKENS} tokens after ${size}, before its arguments were complete, so nothing ran and nothing was written.${parts}`
+}
+
 /** Make the history renderable again. A chat template rejects a tool result that answers no
  *  call, and an assistant that asked for tools and never got results back, with a 400 that is
  *  not about this request at all: the same stored history fails identically on every later
@@ -165,7 +191,10 @@ export function repairToolProtocol(messages: ChatMessage[]): ChatMessage[] {
     const message = messages[index]!
     // Tool results are emitted with the call they answer, below; any other one is an orphan.
     if (message.role === 'tool') continue
-    output.push(message)
+    // Arguments a template cannot parse fail the whole request, so they never stay stored.
+    output.push(message.role === 'assistant' && message.tool_calls?.some(call => !argumentsAreObject(call.function.arguments))
+      ? { ...message, tool_calls: message.tool_calls.map(call => argumentsAreObject(call.function.arguments) ? call : { ...call, function: { ...call.function, arguments: UNPARSEABLE_ARGUMENTS } }) }
+      : message)
     if (message.role !== 'assistant' || !message.tool_calls?.length) continue
     const results = new Map<string, ChatMessage>()
     let scan = index + 1
@@ -263,10 +292,11 @@ export class LocalAgentSession {
       const completion = await this.complete(events, tools, overheadTokens, signal)
       if (completion.usage) events.usage?.(completion.usage)
       const calls: ToolCall[] = completion.toolCalls
+      const truncated = completion.finishReason === 'length'
       this.messages.push({
         role: 'assistant',
         content: completion.content,
-        ...(calls.length ? { tool_calls: calls.map(call => ({ id: call.id, type: 'function' as const, function: { name: call.name, arguments: call.arguments } })) } : {})
+        ...(calls.length ? { tool_calls: calls.map(call => ({ id: call.id, type: 'function' as const, function: { name: call.name, arguments: argumentsAreObject(call.arguments) ? call.arguments : UNPARSEABLE_ARGUMENTS } })) } : {})
       })
       if (completion.content.trim()) finalText = completion.content.trim()
       if (!calls.length) {
@@ -295,6 +325,13 @@ export class LocalAgentSession {
         }
         events.toolStart?.({ id: call.id, name: call.name, input: call.arguments })
         const started = Date.now()
+        if (!argumentsAreObject(call.arguments)) {
+          const output = malformedCallResult(call.name, call.arguments, truncated)
+          if (truncated) events.notice?.(`The model's ${call.name} call hit the local output limit before it was complete; nothing ran, and the model was asked to send it in smaller parts.`)
+          events.toolEnd?.({ id: call.id, name: call.name, output, failed: true, durationMs: Date.now() - started })
+          this.messages.push({ role: 'tool', tool_call_id: call.id, content: output })
+          continue
+        }
         // A tool that throws instead of returning a failure would otherwise unwind the turn
         // between the assistant's call and its result, and that hole is what makes every later
         // request unrenderable. The failure belongs in the transcript as the call's result.
