@@ -126,6 +126,12 @@ export class StructuredAgentStore {
    * they cover only the usage and session rows accounting actually reads.
    */
   private ensureAccountingSchema(): void {
+    // One commit: on a fresh journal this is five schema writes, and every launch and every test
+    // fixture would otherwise pay a separate fsync for each of them.
+    this.db.exec('BEGIN')
+    try { this.applyAccountingSchema(); this.db.exec('COMMIT') } catch (reason) { this.db.exec('ROLLBACK'); throw reason }
+  }
+  private applyAccountingSchema(): void {
     // Generated columns are hidden, so only `table_xinfo` reports one that already exists.
     const columns = this.db.prepare('PRAGMA table_xinfo(structured_events)').all() as Array<{ name: string }>
     const missing = (name: string): boolean => !columns.some(column => column.name === name)

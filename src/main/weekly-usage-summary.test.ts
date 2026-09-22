@@ -38,15 +38,16 @@ describe('WeeklyUsageSummaryService', () => {
     const usageConversation = vi.fn((sessionId: string) => ({ sessionId, provider: 'codex' as const, model: 'gpt-a', events: [usage(sessionId)] }))
     const journal = vi.fn(() => { throw new Error('the desktop path must not take the blocking read') })
     const service = new WeeklyUsageSummaryService({ structured: { usageJournal: journal, usageSessions: () => ids, usageConversation } }, () => now)
-    let ticks = 0
-    const counting = setInterval(() => { ticks += 1 }, 0)
-    const report = await service.readAsync()
-    clearInterval(counting)
+    // Work queued before the read runs while the read is still going, which is exactly what a
+    // single blocking scan cannot allow: it would resolve the read first.
+    let interleaved = false
+    const scan = service.readAsync()
+    setImmediate(() => { interleaved = usageConversation.mock.calls.length < 30 })
+    const report = await scan
+    expect(interleaved).toBe(true)
     expect(usageConversation).toHaveBeenCalledTimes(30)
     expect(usageConversation).toHaveBeenCalledWith('s-0', '2026-09-08T00:00:00.000Z', '2026-09-15T00:00:00.000Z')
     expect(report.models[0]?.totalTokens).toBe(300)
-    // The loop kept running while the journal was read, which a single blocking scan cannot do.
-    expect(ticks).toBeGreaterThan(0)
     // A second caller takes the memoized report, and concurrent callers share one scan.
     service.invalidate()
     const [first, second] = await Promise.all([service.readAsync(), service.readAsync()])
