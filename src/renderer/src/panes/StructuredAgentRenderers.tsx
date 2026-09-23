@@ -411,7 +411,7 @@ function OutputPreview({ value, sessionId, artifactId, language }: { value: stri
 }
 export function interactionOutcome(outcome?: string): string {
   if (!outcome) return 'Resolved'
-  return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', 'allow-session': 'Allowed for session', 'auto-mode': 'Auto-mode enabled', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
+  return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', acceptWithExecpolicyAmendment: 'Always allowed (Codex rule)', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', 'allow-session': 'Allowed for session', 'auto-mode': 'Auto-mode enabled', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
 }
 const MAX_ANSWER_VALUE_LENGTH = 72
 /** Claude can offer a raw, percent-encoded path as an answer choice (a disambiguating

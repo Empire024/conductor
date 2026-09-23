@@ -100,9 +100,20 @@ export const ownerOnlyEscalation = (reach: string): string | undefined => {
   // (live-observed 2026-09-22, codex-cli 0.155.1; availableDecisions accept / acceptWithExecpolicyAmendment / cancel).
   // The interpreter's own path would trip the system-directory rule and hold the owner's desktop-shortcut command,
   // so an absolute interpreter path is reduced to its bare name before matching; what the command itself reaches
-  // is still judged in full.
-  const acted = reach.replace(/"?[a-z]:\\(?:[^"\\\s]+\\)*(powershell|pwsh|cmd|bash|sh|zsh|node|python3?)(\.exe)?"?/gi, '$1')
+  // is still judged in full. Codex quotes that path with doubled separators (`"C:\\WINDOWS\\System32\\…"`,
+  // live-observed 2026-09-23 on every escalation of a Conductor evaluation run), so separator runs are
+  // collapsed first; otherwise the reduction misses and every Windows escalation reads as a system directory.
+  const acted = reach.replace(/\\{2,}/g, '\\').replace(/"?[a-z]:\\(?:[^"\\\s]+\\)*(powershell|pwsh|cmd|bash|sh|zsh|node|python3?)(\.exe)?"?/gi, '$1')
   return OWNER_ONLY_ESCALATIONS.find(([, pattern]) => pattern.test(acted))?.[0]
+}
+
+/** The command prefix Codex offers to remember for a command approval, exactly as offered. */
+export const codexExecpolicyAmendment = (decisions: readonly unknown[]): string[] | undefined => {
+  for (const decision of decisions) {
+    const amendment = record(decision) && record(decision.acceptWithExecpolicyAmendment) ? decision.acceptWithExecpolicyAmendment.execpolicy_amendment : undefined
+    if (Array.isArray(amendment) && amendment.length && amendment.every(part => typeof part === 'string')) return amendment
+  }
+  return undefined
 }
 
 /** What a failed Codex command says when the CLI's Windows sandbox helper could not refresh the
@@ -888,11 +899,17 @@ export class CodexAdapter implements ProviderAdapter {
       throw new Error('Provider approval identity was reused with changed arguments')
     }
     if (this.pending.size >= 128) throw new Error('Too many pending provider requests')
-    let choices = [{ id: 'accept', label: 'Allow once' }, { id: 'acceptForSession', label: 'Allow for this session' }, { id: 'decline', label: 'Deny' }, { id: 'cancel', label: 'Cancel turn' }]
+    let choices: PendingInteraction['choices'] = [{ id: 'accept', label: 'Allow once' }, { id: 'acceptForSession', label: 'Allow for this session' }, { id: 'decline', label: 'Deny' }, { id: 'cancel', label: 'Cancel turn' }]
     let title = 'Approve file changes'
     if (request.method === 'item/commandExecution/requestApproval') {
       title = request.params.networkApprovalContext ? `Allow network access: ${request.params.networkApprovalContext.host}` : request.params.reason ?? 'Approve command execution'
-      if (request.params.availableDecisions) choices = choices.filter(choice => request.params.availableDecisions!.some(decision => decision === choice.id))
+      if (request.params.availableDecisions) {
+        choices = choices.filter(choice => request.params.availableDecisions!.some(decision => decision === choice.id))
+        // Codex's own "don't ask again" for a command prefix. It writes a lasting Codex rule, so it is
+        // only ever the owner's click, labelled with the exact prefix, and never an Auto answer.
+        const amendment = codexExecpolicyAmendment(request.params.availableDecisions)
+        if (amendment) choices.splice(1, 0, { id: 'acceptWithExecpolicyAmendment', label: `Always allow \`${amendment.join(' ')}\``, description: 'Codex saves this prefix as a rule and runs matching commands without asking again, in this and later conversations.' })
+      }
     } else if (request.method === 'item/permissions/requestApproval') {
       title = request.params.reason ?? 'Grant requested permissions'
       choices = [{ id: 'accept', label: 'Grant for this turn' }, { id: 'acceptForSession', label: 'Grant for this session' }, { id: 'decline', label: 'Deny' }]
@@ -929,7 +946,7 @@ export class CodexAdapter implements ProviderAdapter {
       }
     }
     // A reviewed, isolated-reviewer or owner-held Auto request is one exact action, never a session grant.
-    if (this.unattended && !isQuestion && !mcpApproval) choices = choices.filter(choice => choice.id !== 'acceptForSession')
+    if (this.unattended && !isQuestion && !mcpApproval) choices = choices.filter(choice => choice.id !== 'acceptForSession' && choice.id !== 'acceptWithExecpolicyAmendment')
     const interaction: PendingInteraction = {
       id, kind: isQuestion ? 'question' : 'approval', title: isQuestion ? 'Codex needs your input' : title,
       input: json(params), choices: isQuestion ? [] : choices, status: 'pending',
@@ -960,6 +977,11 @@ export class CodexAdapter implements ProviderAdapter {
 
   /** The exact response Codex expects for a decision on this request. */
   private decisionResult(request: ServerRequest, decision: string): Json {
+    if (decision === 'acceptWithExecpolicyAmendment' && request.method === 'item/commandExecution/requestApproval') {
+      const amendment = codexExecpolicyAmendment(request.params.availableDecisions ?? [])
+      if (!amendment) throw new Error('Codex offered no command prefix rule for this request')
+      return { decision: { acceptWithExecpolicyAmendment: { execpolicy_amendment: amendment } } }
+    }
     const granted = decision === 'accept' || decision === 'acceptForSession'
     if (request.method === 'item/permissions/requestApproval') {
       return { permissions: granted ? json(Object.fromEntries(Object.entries(request.params.permissions).filter(([, value]) => value !== null))) : {}, scope: decision === 'acceptForSession' ? 'session' : 'turn' }

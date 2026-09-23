@@ -51,7 +51,7 @@ function fixture(permission: SessionSettings['permission'] = 'auto', extra: Part
     }
   })
   cleanup.push(adapter)
-  const request = (kind: 'commandExecution' | 'fileChange' | 'permissions' = 'commandExecution', command = 'Write-Output synthetic', availableDecisions = ['accept', 'decline', 'cancel']) => {
+  const request = (kind: 'commandExecution' | 'fileChange' | 'permissions' = 'commandExecution', command = 'Write-Output synthetic', availableDecisions: unknown[] = ['accept', 'decline', 'cancel']) => {
     inject({ id: nativeRequestId, method: `item/${kind}/requestApproval`, params: {
       threadId, turnId, itemId: 'auto-item', reason: 'Synthetic policy escalation', cwd: process.cwd(),
       ...(kind === 'commandExecution' ? { command, availableDecisions }
@@ -109,6 +109,35 @@ describe('Auto refusal incident: native approval lifecycle', () => {
     expect(f.notices(new RegExp('^Auto left “Synthetic policy escalation” to you: it reaches ' + boundary.replace(/[.*+?^$()|[\]\\]/g, '\\$&') + '\\. The native request is pending'))).toBe(1)
     await f.answer()
     expect(f.responses()).toEqual([{ id: nativeRequestId, result: { decision: 'accept' } }])
+  })
+
+  // Verbatim from the controller session of 2026-09-23 (agent_mueapu6k_u5nkaij): Codex quotes its
+  // PowerShell wrapper with doubled separators, and Auto held all six evaluation runs as "a Windows
+  // system directory or the hosts file" because the wrapper path was never reduced.
+  const liveWrapper = '"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command '
+  const liveEvaluation = liveWrapper + "'node artifacts/local-files/evaluate.mjs --acceptance-batch --docker=C:/Users/stilj/AppData/Local/Programs/DockerDesktop/resources/bin/docker.exe'"
+  const livePrefix = { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['node', 'artifacts/local-files/evaluate.mjs'] } }
+
+  it('Auto allows a live-quoted evaluation run once and never saves its prefix rule by itself', async () => {
+    const f = fixture(); await f.start(); f.request('commandExecution', liveEvaluation, ['accept', livePrefix, 'cancel'])
+    expect({ pending: f.pending(), responses: f.responses(), held: f.notices(/^Auto left/) }).toEqual({ pending: [], responses: [{ id: nativeRequestId, result: { decision: 'accept' } }], held: 0 })
+  })
+
+  it('a live-quoted wrapper still holds what the command itself reaches', async () => {
+    expect(ownerOnlyEscalation(liveWrapper + "'Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts x'")).toBe('a Windows system directory or the hosts file')
+    expect(ownerOnlyEscalation(liveWrapper + "'Copy-Item k C:\\Users\\owner\\.docker\\config.json'")).toBe('a credential or key store')
+    const f = fixture(); await f.start(); f.request('commandExecution', liveWrapper + "'reg add HKCU\\Software\\x'", ['accept', livePrefix, 'cancel'])
+    expect(f.pending().map(interaction => interaction.choices.map(choice => choice.id))).toEqual([['accept', 'cancel']])
+  })
+
+  it('outside Auto the owner may save the prefix Codex offers, answered exactly as offered', async () => {
+    const f = fixture('accept-edits'); await f.start(); f.request('commandExecution', liveEvaluation, ['accept', livePrefix, 'cancel'])
+    const [card] = f.pending()
+    expect(card?.choices.map(choice => [choice.id, choice.label])).toEqual([['accept', 'Allow once'], ['acceptWithExecpolicyAmendment', 'Always allow `node artifacts/local-files/evaluate.mjs`'], ['cancel', 'Cancel turn']])
+    await f.answer('acceptWithExecpolicyAmendment')
+    expect(f.responses()).toEqual([{ id: nativeRequestId, result: { decision: livePrefix } }])
+    const plain = fixture('accept-edits'); await plain.start(); plain.request('commandExecution', liveEvaluation, ['accept', 'cancel'])
+    await expect(plain.answer('acceptWithExecpolicyAmendment')).rejects.toThrow('not offered')
   })
 
   it('a file change whose paths Auto cannot see, and a permission profile that reaches a boundary, stay owner cards', async () => {
