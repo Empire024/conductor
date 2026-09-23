@@ -5,7 +5,9 @@ export function permissionParity(settings: SessionSettings, capabilities?: Pick<
   if (capabilities?.provider !== 'claude') return undefined
   const effective = capabilities.effectiveSettings
   const mode = effective && typeof effective === 'object' && !Array.isArray(effective) ? effective.permissionMode : undefined
-  if (capabilities.approvalRouting === 'stronger-review') return `This coworker's approvals go to a stronger-model review first, so the runtime asks before each action even though you configured ${settings.permission}${typeof mode === 'string' ? ` (native mode ${mode})` : ''}. You can always answer a request yourself; turn off "Review coworkers" in the controlling tab to stop the reviews.`
+  // Stronger review no longer changes the native mode: a worker on Auto runs on Auto and only the
+  // requests the runtime raises itself go to review first, so there is nothing to explain unless
+  // the native mode genuinely differs from the configured one.
   if (typeof mode !== 'string') return undefined
   const expected = settings.plan ? 'plan' : settings.permission === 'auto' ? 'auto' : settings.permission === 'accept-edits' ? 'acceptEdits' : 'manual'
   const actual = mode === 'default' ? 'manual' : mode

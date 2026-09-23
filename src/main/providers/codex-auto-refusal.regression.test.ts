@@ -184,11 +184,10 @@ describe('Auto refusal incident: native approval lifecycle', () => {
     expect(f.events.some(event => event.data.type === 'interaction' && event.data.interaction.status === 'expired' && /arguments changed/.test(event.data.interaction.outcome ?? ''))).toBe(true)
   })
 
-  it('a reviewed Auto worker exposes only a native turn permission grant and sends the genuine permission response', async () => {
+  it('a reviewed Auto worker still grants a native turn permission by itself with the genuine permission response', async () => {
+    // "Review coworkers" on the controller used to hold this for the owner; Auto stays Auto.
     const f = fixture('auto', { reviewApprovals: true }); await f.start(); f.request('permissions')
-    expect(f.pending()[0]?.choices.map(choice => choice.id)).toEqual(['accept', 'decline'])
-    await expect(f.answer('acceptForSession')).rejects.toThrow('not offered')
-    await f.answer()
+    expect(f.pending()).toEqual([])
     expect(f.responses()).toEqual([{ id: nativeRequestId, result: { permissions: { network: { enabled: true } }, scope: 'turn' } }])
   })
 
@@ -203,11 +202,10 @@ describe('Auto refusal incident: native approval lifecycle', () => {
     expect(f.responses()).toEqual([{ id: nativeRequestId, result: { decision: 'accept' } }])
   })
 
-  it('the existing host review opt-in preserves an Auto native request without answering it', async () => {
+  it('the host review opt-in on the controller does not stop an Auto worker from answering its own request', async () => {
     const f = fixture('auto', { reviewApprovals: true }); await f.start(); f.request()
-    expect(f.pending()).toHaveLength(1)
-    expect(f.responses()).toEqual([])
-    expect(f.events.at(-1)?.data).toMatchObject({ type: 'session', phase: 'waiting_approval' })
+    expect(f.pending()).toEqual([])
+    expect(f.responses()).toEqual([{ id: nativeRequestId, result: { decision: 'accept' } }])
   })
 
   it('an actual owner denial sends decline once and cannot be replaced by a second answer', async () => {

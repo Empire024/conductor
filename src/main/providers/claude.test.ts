@@ -61,10 +61,12 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     await expect(fixture({ approvalReviewer: true, nativeSessionId: 'old-native' }).adapter.start()).rejects.toThrow('fresh isolated')
   })
 
-  it('routes managed Auto workers through native manual approval without changing their configured mode', async () => {
+  it('keeps a managed Auto worker on native auto even when its controller reviews coworkers', async () => {
     const f = fixture({ reviewApprovals: true, settings: { permission: 'auto', plan: false } })
     await f.adapter.start()
-    expect(f.transport.options.args[f.transport.options.args.indexOf('--permission-mode') + 1]).toBe('manual')
+    // The review opt-in used to pin the worker to manual, which made every shell command wait for
+    // the owner; a worker the owner put on Auto stays on Auto.
+    expect(f.transport.options.args[f.transport.options.args.indexOf('--permission-mode') + 1]).toBe('auto')
     expect(f.adapter.capabilities.approvalRouting).toBe('stronger-review')
     await f.adapter.submit('Work', { permission: 'auto', plan: false })
     expect(f.projection().settings.permission).toBe('auto')

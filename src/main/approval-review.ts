@@ -55,9 +55,12 @@ export class ApprovalReviews {
   get(projectId: string, id: string): ReviewRecord | undefined { return this.records(projectId).find(record => record.id === id) }
   lookup(action: ReviewAction): ReviewRecord | undefined { return this.records(action.projectId).find(record => record.requestKey === requestKey(action)) }
   hasDenials(projectId: string): boolean { return this.records(projectId).some(record => record.denied) }
+  /** A denial fences the exact paths it named; a pathless denial (a command, a search) fences only
+   *  the same logical operation again, never every later request of the project. */
   denied(action: ReviewAction): boolean {
-    const keys = targetKeys(action), all = hash([action.projectId, action.machineId, '*'])
-    return this.records(action.projectId).some(record => record.denied && record.machineId === action.machineId && record.targetKeys.some(key => key === all || keys.includes(key)))
+    const keys = targetKeys(action), all = hash([action.projectId, action.machineId, '*']), operation = operationKey(action)
+    return this.records(action.projectId).some(record => record.denied && record.machineId === action.machineId
+      && record.targetKeys.some(key => key === all ? record.operationKey === operation : keys.includes(key) && key !== all))
   }
   private save(record: ReviewRecord): ReviewRecord {
     const records = this.records(record.projectId), index = records.findIndex(item => item.id === record.id)
@@ -89,7 +92,11 @@ export class ApprovalReviews {
     const at = new Date().toISOString()
     const operation = operationKey(action)
     const replay = this.records(action.projectId).find(record => record.operationKey === operation && record.history.some(entry => entry.phase === 'responding'))
-    const uncertain = this.records(action.projectId).some(record => record.history.some(entry => entry.phase === 'responding') && !record.history.some(entry => ['executed', 'execution-failed'].includes(entry.phase)) && record.targetKeys.some(key => targetKeys(action).includes(key)))
+    // Only a concrete path carries an execution uncertainty forward; a pathless request (the
+    // wildcard target) would otherwise fence every later command of the project behind the first
+    // one whose completion was never observed.
+    const concrete = action.paths.length ? targetKeys(action) : []
+    const uncertain = this.records(action.projectId).some(record => record.history.some(entry => entry.phase === 'responding') && !record.history.some(entry => ['executed', 'execution-failed'].includes(entry.phase)) && record.targetKeys.some(key => concrete.includes(key)))
     let record = this.save({ id: randomUUID(), digest, requestKey: key, operationKey: operation, targetKeys: targetKeys(action), projectId: action.projectId, machineId: action.machineId, workerId: action.workerId, runtimeId: action.runtimeId, requestId: action.requestId, phase: 'reviewing', rationale: 'Waiting for a stronger reviewing turn', grantScope: 'exact-action', createdAt: at, updatedAt: at, history: [] })
     if (this.denied(action)) return this.transition(record, 'denied', 'A durable denial covers this target. Another worker, argument or tool route cannot retry it')
     if (replay) return this.transition(record, 'blocked', 'This logical operation already has a native response intent. Reconnect or replacement requests cannot execute it again')
@@ -126,7 +133,7 @@ export class ApprovalReviews {
     if ((ownerAnswer === 'allow' || record.phase === 'approved') && this.denied(action)) throw new Error('A durable denial covers this action target')
     if (ownerAnswer === 'allow' || record.phase === 'approved') {
       const peers = this.records(action.projectId).filter(peer => peer.id !== record.id)
-      const keys = targetKeys(action)
+      const keys = action.paths.length ? targetKeys(action) : []
       if (peers.some(peer => peer.history.some(entry => entry.phase === 'responding') && (peer.operationKey === record.operationKey || !peer.history.some(entry => ['executed', 'execution-failed'].includes(entry.phase)) && peer.targetKeys.some(key => keys.includes(key))))) throw new Error('A competing operation already reserved this mutation or target; duplicate execution refused')
     }
     return this.transition(record, 'responding', 'Response intent persisted before native transport; it must not be replayed', ownerAnswer ? { ownerAnswer } : {})

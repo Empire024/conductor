@@ -5,7 +5,24 @@ import type { AgentSpec } from '../shared/models'
 import type { AdapterEvent, InteractionResponse, Json, PendingInteraction, SessionSettings } from '../shared/structured-agent'
 import { workspacePath } from './agent-artifacts'
 import { ApprovalReviews, actionDigest, canonicalAction, type ReviewAction, type ReviewPersistence, type ReviewRecord, type ReviewResult } from './approval-review'
+import { ownerOnlyEscalation } from './providers/codex'
 import { sanitizeDiagnostic } from './structured-store'
+
+/** Arguments as the reviewer sees them: whole when small, a deterministic prefix when a file
+ *  write or diff would blow the reviewer context. The same inputs always give the same value, so
+ *  the digest that binds the review to the request still holds. */
+const REVIEWER_ARGUMENT_CHARS = 20000
+function boundedArguments(value: Json): Json {
+  const canonical = canonicalAction(value)
+  if (canonical.length <= REVIEWER_ARGUMENT_CHARS) return value
+  return { truncatedForReview: true, totalChars: canonical.length, preview: canonical.slice(0, REVIEWER_ARGUMENT_CHARS) }
+}
+/** The text a command-like request acts through, for the owner-only boundary check. */
+function reachOf(input: Record<string, Json>): string {
+  const parts: string[] = []
+  for (const key of ['command', 'cmd', 'commands', 'permissions', 'grantRoot', 'changes', 'file_path', 'notebook_path', 'path', 'url'] as const) if (input[key] !== undefined) parts.push(canonicalAction(input[key]))
+  return parts.join('\n')
+}
 
 export interface ApprovalReviewRouting {
   enabled(spec: AgentSpec): boolean
@@ -86,9 +103,16 @@ export class ApprovalReviewGate {
     const authorization = this.routing.authorization(binding.spec), native = object(binding.source.native?.payload)
     const input = object(binding.interaction.input), tool = typeof native.tool_name === 'string' ? native.tool_name : binding.source.native?.method ?? 'Unknown native action'
     const settings = this.settings(binding.spec.id)
-    let boundary: ReviewAction['boundary'] = 'unsupported', reason = 'This native approval has no implemented exact-action review boundary', paths: string[] = [], sideEffects: string[] = []
-    if (binding.spec.provider === 'claude' && binding.source.native?.method === 'can_use_tool' && ['Write', 'Edit'].includes(tool) && typeof input.file_path === 'string') {
-      const path = await workspacePath(binding.spec.cwd, input.file_path, true)
+    // Every request a worker under review raises is reviewable: the point of "Review coworkers"
+    // is that a stronger model answers what Auto could not answer by itself, so the owner sees
+    // fewer cards, not more. Only an owner-only boundary (an explicit ask rule, a protected
+    // path, or a command that reaches the system, credentials or recursive deletion) is kept
+    // as 'native-owner', where the reviewer may deny or escalate but never allow.
+    let boundary: ReviewAction['boundary'] = 'workspace-write', reason = 'A routine action of a delegated task: allow what the task plausibly needs inside the workspace, deny what harms it, escalate what needs more owner permission', paths: string[] = [], sideEffects: string[] = []
+    const claudeTool = binding.spec.provider === 'claude' && binding.source.native?.method === 'can_use_tool'
+    const requested = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : undefined
+    if (claudeTool && ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool) && requested) {
+      const path = await workspacePath(binding.spec.cwd, requested, true)
       const localPath = relative(binding.spec.cwd, path).replaceAll('\\', '/')
       if (localPath.includes(':') || /(?:^|\/)(?:\.git|\.codex|\.claude|\.agents)(?:\/|$)|(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|\.mcp\.json)$/i.test(localPath)) throw new Error('Protected configuration, repository metadata or alternate-stream writes require an unsupported native boundary')
       // Existing protected-path and realpath validation stays authoritative. Bind the existing
@@ -97,19 +121,20 @@ export class ApprovalReviewGate {
       try { if ((await stat(path)).size > 1_000_000) throw new Error('Review target exceeds the bounded file limit'); before = createHash('sha256').update(await readFile(path)).digest('hex') }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
       paths = [process.platform === 'win32' ? path.toLowerCase() : path]
-      sideEffects = [tool === 'Write' ? 'Replace this file with the exact supplied content' : 'Apply the exact supplied string replacement', 'Prior file SHA-256: ' + before]
-      const mandatory = native.matched_ask_rule != null || /requires? (?:user )?approval|requires? user interaction/i.test(String(native.decision_reason ?? ''))
-      boundary = mandatory ? 'native-owner' : 'workspace-write'
-      reason = mandatory ? String(native.decision_reason ?? 'Claude matched an owner ask rule; stronger review cannot replace that rule') : 'One exact native workspace file mutation; no session grants or mode switches'
-      if (settings?.plan || settings?.permission === 'read-only' || settings?.sandbox === 'read-only') { boundary = 'unsupported'; reason = 'Owner plan/read-only restriction forbids approving this mutation' }
-      if (boundary !== 'unsupported' && !this.routing.supportsExactExecution?.(binding.spec)) {
-        boundary = 'unsupported'
-        reason = 'This native runtime cannot enforce reviewed file preconditions at execution time or fence equivalent writes across providers. Automatic execution is blocked; a shared mutation broker is required.'
-      }
+      sideEffects = [tool === 'Write' ? 'Replace this file with the exact supplied content' : 'Apply the exact supplied edit', 'Prior file SHA-256: ' + before]
+      reason = 'One exact native workspace file mutation; no session grants or mode switches'
+    } else if (claudeTool) {
+      sideEffects = [`Run the ${tool} tool once with exactly these arguments; no session grant`]
+    } else {
+      sideEffects = ['Answer this native request once, for this request only; no session-wide grant, no policy amendment']
     }
+    const reach = ownerOnlyEscalation(reachOf(input))
+    if (claudeTool && native.matched_ask_rule != null) { boundary = 'native-owner'; reason = String(native.decision_reason ?? 'Claude matched an owner ask rule; stronger review cannot replace that rule') }
+    else if (reach) { boundary = 'native-owner'; reason = `This request reaches ${reach}, an owner-only boundary; the reviewer may only deny it or escalate it to the owner` }
+    if (settings?.plan || settings?.permission === 'read-only' || settings?.sandbox === 'read-only') { boundary = 'unsupported'; reason = 'Owner plan/read-only restriction forbids approving this action' }
     const action: ReviewAction = { projectId: binding.spec.projectId, machineId: 'local', cwd: binding.spec.cwd, ...(authorization.ownerTaskId ? { ownerTaskId: authorization.ownerTaskId } : {}), workerId: binding.spec.id, runtimeId: binding.runtimeId, requestId: binding.interaction.id,
-      tool, arguments: binding.interaction.input, paths, boundary, reason, sideEffects, ownerEvidence: authorization.text, authorizationId: authorization.id, native }
-    if (canonicalAction(action).length > 24000) throw new Error('Exact action and authorization exceed the bounded reviewer context; no truncated review was sent')
+      tool, arguments: boundedArguments(binding.interaction.input), paths, boundary, reason, sideEffects, ownerEvidence: authorization.text, authorizationId: authorization.id, native: boundedArguments(native) }
+    if (canonicalAction(action).length > 64000) throw new Error('Exact action and authorization exceed the bounded reviewer context; no truncated review was sent')
     if (canonicalAction(sanitizeDiagnostic(action)) !== canonicalAction(action)) throw new Error('Exact review context contains sensitive fields; automatic review is unavailable without exposing credentials')
     return action
   }

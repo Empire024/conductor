@@ -194,7 +194,14 @@ export class AgentControl {
         const entry = this.catalog({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }).find(provider => provider.provider === 'claude' && provider.available && provider.source === 'runtime')
         return entry?.models.find(model => model.id === 'opus[1m]')?.id ?? entry?.models.find(model => model.id === 'opus')?.id
       },
-      open: async (spec, model) => (await this.open({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, { provider: 'claude', model, title: 'Stronger approval review', permission: 'default', focus: false }, true)).resourceId!
+      open: async (spec, model) => (await this.open({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, { provider: 'claude', model, title: 'Stronger approval review', permission: 'default', focus: false }, true)).resourceId!,
+      // One review, one tab, gone when the decision is journaled: a swarm's approvals must not
+      // leave a trail of reviewer tabs for the owner to close.
+      close: async (spec, reviewerId) => {
+        const scope = { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }
+        const tab = this.tabs(scope).find(candidate => candidate.resourceId === reviewerId)
+        if (tab) await this.ui(scope, 'tabs.close', { tabId: tab.id })
+      }
     }))
   }
 

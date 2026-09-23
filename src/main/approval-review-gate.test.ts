@@ -35,14 +35,24 @@ function fixture() {
 }
 
 describe('host approval response gate (synthetic reviewers, no inference)', () => {
-  it('blocks production native writes without a trusted executor contract, before spending a reviewer turn', async () => {
+  it('reviews and answers a production native write without any executor contract, so the owner is not asked', async () => {
     const f = fixture()
     delete f.gate.routing!.supportsExactExecution
     f.gate.intercept(f.spec, 'runtime', f.request())
+    await vi.waitFor(() => expect(f.responses).toHaveLength(1))
+    expect(f.run).toHaveBeenCalledOnce()
+    expect(f.responses[0]).toMatchObject({ requestId: 'request', decision: 'allow' })
+    expect(f.run.mock.calls[0]![1]).toMatchObject({ boundary: 'workspace-write', tool: 'Write', sideEffects: ['Replace this file with the exact supplied content', 'Prior file SHA-256: absent'] })
+  })
+
+  it('keeps a command that reaches an owner-only boundary with the owner, whatever the reviewer says', async () => {
+    const f = fixture()
+    f.gate.intercept(f.spec, 'runtime', f.request('danger', { command: 'Remove-Item -Recurse -Force C:\\Users\\owner\\Documents\\old' }, 'Bash'))
     await f.waitPhase('blocked')
-    expect(f.last().review?.rationale).toContain('cannot enforce reviewed file preconditions')
-    expect(f.run).not.toHaveBeenCalled()
+    expect(f.run.mock.calls[0]![1]).toMatchObject({ boundary: 'native-owner' })
+    expect(f.run.mock.calls[0]![1].reason).toContain('recursive deletion')
     expect(f.responses).toHaveLength(0)
+    expect(f.last().choices.every(choice => !choice.disabled)).toBe(true)
   })
 
   it('refuses an automatic response whose live action binding was lost on reconnect, but never the owner', async () => {
@@ -89,14 +99,14 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     expect(f.responses).toHaveLength(0)
     expect(f.last().review?.rationale).toContain('changed')
   })
-  it('blocks unsupported native requests from automatic approval without running a reviewer, leaving them to the owner', async () => {
+  it('reviews a Codex command request like any other and sends the one accepted answer', async () => {
     const f = fixture()
-    f.gate.intercept({ ...f.spec, provider: 'codex' }, 'runtime', f.request('command', { command: 'outside write' }, 'Bash'))
-    await f.waitPhase('blocked')
-    expect(f.last().review?.rationale).toContain('no implemented exact-action')
-    expect(f.run).not.toHaveBeenCalled()
-    expect(f.last().title).toBe('Allow Bash?')
-    expect(f.last().choices.every(choice => !choice.disabled)).toBe(true)
+    f.gate.intercept({ ...f.spec, provider: 'codex' }, 'runtime', f.request('command', { command: 'npm test' }, 'Bash'))
+    await vi.waitFor(() => expect(f.responses).toHaveLength(1))
+    expect(f.run.mock.calls[0]![1]).toMatchObject({ boundary: 'workspace-write', paths: [], sideEffects: ['Answer this native request once, for this request only; no session-wide grant, no policy amendment'] })
+    // A second, different command is not fenced by the first one's unobserved execution.
+    f.gate.intercept({ ...f.spec, provider: 'codex' }, 'runtime', f.request('command-2', { command: 'npm run build' }, 'Bash'))
+    await vi.waitFor(() => expect(f.responses).toHaveLength(2))
   })
   it('never replaces mandatory native approval with a reviewer allow', async () => {
     const f = fixture()

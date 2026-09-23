@@ -389,7 +389,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (settings.permission === 'read-only') throw new Error('Claude CLI has no Conductor read-only sandbox; use explicit permissions or plan mode')
     if (settings.effort && !this.capabilities.effort.includes(settings.effort)) throw new Error('Unsupported Claude effort level')
   }
-  private permissionMode(settings: SessionSettings): string { return settings.plan ? 'plan' : this.options.reviewApprovals || this.options.approvalReviewer ? 'manual' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
+  /** The configured mode, always. "Review coworkers" on the controller never lowers a worker to
+   *  manual: a worker the owner put on Auto runs on Auto, and the review only sees the requests
+   *  the runtime raises on its own. Only the isolated reviewer itself is pinned to manual. */
+  private permissionMode(settings: SessionSettings): string { return settings.plan ? 'plan' : this.options.approvalReviewer ? 'manual' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'auto' ? 'auto' : 'manual' }
   private async imageInput(attachment: ContextAttachment): Promise<Json> {
     if (!attachment.path) throw new Error('Claude image attachment requires a local workspace path')
     const path = await workspacePath(this.options.cwd, attachment.path)

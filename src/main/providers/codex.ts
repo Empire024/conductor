@@ -901,7 +901,9 @@ export class CodexAdapter implements ProviderAdapter {
       choices = [{ id: 'accept', label: 'Allow once' }, ...(mcpApproval.persist.includes('session') ? [{ id: 'acceptForSession', label: 'Allow for this session' }] : []), { id: 'decline', label: 'Deny' }]
     }
     const isQuestion = request.method === 'item/tool/requestUserInput'
-    if (this.unattended && !isQuestion && !this.options.reviewApprovals && !this.options.approvalReviewer) {
+    // A controller's "Review coworkers" opt-in never turns Auto off for a worker: it runs unattended
+    // as configured, and only the isolated reviewer itself keeps every request pending.
+    if (this.unattended && !isQuestion && !this.options.approvalReviewer) {
       // Auto answers for the owner: an enabled MCP tool for the session when Codex offers that,
       // and a command, file change or permission grant that has to leave the workspace sandbox
       // once, for this request only, unless it reaches an owner-only boundary. The host review
