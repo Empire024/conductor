@@ -103,6 +103,12 @@ export interface CompletionRequest {
    *  thinking pass, which is what the smoke probe wants: a tiny token budget spent on the answer
    *  rather than on reasoning it never gets to finish. Left unset for real sessions. */
   reasoningEffort?: 'none' | 'low' | 'medium' | 'high'
+  /** `required` makes llama.cpp constrain the whole reply with the tool grammar instead of only
+   *  triggering it lazily. The agent loop asks for it once after the server's lazy parser has
+   *  handed back a stub it could not read (a Llama 3.1 fine-tune writing "arguments" where the
+   *  template says "parameters" arrives as a one-character call); under the full grammar the
+   *  same model produces a complete, valid call. Left unset for an ordinary request. */
+  toolChoice?: 'auto' | 'required'
   /** Consulted after every streamed delta with what has accumulated so far. A returned string
    *  ends generation early with that word as the finish reason: the agent loop uses it to cut
    *  off a reply that is talking itself in circles rather than acting. */
@@ -208,7 +214,7 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
       temperature: request.temperature ?? 0.3,
       max_tokens: request.maxTokens ?? 4096,
       ...(request.reasoningEffort ? { reasoning_effort: request.reasoningEffort } : {}),
-      ...(request.tools?.length ? { tools: request.tools, tool_choice: 'auto' } : {})
+      ...(request.tools?.length ? { tools: request.tools, tool_choice: request.toolChoice ?? 'auto' } : {})
     })
   })
   if (response.status === 401 || response.status === 403) throw new Error('Local model rejected the API key; regenerate it with setup and restart the servers')

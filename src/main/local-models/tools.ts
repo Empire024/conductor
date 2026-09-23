@@ -153,6 +153,9 @@ async function walk(root: string, directory: string, visit: (path: string) => Pr
 
 export const analysisScratchPath = (workspace: string, taskId: string): string => '.conductor-scratch/' + createHash('sha256').update(workspace + '\0' + taskId).digest('hex').slice(0, 24)
 
+/** The interpreter a saved script's extension names, for a run_command that gives none. */
+export const scriptRuntime = (path: string): 'python3' | 'node' | 'bash' | undefined => /\.py$/i.test(path) ? 'python3' : /\.(?:mjs|cjs|js)$/i.test(path) ? 'node' : /\.sh$/i.test(path) ? 'bash' : undefined
+
 const artifactOwner = (context: ToolContext): string => `${context.workspace}\0${context.analysis?.taskId ?? context.taskId ?? context.sandbox?.name ?? "unscoped"}`
 
 /** Dispatch one tool call. Every path is canonicalized inside the workspace before it is
@@ -172,7 +175,7 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         const scratch = await resolveWritablePath(context.workspace, context.analysisScratch)
         if (scratch.relative === '.') throw new ToolPolicyError('Analysis scratch must be a task subdirectory')
         const inside = relative(scratch.path, resolved.path).replace(/\\/g, '/')
-        if (inside === '..' || inside.startsWith('../') || inside.startsWith('/') || /^[A-Za-z]:/.test(inside)) throw new ToolPolicyError('Analysis source is read-only; writes are allowed only inside the task scratch directory')
+        if (inside === '..' || inside.startsWith('../') || inside.startsWith('/') || /^[A-Za-z]:/.test(inside)) throw new ToolPolicyError(`Analysis source is read-only; writes are allowed only inside the task scratch directory ${context.analysisScratch}/ (you named ${resolved.relative})`)
       } else if (context.analysis) throw new ToolPolicyError('Analysis source is read-only; use run_command code for task-owned scratch diagnostics')
       if (!pathAllowed(context.contract, resolved.relative)) throw new ToolPolicyError(`${resolved.relative} is outside the paths this task may change (${context.contract!.allowedPaths!.join(', ')})`)
       return resolved
@@ -308,17 +311,32 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
       }
       case 'run_command': {
         const forms = ['command', 'code', 'script'].filter(key => args[key] !== undefined)
-        if (forms.length !== 1) throw new ToolPolicyError('Provide exactly one of command, code, script')
+        if (forms.length !== 1) throw new ToolPolicyError(`Provide exactly one of command, code or script (this call had ${forms.length ? forms.join(' and ') : 'none of them'}). Nothing ran. Examples: {"command":"node scratch/match.mjs"}, {"script":"scratch/match.mjs","runtime":"node"}, {"code":"console.log(1)","runtime":"node"}.`)
         const quote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
         const cwd = await resolveInWorkspace(context.workspace, args.cwd === undefined ? '.' : text(args.cwd, 'cwd'))
         if (!(await stat(cwd.path)).isDirectory()) throw new ToolPolicyError('cwd must be a directory')
-        const runtime = args.runtime === undefined ? 'bash' : text(args.runtime, 'runtime')
+        // A saved script names its own interpreter by extension when the call does not; `bash
+        // match.mjs` would only ever fail in a way the model cannot read.
+        const inferred = forms[0] === 'script' && args.runtime === undefined ? scriptRuntime(text(args.script, 'script')) : undefined
+        const runtime = args.runtime === undefined ? inferred ?? 'bash' : text(args.runtime, 'runtime')
         if (!['python3', 'python', 'node', 'bash'].includes(runtime)) throw new ToolPolicyError('runtime must be python3, python, node or bash')
-        if(forms[0]==='command'&&(runtime!=='bash'||args.args!==undefined))throw new ToolPolicyError('command is literal bash shell text and cannot be combined with runtime/args. To run a saved Python file use {"script":"file.py","runtime":"python3"}; for supplied Python use {"code":"print(1)","runtime":"python3"}. Nothing ran. Use the actual workspace filename.')
         if (args.args !== undefined && (!Array.isArray(args.args) || args.args.some(value => typeof value !== 'string' || value.includes('\0')))) throw new ToolPolicyError('args must be strings without NUL bytes')
         let command: string, scriptArtifact: string | undefined
-        if (forms[0] === 'command') command = text(args.command, 'command')
-        else {
+        if (forms[0] === 'command') {
+          command = text(args.command, 'command')
+          // A runtime beside a shell command is accepted when the command already starts with that
+          // interpreter (the two agree, as in {"command":"node x.mjs","runtime":"node"}); a runtime
+          // the command does not start with would silently change what runs, so it is refused with
+          // the forms that do say what the model means. Extra `args` are appended quoted rather
+          // than dropped: the model asked for them.
+          if (runtime !== 'bash') {
+            const first = command.trim().split(/\s+/)[0] ?? ''
+            const binary = first.replace(/^.*\//, '')
+            const agrees = binary === runtime || (runtime.startsWith('python') && /^python3?$/.test(binary))
+            if (!agrees) throw new ToolPolicyError(`command is literal bash shell text, and runtime ${runtime} does not match its first word "${first}", so nothing ran. Either drop runtime, or run a saved workspace file with {"script":"<workspace path>","runtime":"${runtime}"} (a .py file needs python3, a .mjs/.cjs/.js file needs node), or supply inline code with {"code":"...","runtime":"${runtime}"}.`)
+          }
+          if (Array.isArray(args.args) && args.args.length) command += ' ' + (args.args as string[]).map(quote).join(' ')
+        } else {
           let script: string, setup = ''
           if (forms[0] === 'code') {
             const code = text(args.code, 'code')

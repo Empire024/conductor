@@ -43,6 +43,77 @@ export function generateInventoryFixture(): SyntheticFixture {
   ] }
 }
 
+/** A Fio-style bank export (BOM, CRLF, every cell quoted, Czech header, separate currency column) and a headerless
+ * tab-separated invoice list with a `Zobrazit PDF` filler line after each record. Every name and number is invented. */
+export function generateFioFixture(): { source: Buffer; target: Buffer } {
+  const quote = (cells: string[]): string => cells.map(c => `"${c.replace(/"/g, '""')}"`).join(';') + '\r\n'
+  const own = '1234567890'
+  const row = (date: string, amount: string, currency: string, counter: string, bank: string, message: string, note: string, type: string): string => quote([own, date, amount, currency, counter, bank, message, note, type])
+  const card = (day: number, amount: string, shop: string): string => {
+    const text = `Nákup: ${shop}, Hlavní ${day}, Praha, 110 00, CZE, dne ${day}.5.2026, částka  ${amount.replace('-', '').replace(',', '.')} CZK`
+    return row(`${String(day).padStart(2, '0')}.05.2026`, amount, 'CZK', '', '', text, text, 'Karetní transakce')
+  }
+  const income = 'Bezhotovostní příjem'
+  let source = '﻿' + quote(['Zdrojový účet', 'Datum', 'Objem', 'Měna', 'Protiúčet', 'Kód banky', 'Zpráva pro příjemce', 'Poznámka', 'Typ'])
+  const rows = [
+    row('02.05.2026', '400', 'CZK', '', '', '', '', 'Vklad v hotovosti'),
+    row('03.05.2026', '-28004', 'CZK', '9876543210', '3030', '', 'nájem květen', 'Okamžitá odchozí platba'),
+    // Unique amount with a payer note; one trimmed decimal digit (48250,5 = 48 250.50).
+    row('06.05.2026', '48250,5', 'CZK', '1111222233', '0800', 'FA 2026-05-0001', 'NORTHWIND CZ SRO', income),
+    // Two 15 000 payments from the same payer and one anonymous cash deposit of the same amount.
+    row('07.05.2026', '15000', 'CZK', '5555666677', '0100', '', 'ORCHARD MEDIA SRO', income),
+    row('14.05.2026', '15000', 'CZK', '', '', '', '', 'Vklad v hotovosti'),
+    row('21.05.2026', '15000', 'CZK', '5555666677', '0100', 'faktura', 'ORCHARD MEDIA SRO', income),
+    // Same 72 000 amount from two payers; the quoted message carries a delimiter and an escaped quote.
+    row('09.05.2026', '72000', 'CZK', '5555666677', '0100', '', 'ORCHARD MEDIA S.R.O.', income),
+    row('11.05.2026', '72000', 'CZK', '4444333322', '2010', 'Úhrada "FA 0002; květen"', 'KESTREL LABS SRO', income),
+    // The 9 900 amount exists only as an outgoing payment.
+    row('10.05.2026', '-9900', 'CZK', '7777888899', '0300', '', 'Tomáš Dvořák', 'Okamžitá odchozí platba'),
+    // EUR income through the currency column, next to a CZK deposit of the same number.
+    row('12.05.2026', '1800', 'EUR', 'DE89370400440532013000', 'COBADEFFXXX', '/DO2026-05-12/SP', 'HARBOR TRADING GMBH', income),
+    row('13.05.2026', '1800', 'CZK', '', '', '', '', 'Vklad v hotovosti'),
+    // A payer note truncated to 20 characters, next to another payer with the same amount.
+    row('15.05.2026', '64000', 'CZK', '3333444455', '0600', '', 'WESTBROOK INTERNATIONAL S.R.O.'.slice(0, 20), income),
+    row('18.05.2026', '64000', 'CZK', '6666777788', '0100', 'BLUEFIN STUDIO S.R.O.', 'BLUEFIN STUDIO S.R.O.', income),
+    // A person paying under a shortened surname form.
+    row('19.05.2026', '12500', 'CZK', '2222333344', '0800', '', 'NOVÁK JANA', income),
+    row('20.05.2026', '12500', 'CZK', '4444333322', '2010', '', 'KESTREL LABS SRO', income),
+    // An unsupported-but-harmless currency code: parsed, never matched.
+    row('22.05.2026', '250', 'DLH', 'XX00000000000000', 'TESTXXXX', '', 'TEST PAYMENT', income),
+    row('23.05.2026', '-45,5', 'EUR', '', '', 'Nákup: CAFE ALPINE, Wien, AUT', 'Nákup: CAFE ALPINE, Wien, AUT', 'Karetní transakce'),
+    row('24.05.2026', '3100', 'CZK', '9999000011', '0100', 'GREYSTONE', 'GREYSTONE SRO', income),
+    row('25.05.2026', '2000', 'CZK', '', '', '', '', 'Vklad v hotovosti'),
+    row('26.05.2026', '-1500', 'CZK', '', '', '', '', 'Výběr v hotovosti')
+  ]
+  const shops = ['ALBERT HYPERMARKET', 'LIDL CESKA REPUBLIKA', 'DM DROGERIE', 'BENZINA 4455', 'KAVARNA U MOSTU', 'ROHLIK.CZ']
+  for (let i = 0; i < 34; i++) rows.push(card(1 + (i * 7) % 28, `-${120 + i * 37},${i % 4 === 0 ? '9' : String(10 + (i * 13) % 90)}`, shops[i % shops.length]!))
+  for (let i = 0; i < 6; i++) rows.push(row(`${String(27 + (i % 3)).padStart(2, '0')}.05.2026`, i % 2 ? '-9' : '-39', 'CZK', '', '', '', 'Poplatek za službu', i % 2 ? 'Poplatek' : 'Poplatek - platební karta'))
+  source += rows.join('')
+  const invoices: Array<[string, string, string, string]> = [
+    ['2026-05-0001', '2026-05-04', 'NORTHWIND CZ s.r.o.', '48250.50 CZK'],
+    ['2026-05-0002', '2026-05-05', 'KESTREL LABS s.r.o.', '72000.00 CZK'],
+    ['2026-05-0003', '2026-05-06', 'ORCHARD MEDIA s.r.o.', '15000.00 CZK'],
+    ['2026-05-0004', '2026-05-07', 'Tomáš Dvořák', '9900.00 CZK'],
+    ['2026-05-0005', '2026-05-08', 'HARBOR TRADING GmbH', '1800.00 EUR'],
+    ['2026-05-0006', '2026-05-09', 'WESTBROOK INTERNATIONAL s.r.o.', '64000.00 CZK'],
+    ['2026-05-0007', '2026-05-10', 'Jana Nováková', '12500.00 CZK'],
+    ['2026-05-0008', '2026-05-11', 'Petr Svoboda', '5400.00 CZK']
+  ]
+  const target = invoices.map(([id, date, name, amount]) => `${id}\t${date}\t${name}\t${amount}\tImportováno · platba neznámá\r\nZobrazit PDF`).join('\r\n')
+  return { source: Buffer.from(source), target: Buffer.from(target) }
+}
+// Separately maintained expected outcomes for generateFioFixture, written by hand.
+export const FIO_FIXTURE_ORACLE = Object.freeze({
+  '2026-05-0001': { status: 'matched', sourceDates: ['2026-05-06'], narrowed: false },
+  '2026-05-0002': { status: 'matched', sourceDates: ['2026-05-11'], narrowed: true },
+  '2026-05-0003': { status: 'ambiguous', sourceDates: ['2026-05-07', '2026-05-21'], narrowed: true },
+  '2026-05-0004': { status: 'not_found', sourceDates: [], narrowed: false },
+  '2026-05-0005': { status: 'matched', sourceDates: ['2026-05-12'], narrowed: false },
+  '2026-05-0006': { status: 'matched', sourceDates: ['2026-05-15'], narrowed: true },
+  '2026-05-0007': { status: 'matched', sourceDates: ['2026-05-19'], narrowed: true },
+  '2026-05-0008': { status: 'not_found', sourceDates: [], narrowed: false }
+} as const)
+
 // Separately maintained expected outcomes. Never computed by matching/parser code under test.
 export const BANK_FIXTURE_ORACLE = Object.freeze({
   'invoice-positive': { status: 'matched', transactions: ['TX-004107'], sourceDates: ['2026-04-23'], minorUnits: 8_500_000 },

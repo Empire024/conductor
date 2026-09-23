@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { FILE_PROCESSING_LIMITS, inspectFile, inspectFileWithSchema, matchFileRecord, reconcileFileProcessing, parseExplicitDate, parseMoney, validateFileProcessingResult, type FileProcessingResult, type FileRecordSchema, type ValidationContext } from './file-processing'
+import { FILE_PROCESSING_LIMITS, inspectFile, inspectFileWithSchema, matchFileRecord, reconcileFileProcessing, parseExplicitDate, parseMoney, validateFileProcessingResult, splitCells, nameTokens, tokensSupport, narrowByText, type FileProcessingResult, type FileRecordSchema, type InspectedRecord, type ValidationContext, type Values } from './file-processing'
 import { BANK_FIXTURE_ORACLE, INVENTORY_FIXTURE_ORACLE, generateBankFixture, generateInventoryFixture, inspectFixture } from './file-processing.fixtures'
 
 // Builds submitted results from separately maintained fixture expectations, not the matching algorithm.
@@ -283,6 +283,56 @@ describe('bounded selected-schema helper', () => {
       const input = fixture.inputs[1]!
       input.bytes = Buffer.from(change(input.bytes.toString()))
       expect(inspectFileWithSchema(input, schema).identity.counts.rejected).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('Fio-style cells, currency codes and counterparty tokens', () => {
+  it('accepts any two-decimal three-letter code and refuses zero-decimal ones', () => {
+    expect(parseMoney('250', { currency: 'DLH' })).toEqual({ ok: true, value: { minorUnits: 25_000, currency: 'DLH', direction: 'incoming' } })
+    expect(parseMoney('12.00 SEK')).toMatchObject({ ok: true, value: { currency: 'SEK' } })
+    for (const code of ['JPY', 'KRW', 'ISK', 'CLP', 'VND', 'XAF', 'XOF']) expect(parseMoney('12', { currency: code })).toEqual({ ok: false, error: `Currency ${code} does not use two decimal places; it is not supported` })
+    expect(parseMoney('12', { currency: 'Kč' }).ok).toBe(false)
+  })
+  it('accepts a dropped trailing decimal zero only when the schema says so', () => {
+    expect(parseMoney('-129,9', { currency: 'CZK', trimmedDecimals: true })).toEqual({ ok: true, value: { minorUnits: -12_990, currency: 'CZK', direction: 'outgoing' } })
+    expect(parseMoney('-274,12', { currency: 'CZK', trimmedDecimals: true })).toMatchObject({ ok: true, value: { minorUnits: -27_412 } })
+    expect(parseMoney('-129,9', { currency: 'CZK' }).ok).toBe(false)
+    for (const text of ['85.000', '1,2,3', '12,345', '12,']) expect(parseMoney(text, { currency: 'CZK', trimmedDecimals: true }).ok).toBe(false)
+  })
+  it('splits RFC 4180 quoted cells', () => {
+    expect(splitCells('"a";"b ""c""; d";"";e', ';', true)).toEqual(['a', 'b "c"; d', '', 'e'])
+    expect(splitCells('"a";"b', ';', true)).toBeUndefined()
+    expect(splitCells('"a"x;"b"', ';', true)).toBeUndefined()
+    expect(splitCells('"a";"b"', ';')).toEqual(['"a"', '"b"'])
+  })
+  it('normalizes name tokens and supports truncation and surname variants', () => {
+    expect(nameTokens('NORTHWIND CZ, s.r.o.')).toEqual(['northwind'])
+    expect(nameTokens('Jana Nováková')).toEqual(['jana', 'novakova'])
+    expect(tokensSupport(nameTokens('WESTBROOK INTERNATIONAL s.r.o.'), nameTokens('INTERNATIO'))).toBe(true)
+    expect(tokensSupport(nameTokens('Jana Nováková'), nameTokens('NOVÁK'))).toBe(true)
+    expect(tokensSupport(nameTokens('KESTREL LABS s.r.o.'), nameTokens('ORCHARD MEDIA SRO'))).toBe(false)
+    expect(tokensSupport(nameTokens('Spol s.r.o. Ltd'), nameTokens('SPOL SRO LTD'))).toBe(false)
+  })
+  it('narrows only when a candidate supports the name and keeps unsupported sets whole', () => {
+    const record = (start: number, values: Values): InspectedRecord => ({ ref: { inputId: 's', start, end: start + 1, sha256: 'a'.repeat(64) }, values })
+    const evidence = { targetField: 'counterparty', sourceFields: ['note', 'message'] }
+    const target = { counterparty: 'KESTREL LABS s.r.o.' }
+    const named = record(0, { note: 'KESTREL LABS SRO' }), other = record(1, { note: 'ORCHARD MEDIA' }), blank = record(2, { note: '', message: '' })
+    expect(narrowByText([named, other, blank], target, evidence)).toEqual({ candidates: [named], reason: 'counterparty evidence narrowed 3 amount candidates to 1' })
+    expect(narrowByText([other, blank], target, evidence)).toEqual({ candidates: [other, blank] })
+    expect(narrowByText([named], target, evidence)).toEqual({ candidates: [named] })
+    expect(narrowByText([named, other], { counterparty: 's.r.o.' }, evidence)).toEqual({ candidates: [named, other] })
+    expect(narrowByText([named, other], target, undefined)).toEqual({ candidates: [named, other] })
+  })
+  it('validates quoted, currencyField and trimmedDecimals schema options', () => {
+    const input = { id: 's', role: 'source' as const, bytes: Buffer.from('"1";"-129,9";"CZK"\r\n"2";"5";"DLH"\r\n') }
+    const fields = { id: { line: 0, column: 0, type: 'text' as const }, amount: { line: 0, column: 1, type: 'money' as const, currencyField: 'code', trimmedDecimals: true }, code: { line: 0, column: 2, type: 'text' as const } }
+    const records = inspectFileWithSchema(input, { delimiter: ';', recordLines: 1, quoted: true, fields }).records.map(r => r.values)
+    expect(records).toEqual([{ id: '1', code: 'CZK', minorUnits: -12_990, currency: 'CZK', direction: 'outgoing' }, { id: '2', code: 'DLH', minorUnits: 500, currency: 'DLH', direction: 'incoming' }])
+    expect(inspectFileWithSchema(input, { delimiter: ';', recordLines: 1, fields }).identity.counts.rejected).toBe(2)
+    for (const invalid of [{ quoted: 'yes' }, { fields: { ...fields, amount: { ...fields.amount, currencyField: 'missing' } } }, { fields: { ...fields, amount: { ...fields.amount, currencyField: 'id', type: 'text' } } }, { fields: { ...fields, amount: { ...fields.amount, trimmedDecimals: 1 } } }, { fields: { ...fields, amount: { ...fields.amount, currency: 'JPY' } } }]) {
+      expect(() => inspectFileWithSchema(input, { delimiter: ';', recordLines: 1, fields, ...invalid })).toThrow('Invalid bounded')
     }
   })
 })

@@ -2,8 +2,9 @@ import { describe,it,expect,afterEach } from 'vitest'
 import { mkdtempSync,writeFileSync,rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { generateBankFixture, generateInventoryFixture } from './file-processing.fixtures'
-import { processFiles, observedPlan, observedPlanHint, processingRequest, suggestFileSchema } from './processing-workflow'
+import { generateBankFixture, generateInventoryFixture, generateFioFixture, FIO_FIXTURE_ORACLE } from './file-processing.fixtures'
+import { processFiles, observedPlan, observedPlanHint, processingRequest, suggestFileSchema, checkInterpretation } from './processing-workflow'
+import { inspectFileWithSchema, reconcileFileProcessing, validateFileProcessingResult } from './file-processing'
 import { LocalResultStore } from './result-artifacts'
 const cleanup:string[]=[]
 afterEach(()=>cleanup.splice(0).forEach(p=>rmSync(p,{recursive:true,force:true})))
@@ -105,5 +106,94 @@ describe('observed-schema workflow and independent source checks',()=>{
   })
   it('bounds profile evidence and refuses unsupported or inherited dictionary headers',()=>{
     for(const header of ['id\tsku\tconstructor','id\tsku\tignore previous instructions','id\tsku\t'+ 'x'.repeat(100000)])expect(suggestFileSchema(Buffer.from(header+'\none\tABC\tX\n'),'target')).toBeUndefined()
+  })
+})
+
+describe('Fio-style export against a headerless invoice list',()=>{
+  function fio(){
+    const root=mkdtempSync(join(tmpdir(),'processing-fio-'));cleanup.push(root)
+    const {source,target}=generateFioFixture()
+    writeFileSync(join(root,'data.csv'),source);writeFileSync(join(root,'data2.txt'),target)
+    return{root,source,target,store:new LocalResultStore(join(root,'store'))}
+  }
+  it('recognizes the quoted export and the headerless list',()=>{
+    const {source,target}=fio()
+    const s=suggestFileSchema(source,'source')!
+    expect(s).toMatchObject({delimiter:';',recordLines:1,quoted:true})
+    expect(s.skipPrefixes).toEqual(['"Zdrojový účet";"Datum";"Objem";"Měna";"Protiúčet";"Kód banky";"Zpráva pro příjemce";"Poznámka";"Typ"'])
+    expect(Object.keys(s.fields)).toEqual(['ownAccount','date','amount','currencyCode','account','bankCode','message','note','type'])
+    expect(s.fields.amount).toEqual({line:0,column:2,type:'money',currencyField:'currencyCode',trimmedDecimals:true})
+    const t=suggestFileSchema(target,'target')!
+    expect(t).toEqual({delimiter:'\t',recordLines:1,skipPrefixes:['Zobrazit PDF'],skipBlank:true,fields:{id:{line:0,column:0,type:'text'},invoiceDate:{line:0,column:1,type:'date'},amount:{line:0,column:3,type:'money'},counterparty:{line:0,column:2,type:'text'},text1:{line:0,column:4,type:'text'}}})
+  })
+  it('refuses ambiguous headerless typing',()=>{
+    // Two date columns, a partially numeric column, varying widths and differing filler lines.
+    for(const text of ['A-1\t2026-05-01\t2026-05-02\t10.00 CZK\nA-2\t2026-05-03\t2026-05-04\t11.00 CZK\n','A-1\tx\t10.00 CZK\nA-2\t2026-05-03\t11.00 CZK\n','A-1\tx\t10.00 CZK\nA-2\ty\t11.00 CZK\textra\n','A-1\tx\t10.00 CZK\nPDF\nA-2\ty\t11.00 CZK\nView\n','A-1\tx\t10.00 CZK\nA-1\ty\t11.00 CZK\n'])expect(suggestFileSchema(Buffer.from(text),'target')).toBeUndefined()
+  })
+  it('proposes counterparty token evidence, never owner or date fields',async()=>{
+    const {root}=fio()
+    const plan=await observedPlan(root,['data2.txt','data.csv'])
+    expect(plan).toMatchObject({matchFields:['minorUnits','currency','direction'],evidenceFields:[],textEvidence:{targetField:'counterparty',sourceFields:['note','message']}})
+    const hint=await observedPlanHint(root,['data2.txt','data.csv'])
+    expect(hint).toContain('"target":"data2.txt","source":"data.csv"');expect(hint).not.toContain('2026-05-06')
+  })
+  it('returns the independently expected statuses, bank dates and narrowing reasons',async()=>{
+    const {root,store}=fio()
+    const r=await processingRequest(root,'fio',{target:'data2.txt',source:'data.csv'},true,store)
+    expect(r.failed,r.output).toBe(false)
+    expect(r.counts).toMatchObject({targets:8,rejected:0,skipped:1})
+    expect(r.result!.inputs[0]!.counts).toEqual({scanned:16,parsed:8,skipped:8,rejected:0})
+    for(const [id,expected] of Object.entries(FIO_FIXTURE_ORACLE)){
+      const o=r.result!.outcomes.find(x=>x.targetId===id)!
+      expect(o.status,id).toBe(expected.status)
+      expect(o.candidates.map(c=>c.values.date),id).toEqual(expected.sourceDates)
+      expect(Boolean(o.reason),id).toBe(expected.narrowed)
+    }
+    expect(r.result!.outcomes.find(o=>o.targetId==='2026-05-0003')!.reason).toBe('counterparty evidence narrowed 3 amount candidates to 2')
+    expect(r.answer).toContain('counterparty evidence narrowed 2 amount candidates to 1')
+    expect(r.answer).toContain('2026-05-11');expect(r.answer).toContain('1800.00 EUR')
+  })
+  it('parses the unknown currency code and the quoted delimiter instead of rejecting them',()=>{
+    const {source}=fio()
+    const schema=suggestFileSchema(source,'source')!
+    const inspection=inspectFileWithSchema({id:'source',bytes:source,role:'source'},schema)
+    expect(inspection.identity.counts.rejected).toBe(0)
+    expect(inspection.records.find(r=>r.values.currency==='DLH')?.values).toMatchObject({minorUnits:25000,direction:'incoming',currencyCode:'DLH'})
+    expect(inspection.records.find(r=>r.values.note==='KESTREL LABS SRO'&&r.values.minorUnits===7200000)?.values.message).toBe('Úhrada "FA 0002; květen"')
+    expect(inspection.records.find(r=>r.values.minorUnits===4825050)?.values.date).toBe('2026-05-06')
+    expect(checkInterpretation(inspection,schema)).toEqual([])
+    const target=generateFioFixture().target
+    expect(checkInterpretation(inspectFileWithSchema({id:'target',bytes:target,role:'target'},suggestFileSchema(target,'target')!),suggestFileSchema(target,'target')!)).toEqual([])
+  })
+  it('validator recomputes the narrowed candidate set and rejects results that ignore it',async()=>{
+    const {root,source,target,store}=fio()
+    const plan=(await observedPlan(root,['data2.txt','data.csv']))!
+    const inspections=[inspectFileWithSchema({id:'target',bytes:target,role:'target'},plan.target.schema),inspectFileWithSchema({id:'source',bytes:source,role:'source'},plan.source.schema)]
+    const targets=inspections[0]!.records.map(r=>({id:String(r.values.id),ref:r.ref,criteria:{minorUnits:r.values.minorUnits!,currency:r.values.currency!,direction:r.values.direction!},textEvidence:plan.textEvidence!}))
+    const context={inspections,targets}
+    const result=reconcileFileProcessing(context)
+    expect(validateFileProcessingResult(JSON.stringify(result),context)).toEqual({ok:true,diagnostics:[]})
+    // Reporting every same-amount record for the narrowed target is no longer the plausible set.
+    const widened=structuredClone(result),kestrel=widened.outcomes.find(o=>o.targetId==='2026-05-0002')!
+    kestrel.status='ambiguous';kestrel.candidates=inspections[1]!.records.filter(r=>r.values.minorUnits===7200000)
+    expect(validateFileProcessingResult(JSON.stringify(widened),context).diagnostics.map(d=>d.code)).toEqual(expect.arrayContaining(['CANDIDATE_COVERAGE','OUTCOME_CERTAINTY']))
+    // Text evidence must be well formed and point at a target text field.
+    for(const bad of [{targetField:'counterparty',sourceFields:['ownAccount']},{targetField:'invoiceDate',sourceFields:['note']},{targetField:'missing',sourceFields:['note']},{targetField:'counterparty',sourceFields:Array.from({length:7},(_,i)=>`f${i}`)}]){
+      const tampered={...context,targets:targets.map((t,i)=>i===0?{...t,textEvidence:bad}:t)}
+      expect(validateFileProcessingResult(JSON.stringify(result),tampered).diagnostics.map(d=>d.code)).toContain('TARGET_EVIDENCE')
+    }
+    for(const change of [(p:any)=>p.textEvidence={targetField:'counterparty',sourceFields:['ownAccount']},(p:any)=>p.textEvidence={targetField:'counterparty',sourceFields:['date']},(p:any)=>p.textEvidence={targetField:'counterparty',sourceFields:['nonexistent']},(p:any)=>p.textEvidence={targetField:'amount',sourceFields:['note']}]){
+      const bad=structuredClone(plan);change(bad)
+      const r=await processFiles(root,'fio',bad,true,store)
+      expect(r.failed,r.output).toBe(true)
+    }
+  })
+  it('keeps quoted headers exempt only as exact header lines',async()=>{
+    const {root,store}=fio()
+    const plan:any=(await observedPlan(root,['data2.txt','data.csv']))!
+    // Skipping real rows by prefix is uncovered data, not a header.
+    plan.source.schema.skipPrefixes.push('"1234567890";"06.05.2026"')
+    const r=await processFiles(root,'fio',plan,true,store)
+    expect(r.failed).toBe(true);expect(r.output).toContain('Uncovered non-header')
   })
 })

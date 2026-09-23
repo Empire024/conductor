@@ -66,10 +66,16 @@ envelope at 32k. Set `kvCacheType: "f16"` explicitly to opt out. Port 51438, all
 - **An older base.** Llama 3.1 8B dates from 2024; Ornith 1.5 9B is built on Qwen 3.5 (2026). No
   comparable measurement of the two exists here, so this is a note on age, not a ranking. Ornith
   stays the default local model.
-- **Tool reliability in Conductor is unmeasured.** The weights are verified and registered, but no
-  Dolphin server has been started on MAIN yet: the one-server check was skipped on 2026-09-23 after
-  Claude Code's Auto mode refused to stop the resident Ornith server. Tool calling through the
-  agent loop, VRAM use and speed are all still to be observed.
+- **Tool calls need the grammar enforced.** Measured 2026-09-23 on llama.cpp b10901: the
+  fine-tune writes `{"name": ..., "arguments": ...}` where the Llama 3.1 template's lazy tool
+  grammar expects `"parameters"`, so under `tool_choice: auto` the server's parser gives up after
+  the trigger and hands the client a call whose arguments are the single character `{` (the log
+  says `common_chat_peg_parse: unparsed peg-native output`). Under `tool_choice: required` the
+  same model produces complete, valid calls every time, and a non-streaming request fails with
+  HTTP 500. The local loop therefore re-asks once with the grammar enforced whenever a
+  non-truncated call arrives unreadable, and ends the turn if stubs keep coming (see
+  `src/main/local-models/agent.ts`). Speed observed: about 96 tokens/s generation, 1,200 tokens/s
+  prompt evaluation, with the q8_0 KV cache.
 - **Steered by the system prompt.** Dolphin's card is explicit that the system prompt sets its
   alignment; Conductor's own local-agent prompt applies unchanged.
 - **One server at a time.** Starting it stops an idle Ornith (or is refused while Ornith is busy),

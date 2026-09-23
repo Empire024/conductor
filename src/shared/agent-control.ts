@@ -1,7 +1,10 @@
 import type { PaneTab } from './models'
 
 export type AgentControlUiAction = 'tabs.list' | 'tabs.open' | 'tabs.close' | 'tabs.focus' | 'tabs.focus-origin' | 'tabs.split' | 'tabs.rename' | 'tabs.detach' | 'agents.configure' | 'agents.configure-confirmed' | 'agents.grant-confirmed' | 'files.open' | 'workspace.rename' | 'workspace.focus'
-export interface AgentControlScope { projectId: string; sessionId: string; agentSessionId: string }
+/** `owner` marks a call made with the owner's own control credential (the `control-owner.json`
+ *  file beside the app's data) rather than by a registered conversation: it names a project and
+ *  workspace but no tab of its own, needs no confirmation dialog, and may restart the app. */
+export interface AgentControlScope { projectId: string; sessionId: string; agentSessionId: string; owner?: true; /** A wizard conversation (settings.wizard on a frontier model): a tab of its own with the owner's authority. Set by AgentControl.call, never by a caller. */ wizard?: true }
 export interface AgentControlUiRequest extends AgentControlScope {
   id: string
   action: AgentControlUiAction

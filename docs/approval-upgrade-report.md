@@ -62,6 +62,10 @@ A later Conductor evidence coworker produced [approval-auto-refusal-repro.md](ap
 
 The project checklist also retains the remaining owner-scoped observer recovery, Haiku capability/effort and local round-budget accuracy, compact semantic monitoring, confirmed follow-up turns, artifact-freeze integration and evidence-based attribution requirements. These were not silently marked complete.
 
+## Update 2026-09-23 (later): the toggle is now the wand
+
+"Review coworkers" was replaced in the composer by the wizard toggle (`settings.wizard`, frontier models only). A wizard controller gets this same stronger-model review for its coworkers' requests, and on top of it the owner's authority over the app (docs/agent-control.md, "Wizard tabs"). The old `reviewDelegatedActions` setting is still honored for review alone; nothing below changes for it.
+
 ## Update 2026-09-23: "Review coworkers" answers for the owner instead of asking more
 
 The opt-in had the opposite effect from the one the owner wanted: a controller with it on forced every Claude coworker into native manual mode and switched Codex's unattended answers off, and the gate then declared almost every request an "unsupported boundary" and handed it to the owner. Delivered:

@@ -46,6 +46,9 @@ const bridge: ConductorBridge = {
   },
   agentConfirm: {
     onRequest: callback => subscribe('agent-confirm:request', callback),
+    onCancel: callback => subscribe('agent-confirm:cancel', callback),
+    pending: () => ipcRenderer.invoke('agent-confirm:pending'),
+    received: id => ipcRenderer.send('agent-confirm:received', id),
     respond: response => ipcRenderer.send('agent-confirm:response', response)
   },
   phone: {

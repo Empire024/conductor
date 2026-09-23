@@ -5,9 +5,11 @@ import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
 import { hasSessionWork } from './close-confirmation'
-import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type LayoutNode, type PaneKind, type PaneTab } from '../shared/models'
+import { agentConfirmFailure } from './agent-confirm-broker'
+import type { AgentConfirmOutcome } from '../shared/agent-confirm'
+import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type AppUpdateState, type LayoutNode, type PaneKind, type PaneTab, type ProjectRecord } from '../shared/models'
 import type { PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
-import { isSessionPermission, MAX_PROMPT_CHARS, settingsForRuntime } from '../shared/structured-agent'
+import { isSessionPermission, MAX_PROMPT_CHARS, settingsForRuntime, wizardActive } from '../shared/structured-agent'
 import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
@@ -112,6 +114,7 @@ const toolSignatures = {
   'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
+  'agents.artifact': '({agentSessionId,artifactId}) — the full text of a tool output the history only carries a tail of (the outputArtifactId on a tool event), up to 2 MiB',
   'agents.status': '({agentSessionId}) — the compact supervision view of one visible conversation: phase, model, last stop reason with its figures (rounds used of the hard cap, context used / capacity / reserve, compactions, loop warnings, acceptance result, files changed), last tool and its status, and the durable task state a local worker keeps. A few hundred bytes; use it instead of agents.snapshot to poll a local worker',
   'agents.compact': '({agentSessionId}) — fold an idle local-model coworker’s transcript into its durable task state (task, constraints, files changed, recent commands, current failure, remaining work) inside the same conversation, so its next turn starts from compact state without a new tab; only a coworker this caller controls, only between turns; returns the tokens recovered',
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
@@ -158,8 +161,34 @@ export interface DeliveryControl {
   wait(projectId: string, runId: string, timeoutMs: number): Promise<DeliveryRun>
 }
 
+/** What the owner credential may do to the app itself: register a folder as a project, drive the
+ *  updater, and relaunch. Absent where the process is not the app (tests, the CLI). */
+export interface AgentControlHost {
+  version: string
+  pid: number
+  openProject?(path: string, name?: string): Promise<ProjectRecord>
+  updates?: { state(): AppUpdateState; check(): Promise<AppUpdateState>; download(): Promise<AppUpdateState>; install(force: boolean): Promise<void> }
+  relaunch(force: boolean): Promise<void>
+}
+
+/** The agentSessionId an owner-credential call carries. No conversation has this id. */
+export const OWNER_AGENT_ID = 'owner'
+
+const ownerSignatures: Record<string, string> = {
+  'projects.open': '({path,name?}) — owner credential or wizard tab only: register an existing folder as a project (idempotent) and return it with its workspaces',
+  'app.update.check': '() — owner credential or wizard tab only: check the release and local update feeds now and return the update state (phase idle, checking, available, downloading, ready, installing, error or disabled)',
+  'app.update.download': '() — owner credential or wizard tab only: download the pending update; poll app.update.check until phase is ready',
+  'app.update.install': '({force?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch; force skips the running-work confirmation and keeps unsaved editor drafts for recovery. A wizard tab is brought back afterwards and told to continue; an outside process waits for a new control-owner.json',
+  'app.restart': '({force?}) — owner credential or wizard tab only: relaunch this Conductor (a downloaded update installs on the way out); force as above'
+}
+const ownerMethods = new Set(Object.keys(ownerSignatures))
+/** The owner's authority, from either source: the credential file, or a wizard conversation. */
+const sovereign = (scope: AgentControlScope): boolean => scope.owner === true || scope.wizard === true
+
 export interface AgentControlDependencies {
   database: ConductorDatabase
+  /** The app process itself, for the owner credential; absent outside the app. */
+  host?: AgentControlHost
   sessions: StructuredSessions
   orchestration: OrchestrationStore
   collaboration: AgentCollaborationStore
@@ -176,7 +205,8 @@ export interface AgentControlDependencies {
   /** Opens the tab on a paired machine and returns what it created there. */
   openRemote?(machineId: string, request: { projectId: string; sessionId: string; provider?: string; model?: string; effort?: string; title?: string }): Promise<{ tabId: string; agentSessionId?: string; machineName: string }>
   ui(request: AgentControlUiRequest): Promise<unknown>
-  confirm(scope: AgentControlScope, message: string): Promise<boolean>
+  /** `true`/`false` are the owner's answer; the other outcomes say why no answer came. */
+  confirm(scope: AgentControlScope, message: string): Promise<boolean | AgentConfirmOutcome>
   fileChanged(change: AgentFileChange): void
   linksChanged?(scope: { projectId: string; sessionId: string }): void
 }
@@ -209,9 +239,37 @@ export class AgentControl {
    *  again. Deliberately in memory only: the clearance dies with this Conductor process. */
   private readonly updateGrants = new Map<string, { controllerAgentSessionId: string; projectId: string; grantedAt: string }>()
 
-  authorize(scope: AgentControlScope): AgentSpec {
-    if (this.deps.sessions.isApprovalReviewer(scope.agentSessionId)) throw new Error('Approval reviewers have no app-control or delegation authority')
+  /** The scope an owner-credential call runs in. The caller names a project and a workspace (or
+   *  gets the first open ones); it has no tab of its own, and nothing in the body can make it a
+   *  conversation. */
+  ownerScope(input: unknown): AgentControlScope {
     const { database } = this.deps
+    const requested = input === undefined || input === null ? {} : object(input)
+    if (Object.keys(requested).some(key => !['projectId', 'workspaceId'].includes(key))) throw new Error('scope accepts only projectId and workspaceId')
+    const projectId = requested.projectId === undefined ? database.listDeskProjects()[0]?.id ?? database.listProjects()[0]?.id : text(requested, 'projectId', 160)
+    // A fresh profile has no project yet. The owner still needs tools.list, projects.list and
+    // projects.open to get one, so the scope is allowed to name none; call() refuses everything
+    // that would need one.
+    if (!projectId && requested.projectId === undefined) return { projectId: '', sessionId: '', agentSessionId: OWNER_AGENT_ID, owner: true }
+    if (!projectId || !database.getProject(projectId)) throw new Error('No project with that id is open in this Conductor; use projects.list, or projects.open({path}) to register a folder')
+    const workspaces = database.listSessions(projectId)
+    const sessionId = requested.workspaceId === undefined ? workspaces[0]?.id : text(requested, 'workspaceId', 160)
+    if (!sessionId || !workspaces.some(workspace => workspace.id === sessionId)) throw new Error('That workspace is not open in the requested project; use projects.list')
+    return { projectId, sessionId, agentSessionId: OWNER_AGENT_ID, owner: true }
+  }
+
+  authorize(scope: AgentControlScope): AgentSpec {
+    const { database } = this.deps
+    if (scope.owner) {
+      // The owner's own credential: as much authority as the window, addressed at one project
+      // and workspace. It is described as a full-autonomy native controller so every rule that
+      // caps a coworker at its controller's mode lets the owner open coworkers on Auto.
+      if (!scope.projectId && !scope.sessionId) return { id: OWNER_AGENT_ID, projectId: '', sessionId: '', provider: 'claude', title: 'Owner control', cwd: '' }
+      const project = database.getProject(scope.projectId), workspace = database.getSession(scope.sessionId)
+      if (!project || workspace?.projectId !== scope.projectId) throw new Error('Control scope is no longer active')
+      return { id: OWNER_AGENT_ID, projectId: scope.projectId, sessionId: scope.sessionId, provider: 'claude', title: 'Owner control', cwd: project.path }
+    }
+    if (this.deps.sessions.isApprovalReviewer(scope.agentSessionId)) throw new Error('Approval reviewers have no app-control or delegation authority')
     const spec = database.structured.spec<AgentSpec>(scope.agentSessionId)
     const workspace = database.getSession(scope.sessionId)
     if (!spec || spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId || workspace?.projectId !== scope.projectId || !database.listSessions(scope.projectId).some(item => item.id === scope.sessionId)) throw new Error('Control scope is no longer active')
@@ -319,6 +377,7 @@ export class AgentControl {
       observedAt, source: 'native-session' as const, projectId: scope.projectId, workspaceId: scope.sessionId,
       tabId: tab.id, agentSessionId: tab.resourceId, groupId: tab.groupId, detachedId: tab.detachedId,
       title: tab.title, provider: tab.state?.provider, uri: tab.uri, phase: state?.phase ?? null,
+      wizard: wizardActive(state?.settings, typeof tab.state?.provider === 'string' ? tab.state.provider : undefined),
       lastActivityAt: lastEvent?.timestamp ?? null, sequence: state?.sequence ?? 0,
       lastEvent: lastEvent ? {
         sequence: lastEvent.sequence, timestamp: lastEvent.timestamp, type: lastEvent.data.type,
@@ -365,7 +424,8 @@ export class AgentControl {
         ancestors.add(parent); cursor = parent
       }
       if (ancestors.has(id)) throw new Error('An agent cannot control itself or an ancestor')
-      if (link && link.controllerAgentSessionId !== scope.agentSessionId) throw new Error('Another agent already controls this tab; its controller must release it first')
+      // The owner drives any tab in the window, a coworker's included, exactly as from the UI.
+      if (link && link.controllerAgentSessionId !== scope.agentSessionId && !sovereign(scope)) throw new Error('Another agent already controls this tab; its controller must release it first')
     }
     return { tab, scope: target }
   }
@@ -522,6 +582,8 @@ export class AgentControl {
   }
 
   private relationship(scope: AgentControlScope, target: AgentControlScope, tab: AgentControlTab, state: 'attached' | 'detached'): void {
+    // The owner has no tab to draw a cable from and never needs a link to reach a tab.
+    if (scope.owner) return
     const source = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)
     const together = target.projectId === scope.projectId && target.sessionId === scope.sessionId
     if (state === 'attached') {
@@ -658,12 +720,13 @@ export class AgentControl {
       // A tab handed to a sibling project belongs to that project and works in its folder, not in
       // the folder of whoever asked for it.
       const cwd = target.projectId === scope.projectId ? source.cwd : this.deps.database.getProject(target.projectId)!.path
-      const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd }
+      // A coworker of the owner or of a wizard waits out usage limits and continues, like the wizard itself.
+      const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd, ...(sovereign(scope) ? { continueOnLimit: true } : {}) }
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || 'Provider unavailable')
       const created = this.deps.database.structured.snapshot(spec.id)!
       if (explicitPermission && !created.capabilities?.permissions?.includes(explicitPermission)) throw new Error('Choose a permission mode supported by this provider')
-      const sourceSettings = settingsForRuntime(this.deps.database.structured.snapshot(scope.agentSessionId)!.settings)
+      const sourceSettings: SessionSettings = sovereign(scope) ? { permission: 'auto', plan: false } : settingsForRuntime(this.deps.database.structured.snapshot(scope.agentSessionId)!.settings)
       // A native coworker opens on Auto (see dispatchPermission). Only with exactPermission does
       // an explicit ask, else the owner's remembered mode for this provider (permission-memory.ts
       // on the renderer side, mirrored via app-settings.ts), decide — still capped by the
@@ -714,13 +777,22 @@ export class AgentControl {
   async call(scope: AgentControlScope, method: string, rawArgs: unknown = {}): Promise<unknown> {
     const source = this.authorize(scope), args = object(rawArgs), { database, sessions, backlogs, orchestration } = this.deps
     if (process.env.CONDUCTOR_LIVE_TESTS === '1') throw new Error('App control is disabled during isolated live acceptance tests')
+    // A wizard conversation (the wand toggle on a frontier model, not read-only or planning)
+    // carries the owner's authority in its own tab: decided here from its durable settings on
+    // every call, never from anything the caller sends.
+    if (!scope.owner && wizardActive(database.structured.snapshot(scope.agentSessionId)?.settings, source.provider)) scope = { ...scope, wizard: true }
     if (args.sessionId !== undefined && args.sessionId !== scope.sessionId) throw new Error('Requested scope differs from the authorized session')
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return toolSignatures
+    if (method === 'tools.list') return sovereign(scope) ? { ...toolSignatures, ...ownerSignatures } : toolSignatures
+    if (ownerMethods.has(method)) {
+      if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
+      return this.ownerCall(scope, method, args)
+    }
     if (method === 'projects.list') return this.projects(scope)
-    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope) }
+    if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)
+    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null } : {}) }
     if (method === 'machines.list') {
       return this.machines().map(machine => {
         const placement = machineRunsProject(machine, scope.projectId)
@@ -737,7 +809,7 @@ export class AgentControl {
       if (method === 'tabs.split' && !['horizontal', 'vertical'].includes(String(args.direction))) throw new Error('Invalid split direction')
       const closingState = method === 'tabs.close' && tab.kind === 'agent' ? database.structured.snapshot(tab.resourceId!) : undefined
       const where = target.projectId === scope.projectId ? '' : ` in ${database.getProject(target.projectId)?.name ?? 'another project'}`
-      if (method === 'tabs.close' && (!closingState || hasSessionWork(closingState)) && !await this.deps.confirm(scope, `${source.title} wants to close the tab “${tab.title}”${where}.`)) throw new Error('The owner declined to close this tab')
+      if (method === 'tabs.close' && (!closingState || hasSessionWork(closingState))) await this.ask(scope, `${source.title} wants to close the tab “${tab.title}”${where}.`, 'close this tab')
       // The owner may take a while to answer; the tab and the control over it are checked again.
       this.authorize(scope); this.tabTarget(scope, args)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
@@ -745,7 +817,10 @@ export class AgentControl {
       if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, target, tab, 'detached')
       return result
     }
-    if (method === 'agents.handoff') return this.handoff(scope, args)
+    if (method === 'agents.handoff') {
+      if (scope.owner) throw new Error('The owner credential has no conversation to hand off; open a tab with tabs.open instead')
+      return this.handoff(scope, args)
+    }
     if (method === 'agents.list') {
       const observedAt = new Date().toISOString()
       const own = this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
@@ -756,9 +831,16 @@ export class AgentControl {
     }
     if (method.startsWith('agents.')) {
       if (typeof args.agentSessionId !== 'string' || !args.agentSessionId.trim()) throw new Error(method + ' requires agentSessionId: the exact id of a visible conversation, as returned by agents.list or app.state')
-      const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history'].includes(method)
-      const reach = ['agents.snapshot', 'agents.history', 'agents.status'].includes(method) ? 'read' : ['agents.submit', 'agents.steer', 'agents.interrupt'].includes(method) ? 'steer' : null
+      const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history', 'agents.artifact'].includes(method)
+      const reach = ['agents.snapshot', 'agents.history', 'agents.status', 'agents.artifact'].includes(method) ? 'read' : ['agents.submit', 'agents.steer', 'agents.interrupt'].includes(method) ? 'steer' : null
       const { tab, scope: target } = this.target(scope, id, mutate, reach), state = database.structured.snapshot(id)!
+      if (method === 'agents.artifact') {
+        const artifactId = text(args, 'artifactId', 200)
+        let content: string
+        try { content = database.structured.output(id, artifactId) } catch { throw new Error('No such tool output artifact in this conversation; use the outputArtifactId of one of its tool events') }
+        const limit = 2 * 1024 * 1024
+        return { agentSessionId: id, artifactId, bytes: Buffer.byteLength(content), truncated: content.length > limit, content: content.slice(0, limit) }
+      }
       if (method === 'agents.snapshot') {
         const recent = [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence)).slice(0, 60)
         const activeTools = state.items.filter(item => item.data.type === 'tool' && ['preparing', 'running', 'awaiting_approval'].includes(item.data.status))
@@ -826,7 +908,7 @@ export class AgentControl {
         // A coordinated prompt is not the owner's message. Record the controlling tab so the
         // conversation attributes it to that coworker instead of to "You".
         const controller = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
-        const label = controller?.title || 'Another Conductor tab'
+        const label = scope.owner ? 'Owner control' : controller?.title || 'Another Conductor tab'
         const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: target.projectId === scope.projectId ? label : `${label} (${database.getProject(scope.projectId)?.name ?? 'another project'})` }
         try {
           if (method === 'agents.submit') await sessions.submit(id, prompt, state.settings, [], origin)
@@ -892,7 +974,7 @@ export class AgentControl {
     if (method === 'memory.forget') {
       const memory = database.listMemories(scope.projectId).find(memory => memory.id === args.id)
       if (!memory || memory.source !== 'agent') throw new Error('Only agent-authored memories from this project can be forgotten')
-      if (!await this.deps.confirm(scope, `${source.title} wants to forget this agent memory:\n${memory.gist}`)) throw new Error('The owner declined to forget this memory')
+      await this.ask(scope, `${source.title} wants to forget this agent memory:\n${memory.gist}`, 'forget this memory')
       this.authorize(scope); database.removeMemory(memory.id); return { removed: true }
     }
     if (method === 'orchestration.snapshot') return orchestration.snapshot(scope.projectId)
@@ -946,9 +1028,9 @@ export class AgentControl {
       if (!Array.isArray(args.paths) || !args.paths.length || args.paths.length > 500 || args.paths.some(path => typeof path !== 'string' || !path)) throw new Error('paths must be a non-empty list of repository paths')
       paths = args.paths as string[]
     }
-    if (source.provider === 'local' && !await this.deps.confirm(scope, `${source.title} wants to test, build, commit and push this project and publish its release.`)) throw new Error('The owner declined this delivery')
+    if (source.provider === 'local') await this.ask(scope, `${source.title} wants to test, build, commit and push this project and publish its release.`, 'deliver this project')
     this.authorize(scope)
-    const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}) }, { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title })
+    const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}) }, scope.owner ? { kind: 'owner' } : { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title })
     return settle(run)
   }
 
@@ -960,6 +1042,46 @@ export class AgentControl {
    * open. The build only publishes into the local feed; accepting the update stays a click the
    * owner makes in the app.
    */
+  /** Asks the owner and throws unless they allowed it, saying whether they declined or were never reached. */
+  private async ask(scope: AgentControlScope, message: string, action: string): Promise<void> {
+    // The owner's own credential, or a wizard tab, is the owner answering: nobody else to ask.
+    if (sovereign(scope)) return
+    const answer = await this.deps.confirm(scope, message)
+    const outcome: AgentConfirmOutcome = answer === true ? 'allowed' : answer === false ? 'declined' : answer
+    if (outcome !== 'allowed') throw new Error(agentConfirmFailure(outcome, action))
+  }
+
+  /** The owner-only methods: the app itself, not a conversation in it. Each answers at once;
+   *  an install or restart is started after the reply has left, since the process it ends is
+   *  the one sending the reply. */
+  private async ownerCall(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
+    const host = this.deps.host
+    if (method === 'projects.open') {
+      if (!host?.openProject) throw new Error('Registering a project folder is unavailable in this Conductor')
+      if (Object.keys(args).some(key => !['path', 'name'].includes(key))) throw new Error('projects.open accepts only path and name')
+      const project = await host.openProject(text(args, 'path', 4000), args.name === undefined ? undefined : text(args, 'name', 200))
+      return { id: project.id, name: project.name, path: project.path, workspaces: this.deps.database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name })) }
+    }
+    if (!host) throw new Error('App updates and restarts are unavailable in this Conductor')
+    if (args.force !== undefined && typeof args.force !== 'boolean') throw new Error('force must be true or false')
+    const force = args.force === true
+    const later = (label: string, work: () => Promise<void>): void => { setTimeout(() => { work().catch(error => console.warn(`${label} failed`, error)) }, 150) }
+    if (method === 'app.restart') {
+      later('app.restart', () => host.relaunch(force))
+      return { restarting: true, force, note: 'Conductor relaunches; a downloaded update installs on the way out. Wait for a new control-owner.json (new pid) before calling again.' }
+    }
+    if (!host.updates) throw new Error('The updater is unavailable in this Conductor')
+    if (method === 'app.update.check') return host.updates.check()
+    if (method === 'app.update.download') return host.updates.download()
+    if (method === 'app.update.install') {
+      const state = host.updates.state()
+      if (state.phase !== 'ready') throw new Error(`No downloaded update to install (phase ${state.phase}). Call app.update.check, then app.update.download, and poll app.update.check until the phase is ready.`)
+      later('app.update.install', () => host.updates!.install(force))
+      return { installing: true, version: state.availableVersion ?? null, force, note: 'Conductor quits, installs and relaunches. Wait for a new control-owner.json (new pid) before calling again.' }
+    }
+    throw new Error('Unknown control method; use tools.list')
+  }
+
   private async localUpdate(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
     const builder = this.deps.localUpdates
     if (!builder) throw new Error('Local update builds are unavailable in this Conductor')
@@ -987,7 +1109,7 @@ export class AgentControl {
     const granted = Boolean(grant && this.claimHolderIsOpen(grant.projectId, grant.controllerAgentSessionId))
     if (!granted) {
       this.updateGrants.delete(scope.agentSessionId)
-      if (!await this.deps.confirm(scope, `${source.title} wants to build Conductor from this working tree and publish it as a local update.`)) throw new Error('The owner declined to build a local update')
+      await this.ask(scope, `${source.title} wants to build Conductor from this working tree and publish it as a local update.`, 'build a local update')
     }
     this.authorize(scope)
     return { ...builder.start(source.cwd), authorizedBy: granted ? grant!.controllerAgentSessionId : 'owner' }

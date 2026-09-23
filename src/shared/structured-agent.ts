@@ -52,8 +52,28 @@ export interface SessionSettings {
   localContract?: { allowedPaths?: string[]; acceptance?: { command: string; timeoutSec?: number } }
   /** Owner opt-in: bounded stronger review of this controller's delegated approval requests. */
   reviewDelegatedActions?: boolean
+  /** Wizard mode, the wand toggle in the composer: this conversation carries the owner's own
+   *  authority over Conductor. Its coworkers' approvals are reviewed and answered for the owner,
+   *  it steers every tab, updates and restarts the app without a dialog, is brought back after a
+   *  restart Conductor started itself, and it and the coworkers it opens continue when a usage
+   *  limit resets. Frontier models only (`isFrontierModel`); see `wizardActive`. */
+  wizard?: boolean
   plan: boolean
 }
+
+/** Models a wizard tab may run on: the frontier tier of each native provider. Wizard mode hands a
+ *  conversation the owner's authority over the whole app, which only the strongest models get. */
+export const isFrontierModel = (provider: string | undefined, model: string | undefined): boolean => {
+  if (!model) return false
+  if (provider === 'claude') return /(?:^|[-/])(?:opus|fable)/i.test(model)
+  if (provider === 'codex') return /^gpt-6(?:[-.]|$)|astra/i.test(model)
+  return false
+}
+export const WIZARD_MODEL_HINT = 'Claude Opus or Fable, or GPT-6 Astra'
+/** Whether a conversation is a wizard right now: the toggle, a frontier model, and no read-only
+ *  or planning restriction, since a restricted controller could not hand out what it lacks. */
+export const wizardActive = (settings: SessionSettings | undefined, provider: string | undefined): boolean =>
+  Boolean(settings?.wizard) && isFrontierModel(provider, settings?.model) && settings?.permission !== 'read-only' && settings?.sandbox !== 'read-only' && settings?.plan !== true
 /** The only real permission literals a session ever carries. Shared by the renderer's per-provider
  *  memory (permission-memory.ts) and the main-process mirror (app-settings.ts) so both sides
  *  reject the same junk instead of keeping two independent notions of "valid". */

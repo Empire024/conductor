@@ -25,6 +25,15 @@ describe('stronger review routing authority', () => {
     const closed = { worker: spec('worker'), controller: spec('controller') }
     expect(routing({ worker: 'controller' }, closed, id => id !== 'controller').enabled(closed.worker)).toBe(false)
   })
+  it('reviews for a wizard controller on a frontier model, and not for a wand on a lesser one', () => {
+    const specs = { worker: spec('worker'), controller: spec('controller') }
+    const wizard = (model: string) => {
+      const deps = { sessions: { isApprovalReviewer: () => false }, database: { structured: { snapshot: () => ({ settings: { permission: 'auto', plan: false, wizard: true, model } }), spec: (id: string) => specs[id as keyof typeof specs] } } } as unknown as AgentControlDependencies
+      return createApprovalRouting(deps, { controller: id => ({ worker: 'controller' } as Record<string, string | undefined>)[id], localAndOpen: () => true, discoveredOpus: () => 'opus', open: async () => 'reviewer' })
+    }
+    expect(wizard('claude-opus-5').enabled(specs.worker)).toBe(true)
+    expect(wizard('sonnet').enabled(specs.worker)).toBe(false)
+  })
   it('is off when no controller asked for it', () => {
     const specs = { worker: spec('worker'), controller: spec('controller') }
     expect(routing({ worker: 'controller' }, specs, () => true, false).enabled(specs.worker)).toBe(false)

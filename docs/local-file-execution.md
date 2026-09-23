@@ -251,3 +251,56 @@ Then select Ornith in a normal project conversation and ask the ordinary task wi
 Tool details show source coordinates, counts and output handles; the stop card and
 `agents.status` expose recovery/context/budget information and actual blockers. No cloud
 fallback is enabled. Passing these supported fixtures does not establish general 9B reliability.
+
+## Fio export and headerless invoice list
+
+`process_files({target,source})` now profiles a Fio-style bank export and a headerless invoice
+list directly, so the model does not have to write a parser.
+
+- **Quoted cells.** A header whose every cell is double-quoted sets `quoted:true`. Rows are then
+  split RFC 4180 style: a delimiter inside quotes is data, `""` is a quote, the wrapping quotes are
+  removed, and an unterminated quote rejects the record. The same splitter serves the profiler,
+  `inspectFileWithSchema` and the raw-cell witness checks. The header exemption still matches only
+  the exact raw header line.
+- **Export columns.** `Zdrojový účet` becomes `ownAccount`, which is never allowed as match or
+  evidence. The others map as `Datum` to `date`, `Objem` to `amount`, `Měna` to `currencyCode`,
+  `Protiúčet` to `account`, `Kód banky` to `bankCode`, `Zpráva pro příjemce` to `message`,
+  `Poznámka` to `note` and `Typ` to `type`. With both an amount and a currency column, the money
+  field reads its currency from that column (`currencyField`). The sign gives the direction.
+- **Trimmed decimals.** The real export drops a trailing decimal zero (`-129,9` means 129.90). A
+  money field with `trimmedDecimals:true` accepts one or two decimal digits. The profiler sets it
+  only together with `currencyField`. Everywhere else one decimal digit is still refused.
+- **Currency codes.** Any three-letter code counts as a two-decimal currency except `JPY`, `KRW`,
+  `ISK`, `CLP`, `VND`, `XAF` and `XOF`, which are refused with a clear error. A row in an unknown
+  code is parsed normally and just never matches a CZK or EUR target, so it cannot block the run
+  as a rejected record. A money witness now also passes when the record's own raw cells hold the
+  amount plus a separate cell equal to the parsed code.
+- **Headerless lists.** If the first non-blank line contains digits, up to 40 lines are sampled.
+  Lines without the delimiter count as filler. If they all hold the same text and it contains no
+  digits (`Zobrazit PDF`), it goes into `skipPrefixes`, and the coverage check exempts exactly that
+  line. Data lines must share one cell count of at least 3. A column is a date or money column only
+  when every value parses; a column that parses only partly refuses the profile. More than one date
+  or money column also refuses it. Column 0 is `id` when its values are unique and non-empty. The
+  first remaining text column is `counterparty`, and any further ones are `text1`, `text2`, and so on.
+- **Counterparty token evidence.** When the target has `counterparty` and the source has `note`,
+  `message` or `counterparty`, the plan carries
+  `textEvidence:{targetField:'counterparty',sourceFields:[…]}` (at most six fields, never a
+  date, holder or own-account field). To tokenize, a name is decomposed (NFD) with the marks
+  stripped, lowercased, and split on anything that is not a letter or digit. Tokens shorter than 3
+  characters are dropped, as is a stoplist (`sro`, `spol`, `ltd`, `gmbh`, `inc`, `the`, `and`,
+  `pro`, `com`, `www`). A source record supports the target when some token is equal to, or a
+  prefix of, a token on the other side. This covers 20-character truncated notes and
+  `Nováková`/`Novák`. Narrowing runs after the exact amount/currency/direction filter. If any
+  candidate is supported, unsupported candidates are dropped, including ones with no text. If none
+  is supported, all candidates stay. The outcome then carries a reason such as
+  `counterparty evidence narrowed 3 amount candidates to 1`, and the answer shows it next to the
+  dates. The validator recomputes the same narrowed set from its own target and source facts.
+
+Real-file acceptance: the owner's actual export (4,999 lines) and invoice list (92 records) went
+through `processingRequest` with the task's target/source roles, printing counts only. The source
+had 4,998 parsed records, 1 skipped header and 0 rejected. Of the 92 targets, **58 were matched**,
+**33 ambiguous** and **1 not found**, and 25 outcomes carry a narrowing reason. Of the 33 ambiguous
+targets, 25 are the same payer paying the same amount in several months. Token evidence cannot
+separate those, and the invoice date is deliberately not used as payment evidence. The remaining 8
+have no candidate whose note or message names the invoice counterparty. The synthetic
+`generateFioFixture` pair in `file-processing.fixtures.ts` covers the same layout with invented data.

@@ -3,11 +3,14 @@ import { createHash } from 'node:crypto'
 export type Parsed<T> = { ok: true; value: T } | { ok: false; error: string }
 export type Direction = 'incoming' | 'outgoing' | 'neutral'
 export interface Money { minorUnits: number; currency: string; direction: Direction }
-const currencies = new Set(['CZK', 'EUR', 'USD', 'GBP', 'CHF', 'PLN'])
+/** ISO-style three-letter codes with minor units other than two; amounts in them are refused, never rescaled. */
+const nonTwoDecimalCurrencies = new Set(['JPY', 'KRW', 'ISK', 'CLP', 'VND', 'XAF', 'XOF'])
+const twoDecimalCurrency = (x: unknown): x is string => typeof x === 'string' && /^[A-Z]{3}$/.test(x) && !nonTwoDecimalCurrencies.has(x)
 const fail = (error: string): Parsed<never> => ({ ok: false, error })
 
-/** Explicit two-decimal currencies only. No float arithmetic, rounding, inferred separators or zero fallback. */
-export function parseMoney(text: string, options: { currency?: string; direction?: Direction } = {}): Parsed<Money> {
+/** Explicit two-decimal currencies only. No float arithmetic, rounding, inferred separators or zero fallback.
+ * `trimmedDecimals` additionally accepts one decimal digit (`-129,9` = 129.90), as some bank exports drop a trailing zero. */
+export function parseMoney(text: string, options: { currency?: string; direction?: Direction; trimmedDecimals?: boolean } = {}): Parsed<Money> {
   if (typeof text !== 'string' || text.length > 128) return fail('Invalid money text')
   let value = text.trim()
   let currency = options.currency
@@ -16,15 +19,17 @@ export function parseMoney(text: string, options: { currency?: string; direction
   const explicit = token[1] ?? token[3]
   if (explicit && currency && explicit !== currency) return fail('Currency conflict')
   currency = explicit ?? currency
-  if (!currency || !currencies.has(currency)) return fail('An explicit supported two-decimal currency is required')
+  if (!currency || !/^[A-Z]{3}$/.test(currency)) return fail('An explicit three-letter currency code is required')
+  if (!twoDecimalCurrency(currency)) return fail(`Currency ${currency} does not use two decimal places; it is not supported`)
   value = token[2]!.replace(/[\u00a0\u202f]/g, ' ')
   const negative = value.startsWith('-')
   const signed = /^[+-]/.test(value)
   value = value.replace(/^[+-]/, '')
   // A dot is exclusively the decimal separator; grouped numbers use spaces and comma decimals.
-  if (!/^(?:\d+(?:[.,]\d{2})?|\d{1,3}(?: \d{3})+(?:,\d{2})?)$/.test(value)) return fail('Ambiguous or invalid separators/precision')
+  const exact = options.trimmedDecimals === true ? /^(?:\d+(?:[.,]\d{1,2})?|\d{1,3}(?: \d{3})+(?:,\d{1,2})?)$/ : /^(?:\d+(?:[.,]\d{2})?|\d{1,3}(?: \d{3})+(?:,\d{2})?)$/
+  if (!exact.test(value)) return fail('Ambiguous or invalid separators/precision')
   const parts = value.replace(/ /g, '').split(/[.,]/)
-  const magnitude = BigInt(parts[0]!) * 100n + BigInt(parts[1] ?? '0')
+  const magnitude = BigInt(parts[0]!) * 100n + BigInt((parts[1] ?? '0').padEnd(2, '0'))
   if (magnitude > BigInt(Number.MAX_SAFE_INTEGER)) return fail('Amount exceeds exact minor-unit range')
   if (options.direction && !['incoming', 'outgoing', 'neutral'].includes(options.direction)) return fail('Invalid direction')
   const inferred: Direction = magnitude === 0n ? 'neutral' : negative ? 'outgoing' : 'incoming'
@@ -66,7 +71,10 @@ export interface ProcessingTarget {
   criteria: Values
   /** Optional exact evidence: only reject when target and source both have a nonempty, conflicting value. */
   evidence?: Values
+  /** Optional name evidence: the target text field is compared by normalized tokens with these source text fields. */
+  textEvidence?: TextEvidence
 }
+export interface TextEvidence { targetField: string; sourceFields: string[] }
 export interface ValidationContext {
   inspections: Inspection[]
   targets: ProcessingTarget[]
@@ -102,6 +110,57 @@ const refKey = (ref: SourceRef): string => JSON.stringify([ref.inputId, ref.star
 const equalValues = (a: Values, b: Values): boolean => Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(k => Object.hasOwn(b, k) && a[k] === b[k])
 const satisfies = (values: Values, criteria: Values): boolean => Object.keys(criteria).every(k => Object.hasOwn(values, k) && values[k] === criteria[k])
 const present = (value: Values[string] | undefined): boolean => value !== undefined && value !== null && (typeof value !== 'string' || value.trim().length > 0)
+
+const fieldName = (x: unknown): x is string => typeof x === 'string' && /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(x) && !['__proto__', 'constructor', 'prototype'].includes(x)
+/** Name evidence may never come from the statement owner's account/holder or from a date. */
+const refusedTextField = (name: string): boolean => /date|holder|ownAccount/i.test(name)
+export function textEvidenceShape(x: unknown): x is TextEvidence {
+  return object(x) && exactKeys(x, ['targetField', 'sourceFields']) && fieldName(x.targetField) && !refusedTextField(x.targetField) && Array.isArray(x.sourceFields) && x.sourceFields.length >= 1 && x.sourceFields.length <= 6 && x.sourceFields.every(f => fieldName(f) && !refusedTextField(f)) && new Set(x.sourceFields).size === x.sourceFields.length
+}
+
+const tokenStoplist = new Set(['sro', 'spol', 'ltd', 'gmbh', 'inc', 'the', 'and', 'pro', 'com', 'www'])
+/** Normalized name tokens: diacritics, case and punctuation removed; short tokens and legal-form words dropped. */
+export function nameTokens(text: string): string[] {
+  return text.slice(0, FILE_PROCESSING_LIMITS.string).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').split(' ').filter(t => t.length >= 3 && !tokenStoplist.has(t))
+}
+/** Equal tokens, or one a prefix of the other (bank notes truncate names; Czech surnames vary: Nováková/Novák). */
+export function tokensSupport(target: string[], source: string[]): boolean {
+  return target.some(t => source.some(s => t === s || t.startsWith(s) || s.startsWith(t)))
+}
+
+/** Deterministic narrowing of exact amount candidates by counterparty tokens. Recomputed identically by the validator.
+ * If any candidate's text supports the target name, candidates without support (with other text or none) are dropped;
+ * if none supports it, every candidate is kept. It never removes the last candidate. */
+export function narrowByText(candidates: InspectedRecord[], targetValues: Values | undefined, evidence: TextEvidence | undefined): { candidates: InspectedRecord[]; reason?: string } {
+  const text = evidence && targetValues ? targetValues[evidence.targetField] : undefined
+  const wanted = typeof text === 'string' ? nameTokens(text) : []
+  if (!evidence || !wanted.length || candidates.length === 0) return { candidates }
+  const supported = candidates.filter(c => tokensSupport(wanted, evidence.sourceFields.flatMap(f => typeof c.values[f] === 'string' ? nameTokens(c.values[f] as string) : [])))
+  if (!supported.length || supported.length === candidates.length) return { candidates }
+  return { candidates: supported, reason: `counterparty evidence narrowed ${candidates.length} amount candidates to ${supported.length}` }
+}
+
+/** RFC 4180 cell splitting for one physical line: delimiter only outside quotes, `""` is a quote, wrapping quotes removed.
+ * Returns undefined for an unterminated quote or text after a closing quote. Without `quoted` it is a plain split. */
+export function splitCells(line: string, delimiter: string, quoted = false): string[] | undefined {
+  if (!quoted) return line.split(delimiter)
+  const cells: string[] = []
+  let cell = '', inQuotes = false, wasQuoted = false
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!
+    if (inQuotes) {
+      if (c !== '"') cell += c
+      else if (line[i + 1] === '"') { cell += '"'; i++ }
+      else inQuotes = false
+    } else if (c === delimiter) { cells.push(cell); cell = ''; wasQuoted = false }
+    else if (c === '"' && cell.trim() === '' && !wasQuoted) { cell = ''; inQuotes = true; wasQuoted = true }
+    else if (wasQuoted && c.trim() !== '') return undefined
+    else if (!wasQuoted) cell += c
+  }
+  if (inQuotes) return undefined
+  cells.push(cell)
+  return cells
+}
 
 /** Exact required keys plus optional corroboration; no scores, fuzzy names or implicit date semantics. */
 export function matchFileRecord(source: Values, required: Values, evidence: Values = {}): boolean {
@@ -143,22 +202,31 @@ export interface FileColumn {
   currency?: string
   direction?: Direction
   directionField?: string
+  /** Money only: the currency is this text field's value (a separate currency column), not `currency`. */
+  currencyField?: string
+  /** Money only: accept one decimal digit as a dropped trailing zero. */
+  trimmedDecimals?: boolean
 }
 export interface FileRecordSchema {
   delimiter: '\t' | '|' | ';' | ','
   recordLines: number
   skipPrefixes?: string[]
   skipBlank?: boolean
+  /** RFC 4180 quoted cells: delimiters inside quotes are data, `""` is a quote, wrapping quotes are removed. */
+  quoted?: boolean
   fields: Record<string, FileColumn>
 }
 
 function schemaShape(x: unknown): x is FileRecordSchema {
-  if (!object(x) || !exactKeys(x, ['delimiter', 'recordLines', 'fields'], ['skipPrefixes', 'skipBlank']) || typeof x.delimiter !== 'string' || !['\t', '|', ';', ','].includes(x.delimiter) || !integer(x.recordLines) || x.recordLines < 1 || x.recordLines > 8 || !object(x.fields)) return false
+  if (!object(x) || !exactKeys(x, ['delimiter', 'recordLines', 'fields'], ['skipPrefixes', 'skipBlank', 'quoted']) || typeof x.delimiter !== 'string' || !['\t', '|', ';', ','].includes(x.delimiter) || !integer(x.recordLines) || x.recordLines < 1 || x.recordLines > 8 || !object(x.fields)) return false
   if (x.skipPrefixes !== undefined && (!Array.isArray(x.skipPrefixes) || x.skipPrefixes.length > 16 || !x.skipPrefixes.every(s => shortString(s) && s.length <= 128))) return false
   if (x.skipBlank !== undefined && typeof x.skipBlank !== 'boolean') return false
+  if (x.quoted !== undefined && typeof x.quoted !== 'boolean') return false
   const fields = Object.entries(x.fields)
   if (!fields.length || fields.length > 28 || !valuesShape(Object.fromEntries(fields.map(([k]) => [k, ''])))) return false
-  return fields.filter(([, f]) => object(f) && f.type === 'money').length <= 1 && fields.every(([, f]) => object(f) && exactKeys(f, ['line', 'column', 'type'], ['stripPrefix', 'map', 'currency', 'direction', 'directionField']) && integer(f.line) && f.line < Number(x.recordLines) && integer(f.column) && f.column <= 255 && typeof f.type === 'string' && ['text', 'integer', 'date', 'money'].includes(f.type) && (f.stripPrefix === undefined || shortString(f.stripPrefix)) && (f.currency === undefined || (typeof f.currency === 'string' && currencies.has(f.currency))) && (f.direction === undefined || (typeof f.direction === 'string' && ['incoming', 'outgoing', 'neutral'].includes(f.direction))) && (f.directionField === undefined || (shortString(f.directionField) && Object.hasOwn(x.fields as object, f.directionField))) && (f.map === undefined || (object(f.map) && Object.keys(f.map).length <= 32 && Object.entries(f.map).every(([k, v]) => shortString(k) && shortString(v)))))
+  const all = x.fields as Record<string, unknown>
+  const textField = (name: unknown): boolean => shortString(name) && Object.hasOwn(all, name) && object(all[name]) && (all[name] as Record<string, unknown>).type === 'text'
+  return fields.filter(([, f]) => object(f) && f.type === 'money').length <= 1 && fields.every(([, f]) => object(f) && exactKeys(f, ['line', 'column', 'type'], ['stripPrefix', 'map', 'currency', 'direction', 'directionField', 'currencyField', 'trimmedDecimals']) && integer(f.line) && f.line < Number(x.recordLines) && integer(f.column) && f.column <= 255 && typeof f.type === 'string' && ['text', 'integer', 'date', 'money'].includes(f.type) && (f.stripPrefix === undefined || shortString(f.stripPrefix)) && (f.currency === undefined || twoDecimalCurrency(f.currency)) && (f.direction === undefined || (typeof f.direction === 'string' && ['incoming', 'outgoing', 'neutral'].includes(f.direction))) && (f.directionField === undefined || (shortString(f.directionField) && Object.hasOwn(all, f.directionField))) && (f.currencyField === undefined || (f.type === 'money' && textField(f.currencyField))) && (f.trimmedDecimals === undefined || (f.type === 'money' && typeof f.trimmedDecimals === 'boolean')) && (f.map === undefined || (object(f.map) && Object.keys(f.map).length <= 32 && Object.entries(f.map).every(([k, v]) => shortString(k) && shortString(v)))))
 }
 
 /** Bounded, non-executable column/framing helper. A model-selected schema produces proposals, not trusted validation facts. */
@@ -193,7 +261,8 @@ export function inspectFileWithSchema(input: { id: string; bytes: Uint8Array; ro
     if (text.length > 65_536) return { kind: 'rejected' }
     const rows = text.replace(/^\ufeff/, '').replace(/\r?\n$/, '').split(/\r?\n/)
     if (rows.length !== schema.recordLines) return { kind: 'rejected' }
-    const cells = rows.map(row => row.split(schema.delimiter))
+    const cells = rows.map(row => splitCells(row, schema.delimiter, schema.quoted === true))
+    if (cells.some(c => c === undefined)) return { kind: 'rejected' }
     const values: Values = {}
     const entries = Object.entries(schema.fields)
     // Resolve text directions before money, independent of schema property order.
@@ -219,7 +288,9 @@ export function inspectFileWithSchema(input: { id: string; bytes: Uint8Array; ro
       } else {
         const direction = field.directionField ? values[field.directionField] : field.direction
         if (direction !== undefined && direction !== 'incoming' && direction !== 'outgoing' && direction !== 'neutral') return { kind: 'rejected' }
-        const money = parseMoney(value, { currency: field.currency, direction })
+        const currency = field.currencyField ? values[field.currencyField] : field.currency
+        if (currency !== undefined && typeof currency !== 'string') return { kind: 'rejected' }
+        const money = parseMoney(value, { currency, direction, trimmedDecimals: field.trimmedDecimals === true })
         if (!money.ok) return { kind: 'rejected' }
         Object.assign(values, money.value)
       }
@@ -234,10 +305,11 @@ export function reconcileFileProcessing(context: ValidationContext): FileProcess
   const sources = context.inspections.filter(i => i.role === 'source')
   const complete = sources.length > 0 && sources.every(i => i.complete && i.identity.counts.rejected === 0) && sources.some(i => i.records.length > 0)
   const records = sources.flatMap(i => i.records)
+  const targetRecords = new Map(context.inspections.filter(i => i.role === 'target').flatMap(i => i.records).map(r => [refKey(r.ref), r.values]))
   const outcomes: ProcessingOutcome[] = context.targets.map(target => {
-    const candidates = records.filter(r => matchFileRecord(r.values, target.criteria, target.evidence))
+    const { candidates, reason } = narrowByText(records.filter(r => matchFileRecord(r.values, target.criteria, target.evidence)), targetRecords.get(refKey(target.ref)), target.textEvidence)
     if (!complete || candidates.length > FILE_PROCESSING_LIMITS.candidates) return { targetId: target.id, status: 'blocked', candidates: [], reason: !complete ? 'Source inspection is incomplete or contains rejected records.' : 'Plausible candidate count exceeds the result limit; narrow independent criteria or split the task.' }
-    return { targetId: target.id, status: candidates.length === 0 ? 'not_found' : candidates.length === 1 ? 'matched' : 'ambiguous', candidates: candidates.map(c => ({ ref: { ...c.ref }, values: { ...c.values } })) }
+    return { targetId: target.id, status: candidates.length === 0 ? 'not_found' : candidates.length === 1 ? 'matched' : 'ambiguous', candidates: candidates.map(c => ({ ref: { ...c.ref }, values: { ...c.values } })), ...(reason ? { reason } : {}) }
   })
   return { version: 1, inputs: context.inspections.map(i => ({ ...i.identity, counts: { ...i.identity.counts } })), outcomes }
 }
@@ -303,6 +375,7 @@ export function validateFileProcessingResult(jsonText: string, context: Validati
     const fact = records.get(refKey(target.ref))
     if (!shortString(target.id) || targetMap.has(target.id) || targetRefs.has(refKey(target.ref)) || !fact || inputs.get(target.ref.inputId)?.role !== 'target' || !valuesShape(target.criteria) || (fact && !satisfies(fact.values, target.criteria))) add('TARGET_LINEAGE', target.id, 'Target is duplicate, uninspected or has criteria not present in the target', 'Construct targets from independently inspected target records.')
     if (target.evidence !== undefined && (!valuesShape(target.evidence) || (fact && !satisfies(fact.values, target.evidence)))) add('TARGET_EVIDENCE', target.id, 'Optional matching evidence must come from the inspected target', 'Select reference/account/name values from the actual target; do not invent corroboration.')
+    if (target.textEvidence !== undefined && (!textEvidenceShape(target.textEvidence) || (fact && typeof fact.values[target.textEvidence.targetField] !== 'string'))) add('TARGET_EVIDENCE', target.id, 'Counterparty text evidence must name a text field of the inspected target and at most six source text fields', 'Use the target counterparty field and source note/message/counterparty fields; never an account holder, own account or date.')
     targetRefs.add(refKey(target.ref))
     // Matching money always includes its currency and direction, even if a host omitted these criteria.
     if (fact && Object.hasOwn(fact.values, 'minorUnits') && (!['minorUnits', 'currency', 'direction'].every(k => Object.hasOwn(target.criteria, k) && target.criteria[k] === fact.values[k]))) add('TARGET_MONEY', target.id, 'Money criteria must preserve target amount, currency and direction', 'Include exact signed minorUnits, currency and direction from the target.')
@@ -319,7 +392,8 @@ export function validateFileProcessingResult(jsonText: string, context: Validati
     const target = targetMap.get(outcome.targetId)
     if (!target || seenTargets.has(outcome.targetId)) { add('TARGET_COVERAGE', path, 'Unknown or duplicate target outcome', 'Return each requested target exactly once.'); continue }
     seenTargets.add(outcome.targetId)
-    const plausible = sourceRecords.filter(r => matchFileRecord(r.values, target.criteria, target.evidence))
+    // Recomputed from host facts: the target's own inspected text, never the candidate result's reason.
+    const plausible = narrowByText(sourceRecords.filter(r => matchFileRecord(r.values, target.criteria, target.evidence)), records.get(refKey(target.ref))?.values, textEvidenceShape(target.textEvidence) ? target.textEvidence : undefined).candidates
     const candidateKeys = new Set<string>()
     for (const candidate of outcome.candidates) {
       const key = refKey(candidate.ref)

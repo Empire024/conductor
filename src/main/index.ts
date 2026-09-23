@@ -2,7 +2,6 @@ import { WeeklyUsageSummaryService } from './weekly-usage-summary'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs, readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
-import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { importPromptImage } from './prompt-images'
 import { importPromptAttachmentPath, projectPromptAttachment } from './prompt-context'
@@ -43,7 +42,10 @@ import type {
   WorkspaceLayout
 } from '../shared/models'
 import { AGENT_SOUND_PROFILES, isMemoryKind, THEME_IDS, THEME_VARIANTS } from '../shared/models'
+import type { LayoutNode } from '../shared/models'
+import { wizardActive } from '../shared/structured-agent'
 import type { AgentConfirmResponse } from '../shared/agent-confirm'
+import { AgentConfirmBroker } from './agent-confirm-broker'
 import { ConductorDatabase } from './database'
 import { TerminalManager } from './terminal-manager'
 import { AgentManager, onAgentStatusChange, onBroadcast } from './agent-manager'
@@ -136,7 +138,29 @@ const detachedWindows = new Map<string, BrowserWindow>()
 // Native message boxes steal focus and freeze the process behind them; an agent's request to
 // close a tab or forget a memory is routed through the renderer's own confirm UI instead, with
 // this map resolving the owner's answer back to whichever AgentControl call is waiting on it.
-const pendingAgentConfirms = new Map<string, { resolve(allow: boolean): void; timer: ReturnType<typeof setTimeout> }>()
+// Agent requests are shown in the main window only: a detached window has no dialog to show them in.
+const agentConfirms = new AgentConfirmBroker(() => {
+  const window = mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed() ? mainWindow : null
+  if (!window) return null
+  return {
+    send: (channel, payload) => {
+      if (window.isDestroyed() || window.webContents.isDestroyed()) return false
+      window.webContents.send(channel, payload)
+      return true
+    },
+    reveal: () => {
+      if (window.isDestroyed()) return
+      if (window.isMinimized()) window.restore()
+      revealWindow(window)
+      // Windows refuses focus to an app that is not in the foreground, so the window may stay
+      // behind whatever the owner is using; the flashing taskbar button is then the only sign.
+      if (!backgroundWindows && !window.isFocused()) {
+        window.flashFrame(true)
+        window.once('focus', () => { if (!window.isDestroyed()) window.flashFrame(false) })
+      }
+    }
+  }
+})
 const floatingDetachedIds = (): string[] => {
   try { const value: unknown = JSON.parse(database.getSetting('floatingDetachedWindows') ?? '[]'); return Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : [] }
   catch { return [] }
@@ -542,9 +566,37 @@ const disposeRuntimeServices = (): void => {
   }
 }
 
-const prepareForUpdateInstall = async (): Promise<void> => {
-  if (!await confirmApplicationStop(mainWindow, 'restart')) throw Object.assign(new Error('Update restart cancelled. Running work is unchanged.'), { code: 'UPDATE_CANCELLED' })
-  if (!await resolveUnsavedEditors(mainWindow)) throw Object.assign(new Error('Update restart cancelled. Your edits are still open.'), { code: 'UPDATE_CANCELLED' })
+/** After a restart Conductor started itself (an update install or app.restart), every open wizard
+ *  tab is brought back and told to carry on: the "keeps itself running" half of wizard mode. A
+ *  launch the owner made by hand does nothing here; they may have quit to stop everything. */
+const resumeWizardTabs = async (): Promise<void> => {
+  for (const project of database.listDeskProjects()) for (const workspace of database.listSessions(project.id)) {
+    const tabs: PaneTab[] = []
+    const visit = (node: LayoutNode): void => { if (node.type === 'split') node.children.forEach(visit); else tabs.push(...node.tabs) }
+    visit(workspace.layout.root)
+    for (const tab of tabs) {
+      if (tab.kind !== 'agent' || !tab.resourceId) continue
+      const state = database.structured.snapshot(tab.resourceId), spec = database.structured.spec<AgentSpec>(tab.resourceId)
+      if (!state || !spec || spec.provider === 'local' || !state.nativeSessionId || !wizardActive(state.settings, spec.provider)) continue
+      try {
+        await agents.structured.resume(tab.resourceId, state.settings)
+        await agents.structured.submit(tab.resourceId, `[Conductor] Conductor restarted itself (now ${app.getVersion()}) and brought this wizard tab back. Continue your work from where you left off; check app.state and agents.list first, since your coworkers may need resuming too.`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+        console.log(`Wizard tab ${tab.resourceId} resumed after the restart`)
+      } catch (error) { console.warn(`Wizard tab ${tab.resourceId} could not be resumed after the restart`, error) }
+    }
+  }
+}
+
+/** `force` is the owner's own control credential restarting the app unattended: running work is
+ *  stopped without the dialog, and dirty editors are flushed into their recovery drafts instead of
+ *  being asked about, so nothing typed is lost and nothing on disk is overwritten. */
+const prepareForUpdateInstall = async (force = false): Promise<void> => {
+  if (force) {
+    try { await flushEditorWindows(editorWindows()) } catch (error) { console.warn('Editor drafts could not all be flushed before a forced restart', error) }
+  } else {
+    if (!await confirmApplicationStop(mainWindow, 'restart')) throw Object.assign(new Error('Update restart cancelled. Running work is unchanged.'), { code: 'UPDATE_CANCELLED' })
+    if (!await resolveUnsavedEditors(mainWindow)) throw Object.assign(new Error('Update restart cancelled. Your edits are still open.'), { code: 'UPDATE_CANCELLED' })
+  }
   database.setSetting(UPDATE_WINDOW_LAYOUT_KEY, JSON.stringify(captureWindowLayout()))
   database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'true')
   // electron-updater closes windows before Electron emits before-quit. Mark the
@@ -852,6 +904,19 @@ const safeProjectFolderName = (name: string): string => {
  * so a project made here reaches the machines already linked to this one instead of being
  * invisible on them.
  */
+/** An existing folder becomes (or already is) a project on this desk: the open-folder dialog and
+ *  the owner control credential's projects.open share this one path. */
+const registerProjectFolder = async (requested: string, name?: string): Promise<ProjectRecord> => {
+  const path = resolve(requested)
+  if (!(await folderExists(path))) throw new Error(`Project folder is unavailable: ${path}`)
+  const project = database.upsertProject(path, name?.trim() || basename(path))
+  database.includeDeskProject(project.id)
+  await projectBacklogs.ensure(project.id)
+  projectFileChanges?.watch(project)
+  remoteControl?.shareNewProject(project.id)
+  return project
+}
+
 const addLocalProject = async (name: string): Promise<ProjectRecord> => {
   const settings = getAppSettings()
   const folderName = safeProjectFolderName(name)
@@ -1131,13 +1196,7 @@ const registerIpc = (): void => {
       properties: ['openDirectory', 'createDirectory']
     })
     if (result.canceled || !result.filePaths[0]) return null
-    const path = resolve(result.filePaths[0])
-    const project = database.upsertProject(path, basename(path))
-    database.includeDeskProject(project.id)
-    await projectBacklogs.ensure(project.id)
-    projectFileChanges?.watch(project)
-    remoteControl?.shareNewProject(project.id)
-    return project
+    return registerProjectFolder(result.filePaths[0])
   })
   ipcMain.handle('projects:create', async (_event, name: string) => addLocalProject(name))
   ipcMain.handle('projects:remove', (_event, projectId: string) => {
@@ -1734,11 +1793,15 @@ const registerIpc = (): void => {
   })
   ipcMain.on('agent-confirm:response', (event, response: AgentConfirmResponse) => {
     try { trustedStructured(event) } catch { return }
-    const pending = pendingAgentConfirms.get(response?.id)
-    if (!pending) return
-    clearTimeout(pending.timer)
-    pendingAgentConfirms.delete(response.id)
-    pending.resolve(response.allow === true)
+    if (typeof response?.id === 'string') agentConfirms.respond(response.id, response.allow === true)
+  })
+  ipcMain.on('agent-confirm:received', (event, id: unknown) => {
+    try { trustedStructured(event) } catch { return }
+    if (typeof id === 'string') agentConfirms.received(id)
+  })
+  ipcMain.handle('agent-confirm:pending', (event) => {
+    trustedStructured(event)
+    return agentConfirms.list()
   })
 
   // Memory is written about a working copy by the agents that worked on it, so it belongs to the
@@ -2069,22 +2132,27 @@ app.whenReady().then(async () => {
   // without it the two initializers form an inference cycle.
   const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
     localUpdates: localUpdateBuilder,
+    // The owner credential's reach into the app itself. `updates` is assigned further down this
+    // function and only read at call time, so the closures are safe.
+    host: {
+      version: app.getVersion(), pid: process.pid,
+      openProject: registerProjectFolder,
+      updates: { state: () => updates.getState(), check: () => updates.check(), download: () => updates.download(), install: force => updates.install({ force }) },
+      relaunch: async force => {
+        // A downloaded update installs and relaunches by itself; relaunching as well would start
+        // Conductor twice.
+        if (updates.getState().phase === 'ready') { await updates.install({ force }); return }
+        await prepareForUpdateInstall(force)
+        app.relaunch()
+        app.quit()
+      }
+    },
     delivery,
     localModels: { availability: localModelAvailability },
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
-    confirm: async (_scope, message) => {
-      if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) return false
-      if (mainWindow.isMinimized()) mainWindow.restore()
-      mainWindow.show(); mainWindow.focus()
-      const id = randomUUID()
-      return new Promise<boolean>((resolve) => {
-        const timer = setTimeout(() => { pendingAgentConfirms.delete(id); resolve(false) }, 120_000)
-        pendingAgentConfirms.set(id, { resolve, timer })
-        mainWindow!.webContents.send('agent-confirm:request', { id, title: 'Agent request', message })
-      })
-    },
+    confirm: (scope, message) => agentConfirms.request(scope.agentSessionId, message),
     fileChanged: change => projectFileChanges?.changed(change),
     linksChanged: scope => publish('agent-control:links-changed', { projectId: scope.projectId, sessionId: scope.sessionId })
   })
@@ -2093,7 +2161,10 @@ app.whenReady().then(async () => {
   scheduleRunner = new ScheduleRunner({ store: schedules, jobs: { 'latest-models-methods': context => latestModelsJob.run(context) }, changed: projectId => publish('schedules:changed', projectId) })
   agentControlUi.register(control)
   agents.structured.setLocalControl((spec, method, args) => control.call({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, method, args))
-  agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '')
+  // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
+  // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
+  // one after every restart.
+  agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '', { path: join(app.getPath('userData'), 'control-owner.json'), appVersion: app.getVersion(), packaged: app.isPackaged })
   await agentControlServer.start()
   await browserMcp.start()
   remoteControl.registerIpc()
@@ -2175,7 +2246,11 @@ app.whenReady().then(async () => {
   for (const record of detachedRecords) {
     openDetachedWindow(record.id, false, savedWindowLayout?.detached[record.id])
   }
-  if (restoreAfterUpdate) database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'false')
+  if (restoreAfterUpdate) {
+    database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'false')
+    // The windows first, then the wizards: the panes must exist for the resumed turns to show in.
+    setTimeout(() => { void resumeWizardTabs() }, 4000)
+  }
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow()
   })

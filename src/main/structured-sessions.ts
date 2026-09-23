@@ -5,7 +5,7 @@ import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-hist
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
-import { MAX_PROMPT_CHARS, settingsForRuntime } from '../shared/structured-agent'
+import { isFrontierModel, MAX_PROMPT_CHARS, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptDispatchAuthority, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
@@ -155,12 +155,8 @@ export class StructuredSessions {
     // The registered spec is otherwise frozen at first registration, so a conversation opened
     // before the owner switched limit continuation on kept answering `false` for ever. This is
     // the one field the owner can still change, so every `ensure` carries the current answer.
-    if (Boolean(live.spec.continueOnLimit) !== Boolean(spec.continueOnLimit)) {
-      live.spec = { ...live.spec, continueOnLimit: Boolean(spec.continueOnLimit) }
-      store.setContinueOnLimit(spec.id, Boolean(spec.continueOnLimit))
-      this.database.setAgentContinueOnLimit(spec.id, Boolean(spec.continueOnLimit))
-      if (!spec.continueOnLimit) this.cancelContinuation(spec.id)
-    }
+    // A wizard conversation continues after a usage limit whatever its workspace says.
+    this.setContinueOnLimit(spec.id, Boolean(spec.continueOnLimit) || wizardActive(store.snapshot(spec.id)?.settings, spec.provider))
     // A wait that outlives the app, a closed tab, or a backend restart is only re-armed here:
     // the timer lives in this process, the reset time lives in SQLite.
     this.armPersistedContinuation(live)
@@ -369,6 +365,17 @@ export class StructuredSessions {
   /** The composer chooses model, effort and permission for the next message, which can be long
    *  before that message exists. Persisting the choice keeps a reopened pane on what the user
    *  picked instead of resetting it to the registration defaults; it starts no runtime. */
+  /** The one spec field that changes after registration: whether a usage limit is waited out and
+   *  the turn continued. The timer lives in this process, the reset time in SQLite. */
+  setContinueOnLimit(id: string, enabled: boolean): void {
+    const live = this.live.get(id)
+    if (!live || Boolean(live.spec.continueOnLimit) === enabled) return
+    live.spec = { ...live.spec, continueOnLimit: enabled }
+    this.database.structured.setContinueOnLimit(id, enabled)
+    this.database.setAgentContinueOnLimit(id, enabled)
+    if (!enabled) this.cancelContinuation(id)
+  }
+
   saveSettings(id: string, settings: SessionSettings): void {
     const state = this.database.structured.snapshot(id)
     if (!state) throw new Error('Session not found')
@@ -376,6 +383,9 @@ export class StructuredSessions {
     const browserChanged = Boolean(settings.browserMcp) !== Boolean(state.settings.browserMcp)
     if (browserChanged && settings.browserMcp && active.has(state.phase)) throw new Error('Wait for the current turn to finish before enabling browser tools')
     this.database.structured.update(id, { settings })
+    // Turning the wand on is also the decision to wait out usage limits; turning it off leaves the
+    // workspace's own choice, which the next ensure() re-applies.
+    if (wizardActive(settings, state.capabilities?.provider ?? this.database.structured.spec<AgentSpec>(id)?.provider)) this.setContinueOnLimit(id, true)
     if (browserChanged) {
       // Revocation is synchronous and precedes every later await: a disabled credential cannot
       // finish a tool call merely because its browser lookup was already in flight.
@@ -805,6 +815,8 @@ export class StructuredSessions {
   }
   private validateSettings(settings: SessionSettings, capabilities: import('../shared/structured-agent').ProviderCapabilities | undefined): void {
     if (settings.reviewDelegatedActions !== undefined && typeof settings.reviewDelegatedActions !== 'boolean') throw new Error('Invalid delegated review setting')
+    if (settings.wizard !== undefined && typeof settings.wizard !== 'boolean') throw new Error('Invalid wizard setting')
+    if (settings.wizard && capabilities && (capabilities.provider === 'local' || !isFrontierModel(capabilities.provider, settings.model))) throw new Error(`Wizard mode needs a frontier model (${WIZARD_MODEL_HINT}); this conversation runs ${settings.model ?? 'the provider default'}`)
     if (!settings || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.permission) || typeof settings.plan !== 'boolean') throw new Error('Invalid session settings')
     if (settings.browserMcp !== undefined && typeof settings.browserMcp !== 'boolean') throw new Error('Invalid browser MCP setting')
     for (const key of ['localGit', 'localResearch'] as const) {
@@ -831,11 +843,11 @@ export class StructuredSessions {
    * may carry an older copy; preserve their model/effort/permission while taking browserMcp only
    * from the current durable projection. */
   private messageSettings(state: { settings: SessionSettings }, incoming: SessionSettings): SessionSettings {
-    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, localContract: _capturedContract, reviewDelegatedActions: _capturedReview, ...message } = incoming
+    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, localContract: _capturedContract, reviewDelegatedActions: _capturedReview, wizard: _capturedWizard, ...message } = incoming
     const authority: SessionSettings = { ...message }
     // Same rule for the local grants: a queued prompt must not carry a repository or research
     // grant the owner has since withdrawn, nor lose one they have since given.
-    for (const key of ['browserMcp', 'localGit', 'localResearch', 'reviewDelegatedActions'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
+    for (const key of ['browserMcp', 'localGit', 'localResearch', 'reviewDelegatedActions', 'wizard'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
     if (state.settings.localContract !== undefined) authority.localContract = state.settings.localContract
     return authority
   }

@@ -1,0 +1,21 @@
+{
+  "id": "local-dolphin-tools",
+  "title": "Dolphin X1 8B reads a file through well-formed tool calls",
+  "project": { "name": "dolphin-tools", "path": "C:/Claude/conductor", "inputs": ["README.md"] },
+  "worker": { "provider": "local", "model": "local/dolphin-x1-8b", "permission": "accept-edits" },
+  "prompt": "Read README.md and tell me in two sentences what this project is.",
+  "timeoutMinutes": 15,
+  "success": {
+    "phases": ["completed"],
+    "stopReasons": ["completed"],
+    "answerRejects": ["were not a JSON object"],
+    "maxLoopWarnings": 0
+  },
+  "fixer": {
+    "provider": "claude",
+    "model": "opus",
+    "project": "C:/Claude/conductor",
+    "focus": ["src/main/local-models/"],
+    "notes": "Dolphin X1 8B emits Llama-3.1-style tool calls that carry \"arguments\" instead of \"parameters\"; llama.cpp's tool-call parser then hands the local loop a one-character stub argument string `{`, and the loop previously repeated about ten malformed calls per turn before giving up. The fix belongs in how the local runtime parses or repairs this model's tool calls, not in the goal."
+  }
+}

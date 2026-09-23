@@ -180,14 +180,30 @@ it('separates environment discovery from genuinely empty payload stdout and stde
   expect((await call(c, 'read_file', { artifact: id })).output).toContain('stdout:\nACTUAL_PAYLOAD_7319\n\nstderr:\n \n')
 })
 
-it('rejects ambiguous shell/runtime forms instead of silently ignoring structured arguments',async()=>{
-  const c=await fixture(),exec=vi.fn()
+it('rejects a runtime that disagrees with a shell command, and runs the forms that agree instead of dropping their arguments',async()=>{
+  const c=await fixture(),exec=vi.fn(async (command: string) => ({ ...envelope(command, 'ran\n'), exitCode: 0, timedOut: false, truncated: false, durationMs: 5 }))
   c.sandbox={exec,setAnalysisMode(){}} as unknown as DockerSandbox
-  for(const args of [{command:'probe.py',runtime:'python3'},{command:'true',args:['-c','print(1)']}]) {
-    const result=await call(c,'run_command',args)
-    expect(result.failed).toBe(true);expect(result.output).toContain('"script":"file.py"')
-  }
+  // `python3` beside a command that does not start with python3 would silently change what runs.
+  const mismatch=await call(c,'run_command',{command:'probe.py',runtime:'python3'})
+  expect(mismatch.failed).toBe(true);expect(mismatch.output).toContain('"script":"<workspace path>"');expect(mismatch.output).toContain('needs node')
   expect(exec).not.toHaveBeenCalled()
+  // Both forms a small model actually sends: the runtime it named is the command's own first word.
+  const agreeing=await call(c,'run_command',{command:'node match.mjs',runtime:'node',args:['--verbose','a b']})
+  expect(agreeing.failed).toBe(false)
+  expect(exec.mock.calls[0]![0]).toContain("node match.mjs '--verbose' 'a b'")
+  expect(exec.mock.calls[0]![0]).toContain('command -v node')
+  const both=await call(c,'run_command',{command:'x',code:'y'})
+  expect(both.failed).toBe(true);expect(both.output).toContain('command and code')
+})
+it('infers a saved script’s interpreter from its extension when the call names none',async()=>{
+  const c=await fixture(),exec=vi.fn(async (command: string) => ({ ...envelope(command, 'ran\n'), exitCode: 0, timedOut: false, truncated: false, durationMs: 5 }))
+  c.sandbox={exec,setAnalysisMode(){}} as unknown as DockerSandbox
+  await writeFile(join(c.workspace,'check.mjs'),'console.log(1)\n')
+  await writeFile(join(c.workspace,'check.py'),'print(1)\n')
+  expect((await call(c,'run_command',{script:'check.mjs'})).failed).toBe(false)
+  expect(exec.mock.calls[0]![0]).toContain("node '/workspace/check.mjs'")
+  expect((await call(c,'run_command',{script:'check.py'})).failed).toBe(false)
+  expect(exec.mock.calls[1]![0]).toContain("python3 '/workspace/check.py'")
 })
 
 it('keeps actual payload bytes and repeated/forged marker text as payload', () => {

@@ -218,6 +218,47 @@ describe('local agent loop', () => {
     expect(second.tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
   })
 
+  it('re-asks once under the tool grammar when the server hands back a stub call, then runs the repaired call', async () => {
+    // llama.cpp's lazy parser on a Llama 3.1 fine-tune: the trigger fires, the grammar fails on
+    // the model's own "arguments" key, and the client receives name plus a lone `{`.
+    const stub = await stubServer([
+      [frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'read_file', arguments: '{' } }] }, 'tool_calls')],
+      [frame({ tool_calls: [{ index: 0, id: 'call_2', function: { name: 'read_file', arguments: '{"path":"src/index.ts"}' } }] }, 'tool_calls')],
+      [frame({ content: 'The answer is 42.' }, 'stop')]
+    ])
+    cleanup.push(() => stub.server.close())
+    const notices: string[] = [], tools: string[] = [], repairs: string[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/dolphin-x1-8b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })
+    const outcome = await session.run('What is the answer?', { notice: message => notices.push(message), toolEnd: call => tools.push(`${call.name}:${call.failed ? 'failed' : 'ok'}`), telemetry: entry => { if (entry.kind === 'repair') repairs.push(entry.outcome) } })
+    expect(outcome.stopReason).toBe('completed')
+    expect(outcome.text).toBe('The answer is 42.')
+    expect(tools).toEqual(['read_file:ok'])
+    expect(repairs).toEqual(['repaired'])
+    expect(notices.some(message => /could not parse the model's read_file call/.test(message))).toBe(true)
+    const [first, second, third] = stub.requests as Array<{ tool_choice?: string; messages: Array<{ role: string; content: string; tool_calls?: unknown[] }> }>
+    expect(first!.tool_choice).toBe('auto')
+    expect(second!.tool_choice).toBe('required')
+    // The stub never entered the history: the retry saw the same conversation as the first ask.
+    expect(second!.messages.length).toBe(first!.messages.length)
+    expect(third!.tool_choice).toBe('auto')
+    expect(third!.messages.at(-1)!.content).toContain('export const answer = 42')
+    expect(third!.messages.some(message => /were not a JSON object/.test(message.content))).toBe(false)
+  })
+
+  it('ends a run whose calls stay unreadable even under the grammar, instead of spending every round on them', async () => {
+    const stub = await stubServer([[frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'conductor', arguments: '{' } }] }, 'tool_calls')]])
+    cleanup.push(() => stub.server.close())
+    const notices: string[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/dolphin-x1-8b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768, control: async () => ({}) })
+    const outcome = await session.run('Test', { notice: message => notices.push(message) })
+    expect(outcome.stopReason).toBe('stagnation')
+    expect(outcome.report.detail).toMatch(/calls in a row whose arguments were not a JSON object/)
+    // Six stub rounds, each asked twice (lazy, then enforced), and not the 24-round hard limit.
+    expect(stub.requests.length).toBe(12)
+    expect(outcome.report.loopWarnings).toBeGreaterThanOrEqual(1)
+    expect(notices.some(message => /repeating an action without progress/.test(message))).toBe(true)
+  })
+
   it('reports a refused capability to the model instead of executing it', async () => {
     const stub = await stubServer([
       [frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'run_command', arguments: '{"command":"echo SHOULD_NOT_RUN_ON_HOST"}' } }] }, 'tool_calls')],

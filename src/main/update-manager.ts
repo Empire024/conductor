@@ -11,7 +11,8 @@ interface UpdateManagerOptions {
   isPackaged: boolean
   allowDevelopmentUpdates?: boolean
   localBuildDirectory?: string
-  beforeInstall(): void | Promise<void>
+  /** `force` is the owner's own credential asking: no running-work dialog, drafts kept for recovery. */
+  beforeInstall(force: boolean): void | Promise<void>
 }
 interface PendingPrepare {
   requestId: string
@@ -142,12 +143,12 @@ export class UpdateManager {
     catch (reason) { if (this.updater === updater) this.setState({ ...this.state, phase: 'error', message: errorMessage(reason) }) }
     return this.getState()
   }
-  async install(): Promise<void> {
+  async install(options: { force?: boolean } = {}): Promise<void> {
     if (!this.updater || this.state.phase !== 'ready') return
     this.setState({ ...this.state, phase: 'installing', message: 'Saving windows and stopping processes…' })
     try {
       await this.prepareRenderers()
-      await this.options.beforeInstall()
+      await this.options.beforeInstall(options.force === true)
       this.updater.quitAndInstall(true, true)
     } catch (reason) {
       if (reason && typeof reason === 'object' && 'code' in reason && reason.code === 'UPDATE_CANCELLED') { this.setState({ ...this.state, phase: 'ready', message: 'Update ready. Restart whenever you are ready.' }); return }

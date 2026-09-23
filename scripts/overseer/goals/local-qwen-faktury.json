@@ -1,0 +1,24 @@
+{
+  "id": "local-qwen-faktury",
+  "title": "Local model reconciles invoice payments without interruptions",
+  "project": { "name": "faktury", "path": "C:/Users/stilj/Conductor/faktury", "inputs": ["data.csv", "data2.txt"] },
+  "worker": { "provider": "local", "model": "local/ornith1.5-9b", "permission": "accept-edits" },
+  "prompt": "Check data2.txt -> find these payments in data.csv and give me the exact dates for each.",
+  "timeoutMinutes": 25,
+  "success": {
+    "phases": ["completed"],
+    "stopReasons": ["completed"],
+    "answerMatches": ["Validated \\d+ targets"],
+    "answerRejects": ["Could not complete the task"],
+    "requireValidatedArtifact": true,
+    "maxLoopWarnings": 2,
+    "oracle": "scripts/overseer/oracles/faktury.mjs"
+  },
+  "fixer": {
+    "provider": "claude",
+    "model": "opus",
+    "project": "C:/Claude/conductor",
+    "focus": ["src/main/local-models/"],
+    "notes": "The Ornith 1.5 9B local model previously burned 57 tool rounds and the whole 1,000,000-token task budget on a 32k window without finishing. Root causes seen then: process_files did not recognize data.csv, a quoted, semicolon-separated Fio bank export, nor data2.txt, a headerless tab-separated invoice list interleaved with 'Zobrazit PDF' filler lines; and run_command refused a call that combined `command` with `runtime`, so the model's fallback path failed too. Fix the harness so a 9B model can finish this in a handful of rounds, not the model's prompt."
+  }
+}

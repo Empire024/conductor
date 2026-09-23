@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -122,6 +122,18 @@ describe('authorized native app control', () => {
     expect(await f.control.call(localScope, 'app.update.status')).toMatchObject({ state: 'idle' })
     await expect(f.control.call(localScope, 'app.update')).rejects.toThrow('read-only')
     expect(f.localUpdates.start).toHaveBeenCalledTimes(1)
+  })
+  it('tells the agent whether the owner declined app.update or was never reached, and builds nothing either way', async () => {
+    const f = fixture()
+    f.confirm.mockResolvedValueOnce('timeout' as never)
+    await expect(f.control.call(f.scope, 'app.update')).rejects.toThrow(/did not answer the request to build a local update.*did not decline/)
+    f.confirm.mockResolvedValueOnce('undelivered' as never)
+    await expect(f.control.call(f.scope, 'app.update')).rejects.toThrow(/could not show the owner the request to build a local update/)
+    f.confirm.mockResolvedValueOnce('declined' as never)
+    await expect(f.control.call(f.scope, 'app.update')).rejects.toThrow('The owner declined to build a local update')
+    expect(f.localUpdates.start).not.toHaveBeenCalled()
+    f.confirm.mockResolvedValueOnce('allowed' as never)
+    expect(await f.control.call(f.scope, 'app.update')).toMatchObject({ state: 'running', authorizedBy: 'owner' })
   })
   it('ships a cloud coworker’s work on the host in one call, asks the owner for a local model, and refuses read-only turns', async () => {
     const f = fixture()
@@ -1209,5 +1221,182 @@ describe('bounded local tasks and compact supervision through app control', () =
     expect(JSON.stringify(status).length).toBeLessThan(2000)
     expect(JSON.stringify(await f.control.call(f.scope, 'tools.list', {}))).toContain('compact supervision view')
     await expect(f.control.call(f.scope, 'agents.compact', { agentSessionId: f.spec.id })).rejects.toThrow()
+  })
+})
+
+describe('the owner control credential', () => {
+  it('resolves an owner scope to a named or default project and workspace, and never to a conversation', () => {
+    const f = fixture()
+    const owner = f.control.ownerScope({ projectId: f.project.id })
+    expect(owner).toEqual({ projectId: f.project.id, sessionId: f.workspace.id, agentSessionId: 'owner', owner: true })
+    expect(f.control.ownerScope(undefined)).toMatchObject({ projectId: f.project.id, owner: true })
+    expect(() => f.control.ownerScope({ projectId: 'nope' })).toThrow(/projects.open/)
+    expect(() => f.control.ownerScope({ projectId: f.project.id, workspaceId: 'nope' })).toThrow(/workspace/)
+    expect(() => f.control.ownerScope({ agentSessionId: f.spec.id })).toThrow(/only projectId and workspaceId/)
+    expect(f.control.authorize(owner)).toMatchObject({ id: 'owner', provider: 'claude', cwd: f.project.path })
+  })
+
+  it('bootstraps a profile with no project: discovery and projects.open answer, everything else names the gap', async () => {
+    const f = fixture()
+    const folder = join(f.root, 'fresh'); mkdirSync(folder)
+    const host = { version: '1.0.0', pid: 1, openProject: vi.fn(async (path: string) => f.database.upsertProject(path, 'Fresh')), relaunch: vi.fn(async () => {}) }
+    const control = new AgentControl({ ...f.deps, host })
+    f.database.removeProject(f.project.id)
+    const empty = control.ownerScope(undefined)
+    expect(empty).toEqual({ projectId: '', sessionId: '', agentSessionId: 'owner', owner: true })
+    expect(control.authorize(empty)).toMatchObject({ id: 'owner', cwd: '' })
+    expect(Object.keys(await control.call(empty, 'tools.list', {}) as object)).toContain('projects.open')
+    expect(await control.call(empty, 'projects.list', {})).toEqual([])
+    await expect(control.call(empty, 'tabs.list', {})).rejects.toThrow(/needs a project: none is open/)
+    await expect(control.call(empty, 'app.state', {})).rejects.toThrow(/projects.open/)
+    const registered = await control.call(empty, 'projects.open', { path: folder }) as { id: string }
+    expect(control.ownerScope(undefined)).toMatchObject({ projectId: registered.id, owner: true })
+    // A registered project opens with its launcher tab and is now the default owner scope.
+    expect(await control.call(control.ownerScope({ projectId: registered.id }), 'tabs.list', {})).toEqual([expect.objectContaining({ kind: 'launcher' })])
+  })
+
+  it('opens coworkers on Auto without a tab of its own, drives them, and needs no confirmation dialog', async () => {
+    const f = fixture(false, { claude: ['default', 'read-only', 'accept-edits', 'auto'] })
+    const owner = f.control.ownerScope({ projectId: f.project.id })
+    const opened = await f.control.call(owner, 'tabs.open', { provider: 'claude', title: 'Overseer fixer', focus: false }) as { id: string; resourceId: string }
+    expect(f.database.structured.snapshot(opened.resourceId)!.settings.permission).toBe('auto')
+    // No cable: the owner has no tab to draw one from, and reaches the coworker all the same.
+    expect(f.database.getSetting('agentControlParent:' + opened.resourceId)).toBeFalsy()
+    await f.control.call(owner, 'agents.submit', { agentSessionId: opened.resourceId, prompt: 'Fix the failing goal' })
+    expect(f.submissions.at(-1)).toMatchObject({ provider: 'claude', prompt: 'Fix the failing goal' })
+    expect(await f.control.call(owner, 'agents.status', { agentSessionId: opened.resourceId })).toMatchObject({ agentSessionId: opened.resourceId, phase: 'completed' })
+    expect(await f.control.call(owner, 'app.state', {})).toMatchObject({ owner: true, appVersion: null })
+    // A coworker another agent controls is still the owner's to steer, exactly as from the window.
+    const controlled = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Controlled worker' }) as { resourceId: string }
+    await f.control.call(owner, 'agents.submit', { agentSessionId: controlled.resourceId, prompt: 'Owner steering' })
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: 'Owner steering' })
+    // Owner writes ask nobody: forgetting an agent memory happens without the confirm dialog.
+    await f.control.call(owner, 'memory.remember', { gist: 'The overseer keeps its runs under artifacts/overseer.' })
+    const memory = f.database.listMemories(f.project.id).find(entry => entry.source === 'agent')!
+    expect(await f.control.call(owner, 'memory.forget', { id: memory.id })).toEqual({ removed: true })
+    expect(f.confirm).not.toHaveBeenCalled()
+    await expect(f.control.call(owner, 'agents.handoff', { handoff: 'x' })).rejects.toThrow(/no conversation to hand off/)
+  })
+
+  it('answers the owner-only app methods through the host hooks, and refuses them to conversations', async () => {
+    const f = fixture()
+    let phase: 'idle' | 'ready' = 'idle'
+    const state = () => ({ phase, currentVersion: '1.0.0', availableVersion: phase === 'ready' ? '1.0.1' : undefined, configured: true })
+    const host = {
+      version: '1.0.0', pid: 4242,
+      openProject: vi.fn(async (path: string, name?: string) => f.database.upsertProject(path, name ?? 'Registered')),
+      updates: { state: vi.fn(state), check: vi.fn(async () => state()), download: vi.fn(async () => state()), install: vi.fn(async () => {}) },
+      relaunch: vi.fn(async () => {})
+    }
+    const control = new AgentControl({ ...f.deps, host })
+    const owner = control.ownerScope({ projectId: f.project.id })
+    expect(await control.call(owner, 'app.state', {})).toMatchObject({ owner: true, appVersion: '1.0.0', pid: 4242, updates: { phase: 'idle' } })
+    expect(Object.keys(await control.call(owner, 'tools.list', {}) as object)).toEqual(expect.arrayContaining(['projects.open', 'app.restart', 'app.update.install']))
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).not.toContain('app.restart')
+    const folder = join(f.root, 'registered'); mkdirSync(folder)
+    const registered = await control.call(owner, 'projects.open', { path: folder }) as { id: string; path: string; workspaces: Array<{ id: string }> }
+    expect(host.openProject).toHaveBeenCalledWith(folder, undefined)
+    expect(registered.workspaces.length).toBe(1)
+    expect(control.ownerScope({ projectId: registered.id })).toMatchObject({ projectId: registered.id, sessionId: registered.workspaces[0]!.id })
+    expect(await control.call(owner, 'app.update.check', {})).toMatchObject({ phase: 'idle' })
+    await expect(control.call(owner, 'app.update.install', {})).rejects.toThrow(/phase idle/)
+    phase = 'ready'
+    vi.useFakeTimers()
+    expect(await control.call(owner, 'app.update.install', { force: true })).toMatchObject({ installing: true, version: '1.0.1', force: true })
+    expect(await control.call(owner, 'app.restart', {})).toMatchObject({ restarting: true, force: false })
+    expect(host.updates.install).not.toHaveBeenCalled()
+    await vi.runAllTimersAsync()
+    expect(host.updates.install).toHaveBeenCalledWith(true)
+    expect(host.relaunch).toHaveBeenCalledWith(false)
+    vi.useRealTimers()
+    await expect(control.call(owner, 'app.update.install', { force: 'yes' })).rejects.toThrow(/force must be/)
+    await expect(control.call(f.scope, 'app.restart', {})).rejects.toThrow(/owner's own control credential/)
+    await expect(control.call(f.scope, 'projects.open', { path: folder })).rejects.toThrow(/owner's own control credential/)
+    await expect(f.control.call(f.control.ownerScope({ projectId: f.project.id }), 'app.restart', {})).rejects.toThrow(/unavailable in this Conductor/)
+  })
+
+  it('serves the owner credential over the loopback server from a file it writes at start and removes at close', async () => {
+    const f = fixture()
+    const path = join(f.root, 'profile', 'control-owner.json')
+    const server = new AgentControlServer(f.control, false, undefined, { path, appVersion: '1.2.3', packaged: false })
+    dispose.push(() => server.close())
+    await server.start()
+    expect(server.ownerCredentialPath).toBe(path)
+    const file = JSON.parse(readFileSync(path, 'utf8')) as { version: number; endpoint: string; token: string; pid: number; appVersion: string; packaged: boolean }
+    expect(file).toMatchObject({ version: 1, pid: process.pid, appVersion: '1.2.3', packaged: false })
+    expect(file.token).toMatch(/^[a-f0-9]{64}$/)
+    const post = async (token: string, body: unknown) => {
+      const response = await fetch(file.endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token }, body: JSON.stringify(body) })
+      return { status: response.status, body: await response.json() as { result?: unknown; error?: string } }
+    }
+    const listed = await post(file.token, { method: 'tools.list', args: {}, scope: { projectId: f.project.id } })
+    expect(listed.status).toBe(200)
+    expect(Object.keys(listed.body.result as object)).toContain('projects.open')
+    const defaulted = await post(file.token, { method: 'app.state', args: {} })
+    expect(defaulted.body.result).toMatchObject({ owner: true, projectId: f.project.id })
+    expect((await post(file.token, { method: 'tools.list', args: {}, scope: { projectId: 'nope' } })).body.error).toMatch(/projects.open/)
+    expect((await post('0'.repeat(64), { method: 'tools.list', args: {} })).status).toBe(401)
+    // A conversation's credential is unchanged: no owner methods, no scope of its choosing.
+    const agentToken = server.briefing(f.spec).match(/Bearer ([a-f0-9]+)/)![1]!
+    const agentListed = await post(agentToken, { method: 'tools.list', args: {}, scope: { projectId: 'ignored' } })
+    expect(agentListed.status).toBe(200)
+    expect(Object.keys(agentListed.body.result as object)).not.toContain('app.restart')
+    server.close()
+    expect(existsSync(path)).toBe(false)
+  })
+})
+
+describe('wizard tabs', () => {
+  const asWizard = (f: ReturnType<typeof fixture>, model: string) => {
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model } })
+  }
+
+  it('a wizard tab holds the owner’s authority in its own conversation, on a frontier model only', async () => {
+    const f = fixture(false, { claude: ['default', 'read-only', 'accept-edits', 'auto'] })
+    const host = { version: '2.0.0', pid: 77, relaunch: vi.fn(async () => {}), updates: { state: vi.fn(() => ({ phase: 'idle' as const, currentVersion: '2.0.0', configured: true })), check: vi.fn(async () => ({ phase: 'idle' as const, currentVersion: '2.0.0', configured: true })), download: vi.fn(async () => ({ phase: 'idle' as const, currentVersion: '2.0.0', configured: true })), install: vi.fn(async () => {}) } }
+    const control = new AgentControl({ ...f.deps, host })
+    // The controller is a Codex tab on the synthetic model: no wand, no owner authority.
+    await expect(control.call(f.scope, 'app.restart', {})).rejects.toThrow(/wizard tab/)
+    expect(await control.call(f.scope, 'app.state', {})).not.toHaveProperty('wizard')
+    // The wand on a lesser model changes nothing.
+    asWizard(f, 'codex-synthetic')
+    await expect(control.call(f.scope, 'app.restart', {})).rejects.toThrow(/wizard tab/)
+    expect((await control.call(f.scope, 'agents.list', {}) as Array<{ agentSessionId: string; wizard: boolean }>).find(entry => entry.agentSessionId === f.spec.id)?.wizard).toBe(false)
+    // The wand on a frontier model: owner-only methods, no dialogs, coworkers on Auto that continue after limits.
+    asWizard(f, 'gpt-6-astra')
+    expect(await control.call(f.scope, 'app.state', {})).toMatchObject({ wizard: true, owner: false, appVersion: '2.0.0' })
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).toContain('app.restart')
+    expect((await control.call(f.scope, 'agents.list', {}) as Array<{ agentSessionId: string; wizard: boolean }>).find(entry => entry.agentSessionId === f.spec.id)?.wizard).toBe(true)
+    vi.useFakeTimers()
+    expect(await control.call(f.scope, 'app.restart', { force: true })).toMatchObject({ restarting: true, force: true })
+    await vi.runAllTimersAsync()
+    vi.useRealTimers()
+    expect(host.relaunch).toHaveBeenCalledWith(true)
+    const opened = await control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Wizard’s worker', focus: false }) as { id: string; resourceId: string }
+    expect(f.database.structured.snapshot(opened.resourceId)!.settings.permission).toBe('auto')
+    expect(f.database.structured.spec<AgentSpec>(opened.resourceId)?.continueOnLimit).toBe(true)
+    // The cable still exists: a wizard is a conversation with a tab, not the credential file.
+    expect(f.database.getSetting('agentControlParent:' + opened.resourceId)).toBeTruthy()
+    await control.call(f.scope, 'memory.remember', { gist: 'Wizard memory' })
+    const memory = f.database.listMemories(f.project.id).find(entry => entry.source === 'agent')!
+    expect(await control.call(f.scope, 'memory.forget', { id: memory.id })).toEqual({ removed: true })
+    expect(f.confirm).not.toHaveBeenCalled()
+    // Read-only or planning switches the wand off without touching the setting.
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, plan: true } })
+    await expect(control.call(f.scope, 'app.restart', {})).rejects.toThrow(/wizard tab/)
+  })
+
+  it('reads the full text of a tool output the history only carries a tail of', async () => {
+    const f = fixture()
+    const worker = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Worker' }) as { resourceId: string }
+    const artifactId = f.database.structured.putOutput(worker.resourceId, 'x'.repeat(50_000) + '{"result":{"outcomes":[]}}')
+    const read = await f.control.call(f.scope, 'agents.artifact', { agentSessionId: worker.resourceId, artifactId }) as { content: string; bytes: number; truncated: boolean }
+    expect(read.bytes).toBe(50_026)
+    expect(read.truncated).toBe(false)
+    expect(read.content.endsWith('{"result":{"outcomes":[]}}')).toBe(true)
+    await expect(f.control.call(f.scope, 'agents.artifact', { agentSessionId: worker.resourceId, artifactId: 'missing' })).rejects.toThrow(/No such tool output artifact/)
+    expect(JSON.stringify(await f.control.call(f.scope, 'tools.list', {}))).toContain('agents.artifact')
   })
 })

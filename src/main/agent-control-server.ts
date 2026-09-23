@@ -1,8 +1,21 @@
 import { randomBytes } from 'node:crypto'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AgentControlScope } from '../shared/agent-control'
 import type { AgentSpec } from '../shared/models'
 import type { AgentControl } from './agent-control'
+
+/** Where the owner's own credential is written, and what a process that reads it may claim. */
+export interface OwnerCredentialOptions { path: string; appVersion: string; packaged: boolean }
+
+/** What `control-owner.json` holds. A process on this machine that can read the file has the
+ *  owner's authority over this Conductor: it is written under the user profile with owner-only
+ *  permissions, regenerated on every launch, and removed when the control server closes, so a
+ *  supervisor outside the app (docs/overseer.md) finds a fresh endpoint after every restart. */
+export interface OwnerCredentialFile { version: 1; endpoint: string; token: string; pid: number; startedAt: string; appVersion: string; packaged: boolean }
+
+const OWNER_KEY = '\0owner'
 
 /** Loopback-only internal protocol, independent of third-party MCP configuration. */
 export class AgentControlServer {
@@ -10,7 +23,8 @@ export class AgentControlServer {
   private endpoint = ''
   private credentials = new Map<string, { token: string; scope: AgentControlScope }>()
   private busy = new Set<string>()
-  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call'>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string) {}
+  private ownerToken?: string
+  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions) {}
 
   async start(): Promise<void> {
     if (this.disabled || this.server) return
@@ -29,6 +43,26 @@ export class AgentControlServer {
     const address = server.address()
     if (!address || typeof address === 'string') throw new Error('Control server failed to bind')
     this.endpoint = `http://127.0.0.1:${address.port}/control`
+    this.writeOwnerCredential()
+  }
+
+  /** The file a process outside the app reads to drive this Conductor as the owner; absent when
+   *  no owner credential was configured or the server is off. */
+  get ownerCredentialPath(): string | null { return this.owner && this.ownerToken ? this.owner.path : null }
+
+  private writeOwnerCredential(): void {
+    if (!this.owner) return
+    this.ownerToken = randomBytes(32).toString('hex')
+    const file: OwnerCredentialFile = { version: 1, endpoint: this.endpoint, token: this.ownerToken, pid: process.pid, startedAt: new Date().toISOString(), appVersion: this.owner.appVersion, packaged: this.owner.packaged }
+    try {
+      mkdirSync(dirname(this.owner.path), { recursive: true })
+      writeFileSync(this.owner.path, JSON.stringify(file, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
+    } catch (error) {
+      // The app still runs and every conversation keeps its own credential; only an outside
+      // supervisor is left without one, and the log says why.
+      this.ownerToken = undefined
+      console.warn('Owner control credential could not be written', error)
+    }
   }
 
   briefing(spec: AgentSpec): string {
@@ -51,12 +85,14 @@ export class AgentControlServer {
     if (Number(request.headers['content-length']) > 3 * 1024 * 1024) { reply(413, { error: 'Control request exceeds 3 MiB' }); request.resume(); return }
     const authorization = request.headers.authorization
     const credential = [...this.credentials.values()].find(credential => authorization === 'Bearer ' + credential.token)
-    if (!credential) { reply(401, { error: 'Unauthorized control session' }); request.resume(); return }
-    const id = credential.scope.agentSessionId
-    if (this.busy.has(id)) { reply(409, { error: 'This session already has a control request in progress' }); request.resume(); return }
-    this.busy.add(id)
+    const owner = Boolean(this.ownerToken) && authorization === 'Bearer ' + this.ownerToken
+    if (!credential && !owner) { reply(401, { error: 'Unauthorized control session' }); request.resume(); return }
+    // One caller at a time, the owner credential included: a supervisor that wants concurrency
+    // opens more than one conversation rather than racing its own calls.
+    const key = owner ? OWNER_KEY : credential!.scope.agentSessionId
+    if (this.busy.has(key)) { reply(409, { error: 'This session already has a control request in progress' }); request.resume(); return }
+    this.busy.add(key)
     try {
-      this.control.authorize(credential.scope)
       const chunks: Buffer[] = []
       let size = 0
       for await (const chunk of request) {
@@ -64,15 +100,21 @@ export class AgentControlServer {
         if (size > 3 * 1024 * 1024) { reply(413, { error: 'Control request exceeds 3 MiB' }); request.destroy(); return }
         chunks.push(Buffer.from(chunk))
       }
-      const input = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { method?: unknown; args?: unknown }
+      const input = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { method?: unknown; args?: unknown; scope?: unknown }
       if (!input || typeof input.method !== 'string' || input.method.length > 100) throw new Error('Provide a method and args object')
-      const result = await this.control.call(credential.scope, input.method, input.args ?? {})
+      // The owner names the project and workspace per call; a conversation's scope is fixed
+      // when its credential is issued and nothing in the body can move it.
+      const scope = owner ? this.control.ownerScope(input.scope) : credential!.scope
+      this.control.authorize(scope)
+      const result = await this.control.call(scope, input.method, input.args ?? {})
       reply(200, { result })
     } catch (error) { reply(400, { error: error instanceof Error ? error.message : 'Control request failed' }) }
-    finally { this.busy.delete(id) }
+    finally { this.busy.delete(key) }
   }
 
   close(): void {
+    if (this.owner && this.ownerToken) { try { rmSync(this.owner.path, { force: true }) } catch { /* the token dies with the process either way */ } }
+    this.ownerToken = undefined
     this.endpoint = ''; this.credentials.clear(); this.busy.clear()
     this.server?.closeAllConnections(); this.server?.close(); this.server = undefined
   }

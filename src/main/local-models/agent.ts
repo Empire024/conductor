@@ -30,6 +30,9 @@ export type LocalTelemetryEntry =
   | { kind: 'compaction'; round: number; mode: 'normal' | 'aggressive'; level: ContextLevel; beforeTokens: number; afterTokens: number; droppedMessages: number }
   | { kind: 'stage'; round: number; stage: RoundStage }
   | { kind: 'stagnation'; round: number; repeats: number; action: 'warn' | 'stop' }
+  /** The server's lazy tool parser returned a call it could not read, and the request was sent
+   *  again under the full tool grammar. `repaired` means the second answer carried valid calls. */
+  | { kind: 'repair'; round: number; name: string; outcome: 'repaired' | 'failed' }
   | { kind: 'tool'; round: number; name: string; rawChars: number; promptChars: number; excludedChars: number }
   | { kind: 'acceptance'; round: number; passed: boolean; exitCode: number }
   | { kind: 'stop'; report: LocalStopReport }
@@ -212,7 +215,7 @@ export const UNPARSEABLE_ARGUMENTS = '{}'
  *  controls: a smaller call. */
 export function malformedCallResult(name: string, raw: string, truncated: boolean, limitTokens = RESPONSE_RESERVE_TOKENS): string {
   const size = `${raw.length} characters`
-  if (!truncated) return `failed: the ${name} arguments were not a JSON object (${size}), so nothing ran. Send the call again with valid JSON arguments.`
+  if (!truncated) return `failed: the ${name} arguments were not a JSON object (${size}), so nothing ran. Send one tool call whose arguments are a JSON object matching the tool schema, or answer in text without a tool.`
   const parts = name === 'write_file'
     ? ' Write a large file in parts: write_file the first part, then write_file with append: true for each further part, keeping every call under about 6000 characters of content.'
     : ' Split the work into smaller calls.'
@@ -400,7 +403,7 @@ export class LocalAgentSession {
    *  fail exactly the same way on the next prompt: the retry repairs the tool protocol, halves
    *  what is sent and drops the optional parameters a given build may not know. That is the
    *  difference between a conversation that recovers itself and one that stays dead. */
-  private async complete(events: LocalAgentEvents, tools: ToolSpec[], overheadTokens: number, reserveTokens: number, signal?: AbortSignal): Promise<CompletionResult> {
+  private async complete(events: LocalAgentEvents, tools: ToolSpec[], overheadTokens: number, reserveTokens: number, signal?: AbortSignal, toolChoice?: 'auto' | 'required'): Promise<CompletionResult> {
     for (let attempt = 0; ; attempt++) {
       const execution = this.taskState!.execution!
       const exhausted = this.exhausted(execution)
@@ -423,6 +426,7 @@ export class LocalAgentSession {
           contextTokens: this.options.contextTokens,
           measureTokens: this.options.measureTokens,
           maxTokens: reserveTokens,
+          ...(toolChoice ? { toolChoice } : {}),
           // Thinking is left to the model on a first attempt; a retry also gives up the
           // parameter itself, since an unknown one is refused by some builds with the same 400.
           ...(attempt ? {} : { reasoningEffort: 'none' as const }),
@@ -652,15 +656,40 @@ export class LocalAgentSession {
         events.notice?.(error instanceof Error ? error.message : 'Local model request failed')
         return this.finish(ledger, events, finalText, 'provider_error', error instanceof Error ? error.message : 'Local model request failed')
       }
-      if (completion.usage) {
-        execution.budgets.tokens += (completion.usage.inputTokens ?? 0) + (completion.usage.outputTokens ?? 0)
-        ledger.lastExactUsage = completion.usage
-        events.usage?.(completion.usage, { reserveTokens: reserve, round: ledger.round })
-        events.telemetry?.({ kind: 'usage', round: ledger.round, inputTokens: completion.usage.inputTokens, outputTokens: completion.usage.outputTokens, cachedTokens: completion.usage.cachedTokens })
+      const account = (result: CompletionResult): void => {
+        if (!result.usage) return
+        execution.budgets.tokens += (result.usage.inputTokens ?? 0) + (result.usage.outputTokens ?? 0)
+        ledger.lastExactUsage = result.usage
+        events.usage?.(result.usage, { reserveTokens: reserve, round: ledger.round })
+        events.telemetry?.({ kind: 'usage', round: ledger.round, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cachedTokens: result.usage.cachedTokens })
       }
-      const calls: ToolCall[] = completion.toolCalls
-      const truncated = completion.finishReason === 'length'
+      account(completion)
+      let calls: ToolCall[] = completion.toolCalls
+      let truncated = completion.finishReason === 'length'
       const ruminated = completion.finishReason === 'rumination'
+
+      // A call whose arguments are not a JSON object, in a reply that was not cut off, is the
+      // server's lazy tool parser giving up part-way (Dolphin X1, a Llama 3.1 fine-tune, writes
+      // "arguments" where its template says "parameters" and arrives as `{`). The model did want
+      // a tool, so the same request goes out once more with the full grammar enforced, which
+      // makes that model produce the complete call; a second failure falls through to the
+      // ordinary malformed-call result and the stagnation detector below.
+      if (!truncated && calls.length && calls.some(call => !argumentsAreObject(call.arguments)) && ledger.requests < requestCeiling) {
+        const names = [...new Set(calls.filter(call => !argumentsAreObject(call.arguments)).map(call => call.name))].join(', ')
+        events.notice?.(`The local server could not parse the model's ${names} call; asking again with the tool grammar enforced.`)
+        let repaired: CompletionResult | undefined
+        try {
+          ledger.requests++
+          repaired = await this.complete(events, tools, overheadTokens, reserve, signal, 'required')
+        } catch (error) {
+          if (signal?.aborted) return this.finish(ledger, events, finalText, 'interrupted', 'The turn was stopped.')
+          events.notice?.(`The grammar-enforced retry failed: ${error instanceof Error ? error.message : 'local model request failed'}`)
+        }
+        if (repaired) account(repaired)
+        const valid = Boolean(repaired?.toolCalls.length) && repaired!.toolCalls.every(call => argumentsAreObject(call.arguments))
+        events.telemetry?.({ kind: 'repair', round: ledger.round, name: names, outcome: valid ? 'repaired' : 'failed' })
+        if (valid) { completion = repaired!; calls = completion.toolCalls; truncated = false }
+      }
 
       if (ruminated && !calls.length) {
         // The monologue itself is never stored: it is exactly what would fill the next window.
@@ -748,6 +777,11 @@ export class LocalAgentSession {
           events.toolEnd?.({ id: call.id, name: call.name, output, failed: true, durationMs: Date.now() - started })
           this.messages.push({ role: 'tool', tool_call_id: call.id, content: output })
           observeExecution(execution, call, output, true)
+          // A stub is a failed call like any other: the same one again and again is the loop the
+          // detector exists for, and it must end the turn rather than burn every round on it.
+          const verdict = ledger.detector.observe({ name: call.name, arguments: {}, output, failed: true, analysis: this.processing })
+          if (verdict.action === 'stop') { stagnationStop = `The model sent ${verdict.repeats} ${call.name} calls in a row whose arguments were not a JSON object, even after the tool grammar was enforced; this model cannot drive tools in this conversation.`; events.telemetry?.({ kind: 'stagnation', round: ledger.round, repeats: verdict.repeats, action: 'stop' }) }
+          else if (verdict.action === 'warn') { stagnationWarning = verdict.message; events.telemetry?.({ kind: 'stagnation', round: ledger.round, repeats: verdict.repeats, action: 'warn' }) }
           continue
         }
         // A tool that throws instead of returning a failure would otherwise unwind the turn

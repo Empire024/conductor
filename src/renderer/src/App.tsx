@@ -1657,7 +1657,7 @@ export function App(): React.JSX.Element {
           onDismiss={() => setDismissedUpdateVersion(updateState.availableVersion ?? null)}
         />
       )}
-      {agentConfirm.request && <AgentConfirmDialog request={agentConfirm.request} onRespond={agentConfirm.respond} />}
+      {agentConfirm.request && <AgentConfirmDialog key={agentConfirm.request.id} request={agentConfirm.request} onRespond={agentConfirm.respond} />}
       {appSettings.debugLogging && debugConsoleOpen && (
         <DebugConsole
           context={debugContext}

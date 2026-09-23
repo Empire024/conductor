@@ -6,6 +6,7 @@ import type { AgentControlDependencies } from './agent-control'
 import type { ApprovalReviewRouting } from './approval-review-gate'
 import { ReviewRunError, type ReviewAction, type ReviewResult } from './approval-review'
 import { summarizeUsageRun } from '../shared/usage-accounting'
+import { wizardActive } from '../shared/structured-agent'
 
 export interface ReviewRoutingHost {
   controller(id: string): string | undefined
@@ -39,9 +40,14 @@ export function createApprovalRouting(deps: AgentControlDependencies, host: Revi
     }
     return false
   }
+  /** The explicit opt-in, or a wizard controller: a wizard answers for its coworkers, and this
+   *  review is how it does so for the requests the runtime's own Auto could not answer. */
   const enabled = (spec: AgentSpec) => {
     const parent = host.controller(spec.id)
-    return !deps.sessions.isApprovalReviewer(spec.id) && Boolean(parent && deps.database.structured.snapshot(parent)?.settings.reviewDelegatedActions) && supported(spec)
+    if (!parent || deps.sessions.isApprovalReviewer(spec.id)) return false
+    const settings = deps.database.structured.snapshot(parent)?.settings
+    const opted = Boolean(settings?.reviewDelegatedActions) || wizardActive(settings, deps.database.structured.spec<AgentSpec>(parent)?.provider)
+    return opted && supported(spec)
   }
   const authorization = (spec: AgentSpec) => {
     let current = spec
