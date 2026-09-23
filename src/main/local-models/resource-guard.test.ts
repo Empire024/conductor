@@ -28,12 +28,15 @@ describe('local model admission resources', () => {
   })
   it('budgets Dolphin X1 8B with full-attention Llama geometry, not the hybrid 9B cache', () => {
     const model = defaultModelConfig(DOLPHIN_X1_8B)
-    expect(model).toMatchObject({ port: 51438, gpuLayers: 999, quant: 'Q4_K_M', contextTokens: 32768 })
+    expect(model).toMatchObject({ port: 51438, gpuLayers: 999, quant: 'Q4_K_M', contextTokens: 32768, kvCacheType: 'q8_0' })
+    const f16 = { ...model, kvCacheType: undefined }
     // 32 cached layers × 8 KV heads × 128 × K+V × fp16 is 128 KiB per token: 4 GiB at 32k.
-    expect(resourceRequirements({ ...model, contextTokens: 65536 }).vramBytes - resourceRequirements(model).vramBytes).toBe(4 * GiB)
-    expect(resourceRequirements(model).vramBytes).toBe(model.sizeBytes + 4 * GiB + 1.75 * GiB)
-    expect(() => assertResourceHeadroom(model, { ramFreeBytes: 30 * GiB, vramFreeBytes: 11 * GiB })).not.toThrow()
-    expect(() => assertResourceHeadroom(model, { ramFreeBytes: 30 * GiB, vramFreeBytes: 10 * GiB })).toThrow('Not enough memory')
+    expect(resourceRequirements({ ...f16, contextTokens: 65536 }).vramBytes - resourceRequirements(f16).vramBytes).toBe(4 * GiB)
+    expect(resourceRequirements(f16).vramBytes).toBe(model.sizeBytes + 4 * GiB + 1.75 * GiB)
+    expect(() => assertResourceHeadroom(f16, { ramFreeBytes: 30 * GiB, vramFreeBytes: 10 * GiB })).toThrow('Not enough memory')
+    // The default q8_0 cache fits the 9.8 GiB a 12 GB card has free beside the desktop.
+    expect(resourceRequirements(model).vramBytes).toBeLessThan(8.5 * GiB)
+    expect(() => assertResourceHeadroom(model, { ramFreeBytes: 30 * GiB, vramFreeBytes: 9.8 * GiB })).not.toThrow()
     expect(() => assertResourceHeadroom({ ...model, file: 'Dolphin-X1-8B-Q5_K_M.gguf', sizeBytes: 5732991968 }, { ramFreeBytes: 30 * GiB, vramFreeBytes: 12 * GiB })).toThrow('No reviewed memory envelope')
   })
   it('fails closed for unreadable telemetry and unreviewed runtime flags', () => {

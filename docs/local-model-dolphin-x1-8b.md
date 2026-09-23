@@ -55,9 +55,11 @@ size 128, which is 128 KiB per token at fp16, four times what the Qwen 3.5 / Orn
 | Admission VRAM envelope (weights + KV + 1.75 GiB) | 8.13 GiB | 10.33 GiB |
 
 That is why the pin is Q4_K_M rather than Q5_K_M (5.73 GB): Q5 would need an 11.09 GiB envelope,
-more than the card has free with the desktop running. The configured context stays at the stack's
-32k; a larger window should use `kvCacheType: "q8_0"` in the local config rather than a bigger
-quantization. Port 51438, all layers on the GPU.
+more than the card has free with the desktop running. Even the fp16 Q4_K_M envelope proved too big:
+the first start was refused with 9.8 GiB free (the desktop holds about 2.2 GB). Dolphin therefore
+defaults to a q8_0 KV cache (`DEFAULT_KV_CACHE_TYPES` in `src/main/local-models/config.ts`, also
+applied to an existing config that names no `kvCacheType`): 2.12 GiB of KV and an 8.45 GiB
+envelope at 32k. Set `kvCacheType: "f16"` explicitly to opt out. Port 51438, all layers on the GPU.
 
 ## Limits
 

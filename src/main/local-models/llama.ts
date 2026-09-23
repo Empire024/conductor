@@ -479,11 +479,12 @@ async function startAdmittedServer(executable: string, model: LocalModelConfig, 
   const path = modelFilePath(model)
   if (!existsSync(path)) throw new Error(`Model file missing: ${path}`)
   if (switched) await waitForHeadroom(model)
-  assertResourceHeadroom(model)
+  const features = model.kvCacheType || model.flashAttention ? await llamaServerFeatures(executable) : undefined
+  // Budget the cache the server will actually get: a build without the cache-type flags runs f16.
+  assertResourceHeadroom(model.kvCacheType && !(features?.cacheTypeK && features.cacheTypeV) ? { ...model, kvCacheType: undefined } : model)
   const log = openSync(logFile(model), 'a')
   // TEMP, caches and any model-cache variable point at the local root, so the server can never
   // stage large files on the system drive.
-  const features = model.kvCacheType || model.flashAttention ? await llamaServerFeatures(executable) : undefined
   const child = spawn(executable, llamaServerArgs({ ...model, port }, apiKey, path, features), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
   closeSync(log)
   let spawnError = ''

@@ -91,6 +91,10 @@ export const PINNED_MODELS: Record<string, Array<Omit<LocalModelConfig, 'port' |
 export const DEFAULT_CONTEXT_TOKENS = 32768
 export const DEFAULT_PORTS: Record<string, number> = { [ORNITH_9B]: 51435, [QWEN_9B]: 51437, [QWEN_35B]: 51436, [DOLPHIN_X1_8B]: 51438 }
 export const DEFAULT_GPU_LAYERS: Record<string, number> = { [ORNITH_9B]: 999, [QWEN_9B]: 999, [QWEN_35B]: 10, [DOLPHIN_X1_8B]: 999 }
+/** Dolphin X1 8B caches every layer: at f16 its 32k KV (4 GiB) plus weights and reserves needs
+ *  10.3 GiB, more than a 12 GB card has free beside the desktop (~2.2 GB). q8_0 halves the cache.
+ *  Applied when a model's config names no kvCacheType, so existing setups pick it up too. */
+export const DEFAULT_KV_CACHE_TYPES: Record<string, KvCacheType> = { [DOLPHIN_X1_8B]: 'q8_0' }
 
 export const DEFAULT_SANDBOX: SandboxConfig = {
   image: 'conductor-local-sandbox:1',
@@ -189,13 +193,15 @@ export function defaultModelConfig(id: string, quant?: string): LocalModelConfig
   if (!options?.length) throw new Error(`Unknown local model: ${id}`)
   const pinned = quant ? options.find(option => option.quant === quant) : options[0]
   if (!pinned) throw new Error(`Unknown quantization ${quant} for ${id}`)
-  return { ...pinned, port: DEFAULT_PORTS[id]!, contextTokens: DEFAULT_CONTEXT_TOKENS, gpuLayers: DEFAULT_GPU_LAYERS[id]!, extraArgs: [] }
+  return { ...pinned, port: DEFAULT_PORTS[id]!, contextTokens: DEFAULT_CONTEXT_TOKENS, gpuLayers: DEFAULT_GPU_LAYERS[id]!, extraArgs: [], ...(DEFAULT_KV_CACHE_TYPES[id] ? { kvCacheType: DEFAULT_KV_CACHE_TYPES[id] } : {}) }
 }
 
 export function loadConfig(): LocalStackConfig {
   const path = configPath()
   if (!existsSync(path)) throw new Error('Local model stack is not set up; run scripts/local-models/setup.ps1')
-  return validateConfig(JSON.parse(readFileSync(path, 'utf8')) as LocalStackConfig)
+  const config = validateConfig(JSON.parse(readFileSync(path, 'utf8')) as LocalStackConfig)
+  for (const model of Object.values(config.models ?? {})) if (model.kvCacheType === undefined && DEFAULT_KV_CACHE_TYPES[model.id] && model.flashAttention !== 'off') model.kvCacheType = DEFAULT_KV_CACHE_TYPES[model.id]
+  return config
 }
 
 export function saveConfig(config: LocalStackConfig): void {
