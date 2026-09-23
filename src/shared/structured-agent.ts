@@ -1,6 +1,6 @@
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from './agent-change-history'
 /** Versioned, provider-neutral envelope. Native IDs never double as Conductor IDs. */
-export type StructuredProvider = 'codex' | 'claude' | 'local'
+export type StructuredProvider = 'codex' | 'claude' | 'grok' | 'local'
 export type Json = null | boolean | number | string | Json[] | { [key: string]: Json }
 export type SessionPhase = 'idle' | 'starting' | 'running' | 'waiting_approval' | 'waiting_input' | 'interrupting' | 'completed' | 'failed' | 'disconnected' | 'interrupted'
 /** The true native CLI/API ceiling. Text, attachment expansion and recalled memory context
@@ -67,9 +67,11 @@ export const isFrontierModel = (provider: string | undefined, model: string | un
   if (!model) return false
   if (provider === 'claude') return /(?:^|[-/])(?:opus|fable)/i.test(model)
   if (provider === 'codex') return /^gpt-6(?:[-.]|$)|astra/i.test(model)
+  // xAI's frontier tier from Grok 4.6 on (Grok Build 1.0.41 describes 4.6 and 4.7 that way, 2026-09-24).
+  if (provider === 'grok') return /^grok-(?:4\.(?:[6-9]|\d{2,})|[5-9]|\d{2,})(?:[-.]|$)/i.test(model)
   return false
 }
-export const WIZARD_MODEL_HINT = 'Claude Opus or Fable, or GPT-6 Astra'
+export const WIZARD_MODEL_HINT = 'Claude Opus or Fable, GPT-6 Astra, or Grok 4.6 and later'
 /** Whether a conversation is a wizard right now: the toggle, a frontier model, and no read-only
  *  or planning restriction, since a restricted controller could not hand out what it lacks. */
 export const wizardActive = (settings: SessionSettings | undefined, provider: string | undefined): boolean =>

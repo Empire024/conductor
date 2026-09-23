@@ -41,6 +41,7 @@
   const PROVIDER_WORDS = {
     codex: 'Codex',
     claude: 'Claude',
+    grok: 'Grok',
     local: 'Local',
     gemini: 'Gemini',
     qwen: 'Qwen',

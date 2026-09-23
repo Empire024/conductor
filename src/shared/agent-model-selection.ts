@@ -8,6 +8,8 @@ export const explicitModel = (value: unknown): value is string => typeof value =
  *  choose on its own for this account. */
 export const CLAUDE_FALLBACK_MODEL = 'opus[1m]'
 export const CODEX_FALLBACK_MODEL = 'gpt-6-astra'
+/** A signed-in Grok 1.0.41's own default model (`initialize` modelState, 2026-09-24). */
+export const GROK_FALLBACK_MODEL = 'grok-4.7'
 /** True when a Claude selection is only Conductor's pre-discovery stand-in, not something the
  *  owner chose from a catalog or the runtime reported, so the composer can call it "Account default".
  *  With no capabilities yet the provider is unknown to the caller; no other provider uses this id. */
@@ -20,5 +22,5 @@ export function concreteModel(provider: string, configured?: string, capabilitie
   const effective = capabilities?.effectiveSettings
   if (effective && typeof effective === 'object' && !Array.isArray(effective) && explicitModel(effective.model)) return effective.model
   const models = capabilities?.models.filter(model => explicitModel(model.id)) ?? []
-  return models.find(model => model.isDefault)?.id ?? models[0]?.id ?? (provider === 'claude' ? CLAUDE_FALLBACK_MODEL : provider === 'local' ? DEFAULT_LOCAL_MODEL : CODEX_FALLBACK_MODEL)
+  return models.find(model => model.isDefault)?.id ?? models[0]?.id ?? (provider === 'claude' ? CLAUDE_FALLBACK_MODEL : provider === 'grok' ? GROK_FALLBACK_MODEL : provider === 'local' ? DEFAULT_LOCAL_MODEL : CODEX_FALLBACK_MODEL)
 }

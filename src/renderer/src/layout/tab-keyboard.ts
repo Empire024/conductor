@@ -17,6 +17,7 @@ export interface ChordTarget {
 export const TAB_CHORD: Record<string, ChordTarget> = {
   x: { kind: 'agent', provider: 'codex', label: 'Codex' },
   c: { kind: 'agent', provider: 'claude', label: 'Claude Code' },
+  r: { kind: 'agent', provider: 'grok', label: 'Grok' },
   q: { kind: 'agent', provider: 'qwen', label: 'Qwen Code' },
   k: { kind: 'agent', provider: 'kimi', label: 'Kimi Code' },
   g: { kind: 'agent', provider: 'gemini', label: 'Gemini CLI' },

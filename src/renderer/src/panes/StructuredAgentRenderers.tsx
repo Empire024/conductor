@@ -66,7 +66,7 @@ export function isConversationActivity(item: TimelineItem, _index?: number, item
   if (data.type !== 'notice') return true
   if (data.outputArtifactId) return true
   if (/^(?:Snapshot unavailable:|Unsupported .*control request:|Live retry stopped:|Incomplete tool input JSON;)/.test(data.message) || data.message.includes('Interruption requested;')) return true
-  if (/^(?:Codex event:|Codex process diagnostic|Claude process diagnostic|Codex effective thread settings|Native Codex settings updated|Current turn diff \(provider aggregate\)|Codex live fixture isolation|Claude runtime capabilities|Claude reported a lower cumulative cost)/.test(data.message)) return false
+  if (/^(?:Codex event:|Grok event:|Codex process diagnostic|Claude process diagnostic|Grok process diagnostic|Codex effective thread settings|Native Codex settings updated|Current turn diff \(provider aggregate\)|Codex live fixture isolation|Claude runtime capabilities|Claude reported a lower cumulative cost)/.test(data.message)) return false
   // A local run's stop report is conversation activity whenever it is not the model's own final
   // answer: the owner must see "round limit" or "context limit" where a failure would otherwise be.
   const stop = localStopOf(data)
@@ -409,8 +409,14 @@ function OutputPreview({ value, sessionId, artifactId, language }: { value: stri
   }
   return <><pre><SyntaxCode value={value.slice(0, 8000)} language={language} /></pre><div className="sa-output-actions"><button aria-label="Copy output" onClick={() => void copyText(value)}><Copy size={12} /> Copy</button>{(value.length > 8000 || artifactId) && <button onClick={() => void expanded()}><Maximize2 size={12} /> Expand output</button>}</div>{error && <p role="alert">{error}</p>}{full !== null && <AgentDialog title="Tool output" onClose={() => setFull(null)}><div className="sa-diff-toolbar"><button onClick={() => void copyText(full)}><Copy size={13} /> Copy full output</button><small>{full.length.toLocaleString()} characters</small></div><pre className="sa-expanded-output"><SyntaxCode value={full} language={language} /></pre></AgentDialog>}</>
 }
-export function interactionOutcome(outcome?: string): string {
+/** A runtime whose decisions are its own option ids (Grok's ACP options) is named by the label
+ *  it offered for that option rather than by the raw id. */
+export function interactionOutcome(outcome?: string, choices?: Array<{ id: string; label: string }>): string {
   if (!outcome) return 'Resolved'
+  const known = interactionOutcomeLabel(outcome)
+  return known === outcome ? choices?.find(choice => choice.id === outcome)?.label ?? outcome : known
+}
+function interactionOutcomeLabel(outcome: string): string {
   return ({ accept: 'Accepted', acceptForSession: 'Accepted for session', acceptWithExecpolicyAmendment: 'Always allowed (Codex rule)', decline: 'Declined', cancel: 'Cancelled', allow: 'Allowed', 'allow-session': 'Allowed for session', 'auto-mode': 'Auto-mode enabled', deny: 'Denied', abort: 'Cancelled', answered: 'Answered' } as Record<string, string>)[outcome] ?? outcome
 }
 const MAX_ANSWER_VALUE_LENGTH = 72
@@ -442,7 +448,7 @@ function InteractionCard({ item, interactive, onRespond, dockedQuestion, onDockQ
   // question that was actually asked instead of repeating the generic, now-stale "needs your
   // input" prompt, and its body reads as question/answer text instead of a raw request dump.
   const heading = request.kind === 'question' && questions.length ? (questions.length === 1 ? questions[0]!.question : `${questions.length} questions`) : request.title
-  const status = request.kind === 'question' && request.status === 'resolved' ? 'Answered' : request.status === 'resolved' ? interactionOutcome(request.outcome) : request.status === 'expired' ? 'Expired' : 'Unavailable'
+  const status = request.kind === 'question' && request.status === 'resolved' ? 'Answered' : request.status === 'resolved' ? interactionOutcome(request.outcome, request.choices) : request.status === 'expired' ? 'Expired' : 'Unavailable'
   return <details className="sa-interaction sa-interaction-resolved" aria-label={request.kind + ': ' + request.title}>
     <summary><span>{heading}</span><small>{status}</small></summary>
     <div className="sa-interaction-detail">

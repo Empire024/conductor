@@ -79,16 +79,17 @@ export class BrowserMcpServer {
    *  bearer token of every live session in one line, and this bridge grants whoever holds a token
    *  that session's whole browser view — so the secret does not travel in argv. */
   configure(spec: Pick<AgentSpec, 'id' | 'projectId' | 'sessionId' | 'provider'>): string {
-    if (!this.endpoint || this.disabled || !['claude', 'codex'].includes(spec.provider)) return ''
+    if (!this.endpoint || this.disabled || !['claude', 'codex', 'grok'].includes(spec.provider)) return ''
     let credential = this.credentials.get(spec.id)
     if (!credential || credential.scope.projectId !== spec.projectId || credential.scope.sessionId !== spec.sessionId) {
       this.discard(credential)
       credential = { token: randomBytes(32).toString('hex'), scope: { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id } }
       this.credentials.set(spec.id, credential)
     }
-    // Claude consumes this file through --mcp-config. Codex reads the snake_case shape into its
-    // thread/start or thread/resume config; neither token is put on the process command line.
-    const configuration = JSON.stringify(spec.provider === 'claude'
+    // Claude consumes this file through --mcp-config and Grok's adapter turns the same shape into
+    // an ACP session/new server entry. Codex reads the snake_case shape into its thread/start or
+    // thread/resume config; no token is put on a process command line.
+    const configuration = JSON.stringify(spec.provider === 'claude' || spec.provider === 'grok'
       ? { mcpServers: { [BROWSER_MCP_SERVER_NAME]: { type: 'http', url: this.endpoint, headers: { Authorization: `Bearer ${credential.token}` } } } }
       : { mcp_servers: { [BROWSER_MCP_SERVER_NAME]: { url: this.endpoint, http_headers: { Authorization: `Bearer ${credential.token}` } } } })
     // Automation-profile evidence hook: a smoke run has to hold the very credential the CLI was

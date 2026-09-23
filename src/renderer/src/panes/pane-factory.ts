@@ -26,7 +26,7 @@ export const createPaneTab = (
       return {
         id: makeId('pane'),
         kind,
-        title: options?.title ?? (provider === 'local' ? localModelLabel(options?.model) : { codex: 'Codex', claude: 'Claude', gemini: 'Gemini', qwen: 'Qwen Code', kimi: 'Kimi Code' }[provider]),
+        title: options?.title ?? (provider === 'local' ? localModelLabel(options?.model) : { codex: 'Codex', claude: 'Claude', grok: 'Grok', gemini: 'Gemini', qwen: 'Qwen Code', kimi: 'Kimi Code' }[provider]),
         resourceId: options?.resourceId ?? makeId('agent'),
         state: { provider, resume: Boolean(options?.resume), model: options?.model ?? 'default', effort: 'auto', ...remote }
       }

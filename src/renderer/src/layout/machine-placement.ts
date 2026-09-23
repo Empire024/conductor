@@ -149,7 +149,7 @@ export async function createPlacedTab(request: PlacedTabRequest): Promise<PaneTa
   const placed = await window.conductor.remote.openTab({
     machineId, projectId, sessionId, ...(provider ? { provider } : {}), ...(model ? { model } : {})
   })
-  const runtime = provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex'
+  const runtime = provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : provider === 'grok' ? 'Grok'
     : provider === 'local' ? localModelLabel(model) : provider ?? 'Agent'
   return createPaneTab(kind, {
     provider,

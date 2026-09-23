@@ -55,12 +55,12 @@ const REMEMBERED_BROWSER_TOOLS_PREFIX = 'rememberedBrowserTools:'
  * whether the owner or a coworker opened them. Local models have no browser; nothing is stored.
  */
 export function rememberedBrowserTools(getSetting: (key: string) => string | null, provider: string | undefined): boolean | undefined {
-  if (provider !== 'claude' && provider !== 'codex') return undefined
+  if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok') return undefined
   const value = getSetting(REMEMBERED_BROWSER_TOOLS_PREFIX + provider)
   return value === 'true' ? true : value === 'false' ? false : undefined
 }
 export function rememberBrowserTools(setSetting: (key: string, value: string) => void, provider: string | undefined, enabled: boolean): void {
-  if (provider !== 'claude' && provider !== 'codex') return
+  if (provider !== 'claude' && provider !== 'codex' && provider !== 'grok') return
   setSetting(REMEMBERED_BROWSER_TOOLS_PREFIX + provider, enabled ? 'true' : 'false')
 }
 

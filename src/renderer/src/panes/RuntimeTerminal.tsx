@@ -82,7 +82,7 @@ const lightTerminalTheme = {
 }
 
 export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element {
-  if (props.mode === 'agent' && (props.provider === 'codex' || props.provider === 'claude' || props.provider === 'local' || !props.provider)) {
+  if (props.mode === 'agent' && (props.provider === 'codex' || props.provider === 'claude' || props.provider === 'grok' || props.provider === 'local' || !props.provider)) {
     return <StructuredRuntime {...props} />
   }
   return <TerminalRuntimePane {...props} />

@@ -16,7 +16,7 @@ export type PaneKind =
   /** A view of one durable local-model job; resourceId is the job id (src/shared/durable-jobs.ts). */
   | 'job'
 
-export type AgentProviderId = 'codex' | 'claude' | 'gemini' | 'qwen' | 'kimi' | 'local'
+export type AgentProviderId = 'codex' | 'claude' | 'grok' | 'gemini' | 'qwen' | 'kimi' | 'local'
 export type AgentEffort = 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 
 export const THEME_IDS = ['night-owl', 'obsidian', 'nord'] as const

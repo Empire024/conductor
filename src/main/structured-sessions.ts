@@ -1,7 +1,7 @@
 import { concreteModel } from '../shared/agent-model-selection'
 import { sessionCheckpoint } from './local-models/session-checkpoint'
 import { deriveConversationTitle } from '../shared/conversation-title'
-import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-history'
+import { readClaudeHistory, hasClaudeHistory, readGrokHistory, hasGrokHistory, historyEvent } from './native-history'
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
@@ -142,7 +142,7 @@ export class StructuredSessions {
     // them off for this provider (saveSettings remembers the composer's toggle) — whoever opened
     // it: an owner tab, a coworker a controller opened, or a router task. An existing conversation
     // keeps its own choice, and local models have no browser.
-    const browserOn = (spec.provider === 'claude' || spec.provider === 'codex') && (rememberedBrowserTools(key => this.database.getSetting(key), spec.provider) ?? true)
+    const browserOn = (spec.provider === 'claude' || spec.provider === 'codex' || spec.provider === 'grok') && (rememberedBrowserTools(key => this.database.getSetting(key), spec.provider) ?? true)
     if (!previousSpec) store.update(spec.id, { settings: { ...state.settings, model: concreteModel(spec.provider, spec.model, state.capabilities), effort: spec.effort && spec.effort !== 'auto' ? spec.effort : undefined, ...(browserOn ? { browserMcp: true } : {}) } })
     // Registration constructs no process. Views subscribe to this backend resource.
     if (!this.live.has(spec.id)) this.live.set(spec.id, { spec: previousSpec ?? spec, executable: executable ?? '', runtimeId: '', submitting: false, closed: false, responses: new Set() })
@@ -193,7 +193,7 @@ export class StructuredSessions {
     return { id: spec.id, available, status: available ? 'running' : 'unavailable', transcript: '', executable: executable ?? undefined, model: state.settings.model ?? spec.model ?? 'default', message: available ? undefined : 'Provider CLI not found. Configure its executable before connecting.' }
   }
   private validateSpec(spec: AgentSpec): void {
-    if (!spec || !/^[a-zA-Z0-9_-]{1,160}$/.test(spec.id) || !['claude', 'codex', 'local'].includes(spec.provider)) throw new Error('Invalid structured agent session')
+    if (!spec || !/^[a-zA-Z0-9_-]{1,160}$/.test(spec.id) || !['claude', 'codex', 'grok', 'local'].includes(spec.provider)) throw new Error('Invalid structured agent session')
     const project = this.database.getProject(spec.projectId), workspace = this.database.getSession(spec.sessionId)
     if (!project || !workspace || workspace.projectId !== project.id) throw new Error('Invalid project/workspace binding')
     // Existing project model has no separate authorized-worktree catalog.
@@ -301,7 +301,7 @@ export class StructuredSessions {
           this.database.setSetting('newNative:' + id, 'true')
           this.emit(live, { data: { type: 'session', phase: 'idle', nativeSessionId } })
         }
-        const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, nativeSessionId) : await live.adapter?.history?.() ?? []
+        const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, nativeSessionId) : live.spec.provider === 'grok' ? await readGrokHistory(nativeSessionId) : await live.adapter?.history?.() ?? []
         const handoff = { id: randomUUID(), known: history.map((item) => item.id) }
         // Persist ownership before releasing the structured process.
         this.database.setSetting('cliHandoff:' + id, JSON.stringify(handoff))
@@ -314,7 +314,7 @@ export class StructuredSessions {
       state = store.snapshot(id)!
       const settings = settingsForRuntime(state.settings)
       this.emit(live, { data: { type: 'session', phase: 'idle', view: 'cli', settings } })
-      return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings, fresh: live.spec.provider === 'claude' && this.database.getSetting('newNative:' + id) === 'true' && !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) }
+      return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings, fresh: this.database.getSetting('newNative:' + id) === 'true' && (live.spec.provider === 'claude' ? !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) : live.spec.provider === 'grok' && !hasGrokHistory(state.nativeSessionId!)) }
     } finally { live.handoff = false }
   }
   cancelCli(id: string): void {
@@ -338,7 +338,7 @@ export class StructuredSessions {
       }
       await this.connect(live)
       const state = this.database.structured.snapshot(id)!
-      const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, state.nativeSessionId!) : await this.get(id).adapter?.history?.() ?? []
+      const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, state.nativeSessionId!) : live.spec.provider === 'grok' ? await readGrokHistory(state.nativeSessionId!) : await this.get(id).adapter?.history?.() ?? []
       const known = new Set(handoff.known)
       // A failed/retried import reuses the handoff identity, so journal replay reconciles each item.
       for (const item of history) if (!known.has(item.id)) this.emit(live, historyEvent(item, handoff.id))

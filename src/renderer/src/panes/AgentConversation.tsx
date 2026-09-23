@@ -78,7 +78,7 @@ const readableBody = (body: string): string => {
       const trimmed = line.trim()
       if (/^[╭╮╰╯│─┌┐└┘═━┏┓┗┛┊┋]{3,}$/.test(trimmed)) return false
       if (!trimmed || trimmed.length > 180) return true
-      if (seen.has(trimmed) && /^(Claude|Codex|Gemini|Qwen|Kimi|Model|Context|Tips?:)/i.test(trimmed)) return false
+      if (seen.has(trimmed) && /^(Claude|Codex|Grok|Gemini|Qwen|Kimi|Model|Context|Tips?:)/i.test(trimmed)) return false
       seen.add(trimmed)
       return true
     })

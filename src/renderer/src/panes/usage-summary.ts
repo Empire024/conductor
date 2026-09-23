@@ -57,6 +57,7 @@ export interface SubagentSummary {
 const providerCommands: Array<{ provider: AgentProviderId; pattern: RegExp }> = [
   { provider: 'codex', pattern: /(^|[\\/\s"'])codex(\.\w+)?(\s|$)/i },
   { provider: 'claude', pattern: /(^|[\\/\s"'])claude(\.\w+)?(\s|$)/i },
+  { provider: 'grok', pattern: /(^|[\\/\s"'])grok(\.\w+)?(\s|$)/i },
   { provider: 'gemini', pattern: /(^|[\\/\s"'])gemini(\.\w+)?(\s|$)/i },
   { provider: 'qwen', pattern: /(^|[\\/\s"'])qwen(\.\w+)?(\s|$)/i },
   { provider: 'kimi', pattern: /(^|[\\/\s"'])kimi(\.\w+)?(\s|$)/i }

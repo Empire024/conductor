@@ -66,7 +66,7 @@ export class AgentControlServer {
   }
 
   briefing(spec: AgentSpec): string {
-    if (!this.endpoint || this.disabled || !['codex', 'claude'].includes(spec.provider)) return ''
+    if (!this.endpoint || this.disabled || !['codex', 'claude', 'grok'].includes(spec.provider)) return ''
     let credential = this.credentials.get(spec.id)
     if (!credential || credential.scope.projectId !== spec.projectId || credential.scope.sessionId !== spec.sessionId) {
       credential = { token: randomBytes(32).toString('hex'), scope: { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id } }

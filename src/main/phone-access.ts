@@ -197,7 +197,7 @@ export function normalizePhoneSettings(value: unknown): PhoneAccessSettings {
 }
 
 const activeSessionPhases: ReadonlySet<SessionProjection['phase']> = new Set(['running', 'starting', 'waiting_approval', 'waiting_input', 'interrupting'])
-const providerLabels: Record<string, string> = { claude: 'Claude', codex: 'Codex', local: 'Local model' }
+const providerLabels: Record<string, string> = { claude: 'Claude', codex: 'Codex', grok: 'Grok', local: 'Local model' }
 
 /**
  * Everything phone access knows and does, apart from the socket. The listener hands requests in
@@ -598,7 +598,7 @@ export class PhoneAccessService {
         if (models?.length) runtimeModels.set(provider, models)
       }
     }
-    return this.deps.providers().filter(provider => provider.id === 'codex' || provider.id === 'claude' || provider.id === 'local').map(provider => ({
+    return this.deps.providers().filter(provider => provider.id === 'codex' || provider.id === 'claude' || provider.id === 'grok' || provider.id === 'local').map(provider => ({
       id: provider.id as StructuredProvider, displayName: provider.displayName, available: provider.available,
       models: runtimeModels.get(provider.id) ?? provider.models.filter(model => !['default', 'auto'].includes(model.id)).map(model => ({ ...model, effort: provider.efforts.map(effort => effort.id).filter(id => id !== 'auto') }))
     }))

@@ -18,9 +18,12 @@ export function composerSendBlock(message: string, attachments: Pick<ContextAtta
 
 const reported = (value: unknown): value is string => typeof value === 'string' && Boolean(value) && !['default', 'auto'].includes(value)
 /** A bare Codex id (`gpt-6-astra`) reads the way the CLI's own `model/list` display name does
- *  (`GPT-6-Astra`); a label that already came from the CLI, or any other id, is shown verbatim. */
+ *  (`GPT-6-Astra`), and a bare Grok id (`grok-4.6`) the way Grok's catalog names it (`Grok 4.6`);
+ *  a label that already came from the CLI, or any other id, is shown verbatim. */
 export function modelDisplayName(id: string): string {
-  if (/^gpt-\d[\w.-]*$/.test(id)) return id.split('-').map((part, index) => index === 0 ? 'GPT' : /^\d/.test(part) ? part : part[0]!.toUpperCase() + part.slice(1)).join('-')
+  const capitalized = (part: string): string => /^\d/.test(part) ? part : part[0]!.toUpperCase() + part.slice(1)
+  if (/^gpt-\d[\w.-]*$/.test(id)) return id.split('-').map((part, index) => index === 0 ? 'GPT' : capitalized(part)).join('-')
+  if (/^grok-\d[\w.]*(?:-[\w.]+)*$/.test(id)) return id.split('-').map(capitalized).join(' ')
   return id
 }
 /** The Claude aliases the CLI resolves to a concrete API name on the message frames. */
@@ -64,12 +67,21 @@ const codexModeDescriptions: Record<string, string> = {
   'accept-edits': 'Edit files and run workspace commands; ask before leaving the workspace.',
   auto: 'Never ask: workspace edits, commands and network run without approval, MCP tools such as the project browser are allowed for you, and a command or file change that has to leave the workspace sandbox is allowed once when Codex asks, unless it reaches Windows system files, the registry, elevation, services, the firewall, credentials, disks or a recursive delete, which stay yours. Questions always reach you.'
 }
+/** Grok's modes are enforced by Conductor on what Grok escalates (grokApprovalPolicy); Auto is
+ *  also Grok's own auto mode. Grok runs its read-only tools and commands without asking in all of them. */
+const grokModeDescriptions: Record<string, string> = {
+  default: 'Grok asks you before edits and commands it does not treat as read-only.',
+  'accept-edits': 'File edits inside the project run without asking; other actions still ask.',
+  auto: 'Grok\'s own auto mode allows routine work, and Conductor answers its remaining approvals for you, except owner-only boundaries.'
+}
+const modeDescriptions: Partial<Record<ProviderCapabilities['provider'], Record<string, string>>> = { codex: codexModeDescriptions, grok: grokModeDescriptions }
 export function conversationModes(capabilities?: ProviderCapabilities): Array<{ id: string; label: string; description?: string; change: Partial<SessionSettings> }> {
   if (!capabilities) return []
   const labels: Record<SessionSettings['permission'], string> = { default: 'Ask', auto: 'Auto', 'accept-edits': 'Edit', 'read-only': 'Read only' }
+  const descriptions = modeDescriptions[capabilities.provider]
   const modes = (capabilities.permissions ?? []).map(permission => ({
     id: permission as string, label: labels[permission],
-    ...(capabilities.provider === 'codex' ? { description: codexModeDescriptions[permission] } : {}),
+    ...(descriptions ? { description: descriptions[permission] } : {}),
     change: { permission, plan: false } as Partial<SessionSettings>
   }))
   if (capabilities.plans) modes.push({ id: 'plan', label: 'Plan', change: { plan: true } })

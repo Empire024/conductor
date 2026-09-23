@@ -1,4 +1,7 @@
 import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { BrowserWindow } from 'electron'
 import * as pty from 'node-pty'
 import type { IPty } from 'node-pty'
@@ -84,6 +87,25 @@ export const CLAUDE_MODELS = [
   { id: 'haiku', label: 'Claude Haiku' }
 ]
 
+/** What a signed-in Grok 1.0.41 advertised on 2026-09-24; the adapter replaces it on connect. */
+export const GROK_MODELS = [
+  { id: 'default', label: 'Default for account' },
+  { id: 'grok-4.7', label: 'Grok 4.7' },
+  { id: 'grok-4.7-build-fast', label: 'Grok 4.7 Fast' },
+  { id: 'grok-4.6', label: 'Grok 4.6' },
+  { id: 'grok-4.5', label: 'Grok 4.5' }
+]
+const grokEfforts: Array<{ id: AgentEffort; label: string }> = CODEX_EFFORTS.filter(({ id }) => ['auto', 'low', 'medium', 'high', 'xhigh'].includes(id))
+
+/** The Grok installer puts `grok.exe` in ~/.grok/bin and adds that to the user PATH, which an app
+ *  launched before the install does not see; the installer's own location is the fallback. */
+const findGrok = (): string | null => {
+  const found = findOnPath('grok', process.env.CONDUCTOR_GROK_PATH)
+  if (found) return found
+  const installed = join(homedir(), '.grok', 'bin', process.platform === 'win32' ? 'grok.exe' : 'grok')
+  return existsSync(installed) ? installed : null
+}
+
 const findOnPath = (command: string, configured?: string): string | null => {
   if (configured?.trim()) return configured.trim()
   try {
@@ -130,6 +152,22 @@ const providers: Record<AgentProviderId, AgentProvider> = {
       args: [
         ...modelArg(spec),
         ...(spec.effort && spec.effort !== 'auto' ? ['--effort', spec.effort] : []),
+        ...(spec.resume ? ['--continue'] : [])
+      ]
+    })
+  },
+  grok: {
+    id: 'grok',
+    displayName: 'Grok',
+    resolveExecutable: findGrok,
+    installUrl: 'https://x.ai/news/grok-build-cli',
+    models: GROK_MODELS,
+    efforts: grokEfforts,
+    launch: (spec, executable) => ({
+      executable,
+      args: [
+        ...modelArg(spec),
+        ...(spec.effort && spec.effort !== 'auto' ? ['--reasoning-effort', spec.effort] : []),
         ...(spec.resume ? ['--continue'] : [])
       ]
     })
@@ -328,7 +366,7 @@ export class AgentManager {
   }
 
   ensure(spec: AgentSpec): RuntimeEnsureResult {
-    if (spec.provider === 'codex' || spec.provider === 'claude' || spec.provider === 'local') return this.structured.ensure(spec)
+    if (spec.provider === 'codex' || spec.provider === 'claude' || spec.provider === 'grok' || spec.provider === 'local') return this.structured.ensure(spec)
     // Choose and launch the same concrete catalog model shown in this tab.
     if (!spec.model || ['default', 'auto'].includes(spec.model)) spec = { ...spec, model: this.agents.get(spec.id)?.spec.model ?? providers[spec.provider].models.find(model => !['default', 'auto'].includes(model.id))?.id }
     const continuation = this.database.getContinuation(spec.id)
@@ -393,7 +431,7 @@ export class AgentManager {
   }
 
   restart(spec: AgentSpec): RuntimeEnsureResult {
-    if (spec.provider === 'codex' || spec.provider === 'claude') {
+    if (spec.provider === 'codex' || spec.provider === 'claude' || spec.provider === 'grok') {
       throw new Error('Use Resume for a native structured conversation; restarting must not silently replace context')
     }
     this.kill(spec.id)

@@ -41,7 +41,7 @@ export function NativeCliPane({ onChat, ...props }: RuntimeTerminalProps & { onC
     return () => { disposed = true; observer.disconnect(); theme.disconnect(); offData(); offStatus(); input.dispose(); selection.dispose(); term.dispose(); terminal.current = null }
   }, [props.resourceId, props.project.id, props.session.id])
   return <div className="native-cli-pane">
-    <header><div className="agent-view-switch"><button title="Return to this conversation in Chat; stops the CLI process" disabled={busy} onClick={() => { setBusy(true); setError(''); void onChat().catch((reason: unknown) => setError(String(reason))).finally(() => setBusy(false)) }}><MessagesSquare size={14} /> Chat</button><button className="active" aria-pressed><TerminalSquare size={14} /> CLI</button></div><span>{props.provider === 'claude' ? 'Claude Code' : 'Codex'} · {exited ? 'Exited' : 'Native conversation'}</span></header>
+    <header><div className="agent-view-switch"><button title="Return to this conversation in Chat; stops the CLI process" disabled={busy} onClick={() => { setBusy(true); setError(''); void onChat().catch((reason: unknown) => setError(String(reason))).finally(() => setBusy(false)) }}><MessagesSquare size={14} /> Chat</button><button className="active" aria-pressed><TerminalSquare size={14} /> CLI</button></div><span>{props.provider === 'claude' ? 'Claude Code' : props.provider === 'grok' ? 'Grok' : 'Codex'} ·{exited ? 'Exited' : 'Native conversation'}</span></header>
     {error && <div className="sa-error-bar" role="alert">{error}</div>}
     <div className="native-cli-terminal" ref={host} onClick={() => terminal.current?.focus()} />
   </div>

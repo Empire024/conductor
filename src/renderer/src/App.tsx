@@ -1189,6 +1189,7 @@ export function App(): React.JSX.Element {
   const commands = useMemo<PaletteCommand[]>(() => [
     { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then C', run: () => openInFocused('agent', 'claude') },
     { id: 'open-codex', label: 'Open Codex', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then X', run: () => openInFocused('agent', 'codex') },
+    { id: 'open-grok', label: 'Open Grok', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then R', run: () => openInFocused('agent', 'grok') },
     ...LOCAL_MODELS.map(model => ({ id: 'open-' + model.id, label: `Open Local · ${model.label}`, detail: 'Runs on this machine through llama.cpp', category: 'Agents', icon: 'agent' as const, run: () => openInFocused('agent', 'local', model.id) })),
     { id: 'open-qwen', label: 'Open Qwen Code', detail: 'Open the real local Qwen runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then Q', run: () => openInFocused('agent', 'qwen') },
     { id: 'open-kimi', label: 'Open Kimi Code', detail: 'Open the real local Moonshot runtime', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then K', run: () => openInFocused('agent', 'kimi') },
@@ -1202,6 +1203,7 @@ export function App(): React.JSX.Element {
     { id: 'split-below', label: 'Split tab below', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Alt ↓', run: () => splitFocused('below') },
     { id: 'split-claude', label: 'Split Claude Code right', detail: 'Create and launch in one action', category: 'Agents', icon: 'agent', run: () => splitFocused('right', makeTab('agent', 'claude')) },
     { id: 'split-codex', label: 'Split Codex right', detail: 'Create and launch in one action', category: 'Agents', icon: 'agent', run: () => splitFocused('right', makeTab('agent', 'codex')) },
+    { id: 'split-grok', label: 'Split Grok right', detail: 'Create and launch in one action', category: 'Agents', icon: 'agent', run: () => splitFocused('right', makeTab('agent', 'grok')) },
     { id: 'split-terminal', label: 'Split PowerShell below', detail: 'Create and launch in one action', category: 'Tools', icon: 'terminal', run: () => splitFocused('below', makeTab('terminal')) },
     { id: 'reopen', label: 'Reopen closed tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Shift T', run: reopenClosed },
     { id: 'next-tab', label: 'Next tab', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Tab', run: () => cycleFocusedTab(1) },

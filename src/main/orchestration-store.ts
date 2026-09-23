@@ -28,7 +28,7 @@ const taskStatuses = new Set<OrchestrationTaskStatus>([
   'backlog', 'ready', 'in_progress', 'blocked', 'done', 'cancelled'
 ])
 const taskPriorities = new Set<OrchestrationTaskPriority>(['low', 'normal', 'high', 'urgent'])
-const providers = new Set(['codex', 'claude', 'gemini', 'qwen', 'kimi'])
+const providers = new Set(['codex', 'claude', 'grok', 'gemini', 'qwen', 'kimi'])
 
 const requiredText = (value: string, label: string, maxLength: number): string => {
   const normalized = value.replace(/\s+/g, ' ').trim().slice(0, maxLength)

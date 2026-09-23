@@ -43,7 +43,7 @@ import './StructuredAgentPane.css'
 let focusedAgent: { sessionId: string; projectId: string } | null = null
 export function dispatchAgentContext(projectId: string, attachment: ContextAttachment): boolean {
   if (!focusedAgent || focusedAgent.projectId !== projectId) {
-    window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Focus a Claude or Codex conversation in this project, then attach context.' }))
+    window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Focus a Claude, Codex or Grok conversation in this project, then attach context.' }))
     return false
   }
   window.dispatchEvent(new CustomEvent('conductor:agent-context', { detail: { projectId, sessionId: focusedAgent.sessionId, attachment } }))
@@ -95,7 +95,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [workingWord, setWorkingWord] = useState(0)
   useEffect(() => { if (projection.phase !== 'running') return; const timer = window.setInterval(() => setWorkingWord((current) => (current + 1) % 4), 7000); return () => window.clearInterval(timer) }, [projection.phase])
   const [submitting, setSubmitting] = useState(false)
-  const structuredProvider = props.provider === 'claude' || props.provider === 'local' ? props.provider : 'codex'
+  const structuredProvider = props.provider === 'claude' || props.provider === 'grok' || props.provider === 'local' ? props.provider : 'codex'
   const [settings, setSettings] = useState<SessionSettings>({ permission: initialPermission(structuredProvider), plan: false, model: concreteModel(structuredProvider, props.model), effort: props.effort === 'auto' ? undefined : props.effort })
   const settingsRef = useRef(settings)
   settingsRef.current = settings
@@ -183,7 +183,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   // A local conversation is named by the model it is talking to; the two CLI providers are
   // named by the product, exactly as they were.
   const reportedProvider = projection.capabilities?.provider ?? provider
-  const name = reportedProvider === 'claude' ? 'Claude Code' : reportedProvider === 'local' ? localModelLabel(settings.model) : 'Codex'
+  const name = reportedProvider === 'claude' ? 'Claude Code' : reportedProvider === 'grok' ? 'Grok' : reportedProvider === 'local' ? localModelLabel(settings.model) : 'Codex'
   // A runtime that never reached a native session exchanged nothing: startup notices and the
   // failure itself must not lock the composer, or a failed connect leaves no way to retry.
   const unstartedConversation = !projection.nativeSessionId && !projection.truncated && projection.items.every(item => (item.data.type === 'notice' || item.data.type === 'error') && !item.turnId)

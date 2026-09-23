@@ -63,6 +63,7 @@ export function autoFixerAllowance(windows:ObservedUsageWindow[],model:{id:strin
 const staticPermissions:Record<StructuredProvider,SessionSettings['permission'][]> = {
   claude:['default','accept-edits','auto'],
   codex:['default','read-only','accept-edits'],
+  grok:['default','accept-edits','auto'],
   local:['accept-edits','read-only']
 }
 export const projectTaskPrompt = (tasks:ProjectTask[],fixer=false,extra?:string):string => {

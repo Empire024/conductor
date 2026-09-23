@@ -15,6 +15,10 @@ export function nativeCliArgs(provider: StructuredProvider, nativeId: string, se
     ...(settings.sandbox && settings.sandbox !== 'inherit' ? ['--sandbox', settings.sandbox] : settings.permission === 'read-only' ? ['--sandbox', 'read-only'] : []),
     ...(settings.approvalPolicy && settings.approvalPolicy !== 'inherit' ? ['-c', 'approval_policy=' + JSON.stringify(settings.approvalPolicy)] : [])
   ]
+  // Grok's TUI takes Claude-compatible session flags and its own permission-mode names.
+  if (provider === 'grok') return [fresh ? '--session-id' : '--resume', nativeId, ...model,
+    ...(settings.effort && settings.effort !== 'auto' ? ['--reasoning-effort', settings.effort] : []),
+    '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'dontAsk' : settings.permission === 'auto' ? 'auto' : 'default']
   return [fresh ? '--session-id' : '--resume', nativeId, ...model,
     ...(settings.effort && settings.effort !== 'auto' ? ['--effort', settings.effort] : []),
     '--permission-mode', settings.plan ? 'plan' : settings.permission === 'accept-edits' ? 'acceptEdits' : settings.permission === 'read-only' ? 'plan' : settings.permission === 'auto' ? 'auto' : 'manual']

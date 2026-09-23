@@ -45,6 +45,7 @@ const choices: Array<{
 }> = [
   { kind: 'agent', provider: 'claude', icon: Sparkles, title: 'Claude Code', tone: 'amber', key: 'C' },
   { kind: 'agent', provider: 'codex', icon: Bot, title: 'Codex', tone: 'green', key: 'X' },
+  { kind: 'agent', provider: 'grok', icon: Sparkles, title: 'Grok', tone: 'gray', key: 'R' },
   ...LOCAL_MODELS.map((model, index) => ({
     kind: 'agent' as PaneKind, provider: 'local' as AgentProviderId, model: model.id, icon: Bot,
     title: model.label, detail: 'Local model', tone: 'cyan', key: index === 0 ? 'L' : ''
@@ -198,7 +199,7 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
           // travels as a conversation: the weights and servers stay on the machine that is asked
           // to run it, which is how another device reaches a stack it does not have.
           const elsewhere = selected !== LOCAL_MACHINE_ID
-          const mirrorable = provider === 'claude' || provider === 'codex' || provider === 'local'
+          const mirrorable = provider === 'claude' || provider === 'codex' || provider === 'grok' || provider === 'local'
           const blocked = Boolean(current?.reason) || (elsewhere && kind === 'agent' && !mirrorable)
           return (
             <button

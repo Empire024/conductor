@@ -11,7 +11,7 @@ export const MAX_SESSION_ARCHIVE_BYTES = 32 * 1024 * 1024
 const idPattern = /^[a-zA-Z0-9_-]{1,160}$/
 const documentIdPattern = /^document:(?:(?:project|detached):)?[a-zA-Z0-9_-]{1,160}:[a-zA-Z0-9_-]{1,160}$/
 const kinds = new Set(['launcher', 'agent', 'terminal', 'file-tree', 'code', 'preview', 'browser', 'diff', 'tasks', 'memory', 'routine', 'logs', 'job'])
-const providers = new Set(['codex', 'claude', 'gemini', 'qwen', 'kimi', 'local'])
+const providers = new Set(['codex', 'claude', 'grok', 'gemini', 'qwen', 'kimi', 'local'])
 function fail(why: string): never { throw new Error('Invalid session archive: ' + why) }
 const record = (value: unknown): Record<string, any> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : fail('expected an object')
 const text = (value: unknown, max = 1000): string => typeof value === 'string' && value.length <= max && !value.includes('\0') ? value : fail('invalid text')

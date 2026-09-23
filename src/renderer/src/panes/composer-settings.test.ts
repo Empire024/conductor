@@ -41,6 +41,13 @@ describe('model display names', () => {
     expect(modelDisplayName('claude-sonnet-5')).toBe('claude-sonnet-5')
     expect(modelDisplayName('Qwen 3.5 9B')).toBe('Qwen 3.5 9B')
   })
+  it('names a bare Grok id the way Grok\'s own catalog does', () => {
+    expect(modelDisplayName('grok-4.6')).toBe('Grok 4.6')
+    expect(modelDisplayName('grok-4.5')).toBe('Grok 4.5')
+    expect(modelDisplayName('grok-4.6-fast')).toBe('Grok 4.6 Fast')
+    expect(modelDisplayName('Grok 4.6')).toBe('Grok 4.6')
+    expect(modelDisplayName('grok-')).toBe('grok-')
+  })
 })
 
 describe('composer setting changes', () => {
@@ -77,6 +84,12 @@ describe('conversation modes', () => {
     const modes = conversationModes({ provider: 'claude', permissions: ['default', 'accept-edits', 'auto'], plans: true } as unknown as ProviderCapabilities)
     expect(modes.map(mode => mode.id)).toEqual(['default', 'accept-edits', 'auto', 'plan'])
     expect(modes.every(mode => mode.description === undefined)).toBe(true)
+  })
+  it('offers Grok its three modes, each explained in Grok\'s terms, plus its plan mode', () => {
+    const modes = conversationModes({ provider: 'grok', permissions: ['default', 'accept-edits', 'auto'], plans: true } as unknown as ProviderCapabilities)
+    expect(modes.map(mode => [mode.id, mode.label])).toEqual([['default', 'Ask'], ['accept-edits', 'Edit'], ['auto', 'Auto'], ['plan', 'Plan']])
+    expect(modes.filter(mode => mode.id !== 'plan').every(mode => Boolean(mode.description) && !/Codex/.test(mode.description!))).toBe(true)
+    expect(modes.find(mode => mode.id === 'auto')?.description).toContain('owner-only')
   })
 })
 

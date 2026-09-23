@@ -200,6 +200,8 @@ describe('detached background tasks', () => {
   it('matches the executable rather than a passing mention of a runtime', () => {
     expect(providerOfCommand('codex exec --json')).toBe('codex')
     expect(providerOfCommand('C:/tools/claude.exe --print')).toBe('claude')
+    expect(providerOfCommand('C:/Users/me/.grok/bin/grok.exe agent stdio')).toBe('grok')
+    expect(providerOfCommand('echo "grokking the code"')).toBeUndefined()
     expect(providerOfCommand('echo "ask codexional about it"')).toBeUndefined()
     expect(providerOfCommand('npm run build')).toBeUndefined()
   })

@@ -6,7 +6,7 @@ export const SETTINGS_SECTIONS = [
   { id: 'machines', title: 'Machines', description: 'Connect your computers and control them from here.', keywords: 'remote control account machines github sign in invite device pairing relay tailscale advanced' },
   { id: 'phone', title: 'Phone', description: 'Set up phone access and connect your phone to this PC.', keywords: 'phone access iphone android tailscale qr certificate https notifications pairing devices setup' },
   { id: 'updates', title: 'Updates', description: 'Check for updates and choose which builds you receive.', keywords: 'installed app updates local test builds folder github releases version check now' },
-  { id: 'runtimes', title: 'Runtimes', description: 'Check the coding tools available on this PC.', keywords: 'frontier runtimes provider cli path claude codex gemini deepseek docs install' },
+  { id: 'runtimes', title: 'Runtimes', description: 'Check the coding tools available on this PC.', keywords: 'frontier runtimes provider cli path claude codex grok xai gemini deepseek docs install' },
   { id: 'debug', title: 'Debug', description: 'Capture local events to help troubleshoot a problem.', keywords: 'debug tools logging console warnings errors issue reports' }
 ] as const
 

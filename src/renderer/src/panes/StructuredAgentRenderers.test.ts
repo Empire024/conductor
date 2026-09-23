@@ -126,6 +126,8 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
       { type: 'notice', message: 'Codex event: future/event', payload: { exact: 'native payload retained' } },
       { type: 'notice', message: 'Codex effective thread settings', payload: { model: 'actual-model' } },
       { type: 'notice', message: 'Native Codex settings updated' },
+      { type: 'notice', message: 'Grok process diagnostic (stderr)', payload: 'warn: slow disk' },
+      { type: 'notice', message: 'Grok event: session/future_update', payload: { exact: 'native payload retained' } },
       { type: 'notice', message: 'Claude system / init', payload: { type: 'system' } }
     ]
     for (const data of hidden) {
@@ -200,6 +202,9 @@ describe('structured renderer contracts (synthetic, zero inference)', () => {
     expect(interactionOutcome('acceptForSession')).toBe('Accepted for session')
     expect(interactionOutcome('answered')).toBe('Answered')
     expect(interactionOutcome('A future native outcome')).toBe('A future native outcome')
+    // Grok decides with its own ACP option ids; the resolved card names the option it offered.
+    expect(interactionOutcome('proceed_always', [{ id: 'proceed_once', label: 'Allow once' }, { id: 'proceed_always', label: 'Always allow' }])).toBe('Always allow')
+    expect(interactionOutcome('accept', [{ id: 'accept', label: 'Yes' }])).toBe('Accepted')
     const html = renderActivity({ type: 'interaction', interaction: { id: 'id', kind: 'approval', title: 'Run?', status: 'resolved', outcome: 'accept', input: {}, choices: [] } })
     expect(html).toContain('<small>Accepted</small>')
     const expired = renderActivity({ type: 'interaction', interaction: { id: 'id', kind: 'approval', title: 'Run?', status: 'expired', outcome: 'Delivery uncertain after disconnect', input: {}, choices: [] } })
