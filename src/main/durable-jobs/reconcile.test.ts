@@ -162,3 +162,18 @@ describe('git worktree checkpoints', () => {
     expect(JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')).files).toMatchObject([{ path: 'notes.md', bytes: 5 }])
   })
 })
+
+describe('reconciliation in the launch that started the job', () => {
+  it('leaves a job this process started before the pass ran alone, so it keeps running', async () => {
+    const dir = temp('durable-reconcile-live-')
+    const store = new DurableJobStore(':memory:')
+    const runtime = new FakeRuntime([{ kind: 'hang' }])
+    const service = launch(store, runtime, 'pid:2:launch-b', dir)
+    const created = await service.create({ projectId: 'p', title: 'Early', objective: 'Work', model: 'local/qwen' })
+    await until(() => runtime.opened.length === 1 && runtime.observe(runtime.opened[0]!).phase === 'running')
+    const epoch = store.get(created.id).lease!.epoch
+    expect(await service.start()).toEqual([])
+    expect(store.get(created.id)).toMatchObject({ status: 'running', lease: { epoch } })
+    expect(store.get(created.id).counters.recoveries).toBe(0)
+  })
+})

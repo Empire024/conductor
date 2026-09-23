@@ -371,7 +371,7 @@ export class DurableJobController {
       if (!this.owned(run)) return 'stop'
       const completed: DurableJobStage = { ...stage, status: 'completed', completedAt: this.clock().toISOString(), result: decision.result || observation.lastAnswer.trim().slice(0, 1_200), error: undefined, ...(checkpointId ? { checkpointId } : {}) }
       this.store.batch(job.id, () => {
-        this.store.saveStage(job.id, guard, completed, { kind: 'stage', message: `Stage ${stage.index + 1} "${stage.title}" completed after ${stage.attempt} attempt(s)`, data: { filesChanged: observation.filesChanged.slice(0, 100), nextAction: decision.handoff.nextAction } })
+        this.store.saveStage(job.id, guard, completed, { kind: 'stage', message: `Stage ${stage.index + 1} "${stage.title}" completed after ${stage.attempt} attempt(s)`, data: { filesChanged: observation.filesChanged.slice(0, 100), nextAction: decision.handoff.nextAction, promptTokens: observation.report?.context.usedTokens ?? null, peakPromptTokens: observation.report?.timeline.length ? Math.max(...observation.report.timeline.map(round => round.promptTokens)) : null, windowTokens: observation.report?.context.windowTokens ?? null, rounds: observation.report?.rounds ?? null } })
         this.store.count(job.id, guard, { stagesCompleted: 1 })
       })
       if (allStages.some(candidate => candidate.index > stage.index && candidate.status === 'pending')) return 'continue'
@@ -395,7 +395,7 @@ export class DurableJobController {
     const previousErrors = this.store.events(job.id, undefined, 1_000).filter(event => event.kind === 'retry' && event.data?.stageId === stage.id && typeof event.data.error === 'string').map(event => String(event.data!.error))
     this.store.batch(job.id, () => {
       this.store.update(job.id, guard, { handoff: decision.handoff })
-      this.store.saveStage(job.id, guard, failed, { kind: 'retry', message: `Stage ${stage.index + 1} attempt ${stage.attempt} did not finish: ${error}`, data: { error, attempt: stage.attempt, stop: observation.stop?.reason ?? null } })
+      this.store.saveStage(job.id, guard, failed, { kind: 'retry', message: `Stage ${stage.index + 1} attempt ${stage.attempt} did not finish: ${error}`, data: { error, attempt: stage.attempt, stop: observation.stop?.reason ?? null, promptTokens: observation.report?.context.usedTokens ?? null } })
       this.store.count(job.id, guard, { retries: 1, ...(observation.stop?.reason === 'context_limit' && !decision.contextRollover ? { contextRollovers: 1 } : {}) })
     })
     // A tool call whose result was never saved has an unknown side effect. It is recorded and

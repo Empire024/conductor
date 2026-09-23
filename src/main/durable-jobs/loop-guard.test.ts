@@ -95,3 +95,12 @@ describe('loop guard', () => {
     expect(JSON.stringify(loop)).not.toContain(KEY)
   })
 })
+
+describe('loop guard on long reads', () => {
+  it('does not call reading new ranges of a large file a loop, but still stops re-reading the same range', () => {
+    const g = new LoopGuard('stage-reads', () => 0, { idleRoundsLimit: 5 })
+    for (let i = 0; i < 20; i++) expect(g.observeToolCall({ name: 'read_file', arguments: { path: 'modules/alpha.js', offset: i * 300, limit: 300 }, output: `lines ${i * 300}-${i * 300 + 299}: export function alphaTransform${i}() {}`, failed: false }).action).toBe('continue')
+    const verdicts = Array.from({ length: 8 }, () => g.observeToolCall({ name: 'read_file', arguments: { path: 'modules/alpha.js', offset: 0, limit: 300 }, output: 'lines 0-299: the same text', failed: false }).action)
+    expect(verdicts).toContain('replan')
+  })
+})

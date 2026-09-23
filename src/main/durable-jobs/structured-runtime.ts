@@ -46,8 +46,9 @@ const samePath = (a: string, b: string): boolean => {
   try { return realpathSync(a).toLocaleLowerCase() === realpathSync(b).toLocaleLowerCase() } catch { return false }
 }
 
-/** models.list ids for local models may carry the provider prefix; the spec takes the bare id. */
-export const localModelId = (model: string): string => model.startsWith('local/') ? model.slice('local/'.length) : model
+/** The local config, models.list and the adapter all key local models by the full `local/<name>` id;
+ *  a bare name is completed so the conversation never falls back to the default model. */
+export const localModelId = (model: string): string => model.startsWith('local/') ? model : `local/${model}`
 
 export function readLocalExecution(getSetting: (key: string) => string | null, projectId: string, taskId: string): LocalExecutionView | undefined {
   const serialized = getSetting(`local-session-checkpoint:${JSON.stringify([projectId, taskId])}`)

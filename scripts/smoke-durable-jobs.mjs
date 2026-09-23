@@ -20,6 +20,11 @@ import assert from 'node:assert/strict'
 //   --kill-server   (real model) kill llama-server mid-stage; expect a server event and recovery.
 //   --restart-app   close the app mid-job and relaunch on the same profile; expect reconciliation.
 //   --keep          leave the temp profile and project for inspection.
+//   --fixture=crossref  six large modules to summarise and cross-reference over four stages, so the
+//                   job must advance through several fresh contexts (use with --real-model).
+//   --extras=none   stop after the main job's report (skip the cancel and approval jobs).
+//   --loop-case, --stall-case  (stub) a job repeating one identical call, and one whose model never
+//                   answers; both must end blocked within bounds.
 // Every observation is printed with its timestamp; the JSON summary is the evidence.
 const argv = process.argv.slice(2)
 const flag = name => argv.some(arg => arg === `--${name}` || arg.startsWith(`--${name}=`))
@@ -44,6 +49,22 @@ const projectPath = join(root, 'project')
 await mkdir(projectPath, { recursive: true })
 await writeFile(join(projectPath, 'README.md'), '# Durable job smoke\n')
 await writeFile(join(projectPath, 'notes.txt'), 'first line\n')
+// --fixture=crossref: six ~1,100-line modules that call into each other, so summarising and
+// cross-referencing them cannot fit one 32,768-token context and the job has to advance through
+// several fresh ones.
+const fixture = value('fixture', 'append')
+const MODULES = ['alpha', 'beta', 'gamma', 'delta', 'epsilon', 'zeta']
+if (fixture === 'crossref') {
+  await mkdir(join(projectPath, 'modules'), { recursive: true })
+  for (const [index, name] of MODULES.entries()) {
+    const next = MODULES[(index + 1) % MODULES.length], other = MODULES[(index + 3) % MODULES.length]
+    const lines = [`// Module ${name}: part of the durable-job cross-reference fixture.`, `import { ${next}Transform0, ${next}Check0 } from './${next}.js'`, `import { ${other}Transform1 } from './${other}.js'`, '']
+    for (let fn = 0; fn < 60; fn++) {
+      lines.push(`/** ${name}Transform${fn}: folds a record list into the ${name} ledger (variant ${fn}). */`, `export function ${name}Transform${fn}(records, options = {}) {`, `  const limit = options.limit ?? ${100 + fn}`, '  const out = []', '  for (const record of records.slice(0, limit)) {', `    if (!${name}Check${fn}(record)) continue`, `    out.push({ ...record, ledger: '${name}', weight: record.weight * ${fn + 1} })`, '  }', fn % 7 === 0 ? `  return ${next}Transform0(out)` : fn % 11 === 0 ? `  return ${other}Transform1(out)` : '  return out', '}', '', `export function ${name}Check${fn}(record) {`, `  return Boolean(record) && typeof record.weight === 'number' && record.weight > ${fn % 5}${fn % 13 === 0 ? ` && ${next}Check0(record)` : ''}`, '}', '', '')
+    }
+    await writeFile(join(projectPath, 'modules', `${name}.js`), lines.join('\n'))
+  }
+}
 const git = (...args) => execFileSync('git', args, { cwd: projectPath, stdio: 'pipe' }).toString().trim()
 git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'add', '.'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'commit', '-q', '-m', 'Initial')
 
@@ -69,7 +90,10 @@ const stub = realModel ? null : createServer((request, response) => {
     const task = String(messages.find(message => message.role === 'user')?.content ?? '')
     const stageObjective = /THIS STAGE\s*([\s\S]*?)\s*STAGE IS COMPLETE WHEN/.exec(task)?.[1] ?? task
     const appending = stageObjective.includes('Append the line')
+    // STALL-CASE never answers; LOOP-CASE repeats one identical read forever.
+    if (prompt.includes('STALL-CASE')) return
     const reply = prompt.includes('APPROVAL-CASE') ? call('run_command', { command: 'npm install left-pad --save' })
+      : prompt.includes('LOOP-CASE') ? call('read_file', { path: 'README.md' })
       : afterTool ? { content: appending ? 'Appended "durable smoke" to notes.txt.\nJOB STATUS: CONTINUE: verify the line' : 'notes.txt ends with the line durable smoke.\nJOB STATUS: DONE' }
       : appending ? call('write_file', { path: 'notes.txt', content: 'durable smoke\n', append: true })
       : stageObjective.includes('notes.txt') ? call('read_file', { path: 'notes.txt' })
@@ -130,7 +154,7 @@ const jobTabIn = async () => page.evaluate(async id => {
   return sessions.flatMap(session => tabs(session.layout.root)).filter(tab => tab.kind === 'job').map(tab => ({ id: tab.id, resourceId: tab.resourceId }))
 }, projectId)
 
-const STAGE_TIMEOUT = realModel ? 20 * 60_000 : 90_000
+const STAGE_TIMEOUT = Number(process.env.DURABLE_SMOKE_STAGE_TIMEOUT_MS ?? (realModel ? 20 * 60_000 : 90_000))
 const watchdog = setTimeout(() => { observe('watchdog: giving up'); console.log(JSON.stringify({ root, observations }, null, 2)); process.exit(1) }, Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? (realModel ? 90 : 10) * 60_000))
 let failed = null
 try {
@@ -153,7 +177,14 @@ try {
   observe('cloud model refused', { error: refused })
 
   // --- 1. Create and watch it run -------------------------------------------------------------
-  const job = await call('jobs.create', {
+  const pair = (a, b) => ({ title: `Write notes for ${a} and ${b}`, objective: `Read modules/${a}.js and modules/${b}.js in line ranges (never whole) and write notes/${a}.md and notes/${b}.md: for each module, the exported function name families, how many functions it defines, and every import from another module with the functions it uses.`, completionCriteria: [`notes/${a}.md and notes/${b}.md exist and list the imports of each module`] })
+  const job = await call('jobs.create', fixture === 'crossref' ? {
+    title: 'Smoke: cross-reference six modules', model,
+    objective: 'Summarise the six modules in modules/ into notes/<module>.md, then write CROSSREF.md: a table of which module imports which functions from which other module, built from the notes.',
+    constraints: ['Only write files under notes/ and CROSSREF.md', 'Read source files in ranges of at most 300 lines'],
+    stages: [pair('alpha', 'beta'), pair('gamma', 'delta'), pair('epsilon', 'zeta'),
+      { title: 'Write the cross-reference', objective: 'Using notes/*.md (not the sources), write CROSSREF.md with one row per import: importing module, imported module, function names.', completionCriteria: ['CROSSREF.md has a row for every import listed in notes/'] }]
+  } : {
     title: 'Smoke: append a line', objective: 'Append the line "durable smoke" to notes.txt and commit it.',
     model, constraints: ['Only edit notes.txt'],
     stages: [{ title: 'Append', objective: 'Append the line "durable smoke" to notes.txt', completionCriteria: ['notes.txt ends with durable smoke'] },
@@ -228,6 +259,10 @@ try {
   assert.ok(existsSync(join(report.reportPath, '..', 'report.json')), 'report.json was not written')
   assert.equal(report.cloudEscalation.occurred, false)
   observe('report written', { reportPath: report.reportPath, status: report.status, results: report.results.length, checkpoints: report.checkpoints.length, logPaths: report.logPaths.length })
+  // Evidence: every stage's context figures, retries, server and recovery events, in order.
+  const events = await call('jobs.events', { jobId: job.id, limit: 200 })
+  observe('job events', { counters: final.counters, events: events.filter(event => ['stage', 'retry', 'server', 'recovery', 'loop-detected', 'approval', 'escalation'].includes(event.kind) || event.data?.contextRollover || event.data?.test).map(event => ({ at: event.at, kind: event.kind, message: event.message.slice(0, 300), ...(event.data?.peakPromptTokens != null ? { peakPromptTokens: event.data.peakPromptTokens, promptTokens: event.data.promptTokens, windowTokens: event.data.windowTokens, rounds: event.data.rounds } : {}), ...(event.data?.stop ? { stop: event.data.stop, promptTokens: event.data.promptTokens } : {}) })) })
+  if (value('extras', 'all') === 'none') throw Object.assign(new Error('extras skipped'), { skipped: true })
 
   // --- 5. Cancel a second job ----------------------------------------------------------------------
   const second = await call('jobs.create', { title: 'Smoke: cancel me', objective: 'Wait for cancellation', model })
@@ -246,14 +281,34 @@ try {
   assert.match(blocked.statusReason ?? '', /approv|permission|owner/i, `blocked for an unexpected reason: ${blocked.statusReason}`)
   await call('jobs.cancel', { jobId: gated.id, reason: 'Smoke done' })
 
+  // --- 7. Stub only: a loop and a stalled call end within bounds -----------------------------------
+  if (stub && flag('loop-case')) {
+    const looping = await call('jobs.create', { title: 'Smoke: loop', model, objective: 'LOOP-CASE: read README.md', stages: [{ title: 'Loop', objective: 'LOOP-CASE: read README.md until told otherwise', completionCriteria: ['never'] }] })
+    const ended = await waitFor(looping.id, s => ['blocked', 'failed', 'completed'].includes(s.status), 'loop case ended', 20 * 60_000)
+    observe('loop case outcome', { status: ended.status, statusReason: ended.statusReason, counters: ended.counters })
+    assert.equal(ended.status, 'blocked')
+    await call('jobs.cancel', { jobId: looping.id, reason: 'Smoke done' })
+  }
+  if (stub && flag('stall-case')) {
+    const stalled = await call('jobs.create', { title: 'Smoke: stall', model, objective: 'STALL-CASE: wait', budgets: { maxStageAttempts: 1 }, stages: [{ title: 'Stall', objective: 'STALL-CASE: the model never answers', completionCriteria: ['never'] }] })
+    const ended = await waitFor(stalled.id, s => ['blocked', 'failed', 'completed'].includes(s.status), 'stall case ended', 20 * 60_000)
+    const events = await call('jobs.events', { jobId: stalled.id, limit: 200 })
+    observe('stall case outcome', { status: ended.status, statusReason: ended.statusReason, elapsedMs: ended.elapsedMs, interrupts: events.filter(event => /interrupt|stalled|Watchdog/i.test(event.message)).map(event => event.message.slice(0, 200)) })
+    assert.equal(ended.status, 'blocked')
+    await call('jobs.cancel', { jobId: stalled.id, reason: 'Smoke done' })
+  }
+
   // The sidebar panel lists all three jobs.
   await page.getByRole('button', { name: 'Durable jobs' }).first().click().catch(() => {})
   await page.locator('.durable-job-list').first().waitFor().catch(() => {})
   await page.screenshot({ path: join(output, 'jobs-panel.png') })
   observe('done', { jobs: (await call('jobs.list')).map(entry => ({ id: entry.id, status: entry.status })) })
 } catch (error) {
-  failed = error
-  observe('FAILED', { message: String(error?.message ?? error).slice(0, 800) })
+  if (error?.skipped) observe('extras skipped (--extras=none)')
+  else {
+    failed = error
+    observe('FAILED', { message: String(error?.message ?? error).slice(0, 800) })
+  }
 } finally {
   clearTimeout(watchdog)
   await Promise.race([app?.close().catch(() => {}), new Promise(done => setTimeout(done, 20_000))])

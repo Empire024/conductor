@@ -68,11 +68,37 @@ report can be written at any time.
 
 ## Recovering a blocked job
 
-`blocked` means the job needs the owner: an approval it may not grant itself, exhausted stage
-attempts, or a loop the guard stopped. Read `statusReason` and the latest events, then either fix
+`blocked` means the job needs the owner: an approval it may not grant itself (a step the sandbox
+refused twice, such as a network install), exhausted stage attempts, a loop the guard stopped after
+its one replan, a server that did not come back, or the elapsed-time budget (`maxElapsedMs`; a
+resume restarts that budget). Read `statusReason` and the latest events, then either fix
 the cause (grant the approval, adjust the project) and *Resume*, or *Cancel*. A cancelled job keeps
 its worktree, checkpoints and logs; start a new job from the report's remaining work. A job never
 escalates to a cloud model to get unstuck; handing a stage to a cloud coworker is the owner's call.
+
+## How the parts are wired
+
+`src/main/index.ts` builds the service; `src/main/durable-jobs/wiring.ts` adapts the modules to the
+controller's ports:
+
+- **Stage prompt**: `buildStagePrompt` from the persisted handoff, budgeted against the live model's
+  window with the stage kind's system prompt and tools (`stagePromptBudgetTokens` overrides the
+  default ceiling); a stage whose fixed part does not fit blocks the job. The prompt ends asking for
+  `JOB STATUS: DONE` or `JOB STATUS: CONTINUE: <next>`; a CONTINUE with no planned stage left appends one.
+- **Stage kind** (`plan`, `investigate`, `implement`, `verify`, `research`, `report`; inferred from
+  the title when not given) sets the stage conversation's mode: read-only kinds open read-only,
+  coding kinds get the coding tool set. No grant is widened.
+- **After a stage**: `extractHandoff` from the stop report; tests become events with `data.test`;
+  a stage whose context passed `contextRolloverFraction` counts a rollover.
+- **Watchdog and loop guard** read the stage conversation every 15 s: new events are progress,
+  finished tool calls feed the loop guard. A loop replans once (the retry prompt carries the
+  instruction), a second one blocks; a step refused twice blocks for the owner; a stalled call on
+  a server that is not processing is interrupted.
+- **Server**: one `ServerSupervisor` per model over `startServer`; it never stops a model someone is
+  using and switches an idle Conductor-started one only after 10 quiet minutes.
+- **Generation gate**: one process-wide `LocalGenerationGate`; a stage does not start while an
+  interactive local turn is in flight. A running stage is not cut short: llama-server's single
+  slot serves requests in order, so an interactive turn waits at most for the job's current request.
 
 ## Limits
 
@@ -90,9 +116,12 @@ renderer while it runs, pauses, resumes, cancels, and checks that an approval-ga
 `blocked`. Build first (`npm run build`), one smoke at a time.
 
 - `node scripts/smoke-durable-jobs.mjs` — stub model. The script serves an OpenAI-compatible stub
-  on loopback and passes it as `CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT`; the controller must use
-  that endpoint instead of starting llama-server when the variable is set in an unpackaged build.
+  on loopback and passes it as `CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT`; an unpackaged build then
+  sends every local conversation there and starts no llama-server (a packaged app ignores it).
 - `--real-model[=local/qwen3.6-35b-a3b]` — the real server Conductor manages.
 - `--kill-server` (with `--real-model`) — kills `llama-server.exe` mid-stage and expects recovery.
 - `--restart-app` — closes and relaunches the app on the same profile mid-job.
 - `--keep` — keeps the temp profile and project.
+- `--fixture=crossref` — six large modules summarised and cross-referenced over four stages, so
+  the job advances through several fresh contexts; `--extras=none` stops after its report.
+  `DURABLE_SMOKE_STAGE_TIMEOUT_MS` raises the settle wait for a slow real model.

@@ -2201,6 +2201,8 @@ app.whenReady().then(async () => {
     runtime: stageRuntime,
     logRoot: join(app.getPath('userData'), 'durable-jobs'),
     projectPath: projectId => database.getProject(projectId)?.path ?? null,
+    // The local adapter falls back to its default model for an unknown id; a job must not.
+    validateModel: model => { if (!localModel(model)) throw new Error(`${model} is not a configured local model on this machine`) },
     ...durableJobPorts({
       store: durableJobStore,
       gate: generationGate,

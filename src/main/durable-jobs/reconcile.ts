@@ -85,6 +85,9 @@ export async function reconcileJobs(options: ReconcileOptions): Promise<Reconcil
   const outcomes: ReconcileOutcome[] = []
   for (const listed of options.store.list({ status: ['running', 'recovering'] })) {
     const previous = listed.lease
+    // A job this very process already started (created in the seconds before this pass ran) is
+    // live, not left over: taking it over would supersede its own loop and strand it.
+    if (previous?.ownerId === options.ownerId) continue
     const lease = options.store.acquire(listed.id, options.ownerId, options.leaseTtlMs, { takeover: true, reason: 'reconciliation after Conductor restarted' })
     const guard: WriteGuard = { epoch: lease.epoch }
     if (listed.status === 'running') options.store.transition(listed.id, 'recovering', 'Conductor restarted while this job was running', guard)

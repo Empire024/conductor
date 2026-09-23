@@ -191,8 +191,12 @@ export class LoopGuard {
       failed = entry.count
     }
 
+    // A write or a command with new output is progress. A successful call that returned something
+    // not seen before (the next range of a large file) is work, not a loop: it neither resets nor
+    // counts toward the idle limit; endless browsing is bounded by idleStageMs instead. Found in a
+    // real Qwen run, where reading two 1,100-line modules in ranges tripped a replan.
     if (!repeatedOutput && !call.failed && ['write_file', 'edit_file', 'apply_edits', 'run_command'].includes(call.name)) this.idleRounds = 0
-    else this.idleRounds++
+    else if (repeatedOutput || call.failed) this.idleRounds++
 
     if (failed >= this.options.failedApproachLimit) return this.detected({ pattern: 'failed-approach', tool: call.name, target, count: failed, sample: [sample], ...this.base() })
     if (stagnation.action === 'stop') return this.detected({ pattern: 'identical-calls', tool: call.name, target, count: stagnation.repeats, sample: [sample, redactSensitive(stagnation.message ?? '')], ...this.base() })

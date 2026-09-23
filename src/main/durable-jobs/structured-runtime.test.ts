@@ -30,12 +30,12 @@ describe('structured stage runtime helpers', () => {
     expect(readLocalExecution(() => null, 'p', 'agent_1')).toBeUndefined()
   })
 
-  it('keeps the closing instructions when a prompt is too long and strips the provider prefix', () => {
+  it('keeps the closing instructions when a prompt is too long and keeps the full local model id', () => {
     const prompt = `${'x'.repeat(100_000)}\nJOB STATUS line`
     const clamped = clampPrompt(prompt)
     expect(clamped.length).toBeLessThanOrEqual(60_000)
     expect(clamped.endsWith('JOB STATUS line')).toBe(true)
-    expect(localModelId('local/qwen3.6-35b-a3b')).toBe('qwen3.6-35b-a3b')
-    expect(localModelId('qwen')).toBe('qwen')
+    expect(localModelId('local/qwen3.6-35b-a3b')).toBe('local/qwen3.6-35b-a3b')
+    expect(localModelId('qwen')).toBe('local/qwen')
   })
 })
