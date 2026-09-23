@@ -1,5 +1,5 @@
 import { spawn as realSpawn, execFile } from 'node:child_process'
-import { createWriteStream, existsSync } from 'node:fs'
+import { appendFileSync, closeSync, createWriteStream, existsSync, openSync } from 'node:fs'
 import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { clientFromCredential } from './control-client.mjs'
@@ -115,14 +115,19 @@ export class DevInstance {
     delete env.CONDUCTOR_OFFLINE_TESTS
     this.launches += 1
     const logPath = join(this.runDir, `app-${this.launches}.log`)
-    const sink = createWriteStream(logPath)
     const spawnedAt = Date.now()
-    const child = this.spawn(await this.electron(), [resolve(this.checkout, 'out', 'main', 'index.js')], { cwd: this.checkout, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    // Detached, logging through file descriptors rather than pipes: a pipe would keep a plain
+    // `app start` command alive until something killed it, and the app with it. The child
+    // outlives this process; stop() finds it again through the credential and pid files.
+    const logFd = openSync(logPath, 'a')
+    let child
+    try {
+      child = this.spawn(await this.electron(), [resolve(this.checkout, 'out', 'main', 'index.js')], { cwd: this.checkout, env, windowsHide: true, detached: true, stdio: ['ignore', logFd, logFd] })
+    } finally { closeSync(logFd) }
+    child.unref?.()
     this.child = child
     this.exited = new Promise(done => child.once('exit', code => { this.child = null; done(code) }))
-    child.stdout?.pipe(sink)
-    child.stderr?.pipe(sink)
-    child.once('error', error => sink.write(`spawn error: ${error.message}\n`))
+    child.once('error', error => { try { appendFileSync(logPath, `spawn error: ${error.message}\n`) } catch { /* the log is best effort */ } })
     this.log(`dev app launching (pid ${child.pid}), log ${logPath}`)
     const deadline = spawnedAt + this.startTimeoutMs
     let lastReason = ''
