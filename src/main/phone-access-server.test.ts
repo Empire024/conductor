@@ -180,6 +180,48 @@ describe('the phone listener', () => {
     expect(service.serverIdentity(['192.168.0.205', '100.72.193.87', 'fd7a:115c:a1e0::e138:c158', 'e-box.tail8216c8.ts.net', 'MAIN']).hosts).toContain('fd7a:115c:a1e0::e138:c158')
   })
 
+  it('answers /api/health and serves the boot guard to a phone that is not paired', { timeout: 20_000 }, async () => {
+    const { port, ca } = await listening()
+    const health = await call(port, '/api/health', { ca })
+    expect(health.status).toBe(200)
+    expect(JSON.parse(health.body)).toMatchObject({ ok: true, version: '0.1.3', exposure: 'network', viaTailscale: false })
+    expect(typeof (JSON.parse(health.body) as { at: string }).at).toBe('string')
+    expect((await call(port, '/api/health', { ca, method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status).toBe(405)
+    const boot = await call(port, '/boot.js', { ca })
+    expect(boot.status).toBe(200)
+    expect(boot.headers['content-type']).toContain('text/javascript')
+    expect(boot.headers['cache-control']).toBe('no-cache')
+  })
+
+  it('tells the setup steps which phones joined the tailnet and whether HTTPS certificates are on, and re-reads on check without restarting', { timeout: 20_000 }, async () => {
+    let peers: Array<{ id: string; hostName: string; dnsName: string; addresses: string[]; online: boolean; path: 'direct'; relay: null; loginName: string | null; os: string }> = []
+    let certDomains: string[] = []
+    let reads = 0
+    const tailnet = {
+      state: async () => { reads += 1; return { installed: true, backendState: 'Running', self: { hostName: 'e-box', dnsName: 'e-box.tail8216c8.ts.net.', addresses: ['100.72.193.87'], loginName: 'Empire024@github', online: true }, peers, message: null, checkedAt: '2026-09-23T00:00:00.000Z', certDomains } },
+      last: () => ({ installed: true, backendState: null, self: null, peers: [], message: null, checkedAt: null }),
+      selfAddress: async () => '100.72.193.87'
+    }
+    const { service } = serviceFixture()
+    service.updateSettings({ enabled: true, port: 0 })
+    const server = new PhoneAccessServer({ service, tailscale: tailnet, localAddresses: () => ['192.168.0.205'], hostname: () => 'MAIN', assets: { 'index.html': 'x' }, log: () => undefined })
+    cleanup.push(() => server.dispose())
+    const first = await server.apply()
+    expect(first.tailnet).toEqual({ installed: true, backendState: 'Running', loginName: 'Empire024@github', httpsEnabled: false, phones: [], checkedAt: '2026-09-23T00:00:00.000Z' })
+    expect(service.desktopState().recommendedEndpoint).toBe(`https://100.72.193.87:${new URL(first.endpoints[0]!).port}`)
+    // The owner installs Tailscale on the iPhone and flips HTTPS on: "Check again" sees both, and
+    // the socket stays where it was.
+    peers = [{ id: 'nPHONE', hostName: 'iPhone', dnsName: 'iphone.tail8216c8.ts.net.', addresses: ['100.72.9.9'], online: true, path: 'direct', relay: null, loginName: 'Empire024@github', os: 'ios' }, { id: 'nLAPTOP', hostName: 'laptop', dnsName: 'laptop.tail8216c8.ts.net.', addresses: ['100.72.9.10'], online: true, path: 'direct', relay: null, loginName: null, os: 'windows' }]
+    certDomains = ['e-box.tail8216c8.ts.net']
+    const readsBefore = reads
+    const checked = await server.check()
+    expect(reads).toBe(readsBefore + 1)
+    expect(checked.listening).toBe(true)
+    expect(checked.endpoints).toEqual(first.endpoints)
+    expect(checked.tailnet).toMatchObject({ httpsEnabled: true, phones: [{ hostName: 'iPhone', os: 'ios', online: true, addresses: ['100.72.9.9'] }] })
+    expect(service.desktopState().tailscale.phones).toHaveLength(1)
+  })
+
   it('refuses to start in Tailscale exposure without a tailnet address, and names the port when it is taken', { timeout: 20_000 }, async () => {
     const first = await listening()
     const { service } = serviceFixture()

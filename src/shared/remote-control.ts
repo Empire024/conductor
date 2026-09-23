@@ -72,6 +72,8 @@ export interface TailscalePeer {
   /** The DERP region carrying a relayed connection, for the diagnostics view; null otherwise. */
   relay: string | null
   loginName: string | null
+  /** Lower-case OS word as Tailscale reports it ('ios', 'android', 'windows'…); empty when unknown. */
+  os?: string
 }
 
 export interface TailscaleState {
@@ -85,6 +87,11 @@ export interface TailscaleState {
   /** What to do next, in words, whenever the tailnet is not usable from here; null when it is. */
   message: string | null
   checkedAt: string | null
+  /**
+   * Names `tailscale cert` may issue for, from the status document's CertDomains. Present only when
+   * HTTPS certificates are enabled for the tailnet; an empty list means they are not.
+   */
+  certDomains?: string[]
 }
 
 /** The local machine, which is always here. */

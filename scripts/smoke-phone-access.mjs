@@ -157,9 +157,10 @@ try {
   assert.equal((await call(origin, '/api/me', { ca, token })).status, 401)
   check('Revoking the phone on the desktop closes its access immediately')
 
-  // The settings drawer renders the Phone access section with the live listener state.
+  // Settings has a page per section now: the Phone page renders the setup steps with the live
+  // listener state.
   await page.locator('button[aria-label="Settings"]').click()
-  await expect(page.getByText('Phone access', { exact: true })).toBeVisible()
+  await page.locator('.settings-nav button').filter({ hasText: /^Phone$/ }).click()
   await expect(page.getByText('Let my phones control this Conductor')).toBeVisible()
   await expect(page.locator('.phone-access-settings')).toContainText('Reachable')
   await expect(page.getByText('No phones paired yet.')).toBeVisible()

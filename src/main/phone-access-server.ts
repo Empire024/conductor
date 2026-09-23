@@ -8,14 +8,16 @@ import { join } from 'node:path'
 import { createSecureContext, type SecureContext } from 'node:tls'
 import { X509Certificate } from 'node:crypto'
 import indexHtml from '../phone/index.html?raw'
+import bootJs from '../phone/boot.js?raw'
 import appJs from '../phone/app.js?raw'
 import appCss from '../phone/app.css?raw'
 import swJs from '../phone/sw.js?raw'
 import manifestJson from '../phone/manifest.webmanifest?raw'
 import iconSvg from '../phone/icon.svg?raw'
-import type { PhoneDevice } from '../shared/phone-access'
+import { isPhoneOs, type PhoneDevice, type PhoneHealth } from '../shared/phone-access'
+import type { TailscaleState } from '../shared/remote-control'
 import { localAddresses } from './network-addresses'
-import { PhoneAccessError, type PhoneAccessService, type PhoneListenerStatus } from './phone-access'
+import { PhoneAccessError, type PhoneAccessService, type PhoneListenerStatus, type PhoneTailnetDetail } from './phone-access'
 import { PHONE_ICON_SIZES, renderPhoneIcon } from './phone-icon'
 import { resolveBindHost } from './remote-control-server'
 import { INSTALL_TAILSCALE_MESSAGE, isTailscaleAddress, isTailscaleIpv4, type TailscaleReader } from './tailscale'
@@ -39,7 +41,7 @@ export interface PhoneAccessServerDependencies {
   localAddresses?(): string[]
   hostname?(): string
   /** Test seam: the files served at /, /app.js and so on. */
-  assets?: Partial<Record<'index.html' | 'app.js' | 'app.css' | 'sw.js' | 'manifest.webmanifest' | 'icon.svg', string>>
+  assets?: Partial<Record<'index.html' | 'boot.js' | 'app.js' | 'app.css' | 'sw.js' | 'manifest.webmanifest' | 'icon.svg', string>>
   log?(message: string, error?: unknown): void
 }
 
@@ -70,6 +72,26 @@ function asset(body: string | Buffer, type: string, headers?: Record<string, str
   return { body: bytes, type, headers: { ETag: '"' + createHash('sha256').update(bytes).digest('base64url').slice(0, 20) + '"', ...headers } }
 }
 
+/**
+ * The tailnet as the setup steps need it, from one `tailscale status` reading. Peers are reduced
+ * to the phone-shaped ones: the step "install Tailscale on your phone" is done the moment such a
+ * peer exists, whether or not it has opened the app yet. No reading at all (no Tailscale service
+ * wired, a test) reads as "not installed" with nothing known, never as a healthy empty tailnet.
+ */
+export function tailnetDetail(state: TailscaleState | undefined, now = (): number => Date.now()): PhoneTailnetDetail {
+  if (!state) return { installed: false, backendState: null, loginName: null, httpsEnabled: null, phones: [], checkedAt: null }
+  return {
+    installed: state.installed,
+    backendState: state.backendState,
+    loginName: state.self?.loginName ?? null,
+    httpsEnabled: state.certDomains ? state.certDomains.length > 0 : null,
+    phones: state.peers
+      .filter(peer => isPhoneOs(peer.os ?? ''))
+      .map(peer => ({ hostName: peer.hostName || peer.dnsName.split('.')[0] || 'phone', os: (peer.os ?? '').toLowerCase(), online: peer.online, addresses: [...peer.addresses] })),
+    checkedAt: state.checkedAt ?? new Date(now()).toISOString()
+  }
+}
+
 const CSP = "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 
 /**
@@ -90,9 +112,11 @@ export class PhoneAccessServer {
   private status: PhoneListenerStatus = { listening: false, endpoints: [], message: null, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null }
 
   constructor(private readonly deps: PhoneAccessServerDependencies) {
-    const files = { 'index.html': indexHtml, 'app.js': appJs, 'app.css': appCss, 'sw.js': swJs, 'manifest.webmanifest': manifestJson, 'icon.svg': iconSvg, ...deps.assets }
+    const files = { 'index.html': indexHtml, 'boot.js': bootJs, 'app.js': appJs, 'app.css': appCss, 'sw.js': swJs, 'manifest.webmanifest': manifestJson, 'icon.svg': iconSvg, ...deps.assets }
     this.assets.set('/', asset(files['index.html'], 'text/html; charset=utf-8', { 'Content-Security-Policy': CSP, 'Cache-Control': 'no-cache' }))
     this.assets.set('/index.html', this.assets.get('/')!)
+    // The boot guard is what shows an error when app.js cannot; it is small and cached like it.
+    this.assets.set('/boot.js', asset(files['boot.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     this.assets.set('/app.js', asset(files['app.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     this.assets.set('/app.css', asset(files['app.css'], 'text/css; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     this.assets.set('/sw.js', asset(files['sw.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' }))
@@ -118,13 +142,17 @@ export class PhoneAccessServer {
     const settings = this.deps.service.getSettings()
     await this.stopSocket()
     if (intent !== this.intent) return this.getStatus()
-    const stopped = (message: string | null, extra: Partial<PhoneListenerStatus> = {}): PhoneListenerStatus => ({ listening: false, endpoints: [], message, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null, ...extra })
+    // The last tailnet reading is good enough for a listener that is not starting; a fresh one is
+    // taken below for one that is, and the setup steps' "Check again" takes its own.
+    let detail = tailnetDetail(this.deps.tailscale?.last())
+    const stopped = (message: string | null, extra: Partial<PhoneListenerStatus> = {}): PhoneListenerStatus => ({ listening: false, endpoints: [], message, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null, tailnet: detail, ...extra })
     if (!settings.enabled) { this.publish(stopped(null)); return this.getStatus() }
     if (!(await this.vaultAvailable())) { this.publish(stopped('The OS credential store is unavailable, so the certificate key cannot be protected.')); return this.getStatus() }
     // The tailnet is read for both exposures: a phone on the tailnet reaches a 'network' listener
     // by the Tailscale address too, so the certificate should name it whenever it exists.
     const tailnet = await this.deps.tailscale?.state().catch(() => undefined)
     if (intent !== this.intent) return this.getStatus()
+    detail = tailnetDetail(tailnet)
     const tailscaleAddress = tailnet?.self?.addresses.find(isTailscaleIpv4) ?? null
     const tailscaleIpv6 = tailnet?.self?.addresses.find(address => isTailscaleAddress(address) && !address.includes('.')) ?? null
     const dnsName = (tailnet?.self?.dnsName ?? '').replace(/\.$/, '')
@@ -184,7 +212,7 @@ export class PhoneAccessServer {
         message: settings.exposure === 'tailscale'
           ? `Reachable over Tailscale at ${tailscaleAddress} and nowhere else. Only paired phones can use it.`
           : 'Reachable from this network. Only paired phones can use it.',
-        tailscaleCertificate: certificateState, tailscaleMessage: certificateMessage, tailscaleAddress, tailscaleDnsName: dnsName || null
+        tailscaleCertificate: certificateState, tailscaleMessage: certificateMessage, tailscaleAddress, tailscaleDnsName: dnsName || null, tailnet: detail
       })
       this.deps.service.ensurePushKeys()
       this.deps.service.seed()
@@ -219,6 +247,21 @@ export class PhoneAccessServer {
       const detail = error instanceof Error ? error.message : String(error)
       return { state: 'failed', message: `Tailscale did not issue a certificate: ${detail} Enable HTTPS certificates for your tailnet at https://login.tailscale.com/admin/dns, or install the Conductor certificate on the phone instead.` }
     }
+  }
+
+  /**
+   * A fresh tailnet reading for the setup steps: peers (a phone that just signed in), the HTTPS
+   * switch, the login name. The socket is left alone unless the tailnet address it depends on
+   * moved, appeared or vanished, in which case only a restart can follow it.
+   */
+  async check(): Promise<PhoneListenerStatus> {
+    const tailnet = await this.deps.tailscale?.state(true).catch(() => undefined)
+    const address = tailnet?.self?.addresses.find(isTailscaleIpv4) ?? null
+    const settings = this.deps.service.getSettings()
+    const moved = this.bound?.exposure === 'tailscale' ? this.bound.host !== address : address !== this.status.tailscaleAddress
+    if (settings.enabled && moved) return this.apply()
+    this.publish({ ...this.status, tailnet: tailnetDetail(tailnet) })
+    return this.getStatus()
   }
 
   /** Renews the Tailscale certificate in place; nothing else about the listener changes. */
@@ -283,6 +326,14 @@ export class PhoneAccessServer {
       if (this.bound?.exposure === 'tailscale' && !isTailscaleAddress(request.socket.remoteAddress ?? '')) throw new PhoneAccessError('This machine only accepts phones over Tailscale.', 403)
       const url = new URL(request.url ?? '/', 'https://phone.invalid')
       const method = (request.method ?? 'GET').toUpperCase()
+      // The one answer a phone gets before it is paired: proof it reached Conductor at all. A
+      // failure before this point is the network, the address or the certificate, never pairing.
+      if (url.pathname === '/api/health') {
+        if (method !== 'GET' && method !== 'HEAD') throw new PhoneAccessError('Method not allowed', 405)
+        const health: PhoneHealth = { ok: true, version: this.deps.service.version(), exposure: this.bound?.exposure ?? this.deps.service.getSettings().exposure, at: new Date().toISOString(), viaTailscale: isTailscaleAddress(request.socket.remoteAddress ?? '') }
+        reply(200, health)
+        return
+      }
       if (!url.pathname.startsWith('/api/')) {
         if (method !== 'GET' && method !== 'HEAD') { reply(405, { error: 'Method not allowed' }, { Allow: 'GET, HEAD' }); request.resume(); return }
         if (url.pathname === '/ca.crt') {

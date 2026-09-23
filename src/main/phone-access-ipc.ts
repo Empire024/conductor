@@ -12,7 +12,7 @@ export interface PhoneAccessIpcDependencies {
   showSaveDialog(window: BrowserWindow | null, options: SaveDialogOptions): Promise<{ canceled: boolean; filePath?: string }>
 }
 
-const CHANNELS = ['phone:state', 'phone:set-settings', 'phone:pair', 'phone:cancel-pairing', 'phone:revoke', 'phone:rename', 'phone:save-certificate', 'phone:test-notification'] as const
+const CHANNELS = ['phone:state', 'phone:set-settings', 'phone:pair', 'phone:cancel-pairing', 'phone:check', 'phone:revoke', 'phone:rename', 'phone:save-certificate', 'phone:test-notification'] as const
 
 /** The desktop panel's side of phone access: every handler answers with the whole panel state. */
 export function registerPhoneAccessIpc(deps: PhoneAccessIpcDependencies): () => void {
@@ -25,8 +25,11 @@ export function registerPhoneAccessIpc(deps: PhoneAccessIpcDependencies): () => 
     await server.apply()
     return state()
   })
-  handle('phone:pair', () => { service.createPairing(); return state() })
+  handle('phone:pair', (endpoint?: string) => { service.createPairing(typeof endpoint === 'string' && endpoint ? endpoint : undefined); return state() })
   handle('phone:cancel-pairing', () => { service.cancelPairing(); return state() })
+  // The setup steps' "Check again": a fresh tailnet reading, no listener restart unless the bound
+  // address moved. A phone that just joined the tailnet shows up here.
+  handle('phone:check', async () => { await server.check(); return state() })
   handle('phone:revoke', (deviceId: string) => { service.revoke(String(deviceId)); return state() })
   handle('phone:rename', (deviceId: string, name: string) => { service.rename(String(deviceId), name); return state() })
   handle('phone:save-certificate', async () => {

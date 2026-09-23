@@ -72,8 +72,65 @@ export interface PhonePairingOffer {
   code: string
   /** The address to open on the phone; the code rides in the fragment so the QR does both. */
   url: string
+  /** The https origin `url` names: one of PhoneAccessState.endpoints, chosen when the code was made. */
+  endpoint: string
   expiresAt: string
 }
+
+/**
+ * A phone-shaped node on this machine's tailnet, as `tailscale status` lists it. Used by the setup
+ * steps to say "your iPhone joined the tailnet" without the phone having to talk to Conductor
+ * first: a phone that installed Tailscale and signed in appears here before it ever opens the app.
+ */
+export interface PhoneTailnetPeer {
+  hostName: string
+  /** Lower-case OS word as Tailscale reports it: 'ios', 'android', 'windows', 'macos', 'linux'… */
+  os: string
+  online: boolean
+  /** Tailnet IPv4 first. */
+  addresses: string[]
+}
+
+/** The tailnet as the phone setup sees it; every field is a fact read from Tailscale, never a guess. */
+export interface PhoneTailnetView {
+  address: string | null
+  dnsName: string | null
+  /** Whether a Let's Encrypt certificate from Tailscale is serving the MagicDNS name. */
+  certificate: 'off' | 'pending' | 'active' | 'failed'
+  message: string | null
+  /** The CLI was found on this machine. */
+  installed: boolean
+  /** Straight from `tailscale status --json`: Running, NeedsLogin, Stopped…; null when unknown. */
+  backendState: string | null
+  /** The account this machine is signed into, so the phone can be told which one to use. */
+  loginName: string | null
+  /**
+   * Whether HTTPS certificates are enabled for the tailnet (Tailscale lists CertDomains only then).
+   * null while Tailscale has not answered; false means the admin DNS page still needs the switch.
+   */
+  httpsEnabled: boolean | null
+  /** Peers that look like phones or tablets (iOS, iPadOS, Android), any state. */
+  phones: PhoneTailnetPeer[]
+  /** When the tailnet was last read, ISO; null if never. */
+  checkedAt: string | null
+}
+
+/** Where the Tailscale app for a phone lives; QR-encoded by the setup steps. */
+export const TAILSCALE_APP_LINKS = {
+  ios: 'https://apps.apple.com/app/tailscale/id1470499037',
+  android: 'https://play.google.com/store/apps/details?id=com.tailscale.ipn',
+  /** Tailscale's own chooser page, for a QR that should work on either platform. */
+  any: 'https://tailscale.com/download'
+} as const
+
+/** The admin page where HTTPS certificates are switched on for a tailnet. */
+export const TAILSCALE_DNS_ADMIN_URL = 'https://login.tailscale.com/admin/dns'
+
+/** What a phone opens to install the Conductor certificate: a page that hands off to Safari, then /ca.crt. */
+export const trustPageUrl = (endpoint: string): string => `${endpoint.replace(/\/+$/, '')}/#trust`
+
+/** Which of a phone's OS words count as a phone for the setup steps. */
+export const isPhoneOs = (os: string): boolean => /^(ios|ipados|android)$/i.test(os.trim())
 
 export interface PhoneAccessState {
   settings: PhoneAccessSettings
@@ -89,13 +146,14 @@ export interface PhoneAccessState {
   pairing: PhonePairingOffer | null
   /** False when the OS credential store is unavailable, in which case nothing can be served. */
   secureStorage: boolean
-  tailscale: {
-    address: string | null
-    dnsName: string | null
-    /** Whether a Let's Encrypt certificate from Tailscale is serving the MagicDNS name. */
-    certificate: 'off' | 'pending' | 'active' | 'failed'
-    message: string | null
-  }
+  tailscale: PhoneTailnetView
+  /**
+   * The origin a phone should keep: the tailnet one whenever this machine has a tailnet address
+   * (it answers at home and away, as long as Tailscale is on), otherwise the first endpoint. The
+   * MagicDNS name wins over the tailnet IP once a Tailscale certificate is active. Null while not
+   * listening. This is the default `endpoint` for pair().
+   */
+  recommendedEndpoint: string | null
   /** Whether push keys exist, so the panel can say why a test notification cannot go out. */
   pushConfigured: boolean
 }
@@ -104,9 +162,19 @@ export interface PhoneAccessState {
 export interface PhoneAccessBridge {
   state(): Promise<PhoneAccessState>
   setSettings(patch: Partial<PhoneAccessSettings>): Promise<PhoneAccessState>
-  /** Creates (or refreshes) the single active pairing code and returns it in the state. */
-  pair(): Promise<PhoneAccessState>
+  /**
+   * Creates (or refreshes) the single active pairing code and returns it in the state. `endpoint`
+   * must be one of state.endpoints and names the origin the QR and URL carry; omitted, the
+   * recommended endpoint is used.
+   */
+  pair(endpoint?: string): Promise<PhoneAccessState>
   cancelPairing(): Promise<PhoneAccessState>
+  /**
+   * Re-reads Tailscale (peers, HTTPS setting, address) and re-publishes the state without
+   * restarting the listener; the setup steps' "Check again". Restarts the listener only if the
+   * tailnet address it is bound to has changed.
+   */
+  check(): Promise<PhoneAccessState>
   revoke(deviceId: string): Promise<PhoneAccessState>
   rename(deviceId: string, name: string): Promise<PhoneAccessState>
   /** Saves the CA certificate through a native save dialog; null when the owner cancelled. */
@@ -142,8 +210,35 @@ export interface PhoneAccessBridge {
  *   POST /api/push/subscribe              { subscription }          -> { ok: true }
  *   POST /api/push/unsubscribe                                      -> { ok: true }
  *   POST /api/push/test                                             -> { ok: true }
+ *   GET  /api/health                      no auth                   -> PhoneHealth
  *   GET  /ca.crt                          the CA certificate, PEM, no auth
+ *
+ * Shell assets, all GET and unauthenticated: /, /index.html, /boot.js, /app.js, /app.css, /sw.js,
+ * /manifest.webmanifest, /icon.svg, /icon-180.png, /icon-192.png, /icon-512.png.
+ *
+ * Hash routes the shell understands (no server round trip):
+ *   #/                          the app (session list, or the pairing screen without a token)
+ *   #pair=CODE                  pairing with the code filled in; the fragment is dropped at once
+ *   #trust                      the certificate page: explains, hands off to Safari on iOS
+ *                               (x-safari-https://), then links /ca.crt
+ *   #diagnose                   the connection check page, also shown when the shell cannot boot
  * ------------------------------------------------------------------------- */
+
+/**
+ * The one unauthenticated JSON answer, for a phone to prove it is talking to Conductor at all:
+ * the connection check calls it before anything else, and a failure here means TLS, address or
+ * network, never pairing.
+ */
+export interface PhoneHealth {
+  ok: true
+  /** Conductor's package version. */
+  version: string
+  exposure: PhoneExposure
+  /** ISO time on this machine. */
+  at: string
+  /** Whether the socket that asked came in over the tailnet. */
+  viaTailscale: boolean
+}
 
 /** The phone's own record, as the app shows it in its settings. */
 export interface PhoneSelf {

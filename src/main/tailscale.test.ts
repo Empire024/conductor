@@ -121,6 +121,18 @@ describe('reading tailscale status --json', () => {
     expect(state.checkedAt).toBe(new Date(NOW).toISOString())
   })
 
+  it('keeps each node’s OS in one case and reads whether HTTPS certificates are enabled', () => {
+    const raw = JSON.parse(statusJson({ CertDomains: ['render-desktop.tail1234.ts.net'] })) as { Peer: Record<string, Record<string, unknown>> }
+    raw.Peer.nodekey1!.OS = 'iOS'
+    raw.Peer.phone2 = { ID: 'nPHONE', HostName: 'pixel', DNSName: 'pixel.tail1234.ts.net.', TailscaleIPs: ['100.80.7.7'], Online: false, UserID: 77, OS: 'android' }
+    const state = readTailscaleStatus(raw, NOW)
+    expect(state.peers.map(peer => peer.os)).toEqual(['ios', 'android'])
+    expect(state.certDomains).toEqual(['render-desktop.tail1234.ts.net'])
+    // The CLI prints null for CertDomains while the tailnet has HTTPS certificates switched off.
+    expect(readTailscaleStatus(JSON.parse(statusJson({ CertDomains: null })), NOW).certDomains).toEqual([])
+    expect(readTailscaleStatus(JSON.parse(statusJson()), NOW).certDomains).toEqual([])
+  })
+
   it('calls a peer with only a DERP region relayed', () => {
     const raw = JSON.parse(statusJson()) as { Peer: Record<string, Record<string, unknown>> }
     raw.Peer.nodekey1!.CurAddr = ''

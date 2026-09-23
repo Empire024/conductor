@@ -11,37 +11,38 @@ through the same mirror the desktop window uses).
 
 ## Turn it on
 
-Settings → **Phone access**.
+Settings → **Phone**. Switch on "Let my phones control this Conductor". Conductor shows the address
+the phone should keep: the Tailscale address of this computer, which answers at home and away while
+Tailscale is on. The four numbered steps below each show a QR code, a status read from this computer,
+and a "Check again" or "Show a new code" retry.
 
-1. Switch on **Let my phones control this Conductor**. Conductor starts an HTTPS listener on port
-   51841 (change it if you like) and shows the address it answers on.
-2. Choose where it listens. **This network** answers on every interface of this computer, so a phone
-   on the same Wi-Fi can reach it. **Only through Tailscale** binds this computer's tailnet address
-   and nothing else - the same rule remote control follows - and refuses to start at all when
-   Tailscale is missing, signed out or stopped.
-3. **Trust this computer on your phone** (once per phone). The listener speaks HTTPS with a
-   certificate signed by a certificate authority Conductor minted for this computer. The phone has
-   to trust that authority once; after that Conductor can re-issue the server certificate as often
-   as it needs to (a new LAN address, a new tailnet name, an expiry) without touching the phone
-   again. Open `https://<address>:51841/ca.crt` on the phone - or save the certificate from the
-   panel and send it across - and install it:
-   - iPhone / iPad: open the link in Safari, allow the profile, then Settings → Profile Downloaded →
-     Install. Then Settings → General → About → Certificate Trust Settings and enable full trust for
-     "Conductor Phone Access".
-   - Android: download the file, then Settings → Security → Encryption & credentials → Install a
-     certificate → CA certificate. Chrome trusts it from then on.
-   The fingerprint shown in the panel is what you compare against the one the phone shows before
-   you trust it.
-4. **Show pairing code**. The panel shows a QR code and an 8-character code, valid for ten minutes,
-   usable once. Scan the code or open the address on the phone, give the phone a name, and pair. The
-   phone receives its own bearer token; the code is spent. Every phone is listed in the panel with
-   the last time it was seen, and can be renamed or revoked from there. Revoking closes its stream
-   at once and refuses every later request from it.
-5. On the phone, **add the app to the Home Screen** (Share → Add to Home Screen on iOS; the install
-   prompt on Android), then open it from there and turn on notifications under **Phone**. iOS only
-   delivers web push to an app on the Home Screen; Android does not mind either way.
+1. **Tailscale on the phone.** Scan the QR (App Store or Play Store), sign in with the same account
+   as this computer (the panel names it), keep Tailscale on. The step turns green when the phone
+   appears on the tailnet; "Check again" re-reads Tailscale.
+2. **Make the address trusted.** Recommended: a certificate from Tailscale. HTTPS certificates must be
+   enabled for the tailnet at <https://login.tailscale.com/admin/dns> (the panel says whether they are,
+   with a button and a QR to that page); then switch on "Get a trusted certificate from Tailscale". The
+   phone needs nothing installed. The machine's MagicDNS name becomes public in
+   certificate-transparency logs. Alternative: install Conductor's own certificate. Scan the QR of the
+   trust page; on an iPhone the page offers "Open in Safari" because only Safari can install a
+   profile, then Settings → Profile Downloaded → Install, then Settings → General → About →
+   Certificate Trust Settings and full trust for Conductor. Compare the fingerprint with the one in the
+   panel.
+3. **Pair.** "Show pairing code" shows a QR and an 8-character code, valid for ten minutes, one phone.
+   Scanning with the Camera opens the phone's default browser; that page offers "Open in Safari" and
+   shows the code large, so a phone that already has Conductor on its Home Screen can just open it and
+   type the code. The step turns green when the phone appears in the paired list.
+4. **Home Screen and notifications.** Share → Add to Home Screen, open it from there, turn
+   notifications on under Phone. iOS delivers web push only to a Home Screen app, and a Home Screen app
+   has its own storage, which is why pairing should happen inside it.
 
-### A certificate from Tailscale instead
+### Advanced
+
+Folded away in the panel: where it listens ("This network" on every interface, or "Only through
+Tailscale" bound to the tailnet address only, failing closed when Tailscale is off), the port (default
+51841), and the notification master switch.
+
+### The Tailscale certificate, in detail
 
 Under Tailscale exposure, **Get a trusted certificate from Tailscale** asks Tailscale for a Let's
 Encrypt certificate for this computer's MagicDNS name (`tailscale cert`). A phone on the tailnet then
@@ -72,6 +73,22 @@ certificate for everything but that one name, so a phone that trusts the authori
   expensive right now, the runtimes Conductor has open, and the provider usage windows (weekly and
   short) as the providers last reported them.
 - **Phone**: the phone's own name, notifications on/off with a test button, and unpair.
+
+## When the phone shows nothing
+
+A Home Screen app on iOS shows its splash colour and then a blank page when the address it was added
+from does not answer; the browser's error page never appears in a Home Screen app. Since this change
+the app shows a card instead of a blank page whenever its own files fail to load or its script fails,
+and a "Connection check" page (also reachable from the pairing screen and the Phone screen, at
+`#diagnose`) that names the address the app uses, whether the page is running from the Home Screen, and
+what `GET /api/health` answered.
+
+- The computer is off or Conductor is closed. Start it.
+- The phone is not connected to Tailscale. Open Tailscale on the phone.
+- Conductor was switched from "This network" to "Only through Tailscale" after the app was added from
+  the Wi-Fi address. Scan the pairing code again and add the app to the Home Screen from the new
+  address.
+- The certificate is not trusted yet. Do step 2.
 
 ## Notifications
 
@@ -105,6 +122,8 @@ While the app is open, the same events arrive over its live stream as an in-app 
   credential store, like remote control's keys. Without that store nothing is served.
 - A paired phone is trusted like the owner at the keyboard: revoke a lost phone from the panel
   immediately.
+- `GET /api/health` is the only unauthenticated JSON answer: version, exposure and whether the
+  request came over the tailnet, nothing about projects or conversations.
 
 ## Keeping the process alive
 
@@ -117,14 +136,29 @@ first while a phone is connected.
 - `src/main/phone-access.test.ts`: settings, pairing and lockout, token authentication and
   revocation, the certificate chain, the phone's view of sessions/history/usage/metrics, message
   routing (send/steer/queue/resume, local and mirrored), answering questions, opening tabs locally
-  and on a paired machine, and the notification rules with a fake push service.
+  and on a paired machine, the notification rules with a fake push service, the recommended address
+  and the pairing endpoint choice.
 - `src/main/phone-access-server.test.ts`: a real HTTPS listener over the CA-signed chain - shell
-  assets and headers, the pairing endpoint, bearer and origin enforcement, body limits, the live
-  stream, Tailscale fail-closed and a port clash.
+  assets and headers (the boot guard included), `/api/health`, the pairing endpoint, bearer and
+  origin enforcement, body limits, the live stream, Tailscale fail-closed, a port clash, and the
+  tailnet detail behind the setup steps (phones on the tailnet, HTTPS certificates on or off, Check
+  again without a restart).
+- `src/main/tailscale.test.ts`: each node's OS and the tailnet's CertDomains from
+  `tailscale status --json`.
+- `src/phone/phone-shell.test.ts`: boot.js and sw.js exactly as served, in node:vm with a stub
+  DOM - the boot card for a failed, stuck or throwing app.js, the watchdog, browser detection, the
+  Safari hand-off address, and the service worker's built-in "not answering" page.
 - `src/main/phone-tls.test.ts`, `src/main/web-push.test.ts` (RFC 8291 test vector),
   `src/shared/qr-code.test.ts` (with an independent decoder), `src/main/phone-notifications` rules,
-  and the settings panel helpers.
+  and `src/renderer/src/components/phone-access-view.test.ts` for every decision the setup steps
+  show (step status, address labels, phones on the tailnet, the recommended-address sentence).
 - `scripts/smoke-phone-access.mjs` runs the real Electron app with the synthetic Claude fixture:
   enables phone access from the settings bridge, pairs over HTTPS, opens a tab from the phone API,
-  answers a question the agent asks, sends a follow-up, reads metrics and checks the live stream's
-  notifications. Run after `npm.cmd run build`; the report is written to `artifacts/phone-access/`.
+  answers a question the agent asks, sends a follow-up, reads metrics, checks the live stream's
+  notifications and the Settings > Phone page. Run after `npm.cmd run build`; the report is
+  written to `artifacts/phone-access/`.
+- `scripts/smoke-phone-shell.mjs` (`npm run test:phone-shell`) opens the served phone app in a
+  second parked, phone-sized window that trusts only the listener's certificate: boot, the
+  connection check, the trust page, the iPhone Chrome and Safari landings, a real pairing, the boot
+  card with app.js blocked, and "not answering" after phone access is switched off. Screenshots and
+  `smoke-report.json` go to `artifacts/swarm-2026-09-23/phone-app/`.

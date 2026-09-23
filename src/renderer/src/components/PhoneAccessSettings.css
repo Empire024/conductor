@@ -1,8 +1,10 @@
-/* Phone access sits beside the machines section in the settings drawer, so it borrows that
-   section's rhythm exactly rather than introducing a third visual language for the same kind of
-   pairing work. The rules are copied rather than shared: the two sections are free to drift, and
-   a surprise restyle of one from an edit to the other would be worse than the duplication. */
-.phone-access-settings { padding: 19px 17px; border-bottom: 1px solid #272e35; }
+/* Phone access has a settings page of its own now, so the page gives it padding and the rule
+   below it. It still borrows the machines section's rhythm rather than introducing a third visual
+   language for the same kind of pairing work. The rules are copied rather than shared: the two
+   sections are free to drift, and a surprise restyle of one from an edit to the other would be
+   worse than the duplication. The section is a size container so the steps can stack by their own
+   width, not the window's: the page is about 560px beside the settings navigation. */
+.phone-access-settings { container-type: inline-size; display: flex; flex-direction: column; }
 
 .phone-card {
   margin-top: 10px;
@@ -27,7 +29,7 @@
 }
 .phone-error { color: var(--danger); }
 .phone-warning { color: #d9a441; }
-.phone-status { color: var(--text-2); }
+.phone-status { color: var(--accent-muted); }
 .phone-status code { overflow-wrap: anywhere; }
 
 .phone-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; }
@@ -152,3 +154,116 @@
 .phone-dot { width: 6px; height: 6px; flex: 0 0 auto; border-radius: 50%; background: #69717a; }
 .phone-dot[data-connected="true"] { background: var(--accent); box-shadow: 0 0 7px #d6ff7366; }
 .phone-problem { color: #d9a441 !important; font-size: 9.5px; line-height: 1.4; }
+
+/* ---- The address to keep, under the master switch ---- */
+.phone-keep { display: flex; flex-direction: column; gap: 5px; padding-top: 8px; border-top: 1px solid var(--border-soft); }
+.phone-keep > span { color: var(--text-3); font-size: 9.5px; }
+.phone-keep > small { color: var(--text-2); font-size: 10px; line-height: 1.5; }
+.phone-keep .phone-url code { font-size: 11px; color: var(--text); }
+
+/* ---- The four setup steps ---- */
+.phone-steps-title { margin: 18px 0 0; color: var(--text); font-size: 12px; font-weight: 600; }
+.phone-step { gap: 10px; padding: 13px; }
+.phone-step-head { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.phone-step-head > strong { flex: 1 1 auto; min-width: 0; font-size: 12px; font-weight: 600; color: var(--text); }
+/* The number turns into a tick once the step is done, so a glance down the page reads as a list of
+   what is left rather than four identical cards. */
+.phone-step-number {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--border-soft);
+  border-radius: 50%;
+  color: var(--text-2);
+  background: var(--surface-2);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.phone-step-number[data-state="done"] { border-color: var(--accent-muted); color: var(--accent-muted); }
+.phone-step-number[data-state="problem"] { border-color: var(--danger); color: var(--danger); }
+
+/* Chips use the same three colours as the status lines: green done, amber waiting, red problem. */
+.phone-chip {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.phone-chip[data-state="done"] { color: var(--accent-muted); background: color-mix(in srgb, var(--accent-muted) 12%, transparent); }
+.phone-chip[data-state="waiting"] { color: #d9a441; background: color-mix(in srgb, #d9a441 10%, transparent); }
+.phone-chip[data-state="problem"] { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.phone-step[data-state="problem"] { border-color: color-mix(in srgb, var(--danger) 45%, var(--border-soft)); }
+
+/* QR on the left, words on the right; stacked once the page is too narrow for both. */
+.phone-step-body { display: flex; align-items: flex-start; gap: 14px; }
+.phone-step-detail { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1 1 auto; }
+.phone-step-text { margin: 0; color: var(--text-2); font-size: 10.5px; line-height: 1.55; }
+.phone-step-text strong { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.phone-qr.phone-qr-step { width: 132px; height: 132px; padding: 5px; }
+.phone-qr-empty {
+  flex: 0 0 auto;
+  width: 132px;
+  height: 132px;
+  display: grid;
+  place-items: center;
+  padding: 10px;
+  border: 1px dashed var(--border-soft);
+  border-radius: 8px;
+  color: var(--text-3);
+  font-size: 9.5px;
+  text-align: center;
+}
+@container (max-width: 420px) {
+  .phone-step-body { flex-direction: column; }
+}
+
+.phone-checked { color: var(--text-3); font-size: 9.5px; font-variant-numeric: tabular-nums; }
+.phone-link-button {
+  align-self: flex-start;
+  padding: 0;
+  border: 0;
+  color: var(--blue);
+  background: transparent;
+  font-size: 10px;
+  cursor: pointer;
+}
+.phone-link-button:hover { text-decoration: underline; }
+
+/* The two ways of step 2 are alternatives, so they are separated by a rule, not nested cards. */
+.phone-way { display: flex; flex-direction: column; gap: 8px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+.phone-way-title { display: flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 600; color: var(--text); }
+.phone-way-title em {
+  padding: 1px 7px;
+  border-radius: 999px;
+  color: var(--accent-muted);
+  background: color-mix(in srgb, var(--accent-muted) 12%, transparent);
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 600;
+}
+.phone-way .phone-row small code { font-size: 9.5px; overflow-wrap: anywhere; }
+
+.phone-choices { margin: 0; padding: 0; border: 0; display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.phone-choices legend { margin-bottom: 4px; padding: 0; color: var(--text-3); font-size: 9.5px; }
+.phone-choice { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
+.phone-choice input { margin: 2px 0 0; accent-color: var(--accent-muted); }
+.phone-choice > span { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.phone-choice strong { font-size: 10.5px; font-weight: 600; }
+.phone-choice code { color: var(--text-3); font-size: 9.5px; overflow-wrap: anywhere; }
+
+.phone-notes { margin: 0; padding-left: 15px; display: flex; flex-direction: column; gap: 3px; color: var(--text-3); font-size: 10px; line-height: 1.5; }
+
+.phone-spin { animation: phone-spin 0.9s linear infinite; }
+@keyframes phone-spin { to { transform: rotate(360deg); } }
+
+/* Advanced settings are a card that folds; closed, it is one line at the bottom of the page. */
+.phone-advanced-card { gap: 0; }
+.phone-advanced-card > summary { font-size: 11px; font-weight: 600; color: var(--text-2); }
+.phone-advanced-body { display: flex; flex-direction: column; gap: 9px; padding-top: 8px; }

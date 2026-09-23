@@ -12,7 +12,7 @@ import {
   DEFAULT_PHONE_SETTINGS, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
   type PhoneAccessSettings, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
   type PhoneNotification, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
-  type PhoneSelf, type PhoneSessionSummary, type PhoneState, type PhoneTimelineItem, type PhoneUsageWindow
+  type PhoneSelf, type PhoneSessionSummary, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
 } from '../shared/phone-access'
 import { rememberedPermission } from './app-settings'
 import type { AgentActivityRow } from './project-activity'
@@ -112,6 +112,35 @@ export interface PhoneListenerStatus {
   tailscaleMessage: string | null
   tailscaleAddress: string | null
   tailscaleDnsName: string | null
+  /** The rest of the tailnet reading the setup steps show; absent when Tailscale was never read. */
+  tailnet?: PhoneTailnetDetail
+}
+
+/** What the listener learned about the tailnet beyond its own address: filled by the server. */
+export type PhoneTailnetDetail = Pick<PhoneTailnetView, 'installed' | 'backendState' | 'loginName' | 'httpsEnabled' | 'phones' | 'checkedAt'>
+
+const NO_TAILNET: PhoneTailnetDetail = { installed: false, backendState: null, loginName: null, httpsEnabled: null, phones: [], checkedAt: null }
+
+/**
+ * The origin a phone should keep. A tailnet origin answers at home and away as long as Tailscale
+ * is on, so it wins whenever this machine has one; the MagicDNS name only once the publicly
+ * trusted certificate serves it, because until then the name is the same self-signed chain as the
+ * address with one more thing that can fail (MagicDNS on the phone).
+ */
+export function recommendEndpoint(status: Pick<PhoneListenerStatus, 'listening' | 'endpoints' | 'tailscaleAddress' | 'tailscaleDnsName' | 'tailscaleCertificate'>): string | null {
+  if (!status.listening || !status.endpoints.length) return null
+  const hostOf = (endpoint: string): string => { try { return new URL(endpoint).hostname.replace(/^\[|\]$/g, '').toLowerCase() } catch { return '' } }
+  const dnsName = (status.tailscaleDnsName ?? '').toLowerCase()
+  if (status.tailscaleCertificate === 'active' && dnsName) {
+    const named = status.endpoints.find(endpoint => hostOf(endpoint) === dnsName)
+    if (named) return named
+  }
+  const address = (status.tailscaleAddress ?? '').toLowerCase()
+  if (address) {
+    const byAddress = status.endpoints.find(endpoint => hostOf(endpoint) === address)
+    if (byAddress) return byAddress
+  }
+  return status.endpoints[0] ?? null
 }
 
 export interface PhoneAccessDependencies {
@@ -233,12 +262,20 @@ export class PhoneAccessService {
       message: this.listener.message,
       caFingerprint: this.deps.vault.available() ? this.certificateAuthority().fingerprint : null,
       devices: this.devices.map(device => this.describeDevice(device, connected)),
-      pairing: this.pairing ? { code: this.pairing.code, url: this.pairing.url, expiresAt: this.pairing.expiresAt } : null,
+      pairing: this.pairing ? { code: this.pairing.code, url: this.pairing.url, endpoint: this.pairing.endpoint, expiresAt: this.pairing.expiresAt } : null,
       secureStorage: this.deps.vault.available(),
-      tailscale: { address: this.listener.tailscaleAddress, dnsName: this.listener.tailscaleDnsName, certificate: this.listener.tailscaleCertificate, message: this.listener.tailscaleMessage },
+      tailscale: {
+        address: this.listener.tailscaleAddress, dnsName: this.listener.tailscaleDnsName, certificate: this.listener.tailscaleCertificate, message: this.listener.tailscaleMessage,
+        ...(this.listener.tailnet ?? NO_TAILNET),
+        phones: [...(this.listener.tailnet?.phones ?? [])]
+      },
+      recommendedEndpoint: recommendEndpoint(this.listener),
       pushConfigured: Boolean(this.deps.store.getSetting(VAPID_PUBLIC_KEY))
     }
   }
+
+  /** Conductor's own version, for the unauthenticated health answer. */
+  version(): string { return this.deps.version }
 
   private describeDevice(device: StoredDevice, connected: Set<string>): PhoneDevice {
     return { id: device.id, name: device.name, createdAt: device.createdAt, lastSeenAt: device.lastSeenAt, userAgent: device.userAgent, pushEnabled: Boolean(device.subscription), pushFailures: device.pushFailures, connected: connected.has(device.id) }
@@ -257,18 +294,24 @@ export class PhoneAccessService {
     if (this.pairing && Date.parse(this.pairing.expiresAt) <= this.now()) { this.pairing = null; this.deps.changed?.() }
   }
 
-  /** One live code at a time: showing a second one silently retires the first. */
-  createPairing(): PhonePairingOffer {
+  /**
+   * One live code at a time: showing a second one silently retires the first. The code names the
+   * origin the phone will keep: the recommended one unless the owner picked another the listener
+   * answers on. Anything else is refused rather than encoded, since a QR naming an address this
+   * machine does not serve is the blank-screen failure this setup exists to end.
+   */
+  createPairing(endpoint?: string): PhonePairingOffer {
     if (!this.settings.enabled) throw new PhoneAccessError('Switch phone access on before pairing a phone.', 409)
-    const endpoint = this.listener.endpoints[0]
-    if (!this.listener.listening || !endpoint) throw new PhoneAccessError(this.listener.message ?? 'The phone listener is not running yet.', 409)
+    const chosen = endpoint ? this.listener.endpoints.find(known => known.toLowerCase() === endpoint.trim().replace(/\/+$/, '').toLowerCase()) : recommendEndpoint(this.listener)
+    if (!this.listener.listening || !this.listener.endpoints.length) throw new PhoneAccessError(this.listener.message ?? 'The phone listener is not running yet.', 409)
+    if (!chosen) throw new PhoneAccessError('This computer does not answer at that address. Pick one of the addresses it is listening on.', 400)
     if (this.devices.length >= MAX_DEVICES) throw new PhoneAccessError('Revoke a phone before pairing another; the list is full.', 409)
     const bytes = randomBytes(8)
     const raw = [...bytes].map(byte => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('')
     const code = raw.slice(0, 4) + '-' + raw.slice(4)
-    this.pairing = { code, normalized: raw, url: `${endpoint}/#pair=${code}`, expiresAt: new Date(this.now() + PHONE_PAIRING_TTL_MS).toISOString() }
+    this.pairing = { code, normalized: raw, url: `${chosen}/#pair=${code}`, endpoint: chosen, expiresAt: new Date(this.now() + PHONE_PAIRING_TTL_MS).toISOString() }
     this.deps.changed?.()
-    return { code, url: this.pairing.url, expiresAt: this.pairing.expiresAt }
+    return { code, url: this.pairing.url, endpoint: chosen, expiresAt: this.pairing.expiresAt }
   }
 
   cancelPairing(): void { this.pairing = null; this.deps.changed?.() }

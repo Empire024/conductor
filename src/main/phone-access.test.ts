@@ -5,7 +5,7 @@ import type { AgentActivityPhase, AgentProviderInfo, DetachedWindowRecord, PaneT
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import type { AgentEventData, SessionProjection, TimelineItem } from '../shared/structured-agent'
 import type { PhoneNotification } from '../shared/phone-access'
-import { normalizePairingCode, normalizePhoneSettings, PhoneAccessError, PhoneAccessService, trimItem, type PhoneDatabase, type PhoneRemoteSessions, type PhoneSessions } from './phone-access'
+import { normalizePairingCode, normalizePhoneSettings, PhoneAccessError, PhoneAccessService, recommendEndpoint, trimItem, type PhoneDatabase, type PhoneRemoteSessions, type PhoneSessions } from './phone-access'
 import { describeTransition, phoneSessionState } from './phone-notifications'
 import { autoModeDenialMessage, autoModeDenialPayload } from '../shared/auto-mode-denial'
 import { MemoryVault, type SecretKeyValueStore } from './secret-store'
@@ -142,6 +142,44 @@ describe('settings', () => {
     fix.service.updateSettings({ enabled: true, port: 52000 })
     expect(JSON.parse(fix.store.getSetting('phone-access.settings')!)).toMatchObject({ enabled: true, port: 52000 })
     expect(fix.changed).toHaveBeenCalled()
+  })
+})
+
+describe('the address a phone should keep', () => {
+  const status = (over: Partial<Parameters<typeof recommendEndpoint>[0]> = {}): Parameters<typeof recommendEndpoint>[0] => ({
+    listening: true, endpoints: ['https://192.168.0.205:51841', 'https://100.72.193.87:51841', 'https://e-box.tail8216c8.ts.net:51841'],
+    tailscaleAddress: '100.72.193.87', tailscaleDnsName: 'e-box.tail8216c8.ts.net', tailscaleCertificate: 'off', ...over
+  })
+
+  it('prefers the tailnet address over the Wi-Fi one, and the MagicDNS name only once a public certificate serves it', () => {
+    expect(recommendEndpoint(status())).toBe('https://100.72.193.87:51841')
+    expect(recommendEndpoint(status({ tailscaleCertificate: 'active' }))).toBe('https://e-box.tail8216c8.ts.net:51841')
+    expect(recommendEndpoint(status({ tailscaleCertificate: 'pending' }))).toBe('https://100.72.193.87:51841')
+    expect(recommendEndpoint(status({ tailscaleAddress: null, tailscaleDnsName: null, endpoints: ['https://192.168.0.205:51841'] }))).toBe('https://192.168.0.205:51841')
+    expect(recommendEndpoint(status({ listening: false, endpoints: [] }))).toBeNull()
+  })
+
+  it('is what the desktop state and a pairing code name unless the owner picks another address this machine answers on', () => {
+    const fix = fixture()
+    fix.service.updateSettings({ enabled: true })
+    fix.service.setListenerStatus({ ...status(), message: null, tailscaleMessage: null, tailnet: { installed: true, backendState: 'Running', loginName: 'Empire024@github', httpsEnabled: false, phones: [{ hostName: 'iphone', os: 'ios', online: true, addresses: ['100.72.9.9'] }], checkedAt: '2026-09-23T00:00:00.000Z' } })
+    const desktop = fix.service.desktopState()
+    expect(desktop.recommendedEndpoint).toBe('https://100.72.193.87:51841')
+    expect(desktop.tailscale).toMatchObject({ address: '100.72.193.87', loginName: 'Empire024@github', httpsEnabled: false, installed: true, phones: [{ hostName: 'iphone', os: 'ios' }] })
+    const recommended = fix.service.createPairing()
+    expect(recommended.endpoint).toBe('https://100.72.193.87:51841')
+    expect(recommended.url).toBe(`https://100.72.193.87:51841/#pair=${recommended.code}`)
+    const wifi = fix.service.createPairing('https://192.168.0.205:51841/')
+    expect(wifi.endpoint).toBe('https://192.168.0.205:51841')
+    expect(fix.service.desktopState().pairing).toMatchObject({ code: wifi.code, endpoint: 'https://192.168.0.205:51841' })
+    // A code naming an address this machine does not serve would be the blank phone screen again.
+    expect(() => fix.service.createPairing('https://10.0.0.1:51841')).toThrow(/does not answer at that address/)
+  })
+
+  it('reads as nothing known about the tailnet when the listener never looked', () => {
+    const fix = fixture()
+    expect(fix.service.desktopState().tailscale).toEqual({ address: null, dnsName: null, certificate: 'off', message: null, installed: false, backendState: null, loginName: null, httpsEnabled: null, phones: [], checkedAt: null })
+    expect(fix.service.desktopState().recommendedEndpoint).toBeNull()
   })
 })
 

@@ -51,8 +51,9 @@ const bridge: ConductorBridge = {
   phone: {
     state: () => ipcRenderer.invoke('phone:state'),
     setSettings: (patch) => ipcRenderer.invoke('phone:set-settings', patch),
-    pair: () => ipcRenderer.invoke('phone:pair'),
+    pair: (endpoint) => ipcRenderer.invoke('phone:pair', endpoint),
     cancelPairing: () => ipcRenderer.invoke('phone:cancel-pairing'),
+    check: () => ipcRenderer.invoke('phone:check'),
     revoke: (deviceId) => ipcRenderer.invoke('phone:revoke', deviceId),
     rename: (deviceId, name) => ipcRenderer.invoke('phone:rename', deviceId, name),
     saveCertificate: () => ipcRenderer.invoke('phone:save-certificate'),

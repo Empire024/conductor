@@ -891,3 +891,181 @@ textarea.input { resize: none; line-height: 1.45; }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* ------------------------------------------------------------------ boot guard */
+
+/* Drawn by boot.js when app.js cannot start, so it leans only on the palette above. */
+.boot-screen {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: calc(env(safe-area-inset-top) + 24px) max(14px, env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 24px) max(14px, env(safe-area-inset-left));
+}
+.boot-starting { margin: auto 0; font-size: 14px; color: var(--text-3); }
+.boot-card {
+  width: 100%;
+  max-width: 460px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 20px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 109, 117, .35);
+  background: var(--surface-1);
+}
+.boot-title { margin: 0; font-size: 20px; font-weight: 680; }
+.boot-lead { margin: 0; font-size: 14px; color: var(--text-2); }
+.boot-facts { margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.boot-row { display: flex; flex-direction: column; gap: 1px; padding: 6px 0; border-bottom: 1px solid var(--border-soft); }
+.boot-row:last-child { border-bottom: 0; }
+.boot-row dt { font-size: 11px; letter-spacing: .4px; text-transform: uppercase; color: var(--text-3); }
+.boot-row dd { margin: 0; font-size: 13.5px; color: var(--text); overflow-wrap: anywhere; }
+.boot-actions { display: flex; flex-direction: column; gap: 8px; }
+.boot-check { display: flex; flex-direction: column; gap: 8px; font-size: 13.5px; color: var(--text-2); }
+.boot-check[hidden] { display: none; }
+.boot-check-line { margin: 0; overflow-wrap: anywhere; }
+
+.boot-strip {
+  pointer-events: auto;
+  width: 100%;
+  max-width: 520px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 109, 117, .35);
+  background: rgba(21, 26, 32, .96);
+  color: var(--danger);
+  font-size: 13px;
+}
+.boot-strip-text { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.boot-strip-button { flex: 0 0 auto; min-height: 32px; padding: 4px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font-size: 12.5px; }
+
+/* ------------------------------------------------------------------ pairing landing, check, trust */
+
+.steps { margin: 0; padding-left: 22px; display: flex; flex-direction: column; gap: 8px; font-size: 14px; color: var(--text-2); }
+.steps li { padding-left: 2px; }
+
+.link-button { display: flex; align-items: center; justify-content: center; text-align: center; text-decoration: none; }
+
+.scroll.pair-top { padding-top: calc(env(safe-area-inset-top) + 18px); padding-bottom: calc(env(safe-area-inset-bottom) + 24px); }
+.scroll.pair-top > .pair-card { margin: 0 auto; }
+.pair-form { display: flex; flex-direction: column; gap: 14px; }
+.pair-form[hidden] { display: none; }
+.pair-code {
+  margin: -4px 0 0;
+  padding: 12px 8px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 34px;
+  font-weight: 650;
+  letter-spacing: 5px;
+  text-align: center;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  user-select: all;
+  -webkit-user-select: all;
+}
+.pair-address {
+  margin: -6px 0 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13.5px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+  user-select: all;
+  -webkit-user-select: all;
+}
+.pair-divider { height: 1px; background: var(--border-soft); margin: 2px 0; }
+.pair-links { display: flex; flex-wrap: wrap; gap: 8px; }
+.pair-links .ghost { flex: 1 1 140px; font-size: 13px; }
+.pair-warning:empty { display: none; }
+
+.reach-note {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(236, 196, 141, .3);
+  background: rgba(236, 196, 141, .07);
+}
+.reach-note-text { margin: 0; font-size: 13.5px; color: var(--amber); overflow-wrap: anywhere; }
+
+.reach-banner {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 8px max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left));
+  border: 0;
+  border-bottom: 1px solid rgba(236, 196, 141, .3);
+  background: rgba(236, 196, 141, .08);
+  color: var(--amber);
+  font-size: 13.5px;
+  text-align: left;
+}
+.reach-banner[hidden] { display: none; }
+.reach-banner-link { flex: 0 0 auto; color: var(--text); font-weight: 600; }
+
+.check-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 5px 0; border-bottom: 1px solid var(--border-soft); font-size: 13px; }
+.check-row:last-child { border-bottom: 0; }
+.check-label { flex: 0 0 auto; color: var(--text-3); }
+.check-value { min-width: 0; text-align: right; color: var(--text); overflow-wrap: anywhere; }
+.check-value.warn { color: var(--amber); }
+.check-status { margin: 0; font-size: 14.5px; color: var(--text-2); overflow-wrap: anywhere; }
+.check-status.good { color: var(--green); }
+.check-status.warn { color: var(--amber); }
+.check-status.bad { color: var(--danger); }
+
+.trust-line { margin: 0; font-size: 14px; color: var(--text-2); }
+
+/* ------------------------------------------------------------------ qr scanner */
+
+.scanner {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.scanner-video { flex: 1 1 auto; min-height: 0; width: 100%; object-fit: cover; }
+.scanner-frame {
+  position: absolute;
+  top: 38%;
+  left: 50%;
+  width: min(64vw, 280px);
+  height: min(64vw, 280px);
+  transform: translate(-50%, -50%);
+  border: 2px solid var(--accent);
+  border-radius: 18px;
+  box-shadow: 0 0 0 100vmax rgba(0, 0, 0, .35);
+  pointer-events: none;
+}
+.scanner-bar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px max(16px, env(safe-area-inset-right)) calc(env(safe-area-inset-bottom) + 14px) max(16px, env(safe-area-inset-left));
+  background: var(--surface-1);
+  border-top: 1px solid var(--border);
+}
+.scanner-note { margin: 0; font-size: 14px; color: var(--text-2); text-align: center; }
+
+.install-card { margin-bottom: 14px; }
+
+/* Auto margins centre the pairing card while it fits and let it scroll from the top once it does
+   not; align-items: center alone would push a tall card's top out of reach. */
+.scroll.centered { align-items: flex-start; }
+.scroll.centered > .pair-card { margin-top: auto; margin-bottom: auto; }

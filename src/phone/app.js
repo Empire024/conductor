@@ -59,6 +59,22 @@
 
   const BUSY_PHASES = ['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting']
 
+  const HEALTH_TIMEOUT_MS = 8000
+  /* How long the stream may stay down while the owner is looking before the list says so. */
+  const UNREACHABLE_BANNER_MS = 20000
+
+  /* boot.js owns browser detection so the boot card and the app agree on it. If boot.js itself did
+     not load, the app still runs and treats the page as a plain browser tab. */
+  const shell = window.ConductorBoot || {
+    facts: () => ({ origin: window.location.origin, standalone: false, online: navigator.onLine !== false, serviceWorker: false, secure: window.isSecureContext === true }),
+    currentPlatform: () => ({ ios: false, android: false, browser: 'other', name: 'this browser' }),
+    isStandalone: () => false,
+    safariUrl: url => url,
+    pairCodeFromUrl: () => '',
+    booted: () => { window.__conductorBooted = true },
+    notAnsweringSteps: []
+  }
+
   // ------------------------------------------------------------------ app state
 
   const state = {
@@ -85,7 +101,14 @@
     expandedCoworkers: {},
     /* In-progress answers per pending interaction id, same reason as drafts. */
     answers: {},
-    form: null
+    form: null,
+    /* The hash a page like #diagnose returns to. */
+    returnTo: '',
+    /* Why the live stream is not open, in the owner's words; '' while it is, or before it tried. */
+    streamProblem: '',
+    /* Android's deferred install prompt, offered once after pairing in a browser tab. */
+    installPrompt: null,
+    offerInstall: false
   }
 
   let appRoot = null
@@ -352,10 +375,16 @@
   let streamTimer = null
   let lastEventAt = 0
   let refetchTimer = null
+  /* When the stream last went down and when the owner last looked; the later of the two is where
+     "not answering for 20 seconds" starts, so a phone that slept through an outage is not scolded
+     the instant it wakes. */
+  let downSince = Date.now()
+  let visibleSince = Date.now()
 
   const setConnected = value => {
     if (state.connected === value) return
     state.connected = value
+    downSince = value ? 0 : Date.now()
     if (overlayPill) overlayPill.hidden = value || !state.token
     /* The header carries a live dot of its own, and it only repaints when a view is asked to. */
     if (appRoot) render()
@@ -442,11 +471,19 @@
       signal: controller.signal
     }).then(async response => {
       if (response.status === 401) { handleUnauthorized(); return }
-      if (!response.ok || !response.body) throw new Error('Stream refused (' + response.status + ')')
+      if (!response.ok || !response.body) {
+        state.streamProblem = 'The computer refused it (' + response.status + ').'
+        return
+      }
       streamAttempt = 0
+      state.streamProblem = ''
       setConnected(true)
       await readStream(response.body)
-    }).catch(() => { /* every failure is the same failure: try again, slower */ })
+      state.streamProblem = 'The computer closed it.'
+    }).catch(error => {
+      /* Every failure is retried the same way, slower; the connection check only needs the word. */
+      if (!error || error.name !== 'AbortError') state.streamProblem = 'The network failed before the computer answered.'
+    })
       .then(() => {
         if (streamController !== controller) return
         streamController = null
@@ -519,19 +556,37 @@
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
     if (hash.indexOf('#/system') === 0) return { name: 'system', key: 'system' }
     if (hash.indexOf('#/phone') === 0) return { name: 'phone', key: 'phone' }
+    if (hash.indexOf('#diagnose') === 0) return { name: 'diagnose', key: 'diagnose' }
+    if (hash.indexOf('#trust') === 0) return { name: 'trust', key: 'trust' }
     return { name: 'sessions', key: 'sessions' }
   }
+
+  /* The two pages a phone needs before it is paired, or when pairing is what broke. */
+  const OPEN_ROUTES = ['diagnose', 'trust']
 
   const go = hash => {
     if (window.location.hash === hash) render()
     else window.location.hash = hash
   }
 
+  /* Opens a page that has a back button, remembering where back goes. */
+  const visit = hash => {
+    state.returnTo = window.location.hash || '#/'
+    go(hash)
+  }
+
+  const goBack = () => {
+    const target = state.returnTo && state.returnTo !== window.location.hash ? state.returnTo : '#/'
+    state.returnTo = ''
+    go(target)
+  }
+
   const beginTicks = () => { tickers = [] }
   const onTick = fn => { tickers.push(fn); fn() }
 
   const render = () => {
-    const route = state.token ? currentRoute() : { name: 'pair', key: 'pair' }
+    const wanted = currentRoute()
+    const route = state.token || OPEN_ROUTES.indexOf(wanted.name) >= 0 ? wanted : { name: 'pair', key: 'pair' }
     if (screen && screen.key === route.key) {
       if (screen.update) screen.update(route)
       updateTabBar(route)
@@ -553,6 +608,8 @@
     if (route.name === 'new') return newTaskScreen()
     if (route.name === 'system') return systemScreen()
     if (route.name === 'phone') return phoneScreen()
+    if (route.name === 'diagnose') return diagnoseScreen()
+    if (route.name === 'trust') return trustScreen()
     return sessionsScreen()
   }
 
@@ -588,7 +645,7 @@
   }
 
   const updateTabBar = route => {
-    const hidden = route.name === 'pair' || route.name === 'session'
+    const hidden = route.name === 'pair' || route.name === 'session' || OPEN_ROUTES.indexOf(route.name) >= 0
     tabBar.hidden = hidden
     const attention = state.phone && state.phone.counts ? state.phone.counts.attention : 0
     for (const node of tabBar.querySelectorAll('.tab')) {
@@ -639,23 +696,29 @@
     return letters.length > 4 ? letters.slice(0, 4) + '-' + letters.slice(4) : letters
   }
 
-  const pairScreen = () => {
-    const root = el('div', 'screen')
-    const scroll = scroller()
-    scroll.classList.add('centered')
-    const card = el('form', 'pair-card')
+  /* Where the pairing page landed decides what it asks for. iOS gives a Home Screen app storage of
+     its own, apart from Safari and every other browser, so a token made in a browser tab never
+     reaches the Home Screen app: on iOS a tab shows the code to carry over instead of spending it.
+     Android shares storage between Chrome and the installed app, so it pairs right here. */
+  const pairMode = () => {
+    if (shell.isStandalone()) return 'direct'
+    const where = shell.currentPlatform()
+    if (where.ios && where.browser === 'safari') return 'ios-safari'
+    if (where.ios) return 'ios-other'
+    return 'direct'
+  }
 
-    const mark = el('div', 'pair-mark')
-    mark.appendChild(icon(['M16.5 7.5A7.5 7.5 0 1 0 16.5 16.5'], 38))
-    card.appendChild(mark)
-    card.appendChild(el('h1', 'pair-title', 'Conductor'))
-    card.appendChild(el('p', 'pair-lead', 'This phone will watch and steer the agents running on this computer. Enter the code the desktop is showing.'))
+  /* No decoder is bundled: without the browser's own BarcodeDetector the button is not offered. */
+  const canScan = () => 'BarcodeDetector' in window && Boolean(navigator.mediaDevices) && typeof navigator.mediaDevices.getUserMedia === 'function'
+
+  const pairForm = onScan => {
+    const form = el('form', 'pair-form')
 
     const nameInput = el('input', 'input')
     nameInput.type = 'text'
     nameInput.value = guessDeviceName()
     nameInput.autocomplete = 'off'
-    card.appendChild(field('Name this phone', nameInput))
+    form.appendChild(field('Name this phone', nameInput))
 
     const codeInput = el('input', 'input code-input')
     codeInput.type = 'text'
@@ -672,23 +735,25 @@
       if (caretAtEnd) codeInput.setSelectionRange(codeInput.value.length, codeInput.value.length)
       state.pairCode = codeInput.value
     })
-    card.appendChild(field('Pairing code', codeInput))
+    form.appendChild(field('Pairing code', codeInput))
+
+    if (canScan()) form.appendChild(button('ghost wide', 'Scan the code instead', () => onScan()))
 
     const problem = el('p', 'pair-error')
     problem.hidden = true
-    card.appendChild(problem)
+    form.appendChild(problem)
 
     const submit = button('primary', 'Pair', null)
     submit.type = 'submit'
-    card.appendChild(submit)
+    form.appendChild(submit)
 
     /* Push needs both a service worker and a secure context; a self-signed certificate that was
        never trusted gives neither, and the owner deserves to know that before they wonder. */
     if (!window.isSecureContext || !('serviceWorker' in navigator)) {
-      card.appendChild(el('p', 'pair-note', 'This connection is not trusted by the phone yet, so notifications will not work until the Conductor certificate is installed. Everything else works.'))
+      form.appendChild(el('p', 'pair-note', 'This connection is not trusted by the phone yet, so notifications will not work until the Conductor certificate is installed. Everything else works.'))
     }
 
-    card.addEventListener('submit', async event => {
+    form.addEventListener('submit', async event => {
       event.preventDefault()
       const code = formatCode(codeInput.value)
       const name = nameInput.value.trim() || guessDeviceName()
@@ -705,6 +770,9 @@
         setToken(result && result.token)
         state.me = result && result.device ? result.device : null
         state.pairCode = ''
+        /* Android keeps one storage for Chrome and the installed app, so a tab that just paired
+           can still become the app; the list offers it once, if Chrome offered an install. */
+        if (!shell.isStandalone() && shell.currentPlatform().android) state.offerInstall = true
         streamAttempt = 0
         connectStream()
         go('#/')
@@ -716,9 +784,432 @@
       }
     })
 
+    const setCode = code => {
+      codeInput.value = formatCode(code)
+      state.pairCode = codeInput.value
+      problem.hidden = true
+    }
+    return { root: form, setCode: setCode }
+  }
+
+  const bigCode = code => {
+    const node = el('p', 'pair-code', code)
+    node.setAttribute('aria-label', 'Pairing code ' + code.split('').join(' '))
+    return node
+  }
+
+  const stepsList = items => {
+    const list = el('ol', 'steps')
+    for (const item of items) if (item) list.appendChild(el('li', null, item))
+    return list
+  }
+
+  const linkButton = (className, label, href) => {
+    const node = el('a', className, label)
+    node.href = href
+    return node
+  }
+
+  const pairLinks = () => box('pair-links', [
+    button('ghost', 'Connection check', () => visit('#diagnose')),
+    button('ghost', 'Install the certificate', () => visit('#trust'))
+  ])
+
+  /* The notice a page shows when GET /api/health failed: where it asked, and a way to the check. */
+  const notAnsweringNote = () => {
+    const node = el('div', 'reach-note')
+    node.setAttribute('role', 'alert')
+    node.appendChild(el('p', 'reach-note-text', 'This computer is not answering at ' + window.location.origin + '.'))
+    node.appendChild(button('ghost', 'Connection check', () => visit('#diagnose')))
+    return node
+  }
+
+  const pairScreen = () => {
+    const root = el('div', 'screen')
+    const scroll = scroller()
+    const mode = pairMode()
+    const where = shell.currentPlatform()
+    const code = formatCode(state.pairCode)
+    const origin = window.location.origin
+    scroll.classList.add(mode === 'direct' ? 'centered' : 'pair-top')
+    const card = el('div', 'pair-card')
+
+    const mark = el('div', 'pair-mark')
+    mark.appendChild(icon(['M16.5 7.5A7.5 7.5 0 1 0 16.5 16.5'], 38))
+    card.appendChild(mark)
+
+    let stopScanner = null
+    const form = pairForm(() => {
+      if (stopScanner) stopScanner()
+      stopScanner = openScanner(found => form.setCode(found))
+    })
+    const warning = el('div', 'pair-warning')
+
+    if (mode === 'ios-other') {
+      card.appendChild(el('h1', 'pair-title', 'Open Conductor in Safari'))
+      card.appendChild(el('p', 'pair-lead', (code ? 'The Camera opened this link in ' : 'This page is open in ') + where.name + '. Continue in Safari: on iPhone it is the only browser that can install this computer\'s certificate.'))
+      card.appendChild(warning)
+      card.appendChild(linkButton('primary wide link-button', 'Open in Safari', shell.safariUrl(origin + '/' + (code ? '#pair=' + encodeURIComponent(code) : ''))))
+      card.appendChild(el('p', 'pair-note', 'If Safari does not open, open Safari yourself and go to this address:'))
+      card.appendChild(el('p', 'pair-address', origin + '/'))
+      if (code) {
+        card.appendChild(el('span', 'field-label', 'Pairing code'))
+        card.appendChild(bigCode(code))
+        card.appendChild(el('p', 'pair-note', 'Already have Conductor on your Home Screen? Open it and enter this code. The code works for ten minutes after the computer showed it.'))
+      }
+      form.root.hidden = true
+      const reveal = button('ghost wide', 'Pair in ' + where.name + ' instead', () => {
+        reveal.hidden = true
+        form.root.hidden = false
+      })
+      card.appendChild(el('div', 'pair-divider'))
+      card.appendChild(reveal)
+      card.appendChild(form.root)
+    } else if (mode === 'ios-safari') {
+      card.appendChild(el('h1', 'pair-title', 'Add Conductor to your Home Screen'))
+      card.appendChild(el('p', 'pair-lead', 'iOS gives a Home Screen app its own storage, apart from Safari, so a pairing made in this tab would not reach it. Pair inside the Home Screen app.'))
+      card.appendChild(warning)
+      if (code) {
+        card.appendChild(el('span', 'field-label', 'Pairing code'))
+        card.appendChild(bigCode(code))
+        card.appendChild(el('p', 'pair-note', 'The code works for ten minutes after the computer showed it.'))
+      }
+      card.appendChild(stepsList([
+        'Tap Share, the square with the arrow.',
+        'Tap Add to Home Screen, then Add.',
+        code ? 'Open Conductor from the Home Screen and enter this code.' : 'Open Conductor from the Home Screen and enter the code the computer shows.'
+      ]))
+      card.appendChild(el('div', 'pair-divider'))
+      card.appendChild(el('p', 'pair-note', 'Only want a browser tab? Pair here instead.'))
+      card.appendChild(form.root)
+    } else {
+      card.appendChild(el('h1', 'pair-title', 'Conductor'))
+      card.appendChild(el('p', 'pair-lead', 'This phone will watch and steer the agents running on this computer. Enter the code the desktop is showing.'))
+      card.appendChild(warning)
+      card.appendChild(form.root)
+    }
+    card.appendChild(pairLinks())
+
     scroll.appendChild(card)
     root.appendChild(scroll)
-    return { key: 'pair', root: root }
+
+    let alive = true
+    void checkHealth().then(result => {
+      if (!alive || result.kind !== 'unreachable') return
+      warning.appendChild(notAnsweringNote())
+    })
+
+    return {
+      key: 'pair',
+      root: root,
+      destroy: () => {
+        alive = false
+        if (stopScanner) stopScanner()
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ qr scanner
+
+  /* Full-screen camera view reading QR codes with the browser's own BarcodeDetector. Only a code
+     for this very origin counts; anything else is named and ignored. Returns a stop function. */
+  const openScanner = onCode => {
+    const view = el('div', 'scanner')
+    view.setAttribute('role', 'dialog')
+    view.setAttribute('aria-label', 'Scan the pairing code')
+    const video = el('video', 'scanner-video')
+    video.setAttribute('playsinline', '')
+    video.setAttribute('muted', '')
+    video.muted = true
+    video.autoplay = true
+    const note = el('p', 'scanner-note', 'Point the camera at the pairing code on the computer.')
+    let stream = null
+    let timer = null
+    let stopped = false
+
+    const stop = () => {
+      if (stopped) return
+      stopped = true
+      if (timer) clearTimeout(timer)
+      if (stream) for (const track of stream.getTracks()) track.stop()
+      document.removeEventListener('visibilitychange', onHidden)
+      if (view.parentNode) view.parentNode.removeChild(view)
+    }
+    /* iOS keeps the camera light on for a page in the background; a hidden scanner is a closed one. */
+    const onHidden = () => { if (document.visibilityState !== 'visible') stop() }
+    document.addEventListener('visibilitychange', onHidden)
+
+    view.appendChild(video)
+    view.appendChild(el('div', 'scanner-frame'))
+    view.appendChild(fill(el('div', 'scanner-bar'), [note, button('ghost wide', 'Cancel', stop)]))
+    document.body.appendChild(view)
+
+    const scan = async detector => {
+      if (stopped) return
+      try {
+        if (video.readyState >= 2) {
+          const found = await detector.detect(video)
+          for (const entry of found) {
+            const code = shell.pairCodeFromUrl(entry.rawValue, window.location.origin)
+            if (code) { onCode(code); stop(); return }
+            if (entry.rawValue) note.textContent = 'That code is for a different address. Scan the pairing code for ' + window.location.host + ', or type the code.'
+          }
+        }
+      } catch (error) { /* a frame the detector could not read; the next one may */ }
+      if (!stopped) timer = setTimeout(() => void scan(detector), 250)
+    }
+
+    void (async () => {
+      try {
+        const Detector = window.BarcodeDetector
+        const formats = typeof Detector.getSupportedFormats === 'function' ? await Detector.getSupportedFormats() : ['qr_code']
+        if (formats.indexOf('qr_code') < 0) throw new Error('This browser cannot read QR codes. Type the code instead.')
+        const detector = new Detector({ formats: ['qr_code'] })
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false })
+        if (stopped) { for (const track of stream.getTracks()) track.stop(); return }
+        video.srcObject = stream
+        try { await video.play() } catch (error) { /* autoplay with muted video is allowed; a refusal still shows frames */ }
+        void scan(detector)
+      } catch (error) {
+        note.textContent = error && error.name === 'NotAllowedError'
+          ? 'The camera is not allowed for this page. Type the code instead.'
+          : (errorMessage(error) || 'The camera could not start. Type the code instead.')
+      }
+    })()
+    return stop
+  }
+
+  // ------------------------------------------------------------------ connection check
+
+  /* GET /api/health needs no token: it is the one question that separates "cannot reach the
+     computer" (address, network, Tailscale, certificate) from "reached it, something else is off". */
+  const checkHealth = async () => {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null
+    const timer = setTimeout(() => { if (controller) controller.abort() }, HEALTH_TIMEOUT_MS)
+    try {
+      const response = await fetch('/api/health', { cache: 'no-store', signal: controller ? controller.signal : undefined })
+      const text = await response.text()
+      let data = null
+      try { data = JSON.parse(text) } catch (error) { data = null }
+      if (response.ok && data && data.ok === true) return { kind: 'ok', health: data }
+      return { kind: 'odd', status: response.status, message: data && typeof data.error === 'string' ? data.error : '' }
+    } catch (error) {
+      return { kind: 'unreachable', timedOut: Boolean(error && error.name === 'AbortError') }
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  const pageHeader = title => {
+    const header = topbar()
+    const back = button('back', null, goBack)
+    back.setAttribute('aria-label', 'Back')
+    back.appendChild(icon(['M15 5l-7 7 7 7'], 24))
+    const line = el('div', 'topbar-main')
+    line.appendChild(back)
+    line.appendChild(el('h1', 'topbar-title', title))
+    header.appendChild(line)
+    return header
+  }
+
+  const factRow = (label, value, tone) => {
+    const row = el('div', 'check-row')
+    row.appendChild(el('span', 'check-label', label))
+    row.appendChild(el('span', 'check-value' + (tone ? ' ' + tone : ''), value))
+    return row
+  }
+
+  const diagnoseScreen = () => {
+    const root = el('div', 'screen')
+    const scroll = scroller()
+    root.appendChild(pageHeader('Connection check'))
+    root.appendChild(scroll)
+
+    let alive = true
+    let run = 0
+    let health = null
+    /* 'none' without a token; otherwise running, ok (with me), rejected (401) or failed. */
+    let pairing = { kind: state.token ? 'running' : 'none' }
+
+    const phoneCard = () => {
+      const known = shell.facts()
+      const where = shell.currentPlatform()
+      const card = el('section', 'card')
+      card.appendChild(el('h2', 'card-title', 'This phone'))
+      card.appendChild(factRow('Address', known.origin || window.location.origin))
+      card.appendChild(factRow('Opened from', known.standalone ? 'The Home Screen app' : 'A tab in ' + where.name))
+      card.appendChild(factRow('Network', known.online ? 'The phone says it is online' : 'The phone says it is offline', known.online ? '' : 'warn'))
+      card.appendChild(factRow('Service worker', known.serviceWorker ? 'Controls this page' : 'Not in control of this page'))
+      card.appendChild(factRow('Certificate', known.secure ? 'Trusted' : 'Not trusted by this phone yet', known.secure ? '' : 'warn'))
+      return card
+    }
+
+    const computerCard = () => {
+      const card = el('section', 'card')
+      card.appendChild(el('h2', 'card-title', 'This computer'))
+      const origin = window.location.origin
+      if (!health) {
+        card.appendChild(el('p', 'check-status', 'Asking ' + origin + '/api/health…'))
+        return card
+      }
+      if (health.kind === 'ok') {
+        const info = health.health
+        card.appendChild(el('p', 'check-status good', 'Reached Conductor ' + (info.version || '') + '.'))
+        card.appendChild(factRow('Listening', info.exposure === 'tailscale' ? 'Only through Tailscale' : 'On this network'))
+        card.appendChild(factRow('This phone came in', info.viaTailscale ? 'Over Tailscale' : 'Not over Tailscale'))
+        return card
+      }
+      if (health.kind === 'odd') {
+        card.appendChild(el('p', 'check-status warn', 'Something answered at ' + origin + ' with status ' + health.status + ', but not the way Conductor does.'))
+        if (health.message) card.appendChild(el('p', 'card-note', 'It said: ' + health.message))
+        if (health.status === 404) card.appendChild(el('p', 'card-note', 'An older Conductor does not know this check. Update Conductor on the computer.'))
+        return card
+      }
+      card.appendChild(el('p', 'check-status bad', 'This computer is not answering at ' + origin + '.'))
+      if (health.timedOut) card.appendChild(el('p', 'card-note', 'Nothing came back within ' + Math.round(HEALTH_TIMEOUT_MS / 1000) + ' seconds.'))
+      card.appendChild(stepsList(shell.notAnsweringSteps.concat(['If the phone warned about the certificate, trust it first: Install the certificate, below.'])))
+      return card
+    }
+
+    const pairingCard = () => {
+      if (!health || health.kind !== 'ok') return null
+      const card = el('section', 'card')
+      card.appendChild(el('h2', 'card-title', 'This phone and Conductor'))
+      if (pairing.kind === 'none') {
+        card.appendChild(el('p', 'check-status', 'This phone is not paired yet.'))
+        card.appendChild(el('p', 'card-note', 'Enter the code Conductor shows under Settings, Phone.'))
+        card.appendChild(button('ghost wide', 'Pair this phone', () => go('#/')))
+        return card
+      }
+      if (pairing.kind === 'running') {
+        card.appendChild(el('p', 'check-status', 'Checking this phone\'s pairing…'))
+        return card
+      }
+      if (pairing.kind === 'rejected') {
+        card.appendChild(el('p', 'check-status bad', 'The computer rejected this phone\'s pairing (401).'))
+        card.appendChild(el('p', 'card-note', 'It was unpaired or revoked on the computer. Pair it again with a new code.'))
+        card.appendChild(button('ghost wide', 'Pair again', () => go('#/')))
+        return card
+      }
+      if (pairing.kind === 'failed') {
+        card.appendChild(el('p', 'check-status warn', 'The computer answered the check but not this phone\'s request.'))
+        card.appendChild(el('p', 'card-note', pairing.message))
+        return card
+      }
+      const me = pairing.me
+      card.appendChild(el('p', 'check-status good', 'Paired as ' + (me && me.name ? me.name : 'this phone') + ' with ' + (me && me.machineName ? me.machineName : 'this computer') + '.'))
+      if (state.connected) card.appendChild(factRow('Live connection', 'Open'))
+      else card.appendChild(factRow('Live connection', state.streamProblem ? 'Not open. ' + state.streamProblem : 'Opening…', state.streamProblem ? 'warn' : ''))
+      return card
+    }
+
+    const draw = () => {
+      if (!alive) return
+      const top = scroll.scrollTop
+      clear(scroll)
+      const body = el('div', 'form')
+      body.appendChild(phoneCard())
+      body.appendChild(computerCard())
+      const paired = pairingCard()
+      if (paired) body.appendChild(paired)
+      const again = button('primary wide', 'Run again', () => void check())
+      again.disabled = !health
+      body.appendChild(again)
+      body.appendChild(button('ghost wide', 'Install the certificate', () => visit('#trust')))
+      scroll.appendChild(body)
+      scroll.scrollTop = top
+    }
+
+    const check = async () => {
+      const mine = ++run
+      health = null
+      pairing = { kind: state.token ? 'running' : 'none' }
+      draw()
+      const result = await checkHealth()
+      if (!alive || mine !== run) return
+      health = result
+      draw()
+      if (result.kind !== 'ok' || !state.token) return
+      try {
+        const me = await api('/api/me')
+        if (me) state.me = me
+        pairing = { kind: 'ok', me: me }
+      } catch (error) {
+        /* api() has already dropped a rejected token; the page says so instead of leaving. */
+        pairing = error && error.status === 401 ? { kind: 'rejected' } : { kind: 'failed', message: errorMessage(error) || 'The request failed.' }
+      }
+      if (!alive || mine !== run) return
+      draw()
+    }
+
+    void check()
+    return {
+      key: 'diagnose',
+      root: root,
+      update: draw,
+      destroy: () => { alive = false }
+    }
+  }
+
+  // ------------------------------------------------------------------ certificate page
+
+  const trustScreen = () => {
+    const root = el('div', 'screen')
+    const scroll = scroller()
+    root.appendChild(pageHeader('Trust this computer'))
+    root.appendChild(scroll)
+
+    const where = shell.currentPlatform()
+    const standalone = shell.isStandalone()
+    const origin = window.location.origin
+    const body = el('div', 'form')
+
+    const why = el('section', 'card')
+    why.appendChild(el('h2', 'card-title', 'Why'))
+    why.appendChild(el('p', 'trust-line', 'Conductor on your computer made its own certificate, so this phone does not know it yet.'))
+    why.appendChild(el('p', 'trust-line', 'Trusting it once lets the phone open Conductor without warnings, and lets notifications and the Home Screen app work.'))
+    why.appendChild(el('p', 'trust-line', 'This page cannot read the fingerprint itself: compare the one your phone shows with the fingerprint shown in Conductor\'s settings under Phone.'))
+    why.appendChild(el('p', 'card-note', 'If Conductor uses a certificate from Tailscale (an address ending in .ts.net), the phone already trusts it and you can skip this.'))
+    body.appendChild(why)
+
+    const how = el('section', 'card')
+    how.appendChild(el('h2', 'card-title', 'How'))
+    const iosSteps = [
+      'Tap Allow when Safari asks to download a configuration profile.',
+      'Open Settings and tap Profile Downloaded near the top (or General, then VPN & Device Management). Tap Install and enter your passcode.',
+      'In Settings, go to General, About, Certificate Trust Settings, and turn on full trust for Conductor.',
+      'Come back to Conductor and reload.'
+    ]
+    if (where.ios && (where.browser !== 'safari' || standalone)) {
+      /* x-safari-https has no feature test; if it does nothing, the plain address below still works. */
+      how.appendChild(linkButton('primary wide link-button', 'Open in Safari', shell.safariUrl(origin + '/#trust')))
+      how.appendChild(el('p', 'card-note', standalone
+        ? 'Only Safari can install a profile on iPhone, so this continues there.'
+        : 'Only Safari can install a profile on iPhone. ' + where.name + ' would only save the file.'))
+      how.appendChild(el('p', 'card-note', 'If Safari does not open, open Safari yourself and go to this address:'))
+      how.appendChild(el('p', 'pair-address', origin + '/#trust'))
+      how.appendChild(el('p', 'card-note', 'Then, in Safari:'))
+      how.appendChild(stepsList(['Tap Download the certificate.'].concat(iosSteps)))
+    } else if (where.ios) {
+      how.appendChild(linkButton('primary wide link-button', 'Download the certificate', '/ca.crt'))
+      how.appendChild(stepsList(iosSteps))
+    } else if (where.android) {
+      how.appendChild(linkButton('primary wide link-button', 'Download the certificate', '/ca.crt'))
+      how.appendChild(stepsList([
+        'The file lands in Downloads. Android does not install a certificate from the browser.',
+        'Open Settings, then Security & privacy, More security settings, Encryption & credentials, Install a certificate, CA certificate. The names differ a little between phone makers; searching Settings for "CA certificate" finds it.',
+        'Tap Install anyway and pick conductor-phone-ca.crt.',
+        'Come back to Conductor and reload. Chrome trusts a certificate installed this way.'
+      ]))
+    } else {
+      how.appendChild(linkButton('primary wide link-button', 'Download the certificate', '/ca.crt'))
+      how.appendChild(el('p', 'card-note', 'Open the file and mark it as trusted for websites. Each system asks for this in its own place.'))
+    }
+    body.appendChild(how)
+    body.appendChild(button('ghost wide', 'Connection check', () => visit('#diagnose')))
+
+    scroll.appendChild(body)
+    return { key: 'trust', root: root }
   }
 
   // ------------------------------------------------------------------ sessions screen
@@ -820,7 +1311,7 @@
           toggle.setAttribute('aria-expanded', expanded ? 'true' : 'false')
           toggle.appendChild(el('span', 'coworker-toggle-label', coworkers.length + (coworkers.length === 1 ? ' coworker' : ' coworkers')))
           toggle.appendChild(el('span', 'coworker-toggle-state', dotRow([waiting ? waiting + ' waiting' : '', working ? working + ' working' : ''])))
-          toggle.appendChild(el('span', 'chev' + (expanded ? ' down' : ''), 'â€º'))
+          toggle.appendChild(el('span', 'chev' + (expanded ? ' down' : ''), '›'))
           list.appendChild(toggle)
           if (expanded) {
             const children = el('div', 'coworker-list')
@@ -834,11 +1325,45 @@
     }
   }
 
+  /* The stream has been down for 20 seconds of the owner actually looking at the phone. */
+  const unreachableTooLong = () => {
+    if (!state.token || state.connected || document.visibilityState !== 'visible') return false
+    return Date.now() - Math.max(downSince, visibleSince) > UNREACHABLE_BANNER_MS
+  }
+
+  const installCard = () => {
+    const card = el('section', 'card install-card')
+    card.appendChild(el('h2', 'card-title', 'Add to Home Screen'))
+    card.appendChild(el('p', 'card-note', 'Install Conductor as an app on this phone. It keeps this pairing.'))
+    const row = el('div', 'inline')
+    row.appendChild(button('primary', 'Install', async () => {
+      const prompt = state.installPrompt
+      state.installPrompt = null
+      state.offerInstall = false
+      render()
+      if (!prompt) return
+      try { await prompt.prompt() } catch (error) { /* Chrome allows one prompt per event */ }
+    }))
+    row.appendChild(button('ghost', 'Not now', () => {
+      state.offerInstall = false
+      render()
+    }))
+    card.appendChild(row)
+    return card
+  }
+
   const sessionsScreen = () => {
     const root = el('div', 'screen')
     const header = topbar()
     const scroll = scroller()
+    /* A line under the header, never a takeover: the list below may still be worth reading. */
+    const reach = button('reach-banner', null, () => visit('#diagnose'))
+    reach.appendChild(el('span', 'reach-banner-text', 'This computer is not answering.'))
+    reach.appendChild(el('span', 'reach-banner-link', 'Connection check ›'))
+    reach.hidden = true
+    const drawReach = () => { reach.hidden = !unreachableTooLong() }
     root.appendChild(header)
+    root.appendChild(reach)
     root.appendChild(scroll)
 
     const drawHeader = () => {
@@ -881,6 +1406,7 @@
         scroll.appendChild(emptyNote('Reading this computer…', 'The list appears as soon as the stream connects.'))
         return
       }
+      if (state.offerInstall && state.installPrompt) scroll.appendChild(installCard())
       const all = phone.sessions || []
       const open = all.filter(session => session.tabId !== null && matchesFilter(session))
       const closed = all.filter(session => session.tabId === null && matchesFilter(session))
@@ -917,10 +1443,12 @@
 
     drawHeader()
     drawList()
+    drawReach()
     return {
       key: 'sessions',
       root: root,
-      update: () => { drawHeader(); drawList() }
+      update: () => { drawHeader(); drawList(); drawReach() },
+      onSecond: drawReach
     }
   }
 
@@ -2027,6 +2555,10 @@
       facts.appendChild(el('p', 'fact', 'Conductor ' + (me ? me.version : '…')))
       facts.appendChild(el('p', 'fact', state.connected ? 'Live connection is open.' : 'Not connected right now.'))
       body.appendChild(facts)
+      body.appendChild(box('inline', [
+        button('ghost', 'Connection check', () => visit('#diagnose')),
+        button('ghost', 'Certificate', () => visit('#trust'))
+      ]))
 
       const notifications = el('section', 'card')
       notifications.appendChild(el('h2', 'card-title', 'Notifications'))
@@ -2141,6 +2673,17 @@
     takePairHash()
     applyViewport()
 
+    /* Chrome on Android offers installation once it decides the app qualifies; keep the event so
+       a tab that has just paired can offer it, instead of Chrome's own banner at a random time. */
+    window.addEventListener('beforeinstallprompt', event => {
+      event.preventDefault()
+      state.installPrompt = event
+      if (state.offerInstall) render()
+    })
+    window.addEventListener('appinstalled', () => {
+      state.installPrompt = null
+      state.offerInstall = false
+    })
     window.addEventListener('hashchange', () => render())
     window.addEventListener('online', () => { if (state.token) restartStream() })
     window.addEventListener('resize', applyViewport)
@@ -2151,6 +2694,7 @@
     document.addEventListener('visibilitychange', () => {
       const visible = document.visibilityState === 'visible'
       if (screen && screen.onVisibility) screen.onVisibility(visible)
+      if (visible) visibleSince = Date.now()
       if (!visible || !state.token) return
       /* A phone that was asleep often keeps a stream object that is already dead, so a quiet
          connection counts as no connection the moment the owner looks at the screen again. */
@@ -2160,6 +2704,7 @@
       for (const fn of tickers) {
         try { fn() } catch (error) { /* a dead node is not worth a crash */ }
       }
+      if (screen && screen.onSecond) screen.onSecond()
       /* A stream that has gone quiet is a stream the phone slept through. */
       if (state.connected && document.visibilityState === 'visible' && Date.now() - lastEventAt > STREAM_STALE_MS) restartStream()
     }, 1000)
@@ -2167,6 +2712,9 @@
     registerServiceWorker()
     render()
     if (state.token) connectStream()
+    /* The boot guard's watchdog waits for this; its placeholder is already gone with the first render. */
+    window.__conductorBooted = true
+    shell.booted()
   }
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot)

@@ -127,8 +127,20 @@ function readPeer(node: Record<string, unknown>, users: Map<string, string>): Ta
     online: node.Online === true,
     path: pathFor(curAddr, relay),
     relay: relay || null,
-    loginName: users.get(String(node.UserID ?? '')) ?? null
+    loginName: users.get(String(node.UserID ?? '')) ?? null,
+    // Tailscale writes "iOS", "android", "windows", "macOS", "linux"; one case so callers can compare.
+    os: text(node.OS, 40).toLowerCase()
   }
+}
+
+/**
+ * The names `tailscale cert` may issue for. Tailscale lists them only while HTTPS certificates are
+ * enabled for the tailnet, so an empty list is the "switch it on at admin/dns" signal and a missing
+ * document field is the same thing as none.
+ */
+function readCertDomains(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap(entry => (typeof entry === 'string' && entry.trim() ? [entry.trim().toLowerCase().replace(/\.$/, '')] : [])).slice(0, 20)
 }
 
 /**
@@ -156,7 +168,7 @@ export function readTailscaleStatus(raw: unknown, now: number): TailscaleState {
     .flatMap(value => (isRecord(value) ? [readPeer(value, users)] : []))
     .flatMap(peer => (peer ? [peer] : []))
     .slice(0, 200)
-  return { installed: true, backendState, self, peers, message: statusMessage(backendState, self), checkedAt }
+  return { installed: true, backendState, self, peers, message: statusMessage(backendState, self), checkedAt, certDomains: readCertDomains(raw.CertDomains) }
 }
 
 /** What to do next, in words, whenever the tailnet cannot carry anything from here. */

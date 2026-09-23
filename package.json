@@ -55,6 +55,7 @@
     "measure:context-churn": "node scripts/measure-context-churn.mjs",
     "probe:context-cost": "node scripts/probe-context-cost.mjs",
     "test:local-models": "npm run build && node scripts/smoke-local-models.mjs",
+    "test:phone-shell": "npm run build && node scripts/smoke-phone-shell.mjs",
     "test:local-grants": "npm run build && node scripts/smoke-local-grants.mjs",
     "relay": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/relay-server/main.ts",
     "relay:secret": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON src/relay-server/main.ts new-secret",

@@ -1,9 +1,27 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_PHONE_SETTINGS } from '../../../shared/phone-access'
-import type { PhoneAccessSettings } from '../../../shared/phone-access'
+import type { PhoneAccessSettings, PhoneTailnetPeer, PhoneTailnetView } from '../../../shared/phone-access'
 import {
   accessStatus,
   certificateUrl,
+  checkedText,
+  chosenEndpoint,
+  endpointChoices,
+  endpointLabel,
+  isTailnetEndpoint,
+  newestDevice,
+  notificationStep,
+  notificationTarget,
+  osName,
+  pairStepStatus,
+  phoneTailscaleStep,
+  recommendedEndpointOf,
+  recommendedEndpointSentence,
+  stepStateWord,
+  tailnetOf,
+  tailnetPhonesSummary,
+  tailscaleCertificateStep,
+  tailscaleHereProblem,
   countdownText,
   exposureExplanation,
   fingerprintGroups,
@@ -27,6 +45,12 @@ const status = (patch: Partial<Parameters<typeof accessStatus>[0]> = {}): Parame
 describe('the status line under the phone access switch', () => {
   it('names the address a phone should open while the listener is up', () => {
     expect(accessStatus(status())).toEqual({ kind: 'ok', text: 'Reachable at https://192.168.1.4:51841' })
+  })
+
+  it('names the address the phone should keep once the main process recommends one', () => {
+    expect(accessStatus(status({ recommendedEndpoint: 'https://100.84.2.9:51841' })).text).toBe('Reachable at https://100.84.2.9:51841')
+    // An older main process sends no recommendation at all; the first address still stands.
+    expect(accessStatus(status({ recommendedEndpoint: undefined })).text).toBe('Reachable at https://192.168.1.4:51841')
   })
 
   it('says nothing at all while the owner has phone access switched off', () => {
@@ -178,5 +202,196 @@ describe('what each paired phone reads as', () => {
     expect(renameToCommit('   ', 'iPhone')).toBeNull()
     expect(renameToCommit('iPhone', 'iPhone')).toBeNull()
     expect(renameToCommit('x'.repeat(80), 'iPhone')).toHaveLength(60)
+  })
+})
+
+const LAN = 'https://192.168.0.205:51841'
+const TAILNET_IP = 'https://100.72.193.87:51841'
+const MAGIC = 'https://e-box.tail8216c8.ts.net:51841'
+const iphone = (patch: Partial<PhoneTailnetPeer> = {}): PhoneTailnetPeer => ({ hostName: 'juraj-iphone', os: 'ios', online: true, addresses: ['100.101.1.2'], ...patch })
+const tailnet = (patch: Partial<PhoneTailnetView> = {}): PhoneTailnetView => ({
+  address: '100.72.193.87', dnsName: 'e-box.tail8216c8.ts.net', certificate: 'off', message: null, installed: true, backendState: 'Running',
+  loginName: 'owner@github', httpsEnabled: false, phones: [], checkedAt: '2026-09-23T10:00:00.000Z', ...patch
+})
+const device = (id: string, createdAt: string, patch: { name?: string; pushEnabled?: boolean } = {}): { id: string; name: string; createdAt: string; pushEnabled: boolean } =>
+  ({ id, name: patch.name ?? id, createdAt, pushEnabled: patch.pushEnabled ?? false })
+
+describe('the tailnet as an older main process reports it', () => {
+  it('fills every missing field with "not read yet" rather than an empty or broken tailnet', () => {
+    const view = tailnetOf({ address: '100.72.193.87', dnsName: null, certificate: 'off', message: null })
+    expect(view).toMatchObject({ installed: false, backendState: null, loginName: null, httpsEnabled: null, phones: [], checkedAt: null })
+    expect(tailnetOf(undefined).certificate).toBe('off')
+    // Never read is not a problem to fix; it is a reading to take.
+    expect(phoneTailscaleStep(view)).toMatchObject({ state: 'waiting', text: 'Tailscale has not been read yet.' })
+  })
+
+  it('keeps the recommended address, or falls back to the first one, and names none while not listening', () => {
+    expect(recommendedEndpointOf({ listening: true, endpoints: [LAN, TAILNET_IP], primaryEndpoint: LAN, recommendedEndpoint: TAILNET_IP })).toBe(TAILNET_IP)
+    expect(recommendedEndpointOf({ listening: true, endpoints: [LAN, TAILNET_IP], primaryEndpoint: LAN })).toBe(LAN)
+    expect(recommendedEndpointOf({ listening: false, endpoints: [], primaryEndpoint: null, recommendedEndpoint: null })).toBeNull()
+  })
+})
+
+describe('the addresses a phone can keep', () => {
+  it('knows a tailnet address by its name, its number or Tailscale’s ranges', () => {
+    expect(isTailnetEndpoint(MAGIC, tailnet())).toBe(true)
+    expect(isTailnetEndpoint(TAILNET_IP, tailnet({ address: null, dnsName: null }))).toBe(true)
+    expect(isTailnetEndpoint('https://[fd7a:115c:a1e0::1]:51841', tailnet({ address: null, dnsName: null }))).toBe(true)
+    expect(isTailnetEndpoint(LAN, tailnet())).toBe(false)
+    // 100.x outside 100.64.0.0/10 is somebody's public address, not the tailnet.
+    expect(isTailnetEndpoint('https://100.20.1.1:51841', tailnet({ address: null, dnsName: null }))).toBe(false)
+    expect(isTailnetEndpoint('not a url', tailnet())).toBe(false)
+  })
+
+  it('says why to keep the address, and that a Wi-Fi one stops working away from home', () => {
+    expect(recommendedEndpointSentence(TAILNET_IP, tailnet())).toContain('works at home and away while Tailscale is on')
+    expect(recommendedEndpointSentence(LAN, tailnet())).toContain('only on this network')
+    expect(recommendedEndpointSentence(null, tailnet())).toBe('')
+  })
+
+  it('labels each pairing address by where it works, the recommended one first', () => {
+    expect(endpointLabel(TAILNET_IP, tailnet())).toBe('Tailscale, works anywhere')
+    expect(endpointLabel(MAGIC, tailnet())).toBe('Tailscale name, works anywhere')
+    expect(endpointLabel(LAN, tailnet())).toBe('This Wi-Fi only')
+    expect(endpointChoices([LAN, TAILNET_IP, MAGIC], TAILNET_IP, tailnet())).toEqual([
+      { endpoint: TAILNET_IP, label: 'Tailscale, works anywhere', recommended: true },
+      { endpoint: LAN, label: 'This Wi-Fi only', recommended: false },
+      { endpoint: MAGIC, label: 'Tailscale name, works anywhere', recommended: false }
+    ])
+    // A recommendation the listener no longer answers on is not offered.
+    expect(endpointChoices([LAN], TAILNET_IP, tailnet()).map(choice => choice.endpoint)).toEqual([LAN])
+  })
+
+  it('keeps the owner’s pick of address only while the listener still answers on it', () => {
+    expect(chosenEndpoint(LAN, [LAN, TAILNET_IP], TAILNET_IP)).toBe(LAN)
+    expect(chosenEndpoint('https://10.0.0.9:51841', [LAN, TAILNET_IP], TAILNET_IP)).toBe(TAILNET_IP)
+    expect(chosenEndpoint(null, [LAN], null)).toBe(LAN)
+    expect(chosenEndpoint(null, [], null)).toBeNull()
+  })
+})
+
+describe('step 1: Tailscale on the phone', () => {
+  it('is done once a phone is on the tailnet, naming it and whether it is online', () => {
+    const step = phoneTailscaleStep(tailnet({ phones: [iphone()] }))
+    expect(step.state).toBe('done')
+    expect(step.text).toBe('juraj-iphone (iOS, online) is on your tailnet.')
+  })
+
+  it('waits while no phone has joined', () => {
+    expect(phoneTailscaleStep(tailnet())).toMatchObject({ state: 'waiting', text: 'No phone has joined your tailnet yet.' })
+  })
+
+  it('names what is wrong with Tailscale on this computer, with the fix', () => {
+    expect(tailscaleHereProblem(tailnet())).toBeNull()
+    expect(tailscaleHereProblem(tailnet({ installed: false, backendState: null }))).toMatchObject({ state: 'problem', text: 'Tailscale is not installed on this computer.' })
+    expect(tailscaleHereProblem(tailnet({ backendState: 'NeedsLogin' }))?.fix).toContain('sign in')
+    expect(tailscaleHereProblem(tailnet({ backendState: 'Stopped' }))?.text).toContain('turned off')
+    expect(tailscaleHereProblem(tailnet({ backendState: 'NeedsMachineAuth' }))?.fix).toContain('admin console')
+    expect(tailscaleHereProblem(tailnet({ backendState: 'Starting' }))?.state).toBe('waiting')
+    expect(tailscaleHereProblem(tailnet({ backendState: 'Weird' }))?.text).toContain('"Weird"')
+    expect(tailscaleHereProblem(tailnet({ backendState: null }))?.text).toContain('did not answer')
+    // Not read yet is not the same as not installed.
+    expect(tailscaleHereProblem(tailnet({ installed: false, backendState: null, checkedAt: null }))).toBeNull()
+    // A problem here outranks a phone listed from an older reading.
+    expect(phoneTailscaleStep(tailnet({ backendState: 'Stopped', phones: [iphone()] })).state).toBe('problem')
+  })
+
+  it('sums up the phones on the tailnet, online ones first', () => {
+    expect(tailnetPhonesSummary([])).toBe('')
+    expect(tailnetPhonesSummary([iphone({ hostName: 'old', online: false }), iphone()]))
+      .toBe('juraj-iphone (iOS, online) and old (iOS, offline) are on your tailnet.')
+    expect(tailnetPhonesSummary([iphone(), iphone({ hostName: 'b', os: 'android' }), iphone({ hostName: 'c' }), iphone({ hostName: 'd' })]))
+      .toBe('juraj-iphone (iOS, online) and 3 more phones are on your tailnet.')
+    expect(osName('ipados')).toBe('iPadOS')
+    expect(osName('android')).toBe('Android')
+    expect(osName('')).toBe('unknown OS')
+  })
+
+  it('says when the tailnet was last read', () => {
+    const now = Date.parse('2026-09-23T10:05:00.000Z')
+    expect(checkedText('2026-09-23T10:00:00.000Z', now)).toBe('Checked 5 min ago')
+    expect(checkedText(null, now)).toBe('Not checked yet')
+  })
+})
+
+describe('step 2: a trusted address through Tailscale', () => {
+  it('says HTTPS certificates are off for the tailnet, which is the evidence on the owner’s machine', () => {
+    const step = tailscaleCertificateStep(tailnet({ httpsEnabled: false }), false)
+    expect(step).toMatchObject({ state: 'problem', text: 'HTTPS certificates are off for your tailnet.' })
+    expect(step.fix).toContain('DNS page')
+  })
+
+  it('does not claim anything about HTTPS before Tailscale has answered', () => {
+    expect(tailscaleCertificateStep(tailnet({ httpsEnabled: null }), false)).toMatchObject({ state: 'waiting' })
+    expect(tailscaleCertificateStep(tailnet({ httpsEnabled: null }), false).text).toContain('not read yet')
+  })
+
+  it('asks for the switch once HTTPS is on, then waits for the certificate', () => {
+    expect(tailscaleCertificateStep(tailnet({ httpsEnabled: true }), false).fix).toContain('switch below')
+    expect(tailscaleCertificateStep(tailnet({ httpsEnabled: true, certificate: 'pending' }), true)).toMatchObject({ state: 'waiting', text: 'Tailscale is issuing the certificate.' })
+    expect(tailscaleCertificateStep(tailnet({ httpsEnabled: true, dnsName: null }), true).state).toBe('problem')
+  })
+
+  it('is done when the certificate is active, and passes on Tailscale’s reason when it failed', () => {
+    expect(tailscaleCertificateStep(tailnet({ certificate: 'active', httpsEnabled: null }), true)).toMatchObject({ state: 'done' })
+    expect(tailscaleCertificateStep(tailnet({ certificate: 'active' }), true).text).toContain('e-box.tail8216c8.ts.net')
+    const failed = tailscaleCertificateStep(tailnet({ certificate: 'failed', message: 'Tailscale did not issue a certificate: 500.' }), true)
+    expect(failed).toMatchObject({ state: 'problem', fix: 'Tailscale did not issue a certificate: 500.' })
+  })
+
+  it('points back to step 1 while Tailscale is not running here', () => {
+    expect(tailscaleCertificateStep(tailnet({ backendState: 'Stopped' }), true).text).toContain('step 1')
+  })
+})
+
+describe('step 3: pairing', () => {
+  const known = new Set(['a'])
+  it('is done only for a phone that paired after the panel opened', () => {
+    const devices = [device('a', '2026-08-01T00:00:00Z', { name: 'Old iPhone' }), device('b', '2026-09-23T10:00:00Z', { name: 'New iPhone' })]
+    expect(pairStepStatus(devices, known, null, true)).toEqual({ state: 'done', text: 'New iPhone is paired.' })
+  })
+
+  it('treats a phone paired before as a fact, not as done, since it may hold an address that no longer answers', () => {
+    const step = pairStepStatus([device('a', '2026-08-01T00:00:00Z', { name: 'Old iPhone' })], known, null, true)
+    expect(step.state).toBe('waiting')
+    expect(step.text).toBe('Old iPhone was paired before.')
+  })
+
+  it('waits for the code while one is shown, and cannot show one while not listening', () => {
+    expect(pairStepStatus([], new Set(), { code: 'ABCD-EFGH' }, true).text).toContain('use the code')
+    expect(pairStepStatus([], new Set(), null, false).fix).toContain('Turn on phone access')
+    expect(pairStepStatus([], new Set(), null, true).text).toBe('No phone is paired yet.')
+    // Before the first state nothing can be new.
+    expect(pairStepStatus([device('a', '2026-09-23T10:00:00Z')], null, null, true).state).toBe('waiting')
+  })
+
+  it('finds the newest phone by when it was paired', () => {
+    expect(newestDevice([device('a', '2026-08-01T00:00:00Z'), device('c', '2026-09-23T00:00:00Z'), device('b', '2026-09-01T00:00:00Z')])?.id).toBe('c')
+    expect(newestDevice([])).toBeNull()
+  })
+})
+
+describe('step 4: Home Screen and notifications', () => {
+  it('is done when any phone has notifications on', () => {
+    const devices = [device('a', '2026-08-01T00:00:00Z', { name: 'iPhone', pushEnabled: true }), device('b', '2026-09-01T00:00:00Z')]
+    expect(notificationStep(devices, true, true)).toEqual({ state: 'done', text: 'Notifications are on for iPhone.' })
+    expect(notificationTarget(devices)?.id).toBe('a')
+    expect(notificationTarget([device('b', '2026-09-01T00:00:00Z')])?.id).toBe('b')
+  })
+
+  it('waits with the reason otherwise', () => {
+    expect(notificationStep([], true, true).text).toContain('step 3')
+    expect(notificationStep([device('b', '2026-09-01T00:00:00Z', { name: 'iPhone' })], true, false).text).toContain('push keys')
+    expect(notificationStep([device('b', '2026-09-01T00:00:00Z', { name: 'iPhone' })], true, true).text).toBe('iPhone has not turned notifications on yet.')
+  })
+
+  it('is a problem while the master switch stops every notification', () => {
+    expect(notificationStep([device('a', '2026-08-01T00:00:00Z', { pushEnabled: true })], false, true)).toMatchObject({ state: 'problem' })
+  })
+
+  it('has a word for every chip', () => {
+    expect(stepStateWord('done')).toBe('Done')
+    expect(stepStateWord('waiting')).toBe('Waiting')
+    expect(stepStateWord('problem')).toBe('Needs a fix')
   })
 })
