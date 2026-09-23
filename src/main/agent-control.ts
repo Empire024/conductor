@@ -89,17 +89,17 @@ function handoffText(args: Args): string {
 const toolSignatures = {
   'tools.list': '() — discover these methods and arguments',
   'app.state': '() — current project, workspace, tabs, relationships, the machine each tab runs on, and the other projects open in this Conductor',
-  'projects.list': '() — every project open in this Conductor with its workspaces; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks',
+  'projects.list': '() — every project open in this Conductor with its workspaces; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks, and on tabs.focus/rename/split/detach/close for an agent tab this caller controls there',
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
   'tabs.open': '({kind?,provider?,model?,effort?,permission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?}) — visible tab; agent default kind, provider/model must be available; a new agent tab opens on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode — always clamped to the controller’s autonomy and to what the target provider offers; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish',
-  'tabs.focus': '({tabId})',
-  'tabs.rename': '({tabId,title})',
-  'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
-  'tabs.detach': '({tabId})',
-  'tabs.close': '({tabId}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors',
-  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project and sibling-project tabs nobody controls (controlled:false), which agents.snapshot/status/history/submit/steer/interrupt may reach',
+  'tabs.focus': '({tabId,projectId?,workspaceId?}) — any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
+  'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
+  'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
+  'tabs.detach': '({tabId,projectId?,workspaceId?})',
+  'tabs.close': '({tabId,projectId?,workspaceId?}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors; a coworker this caller controls in a sibling project closes under the same rule and its control link is released',
+  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.status': '({agentSessionId}) — the compact supervision view of one visible conversation: phase, model, last stop reason with its figures (rounds used of the hard cap, context used / capacity / reserve, compactions, loop warnings, acceptance result, files changed), last tool and its status, and the durable task state a local worker keeps. A few hundred bytes; use it instead of agents.snapshot to poll a local worker',
@@ -108,10 +108,10 @@ const toolSignatures = {
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
   'agents.steer': '({agentSessionId,prompt}) — same steering/queue behavior as the user composer',
-  'agents.interrupt': '({agentSessionId})',
-  'agents.resume': '({agentSessionId}) ? reconnect an idle/disconnected native conversation with its existing settings',
-  'agents.fork': '({agentSessionId,title?}) ? fork supported idle native history into a visible linked tab',
-  'agents.release': '({agentSessionId}) — release this controller relationship',
+  'agents.interrupt': '({agentSessionId}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. Interrupting does not take control, here or in a sibling project',
+  'agents.resume': '({agentSessionId}) — reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls',
+  'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
+  'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.handoff': `({handoff,title?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
@@ -139,7 +139,7 @@ const toolSignatures = {
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
  *  stay out: a change to a sibling project is made by a tab that lives there and shows its work. */
-const crossProjectMethods: string[] = ['tabs.list', 'tabs.open', 'files.list', 'files.read', 'files.open', 'tasks.list']
+const crossProjectMethods: string[] = ['tabs.list', 'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close', 'files.list', 'files.read', 'files.open', 'tasks.list']
 
 export interface DeliveryControl {
   status(projectId: string, cwd: string): Promise<RepositoryStatus>
@@ -231,6 +231,19 @@ export class AgentControl {
     return tab
   }
 
+  /** The tab a tabs.* call names, and the workspace that holds it. Any tab of the caller's own
+   *  workspace, as before; outside it only an agent tab this caller controls, so a controller can
+   *  stop, close, rename or focus the coworker it opened or took over in a sibling project, but
+   *  cannot touch anything else there. projectId/workspaceId, when given, must be where it is. */
+  private tabTarget(scope: AgentControlScope, args: Args): { tab: AgentControlTab; scope: AgentControlScope } {
+    const id = text(args, 'tabId', 160)
+    const own = this.tabs(scope).find(tab => tab.id === id)
+    const found = own ? { tab: own, scope } : this.reachableElsewhere(scope).find(entry => entry.yours && entry.tab.id === id)
+    if (!found) throw new Error('Tab is outside this workspace or closed; outside it, name an agent tab this agent controls (agents.list controlled:true)')
+    if (args.projectId !== undefined && args.projectId !== found.scope.projectId || args.workspaceId !== undefined && args.workspaceId !== found.scope.sessionId) throw new Error('That tab is not open in the requested project or workspace')
+    return { tab: found.tab, scope: found.scope }
+  }
+
   async openUri(uri: string): Promise<void> {
     const target = new URL(uri)
     if (target.protocol !== 'conductor:' || target.username || target.password || target.port || target.search || target.hash) throw new Error('Invalid Conductor link')
@@ -314,9 +327,12 @@ export class AgentControl {
     const elsewhere = spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId
     const link = this.linkFor(id)
     const sideways = elsewhere && link?.controllerAgentSessionId !== scope.agentSessionId
+    if (sideways && spec.projectId === scope.projectId) throw missing
+    // Even a tab it controls: a link made before a paired machine took this conversation over
+    // does not carry that machine past the project it was granted.
+    if (spec.projectId !== scope.projectId && this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
+    if (sideways && !reach) throw link ? missing : new Error('That tab is outside this workspace and this agent does not control it. agents.submit or agents.steer takes control of an uncontrolled tab in a sibling project; after that it answers every agents.* and tabs.* method')
     if (sideways) {
-      if (spec.projectId === scope.projectId || !reach) throw missing
-      if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
       if (link) throw new Error(`Another agent controls that tab in ${this.deps.database.getProject(spec.projectId)?.name ?? 'the other project'}; only its controller can read or steer it`)
       if (reach === 'steer' && this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)?.provider === 'local') throw new Error('A sandboxed local conversation cannot steer a tab in another project; a non-local coworker or the owner can')
     }
@@ -523,6 +539,7 @@ export class AgentControl {
     const found: Array<{ tab: AgentControlTab; scope: AgentControlScope; yours: boolean }> = []
     const paired = Boolean(this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId)
     for (const project of this.deps.database.listProjects()) {
+      if (paired && project.id !== scope.projectId) continue
       for (const workspace of this.deps.database.listSessions(project.id)) {
         if (project.id === scope.projectId && workspace.id === scope.sessionId) continue
         const target = { projectId: project.id, sessionId: workspace.id, agentSessionId: scope.agentSessionId }
@@ -530,7 +547,7 @@ export class AgentControl {
           if (tab.kind !== 'agent' || !tab.resourceId) continue
           const link = this.linkFor(tab.resourceId)
           if (link?.controllerAgentSessionId === scope.agentSessionId) found.push({ tab, scope: target, yours: true })
-          else if (!link && !paired && project.id !== scope.projectId) found.push({ tab, scope: target, yours: false })
+          else if (!link && project.id !== scope.projectId) found.push({ tab, scope: target, yours: false })
         }
       }
     }
@@ -695,16 +712,18 @@ export class AgentControl {
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
     if (method === 'tabs.open') return this.open(scope, args)
     if (['tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close'].includes(method)) {
-      const tab = this.tab(scope, text(args, 'tabId', 160))
+      const { tab, scope: target } = this.tabTarget(scope, args)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
       if (method === 'tabs.rename') text(args, 'title', 120)
       if (method === 'tabs.split' && !['horizontal', 'vertical'].includes(String(args.direction))) throw new Error('Invalid split direction')
       const closingState = method === 'tabs.close' && tab.kind === 'agent' ? database.structured.snapshot(tab.resourceId!) : undefined
-      if (method === 'tabs.close' && (!closingState || hasSessionWork(closingState)) && !await this.deps.confirm(scope, `${source.title} wants to close the tab “${tab.title}”.`)) throw new Error('The owner declined to close this tab')
-      this.authorize(scope); this.tab(scope, tab.id)
+      const where = target.projectId === scope.projectId ? '' : ` in ${database.getProject(target.projectId)?.name ?? 'another project'}`
+      if (method === 'tabs.close' && (!closingState || hasSessionWork(closingState)) && !await this.deps.confirm(scope, `${source.title} wants to close the tab “${tab.title}”${where}.`)) throw new Error('The owner declined to close this tab')
+      // The owner may take a while to answer; the tab and the control over it are checked again.
+      this.authorize(scope); this.tabTarget(scope, args)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
-      const result = await this.ui(scope, method as AgentControlUiRequest['action'], args)
-      if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, scope, tab, 'detached')
+      const result = await this.ui(target, method as AgentControlUiRequest['action'], args)
+      if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, target, tab, 'detached')
       return result
     }
     if (method === 'agents.handoff') return this.handoff(scope, args)

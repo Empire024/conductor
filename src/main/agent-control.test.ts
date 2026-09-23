@@ -832,6 +832,105 @@ describe('steering an uncontrolled tab in a co-opened project', () => {
     expect(f.submissions).toHaveLength(before)
     expect(f.database.getSetting('agentControlParent:' + f.spec.id)).toBeFalsy()
   })
+
+  /** Astra takes over a worker in the Control project by steering it, with a linksChanged spy. */
+  const controlling = async () => {
+    const { f, other, astra } = withAstra(), linksChanged = vi.fn()
+    const control = new AgentControl({ ...f.deps, linksChanged })
+    const worker = agentIn(f, f.project.id, f.workspace.id, 'worker')
+    await control.call(astra, 'agents.submit', { agentSessionId: worker.agentSessionId, prompt: 'Fix the invoice totals' })
+    const phase = (value: string) => f.database.structured.append({ schemaVersion: 1, id: 'phase-' + value + '-' + Math.random(), sequence: f.database.structured.snapshot('worker')!.sequence + 1, sessionId: 'worker', runtimeId: 'fixture', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase: value as 'running' } })
+    return { f, other, astra, control, linksChanged, worker, phase }
+  }
+  const beside = (f: ReturnType<typeof fixture>) => ({ projectId: f.project.id, sessionId: f.workspace.id })
+
+  it('renames, focuses and splits a coworker it controls in a sibling project, in the workspace that holds it', async () => {
+    const { f, astra, control } = await controlling()
+    await control.call(astra, 'tabs.rename', { tabId: 'tab-worker', title: 'Invoices' })
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.rename', ...beside(f), agentSessionId: 'astra', params: { tabId: 'tab-worker', title: 'Invoices' } })
+    await control.call(astra, 'tabs.focus', { tabId: 'tab-worker', projectId: f.project.id, workspaceId: f.workspace.id })
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', ...beside(f) })
+    await control.call(astra, 'tabs.split', { tabId: 'tab-worker', direction: 'vertical' })
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.split', ...beside(f) })
+    await expect(control.call(astra, 'tabs.focus', { tabId: 'tab-worker', projectId: astra.projectId })).rejects.toThrow(/not open in the requested project/)
+    // Nothing else in that project: not the owner's own tab, which nobody gave Astra.
+    await expect(control.call(astra, 'tabs.rename', { tabId: f.rootTab.id, title: 'Mine' })).rejects.toThrow(/outside this workspace or closed/)
+    await expect(control.call(astra, 'tabs.close', { tabId: f.rootTab.id })).rejects.toThrow(/outside this workspace or closed/)
+  })
+
+  it('stops a running or approval-waiting coworker in a sibling project, and interrupting alone takes no control', async () => {
+    const { f, astra, control, phase } = await controlling()
+    const interrupt = vi.spyOn(f.sessions, 'interrupt')
+    for (const value of ['running', 'waiting_approval']) {
+      phase(value)
+      await expect(control.call(astra, 'agents.interrupt', { agentSessionId: 'worker' })).resolves.toMatchObject({ interrupted: true })
+      expect(f.database.structured.snapshot('worker')!.phase).toBe('interrupting')
+    }
+    expect(interrupt).toHaveBeenCalledTimes(2)
+    // An uncontrolled tab next door can be stopped, and stays uncontrolled, as inside one workspace.
+    const idle = agentIn(f, f.project.id, f.workspace.id, 'bystander')
+    await control.call(astra, 'agents.interrupt', { agentSessionId: idle.agentSessionId })
+    expect(f.database.getSetting('agentControlParent:bystander')).toBeFalsy()
+  })
+
+  it('closes a controlled sibling-project coworker, asking the owner first while it has work, and releases the link on both sides', async () => {
+    const { f, astra, control, linksChanged, phase } = await controlling()
+    phase('running')
+    await expect(control.call(astra, 'tabs.close', { tabId: 'tab-worker' })).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenLastCalledWith(astra, expect.stringContaining('“worker” in Control project'))
+    expect(f.requests.filter(request => request.action === 'tabs.close')).toHaveLength(0)
+    f.confirm.mockResolvedValue(true)
+    linksChanged.mockClear()
+    await control.call(astra, 'tabs.close', { tabId: 'tab-worker', projectId: f.project.id })
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.close', ...beside(f), params: { tabId: 'tab-worker' } })
+    expect(f.database.getSetting('agentControlParent:worker')).toBeFalsy()
+    expect(linksChanged).toHaveBeenCalledWith(expect.objectContaining(beside(f)))
+    expect(linksChanged).toHaveBeenCalledWith(expect.objectContaining({ projectId: astra.projectId, sessionId: astra.sessionId }))
+  })
+
+  it('closes a settled sibling-project coworker without asking', async () => {
+    const { f, astra, control } = await controlling()
+    await control.call(astra, 'tabs.close', { tabId: 'tab-worker' })
+    expect(f.confirm).not.toHaveBeenCalled()
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.close', ...beside(f) })
+  })
+
+  it('configures, resumes and releases a controlled sibling-project coworker', async () => {
+    const { f, astra, control, linksChanged } = await controlling()
+    const configured = await control.call(astra, 'agents.configure', { agentSessionId: 'worker', model: 'codex-advanced', effort: 'high' })
+    expect(configured).toMatchObject({ projectId: f.project.id, workspaceId: f.workspace.id, model: 'codex-advanced', effort: 'high' })
+    expect(f.requests.filter(request => request.action.startsWith('agents.configure')).every(request => request.projectId === f.project.id && request.sessionId === f.workspace.id)).toBe(true)
+    await expect(control.call(astra, 'agents.resume', { agentSessionId: 'worker' })).resolves.toMatchObject({ agentSessionId: 'worker' })
+    linksChanged.mockClear()
+    await expect(control.call(astra, 'agents.release', { agentSessionId: 'worker' })).resolves.toMatchObject({ released: true })
+    expect(linksChanged).toHaveBeenCalledWith(expect.objectContaining(beside(f)))
+    expect(linksChanged).toHaveBeenCalledWith(expect.objectContaining({ projectId: astra.projectId, sessionId: astra.sessionId }))
+    expect((await control.call(astra, 'agents.list') as Listed[]).find(agent => agent.agentSessionId === 'worker')).toMatchObject({ controlled: false })
+    // Released, it is anyone's again, and durable changes need control first.
+    await expect(control.call(astra, 'agents.resume', { agentSessionId: 'worker' })).rejects.toThrow(/does not control it/)
+    await expect(control.call(astra, 'tabs.rename', { tabId: 'tab-worker', title: 'x' })).rejects.toThrow(/outside this workspace or closed/)
+  })
+
+  it('keeps every boundary around a controlled sibling-project coworker', async () => {
+    const { f, other, astra, control } = await controlling()
+    // Another agent in Astra's project cannot close or rename what Astra controls next door.
+    const neighbour = agentIn(f, other.project.id, other.workspace.id, 'neighbour')
+    await expect(control.call(neighbour, 'tabs.close', { tabId: 'tab-worker' })).rejects.toThrow(/outside this workspace or closed/)
+    await expect(control.call(neighbour, 'agents.interrupt', { agentSessionId: 'worker' })).rejects.toThrow(/Another agent controls that tab/)
+    // The coworker cannot turn round and control or close its controller.
+    const worker = { projectId: f.project.id, sessionId: f.workspace.id, agentSessionId: 'worker' }
+    await expect(control.call(worker, 'agents.submit', { agentSessionId: 'astra', prompt: 'Stop me' })).rejects.toThrow(/itself or an ancestor/)
+    await expect(control.call(worker, 'tabs.close', { tabId: 'tab-astra' })).rejects.toThrow(/outside this workspace or closed/)
+    // Writing into the sibling project still goes through the tab that lives there.
+    await expect(control.call(astra, 'files.write', { projectId: f.project.id, path: 'x.md', content: 'x', expectedContent: null })).rejects.toThrow(/only runs in the authorized project/)
+    // Once a paired machine drives Astra, even the coworker it controls is out of reach.
+    stamp(f, other.workspace.id, 'tab-astra', 'peer-3')
+    expect((await control.call(astra, 'agents.list') as Listed[]).map(agent => agent.agentSessionId)).not.toContain('worker')
+    for (const [method, args] of [['agents.interrupt', { agentSessionId: 'worker' }], ['agents.release', { agentSessionId: 'worker' }], ['tabs.close', { tabId: 'tab-worker' }]] as const) {
+      await expect(control.call(astra, method, args)).rejects.toThrow(/paired machine|outside this workspace or closed/)
+    }
+    expect(f.requests.filter(request => request.action === 'tabs.close')).toHaveLength(0)
+  })
 })
 
 describe('a conversation a paired machine is driving', () => {
