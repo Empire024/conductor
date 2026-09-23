@@ -2,7 +2,7 @@ import { useAgentControl } from './use-agent-control'
 import { ListTodo } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import { Bot, Brain, Clock3, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
+import { Bot, Brain, Clock3, Gauge, GitBranch, Globe2, HardDrive, Hourglass, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
 import type {
   AgentActivityPhase,
   AgentProviderId,
@@ -19,7 +19,7 @@ import type {
   WorkspaceRecoveryCheckpoint,
   WorkspaceLayout
 } from '../../shared/models'
-import { makeLauncherTab } from '../../shared/models'
+import { makeId, makeLauncherTab } from '../../shared/models'
 import { TitleBar } from './components/TitleBar'
 import { Sidebar, type SidebarUtilityPanel } from './components/Sidebar'
 import { ExecutionTargetChip } from './components/ExecutionTargetChip'
@@ -42,6 +42,7 @@ import {
   instantiateLayout,
   splitGroup,
   stripWorkspaceUtilityTabs,
+  RUNTIME_TAB_KINDS,
   type DockEdge
 } from './layout/layout-operations'
 import {
@@ -62,6 +63,7 @@ import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { SourceControlPane } from './components/SourceControlPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
 import { SchedulesPane } from './components/SchedulesPane'
+import { DurableJobsPane } from './components/DurableJobsPane'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile, changeWorkspacePath, loadWorkspaceFiles, workspaceFileIds, workspaceFileMachine } from './components/workspace-files-state'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
@@ -139,7 +141,7 @@ export function App(): React.JSX.Element {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [utilityPanel, setUtilityPanel] = useState<SidebarUtilityPanel | null>(() => {
     const saved = localStorage.getItem('conductor.utilityPanel')
-    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules', 'source-control'].includes(saved ?? '')
+    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules', 'source-control', 'jobs'].includes(saved ?? '')
       ? saved as SidebarUtilityPanel
       : null
   })
@@ -289,6 +291,8 @@ export function App(): React.JSX.Element {
         ? { label: 'Schedules', aria: 'Smart schedules and run history', icon: Clock3 }
       : utilityPanel === 'source-control'
         ? { label: 'Source control', aria: 'Repository status and delivery', icon: GitBranch }
+      : utilityPanel === 'jobs'
+        ? { label: 'Durable jobs', aria: 'Durable overnight local-model jobs', icon: Hourglass }
       : utilityPanel === 'routines'
         ? { label: 'Automation', aria: 'Project automation', icon: Workflow }
       : { label: 'Automation', aria: 'Agents, tasks, and routines', icon: Bot }
@@ -336,7 +340,7 @@ export function App(): React.JSX.Element {
     const persisted = await window.conductor.sessions.list(projectId)
     const loaded = persisted.map((session) => {
       const layout = migrateLegacyCodexModels(stripWorkspaceUtilityTabs(session.layout))
-      const retainedClosedTabs = session.closedTabs.filter((tab) => ['launcher', 'agent', 'terminal'].includes(tab.kind))
+      const retainedClosedTabs = session.closedTabs.filter((tab) => RUNTIME_TAB_KINDS.includes(tab.kind))
       const closedTabs = retainedClosedTabs.map(migrateLegacyCodexTab)
       const closedTabsChanged = closedTabs.some((tab, index) => tab !== retainedClosedTabs[index])
       if (layout === session.layout && closedTabs.length === session.closedTabs.length && !closedTabsChanged) return session
@@ -1031,6 +1035,24 @@ export function App(): React.JSX.Element {
     setFocusedGroupId(group.id)
   }, [activeSession, focusedGroupId, setLayout])
 
+  /** One view per job and workspace: an open job tab is focused, otherwise one is added to the
+   *  focused group. The tab's resourceId is the job id, which is all that identifies the job. */
+  const openJobTab = useCallback((job: { id: string; title: string }): void => {
+    if (!activeSession) return
+    const groups = listGroups(activeSession.layout.root)
+    const holder = groups.find(group => group.tabs.some(tab => tab.kind === 'job' && tab.resourceId === job.id))
+    if (holder) {
+      const tab = holder.tabs.find(item => item.kind === 'job' && item.resourceId === job.id)!
+      setLayout(activateTab(activeSession.layout, holder.id, tab.id))
+      setFocusedGroupId(holder.id)
+      return
+    }
+    const group = findGroup(activeSession.layout.root, focusedGroupId) ?? groups[0]
+    if (!group) return
+    setLayout(addTab(activeSession.layout, group.id, { id: makeId('pane'), kind: 'job', title: job.title.slice(0, 120), resourceId: job.id }))
+    setFocusedGroupId(group.id)
+  }, [activeSession, focusedGroupId, setLayout])
+
   const openExplorerFile = useCallback((relativePath: string, mode: 'editor' | 'preview', projectId?: string): void => {
     const owner = projectId ?? activeProjectIdRef.current
     if (owner) openWorkspaceFile(owner, relativePath, mode)
@@ -1555,6 +1577,8 @@ export function App(): React.JSX.Element {
                           ? <ProcessDashboardPane project={activeProject} />
                           : utilityPanel === 'schedules'
                             ? <SchedulesPane projectId={activeProject.id} />
+                          : utilityPanel === 'jobs'
+                            ? <DurableJobsPane key={activeProject.id} projectId={activeProject.id} workspaceId={activeSession?.id} onOpenJob={openJobTab} />
                           : utilityPanel === 'source-control'
                             ? <SourceControlPane key={activeProject.id} project={activeProject} />
                           : <OrchestrationHub

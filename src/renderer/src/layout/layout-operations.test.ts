@@ -112,6 +112,13 @@ describe('layout operations', () => {
     expect(listGroups(codingOnly.root).flatMap((group) => group.tabs).map((tab) => tab.kind)).toEqual([])
   })
 
+  it('keeps a durable job tab across a reload, with the job id as its identity', () => {
+    let layout = createDefaultLayout()
+    layout = addTab(layout, layout.root.id, { id: 'job-view', kind: 'job', title: 'Overnight job', resourceId: 'job_0001' })
+    const reloaded = stripWorkspaceUtilityTabs(layout)
+    expect(listGroups(reloaded.root).flatMap((group) => group.tabs).find((tab) => tab.kind === 'job')).toMatchObject({ id: 'job-view', resourceId: 'job_0001' })
+  })
+
   it('inserts a tab at a specific index instead of always appending', () => {
     const layout = createDefaultLayout()
     const groupId = layout.root.id

@@ -1,0 +1,50 @@
+.durable-jobs-pane { padding: 14px; overflow: auto; height: 100%; color: var(--text-2); display: grid; align-content: start; gap: 12px; }
+.durable-jobs-intro { margin: 0; font-size: 11px; line-height: 1.5; }
+.durable-jobs-pane button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-2); color: var(--text); padding: 6px 9px; cursor: pointer; font-size: 11px; }
+.durable-jobs-pane button:hover:not(:disabled) { border-color: var(--accent-muted); }
+.durable-jobs-pane button:disabled { opacity: .55; cursor: default; }
+.durable-jobs-pane button.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+.durable-job-error { margin: 0; color: var(--danger); font-size: 11px; }
+.durable-job-muted { margin: 0; color: var(--text-3); font-size: 11px; }
+.durable-job-create { display: grid; gap: 8px; border: 1px solid var(--border); background: var(--surface-1); border-radius: 8px; padding: 12px; }
+.durable-job-create label { display: grid; gap: 4px; font-size: 10px; color: var(--text-3); text-transform: uppercase; }
+.durable-job-create textarea, .durable-job-create input, .durable-job-create select { border: 1px solid var(--border); border-radius: 4px; background: var(--surface-0); color: var(--text); padding: 6px; font: inherit; font-size: 12px; text-transform: none; resize: vertical; }
+.durable-job-create button { justify-self: start; }
+.durable-job-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.durable-job-list button { width: 100%; display: grid !important; grid-template-columns: auto 1fr; justify-items: start; text-align: left; gap: 2px 8px !important; background: var(--surface-1) !important; }
+.durable-job-list button.active { border-color: var(--accent); background: var(--accent-bg) !important; }
+.durable-job-list strong { color: var(--text); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.durable-job-list small { grid-column: 2; color: var(--text-3); font-size: 10px; }
+.durable-job { border: 1px solid var(--border); background: var(--surface-1); border-radius: 8px; padding: 12px; display: grid; gap: 12px; }
+.durable-job-header { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+.durable-job-header > div { display: grid; gap: 3px; min-width: 0; }
+.durable-job-header strong { color: var(--text); font-size: 13px; }
+.durable-job-header small { color: var(--text-3); font-family: ui-monospace, monospace; font-size: 10px; }
+.durable-job-status { text-transform: capitalize; font-size: 10px; padding: 2px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--text-2); white-space: nowrap; }
+.durable-job-status.status-running, .durable-job-status.status-recovering { color: var(--accent); border-color: var(--accent-muted); }
+.durable-job-status.status-completed { color: var(--blue); }
+.durable-job-status.status-blocked, .durable-job-status.status-failed { color: var(--danger); border-color: var(--danger); }
+.durable-job-status.status-paused, .durable-job-status.status-cancelled, .durable-job-status.status-queued { color: var(--text-3); }
+.durable-job-reason { margin: 0; font-size: 11px; line-height: 1.45; }
+.durable-job-reason.problem { color: var(--danger); }
+.durable-job-controls { display: flex; flex-wrap: wrap; gap: 6px; }
+.durable-job-facts { display: grid; grid-template-columns: 1fr 1fr; margin: 0; gap: 8px; }
+.durable-job-facts div { background: var(--surface-0); border-radius: 5px; padding: 7px; min-width: 0; }
+.durable-job-facts dt { color: var(--text-3); font-size: 9px; text-transform: uppercase; }
+.durable-job-facts dd { margin: 3px 0 0; font-size: 11px; color: var(--text); overflow-wrap: anywhere; }
+.durable-job-section h4 { margin: 0 0 6px; color: var(--text); font-size: 11px; }
+.durable-job-section ol, .durable-job-section ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.durable-job-section li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 7px; border-top: 1px solid var(--border-soft); padding: 5px 0; font-size: 11px; }
+.durable-job-section li p { flex-basis: 100%; margin: 0; color: var(--text-2); font-size: 10px; line-height: 1.45; }
+.durable-job-section time { margin-left: auto; color: var(--text-3); font-size: 9px; }
+.durable-job-section code { color: var(--blue); font-size: 10px; }
+.durable-job-section table { width: 100%; border-collapse: collapse; font-size: 10px; }
+.durable-job-section td { border-top: 1px solid var(--border-soft); padding: 4px 4px 4px 0; }
+.durable-job-section tr.stage-running td { color: var(--accent); }
+.durable-job-section tr.stage-failed td { color: var(--danger); }
+.durable-job-section tr.stage-pending td { color: var(--text-3); }
+.durable-job-kind { text-transform: uppercase; font-size: 9px; color: var(--text-3); }
+.durable-job-section li.issue-error .durable-job-kind, .durable-job-section li.issue-loop-detected .durable-job-kind { color: var(--danger); }
+.durable-job-section li.issue-recovery .durable-job-kind { color: var(--accent); }
+.durable-job-report { display: grid; gap: 6px; }
+.durable-job-path { margin: 0; font-family: ui-monospace, monospace; font-size: 10px; color: var(--text-3); overflow-wrap: anywhere; }

@@ -2,6 +2,7 @@ import { bindConversationTab, type ConversationIdentity } from '../panes/convers
 import { AgentControlLinks } from '../components/AgentControlLinks'
 import { useAgentControlLinks } from '../components/useAgentControlLinks'
 import { ProjectBacklogPane } from '../components/ProjectBacklogPane'
+import { DurableJobPanel, DurableJobsPane } from '../components/DurableJobsPane'
 import '../navigation.css'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { PaneTabMenu, TabGroupMenu } from '../components/PaneTabMenu'
@@ -15,6 +16,7 @@ import {
   FolderTree,
   Globe2,
   GripVertical,
+  Hourglass,
   MoreHorizontal,
   Plus,
   TerminalSquare,
@@ -119,6 +121,7 @@ const iconFor = (tab: PaneTab): typeof Bot => {
   // Same mapping the explorer, file tabs and Ctrl+E picker use, so a .tsx tab's icon matches everywhere.
   if (tab.kind === 'code' || tab.kind === 'preview') return fileTypeIcon((tab.state?.path as string) ?? tab.resourceId ?? '')
   if (tab.kind === 'browser') return Globe2
+  if (tab.kind === 'job') return Hourglass
   return FileText
 }
 
@@ -223,6 +226,8 @@ const PaneBody = ({
         onOpenFile={file => onOpenFile(file.path, undefined, 'editor')} />
     : <FileTreePane project={project} onOpenFile={onOpenFile} />
   if (tab.kind === 'tasks') return <ProjectBacklogPane project={project} />
+  // The job id is the tab's identity: whatever happens to the layout, this tab shows that job.
+  if (tab.kind === 'job') return tab.resourceId ? <DurableJobPanel projectId={project.id} jobId={tab.resourceId} /> : <DurableJobsPane projectId={project.id} workspaceId={session.id} />
   // Every read and write for a remote project's file goes through the host, which is what carries
   // the revision check that turns a concurrent edit into a conflict message instead of an overwrite.
   if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} machineId={host ?? fileMachineId(tab.state?.machineId as string | undefined)} />

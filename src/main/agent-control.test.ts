@@ -15,6 +15,8 @@ import { LOCAL_CONNECTION, type MachineProjectLink } from '../shared/remote-cont
 import type { ProjectIdentity } from '../shared/project-identity'
 import type { AgentEventData, ProviderCapabilities, SessionProjection, StructuredProvider } from '../shared/structured-agent'
 import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
+import { FakeDurableJobsService } from '../shared/durable-jobs-fake'
+import type { DurableJobEvent, DurableJobSummary } from '../shared/durable-jobs'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
@@ -1398,5 +1400,118 @@ describe('wizard tabs', () => {
     expect(read.content.endsWith('{"result":{"outcomes":[]}}')).toBe(true)
     await expect(f.control.call(f.scope, 'agents.artifact', { agentSessionId: worker.resourceId, artifactId: 'missing' })).rejects.toThrow(/No such tool output artifact/)
     expect(JSON.stringify(await f.control.call(f.scope, 'tools.list', {}))).toContain('agents.artifact')
+  })
+})
+describe('durable jobs over app control', () => {
+  const localProvider: AgentProviderInfo = { id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local/qwen3.6-35b-a3b', label: 'Qwen 3.6 35B A3B' }], efforts: [{ id: 'low', label: 'Low' }] }
+  const jobsFixture = () => {
+    const f = fixture()
+    const service = new FakeDurableJobsService()
+    const control = new AgentControl({ ...f.deps, providers: () => [...f.deps.providers(), localProvider] })
+    control.setDurableJobs(service)
+    const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker' }
+    f.sessions.ensure(local)
+    openAgentTab(f, local.id, 'local-tab')
+    const peer: AgentSpec = { ...f.spec, id: 'peer', title: 'Peer' }
+    f.sessions.ensure(peer)
+    openAgentTab(f, peer.id, 'peer-tab')
+    return { ...f, service, control, localScope: { ...f.scope, agentSessionId: local.id }, peerScope: { ...f.scope, agentSessionId: peer.id }, owner: control.ownerScope({ projectId: f.project.id }) }
+  }
+  const create = { objective: 'Make the invoice parser accept Fio exports', model: 'local/qwen3.6-35b-a3b', constraints: ['Do not touch src/main/index.ts'] }
+
+  it('lists jobs.* only once the job controller is plugged in, through the setDurableJobs hook', async () => {
+    const f = fixture()
+    const control = new AgentControl({ ...f.deps, providers: () => [...f.deps.providers(), localProvider] })
+    expect(Object.keys(await control.call(f.scope, 'tools.list') as object)).not.toContain('jobs.create')
+    await expect(control.call(f.scope, 'jobs.list')).rejects.toThrow(/unavailable/)
+    control.setDurableJobs(new FakeDurableJobsService())
+    expect(Object.keys(await control.call(f.scope, 'tools.list') as object)).toEqual(expect.arrayContaining(['jobs.create', 'jobs.list', 'jobs.status', 'jobs.events', 'jobs.pause', 'jobs.resume', 'jobs.cancel', 'jobs.report']))
+    expect(await control.call(f.scope, 'jobs.list')).toEqual([])
+  })
+
+  it('lets the owner, a wizard tab or a writable non-local conversation create a job on a local model only', async () => {
+    const f = jobsFixture()
+    const byOwner = await f.control.call(f.owner, 'jobs.create', create) as DurableJobSummary
+    expect(byOwner).toMatchObject({ projectId: f.project.id, status: 'queued', model: 'local/qwen3.6-35b-a3b', title: 'Make the invoice parser accept Fio exports' })
+    expect(f.service.created[0]).toMatchObject({ projectId: f.project.id, workspaceId: f.workspace.id, constraints: ['Do not touch src/main/index.ts'], createdBy: { kind: 'owner', agentSessionId: 'owner' } })
+    const byController = await f.control.call(f.scope, 'jobs.create', { ...create, title: 'Parser', stages: [{ title: 'Reproduce', objective: 'Reproduce it', completionCriteria: ['failing test'] }], budgets: { maxStageAttempts: 2 }, isolateWorktree: true }) as DurableJobSummary
+    expect(f.service.created[1]).toMatchObject({ title: 'Parser', stages: [{ title: 'Reproduce' }], budgets: { maxStageAttempts: 2 }, isolateWorktree: true, createdBy: { kind: 'agent', agentSessionId: f.spec.id } })
+    expect(byController.stagesTotal).toBe(1)
+    // Never a cloud model, and no argument through which one could be asked for.
+    await expect(f.control.call(f.scope, 'jobs.create', { ...create, model: 'claude-synthetic' })).rejects.toThrow(/local model only/)
+    await expect(f.control.call(f.scope, 'jobs.create', { ...create, escalation: 'report-and-block' })).rejects.toThrow(/escalation is not an argument/)
+    await expect(f.control.call(f.scope, 'jobs.create', { ...create, provider: 'claude' })).rejects.toThrow(/provider is not an argument/)
+    await expect(f.control.call(f.scope, 'jobs.create', { ...create, budgets: { cloudFallback: 1 } })).rejects.toThrow(/budgets accepts only/)
+    // A sandboxed local model starts nothing; neither does a read-only turn.
+    await expect(f.control.call(f.localScope, 'jobs.create', create)).rejects.toThrow(/sandboxed local conversation cannot start/)
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, permission: 'read-only' } })
+    await expect(f.control.call(f.scope, 'jobs.create', create)).rejects.toThrow(/read-only/)
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+    await f.control.call(f.scope, 'jobs.create', create)
+    expect(f.service.created[2]).toMatchObject({ createdBy: { kind: 'wizard' } })
+    expect(f.service.created).toHaveLength(3)
+  })
+
+  it('lets the creator, the owner and a wizard tab pause, resume and cancel; others and local models only read', async () => {
+    const f = jobsFixture()
+    const job = await f.control.call(f.scope, 'jobs.create', create) as DurableJobSummary
+    f.service.setStatus(job.id, 'running')
+    // Anyone in the project reads it, a local model included.
+    for (const scope of [f.localScope, f.peerScope]) {
+      expect(await f.control.call(scope, 'jobs.status', { jobId: job.id })).toMatchObject({ id: job.id, status: 'running' })
+      expect((await f.control.call(scope, 'jobs.list') as DurableJobSummary[]).map(entry => entry.id)).toEqual([job.id])
+      expect((await f.control.call(scope, 'jobs.events', { jobId: job.id, limit: 1 }) as DurableJobEvent[])).toHaveLength(1)
+      expect(await f.control.call(scope, 'jobs.report', { jobId: job.id })).toMatchObject({ jobId: job.id, cloudEscalation: { occurred: false }, reportPath: expect.stringContaining('report.md') })
+    }
+    await expect(f.control.call(f.localScope, 'jobs.pause', { jobId: job.id })).rejects.toThrow(/sandboxed local conversation cannot change/)
+    await expect(f.control.call(f.localScope, 'jobs.cancel', { jobId: job.id })).rejects.toThrow(/sandboxed local conversation cannot change/)
+    await expect(f.control.call(f.peerScope, 'jobs.pause', { jobId: job.id })).rejects.toThrow(/conversation that created this job/)
+    expect(f.service.status(job.id).status).toBe('running')
+    expect(await f.control.call(f.scope, 'jobs.pause', { jobId: job.id, reason: 'Owner wants the GPU' })).toMatchObject({ status: 'paused', statusReason: 'Owner wants the GPU' })
+    expect(await f.control.call(f.scope, 'jobs.resume', { jobId: job.id })).toMatchObject({ status: 'running' })
+    expect(await f.control.call(f.owner, 'jobs.pause', { jobId: job.id })).toMatchObject({ status: 'paused' })
+    // An illegal transition is the service's to refuse, and it reaches the caller as is.
+    await expect(f.control.call(f.owner, 'jobs.pause', { jobId: job.id })).rejects.toThrow(/cannot become paused/)
+    const state = f.database.structured.snapshot(f.peerScope.agentSessionId)!
+    f.database.structured.update(f.peerScope.agentSessionId, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+    expect(await f.control.call(f.peerScope, 'jobs.cancel', { jobId: job.id, reason: 'Superseded' })).toMatchObject({ status: 'cancelled' })
+    expect(f.confirm).not.toHaveBeenCalled()
+  })
+
+  it('treats another project’s job as missing and bounds the event page', async () => {
+    const f = jobsFixture()
+    const foreign = await f.service.create({ projectId: 'another-project', title: 'Theirs', objective: 'O', model: 'local/qwen3.6-35b-a3b' })
+    await expect(f.control.call(f.owner, 'jobs.status', { jobId: foreign.id })).rejects.toThrow(/No durable job with that id in this project/)
+    await expect(f.control.call(f.owner, 'jobs.cancel', { jobId: foreign.id })).rejects.toThrow(/No durable job with that id in this project/)
+    await expect(f.control.call(f.owner, 'jobs.status', { jobId: 'job_missing' })).rejects.toThrow(/No durable job with that id in this project/)
+    expect(await f.control.call(f.owner, 'jobs.list')).toEqual([])
+    await expect(f.control.call(f.owner, 'jobs.list', { status: ['sleeping'] })).rejects.toThrow(/job statuses/)
+    const job = await f.control.call(f.owner, 'jobs.create', create) as DurableJobSummary
+    for (let index = 0; index < 250; index += 1) f.service.record(job.id, 'note', `note ${index}`)
+    expect(await f.control.call(f.owner, 'jobs.events', { jobId: job.id, limit: 1000 })).toHaveLength(200)
+    const first = await f.control.call(f.owner, 'jobs.events', { jobId: job.id, limit: 2 }) as DurableJobEvent[]
+    expect((await f.control.call(f.owner, 'jobs.events', { jobId: job.id, afterId: first[1]!.id, limit: 1 }) as DurableJobEvent[])[0]!.message).toBe('note 1')
+    await expect(f.control.call(f.owner, 'jobs.events', { jobId: job.id, limit: 0 })).rejects.toThrow(/positive whole number/)
+  })
+
+  it('opens a job tab whose identity is the job id, focuses it when asked again and reopens it after a close', async () => {
+    const f = jobsFixture()
+    const job = await f.control.call(f.scope, 'jobs.create', create) as DurableJobSummary
+    const opened = await f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: job.id }) as AgentControlTab
+    expect(opened).toMatchObject({ kind: 'job', resourceId: job.id, title: job.title })
+    const again = await f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: job.id }) as AgentControlTab
+    expect(again.id).toBe(opened.id)
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', params: { tabId: opened.id } })
+    // Closing the tab is a layout change; the job and its id are untouched.
+    const layout = f.database.getSession(f.workspace.id)!.layout
+    if (layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    layout.root.tabs = layout.root.tabs.filter(tab => tab.id !== opened.id)
+    f.database.saveSession(f.workspace.id, layout, null, [])
+    const reopened = await f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: job.id }) as AgentControlTab
+    expect(reopened.id).not.toBe(opened.id)
+    expect(reopened.resourceId).toBe(job.id)
+    expect(f.service.list()).toHaveLength(1)
+    await expect(f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: 'job_missing' })).rejects.toThrow(/No durable job/)
   })
 })

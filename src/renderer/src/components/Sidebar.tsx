@@ -14,6 +14,7 @@ import {
   ChevronDown,
   ChevronRight,
   Clock3,
+  Hourglass,
   FolderInput,
   FolderOpen,
   FolderGit2,
@@ -92,7 +93,7 @@ interface SidebarProps {
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
-export type SidebarUtilityPanel = WorkspacePanel | 'schedules' | 'source-control'
+export type SidebarUtilityPanel = WorkspacePanel | 'schedules' | 'source-control' | 'jobs'
 
 // "Workspace", "Explorer" and "Browser" are the primary destinations; the rest open utility
 // panels beside the workspace. An item marked `unfinished` has nothing wired up yet, so it is
@@ -114,7 +115,8 @@ const railItems: Array<{
   { icon: MemoryStick, label: 'Memory', utility: 'memory', group: 'secondary' },
   { icon: Gauge, label: 'Processes', utility: 'processes', group: 'secondary' },
   { icon: GitBranch, label: 'Source control', utility: 'source-control', group: 'secondary' },
-  { icon: Clock3, label: 'Schedules', utility: 'schedules', group: 'secondary' }
+  { icon: Clock3, label: 'Schedules', utility: 'schedules', group: 'secondary' },
+  { icon: Hourglass, label: 'Durable jobs', utility: 'jobs', group: 'secondary' }
 ]
 
 export function Sidebar(props: SidebarProps): React.JSX.Element {
