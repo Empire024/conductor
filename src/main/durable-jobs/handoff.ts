@@ -29,7 +29,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { DurableJob, DurableJobArtifactRef, DurableJobBudgets, DurableJobHandoff, DurableJobStage } from '../../shared/durable-jobs.ts'
+import type { DurableJob, DurableJobArtifactRef, DurableJobBudgets, DurableJobHandoff, DurableJobStage, DurableStageKind } from '../../shared/durable-jobs.ts'
 import type { LocalStopReason, LocalStopReport } from '../../shared/local-stop.ts'
 import { argumentsAreObject, RESPONSE_RESERVE_TOKENS, systemPrompt, trimMessages } from '../local-models/agent.ts'
 import { DEFAULT_LOCAL_AGENT_POLICY, type ToolOutputPolicy } from '../local-models/agent-policy.ts'
@@ -417,8 +417,7 @@ export const readExcerptFile = (path: string): Promise<string> => readFile(path,
  *  search, plus write_file/edit_file/apply_edits/run_command unless read-only). A session is in
  *  the coding scope exactly when LocalAgentOptions.contract is set, so a stage passes a contract
  *  (at least `{}`). readOnly removes every mutating tool. */
-export const DURABLE_STAGE_KINDS = ['plan', 'investigate', 'implement', 'verify', 'research', 'report'] as const
-export type DurableStageKind = (typeof DURABLE_STAGE_KINDS)[number]
+export { DURABLE_STAGE_KINDS, type DurableStageKind } from '../../shared/durable-jobs.ts'
 
 export const STAGE_TOOL_MAP: Readonly<Record<DurableStageKind, { scope: ToolScope; readOnly: boolean; research: boolean }>> = {
   plan: { scope: 'coding', readOnly: true, research: false },
@@ -429,7 +428,7 @@ export const STAGE_TOOL_MAP: Readonly<Record<DurableStageKind, { scope: ToolScop
   report: { scope: 'coding', readOnly: true, research: false }
 }
 
-/** Until the contract carries a stage kind, infer it from the title and objective. */
+/** A stage without an explicit kind: inferred from the title and objective. */
 export function stageKind(stage: Pick<DurableJobStage, 'title' | 'objective'>): DurableStageKind {
   const text = `${stage.title} ${stage.objective}`.toLowerCase()
   if (/\b(verify|validate|test|check|acceptance)\b/.test(stage.title.toLowerCase())) return 'verify'

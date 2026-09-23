@@ -3,6 +3,7 @@ import { basename } from 'node:path'
 import { makeId, type AgentSpec, type ProjectRecord, type SessionRecord } from '../../shared/models'
 import { localStopOf } from '../../shared/local-stop'
 import type { PromptOrigin, SessionProjection, SessionSettings } from '../../shared/structured-agent'
+import { STAGE_TOOL_MAP, stageKind } from './handoff'
 import type { LocalExecutionView, OpenStageRequest, StageObservation, StageRuntime } from './ports'
 
 /**
@@ -74,7 +75,7 @@ export function observeProjection(state: SessionProjection | null, execution: Lo
   return {
     phase: state.phase,
     stopSequence: stopItem ? stopItem.updatedSequence ?? stopItem.sequence : 0,
-    ...(stop ? { stop: { reason: stop.reason, detail: stop.detail, filesChanged: stop.filesChanged ?? [], ...(stop.acceptance ? { acceptance: stop.acceptance } : {}) } } : {}),
+    ...(stop ? { stop: { reason: stop.reason, detail: stop.detail, filesChanged: stop.filesChanged ?? [], ...(stop.acceptance ? { acceptance: stop.acceptance } : {}) }, report: stop } : {}),
     lastAnswer: lastText && lastText.data.type === 'text' ? lastText.data.text : '',
     ...(lastError && lastError.data.type === 'error' ? { lastError: lastError.data.message.slice(0, 600) } : {}),
     filesChanged: [...changed].slice(0, 400),
@@ -114,7 +115,10 @@ export function structuredStageRuntime(deps: StructuredRuntimeDeps): StageRuntim
       if (!created) throw new Error('The stage conversation was not registered')
       // Local models have no Auto; accept-edits is their working mode (the sandbox still applies).
       // No grants are widened here: no repository writes, no research, no bypassed approvals.
-      database.structured.update(spec.id, { settings: { ...created.settings, model, permission: 'accept-edits', plan: false } })
+      // The stage kind picks the tool scope (handoff.ts STAGE_TOOL_MAP): read-only kinds get no
+      // mutating tool, and a coding-scope kind gets the coding tool set through an empty contract.
+      const tools = STAGE_TOOL_MAP[request.stage.kind ?? stageKind(request.stage)]
+      database.structured.update(spec.id, { settings: { ...created.settings, model, permission: tools.readOnly ? 'read-only' : 'accept-edits', plan: false, localGit: false, localResearch: false, ...(tools.scope === 'coding' ? { localContract: {} } : {}) } })
       void deps.showTab?.({ projectId: project.id, workspaceId, agentSessionId: spec.id, title: spec.title, model, jobId: request.job.id }).catch(error => console.warn('Durable job tab could not be shown', error))
       return { agentSessionId: spec.id }
     },

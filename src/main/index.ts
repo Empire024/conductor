@@ -62,6 +62,11 @@ import { OrchestrationStore } from './orchestration-store'
 import { registerOrchestrationIpc } from './orchestration-ipc'
 import { ScheduleStore } from './schedule-store'
 import { createDurableJobsService, DurableJobStore, structuredStageRuntime, type DurableJobsServiceImpl } from './durable-jobs'
+import { durableJobPorts, gatedRuntime } from './durable-jobs/wiring'
+import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/server-lifecycle'
+import { registerDurableJobsIpc } from './durable-jobs-ipc'
+import { health as llamaHealth, readRunRecord } from './local-models/llama'
+import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
 import { ScheduleRunner } from './schedule-runner'
 import { LatestModelsJob } from './schedule-jobs/latest-models'
 import { registerScheduleIpc } from './schedule-ipc'
@@ -83,7 +88,7 @@ import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
 import { LocalUpdateBuilder } from './local-update-build'
-import { localModelAvailability } from './providers/local'
+import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
 import { registerDeliveryIpc } from './delivery-ipc'
 import { gitHubCredential } from './github-credential'
@@ -113,6 +118,8 @@ let schedules: ScheduleStore
 let scheduleRunner: ScheduleRunner
 /** Durable overnight local-model jobs (src/main/durable-jobs); null until the app is ready. */
 let durableJobs: DurableJobsServiceImpl | null = null
+let disposeDurableJobsIpc: (() => void) | undefined
+let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
@@ -549,7 +556,7 @@ const disposeRuntimeServices = (): void => {
     // First: the job controller stops watching before the agents it drives are torn down, so an
     // app quit is never recorded as a failed stage. The jobs stay running and are reconciled on
     // the next launch.
-    ['durable jobs', () => durableJobs?.dispose()],
+    ['durable jobs', () => { durableJobs?.dispose(); disposeDurableJobsGate?.(); disposeDurableJobsIpc?.() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
@@ -1994,6 +2001,15 @@ const registerIpc = (): void => {
       }
     }
   )
+  if (durableJobs) {
+    disposeDurableJobsIpc = registerDurableJobsIpc({
+      service: durableJobs,
+      authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, structuredId(projectId), 'Durable jobs') },
+      localModels: () => agents.listProviders().find(provider => provider.id === 'local')?.models.map(model => model.id) ?? [],
+      publish: (channel, payload) => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send(channel, payload) },
+      reveal: path => shell.showItemInFolder(path)
+    })
+  }
 }
 
 app.whenReady().then(async () => {
@@ -2170,12 +2186,39 @@ app.whenReady().then(async () => {
   agents.structured.setLocalControl((spec, method, args) => control.call({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, method, args))
   // Durable overnight jobs run in this process on the same structured runtime as every tab; a
   // renderer only views their stage conversations.
+  // An unpackaged build may point every local conversation at a stand-in endpoint (the
+  // durable-jobs smoke's stub model); a packaged app ignores the variable.
+  if (!app.isPackaged && process.env.CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT) setLocalEndpointOverride(process.env.CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT)
+  const durableJobStore = new DurableJobStore(databasePath)
+  // One process-wide gate: one job generation at a time, and none while an interactive local
+  // turn is in flight (llama-server runs a single slot).
+  const generationGate = new LocalGenerationGate({ now: () => Date.now(), sleep: ms => new Promise(done => setTimeout(done, ms).unref?.()), interactiveActive: async () => localTurnsInFlight() ? 'an interactive local conversation is mid-turn' : null })
+  const localModel = (modelId: string): ReturnType<typeof loadLocalConfig>['models'][string] | null => { try { return loadLocalConfig().models[modelId] ?? null } catch { return null } }
+  const stageRuntime = gatedRuntime(structuredStageRuntime({ sessions: agents.structured, database }), generationGate, onLocalTurnStart)
+  disposeDurableJobsGate = () => stageRuntime.dispose()
   durableJobs = createDurableJobsService({
-    store: new DurableJobStore(databasePath),
-    runtime: structuredStageRuntime({ sessions: agents.structured, database }),
+    store: durableJobStore,
+    runtime: stageRuntime,
     logRoot: join(app.getPath('userData'), 'durable-jobs'),
-    projectPath: projectId => database.getProject(projectId)?.path ?? null
+    projectPath: projectId => database.getProject(projectId)?.path ?? null,
+    ...durableJobPorts({
+      store: durableJobStore,
+      gate: generationGate,
+      snapshot: id => database.structured.snapshot(id),
+      modelConfig: modelId => { const model = localModel(modelId); return model ? { id: model.id, contextTokens: model.contextTokens } : null },
+      endpointOverride: localEndpointOverride,
+      serverPorts: (modelId, emit) => createLlamaServerPorts(modelId, emit),
+      probeHealth: async modelId => {
+        const model = localModel(modelId)
+        if (!model) return { healthy: false, detail: `${modelId} is not configured` }
+        const apiKey = readLocalApiKey()
+        const port = readRunRecord(model)?.port ?? model.port
+        const result = await llamaHealth(port, apiKey, 4000)
+        return { healthy: result.ok, processing: result.ok ? await slotsProcessing(port, apiKey) : false, ...(result.detail ? { detail: result.detail } : {}) }
+      }
+    })
   })
+  control.setDurableJobs(durableJobs)
   // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
   // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
   // one after every restart.

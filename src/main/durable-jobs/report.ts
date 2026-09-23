@@ -185,7 +185,7 @@ export function writeDurableJobReport(report: DurableJobReport, job: JobWithStag
  * The whole path for a job the service knows: read it, build, write. The service's own report()
  * may call this with its store's checkpoints; the control protocol and IPC call service.report().
  */
-export function generateDurableJobReport(service: Pick<DurableJobsService, 'get' | 'events'>, jobId: string, options: { checkpoints?: readonly DurableJobCheckpoint[]; now?: number } = {}): DurableJobReport & { reportPath: string } {
+export function generateDurableJobReport(service: Pick<DurableJobsService, 'get' | 'events'> & Partial<Pick<DurableJobsService, 'checkpoints'>>, jobId: string, options: { checkpoints?: readonly DurableJobCheckpoint[]; now?: number } = {}): DurableJobReport & { reportPath: string } {
   const job = service.get(jobId)
   const events: DurableJobEvent[] = []
   for (let after: string | undefined; ;) {
@@ -194,5 +194,5 @@ export function generateDurableJobReport(service: Pick<DurableJobsService, 'get'
     if (page.length < 500) break
     after = page[page.length - 1]!.id
   }
-  return writeDurableJobReport(buildDurableJobReport({ job, events, checkpoints: options.checkpoints, now: options.now }), job)
+  return writeDurableJobReport(buildDurableJobReport({ job, events, checkpoints: options.checkpoints ?? service.checkpoints?.(jobId), now: options.now }), job)
 }

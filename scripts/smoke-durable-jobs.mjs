@@ -59,10 +59,32 @@ const stub = realModel ? null : createServer((request, response) => {
     const send = payload => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(payload)) }
     if (request.url?.startsWith('/health')) return send({ status: 'ok' })
     if (request.url?.startsWith('/v1/models')) return send({ object: 'list', data: [{ id: model, object: 'model' }] })
-    const reply = prompt.includes('APPROVAL-CASE')
-      ? { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'run_command', arguments: JSON.stringify({ command: 'npm install left-pad --save' }) } }] }
-      : { role: 'assistant', content: 'Appended the line to notes.txt. STAGE COMPLETE.' }
-    setTimeout(() => send({ id: 'stub', object: 'chat.completion', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: reply, finish_reason: reply.tool_calls ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 } }), Number(process.env.DURABLE_SMOKE_STUB_DELAY_MS ?? 4000))
+    // Scripted like a small model: the stage's first request makes one real tool call through the
+    // local runtime, the answer after its result closes the stage with the job status line. The
+    // approval case keeps asking for the install the sandbox refuses.
+    const messages = Array.isArray(body.messages) ? body.messages : []
+    const afterTool = messages.at(-1)?.role === 'tool'
+    const call = (name, args) => ({ tool_calls: [{ index: 0, id: `call_${stubRequests.length}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] })
+    // The stage's own objective sits between these headings of the durable-job stage prompt.
+    const task = String(messages.find(message => message.role === 'user')?.content ?? '')
+    const stageObjective = /THIS STAGE\s*([\s\S]*?)\s*STAGE IS COMPLETE WHEN/.exec(task)?.[1] ?? task
+    const appending = stageObjective.includes('Append the line')
+    const reply = prompt.includes('APPROVAL-CASE') ? call('run_command', { command: 'npm install left-pad --save' })
+      : afterTool ? { content: appending ? 'Appended "durable smoke" to notes.txt.\nJOB STATUS: CONTINUE: verify the line' : 'notes.txt ends with the line durable smoke.\nJOB STATUS: DONE' }
+      : appending ? call('write_file', { path: 'notes.txt', content: 'durable smoke\n', append: true })
+      : stageObjective.includes('notes.txt') ? call('read_file', { path: 'notes.txt' })
+      : { content: 'Nothing to do for this stage.\nJOB STATUS: DONE' }
+    const finish = reply.tool_calls ? 'tool_calls' : 'stop'
+    const usage = { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 }
+    setTimeout(() => {
+      if (!body.stream) return send({ id: 'stub', object: 'chat.completion', created: Math.floor(Date.now() / 1000), model, choices: [{ index: 0, message: { role: 'assistant', content: reply.content ?? null, ...(reply.tool_calls ? { tool_calls: reply.tool_calls.map(({ index: _index, ...rest }) => rest) } : {}) }, finish_reason: finish }], usage })
+      response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+      const chunk = payload => response.write(`data: ${JSON.stringify({ id: 'stub', object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model, ...payload })}\n\n`)
+      chunk({ choices: [{ index: 0, delta: { role: 'assistant', ...reply }, finish_reason: null }] })
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: finish }] })
+      chunk({ choices: [], usage })
+      response.end('data: [DONE]\n\n')
+    }, Number(process.env.DURABLE_SMOKE_STUB_DELAY_MS ?? 4000))
   })
 })
 if (stub) await new Promise(done => stub.listen(0, '127.0.0.1', done))

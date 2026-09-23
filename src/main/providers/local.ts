@@ -81,7 +81,25 @@ const startingServers = new Map<string, Promise<void>>()
  *  idle server gives way to another model, so a switch never lands in the middle of a turn that
  *  this process is running. */
 const turnsInFlight = new Map<string, Set<string>>()
+/** Told when any local turn starts (the durable-job generation gate yields to interactive use). */
+const turnListeners = new Set<(modelId: string, runtimeId: string) => void>()
+export function onLocalTurnStart(listener: (modelId: string, runtimeId: string) => void): () => void {
+  turnListeners.add(listener)
+  return () => { turnListeners.delete(listener) }
+}
+/** How many local turns this process has in flight, across models. */
+export const localTurnsInFlight = (): number => [...turnsInFlight.values()].reduce((sum, set) => sum + set.size, 0)
+
+/** Test hook for unpackaged builds only (src/main/index.ts reads CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT):
+ *  an OpenAI-compatible endpoint that stands in for llama-server, so the durable-job smoke runs
+ *  without loading a model. No server is started, no model file is required. */
+let endpointOverride: string | null = null
+export function setLocalEndpointOverride(endpoint: string | null): void { endpointOverride = endpoint }
+export const localEndpointOverride = (): string | null => endpointOverride
+const endpointOf = (model: LocalModelConfig): string => endpointOverride ?? endpointFor(model)
+
 function markTurn(modelId: string, runtimeId: string): () => void {
+  for (const listener of turnListeners) { try { listener(modelId, runtimeId) } catch { /* a listener never breaks a turn */ } }
   const set = turnsInFlight.get(modelId) ?? new Set<string>()
   set.add(runtimeId)
   turnsInFlight.set(modelId, set)
@@ -252,6 +270,7 @@ export class LocalAdapter implements ProviderAdapter {
    *  crashed between messages is brought back rather than failing the turn. */
   private async ready(turnId?: string): Promise<LocalModelConfig> {
     const model = this.model()
+    if (endpointOverride) return model
     if (!existsSync(modelFilePath(model))) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
     let announced = false
     await ensureServer(this.stack!, model, this.key(), () => {
@@ -259,7 +278,7 @@ export class LocalAdapter implements ProviderAdapter {
       this.emit({ turnId, data: { type: 'notice', message: `Starting ${localModelLabel(model.id)} locally; the first start loads the model into memory and can take a few minutes.` } })
     })
     if (announced) this.emit({ turnId, data: { type: 'notice', message: `${localModelLabel(model.id)} is ready.` } })
-    this.endpointContext = await probeLocalContext(endpointFor(model), this.key(), model.id, model.contextTokens)
+    this.endpointContext = await probeLocalContext(endpointOf(model), this.key(), model.id, model.contextTokens)
     this.emit({ turnId, data: { type: 'notice', message: 'Local endpoint context and template diagnostics', payload: { localEndpointContext: this.endpointContext as unknown as Json } } })
     if (this.endpointContext.template.toolCalls === 'unsupported') throw new Error('Local server chat template does not support tool calls; choose a compatible local template before continuing')
     return { ...model, contextTokens: this.endpointContext.effectiveTokens }
@@ -270,7 +289,7 @@ export class LocalAdapter implements ProviderAdapter {
     // calls ready(), so an unused local conversation consumes no GPU, RAM or server process.
     const model = this.model()
     this.key()
-    if (!existsSync(modelFilePath(model))) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
+    if (!endpointOverride && !existsSync(modelFilePath(model))) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
     if (this.options.localCheckpoint) this.ensureSession(model, false)
     this.emit({ data: { type: 'session', phase: 'idle', capabilities: this.providerCapabilities } })
   }
@@ -289,7 +308,7 @@ export class LocalAdapter implements ProviderAdapter {
     const sandbox = readOnly ? null : this.sandbox
     if (!this.session) {
       this.session = new LocalAgentSession({
-        endpoint: endpointFor(model), apiKey: this.key(), model: model.id, workspace: this.options.cwd,
+        endpoint: endpointOf(model), apiKey: this.key(), model: model.id, workspace: this.options.cwd,
         sandbox, readOnly, grants, contract, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
         control: this.options.localControl,
         taskId: this.options.localTaskId,
@@ -302,7 +321,7 @@ export class LocalAdapter implements ProviderAdapter {
     } else {
       // Both of these can change between turns of one conversation. The mode change is
       // already visible in the composer; a model change is not, so only that is announced.
-      this.session.retarget({ model: model.id, endpoint: endpointFor(model), contextTokens: model.contextTokens, measureTokens: this.endpointContext?.propsProbed ?? false, readOnly, grants, contract, sandbox })
+      this.session.retarget({ model: model.id, endpoint: endpointOf(model), contextTokens: model.contextTokens, measureTokens: this.endpointContext?.propsProbed ?? false, readOnly, grants, contract, sandbox })
       if (this.sessionModel !== model.id) this.emit({ data: { type: 'notice', message: `This conversation now uses ${localModelLabel(model.id)}.` } })
     }
     this.sessionModel = model.id

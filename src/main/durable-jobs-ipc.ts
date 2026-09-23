@@ -55,7 +55,7 @@ export function registerDurableJobsIpc(options: {
       if (page.length < 500 || events.length >= 20_000) break
       after = page[page.length - 1]!.id
     }
-    return { job: jobs.get(summary.id), summary, events: events.slice(-200), checkpoints: checkpointsFromEvents(events) }
+    return { job: jobs.get(summary.id), summary, events: events.slice(-200), checkpoints: jobs.checkpoints(summary.id) }
   })
   handle(DURABLE_JOB_CHANNELS.events, (_event, projectId, jobId, afterId?: string, limit?: number) => {
     const summary = owned(projectId, jobId)
@@ -72,7 +72,7 @@ export function registerDurableJobsIpc(options: {
       title: typeof request.title === 'string' && request.title.trim() ? request.title.trim().slice(0, 120) : objective.replace(/\s+/g, ' ').trim().slice(0, 80),
       objective, model, ...(constraints.length ? { constraints } : {}),
       createdBy: { kind: 'owner', agentSessionId: 'owner', title: 'Owner (job view)' }
-    } as Parameters<DurableJobsService['create']>[0])
+    })
   })
   handle(DURABLE_JOB_CHANNELS.pause, (_event, projectId, jobId, reason?: string) => service().pause(owned(projectId, jobId).id, typeof reason === 'string' ? reason.slice(0, 500) : undefined))
   handle(DURABLE_JOB_CHANNELS.resume, (_event, projectId, jobId) => service().resume(owned(projectId, jobId).id))

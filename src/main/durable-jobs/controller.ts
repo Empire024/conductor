@@ -204,9 +204,11 @@ export class DurableJobController {
     while (true) {
       const job = this.owned(run)
       if (!job) return
-      if (job.budgets.maxElapsedMs > 0 && job.startedAt && this.clock().getTime() - Date.parse(job.startedAt) >= job.budgets.maxElapsedMs) {
-        this.store.transition(job.id, 'failed', `Reached the job's elapsed-time budget of ${Math.round(job.budgets.maxElapsedMs / 60_000)} minutes`, this.guard(run))
-        this.options.finished?.(job.id)
+      // The elapsed budget blocks (resumable) rather than fails: the work so far stands, and the
+      // owner's resume restarts the budget from that moment (the latest 'elapsed-budget' note).
+      const since = this.elapsedSince(job)
+      if (job.budgets.maxElapsedMs > 0 && since !== undefined && this.clock().getTime() - since >= job.budgets.maxElapsedMs) {
+        this.block(run, `Reached the job's elapsed-time budget of ${Math.round(job.budgets.maxElapsedMs / 60_000)} minutes`, job.handoff.nextAction || 'Read the report so far; resume to give the job another elapsed-time budget, or cancel it.')
         return
       }
       const stages = this.store.stages(job.id)
@@ -218,6 +220,13 @@ export class DurableJobController {
       }
       if (await this.runStage(run, job, stage, stages) === 'stop') return
     }
+  }
+
+  /** Start of the current elapsed-time budget: the job's start, or the owner's latest resume. */
+  private elapsedSince(job: StoredJob): number | undefined {
+    if (!job.budgets.maxElapsedMs || !job.startedAt) return undefined
+    const restarted = this.store.events(job.id, undefined, 1_000).filter(event => event.kind === 'note' && event.data?.elapsedBudget === 'restarted').at(-1)
+    return Date.parse(restarted?.at ?? job.startedAt)
   }
 
   /** One llama-server: stage attempts across jobs take turns. */
@@ -290,7 +299,7 @@ export class DurableJobController {
   private async serverReady(run: Run, job: StoredJob): Promise<'ready' | 'blocked'> {
     const retries = this.options.serverRetries ?? 3
     for (let attempt = 0; ; attempt++) {
-      const readiness = await this.options.server.ensureReady(job.model.model)
+      const readiness = await this.options.server.ensureReady(job.model.model, { jobId: job.id, epoch: run.epoch })
       if (readiness.ready) return 'ready'
       if (!this.owned(run)) return 'blocked'
       if (!readiness.retryable || attempt >= retries) {
@@ -349,6 +358,13 @@ export class DurableJobController {
     const latest = this.store.get(job.id)
     const allStages = this.store.stages(job.id)
     const decision = this.options.handoff.afterStage({ job: latest, stage, stages: allStages, observation, succeeded })
+    this.store.batch(job.id, () => {
+      for (const test of decision.tests ?? []) this.store.event(job.id, guard, 'note', `Test ${test.outcome}: ${test.command}`, { stageId: stage.id, test })
+      if (decision.contextRollover) {
+        this.store.count(job.id, guard, { contextRollovers: 1 })
+        this.store.event(job.id, guard, 'note', `Stage ${stage.index + 1} filled its context past the rollover threshold; the next stage starts fresh from the handoff`, { stageId: stage.id, contextRollover: true, promptTokens: observation.report?.context.usedTokens ?? null })
+      }
+    })
     if (succeeded) {
       this.store.update(job.id, guard, { handoff: decision.handoff })
       const checkpointId = await this.checkpoint(run, stage, `After stage ${stage.index + 1} "${stage.title}"`, observation.filesChanged)
@@ -380,7 +396,7 @@ export class DurableJobController {
     this.store.batch(job.id, () => {
       this.store.update(job.id, guard, { handoff: decision.handoff })
       this.store.saveStage(job.id, guard, failed, { kind: 'retry', message: `Stage ${stage.index + 1} attempt ${stage.attempt} did not finish: ${error}`, data: { error, attempt: stage.attempt, stop: observation.stop?.reason ?? null } })
-      this.store.count(job.id, guard, { retries: 1, ...(observation.stop?.reason === 'context_limit' ? { contextRollovers: 1 } : {}) })
+      this.store.count(job.id, guard, { retries: 1, ...(observation.stop?.reason === 'context_limit' && !decision.contextRollover ? { contextRollovers: 1 } : {}) })
     })
     // A tool call whose result was never saved has an unknown side effect. It is recorded and
     // never replayed; the owner inspects before the job continues.
@@ -394,10 +410,14 @@ export class DurableJobController {
       return 'stop'
     }
     if (observation.stop?.reason === 'provider_error') {
-      const restarted = await this.options.server.recover(job.model.model, error).catch(() => false)
+      const restarted = await this.options.server.recover(job.model.model, error, { jobId: job.id, epoch: run.epoch }).catch(() => false)
       if (this.owned(run)) this.store.event(job.id, guard, 'server', restarted ? 'Local model server restarted after a provider error' : 'Local model server reported an error; no restart was made', { error })
     }
     const loop = this.options.loopGuard.assess({ job: this.store.get(job.id), stage: failed, stages: this.store.stages(job.id), observation, error, previousErrors })
+    if (loop.loop && loop.kind === 'approval') {
+      this.block(run, `Stage ${stage.index + 1} needs the owner's permission: ${loop.detail}`, `Grant or perform that step yourself (the job never widens its own permissions), then resume the job.`, 'approval')
+      return 'stop'
+    }
     if (loop.loop) {
       this.store.count(job.id, guard, { loopsDetected: 1 })
       this.block(run, `Loop detected in stage ${stage.index + 1}: ${loop.detail}`, `Change the approach for stage ${stage.index + 1} (${stage.title}); resuming grants new attempts.`, 'loop-detected')

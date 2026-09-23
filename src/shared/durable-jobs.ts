@@ -16,6 +16,10 @@ export type DurableJobStatus = (typeof DURABLE_JOB_STATUSES)[number]
 export const DURABLE_STAGE_STATUSES = ['pending', 'running', 'completed', 'failed', 'skipped'] as const
 export type DurableStageStatus = (typeof DURABLE_STAGE_STATUSES)[number]
 
+/** What a stage is for; it decides the stage's tool scope (handoff.ts STAGE_TOOL_MAP). */
+export const DURABLE_STAGE_KINDS = ['plan', 'investigate', 'implement', 'verify', 'research', 'report'] as const
+export type DurableStageKind = (typeof DURABLE_STAGE_KINDS)[number]
+
 /** Terminal job statuses never transition again. */
 export const TERMINAL_JOB_STATUSES: readonly DurableJobStatus[] = ['completed', 'failed', 'cancelled']
 
@@ -32,6 +36,8 @@ export interface DurableJobBudgets {
   contextRolloverFraction: number
   /** Tokens kept free for the next tool response on top of the reserved output tokens. */
   contextSafetyMarginTokens: number
+  /** Ceiling for a fresh stage's prompt; default min(8,192, a quarter of the model window). */
+  stagePromptBudgetTokens?: number
 }
 
 export const DEFAULT_DURABLE_JOB_BUDGETS: DurableJobBudgets = {
@@ -80,6 +86,8 @@ export interface DurableJobStage {
   jobId: string
   index: number
   title: string
+  /** Set by the plan; when absent it is inferred from the title (handoff.ts stageKind). */
+  kind?: DurableStageKind
   objective: string
   completionCriteria: string[]
   inputs: DurableJobArtifactRef[]
@@ -136,7 +144,16 @@ export interface DurableJobEvent {
   at: string
   kind: 'transition' | 'stage' | 'checkpoint' | 'recovery' | 'retry' | 'loop-detected' | 'server' | 'approval' | 'escalation' | 'note'
   message: string
+  /** Conventions: a test run carries data.test ({ command, outcome: 'pass' | 'fail' | 'not-run', detail? });
+   *  an escalation event carries data.occurred (true only when a cloud model actually ran). */
   data?: Record<string, unknown>
+}
+
+/** Who created a job: besides the owner, only that conversation may pause, resume or cancel it. */
+export interface DurableJobCreator {
+  kind: 'owner' | 'wizard' | 'agent'
+  agentSessionId: string
+  title: string
 }
 
 export interface DurableJob {
@@ -148,6 +165,7 @@ export interface DurableJob {
   worktree?: { path: string; branch: string; baseCommit: string }
   title: string
   objective: string
+  createdBy?: DurableJobCreator
   status: DurableJobStatus
   statusReason?: string
   model: DurableJobModelPolicy
@@ -193,11 +211,12 @@ export interface CreateDurableJobInput {
   objective: string
   model: string
   /** Optional explicit stage plan; when absent the controller plans one bounded first stage. */
-  stages?: Array<Pick<DurableJobStage, 'title' | 'objective' | 'completionCriteria'> & { inputs?: DurableJobArtifactRef[] }>
+  stages?: Array<Pick<DurableJobStage, 'title' | 'objective' | 'completionCriteria'> & { kind?: DurableStageKind; inputs?: DurableJobArtifactRef[] }>
   budgets?: Partial<DurableJobBudgets>
   constraints?: string[]
   /** Use an isolated git worktree/branch when the project is a repository (default true). */
   isolateWorktree?: boolean
+  createdBy?: DurableJobCreator
 }
 
 export interface DurableJobReport {
@@ -241,6 +260,7 @@ export interface DurableJobsService {
   get(jobId: string): DurableJob & { stages: DurableJobStage[] }
   status(jobId: string): DurableJobSummary
   events(jobId: string, afterId?: string, limit?: number): DurableJobEvent[]
+  checkpoints(jobId: string): DurableJobCheckpoint[]
   pause(jobId: string, reason?: string): DurableJobSummary
   resume(jobId: string): Promise<DurableJobSummary>
   cancel(jobId: string, reason?: string): Promise<DurableJobSummary>

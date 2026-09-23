@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { makeId } from '../../shared/models'
-import { DEFAULT_DURABLE_JOB_BUDGETS, TERMINAL_JOB_STATUSES, type CreateDurableJobInput, type DurableJob, type DurableJobBudgets, type DurableJobEvent, type DurableJobReport, type DurableJobsService, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../shared/durable-jobs'
+import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_STAGE_KINDS, TERMINAL_JOB_STATUSES, type CreateDurableJobInput, type DurableJobCheckpoint, type DurableJob, type DurableJobBudgets, type DurableJobEvent, type DurableJobReport, type DurableJobsService, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../shared/durable-jobs'
 import { DurableJobController } from './controller'
 import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type HandoffPort, type LoopGuardPort, type ReportPort, type ServerLifecyclePort, type StageRuntime, type WatchdogPort } from './ports'
 import { reconcileJobs, type ReconcileOutcome } from './reconcile'
@@ -48,7 +48,18 @@ function budgetsFrom(input: Partial<DurableJobBudgets> = {}): DurableJobBudgets 
   for (const key of ['maxElapsedMs', 'modelCallTimeoutMs', 'toolCallTimeoutMs', 'stageTimeoutMs', 'contextSafetyMarginTokens'] as const) if (!Number.isSafeInteger(budgets[key]) || budgets[key] < 0) throw new Error(`budgets.${key} must be a non-negative integer`)
   if (!Number.isInteger(budgets.maxStageAttempts) || budgets.maxStageAttempts < 1 || budgets.maxStageAttempts > 20) throw new Error('budgets.maxStageAttempts must be 1-20')
   if (!(budgets.contextRolloverFraction > 0.1 && budgets.contextRolloverFraction <= 0.95)) throw new Error('budgets.contextRolloverFraction must be in (0.1, 0.95]')
+  if (budgets.stagePromptBudgetTokens !== undefined && (!Number.isSafeInteger(budgets.stagePromptBudgetTokens) || budgets.stagePromptBudgetTokens < 512)) throw new Error('budgets.stagePromptBudgetTokens must be a whole number of at least 512')
   return budgets
+}
+
+const stageKindOf = (value: unknown): NonNullable<DurableJobStage['kind']> => {
+  if (!DURABLE_STAGE_KINDS.includes(value as never)) throw new Error(`stage kind must be one of ${DURABLE_STAGE_KINDS.join(', ')}`)
+  return value as NonNullable<DurableJobStage['kind']>
+}
+
+const creatorOf = (value: NonNullable<CreateDurableJobInput['createdBy']>): NonNullable<DurableJob['createdBy']> => {
+  if (!['owner', 'wizard', 'agent'].includes(value.kind)) throw new Error('createdBy.kind must be owner, wizard or agent')
+  return { kind: value.kind, agentSessionId: text(value.agentSessionId, 'createdBy.agentSessionId', 200), title: String(value.title ?? '').slice(0, 200) }
 }
 
 /**
@@ -136,12 +147,13 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     const stages: DurableJobStage[] = (plan ?? [{ title: 'Stage 1', objective, completionCriteria: [] }]).map((stage, index) => ({
       id: makeId('jobstage'), jobId: id, index,
       title: text(stage.title, 'stage title', 200), objective: text(stage.objective, 'stage objective', 20_000),
+      ...('kind' in stage && stage.kind ? { kind: stageKindOf(stage.kind) } : {}),
       completionCriteria: (stage.completionCriteria ?? []).map(String).slice(0, 20), inputs: 'inputs' in stage && stage.inputs ? stage.inputs.slice(0, 50) : [],
       status: 'pending', attempt: 0
     }))
     const job: DurableJob = {
       id, projectId: input.projectId, ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), cwd, ...(worktree ? { worktree } : {}),
-      title, objective, status: 'queued',
+      title, objective, ...(input.createdBy ? { createdBy: creatorOf(input.createdBy) } : {}), status: 'queued',
       model: { provider: 'local', model, escalation: 'never' }, budgets,
       handoff: { objective, constraints: (input.constraints ?? []).map(String).slice(0, 40), decisions: [], workDone: [], filesChanged: [], testResults: [], unresolvedIssues: [], nextAction: stages[0]!.objective, artifacts: [], updatedAt: now },
       createdAt: now, updatedAt: now, activeMs: 0,
@@ -174,6 +186,11 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     return this.store.events(jobId, afterId, limit)
   }
 
+  checkpoints(jobId: string): DurableJobCheckpoint[] {
+    this.store.get(jobId)
+    return this.store.checkpoints(jobId)
+  }
+
   pause(jobId: string, reason = 'Paused by the owner'): DurableJobSummary {
     const job = this.store.get(jobId)
     if (job.status !== 'running' && job.status !== 'queued') throw new Error(`Only a running or queued job can be paused; this one is ${job.status}`)
@@ -201,6 +218,7 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     if (current && current.attempt >= job.budgets.maxStageAttempts + this.store.attemptBase(current.id)) this.store.grantAttempts(jobId, { owner: true }, current.id)
     const unknown = this.store.operations(jobId, 'unknown')
     if (unknown.length && job.status === 'blocked') this.store.event(jobId, { owner: true }, 'note', `Resumed by the owner with ${unknown.length} unverified side effect(s) left as they are; nothing is replayed.`)
+    if (job.budgets.maxElapsedMs > 0) this.store.event(jobId, { owner: true }, 'note', 'The elapsed-time budget restarts from the owner\'s resume.', { elapsedBudget: 'restarted' })
     this.controller.start(jobId, 'Resumed by the owner')
     return this.status(jobId)
   }

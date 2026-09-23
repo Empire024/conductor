@@ -13,7 +13,7 @@
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { SessionPhase } from '../../shared/structured-agent'
-import type { LocalStopReason } from '../../shared/local-stop'
+import type { LocalStopReason, LocalStopReport } from '../../shared/local-stop'
 import type { DurableJob, DurableJobCheckpoint, DurableJobEvent, DurableJobHandoff, DurableJobOperation, DurableJobReport, DurableJobStage } from '../../shared/durable-jobs'
 
 /** A planned stage the controller may append (same shape as CreateDurableJobInput.stages). */
@@ -26,6 +26,8 @@ export interface StageObservation {
   /** Sequence of the newest local stop report on the timeline; 0 when none. */
   stopSequence: number
   stop?: { reason: LocalStopReason; detail: string; filesChanged: string[]; acceptance?: { command: string; passed: boolean; exitCode: number } }
+  /** The full local stop report behind `stop` (context figures, timeline), when there is one. */
+  report?: LocalStopReport
   /** The last assistant answer text (may be empty or truncated; never proof of success alone). */
   lastAnswer: string
   lastError?: string
@@ -82,6 +84,10 @@ export interface StageResultDecision {
   nextStage?: DurableStagePlan
   /** Short factual result for DurableJobStage.result. */
   result: string
+  /** The stage's context crossed the rollover threshold: the next stage starts from the handoff. */
+  contextRollover?: boolean
+  /** Test runs this stage made, recorded as events carrying data.test. */
+  tests?: DurableJobReport['tests']
 }
 
 /** Opus B: context budgeting, next-stage prompt and handoff extraction. */
@@ -97,14 +103,18 @@ export interface WatchdogPort {
 }
 
 export type ServerReadiness = { ready: true } | { ready: false; reason: string; retryable: boolean }
+/** Which job asks, so server events land in its log under its lease. */
+export interface ServerContext { jobId: string; epoch: number }
 /** Opus C: the one llama-server this machine can carry. */
 export interface ServerLifecyclePort {
-  ensureReady(model: string): Promise<ServerReadiness>
+  ensureReady(model: string, context?: ServerContext): Promise<ServerReadiness>
   /** Called after a provider_error stop; true when the server was restarted and a retry makes sense. */
-  recover(model: string, reason: string): Promise<boolean>
+  recover(model: string, reason: string, context?: ServerContext): Promise<boolean>
 }
 
-export type LoopAssessment = { loop: false } | { loop: true; detail: string }
+/** `approval`: the stage keeps asking for something only the owner may grant (a refused install,
+ *  a denied path); the job blocks for the owner instead of retrying. */
+export type LoopAssessment = { loop: false } | { loop: true; detail: string; kind?: 'loop' | 'approval' }
 /** Opus C: detects a stage repeating without progress across attempts. */
 export interface LoopGuardPort {
   /** `error` is this attempt's failure as recorded; `previousErrors` the stage's earlier ones, oldest first. */

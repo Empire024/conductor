@@ -1,3 +1,4 @@
+import { checkpointsFromEvents } from './durable-jobs-bridge'
 import {
   canTransition, DEFAULT_DURABLE_JOB_BUDGETS, TERMINAL_JOB_STATUSES,
   type CreateDurableJobInput, type DurableJob, type DurableJobCheckpoint, type DurableJobEvent, type DurableJobReport, type DurableJobsService,
@@ -35,7 +36,7 @@ export class FakeDurableJobsService implements DurableJobsService {
     const plan = input.stages?.length ? input.stages : [{ title: 'Plan and first step', objective: input.objective, completionCriteria: ['A plan is recorded'] }]
     const job: DurableJob & { stages: DurableJobStage[] } = {
       id, projectId: input.projectId, ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}), cwd: `/fake/${id}`,
-      title: input.title, objective: input.objective, status: 'queued', model: { provider: 'local', model: input.model, escalation: 'never' },
+      title: input.title, objective: input.objective, ...(input.createdBy ? { createdBy: input.createdBy } : {}), status: 'queued', model: { provider: 'local', model: input.model, escalation: 'never' },
       budgets: { ...DEFAULT_DURABLE_JOB_BUDGETS, ...input.budgets },
       handoff: { objective: input.objective, constraints: input.constraints ?? [], decisions: [], workDone: [], filesChanged: [], testResults: [], unresolvedIssues: [], nextAction: plan[0]!.objective, artifacts: [], updatedAt: at },
       createdAt: at, updatedAt: at, activeMs: 0,
@@ -63,6 +64,11 @@ export class FakeDurableJobsService implements DurableJobsService {
     const all = this.eventLog.get(jobId) ?? []
     const start = afterId ? all.findIndex(event => event.id === afterId) + 1 : 0
     return all.slice(start, start + limit)
+  }
+
+  checkpoints(jobId: string): DurableJobCheckpoint[] {
+    this.require(jobId)
+    return checkpointsFromEvents(this.eventLog.get(jobId) ?? [])
   }
 
   pause(jobId: string, reason?: string): DurableJobSummary { return this.setStatus(jobId, 'paused', reason ?? 'Paused by request') }
