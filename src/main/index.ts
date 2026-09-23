@@ -61,6 +61,7 @@ import {
 import { OrchestrationStore } from './orchestration-store'
 import { registerOrchestrationIpc } from './orchestration-ipc'
 import { ScheduleStore } from './schedule-store'
+import { createDurableJobsService, DurableJobStore, structuredStageRuntime, type DurableJobsServiceImpl } from './durable-jobs'
 import { ScheduleRunner } from './schedule-runner'
 import { LatestModelsJob } from './schedule-jobs/latest-models'
 import { registerScheduleIpc } from './schedule-ipc'
@@ -110,6 +111,8 @@ let orchestration: OrchestrationStore
 let disposeOrchestrationIpc: (() => void) | undefined
 let schedules: ScheduleStore
 let scheduleRunner: ScheduleRunner
+/** Durable overnight local-model jobs (src/main/durable-jobs); null until the app is ready. */
+let durableJobs: DurableJobsServiceImpl | null = null
 let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
@@ -543,6 +546,10 @@ const disposeRuntimeServices = (): void => {
   if (servicesDisposed) return
   servicesDisposed = true
   const disposals: Array<[string, () => void]> = [
+    // First: the job controller stops watching before the agents it drives are torn down, so an
+    // app quit is never recorded as a failed stage. The jobs stay running and are reconciled on
+    // the next launch.
+    ['durable jobs', () => durableJobs?.dispose()],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
@@ -2161,6 +2168,14 @@ app.whenReady().then(async () => {
   scheduleRunner = new ScheduleRunner({ store: schedules, jobs: { 'latest-models-methods': context => latestModelsJob.run(context) }, changed: projectId => publish('schedules:changed', projectId) })
   agentControlUi.register(control)
   agents.structured.setLocalControl((spec, method, args) => control.call({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, method, args))
+  // Durable overnight jobs run in this process on the same structured runtime as every tab; a
+  // renderer only views their stage conversations.
+  durableJobs = createDurableJobsService({
+    store: new DurableJobStore(databasePath),
+    runtime: structuredStageRuntime({ sessions: agents.structured, database }),
+    logRoot: join(app.getPath('userData'), 'durable-jobs'),
+    projectPath: projectId => database.getProject(projectId)?.path ?? null
+  })
   // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
   // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
   // one after every restart.
@@ -2254,6 +2269,8 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow()
   })
+  // Jobs the previous process left running are reconciled and resumed once the windows are up.
+  setTimeout(() => { void durableJobs?.start().catch(error => console.error('Durable jobs could not be reconciled', error)) }, 3000)
 })
 
 // 'window-all-closed' is owned by the host lifecycle: it quits exactly as before unless this machine
