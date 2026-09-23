@@ -122,6 +122,114 @@ export function inspectFile(input: { id: string; bytes: Uint8Array; role: Inspec
   return { identity: { id: input.id, sha256: fingerprintBytes(bytes), bytes: bytes.length, counts }, role: input.role, bytes, records, complete }
 }
 
+export interface FileColumn {
+  line: number
+  column: number
+  type: 'text' | 'integer' | 'date' | 'money'
+  stripPrefix?: string
+  map?: Record<string, string>
+  currency?: string
+  direction?: Direction
+  directionField?: string
+}
+export interface FileRecordSchema {
+  delimiter: '\t' | '|' | ';' | ','
+  recordLines: number
+  skipPrefixes?: string[]
+  skipBlank?: boolean
+  fields: Record<string, FileColumn>
+}
+
+function schemaShape(x: unknown): x is FileRecordSchema {
+  if (!object(x) || !exactKeys(x, ['delimiter', 'recordLines', 'fields'], ['skipPrefixes', 'skipBlank']) || typeof x.delimiter !== 'string' || !['\t', '|', ';', ','].includes(x.delimiter) || !integer(x.recordLines) || x.recordLines < 1 || x.recordLines > 8 || !object(x.fields)) return false
+  if (x.skipPrefixes !== undefined && (!Array.isArray(x.skipPrefixes) || x.skipPrefixes.length > 16 || !x.skipPrefixes.every(s => shortString(s) && s.length <= 128))) return false
+  if (x.skipBlank !== undefined && typeof x.skipBlank !== 'boolean') return false
+  const fields = Object.entries(x.fields)
+  if (!fields.length || fields.length > 28 || !valuesShape(Object.fromEntries(fields.map(([k]) => [k, ''])))) return false
+  return fields.filter(([, f]) => object(f) && f.type === 'money').length <= 1 && fields.every(([, f]) => object(f) && exactKeys(f, ['line', 'column', 'type'], ['stripPrefix', 'map', 'currency', 'direction', 'directionField']) && integer(f.line) && f.line < Number(x.recordLines) && integer(f.column) && f.column <= 255 && typeof f.type === 'string' && ['text', 'integer', 'date', 'money'].includes(f.type) && (f.stripPrefix === undefined || shortString(f.stripPrefix)) && (f.currency === undefined || (typeof f.currency === 'string' && currencies.has(f.currency))) && (f.direction === undefined || (typeof f.direction === 'string' && ['incoming', 'outgoing', 'neutral'].includes(f.direction))) && (f.directionField === undefined || (shortString(f.directionField) && Object.hasOwn(x.fields as object, f.directionField))) && (f.map === undefined || (object(f.map) && Object.keys(f.map).length <= 32 && Object.entries(f.map).every(([k, v]) => shortString(k) && shortString(v)))))
+}
+
+/** Bounded, non-executable column/framing helper. A model-selected schema produces proposals, not trusted validation facts. */
+export function inspectFileWithSchema(input: { id: string; bytes: Uint8Array; role: Inspection['role'] }, schema: unknown): Inspection {
+  if (!schemaShape(schema)) throw new Error('Invalid bounded file record schema')
+  if (input.bytes.byteLength > FILE_PROCESSING_LIMITS.inputBytes) throw new Error('Input byte limit exceeded')
+  const bytes = Buffer.from(input.bytes)
+  const lines: Segment[] = []
+  let start = 0
+  for (let i = 0; i < bytes.length; i++) if (bytes[i] === 10) {
+    lines.push({ start, end: i + 1 }); start = i + 1
+    if (lines.length > FILE_PROCESSING_LIMITS.records * 8) throw new Error('Line count limit exceeded')
+  }
+  if (start < bytes.length) lines.push({ start, end: bytes.length })
+  const skip = (text: string): boolean => (schema.skipBlank === true && text.trim() === '') || (schema.skipPrefixes ?? []).some(prefix => text.replace(/^\ufeff/, '').startsWith(prefix))
+  const skipped = new Set<number>()
+  const segments: Segment[] = []
+  for (let i = 0; i < lines.length;) {
+    const first = lines[i]!
+    const firstText = bytes.subarray(first.start, first.end).toString('utf8')
+    if (skip(firstText)) { segments.push(first); skipped.add(first.start); i++; continue }
+    let count = 1
+    while (count < schema.recordLines && i + count < lines.length) {
+      const next = lines[i + count]!
+      if (skip(bytes.subarray(next.start, next.end).toString('utf8'))) break
+      count++
+    }
+    segments.push({ start: first.start, end: lines[i + count - 1]!.end }); i += count
+  }
+  return inspectFile(input, segments, (text, segment) => {
+    if (skipped.has(segment.start)) return { kind: 'skipped' }
+    if (text.length > 65_536) return { kind: 'rejected' }
+    const rows = text.replace(/^\ufeff/, '').replace(/\r?\n$/, '').split(/\r?\n/)
+    if (rows.length !== schema.recordLines) return { kind: 'rejected' }
+    const cells = rows.map(row => row.split(schema.delimiter))
+    const values: Values = {}
+    const entries = Object.entries(schema.fields)
+    // Resolve text directions before money, independent of schema property order.
+    for (const [name, field] of [...entries.filter(([, f]) => f.type !== 'money'), ...entries.filter(([, f]) => f.type === 'money')]) {
+      let value = cells[field.line]?.[field.column]?.trim()
+      if (value === undefined || value.length > FILE_PROCESSING_LIMITS.string) return { kind: 'rejected' }
+      if (field.stripPrefix) {
+        if (!value.startsWith(field.stripPrefix)) return { kind: 'rejected' }
+        value = value.slice(field.stripPrefix.length).trim()
+      }
+      if (field.map) {
+        if (!Object.hasOwn(field.map, value)) return { kind: 'rejected' }
+        value = field.map[value]!
+      }
+      if (field.type === 'text') values[name] = value
+      else if (field.type === 'integer') {
+        if (!/^[+-]?\d+$/.test(value) || !Number.isSafeInteger(Number(value))) return { kind: 'rejected' }
+        values[name] = Number(value)
+      } else if (field.type === 'date') {
+        const date = parseExplicitDate(value)
+        if (!date.ok) return { kind: 'rejected' }
+        values[name] = date.value
+      } else {
+        const direction = field.directionField ? values[field.directionField] : field.direction
+        if (direction !== undefined && direction !== 'incoming' && direction !== 'outgoing' && direction !== 'neutral') return { kind: 'rejected' }
+        const money = parseMoney(value, { currency: field.currency, direction })
+        if (!money.ok) return { kind: 'rejected' }
+        Object.assign(values, money.value)
+      }
+    }
+    return { kind: 'record', values }
+  })
+}
+
+/** Deterministic candidate producer for a tool wrapper. Acceptance still requires an independent context. */
+export function reconcileFileProcessing(context: ValidationContext): FileProcessingResult {
+  if (context.targets.length > FILE_PROCESSING_LIMITS.targets || context.inspections.length > FILE_PROCESSING_LIMITS.inputs || context.inspections.reduce((n, i) => n + i.records.length, 0) > FILE_PROCESSING_LIMITS.records) throw new Error('Reconciliation context limit exceeded')
+  const sources = context.inspections.filter(i => i.role === 'source')
+  const complete = sources.length > 0 && sources.every(i => i.complete && i.identity.counts.rejected === 0) && sources.some(i => i.records.length > 0)
+  const records = sources.flatMap(i => i.records)
+  const outcomes: ProcessingOutcome[] = context.targets.map(target => {
+    const candidates = records.filter(r => satisfies(r.values, target.criteria))
+    if (!complete || candidates.length > FILE_PROCESSING_LIMITS.candidates) return { targetId: target.id, status: 'blocked', candidates: [], reason: !complete ? 'Source inspection is incomplete or contains rejected records.' : 'Plausible candidate count exceeds the result limit; narrow independent criteria or split the task.' }
+    return { targetId: target.id, status: candidates.length === 0 ? 'not_found' : candidates.length === 1 ? 'matched' : 'ambiguous', candidates: candidates.map(c => ({ ref: { ...c.ref }, values: { ...c.values } })) }
+  })
+  return { version: 1, inputs: context.inspections.map(i => ({ ...i.identity, counts: { ...i.identity.counts } })), outcomes }
+}
+
 function resultShape(x: unknown): x is FileProcessingResult {
   if (!object(x) || !exactKeys(x, ['version', 'inputs', 'outcomes']) || x.version !== 1 || !Array.isArray(x.inputs) || x.inputs.length > FILE_PROCESSING_LIMITS.inputs || !Array.isArray(x.outcomes) || x.outcomes.length > FILE_PROCESSING_LIMITS.targets) return false
   if (!x.inputs.every(i => object(i) && exactKeys(i, ['id', 'sha256', 'bytes', 'counts']) && shortString(i.id) && typeof i.sha256 === 'string' && /^[a-f0-9]{64}$/.test(i.sha256) && integer(i.bytes) && countsShape(i.counts))) return false

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { FILE_PROCESSING_LIMITS, inspectFile, parseExplicitDate, parseMoney, validateFileProcessingResult, type FileProcessingResult, type ValidationContext } from './file-processing'
+import { FILE_PROCESSING_LIMITS, inspectFile, inspectFileWithSchema, reconcileFileProcessing, parseExplicitDate, parseMoney, validateFileProcessingResult, type FileProcessingResult, type FileRecordSchema, type ValidationContext } from './file-processing'
 import { BANK_FIXTURE_ORACLE, INVENTORY_FIXTURE_ORACLE, generateBankFixture, generateInventoryFixture, inspectFixture } from './file-processing.fixtures'
 
 // Builds submitted results from separately maintained fixture expectations, not the matching algorithm.
@@ -237,5 +237,52 @@ describe('untrusted machine JSON bounds and inspection errors', () => {
     expect(() => inspectFile({ id: 'x', bytes, role: 'source' }, [{ start: 0, end: 4 }, { start: 3, end: 5 }], () => ({ kind: 'skipped' }))).toThrow('overlapping')
     expect(inspectFile({ id: 'x', bytes: Buffer.from([255]), role: 'source' }, [{ start: 0, end: 1 }], () => ({ kind: 'record', values: { text: 'fabricated' } })).identity.counts.rejected).toBe(1)
     expect(inspectFile({ id: 'x', bytes, role: 'source' }, [{ start: 0, end: bytes.length }], () => { throw new Error('bad parser') }).identity.counts.rejected).toBe(1)
+  })
+})
+
+describe('bounded selected-schema helper', () => {
+  const schema: FileRecordSchema = { delimiter: '\t', recordLines: 2, skipPrefixes: ['DATUM\t'], fields: {
+    money: { line: 0, column: 1, type: 'money', directionField: 'direction' },
+    date: { line: 0, column: 0, type: 'date' },
+    direction: { line: 0, column: 2, type: 'text', map: { PŘÍJEM: 'incoming', VÝDAJ: 'outgoing' } },
+    transaction: { line: 0, column: 3, type: 'text' },
+    reference: { line: 1, column: 0, type: 'text', stripPrefix: 'VS:' },
+    account: { line: 1, column: 1, type: 'text', stripPrefix: 'ÚČET:' }
+  } }
+  it('parses multiline BOM/CRLF bank records and matches the independent fixture oracle', () => {
+    const fixture = generateBankFixture()
+    const trusted = inspectFixture(fixture)
+    const proposal = inspectFileWithSchema(fixture.inputs[1]!, schema)
+    expect(proposal).toEqual(trusted.inspections[1])
+    const proposedContext = { ...trusted, inspections: [trusted.inspections[0]!, proposal] }
+    const result = reconcileFileProcessing(proposedContext)
+    expect(result).toEqual(oracleResult(trusted))
+    expect(codes(result, trusted)).toEqual([])
+  })
+  it('does not trust a schema selected to skip every positive record', () => {
+    const fixture = generateBankFixture('principal', 0)
+    const trusted = inspectFixture(fixture)
+    const dishonest = inspectFileWithSchema(fixture.inputs[1]!, { ...schema, skipPrefixes: ['DATUM', '23.', '15.', '2026', '24.', '25.', '  '] })
+    expect(dishonest.records).toHaveLength(0)
+    const result = reconcileFileProcessing({ ...trusted, inspections: [trusted.inspections[0]!, dishonest] })
+    expect(codes(result, trusted)).toContain('ZERO_PARSE')
+  })
+  it('supports generic inventory integer columns and detects malformed values', () => {
+    const input = generateInventoryFixture().inputs[1]!
+    const inventory: FileRecordSchema = { delimiter: '\t', recordLines: 1, skipPrefixes: ['lot\t'], fields: { lot: { line: 0, column: 0, type: 'text' }, sku: { line: 0, column: 1, type: 'text' }, warehouse: { line: 0, column: 2, type: 'text' }, quantity: { line: 0, column: 3, type: 'integer' } } }
+    expect(inspectFileWithSchema(input, inventory).records[0]!.values.quantity).toBe(12)
+    input.bytes = Buffer.from(input.bytes.toString().replace('\t12\n', '\tNaN\n'))
+    expect(inspectFileWithSchema(input, inventory).identity.counts.rejected).toBe(1)
+  })
+  it.each([{ ...schema, recordLines: 0 }, { ...schema, recordLines: 9 }, { ...schema, delimiter: 'regex' }, { ...schema, regex: '(a+)+' }, { ...schema, fields: { bad: { type: { toString: null }, line: 0, column: 0 } } }, { ...schema, fields: { bad: { type: 'text', line: 0, column: 999 } } }])('rejects an untrusted executable/out-of-bound schema', invalid => {
+    expect(() => inspectFileWithSchema(generateBankFixture('principal', 0).inputs[1]!, invalid)).toThrow('Invalid bounded')
+  })
+  it('rejects missing continuation, invalid dates, amounts and direction maps instead of inventing values', () => {
+    for (const change of [(s: string) => s.replace('23.04.2026', '31.04.2026'), (s: string) => s.replace('85\u00a0000,00', 'invalid'), (s: string) => s.replace('PŘÍJEM', 'unknown'), (s: string) => s.replace(/  VS: 4107[^\n]*\n/, '')]) {
+      const fixture = generateBankFixture('principal', 0)
+      const input = fixture.inputs[1]!
+      input.bytes = Buffer.from(change(input.bytes.toString()))
+      expect(inspectFileWithSchema(input, schema).identity.counts.rejected).toBeGreaterThan(0)
+    }
   })
 })
