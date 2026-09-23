@@ -1,5 +1,5 @@
 import { spawn, execFileSync } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, lstatSync } from 'node:fs'
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -17,6 +17,12 @@ for (let index = 2; index < process.argv.length; index++) {
   } else throw new Error(`Unknown argument: ${argument}`)
 }
 if (process.platform !== 'win32') throw new Error('Local installed-app updates currently require Windows x64')
+// electron-builder collects production dependencies by walking node_modules; through a junction
+// (a worktree borrowing the checkout's node_modules) it silently drops hoisted transitive ones such
+// as fs-extra, and the installed app then dies at startup with "Cannot find module".
+if (existsSync(resolve(workspace, 'node_modules')) && lstatSync(resolve(workspace, 'node_modules')).isSymbolicLink()) {
+  throw new Error('node_modules is a junction or symlink; electron-builder would package an app missing its dependencies. Build from the main checkout, or run npm ci inside this worktree first.')
+}
 const sourcePackage = JSON.parse(await readFile(resolve(workspace, 'package.json'), 'utf8'))
 const feedDirectory = options.feedDirectory ? resolve(options.feedDirectory) : localFeedDirectory()
 const previous = await readPreviousDescriptor(feedDirectory)
