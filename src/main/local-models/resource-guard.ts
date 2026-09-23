@@ -3,7 +3,7 @@ import { createServer } from 'node:net'
 import { freemem } from 'node:os'
 import type { LocalModelConfig } from './config.ts'
 import { KV_CACHE_SCALE } from './config.ts'
-import { ORNITH_9B, PINNED_MODELS, QWEN_35B, QWEN_9B } from './config.ts'
+import { DOLPHIN_X1_8B, ORNITH_9B, PINNED_MODELS, QWEN_35B, QWEN_9B } from './config.ts'
 
 const GiB = 1024 ** 3
 // Machine-wide (not per checkout/root). The OS releases this mutex even on a crash;
@@ -55,18 +55,27 @@ export function measureResources(): ResourceSnapshot {
   } catch { return { ramFreeBytes, vramFreeBytes: null, detail: 'NVIDIA free VRAM could not be measured' } }
 }
 
+/** Reviewed attention geometry per model, K+V at fp16 per cached layer. The Qwen-family models
+ *  are hybrid (docs/local-model-shortlist.md): the 9Bs cache 8 of 32 layers × 4 KV heads, the 35B
+ *  10 of 40 × 2, head size 256. Dolphin X1 8B is Llama 3.1 and caches all 32 layers × 8 KV heads
+ *  at head size 128, four times the 9Bs' cache per token (docs/local-model-dolphin-x1-8b.md).
+ *  Compute/linear-attention buffers remain covered by the separate reserves below. */
+const KV_GEOMETRY: Record<string, { layers: number; cachedLayers: number; kvHeads: number; headDim: number }> = {
+  [QWEN_9B]: { layers: 32, cachedLayers: 8, kvHeads: 4, headDim: 256 },
+  [ORNITH_9B]: { layers: 32, cachedLayers: 8, kvHeads: 4, headDim: 256 },
+  [QWEN_35B]: { layers: 40, cachedLayers: 10, kvHeads: 2, headDim: 256 },
+  [DOLPHIN_X1_8B]: { layers: 32, cachedLayers: 32, kvHeads: 8, headDim: 128 }
+}
+
 /** Deliberately conservative envelopes from MAIN's machine profile, not active parameter
  * counts: full GGUF residency in RAM, context/KV growth, compute buffers and desktop reserves.
  * These are admission estimates, not assertions about actual allocations. */
 export function resourceRequirements(model: LocalModelConfig): { ramBytes: number; vramBytes: number } {
   const pinned = PINNED_MODELS[model.id]?.find(p => p.file === model.file && p.sizeBytes === model.sizeBytes)
-  if (!pinned || ![QWEN_9B, QWEN_35B, ORNITH_9B].includes(model.id) || model.extraArgs.length) throw new Error(`No reviewed memory envelope for ${model.id} with these weights/extra arguments; no server started. Review GGUF size, context, offload and runtime buffers first.`)
-  // Reviewed hybrid attention geometry (docs/local-model-shortlist.md): the 9B models
-  // cache 8 layers × 4 KV heads; the 35B caches 10 × 2. Head size 256, K+V, fp16.
-  // Compute/linear-attention buffers remain covered by the separate reserves below.
-  const small = model.id !== QWEN_35B
-  const kv = model.contextTokens * (small ? 8 * 4 : 10 * 2) * 256 * 2 * 2 * (model.kvCacheType ? KV_CACHE_SCALE[model.kvCacheType] : 1)
-  const layers = small ? 32 : 40
+  const geometry = KV_GEOMETRY[model.id]
+  if (!pinned || !geometry || model.extraArgs.length) throw new Error(`No reviewed memory envelope for ${model.id} with these weights/extra arguments; no server started. Review GGUF size, context, offload and runtime buffers first.`)
+  const kv = model.contextTokens * geometry.cachedLayers * geometry.kvHeads * geometry.headDim * 2 * 2 * (model.kvCacheType ? KV_CACHE_SCALE[model.kvCacheType] : 1)
+  const layers = geometry.layers
   // Partial offload is uneven (especially MoE tensors); add 25% to the layer share.
   const gpuWeights = model.sizeBytes * Math.min(1, model.gpuLayers >= layers ? 1 : 1.25 * model.gpuLayers / layers)
   return { ramBytes: model.sizeBytes + kv + 2 * GiB + 8 * GiB, vramBytes: model.gpuLayers ? gpuWeights + kv + 1.75 * GiB : 0 }

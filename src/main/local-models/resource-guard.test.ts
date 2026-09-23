@@ -4,7 +4,7 @@ import { createServer } from 'node:net'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defaultModelConfig, ORNITH_9B, QWEN_9B, QWEN_35B } from './config.ts'
+import { defaultModelConfig, DOLPHIN_X1_8B, ORNITH_9B, QWEN_9B, QWEN_35B } from './config.ts'
 import { admissionRefusal, assertResourceHeadroom, resourceRequirements, withAdmissionLock } from './resource-guard.ts'
 
 const GiB = 1024 ** 3
@@ -25,6 +25,16 @@ describe('local model admission resources', () => {
     expect(() => assertResourceHeadroom({ ...model, contextTokens: 131072 }, available)).toThrow('Not enough memory')
     expect(() => assertResourceHeadroom({ ...model, sizeBytes: model.sizeBytes + 1 }, available)).toThrow('No reviewed memory envelope')
     expect(resourceRequirements(model).vramBytes).toBeGreaterThan(8 * GiB)
+  })
+  it('budgets Dolphin X1 8B with full-attention Llama geometry, not the hybrid 9B cache', () => {
+    const model = defaultModelConfig(DOLPHIN_X1_8B)
+    expect(model).toMatchObject({ port: 51438, gpuLayers: 999, quant: 'Q4_K_M', contextTokens: 32768 })
+    // 32 cached layers × 8 KV heads × 128 × K+V × fp16 is 128 KiB per token: 4 GiB at 32k.
+    expect(resourceRequirements({ ...model, contextTokens: 65536 }).vramBytes - resourceRequirements(model).vramBytes).toBe(4 * GiB)
+    expect(resourceRequirements(model).vramBytes).toBe(model.sizeBytes + 4 * GiB + 1.75 * GiB)
+    expect(() => assertResourceHeadroom(model, { ramFreeBytes: 30 * GiB, vramFreeBytes: 11 * GiB })).not.toThrow()
+    expect(() => assertResourceHeadroom(model, { ramFreeBytes: 30 * GiB, vramFreeBytes: 10 * GiB })).toThrow('Not enough memory')
+    expect(() => assertResourceHeadroom({ ...model, file: 'Dolphin-X1-8B-Q5_K_M.gguf', sizeBytes: 5732991968 }, { ramFreeBytes: 30 * GiB, vramFreeBytes: 12 * GiB })).toThrow('No reviewed memory envelope')
   })
   it('fails closed for unreadable telemetry and unreviewed runtime flags', () => {
     const model = defaultModelConfig(QWEN_9B)

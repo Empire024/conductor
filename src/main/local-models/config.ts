@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { LOCAL_ORNITH_9B, LOCAL_QWEN_35B, LOCAL_QWEN_9B } from '../../shared/local-models.ts'
+import { LOCAL_DOLPHIN_X1_8B, LOCAL_ORNITH_9B, LOCAL_QWEN_35B, LOCAL_QWEN_9B } from '../../shared/local-models.ts'
 import { assertLocalRootUsable, layout, localRoot } from './paths.ts'
 
 /** One locally served model: which GGUF it is, where it came from, and how its llama.cpp
@@ -61,6 +61,7 @@ export const LOCAL_MODEL_PREFIX = 'local/'
 export const QWEN_9B = LOCAL_QWEN_9B
 export const QWEN_35B = LOCAL_QWEN_35B
 export const ORNITH_9B = LOCAL_ORNITH_9B
+export const DOLPHIN_X1_8B = LOCAL_DOLPHIN_X1_8B
 
 /** Upstream facts pinned at review time (Hugging Face model API, blobs=true). A download that
  *  does not match these bytes is rejected: a repository that later serves different content
@@ -75,6 +76,12 @@ export const PINNED_MODELS: Record<string, Array<Omit<LocalModelConfig, 'port' |
   ],
   [QWEN_35B]: [
     { id: QWEN_35B, label: 'Qwen3.6 35B-A3B (local)', repo: 'ggml-org/Qwen3.6-35B-A3B-GGUF', revision: 'baec3ebee244827cda0f4557eafa8b28f7545fa6', file: 'Qwen3.6-35B-A3B-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 20419565568, sha256: '671e47e0ec53c665d048b98c3ecbfd5236b5ca9c3e02ed19fc8f81f7b85140c7' }
+  ],
+  // Uncensored by fine-tuning (dphn, the Dolphin lab), not by abliteration; first-party GGUF.
+  // Llama 3.1 8B caches every layer, so Q4_K_M rather than Q5 keeps 32k inside the VRAM envelope.
+  // Reviewed in docs/local-model-dolphin-x1-8b.md.
+  [DOLPHIN_X1_8B]: [
+    { id: DOLPHIN_X1_8B, label: 'Dolphin X1 8B (local)', repo: 'dphn/Dolphin-X1-8B-GGUF', revision: 'e9a40049775e918557e2ee8f8165a059bd10b85a', file: 'Dolphin-X1-8B-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 4920738784, sha256: '90b091874cdfe3fa924302067b71f93a277dc6b99f839cf5569c5bc364d27d9d' }
   ]
 }
 
@@ -82,8 +89,8 @@ export const PINNED_MODELS: Record<string, Array<Omit<LocalModelConfig, 'port' |
  * full GGUF residency, context/KV growth, offload and desktop reserves before spawning.
  * The 35B MoE keeps most weights in RAM; its active parameter count is not its size. */
 export const DEFAULT_CONTEXT_TOKENS = 32768
-export const DEFAULT_PORTS: Record<string, number> = { [ORNITH_9B]: 51435, [QWEN_9B]: 51437, [QWEN_35B]: 51436 }
-export const DEFAULT_GPU_LAYERS: Record<string, number> = { [ORNITH_9B]: 999, [QWEN_9B]: 999, [QWEN_35B]: 10 }
+export const DEFAULT_PORTS: Record<string, number> = { [ORNITH_9B]: 51435, [QWEN_9B]: 51437, [QWEN_35B]: 51436, [DOLPHIN_X1_8B]: 51438 }
+export const DEFAULT_GPU_LAYERS: Record<string, number> = { [ORNITH_9B]: 999, [QWEN_9B]: 999, [QWEN_35B]: 10, [DOLPHIN_X1_8B]: 999 }
 
 export const DEFAULT_SANDBOX: SandboxConfig = {
   image: 'conductor-local-sandbox:1',
