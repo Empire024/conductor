@@ -60,7 +60,13 @@ export interface Inspection {
 }
 export type Segment = { start: number; end: number }
 export type RecordParse = { kind: 'record'; values: Values } | { kind: 'skipped' | 'rejected' }
-export interface ProcessingTarget { id: string; ref: SourceRef; criteria: Values }
+export interface ProcessingTarget {
+  id: string
+  ref: SourceRef
+  criteria: Values
+  /** Optional exact evidence: only reject when target and source both have a nonempty, conflicting value. */
+  evidence?: Values
+}
 export interface ValidationContext {
   inspections: Inspection[]
   targets: ProcessingTarget[]
@@ -95,6 +101,12 @@ function countsShape(x: unknown): x is Counts {
 const refKey = (ref: SourceRef): string => JSON.stringify([ref.inputId, ref.start, ref.end, ref.sha256])
 const equalValues = (a: Values, b: Values): boolean => Object.keys(a).length === Object.keys(b).length && Object.keys(a).every(k => Object.hasOwn(b, k) && a[k] === b[k])
 const satisfies = (values: Values, criteria: Values): boolean => Object.keys(criteria).every(k => Object.hasOwn(values, k) && values[k] === criteria[k])
+const present = (value: Values[string] | undefined): boolean => value !== undefined && value !== null && (typeof value !== 'string' || value.trim().length > 0)
+
+/** Exact required keys plus optional corroboration; no scores, fuzzy names or implicit date semantics. */
+export function matchFileRecord(source: Values, required: Values, evidence: Values = {}): boolean {
+  return Object.keys(required).length > 0 && Object.keys(required).every(k => present(required[k]) && Object.hasOwn(source, k) && source[k] === required[k]) && Object.keys(evidence).every(k => !present(evidence[k]) || !Object.hasOwn(source, k) || !present(source[k]) || source[k] === evidence[k])
+}
 
 /** Trusted adapter entry point. Segments are byte spans, including headers/whitespace for full coverage. */
 export function inspectFile(input: { id: string; bytes: Uint8Array; role: Inspection['role'] }, segments: Segment[], parse: (text: string, segment: Segment) => RecordParse): Inspection {
@@ -223,7 +235,7 @@ export function reconcileFileProcessing(context: ValidationContext): FileProcess
   const complete = sources.length > 0 && sources.every(i => i.complete && i.identity.counts.rejected === 0) && sources.some(i => i.records.length > 0)
   const records = sources.flatMap(i => i.records)
   const outcomes: ProcessingOutcome[] = context.targets.map(target => {
-    const candidates = records.filter(r => satisfies(r.values, target.criteria))
+    const candidates = records.filter(r => matchFileRecord(r.values, target.criteria, target.evidence))
     if (!complete || candidates.length > FILE_PROCESSING_LIMITS.candidates) return { targetId: target.id, status: 'blocked', candidates: [], reason: !complete ? 'Source inspection is incomplete or contains rejected records.' : 'Plausible candidate count exceeds the result limit; narrow independent criteria or split the task.' }
     return { targetId: target.id, status: candidates.length === 0 ? 'not_found' : candidates.length === 1 ? 'matched' : 'ambiguous', candidates: candidates.map(c => ({ ref: { ...c.ref }, values: { ...c.values } })) }
   })
@@ -290,6 +302,7 @@ export function validateFileProcessingResult(jsonText: string, context: Validati
   for (const target of context.targets) {
     const fact = records.get(refKey(target.ref))
     if (!shortString(target.id) || targetMap.has(target.id) || targetRefs.has(refKey(target.ref)) || !fact || inputs.get(target.ref.inputId)?.role !== 'target' || !valuesShape(target.criteria) || (fact && !satisfies(fact.values, target.criteria))) add('TARGET_LINEAGE', target.id, 'Target is duplicate, uninspected or has criteria not present in the target', 'Construct targets from independently inspected target records.')
+    if (target.evidence !== undefined && (!valuesShape(target.evidence) || (fact && !satisfies(fact.values, target.evidence)))) add('TARGET_EVIDENCE', target.id, 'Optional matching evidence must come from the inspected target', 'Select reference/account/name values from the actual target; do not invent corroboration.')
     targetRefs.add(refKey(target.ref))
     // Matching money always includes its currency and direction, even if a host omitted these criteria.
     if (fact && Object.hasOwn(fact.values, 'minorUnits') && (!['minorUnits', 'currency', 'direction'].every(k => Object.hasOwn(target.criteria, k) && target.criteria[k] === fact.values[k]))) add('TARGET_MONEY', target.id, 'Money criteria must preserve target amount, currency and direction', 'Include exact signed minorUnits, currency and direction from the target.')
@@ -306,7 +319,7 @@ export function validateFileProcessingResult(jsonText: string, context: Validati
     const target = targetMap.get(outcome.targetId)
     if (!target || seenTargets.has(outcome.targetId)) { add('TARGET_COVERAGE', path, 'Unknown or duplicate target outcome', 'Return each requested target exactly once.'); continue }
     seenTargets.add(outcome.targetId)
-    const plausible = sourceRecords.filter(r => satisfies(r.values, target.criteria))
+    const plausible = sourceRecords.filter(r => matchFileRecord(r.values, target.criteria, target.evidence))
     const candidateKeys = new Set<string>()
     for (const candidate of outcome.candidates) {
       const key = refKey(candidate.ref)
@@ -314,7 +327,7 @@ export function validateFileProcessingResult(jsonText: string, context: Validati
       if (!fact || inputs.get(candidate.ref.inputId)?.role !== 'source') add('CANDIDATE_LINEAGE', path, 'Candidate does not reference an inspected source record', 'Cite the exact source input and byte span.')
       else {
         if (!equalValues(candidate.values, fact.values)) add('EVIDENCE_MISMATCH', path, 'Candidate fields differ from inspected source (including its date)', 'Copy source fields exactly; do not substitute target date or fabricate evidence.')
-        if (!satisfies(fact.values, target.criteria)) add('INCOMPATIBLE_MATCH', path, 'Source record conflicts with target criteria', 'Compare exact money/currency/direction and required reference/account or generic keys.')
+        if (!matchFileRecord(fact.values, target.criteria, target.evidence)) add('INCOMPATIBLE_MATCH', path, 'Source record conflicts with target criteria or nonempty optional evidence', 'Compare exact required keys; optional reference/account/name can reject only when both values are present and disagree.')
       }
       if (candidateKeys.has(key)) add('CANDIDATE_DUPLICATE', path, 'Candidate appears twice', 'Deduplicate candidates by input identity and span.')
       candidateKeys.add(key)

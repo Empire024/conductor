@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { FILE_PROCESSING_LIMITS, inspectFile, inspectFileWithSchema, reconcileFileProcessing, parseExplicitDate, parseMoney, validateFileProcessingResult, type FileProcessingResult, type FileRecordSchema, type ValidationContext } from './file-processing'
+import { FILE_PROCESSING_LIMITS, inspectFile, inspectFileWithSchema, matchFileRecord, reconcileFileProcessing, parseExplicitDate, parseMoney, validateFileProcessingResult, type FileProcessingResult, type FileRecordSchema, type ValidationContext } from './file-processing'
 import { BANK_FIXTURE_ORACLE, INVENTORY_FIXTURE_ORACLE, generateBankFixture, generateInventoryFixture, inspectFixture } from './file-processing.fixtures'
 
 // Builds submitted results from separately maintained fixture expectations, not the matching algorithm.
@@ -284,5 +284,39 @@ describe('bounded selected-schema helper', () => {
       input.bytes = Buffer.from(change(input.bytes.toString()))
       expect(inspectFileWithSchema(input, schema).identity.counts.rejected).toBeGreaterThan(0)
     }
+  })
+})
+
+describe('optional matching evidence', () => {
+  it('matches exact required keys and refines only when optional values are both present', () => {
+    const base = { minorUnits: 10000, currency: 'CZK', direction: 'incoming' }
+    expect(matchFileRecord({ ...base, reference: '4107' }, base, { reference: '4107' })).toBe(true)
+    expect(matchFileRecord({ ...base, reference: '9999' }, base, { reference: '4107' })).toBe(false)
+    for (const reference of ['', '  ', null]) expect(matchFileRecord({ ...base, reference }, base, { reference: '4107' })).toBe(true)
+    expect(matchFileRecord(base, base, { reference: '4107' })).toBe(true)
+    expect(matchFileRecord({ ...base, reference: '4107' }, base, { reference: '' })).toBe(true)
+    expect(matchFileRecord({ ...base, currency: 'EUR' }, base)).toBe(false)
+    expect(matchFileRecord({ value: null }, { value: null })).toBe(false)
+    expect(matchFileRecord({ value: 0 }, { value: 0 })).toBe(true)
+    expect(matchFileRecord({ ...base, date: '2026-04-23' }, base, { account: '' })).toBe(true)
+  })
+  it('keeps missing-reference candidates plausible and rejects unsupported certainty', () => {
+    const { context } = setup()
+    const target = context.targets[0]!
+    target.evidence = { reference: target.criteria.reference!, account: target.criteria.account! }
+    delete target.criteria.reference; delete target.criteria.account
+    expect(reconcileFileProcessing(context).outcomes[0]!.status).toBe('matched')
+    const bank = context.inspections[1]!
+    // Host fact for this test deliberately observes a missing reference on the otherwise compatible row.
+    const missing = bank.records.find(r => r.values.transaction === 'TX-004999')!
+    missing.values.reference = ''
+    const result = reconcileFileProcessing(context)
+    expect(result.outcomes[0]!.status).toBe('ambiguous')
+    expect(result.outcomes[0]!.candidates).toHaveLength(2)
+    expect(codes(result, context)).toEqual([])
+    result.outcomes[0]!.status = 'matched'; result.outcomes[0]!.candidates.pop()
+    expect(codes(result, context)).toContain('OUTCOME_CERTAINTY')
+    target.evidence.account = 'fabricated'
+    expect(codes(result, context)).toContain('TARGET_EVIDENCE')
   })
 })
