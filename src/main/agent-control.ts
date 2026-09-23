@@ -30,6 +30,7 @@ import { createApprovalRouting } from './approval-review-routing'
 import { localStopOf } from '../shared/local-stop.ts'
 import { summarizeContext } from '../shared/usage-accounting'
 import { normaliseContract } from './local-models/completion.ts'
+import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, type CreateDurableJobInput, type DurableJobsService, type DurableJobStatus, type DurableJobSummary } from '../shared/durable-jobs'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -105,7 +106,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?}) — visible tab; agent default kind, provider/model must be available; a Claude or Codex coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?}) — visible tab; agent default kind, provider/model must be available; a Claude or Codex coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again focuses the open one',
   'tabs.focus': '({tabId,projectId?,workspaceId?}) — any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
   'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
@@ -185,6 +186,36 @@ const ownerMethods = new Set(Object.keys(ownerSignatures))
 /** The owner's authority, from either source: the credential file, or a wizard conversation. */
 const sovereign = (scope: AgentControlScope): boolean => scope.owner === true || scope.wizard === true
 
+/** Durable overnight jobs on a local model (docs/durable-jobs.md). Listed only where the job
+ *  controller is running. Reading is open to the whole project; changing a job is the owner's,
+ *  a wizard tab's, or the conversation that created it. */
+const jobSignatures: Record<string, string> = {
+  'jobs.create': '({objective,model,title?,constraints?:string[],stages?:[{title,objective,completionCriteria:string[]}],budgets?,isolateWorktree?}) — start a durable job in this project that runs overnight on a local model: model must be a local entry of models.list, and a job never switches to a cloud model on its own. The owner credential, a wizard tab or a non-local, writable conversation may create one; a sandboxed local model may not. Returns the job summary; follow it with jobs.status or jobs.events',
+  'jobs.list': '({status?:string[]}) — durable jobs of this project: status, current stage and attempt, elapsed and active time, last checkpoint, last event and counters',
+  'jobs.status': '({jobId}) — the compact summary of one job; poll this rather than jobs.events',
+  'jobs.events': '({jobId,afterId?,limit?}) — the job’s event stream (transitions, stages, checkpoints, retries, recoveries, server restarts, approvals), oldest first, at most 200 per call; pass the last id as afterId to continue',
+  'jobs.pause': '({jobId,reason?}) — the owner, a wizard tab, or the conversation that created the job; the current step finishes at a safe point and nothing new starts',
+  'jobs.resume': '({jobId}) — resume a paused or blocked job on its own local model, under the same rule as jobs.pause',
+  'jobs.cancel': '({jobId,reason?}) — stop the job for good under the same rule as jobs.pause; its worktree, checkpoints and logs stay for inspection',
+  'jobs.report': '({jobId}) — write report.json and report.md into the job’s log directory and return the report (results, files, tests, checkpoints, recoveries, remaining work, models by stage, log paths) with reportPath; open to anyone in the project'
+}
+const jobMethods = new Set(Object.keys(jobSignatures))
+const jobKeys: Record<string, string[]> = {
+  'jobs.create': ['objective', 'model', 'title', 'constraints', 'stages', 'budgets', 'isolateWorktree'],
+  'jobs.list': ['status'],
+  'jobs.status': ['jobId'],
+  'jobs.events': ['jobId', 'afterId', 'limit'],
+  'jobs.pause': ['jobId', 'reason'],
+  'jobs.resume': ['jobId'],
+  'jobs.cancel': ['jobId', 'reason'],
+  'jobs.report': ['jobId']
+}
+const JOB_CREATOR_SETTING = 'durableJobCreator:'
+const strings = (value: unknown, key: string, count: number, length: number): string[] => {
+  if (!Array.isArray(value) || value.length > count || value.some(item => typeof item !== 'string' || !item.trim() || item.length > length || item.includes('\0'))) throw new Error(`${key} must be a list of at most ${count} non-empty strings of up to ${length} characters`)
+  return value as string[]
+}
+
 export interface AgentControlDependencies {
   database: ConductorDatabase
   /** The app process itself, for the owner credential; absent outside the app. */
@@ -197,6 +228,9 @@ export interface AgentControlDependencies {
   localUpdates?: LocalUpdateBuildService
   /** Host-side test, build, commit, push and release verification; absent where unavailable. */
   delivery?: DeliveryControl
+  /** Durable overnight local-model jobs; absent until the job controller is constructed. The
+   *  app plugs it in with AgentControl.setDurableJobs, so construction order does not matter. */
+  durableJobs?: DurableJobsService
   /** Whether a local model could start its server now; absent where the local runtime is not wired. */
   localModels?: { availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }> }
   providers(): AgentProviderInfo[]
@@ -671,8 +705,9 @@ export class AgentControl {
 
   private async open(scope: AgentControlScope, args: Args, approvalReviewer = false): Promise<AgentControlTab & { projectId: string; workspaceId: string; grants?: { repository: boolean; research: boolean } }> {
     const kind = (args.kind ?? 'agent') as PaneKind
-    const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs']
+    const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs', 'job']
     if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
+    if (kind === 'job') return this.openJobTab(scope, args)
     // Where the tab is going. Only the caller's own scope is ever authorized; the target only
     // says which open workspace receives the tab.
     const target = this.sibling(scope, args)
@@ -785,7 +820,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return sovereign(scope) ? { ...toolSignatures, ...ownerSignatures } : toolSignatures
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -993,7 +1028,131 @@ export class AgentControl {
     if (method === 'workspace.rename') return this.ui(scope, 'workspace.rename', { title: text(args, 'title', 120) })
     if (method === 'router.start') return this.startRouter(scope, args)
     if (method === 'router.dispatch') return this.dispatchRouter(scope, args)
+    if (jobMethods.has(method)) return this.jobs(scope, source, method, args)
     throw new Error('Unknown control method; use tools.list')
+  }
+
+  /** A job tab is a view of one durable job: its resourceId is the job id, so closing, splitting,
+   *  reopening or reloading the tab never changes which job it shows, and the job runs whether or
+   *  not any tab shows it. One tab per job and workspace: asking again focuses the open one. */
+  private async openJobTab(scope: AgentControlScope, args: Args): Promise<AgentControlTab & { projectId: string; workspaceId: string }> {
+    const service = this.deps.durableJobs
+    if (!service) throw new Error('Durable jobs are unavailable in this Conductor')
+    if (args.projectId !== undefined && args.projectId !== scope.projectId || args.workspaceId !== undefined && args.workspaceId !== scope.sessionId) throw new Error('A job tab opens in the caller’s own workspace')
+    const job = this.job(scope, service, args)
+    const existing = this.tabs(scope).find(tab => tab.kind === 'job' && tab.resourceId === job.id)
+    if (existing) {
+      if (args.focus !== false) await this.ui(scope, 'tabs.focus', { tabId: existing.id })
+      return { ...existing, projectId: scope.projectId, workspaceId: scope.sessionId }
+    }
+    const tab: PaneTab = { id: makeId('tab'), kind: 'job', title: args.title === undefined ? job.title.slice(0, 120) : text(args, 'title', 120), resourceId: job.id }
+    await this.ui(scope, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
+    return { ...this.tab(scope, tab.id), projectId: scope.projectId, workspaceId: scope.sessionId }
+  }
+
+  /** Plugs in the durable job controller once it is constructed (src/main/index.ts); undefined
+   *  unplugs it. jobs.* methods and job tabs answer only while one is set. */
+  setDurableJobs(service: DurableJobsService | undefined): void { this.deps.durableJobs = service }
+
+  /** The job a jobs.* call names, only when it belongs to the caller's project. Another project's
+   *  job reads as missing, so its id discloses nothing. */
+  private job(scope: AgentControlScope, service: DurableJobsService, args: Args): DurableJobSummary {
+    const jobId = text(args, 'jobId', 160)
+    let summary: DurableJobSummary
+    try { summary = service.status(jobId) } catch { throw new Error('No durable job with that id in this project; use jobs.list') }
+    if (summary.projectId !== scope.projectId) throw new Error('No durable job with that id in this project; use jobs.list')
+    return summary
+  }
+
+  /** Who may change a job: the owner (credential or wizard tab), or the writable, non-local
+   *  conversation that created it. A local model never steers a job: pausing, resuming or
+   *  cancelling is the owner's or its controller's decision, and nothing here can switch a job
+   *  to a cloud model. */
+  private mayChangeJob(scope: AgentControlScope, source: AgentSpec, jobId: string): void {
+    if (sovereign(scope)) return
+    if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot change a durable job; the owner, a wizard tab or the conversation that created the job can')
+    if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    const creator = this.deps.database.getSetting(JOB_CREATOR_SETTING + jobId)
+    if (creator !== scope.agentSessionId) throw new Error('Only the owner, a wizard tab or the conversation that created this job may pause, resume or cancel it')
+  }
+
+  private async jobs(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const service = this.deps.durableJobs
+    if (!service) throw new Error('Durable jobs are unavailable in this Conductor')
+    const allowed = jobKeys[method]!
+    const extra = Object.keys(args).filter(key => !allowed.includes(key) && key !== 'projectId')
+    if (extra.length) throw new Error(`${method} accepts only ${allowed.join(', ') || 'no arguments'}; ${extra.join(', ')} is not an argument`)
+    if (method === 'jobs.list') {
+      let status: DurableJobStatus[] | undefined
+      if (args.status !== undefined) {
+        status = strings(args.status, 'status', DURABLE_JOB_STATUSES.length, 20) as DurableJobStatus[]
+        if (status.some(value => !DURABLE_JOB_STATUSES.includes(value))) throw new Error(`status names job statuses: ${DURABLE_JOB_STATUSES.join(', ')}`)
+      }
+      return service.list({ projectId: scope.projectId, ...(status ? { status } : {}) })
+    }
+    if (method === 'jobs.create') return this.createJob(scope, source, service, args)
+    const summary = this.job(scope, service, args)
+    if (method === 'jobs.status') return summary
+    if (method === 'jobs.events') {
+      const limit = args.limit === undefined ? 50 : args.limit
+      if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1) throw new Error('limit must be a positive whole number')
+      return service.events(summary.id, args.afterId === undefined ? undefined : text(args, 'afterId', 160), Math.min(limit, 200))
+    }
+    if (method === 'jobs.report') {
+      const report = await service.report(summary.id)
+      return { ...report, note: 'The report is a file beside the job logs; read reportPath for the full account. Log paths are listed, not pasted.' }
+    }
+    this.mayChangeJob(scope, source, summary.id)
+    const reason = args.reason === undefined ? undefined : text(args, 'reason', 500)
+    this.authorize(scope)
+    if (method === 'jobs.pause') return service.pause(summary.id, reason)
+    if (method === 'jobs.resume') return service.resume(summary.id)
+    return service.cancel(summary.id, reason)
+  }
+
+  private async createJob(scope: AgentControlScope, source: AgentSpec, service: DurableJobsService, args: Args): Promise<DurableJobSummary> {
+    if (!sovereign(scope)) {
+      if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot start a durable job; the owner, a wizard tab or a non-local coworker can')
+      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    }
+    const objective = text(args, 'objective', 20000)
+    const model = text(args, 'model', 200)
+    // Only a local entry: the catalog the caller sees (runtime models first) or the configured
+    // local models. A cloud model id is refused by name, never mapped to something local.
+    const local = [...(this.catalog(scope).find(entry => entry.provider === 'local')?.models ?? []), ...(this.deps.providers().find(provider => provider.id === 'local')?.models ?? [])]
+    if (!local.some(entry => entry.id === model)) throw new Error(`Durable jobs run on a local model only; ${model} is not a local entry of models.list`)
+    const input: CreateDurableJobInput & { createdBy: { kind: 'owner' | 'wizard' | 'agent'; agentSessionId: string; title: string } } = {
+      projectId: scope.projectId, workspaceId: scope.sessionId,
+      title: args.title === undefined ? objective.replace(/\s+/g, ' ').trim().slice(0, 80) : text(args, 'title', 120),
+      objective, model,
+      createdBy: { kind: scope.owner ? 'owner' : scope.wizard ? 'wizard' : 'agent', agentSessionId: scope.agentSessionId, title: source.title }
+    }
+    if (args.constraints !== undefined) input.constraints = strings(args.constraints, 'constraints', 50, 2000)
+    if (args.isolateWorktree !== undefined) {
+      if (typeof args.isolateWorktree !== 'boolean') throw new Error('isolateWorktree must be true or false')
+      input.isolateWorktree = args.isolateWorktree
+    }
+    if (args.stages !== undefined) {
+      if (!Array.isArray(args.stages) || !args.stages.length || args.stages.length > 50) throw new Error('stages must be a list of 1 to 50 stages')
+      input.stages = args.stages.map((raw, index) => {
+        const stage = object(raw)
+        if (Object.keys(stage).some(key => !['title', 'objective', 'completionCriteria'].includes(key))) throw new Error(`stage ${index + 1} accepts only title, objective and completionCriteria`)
+        return { title: text(stage, 'title', 200), objective: text(stage, 'objective', 8000), completionCriteria: strings(stage.completionCriteria ?? [], 'completionCriteria', 20, 1000) }
+      })
+    }
+    if (args.budgets !== undefined) {
+      const budgets = object(args.budgets), known = Object.keys(DEFAULT_DURABLE_JOB_BUDGETS)
+      const unknown = Object.keys(budgets).filter(key => !known.includes(key))
+      if (unknown.length) throw new Error(`budgets accepts only ${known.join(', ')}`)
+      for (const [key, value] of Object.entries(budgets)) if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`budgets.${key} must be a non-negative number`)
+      input.budgets = budgets as CreateDurableJobInput['budgets']
+    }
+    this.authorize(scope)
+    const summary = await service.create(input)
+    // Recorded beside the job rather than trusted from any later call: the creator is who may
+    // pause, resume and cancel it besides the owner.
+    this.deps.database.setSetting(JOB_CREATOR_SETTING + summary.id, scope.agentSessionId)
+    return summary
   }
 
   /**

@@ -205,14 +205,17 @@ export const closeTab = (
   }
 }
 
-/** Runtime tab groups are intentionally limited to agents, shells, and the
- * runtime launcher. Files, editors, browsers, memory, and automation live in
- * workspace chrome so their lifecycles cannot be confused with PTY sessions. */
+/** Runtime tab groups are intentionally limited to agents, shells, the runtime
+ * launcher and durable job views. Files, editors, browsers, memory, and automation
+ * live in workspace chrome so their lifecycles cannot be confused with PTY sessions.
+ * A job tab stays because it is a durable identity (its resourceId is the job id):
+ * a reload must bring back the same job, not drop the view of it. */
+export const RUNTIME_TAB_KINDS: readonly string[] = ['launcher', 'agent', 'terminal', 'job']
 export const stripWorkspaceUtilityTabs = (layout: WorkspaceLayout): WorkspaceLayout => {
   let next = layout
   const utilityTabs = listGroups(layout.root).flatMap((group) =>
     group.tabs
-      .filter((tab) => !['launcher', 'agent', 'terminal'].includes(tab.kind))
+      .filter((tab) => !RUNTIME_TAB_KINDS.includes(tab.kind))
       .map((tab) => ({ groupId: group.id, tabId: tab.id }))
   )
   for (const utility of utilityTabs) {

@@ -12,6 +12,7 @@ import type {
 import { orchestrationBridge } from './orchestration'
 import { agentCollaborationBridge } from './agent-collaboration'
 import { deliveryBridge } from './delivery'
+import { durableJobsBridge } from './durable-jobs'
 
 const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => void) => {
   const listener = (_event: Electron.IpcRendererEvent, payload: T): void => callback(payload)
@@ -164,6 +165,7 @@ const bridge: ConductorBridge = {
   orchestration: orchestrationBridge,
   collaboration: agentCollaborationBridge,
   delivery: deliveryBridge,
+  durableJobs: durableJobsBridge,
   projects: {
     reorder: (ids) => ipcRenderer.invoke('projects:reorder', ids),
     list: () => ipcRenderer.invoke('projects:list'),

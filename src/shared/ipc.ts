@@ -52,6 +52,7 @@ export interface ConductorBridge {
   phone: import('./phone-access').PhoneAccessBridge
   projectTasks: import('./project-backlog').ProjectBacklogBridge
   delivery: import('./delivery').DeliveryBridge
+  durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
   nativeCli: {
     ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }>
     chat(id: string): Promise<void>
