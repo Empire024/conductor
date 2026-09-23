@@ -88,6 +88,35 @@ end with a truthful blocker. Sandbox scripts remain available for investigation,
 script JSON is not automatically trusted as a validated reconciliation. A structural validator
 cannot prove arbitrary prose or an unknown schema semantically correct.
 
+### Review follow-up (verified against `5d39001`)
+
+The retired workers' read-only review findings were re-checked against the committed code.
+Already fixed by `d811294`, with tests: unknown header cells reject the whole profile, so the
+runtime hint carries only canonical field names and is labelled untrusted; profiling decodes at
+most 64 KiB, 40 lines and a 2,048-character header; alias and direction dictionaries use own-key
+lookups. Still open at that commit and fixed afterwards, each with a regression test that fails
+on the old code:
+
+- The header coverage exemption accepted any digit-free first row with two cells *starting* with
+  a label, so a row such as `id alpha | sku widget | …` could be skipped silently. A header is
+  now a line whose every cell is exactly a recognized label.
+- Payment detection depended on the prompt wording and the model's schema. An amount/Částka
+  column in either input's raw header now makes the task financial, so a schema that leaves the
+  money out is refused instead of matching on references alone.
+- Model-named plan fields (`idField`, match/evidence fields) and schema field names were looked
+  up through the prototype chain; `toString`/`constructor` now fail as missing fields with a
+  plain diagnostic.
+- Source strings in the rendered answer could carry Markdown links or HTML; table-breaking and
+  Markdown-active characters are now escaped.
+- Profiling read the whole input (up to 16 MiB) to sample 64 KiB; it now reads only the sample,
+  and the hint is dropped rather than sent if it would exceed 4,096 characters.
+
+Reviewed and left as is: the validator's field maps are already limited to recognized direction
+labels on a `direction` text field; money and date values need an independent raw-cell witness
+(a conservative check: without a currency in the cell or header, a record is blocked, not
+guessed); optional evidence retains a candidate unless both sides hold differing values. No
+live model run was made for this follow-up, so the model reliability figures below are unchanged.
+
 The principal fixture is about 1 MiB, UTF-8 BOM/CRLF, Czech money/directions and multiline
 records. Its four independent expected outcomes are two matches, one two-candidate ambiguity,
 and one covered absence. The 85,000 CZK target's 15 April invoice date matches a 23 April bank

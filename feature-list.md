@@ -1,5 +1,5 @@
 Bug list:
-- [~] Local file-processing execution: harness repairs and ordinary Ornith/UI validation delivered; short-segment model reliability remains limited (docs/local-file-execution.md). <!-- conductor-task:local-file-processing-e2e agent=agent_mueapu6k_u5nkaij -->
+- [~] Local file-processing execution: harness repairs and ordinary Ornith/UI validation delivered; short-segment model reliability remains limited (docs/local-file-execution.md). <!-- conductor-task:local-file-processing-e2e agent=agent_mueje2l6_f2wbi6y -->
 1. [Implemented] Double clicking to copy will only work inside terminals.
 2. [Implemented] Bug with long text going over parts of UI like scrollbar & cursor position
 3. [Implemented] Add button to easily toggle breaking of words inside editors based on current tab/window size
