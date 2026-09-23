@@ -816,7 +816,7 @@ kbd {
 .command-palette > footer span { display: flex; align-items: center; gap: 3px; }
 
 /* Settings and project creation */
-.dialog-backdrop, .settings-scrim { position: fixed; inset: 39px 0 0; z-index: 1300; background: #05070a99; backdrop-filter: blur(2px); }
+.dialog-backdrop { position: fixed; inset: 39px 0 0; z-index: 1300; background: #05070a99; backdrop-filter: blur(2px); }
 .dialog-backdrop { display: grid; place-items: center; }
 .update-prompt-backdrop { position: fixed; inset: 39px 0 0; z-index: 1350; display: grid; place-items: center; padding: 24px; background: #05070aaa; backdrop-filter: blur(3px); }
 .update-prompt { width: min(460px, calc(100vw - 32px)); overflow: hidden; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface-1); box-shadow: 0 26px 90px #000c; }
@@ -845,8 +845,8 @@ kbd {
 .create-project-dialog > header > div:nth-child(2) { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 3px; }
 .create-project-dialog > header strong { color: #e5e8ea; font-size: 12px; font-weight: 600; }
 .create-project-dialog > header span { color: #69717b; font-size: 9px; }
-.create-project-dialog > header button, .settings-panel > header button { width: 26px; height: 26px; border: 0; border-radius: 4px; display: grid; place-items: center; color: #69717b; background: transparent; }
-.create-project-dialog > header button:hover, .settings-panel > header button:hover { color: #fff; background: #252c33; }
+.create-project-dialog > header button { width: 26px; height: 26px; border: 0; border-radius: 4px; display: grid; place-items: center; color: #69717b; background: transparent; }
+.create-project-dialog > header button:hover { color: #fff; background: #252c33; }
 .create-project-dialog > label { display: flex; flex-direction: column; gap: 7px; padding: 17px 16px 10px; }
 .create-project-dialog > label span { color: #8b939d; font-size: 9px; font-weight: 600; }
 .create-project-dialog > label input { height: 34px; padding: 0 10px; border: 1px solid #38414a; border-radius: 5px; outline: 0; color: #e5e7e9; background: #0e1216; font-size: 11px; }
@@ -861,51 +861,6 @@ kbd {
 .create-project-dialog > footer button.primary { border-color: #a8c75e; color: #12160e; background: var(--accent); font-weight: 650; }
 .create-project-dialog > footer button.primary:disabled { opacity: .38; }
 
-.settings-scrim { display: flex; justify-content: flex-end; }
-.settings-panel { width: 430px; height: 100%; overflow-y: auto; border-left: 1px solid #343c45; background: #12171c; box-shadow: -18px 0 60px #0009; }
-.settings-panel > header { height: 65px; padding: 0 14px 0 17px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #293038; }
-.settings-panel > header > div { display: flex; flex-direction: column; gap: 3px; }
-.settings-panel > header strong { font-size: 13px; font-weight: 600; }
-.settings-panel > header span { color: #626b75; font-size: 8.5px; }
-.settings-panel > section { padding: 19px 17px; border-bottom: 1px solid #272e35; }
-.settings-section-title { display: flex; align-items: flex-start; gap: 9px; }
-.settings-section-title > svg { margin-top: 1px; color: #a7c45f; }
-.settings-section-title > div { display: flex; flex-direction: column; gap: 3px; }
-.settings-section-title strong { color: #d6dade; font-size: 10px; font-weight: 600; }
-.settings-section-title span { color: #626b74; font-size: 8.5px; }
-.folder-setting { height: 34px; margin-top: 13px; padding-left: 9px; display: flex; align-items: center; gap: 7px; border: 1px solid #303841; border-radius: 5px; background: #0d1115; }
-.folder-setting code { min-width: 0; flex: 1; overflow: hidden; color: #949ca5; font: 9px "Cascadia Mono", Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
-.folder-setting button { align-self: stretch; padding: 0 9px; border: 0; border-left: 1px solid #303841; color: #a7b775; background: #181e23; font-size: 8.5px; }
-.settings-panel section > p { margin: 7px 1px 0; color: #4e5660; font-size: 8px; line-height: 1.5; }
-.update-feed-setting { margin-top: 13px; display: flex; flex-direction: column; gap: 6px; }
-.update-feed-setting > span { color: var(--text-3); font-size: 8px; }
-.update-feed-setting > div { height: 34px; display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--surface-0); }
-.update-feed-setting input { min-width: 0; flex: 1; padding: 0 9px; border: 0; outline: 0; color: var(--text-2); background: transparent; font: 8.5px "Cascadia Mono", Consolas, monospace; user-select: text; }
-.update-feed-setting button, .update-status-setting button { padding: 0 10px; border: 0; border-left: 1px solid var(--border); color: var(--accent-muted); background: var(--surface-2); font-size: 8px; }
-.update-feed-setting button:disabled, .update-status-setting button:disabled { color: var(--text-3); opacity: .55; }
-.update-source-setting { min-height: 35px; margin-top: 13px; padding: 7px 9px; display: flex; flex-direction: column; justify-content: center; gap: 3px; border: 1px solid var(--border-soft); border-radius: 6px; background: var(--surface-0); }
-.update-source-setting strong { color: var(--text-2); font-size: 8.5px; }
-.update-source-setting small { color: var(--text-3); font-size: 7.5px; }
-.update-status-setting { min-height: 42px; margin-top: 8px; padding-left: 9px; display: flex; align-items: stretch; border: 1px solid var(--border-soft); border-radius: 6px; overflow: hidden; background: var(--surface-1); }
-.update-status-setting > span { min-width: 0; flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 3px; }
-.update-status-setting strong { color: var(--text-2); font-size: 8.5px; font-weight: 600; }
-.update-status-setting small { overflow: hidden; color: var(--text-3); font-size: 7.5px; text-overflow: ellipsis; white-space: nowrap; }
-.update-status-setting button { display: flex; align-items: center; gap: 5px; }
-.zoom-setting { height: 34px; margin-top: 13px; display: flex; align-items: center; gap: 7px; }
-.zoom-setting > button { width: 29px; height: 29px; flex: 0 0 auto; border: 1px solid #333b44; border-radius: 4px; display: grid; place-items: center; color: #929aa3; background: #191e24; }
-.zoom-setting > button:hover { color: #e8eaec; background: #242b32; }
-.zoom-setting input { min-width: 0; flex: 1; accent-color: #a9cc5b; }
-.zoom-setting output { width: 38px; color: #b9c0c7; font: 9px "Cascadia Mono", Consolas, monospace; text-align: right; }
-.zoom-setting > button.zoom-reset { border-color: transparent; background: transparent; }
-.shortcut-hints { display: flex; gap: 12px; margin-top: 9px; color: #535b64; font-size: 8px; }
-.shortcut-hints span { display: flex; align-items: center; gap: 2px; }
-.agent-sound-setting { min-height: 34px; margin-top: 12px; display: flex; align-items: flex-end; gap: 7px; }
-.agent-sound-setting > label { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 5px; color: var(--text-3); font-size: 8px; }
-.agent-sound-setting select { height: 29px; padding: 0 28px 0 8px; border: 1px solid var(--border); border-radius: 6px; outline: 0; color: var(--text-2); background: var(--surface-0); font-size: 8.5px; }
-.agent-sound-setting > div { display: flex; gap: 3px; }
-.agent-sound-setting button { height: 29px; padding: 0 7px; display: flex; align-items: center; gap: 4px; border: 1px solid transparent; border-radius: 6px; color: var(--text-3); background: transparent; font-size: 7.5px; }
-.agent-sound-setting button:hover:not(:disabled) { border-color: var(--border-soft); color: var(--text-2); background: var(--surface-hover); }
-.agent-sound-setting button:disabled { opacity: .32; }
 .app-toast { position: fixed; z-index: 1800; left: 50%; bottom: 34px; max-width: 560px; transform: translateX(-50%); padding: 8px 12px; overflow: hidden; border: 1px solid #465237; border-radius: 5px; color: #c4d49b; background: #151b13ed; box-shadow: 0 8px 30px #000a; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
 
 .debug-console { position: fixed; z-index: 1250; left: 48px; right: 0; bottom: 0; height: 218px; display: flex; flex-direction: column; border-top: 1px solid var(--border); color: var(--text-2); background: color-mix(in srgb, var(--surface-0) 97%, transparent); box-shadow: 0 -14px 34px #0007; backdrop-filter: blur(10px); }
@@ -1000,7 +955,6 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 :root[data-theme="light"] .launcher-grid button,
 :root[data-theme="light"] .layout-popover,
 :root[data-theme="light"] .cursor-context-menu,
-:root[data-theme="light"] .settings-panel,
 :root[data-theme="light"] .agent-activity { background: #fffffff2; border-color: var(--border); color: var(--text); }
 :root[data-theme="light"] .launcher-grid strong,
 :root[data-theme="light"] .launcher-heading h2,
@@ -1230,18 +1184,6 @@ button.memory-origin-link:hover { color: var(--text); text-decoration: underline
 .process-empty { padding: 8px 10px; color: var(--text-3); font-size: 8px; }
 @keyframes process-progress { from { transform: translateX(-110%); } to { transform: translateX(310%); } }
 
-.theme-setting { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 11px; }
-.theme-setting button { min-height: 40px; display: flex; align-items: center; justify-content: center; gap: 7px; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface-0); font-size: 9px; }
-.theme-setting button.active { border-color: var(--accent-muted); color: var(--text); background: var(--accent-bg); }
-.settings-panel { overflow-y: auto; }
-.provider-settings { display: flex; flex-direction: column; gap: 5px; margin-top: 12px; }
-.provider-settings article { min-height: 43px; padding: 5px 6px 5px 8px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--border-soft); border-radius: 10px; background: var(--surface-0); }
-.provider-settings article > span { width: 27px; height: 27px; display: grid; place-items: center; border-radius: 8px; color: var(--text-3); background: var(--surface-2); }
-.provider-settings article > span.available { color: #22c57a; background: #22c57a14; }
-.provider-settings article > div { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
-.provider-settings article strong { color: var(--text); font-size: 9px; }
-.provider-settings article small { color: var(--text-3); font-size: 7.5px; }
-.provider-settings article button { height: 28px; padding: 0 8px; display: flex; align-items: center; gap: 5px; border: 0; border-radius: 8px; color: var(--accent-muted); background: var(--accent-bg); font-size: 8px; }
 .rail-bottom { display: flex; flex-direction: column; gap: 3px; }
 .sidebar-reveal { position: fixed; z-index: 60; left: 8px; top: 48px; width: 34px; height: 34px; padding: 0; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 10px; color: var(--text-2); background: var(--surface-1); box-shadow: 0 7px 18px #0003; opacity: .72; }
 .sidebar-reveal:hover { color: var(--accent-muted); border-color: var(--accent-muted); }
