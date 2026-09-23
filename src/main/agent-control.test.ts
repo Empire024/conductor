@@ -726,15 +726,20 @@ describe('projects open side by side in one window', () => {
     // Ownership binds in the receiving project too, so nobody there can take the tab over.
     const local = agentIn(f, other.project.id, other.workspace.id, 'theme-agent')
     await expect(f.control.call(local, 'agents.steer', { agentSessionId: handed.resourceId, prompt: 'Mine now' })).rejects.toThrow(/already controls this tab/)
-    // And an unrelated agent cannot reach across into a conversation it did not open.
+    // And an unrelated agent cannot reach across into a conversation another controller holds.
     const stranger = agentIn(f, f.project.id, f.workspace.id, 'stranger')
-    await expect(f.control.call(stranger, 'agents.snapshot', { agentSessionId: handed.resourceId })).rejects.toThrow(/outside this workspace/)
+    await expect(f.control.call(stranger, 'agents.snapshot', { agentSessionId: handed.resourceId })).rejects.toThrow(/Another agent controls that tab in Theme/)
+    expect((await f.control.call(stranger, 'agents.list') as Array<{ agentSessionId?: string }>).map(agent => agent.agentSessionId)).not.toContain(handed.resourceId)
+    // Released, it is an uncontrolled tab in a co-opened project like any other, and steering it takes it back.
     await f.control.call(f.scope, 'agents.release', { agentSessionId: handed.resourceId })
-    await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: handed.resourceId, prompt: 'Once more' })).rejects.toThrow(/outside this workspace/)
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: handed.resourceId, prompt: 'Once more' })
+    expect(f.submissions.at(-1)?.prompt).toContain('Once more')
+    await expect(f.control.call(stranger, 'agents.snapshot', { agentSessionId: handed.resourceId })).rejects.toThrow(/Another agent controls/)
     // The owner's own release button reaches a cross-project link as well.
     const second = await f.control.call(f.scope, 'tabs.open', { projectId: other.project.id, provider: 'claude', title: 'Second worker' }) as AgentControlTab
+    await expect(f.control.call(stranger, 'agents.snapshot', { agentSessionId: second.resourceId })).rejects.toThrow(/Another agent controls/)
     f.control.releaseByOwner(second.resourceId!)
-    await expect(f.control.call(f.scope, 'agents.snapshot', { agentSessionId: second.resourceId })).rejects.toThrow(/outside this workspace/)
+    await expect(f.control.call(stranger, 'agents.snapshot', { agentSessionId: second.resourceId })).resolves.toMatchObject({ agentSessionId: second.resourceId })
   })
 
   it('dispatches a coworker into the sibling project but never hands it this project’s task claims', async () => {
@@ -748,6 +753,84 @@ describe('projects open side by side in one window', () => {
     expect(f.orchestration.listTasks(other.project.id)).toHaveLength(0)
     expect(f.submissions.at(-1)?.prompt).toContain('handed to the Theme project')
     expect(f.submissions.at(-1)?.prompt).not.toContain('orchestration.tasks.update')
+  })
+})
+
+describe('steering an uncontrolled tab in a co-opened project', () => {
+  type Listed = { agentSessionId?: string; projectId: string; crossProject?: boolean; controlled?: boolean }
+  /** Astra, a coworker in a sibling project, reaching back to the owner's own tab here. */
+  const withAstra = (provider: StructuredProvider = 'codex') => {
+    const f = fixture(false, { local: ['default', 'accept-edits', 'read-only'] }), other = sibling(f, 'Faktury')
+    f.sessions.ensure({ id: 'astra', projectId: other.project.id, sessionId: other.workspace.id, cwd: other.path, provider, title: 'astra', model: provider + '-synthetic' })
+    const current = f.database.getSession(other.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    current.layout.root.tabs.push({ id: 'tab-astra', kind: 'agent', resourceId: 'astra', title: 'Astra', state: { provider, model: provider + '-synthetic' } })
+    f.database.saveSession(other.workspace.id, current.layout, null, [])
+    const astra: AgentControlScope = { projectId: other.project.id, sessionId: other.workspace.id, agentSessionId: 'astra' }
+    return { f, other, astra }
+  }
+  const stamp = (f: ReturnType<typeof fixture>, sessionId: string, tabId: string, remotePeerId: string) => {
+    const current = f.database.getSession(sessionId)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    const tab = current.layout.root.tabs.find(candidate => candidate.id === tabId)!
+    tab.state = { ...tab.state, remotePeerId, remoteMachineName: 'Render Desktop' }
+    f.database.saveSession(sessionId, current.layout, null, [])
+  }
+
+  it('lists the owner’s uncontrolled tab to an agent of a sibling project and lets it read and steer it', async () => {
+    const { f, astra } = withAstra()
+    const listed = await f.control.call(astra, 'agents.list') as Listed[]
+    expect(listed.find(agent => agent.agentSessionId === f.spec.id)).toMatchObject({ projectId: f.project.id, crossProject: true, controlled: false })
+    await expect(f.control.call(astra, 'agents.snapshot', { agentSessionId: f.spec.id })).resolves.toMatchObject({ agentSessionId: f.spec.id })
+    await expect(f.control.call(astra, 'agents.status', { agentSessionId: f.spec.id })).resolves.toBeTruthy()
+    await expect(f.control.call(astra, 'agents.history', { agentSessionId: f.spec.id })).resolves.toBeInstanceOf(Array)
+    // Settings outlive a prompt, so an uncontrolled tab is not configurable from next door.
+    await expect(f.control.call(astra, 'agents.configure', { agentSessionId: f.spec.id, model: 'codex-advanced', effort: 'high' })).rejects.toThrow(/outside this workspace/)
+    await f.control.call(astra, 'agents.submit', { agentSessionId: f.spec.id, prompt: 'Rebuild the invoice export' })
+    expect(f.submissions.at(-1)?.prompt).toContain('Rebuild the invoice export')
+    // Steering takes control, exactly as it does inside one workspace.
+    expect((await f.control.call(astra, 'agents.list') as Listed[]).find(agent => agent.agentSessionId === f.spec.id)).toMatchObject({ controlled: true })
+    await expect(f.control.call(astra, 'agents.interrupt', { agentSessionId: f.spec.id })).resolves.toMatchObject({ interrupted: true })
+  })
+
+  it('hides a sibling-project tab another agent controls and refuses to read or steer it', async () => {
+    const { f, astra } = withAstra()
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Owned worker' }) as AgentControlTab
+    const listed = await f.control.call(astra, 'agents.list') as Listed[]
+    expect(listed.map(agent => agent.agentSessionId)).not.toContain(child.resourceId)
+    expect(listed.map(agent => agent.agentSessionId)).toContain(f.spec.id)
+    const before = f.submissions.length
+    for (const method of ['agents.snapshot', 'agents.steer', 'agents.submit', 'agents.interrupt']) {
+      await expect(f.control.call(astra, method, { agentSessionId: child.resourceId, prompt: 'Mine now' })).rejects.toThrow(/Another agent controls that tab in Control project/)
+    }
+    expect(f.submissions).toHaveLength(before)
+  })
+
+  it('reads but never steers a tab a paired machine drives, and keeps a paired caller inside its project', async () => {
+    const { f, astra } = withAstra()
+    stamp(f, f.workspace.id, f.rootTab.id, 'peer-1')
+    await expect(f.control.call(astra, 'agents.snapshot', { agentSessionId: f.spec.id })).resolves.toMatchObject({ agentSessionId: f.spec.id })
+    const before = f.submissions.length
+    for (const method of ['agents.submit', 'agents.steer', 'agents.interrupt']) {
+      await expect(f.control.call(astra, method, { agentSessionId: f.spec.id, prompt: 'Take over' })).rejects.toThrow(/paired machine/)
+    }
+    expect(f.submissions).toHaveLength(before)
+    // The other way round: a caller a paired machine drives sees and reaches nothing next door.
+    const { f: g, other: next, astra: driven } = withAstra()
+    stamp(g, next.workspace.id, 'tab-astra', 'peer-2')
+    expect((await g.control.call(driven, 'agents.list') as Listed[]).map(agent => agent.agentSessionId)).not.toContain(g.spec.id)
+    await expect(g.control.call(driven, 'agents.snapshot', { agentSessionId: g.spec.id })).rejects.toThrow(/driven by a paired machine/)
+  })
+
+  it('lets a sandboxed local caller read the tab but not steer it', async () => {
+    const { f, astra } = withAstra('local')
+    await expect(f.control.call(astra, 'agents.snapshot', { agentSessionId: f.spec.id })).resolves.toMatchObject({ agentSessionId: f.spec.id })
+    const before = f.submissions.length
+    for (const method of ['agents.submit', 'agents.steer', 'agents.interrupt']) {
+      await expect(f.control.call(astra, method, { agentSessionId: f.spec.id, prompt: 'Push it' })).rejects.toThrow(/sandboxed local conversation/)
+    }
+    expect(f.submissions).toHaveLength(before)
+    expect(f.database.getSetting('agentControlParent:' + f.spec.id)).toBeFalsy()
   })
 })
 

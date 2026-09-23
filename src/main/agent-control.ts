@@ -99,7 +99,7 @@ const toolSignatures = {
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
   'tabs.detach': '({tabId})',
   'tabs.close': '({tabId}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors',
-  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project',
+  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project and sibling-project tabs nobody controls (controlled:false), which agents.snapshot/status/history/submit/steer/interrupt may reach',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.status': '({agentSessionId}) — the compact supervision view of one visible conversation: phase, model, last stop reason with its figures (rounds used of the hard cap, context used / capacity / reserve, compactions, loop warnings, acceptance result, files changed), last tool and its status, and the durable task state a local worker keeps. A few hundred bytes; use it instead of agents.snapshot to poll a local worker',
@@ -299,20 +299,31 @@ export class AgentControl {
 
   /**
    * The tab an agents.* call names, and the workspace it actually lives in. Anything in the
-   * caller's own workspace stays open to it as before. A tab somewhere else - another workspace,
-   * or a sibling project the owner co-opened - is reachable only to the controller that opened it
-   * there, so a project cannot reach sideways into conversations it did not create.
+   * caller's own workspace stays open to it as before, and a tab the caller opened anywhere else
+   * stays its own. `reach` opens one more door: a tab in a sibling project the owner co-opened
+   * that nobody controls - the owner's own conversation included - may be read ('read') or
+   * prompted and interrupted ('steer'), so the owner no longer relays prompts between projects by
+   * hand. Co-opening the projects is that consent. A tab another controller holds stays out of
+   * reach; a conversation a paired machine drives keeps the bounds its pairing drew, on either
+   * end; and a sandboxed local model does not steer outside its own project.
    */
-  private target(scope: AgentControlScope, id: string, mutate = false): { tab: AgentControlTab; scope: AgentControlScope } {
+  private target(scope: AgentControlScope, id: string, mutate = false, reach: 'read' | 'steer' | null = null): { tab: AgentControlTab; scope: AgentControlScope } {
     const spec = this.deps.database.structured.spec<AgentSpec>(id)
     const missing = new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name')
     if (!spec) throw missing
     const elsewhere = spec.projectId !== scope.projectId || spec.sessionId !== scope.sessionId
     const link = this.linkFor(id)
-    if (elsewhere && link?.controllerAgentSessionId !== scope.agentSessionId) throw missing
+    const sideways = elsewhere && link?.controllerAgentSessionId !== scope.agentSessionId
+    if (sideways) {
+      if (spec.projectId === scope.projectId || !reach) throw missing
+      if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
+      if (link) throw new Error(`Another agent controls that tab in ${this.deps.database.getProject(spec.projectId)?.name ?? 'the other project'}; only its controller can read or steer it`)
+      if (reach === 'steer' && this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)?.provider === 'local') throw new Error('A sandboxed local conversation cannot steer a tab in another project; a non-local coworker or the owner can')
+    }
     const target = elsewhere ? { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId } : scope
     const tab = this.tabs(target).find(tab => tab.kind === 'agent' && tab.resourceId === id)
     if (!tab) throw missing
+    if (sideways && reach === 'steer' && tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
     if (mutate) {
       const ancestors = new Set([scope.agentSessionId])
       for (let cursor = scope.agentSessionId;;) {
@@ -504,17 +515,22 @@ export class AgentControl {
     }))
   }
 
-  /** The tabs this caller opened outside its own workspace, so a handoff stays findable after the
-   *  agentSessionId that tabs.open returned has scrolled out of the caller's context. */
-  private controlledElsewhere(scope: AgentControlScope): Array<{ tab: AgentControlTab; scope: AgentControlScope }> {
-    const found: Array<{ tab: AgentControlTab; scope: AgentControlScope }> = []
+  /** The tabs outside its own workspace this caller may name: the ones it opened, so a handoff
+   *  stays findable after the agentSessionId that tabs.open returned has scrolled out of the
+   *  caller's context, and the uncontrolled ones in a sibling project that target() lets it read
+   *  and steer. A tab another controller holds is not listed at all. */
+  private reachableElsewhere(scope: AgentControlScope): Array<{ tab: AgentControlTab; scope: AgentControlScope; yours: boolean }> {
+    const found: Array<{ tab: AgentControlTab; scope: AgentControlScope; yours: boolean }> = []
+    const paired = Boolean(this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId)
     for (const project of this.deps.database.listProjects()) {
       for (const workspace of this.deps.database.listSessions(project.id)) {
         if (project.id === scope.projectId && workspace.id === scope.sessionId) continue
         const target = { projectId: project.id, sessionId: workspace.id, agentSessionId: scope.agentSessionId }
         for (const tab of this.tabs(target)) {
           if (tab.kind !== 'agent' || !tab.resourceId) continue
-          if (this.linkFor(tab.resourceId)?.controllerAgentSessionId === scope.agentSessionId) found.push({ tab, scope: target })
+          const link = this.linkFor(tab.resourceId)
+          if (link?.controllerAgentSessionId === scope.agentSessionId) found.push({ tab, scope: target, yours: true })
+          else if (!link && !paired && project.id !== scope.projectId) found.push({ tab, scope: target, yours: false })
         }
       }
     }
@@ -697,12 +713,14 @@ export class AgentControl {
       const own = this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
       // A tab this caller handed to another open project is still its own work to follow, and it
       // would otherwise be unfindable after the id that came back from tabs.open is forgotten.
-      return [...own, ...this.controlledElsewhere(scope).map(({ tab, scope: target }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true }))]
+      // `controlled: false` marks a sibling-project tab nobody controls yet.
+      return [...own, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))]
     }
     if (method.startsWith('agents.')) {
       if (typeof args.agentSessionId !== 'string' || !args.agentSessionId.trim()) throw new Error(method + ' requires agentSessionId: the exact id of a visible conversation, as returned by agents.list or app.state')
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history'].includes(method)
-      const { tab, scope: target } = this.target(scope, id, mutate), state = database.structured.snapshot(id)!
+      const reach = ['agents.snapshot', 'agents.history', 'agents.status'].includes(method) ? 'read' : ['agents.submit', 'agents.steer', 'agents.interrupt'].includes(method) ? 'steer' : null
+      const { tab, scope: target } = this.target(scope, id, mutate, reach), state = database.structured.snapshot(id)!
       if (method === 'agents.snapshot') {
         const recent = [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence)).slice(0, 60)
         const activeTools = state.items.filter(item => item.data.type === 'tool' && ['preparing', 'running', 'awaiting_approval'].includes(item.data.status))
