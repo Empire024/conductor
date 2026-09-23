@@ -1,0 +1,29 @@
+# File processing integration (v1)
+
+Owned implementation: `src/main/local-models/file-processing.ts`; synthetic fixtures: `file-processing.fixtures.ts`. No agent/provider integration in this change.
+
+API: `parseMoney(text, { currency?, direction? })` returns a discriminated success/error with exact signed integer `minorUnits`, ISO currency and `incoming | outgoing | neutral` direction; `parseExplicitDate(text)` returns a calendar `YYYY-MM-DD`, never a Date. Invalid/ambiguous input is an error, never zero.
+
+Host calls `inspectFile({ id, bytes, role }, segments, parse)` with byte-offset segments and an independent schema-specific parser returning `{ kind: 'record', values }`, `skipped`, or `rejected`. Inspection retains actual bytes, SHA-256 identities, record span refs, counts and coverage. Parsers and segmenters are trusted host adapters, **not model-generated scripts or stdout**. The host constructs `ValidationContext` with `inspections`, `targets` (`id`, target `ref`, exact `criteria` for source values), optional independent `knownPositiveExamples`, and optional `allowSourceReuse`. Target criteria must be derived independently; include amount/currency/direction and reference/account where the task requires them. Invoice date and bank date are separate values; do not require equality unless the task says so.
+
+Model returns only JSON: `{ version: 1, inputs: [{ id, sha256, bytes, counts: { scanned, parsed, skipped, rejected } }], outcomes: [{ targetId, status: 'matched' | 'ambiguous' | 'not_found' | 'blocked', candidates: [{ ref: { inputId, start, end, sha256 }, values: { ...inspected scalar fields } }], reason? }] }`. Each target appears exactly once. Candidate values must equal the full independently inspected record, including source date. `validateFileProcessingResult(jsonText, context)` validates bounded untrusted JSON and returns `{ ok, diagnostics }`; diagnostics have stable `code`, `path`, `message`, `recovery` for bounded repair. Never treat successful script exit or syntactically valid JSON as evidence.
+
+Coverage requires contiguous complete byte inspection, no rejected records, and at least one parsed source record before permitting absence/uniqueness claims. Skipped segments must be independently classified (headers/whitespace). Candidate sets must equal all records satisfying the host's criteria. Multiple plausible candidates prohibit a certain match. Inspection/ref identity changes, missing target lineage, wrong source fields, hidden candidates, reuse, count fraud and zero parses with positive observations are rejected.
+
+Fixture generator returns input bytes and public parsing adapters separately from an evaluator-only oracle. Only write `.inputs` bytes into a live model workspace. Keep generator source, adapters, test source and oracle outside that workspace; they contain expected values. Default principal bank input is approximately 1 MiB, with BOM, CRLF, multiline rows, repeated headers/amounts, direction, Czech amounts, IDs/suffixes and April 15 invoice/April 23 payment. Held-out variant changes delimiters/order/row framing. Inventory fixture exercises generic scalar criteria.
+
+Unit tests prove deterministic helper behavior only. They do not establish live local-model repair or successful end-to-end integration. Root owns runtime wiring, independent adapter selection, private fixture placement and live acceptance.
+
+Evaluator usage (outside the model workspace):
+
+```ts
+const fixture = generateBankFixture('principal') // or 'heldout'; default >= 1 MiB
+// Write only fixture.inputs entries' `bytes` under their `name` into the isolated workspace.
+const context = inspectFixture(fixture) // independent adapter plus literal positive witness
+const checked = validateFileProcessingResult(modelResultText, context)
+// Feed checked.diagnostics to bounded recovery; compare accepted results to the private oracle.
+```
+
+Production adapters should use `inspectFile` directly; `inspectFixture` is fixture-specific evaluator code. All refs use **UTF-8 byte offsets**, not JavaScript string offsets. Input paths are not accepted by the validator and no model-supplied path is read. Capture/read actual bytes under the host's existing file permissions, and refresh inspection if inputs change. Input IDs are host-assigned independent identities, not filenames inferred from stdout. Register every inspected target record; partial/rejected target inspection fails validation.
+
+Limits: 1 MiB result JSON, 64 inputs, 2,048 targets, 256 candidates per outcome, 32 scalar fields per record, 512 characters per value, 50,000 inspected records and 32 diagnostics. A candidate set larger than the contract permits must be `blocked` with a reason or split by the host. Money supports CZK/EUR/USD/GBP/CHF/PLN with two decimal places only; unsupported currencies and ambiguous grouping are errors. Generic matching is exact equality against host-selected target fields; fuzzy matching, date windows, bank format discovery, OCR and automatic schema selection are intentionally outside this helper.
