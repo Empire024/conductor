@@ -318,22 +318,34 @@ describe('authorized native app control', () => {
     expect(settings).toMatchObject({ permission: 'accept-edits', plan: false })
     expect(settings.sandbox).toBeUndefined()
     f.database.structured.update(f.spec.id, { settings: { permission: 'accept-edits', plan: false, temporaryPermission: { runtimeId: 'earlier-runtime', restore: 'default' } } })
-    const guarded = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const guarded = await f.control.call(f.scope, 'tabs.open', { exactPermission: true }) as AgentControlTab
     expect(f.database.structured.snapshot(guarded.resourceId!)?.settings).toMatchObject({ permission: 'default' })
   })
 
-  it('opens a new agent tab on the owner\'s remembered mode for that provider, not just whatever the controller happens to be on', async () => {
-    const f = fixture()
+  it('opens a native coworker on Auto, the highest mode its provider offers, whatever the owner remembered or the caller asked', async () => {
+    // The owner does not want to babysit a dispatched coworker: a worker on ask or edit mode is
+    // the owner clicking Allow for every command the controller should have been trusted with.
+    const f = fixture(false, { claude: ['default', 'read-only', 'accept-edits', 'auto'] })
     f.database.setSetting('rememberedPermission:claude', 'read-only')
-    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude' }) as AgentControlTab
-    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'read-only' })
+    const remembered = await f.control.call(f.scope, 'tabs.open', { provider: 'claude' }) as AgentControlTab
+    expect(f.database.structured.snapshot(remembered.resourceId!)?.settings).toMatchObject({ permission: 'auto' })
+    const asked = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'accept-edits' }) as AgentControlTab
+    expect(f.database.structured.snapshot(asked.resourceId!)?.settings).toMatchObject({ permission: 'auto' })
+    // A provider without Auto gets its highest mode.
+    const capped = await f.control.call(f.scope, 'tabs.open', { provider: 'codex' }) as AgentControlTab
+    expect(f.database.structured.snapshot(capped.resourceId!)?.settings).toMatchObject({ permission: 'accept-edits' })
+    const dispatched = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Auto worker', prompt: 'Do the thing', provider: 'claude', permission: 'default' }] }) as Array<{ agentSessionId: string }>
+    expect(f.database.structured.snapshot(dispatched[0]!.agentSessionId)?.settings).toMatchObject({ permission: 'auto' })
   })
 
-  it('lets an explicit tabs.open permission win over the owner\'s remembered mode', async () => {
-    const f = fixture()
+  it('keeps a lower mode only for an agent the caller marks as not to be trusted, from its explicit ask or the owner\'s remembered mode', async () => {
+    const f = fixture(false, { claude: ['default', 'read-only', 'accept-edits', 'auto'] })
     f.database.setSetting('rememberedPermission:claude', 'read-only')
-    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'default' }) as AgentControlTab
-    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'default' })
+    const remembered = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', exactPermission: true }) as AgentControlTab
+    expect(f.database.structured.snapshot(remembered.resourceId!)?.settings).toMatchObject({ permission: 'read-only' })
+    const explicit = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'default', exactPermission: true }) as AgentControlTab
+    expect(f.database.structured.snapshot(explicit.resourceId!)?.settings).toMatchObject({ permission: 'default' })
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', exactPermission: 'yes' })).rejects.toThrow('exactPermission must be true or false')
   })
 
   it('rejects an explicit tabs.open permission that is not a real mode, or one this provider does not offer', async () => {
@@ -345,7 +357,7 @@ describe('authorized native app control', () => {
   it('never lets a Claude-only remembered mode leak into a new Codex tab', async () => {
     const f = fixture(false, { claude: ['default', 'read-only', 'accept-edits', 'auto'], codex: ['default', 'read-only', 'accept-edits'] })
     f.database.setSetting('rememberedPermission:claude', 'auto')
-    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex' }) as AgentControlTab
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', exactPermission: true }) as AgentControlTab
     expect(f.database.structured.snapshot(child.resourceId!)?.settings).toMatchObject({ permission: 'default' })
   })
 

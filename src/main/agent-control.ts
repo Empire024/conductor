@@ -45,6 +45,16 @@ const inheritedPermission = (source: SessionSettings, supported?: SessionSetting
   const allowed = offered.filter(value => permissionOrder.indexOf(value) <= permissionOrder.indexOf(cap))
   return allowed.sort((a, b) => permissionOrder.indexOf(b) - permissionOrder.indexOf(a))[0] ?? 'default'
 }
+/** What a dispatched coworker opens on. A native coworker (Claude, Codex) runs on Auto, the
+ *  highest mode its provider offers: a worker that has to ask for every command is one the owner
+ *  babysits instead of the controller, which defeats dispatching it. Two things keep the lower
+ *  modes: a controller that is itself read-only or planning cannot hand out more than it has, and
+ *  a caller that says the worker cannot be trusted at all (`exactPermission`) keeps the mode it
+ *  named or the owner's remembered one. A local model has no Auto and stays on its own rules. */
+const dispatchPermission = (source: SessionSettings, supported: SessionSettings['permission'][] | undefined, provider: StructuredProvider, requested: SessionSettings['permission'] | undefined, exact: boolean): SessionSettings['permission'] => {
+  if (exact || provider === 'local' || restricted(source)) return inheritedPermission(source, supported, requested)
+  return inheritedPermission({ ...source, permission: 'auto' }, supported, 'auto')
+}
 const text = (args: Args, key: string, maximum = 20000): string => {
   const value = args[key]
   if (typeof value === 'string' && value.length > maximum) throw new Error(`The ${key} is ${value.length.toLocaleString('en-US')} characters; the limit is ${maximum.toLocaleString('en-US')}.`)
@@ -93,7 +103,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?}) — visible tab; agent default kind, provider/model must be available; a new agent tab opens on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode — always clamped to the controller’s autonomy and to what the target provider offers; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?}) — visible tab; agent default kind, provider/model must be available; a Claude or Codex coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish',
   'tabs.focus': '({tabId,projectId?,workspaceId?}) — any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
   'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
@@ -134,7 +144,7 @@ const toolSignatures = {
   'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does'
 } as const
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
@@ -614,6 +624,7 @@ export class AgentControl {
       const effort = args.effort === undefined ? model.defaultEffort : text(args, 'effort', 40)
       if (effort && !model.effort?.includes(effort)) throw new Error('Choose an effort supported by this model')
       if (args.permission !== undefined && !isSessionPermission(args.permission)) throw new Error('Invalid permission mode')
+      if (args.exactPermission !== undefined && typeof args.exactPermission !== 'boolean') throw new Error('exactPermission must be true or false')
       const explicitPermission = args.permission as SessionSettings['permission'] | undefined
       // Grants are checked before the session exists, so a refused ask leaves no orphaned
       // conversation behind; the rules are the ones agents.grant applies later.
@@ -646,11 +657,12 @@ export class AgentControl {
       const created = this.deps.database.structured.snapshot(spec.id)!
       if (explicitPermission && !created.capabilities?.permissions?.includes(explicitPermission)) throw new Error('Choose a permission mode supported by this provider')
       const sourceSettings = settingsForRuntime(this.deps.database.structured.snapshot(scope.agentSessionId)!.settings)
-      // An explicit ask always wins; otherwise a new tab opens on the owner's remembered mode for
-      // this provider (permission-memory.ts on the renderer side, mirrored via app-settings.ts) —
-      // still capped by the controller's own autonomy and by what this provider actually offers.
+      // A native coworker opens on Auto (see dispatchPermission). Only with exactPermission does
+      // an explicit ask, else the owner's remembered mode for this provider (permission-memory.ts
+      // on the renderer side, mirrored via app-settings.ts), decide — still capped by the
+      // controller's own autonomy and by what this provider actually offers.
       const requested = explicitPermission ?? rememberedPermission(key => this.deps.database.getSetting(key), provider)
-      const permission = inheritedPermission(sourceSettings, created.capabilities?.permissions, requested)
+      const permission = dispatchPermission(sourceSettings, created.capabilities?.permissions, provider, requested, args.exactPermission === true)
       const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(permission === 'read-only' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude', ...requestedGrants, ...(contract ? { localContract: contract } : {}) }
       this.deps.database.structured.update(spec.id, { settings })
       if (Object.keys(requestedGrants).length) grants = { repository: Boolean(settings.localGit), research: Boolean(settings.localResearch) }
@@ -1091,7 +1103,8 @@ export class AgentControl {
     // provider default or the owner's remembered mode. A read-only or planning caller therefore
     // hands off to a read-only or planning receiver, which is why it is allowed to hand off at all.
     const tab = await this.open(scope, {
-      kind: 'agent', title, model: settings.model ?? spec.model, permission: settings.permission,
+      // The same agent continuing: it keeps the mode the owner set on the caller, not a dispatch default.
+      kind: 'agent', title, model: settings.model ?? spec.model, permission: settings.permission, exactPermission: true,
       ...(settings.effort ? { effort: settings.effort } : {})
     })
     // A tab placed on a paired machine comes back in the remote shape, which names the session
