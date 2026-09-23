@@ -210,7 +210,6 @@ const jobKeys: Record<string, string[]> = {
   'jobs.cancel': ['jobId', 'reason'],
   'jobs.report': ['jobId']
 }
-const JOB_CREATOR_SETTING = 'durableJobCreator:'
 const strings = (value: unknown, key: string, count: number, length: number): string[] => {
   if (!Array.isArray(value) || value.length > count || value.some(item => typeof item !== 'string' || !item.trim() || item.length > length || item.includes('\0'))) throw new Error(`${key} must be a list of at most ${count} non-empty strings of up to ${length} characters`)
   return value as string[]
@@ -1068,12 +1067,11 @@ export class AgentControl {
    *  conversation that created it. A local model never steers a job: pausing, resuming or
    *  cancelling is the owner's or its controller's decision, and nothing here can switch a job
    *  to a cloud model. */
-  private mayChangeJob(scope: AgentControlScope, source: AgentSpec, jobId: string): void {
+  private mayChangeJob(scope: AgentControlScope, source: AgentSpec, service: DurableJobsService, jobId: string): void {
     if (sovereign(scope)) return
     if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot change a durable job; the owner, a wizard tab or the conversation that created the job can')
     if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
-    const creator = this.deps.database.getSetting(JOB_CREATOR_SETTING + jobId)
-    if (creator !== scope.agentSessionId) throw new Error('Only the owner, a wizard tab or the conversation that created this job may pause, resume or cancel it')
+    if (service.get(jobId).createdBy?.agentSessionId !== scope.agentSessionId) throw new Error('Only the owner, a wizard tab or the conversation that created this job may pause, resume or cancel it')
   }
 
   private async jobs(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
@@ -1102,7 +1100,7 @@ export class AgentControl {
       const report = await service.report(summary.id)
       return { ...report, note: 'The report is a file beside the job logs; read reportPath for the full account. Log paths are listed, not pasted.' }
     }
-    this.mayChangeJob(scope, source, summary.id)
+    this.mayChangeJob(scope, source, service, summary.id)
     const reason = args.reason === undefined ? undefined : text(args, 'reason', 500)
     this.authorize(scope)
     if (method === 'jobs.pause') return service.pause(summary.id, reason)
@@ -1121,7 +1119,7 @@ export class AgentControl {
     // local models. A cloud model id is refused by name, never mapped to something local.
     const local = [...(this.catalog(scope).find(entry => entry.provider === 'local')?.models ?? []), ...(this.deps.providers().find(provider => provider.id === 'local')?.models ?? [])]
     if (!local.some(entry => entry.id === model)) throw new Error(`Durable jobs run on a local model only; ${model} is not a local entry of models.list`)
-    const input: CreateDurableJobInput & { createdBy: { kind: 'owner' | 'wizard' | 'agent'; agentSessionId: string; title: string } } = {
+    const input: CreateDurableJobInput = {
       projectId: scope.projectId, workspaceId: scope.sessionId,
       title: args.title === undefined ? objective.replace(/\s+/g, ' ').trim().slice(0, 80) : text(args, 'title', 120),
       objective, model,
@@ -1141,18 +1139,16 @@ export class AgentControl {
       })
     }
     if (args.budgets !== undefined) {
-      const budgets = object(args.budgets), known = Object.keys(DEFAULT_DURABLE_JOB_BUDGETS)
+      const budgets = object(args.budgets), known = [...Object.keys(DEFAULT_DURABLE_JOB_BUDGETS), 'stagePromptBudgetTokens']
       const unknown = Object.keys(budgets).filter(key => !known.includes(key))
       if (unknown.length) throw new Error(`budgets accepts only ${known.join(', ')}`)
       for (const [key, value] of Object.entries(budgets)) if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`budgets.${key} must be a non-negative number`)
       input.budgets = budgets as CreateDurableJobInput['budgets']
     }
     this.authorize(scope)
-    const summary = await service.create(input)
-    // Recorded beside the job rather than trusted from any later call: the creator is who may
-    // pause, resume and cancel it besides the owner.
-    this.deps.database.setSetting(JOB_CREATOR_SETTING + summary.id, scope.agentSessionId)
-    return summary
+    // The service persists createdBy on the job: the creator is who may pause, resume and cancel
+    // it besides the owner.
+    return service.create(input)
   }
 
   /**
