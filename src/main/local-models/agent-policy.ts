@@ -76,6 +76,8 @@ export interface LocalAgentPolicy {
   rounds: RoundPolicy
   stagnation: StagnationPolicy
   generation: GenerationPolicy
+  /** Cumulative task budget. A reasoning segment never resets these counters. */
+  task: { maxRounds: number; maxRequests: number; maxRecoveries: number; maxMilliseconds: number; maxTokens: number }
 }
 
 export const DEFAULT_LOCAL_AGENT_POLICY: LocalAgentPolicy = {
@@ -83,7 +85,8 @@ export const DEFAULT_LOCAL_AGENT_POLICY: LocalAgentPolicy = {
   toolOutput: { commandChars: 6000, testReportChars: 6000, readWindowLines: 200, readMaxLines: 800, otherChars: 8000, supersededChars: 400, narrationChars: 500 },
   rounds: { softWarningAt: 10, strongWarningAt: 16, finishAt: 20, hardLimit: 24 },
   stagnation: { repeatWarnAt: 3, repeatStopAt: 6, idleRoundsWarnAt: 6 },
-  generation: { ruminationMinChars: 2500, ruminationDensity: 4, ruminationMaxChars: 9000 }
+  generation: { ruminationMinChars: 2500, ruminationDensity: 4, ruminationMaxChars: 9000 },
+  task: { maxRounds: 72, maxRequests: 96, maxRecoveries: 3, maxMilliseconds: 1_200_000, maxTokens: 1_000_000 }
 }
 
 /** Research is search, read, re-search: the rounds are the work, so every stage moves out. */
@@ -99,7 +102,8 @@ export function resolveLocalAgentPolicy(overrides: LocalAgentPolicyOverrides = {
     toolOutput: { ...base.toolOutput, ...overrides.toolOutput },
     rounds: { ...base.rounds, ...overrides.rounds },
     stagnation: { ...base.stagnation, ...overrides.stagnation },
-    generation: { ...base.generation, ...overrides.generation }
+    generation: { ...base.generation, ...overrides.generation },
+    task: { ...base.task, ...overrides.task }
   }
   const { context, rounds, stagnation, toolOutput } = policy
   const fraction = (value: number, name: string): void => { if (!(value > 0 && value <= 1)) throw new Error(`Local agent policy: ${name} must be a fraction between 0 and 1`) }
@@ -112,6 +116,7 @@ export function resolveLocalAgentPolicy(overrides: LocalAgentPolicyOverrides = {
   positive(stagnation.repeatWarnAt, 'stagnation.repeatWarnAt'); positive(stagnation.repeatStopAt, 'stagnation.repeatStopAt'); positive(stagnation.idleRoundsWarnAt, 'stagnation.idleRoundsWarnAt')
   if (stagnation.repeatWarnAt > stagnation.repeatStopAt) throw new Error('Local agent policy: stagnation warning must come before the stop')
   for (const key of Object.keys(toolOutput) as Array<keyof ToolOutputPolicy>) positive(toolOutput[key], `toolOutput.${key}`)
+  for (const [key, value] of Object.entries(policy.task)) positive(value, `task.${key}`)
   if (toolOutput.readWindowLines > toolOutput.readMaxLines) throw new Error('Local agent policy: the default read window cannot exceed the read cap')
   return policy
 }

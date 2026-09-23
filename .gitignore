@@ -13,3 +13,4 @@ Thumbs.db
 .smoke-*/
 # Local model GGUFs, the generated local API key, logs and run state. Never committed.
 .local-models/
+.conductor-scratch/

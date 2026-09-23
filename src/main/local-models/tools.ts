@@ -1,3 +1,8 @@
+import { boundedSearch } from './bounded-search.ts'
+import { splitExecutionEnvelope } from './bounded-execution.ts'
+import { createHash, randomUUID } from 'node:crypto'
+import { boundedFile, staleEvidence, type LocalFileEvidence } from './bounded-files.ts'
+import { defaultResultStore, type LocalResultStore } from './result-artifacts.ts'
 import { appendFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import type { ToolSpec } from './client.ts'
@@ -62,16 +67,16 @@ export function assertToolAllowed(name: string, readOnly: boolean, grants: Local
   if (name === 'web_search' && !grants.research) throw new ToolPolicyError('Tool denied by policy: web_search needs deep research turned on for this conversation')
 }
 
-const MAX_READ_BYTES = 256 * 1024
+const MAX_READ_BYTES = 8 * 1024 * 1024
 const MAX_WRITE_BYTES = 1024 * 1024
 const MAX_SEARCH_HITS = 200
 const SKIP_DIRECTORIES = new Set(['node_modules', '.git', 'out', 'dist', 'release', '.venv', 'venv', '__pycache__', '.next', 'target'])
 
 export function toolSpecs(readOnly: boolean, control = false, grants: LocalGrants = NO_GRANTS, scope: ToolScope = 'full', window: ReadWindow = DEFAULT_READ_WINDOW): ToolSpec[] {
   const specs: ToolSpec[] = [
-    { type: 'function', function: { name: 'read_file', description: `Read a UTF-8 text file from the workspace. Returns at most ${window.defaultLines} lines unless limit is given (never more than ${window.maxLines}); the first line reports total_lines and the range returned, so read a large file in the ranges you need, or use search to find the lines first.`, parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative path, for example src/main/index.ts' }, offset: { type: 'integer', description: 'First line to return (1-based).' }, limit: { type: 'integer', description: 'Maximum number of lines to return.' } }, required: ['path'] } } },
+    { type: 'function', function: { name: 'read_file', description: `Read bounded ranges; inspect gives SHA256/encoding evidence, bytes gives raw/hex samples. Returns at most ${window.defaultLines} lines unless limit is given (never more than ${window.maxLines}); the first line reports total_lines and the range returned, so read a large file in the ranges you need, or use search to find the lines first.`, parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative file' }, mode: { type: 'string', enum: ['lines', 'inspect', 'bytes'] }, byte_offset: { type: 'integer' }, byte_limit: { type: 'integer' }, artifact: { type: 'string', description: 'Owned result handle; replaces path' }, offset: { type: 'integer', description: 'First line to return (1-based).' }, limit: { type: 'integer', description: 'Maximum number of lines to return.' } }, } } },
     { type: 'function', function: { name: 'list_files', description: 'List the entries of a workspace directory.', parameters: { type: 'object', properties: { path: { type: 'string', description: 'Workspace-relative directory; defaults to the workspace root.' } } } } },
-    { type: 'function', function: { name: 'search', description: 'Search workspace file contents with a regular expression.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'JavaScript regular expression.' }, path: { type: 'string', description: 'Workspace-relative directory to search.' }, glob: { type: 'string', description: 'Only search files whose name ends with this suffix, for example .ts' } }, required: ['pattern'] } } }
+    { type: 'function', function: { name: 'search', description: 'Search an authorized file or directory with a regular expression; reports coverage and skipped data.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'JavaScript regular expression.' }, path: { type: 'string', description: 'Workspace-relative file or directory to search.' }, glob: { type: 'string', description: 'Only search files whose name ends with this suffix, for example .ts' } }, required: ['pattern'] } } }
   ]
   if (scope === 'coding') return readOnly ? specs : [...specs, ...writeSpecs(grants)]
   if (grants.research) specs.push({ type: 'function', function: { name: 'web_search', description: 'Search the public web and get back a numbered list of result titles and HTTPS links. Read the promising ones with web_read. Search as many times as the question needs, with different wordings; only the query text leaves this machine, so never put private workspace content in it.', parameters: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer', description: 'How many results to return, 1 to 25. Defaults to 10.' } }, required: ['query'] } } })
@@ -86,12 +91,16 @@ function writeSpecs(grants: LocalGrants): ToolSpec[] {
     { type: 'function', function: { name: 'write_file', description: 'Create or overwrite a workspace file. With append: true the content is added to the end of the file instead, creating it if needed. One call can only carry a few thousand tokens, so write a large file in parts: the first part plainly, then each further part with append: true.', parameters: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, append: { type: 'boolean' } }, required: ['path', 'content'] } } },
     { type: 'function', function: { name: 'edit_file', description: 'Replace an exact string in a workspace file.', parameters: { type: 'object', properties: { path: { type: 'string' }, old_text: { type: 'string' }, new_text: { type: 'string' }, replace_all: { type: 'boolean' } }, required: ['path', 'old_text', 'new_text'] } } },
     { type: 'function', function: { name: 'apply_edits', description: 'Apply several exact replacements to one workspace file in a single call, atomically: every old_text must occur exactly once in the current file, or nothing is written and the result says which edit failed. Use this instead of one edit_file per change when a task lists several exact edits.', parameters: { type: 'object', properties: { path: { type: 'string' }, edits: { type: 'array', items: { type: 'object', properties: { old_text: { type: 'string' }, new_text: { type: 'string' } }, required: ['old_text', 'new_text'] }, description: 'Up to 40 replacements, applied in order.' } }, required: ['path', 'edits'] } } },
-    { type: 'function', function: { name: 'run_command', description: 'Run a shell command inside the isolated Linux sandbox container. The workspace is mounted at /workspace. There is no network access. npm, npx, yarn, pnpm and bun installs are refused: with no network they can only destroy the dependency tree that is already there. Run installed binaries directly instead, for example `node ./node_modules/typescript/bin/tsc --noEmit` or `./node_modules/.bin/vitest run <file>`.' + (grants.git ? ' Git is writable in this conversation: commit and branch locally as you work. `git push` works too, but it is run for you on the host, because the container has no network: send it as a command of its own, with at most an existing remote and the branch you are on. Force, delete and other push flags stay refused.' : ' The .git directory is read-only: git log and git diff work, git commit does not.'), parameters: { type: 'object', properties: { command: { type: 'string' }, timeout_sec: { type: 'integer' } }, required: ['command'] } } }
+    { type: 'function', function: { name: 'run_command', description: 'Run command OR saved script OR code with runtime and args in Docker. Code is saved in task scratch; results have owned retrieval handles. cwd is workspace-relative. The workspace is mounted at /workspace. There is no network access. npm, npx, yarn, pnpm and bun installs are refused: with no network they can only destroy the dependency tree that is already there. Run installed binaries directly instead, for example `node ./node_modules/typescript/bin/tsc --noEmit` or `./node_modules/.bin/vitest run <file>`.' + (grants.git ? ' Git is writable in this conversation: commit and branch locally as you work. `git push` works too, but it is run for you on the host, because the container has no network: send it as a command of its own, with at most an existing remote and the branch you are on. Force, delete and other push flags stay refused.' : ' The .git directory is read-only: git log and git diff work, git commit does not.'), parameters: { type: 'object', properties: { command: { type: 'string' }, code: { type: 'string' }, script: { type: 'string' }, runtime: { type: 'string', enum: ['python3', 'python', 'node', 'bash'] }, args: { type: 'array', items: { type: 'string' } }, cwd: { type: 'string' }, timeout_sec: { type: 'integer' } } } } }
   ]
 }
 
 export interface ToolContext {
   workspace: string
+  taskId?: string
+  artifacts?: LocalResultStore
+  analysisScratch?: string
+  analysis?: { taskId: string }
   readOnly: boolean
   grants?: LocalGrants
   /** A bounded task's contract: paths a write may touch. Enforced here, not in the prompt. */
@@ -106,7 +115,7 @@ export interface ToolContext {
   afterTool?(paths: string[], success: boolean): Promise<void>
 }
 
-export interface ToolOutcome { output: string; failed: boolean; paths: string[]; exitCode?: number }
+export interface ToolOutcome { output: string; failed: boolean; paths: string[]; exitCode?: number; evidence?: LocalFileEvidence }
 
 const argumentsOf = (raw: string): Record<string, unknown> => {
   if (!raw?.trim()) return {}
@@ -124,20 +133,27 @@ const text = (value: unknown, name: string): string => {
 
 const integer = (value: unknown, fallback: number): number => Number.isInteger(value) ? value as number : fallback
 
-async function walk(root: string, directory: string, visit: (path: string) => Promise<boolean>): Promise<void> {
-  const entries = await readdir(directory, { withFileTypes: true })
+async function walk(root: string, directory: string, visit: (path: string) => Promise<boolean>, skipped: string[], budget = { remaining: 10000 }): Promise<boolean> {
+  let entries: import('node:fs').Dirent[]
+  try { entries = await readdir(directory, { withFileTypes: true }) } catch { skipped.push(`${relative(root, directory)}: unreadable directory`); return true }
   for (const entry of entries) {
+    if (--budget.remaining < 0) { skipped.push('directory entry limit reached; narrow path'); return false }
     const full = join(directory, entry.name)
     const rel = relative(root, full).replace(/\\/g, '/')
-    if (isSecretPath(rel)) continue
+    if (isSecretPath(rel)) { skipped.push('secret path'); continue }
     if (entry.isDirectory()) {
-      if (SKIP_DIRECTORIES.has(entry.name)) continue
-      await walk(root, full, visit)
+      if (SKIP_DIRECTORIES.has(entry.name)) { skipped.push(`${rel}: excluded directory`); continue }
+      if (!await walk(root, full, visit, skipped, budget)) return false
     } else if (entry.isFile()) {
-      if (!await visit(full)) return
-    }
+      if (!await visit(full)) return false
+    } else skipped.push(`${rel}: symlink or nonregular entry`)
   }
+  return true
 }
+
+export const analysisScratchPath = (workspace: string, taskId: string): string => '.conductor-scratch/' + createHash('sha256').update(workspace + '\0' + taskId).digest('hex').slice(0, 24)
+
+const artifactOwner = (context: ToolContext): string => `${context.workspace}\0${context.analysis?.taskId ?? context.taskId ?? context.sandbox?.name ?? "unscoped"}`
 
 /** Dispatch one tool call. Every path is canonicalized inside the workspace before it is
  *  touched, every command goes to the container, and any refusal is returned to the model as a
@@ -145,12 +161,19 @@ async function walk(root: string, directory: string, visit: (path: string) => Pr
  *  work with, and the denial itself is not negotiable. */
 export async function runTool(name: string, rawArguments: string, context: ToolContext): Promise<ToolOutcome> {
   try {
+    if (context.analysis && !context.analysisScratch) context = { ...context, analysisScratch: analysisScratchPath(context.workspace, context.analysis.taskId) }
     assertToolAllowed(name, context.readOnly, context.grants ?? NO_GRANTS, context.scope ?? 'full')
     context.signal?.throwIfAborted()
     const args = argumentsOf(rawArguments)
     const window = context.readWindow ?? DEFAULT_READ_WINDOW
     const writable = async (requested: string): Promise<{ path: string; relative: string }> => {
       const resolved = await resolveWritablePath(context.workspace, requested)
+      if (context.analysisScratch) {
+        const scratch = await resolveWritablePath(context.workspace, context.analysisScratch)
+        if (scratch.relative === '.') throw new ToolPolicyError('Analysis scratch must be a task subdirectory')
+        const inside = relative(scratch.path, resolved.path).replace(/\\/g, '/')
+        if (inside === '..' || inside.startsWith('../') || inside.startsWith('/') || /^[A-Za-z]:/.test(inside)) throw new ToolPolicyError('Analysis source is read-only; writes are allowed only inside the task scratch directory')
+      } else if (context.analysis) throw new ToolPolicyError('Analysis source is read-only; use run_command code for task-owned scratch diagnostics')
       if (!pathAllowed(context.contract, resolved.relative)) throw new ToolPolicyError(`${resolved.relative} is outside the paths this task may change (${context.contract!.allowedPaths!.join(', ')})`)
       return resolved
     }
@@ -166,24 +189,12 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
       case 'web_read': return { output: await readPublicWeb(text(args.url, 'url'), context.signal), failed: false, paths: [] }
       case 'web_search': return { output: await searchPublicWeb(text(args.query, 'query'), context.signal, args.limit === undefined ? 10 : integer(args.limit, 10)), failed: false, paths: [] }
       case 'read_file': {
-        const { path, relative: rel } = await resolveInWorkspace(context.workspace, text(args.path, 'path'))
-        const info = await stat(path)
-        if (!info.isFile()) return { output: `${rel} is not a file`, failed: true, paths: [] }
-        if (info.size > MAX_READ_BYTES) return { output: `${rel} is ${info.size} bytes; read a smaller file or use search`, failed: true, paths: [] }
-        const content = await readFile(path, 'utf8')
-        // Offset is positive and 1-based (not a byte position or negative tail index).
-        // Document this in results/errors without changing the cache-stable tool schema.
+        if (args.artifact !== undefined) return { output: (context.artifacts ?? defaultResultStore).read(artifactOwner(context), text(args.artifact, 'artifact'), integer(args.byte_offset, 0), integer(args.byte_limit, 4096)), failed: false, paths: [] }
+        const { path } = await resolveInWorkspace(context.workspace, text(args.path, 'path'))
         if (args.offset !== undefined && (!Number.isSafeInteger(args.offset) || Number(args.offset) < 1)) throw new ToolPolicyError('offset must be a positive 1-based line number; negative offsets are not supported')
-        const offset = Math.max(1, integer(args.offset, 1))
-        const limit = Math.max(1, Math.min(integer(args.limit, window.defaultLines), window.maxLines))
-        const lines = content.split('\n').slice(offset - 1, offset - 1 + limit)
-        const totalLines = content === '' ? 0 : content.split('\n').length - (content.endsWith('\n') ? 1 : 0)
-        const first = offset <= totalLines ? offset : 0
-        const last = first ? Math.min(totalLines, offset + limit - 1) : 0
-        const truncated = totalLines > 0 && (first !== 1 || last !== totalLines)
-        const hint = truncated && last < totalLines ? `; next range: offset=${last + 1}` : ''
-        const metadata = `[read_file: total_lines=${totalLines}; returned_lines=${first}-${last}; truncated=${truncated}${hint}; offset is a positive 1-based line number]\n`
-        return { output: metadata + (lines.join('\n') || (totalLines ? '(no lines in requested range)' : '(empty file)')), failed: false, paths: [path] }
+        let evidence: LocalFileEvidence | undefined
+        const output = await boundedFile(path, { mode: args.mode === undefined ? 'lines' : text(args.mode, 'mode'), offset: args.offset === undefined ? 1 : Number(args.offset), limit: Math.max(1, Math.min(integer(args.limit, window.defaultLines), window.maxLines)), byteOffset: args.byte_offset === undefined ? 0 : Number(args.byte_offset), byteLimit: args.byte_limit === undefined ? 4096 : Number(args.byte_limit), signal: context.signal, evidence: value => { evidence = value } })
+        return { output, failed: false, paths: [path], evidence }
       }
       case 'list_files': {
         const { path, relative: rel } = await resolveInWorkspace(context.workspace, args.path === undefined ? '.' : text(args.path, 'path'))
@@ -197,35 +208,45 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
       case 'search': {
         const pattern = text(args.pattern, 'pattern')
         if (pattern.length > 400) throw new ToolPolicyError('pattern is too long')
-        let expression: RegExp
-        try { expression = new RegExp(pattern, 'g') } catch { throw new ToolPolicyError('pattern is not a valid regular expression') }
+        try { new RegExp(pattern, 'g') } catch { throw new ToolPolicyError('pattern is not a valid regular expression') }
         const suffix = args.glob === undefined ? '' : text(args.glob, 'glob')
         const { path: root } = await resolveInWorkspace(context.workspace, args.path === undefined ? '.' : text(args.path, 'path'))
         const hits: string[] = []
-        await walk(context.workspace, root, async file => {
-          if (suffix && !file.endsWith(suffix)) return true
+        const skipped: string[] = []; let scanned = 0
+        const searchStarted = Date.now()
+        const visit = async (file: string): Promise<boolean> => {
+          context.signal?.throwIfAborted()
+          if (Date.now() - searchStarted > 1500) { skipped.push('search time budget reached; narrow path/pattern'); return false }
+          if (scanned >= 2000) { skipped.push('file count limit reached'); return false }
+          file = (await resolveInWorkspace(context.workspace, relative(context.workspace, file))).path
+          if (suffix && !file.endsWith(suffix)) { skipped.push(`${relative(context.workspace, file)}: suffix filter`); return true }
           const info = await stat(file)
-          if (info.size > MAX_READ_BYTES) return true
+          if (info.size > MAX_READ_BYTES) { skipped.push(`${relative(context.workspace, file)}: exceeds 8 MiB; use read_file inspect/bytes`); return true }
           let content: string
-          try { content = await readFile(file, 'utf8') } catch { return true }
+          try { content = await readFile(file, 'utf8') } catch { skipped.push(`${relative(context.workspace, file)}: unreadable`); return true }
+          scanned++
+          if (content.includes('\0') || content.includes('\uFFFD')) { skipped.push(`${relative(context.workspace, file)}: binary or invalid UTF-8; use read_file inspect/bytes`); return true }
           const rel = relative(context.workspace, file).replace(/\\/g, '/')
-          const lines = content.split('\n')
-          for (let index = 0; index < lines.length; index++) {
-            expression.lastIndex = 0
-            if (!expression.test(lines[index]!)) continue
-            hits.push(`${rel}:${index + 1}: ${lines[index]!.slice(0, 300)}`)
-            if (hits.length >= MAX_SEARCH_HITS) return false
-          }
+          const found = boundedSearch(content, pattern, MAX_SEARCH_HITS - hits.length)
+          for (const hit of found.hits) hits.push(`${rel}:${hit.line}:${hit.column}: ${hit.excerpt}`)
+          if (found.skippedCount) skipped.push(`${rel}: ${found.skippedCount} lines exceed 16 KiB regex limit (first lines: ${found.skippedLines.join(', ')}); use read_file bytes or a saved streaming script`)
+          if (found.timedOut) { skipped.push(`${rel}: regex exceeded 25 ms; file coverage unknown; simplify pattern or use a saved script`); return false }
+          if (found.stopped) { skipped.push(`${rel}: hit/line scan limit; narrow pattern or read a range`); return false }
           return true
-        })
-        return { output: hits.join('\n') || 'no matches', failed: false, paths: [] }
+        }
+        const complete = (await stat(root)).isFile() ? await visit(root) : await walk(context.workspace, root, visit, skipped)
+        return { output: `[search: scanned_files=${scanned}; hits=${hits.length}; coverage=${complete && !skipped.length ? 'complete' : 'partial'}; skipped=${skipped.length}; hit_limit=${MAX_SEARCH_HITS}]\n${hits.join('\n') || 'no matches in searched coverage'}\n${skipped.slice(0, 30).join('\n')}${skipped.length > 30 ? '\nFurther skip details omitted' : ''}${!complete ? '\nSearch stopped at limit; narrow path/pattern.' : ''}`, failed: false, paths: [] }
       }
       case 'write_file': {
         const content = text(args.content, 'content')
         if (Buffer.byteLength(content) > MAX_WRITE_BYTES) throw new ToolPolicyError('content exceeds the 1 MiB write limit')
         const { path, relative: rel } = await writable(text(args.path, 'path'))
+        const previous = await readFile(path).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+        const revision = context.analysisScratch ? await readFile(path, 'utf8').then(content => (context.artifacts ?? defaultResultStore).save(artifactOwner(context), content), error => { if (error.code === 'ENOENT') return undefined; throw error }) : undefined
         await context.beforeTool?.([path])
         context.signal?.throwIfAborted()
+        const current = await readFile(path).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+        if (previous === null ? current !== null : current === null || !previous.equals(current)) return { output: `File changed externally; nothing written. ${staleEvidence(current?.toString('utf8') ?? '')}`, failed: true, paths: [] }
         await mkdir(join(path, '..'), { recursive: true })
         context.signal?.throwIfAborted()
         if (args.append === true) {
@@ -234,7 +255,7 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
           await appendFile(path, content, 'utf8')
         } else await writeFile(path, content, 'utf8')
         await context.afterTool?.([path], true)
-        return { output: `${args.append === true ? 'appended to' : 'wrote'} ${rel} (${content.length} characters)`, failed: false, paths: [path] }
+        return { output: `${args.append === true ? 'appended to' : 'wrote'} ${rel} (${content.length} characters)${revision ? `; previous revision artifact=${revision}` : ""}`, failed: false, paths: [path] }
       }
       case 'edit_file': {
         const oldText = text(args.old_text, 'old_text')
@@ -242,13 +263,16 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         const { path, relative: rel } = await writable(text(args.path, 'path'))
         const before = await readFile(path, 'utf8')
         const occurrences = before.split(oldText).length - 1
-        if (!occurrences) return { output: `old_text was not found in ${rel}`, failed: true, paths: [] }
+        if (!oldText) throw new ToolPolicyError('old_text must not be empty')
+        if (!occurrences) return { output: `old_text was not found in ${rel}; ${staleEvidence(before)}`, failed: true, paths: [] }
         if (occurrences > 1 && args.replace_all !== true) return { output: `old_text appears ${occurrences} times in ${rel}; pass replace_all or use a longer unique snippet`, failed: true, paths: [] }
+        const revision = context.analysisScratch ? (context.artifacts ?? defaultResultStore).save(artifactOwner(context), before) : undefined
         await context.beforeTool?.([path])
         context.signal?.throwIfAborted()
-        await writeFile(path, args.replace_all === true ? before.split(oldText).join(newText) : before.replace(oldText, newText), 'utf8')
+        if (await readFile(path, 'utf8') !== before) return { output: `File changed externally; nothing written. ${staleEvidence(await readFile(path, 'utf8'))}`, failed: true, paths: [] }
+        await writeFile(path, args.replace_all === true ? before.split(oldText).join(newText) : before.replace(oldText, () => newText), 'utf8')
         await context.afterTool?.([path], true)
-        return { output: `edited ${rel} (${occurrences} replacement${occurrences === 1 ? '' : 's'})`, failed: false, paths: [path] }
+        return { output: `edited ${rel} (${occurrences} replacement${occurrences === 1 ? '' : 's'})${revision ? `; previous revision artifact=${revision}` : ''}`, failed: false, paths: [path] }
       }
       case 'apply_edits': {
         if (!Array.isArray(args.edits) || !args.edits.length || args.edits.length > 40) throw new ToolPolicyError('edits must be a list of 1 to 40 {old_text, new_text} objects')
@@ -260,7 +284,8 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
           return { oldText, newText }
         })
         const { path, relative: rel } = await writable(text(args.path, 'path'))
-        let content = await readFile(path, 'utf8')
+        const original = await readFile(path, 'utf8')
+        let content = original
         const status: string[] = []
         // Every anchor is checked against the file as it stands after the previous edits, so
         // edits apply in order, and one failure leaves the file untouched.
@@ -268,39 +293,90 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
           const occurrences = content.split(edit.oldText).length - 1
           if (occurrences !== 1) {
             status.push(`edit ${index + 1}: ${occurrences === 0 ? 'old_text not found' : `old_text appears ${occurrences} times`}`)
-            return { output: `failed: nothing written to ${rel}. ${status.join('; ')}. ${index} earlier edit${index === 1 ? '' : 's'} matched but were not applied either; fix this anchor (it must occur exactly once in the current file) and send the whole call again.`, failed: true, paths: [] }
+            return { output: `failed: nothing written to ${rel}. ${status.join('; ')}. ${index} earlier edit${index === 1 ? '' : 's'} matched but were not applied either; ${staleEvidence(original)}`, failed: true, paths: [] }
           }
           content = content.replace(edit.oldText, () => edit.newText)
           status.push(`edit ${index + 1}: ok`)
         }
+        const revision = context.analysisScratch ? (context.artifacts ?? defaultResultStore).save(artifactOwner(context), original) : undefined
         await context.beforeTool?.([path])
         context.signal?.throwIfAborted()
+        if (await readFile(path, 'utf8') !== original) return { output: `File changed externally; nothing written. ${staleEvidence(await readFile(path, 'utf8'))}`, failed: true, paths: [] }
         await writeFile(path, content, 'utf8')
         await context.afterTool?.([path], true)
-        return { output: `applied ${edits.length} edit${edits.length === 1 ? '' : 's'} to ${rel} (${status.join('; ')})`, failed: false, paths: [path] }
+        return { output: `applied ${edits.length} edit${edits.length === 1 ? '' : 's'} to ${rel} (${status.join('; ')})${revision ? `; previous revision artifact=${revision}` : ''}`, failed: false, paths: [path] }
       }
       case 'run_command': {
-        const command = text(args.command, 'command')
+        const forms = ['command', 'code', 'script'].filter(key => args[key] !== undefined)
+        if (forms.length !== 1) throw new ToolPolicyError('Provide exactly one of command, code, script')
+        const quote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
+        const cwd = await resolveInWorkspace(context.workspace, args.cwd === undefined ? '.' : text(args.cwd, 'cwd'))
+        if (!(await stat(cwd.path)).isDirectory()) throw new ToolPolicyError('cwd must be a directory')
+        const runtime = args.runtime === undefined ? 'bash' : text(args.runtime, 'runtime')
+        if (!['python3', 'python', 'node', 'bash'].includes(runtime)) throw new ToolPolicyError('runtime must be python3, python, node or bash')
+        if(forms[0]==='command'&&(runtime!=='bash'||args.args!==undefined))throw new ToolPolicyError('command is literal bash shell text and cannot be combined with runtime/args. To run a saved Python file use {"script":"file.py","runtime":"python3"}; for supplied Python use {"code":"print(1)","runtime":"python3"}. Nothing ran. Use the actual workspace filename.')
+        if (args.args !== undefined && (!Array.isArray(args.args) || args.args.some(value => typeof value !== 'string' || value.includes('\0')))) throw new ToolPolicyError('args must be strings without NUL bytes')
+        let command: string, scriptArtifact: string | undefined
+        if (forms[0] === 'command') command = text(args.command, 'command')
+        else {
+          let script: string, setup = ''
+          if (forms[0] === 'code') {
+            const code = text(args.code, 'code')
+            if (Buffer.byteLength(code) > 12 * 1024) throw new ToolPolicyError('code exceeds the 12 KiB inline-script limit; use a workspace script path for larger programs')
+            scriptArtifact = (context.artifacts ?? defaultResultStore).save(artifactOwner(context), code)
+            const extension = runtime.startsWith('python') ? '.py' : runtime === 'node' ? '.cjs' : '.sh'
+            if (context.analysisScratch) {
+              const scratch = await writable(context.analysisScratch + '/script-' + randomUUID() + extension)
+              await mkdir(join(scratch.path, '..'), { recursive: true })
+              await writeFile(scratch.path, code, { flag: 'wx' })
+              script = '/workspace/' + scratch.relative
+            } else {
+              script = '/tmp/conductor-script-' + randomUUID() + extension
+              setup = 'printf %s ' + quote(Buffer.from(code).toString('base64')) + ' | base64 -d > ' + quote(script) + ' && '
+            }
+          } else {
+            const source = await resolveInWorkspace(context.workspace, text(args.script, 'script'))
+            if ((await stat(source.path)).size > MAX_WRITE_BYTES) throw new ToolPolicyError('Saved script exceeds the 1 MiB diagnostic snapshot limit')
+            scriptArtifact = (context.artifacts ?? defaultResultStore).save(artifactOwner(context), await readFile(source.path, 'utf8'))
+            script = '/workspace/' + source.relative
+          }
+          command = setup + runtime + ' ' + quote(script) + ' ' + ((args.args ?? []) as string[]).map(quote).join(' ')
+        }
         assertNoPackageInstall(command)
         // The container has no network and never sees the owner's credentials, so a push can
         // only run on the host. With the repository grant on, one is brokered there under the
         // checks in git-push.ts; without it, the refusal says so rather than letting the model
         // watch git fail obscurely inside the sandbox.
         if (mentionsGitPush(command)) {
+          if (context.analysis || context.analysisScratch) throw new ToolPolicyError('Analysis source is read-only; repository mutation is unavailable')
           if (!(context.grants ?? NO_GRANTS).git) throw new ToolPolicyError('Tool denied by policy: pushing needs repository writes turned on for this conversation')
           const pushed = await brokeredGitPush(context.workspace, command, context.signal)
           return { ...pushed, paths: [] }
         }
         if (!context.sandbox) throw new SandboxUnavailableError('Sandbox unavailable: command execution is disabled without the Docker sandbox')
-        const result = await context.sandbox.exec(command, Math.max(1, Math.min(integer(args.timeout_sec, context.timeoutSec), context.timeoutSec)), context.signal)
+        if (context.analysisScratch) {
+          const scratch = await resolveWritablePath(context.workspace, context.analysisScratch)
+          if (scratch.relative === '.') throw new ToolPolicyError('Analysis scratch must be a task subdirectory')
+          await mkdir(scratch.path, { recursive: true })
+          context.sandbox.setAnalysisAccess(scratch.relative)
+        } else context.sandbox.setAnalysisMode?.(!!context.analysis)
+        const marker = '__CONDUCTOR_PAYLOAD_' + randomUUID().replace(/-/g, '') + '__'
+        const execution = `cd ${quote('/workspace/' + cwd.relative)} || exit 125; printf 'environment: os=Linux sandbox=Docker cwd=%s runtime=%s\n' "$PWD" "$(command -v ${runtime} || printf unavailable)"; ${runtime} --version 2>&1; printf '\\n${marker}\\n'; printf '\\n${marker}\\n' >&2; ` + command
+        const result = await context.sandbox.exec(execution, Math.max(1, Math.min(integer(args.timeout_sec, context.timeoutSec), context.timeoutSec)), context.signal)
+        const payload = splitExecutionEnvelope(result.stdout, result.stderr, marker)
+        const environment = `[environment: ${JSON.stringify({ discovery: payload.environment.slice(0, 1024), stderr: payload.environmentStderr.slice(0, 1024), truncated: payload.environment.length > 1024 || payload.environmentStderr.length > 1024 })}]`
+        const metadata = `[execution: payload_started=${payload.payloadStarted}; stdout_empty=${payload.payloadStarted ? payload.stdout.length === 0 : "unknown"}; stderr_empty=${payload.payloadStarted ? payload.stderr.length === 0 : "unknown"}; exit_code=${result.exitCode}; timed_out=${result.timedOut}; cancelled=${result.cancelled ?? false}; truncated=${result.truncated}; duration_ms=${result.durationMs}; source_read_only=${!!(context.analysis || context.analysisScratch)}]`
+        const full = `${metadata}\n${environment}\nstdout:\n${payload.stdout}\nstderr:\n${payload.stderr}`
+        const artifact = (context.artifacts ?? defaultResultStore).save(artifactOwner(context), full)
         const parts = [
-          result.stdout.trim() ? `stdout:\n${result.stdout.trim()}` : '',
-          result.stderr.trim() ? `stderr:\n${result.stderr.trim()}` : '',
+          `${metadata}\n${environment}\n[result_artifact: id=${artifact}; read_file artifact=${artifact} byte_offset=0 byte_limit=4096; retained_output=${result.truncated ? 'partial: execution output cap reached' : 'complete'}]${scriptArtifact ? `\n[script_artifact: id=${scriptArtifact}]` : ''}`,
+          `stdout:\n${payload.stdout}`,
+          `stderr:\n${payload.stderr}`,
           result.timedOut ? 'command exceeded its time limit and was terminated' : '',
           result.truncated ? 'output was truncated at the sandbox limit' : '',
           `exit code: ${result.exitCode}`
         ].filter(Boolean)
-        return { output: parts.join('\n\n'), failed: result.exitCode !== 0, paths: [], exitCode: result.exitCode }
+        return { output: parts.join('\n\n'), failed: result.exitCode !== 0 || !payload.payloadStarted, paths: [], exitCode: result.exitCode }
       }
       default:
         throw new ToolPolicyError(`Tool denied by policy: ${name}`)

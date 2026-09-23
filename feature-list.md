@@ -1,4 +1,5 @@
 Bug list:
+- [~] Local file-processing execution: harness repairs and ordinary Ornith/UI validation delivered; short-segment model reliability remains limited (docs/local-file-execution.md). <!-- conductor-task:local-file-processing-e2e agent=agent_mueapu6k_u5nkaij -->
 1. [Implemented] Double clicking to copy will only work inside terminals.
 2. [Implemented] Bug with long text going over parts of UI like scrollbar & cursor position
 3. [Implemented] Add button to easily toggle breaking of words inside editors based on current tab/window size
@@ -649,3 +650,5 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] Phone access over Tailscale from any network: Settings > Phone is a four-step guided setup (Tailscale on the phone, a trusted address, pairing, Home Screen and notifications) with a QR code, a status read from Tailscale and the listener, and a retry per step; the phone keeps the tailnet address; the phone app shows a boot card, a connection check (#diagnose over the unauthenticated /api/health), a Safari hand-off trust page and a pairing landing that copes with Chrome on iOS instead of a blank screen; the settings panel has searchable page navigation (commit a05744e). <!-- conductor-task:phone-tailscale-setup-and-settings-nav agent=agent_mudb8nhm_wvc846v -->
 
 - [x] A controller on Auto spawns coworkers on Auto, and "Review coworkers" makes Auto more automatic instead of less: the opt-in no longer drops a Claude coworker to native manual mode or turns Codex's unattended answers off; every request a reviewed coworker still raises is reviewed by a stronger model and answered, reviews queue instead of pausing, and only an explicit ask rule or an owner-only reach (system, credentials, recursive deletion) still lands on the owner. Delivered as commit 18312fd and local update 0.1.53-local.1790160137286. <!-- conductor-task:review-coworkers-auto agent=agent_mudb8nhm_wvc846v -->
+
+- [ ] typing in web app is broken on phone , content is too way up and we can’t see text. Make it easy to see what we’re typing no matter where. <!-- conductor-task:f0f8aaf7-80a2-41b2-968d-58c95a89c92f -->

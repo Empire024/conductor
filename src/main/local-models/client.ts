@@ -2,7 +2,7 @@
  *  this protocol shape to other providers, so nothing new is invented here: one streaming chat
  *  completion endpoint, tool calls in the standard function-call form, and the local API key on
  *  every request. */
-import { assertRequestBudget } from './context-budget.ts'
+import { assertRequestBudget, ContextBudgetError } from './context-budget.ts'
 
 export interface ToolCall { id: string; name: string; arguments: string }
 
@@ -88,6 +88,8 @@ export class StreamAccumulator {
 }
 
 export interface CompletionRequest {
+  measureTokens?: boolean
+  onBudget?(measurement: { promptTokens: number; method: 'runtime tokenizer' | 'conservative estimate' }): void
   endpoint: string
   apiKey: string
   model: string
@@ -158,8 +160,35 @@ function readTimings(value: unknown): LlamaTimings | undefined {
   return Object.keys(timings).length ? timings : undefined
 }
 
+const unsupportedTokenizer = new Set<string>()
+/** Measures the rendered chat, including tool schemas and generation framing. No generation. */
+export async function runtimePromptTokens(request: CompletionRequest): Promise<number | undefined> {
+  if(!request.measureTokens || unsupportedTokenizer.has(request.endpoint)) return undefined
+  try {
+    const signal = request.signal ? AbortSignal.any([request.signal,AbortSignal.timeout(3000)]) : AbortSignal.timeout(3000)
+    const headers = {'Content-Type':'application/json',Authorization:`Bearer ${request.apiKey}`}
+    const template=await fetch(`${request.endpoint}/apply-template`,{method:'POST',headers,signal,body:JSON.stringify({messages:request.messages,tools:request.tools??[],add_generation_prompt:true,...(request.reasoningEffort?{reasoning_effort:request.reasoningEffort}:{})})})
+    if(!template.ok) { unsupportedTokenizer.add(request.endpoint); return undefined }
+    const rendered=await template.json() as {prompt?:unknown}
+    if(typeof rendered.prompt!=='string'||rendered.prompt.length>2_000_000) return undefined
+    const response=await fetch(`${request.endpoint}/tokenize`,{method:'POST',headers,signal,body:JSON.stringify({content:rendered.prompt,add_special:false,parse_special:true})})
+    if(!response.ok) {unsupportedTokenizer.add(request.endpoint);return undefined}
+    const result=await response.json() as {tokens?:unknown}
+    return Array.isArray(result.tokens)&&result.tokens.every(n=>Number.isInteger(n)) ? result.tokens.length : undefined
+  } catch { request.signal?.throwIfAborted(); return undefined }
+}
+
 export async function chatCompletion(request: CompletionRequest): Promise<CompletionResult> {
-  if (request.contextTokens !== undefined) assertRequestBudget(request.messages, request.tools ?? [], request.contextTokens, request.maxTokens ?? 4096)
+  if (request.contextTokens !== undefined) {
+    const promptTokens=await runtimePromptTokens(request), responseTokens=request.maxTokens??4096
+    if(promptTokens!==undefined) {
+      request.onBudget?.({promptTokens,method:'runtime tokenizer'})
+      if(promptTokens+responseTokens>request.contextTokens)throw new ContextBudgetError({promptTokens,responseTokens,contextTokens:request.contextTokens,totalTokens:promptTokens+responseTokens})
+    } else {
+      const budget=assertRequestBudget(request.messages,request.tools??[],request.contextTokens,responseTokens)
+      request.onBudget?.({promptTokens:budget.promptTokens,method:'conservative estimate'})
+    }
+  }
   // An early stop closes the stream from this side; the caller's own signal still aborts too.
   const stopper = new AbortController()
   const onCallerAbort = (): void => stopper.abort(request.signal?.reason)

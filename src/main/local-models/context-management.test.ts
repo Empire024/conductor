@@ -122,7 +122,7 @@ describe('context management in the local agent loop', () => {
   it('warns at the soft round, presses to finish, and stops at the hard limit rather than looping forever', async () => {
     const server = await stub((sent, index) => ({ frames: [call(`r${index}`, 'read_file', { path: `big-${index % 12}.txt`, offset: 1 + index, limit: 3 })] }))
     cleanup.push(() => server.server.close())
-    const session = new LocalAgentSession({ endpoint: server.endpoint, apiKey: KEY, model: 'local/ornith1.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768, policy: { rounds: { softWarningAt: 2, strongWarningAt: 3, finishAt: 4, hardLimit: 5 } } })
+    const session = new LocalAgentSession({ endpoint: server.endpoint, apiKey: KEY, model: 'local/ornith1.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768, policy: { task:{maxRounds:5}, rounds: { softWarningAt: 2, strongWarningAt: 3, finishAt: 4, hardLimit: 5 } } })
     const notices: string[] = []
     const outcome = await session.run('Keep reading.', { notice: message => notices.push(message) })
     expect(outcome.stopReason).toBe('round_limit')
@@ -133,7 +133,7 @@ describe('context management in the local agent loop', () => {
     expect(lastUser(server.sent[3]!)).toContain('2 tool rounds remain. Focus')
     expect(lastUser(server.sent[4]!)).toContain('Finish phase')
     expect(allUser(server.sent[1]!)).not.toContain('[Conductor]')
-    expect(notices.at(-1)).toContain('hard limit')
+    expect(outcome.text).toContain('cumulative limit')
     // 10: the reserve tightens for the finish phase.
     expect(server.sent[4]!.max_tokens).toBe(1536)
     expect(server.sent[0]!.max_tokens).toBe(2560)
@@ -149,7 +149,7 @@ describe('context management in the local agent loop', () => {
     expect(outcome.report.loopWarnings).toBe(1)
     expect(outcome.report.rounds).toBe(6)
     expect(lastUser(server.sent[3]!)).toContain('repeating an unsuccessful action (read_file, 3 times')
-    expect(notices.some(message => message.startsWith('Stopped: The same read_file call'))).toBe(true)
+    expect(notices.some(message => message.startsWith('Stopped: The read_file approach'))).toBe(true)
   })
 
   it('does not raise a loop warning while the model makes distinct progress', async () => {
@@ -205,7 +205,8 @@ describe('context management in the local agent loop', () => {
     expect(outcome.stopReason).toBe('unverified_claim')
     expect(outcome.report.unverified).toMatch(/no write, edit or apply_edits tool call ran/)
     expect(outcome.report.filesChanged).toEqual([])
-    expect(outcome.text).toContain('All 5 exact replacements')
+    expect(outcome.text).toContain('Could not complete the task')
+    expect(outcome.text).not.toContain('All 5 exact replacements')
   })
 
   it('cuts off a reply that reasons in circles, keeps the monologue out of the history, and lets the model act', async () => {

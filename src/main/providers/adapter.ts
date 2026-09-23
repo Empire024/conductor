@@ -4,6 +4,11 @@ export interface AdapterOptions {
   executable: string
   cwd: string
   runtimeId: string
+  /** Registered conversation identity, stable across transport incarnations. */
+  localTaskId?: string
+  localCheckpoint?: import('../local-models/session-checkpoint').SessionCheckpoint
+  /** Host-only evaluation override; never accepted from model tools or renderer settings. */
+  localPolicy?: import('../local-models/agent-policy').LocalAgentPolicyOverrides
   nativeSessionId?: string
   newNativeSession?: boolean
   settings: SessionSettings

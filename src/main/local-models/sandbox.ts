@@ -5,7 +5,7 @@ import { mkdir, readdir, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, parse, relative, resolve } from 'node:path'
 import type { SandboxConfig } from './config.ts'
 import { runDir } from './config.ts'
-import { isSecretPath } from './workspace.ts'
+import { isSecretPath, resolveInWorkspace } from './workspace.ts'
 
 /** The sandbox could not be used. Every tool that needs execution turns this into a refusal;
  *  nothing in this module or its callers ever falls back to a host shell. That is the whole
@@ -69,6 +69,7 @@ export interface SandboxResult {
   stderr: string
   truncated: boolean
   timedOut: boolean
+  cancelled?: boolean
   durationMs: number
 }
 
@@ -91,15 +92,19 @@ interface RunOutcome { code: number | null; stdout: string; stderr: string; time
 function runDocker(args: string[], timeoutMs: number, maxBytes: number): Promise<RunOutcome> {
   return new Promise(resolvePromise => {
     let stdout = '', stderr = '', bytes = 0, timedOut = false, truncated = false, settled = false
+    const outChunks: Buffer[] = [], errChunks: Buffer[] = []
     const child = spawn(dockerExecutable(), args, { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
-    const finish = (outcome: RunOutcome): void => { if (settled) return; settled = true; clearTimeout(timer); resolvePromise(outcome) }
+    const finish = (outcome: RunOutcome): void => {
+      if (settled) return
+      settled = true; clearTimeout(timer)
+      resolvePromise({ ...outcome, stdout: Buffer.concat(outChunks).toString('utf8'), stderr: Buffer.concat(errChunks).toString('utf8') })
+    }
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, timeoutMs)
     const capture = (chunk: Buffer, target: 'out' | 'err'): void => {
       const remaining = Math.max(0, maxBytes - bytes)
       bytes += chunk.length
-      const captured = chunk.subarray(0, remaining).toString('utf8')
-      if (target === 'out') stdout += captured
-      else stderr += captured
+      const captured = chunk.subarray(0, remaining)
+      if (captured.length) (target === 'out' ? outChunks : errChunks).push(captured)
       if (bytes > maxBytes) { truncated = true; child.kill('SIGKILL') }
     }
     child.stdout.on('data', chunk => capture(chunk as Buffer, 'out'))
@@ -418,6 +423,8 @@ export function containerRunArgs(options: {
   masks: SecretMask[]
   emptyFile: string
   /** Off unless the owner grants it in the conversation: see the .git mount below. */
+  analysis?: boolean
+  analysisScratch?: string
   gitWritable?: boolean
   /** The host repository's own `core.autocrlf`, mirrored into a granted container: see below. */
   gitAutocrlf?: string
@@ -448,13 +455,14 @@ export function containerRunArgs(options: {
     '--tmpfs', `/home/agent:rw,nosuid,nodev,size=${Math.min(options.sandbox.tmpfsSizeMb, 128)}m`,
     '--label', 'conductor.local-sandbox=1',
     '--workdir', '/workspace',
-    '--mount', `type=bind,source=${workspace},target=/workspace`,
+    '--mount', `type=bind,source=${workspace},target=/workspace${options.analysis ? ",readonly" : ""}`,
+    ...(options.analysis && options.analysisScratch ? ['--mount', `type=bind,source=${workspace}/${options.analysisScratch},target=/workspace/${options.analysisScratch}`] : []),
     // Repository metadata stays readable for status and diffs but can never be rewritten, so a
     // sandboxed turn cannot install a git hook or change remotes in the owner's repository.
     // The owner can grant write access per conversation; the container still has no network, so
     // the grant reaches local history only. A push under that grant is brokered on the host
     // instead, under the checks in git-push.ts — nothing in here ever reaches a remote.
-    ...(!options.gitWritable && existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : []),
+    ...((options.analysis || !options.gitWritable) && existsSync(join(options.workspace, '.git')) ? ['--mount', `type=bind,source=${workspace}/.git,target=/workspace/.git,readonly`] : []),
     // An installed dependency tree is an input to a sandboxed command and never its output. The
     // container has no network, so it can never repair an install — but npm and npx tear a tree
     // down *before* they discover that, and a plain `npx tsc` in this repo removed the owner's
@@ -554,6 +562,15 @@ export class DockerSandbox {
   private starting?: Promise<void>
   private mountSignature?: string
   private gitWritable = false
+  private analysis = false
+  private analysisScratch?: string
+
+  setAnalysisMode(enabled: boolean): void { this.analysis = enabled; this.analysisScratch = undefined }
+
+  setAnalysisAccess(scratchRelative: string): void {
+    if (!scratchRelative || scratchRelative === '.' || /(^|[\\/])\.\.([\\/]|$)|^[\\/]|[:,=\r\n]/.test(scratchRelative) || isSecretPath(scratchRelative)) throw new SandboxUnavailableError('Invalid analysis scratch subdirectory')
+    this.analysis = true; this.analysisScratch = scratchRelative.replace(/\\/g, '/')
+  }
   private gitAutocrlf?: string
 
   constructor(sessionId: string, workspace: string, sandbox: SandboxConfig) {
@@ -567,15 +584,19 @@ export class DockerSandbox {
   setGitAccess(writable: boolean): void { this.gitWritable = writable }
 
   private signature(masks: SecretMask[]): string {
-    return JSON.stringify({ masks, git: this.gitWritable, autocrlf: this.gitAutocrlf ?? null, workspace: resolve(this.workspace) })
+    return JSON.stringify({ masks, analysis: this.analysis, analysisScratch: this.analysisScratch, git: this.gitWritable, autocrlf: this.gitAutocrlf ?? null, workspace: resolve(this.workspace) })
   }
 
   /** The mounts this session should be running with right now: the cached secret scan, plus the
    *  index-backed replicas that keep a granted `git` from committing a mask as a deletion. Plans
    *  only — nothing is written to disk until the container is actually created. */
   private async plannedMasks(): Promise<{ masks: SecretMask[]; writes: TrackedMaskWrite[] }> {
+    if (this.analysisScratch) {
+      const scratch = await resolveInWorkspace(this.workspace, this.analysisScratch)
+      if (scratch.relative !== this.analysisScratch || !(await stat(scratch.path)).isDirectory()) throw new SandboxUnavailableError('Analysis scratch must be a canonical task directory')
+    }
     const masks = await secretPathsFor(this.workspace)
-    if (!this.gitWritable) return { masks, writes: [] }
+    if (!this.gitWritable || this.analysis) return { masks, writes: [] }
     this.gitAutocrlf = await hostAutocrlf(this.workspace)
     return trackedMaskPlan(this.workspace, masks, join(runDir(), 'masked-tracked'))
   }
@@ -611,7 +632,7 @@ export class DockerSandbox {
     const emptyFile = join(runDir(), 'masked-empty')
     if (!existsSync(emptyFile)) writeFileSync(emptyFile, '', 'utf8')
     await materializeMaskSources(this.workspace, planned.writes)
-    const args = containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks: planned.masks, emptyFile, gitWritable: this.gitWritable, gitAutocrlf: this.gitAutocrlf })
+    const args = containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks: planned.masks, emptyFile, analysis: this.analysis, analysisScratch: this.analysisScratch, gitWritable: this.gitWritable, gitAutocrlf: this.gitAutocrlf })
     args.splice(args.indexOf('--label'), 0, '--label', `${MOUNT_LABEL}=${digest}`)
     const created = await runDocker(args, 120_000, 256 * 1024)
     if (created.spawnError || created.code !== 0) throw new SandboxUnavailableError(`Sandbox failed to start: ${(created.stderr || created.stdout).trim().slice(0, 400) || 'docker run failed'}`)
@@ -634,9 +655,8 @@ export class DockerSandbox {
     const cancel = (): void => { stopping ??= this.stop() }
     signal?.addEventListener('abort', cancel, { once: true })
     let outcome: RunOutcome
-    try { outcome = await runDocker(execArgs(this.name, command, timeoutSec), (timeoutSec + 15) * 1000, this.sandbox.maxOutputBytes) }
+    try { outcome = await runDocker(execArgs(this.name, command, timeoutSec), (timeoutSec + 15) * 1000, 8 * 1024 * 1024) }
     finally { signal?.removeEventListener('abort', cancel); await stopping }
-    signal?.throwIfAborted()
     if (outcome.spawnError) throw new SandboxUnavailableError('Docker unavailable: the docker CLI could not be launched')
     const truncated = outcome.truncated
     // 124 is `timeout` reporting that it killed the command; 137 is the kill that followed.
@@ -644,7 +664,7 @@ export class DockerSandbox {
     // Overflow terminates the Docker client, not the container's process tree. Waiting for
     // container removal also prevents escaped/delayed children surviving a command timeout.
     if (truncated || timedOut) await this.stop()
-    return { exitCode: truncated ? -1 : outcome.code ?? -1, stdout: outcome.stdout, stderr: outcome.stderr, truncated, timedOut, durationMs: Date.now() - started }
+    return { cancelled: signal?.aborted ?? false, exitCode: signal?.aborted ? -1 : truncated ? -1 : outcome.code ?? -1, stdout: outcome.stdout, stderr: outcome.stderr, truncated, timedOut, durationMs: Date.now() - started }
   }
 
   async stop(): Promise<void> {

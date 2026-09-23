@@ -73,6 +73,14 @@ export function shapeDiffOutput(raw: string, limit: number): { text: string; exc
 /** The shaped form of one raw tool result for the prompt. `input` is the parsed call arguments,
  *  used only to recognise what kind of command ran. */
 export function shapeToolOutput(name: string, input: Record<string, unknown>, raw: string, policy: ToolOutputPolicy): ShapedOutput {
+  // Execution evidence and retrieval handles survive test/diff shaping too. They are the
+  // model's route back to the complete captured output, not merely a timeline reference.
+  const evidence = raw.split('\n').filter(line => /^\[(execution|environment|result_artifact|script_artifact):/.test(line)).join('\n')
+  if (name === 'run_command' && evidence) {
+    const body = raw.split('\n').filter(line => !/^\[(execution|environment|result_artifact|script_artifact):/.test(line)).join('\n')
+    const shaped = shapeToolOutput(name, input, body, policy)
+    return { ...shaped, text: evidence + '\n' + shaped.text }
+  }
   if (name === 'run_command') {
     const command = typeof input.command === 'string' ? input.command : ''
     if (DIFF_COMMAND.test(command)) { const shaped = shapeDiffOutput(raw, policy.commandChars); return { text: shaped.text, excludedChars: shaped.excluded, kind: 'diff' } }

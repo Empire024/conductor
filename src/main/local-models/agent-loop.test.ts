@@ -324,7 +324,10 @@ describe('local agent loop', () => {
     const notices: string[] = []
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
     // The text stands, and the stop reason says it was the output limit rather than a finished answer.
-    expect(await session.run('Explain', { notice: message => notices.push(message) })).toMatchObject({ stopReason: 'output_limit', text: 'Half of an ans' })
+    const outcome = await session.run('Explain', { notice: message => notices.push(message) })
+    expect(outcome.stopReason).toBe('output_limit')
+    expect(outcome.text).toContain('Half of an ans')
+    expect(outcome.text).toContain('Could not complete')
     expect(notices.join(' ')).toContain('token limit')
   })
 

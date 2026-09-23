@@ -348,15 +348,14 @@ loopback — the container never needs to reach the model servers.
   Docker Desktop put it — usually `C:` — and is deliberately not relocated by this stack.
 - If the local root drive is disconnected, every command fails closed with that reason; nothing is
   recreated on the system drive.
-- Conversations are not resumable and there is no approval/question flow, plan mode or effort
-  selection for local models. A restored tab keeps its provider, model and transcript, but the
-  model itself starts the next turn with no memory of the conversation before the restart.
+- Local conversations checkpoint scoped execution state and paired messages in the existing
+  session store. A restored tab retains evidence, cumulative budgets and artifact handles.
+  In-flight work after a process crash becomes a visible blocker, never an automatic replay.
+  Local models still have no approval/question flow, plan mode or effort selection.
 - Local tabs cannot be placed on a paired machine, and cannot be handed to a native CLI view.
 - No automatic routing between local and cloud models, no benchmarking, no quant auto-selection,
   no MCP, no llama.cpp agent mode, no GUI model manager.
-- Both servers can be resident, but only one should do meaningful inference at a time; if VRAM
-  pressure causes instability, lower the 9B quantization or context first, then `gpuLayers` for
-  the 35B.
+- MAIN admits one model server at a time; see section 13 and `docs/machine-profile.md`.
 - Startup verification re-hashes ~26 GB by default; use `-Fast` when that is too slow.
 
 ## 14. Context and progress management for local agents (2026-09-23)
@@ -369,7 +368,9 @@ until it broke what worked. `src/main/local-models/agent.ts` now manages all thr
 one typed policy (`agent-policy.ts`, defaults below) rather than by prompt text the model ignores.
 
 - **Reserve and budget.** Every request is measured before it is sent (messages, tool schemas and
-  framing, at three characters per token, pessimistic) against the window less the reserve for the
+  framing). Authenticated runtime template/tokenizer endpoints provide the count when available;
+  otherwise three characters per token is an explicitly conservative estimate. The effective
+  window is the smaller configured/server context, not the model's training context, less reserve for the
   answer: 2,560 tokens on a tool round, 1,536 once the loop has asked for the final answer. The
   usage figures the ring shows carry both (`contextReserveTokens`, `contextCapacityTokens`).
 - **Tool output shaping** (`tool-output.ts`). The timeline gets every raw result; the prompt gets
@@ -383,11 +384,14 @@ one typed policy (`agent-policy.ts`, defaults below) rather than by prompt text 
   newest tool groups stay verbatim; at 90% only the newest. A request the server still refuses as
   too large gets one aggressive compaction and one retry. Compaction is deterministic and local:
   no model call, so it cannot fail for want of context. The full history stays in the timeline.
-- **Rounds** (`progress.ts`). Soft warning at 10, strong at 16, finish phase at 20, hard stop at
-  24 (research grant: 24 / 36 / 42 / 48). Each stage speaks once, as a user turn.
+- **Rounds** (`progress.ts`). Soft warning at 10, strong at 16, finish phase at 20, segment limit
+  24 (research: 24 / 36 / 42 / 48). A segment with new source evidence checkpoints and continues
+  automatically after compaction. The whole task remains bounded by 72 tool rounds, 96 requests,
+  three recoveries, 20 minutes and one million reported tokens. No continuation resets them.
 - **Stagnation.** The same call with the same result three times draws a correction; six ends the
   run with a blocker report. Six rounds without a new file change or command result draw one
-  warning. Distinct edits and distinct commands never trigger it.
+  warning. File-processing script rewrites and exit zero alone do not count as progress;
+  equivalent failed approaches remain detectable across intervening probes.
 - **Runaway generation.** A reply dense with self-corrections ("wait", "actually", "let me
   rethink") is cut off after 2,500 characters, never stored, and the model is told to act; a
   second such reply ends the turn as `output_limit`.
@@ -409,6 +413,14 @@ one typed policy (`agent-policy.ts`, defaults below) rather than by prompt text 
   `agents.status({agentSessionId})` returns the compact supervision view (a few hundred bytes);
   `agents.compact({agentSessionId})` folds an idle local coworker's transcript into its task state
   inside the same conversation, the fresh-tab pattern without a new tab.
+- **File processing.** Named-file lookup/reconciliation requests select a small deterministic
+  tool path. Bounded inspection preserves raw/escaped/hex evidence. `process_files` accepts
+  explicit target/source paths for recognized headers or independently observed schemas for
+  fixed records. It checks coverage, signed money, dates, lineage, ambiguity and transaction reuse
+  before rendering the result. A shell exit code cannot satisfy this gate. Sources are read-only;
+  generated scripts use task-owned `.conductor-scratch/` paths. Large output has durable,
+  project/task-scoped retrieval handles. See [implementation and live evidence](local-file-execution.md)
+  for supported layouts and remaining limitations; this is not a universal statement parser.
 - **KV cache.** `kvCacheType` (`f16` default, `q8_0` recommended) and `flashAttention` in a
   model's config entry are passed to `llama-server` as `--cache-type-k/-v` and `--flash-attn`
   only when the installed binary lists those flags in `--help` (build b10901 does). A quantized V

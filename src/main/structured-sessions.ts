@@ -1,4 +1,5 @@
 import { concreteModel } from '../shared/agent-model-selection'
+import { sessionCheckpoint } from './local-models/session-checkpoint'
 import { deriveConversationTitle } from '../shared/conversation-title'
 import { readClaudeHistory, hasClaudeHistory, historyEvent } from './native-history'
 import { randomUUID } from 'node:crypto'
@@ -221,7 +222,13 @@ export class StructuredSessions {
       approvalReviewer: this.isApprovalReviewer(id),
       reviewApprovals: Boolean(this.reviewRouting?.enabled(live.spec)),
       authorizeTool: (name, input) => this.approvalGate.guardTool(live.spec, name, input),
-      ...(live.spec.provider === 'local' ? { localControl: async (method: string, args: Record<string, unknown>) => {
+      ...(live.spec.provider === 'local' ? { localTaskId: id,
+        localCheckpoint: sessionCheckpoint(this.database, { projectId: live.spec.projectId, taskId: id }, () => {
+          if (live.closed || live.runtimeId !== runtimeId || this.live.get(id) !== live) throw new Error('Local checkpoint is unavailable for this runtime')
+          this.validateSpec(live.spec)
+          if (this.database.structured.spec<AgentSpec>(id)?.projectId !== live.spec.projectId) throw new Error('Local checkpoint session is no longer registered')
+        }),
+        localControl: async (method: string, args: Record<string, unknown>) => {
         if (live.closed || live.runtimeId !== runtimeId || !this.localControl) throw new Error('Local Conductor bridge is unavailable for this runtime')
         this.validateSpec(live.spec)
         const current = this.database.structured.snapshot(id)!

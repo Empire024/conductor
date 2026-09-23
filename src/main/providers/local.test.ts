@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createServer, type Server } from 'node:http'
 import { createServer as createTcpServer } from 'node:net'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { LocalAdapter, LocalSetupError, localModelAvailability, phaseFor, releaseVerdict } from './local'
@@ -26,11 +26,13 @@ const frame = (delta: Record<string, unknown>, finish?: string): string => JSON.
 
 /** A stand-in llama.cpp server: it answers the health probe, enforces the key and replays
  *  scripted SSE frames, so the adapter can be driven end to end without a model. */
-function stubServer(frames: string[], holdMs = 0, identity = { model: QWEN_9B, anonymous: false }): Promise<{ port: number; server: Server; identity: typeof identity; prompts: string[][]; requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> }> {
+function stubServer(frames: string[], holdMs = 0, identity: { model: string; anonymous: boolean; contextTokens?: number } = { model: QWEN_9B, anonymous: false }): Promise<{ port: number; server: Server; identity: typeof identity; prompts: string[][]; requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> }> {
   const prompts: string[][] = []
   const requests: Array<{ messages: Array<{ role: string; content: string }>; tools?: Array<{ function: { name: string; description: string } }> }> = []
   const server = createServer((request, response) => {
     if (!identity.anonymous && request.headers.authorization !== `Bearer ${KEY}`) { response.writeHead(401).end('{}'); return }
+    if (request.url === '/props' && identity.contextTokens) { response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ default_generation_settings: { n_ctx: identity.contextTokens } })); return }
+    if (request.url === '/apply-template' || request.url === '/tokenize') { response.writeHead(404).end('{}'); return }
     if (request.url?.startsWith('/v1/models')) { response.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ data: [{ id: identity.model }] })); return }
     // No /slots here, like a server built without it: the release policy then relies on what this process knows.
     if (request.method === 'GET') { response.writeHead(404).end(); return }
@@ -113,6 +115,51 @@ describe('local provider adapter', () => {
   const texts = (events: AdapterEvent[], role: 'assistant' | 'status'): string =>
     events.filter(event => event.data.type === 'text' && event.data.role === role).map(event => event.data.type === 'text' ? event.data.text : '').join('')
 
+  it('restores registered task state on start without submitting or replaying a turn', async () => {
+    const { small, workspace } = await stack([frame({ content: 'Recorded answer.' }, 'stop')])
+    let saved: unknown
+    const checkpoint = { load: () => saved, save: async (value: unknown) => { saved = structuredClone(value) } }
+    const events: AdapterEvent[] = []
+    const first = new LocalAdapter({ executable: '', cwd: workspace, runtimeId: 'old-runtime', localTaskId: 'registered-task', localCheckpoint: checkpoint, settings: settings({ permission: 'read-only' }), emit: event => events.push(event) })
+    cleanup.push(() => first.dispose())
+    await first.start()
+    await first.submit('Keep this original input.', settings({ permission: 'read-only' }))
+    expect(await settled(events)).toBe('completed')
+    const before = first.runStatus()
+    expect(saved).toMatchObject({ taskId: 'registered-task' })
+    first.dispose()
+    const restored = new LocalAdapter({ executable: '', cwd: workspace, runtimeId: 'replacement-runtime', localTaskId: 'registered-task', localCheckpoint: checkpoint, settings: settings({ permission: 'read-only' }), emit: () => {} })
+    cleanup.push(() => restored.dispose())
+    const requests = small.requests.length
+    await restored.start()
+    expect(restored.runStatus()).toEqual(before)
+    await restored.start()
+    expect(small.requests).toHaveLength(requests)
+  })
+
+  it.each(['cancelled', 'blocked', 'pending'] as const)('does not restart %s work while restoring a view', async lifecycle => {
+    const { small, workspace } = await stack([frame({ content: 'Recorded answer.' }, 'stop')])
+    let saved: unknown
+    const checkpoint = { load: () => saved, save: async (value: unknown) => { saved = structuredClone(value) } }
+    const events: AdapterEvent[] = []
+    const first = new LocalAdapter({ executable: '', cwd: workspace, runtimeId: 'old-runtime', localTaskId: 'registered-task', localCheckpoint: checkpoint, settings: settings({ permission: 'read-only' }), emit: event => events.push(event) })
+    cleanup.push(() => first.dispose())
+    await first.submit('Keep this input.', settings({ permission: 'read-only' }))
+    expect(await settled(events)).toBe('completed')
+    const stored = saved as { state: { execution: { lifecycle: string; pending?: { id: string; name: string; arguments: string } } } }
+    stored.state.execution.lifecycle = lifecycle === 'pending' ? 'running' : lifecycle
+    if (lifecycle === 'pending') stored.state.execution.pending = { id: 'mutation-before-crash', name: 'write_file', arguments: '{"path":"never-replay.txt","content":"private"}' }
+    first.dispose()
+    const restored = new LocalAdapter({ executable: '', cwd: workspace, runtimeId: 'new-runtime', localTaskId: 'registered-task', localCheckpoint: checkpoint, settings: settings({ permission: 'read-only' }), emit: () => {} })
+    cleanup.push(() => restored.dispose())
+    const requests = small.requests.length
+    await restored.start()
+    expect(restored.runStatus()).toMatchObject({ execution: { lifecycle: lifecycle === 'pending' ? 'blocked' : lifecycle } })
+    if (lifecycle === 'pending') expect(restored.runStatus()).toMatchObject({ execution: { pending: { id: 'mutation-before-crash' } } })
+    expect(small.requests).toHaveLength(requests)
+    expect(existsSync(join(workspace, 'never-replay.txt'))).toBe(false)
+  })
+
   it('says whether a local model can start now: an idle server of ours gives way, a mid-turn one is named', async () => {
     const { small, large, workspace } = await stack([frame({ content: 'ok' }, 'stop')], 600)
     vi.spyOn(resources, 'runningLlamaProcesses').mockReturnValue([])
@@ -175,11 +222,24 @@ describe('local provider adapter', () => {
     await instance.start()
     await instance.submit('answer', settings())
     expect(await settled(events)).toBe('completed')
-    expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { inputTokens: 2100, cachedTokens: 2000, outputTokens: 3, totalTokens: 2103 }, native: { method: 'llama.cpp/timings', payload: { cache_n: 2000, prompt_n: 100, prompt_ms: 90, predicted_ms: 30 } } })
+    expect(events.find(event => event.data.type === 'usage')).toMatchObject({ itemId: expect.stringContaining(':usage:0'), data: { scope: 'message', inputTokens: 2100, cachedTokens: 2000, outputTokens: 3, totalTokens: 2103 }, native: { method: 'llama.cpp/timings', payload: { cache_n: 2000, prompt_n: 100, prompt_ms: 90, predicted_ms: 30 } } })
     // Context figures the ring and "Model context window" read, as the CLIs report them: the
     // configured 32,768-token window, capacity once this round's answer reserve (the policy's
     // tool-round reserve, 2,560 tokens) is held back, and the reserve itself so the pane can say so.
     expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { limits: { contextUsedTokens: 2103, contextCapacityTokens: 32768 - 2560, contextReserveTokens: 2560, modelContextWindow: 32768 } } })
+  })
+
+  it('emits the actual server context ceiling and leaves missing occupancy unknown', async () => {
+    const ready = await stack([frame({ content: 'ok' }, 'stop'), JSON.stringify({ choices: [], usage: { completion_tokens: 3 } })])
+    ready.small.identity.contextTokens = 8192
+    const events: AdapterEvent[] = []
+    const instance = adapter(ready.workspace, events, { permission: 'read-only' })
+    await instance.submit('answer', settings({ permission: 'read-only' }))
+    expect(await settled(events)).toBe('completed')
+    const usage = events.find(event => event.data.type === 'usage')
+    expect(usage).toMatchObject({ data: { scope: 'message', limits: { modelContextWindow: 8192, contextCapacityTokens: 8192 - 2560, contextMeasurement: expect.stringContaining('unknown') } } })
+    expect(usage?.data.type === 'usage' && usage.data.limits).toHaveProperty('contextUsedTokens', null)
+    expect(events.some(event => event.data.type === 'notice' && (event.data.payload as Record<string, unknown> | undefined)?.localEndpointContext)).toBe(true)
   })
 
   const guard = (reason: unknown): void => { if (!(reason instanceof Error) || reason.message !== 'skip') throw reason }
@@ -292,9 +352,9 @@ describe('local provider adapter', () => {
     await instance.submit('open it', settings())
     expect(await settled(events)).toBe('failed')
     const report = events.map(event => localStopOf(event.data)).find(Boolean)
-    expect(report).toMatchObject({ reason: 'stagnation', rounds: 6, hardLimit: 24, loopWarnings: 1, context: { windowTokens: 32768, reserveTokens: 2560 } })
+    expect(report).toMatchObject({ reason: 'stagnation', rounds: 6, hardLimit: 72, task: { segmentLimit: 24 }, loopWarnings: 1, context: { windowTokens: 32768, reserveTokens: 2560 } })
     const notice = events.find(event => event.data.type === 'notice' && localStopOf(event.data))
-    expect(notice && notice.data.type === 'notice' ? notice.data.message : '').toMatch(/^Stopped: repeating without progress after 6 of 24 tool rounds/)
+    expect(notice && notice.data.type === 'notice' ? notice.data.message : '').toMatch(/^Stopped: repeating without progress after 6 of 72 tool rounds/)
     expect(ready.small.requests.length).toBe(6)
     expect(instance.runStatus()).toMatchObject({ task: 'open it', filesChanged: [] })
   })

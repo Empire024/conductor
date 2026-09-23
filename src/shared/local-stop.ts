@@ -54,6 +54,7 @@ export interface LocalStopReport {
   /** Set for unverified_claim: what was claimed without evidence. */
   unverified?: string
   timeline: LocalRoundEntry[]
+  task?: { lifecycle: string; requests: number; recoveries: number; elapsedMs: number; tokens: number; segmentLimit: number; maxRounds: number }
 }
 
 export const LOCAL_STOP_KEY = 'localStop'

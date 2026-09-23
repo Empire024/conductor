@@ -1,7 +1,7 @@
 import type { ChatMessage, CompletionResult, ToolCall, ToolSpec, Usage } from './client.ts'
 import { chatCompletion, LocalRequestError, ruminationVerdict } from './client.ts'
 import type { DockerSandbox } from './sandbox.ts'
-import { runTool, toolSpecs, NO_GRANTS, WRITE_TOOLS, type LocalControl, type LocalGrants, type ToolScope } from './tools.ts'
+import { runTool, toolSpecs, NO_GRANTS, WRITE_TOOLS, analysisScratchPath, type LocalControl, type LocalGrants, type ToolScope, type ToolOutcome } from './tools.ts'
 import { boundedToolResult, ContextBudgetError } from './context-budget.ts'
 import { DEFAULT_LOCAL_AGENT_POLICY, resolveLocalAgentPolicy, RESEARCH_ROUNDS, type LocalAgentPolicy, type LocalAgentPolicyOverrides } from './agent-policy.ts'
 import { compactHistory, emptyTaskState, measureContext, noteCommand, noteConclusion, noteDiscovery, noteFailure, noteFileChanged, notePass, renderTaskState, type CompactionResult, type ContextLevel, type ContextMeasure, type TaskState } from './context-manager.ts'
@@ -10,6 +10,9 @@ import { roundStage, roundStageMessage, StagnationDetector, type RoundStage } fr
 import { completionEstablished, contractConstraints, emptyEvidence, finalizeNow, recordCommand, recordWrite, unverifiedClaim, type AcceptanceResult, type RunEvidence, type TaskContract } from './completion.ts'
 import type { LocalRoundEntry, LocalStopReason, LocalStopReport } from '../../shared/local-stop.ts'
 import { relative } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { newExecutionState, observeExecution, fingerprint, type ExecutionState } from './execution-state.ts'
+import { isFileProcessingTask, processingRequest, processingTool, PROCESSING_GUIDE, observedPlanHint, type ProcessingRun } from './processing-workflow.ts'
 
 /** The whole agent loop for a local model. Conductor stays the orchestrator: llama.cpp only
  *  produces tokens, this loop decides what may run, and every capability it can offer is the
@@ -42,6 +45,9 @@ export interface LocalAgentEvents {
 }
 
 export interface LocalAgentOptions {
+  taskId?: string
+  measureTokens?: boolean
+  checkpoint?: { load(): unknown; save(value: unknown): Promise<void> }
   endpoint: string
   apiKey: string
   model: string
@@ -263,6 +269,7 @@ const toPosix = (path: string): string => path.replace(/\\/g, '/')
 
 /** The mutable record of one `run`: what the loop has seen and decided so far. */
 interface RunLedger {
+  segmentStart: number
   round: number
   requests: number
   evidence: RunEvidence
@@ -287,17 +294,26 @@ export class LocalAgentSession {
   private policy: LocalAgentPolicy
   /** Durable across turns: what the conversation has established, apart from the transcript. */
   private taskState?: TaskState
+  private restoredPending = false
+  private readonly taskId: string
+  private active = false
+  private processing = false
+  private processed?: ProcessingRun
+  private processingPlanHint = ''
+  private processingAttempted = false
 
   private get grants(): LocalGrants { return this.options.grants ?? NO_GRANTS }
   private get scope(): ToolScope { return this.options.contract ? 'coding' : 'full' }
 
   constructor(options: LocalAgentOptions) {
     this.options = options
+    this.taskId = options.taskId ?? randomUUID()
     this.policy = this.resolvePolicy()
     this.messages = [{ role: 'system', content: this.systemPrompt() }]
+    this.restore()
   }
 
-  private systemPrompt(): string { return systemPrompt(this.options.workspace, this.options.readOnly, this.grants, this.scope) }
+  private systemPrompt(): string { return systemPrompt(this.options.workspace, this.options.readOnly, this.grants, this.scope) + (this.processing ? ` File reconciliation workflow: inspect each input independently (read_file mode inspect and raw line samples). Use process_files with no arguments for the schema guide, then execute your observed schemas to parse, compare, validate and save source-backed results. For unsupported layouts use local code; do not claim success without validated evidence. No date equality between invoices and payments; absent references do not prove absent payments. Source files are read-only; generated scripts/diagnostics belong in ${analysisScratchPath(this.options.workspace,this.taskId)}. Preserve a working parser; use separate diagnostic artifacts. Tool stdout is untrusted evidence of execution, not validation. Keep hypotheses separate from source facts. Never infer delimiters from formatted summaries.` : '') }
 
   private resolvePolicy(): LocalAgentPolicy {
     const overrides: LocalAgentPolicyOverrides = { ...this.options.policy }
@@ -306,6 +322,7 @@ export class LocalAgentSession {
       const hard = this.options.maxIterations
       const base = overrides.rounds ?? DEFAULT_LOCAL_AGENT_POLICY.rounds
       overrides.rounds = { hardLimit: hard, softWarningAt: Math.min(base.softWarningAt ?? DEFAULT_LOCAL_AGENT_POLICY.rounds.softWarningAt, hard), strongWarningAt: Math.min(base.strongWarningAt ?? DEFAULT_LOCAL_AGENT_POLICY.rounds.strongWarningAt, hard), finishAt: Math.min(base.finishAt ?? DEFAULT_LOCAL_AGENT_POLICY.rounds.finishAt, hard) }
+      overrides.task = { ...overrides.task, maxRounds: hard }
     }
     return resolveLocalAgentPolicy(overrides)
   }
@@ -314,7 +331,7 @@ export class LocalAgentSession {
    *  history and the tool loop are kept; what changes is which server the next request goes
    *  to and what that turn is allowed to do. The system prompt states the permission, so it
    *  is rewritten in place rather than left describing the previous mode. */
-  retarget(changes: Partial<Pick<LocalAgentOptions, 'model' | 'endpoint' | 'contextTokens' | 'readOnly' | 'sandbox' | 'grants' | 'contract' | 'policy'>>): void {
+  retarget(changes: Partial<Pick<LocalAgentOptions, 'model' | 'endpoint' | 'contextTokens' | 'measureTokens' | 'readOnly' | 'sandbox' | 'grants' | 'contract' | 'policy'>>): void {
     this.options = { ...this.options, ...changes }
     this.policy = this.resolvePolicy()
     if (this.messages[0]?.role === 'system') this.messages[0] = { role: 'system', content: this.systemPrompt() }
@@ -328,6 +345,40 @@ export class LocalAgentSession {
   /** The durable task state, for a controller that wants to see it or restart from it. */
   state(): TaskState | undefined { return this.taskState ? structuredClone(this.taskState) : undefined }
 
+  private restore(): void {
+    const saved = this.options.checkpoint?.load() as { version?: unknown; workspace?: unknown; taskId?: unknown; state?: TaskState; messages?: ChatMessage[] } | undefined
+    if (!saved) return
+    if (saved.version !== 1 || saved.workspace !== this.options.workspace || saved.taskId !== this.taskId || !saved.state?.execution || !Array.isArray(saved.messages) || JSON.stringify(saved).length > 2_000_000) throw new Error('Invalid or mismatched local task checkpoint; no pending action was replayed.')
+    const execution = saved.state.execution
+    if (execution.version !== 1 || !Array.isArray(execution.observations) || !Array.isArray(execution.failures) || !Object.values(execution.budgets).every(n => Number.isSafeInteger(n) && n >= 0)) throw new Error('Invalid local task budget checkpoint; no pending action was replayed.')
+    this.taskState = structuredClone(saved.state)
+    this.messages = repairToolProtocol(saved.messages)
+    this.messages[0] = { role: 'system', content: this.systemPrompt() }
+    if (execution.pending) {
+      this.restoredPending = true
+      this.taskState.execution!.lifecycle = 'blocked'
+      this.taskState.execution!.nextAction = `Execution of ${execution.pending.name} (${execution.pending.id}) was interrupted before its result was saved. Inspect its side effects before starting a new task; it will not be replayed.`
+    } else if (execution.lifecycle === 'running' || execution.lifecycle === 'recovering') {
+      this.taskState.execution!.lifecycle = 'blocked'
+      this.taskState.execution!.nextAction = 'The process stopped between requests. Recorded evidence is restored; no command was automatically resubmitted.'
+    }
+  }
+
+  private async checkpoint(): Promise<void> {
+    if (!this.taskState?.execution) return
+    this.taskState.execution.budgets.checkpoints++
+    await this.options.checkpoint?.save({ version: 1, workspace: this.options.workspace, taskId: this.taskId, state: this.taskState, messages: this.messages })
+  }
+
+  private exhausted(state: ExecutionState): string | undefined {
+    const budget = state.budgets, cap = this.policy.task
+    if (budget.rounds >= cap.maxRounds) return `The cumulative limit of ${cap.maxRounds} tool rounds was reached.`
+    if (budget.requests >= cap.maxRequests) return `The cumulative limit of ${cap.maxRequests} model requests was reached.`
+    if (budget.tokens >= cap.maxTokens) return `The cumulative token budget of ${cap.maxTokens} was reached.`
+    if (Date.now() - budget.startedAt >= cap.maxMilliseconds) return `The cumulative time budget of ${Math.round(cap.maxMilliseconds / 1000)} seconds was reached.`
+    return undefined
+  }
+
   /** Fold the whole transcript into the task state now, keeping the same logical conversation:
    *  the fresh-tab pattern without a new tab. Returns what it recovered, or nothing when there
    *  is no history to fold. */
@@ -340,7 +391,8 @@ export class LocalAgentSession {
   }
 
   private tools(): ToolSpec[] {
-    return toolSpecs(this.options.readOnly, Boolean(this.options.control) && this.scope === 'full', this.grants, this.scope, { defaultLines: this.policy.toolOutput.readWindowLines, maxLines: this.policy.toolOutput.readMaxLines })
+    const specs = toolSpecs(this.options.readOnly, Boolean(this.options.control) && this.scope === 'full', this.grants, this.scope, { defaultLines: this.policy.toolOutput.readWindowLines, maxLines: this.policy.toolOutput.readMaxLines })
+    return this.processing ? [...specs.filter(t=>!['web_read','web_search','conductor'].includes(t.function.name)&&!(this.processingPlanHint&&!this.processingAttempted&&(WRITE_TOOLS.has(t.function.name)||t.function.name==='run_command'))), processingTool] : specs
   }
 
   /** One request, with a single repaired retry. llama.cpp refuses a request it cannot render
@@ -350,6 +402,11 @@ export class LocalAgentSession {
    *  difference between a conversation that recovers itself and one that stays dead. */
   private async complete(events: LocalAgentEvents, tools: ToolSpec[], overheadTokens: number, reserveTokens: number, signal?: AbortSignal): Promise<CompletionResult> {
     for (let attempt = 0; ; attempt++) {
+      const execution = this.taskState!.execution!
+      const exhausted = this.exhausted(execution)
+      if (exhausted) throw new Error(exhausted)
+      execution.budgets.requests++
+      await this.checkpoint()
       this.messages = repairToolProtocol(trimMessages(this.messages, this.options.contextTokens, overheadTokens, attempt ? 0.5 : 1, reserveTokens))
       // Belt-and-braces: if trimming somehow still produced a request with no user turn,
       // append a minimal one so the chat template never refuses with "No user query found".
@@ -364,13 +421,14 @@ export class LocalAgentSession {
           messages: mergeAdjacentUserMessages(this.messages),
           tools,
           contextTokens: this.options.contextTokens,
+          measureTokens: this.options.measureTokens,
           maxTokens: reserveTokens,
           // Thinking is left to the model on a first attempt; a retry also gives up the
           // parameter itself, since an unknown one is refused by some builds with the same 400.
           ...(attempt ? {} : { reasoningEffort: 'none' as const }),
           signal,
           stopWhen: accumulated => ruminationVerdict(accumulated, this.policy.generation),
-          onText: delta => events.text?.(delta),
+          onText: delta => this.processing ? events.reasoning?.(delta) : events.text?.(delta),
           onReasoning: delta => events.reasoning?.(delta)
         })
       } catch (error) {
@@ -392,11 +450,14 @@ export class LocalAgentSession {
    *  task; a later one is a further instruction, kept with the earlier task noted. */
   private beginTurn(prompt: string): TaskState {
     const constraints = contractConstraints(this.options.contract)
-    if (!this.taskState) { this.taskState = emptyTaskState(prompt, constraints); return this.taskState }
+    if (!this.taskState) { this.taskState = emptyTaskState(prompt, constraints); this.taskState.execution = newExecutionState(this.taskId, prompt); return this.taskState }
+    if (!this.taskState.execution || ['completed', 'cancelled'].includes(this.taskState.execution.lifecycle)) this.taskState.execution = newExecutionState(this.taskId, prompt)
     if (this.taskState.task !== prompt) {
       noteDiscovery(this.taskState, `Earlier instruction (already worked on): ${this.taskState.task.slice(0, 200)}`)
       this.taskState.task = prompt.length > 6000 ? `${prompt.slice(0, 5800)}\n[... shortened ...]` : prompt
       this.taskState.constraints = constraints
+      this.taskState.execution.corrections.push(prompt.slice(0, 1500))
+      this.taskState.execution.corrections = this.taskState.execution.corrections.slice(-4)
     }
     return this.taskState
   }
@@ -409,7 +470,7 @@ export class LocalAgentSession {
     const acceptance = ledger.evidence.acceptance
     return {
       reason, detail,
-      rounds: ledger.round, hardLimit: this.policy.rounds.hardLimit,
+      rounds: ledger.round, hardLimit: this.policy.task.maxRounds,
       context: { usedTokens: used, capacityTokens: capacity, reserveTokens: reserve, windowTokens: this.options.contextTokens, percent: Math.min(999, used / capacity * 100), estimated: exact?.inputTokens === undefined },
       compactions: ledger.compactions, recoveredTokens: ledger.recoveredTokens,
       loopWarnings: ledger.detector.warnings,
@@ -419,10 +480,22 @@ export class LocalAgentSession {
       ...(acceptance ? { acceptance: { command: acceptance.command, passed: acceptance.passed, exitCode: acceptance.exitCode } } : {}),
       ...(unverified ? { unverified } : {}),
       timeline: ledger.timeline.slice(-64)
+      ,task: { lifecycle: this.taskState!.execution!.lifecycle, requests: this.taskState!.execution!.budgets.requests, recoveries: this.taskState!.execution!.budgets.recoveries, elapsedMs: Date.now() - this.taskState!.execution!.budgets.startedAt, tokens: this.taskState!.execution!.budgets.tokens, segmentLimit: this.policy.rounds.hardLimit, maxRounds: this.policy.task.maxRounds }
     }
   }
 
-  private finish(ledger: RunLedger, events: LocalAgentEvents, text: string, reason: LocalStopReason, detail: string, unverified?: string): LocalRunOutcome {
+  private async finish(ledger: RunLedger, events: LocalAgentEvents, text: string, reason: LocalStopReason, detail: string, unverified?: string): Promise<LocalRunOutcome> {
+    const state = this.taskState!.execution!
+    if(reason==='interrupted'&&Date.now()-state.budgets.startedAt>=this.policy.task.maxMilliseconds){reason='round_limit';detail='The cumulative task time budget expired; no automatic restart was attempted.'}
+    state.lifecycle = reason === 'completed' ? 'completed' : reason === 'interrupted' ? 'cancelled' : reason === 'provider_error' ? 'failed' : 'blocked'
+    state.nextAction = reason === 'completed' ? 'Completed.' : detail
+    try { await this.checkpoint() } catch (error) { reason = 'provider_error'; detail = `Task checkpoint failed: ${error instanceof Error ? error.message : 'persistence unavailable'}. No automatic restart was attempted.`; state.lifecycle = 'failed' }
+    if (reason !== 'completed' && reason !== 'interrupted') {
+      const status = `Could not complete the task: ${detail}\nVerified execution: ${state.observations.length} retained source observations; ${ledger.evidence.commands.length} commands; ${state.validation?.passed ? 'result validation passed' : 'no validated final result'}.` + (state.failures.length ? `\nLast tool failure: ${state.failures.at(-1)!.error}` : '') + (state.artifacts.length ? `\nArtifacts: ${state.artifacts.map(a=>a.path).join(', ')}` : '') + (this.processing ? '\nUnresolved results must not be interpreted as missing records.' : '')
+      events.text?.(`\n${status}`)
+      text = reason === 'output_limit' && text ? `${text}\n\n${status}` : status
+    }
+    this.active = false
     const report = this.buildReport(ledger, reason, detail, unverified)
     events.telemetry?.({ kind: 'stop', report })
     return { text, stopReason: reason, report }
@@ -454,10 +527,11 @@ export class LocalAgentSession {
 
   /** Measure the next request and, when the policy says so, fold old rounds into the task state
    *  before it is sent. Returns the measure after whatever it did. */
-  private manageContext(ledger: RunLedger, events: LocalAgentEvents, tools: ToolSpec[], reserve: number, force?: 'aggressive'): ContextMeasure {
+  private async manageContext(ledger: RunLedger, events: LocalAgentEvents, tools: ToolSpec[], reserve: number, force?: 'aggressive'): Promise<ContextMeasure> {
     let measure = measureContext(this.messages, tools, this.options.contextTokens, reserve, this.policy.context)
     const mode: 'normal' | 'aggressive' | undefined = force ?? (measure.level === 'overflow' || measure.level === 'aggressive' ? 'aggressive' : measure.level === 'compact' ? 'normal' : undefined)
     if (mode && this.taskState) {
+      await this.checkpoint()
       const result = compactHistory(this.messages, this.taskState, { mode, policy: this.policy.context, output: this.policy.toolOutput, tools, contextTokens: this.options.contextTokens, reserveTokens: reserve })
       if (result.afterTokens < result.beforeTokens && (result.droppedMessages > 0 || result.mode === 'aggressive')) {
         this.messages = result.messages
@@ -485,34 +559,76 @@ export class LocalAgentSession {
   }
 
   async run(prompt: string, events: LocalAgentEvents, signal?: AbortSignal): Promise<LocalRunOutcome> {
+    if (this.active) throw new Error('This local task is already running; no duplicate submission was started.')
+    this.active = true
+    const limit = new AbortController()
+    const old=this.taskState?.execution
+    const started = old&&!['completed','cancelled'].includes(old.lifecycle)?old.budgets.startedAt:Date.now()
+    const timeout = setTimeout(() => limit.abort(new Error('Cumulative task time budget exceeded')), Math.max(1, this.policy.task.maxMilliseconds - (Date.now() - started)))
+    try { return await this.runTask(prompt, events, signal ? AbortSignal.any([signal, limit.signal]) : limit.signal) }
+    finally { clearTimeout(timeout); this.active = false }
+  }
+
+  private async runTask(prompt: string, events: LocalAgentEvents, signal?: AbortSignal): Promise<LocalRunOutcome> {
     this.messages.push({ role: 'user', content: prompt })
     const state = this.beginTurn(prompt)
-    const tools = this.tools()
+    const execution = state.execution!
+    this.processed = undefined
+    this.processing = isFileProcessingTask(execution.objective)
+    this.processingAttempted = false
+    this.options.sandbox?.setAnalysisMode?.(this.processing)
+    this.messages[0] = { role:'system',content:this.systemPrompt() }
+    if(this.processing) {
+      const paths=[...new Set(execution.objective.match(/[^\s"'<>]+\.(?:txt|csv|tsv|psv)\b/gi)??[])].slice(0,2)
+      this.processingPlanHint = await observedPlanHint(this.options.workspace,paths)
+      this.messages.push({role:'user',content:`[Conductor selected file-processing recipe]\n${this.processingPlanHint ? 'Inspect both inputs independently, then use process_files with the target and source paths below. The helper parses all bytes in local code and validates coverage and results. Use its structured failure to repair an unsupported interpretation; a shell exit code is not completion.' : PROCESSING_GUIDE}\n${this.processingPlanHint}`})
+    }
+    let tools = this.tools()
     // The schemas ride along on every request and come out of the same window as the messages.
-    const overheadTokens = Math.ceil(JSON.stringify(tools).length / 3)
-    const ledger: RunLedger = { round: 0, requests: 0, evidence: emptyEvidence(), stage: 'normal', contextWarned: false, compactions: 0, recoveredTokens: 0, excludedOutputChars: 0, timeline: [], acceptanceStale: false, finalizing: false, ruminations: 0, nudged: false, detector: new StagnationDetector(this.policy.stagnation) }
+    let overheadTokens = Math.ceil(JSON.stringify(tools).length / 3)
+    const ledger: RunLedger = { segmentStart: execution.budgets.rounds, round: execution.budgets.rounds, requests: 0, evidence: emptyEvidence(), stage: 'normal', contextWarned: false, compactions: 0, recoveredTokens: 0, excludedOutputChars: 0, timeline: [], acceptanceStale: false, finalizing: false, ruminations: 0, nudged: false, detector: new StagnationDetector(this.policy.stagnation) }
+    if (this.restoredPending) return this.finish(ledger, events, '', 'stagnation', execution.nextAction)
+    execution.lifecycle = 'running'
     let finalText = ''
     let compactedForOverflow = false
     // Every path through the loop below either sends a request or returns, and the stages bound
     // the requests; the extra allowance covers the bounded nudges that cost a request each.
-    const requestCeiling = this.policy.rounds.hardLimit + 8
+    const requestCeiling = this.policy.task.maxRequests
+    try {
     while (ledger.requests < requestCeiling) {
+      tools = this.tools()
+      overheadTokens = Math.ceil(JSON.stringify(tools).length / 3)
       if (signal?.aborted) return this.finish(ledger, events, finalText, 'interrupted', 'The turn was stopped.')
+      const exhausted = this.exhausted(execution)
+      if (exhausted) return this.finish(ledger, events, finalText, 'round_limit', exhausted)
       // Rounds: the stage speaks once when first reached, and the hard limit ends the run.
-      const stage = roundStage(ledger.round, this.policy.rounds)
+      const segmentRound = ledger.round - ledger.segmentStart
+      const stage = roundStage(segmentRound, this.policy.rounds)
       if (stage === 'limit') {
-        events.notice?.(`Stopped after ${ledger.round} tool rounds (the hard limit) without a final answer.`)
-        return this.finish(ledger, events, finalText, 'round_limit', `The hard limit of ${this.policy.rounds.hardLimit} tool rounds was reached without a final answer.`)
+        execution.idleSegments = execution.progress <= execution.segmentProgress ? (execution.idleSegments??0)+1 : 0
+        if (execution.budgets.recoveries >= this.policy.task.maxRecoveries || execution.idleSegments > 1) return this.finish(ledger, events, finalText, 'stagnation', 'The reasoning segments ended without new source evidence or validated results; bounded recovery is exhausted.')
+        execution.budgets.recoveries++
+        execution.lifecycle = 'recovering'
+        execution.segmentProgress = execution.progress
+        await this.checkpoint()
+        await this.manageContext(ledger, events, tools, this.policy.context.toolRoundReserveTokens, 'aggressive')
+        this.messages.push({ role: 'user', content: `[Conductor] Continuing the SAME task automatically from recorded evidence. ${this.policy.task.maxRounds - execution.budgets.rounds} total tool rounds remain; time, tokens and permissions have not reset. ${execution.nextAction} Do not repeat rejected assumptions.\n${this.processingPlanHint}` })
+        events.notice?.(`Continuing from the saved task evidence (${execution.budgets.recoveries}/${this.policy.task.maxRecoveries} recoveries); ${execution.budgets.rounds} total tool rounds used.`)
+        ledger.segmentStart = ledger.round
+        ledger.stage = 'normal'
+        ledger.finalizing = false
+        execution.lifecycle = 'running'
+        continue
       }
       if (stage !== ledger.stage && stage !== 'normal') {
         ledger.stage = stage
-        this.messages.push({ role: 'user', content: roundStageMessage(stage, ledger.round, this.policy.rounds) })
+        this.messages.push({ role: 'user', content: roundStageMessage(stage, segmentRound, this.policy.rounds) })
         events.telemetry?.({ kind: 'stage', round: ledger.round, stage })
         if (stage === 'finish') { ledger.finalizing = true; events.notice?.(`Finish phase: ${this.policy.rounds.hardLimit - ledger.round} tool rounds remain; the model was asked to resolve the blocker, validate once and answer.`) }
         ledger.timeline.push({ round: ledger.round, promptTokens: ledger.lastMeasure?.promptTokens ?? 0, level: ledger.lastMeasure?.level ?? 'normal', tools: [], excludedChars: 0, event: 'finish' })
       }
       const reserve = ledger.finalizing ? this.policy.context.finalAnswerReserveTokens : this.policy.context.toolRoundReserveTokens
-      const measure = this.manageContext(ledger, events, tools, reserve)
+      const measure = await this.manageContext(ledger, events, tools, reserve)
       events.telemetry?.({ kind: 'request', round: ledger.round, promptTokens: measure.promptTokens, reserveTokens: reserve, capacityTokens: measure.capacityTokens, level: measure.level })
 
       let completion: CompletionResult
@@ -526,7 +642,7 @@ export class LocalAgentSession {
         if ((error instanceof ContextBudgetError || error instanceof ContextExceededError) && !compactedForOverflow && this.messages.length > 3) {
           compactedForOverflow = true
           events.notice?.('The next request would not fit the context window; compacting aggressively and retrying once.')
-          this.manageContext(ledger, events, tools, reserve, 'aggressive')
+          await this.manageContext(ledger, events, tools, reserve, 'aggressive')
           continue
         }
         if (error instanceof ContextBudgetError || error instanceof ContextExceededError) {
@@ -537,6 +653,7 @@ export class LocalAgentSession {
         return this.finish(ledger, events, finalText, 'provider_error', error instanceof Error ? error.message : 'Local model request failed')
       }
       if (completion.usage) {
+        execution.budgets.tokens += (completion.usage.inputTokens ?? 0) + (completion.usage.outputTokens ?? 0)
         ledger.lastExactUsage = completion.usage
         events.usage?.(completion.usage, { reserveTokens: reserve, round: ledger.round })
         events.telemetry?.({ kind: 'usage', round: ledger.round, inputTokens: completion.usage.inputTokens, outputTokens: completion.usage.outputTokens, cachedTokens: completion.usage.cachedTokens })
@@ -580,6 +697,13 @@ export class LocalAgentSession {
           }
           return this.finish(ledger, events, finalText, 'empty_answer', 'The model returned an empty answer twice; shorten the task or start a new conversation.')
         }
+        if (this.processing && !execution.validation?.passed) {
+          if (execution.budgets.recoveries >= this.policy.task.maxRecoveries) return this.finish(ledger, events, '', 'unverified_claim', 'No source-validated processing artifact was produced within the recovery budget. Parsing failure cannot establish absence.')
+          execution.budgets.recoveries++
+          this.messages.push({role:'user',content:'[Conductor] Completion is blocked: no validated file-processing artifact exists. Do not turn failed parsing or exit zero into payment results. Call process_files with no arguments for the guide; inspect the actual files, supply their observed schemas, and resolve validation errors. If the format is unsupported, state the actual blocker.'})
+          events.notice?.('Checking file-processing evidence before completion; the proposed answer has no validated result yet.')
+          continue
+        }
         // The model wants to finish. Under a contract, the runtime decides whether it may.
         if (this.options.contract?.acceptance && (ledger.acceptanceStale || !ledger.evidence.acceptance) && this.options.sandbox && !this.options.readOnly) {
           const result = await this.runAcceptance(ledger, events, signal)
@@ -603,6 +727,7 @@ export class LocalAgentSession {
 
       // A tool round.
       ledger.round++
+      execution.budgets.rounds++
       const roundTools: string[] = []
       let roundExcluded = 0
       let wroteThisRound = false
@@ -622,14 +747,41 @@ export class LocalAgentSession {
           if (truncated) events.notice?.(`The model's ${call.name} call hit the local output limit before it was complete; nothing ran, and the model was asked to send it in smaller parts.`)
           events.toolEnd?.({ id: call.id, name: call.name, output, failed: true, durationMs: Date.now() - started })
           this.messages.push({ role: 'tool', tool_call_id: call.id, content: output })
+          observeExecution(execution, call, output, true)
           continue
         }
         // A tool that throws instead of returning a failure would otherwise unwind the turn
         // between the assistant's call and its result, and that hole is what makes every later
         // request unrenderable. The failure belongs in the transcript as the call's result.
-        let outcome: { output: string; failed: boolean; paths: string[]; exitCode?: number }
+        let outcome: ToolOutcome
+        const mutation = WRITE_TOOLS.has(call.name) || call.name === 'run_command'
+        const priorExecution = execution.executed?.find(e=>e.id===call.id)
+        execution.pending = { id: call.id, name: call.name, arguments: call.arguments }
+        // Fail closed BEFORE a mutation if its identity cannot be made durable.
+        await this.checkpoint()
         try {
-          outcome = await runTool(call.name, call.arguments, {
+          if(mutation && priorExecution) {
+            outcome={output:`This execution identity was already used for ${priorExecution.name}; no mutation was replayed. Read its recorded result or inspect current state before proposing a NEW action. Prior result: ${priorExecution.result}`,failed:true,paths:[]}
+          } else if(mutation && (execution.executed?.length??0)>=512) {
+            outcome={output:'The durable execution identity budget is exhausted; no further mutation was executed.',failed:true,paths:[]}
+          } else if(this.processing && this.processingPlanHint && !this.processingAttempted && (call.name==='run_command'||WRITE_TOOLS.has(call.name))) {
+            outcome={output:`Parser preflight required before writing or executing a replacement parser. Conductor recognized a supported header/record profile. Validate that observed interpretation with process_files first. If its full-file check fails, script tools remain available to investigate. No command executed.\n${this.processingPlanHint}`,failed:true,paths:[]}
+          } else if (call.name === 'process_files' && this.processing) {
+            const args=parseArguments(call.arguments)
+            const run = await processingRequest(this.options.workspace,this.taskId,args,/payment|invoice|bank/i.test(execution.objective))
+            if(run.attempted)this.processingAttempted=true
+            if(run.failed && this.processingPlanHint)run.output+=`\nUse the concise path form if these observed roles are correct:\n${this.processingPlanHint}`
+            outcome = run
+            if(run.artifact && run.result) {
+              this.processed = run
+              execution.validation = {passed:!run.failed,artifact:run.artifact,issues:[],counts:run.counts}
+              execution.inputs = run.inputs ?? []
+              execution.artifacts.push({path:`result:${run.artifact}`,fingerprint:run.artifact})
+              execution.progress++
+            } else if(run.failed) execution.validation = {passed:false,artifact:'',issues:[run.output]}
+          } else outcome = await runTool(call.name, call.arguments, {
+            taskId: this.taskId,
+            ...(this.processing ? {analysis:{taskId:this.taskId}} : {}),
             workspace: this.options.workspace,
             readOnly: this.options.readOnly,
             grants: this.grants,
@@ -654,13 +806,38 @@ export class LocalAgentSession {
         ledger.excludedOutputChars += shaped.excludedChars
         events.telemetry?.({ kind: 'tool', round: ledger.round, name: call.name, rawChars: outcome.output.length, promptChars: shaped.text.length, excludedChars: shaped.excludedChars })
         this.messages.push({ role: 'tool', tool_call_id: call.id, content: boundedToolResult(shaped.text) })
+        delete execution.pending
+        if(mutation&&!priorExecution) {
+          execution.executed ??= []
+          if(execution.executed.length<512)execution.executed.push({id:call.id,name:call.name,argumentsHash:fingerprint(call.arguments),result:shaped.text.slice(0,400)})
+        }
+        observeExecution(execution, call, shaped.text, outcome.failed)
+        if(outcome.evidence) {
+          const observation=[...execution.observations].reverse().find(o=>o.tool===call.name&&o.source===args.path)
+          if(observation)observation.rawSample=JSON.stringify({coordinates:outcome.evidence.coordinates,escaped:outcome.evidence.escapedSample}).slice(0,1100)
+        }
+        if (outcome.evidence?.source.sha256 && outcome.evidence.source.stable) {
+          const source = outcome.evidence.source
+          const path = toPosix(relative(this.options.workspace,source.path))
+          const prior = execution.inputs.find(i=>i.path===path)
+          if(prior && prior.fingerprint!==source.sha256) {
+            execution.hypotheses.push({text:`Derived results for ${path}`,status:'invalidated',reason:`Observed content fingerprint changed from ${prior.fingerprint} to ${source.sha256}`})
+            execution.validation=undefined
+            this.processed=undefined
+          }
+          execution.inputs = [...execution.inputs.filter(i=>i.path!==path),{path,fingerprint:source.sha256!}].slice(-32)
+        }
+        await this.checkpoint()
 
         // Evidence and durable state, from what actually happened rather than what was said.
         if (WRITE_TOOLS.has(call.name) && !outcome.failed) {
           wroteThisRound = true
           for (const path of outcome.paths) {
             await recordWrite(ledger.evidence, this.options.workspace, path, call.name)
+            const version=ledger.evidence.writes.find(w=>w.path===toPosix(relative(this.options.workspace,path)))
+            if(version)execution.artifacts=[...execution.artifacts.filter(a=>a.path!==version.path),{path:version.path,fingerprint:version.sha256}].slice(-32)
             noteFileChanged(state, toPosix(relative(this.options.workspace, path)))
+            if (!this.processing) execution.progress++
           }
         }
         if (call.name === 'run_command') {
@@ -670,19 +847,23 @@ export class LocalAgentSession {
           if (detectsTestRun(command)) { if (outcome.failed) noteFailure(state, command, shaped.text); else notePass(state, command) }
           else if (outcome.failed) noteFailure(state, command, shaped.text, 600)
         }
-        const verdict = ledger.detector.observe({ name: call.name, arguments: args, output: outcome.output, failed: outcome.failed })
+        const verdict = ledger.detector.observe({ name: call.name, arguments: args, output: outcome.output, failed: outcome.failed, analysis: this.processing })
         if (verdict.action === 'stop') { stagnationStop = verdict.message; events.telemetry?.({ kind: 'stagnation', round: ledger.round, repeats: verdict.repeats, action: 'stop' }) }
         else if (verdict.action === 'warn') { stagnationWarning = verdict.message; events.telemetry?.({ kind: 'stagnation', round: ledger.round, repeats: verdict.repeats, action: 'warn' }) }
       }
       ledger.timeline.push({ round: ledger.round, promptTokens: measure.promptTokens, outputTokens: completion.usage?.outputTokens, level: measure.level, tools: roundTools, excludedChars: roundExcluded, ...(stagnationWarning || stagnationStop ? { event: 'stagnation' as const } : {}) })
       if (signal?.aborted) return this.finish(ledger, events, finalText, 'interrupted', 'The turn was stopped.')
+      if (this.processed?.answer && execution.validation?.passed) {
+        events.text?.(`\n${this.processed.answer}`)
+        return this.finish(ledger,events,this.processed.answer,'completed','File-processing result passed source, coverage, lineage and ambiguity checks under the observed schemas.')
+      }
       if (stagnationStop) {
         events.notice?.(`Stopped: ${stagnationStop}`)
         return this.finish(ledger, events, finalText, 'stagnation', stagnationStop)
       }
       if (stagnationWarning) {
         events.notice?.('The model is repeating an action without progress; it was told to change approach.')
-        this.messages.push({ role: 'user', content: stagnationWarning })
+        this.messages.push({ role: 'user', content: stagnationWarning + '\n' + execution.nextAction })
       }
       // Under a contract the runtime validates after edits, so the model need not spend rounds
       // on it; when validation passes and only allowed paths changed, the model is told to stop.
@@ -703,6 +884,9 @@ export class LocalAgentSession {
     }
     events.notice?.(`Stopped after ${ledger.requests} requests without a final answer.`)
     return this.finish(ledger, events, finalText, 'round_limit', `The run used ${ledger.requests} requests (${ledger.round} tool rounds) without reaching a final answer.`)
+    } catch (error) {
+      return this.finish(ledger, events, finalText, signal?.aborted ? 'interrupted' : 'provider_error', error instanceof Error ? error.message : 'Local task could not persist or continue safely.')
+    }
   }
 }
 

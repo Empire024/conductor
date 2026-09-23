@@ -27,7 +27,7 @@ export function roundStageMessage(stage: Exclude<RoundStage, 'normal' | 'limit'>
   }
 }
 
-export interface ObservedCall { name: string; arguments: Record<string, unknown>; output: string; failed: boolean }
+export interface ObservedCall { name: string; arguments: Record<string, unknown>; output: string; failed: boolean; analysis?: boolean }
 
 export interface StagnationVerdict {
   /** Identical calls seen in a row (this one included). */
@@ -40,6 +40,7 @@ export interface StagnationVerdict {
 
 const stable = (value: unknown): string => JSON.stringify(value, Object.keys((value ?? {}) as object).sort())
 const digest = (text: string): string => createHash('sha1').update(text).digest('hex').slice(0, 16)
+const comparableOutput = (text: string): string => text.replace(/^\[(?:execution|result_artifact|script_artifact|environment)[^\n]*\n?/gm,'').replace(/[a-f0-9]{8}-[a-f0-9-]{27,}/gi,'<id>').replace(/duration_ms=\d+/g,'duration_ms=#')
 
 /** A call's identity for repetition: the tool and its arguments, with the command text
  *  whitespace-normalised so the same test run with a stray space still counts. */
@@ -60,6 +61,7 @@ export class StagnationDetector {
   private idleRounds = 0
   private warned = new Set<string>()
   private seenEvidence = new Set<string>()
+  private failedApproaches = new Map<string, number>()
   /** How many warnings this run has fired, for the stop report. */
   warnings = 0
 
@@ -67,22 +69,27 @@ export class StagnationDetector {
 
   observe(call: ObservedCall): StagnationVerdict {
     const fingerprint = callFingerprint(call.name, call.arguments)
-    const outcome = digest(`${fingerprint}|${call.failed}|${call.output.slice(0, 2000)}`)
+    const comparable = comparableOutput(call.output)
+    const outcome = digest(`${fingerprint}|${call.failed}|${comparable.slice(0, 2000)}`)
     if (fingerprint === this.lastFingerprint) this.repeats++
     else { this.lastFingerprint = fingerprint; this.repeats = 1 }
     if (outcome === this.lastOutcome) this.outcomeRepeats++
     else { this.lastOutcome = outcome; this.outcomeRepeats = 1 }
+    const failedMethod = `${call.name}:${String(call.arguments.path ?? '')}:${comparable.replace(/[a-f0-9]{32,64}/g, '#').replace(/\bline \d+|:\d+:\d+/g,'line #').slice(0, 400)}`
+    const failures = call.failed ? (this.failedApproaches.get(failedMethod) ?? 0) + 1 : 0
+    if (call.failed) this.failedApproaches.set(failedMethod, failures)
 
     // New evidence: a write that changed something, or a command whose result we have not seen.
     const noop = call.name === 'edit_file' && /\(0 replacements?\)|was not found/.test(call.output)
-    const evidence = call.name === 'write_file' || call.name === 'edit_file' || call.name === 'apply_edits' ? (call.failed || noop ? '' : `write:${digest(stable(call.arguments))}`) : call.name === 'run_command' ? `run:${outcome}` : ''
+    const evidence = call.failed || noop ? '' : !call.analysis && ['write_file','edit_file','apply_edits'].includes(call.name) ? `write:${digest(stable(call.arguments))}` : ['read_file','search','list_files','process_files'].includes(call.name) ? `source:${outcome}` : call.name === 'run_command' ? `run:${digest(comparable)}` : ''
     if (evidence && !this.seenEvidence.has(evidence)) { this.seenEvidence.add(evidence); this.idleRounds = 0 }
     else this.idleRounds++
 
-    const repeated = Math.max(this.repeats, this.outcomeRepeats)
+    const repeated = Math.max(this.repeats, this.outcomeRepeats, failures)
     const idle = this.idleRounds >= this.policy.idleRoundsWarnAt
+    if (call.analysis && this.idleRounds >= this.policy.idleRoundsWarnAt * 2) return { repeats: repeated, idle, action:'stop',message:'Repeated script changes and calls produced no new source evidence or execution result. Processing remains unvalidated.' }
     if (repeated >= this.policy.repeatStopAt) {
-      return { repeats: repeated, idle, action: 'stop', message: `The same ${call.name} call has now produced the same result ${repeated} times in a row without progress.` }
+      return { repeats: repeated, idle, action: 'stop', message: `The ${call.name} approach has produced equivalent results ${repeated} times without progress, including intervening attempts.` }
     }
     if (repeated >= this.policy.repeatWarnAt && !this.warned.has(fingerprint)) {
       this.warned.add(fingerprint); this.warnings++
@@ -90,7 +97,7 @@ export class StagnationDetector {
     }
     if (idle && !this.warned.has('idle')) {
       this.warned.add('idle'); this.warnings++
-      return { repeats: repeated, idle, action: 'warn', message: `[Conductor] The last ${this.idleRounds} tool calls changed no file and produced no new command result. Stop exploring: make the edit the task needs, then run its validation.` }
+      return { repeats: repeated, idle, action: 'warn', message: `[Conductor] The last ${this.idleRounds} tool calls produced no new source evidence or execution result. Script rewrites alone are not progress. Check a raw record or a failing parser example before another full run.` }
     }
     return { repeats: repeated, idle, action: 'none' }
   }

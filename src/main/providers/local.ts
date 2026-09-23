@@ -17,6 +17,49 @@ const readConfig = (): LocalStackConfig | null => {
   try { return loadConfig() } catch { return null }
 }
 
+export interface LocalEndpointContext {
+  propsProbed: boolean
+  configuredTokens: number
+  effectiveTokens: number
+  serverTokens?: number
+  contextSource: string[]
+  template: { available: boolean; toolCalls: 'supported' | 'unsupported' | 'unknown'; thinking: 'unspecified'; capabilities: Record<string, boolean> }
+  diagnostics: string[]
+}
+
+/** Read runtime metadata only: no generation, template execution, or server changes. Training
+ * context (n_ctx_train) is deliberately excluded: it is not the running slot's capacity. */
+export async function probeLocalContext(endpoint: string, apiKey: string, modelId: string, configuredTokens: number): Promise<LocalEndpointContext> {
+  const diagnostics: string[] = []
+  let propsProbed = false
+  const read = async (path: string): Promise<Record<string, unknown>> => {
+    try {
+      const response = await fetch(`${endpoint.replace(/\/$/, '')}${path}`, { headers: { Authorization: `Bearer ${apiKey}` }, signal: AbortSignal.timeout(2500) })
+      if (!response.ok) { diagnostics.push(`${path}: HTTP ${response.status}`); return {} }
+      const body: unknown = await response.json()
+      if (!body || typeof body !== 'object' || Array.isArray(body)) { diagnostics.push(`${path}: malformed metadata`); return {} }
+      if (path === '/props') propsProbed = true
+      return body as Record<string, unknown>
+    } catch { diagnostics.push(`${path}: metadata unavailable`); return {} }
+  }
+  const [props, models] = await Promise.all([read('/props'), read('/v1/models')])
+  const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+  const listed = Array.isArray(models.data) ? models.data.map(object) : []
+  const model = listed.find(item => item.id === modelId) ?? (listed.length === 1 ? listed[0] : undefined) ?? {}
+  const settings = object(props.default_generation_settings)
+  const candidates: Array<[string, unknown]> = [['/props.default_generation_settings.n_ctx', settings.n_ctx], ['/props.n_ctx', props.n_ctx], ['/v1/models.n_ctx', model.n_ctx], ['/v1/models.meta.n_ctx', object(model.meta).n_ctx]]
+  const valid = candidates.filter((entry): entry is [string, number] => typeof entry[1] === 'number' && Number.isSafeInteger(entry[1]) && entry[1] > 0)
+  const serverTokens = valid.length ? Math.min(...valid.map(([, value]) => value)) : undefined
+  if (!serverTokens) diagnostics.push('Runtime context is unverified; configured context is only a ceiling, not a server measurement.')
+  const caps = object(props.chat_template_caps)
+  const capabilities = Object.fromEntries(Object.entries(caps).filter((entry): entry is [string, boolean] => typeof entry[1] === 'boolean'))
+  const toolCalls = caps.supports_tools === false || caps.supports_tool_calls === false ? 'unsupported' : caps.supports_tools === true && caps.supports_tool_calls === true ? 'supported' : 'unknown'
+  const available = typeof props.chat_template === 'string' && props.chat_template.length > 0
+  if (!available) diagnostics.push('Chat template metadata unavailable; compatibility requires a real apply-template/tokenize check.')
+  if (toolCalls === 'unsupported') diagnostics.push('Server chat template reports no tool-call support.')
+  return { propsProbed, configuredTokens, effectiveTokens: Math.min(configuredTokens, serverTokens ?? configuredTokens), serverTokens, contextSource: valid.map(([source]) => source), template: { available, toolCalls, thinking: 'unspecified', capabilities }, diagnostics }
+}
+
 /** StructuredSessions preserves this code for the renderer. The URL is public setup guidance;
  * no local path, key or config value is attached to the error. */
 export class LocalSetupError extends Error {
@@ -152,6 +195,7 @@ export class LocalAdapter implements ProviderAdapter {
   /** The turn in flight, so stopping the session can wait for it to unwind. */
   private turn?: Promise<void>
   private disposed = false
+  private endpointContext?: LocalEndpointContext
   private readonly providerCapabilities: ProviderCapabilities
 
   constructor(options: AdapterOptions) {
@@ -178,7 +222,7 @@ export class LocalAdapter implements ProviderAdapter {
         'Commands run in a non-root Docker container with no network access; when the sandbox is unavailable, execution is refused rather than run on Windows.',
         'Nothing asks for approval: choose Read only for a turn that must not write files or run commands.',
         'Repository writes and web search are off unless the owner turns them on for the conversation. The container has no network even when granted: it commits locally, and a plain push of the checked-out branch to an existing remote is run on the host for it.',
-        'Conversations are not resumable: history lives with the running adapter, not in a native session store.',
+        'Registered conversations preserve local checkpoints. Reopening restores state without executing pending work; continuation requires an explicit input.',
         'Approvals, questions, plan mode and effort levels are not part of this runtime.',
         'The active prompt is managed: tool results are shaped before they enter it, old rounds are folded into a durable task state as the window fills, tool rounds are paced to a hard cap, repetition is noticed, and a task contract (allowedPaths, acceptance command) is enforced by the runtime rather than the prompt.'
       ]
@@ -215,7 +259,10 @@ export class LocalAdapter implements ProviderAdapter {
       this.emit({ turnId, data: { type: 'notice', message: `Starting ${localModelLabel(model.id)} locally; the first start loads the model into memory and can take a few minutes.` } })
     })
     if (announced) this.emit({ turnId, data: { type: 'notice', message: `${localModelLabel(model.id)} is ready.` } })
-    return model
+    this.endpointContext = await probeLocalContext(endpointFor(model), this.key(), model.id, model.contextTokens)
+    this.emit({ turnId, data: { type: 'notice', message: 'Local endpoint context and template diagnostics', payload: { localEndpointContext: this.endpointContext as unknown as Json } } })
+    if (this.endpointContext.template.toolCalls === 'unsupported') throw new Error('Local server chat template does not support tool calls; choose a compatible local template before continuing')
+    return { ...model, contextTokens: this.endpointContext.effectiveTokens }
   }
 
   async start(): Promise<void> {
@@ -224,17 +271,18 @@ export class LocalAdapter implements ProviderAdapter {
     const model = this.model()
     this.key()
     if (!existsSync(modelFilePath(model))) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
+    if (this.options.localCheckpoint) this.ensureSession(model, false)
     this.emit({ data: { type: 'session', phase: 'idle', capabilities: this.providerCapabilities } })
   }
 
-  private ensureSession(model: LocalModelConfig): LocalAgentSession {
+  private ensureSession(model: LocalModelConfig, prepareSandbox = true): LocalAgentSession {
     const stack = this.stack!
     const readOnly = this.settings.permission === 'read-only' || this.settings.sandbox === 'read-only' || this.settings.plan
     const grants: LocalGrants = { git: Boolean(this.settings.localGit), research: Boolean(this.settings.localResearch) }
     const contract = normaliseContract(this.settings.localContract ?? undefined)
     // A container is only built for a turn that may actually run something, and once built
     // it is reused: a conversation that toggles back to Read only keeps it for later.
-    if (!this.sandbox && !readOnly) this.sandbox = new DockerSandbox(this.options.runtimeId, this.options.cwd, stack.sandbox)
+    if (prepareSandbox && !this.sandbox && !readOnly) this.sandbox = new DockerSandbox(this.options.runtimeId, this.options.cwd, stack.sandbox)
     // The mount is decided when the container starts, so the grant is applied before the turn
     // rather than read out of the settings at exec time.
     this.sandbox?.setGitAccess(grants.git)
@@ -244,13 +292,17 @@ export class LocalAdapter implements ProviderAdapter {
         endpoint: endpointFor(model), apiKey: this.key(), model: model.id, workspace: this.options.cwd,
         sandbox, readOnly, grants, contract, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
         control: this.options.localControl,
+        taskId: this.options.localTaskId,
+        checkpoint: this.options.localCheckpoint,
+        policy: this.options.localPolicy,
+        measureTokens: this.endpointContext?.propsProbed ?? false,
         beforeTool: paths => this.options.beforeTool?.(this.toolItemId, paths) ?? Promise.resolve(),
         afterTool: (paths, success) => this.options.afterTool?.(this.toolItemId, paths, success) ?? Promise.resolve()
       })
     } else {
       // Both of these can change between turns of one conversation. The mode change is
       // already visible in the composer; a model change is not, so only that is announced.
-      this.session.retarget({ model: model.id, endpoint: endpointFor(model), contextTokens: model.contextTokens, readOnly, grants, contract, sandbox })
+      this.session.retarget({ model: model.id, endpoint: endpointFor(model), contextTokens: model.contextTokens, measureTokens: this.endpointContext?.propsProbed ?? false, readOnly, grants, contract, sandbox })
       if (this.sessionModel !== model.id) this.emit({ data: { type: 'notice', message: `This conversation now uses ${localModelLabel(model.id)}.` } })
     }
     this.sessionModel = model.id
@@ -278,6 +330,7 @@ export class LocalAdapter implements ProviderAdapter {
     // Each tool round gets its own text and reasoning items so thinking, answer text and tool
     // calls stay in the order they happened instead of collapsing into one block.
     let round = 0
+    let usageIndex = 0
     const textItem = (): string => `${turnId}:text:${round}`
     const reasoningItem = (): string => `${turnId}:reasoning:${round}`
     let releaseTurn = (): void => {}
@@ -291,7 +344,7 @@ export class LocalAdapter implements ProviderAdapter {
       const prompt = attachments.filter(item => item.content).map(item => `[Attached ${item.kind}: ${item.name}]\n${item.content}`).concat(text).join('\n\n')
       const outcome = await session.run(prompt, {
         text: delta => this.emit({ turnId, itemId: textItem(), data: { type: 'text', role: 'assistant', text: delta, mode: 'delta' } }),
-        // Qwen's thinking is presented the way Codex's reasoning summaries are: a status item
+        // Provider-emitted reasoning is presented as a status item
         // in the timeline, never raw protocol dumped into the answer.
         reasoning: delta => this.emit({ turnId, itemId: reasoningItem(), data: { type: 'text', role: 'status', text: delta, mode: 'delta' } }),
         toolStart: call => {
@@ -308,8 +361,8 @@ export class LocalAdapter implements ProviderAdapter {
         // CLIs report: the window, and the room left once this round's answer reserve is held
         // back. Used is what the server counted for the request just made plus what it wrote,
         // which is what the next request will carry before its own shaping.
-        usage: (usage, context) => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider',
-          limits: { contextUsedTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0), contextCapacityTokens: model.contextTokens - context.reserveTokens, contextReserveTokens: context.reserveTokens, modelContextWindow: model.contextTokens, contextRound: context.round, contextMeasurement: 'llama.cpp usage, exact for the last request' } }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
+        usage: (usage, context) => this.emit({ turnId, itemId: `${turnId}:usage:${usageIndex++}`, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'message', source: 'provider',
+          limits: { contextUsedTokens: usage.inputTokens !== undefined && usage.outputTokens !== undefined ? usage.inputTokens + usage.outputTokens : null, contextCapacityTokens: Math.max(0, model.contextTokens - context.reserveTokens), contextReserveTokens: context.reserveTokens, modelContextWindow: model.contextTokens, contextRound: context.round, contextMeasurement: usage.inputTokens !== undefined && usage.outputTokens !== undefined ? 'llama.cpp usage, exact for the last request' : 'llama.cpp usage incomplete; context occupancy unknown' } }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
         notice: message => this.emit({ turnId, data: { type: 'notice', message } }),
         // Structured, debug-level: a payload keeps these out of the conversation and in the
         // event log, where a usage timeline can be built from them later.
@@ -330,7 +383,7 @@ export class LocalAdapter implements ProviderAdapter {
 
   async compactContext(): Promise<Json | null> {
     if (this.controller) throw new Error('Wait for the current turn to finish before compacting')
-    const result = this.session?.compactNow()
+    const result = await this.session?.compactNow()
     if (!result) return null
     const recovered = result.beforeTokens - result.afterTokens
     this.emit({ data: { type: 'notice', message: `Context compacted on request: about ${recovered.toLocaleString()} tokens of earlier rounds folded into the task state; ${result.droppedMessages} messages left the active prompt.`, payload: { contextReset: true } } })
