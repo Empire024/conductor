@@ -3,7 +3,9 @@ import { existsSync } from 'node:fs'
 import type { AdapterOptions, ProviderAdapter } from './adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL, localModelLabel } from '../../shared/local-models'
-import { LocalAgentSession, RESPONSE_RESERVE_TOKENS } from '../local-models/agent.ts'
+import { LocalAgentSession } from '../local-models/agent.ts'
+import { normaliseContract } from '../local-models/completion.ts'
+import { localStopPayload, localStopSummary, type LocalStopReport } from '../../shared/local-stop.ts'
 import { endpointFor, loadConfig, modelFilePath, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
 import { inspectAdmission, startServer } from '../local-models/llama.ts'
@@ -128,6 +130,16 @@ async function ensureServer(stack: LocalStackConfig, model: LocalModelConfig, ap
  *  One adapter is one conversation. The model server is shared; conversation history, the tool
  *  loop, the sandbox container and the cancellation token all live on this instance, so two
  *  tabs on the same model cannot see or interrupt each other. */
+/** Which phase a stop reason lands in. An answer cut at the output limit still stands as one
+ *  when there is text; every other stop that is not the model's own final answer is a failure,
+ *  so a controller polling the phase does not read a fabricated or truncated run as done. */
+export function phaseFor(outcome: { stopReason: LocalStopReport['reason']; text: string }): 'completed' | 'failed' | 'interrupted' {
+  if (outcome.stopReason === 'interrupted') return 'interrupted'
+  if (outcome.stopReason === 'completed') return 'completed'
+  if (outcome.stopReason === 'output_limit' && outcome.text.trim()) return 'completed'
+  return 'failed'
+}
+
 export class LocalAdapter implements ProviderAdapter {
   readonly provider = 'local' as const
   private readonly options: AdapterOptions
@@ -167,7 +179,8 @@ export class LocalAdapter implements ProviderAdapter {
         'Nothing asks for approval: choose Read only for a turn that must not write files or run commands.',
         'Repository writes and web search are off unless the owner turns them on for the conversation. The container has no network even when granted: it commits locally, and a plain push of the checked-out branch to an existing remote is run on the host for it.',
         'Conversations are not resumable: history lives with the running adapter, not in a native session store.',
-        'Approvals, questions, plan mode and effort levels are not part of this runtime.'
+        'Approvals, questions, plan mode and effort levels are not part of this runtime.',
+        'The active prompt is managed: tool results are shaped before they enter it, old rounds are folded into a durable task state as the window fills, tool rounds are paced to a hard cap, repetition is noticed, and a task contract (allowedPaths, acceptance command) is enforced by the runtime rather than the prompt.'
       ]
     }
   }
@@ -218,6 +231,7 @@ export class LocalAdapter implements ProviderAdapter {
     const stack = this.stack!
     const readOnly = this.settings.permission === 'read-only' || this.settings.sandbox === 'read-only' || this.settings.plan
     const grants: LocalGrants = { git: Boolean(this.settings.localGit), research: Boolean(this.settings.localResearch) }
+    const contract = normaliseContract(this.settings.localContract ?? undefined)
     // A container is only built for a turn that may actually run something, and once built
     // it is reused: a conversation that toggles back to Read only keeps it for later.
     if (!this.sandbox && !readOnly) this.sandbox = new DockerSandbox(this.options.runtimeId, this.options.cwd, stack.sandbox)
@@ -228,7 +242,7 @@ export class LocalAdapter implements ProviderAdapter {
     if (!this.session) {
       this.session = new LocalAgentSession({
         endpoint: endpointFor(model), apiKey: this.key(), model: model.id, workspace: this.options.cwd,
-        sandbox, readOnly, grants, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
+        sandbox, readOnly, grants, contract, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
         control: this.options.localControl,
         beforeTool: paths => this.options.beforeTool?.(this.toolItemId, paths) ?? Promise.resolve(),
         afterTool: (paths, success) => this.options.afterTool?.(this.toolItemId, paths, success) ?? Promise.resolve()
@@ -236,7 +250,7 @@ export class LocalAdapter implements ProviderAdapter {
     } else {
       // Both of these can change between turns of one conversation. The mode change is
       // already visible in the composer; a model change is not, so only that is announced.
-      this.session.retarget({ model: model.id, endpoint: endpointFor(model), contextTokens: model.contextTokens, readOnly, grants, sandbox })
+      this.session.retarget({ model: model.id, endpoint: endpointFor(model), contextTokens: model.contextTokens, readOnly, grants, contract, sandbox })
       if (this.sessionModel !== model.id) this.emit({ data: { type: 'notice', message: `This conversation now uses ${localModelLabel(model.id)}.` } })
     }
     this.sessionModel = model.id
@@ -291,12 +305,19 @@ export class LocalAdapter implements ProviderAdapter {
           round++
         },
         // The context figures give the composer ring and "Model context window" the same data the
-        // CLIs report: the configured window, the room left once the answer reserve is held back.
-        usage: usage => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider',
-          limits: { contextUsedTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0), contextCapacityTokens: model.contextTokens - RESPONSE_RESERVE_TOKENS, modelContextWindow: model.contextTokens } }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
-        notice: message => this.emit({ turnId, data: { type: 'notice', message } })
+        // CLIs report: the window, and the room left once this round's answer reserve is held
+        // back. Used is what the server counted for the request just made plus what it wrote,
+        // which is what the next request will carry before its own shaping.
+        usage: (usage, context) => this.emit({ turnId, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'turn', source: 'provider',
+          limits: { contextUsedTokens: (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0), contextCapacityTokens: model.contextTokens - context.reserveTokens, contextReserveTokens: context.reserveTokens, modelContextWindow: model.contextTokens, contextRound: context.round, contextMeasurement: 'llama.cpp usage, exact for the last request' } }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
+        notice: message => this.emit({ turnId, data: { type: 'notice', message } }),
+        // Structured, debug-level: a payload keeps these out of the conversation and in the
+        // event log, where a usage timeline can be built from them later.
+        telemetry: entry => { if (entry.kind !== 'usage' && entry.kind !== 'request' && entry.kind !== 'tool' && entry.kind !== 'stop') this.emit({ turnId, data: { type: 'notice', message: `Local run telemetry: ${entry.kind}`, payload: { localTelemetry: entry as unknown as Json } } }) }
       }, controller.signal)
-      this.emit({ turnId, data: { type: 'session', phase: outcome.stopReason === 'interrupted' ? 'interrupted' : outcome.stopReason === 'iteration_limit' ? 'failed' : 'completed' } })
+      if (outcome.stopReason === 'provider_error' || outcome.stopReason === 'context_limit') this.emit({ turnId, data: { type: 'error', message: outcome.report.detail } })
+      this.emit({ turnId, itemId: `${turnId}:stop`, data: { type: 'notice', message: localStopSummary(outcome.report), payload: localStopPayload(outcome.report) } })
+      this.emit({ turnId, data: { type: 'session', phase: phaseFor(outcome) } })
     } catch (error) {
       if (controller.signal.aborted) { this.emit({ turnId, data: { type: 'session', phase: 'interrupted' } }); return }
       this.emit({ turnId, data: { type: 'error', message: error instanceof Error ? error.message : 'Local model request failed' } })
@@ -305,6 +326,20 @@ export class LocalAdapter implements ProviderAdapter {
       releaseTurn()
       if (this.controller === controller) this.controller = undefined
     }
+  }
+
+  async compactContext(): Promise<Json | null> {
+    if (this.controller) throw new Error('Wait for the current turn to finish before compacting')
+    const result = this.session?.compactNow()
+    if (!result) return null
+    const recovered = result.beforeTokens - result.afterTokens
+    this.emit({ data: { type: 'notice', message: `Context compacted on request: about ${recovered.toLocaleString()} tokens of earlier rounds folded into the task state; ${result.droppedMessages} messages left the active prompt.`, payload: { contextReset: true } } })
+    return { recoveredTokens: recovered, droppedMessages: result.droppedMessages, mode: result.mode, promptTokensAfter: result.afterTokens }
+  }
+
+  runStatus(): Json | null {
+    const state = this.session?.state()
+    return state ? state as unknown as Json : null
   }
 
   async respond(_response: InteractionResponse): Promise<void> {

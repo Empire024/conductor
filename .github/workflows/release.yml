@@ -1,9 +1,10 @@
 name: Release Conductor
 
+# Started by Conductor's delivery when a release is explicitly published (git.ship with
+# publish: true, or the Source control panel's Publish switch), or by hand from the Actions page.
+# Never on push: routine deliveries are local commits, and a hosted build per push was paying
+# for a release nobody installed.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 concurrency:

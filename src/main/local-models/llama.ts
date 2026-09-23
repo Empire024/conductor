@@ -7,6 +7,30 @@ import { configPath, loadConfig, logsDir, modelFilePath, runDir, runFile } from 
 import { childEnvironment } from './paths.ts'
 import { AdmissionRefusal, admissionRefusal, assertResourceHeadroom, runningLlamaProcesses, withAdmissionLock, type BlockingServer, type ServerProcess } from './resource-guard.ts'
 
+/** What the installed llama-server accepts, read from its own --help once per executable. A
+ *  flag is only ever passed when the binary lists it; an older build simply gets the defaults. */
+export interface LlamaServerFeatures { cacheTypeK: boolean; cacheTypeV: boolean; flashAttn: boolean }
+const featureCache = new Map<string, LlamaServerFeatures>()
+export function parseLlamaServerFeatures(helpText: string): LlamaServerFeatures {
+  return { cacheTypeK: /--cache-type-k\b/.test(helpText), cacheTypeV: /--cache-type-v\b/.test(helpText), flashAttn: /--flash-attn\b/.test(helpText) }
+}
+export async function llamaServerFeatures(executable: string): Promise<LlamaServerFeatures> {
+  const cached = featureCache.get(executable)
+  if (cached) return cached
+  const help = await new Promise<string>(resolve => {
+    let output = ''
+    const child = spawn(executable, ['--help'], { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const timer = setTimeout(() => child.kill('SIGKILL'), 20_000)
+    child.stdout.on('data', chunk => { output += String(chunk) })
+    child.stderr.on('data', chunk => { output += String(chunk) })
+    child.on('error', () => { clearTimeout(timer); resolve('') })
+    child.on('close', () => { clearTimeout(timer); resolve(output) })
+  })
+  const features = parseLlamaServerFeatures(help)
+  featureCache.set(executable, features)
+  return features
+}
+
 /** llama.cpp is an inference engine here and nothing else. These flags would hand it tools, a
  *  network surface or an agent runtime of its own, so they are refused wherever extra arguments
  *  can be configured: Conductor stays the only orchestrator, and the server stays loopback-only
@@ -27,8 +51,14 @@ export function validateExtraArgs(args: string[]): string[] {
 /** The exact server argv. Bound to 127.0.0.1 only, web UI off, API key required, one slot, and
  *  --jinja so the model's own chat template drives OpenAI-style tool calls. No tool runtime, no
  *  MCP, no agent mode, no RPC backend. */
-export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPath = modelFilePath(model)): string[] {
+export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPath = modelFilePath(model), features?: LlamaServerFeatures): string[] {
   if (!/^[a-f0-9]{32,}$/i.test(apiKey)) throw new Error('Local model API key is malformed')
+  const quantizedKv = Boolean(model.kvCacheType && model.kvCacheType !== 'f16' && model.kvCacheType !== 'bf16')
+  const cacheArgs = model.kvCacheType && features?.cacheTypeK && features.cacheTypeV ? ['--cache-type-k', model.kvCacheType, '--cache-type-v', model.kvCacheType] : []
+  // A quantized V cache is refused by llama.cpp without flash attention, so it is asked for
+  // explicitly there; otherwise the build's own default (auto) is left alone unless configured.
+  const flash = model.flashAttention ?? (quantizedKv && cacheArgs.length ? 'on' : undefined)
+  const flashArgs = flash && features?.flashAttn ? ['--flash-attn', flash] : []
   return [
     '--host', '127.0.0.1',
     '--port', String(model.port),
@@ -40,6 +70,8 @@ export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPa
     '--n-gpu-layers', String(model.gpuLayers),
     '--parallel', '1',
     '--jinja',
+    ...cacheArgs,
+    ...flashArgs,
     ...validateExtraArgs(model.extraArgs ?? [])
   ]
 }
@@ -451,7 +483,8 @@ async function startAdmittedServer(executable: string, model: LocalModelConfig, 
   const log = openSync(logFile(model), 'a')
   // TEMP, caches and any model-cache variable point at the local root, so the server can never
   // stage large files on the system drive.
-  const child = spawn(executable, llamaServerArgs({ ...model, port }, apiKey, path), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
+  const features = model.kvCacheType || model.flashAttention ? await llamaServerFeatures(executable) : undefined
+  const child = spawn(executable, llamaServerArgs({ ...model, port }, apiKey, path, features), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
   closeSync(log)
   let spawnError = ''
   child.on('error', error => { spawnError = error.message })

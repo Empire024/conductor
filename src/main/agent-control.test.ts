@@ -995,3 +995,25 @@ describe('local-model grants through app control', () => {
     expect(registered()).toBe(count)
   })
 })
+
+describe('bounded local tasks and compact supervision through app control', () => {
+  const withLocal = () => {
+    const f = fixture(false, { local: ['default', 'accept-edits', 'read-only'] })
+    f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })
+    return f
+  }
+
+  it('stores a task contract on a local tab it opens, refuses one elsewhere, and exposes a compact status', async () => {
+    const f = withLocal()
+    const contract = { allowedPaths: ['public/text-diff.js'], acceptance: { command: 'node --test tests/text-diff.test.mjs' } }
+    const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic', contract }) as AgentControlTab
+    expect(f.database.structured.snapshot(tab.resourceId!)!.settings.localContract).toEqual(contract)
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic', contract: { allowedPaths: ['../escape'] } })).rejects.toThrow(/workspace-relative/)
+    await expect(f.control.call(f.scope, 'tabs.open', { contract })).rejects.toThrow(/local models only/)
+    const status = await f.control.call(f.scope, 'agents.status', { agentSessionId: tab.resourceId }) as Record<string, unknown>
+    expect(status).toMatchObject({ agentSessionId: tab.resourceId, provider: 'local', model: 'local-synthetic', contract, stop: null, lastTool: null, filesChanged: [] })
+    expect(JSON.stringify(status).length).toBeLessThan(2000)
+    expect(JSON.stringify(await f.control.call(f.scope, 'tools.list', {}))).toContain('compact supervision view')
+    await expect(f.control.call(f.scope, 'agents.compact', { agentSessionId: f.spec.id })).rejects.toThrow()
+  })
+})

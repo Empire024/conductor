@@ -1983,3 +1983,5 @@ body.autoscrolling * { cursor: all-scroll !important; }
 .scp-ship:hover:not(:disabled) { filter: brightness(1.08); }
 .scp-ship:disabled { border-color: var(--border); color: var(--text-3); background: var(--surface-2); cursor: default; }
 .scp-ship-reason { min-width: 0; color: var(--text-3); font-size: 9px; line-height: 1.35; }
+.scp-publish { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text-2); white-space: nowrap; cursor: pointer; }
+.scp-publish input { margin: 0; }

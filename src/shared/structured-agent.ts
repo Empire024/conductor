@@ -46,6 +46,10 @@ export interface SessionSettings {
    *  and a wide web research mode (a search tool and the tool rounds to use it). */
   localGit?: boolean
   localResearch?: boolean
+  /** Local models only: a bounded coding task's contract. The runtime refuses writes outside
+   *  allowedPaths and runs the acceptance command itself after edits; when it passes and only
+   *  allowed paths changed, the model is told to finish. Set by whoever dispatched the task. */
+  localContract?: { allowedPaths?: string[]; acceptance?: { command: string; timeoutSec?: number } }
   /** Owner opt-in: bounded stronger review of this controller's delegated approval requests. */
   reviewDelegatedActions?: boolean
   plan: boolean

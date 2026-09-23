@@ -32,7 +32,7 @@ const run = (patch: Partial<DeliveryRun> = {}): DeliveryRun => ({
 })
 const noop = (): void => {}
 const render = (patch: Partial<SourceControlViewProps> = {}): string => renderToStaticMarkup(createElement(SourceControlView, {
-  status: status(), run: null, message: '', selected: new Set(files.map(item => item.path)), shipping: false, refreshing: false,
+  status: status(), run: null, message: '', selected: new Set(files.map(item => item.path)), shipping: false, refreshing: false, publish: false, onPublish: () => {},
   error: '', now: Date.parse(at(5)), expanded: {},
   onMessage: noop, onToggleFile: noop, onSelectAll: noop, onShip: noop, onCancel: noop, onRefresh: noop, onToggleStage: noop,
   ...patch
@@ -113,7 +113,11 @@ describe('source control view', () => {
     expect(html).toContain('abcdef1')
     expect(html).toContain('Previous change')
     expect(html).toContain('Empire024/conductor')
-    expect(html).toContain('Release workflow will be verified')
+    expect(html).toContain('Local commit; no push or release')
+    expect(html).toContain('Publish release')
+    expect(html).not.toContain('Release workflow will be')
+    expect(render({ publish: true })).toContain('Release workflow will be started and verified')
+    expect(render({ publish: true })).toContain('Ship &amp; publish')
     expect(html).toContain('4 of 4 changes selected')
     expect(html.match(/type="checkbox" checked=""/g)).toHaveLength(4)
     expect(html).toContain('badge-untracked')

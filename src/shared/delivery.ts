@@ -1,8 +1,10 @@
 /**
  * Source control delivery: one call takes a project's finished work from the working tree to a
- * verified release — test, build, commit, push, then wait for the release the push triggers.
- * It runs on the host, with the owner's own Git credentials and network, so no agent sandbox has
- * to reach GitHub or ask to leave the workspace to deliver.
+ * verified local commit — test, build, commit — and, only when asked to publish, on to a push and
+ * the GitHub release that other devices update from. Routine deliveries stay on this machine;
+ * the installed app here updates from the checkout through app.update. It runs on the host, with
+ * the owner's own Git credentials and network, so no agent sandbox has to reach GitHub or ask to
+ * leave the workspace to deliver.
  */
 
 export type DeliveryStageId = 'preflight' | 'test' | 'build' | 'commit' | 'push' | 'release'
@@ -30,6 +32,9 @@ export interface DeliveryRun {
   message: string
   /** Null commits every change in the working tree; otherwise only these repository paths. */
   paths: string[] | null
+  /** False: the commit stays local (push and release are skipped). True: push and verify the
+   *  GitHub release. Absent on runs recorded before the distinction existed, which published. */
+  publish?: boolean
   startedAt: string
   finishedAt: string | null
   commit: string | null
@@ -71,6 +76,9 @@ export interface DeliveryRequest {
   projectId: string
   message: string
   paths?: string[]
+  /** Push and publish a GitHub release after the commit. Off by default: a release costs a
+   *  hosted build and is only needed when another device must update. */
+  publish?: boolean
 }
 
 export interface DeliveryBridge {

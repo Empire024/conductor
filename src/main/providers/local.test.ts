@@ -4,12 +4,13 @@ import { createServer as createTcpServer } from 'node:net'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { LocalAdapter, LocalSetupError, localModelAvailability, releaseVerdict } from './local'
+import { LocalAdapter, LocalSetupError, localModelAvailability, phaseFor, releaseVerdict } from './local'
 import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, modelDir, runFile } from '../local-models/config.ts'
 import type { LocalModelConfig } from '../local-models/config.ts'
 import * as localPaths from '../local-models/paths.ts'
 import * as resources from '../local-models/resource-guard.ts'
 import type { AdapterEvent, SessionSettings } from '../../shared/structured-agent'
+import { localStopOf } from '../../shared/local-stop.ts'
 
 /** Synthetic server state needs no model disk or writable secondary drive. */
 function scratchRoot(): string | null {
@@ -176,8 +177,9 @@ describe('local provider adapter', () => {
     expect(await settled(events)).toBe('completed')
     expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { inputTokens: 2100, cachedTokens: 2000, outputTokens: 3, totalTokens: 2103 }, native: { method: 'llama.cpp/timings', payload: { cache_n: 2000, prompt_n: 100, prompt_ms: 90, predicted_ms: 30 } } })
     // Context figures the ring and "Model context window" read, as the CLIs report them: the
-    // configured 32,768-token window, capacity once the 4,096-token answer reserve is held back.
-    expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { limits: { contextUsedTokens: 2103, contextCapacityTokens: 32768 - 4096, modelContextWindow: 32768 } } })
+    // configured 32,768-token window, capacity once this round's answer reserve (the policy's
+    // tool-round reserve, 2,560 tokens) is held back, and the reserve itself so the pane can say so.
+    expect(events.find(event => event.data.type === 'usage')).toMatchObject({ data: { limits: { contextUsedTokens: 2103, contextCapacityTokens: 32768 - 2560, contextReserveTokens: 2560, modelContextWindow: 32768 } } })
   })
 
   const guard = (reason: unknown): void => { if (!(reason instanceof Error) || reason.message !== 'skip') throw reason }
@@ -281,6 +283,22 @@ describe('local provider adapter', () => {
     expect(events.some(event => event.data.type === 'error')).toBe(false)
   })
 
+  it('ends a run that repeats one failing call with a failed phase and a stop report the pane and a controller can read', async () => {
+    let ready: Awaited<ReturnType<typeof stack>>
+    // The stub replays the same read of a missing file on every request: the loop notices.
+    try { ready = await stack([frame({ tool_calls: [{ index: 0, id: 'same', function: { name: 'read_file', arguments: '{"path":"missing.txt"}' } }] }, 'tool_calls')]) } catch (reason) { return guard(reason) }
+    const events: AdapterEvent[] = []
+    const instance = adapter(ready.workspace, events)
+    await instance.submit('open it', settings())
+    expect(await settled(events)).toBe('failed')
+    const report = events.map(event => localStopOf(event.data)).find(Boolean)
+    expect(report).toMatchObject({ reason: 'stagnation', rounds: 6, hardLimit: 24, loopWarnings: 1, context: { windowTokens: 32768, reserveTokens: 2560 } })
+    const notice = events.find(event => event.data.type === 'notice' && localStopOf(event.data))
+    expect(notice && notice.data.type === 'notice' ? notice.data.message : '').toMatch(/^Stopped: repeating without progress after 6 of 24 tool rounds/)
+    expect(ready.small.requests.length).toBe(6)
+    expect(instance.runStatus()).toMatchObject({ task: 'open it', filesChanged: [] })
+  })
+
   /**
    * The port in config is only a request: a server that could not bind it moved to a neighbouring
    * or OS-assigned one and recorded where it landed, which is what every other client reads. If
@@ -321,5 +339,15 @@ describe('local provider adapter', () => {
     expect(await settled(events)).toBe('failed')
     expect(events.some(event => event.data.type === 'error' && /Local model failed to start|not answering|llama/i.test(event.data.message))).toBe(true)
     expect(JSON.stringify(events)).not.toContain(KEY)
+  })
+})
+
+describe('local stop diagnostics', () => {
+  it('maps every stop reason to a phase a controller can trust', () => {
+    expect(phaseFor({ stopReason: 'completed', text: 'done' })).toBe('completed')
+    expect(phaseFor({ stopReason: 'interrupted', text: '' })).toBe('interrupted')
+    expect(phaseFor({ stopReason: 'output_limit', text: 'half an ans' })).toBe('completed')
+    expect(phaseFor({ stopReason: 'output_limit', text: '' })).toBe('failed')
+    for (const reason of ['round_limit', 'stagnation', 'context_limit', 'unverified_claim', 'provider_error', 'empty_answer'] as const) expect(phaseFor({ stopReason: reason, text: 'text' }), reason).toBe('failed')
   })
 })

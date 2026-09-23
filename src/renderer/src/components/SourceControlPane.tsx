@@ -99,6 +99,7 @@ export function runHeadline(run: DeliveryRun): RunHeadline {
   }
   if (run.state === 'delivered') {
     const commit = run.commit ? run.commit.slice(0, 7) : null
+    if (run.publish === false) return { tone: 'delivered', title: 'Committed locally', detail: [commit && `commit ${commit}`, 'not pushed; publish when other devices need it'].filter(Boolean).join(' · ') }
     return { tone: 'delivered', title: run.releaseTag ? `Delivered ${run.releaseTag}` : 'Delivered', detail: [commit && `commit ${commit}`, run.releaseTag ? 'release verified' : 'pushed'].filter(Boolean).join(' · ') }
   }
   if (run.state === 'failed') {
@@ -145,6 +146,9 @@ export interface SourceControlViewProps {
   onMessage(value: string): void
   onToggleFile(path: string): void
   onSelectAll(all: boolean): void
+  /** Push and publish a GitHub release after the commit; off by default. */
+  publish: boolean
+  onPublish(publish: boolean): void
   onShip(): void
   onCancel(): void
   onRefresh(): void
@@ -173,8 +177,8 @@ export function SourceControlView(props: SourceControlViewProps): React.JSX.Elem
     {status?.available && <div className="scp-facts">
       {status.head && <span title={status.head}><GitCommitHorizontal size={11} /><code>{status.head.slice(0, 7)}</code>{status.headSubject}</span>}
       {status.github && <span><Github size={11} />{status.github.owner}/{status.github.repo}</span>}
-      <span className={status.releaseWorkflow ? 'scp-release-on' : undefined}>
-        <Rocket size={11} />{status.releaseWorkflow ? 'Release workflow will be verified' : 'No release workflow; release check is skipped'}
+      <span className={status.releaseWorkflow && props.publish ? 'scp-release-on' : undefined}>
+        <Rocket size={11} />{!props.publish ? 'Local commit; no push or release' : status.releaseWorkflow ? 'Release workflow will be started and verified' : 'No release workflow; the push is the delivery'}
       </span>
       {!status.upstream && <span className="scp-warn"><AlertCircle size={11} />No upstream branch</span>}
     </div>}
@@ -271,10 +275,13 @@ export function SourceControlView(props: SourceControlViewProps): React.JSX.Elem
         }}
       />
       <div className="scp-ship-row">
-        <button type="submit" className="scp-ship" disabled={Boolean(blocker)} title={blocker ?? 'Test, build, commit, push and verify the release · Ctrl+Enter'}>
-          {shipping ? <LoaderCircle size={13} className="spin" /> : <Rocket size={13} />}Ship
+        <button type="submit" className="scp-ship" disabled={Boolean(blocker)} title={blocker ?? (props.publish ? 'Test, build, commit, push and verify the release · Ctrl+Enter' : 'Test, build and commit on this machine · Ctrl+Enter')}>
+          {shipping ? <LoaderCircle size={13} className="spin" /> : <Rocket size={13} />}{props.publish ? 'Ship & publish' : 'Ship'}
         </button>
-        <small className="scp-ship-reason">{blocker ?? 'Test → build → commit → push → verify release'}</small>
+        <label className="scp-publish" title="Off: the commit stays on this machine and the installed app updates through app.update. On: push main and build a GitHub release for other devices; it costs a hosted build, so use it for bigger, tested states rather than every delivery.">
+          <input type="checkbox" checked={props.publish} disabled={running} onChange={event => props.onPublish(event.target.checked)} />Publish release
+        </label>
+        <small className="scp-ship-reason">{blocker ?? (props.publish ? 'Test → build → commit → push → start & verify release' : 'Test → build → commit (local)')}</small>
       </div>
     </form>}
   </div>
@@ -289,6 +296,7 @@ export function SourceControlPane({ project }: { project: ProjectRecord }): Reac
   // Tracked as exclusions so every change is selected by default, including ones that appear later.
   const [excluded, setExcluded] = useState<ReadonlySet<string>>(() => new Set())
   const [shipping, setShipping] = useState(false)
+  const [publish, setPublish] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const [now, setNow] = useState(Date.now())
@@ -348,7 +356,7 @@ export function SourceControlPane({ project }: { project: ProjectRecord }): Reac
     setShipping(true); setError('')
     try {
       const paths = shipPaths(status.files, selected)
-      const started = await deliveryBridge().ship({ projectId: project.id, message: message.trim(), ...(paths ? { paths } : {}) })
+      const started = await deliveryBridge().ship({ projectId: project.id, message: message.trim(), ...(paths ? { paths } : {}), publish })
       setExpanded({})
       setRun(started)
     } catch (reason) {
@@ -383,6 +391,8 @@ export function SourceControlPane({ project }: { project: ProjectRecord }): Reac
       return next
     })}
     onSelectAll={(all) => setExcluded(all ? new Set() : new Set((status?.files ?? []).map(file => file.path)))}
+    publish={publish}
+    onPublish={setPublish}
     onShip={() => void ship()}
     onCancel={() => void cancel()}
     onRefresh={() => void refresh()}

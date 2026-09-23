@@ -7,7 +7,7 @@ import { conductorUri } from '../shared/agent-control'
 import { hasSessionWork } from './close-confirmation'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type LayoutNode, type PaneKind, type PaneTab } from '../shared/models'
 import type { PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
-import { isSessionPermission, settingsForRuntime } from '../shared/structured-agent'
+import { isSessionPermission, MAX_PROMPT_CHARS, settingsForRuntime } from '../shared/structured-agent'
 import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
@@ -25,6 +25,9 @@ import type { LocalUpdateBuildService } from './local-update-build'
 import type { DeliveryRequester, DeliveryRun, RepositoryStatus } from '../shared/delivery'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import { createApprovalRouting } from './approval-review-routing'
+import { localStopOf } from '../shared/local-stop.ts'
+import { summarizeContext } from '../shared/usage-accounting'
+import { normaliseContract } from './local-models/completion.ts'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -44,7 +47,8 @@ const inheritedPermission = (source: SessionSettings, supported?: SessionSetting
 }
 const text = (args: Args, key: string, maximum = 20000): string => {
   const value = args[key]
-  if (typeof value !== 'string' || !value.trim() || value.length > maximum || value.includes('\0')) throw new Error(`Invalid ${key}`)
+  if (typeof value === 'string' && value.length > maximum) throw new Error(`The ${key} is ${value.length.toLocaleString('en-US')} characters; the limit is ${maximum.toLocaleString('en-US')}.`)
+  if (typeof value !== 'string' || !value.trim() || value.includes('\0')) throw new Error(`Invalid ${key}`)
   return value
 }
 const object = (value: unknown): Args => {
@@ -89,7 +93,7 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,title?,machineId?,projectId?,workspaceId?,repository?,research?}) — visible tab; agent default kind, provider/model must be available; a new agent tab opens on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode — always clamped to the controller’s autonomy and to what the target provider offers; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?}) — visible tab; agent default kind, provider/model must be available; a new agent tab opens on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode — always clamped to the controller’s autonomy and to what the target provider offers; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish',
   'tabs.focus': '({tabId})',
   'tabs.rename': '({tabId,title})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical"})',
@@ -98,6 +102,8 @@ const toolSignatures = {
   'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller opened in a sibling project',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
+  'agents.status': '({agentSessionId}) — the compact supervision view of one visible conversation: phase, model, last stop reason with its figures (rounds used of the hard cap, context used / capacity / reserve, compactions, loop warnings, acceptance result, files changed), last tool and its status, and the durable task state a local worker keeps. A few hundred bytes; use it instead of agents.snapshot to poll a local worker',
+  'agents.compact': '({agentSessionId}) — fold an idle local-model coworker’s transcript into its durable task state (task, constraints, files changed, recent commands, current failure, remaining work) inside the same conversation, so its next turn starts from compact state without a new tab; only a coworker this caller controls, only between turns; returns the tokens recovered',
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
@@ -124,11 +130,11 @@ const toolSignatures = {
   'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. The owner confirms each build, unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner accepts it',
   'app.update.status': '() — state, version, log tail and result of the local update build',
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
-  'git.ship': '({message,paths?,waitSeconds?}) — deliver finished work in one call. Conductor runs it on the host with the owner’s own Git credentials and network: tests, build, commit (only paths if given, verified in an isolated copy when other work is also in the tree), push, then it waits for the release the push triggers and checks its assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
+  'git.ship': '({message,paths?,publish?,waitSeconds?}) — deliver finished work in one call. Conductor runs it on the host with the owner’s own Git credentials and network: tests, build, commit (only paths if given, verified in an isolated copy when other work is also in the tree), push, then it waits for the release the push triggers and checks its assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
   'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; each opens on permission if given, else the owner’s remembered mode for its provider, same as tabs.open; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does'
 } as const
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
@@ -247,6 +253,34 @@ export class AgentControl {
     if (kind === 'workspace') await this.ui(scope, 'workspace.focus', {})
     else if (kind === 'file') await this.ui(scope, 'files.open', { path: relative(await realpath(project.path), await workspacePath(project.path, id)).replaceAll('\\', '/') })
     else throw new Error('Unsupported Conductor link')
+  }
+
+  /** The few hundred bytes a controller needs to supervise a worker, in place of a 40 KB
+   *  snapshot: where it is, why it last stopped, what it changed. The stop figures come from the
+   *  local runtime's own report on the timeline, so a controller sees the same numbers the owner
+   *  does; a native CLI conversation reports what its events carry. */
+  private status(scope: AgentControlScope, tab: AgentControlTab, state: SessionProjection) {
+    const items = [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence))
+    const stop = items.map(item => localStopOf(item.data)).find(Boolean)
+    const lastTool = items.find(item => item.data.type === 'tool' && item.data.name !== 'acceptance')
+    const lastText = items.find(item => item.data.type === 'text' && item.data.role === 'assistant')
+    const lastError = items.find(item => item.data.type === 'error')
+    const context = summarizeContext(state.items)
+    const changed = new Set<string>()
+    for (const item of state.items) if (item.data.type === 'changes') for (const change of item.data.changes) changed.add(change.path)
+    return {
+      ...this.observation(scope, tab, state, new Date().toISOString()),
+      model: state.settings.model ?? tab.state?.model ?? null,
+      permission: state.settings.permission,
+      contract: state.settings.localContract ?? null,
+      stop: stop ? { reason: stop.reason, detail: stop.detail, rounds: stop.rounds, hardLimit: stop.hardLimit, context: stop.context, compactions: stop.compactions, loopWarnings: stop.loopWarnings, acceptance: stop.acceptance ?? null, filesChanged: stop.filesChanged, unverified: stop.unverified ?? null } : null,
+      context: context ? { used: context.used, capacity: context.capacity, window: context.window ?? null, percent: Math.round(context.percent * 10) / 10, level: context.level } : null,
+      lastTool: lastTool && lastTool.data.type === 'tool' ? { name: lastTool.data.name, status: lastTool.data.status, at: lastTool.timestamp } : null,
+      lastError: lastError && lastError.data.type === 'error' ? lastError.data.message.slice(0, 400) : null,
+      lastAnswer: lastText && lastText.data.type === 'text' ? lastText.data.text.slice(-600) : null,
+      filesChanged: [...changed].slice(0, 100),
+      taskState: this.deps.sessions.runStatus(tab.resourceId!)
+    }
   }
 
   private observation(scope: AgentControlScope, tab: AgentControlTab, state: SessionProjection | null, observedAt: string) {
@@ -555,6 +589,10 @@ export class AgentControl {
         this.grantAuthority(scope, source)
         if (provider !== 'local') throw new Error('Repository and research grants apply to local models only')
       }
+      // A contract narrows what the worker may do rather than widening it, so any caller that may
+      // open a tab may set one; it only means something to the local runtime.
+      const contract = normaliseContract(args.contract)
+      if (contract && provider !== 'local') throw new Error('A task contract applies to local models only')
       // A local model whose server cannot start right now (another model is busy on the one
       // slot this machine has) is refused here, with the reason, rather than as the failure of the
       // first turn inside a tab that then sits there.
@@ -580,7 +618,7 @@ export class AgentControl {
       // still capped by the controller's own autonomy and by what this provider actually offers.
       const requested = explicitPermission ?? rememberedPermission(key => this.deps.database.getSetting(key), provider)
       const permission = inheritedPermission(sourceSettings, created.capabilities?.permissions, requested)
-      const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(permission === 'read-only' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude', ...requestedGrants }
+      const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(permission === 'read-only' ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && provider === 'claude', ...requestedGrants, ...(contract ? { localContract: contract } : {}) }
       this.deps.database.structured.update(spec.id, { settings })
       if (Object.keys(requestedGrants).length) grants = { repository: Boolean(settings.localGit), research: Boolean(settings.localResearch) }
     } else {
@@ -671,6 +709,13 @@ export class AgentControl {
         return { ...this.observation(target, tab, state, new Date().toISOString()), ...state, activeTools, items: recent.sort((a, b) => a.sequence - b.sequence), truncated: state.truncated || state.items.length > recent.length }
       }
       if (method === 'agents.history') return database.structured.events(id, typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0).slice(0, 100)
+      if (method === 'agents.status') return this.status(target, tab, state)
+      if (method === 'agents.compact') {
+        if (Object.keys(args).some(key => key !== 'agentSessionId')) throw new Error('agents.compact accepts only agentSessionId')
+        if (database.structured.spec<AgentSpec>(id)?.provider !== 'local') throw new Error('Only a local-model conversation keeps a task state Conductor can compact; native CLIs compact themselves')
+        const result = await sessions.compactContext(id)
+        return { agentSessionId: id, compacted: result !== null, result, note: result ? 'The next turn starts from the compacted task state; the full history stays in the timeline.' : 'Nothing to fold yet.' }
+      }
       if (method === 'agents.configure') {
         if (Object.keys(args).some(key => !['agentSessionId', 'model', 'effort'].includes(key))) throw new Error('agents.configure accepts only agentSessionId, model, and effort')
         const spec = database.structured.spec<AgentSpec>(id)
@@ -719,7 +764,7 @@ export class AgentControl {
       if (method === 'agents.release') { this.relationship(scope, target, tab, 'detached'); return { released: true } }
       if (method === 'agents.interrupt') { await sessions.interrupt(id); return { interrupted: true } }
       if (method === 'agents.submit' || method === 'agents.steer') {
-        const prompt = text(args, 'prompt')
+        const prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot dispatch to a writable conversation')
         this.relationship(scope, target, tab, 'attached')
         // A coordinated prompt is not the owner's message. Record the controlling tab so the
@@ -836,7 +881,8 @@ export class AgentControl {
       return await settle(run) ?? { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
     }
     if (method !== 'git.ship') throw new Error('Unknown control method; use tools.list')
-    if (Object.keys(args).some(key => !['message', 'paths', 'waitSeconds'].includes(key))) throw new Error('git.ship accepts only message, paths and waitSeconds')
+    if (Object.keys(args).some(key => !['message', 'paths', 'publish', 'waitSeconds'].includes(key))) throw new Error('git.ship accepts only message, paths, publish and waitSeconds')
+    if (args.publish !== undefined && typeof args.publish !== 'boolean') throw new Error('publish must be true or false')
     if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
     const message = text(args, 'message', 5000)
     let paths: string[] | undefined
@@ -901,7 +947,7 @@ export class AgentControl {
   }
 
   private async startRouter(scope: AgentControlScope, args: Args): Promise<unknown> {
-    const prompt = text(args, 'prompt')
+    const prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
     const tab = await this.open(scope, { ...args, kind: 'agent', title: 'Conductor router' })
     const { agent, routine } = this.router(scope, tab.state!.provider as StructuredProvider, String(tab.state!.model))
     const started = this.deps.orchestration.startRoutine(routine.id), task = started.tasks[0]!
@@ -915,7 +961,7 @@ export class AgentControl {
     if (!Array.isArray(args.tasks) || !args.tasks.length || args.tasks.length > 4) throw new Error('Route one to four bounded tasks per call')
     const seen = new Set<string>()
     const requests: Array<Args & { projectTaskIds: string[] }> = args.tasks.map(value => {
-      const request = object(value); text(request, 'title', 120); text(request, 'prompt')
+      const request = object(value); text(request, 'title', 120); text(request, 'prompt', MAX_PROMPT_CHARS)
       const ids = request.projectTaskIds ?? []
       if (!Array.isArray(ids) || ids.length > 50 || ids.some(id => typeof id !== 'string' || !id || id.length > 160 || seen.has(id) || !seen.add(id))) throw new Error('Provide distinct exact project task IDs across this dispatch')
       // A checklist claim is owned by the project whose feature-list.md holds it, and only an
@@ -957,8 +1003,8 @@ export class AgentControl {
         // sibling project is not asked to close a task it cannot even see; its controller does that.
         const coordination = tab.projectId === scope.projectId
           ? tab.state!.provider === 'local'
-            ? '\n\nConductor orchestration task: ' + task.id + '. When finished, report concrete evidence, tests, and remaining limitations to your controller ' + scope.agentSessionId + '. Your controller updates the orchestration task.'
-            : '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol.'
+            ? '\n\nConductor orchestration task: ' + task.id + '. When finished, report concrete evidence, tests, and remaining limitations to your controller ' + scope.agentSessionId + '. Your controller updates the orchestration task. Deliver with git.ship({message, paths}) as a local commit only; never pass publish: true. Your controller publishes one release for the whole batch when it is done.'
+            : '\n\nConductor orchestration task: ' + task.id + '. Mark it done with orchestration.tasks.update only after finishing. Your controller is ' + scope.agentSessionId + '; coordinate through the provided app protocol. Deliver with git.ship({message, paths}) as a local commit only; never pass publish: true. Your controller publishes one release for the whole batch when it is done.'
           : '\n\nThis work was handed to the ' + (this.deps.database.getProject(tab.projectId)?.name ?? 'this') + ' project by a coworker in ' + (this.deps.database.getProject(scope.projectId)?.name ?? 'another project') + '. You work only in this project; your controller is ' + scope.agentSessionId + ' and tracks the task on its own side, so report your result here rather than looking for its task board.'
         await this.call(scope, 'agents.submit', { agentSessionId: tab.resourceId, prompt: String(request.prompt) + ownership + coordination })
         accepted = true

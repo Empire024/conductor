@@ -22,7 +22,19 @@ export interface LocalModelConfig {
    *  64 GB of system RAM. Only one model server may be resident at a time. */
   gpuLayers: number
   extraArgs: string[]
+  /** KV cache element type for K and V. f16 is llama.cpp's default; q8_0 halves the cache at a
+   *  negligible quality cost and is what makes a 64K window fit beside the weights in 12 GB.
+   *  A quantized V cache needs flash attention, which the launcher turns on for it. Only passed
+   *  when the installed llama-server advertises the flag. */
+  kvCacheType?: KvCacheType
+  /** Flash attention: llama.cpp's own default is auto (on where the backend supports it). */
+  flashAttention?: 'auto' | 'on' | 'off'
 }
+
+export const KV_CACHE_TYPES = ['f16', 'bf16', 'q8_0', 'q5_1', 'q5_0', 'q4_1', 'q4_0'] as const
+export type KvCacheType = (typeof KV_CACHE_TYPES)[number]
+/** Bytes per element relative to f16, for the admission estimate. */
+export const KV_CACHE_SCALE: Record<KvCacheType, number> = { f16: 1, bf16: 1, q8_0: 0.53, q5_1: 0.375, q5_0: 0.34, q4_1: 0.31, q4_0: 0.28 }
 
 export interface SandboxConfig {
   image: string
@@ -150,6 +162,9 @@ export function validateConfig(config: LocalStackConfig): LocalStackConfig {
     if (!Number.isInteger(model.contextTokens) || model.contextTokens < 2048 || model.contextTokens > 262144) throw new Error(`Invalid context size for ${id}`)
     if (!Number.isInteger(model.gpuLayers) || model.gpuLayers < 0 || model.gpuLayers > 999) throw new Error(`Invalid gpuLayers for ${id}`)
     if (!Array.isArray(model.extraArgs) || model.extraArgs.some(arg => typeof arg !== 'string')) throw new Error(`Invalid extraArgs for ${id}`)
+    if (model.kvCacheType !== undefined && !(KV_CACHE_TYPES as readonly string[]).includes(model.kvCacheType)) throw new Error(`Invalid kvCacheType for ${id}; one of ${KV_CACHE_TYPES.join(', ')}`)
+    if (model.flashAttention !== undefined && !['auto', 'on', 'off'].includes(model.flashAttention)) throw new Error(`Invalid flashAttention for ${id}; auto, on or off`)
+    if (model.kvCacheType && model.kvCacheType !== 'f16' && model.kvCacheType !== 'bf16' && model.flashAttention === 'off') throw new Error(`A quantized KV cache for ${id} needs flash attention; set flashAttention to auto or on`)
   }
   const sandbox = config.sandbox
   if (!sandbox || !/^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?$/.test(sandbox.image)) throw new Error('Invalid sandbox image reference')

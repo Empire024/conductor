@@ -359,6 +359,65 @@ loopback — the container never needs to reach the model servers.
   the 35B.
 - Startup verification re-hashes ~26 GB by default; use `-Fast` when that is too slow.
 
+## 14. Context and progress management for local agents (2026-09-23)
+
+The active prompt of a local conversation is not its execution log. Field runs of Ornith 1.5 9B on
+32K windows ended for three reasons that had nothing to do with the task: the transcript filled
+the window (every whole-file read, test dump and "wait, actually" narration was re-sent on every
+request), a fixed 16-round cap ended productive runs, and a model that had finished kept inspecting
+until it broke what worked. `src/main/local-models/agent.ts` now manages all three, configured by
+one typed policy (`agent-policy.ts`, defaults below) rather than by prompt text the model ignores.
+
+- **Reserve and budget.** Every request is measured before it is sent (messages, tool schemas and
+  framing, at three characters per token, pessimistic) against the window less the reserve for the
+  answer: 2,560 tokens on a tool round, 1,536 once the loop has asked for the final answer. The
+  usage figures the ring shows carry both (`contextReserveTokens`, `contextCapacityTokens`).
+- **Tool output shaping** (`tool-output.ts`). The timeline gets every raw result; the prompt gets
+  the head and tail of a command (6 KB), a test run reduced to its failures, assertions and
+  summary, a diff reduced to its hunks, and `read_file` returns 200 lines by default with the
+  total and the next range in its header (800 lines at most). `apply_edits` applies several exact
+  replacements to one file atomically, so a task with N edits is not N rounds.
+- **Compaction** (`context-manager.ts`). At 70% of the usable window the model is warned once; at
+  78% the older rounds are folded into a durable task state (task, constraints, files changed,
+  recent commands, current failure, the model's last conclusion, remaining work) and only the two
+  newest tool groups stay verbatim; at 90% only the newest. A request the server still refuses as
+  too large gets one aggressive compaction and one retry. Compaction is deterministic and local:
+  no model call, so it cannot fail for want of context. The full history stays in the timeline.
+- **Rounds** (`progress.ts`). Soft warning at 10, strong at 16, finish phase at 20, hard stop at
+  24 (research grant: 24 / 36 / 42 / 48). Each stage speaks once, as a user turn.
+- **Stagnation.** The same call with the same result three times draws a correction; six ends the
+  run with a blocker report. Six rounds without a new file change or command result draw one
+  warning. Distinct edits and distinct commands never trigger it.
+- **Runaway generation.** A reply dense with self-corrections ("wait", "actually", "let me
+  rethink") is cut off after 2,500 characters, never stored, and the model is told to act; a
+  second such reply ends the turn as `output_limit`.
+- **Evidence-based completion** (`completion.ts`). A final message that claims edits or passing
+  tests with no matching tool call in the run ends as `unverified_claim`, never `completed`.
+  With a task contract (`tabs.open` / `router.dispatch` `contract: { allowedPaths, acceptance:
+  { command } }`, or `settings.localContract`), the runtime refuses writes outside the allowed
+  paths, runs the acceptance command itself after every round that wrote a file and when the model
+  tries to finish, feeds back a shaped report, and once it passes with only allowed paths changed
+  tells the model to stop. A contracted task also gets the coding tool set only (no memory, task
+  board or web tools), which saves their schema tokens on every round.
+- **Stop diagnostics.** Every turn ends with a `localStop` notice payload (`src/shared/local-stop.ts`):
+  reason (`completed`, `round_limit`, `stagnation`, `context_limit`, `output_limit`,
+  `unverified_claim`, `provider_error`, `empty_answer`, `interrupted`), rounds used of the cap,
+  context used / capacity / reserve / window, compactions and tokens recovered, loop warnings,
+  acceptance result, files changed, raw output kept out of the prompt, and a per-round timeline.
+  The conversation shows it as a card for every reason but an ordinary completion; the phase is
+  `completed` only for a real completion (or a truncated answer that still has text).
+  `agents.status({agentSessionId})` returns the compact supervision view (a few hundred bytes);
+  `agents.compact({agentSessionId})` folds an idle local coworker's transcript into its task state
+  inside the same conversation, the fresh-tab pattern without a new tab.
+- **KV cache.** `kvCacheType` (`f16` default, `q8_0` recommended) and `flashAttention` in a
+  model's config entry are passed to `llama-server` as `--cache-type-k/-v` and `--flash-attn`
+  only when the installed binary lists those flags in `--help` (build b10901 does). A quantized V
+  cache needs flash attention, so the launcher turns it on for it. The admission estimate scales
+  the KV envelope by the cache type. On MAIN, `q8_0` halves the 9B's KV cache (about 0.5 GB at
+  32K, 1 GB at 64K), which is what makes a 64K window fit beside the weights in 12 GB. Change it
+  in `<root>\config\config.json` and restart the server by hand; the running server is never
+  restarted by the app.
+
 ## 13. One server at a time (2026-09-21)
 
 MAIN admits one llama.cpp server at a time (see `docs/machine-profile.md`). `scripts/local-models/start.ps1` starts the default 9B model; `-Model local/qwen3.6-35b-a3b` selects the other model explicitly. CLI and app startup share a machine-wide admission mutex on loopback port 51434 (`src/main/local-models/resource-guard.ts`). A matching, authenticated running model is reused. When the app asks for another model, the resident server gives way if this Conductor started it (its run record holds the pid) and nothing is using it: no conversation in this Conductor is mid-turn on it, and llama.cpp's own `/slots` shows no generation in progress. It is then stopped by pid and the requested model starts in its place; the tab's start notice says so. A busy server is refused with what keeps it busy; a server started outside Conductor (adopted, or found only in the process inventory) is never touched and is refused by name; and the CLI (`start.ps1`, `cli.ts start`) keeps refusing another model outright, so a hand-started server is only ever stopped by hand. `tabs.open` and `router.dispatch` ask the same question before opening a local-model tab, so a task that could not start is refused with the reason instead of opening a tab that fails on its first turn.

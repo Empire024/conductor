@@ -16,7 +16,7 @@ export function registerDeliveryIpc(options: {
   ipcMain.handle('delivery:ship', (event, request: DeliveryRequest) => {
     options.authorize(event, request?.projectId)
     // Only the owner's own window reaches this channel; agents ship through the control server.
-    return options.service.ship(request.projectId, options.projectPath(request.projectId), { message: request.message, ...(request.paths ? { paths: request.paths } : {}) }, { kind: 'owner' })
+    return options.service.ship(request.projectId, options.projectPath(request.projectId), { message: request.message, ...(request.paths ? { paths: request.paths } : {}), publish: request.publish === true }, { kind: 'owner' })
   })
   ipcMain.handle('delivery:cancel', (event, projectId: string) => { options.authorize(event, projectId); return options.service.cancel(projectId) })
   return () => { for (const channel of deliveryIpcChannels) ipcMain.removeHandler(channel) }

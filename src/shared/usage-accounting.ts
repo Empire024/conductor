@@ -91,22 +91,24 @@ export function summarizeUsage(items: TimelineItem[]): UsageSummary {
   }
 }
 
-export interface ContextSummary { used: number; capacity: number; window?: number; percent: number; level: 'normal' | 'warning' | 'critical' }
+export interface ContextSummary { used: number; capacity: number; window?: number; percent: number; level: 'normal' | 'warning' | 'critical'; reserve?: number; measurement?: string }
 export function summarizeContext(items: TimelineItem[], runtimeId?: string): ContextSummary | undefined {
   const root = items.filter(item => !item.parentId)
   const runtime = runtimeId ?? root.at(-1)?.runtimeId
   const usage = root.filter(item => item.runtimeId === runtime && item.data.type === 'usage').sort((a, b) => updatedSequence(a) - updatedSequence(b))
-  let used: number | undefined, capacity: number | undefined, window: number | undefined
+  let used: number | undefined, capacity: number | undefined, window: number | undefined, reserve: number | undefined, measurement: string | undefined
   for (const item of usage) {
     if (item.data.type !== 'usage') continue
     const limits = object(item.data.limits)
     if ('contextUsedTokens' in limits) used = number(limits.contextUsedTokens)
     if ('contextCapacityTokens' in limits) capacity = number(limits.contextCapacityTokens)
     if ('modelContextWindow' in limits) window = number(limits.modelContextWindow)
+    if ('contextReserveTokens' in limits) reserve = number(limits.contextReserveTokens)
+    if (typeof limits.contextMeasurement === 'string') measurement = limits.contextMeasurement
   }
   if (used === undefined || capacity === undefined || capacity <= 0) return undefined
   const percent = Math.min(100, used / capacity * 100)
-  return { used, capacity, window, percent, level: percent >= 90 ? 'critical' : percent >= 70 ? 'warning' : 'normal' }
+  return { used, capacity, window, percent, level: percent >= 90 ? 'critical' : percent >= 70 ? 'warning' : 'normal', ...(reserve !== undefined ? { reserve } : {}), ...(measurement ? { measurement } : {}) }
 }
 
 /** Undefined means still pending; callers render a loader instead of text. */

@@ -79,7 +79,7 @@ describe('local agent loop', () => {
     const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`
     const session = new LocalAgentSession({ endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: root, sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768, maxIterations: 2 })
     const reviewed: string[] = []
-    expect(await session.run('Read long.txt and answer with the tail marker', { toolEnd: call => reviewed.push(call.output) })).toEqual({ text: '7319', stopReason: 'complete' })
+    expect(await session.run('Read long.txt and answer with the tail marker', { toolEnd: call => reviewed.push(call.output) })).toMatchObject({ text: '7319', stopReason: 'completed' })
     expect(requests).toBe(2)
     expect(reviewed[0]).toContain(raw)
     expect(reviewed[0]!.length).toBeGreaterThan(32000)
@@ -116,9 +116,11 @@ describe('local agent loop', () => {
     const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`
     const session = new LocalAgentSession({ endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: root, sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768, maxIterations: 2 })
 
-    expect(await session.run('Read all five files once, then report completion', {})).toEqual({ text: 'ALL_RESULTS_REACHED_MODEL', stopReason: 'complete' })
+    expect(await session.run('Read all five files once, then report completion', {})).toMatchObject({ text: 'ALL_RESULTS_REACHED_MODEL', stopReason: 'completed' })
     expect(requests).toBe(2)
-    expect(secondOutbound.map(message => message.role)).toEqual(['system', 'user', 'assistant', 'tool', 'tool', 'tool', 'tool', 'tool'])
+    // Five results this size put the estimate past the warning band, so the request also carries
+    // the one-time context warning after the group; the group itself is complete and unshrunk.
+    expect(secondOutbound.map(message => message.role)).toEqual(['system', 'user', 'assistant', 'tool', 'tool', 'tool', 'tool', 'tool', 'user'])
     expect(secondOutbound.filter(message => message.role === 'tool').map(message => message.toolCallId)).toEqual(paths.map((_path, index) => `read-${index}`))
     expect(new Set(secondOutbound.filter(message => message.role === 'tool').map(message => message.digest)).size).toBe(5)
     expect(secondOutbound.filter(message => message.role === 'tool').every(message => message.chars > 1_000 && message.chars < 20_000)).toBe(true)
@@ -154,7 +156,10 @@ describe('local agent loop', () => {
     const stub = await stubServer([[frame({ content: 'must not be requested' }, 'stop')]])
     cleanup.push(() => stub.server.close())
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 8192 })
-    await expect(session.run('x'.repeat(30000), {})).rejects.toThrow('No request was sent')
+    const outcome = await session.run('x'.repeat(30000), {})
+    expect(outcome.stopReason).toBe('context_limit')
+    expect(outcome.report.detail).toContain('No request was sent')
+    expect(outcome.report.context.windowTokens).toBe(8192)
     expect(stub.requests).toHaveLength(0)
   })
 
@@ -172,7 +177,7 @@ describe('local agent loop', () => {
     const executed: string[] = []
     expect((await session.run('Read and write', { toolEnd: call => { executed.push(call.name); controller.abort() } }, controller.signal)).stopReason).toBe('interrupted')
     expect(executed).toEqual(['read_file'])
-    expect((await session.run('Continue', {})).stopReason).toBe('complete')
+    expect((await session.run('Continue', {})).stopReason).toBe('completed')
     const messages = stub.requests[1]!.messages as Array<{ role: string; tool_call_id?: string; content: string }>
     expect(messages.filter(message => message.role === 'tool').map(message => message.tool_call_id)).toEqual(['first', 'skipped'])
     expect(messages.find(message => message.tool_call_id === 'skipped')?.content).toContain('Interrupted before execution')
@@ -186,7 +191,7 @@ describe('local agent loop', () => {
     cleanup.push(() => stub.server.close())
     const remembered: unknown[] = []
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768, control: async (method, args) => { remembered.push({ method, args }); return { id: 'memory-from-host' } } })
-    expect((await session.run('Remember this', {})).stopReason).toBe('complete')
+    expect((await session.run('Remember this', {})).stopReason).toBe('completed')
     expect(remembered).toEqual([{ method: 'memory.remember', args: { gist: 'Durable fixture fact', kind: 'semantic' } }])
     expect(JSON.stringify(stub.requests[1]!.messages)).toContain('memory-from-host')
   })
@@ -203,14 +208,14 @@ describe('local agent loop', () => {
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: root, sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })
     const outcome = await session.run('What is the answer?', { text: delta => deltas.push(delta), toolEnd: call => tools.push(`${call.name}:${call.failed ? 'failed' : 'ok'}`) })
 
-    expect(outcome.stopReason).toBe('complete')
+    expect(outcome.stopReason).toBe('completed')
     expect(outcome.text).toBe('The answer is 42.')
     expect(deltas.join('')).toBe('LookingThe answer is 42.')
     expect(tools).toEqual(['read_file:ok'])
     const second = stub.requests[1] as { messages: Array<{ role: string; content: string }>; tools: Array<{ function: { name: string } }> }
     expect(second.messages.at(-1)).toMatchObject({ role: 'tool' })
     expect(second.messages.at(-1)!.content).toContain('export const answer = 42')
-    expect(second.tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'run_command'])
+    expect(second.tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
   })
 
   it('reports a refused capability to the model instead of executing it', async () => {
@@ -267,7 +272,7 @@ describe('local agent loop', () => {
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/ornith1.5-9b', workspace: root, sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })
     const outcome = await session.run('Create the translations file', { notice: message => notices.push(message), toolEnd: call => tools.push(`${call.name}:${call.failed ? 'failed' : 'ok'}`) })
 
-    expect(outcome).toMatchObject({ stopReason: 'complete', text: 'Written in parts.' })
+    expect(outcome).toMatchObject({ stopReason: 'completed', text: 'Written in parts.' })
     expect(tools).toEqual(['write_file:failed', 'write_file:ok', 'write_file:ok'])
     expect(notices.join(' ')).toContain('output limit')
     const second = stub.requests[1] as { messages: Array<{ role: string; content: string; tool_calls?: Array<{ function: { arguments: string } }> }> }
@@ -293,7 +298,9 @@ describe('local agent loop', () => {
     const stub = await stubServer([[]], [{ status: 400, body: overflow }, { status: 400, body: overflow }])
     cleanup.push(() => stub.server.close())
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
-    await expect(session.run('Continue', {})).rejects.toThrow(/32768 tokens of local context/)
+    const outcome = await session.run('Continue', {})
+    expect(outcome.stopReason).toBe('context_limit')
+    expect(outcome.report.detail).toMatch(/32768 tokens of local context/)
     expect(stub.requests).toHaveLength(2)
   })
 
@@ -306,7 +313,7 @@ describe('local agent loop', () => {
     const notices: string[] = []
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
     const outcome = await session.run('What is the answer?', { notice: message => notices.push(message) })
-    expect(outcome).toMatchObject({ stopReason: 'complete', text: 'The answer is 42.' })
+    expect(outcome).toMatchObject({ stopReason: 'completed', text: 'The answer is 42.' })
     expect(notices.join(' ')).toContain('reasoning only')
     expect((stub.requests[1] as { messages: Array<{ role: string; content: string }> }).messages.at(-1)).toMatchObject({ role: 'user' })
   })
@@ -316,7 +323,8 @@ describe('local agent loop', () => {
     cleanup.push(() => stub.server.close())
     const notices: string[] = []
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
-    expect(await session.run('Explain', { notice: message => notices.push(message) })).toMatchObject({ stopReason: 'complete', text: 'Half of an ans' })
+    // The text stands, and the stop reason says it was the output limit rather than a finished answer.
+    expect(await session.run('Explain', { notice: message => notices.push(message) })).toMatchObject({ stopReason: 'output_limit', text: 'Half of an ans' })
     expect(notices.join(' ')).toContain('token limit')
   })
 
@@ -324,7 +332,9 @@ describe('local agent loop', () => {
     const stub = await stubServer([[frame({ content: 'never' }, 'stop')]])
     cleanup.push(() => stub.server.close())
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'w'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
-    await expect(session.run('hello', {})).rejects.toThrow(/API key/)
+    const outcome = await session.run('hello', {})
+    expect(outcome.stopReason).toBe('provider_error')
+    expect(outcome.report.detail).toMatch(/API key/)
     expect(stub.unauthorized).toBe(1)
   })
 })

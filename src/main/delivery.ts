@@ -295,8 +295,26 @@ interface Plan {
   testSkip: string
   build: string[] | null
   buildSkip: string
-  release: { workflow: string; assets: string[] } | null
+  release: { workflow: string; assets: string[]; dispatch: boolean } | null
   releaseSkip: string
+  publish: boolean
+}
+
+/** Whether a workflow file runs on push. A dispatch-only workflow (the shape this project uses,
+ *  so that pushes never build a release by themselves) has to be started by the delivery. Read
+ *  as text: the only question is whether `push` appears as a trigger under `on`. */
+export function workflowRunsOnPush(text: string): boolean {
+  const lines = text.replace(/\r\n/g, '\n').split('\n')
+  const start = lines.findIndex(line => /^(on|"on"|'on'):\s*(\S.*)?$/.test(line))
+  if (start < 0) return false
+  const inline = /^(on|"on"|'on'):\s*(\S.*)$/.exec(lines[start]!)?.[2] ?? ''
+  if (inline) return /\bpush\b/.test(inline.replace(/#.*$/, ''))
+  for (let index = start + 1; index < lines.length; index++) {
+    const line = lines[index]!
+    if (/^\S/.test(line)) break
+    if (/^\s+(-\s*)?push\s*:?\s*(#.*)?$/.test(line)) return true
+  }
+  return false
 }
 
 type GithubResponse = { ok: true; data: any } | { ok: false; status: number; message: string }
@@ -380,7 +398,7 @@ export class DeliveryService {
     }
   }
 
-  ship(projectId: string, cwd: string, request: { message: string; paths?: string[] }, requestedBy: DeliveryRequester): DeliveryRun {
+  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean }, requestedBy: DeliveryRequester): DeliveryRun {
     const root = resolve(cwd)
     const key = process.platform === 'win32' ? root.toLowerCase() : root
     for (const [id, active] of this.active) {
@@ -396,6 +414,7 @@ export class DeliveryService {
       id: `delivery-${randomUUID()}`, projectId, state: 'running', requestedBy: { ...requestedBy },
       message: typeof request?.message === 'string' ? request.message : '',
       paths: Array.isArray(request?.paths) ? [...request.paths] : null,
+      publish: request?.publish === true,
       startedAt: now, finishedAt: null, commit: null, releaseTag: null, releaseUrl: null, workflowRunUrl: null,
       stages: DELIVERY_STAGES.map(({ id, label }) => ({ id, label, state: 'pending', startedAt: null, finishedAt: null, detail: '', log: [] })),
       error: null
@@ -458,6 +477,14 @@ export class DeliveryService {
       if (worktree) { await this.removeWorktree(plan.root, worktree); worktree = null }
       if (!plan.commitNeeded) this.skip(active, 'commit', 'No changes to commit; pushing the local commits that are ahead of the remote.')
       else await this.stage(active, 'commit', stage => this.commit(active, stage, plan))
+      if (!plan.publish) {
+        // The default: the commit is the delivery. A hosted release build is only worth its
+        // minutes when another device has to update, and that is a separate, explicit ask.
+        this.skip(active, 'push', `Local delivery: commit ${short(active.run.commit)} stays on this machine. Publish (git.ship with publish: true, or the Source control panel's Publish switch) when other devices need a release.`)
+        this.skip(active, 'release', 'Not published: no GitHub release was requested. The installed app on this machine updates from the checkout through app.update.')
+        this.finalize(active, 'delivered', null)
+        return
+      }
       await this.stage(active, 'push', stage => this.push(active, stage, plan))
       active.pushed = true
       if (!plan.release) this.skip(active, 'release', plan.releaseSkip)
@@ -499,9 +526,10 @@ export class DeliveryService {
       const busy = [['MERGE_HEAD', 'a merge'], ['rebase-merge', 'a rebase'], ['rebase-apply', 'a rebase or am'], ['CHERRY_PICK_HEAD', 'a cherry-pick'], ['REVERT_HEAD', 'a revert']].find(([name]) => existsSync(join(dir, name!)))
       if (busy) throw new StageFailure(`${busy[1]} is in progress; finish or abort it before delivering.`)
     }
+    const publish = active.run.publish === true
     const remoteUrl = await this.git(['remote', 'get-url', config.remote], root, signal)
-    if (remoteUrl.code !== 0) throw new StageFailure(`There is no "${config.remote}" remote to push to.`)
-    const github = parseGithubRemote(remoteUrl.stdout)
+    if (remoteUrl.code !== 0 && publish) throw new StageFailure(`There is no "${config.remote}" remote to push to.`)
+    const github = remoteUrl.code === 0 ? parseGithubRemote(remoteUrl.stdout) : null
 
     const status = await this.git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], root, signal)
     if (status.code !== 0) throw new StageFailure(`git status failed:\n${status.lines.slice(-10).join('\n')}`)
@@ -517,15 +545,20 @@ export class DeliveryService {
     }
     const outside = scope ? entries.filter(entry => !inside.includes(entry)) : []
 
-    this.log(active, stage, [`git fetch ${config.remote} ${config.branch}`])
-    const fetched = await this.git(['fetch', config.remote, config.branch], root, signal, NETWORK_TIMEOUT_MS)
-    let remoteExists = true
-    if (fetched.code !== 0) {
-      if (fetched.lines.some(line => /couldn't find remote ref/i.test(line))) remoteExists = false
-      else throw new StageFailure(`git fetch ${config.remote} ${config.branch} failed, so the remote cannot be compared:\n${fetched.lines.slice(-10).join('\n')}`)
+    // A local delivery never touches the network: nothing is compared or pushed.
+    let remoteExists = publish
+    if (publish) {
+      this.log(active, stage, [`git fetch ${config.remote} ${config.branch}`])
+      const fetched = await this.git(['fetch', config.remote, config.branch], root, signal, NETWORK_TIMEOUT_MS)
+      if (fetched.code !== 0) {
+        if (fetched.lines.some(line => /couldn't find remote ref/i.test(line))) remoteExists = false
+        else throw new StageFailure(`git fetch ${config.remote} ${config.branch} failed, so the remote cannot be compared:\n${fetched.lines.slice(-10).join('\n')}`)
+      }
     }
     let ahead = 0, behind = 0
-    if (remoteExists) {
+    if (!publish) {
+      if (!inside.length) throw new StageFailure(scope && !scope.length ? 'Nothing to commit: no paths were selected. A local delivery commits changes; publish when there are commits to push.' : scope ? 'Nothing to commit: the requested paths have no changes.' : 'Nothing to commit: the working tree is clean.')
+    } else if (remoteExists) {
       const counts = await this.git(['rev-list', '--left-right', '--count', `${config.remote}/${config.branch}...HEAD`], root, signal)
       const [b, a] = counts.stdout.trim().split(/\s+/).map(Number)
       if (counts.code === 0) { behind = b || 0; ahead = a || 0 }
@@ -533,7 +566,7 @@ export class DeliveryService {
       const count = await this.git(['rev-list', '--count', 'HEAD'], root, signal)
       ahead = Number(count.stdout.trim()) || 0
     }
-    if (!inside.length && !ahead) throw new StageFailure(scope && !scope.length ? 'Nothing to deliver: no paths were selected and no local commits are ahead of the remote.' : scope ? 'Nothing to deliver: the requested paths have no changes and no local commits are ahead of the remote.' : 'Nothing to deliver: the working tree is clean and no local commits are ahead of the remote.')
+    if (publish && !inside.length && !ahead) throw new StageFailure(scope && !scope.length ? 'Nothing to deliver: no paths were selected and no local commits are ahead of the remote.' : scope ? 'Nothing to deliver: the requested paths have no changes and no local commits are ahead of the remote.' : 'Nothing to deliver: the working tree is clean and no local commits are ahead of the remote.')
 
     const scripts = packageScripts(root)
     const pick = (key: 'test' | 'build', script: string, argv: string[]): { argv: string[] | null; skip: string } => {
@@ -550,15 +583,19 @@ export class DeliveryService {
     if (config.release === null) releaseSkip = 'Release verification is disabled in .conductor/delivery.json.'
     else if (!github) releaseSkip = `The "${config.remote}" remote is not on GitHub, so there is no release to verify.`
     else if (!existsSync(join(root, '.github', 'workflows', workflow))) releaseSkip = `No .github/workflows/${workflow}, so the push is the delivery.`
-    else release = { workflow, assets: config.release?.assets ?? DEFAULT_ASSETS }
+    else {
+      let text = ''
+      try { text = readFileSync(join(root, '.github', 'workflows', workflow), 'utf8') } catch { /* unreadable: treated as push-triggered, the older shape */ }
+      release = { workflow, assets: config.release?.assets ?? DEFAULT_ASSETS, dispatch: text ? !workflowRunsOnPush(text) : false }
+    }
 
     const parts = [
       inside.length ? `${inside.length} changed file${inside.length === 1 ? '' : 's'}${scope ? ` in scope (${outside.length} other change${outside.length === 1 ? '' : 's'} stay uncommitted)` : ''}` : 'no uncommitted changes',
-      `${ahead} local commit${ahead === 1 ? '' : 's'} ahead of ${config.remote}/${config.branch}`
+      publish ? `${ahead} local commit${ahead === 1 ? '' : 's'} ahead of ${config.remote}/${config.branch}` : 'local delivery (no push, no release)'
     ]
     if (behind) parts.push(`${behind} remote commit${behind === 1 ? '' : 's'} behind (the push will rebase onto them)`)
-    if (!remoteExists) parts.push(`${config.remote}/${config.branch} does not exist yet`)
-    const plan: Plan = { root, config, entries, scope, commitNeeded: inside.length > 0, isolate: Boolean(scope && outside.length), github, test: test.argv, testSkip: test.skip, build: build.argv, buildSkip: build.skip, release, releaseSkip }
+    if (publish && !remoteExists) parts.push(`${config.remote}/${config.branch} does not exist yet`)
+    const plan: Plan = { root, config, entries, scope, commitNeeded: inside.length > 0, isolate: Boolean(scope && outside.length), github, test: test.argv, testSkip: test.skip, build: build.argv, buildSkip: build.skip, release, releaseSkip, publish }
     return { plan, detail: `${parts.join('; ')}.` }
   }
 
@@ -670,6 +707,18 @@ export class DeliveryService {
     const started = this.deps.now().getTime()
     const elapsed = (): number => this.deps.now().getTime() - started
     const api = (path: string): Promise<GithubResponse> => this.github(active, stage, `https://api.github.com/repos/${owner}/${repo}${path}`, token, started + RELEASE_TIMEOUT_MS)
+    if (plan.release!.dispatch) {
+      // A dispatch-only workflow never runs on its own; this is the one place a release is asked
+      // for, so an ordinary push (or a coworker's local delivery) can never start one by accident.
+      if (!token) throw new StageFailure(`The push succeeded, but ${workflow} only runs on request and no GitHub token was available to start it. Run it once from the repository's Actions page (or \`gh workflow run ${workflow}\`), or sign Git in to GitHub so Conductor can start it next time.`)
+      const dispatched = await this.deps.fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
+        method: 'POST', signal,
+        headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Conductor', 'X-GitHub-Api-Version': '2022-11-28', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: plan.config.branch })
+      })
+      if (dispatched.status !== 204) throw new StageFailure(`The push succeeded, but GitHub answered ${dispatched.status} when asked to start ${workflow}. Start it from the repository's Actions page.`)
+      this.log(active, stage, [`Started ${workflow} on ${plan.config.branch}`])
+    }
     this.log(active, stage, [`Waiting for ${workflow} on ${short(sha)}`])
     let workflowRun: any = null
     let lastStatus = ''

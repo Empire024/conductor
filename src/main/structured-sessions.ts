@@ -18,6 +18,7 @@ import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
+import { normaliseContract } from './local-models/completion.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-review-gate'
 
@@ -437,6 +438,20 @@ export class StructuredSessions {
     if (!live.adapter?.discover) throw new Error('Native discovery is unavailable on this adapter')
     return sanitizeDiagnostic(await live.adapter.discover()) as Json
   }
+  /** Fold a local conversation's transcript into its durable task state without ending it:
+   *  the fresh-tab pattern inside the same logical agent. Only between turns. */
+  async compactContext(id: string): Promise<Json | null> {
+    const live = this.get(id), state = this.database.structured.snapshot(id)!
+    if (state.phase === 'disconnected') return null
+    await this.connect(live)
+    if (!live.adapter?.compactContext) throw new Error('This provider compacts its own context; there is nothing for Conductor to fold')
+    if (['starting', 'running', 'waiting_input', 'waiting_approval', 'interrupting'].includes(this.database.structured.snapshot(id)!.phase)) throw new Error('Wait for the current turn to finish before compacting')
+    return await live.adapter.compactContext()
+  }
+  /** The local runtime's own compact view of its last run, when it keeps one. */
+  runStatus(id: string): Json | null {
+    return this.live.get(id)?.adapter?.runStatus?.() ?? null
+  }
   async refreshUsage(id: string): Promise<boolean> {
     const live = this.get(id), state = this.database.structured.snapshot(id)!
     if (state.phase === 'disconnected') return false
@@ -792,6 +807,10 @@ export class StructuredSessions {
       // record an authority no adapter reads and no pane can explain.
       if (settings[key] && capabilities && capabilities.provider !== 'local') throw new Error('Repository and research grants apply to local models only')
     }
+    if (settings.localContract !== undefined) {
+      if (settings.localContract !== null && capabilities && capabilities.provider !== 'local') throw new Error('A task contract applies to local models only')
+      normaliseContract(settings.localContract)
+    }
     if (settings.temporaryPermission && (typeof settings.temporaryPermission.runtimeId !== 'string' || !['default', 'read-only', 'accept-edits', 'auto'].includes(settings.temporaryPermission.restore))) throw new Error('Invalid temporary permission scope')
     if (settings.plan && !capabilities?.plans) throw new Error('Planning is unavailable on this adapter baseline')
     if (capabilities?.permissions && !capabilities.permissions.includes(settings.permission)) throw new Error('Permission policy unsupported by this provider')
@@ -805,11 +824,12 @@ export class StructuredSessions {
    * may carry an older copy; preserve their model/effort/permission while taking browserMcp only
    * from the current durable projection. */
   private messageSettings(state: { settings: SessionSettings }, incoming: SessionSettings): SessionSettings {
-    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, reviewDelegatedActions: _capturedReview, ...message } = incoming
+    const { browserMcp: _capturedBrowser, localGit: _capturedGit, localResearch: _capturedResearch, localContract: _capturedContract, reviewDelegatedActions: _capturedReview, ...message } = incoming
     const authority: SessionSettings = { ...message }
     // Same rule for the local grants: a queued prompt must not carry a repository or research
     // grant the owner has since withdrawn, nor lose one they have since given.
     for (const key of ['browserMcp', 'localGit', 'localResearch', 'reviewDelegatedActions'] as const) if (state.settings[key] !== undefined) authority[key] = state.settings[key]
+    if (state.settings.localContract !== undefined) authority.localContract = state.settings.localContract
     return authority
   }
   private assertPromptDispatchAuthority(origin: PromptOrigin | undefined, spec: AgentSpec): void {

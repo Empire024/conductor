@@ -70,6 +70,11 @@
 .sa-usage { color: var(--text-2); display: block; font-size: 10px; }
 .sa-notice { color: var(--text-2); margin: 7px 0; font-size: 11px; }
 .sa-auto-denial { display: grid; gap: 6px; }
+.sa-local-stop { display: grid; gap: 6px; }
+.sa-local-stop-figures { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0; font-size: 12px; }
+.sa-local-stop-figures dt { color: var(--text-2); }
+.sa-local-stop-figures dd { margin: 0; }
+.sa-local-stop-figures code { font-size: 11px; }
 .sa-auto-denial-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
 .sa-auto-denial-reason { font-size: 11px; color: var(--text-2); padding: 1px 7px; border: 1px solid var(--border-soft); border-radius: 999px; }
 .structured-agent-pane summary, .sa-dialog summary { cursor: pointer; color: var(--text-2); padding: 3px 0; font-size: 11px; }

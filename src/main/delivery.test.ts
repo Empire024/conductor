@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DeliveryService, normalizeDeliveryPath, parseDeliveryConfig, parseGithubRemote, parsePorcelain, type DeliveryRunOptions } from './delivery'
+import { DeliveryService, normalizeDeliveryPath, parseDeliveryConfig, parseGithubRemote, parsePorcelain, workflowRunsOnPush, type DeliveryRunOptions } from './delivery'
 import type { DeliveryRun } from '../shared/delivery'
 
 const SHA = 'a'.repeat(40)
@@ -68,14 +68,68 @@ function harness(setup: { replies?: Record<string, Handler>; files?: Record<stri
     now: () => new Date(clock), sleep: async ms => { sleeps.push(ms); clock += ms }, tempDir: () => temp
   })
   const ran = (prefix: string): boolean => calls.some(call => [call.command, ...call.args].join(' ').startsWith(prefix))
-  const ship = async (request: { message: string; paths?: string[] } = { message: 'Ship it' }): Promise<DeliveryRun> => {
-    const started = service.ship('p1', root, request, { kind: 'agent', agentSessionId: 's1', title: 'Agent' })
+  const ship = async (request: { message: string; paths?: string[]; publish?: boolean } = { message: 'Ship it' }): Promise<DeliveryRun> => {
+    const started = service.ship('p1', root, { publish: true, ...request }, { kind: 'agent', agentSessionId: 's1', title: 'Agent' })
     return service.wait('p1', started.id, 5000)
   }
   return { service, root, temp, calls, requests, sleeps, ran, ship, replies }
 }
 
 const stageStates = (run: DeliveryRun): Record<string, string> => Object.fromEntries(run.stages.map(stage => [stage.id, stage.state]))
+
+describe('local delivery by default', () => {
+  it('tests, builds and commits without touching the network, and says so', async () => {
+    const h = harness()
+    const run = await h.ship({ message: 'Local step', publish: false })
+    expect(run.error).toBeNull()
+    expect(run.state).toBe('delivered')
+    expect(run.publish).toBe(false)
+    expect(stageStates(run)).toEqual({ preflight: 'passed', test: 'passed', build: 'passed', commit: 'passed', push: 'skipped', release: 'skipped' })
+    expect(run.commit).toBe(SHA)
+    expect(run.stages[4]!.detail).toMatch(/Local delivery: commit aaaaaaa stays on this machine/)
+    expect(run.stages[5]!.detail).toMatch(/app\.update/)
+    expect(h.ran('npm test')).toBe(true)
+    expect(h.ran('git commit')).toBe(true)
+    expect(h.ran('git fetch')).toBe(false)
+    expect(h.ran('git push')).toBe(false)
+    expect(h.requests).toHaveLength(0)
+    expect(run.stages[0]!.detail).toContain('local delivery (no push, no release)')
+  })
+
+  it('needs no remote for a local commit, and refuses a clean tree', async () => {
+    const h = harness({ replies: { 'git remote get-url origin': { code: 2, stdout: '' } } })
+    expect((await h.ship({ message: 'No remote yet', publish: false })).state).toBe('delivered')
+    const clean = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: '' } } })
+    expect((await clean.ship({ message: 'x', publish: false })).error).toMatch(/Nothing to commit: the working tree is clean/)
+    expect((await clean.ship({ message: 'x', publish: true })).error).toMatch(/no local commits are ahead/)
+  })
+
+  it('starts a dispatch-only release workflow with the token when publishing, and says what to do without one', async () => {
+    const dispatchOnly = { '.github/workflows/release.yml': 'on:\n  workflow_dispatch:\njobs: {}\n' }
+    const h = harness({ files: dispatchOnly, github: { '/actions/workflows/release.yml/dispatches': new Response(null, { status: 204 }) } })
+    const run = await h.ship()
+    expect(run.state).toBe('delivered')
+    expect(run.releaseTag).toBe('v1.2.3')
+    const dispatch = h.requests.find(request => request.url.endsWith('/actions/workflows/release.yml/dispatches'))
+    expect(dispatch?.headers).toMatchObject({ Authorization: 'Bearer token' })
+    expect(run.stages[5]!.log).toContain('Started release.yml on main')
+    const anonymous = harness({ files: dispatchOnly, token: null })
+    const failed = await anonymous.ship()
+    expect(failed.state).toBe('failed')
+    expect(failed.error).toMatch(/only runs on request and no GitHub token/)
+    expect(anonymous.requests.some(request => request.url.includes('/dispatches'))).toBe(false)
+    // The older push-triggered shape is left to run itself.
+    expect((await harness().ship()).stages[5]!.log).not.toContain('Started release.yml on main')
+  })
+
+  it('reads whether a workflow runs on push', () => {
+    expect(workflowRunsOnPush('on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n')).toBe(true)
+    expect(workflowRunsOnPush('on: [push, workflow_dispatch]')).toBe(true)
+    expect(workflowRunsOnPush('on: push\n')).toBe(true)
+    expect(workflowRunsOnPush('# runs on push? no\non:\n  workflow_dispatch:\njobs:\n  push:\n    runs-on: x\n')).toBe(false)
+    expect(workflowRunsOnPush('on:\n  workflow_dispatch:\n')).toBe(false)
+  })
+})
 
 describe('DeliveryService pipeline', () => {
   it('delivers the whole tree through a verified release', async () => {

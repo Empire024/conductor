@@ -20,6 +20,8 @@ import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../../../sh
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { autoModeDenialOf } from '../../../shared/auto-mode-denial'
 import { AutoModeDenialCard } from './AutoModeDenialCard'
+import { localStopOf } from '../../../shared/local-stop'
+import { LocalStopCard } from './LocalStopCard'
 import './StructuredAgentActivity.css'
 import './StructuredFileLinkMenu.css'
 
@@ -65,6 +67,10 @@ export function isConversationActivity(item: TimelineItem, _index?: number, item
   if (data.outputArtifactId) return true
   if (/^(?:Snapshot unavailable:|Unsupported .*control request:|Live retry stopped:|Incomplete tool input JSON;)/.test(data.message) || data.message.includes('Interruption requested;')) return true
   if (/^(?:Codex event:|Codex process diagnostic|Claude process diagnostic|Codex effective thread settings|Native Codex settings updated|Current turn diff \(provider aggregate\)|Codex live fixture isolation|Claude runtime capabilities|Claude reported a lower cumulative cost)/.test(data.message)) return false
+  // A local run's stop report is conversation activity whenever it is not the model's own final
+  // answer: the owner must see "round limit" or "context limit" where a failure would otherwise be.
+  const stop = localStopOf(data)
+  if (stop) return stop.reason !== 'completed'
   return data.payload === undefined
 }
 
@@ -586,7 +592,10 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
     case 'plan': body = <section className="sa-plan"><strong>Plan</strong>{data.explanation && <StructuredMarkdown text={data.explanation} cwd={props.cwd} projectId={props.projectId} machineId={props.machineId} onOpenFile={props.onOpenFile} />}<ol>{data.steps.map((step, index) => <li key={index} className={'status-' + step.status}><span>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '●' : '○'}</span><span>{step.text}</span><small>{step.status.replace('_', ' ')}</small></li>)}</ol></section>; break
     case 'subagent': body = <section className="sa-subagent"><strong>{data.name}</strong><small>{data.status.replaceAll('_', ' ')}</small></section>; break
     case 'error': body = <p className="sa-error" role="alert">{data.message}{data.code && data.code !== LOCAL_MODEL_SETUP_ERROR_CODE && <small> ({data.code})</small>}{data.code === LOCAL_MODEL_SETUP_ERROR_CODE && <button type="button" onClick={() => void window.conductor.system.openExternal(LOCAL_MODEL_SETUP_URL)}>Download / set up local model</button>}</p>; break
-    case 'notice': { const denial = autoModeDenialOf(data); if (denial) { body = <AutoModeDenialCard denial={denial} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break } }
+    case 'notice': {
+      const denial = autoModeDenialOf(data); if (denial) { body = <AutoModeDenialCard denial={denial} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
+      const stop = localStopOf(data); if (stop) { body = <LocalStopCard report={stop} />; break }
+    }
       body = <div className="sa-notice">{data.message}{data.outputArtifactId && <OutputPreview sessionId={props.sessionId} artifactId={data.outputArtifactId} value="Saved terminal output from before structured integration. Native conversation identity was not recorded." />}</div>; break
     case 'review': body = <p className="sa-muted">{data.outcome === 'kept' ? 'Edit marked reviewed.' : 'Edit reverted.'}</p>; break
     case 'usage': return null

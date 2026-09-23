@@ -101,6 +101,10 @@ export interface CompletionRequest {
    *  thinking pass, which is what the smoke probe wants: a tiny token budget spent on the answer
    *  rather than on reasoning it never gets to finish. Left unset for real sessions. */
   reasoningEffort?: 'none' | 'low' | 'medium' | 'high'
+  /** Consulted after every streamed delta with what has accumulated so far. A returned string
+   *  ends generation early with that word as the finish reason: the agent loop uses it to cut
+   *  off a reply that is talking itself in circles rather than acting. */
+  stopWhen?(accumulated: { content: string; reasoning: string }): string | undefined
   signal?: AbortSignal
   onText?(delta: string): void
   onReasoning?(delta: string): void
@@ -156,10 +160,17 @@ function readTimings(value: unknown): LlamaTimings | undefined {
 
 export async function chatCompletion(request: CompletionRequest): Promise<CompletionResult> {
   if (request.contextTokens !== undefined) assertRequestBudget(request.messages, request.tools ?? [], request.contextTokens, request.maxTokens ?? 4096)
+  // An early stop closes the stream from this side; the caller's own signal still aborts too.
+  const stopper = new AbortController()
+  const onCallerAbort = (): void => stopper.abort(request.signal?.reason)
+  if (request.signal?.aborted) stopper.abort(request.signal.reason)
+  else request.signal?.addEventListener('abort', onCallerAbort, { once: true })
+  let stoppedFor: string | undefined
+  try {
   const response = await fetch(`${request.endpoint}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${request.apiKey}` },
-    signal: request.signal,
+    signal: stopper.signal,
     body: JSON.stringify({
       model: request.model,
       messages: request.messages,
@@ -176,7 +187,9 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
   const accumulator = new StreamAccumulator()
   const decoder = new TextDecoder()
   let buffer = ''
+  try {
   for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    if (stoppedFor) break
     buffer += decoder.decode(chunk, { stream: true })
     let end: number
     while ((end = buffer.indexOf('\n')) >= 0) {
@@ -195,8 +208,30 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
         const emitted = accumulator.push(choice.delta, choice.finish_reason)
         if (emitted.text) request.onText?.(emitted.text)
         if (emitted.reasoning) request.onReasoning?.(emitted.reasoning)
+        if (!stoppedFor && request.stopWhen && (emitted.text || emitted.reasoning)) {
+          stoppedFor = request.stopWhen({ content: accumulator.content, reasoning: accumulator.reasoning })
+          if (stoppedFor) { accumulator.finishReason = stoppedFor; stopper.abort(); break }
+        }
       }
+      if (stoppedFor) break
     }
   }
+  } catch (error) {
+    // The stream this side closed on purpose is not a failure; anything else still is.
+    if (!stoppedFor) throw error
+  }
   return accumulator.result()
+  } finally { request.signal?.removeEventListener('abort', onCallerAbort) }
+}
+
+/** Whether a streamed reply has turned into rumination: long, and dense with the phrases a
+ *  small model uses to restart its own reasoning. Counted over content and reasoning together,
+ *  since either channel can carry the loop. */
+const SELF_CORRECTION = /\b(wait|actually|hmm|hold on|let me (?:re-?think|re-?trace|re-?check|reconsider|try again|think again|look again)|no,? that|on second thought|but wait|scratch that)\b/gi
+export function ruminationVerdict(accumulated: { content: string; reasoning: string }, policy: { ruminationMinChars: number; ruminationDensity: number; ruminationMaxChars: number }): string | undefined {
+  const text = accumulated.content + accumulated.reasoning
+  if (text.length < policy.ruminationMinChars) return undefined
+  if (text.length >= policy.ruminationMaxChars) return 'rumination'
+  const hits = text.match(SELF_CORRECTION)?.length ?? 0
+  return hits / (text.length / 1000) >= policy.ruminationDensity ? 'rumination' : undefined
 }

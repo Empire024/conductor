@@ -42,6 +42,13 @@ export interface ProviderAdapter {
    *  about it: the tool call returned the moment the work was handed to the background. Only
    *  the runtime that reported the work can answer, so this is the live process' own count. */
   backgroundWork?(): number
+  /** Fold the runtime's own transcript into its durable task state, keeping the same logical
+   *  conversation (the local runtime; native CLIs compact themselves). Null when there is
+   *  nothing to fold. */
+  compactContext?(): Promise<Json | null>
+  /** The runtime's compact view of where a run stands: stop reason, rounds, context figures,
+   *  files changed. Null when the runtime does not keep one. */
+  runStatus?(): Json | null
   stop?(): Promise<void>
   history?(): Promise<import('../native-history').NativeHistoryItem[]>
   dispose(): void
