@@ -6,7 +6,7 @@ import type { AgentCollaborationSnapshot } from '../../../shared/agent-collabora
 import { summarizeUsageRun, type UsageScopeReport } from '../../../shared/usage-accounting'
 import { evaluateUsageWarning, type UsageWarningLevel } from '../../../shared/usage-warning'
 import { processModelLabel } from '../agent-models'
-import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, type ProcessTrackerState } from './ProcessDashboardPane.helpers'
+import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses, type ProcessTrackerState } from './ProcessDashboardPane.helpers'
 import './ProcessDashboardPane.css'
 import { WeeklyUsage } from '../components/WeeklyUsage'
 
@@ -17,12 +17,14 @@ interface ProcessFacts {
 }
 interface DashboardSnapshot {
   processes: RuntimeProcessSummary[]
+  projects: ProjectRecord[]
+  hiddenOlder: number
   collaboration: AgentCollaborationSnapshot
   facts: Map<string, ProcessFacts>
   observedAt: number
 }
 
-const emptyDashboard = (): DashboardSnapshot => ({ processes: [], collaboration: { messages: [], presence: [] }, facts: new Map(), observedAt: Date.now() })
+const emptyDashboard = (project: ProjectRecord): DashboardSnapshot => ({ processes: [], projects: [project], hiddenOlder: 0, collaboration: { messages: [], presence: [] }, facts: new Map(), observedAt: Date.now() })
 const relativeTime = (timestamp: string, now: number): string => {
   const seconds = Math.max(0, Math.round((now - Date.parse(timestamp)) / 1000))
   if (seconds < 60) return `${seconds}s ago`
@@ -56,8 +58,9 @@ async function readFacts(process: RuntimeProcessSummary): Promise<readonly [stri
 }
 
 export function ProcessDashboardPane({ project }: { project: ProjectRecord }): React.JSX.Element {
-  const [dashboard, setDashboard] = useState<DashboardSnapshot>(emptyDashboard)
+  const [dashboard, setDashboard] = useState<DashboardSnapshot>(() => emptyDashboard(project))
   const [providers, setProviders] = useState<AgentProviderInfo[]>([])
+  const [olderLimit, setOlderLimit] = useState(0)
   const [reconnecting, setReconnecting] = useState<string>()
   const [error, setError] = useState('')
   const [now, setNow] = useState(Date.now())
@@ -70,18 +73,26 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
   useEffect(() => {
     let active = true
     const poller = createSerialPoller(async () => {
-      const [processes, collaboration] = await Promise.all([
-        window.conductor.agents.listProcesses(project.id),
+      const observedAt = Date.now()
+      const projects = await window.conductor.projects.list()
+      const [inventory, collaboration] = await Promise.all([
+        olderLimit > 0
+          ? Promise.all(projects.map(item => window.conductor.agents.listProcesses(item.id))).then(items => items.flat())
+          : window.conductor.agents.listProcesses(),
         window.conductor.collaboration.snapshot({ projectId: project.id, limit: 30 })
       ])
+      // Filter lightweight runtime rows before asking for any conversation projection. The
+      // initial open therefore cannot transfer weeks of retained sessions into the renderer.
+      const selected = selectProcessBoardProcesses(inventory, observedAt, olderLimit)
+      const processes = selected.processes
       const facts = new Map(await Promise.all(processes.map(readFacts)))
-      return { processes, collaboration, facts, observedAt: Date.now() }
+      return { processes, projects, hiddenOlder: selected.hiddenOlder, collaboration, facts, observedAt }
     }, value => { setDashboard(value); setNow(value.observedAt); setError('') })
     const refresh = (): void => { void poller.run().catch(reason => { if (active) setError(`Process refresh failed: ${reason instanceof Error ? reason.message : String(reason)}`) }) }
     refresh()
     const timer = window.setInterval(() => { setNow(Date.now()); if (!document.hidden) refresh() }, 2500)
     return () => { active = false; poller.dispose(); window.clearInterval(timer) }
-  }, [project.id])
+  }, [olderLimit, project.id])
 
   const rows = useMemo(() => dashboard.processes.map(process => {
     const facts = dashboard.facts.get(process.id) ?? {}
@@ -98,8 +109,26 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
     tokens: total.tokens + (facts.usage?.tokens?.totalTokens ?? 0),
     cost: total.cost + (facts.usage?.costUsd ?? 0)
   }), { tokens: 0, cost: 0 }), [dashboard.facts])
+  const groups = useMemo(() => {
+    const names = new Map(dashboard.projects.map(item => [item.id, item.name]))
+    const grouped = new Map<string, typeof rows>()
+    for (const row of rows) grouped.set(row.process.projectId, [...(grouped.get(row.process.projectId) ?? []), row])
+    return [...grouped].map(([projectId, projectRows]) => ({
+      projectId,
+      name: names.get(projectId) ?? 'Unknown project',
+      rows: projectRows,
+      needsOwner: projectRows.filter(row => ['attention', 'paused', 'disconnected'].includes(row.state)).length,
+      active: projectRows.filter(row => row.state === 'working').length
+    })).sort((a, b) => b.needsOwner - a.needsOwner || b.active - a.active || a.name.localeCompare(b.name))
+  }, [dashboard.projects, rows])
 
-  const focus = (process: RuntimeProcessSummary): void => { window.dispatchEvent(new CustomEvent('conductor:focus-process', { detail: process })) }
+  const focus = (process: RuntimeProcessSummary): void => {
+    if (process.kind === 'agent') {
+      void window.conductor.agentControl.focusOrigin(process.id).catch(reason => setError(reason instanceof Error ? reason.message : String(reason)))
+      return
+    }
+    window.dispatchEvent(new CustomEvent('conductor:focus-process', { detail: process }))
+  }
   const reconnect = async (process: RuntimeProcessSummary, facts: ProcessFacts): Promise<void> => {
     setReconnecting(process.id); setError('')
     try {
@@ -114,7 +143,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
 
   return <div className="process-dashboard pd-dashboard">
     <header className="pd-header">
-      <div><Gauge size={20} /><span><strong>Processes</strong><small>Observed runtime facts · {project.name}</small></span></div>
+      <div><Gauge size={20} /><span><strong>Processes</strong><small>All open projects · recent 24 hours</small></span></div>
       <span className="pd-observed"><i /> Updated {relativeTime(new Date(dashboard.observedAt).toISOString(), now)}</span>
     </header>
     <section className="pd-overview" aria-label="Project process summary">
@@ -130,7 +159,12 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
     {error && <p className="pd-error" role="alert">{error}</p>}
     <div className="pd-table" role="table" aria-label="Project runtimes">
       <div className="pd-table-head" role="row"><span>Runtime</span><span>State</span><span>Progress</span><span>Usage</span><span>Activity</span><span /></div>
-      {rows.map(({ process, facts, state }) => {
+      {groups.map(group => <section className="pd-project-group" role="rowgroup" key={group.projectId}>
+        <header className="pd-project-heading" role="row">
+          <span><strong>{group.name}</strong><small>{group.rows.length} visible</small></span>
+          <span className={group.needsOwner ? 'needs-owner' : group.active ? 'active' : ''}>{group.needsOwner ? `${group.needsOwner} need${group.needsOwner === 1 ? 's' : ''} owner` : group.active ? `${group.active} working` : 'Recent activity'}</span>
+        </header>
+        {group.rows.map(({ process, facts, state }) => {
         const finishedExecution = state === 'disconnected' && processTrackerState(process) === 'finished'
         const plan = reportedPlanProgress(facts.snapshot)
         const turnTime = durationLabel(currentTurnStartedAt(facts.snapshot), now)
@@ -151,7 +185,13 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
           </div>
         </article>
       })}
-      {!rows.length && <div className="pd-empty"><Clock3 size={18} /><strong>No retained runtimes</strong><small>Started conversations and terminals will appear here.</small></div>}
+      </section>)}
+      {!rows.length && <div className="pd-empty"><Clock3 size={18} /><strong>No recent or active runtimes</strong><small>{dashboard.hiddenOlder ? 'Older settled work is available on demand.' : 'Started conversations and terminals will appear here.'}</small></div>}
+      <div className="pd-older-controls">
+        {olderLimit === 0 && <button type="button" onClick={() => setOlderLimit(25)}>Show older</button>}
+        {olderLimit > 0 && dashboard.hiddenOlder > 0 && <button type="button" onClick={() => setOlderLimit(limit => limit + 25)}>Show more <span>{Math.min(25, dashboard.hiddenOlder)} of {dashboard.hiddenOlder}</span></button>}
+        {olderLimit > 0 && <button type="button" className="quiet" onClick={() => setOlderLimit(0)}>Hide older</button>}
+      </div>
     </div>
 
     {dashboard.collaboration.presence.length > 0 && <section className="pd-presence">

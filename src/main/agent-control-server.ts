@@ -5,6 +5,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AgentControlScope } from '../shared/agent-control'
 import type { AgentSpec } from '../shared/models'
 import type { AgentControl } from './agent-control'
+import { controlMethodClass } from './control-method-classes'
 
 /** Where the owner's own credential is written, and what a process that reads it may claim. */
 export interface OwnerCredentialOptions { path: string; appVersion: string; packaged: boolean }
@@ -16,13 +17,15 @@ export interface OwnerCredentialOptions { path: string; appVersion: string; pack
 export interface OwnerCredentialFile { version: 1; endpoint: string; token: string; pid: number; startedAt: string; appVersion: string; packaged: boolean }
 
 const OWNER_KEY = '\0owner'
+const MAX_IN_FLIGHT_PER_SESSION = 8
 
 /** Loopback-only internal protocol, independent of third-party MCP configuration. */
 export class AgentControlServer {
   private server?: Server
   private endpoint = ''
   private credentials = new Map<string, { token: string; scope: AgentControlScope }>()
-  private busy = new Set<string>()
+  private inFlight = new Map<string, number>()
+  private mutationTails = new Map<string, Promise<void>>()
   private ownerToken?: string
   constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions) {}
 
@@ -87,11 +90,12 @@ export class AgentControlServer {
     const credential = [...this.credentials.values()].find(credential => authorization === 'Bearer ' + credential.token)
     const owner = Boolean(this.ownerToken) && authorization === 'Bearer ' + this.ownerToken
     if (!credential && !owner) { reply(401, { error: 'Unauthorized control session' }); request.resume(); return }
-    // One caller at a time, the owner credential included: a supervisor that wants concurrency
-    // opens more than one conversation rather than racing its own calls.
+    // Reads and waits may overlap a caller's mutation. Mutations keep their per-session order,
+    // while the bounded request count prevents one credential from monopolising the server.
     const key = owner ? OWNER_KEY : credential!.scope.agentSessionId
-    if (this.busy.has(key)) { reply(409, { error: 'This session already has a control request in progress' }); request.resume(); return }
-    this.busy.add(key)
+    const inFlight = this.inFlight.get(key) ?? 0
+    if (inFlight >= MAX_IN_FLIGHT_PER_SESSION) { reply(429, { error: `This session already has ${MAX_IN_FLIGHT_PER_SESSION} control requests in progress` }); request.resume(); return }
+    this.inFlight.set(key, inFlight + 1)
     try {
       const chunks: Buffer[] = []
       let size = 0
@@ -105,17 +109,43 @@ export class AgentControlServer {
       // The owner names the project and workspace per call; a conversation's scope is fixed
       // when its credential is issued and nothing in the body can move it.
       const scope = owner ? this.control.ownerScope(input.scope) : credential!.scope
-      this.control.authorize(scope)
-      const result = await this.control.call(scope, input.method, input.args ?? {})
+      const call = async (): Promise<unknown> => {
+        this.control.authorize(scope)
+        return this.control.call(scope, input.method as string, input.args ?? {})
+      }
+      const result = controlMethodClass(input.method) === 'read'
+        ? await call()
+        : await this.withMutationLock(key, call)
+      if (input.method === 'tools.list' && result && typeof result === 'object' && !Array.isArray(result)) {
+        const unclassified = Object.keys(result).filter(method => !controlMethodClass(method))
+        if (unclassified.length) throw new Error(`Unclassified control methods: ${unclassified.join(', ')}`)
+      }
       reply(200, { result })
     } catch (error) { reply(400, { error: error instanceof Error ? error.message : 'Control request failed' }) }
-    finally { this.busy.delete(key) }
+    finally {
+      const remaining = (this.inFlight.get(key) ?? 1) - 1
+      if (remaining > 0) this.inFlight.set(key, remaining)
+      else this.inFlight.delete(key)
+    }
+  }
+
+  private async withMutationLock<T>(key: string, call: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTails.get(key) ?? Promise.resolve()
+    let release!: () => void
+    const tail = new Promise<void>(resolve => { release = resolve })
+    this.mutationTails.set(key, tail)
+    await previous
+    try { return await call() }
+    finally {
+      release()
+      if (this.mutationTails.get(key) === tail) this.mutationTails.delete(key)
+    }
   }
 
   close(): void {
     if (this.owner && this.ownerToken) { try { rmSync(this.owner.path, { force: true }) } catch { /* the token dies with the process either way */ } }
     this.ownerToken = undefined
-    this.endpoint = ''; this.credentials.clear(); this.busy.clear()
+    this.endpoint = ''; this.credentials.clear(); this.inFlight.clear(); this.mutationTails.clear()
     this.server?.closeAllConnections(); this.server?.close(); this.server = undefined
   }
 }

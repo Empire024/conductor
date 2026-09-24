@@ -515,6 +515,15 @@ export class ConductorDatabase {
     this.ensureColumn('agent_sessions', 'effort', 'TEXT')
     this.ensureColumn('agent_sessions', 'continue_on_limit', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('agent_sessions', 'activity_phase', "TEXT NOT NULL DEFAULT 'idle'")
+    // The cross-project Processes board opens on a bounded 24-hour window plus live work. These
+    // indexes keep that read on the small runtime tables; it never scans structured_events.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS terminal_sessions_process_board_time ON terminal_sessions(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS terminal_sessions_process_board_status ON terminal_sessions(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS agent_sessions_process_board_time ON agent_sessions(updated_at DESC);
+      CREATE INDEX IF NOT EXISTS agent_sessions_process_board_status ON agent_sessions(status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS agent_sessions_process_board_phase ON agent_sessions(activity_phase, updated_at DESC);
+    `)
     // Agents could not write memory before this column existed, so every
     // pre-existing row came from a person and must never be auto-forgotten.
     this.ensureColumn('memories', 'source', "TEXT NOT NULL DEFAULT 'human'")
@@ -1345,17 +1354,26 @@ export class ConductorDatabase {
   }
 
   listProcesses(projectId?: string): RuntimeProcessSummary[] {
-    const filter = projectId ? ' WHERE project_id = ?' : ''
-    const params = projectId ? [projectId] : []
+    // A project-specific read is an explicit drill-in and retains its complete history. The
+    // cross-project board read is deliberately bounded before rows cross IPC; older settled work
+    // is loaded only after the renderer explicitly drills into the open projects.
+    const recentAfter = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
+    const terminalFilter = projectId
+      ? ' WHERE project_id = ?'
+      : " WHERE updated_at >= ? OR status IN ('starting','running','waiting_input','limited')"
+    const agentFilter = projectId
+      ? 'WHERE a.project_id = ?'
+      : "WHERE a.updated_at >= ? OR a.status IN ('starting','running','waiting_input','limited') OR a.activity_phase IN ('working','waiting_input','waiting_background','limited','disconnected')"
+    const params = projectId ? [projectId] : [recentAfter]
     const terminals = this.db.prepare(
-      `SELECT id, project_id, session_id, title, status, updated_at FROM terminal_sessions${filter}`
+      `SELECT id, project_id, session_id, title, status, updated_at FROM terminal_sessions${terminalFilter}`
     ).all(...params) as DbRow[]
     const agents = this.db.prepare(
       `SELECT a.id, a.project_id, a.session_id, a.title, a.provider, a.model, a.status, a.activity_phase,
               a.updated_at, c.resume_at
        FROM agent_sessions a LEFT JOIN agent_continuations c
          ON c.agent_id = a.id AND c.status = 'pending'
-       ${projectId ? 'WHERE a.project_id = ?' : ''}`
+       ${agentFilter}`
     ).all(...params) as DbRow[]
     return [
       ...terminals.map((row) => ({

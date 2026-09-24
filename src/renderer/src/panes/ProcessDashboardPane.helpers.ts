@@ -9,6 +9,35 @@ export interface ReportedPlanProgress {
   label: string
 }
 
+export const PROCESS_BOARD_RECENT_MS = 24 * 60 * 60 * 1000
+
+export interface ProcessBoardSelection {
+  processes: RuntimeProcessSummary[]
+  hiddenOlder: number
+}
+
+/** Keep the automatic board bounded before any conversation snapshot is requested. Live,
+ * waiting, interrupted, and owner-attention rows stay visible regardless of age; settled rows
+ * enter through the 24-hour window or explicit, page-sized "show older" requests. */
+export function selectProcessBoardProcesses(
+  processes: readonly RuntimeProcessSummary[],
+  now = Date.now(),
+  olderLimit = 0
+): ProcessBoardSelection {
+  const recentAfter = now - PROCESS_BOARD_RECENT_MS
+  const current: RuntimeProcessSummary[] = []
+  const older: RuntimeProcessSummary[] = []
+  for (const process of [...processes].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
+    const updatedAt = Date.parse(process.updatedAt)
+    const active = process.needsInput || ['starting', 'running', 'waiting_input', 'limited'].includes(process.status) ||
+      ['working', 'waiting_input', 'waiting_background', 'limited', 'disconnected'].includes(process.activityPhase ?? '')
+    if (active || (Number.isFinite(updatedAt) && updatedAt >= recentAfter)) current.push(process)
+    else older.push(process)
+  }
+  const requestedOlder = older.slice(0, Math.max(0, olderLimit))
+  return { processes: [...current, ...requestedOlder], hiddenOlder: older.length - requestedOlder.length }
+}
+
 /** Runtime state comes from the persisted process/activity record. A connected adapter is only
  * "working" when it is starting or its activity phase says work is being produced. */
 export function processTrackerState(process: RuntimeProcessSummary, snapshot?: Pick<SessionProjection, 'phase'> | null): ProcessTrackerState {

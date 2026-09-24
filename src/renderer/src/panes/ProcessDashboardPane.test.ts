@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { RuntimeProcessSummary } from '../../../shared/models'
 import type { SessionProjection, TimelineItem } from '../../../shared/structured-agent'
-import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress } from './ProcessDashboardPane.helpers'
+import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses } from './ProcessDashboardPane.helpers'
 
 const process = (overrides: Partial<RuntimeProcessSummary> = {}): RuntimeProcessSummary => ({
   id: 'agent-1', projectId: 'project-1', sessionId: 'workspace-1', kind: 'agent', title: 'Agent',
@@ -63,5 +63,31 @@ describe('serial process polling', () => {
     const second = poller.run()
     poller.dispose(); resolve(2); await second
     expect(commit).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('bounded cross-project process board', () => {
+  it('keeps live and owner-attention work across projects, but does not hydrate old settled sessions on open', () => {
+    const now = Date.parse('2026-09-24T12:00:00.000Z')
+    const processes = [
+      process({ id: 'old-live', projectId: 'project-a', activityPhase: 'working', updatedAt: '2026-09-01T00:00:00.000Z' }),
+      process({ id: 'attention', projectId: 'project-b', status: 'waiting_input', needsInput: true, updatedAt: '2026-09-01T00:00:00.000Z' }),
+      process({ id: 'recent-done', projectId: 'project-b', status: 'complete', activityPhase: 'complete', updatedAt: '2026-09-24T01:00:00.000Z' }),
+      process({ id: 'old-done', projectId: 'project-a', status: 'complete', activityPhase: 'complete', updatedAt: '2026-08-20T00:00:00.000Z' })
+    ]
+    const initial = selectProcessBoardProcesses(processes, now)
+    expect(initial.processes.map(row => row.id)).toEqual(['recent-done', 'old-live', 'attention'])
+    expect(initial.hiddenOlder).toBe(1)
+    expect(selectProcessBoardProcesses(processes, now, 25).processes.map(row => row.id)).toContain('old-done')
+  })
+
+  it('reveals older settled rows in bounded pages', () => {
+    const now = Date.parse('2026-09-24T12:00:00.000Z')
+    const processes = Array.from({ length: 60 }, (_, index) => process({
+      id: `old-${index}`, status: 'complete', activityPhase: 'complete',
+      updatedAt: new Date(Date.parse('2026-08-01T00:00:00.000Z') - index * 1000).toISOString()
+    }))
+    expect(selectProcessBoardProcesses(processes, now, 25)).toMatchObject({ hiddenOlder: 35 })
+    expect(selectProcessBoardProcesses(processes, now, 25).processes).toHaveLength(25)
   })
 })
