@@ -66,6 +66,11 @@ export class FakeDurableJobsService implements DurableJobsService {
     return all.slice(start, start + limit)
   }
 
+  latestEvents(jobId: string, limit: number): DurableJobEvent[] {
+    this.require(jobId)
+    return (this.eventLog.get(jobId) ?? []).slice(-Math.max(1, limit))
+  }
+
   checkpoints(jobId: string): DurableJobCheckpoint[] {
     this.require(jobId)
     return checkpointsFromEvents(this.eventLog.get(jobId) ?? [])

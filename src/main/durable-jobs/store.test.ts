@@ -1,7 +1,8 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { DatabaseSync } from 'node:sqlite'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, DURABLE_JOB_TRANSITIONS, type DurableJob, type DurableJobStage } from '../../shared/durable-jobs'
 import { DurableJobStore, IllegalTransitionError, LeaseHeldError, StaleEpochError } from './store'
 
@@ -203,5 +204,49 @@ describe('DurableJobStore', () => {
     expect(store.matchingEvents('job_1', { kind: 'loop-detected', stageId: 'job_1_s0', dataType: { replan: 'number' } })).toEqual([])
     expect(store.matchingEvents('job_2', { kind: 'note', dataEquals: { elapsedBudget: 'restarted' } }).map(event => event.message)).toEqual(['other job restart'])
     store.close()
+  })
+
+  it('returns the exact newest events beyond 20,000, oldest first, from one indexed bounded query', () => {
+    const db = new DatabaseSync(':memory:')
+    const store = new DurableJobStore(db)
+    store.create(job(), [], false)
+    store.create(job('job_2'), [], false)
+    store.batch('job_1', () => { for (let i = 0; i < 20_500; i++) store.event('job_1', { owner: true }, 'note', `n${i}`) })
+    store.event('job_2', { owner: true }, 'note', 'other job is newer')
+    store.event('job_1', { owner: true }, 'note', 'late marker', { marker: true })
+    const prefix = store.events('job_1', undefined, 1_000)
+    expect(prefix.some(event => event.message === 'late marker')).toBe(false)
+
+    const prepared: string[] = []
+    const prepare = db.prepare.bind(db)
+    const spy = vi.spyOn(db, 'prepare').mockImplementation(sql => { prepared.push(sql); return prepare(sql) })
+    const tail = store.latestEvents('job_1', 200)
+    spy.mockRestore()
+    expect(tail.map(event => event.message)).toEqual([...Array.from({ length: 199 }, (_, i) => `n${20_301 + i}`), 'late marker'])
+    expect(tail.every(event => event.jobId === 'job_1')).toBe(true)
+    expect(prepared).toHaveLength(1)
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${prepared[0]}`).all('job_1', 200) as Array<{ detail: string }>).map(row => row.detail).join('\n')
+    expect(plan).toContain('durable_job_events_job_idx')
+    expect(plan).not.toContain('TEMP B-TREE')
+
+    expect(store.latestEvents('job_1', 1).map(event => event.message)).toEqual(['late marker'])
+    expect(store.latestEvents('job_1', 50_000)).toHaveLength(1_000)
+    expect(store.latestEvents('job_2', 200).map(event => event.message)).toEqual(['Created as queued', 'other job is newer'])
+    expect(store.latestEvents('job_3', 200)).toEqual([])
+    store.close()
+  })
+
+  it('reads the newest tail again after the database file is reopened', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'durable-store-')); dirs.push(dir)
+    const path = join(dir, 'conductor.db')
+    const first = new DurableJobStore(path)
+    first.create(job(), [], false)
+    first.batch('job_1', () => { for (let i = 0; i < 20_100; i++) first.event('job_1', { owner: true }, 'note', `n${i}`) })
+    first.close()
+    const second = new DurableJobStore(path)
+    try {
+      second.event('job_1', { owner: true }, 'note', 'after restart')
+      expect(second.latestEvents('job_1', 3).map(event => event.message)).toEqual(['n20098', 'n20099', 'after restart'])
+    } finally { second.close() }
   })
 })

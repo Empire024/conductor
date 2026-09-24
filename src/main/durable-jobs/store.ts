@@ -265,6 +265,15 @@ export class DurableJobStore {
   }
 
   /**
+   * The job's newest `limit` events (at most 1000), oldest first: one indexed read however long
+   * the history is, for a view that shows the latest activity. Forward paging stays events().
+   */
+  latestEvents(jobId: string, limit: number): DurableJobEvent[] {
+    const bounded = Math.max(1, Math.min(1_000, Math.floor(limit)))
+    return (this.db.prepare('SELECT data FROM durable_job_events WHERE job_id = ? ORDER BY seq DESC LIMIT ?').all(jobId, bounded) as Row[]).reverse().map(row => json<DurableJobEvent>(row.data))
+  }
+
+  /**
    * Events that match, oldest first. `limit` keeps the newest matches and still returns them
    * oldest first, so a later budget note, retry or replan is not hidden behind earlier rows.
    * Omit `limit` to return every match. Clients that page with afterId keep using events().

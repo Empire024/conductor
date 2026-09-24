@@ -260,6 +260,8 @@ export interface DurableJobsService {
   get(jobId: string): DurableJob & { stages: DurableJobStage[] }
   status(jobId: string): DurableJobSummary
   events(jobId: string, afterId?: string, limit?: number): DurableJobEvent[]
+  /** The newest `limit` events, oldest first, read without paging the whole history. */
+  latestEvents(jobId: string, limit: number): DurableJobEvent[]
   checkpoints(jobId: string): DurableJobCheckpoint[]
   pause(jobId: string, reason?: string): DurableJobSummary
   resume(jobId: string): Promise<DurableJobSummary>

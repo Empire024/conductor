@@ -47,15 +47,9 @@ export function registerDurableJobsIpc(options: {
   handle(DURABLE_JOB_CHANNELS.detail, (_event, projectId, jobId): DurableJobDetail => {
     const summary = owned(projectId, jobId)
     const jobs = service()
-    // The view needs the recent tail plus every checkpoint; checkpoints come from the full stream.
-    const events = []
-    for (let after: string | undefined; ;) {
-      const page = jobs.events(summary.id, after, 500)
-      events.push(...page)
-      if (page.length < 500 || events.length >= 20_000) break
-      after = page[page.length - 1]!.id
-    }
-    return { job: jobs.get(summary.id), summary, events: events.slice(-200), checkpoints: jobs.checkpoints(summary.id) }
+    // The view shows the newest 200 events however long the job has run; one bounded read, not a
+    // walk of the history. Checkpoints have their own table.
+    return { job: jobs.get(summary.id), summary, events: jobs.latestEvents(summary.id, 200), checkpoints: jobs.checkpoints(summary.id) }
   })
   handle(DURABLE_JOB_CHANNELS.events, (_event, projectId, jobId, afterId?: string, limit?: number) => {
     const summary = owned(projectId, jobId)

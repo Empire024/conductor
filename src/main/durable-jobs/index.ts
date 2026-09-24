@@ -187,6 +187,11 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     return this.store.events(jobId, afterId, limit)
   }
 
+  latestEvents(jobId: string, limit: number): DurableJobEvent[] {
+    this.store.get(jobId)
+    return this.store.latestEvents(jobId, limit)
+  }
+
   checkpoints(jobId: string): DurableJobCheckpoint[] {
     this.store.get(jobId)
     return this.store.checkpoints(jobId)
