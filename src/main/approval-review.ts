@@ -54,6 +54,8 @@ export class ApprovalReviews {
   }
   get(projectId: string, id: string): ReviewRecord | undefined { return this.records(projectId).find(record => record.id === id) }
   lookup(action: ReviewAction): ReviewRecord | undefined { return this.records(action.projectId).find(record => record.requestKey === requestKey(action)) }
+  /** The reviews raised for one worker's requests, for its usage attribution. */
+  forWorker(projectId: string, workerId: string): ReviewRecord[] { return this.records(projectId).filter(record => record.workerId === workerId) }
   hasDenials(projectId: string): boolean { return this.records(projectId).some(record => record.denied) }
   /** A denial fences the exact paths it named; a pathless denial (a command, a search) fences only
    *  the same logical operation again, never every later request of the project. */

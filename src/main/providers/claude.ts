@@ -8,7 +8,6 @@ import { captureAdapterState, restoreAdapterState, settled } from './adapter-sta
 import { JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, parseAutoModeDenialReason } from '../../shared/auto-mode-denial'
-import { modelEfforts } from '../../shared/model-effort'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -89,6 +88,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private settings: SessionSettings
   private phase: Extract<AdapterEvent['data'], { type: 'session' }>['phase'] = 'idle'
   private ready = false
+  /** Models the native catalog explicitly lists without effort (supportsEffort: false), e.g. Haiku. */
+  private effortless = new Set<string>()
   private disposed = false
   private active = false
   private stopRequested = false
@@ -195,6 +196,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.capabilities.models = array(initialized.models).flatMap((entry) => {
         const model = object(entry)
         const id = string(model.value) ?? string(model.id)
+        if (id && model.supportsEffort === false) this.effortless.add(id)
         const effort = model.supportsEffort === false ? [] : Array.isArray(model.supportedEffortLevels)
           ? model.supportedEffortLevels.filter((value): value is string => typeof value === 'string' && this.capabilities.effort.includes(value))
           : model.supportsEffort === true ? this.capabilities.effort : []
@@ -254,7 +256,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.validateSettings(settings)
     // A model the native catalog lists with no effort levels (Haiku) gets none: an effort carried
     // over from another model is neither sent nor reported as effective.
-    if (settings.effort && modelEfforts(this.capabilities, settings.model)?.length === 0) settings = { ...settings, effort: undefined }
+    const chosenModel = settings.model ?? string(object(this.capabilities.effectiveSettings).model)
+    if (settings.effort && chosenModel && this.effortless.has(chosenModel)) settings = { ...settings, effort: undefined }
     const messageId = randomUUID()
     const message = await this.userMessage(text, attachments, messageId)
     try {

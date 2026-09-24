@@ -124,6 +124,26 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     await f.adapter.submit('Continue', { ...settings, model: 'haiku' })
     expect(f.transport.sent.some(item => /set_model|set_permission_mode/.test(JSON.stringify(item)))).toBe(false)
   })
+  it('never sends or reports an effort for a model whose native catalog offers none (Haiku)', async () => {
+    const f = fixture({ settings: { ...settings, model: 'opus', effort: 'high' } }, false)
+    const starting = f.adapter.start()
+    await flush()
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: (f.transport.sent[0] as { request_id: string }).request_id, response: { models: [
+      { value: 'opus', displayName: 'Opus', supportsEffort: true, supportedEffortLevels: ['low', 'high'] },
+      { value: 'haiku', displayName: 'Haiku', supportsEffort: false }
+    ] } } })
+    await starting
+    const flags = () => f.transport.sent.filter(item => JSON.stringify(item).includes('apply_flag_settings')).map(item => (item as { request: { settings: { effortLevel: unknown } } }).request.settings.effortLevel)
+    // The effort carried over from Opus is dropped for Haiku, and the launch-time effort is cleared.
+    await f.adapter.submit('Switch to the cheap model', { ...settings, model: 'haiku', effort: 'high' })
+    expect(flags()).toEqual([null])
+    expect(f.adapter.capabilities.effectiveSettings).toMatchObject({ effort: null })
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, usage: {} })
+    await flush()
+    // Back on a model with a ladder, the chosen effort is sent again.
+    await f.adapter.submit('Back to Opus', { ...settings, model: 'opus', effort: 'high' })
+    expect(flags()).toEqual([null, 'high'])
+  })
   it('connects to patch and minor releases at or above the baseline, recording the unverified gap', async () => {
     expect(claudeCompatibility(CLAUDE_COMPATIBILITY)).toEqual({ supported: true, verified: true })
     expect(claudeCompatibility('2.1.280')).toEqual({ supported: true, verified: false })
