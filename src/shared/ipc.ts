@@ -63,6 +63,7 @@ export interface ConductorBridge {
     onStatus(callback: (state: { id: string; status: string; exitCode?: number }) => void): () => void
   }
   structured: StructuredAgentBridge
+  conversationHistory: import('./conversation-history').ConversationHistoryBridge
   browser: {
     mount(request: BrowserSurfaceRequest): Promise<BrowserSurfaceState>
     update(request: BrowserSurfaceRequest): Promise<BrowserSurfaceState>

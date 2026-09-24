@@ -241,6 +241,14 @@ export class StructuredAgentStore {
   events(id: string, after = 0): AgentEvent[] {
     return (this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent)
   }
+  /** The oldest sequence the journal still holds for a conversation; a primary-key seek. */
+  journalFloor(id: string): number | null {
+    return (this.db.prepare('SELECT sequence FROM structured_events WHERE session_id=? ORDER BY sequence LIMIT 1').get(id) as { sequence: number } | undefined)?.sequence ?? null
+  }
+  /** One primary-key-bounded slice of the journal, `from` <= sequence < `to`, at most `limit` rows. */
+  journalRange(id: string, from: number, to: number, limit: number): AgentEvent[] {
+    return (this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>=? AND sequence<? ORDER BY sequence LIMIT ?').all(id, from, to, limit) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent)
+  }
   /**
    * A narrow durable journal for shared weekly accounting. It bypasses history()'s UI cap and
    * events()'s page cap, and reads only the envelope and token fields accounting needs - never

@@ -136,6 +136,11 @@ const bridge: ConductorBridge = {
     onData: (callback) => subscribe('native-cli:data', callback),
     onStatus: (callback) => subscribe('native-cli:status', callback)
   },
+  conversationHistory: {
+    page: (id, before, limit) => ipcRenderer.invoke('conversation-history:page', id, before, limit),
+    search: (id, query) => ipcRenderer.invoke('conversation-history:search', id, query),
+    transcript: (id) => ipcRenderer.invoke('conversation-history:transcript', id)
+  },
   structured: {
     bindWorkspace: (id, sessionId) => ipcRenderer.invoke('structured:bind-workspace', id, sessionId),
     queue: (id, text, settings, attachments) => ipcRenderer.invoke('structured:queue', id, text, settings, attachments),
