@@ -1,0 +1,30 @@
+﻿
+ RUN  v3.2.7 C:/Users/stilj/AppData/Local/Temp/item9-nYb5
+
+ ✓ src/main/durable-jobs/watchdog.test.ts (10 tests) 7ms
+ ✓ src/main/durable-jobs/loop-guard.test.ts (10 tests) 21ms
+ ✓ src/main/durable-jobs/server-lifecycle.test.ts (13 tests) 277ms
+ ✓ src/main/durable-jobs/structured-runtime.test.ts (3 tests) 4ms
+ ✓ src/main/durable-jobs/handoff.test.ts (16 tests) 104ms
+ ✓ src/main/durable-jobs/report.test.ts (8 tests) 455ms
+ ✓ src/main/durable-jobs/controller.test.ts (17 tests) 903ms
+ ✓ src/main/durable-jobs/reconcile.test.ts (8 tests) 1306ms
+   ✓ git worktree checkpoints > works in its own worktree from HEAD, never touches the owner's dirty tree and finds its checkpoint commit  971ms
+ ✓ src/main/durable-jobs/store.test.ts (12 tests) 1898ms
+   ✓ DurableJobStore > returns the exact newest events beyond 20,000, oldest first, from one indexed bounded query  764ms
+   ✓ DurableJobStore > reads the newest tail again after the database file is reopened  772ms
+ ✓ src/main/durable-jobs/worktree.test.ts (8 tests) 1967ms
+   ✓ dependencies in a job worktree > does not link the owner's node_modules by default and says why tests cannot run  490ms
+   ✓ dependencies in a job worktree > copies real files on opt-in, skips links, and a write in the copy never reaches the owner  543ms
+   ✓ dependencies in a job worktree > refuses to copy node_modules a checkpoint commit would pick up  459ms
+   ✓ dependencies in a job worktree > reports nothing for a project without package.json  410ms
+ ✓ src/main/durable-jobs/wiring.test.ts (15 tests) 2258ms
+   ✓ supervision ports > gives a quiet running tool the tool budget, past the model timeout, then watches the model again  589ms
+   ✓ supervision ports > stops a tool that runs past the tool budget, and not before  562ms
+
+ Test Files  11 passed (11)
+      Tests  120 passed (120)
+   Start at  11:54:57
+   Duration  3.08s (transform 943ms, setup 0ms, collect 3.25s, tests 9.20s, environment 2ms, prepare 1.74s)
+
+isolated vitest exit 0

@@ -76,6 +76,52 @@ the cause (grant the approval, adjust the project) and *Resume*, or *Cancel*. A 
 its worktree, checkpoints and logs; start a new job from the report's remaining work. A job never
 escalates to a cloud model to get unstuck; handing a stage to a cloud coworker is the owner's call.
 
+## Dependencies in a job worktree
+
+A job on a repository works in its own `git worktree`, which holds committed files only. A Node
+project's `node_modules` is git-ignored, so the worktree starts without it and `npm test` or a
+build there fails with "module not found". `gitWorktrees.create` (`src/main/durable-jobs/worktree.ts`)
+checks every `package.json` folder (repository root and the job's project folder) and returns the
+result in `worktree.dependencies` (`mode`, `status`: `ready` / `copied` / `missing`, `note`).
+
+- **Default: nothing is provisioned, never a link.** A junction or symlink to the owner's
+  `node_modules` would let an `npm install`, a `patch-package` or a build cache write straight into
+  the owner's tree, which defeats the isolation the worktree exists for, and electron-builder drops
+  packages it reaches through a junction (`docs/machine-profile.md`). A hard-link farm has the same
+  write-through problem for any tool that rewrites a file in place. `dependencies.note` says why
+  tests cannot run and what unblocks them: install in the worktree (`npm ci`, which needs network
+  and the owner's permission) or opt in to a copy.
+- **Opt-in: a private copy.** `.conductor/durable-jobs.json` in the project folder with
+  `{"worktreeDependencies":"copy"}` makes job creation copy the project's `node_modules` into the
+  worktree as real files. Links inside it are skipped, not followed, so nothing in the copy points
+  back into the owner's tree. The copy is made only where git ignores `node_modules`, so a
+  checkpoint commit can never pick it up; otherwise the note says it was refused. It reflects the
+  owner's install when the job started. Cost on this machine: Conductor's own 724 MB
+  `node_modules` copies in about 18 s, and vitest runs from the copy.
+- The setting is read when the job is created; changing it affects the next job.
+
+The note must reach the stage prompt and the job's events to be useful: `index.ts` is expected to
+record `worktree.dependencies.note` as a creation note and a handoff constraint (see
+`docs/autopilot-evidence/review-item-9.md` for the state of that hook).
+
+## Checkpoints in a folder without git
+
+A job on a folder without git (or with isolation off) works in place, and each checkpoint is a
+snapshot of the whole folder, not only the files the model reported changing: a file a shell
+command or a test run created is captured too. Contents go into a content-addressed store shared by
+the job's snapshots (`<logDir>/checkpoints/objects/`), so an unchanged file is stored once and is
+not re-hashed when its size and mtime match the previous snapshot. `manifest.json` is written last
+and lists every file with its sha256, the files reported changed, and what was skipped.
+
+- Skipped: links (never followed), `.git`, `.hg`, `.svn`, `node_modules`, `.venv`, `venv`,
+  `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.tox`, `.cache`, and files over 50 MB. A
+  snapshot stops capturing at 20,000 files or 2 GB and marks itself `truncated`.
+- `gitWorktrees.restore(directory, cwd?, {prune?})` verifies every stored copy against the manifest
+  before it touches the folder, then rewrites each file whose content differs. With `prune` it also
+  deletes files the snapshot did not have (skipped folders and over-size files are left alone); a
+  truncated snapshot refuses to prune. Snapshots written in the earlier `files/` layout still
+  restore. No automatic step calls restore; it is the owner's (or a tool's) explicit rollback.
+
 ## How the parts are wired
 
 `src/main/index.ts` builds the service; `src/main/durable-jobs/wiring.ts` adapts the modules to the

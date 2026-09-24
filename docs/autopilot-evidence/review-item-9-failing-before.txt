@@ -1,0 +1,140 @@
+
+ RUN  v3.2.7 C:/Claude/conductor
+
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'a.txt', LF will be replaced by CRLF the next time Git touches it
+ ❯ src/main/durable-jobs/worktree.test.ts (8 tests | 7 failed) 889ms
+   × non-git checkpoints > capture a file the stage created but never reported, and restore brings it back 15ms
+     → expected [ 'notes.md' ] to deeply equal [ 'generated/untracked.txt', …(1) ]
+   × non-git checkpoints > stores unchanged content once across checkpoints 7ms
+     → ENOENT: no such file or directory, scandir 'C:\Users\stilj\AppData\Local\Temp\durable-snap-b6GezE\objects'
+   × non-git checkpoints > refuses a restore whose stored content no longer matches the manifest 3ms
+     → ENOENT: no such file or directory, scandir 'C:\Users\stilj\AppData\Local\Temp\durable-snap-X1s2DS\objects'
+   × non-git checkpoints > restores a snapshot written in the earlier files/ layout 2ms
+     → gitWorktrees.restore is not a function
+   × dependencies in a job worktree > does not link the owner's node_modules by default and says why tests cannot run 306ms
+     → expected undefined to match object { mode: 'none', …(2) }
+   × dependencies in a job worktree > copies real files on opt-in, skips links, and a write in the copy never reaches the owner 141ms
+     → The "path" argument must be of type string. Received undefined
+   × dependencies in a job worktree > refuses to copy node_modules a checkpoint commit would pick up 136ms
+     → The "path" argument must be of type string. Received undefined
+   ✓ dependencies in a job worktree > reports nothing for a project without package.json 278ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 7 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/main/durable-jobs/worktree.test.ts > non-git checkpoints > capture a file the stage created but never reported, and restore brings it back
+AssertionError: expected [ 'notes.md' ] to deeply equal [ 'generated/untracked.txt', …(1) ]
+
+- Expected
++ Received
+
+  [
+-   "generated/untracked.txt",
+    "notes.md",
+  ]
+
+ ❯ src/main/durable-jobs/worktree.test.ts:32:78
+     30|     expect(gitWorktrees.snapshotComplete(directory)).toBe(true)
+     31|     const manifest = JSON.parse(read(join(directory, 'manifest.json')))
+     32|     expect(manifest.files.map((file: { path: string }) => file.path).s…
+       |                                                                              ^
+     33|     expect(manifest.skipped.directories).toContain('node_modules')
+     34| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/7]⎯
+
+ FAIL  src/main/durable-jobs/worktree.test.ts > non-git checkpoints > stores unchanged content once across checkpoints
+Error: ENOENT: no such file or directory, scandir 'C:\Users\stilj\AppData\Local\Temp\durable-snap-b6GezE\objects'
+ ❯ src/main/durable-jobs/worktree.test.ts:61:21
+     59|     write(join(cwd, 'c.txt'), 'new\n')
+     60|     await gitWorktrees.snapshot(cwd, ['c.txt'], join(checkpoints, 'sna…
+     61|     const objects = readdirSync(join(checkpoints, 'objects'), { recurs…
+       |                     ^
+     62|     expect(objects).toHaveLength(2)
+     63|   })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/7]⎯
+
+ FAIL  src/main/durable-jobs/worktree.test.ts > non-git checkpoints > refuses a restore whose stored content no longer matches the manifest
+Error: ENOENT: no such file or directory, scandir 'C:\Users\stilj\AppData\Local\Temp\durable-snap-X1s2DS\objects'
+ ❯ src/main/durable-jobs/worktree.test.ts:71:20
+     69|     const directory = join(checkpoints, 'snap_1')
+     70|     await gitWorktrees.snapshot(cwd, [], directory)
+     71|     const object = readdirSync(join(checkpoints, 'objects'), { recursi…
+       |                    ^
+     72|     writeFileSync(join(object.parentPath, object.name), 'tampered\n')
+     73|     writeFileSync(join(cwd, 'a.txt'), 'changed\n')
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/7]⎯
+
+ FAIL  src/main/durable-jobs/worktree.test.ts > non-git checkpoints > restores a snapshot written in the earlier files/ layout
+TypeError: gitWorktrees.restore is not a function
+ ❯ src/main/durable-jobs/worktree.test.ts:83:32
+     81|     write(join(directory, 'files', 'notes.md'), 'hello')
+     82|     writeFileSync(join(directory, 'manifest.json'), JSON.stringify({ c…
+     83|     expect((await gitWorktrees.restore(directory, cwd)).written).toEqu…
+       |                                ^
+     84|     expect(read(join(cwd, 'notes.md'))).toBe('hello')
+     85|   })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/7]⎯
+
+ FAIL  src/main/durable-jobs/worktree.test.ts > dependencies in a job worktree > does not link the owner's node_modules by default and says why tests cannot run
+AssertionError: expected undefined to match object { mode: 'none', …(2) }
+
+- Expected: 
+{
+  "mode": "none",
+  "packageDirs": [
+    ".",
+  ],
+  "status": "missing",
+}
+
++ Received: 
+undefined
+
+ ❯ src/main/durable-jobs/worktree.test.ts:109:31
+    107|     const tree = await create(repo, 'job_deps_default')
+    108|     expect(existsSync(join(tree.path, 'node_modules'))).toBe(false)
+    109|     expect(tree.dependencies).toMatchObject({ mode: 'none', status: 'm…
+       |                               ^
+    110|     expect(tree.dependencies!.note).toMatch(/no node_modules/)
+    111|     expect(tree.dependencies!.note).toContain('npm ci')
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/7]⎯
+
+ FAIL  src/main/durable-jobs/worktree.test.ts > dependencies in a job worktree > copies real files on opt-in, skips links, and a write in the copy never reaches the owner
+TypeError: The "path" argument must be of type string. Received undefined
+ ❯ src/main/durable-jobs/worktree.test.ts:117:11
+    115|   it('copies real files on opt-in, skips links, and a write in the cop…
+    116|     const repo = nodeRepo()
+    117|     write(join(repo, WORKTREE_SETTINGS_FILE), '{"worktreeDependencies"…
+       |           ^
+    118|     const outside = temp('durable-link-target-')
+    119|     write(join(outside, 'index.js'), 'owner workspace package\n')
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/7]⎯
+
+ FAIL  src/main/durable-jobs/worktree.test.ts > dependencies in a job worktree > refuses to copy node_modules a checkpoint commit would pick up
+TypeError: The "path" argument must be of type string. Received undefined
+ ❯ src/main/durable-jobs/worktree.test.ts:138:11
+    136|   it('refuses to copy node_modules a checkpoint commit would pick up',…
+    137|     const repo = nodeRepo(false)
+    138|     write(join(repo, WORKTREE_SETTINGS_FILE), '{"worktreeDependencies"…
+       |           ^
+    139|     const tree = await create(repo, 'job_deps_unignored')
+    140|     expect(existsSync(join(tree.path, 'node_modules'))).toBe(false)
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/7]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  7 failed | 1 passed (8)
+   Start at  11:50:15
+   Duration  1.21s (transform 32ms, setup 0ms, collect 38ms, tests 889ms, environment 0ms, prepare 102ms)
+
