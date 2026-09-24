@@ -198,6 +198,7 @@ const bridge: ConductorBridge = {
     check: () => ipcRenderer.invoke('updates:check'),
     download: () => ipcRenderer.invoke('updates:download'),
     install: () => ipcRenderer.invoke('updates:install'),
+    restart: () => ipcRenderer.invoke('updates:restart'),
     acknowledgePrepare: (requestId) => ipcRenderer.send('updates:prepare-ack', requestId),
     onState: (callback) => subscribe('updates:state', callback),
     onPrepareInstall: (callback) => subscribe('updates:prepare-install', callback)

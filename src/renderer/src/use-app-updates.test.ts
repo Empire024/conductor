@@ -14,6 +14,7 @@ function fakeBridge(initial: AppUpdateState) {
     check: vi.fn(async () => available),
     download: vi.fn(async () => ready),
     install: vi.fn(async () => {}),
+    restart: vi.fn(async () => {}),
     acknowledgePrepare: vi.fn(),
     onState: vi.fn((callback: (state: AppUpdateState) => void) => { onStateCallback = callback; return () => { onStateCallback = null } }),
     onPrepareInstall: vi.fn(() => () => {})

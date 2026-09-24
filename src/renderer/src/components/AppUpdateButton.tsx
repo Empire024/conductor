@@ -7,6 +7,10 @@ export const isUpdateActionVisible = (state: AppUpdateState): boolean =>
   ['available', 'downloading', 'ready', 'installing'].includes(state.phase) ||
   (state.phase === 'error' && Boolean(state.availableVersion))
 
+/** A wizard tab's app.restart.request, as the owner's update control shows it. */
+export const restartRequestLabel = (state: AppUpdateState): string | undefined =>
+  state.restartRequest && `Restart requested by ${state.restartRequest.title} — ${state.restartRequest.reason}`
+
 export function AppUpdateButton({
   state,
   onAction
@@ -19,7 +23,20 @@ export function AppUpdateButton({
   // the same shared update store rather than threaded through as another prop.
   const { pendingQuitConfirm, confirmQuitAndInstall, cancelQuitConfirm } = useAppUpdates()
   const confirm = pendingQuitConfirm && <UpdateQuitConfirm running={pendingQuitConfirm} onConfirm={() => void confirmQuitAndInstall()} onCancel={cancelQuitConfirm} />
-  if (!isUpdateActionVisible(state)) return confirm
+  const requested = restartRequestLabel(state)
+  if (!isUpdateActionVisible(state)) {
+    // No update to install: the request itself is the restart control.
+    if (!requested) return confirm
+    return (
+      <>
+        <button className="statusbar-update ready" onClick={() => void window.conductor.updates.restart()} title={requested}>
+          <RotateCcw size={11} />
+          <span aria-live="polite">{requested.length > 90 ? requested.slice(0, 89) + '…' : requested}</span>
+        </button>
+        {confirm}
+      </>
+    )
+  }
 
   const busy = state.phase === 'downloading' || state.phase === 'installing'
   const progress = typeof state.progress === 'number' && Number.isFinite(state.progress) ? Math.round(Math.max(0, Math.min(100, state.progress))) : undefined
@@ -41,10 +58,11 @@ export function AppUpdateButton({
         onClick={onAction}
         disabled={busy}
         aria-busy={busy}
-        title={state.message ?? (state.availableVersion ? `${label}: Conductor ${state.availableVersion}` : label)}
+        title={[requested, state.message ?? (state.availableVersion ? `${label}: Conductor ${state.availableVersion}` : label)].filter(Boolean).join('\n')}
       >
         <Icon size={11} />
         <span aria-live="polite">{label}</span>
+        {requested && <span>· {requested.length > 90 ? requested.slice(0, 89) + '…' : requested}</span>}
         {state.phase === 'downloading' && <progress aria-label="Update download progress" value={progress} max={100} />}
       </button>
       {confirm}

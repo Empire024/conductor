@@ -108,6 +108,8 @@ export interface ConductorBridge {
     check(): Promise<AppUpdateState>
     download(): Promise<AppUpdateState>
     install(): Promise<void>
+    /** Restart for a wizard's restart request when no update is waiting to install. */
+    restart(): Promise<void>
     acknowledgePrepare(requestId: string): void
     onState(callback: (state: AppUpdateState) => void): () => void
     onPrepareInstall(callback: (payload: { requestId: string }) => void): () => void
