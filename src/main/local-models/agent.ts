@@ -9,8 +9,10 @@ import { detectsTestRun, shapeTestOutput, shapeToolOutput } from './tool-output.
 import { roundStage, roundStageMessage, StagnationDetector, type RoundStage } from './progress.ts'
 import { completionEstablished, contractConstraints, emptyEvidence, finalizeNow, recordCommand, recordWrite, unverifiedClaim, type AcceptanceResult, type RunEvidence, type TaskContract } from './completion.ts'
 import type { LocalRoundEntry, LocalStopReason, LocalStopReport } from '../../shared/local-stop.ts'
-import { relative } from 'node:path'
+import { join, relative } from 'node:path'
 import { randomUUID } from 'node:crypto'
+import { stat } from 'node:fs/promises'
+import { outputBudgetLoopStop, truncatedCallResult, type OutputBudgetLoop } from './output-budget.ts'
 import { newExecutionState, observeExecution, fingerprint, type ExecutionState } from './execution-state.ts'
 import { isFileProcessingTask, processingRequest, processingTool, PROCESSING_GUIDE, observedPlanHint, type ProcessingRun } from './processing-workflow.ts'
 
@@ -216,10 +218,7 @@ export const UNPARSEABLE_ARGUMENTS = '{}'
 export function malformedCallResult(name: string, raw: string, truncated: boolean, limitTokens = RESPONSE_RESERVE_TOKENS): string {
   const size = `${raw.length} characters`
   if (!truncated) return `failed: the ${name} arguments were not a JSON object (${size}), so nothing ran. Send one tool call whose arguments are a JSON object matching the tool schema, or answer in text without a tool.`
-  const parts = name === 'write_file'
-    ? ' Write a large file in parts: write_file the first part, then write_file with append: true for each further part, keeping every call under about 6000 characters of content.'
-    : ' Split the work into smaller calls.'
-  return `failed: the ${name} call was cut off at the local output limit of ${limitTokens} tokens after ${size}, before its arguments were complete, so nothing ran and nothing was written.${parts}`
+  return truncatedCallResult(name, raw, limitTokens)
 }
 
 /** Make the history renderable again. A chat template rejects a tool result that answers no
@@ -289,6 +288,8 @@ interface RunLedger {
   ruminations: number
   nudged: boolean
   detector: StagnationDetector
+  /** Argument characters of every call the output limit cut off this turn, by tool. */
+  truncatedCalls: Map<string, number[]>
 }
 
 export class LocalAgentSession {
@@ -496,8 +497,11 @@ export class LocalAgentSession {
     try { await this.checkpoint() } catch (error) { reason = 'provider_error'; detail = `Task checkpoint failed: ${error instanceof Error ? error.message : 'persistence unavailable'}. No automatic restart was attempted.`; state.lifecycle = 'failed' }
     if (reason !== 'completed' && reason !== 'interrupted') {
       const status = `Could not complete the task: ${detail}\nVerified execution: ${state.observations.length} retained source observations; ${ledger.evidence.commands.length} commands; ${state.validation?.passed ? 'result validation passed' : 'no validated final result'}.` + (state.failures.length ? `\nLast tool failure: ${state.failures.at(-1)!.error}` : '') + (state.artifacts.length ? `\nArtifacts: ${state.artifacts.map(a=>a.path).join(', ')}` : '') + (this.processing ? '\nUnresolved results must not be interpreted as missing records.' : '')
-      events.text?.(`\n${status}`)
-      text = reason === 'output_limit' && text ? `${text}\n\n${status}` : status
+      // An output-budget loop carries its partial result (what was written, the salvaged
+      // content, how to continue) so it outlives the turn in the conversation and the journal.
+      const partial = reason === 'output_budget_loop' && text ? `\n\n${text}` : ''
+      events.text?.(`\n${status}${partial}`)
+      text = reason === 'output_limit' && text ? `${text}\n\n${status}` : status + partial
     }
     this.active = false
     const report = this.buildReport(ledger, reason, detail, unverified)
@@ -590,7 +594,7 @@ export class LocalAgentSession {
     let tools = this.tools()
     // The schemas ride along on every request and come out of the same window as the messages.
     let overheadTokens = Math.ceil(JSON.stringify(tools).length / 3)
-    const ledger: RunLedger = { segmentStart: execution.budgets.rounds, round: execution.budgets.rounds, requests: 0, evidence: emptyEvidence(), stage: 'normal', contextWarned: false, compactions: 0, recoveredTokens: 0, excludedOutputChars: 0, timeline: [], acceptanceStale: false, finalizing: false, ruminations: 0, nudged: false, detector: new StagnationDetector(this.policy.stagnation) }
+    const ledger: RunLedger = { segmentStart: execution.budgets.rounds, round: execution.budgets.rounds, requests: 0, evidence: emptyEvidence(), stage: 'normal', contextWarned: false, compactions: 0, recoveredTokens: 0, excludedOutputChars: 0, timeline: [], acceptanceStale: false, finalizing: false, ruminations: 0, nudged: false, detector: new StagnationDetector(this.policy.stagnation), truncatedCalls: new Map() }
     if (this.restoredPending) return this.finish(ledger, events, '', 'stagnation', execution.nextAction)
     execution.lifecycle = 'running'
     let finalText = ''
@@ -762,6 +766,7 @@ export class LocalAgentSession {
       let wroteThisRound = false
       let stagnationStop: string | undefined
       let stagnationWarning: string | undefined
+      let outputBudgetLoop: OutputBudgetLoop | undefined
       for (const call of calls) {
         roundTools.push(call.name)
         if (signal?.aborted) {
@@ -772,8 +777,17 @@ export class LocalAgentSession {
         events.toolStart?.({ id: call.id, name: call.name, input: call.arguments })
         const started = Date.now()
         if (!argumentsAreObject(call.arguments)) {
-          const output = malformedCallResult(call.name, call.arguments, truncated, reserve)
-          if (truncated) events.notice?.(`The model's ${call.name} call hit the local output limit before it was complete; nothing ran, and the model was asked to send it in smaller parts.`)
+          // One repair per tool and turn: the first cut gets a concrete smaller size, and a second
+          // cut of the same tool is the output-budget loop, which ends the turn below instead of
+          // spending another full-length generation on the same oversized call.
+          const cuts = truncated ? [...(ledger.truncatedCalls.get(call.name) ?? []), call.arguments.length] : []
+          if (truncated) ledger.truncatedCalls.set(call.name, cuts)
+          const loop = cuts.length >= 2
+          const output = loop
+            ? `failed: the ${call.name} call was cut off at the local output limit of ${reserve} tokens again, after ${call.arguments.length} characters; nothing ran and nothing was written. Conductor ended the turn instead of retrying.`
+            : malformedCallResult(call.name, call.arguments, truncated, reserve)
+          if (loop) outputBudgetLoop = { name: call.name, limitTokens: reserve, cutChars: cuts, raw: call.arguments, written: [] }
+          else if (truncated) events.notice?.(`The model's ${call.name} call hit the local output limit before it was complete; nothing ran, and the model was asked to send it in smaller parts. A second cut ${call.name} ends the turn.`)
           events.toolEnd?.({ id: call.id, name: call.name, output, failed: true, durationMs: Date.now() - started })
           this.messages.push({ role: 'tool', tool_call_id: call.id, content: output })
           observeExecution(execution, call, output, true)
@@ -890,6 +904,15 @@ export class LocalAgentSession {
       if (this.processed?.answer && execution.validation?.passed) {
         events.text?.(`\n${this.processed.answer}`)
         return this.finish(ledger,events,this.processed.answer,'completed','File-processing result passed source, coverage, lineage and ambiguity checks under the observed schemas.')
+      }
+      if (outputBudgetLoop) {
+        for (const write of ledger.evidence.writes) {
+          const bytes = await stat(join(this.options.workspace, write.path)).then(info => info.size, () => undefined)
+          if (!outputBudgetLoop.written.some(file => file.path === write.path)) outputBudgetLoop.written.push({ path: write.path, ...(bytes !== undefined ? { bytes } : {}) })
+        }
+        const stop = outputBudgetLoopStop(outputBudgetLoop)
+        events.notice?.(`Stopped: ${stop.detail}`)
+        return this.finish(ledger, events, stop.partial, 'output_budget_loop', stop.detail)
       }
       if (stagnationStop) {
         events.notice?.(`Stopped: ${stagnationStop}`)

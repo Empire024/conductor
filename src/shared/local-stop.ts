@@ -11,6 +11,8 @@ export type LocalStopReason =
   | 'stagnation'
   | 'context_limit'
   | 'output_limit'
+  /** A tool call was cut off at the output limit again after the runtime asked for smaller parts. */
+  | 'output_budget_loop'
   | 'unverified_claim'
   | 'provider_error'
   | 'empty_answer'
@@ -66,6 +68,7 @@ export const localStopLabels: Record<LocalStopReason, string> = {
   stagnation: 'Stopped: repeating without progress',
   context_limit: 'Context limit reached',
   output_limit: 'Model output limit reached',
+  output_budget_loop: 'Stopped: tool call too large for the output limit twice',
   unverified_claim: 'Unverified completion claim',
   provider_error: 'Local server error',
   empty_answer: 'No answer produced'
