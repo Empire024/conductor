@@ -93,3 +93,14 @@ What the new tests show:
 No Electron smoke was run. These changes do not affect restart, lease or persistence behaviour.
 A live check would have needed a local model to fill 70% of its window, and the machine's one
 llama.cpp server was in use.
+
+## Delivery
+
+- a69212c: redaction, research grant, tool-schema budget, `ContextRolloverWatch`, and all tests
+  except the end-to-end rollover test. store.ts also carried the 3+6+7 worker's self-contained
+  `activeUntil` parameter, because git.ship commits whole files.
+- 79ca9ae (the review 3+6+7 worker): its whole-file ship of wiring.ts included this worker's
+  `scan()` rollover hook, which sat in the same file as its abort-signal change.
+- The follow-up commit adds `context-rollover.test.ts`. It needs the hook, so it is shipped only
+  after 79ca9ae. `npx vitest run src/main/durable-jobs/` exit 0 on that HEAD, and
+  `npx tsc --noEmit` exit 0.
