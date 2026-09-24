@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -7,6 +8,10 @@ import type { DeliveryRun } from '../shared/delivery'
 
 const SHA = 'a'.repeat(40)
 const REBASED = 'b'.repeat(40)
+const gitBlob = (content: string | Buffer): string => {
+  const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content)
+  return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+}
 type Reply = { code?: number | null; stdout?: string; lines?: string[] }
 type Handler = Reply | Reply[] | ((options: DeliveryRunOptions, args: string[]) => Reply | Promise<Reply>)
 
@@ -19,7 +24,8 @@ function harness(setup: { replies?: Record<string, Handler>; files?: Record<stri
   const root = join(base, 'repo')
   const temp = join(base, 'tmp')
   mkdirSync(root, { recursive: true }); mkdirSync(temp)
-  writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run', build: 'tsc' } }))
+  writeFileSync(join(root, 'package.json'), JSON.stringify({ scripts: { test: 'vitest run && npm run test:scripts', 'test:scripts': 'node --test scripts/*.test.mjs', build: 'npm run typecheck && electron-vite build' } }))
+  mkdirSync(join(root, 'src'), { recursive: true }); writeFileSync(join(root, 'src', 'a.ts'), 'export const a = 1\n')
   if (setup.workflow !== false) { mkdirSync(join(root, '.github', 'workflows'), { recursive: true }); writeFileSync(join(root, '.github', 'workflows', 'release.yml'), 'on: push') }
   for (const [path, content] of Object.entries(setup.files ?? {})) { mkdirSync(join(root, path, '..'), { recursive: true }); writeFileSync(join(root, path), content) }
   const replies: Record<string, Handler> = {
@@ -30,13 +36,24 @@ function harness(setup: { replies?: Record<string, Handler>; files?: Record<stri
     'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0' },
     'git rev-list --left-right --count origin/main...HEAD': { stdout: '0\t0\n' },
     'git rev-parse HEAD': { stdout: `${SHA}\n` },
+    'git hash-object': (options, args) => {
+      const path = join(options.cwd, args.at(-1)!)
+      if (!existsSync(path)) return { code: 1 }
+      const content = readFileSync(path)
+      return { stdout: gitBlob(content) + '\n' }
+    },
+    'git ls-files -s': (options, args) => {
+      const path = args.at(-1)!, content = readFileSync(join(options.cwd, path))
+      const blob = gitBlob(content)
+      return { stdout: `100644 ${blob} 0\t${path}\n` }
+    },
     'git diff --binary': (options, args) => { writeFileSync(args.find(arg => arg.startsWith('--output='))!.slice('--output='.length), 'diff --git a/x b/x\n'); return {} },
     'git worktree add': (_options, args) => { mkdirSync(args[3]!, { recursive: true }); return {} },
     ...setup.replies
   }
-  const calls: { command: string; args: string[]; cwd: string }[] = []
+  const calls: { command: string; args: string[]; cwd: string; env?: NodeJS.ProcessEnv }[] = []
   const run = vi.fn(async (command: string, args: string[], options: DeliveryRunOptions) => {
-    calls.push({ command, args, cwd: options.cwd })
+    calls.push({ command, args, cwd: options.cwd, env: options.env })
     const line = [command, ...args].join(' ')
     const key = Object.keys(replies).filter(prefix => line === prefix || line.startsWith(`${prefix} `)).sort((a, b) => b.length - a.length)[0]
     let handler = key ? replies[key]! : {}
@@ -88,7 +105,10 @@ describe('local delivery by default', () => {
     expect(run.commit).toBe(SHA)
     expect(run.stages[4]!.detail).toMatch(/Local delivery: commit aaaaaaa stays on this machine/)
     expect(run.stages[5]!.detail).toMatch(/app\.update/)
-    expect(h.ran('npm test')).toBe(true)
+    expect(h.ran('npx vitest run')).toBe(true)
+    expect(h.ran('npm run test:scripts')).toBe(false)
+    expect(h.ran('npx tsc --noEmit --incremental --tsBuildInfoFile .conductor-scratch/delivery-cache/tsconfig.tsbuildinfo')).toBe(true)
+    expect(h.ran('npx electron-vite build')).toBe(true)
     expect(h.ran('git commit')).toBe(true)
     expect(h.ran('git fetch')).toBe(false)
     expect(h.ran('git push')).toBe(false)
@@ -142,41 +162,44 @@ describe('DeliveryService pipeline', () => {
     expect(stageStates(run)).toEqual({ preflight: 'passed', test: 'passed', build: 'passed', commit: 'passed', push: 'passed', release: 'passed' })
     expect(run).toMatchObject({ commit: SHA, releaseTag: 'v1.2.3', releaseUrl: 'https://github.com/owner/app/releases/tag/v1.2.3', workflowRunUrl: 'https://github.com/owner/app/actions/runs/7' })
     expect(h.ran('git fetch origin main')).toBe(true)
-    expect(h.ran('npm test')).toBe(true)
-    expect(h.ran('npm run build')).toBe(true)
-    expect(h.ran('git add -A')).toBe(true)
+    expect(h.ran('npx vitest run')).toBe(true)
+    expect(h.ran('npm run test:scripts')).toBe(false)
+    expect(h.ran('npx tsc --noEmit --incremental')).toBe(true)
+    expect(h.ran('npx electron-vite build')).toBe(true)
+    expect(h.ran('git read-tree HEAD')).toBe(true)
+    expect(h.calls.some(call => call.args[0] === 'update-index' && call.cwd === h.root && call.env?.GIT_INDEX_FILE)).toBe(true)
     const commit = h.calls.find(call => call.args[0] === 'commit')!
     expect(commit.args.slice(0, 2)).toEqual(['commit', '-F'])
     expect(commit.args).not.toContain('Ship it')
     expect(commit.args).not.toContain('--no-verify')
     expect(h.ran('git push origin HEAD:main')).toBe(true)
-    expect(h.ran('git worktree')).toBe(false)
+    expect(h.ran('git worktree add')).toBe(true)
     expect(h.requests[0]!.headers).toMatchObject({ Authorization: 'Bearer token', Accept: 'application/vnd.github+json', 'User-Agent': 'Conductor' })
     expect(snapshots.at(-1)!.state).toBe('delivered')
     snapshots[0]!.stages[0]!.log.push('mutated')
     expect(h.service.current('p1')!.stages[0]!.log).not.toContain('mutated')
   })
 
-  it('verifies a path subset in an isolated worktree and removes it even when tests fail', async () => {
+  it('verifies a path subset in an isolated worktree and retains it for reuse when tests fail', async () => {
     const h = harness({
       files: { 'src/new file.ts': 'export {}' },
       replies: {
         'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0?? src/new file.ts\0 M other/agent.ts\0' },
-        'npm test': { code: 1, lines: ['RUN v3', ' FAIL src/a.test.ts > adds', 'AssertionError: expected 1 to be 2', 'Test Files 1 failed'] }
+        'npx vitest run': { code: 1, lines: ['RUN v3', ' FAIL src/a.test.ts > adds', 'AssertionError: expected 1 to be 2', 'Test Files 1 failed'] }
       }
     })
     const run = await h.ship({ message: 'Only mine', paths: ['src/a.ts', 'src/new file.ts'] })
     expect(run.state).toBe('failed')
-    expect(stageStates(run)).toMatchObject({ preflight: 'passed', test: 'failed', build: 'pending', commit: 'pending' })
+    expect(stageStates(run)).toMatchObject({ preflight: 'passed', test: 'failed', build: 'passed', commit: 'pending' })
     expect(run.error).toMatch(/Tests failed.*isolated worktree/)
     expect(run.error).toContain('FAIL src/a.test.ts > adds')
     const add = h.calls.find(call => call.args[0] === 'worktree' && call.args[1] === 'add')!
     const tree = add.args[3]!
-    expect(h.calls.find(call => call.command === 'npm')!.cwd).toBe(tree)
-    expect(h.calls.find(call => call.args[0] === 'apply')!.cwd).toBe(tree)
-    expect(h.calls.find(call => call.args[0] === 'diff')!.args).toEqual(expect.arrayContaining(['HEAD', '--', 'src/a.ts', 'src/new file.ts']))
-    expect(h.ran(`git worktree remove --force ${tree}`)).toBe(true)
-    expect(existsSync(tree)).toBe(false)
+    expect(h.calls.find(call => call.command === 'npx' && call.args[0] === 'vitest')!.cwd).toBe(tree)
+    expect(h.calls.some(call => call.args[0] === 'update-index' && call.cwd === tree)).toBe(true)
+    expect(h.calls.some(call => call.args[0] === 'checkout-index' && call.cwd === tree)).toBe(true)
+    expect(h.ran(`git worktree remove --force ${tree}`)).toBe(false)
+    expect(existsSync(tree)).toBe(true)
     expect(h.ran('git commit')).toBe(false)
   })
 
@@ -185,17 +208,86 @@ describe('DeliveryService pipeline', () => {
     const run = await h.ship({ message: 'Mine', paths: ['src/a.ts'] })
     expect(run.state).toBe('delivered')
     expect(run.stages[1]!.detail).toMatch(/isolated worktree/)
-    expect(h.ran('git add -A -- src/a.ts')).toBe(true)
-    expect(h.calls.find(call => call.args[0] === 'commit')!.args.slice(-2)).toEqual(['--', 'src/a.ts'])
-    expect(h.ran('git worktree remove --force')).toBe(true)
+    expect(h.calls.some(call => call.args[0] === 'update-index' && call.cwd === h.root && call.args.at(-1) === 'src/a.ts' && call.env?.GIT_INDEX_FILE)).toBe(true)
+    expect(h.calls.find(call => call.args[0] === 'commit')!.args).not.toContain('src/a.ts')
+    expect(h.ran('git worktree remove --force')).toBe(false)
   })
 
-  it('stops before committing when tests fail in the working tree', async () => {
-    const h = harness({ replies: { 'npm test': { code: 1, lines: ['src/x.ts(3,1): error TS2322: nope'] } } })
+  it('commits the verified blob when a requested file changes while verification is running', async () => {
+    let release!: () => void
+    const original = 'export const a = 1\n'
+    const h = harness({
+      replies: {
+        'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0 M other/agent.ts\0' },
+        'npx vitest related': () => new Promise<Reply>(resolve => { release = () => resolve({}) })
+      }
+    })
+    const started = h.service.ship('p1', h.root, { message: 'Snapshot', paths: ['src/a.ts'], publish: false }, { kind: 'owner' })
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'))
+    writeFileSync(join(h.root, 'src', 'a.ts'), 'export const a = 2 // another worker\n')
+    release()
+    const run = await h.service.wait('p1', started.id, 5000)
+    expect(run.state).toBe('delivered')
+    const committed = h.calls.find(call => call.cwd === h.root && call.args[0] === 'update-index' && call.env?.GIT_INDEX_FILE && call.args.at(-1) === 'src/a.ts')
+    expect(committed?.args).toEqual(['update-index', '--add', '--cacheinfo', '100644', gitBlob(original), 'src/a.ts'])
+    expect(run.stages.find(stage => stage.id === 'commit')?.detail).toContain('src/a.ts changed during delivery; the verified version was committed')
+    expect(readFileSync(join(h.root, 'src', 'a.ts'), 'utf8')).toContain('another worker')
+  })
+
+  it('runs affected Vitest tests for scoped local changes and keeps script tests scoped to scripts', async () => {
+    const source = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/main/delivery.ts\0 M other/agent.ts\0' } } })
+    expect((await source.ship({ message: 'Source only', paths: ['src/main/delivery.ts'], publish: false })).state).toBe('delivered')
+    expect(source.ran('npx vitest related src/main/delivery.ts --run --passWithNoTests')).toBe(true)
+    expect(source.ran('npm run test:scripts')).toBe(false)
+
+    const scripts = harness({
+      files: { 'scripts/example.mjs': 'export {}' },
+      replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M scripts/example.mjs\0 M other/agent.ts\0' } }
+    })
+    expect((await scripts.ship({ message: 'Script', paths: ['scripts/example.mjs'], publish: false })).state).toBe('delivered')
+    expect(scripts.ran('npx vitest related scripts/example.mjs --run --passWithNoTests')).toBe(true)
+    expect(scripts.ran('npm run test:scripts')).toBe(true)
+  })
+
+  it('uses the full Vitest suite for publish and shared-core changes', async () => {
+    const publish = harness()
+    expect((await publish.ship()).state).toBe('delivered')
+    expect(publish.ran('npx vitest run')).toBe(true)
+    expect(publish.calls.find(call => call.command === 'npx' && call.args[0] === 'vitest')!.args).toEqual(['vitest', 'run'])
+
+    const core = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/shared/orchestration.ts\0 M other/agent.ts\0' } } })
+    expect((await core.ship({ message: 'Core', paths: ['src/shared/orchestration.ts'], publish: false })).state).toBe('delivered')
+    expect(core.calls.find(call => call.command === 'npx' && call.args[0] === 'vitest')!.args).toEqual(['vitest', 'run'])
+  })
+
+  it('runs tests, incremental typecheck and electron-vite concurrently', async () => {
+    const waiting = new Map<string, () => void>()
+    const block = (name: string) => () => new Promise<Reply>(resolve => { waiting.set(name, () => resolve({})) })
+    const h = harness({ replies: {
+      'npx vitest run': block('test'),
+      'npx tsc --noEmit': block('typecheck'),
+      'npx electron-vite build': block('bundle')
+    } })
+    const started = h.service.ship('p1', h.root, { message: 'Parallel', publish: false }, { kind: 'owner' })
+    await vi.waitFor(() => expect([...waiting.keys()].sort()).toEqual(['bundle', 'test', 'typecheck']))
+    for (const release of waiting.values()) release()
+    expect((await h.service.wait('p1', started.id, 5000)).state).toBe('delivered')
+  })
+
+  it('resets and reuses one isolated worktree across deliveries', async () => {
+    const h = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: ' M src/a.ts\0 M other/agent.ts\0' } } })
+    expect((await h.ship({ message: 'First', paths: ['src/a.ts'], publish: false })).state).toBe('delivered')
+    expect((await h.ship({ message: 'Second', paths: ['src/a.ts'], publish: false })).state).toBe('delivered')
+    expect(h.calls.filter(call => call.args[0] === 'worktree' && call.args[1] === 'add')).toHaveLength(1)
+    expect(h.ran(`git reset --hard ${SHA}`)).toBe(true)
+  })
+
+  it('stops before committing when tests fail against the frozen snapshot', async () => {
+    const h = harness({ replies: { 'npx vitest run': { code: 1, lines: ['src/x.ts(3,1): error TS2322: nope'] } } })
     const run = await h.ship()
     expect(run.state).toBe('failed')
     expect(run.error).toContain('error TS2322')
-    expect(run.error).toContain('in the working tree')
+    expect(run.error).toContain('in an isolated worktree')
     expect(h.ran('git commit')).toBe(false)
     expect(h.ran('git push')).toBe(false)
     expect(run.stages.some(stage => stage.state === 'running')).toBe(false)
@@ -206,7 +298,7 @@ describe('DeliveryService pipeline', () => {
     const run = await h.ship()
     expect(run.state).toBe('delivered')
     expect(run.stages[1]).toMatchObject({ state: 'skipped', detail: expect.stringMatching(/Disabled/) })
-    expect(h.ran('npm test')).toBe(false)
+    expect(h.ran('npx vitest run')).toBe(false)
   })
 
   it('rebases once onto a moved remote and pushes again', async () => {
@@ -306,7 +398,7 @@ describe('DeliveryService pipeline', () => {
 
   it('refuses a second delivery for the same project or folder while one runs', async () => {
     let release!: () => void
-    const h = harness({ replies: { 'npm test': () => new Promise<Reply>(resolve => { release = () => resolve({}) }) } })
+    const h = harness({ replies: { 'npx vitest run': () => new Promise<Reply>(resolve => { release = () => resolve({}) }) } })
     const first = h.service.ship('p1', h.root, { message: 'one' }, { kind: 'owner' })
     await vi.waitFor(() => expect(release).toBeTypeOf('function'))
     expect(() => h.service.ship('p1', h.root, { message: 'two' }, { kind: 'owner' })).toThrow(first.id)
@@ -331,7 +423,7 @@ describe('DeliveryService pipeline', () => {
     const clean = harness({ replies: { 'git status --porcelain=v1 -z --untracked-files=all': { stdout: '' } } })
     const run = await clean.ship()
     expect(run.error).toMatch(/Nothing to deliver/)
-    expect(clean.ran('npm test')).toBe(false)
+    expect(clean.ran('npx vitest run')).toBe(false)
   })
 
   it('pushes local commits without committing when the tree is clean', async () => {
@@ -351,7 +443,7 @@ describe('DeliveryService pipeline', () => {
     expect(h.ran('git add')).toBe(false)
     expect(h.ran('git commit')).toBe(false)
     expect(h.ran('git diff --binary')).toBe(false)
-    expect(h.ran('git worktree remove --force')).toBe(true)
+    expect(h.ran('git worktree remove --force')).toBe(false)
     expect(h.ran('git push origin HEAD:main')).toBe(true)
     expect(run.releaseTag).toBe('v1.2.3')
     const nothing = harness()
@@ -360,7 +452,7 @@ describe('DeliveryService pipeline', () => {
 
   it('cancels a running test, aborting its process', async () => {
     let aborted = false
-    const h = harness({ replies: { 'npm test': options => new Promise<Reply>(resolve => options.signal.addEventListener('abort', () => { aborted = true; resolve({ code: null }) })) } })
+    const h = harness({ replies: { 'npx vitest run': options => new Promise<Reply>(resolve => options.signal.addEventListener('abort', () => { aborted = true; resolve({ code: null }) })) } })
     const started = h.service.ship('p1', h.root, { message: 'x' }, { kind: 'owner' })
     await vi.waitFor(() => expect(h.service.current('p1')!.stages[1]!.state).toBe('running'))
     const cancelled = h.service.cancel('p1')!

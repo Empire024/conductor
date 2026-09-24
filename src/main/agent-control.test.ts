@@ -211,6 +211,32 @@ describe('authorized native app control', () => {
     await expect(f.control.call(f.scope, 'git.ship', { message: 'Read only' })).rejects.toThrow('read-only')
     expect(f.delivery.ship).toHaveBeenCalledTimes(2)
   })
+  it('registers the v1 logic-loop methods and persists caller-recorded step results', async () => {
+    const f = fixture()
+    mkdirSync(join(f.project.path, '.conductor', 'loops'), { recursive: true })
+    writeFileSync(join(f.project.path, '.conductor', 'loops', 'sample.md'), `---
+id: sample
+version: 1
+title: Sample
+trigger: [manual]
+inputs: [taskId]
+steps:
+  - id: inspect
+    role: reviewer
+    model: codex:gpt-6-astra
+    effort: high
+---
+Run it.
+`)
+    const tools = await f.control.call(f.scope, 'tools.list') as Record<string, string>
+    expect(Object.keys(tools)).toEqual(expect.arrayContaining(['loops.list', 'loops.get', 'loops.history', 'loops.run', 'loops.record']))
+    expect(await f.control.call(f.scope, 'loops.list')).toEqual([expect.objectContaining({ id: 'sample', version: 1 })])
+    const planned = await f.control.call(f.scope, 'loops.run', { id: 'sample', inputs: { taskId: 't1' } }) as { runId: string; steps: Array<{ model: string; effort: string }> }
+    expect(planned.steps).toEqual([expect.objectContaining({ model: 'codex:gpt-6-astra', effort: 'high' })])
+    expect(await f.control.call(f.scope, 'loops.record', { runId: planned.runId, stepId: 'inspect', model: 'codex:gpt-6-astra', startedAt: '2026-09-24T10:00:00.000Z', finishedAt: '2026-09-24T10:01:00.000Z', outcome: 'success', tokens: { total: 12 } })).toMatchObject({ outcome: 'success', tokens: { total: 12 } })
+    await expect(f.control.call(f.scope, 'loops.run', { id: 'sample', inputs: {} })).rejects.toThrow(/taskId/)
+    await expect(f.control.call(f.scope, 'loops.record', { runId: 'outside', stepId: 'inspect', model: 'x', startedAt: '2026-09-24T10:00:00.000Z', finishedAt: '2026-09-24T10:01:00.000Z', outcome: 'success' })).rejects.toThrow(/run/i)
+  })
   it('advertises configured local models and dispatches native local coworkers within inherited read-only permissions', async () => {
     const f = fixture(false, { local: ['accept-edits', 'read-only'] })
     f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })

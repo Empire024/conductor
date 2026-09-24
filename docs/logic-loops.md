@@ -91,8 +91,11 @@ and a short note).
 
 ## App control and UI
 
-- `loops.list`, `loops.get({id})`, `loops.run({id, inputs})`, `loops.status({runId})`, `loops.propose(...)`,
-  `loops.apply({proposalId})` (owner or wizard only), `loops.history({id})`.
+- v1 exposes `loops.list`, `loops.get({id})`, `loops.history({id})`, `loops.run({id, inputs})`, and
+  `loops.record({runId, stepId, model, startedAt, finishedAt, outcome, tokens?, note?})`. `loops.run`
+  records the plan, checks current reported usage against the loop budget, applies an allowed fallback, and returns
+  exact model/effort steps for the caller to execute. It does not autonomously dispatch them.
+- `loops.status`, `loops.propose`, and `loops.apply` (owner or wizard only) remain v2 work.
 - No new sidebar tab (see the owner's durable-jobs note). Loops appear in the **Scheduled tasks** panel, where a
   schedule can trigger one, and in **Project tasks**, where "Run task-triage" produces the grouped plan. A run shows
   its steps inline with model, time, tokens and outcome, and a pending proposal shows as a reviewable diff.
@@ -112,5 +115,8 @@ and a short note).
 
 1. **v0 (no code).** The seed loop files exist, and `AUTO_FIXER_INSTRUCTIONS` tells the Auto Fixer to read and follow
    `.conductor/loops/*.md` and append a run note to the file's `## Run log`. This is already useful and costs nothing.
-2. **v1.** Front-matter parser and validator, `loops.*` control methods, `loop_runs` metrics, and the budget gate in the runner.
+2. **v1 (done 2026-09-24).** The front-matter parser validates the checked-in loop schema and filename identity;
+   `loops.list/get/history/run/record` are registered in app control; `loop_runs` and `loop_step_runs` store plans and
+   caller-recorded outcomes; and the budget helper reads current usage windows, selects a declared fallback, or pauses
+   a plan at a hard cap. The Auto Fixer reads these files and records every executed step.
 3. **v2.** `loops.propose` / apply / auto-revert, the UI inside Scheduled tasks and Project tasks, and `agents.report` for local models.

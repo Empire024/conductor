@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import { DELIVERY_STAGES, type DeliveryRequester, type DeliveryRun, type DeliveryStage, type DeliveryStageId, type RepositoryFile, type RepositoryStatus } from '../shared/delivery'
@@ -287,18 +287,31 @@ interface Plan {
   root: string
   config: DeliveryConfig
   entries: PorcelainEntry[]
+  changedPaths: string[]
+  snapshots: DeliverySnapshot[]
   scope: string[] | null
   commitNeeded: boolean
   isolate: boolean
   github: { owner: string; repo: string } | null
   test: string[] | null
+  defaultTest: boolean
   testSkip: string
   build: string[] | null
+  defaultBuild: boolean
   buildSkip: string
   release: { workflow: string; assets: string[]; dispatch: boolean } | null
   releaseSkip: string
   publish: boolean
 }
+
+interface VerificationCommand { command: string; args: string[]; env?: NodeJS.ProcessEnv }
+interface DeliverySnapshot { path: string; blob: string | null; mode: string }
+
+const sharedCore = (path: string): boolean =>
+  path === 'package.json' || path === 'package-lock.json' || path === 'tsconfig.json'
+  || /^(?:vitest|electron\.vite)\.config\.[cm]?[jt]s$/.test(path)
+  || path.startsWith('src/shared/')
+  || ['src/main/database.ts', 'src/main/structured-store.ts', 'src/main/structured-sessions.ts', 'src/main/agent-control.ts'].includes(path)
 
 /** Whether a workflow file runs on push. A dispatch-only workflow (the shape this project uses,
  *  so that pushes never build a release by themselves) has to be started by the delivery. Read
@@ -331,6 +344,9 @@ export class DeliveryService {
   private readonly done = new Map<string, Promise<void>>()
   private readonly listeners = new Set<(run: DeliveryRun) => void>()
   private readonly emitTimers = new Map<string, NodeJS.Timeout>()
+  /** Detached verification trees are expensive to register and populate on Windows. Keep one
+   *  cleanable tree per repository for this host process and reset it to the next delivery's HEAD. */
+  private readonly worktrees = new Map<string, { dir: string; parent: string }>()
 
   constructor(deps: Partial<DeliveryDependencies> = {}) {
     this.deps = {
@@ -456,25 +472,32 @@ export class DeliveryService {
 
   private async execute(active: Active): Promise<void> {
     const signal = active.controller.signal
-    let worktree: { dir: string; parent: string } | null = null
     try {
       let plan!: Plan
       await this.stage(active, 'preflight', async () => { const checked = await this.preflight(active); plan = checked.plan; return checked.detail })
-      if (plan.isolate && (plan.test || plan.build)) worktree = await this.createWorktree(active, plan)
+      const worktree = plan.isolate && (plan.test || plan.build) ? await this.createWorktree(active, plan) : null
       const verifyAt = worktree?.dir ?? plan.root
-      const where = worktree ? ' in an isolated worktree holding only the requested paths' : ' in the working tree'
-      for (const [id, argv, skip] of [['test', plan.test, plan.testSkip], ['build', plan.build, plan.buildSkip]] as const) {
-        if (!argv) { this.skip(active, id, skip); continue }
-        await this.stage(active, id, async stage => {
-          const result = await this.command(active, stage, argv[0]!, argv.slice(1), verifyAt, VERIFY_TIMEOUT_MS, { CI: '1' })
-          if (result.code !== 0) {
+      const where = worktree ? ' in an isolated worktree holding the frozen delivery snapshot' : ' in the working tree'
+      const verification = [
+        ['test', this.testCommands(plan), plan.testSkip],
+        ['build', this.buildCommands(plan, verifyAt), plan.buildSkip]
+      ] as const
+      const running: Promise<void>[] = []
+      for (const [id, commands, skip] of verification) {
+        if (!commands.length) { this.skip(active, id, skip); continue }
+        running.push(this.stage(active, id, async stage => {
+          const results = await Promise.all(commands.map(async ({ command, args, env }) => ({ command, args, result: await this.command(active, stage, command, args, verifyAt, VERIFY_TIMEOUT_MS, { CI: '1', ...env }) })))
+          const failed = results.find(entry => entry.result.code !== 0)
+          if (failed) {
             const what = id === 'test' ? 'Tests failed' : 'The build failed'
-            throw new StageFailure(`${what} (${argv.join(' ')}, exit ${result.code ?? 'none'})${where}. Nothing was committed or pushed.\n${failureLines(result.lines).join('\n')}`)
+            throw new StageFailure(`${what} (${[failed.command, ...failed.args].join(' ')}, exit ${failed.result.code ?? 'none'})${where}. Nothing was committed or pushed.\n${failureLines(failed.result.lines).join('\n')}`)
           }
-          return `${argv.join(' ')} passed${where}.`
-        })
+          return `${results.map(entry => [entry.command, ...entry.args].join(' ')).join(' + ')} passed${where}.`
+        }))
       }
-      if (worktree) { await this.removeWorktree(plan.root, worktree); worktree = null }
+      const verified = await Promise.allSettled(running)
+      const failure = verified.find((result): result is PromiseRejectedResult => result.status === 'rejected')
+      if (failure) throw failure.reason
       if (!plan.commitNeeded) this.skip(active, 'commit', 'No changes to commit; pushing the local commits that are ahead of the remote.')
       else await this.stage(active, 'commit', stage => this.commit(active, stage, plan))
       if (!plan.publish) {
@@ -494,9 +517,26 @@ export class DeliveryService {
       if (signal.aborted || error instanceof Cancelled) this.finalize(active, 'cancelled', 'Cancelled by request.', active.pushed)
       else if (error instanceof StageFailure) this.finalize(active, error.outcome, error.message)
       else this.finalize(active, 'failed', `Delivery stopped unexpectedly: ${error instanceof Error ? error.message : String(error)}`)
-    } finally {
-      if (worktree) await this.removeWorktree(active.root, worktree).catch(() => undefined)
     }
+  }
+
+  private testCommands(plan: Plan): VerificationCommand[] {
+    if (!plan.test) return []
+    if (!plan.defaultTest) return [{ command: plan.test[0]!, args: plan.test.slice(1) }]
+    const full = plan.publish || !plan.scope || plan.changedPaths.some(sharedCore)
+    const commands: VerificationCommand[] = [{ command: 'npx', args: full ? ['vitest', 'run'] : ['vitest', 'related', ...plan.changedPaths, '--run', '--passWithNoTests'] }]
+    if (plan.changedPaths.some(path => path === 'scripts' || path.startsWith('scripts/'))) commands.push({ command: 'npm', args: ['run', 'test:scripts'] })
+    return commands
+  }
+
+  private buildCommands(plan: Plan, verifyAt: string): VerificationCommand[] {
+    if (!plan.build) return []
+    if (!plan.defaultBuild) return [{ command: plan.build[0]!, args: plan.build.slice(1) }]
+    mkdirSync(join(verifyAt, '.conductor-scratch', 'delivery-cache'), { recursive: true })
+    return [
+      { command: 'npx', args: ['tsc', '--noEmit', '--incremental', '--tsBuildInfoFile', '.conductor-scratch/delivery-cache/tsconfig.tsbuildinfo'] },
+      { command: 'npx', args: ['electron-vite', 'build'] }
+    ]
   }
 
   private async preflight(active: Active): Promise<{ plan: Plan; detail: string }> {
@@ -544,6 +584,7 @@ export class DeliveryService {
       for (const entry of inside) for (const path of [entry.path, entry.from]) if (path && !inScope(path, scope)) scope.push(path)
     }
     const outside = scope ? entries.filter(entry => !inside.includes(entry)) : []
+    const snapshots = await this.snapshotPaths(root, inside, signal)
 
     // A local delivery never touches the network: nothing is compared or pushed.
     let remoteExists = publish
@@ -569,11 +610,13 @@ export class DeliveryService {
     if (publish && !inside.length && !ahead) throw new StageFailure(scope && !scope.length ? 'Nothing to deliver: no paths were selected and no local commits are ahead of the remote.' : scope ? 'Nothing to deliver: the requested paths have no changes and no local commits are ahead of the remote.' : 'Nothing to deliver: the working tree is clean and no local commits are ahead of the remote.')
 
     const scripts = packageScripts(root)
-    const pick = (key: 'test' | 'build', script: string, argv: string[]): { argv: string[] | null; skip: string } => {
+    const pick = (key: 'test' | 'build', script: string, argv: string[]): { argv: string[] | null; skip: string; default: boolean } => {
       const configured = config[key]
-      if (configured === null) return { argv: null, skip: `Disabled in .conductor/delivery.json.` }
-      if (configured) return { argv: configured, skip: '' }
-      return typeof scripts[script] === 'string' ? { argv, skip: '' } : { argv: null, skip: `package.json has no "${script}" script.` }
+      if (configured === null) return { argv: null, skip: `Disabled in .conductor/delivery.json.`, default: false }
+      if (configured) return { argv: configured, skip: '', default: false }
+      if (typeof scripts[script] !== 'string') return { argv: null, skip: `package.json has no "${script}" script.`, default: false }
+      const optimized = key === 'test' ? /\bvitest\b/.test(scripts[script] as string) : /\belectron-vite\s+build\b/.test(scripts[script] as string)
+      return { argv, skip: '', default: optimized }
     }
     const test = pick('test', 'test', ['npm', 'test'])
     const build = pick('build', 'build', ['npm', 'run', 'build'])
@@ -595,44 +638,72 @@ export class DeliveryService {
     ]
     if (behind) parts.push(`${behind} remote commit${behind === 1 ? '' : 's'} behind (the push will rebase onto them)`)
     if (publish && !remoteExists) parts.push(`${config.remote}/${config.branch} does not exist yet`)
-    const plan: Plan = { root, config, entries, scope, commitNeeded: inside.length > 0, isolate: Boolean(scope && outside.length), github, test: test.argv, testSkip: test.skip, build: build.argv, buildSkip: build.skip, release, releaseSkip, publish }
+    const changedPaths = [...new Set(inside.flatMap(entry => entry.from ? [entry.path, entry.from] : [entry.path]))]
+    const plan: Plan = { root, config, entries, changedPaths, snapshots, scope, commitNeeded: inside.length > 0, isolate: inside.length > 0, github, test: test.argv, defaultTest: test.default, testSkip: test.skip, build: build.argv, defaultBuild: build.default, buildSkip: build.skip, release, releaseSkip, publish }
     return { plan, detail: `${parts.join('; ')}.` }
   }
 
+  /** Freeze every changed path as a Git object before verification. The worktree can keep moving
+   *  while tests run; these object IDs are both what the isolated tree sees and what commit uses. */
+  private async snapshotPaths(root: string, entries: PorcelainEntry[], signal: AbortSignal): Promise<DeliverySnapshot[]> {
+    const paths = [...new Set(entries.flatMap(entry => entry.from ? [entry.path, entry.from] : [entry.path]))]
+    const snapshots: DeliverySnapshot[] = []
+    for (const path of paths) {
+      if (!existsSync(join(root, path))) { snapshots.push({ path, blob: null, mode: '100644' }); continue }
+      const staged = await this.git(['ls-files', '-s', '--', path], root, signal)
+      const mode = /^(100644|100755|120000)\s/.exec(staged.stdout.trim())?.[1] ?? (process.platform !== 'win32' && (statSync(join(root, path)).mode & 0o111) ? '100755' : '100644')
+      const hashed = await this.git(['hash-object', '-w', '--', path], root, signal)
+      const blob = hashed.stdout.trim()
+      if (hashed.code !== 0 || !/^[a-f0-9]{40,64}$/i.test(blob)) throw new StageFailure(`Could not snapshot ${path} before verification:\n${hashed.lines.slice(-10).join('\n')}`)
+      snapshots.push({ path, blob, mode })
+    }
+    return snapshots
+  }
+
   /** Other agents' unfinished work shares the tree, so a subset is verified on its own: a detached
-   *  worktree of HEAD plus only the requested changes, with the repository's node_modules linked in. */
+   *  worktree of HEAD plus only the requested snapshots, with the repository's node_modules linked in. */
   private async createWorktree(active: Active, plan: Plan): Promise<{ dir: string; parent: string }> {
     const signal = active.controller.signal
-    const parent = mkdtempSync(join(this.deps.tempDir(), 'conductor-delivery-'))
-    const dir = join(parent, 'tree')
-    const worktree = { dir, parent }
+    const key = process.platform === 'win32' ? plan.root.toLowerCase() : plan.root
+    let worktree = this.worktrees.get(key)
+    if (worktree && !existsSync(worktree.dir)) { this.worktrees.delete(key); worktree = undefined }
+    const reused = Boolean(worktree)
+    if (!worktree) {
+      const parent = mkdtempSync(join(this.deps.tempDir(), 'conductor-delivery-'))
+      worktree = { dir: join(parent, 'tree'), parent }
+    }
+    const { dir } = worktree
     const stage = this.stageOf(active.run, 'test')
     try {
-      const added = await this.git(['worktree', 'add', '--detach', dir, 'HEAD'], plan.root, signal)
-      if (added.code !== 0) throw new StageFailure(`Could not create an isolated worktree to verify the requested paths:\n${added.lines.slice(-10).join('\n')}`)
-      const scope = plan.scope!
-      const tracked = plan.entries.filter(entry => entry.index !== '?' && (inScope(entry.path, scope) || (entry.from && inScope(entry.from, scope))))
-      if (tracked.length) {
-        const patch = join(parent, 'scope.patch')
-        const diff = await this.git(['diff', '--binary', `--output=${patch}`, 'HEAD', '--', ...scope], plan.root, signal)
-        if (diff.code !== 0) throw new StageFailure(`Could not capture the requested changes:\n${diff.lines.slice(-10).join('\n')}`)
-        if (existsSync(patch) && statSync(patch).size > 0) {
-          const applied = await this.git(['apply', '--binary', '--whitespace=nowarn', patch], dir, signal)
-          if (applied.code !== 0) throw new StageFailure(`Could not apply the requested changes in the isolated worktree:\n${applied.lines.slice(-10).join('\n')}`)
-        }
+      if (reused) {
+        const head = await this.git(['rev-parse', 'HEAD'], plan.root, signal)
+        if (head.code !== 0 || !head.stdout.trim()) throw new StageFailure(`Could not resolve HEAD before resetting the cached verification worktree:\n${head.lines.slice(-10).join('\n')}`)
+        const reset = await this.git(['reset', '--hard', head.stdout.trim()], dir, signal)
+        const clean = await this.git(['clean', '-fd', '-e', 'node_modules', '-e', '.conductor-scratch'], dir, signal)
+        if (reset.code !== 0 || clean.code !== 0) throw new StageFailure(`Could not reset the cached verification worktree:\n${[...reset.lines, ...clean.lines].slice(-10).join('\n')}`)
+      } else {
+        const added = await this.git(['worktree', 'add', '--detach', dir, 'HEAD'], plan.root, signal)
+        if (added.code !== 0) throw new StageFailure(`Could not create an isolated worktree to verify the requested paths:\n${added.lines.slice(-10).join('\n')}`)
+        this.worktrees.set(key, worktree)
       }
-      for (const entry of plan.entries) {
-        if (entry.index !== '?' || !inScope(entry.path, scope)) continue
-        const target = join(dir, entry.path)
-        mkdirSync(dirname(target), { recursive: true })
-        copyFileSync(join(plan.root, entry.path), target)
+      for (const snapshot of plan.snapshots) {
+        const indexed = snapshot.blob
+          ? await this.git(['update-index', '--add', '--cacheinfo', snapshot.mode, snapshot.blob, snapshot.path], dir, signal)
+          : await this.git(['update-index', '--force-remove', '--', snapshot.path], dir, signal)
+        if (indexed.code !== 0) throw new StageFailure(`Could not materialize the verified snapshot of ${snapshot.path}:\n${indexed.lines.slice(-10).join('\n')}`)
+        if (snapshot.blob) {
+          const checkedOut = await this.git(['checkout-index', '--force', '--', snapshot.path], dir, signal)
+          if (checkedOut.code !== 0) throw new StageFailure(`Could not check out the verified snapshot of ${snapshot.path}:\n${checkedOut.lines.slice(-10).join('\n')}`)
+        } else {
+          try { rmSync(join(dir, snapshot.path), { recursive: true, force: true }) } catch { /* already absent */ }
+        }
       }
       const modules = join(plan.root, 'node_modules')
       if (existsSync(modules) && existsSync(dir) && !existsSync(join(dir, 'node_modules'))) symlinkSync(modules, join(dir, 'node_modules'), 'junction')
-      this.log(active, stage, [`Verifying in isolated worktree ${dir}`])
+      this.log(active, stage, [`Verifying in ${reused ? 'cached ' : ''}isolated worktree ${dir}`])
       return worktree
     } catch (error) {
-      await this.removeWorktree(plan.root, worktree).catch(() => undefined)
+      if (!reused) { this.worktrees.delete(key); await this.removeWorktree(plan.root, worktree).catch(() => undefined) }
       if (signal.aborted) throw new Cancelled('cancelled')
       throw error instanceof StageFailure ? error : new StageFailure(`Could not prepare the isolated worktree: ${error instanceof Error ? error.message : String(error)}`)
     }
@@ -655,17 +726,42 @@ export class DeliveryService {
     // The message goes through a file: on Windows a multi-line message on the command line is
     // mangled by quoting, and it could be long.
     const file = join(this.deps.tempDir(), `conductor-commit-${active.run.id}.txt`)
+    const index = join(this.deps.tempDir(), `conductor-index-${active.run.id}`)
     writeFileSync(file, active.run.message.replace(/\r\n/g, '\n'), 'utf8')
+    const env = { GIT_INDEX_FILE: index }
     try {
-      const pathspec = plan.scope ? ['--', ...plan.scope] : []
-      const added = await this.command(active, stage, 'git', ['add', '-A', ...pathspec], plan.root, GIT_TIMEOUT_MS)
-      if (added.code !== 0) throw new StageFailure(`git add failed:\n${added.lines.slice(-15).join('\n')}`)
-      const committed = await this.command(active, stage, 'git', ['commit', '-F', file, ...pathspec], plan.root, COMMIT_TIMEOUT_MS)
+      try { rmSync(index, { force: true }) } catch { /* Git needs a missing file, not an empty index. */ }
+      const read = await this.command(active, stage, 'git', ['read-tree', 'HEAD'], plan.root, GIT_TIMEOUT_MS, env)
+      if (read.code !== 0) throw new StageFailure(`Could not create the delivery index:\n${read.lines.slice(-15).join('\n')}`)
+      for (const snapshot of plan.snapshots) {
+        const indexed = snapshot.blob
+          ? await this.command(active, stage, 'git', ['update-index', '--add', '--cacheinfo', snapshot.mode, snapshot.blob, snapshot.path], plan.root, GIT_TIMEOUT_MS, env)
+          : await this.command(active, stage, 'git', ['update-index', '--force-remove', '--', snapshot.path], plan.root, GIT_TIMEOUT_MS, env)
+        if (indexed.code !== 0) throw new StageFailure(`Could not add the verified snapshot of ${snapshot.path} to the delivery index:\n${indexed.lines.slice(-15).join('\n')}`)
+      }
+      const committed = await this.command(active, stage, 'git', ['commit', '-F', file], plan.root, COMMIT_TIMEOUT_MS, env)
       if (committed.code !== 0) throw new StageFailure(`git commit failed (a commit hook may have rejected it):\n${failureLines(committed.lines, 15).join('\n')}`)
-    } finally { try { rmSync(file, { force: true }) } catch { /* temp file */ } }
+    } finally {
+      try { rmSync(file, { force: true }) } catch { /* temp file */ }
+      try { rmSync(index, { force: true }) } catch { /* temp index */ }
+    }
     const head = await this.git(['rev-parse', 'HEAD'], plan.root, active.controller.signal)
     active.run.commit = head.stdout.trim() || null
-    return `Committed ${short(active.run.commit)}${plan.scope ? ` with ${plan.scope.length} requested path${plan.scope.length === 1 ? '' : 's'}` : ''}.`
+    // The real index may contain another worker's staged work. Reset only our exact paths to the
+    // new HEAD, leaving their entries intact and leaving later working-tree bytes uncommitted.
+    const committedPaths = plan.snapshots.map(snapshot => snapshot.path)
+    if (committedPaths.length) await this.git(['reset', '--mixed', 'HEAD', '--', ...committedPaths], plan.root, active.controller.signal)
+    const changed: string[] = []
+    for (const snapshot of plan.snapshots) {
+      let blob: string | null = null
+      if (existsSync(join(plan.root, snapshot.path))) {
+        const current = await this.git(['hash-object', '--', snapshot.path], plan.root, active.controller.signal)
+        blob = current.code === 0 ? current.stdout.trim() : null
+      }
+      if (blob !== snapshot.blob) changed.push(`${snapshot.path} changed during delivery; the verified version was committed`)
+    }
+    if (changed.length) this.log(active, stage, changed)
+    return `Committed ${short(active.run.commit)}${plan.scope ? ` with ${plan.scope.length} requested path${plan.scope.length === 1 ? '' : 's'}` : ''}.${changed.length ? ` ${changed.join('. ')}.` : ''}`
   }
 
   private async push(active: Active, stage: DeliveryStage, plan: Plan): Promise<string> {

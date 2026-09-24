@@ -45,6 +45,29 @@ import {
 
 type DbRow = Record<string, unknown>
 
+export interface LoopRunRecord {
+  id: string
+  projectId: string
+  loopId: string
+  loopVersion: number
+  inputs: Record<string, unknown>
+  status: 'ready' | 'paused'
+  createdAt: string
+}
+
+export interface LoopStepRunRecord {
+  id: string
+  runId: string
+  stepId: string
+  model: string
+  startedAt: string
+  finishedAt: string
+  outcome: string
+  tokens?: Record<string, number>
+  note?: string
+  createdAt: string
+}
+
 /**
  * The value stored in `projects.path` for a project that lives on another machine.
  *
@@ -505,6 +528,35 @@ export class ConductorDatabase {
 
       CREATE INDEX IF NOT EXISTS project_task_activity_idx
         ON project_task_activity(project_id, task_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS loop_runs (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        loop_id TEXT NOT NULL,
+        loop_version INTEGER NOT NULL,
+        inputs_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS loop_runs_project_idx
+        ON loop_runs(project_id, loop_id, created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS loop_step_runs (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES loop_runs(id) ON DELETE CASCADE,
+        step_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        finished_at TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        tokens_json TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS loop_step_runs_run_idx
+        ON loop_step_runs(run_id, created_at ASC);
     `)
     this.ensureColumn('project_task_activity', 'assigned_agent_id', 'TEXT')
     this.ensureColumn('editor_drafts', 'base_content_json', 'TEXT')
@@ -1576,6 +1628,42 @@ export class ConductorDatabase {
   private getMemory(id: string): AgentMemory | null {
     const row = this.db.prepare('SELECT * FROM memories WHERE id = ?').get(id) as DbRow | undefined
     return row ? this.mapMemory(row) : null
+  }
+
+  createLoopRun(input: { projectId: string; loopId: string; loopVersion: number; inputs: Record<string, unknown>; status: 'ready' | 'paused' }): LoopRunRecord {
+    const record: LoopRunRecord = { id: makeId('looprun'), ...input, createdAt: now() }
+    this.db.prepare('INSERT INTO loop_runs(id,project_id,loop_id,loop_version,inputs_json,status,created_at) VALUES(?,?,?,?,?,?,?)')
+      .run(record.id, record.projectId, record.loopId, record.loopVersion, JSON.stringify(record.inputs), record.status, record.createdAt)
+    return record
+  }
+
+  getLoopRun(id: string): LoopRunRecord | null {
+    const row = this.db.prepare('SELECT * FROM loop_runs WHERE id = ?').get(id) as DbRow | undefined
+    if (!row) return null
+    let inputs: Record<string, unknown> = {}
+    try { const parsed = JSON.parse(row.inputs_json as string); if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) inputs = parsed }
+    catch { /* A malformed historical payload is still a readable run with no inputs. */ }
+    return { id: row.id as string, projectId: row.project_id as string, loopId: row.loop_id as string, loopVersion: row.loop_version as number, inputs, status: row.status as 'ready' | 'paused', createdAt: row.created_at as string }
+  }
+
+  recordLoopStepRun(input: { runId: string; stepId: string; model: string; startedAt: string; finishedAt: string; outcome: string; tokens?: Record<string, number>; note?: string }): LoopStepRunRecord {
+    const record: LoopStepRunRecord = { id: makeId('loopstep'), ...input, createdAt: now() }
+    this.db.prepare('INSERT INTO loop_step_runs(id,run_id,step_id,model,started_at,finished_at,outcome,tokens_json,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)')
+      .run(record.id, record.runId, record.stepId, record.model, record.startedAt, record.finishedAt, record.outcome, record.tokens ? JSON.stringify(record.tokens) : null, record.note ?? null, record.createdAt)
+    return record
+  }
+
+  listLoopStepRuns(runId: string): LoopStepRunRecord[] {
+    return (this.db.prepare('SELECT * FROM loop_step_runs WHERE run_id = ? ORDER BY created_at ASC, rowid ASC').all(runId) as DbRow[]).map(row => {
+      let tokens: Record<string, number> | undefined
+      try { const parsed = row.tokens_json ? JSON.parse(row.tokens_json as string) : undefined; if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) tokens = parsed }
+      catch { /* Old malformed token detail is omitted without hiding the step result. */ }
+      return {
+        id: row.id as string, runId: row.run_id as string, stepId: row.step_id as string, model: row.model as string,
+        startedAt: row.started_at as string, finishedAt: row.finished_at as string, outcome: row.outcome as string,
+        ...(tokens ? { tokens } : {}), ...((row.note as string | null) ? { note: row.note as string } : {}), createdAt: row.created_at as string
+      }
+    })
   }
 
   close(): void {

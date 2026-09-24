@@ -50,6 +50,12 @@ describe('the Auto Fixer brief', () => {
     expect(fixer).toMatch(/confirm the release actually published/i)
   })
 
+  it('runs saved project logic loops and records their measured steps', () => {
+    expect(fixer).toMatch(/\.conductor\/loops\/\*\.md/)
+    expect(fixer).toMatch(/loops\.run/)
+    expect(fixer).toMatch(/loops\.record/)
+  })
+
   it('keeps the plain assignment brief free of orchestration instructions', () => {
     const plain = projectTaskPrompt([task()], false)
     expect(plain).not.toMatch(/router\.dispatch/)

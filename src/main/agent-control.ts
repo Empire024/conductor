@@ -35,6 +35,7 @@ import { summarizeContext } from '../shared/usage-accounting'
 import { normaliseContract } from './local-models/completion.ts'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, type CreateDurableJobInput, type DurableJobsService, type DurableJobStatus, type DurableJobSummary } from '../shared/durable-jobs'
 import { scheduleCall, scheduleMethods, scheduleSignatures, type ScheduleControlService } from './schedule-control'
+import { LogicLoops, type LoopRecordInput } from './logic-loops'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -148,11 +149,16 @@ const toolSignatures = {
   'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. A native coworker in Auto builds without asking; below Auto, and for a local model, the owner confirms each build unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner (or a wizard tab) installs it',
   'app.update.status': '() — state, version, log tail and result of the local update build',
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
-  'git.ship': '({message,paths?,publish?,waitSeconds?}) — deliver finished work in one call. Conductor runs it on the host with the owner’s own Git credentials and network: tests, build, then a local commit (only paths if given, verified in an isolated copy when other work is also in the tree); nothing is pushed and no release is built. Only publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow and checks the release’s assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
+  'git.ship': '({message,paths?,publish?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow and checks its assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
   'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
   'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
   'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated',
+  'loops.list': '() — validated .conductor/loops/*.md definitions in this project, with version, triggers, inputs, budget and step count',
+  'loops.get': '({id}) — one validated logic loop including its instructions and exact model/effort/action steps',
+  'loops.history': '({id}) — the loop file’s git history: commit, timestamp and subject',
+  'loops.run': '({id,inputs}) — record a v1 loop run, check current usage windows against its budget, and return ordered steps with exact model/effort for the caller to execute; no autonomous runner yet',
+  'loops.record': '({runId,stepId,model,startedAt,finishedAt,outcome,tokens?,note?}) — record one caller-executed step in loop_runs/loop_step_runs',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
   'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
@@ -1050,6 +1056,31 @@ export class AgentControl {
       const updated = await backlogs.edit(scope.projectId, text(args, 'revision', 100), { type: 'update', id, status: status as 'todo' | 'doing' | 'done', ...(args.title === undefined ? {} : { title: text(args, 'title', PROJECT_TASK_MAX_LENGTH) }), ...(args.priority === undefined ? {} : { priority: args.priority as ProjectTaskPriority }), agentId: scope.agentSessionId }, { actor: 'agent', agentId: scope.agentSessionId, sessionId: scope.sessionId })
       this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
       return updated
+    }
+    if (method.startsWith('loops.')) {
+      const project = database.getProject(scope.projectId)
+      if (!project) throw new Error('This project is no longer open')
+      const loops = new LogicLoops(project.path, scope.projectId, database, { usage: () => sessions.usageLimits() })
+      if (method === 'loops.list') {
+        if (Object.keys(args).length) throw new Error('loops.list takes no arguments')
+        return loops.list()
+      }
+      if (method === 'loops.get' || method === 'loops.history') {
+        if (Object.keys(args).some(key => key !== 'id')) throw new Error(`${method} accepts only id`)
+        const id = text(args, 'id', 80)
+        return method === 'loops.get' ? loops.get(id) : loops.history(id)
+      }
+      if (method === 'loops.run') {
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (Object.keys(args).some(key => !['id', 'inputs'].includes(key))) throw new Error('loops.run accepts only id and inputs')
+        return loops.run(text(args, 'id', 80), args.inputs)
+      }
+      if (method === 'loops.record') {
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (Object.keys(args).some(key => !['runId', 'stepId', 'model', 'startedAt', 'finishedAt', 'outcome', 'tokens', 'note'].includes(key))) throw new Error('loops.record received an unknown argument')
+        return loops.record(args as unknown as LoopRecordInput)
+      }
+      throw new Error('Unknown loops method; use tools.list')
     }
     if (method === 'memory.recall') return database.recall(scope.projectId, typeof args.query === 'string' ? args.query.slice(0, 4000) : '', undefined, 12)
     if (method === 'memory.remember') {
