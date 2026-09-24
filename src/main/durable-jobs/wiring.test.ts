@@ -9,7 +9,8 @@ import { DurableJobsServiceImpl } from './index'
 import type { StageObservation } from './ports'
 import { LocalGenerationGate } from './server-lifecycle'
 import { DurableJobStore } from './store'
-import { FakeRuntime, FakeWorktrees, tick, until } from './test-fakes'
+import { FakeRuntime, FakeWorktrees, tick, until, type ScriptedOutcome } from './test-fakes'
+import type { HealthProbe } from './watchdog'
 import { durableJobPorts, gatedRuntime, handoffPort, serverPort, supervisionPorts } from './wiring'
 
 const dirs: string[] = []
@@ -135,6 +136,126 @@ describe('supervision ports', () => {
     expect(otherOnly.events('job_1', undefined, 1_000).some(event => event.message === 'late replan for another stage')).toBe(false)
     expect(await drive(otherOnly)).toMatch(/loop guard replan/)
     otherOnly.close()
+  })
+
+  /** A watch on a fake clock: each step moves the clock at most a minute and lets the watch tick. */
+  const clocked = (probe: HealthProbe) => {
+    let now = 0
+    const items: TimelineItem[] = []
+    const ports = supervisionPorts({ store: store(), snapshot: () => projection(items), modelConfig: window.modelConfig, probeHealth: async () => probe, serverPorts: async () => { throw new Error('unused') }, endpointOverride: () => null, gate: new LocalGenerationGate({ now: Date.now, sleep: tick, interactiveActive: async () => null }), now: () => now, watchdog: { tickMs: 5, clockJumpMs: 24 * 3_600_000 } })
+    const stuck: string[] = []
+    const watch = ports.watchdog.watch({ job: job(), stage: stage(), agentSessionId: 's' }, reason => stuck.push(reason))
+    const advance = async (ms: number): Promise<void> => {
+      for (let spent = 0; spent < ms;) { const step = Math.min(60_000, ms - spent); now += step; spent += step; await new Promise(resolve => setTimeout(resolve, 25)) }
+    }
+    const running = (id: string, name: string, input: { [key: string]: Json }, sequence: number): TimelineItem => ({ id, runtimeId: 'r', sequence, timestamp: '', data: { type: 'tool', name, input, status: 'running' } })
+    return { items, stuck, watch, advance, running }
+  }
+  // job(): modelCallTimeoutMs 10 min, toolCallTimeoutMs 15 min; the stall window is 3 min.
+  const minutes = (count: number): number => count * 60_000
+
+  it('gives a quiet running tool the tool budget, past the model timeout, then watches the model again', async () => {
+    const { items, stuck, watch, advance, running } = clocked({ healthy: true, processing: false })
+    items.push(running('t1', 'run_command', { command: 'npm test' }, 1))
+    await advance(1_000)
+    await advance(minutes(12))
+    expect(stuck).toEqual([])
+    items[0] = toolItem('t1', 'run_command', { command: 'npm test' }, 'Tests passed', false, 2)
+    await advance(1_000)
+    expect(stuck).toEqual([])
+    // The model's turn after the tool is a model call again: silence there is a stall.
+    await advance(minutes(4))
+    watch.dispose()
+    expect(stuck).toHaveLength(1)
+    expect(stuck[0]).toMatch(/^no progress for \d+s and the server is not processing/)
+  })
+
+  it('stops a tool that runs past the tool budget, and not before', async () => {
+    const { items, stuck, watch, advance, running } = clocked({ healthy: true, processing: false })
+    items.push(running('t1', 'run_command', { command: 'npm run build' }, 1))
+    await advance(1_000)
+    await advance(minutes(14))
+    expect(stuck).toEqual([])
+    await advance(minutes(2))
+    watch.dispose()
+    expect(stuck).toHaveLength(1)
+    expect(stuck[0]).toMatch(/run_command ran past its 900s tool-call budget/)
+  })
+
+  it('still stops a silent model call as a stall when no tool is running', async () => {
+    const { stuck, watch, advance } = clocked({ healthy: true, processing: false })
+    await advance(minutes(2))
+    expect(stuck).toEqual([])
+    await advance(minutes(2))
+    watch.dispose()
+    expect(stuck).toHaveLength(1)
+    expect(stuck[0]).toMatch(/^no progress for \d+s and the server is not processing/)
+  })
+})
+
+describe('generation gate across an approval block', () => {
+  const model = 'local/qwen3.6-35b-a3b'
+  const gated = (script: ScriptedOutcome[]) => {
+    const dir = mkdtempSync(join(tmpdir(), 'wiring-gate-')); dirs.push(dir)
+    const gate = new LocalGenerationGate({ now: Date.now, sleep: tick, interactiveActive: async () => null })
+    const inner = new FakeRuntime(script)
+    const store = new DurableJobStore(':memory:')
+    const service = new DurableJobsServiceImpl({ store, runtime: gatedRuntime(inner, gate), worktrees: new FakeWorktrees(), logRoot: dir, projectPath: () => dir, sleep: tick, pollMs: 0, interruptGraceMs: 200 })
+    services.push(service)
+    return { gate, inner, store, service }
+  }
+  const finished = (answer: string): StageObservation => ({ phase: 'completed', stopSequence: 1, stop: { reason: 'completed', detail: 'done', filesChanged: [] }, lastAnswer: answer, filesChanged: [] })
+
+  it('releases local generation capacity while a job waits on an approval, so a second job runs', async () => {
+    const { gate, service } = gated([{ kind: 'approval' }, { kind: 'answer', text: 'Second done.\nJOB STATUS: DONE' }])
+    const first = await service.create({ projectId: 'p', title: 'Needs approval', objective: 'Install a package', model })
+    await until(() => service.status(first.id).status === 'blocked')
+    const second = await service.create({ projectId: 'p', title: 'Second', objective: 'Summarise the modules', model })
+    // Before the fix the second job showed running forever, queued on the gate the blocked job held.
+    await until(() => service.status(second.id).status === 'completed').catch(() => { throw new Error(`second job starved: ${service.status(second.id).status}, gate held by ${gate.holder() === first.id ? 'the blocked job' : gate.holder()}`) })
+    expect(service.status(first.id).status).toBe('blocked')
+    expect(gate.holder()).toBeNull()
+  })
+
+  it('resumes the answered approval in the same conversation only after reacquiring the gate behind a running job', async () => {
+    const { gate, inner, store, service } = gated([{ kind: 'approval' }, { kind: 'hang' }])
+    const first = await service.create({ projectId: 'p', title: 'Needs approval', objective: 'Install a package', model })
+    await until(() => service.status(first.id).status === 'blocked')
+    const firstSession = service.get(first.id).stages[0]!.agentSessionId!
+    const second = await service.create({ projectId: 'p', title: 'Second', objective: 'Summarise the modules', model })
+    await until(() => gate.holder() === second.id && Boolean(service.get(second.id).stages[0]!.agentSessionId))
+    const secondSession = service.get(second.id).stages[0]!.agentSessionId!
+    // The owner answers the approval in the stage tab: the same conversation carries on.
+    inner.set(firstSession, { phase: 'running', stopSequence: 0, lastAnswer: '', filesChanged: [] })
+    await service.resume(first.id)
+    await new Promise(resolve => setTimeout(resolve, 40))
+    expect(service.status(first.id).status).toBe('running')
+    expect(gate.holder()).toBe(second.id)
+    inner.set(secondSession, finished('Second done.\nJOB STATUS: DONE'))
+    await until(() => gate.holder() === first.id)
+    expect(service.status(second.id).status).toBe('completed')
+    inner.set(firstSession, finished('Installed.\nJOB STATUS: DONE'))
+    await until(() => service.status(first.id).status === 'completed')
+    expect(gate.holder()).toBeNull()
+    // Exactly once: no new conversation, no second prompt, one attempt, one model call settled.
+    expect(inner.opened).toEqual([firstSession, secondSession])
+    expect(inner.prompts).toHaveLength(2)
+    expect(service.get(first.id).stages[0]!.attempt).toBe(1)
+    const calls = store.operations(first.id).filter(operation => operation.kind === 'model-call')
+    expect(calls.map(operation => operation.status)).toEqual(['done'])
+    expect(service.events(first.id).filter(event => event.kind === 'approval')).toHaveLength(1)
+  })
+
+  it('blocks again without holding the gate when resumed before the approval is answered', async () => {
+    const { gate, inner, service } = gated([{ kind: 'approval' }])
+    const first = await service.create({ projectId: 'p', title: 'Needs approval', objective: 'Install a package', model })
+    await until(() => service.status(first.id).status === 'blocked')
+    await service.resume(first.id)
+    await until(() => service.status(first.id).status === 'blocked' && !service.controller.isRunning(first.id))
+    expect(gate.holder()).toBeNull()
+    expect(inner.opened).toHaveLength(1)
+    expect(inner.prompts).toHaveLength(1)
+    expect(service.events(first.id).filter(event => event.kind === 'approval')).toHaveLength(2)
   })
 })
 

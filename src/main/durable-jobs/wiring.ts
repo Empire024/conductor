@@ -141,10 +141,25 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
       const guard = guardFor(job, stage)
       guard.verdict = undefined
       const dog = new Watchdog(job.budgets, { now, probeHealth: () => options.endpointOverride() ? Promise.resolve({ healthy: true }) : options.probeHealth(localModelId(job.model.model)), emit }, options.watchdog)
-      // One model-call watch at a time: a finished tool round starts the next call's budget.
-      let call = dog.begin('model-call', `stage ${stage.index + 1} round 1`, `${stage.id}:call`)
+      // One model-call watch while the model works: a finished tool round starts the next call's
+      // budget. A running tool is not model work: it gets a tool-call watch on toolCallTimeoutMs
+      // instead, where silence is not a stall (a test suite or a build may print nothing).
+      let call: string | null = dog.begin('model-call', `stage ${stage.index + 1} round 1`, `${stage.id}:call`)
       let rounds = 1, lastSequence = options.snapshot(agentSessionId)?.sequence ?? 0, stopped = false
       const seen = new Set<string>()
+      const tools = new Map<string, string>()
+      const toolStarted = (itemId: string, name: string): void => {
+        if (tools.has(itemId)) return
+        if (call) { dog.end(call); call = null }
+        tools.set(itemId, dog.begin('tool-call', name, `${stage.id}:tool:${name}`))
+      }
+      const toolFinished = (itemId: string): void => {
+        const watch = tools.get(itemId)
+        if (watch) { dog.end(watch); tools.delete(itemId) }
+        if (tools.size) return
+        if (call) dog.end(call)
+        call = dog.begin('model-call', `stage ${stage.index + 1} round ${++rounds}`, `${stage.id}:call`)
+      }
       // After the attempt settled (dispose), a verdict is still recorded but nothing is interrupted.
       let settled = false
       const stop = (reason: string): void => { if (!stopped) { stopped = true; if (!settled) onStuck(reason) } }
@@ -154,17 +169,19 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
       /** Feeds the conversation's finished tool calls to the loop guard; true when the stage must stop. */
       const scan = (): boolean => {
         const state = options.snapshot(agentSessionId)
-        if (state && state.sequence > lastSequence) { dog.signal(call, { kind: 'tokens', count: state.sequence - lastSequence }); lastSequence = state.sequence }
+        if (state && state.sequence > lastSequence) { if (call) dog.signal(call, { kind: 'tokens', count: state.sequence - lastSequence }); lastSequence = state.sequence }
         for (const item of state?.items ?? []) {
           const data = item.data
           if (data.type === 'changes') { if (!seen.has(item.id)) { seen.add(item.id); for (const change of data.changes) guard.loop.observeProgress({ kind: 'file-diff', path: change.path }) } continue }
-          if (data.type !== 'tool' || (data.status !== 'completed' && data.status !== 'failed') || seen.has(item.id)) continue
+          if (data.type !== 'tool' || seen.has(item.id)) continue
+          if (data.status === 'preparing' || data.status === 'running') { toolStarted(item.id, data.name); continue }
+          if (data.status === 'awaiting_approval') continue
           seen.add(item.id)
+          toolFinished(item.id)
+          if (data.status !== 'completed' && data.status !== 'failed') continue
           const input = data.input && typeof data.input === 'object' && !Array.isArray(data.input) ? data.input as Record<string, unknown> : {}
           const output = String(data.output ?? '')
           const failed = data.status === 'failed'
-          dog.end(call)
-          call = dog.begin('model-call', `stage ${stage.index + 1} round ${++rounds}`, `${stage.id}:call`)
           if (failed && PERMISSION_REFUSAL.test(output)) {
             const key = `${data.name}|${JSON.stringify(input)}`
             const count = (refusals.get(key) ?? 0) + 1
@@ -186,7 +203,8 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
         if (idle.action === 'block') { emit(idle.event); giveUp(idle.reason, 'loop'); return }
         for (const decision of await dog.tick()) {
           if (decision.action !== 'interrupt') continue
-          stop(decision.reason === 'server-unhealthy' ? `the local model server stopped answering (${String(decision.diagnostics.health ?? 'unhealthy')})` : decision.reason === 'stalled' ? `no progress for ${Math.round(Number(decision.diagnostics.sinceProgressMs) / 1000)}s and the server is not processing` : `a model call ran past its ${Math.round(Number(decision.diagnostics.deadlineMs) / 1000)}s budget`)
+          const budget = Math.round(Number(decision.diagnostics.deadlineMs) / 1000)
+          stop(decision.reason === 'server-unhealthy' ? `the local model server stopped answering (${String(decision.diagnostics.health ?? 'unhealthy')})` : decision.reason === 'stalled' ? `no progress for ${Math.round(Number(decision.diagnostics.sinceProgressMs) / 1000)}s and the server is not processing` : decision.scope === 'tool-call' ? `the tool call ${decision.label} ran past its ${budget}s tool-call budget` : `a model call ran past its ${budget}s budget`)
           return
         }
       }
@@ -196,7 +214,8 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
       return {
         dispose() {
           clearInterval(timer)
-          dog.end(call, false)
+          if (call) dog.end(call, false)
+          for (const watch of tools.values()) dog.end(watch, false)
           // Calls the last tick missed still count toward the loop port's verdict.
           settled = true
           if (!stopped) scan()
@@ -266,6 +285,8 @@ export function durableJobPorts(options: DurableJobsWiringOptions): { handoff: H
 // --- Generation gate -------------------------------------------------------------------------
 
 const SETTLED = new Set<string>(['completed', 'failed', 'interrupted', 'disconnected', 'missing'])
+const ACTIVE_PHASES = new Set<string>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
+const WAITING_ON_OWNER = new Set<string>(['waiting_approval', 'waiting_input'])
 
 /**
  * Takes the process-wide LocalGenerationGate for each stage attempt: a stage does not start while
@@ -273,13 +294,24 @@ const SETTLED = new Set<string>(['completed', 'failed', 'interrupted', 'disconne
  * that starts while a job holds the gate is noted as demand. A running stage is not cut short:
  * the one-slot server serves requests in order, so an interactive turn waits at most for the
  * job's current request, which modelCallTimeoutMs bounds.
+ *
+ * A conversation waiting on the owner (an approval or a question) generates nothing, and the
+ * controller blocks its job and stops observing it, so the gate is released as soon as that wait
+ * is observed: another job runs meanwhile. The attempt stays parked, with the baseline of its
+ * original submit. The owner's answer in the tab continues the same conversation; the job's
+ * resume re-attaches through `reattach`, which takes the gate again (behind whichever job holds
+ * it) before the controller watches the attempt, and never resubmits the prompt.
  */
-export function gatedRuntime(runtime: StageRuntime, gate: LocalGenerationGate, onTurnStart?: (listener: () => void) => () => void): StageRuntime & { dispose(): void } {
-  const held = new Map<string, { release(): void; baseline: number }>()
+export function gatedRuntime(runtime: StageRuntime, gate: LocalGenerationGate, onTurnStart?: (listener: () => void) => () => void): StageRuntime & { reattach(id: string): Promise<void>; dispose(): void } {
+  /** Attempts this runtime submitted; `release` is absent while the attempt is parked on the owner. */
+  const held = new Map<string, { release?: () => void; baseline: number }>()
   const jobs = new Map<string, string>()
+  /** Interrupts per conversation, so a re-attach that was waiting for the gate sees one. */
+  const interrupts = new Map<string, number>()
   let submitting = 0
   const unsubscribe = onTurnStart?.(() => { if (!submitting && gate.holder() !== null) gate.noteInteractiveDemand() })
-  const release = (id: string): void => { held.get(id)?.release(); held.delete(id) }
+  const release = (id: string): void => { held.get(id)?.release?.(); held.delete(id) }
+  const park = (id: string): void => { const entry = held.get(id); if (entry?.release) { entry.release(); delete entry.release } }
   return {
     async open(request) {
       const opened = await runtime.open(request)
@@ -292,13 +324,29 @@ export function gatedRuntime(runtime: StageRuntime, gate: LocalGenerationGate, o
       submitting++
       try { await runtime.submit(id, prompt) } catch (error) { release(id); throw error } finally { submitting-- }
     },
+    async reattach(id) {
+      const observation = runtime.observe(id)
+      // Still waiting on the owner (the controller blocks again at once) or already stopped:
+      // nothing will generate, so the gate is not taken.
+      if (!ACTIVE_PHASES.has(observation.phase) || WAITING_ON_OWNER.has(observation.phase)) return
+      const entry = held.get(id)
+      if (entry?.release) return
+      // Queue behind the holder only: this generation is already under way, and a local
+      // conversation's own turn would otherwise count as the interactive work to yield to.
+      const before = interrupts.get(id) ?? 0
+      const lease = await gate.acquire(jobs.get(id) ?? id, undefined, { yieldToInteractive: false })
+      if ((interrupts.get(id) ?? 0) !== before) { lease.release(); return }
+      held.set(id, { release: lease.release, baseline: entry?.baseline ?? observation.stopSequence })
+    },
     observe(id) {
       const observation = runtime.observe(id)
       const entry = held.get(id)
       if (entry && SETTLED.has(observation.phase) && (observation.stopSequence > entry.baseline || observation.phase === 'missing')) release(id)
+      else if (entry && WAITING_ON_OWNER.has(observation.phase)) park(id)
       return observation
     },
     async interrupt(id) {
+      interrupts.set(id, (interrupts.get(id) ?? 0) + 1)
       try { await runtime.interrupt(id) } finally { release(id) }
     },
     dispose() { unsubscribe?.(); for (const id of [...held.keys()]) release(id) }

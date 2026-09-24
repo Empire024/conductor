@@ -219,7 +219,9 @@ export class ServerSupervisor {
  *
  *   interface GenerationGatePorts { now(); sleep(ms); interactiveActive(): Promise<string | null> }
  *   class LocalGenerationGate(ports, { pollMs, maxYieldMs })
- *     acquire(jobId, signal?): Promise<{ release(): void; waitedMs: number; yieldedTo: string | null }>
+ *     acquire(jobId, signal?, { yieldToInteractive }?): Promise<{ release(): void; waitedMs: number; yieldedTo: string | null }>
+ *                                      yieldToInteractive false: queue behind the holder only, for a
+ *                                      generation already under way (its own turn counts as interactive)
  *     noteInteractiveDemand(): void    host hook: an interactive local turn wants the server
  *     yieldRequested(): boolean        true while demand is pending and a job holds the gate
  *     holder(): string | null
@@ -250,13 +252,13 @@ export class LocalGenerationGate {
   noteInteractiveDemand(): void { this.demand = true }
   yieldRequested(): boolean { return this.demand && this.current !== null }
 
-  async acquire(jobId: string, signal?: AbortSignal): Promise<{ release(): void; waitedMs: number; yieldedTo: string | null }> {
+  async acquire(jobId: string, signal?: AbortSignal, options: { yieldToInteractive?: boolean } = {}): Promise<{ release(): void; waitedMs: number; yieldedTo: string | null }> {
     const started = this.ports.now()
     if (this.current !== null) await new Promise<void>(resolve => this.queue.push(resolve))
     this.current = jobId
     let yieldedTo: string | null = null
     try {
-      while (!signal?.aborted && this.ports.now() - started < this.maxYieldMs) {
+      while (options.yieldToInteractive !== false && !signal?.aborted && this.ports.now() - started < this.maxYieldMs) {
         const busy = await this.ports.interactiveActive().catch(() => null)
         if (!busy) break
         yieldedTo = busy

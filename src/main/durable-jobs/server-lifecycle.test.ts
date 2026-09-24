@@ -150,4 +150,20 @@ describe('local generation gate', () => {
     lease.release()
     expect(gate.holder()).toBeNull()
   })
+
+  it('re-attaching a generation already under way queues behind the holder but does not yield to interactive work', async () => {
+    let slept = 0
+    const gate = new LocalGenerationGate({ now: () => 0, sleep: async () => { slept++ }, interactiveActive: async () => 'the resumed conversation\'s own turn' })
+    const holder = await gate.acquire('job-a', undefined, { yieldToInteractive: false })
+    let granted = false
+    const resumed = gate.acquire('job-b', undefined, { yieldToInteractive: false }).then(lease => { granted = true; return lease })
+    await Promise.resolve()
+    expect(granted).toBe(false)
+    holder.release()
+    const lease = await resumed
+    expect(lease.yieldedTo).toBeNull()
+    expect(slept).toBe(0)
+    expect(gate.holder()).toBe('job-b')
+    lease.release()
+  })
 })

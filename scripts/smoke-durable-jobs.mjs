@@ -25,6 +25,10 @@ import assert from 'node:assert/strict'
 //   --extras=none   stop after the main job's report (skip the cancel and approval jobs).
 //   --loop-case, --stall-case  (stub) a job repeating one identical call, and one whose model never
 //                   answers; both must end blocked within bounds.
+//   --approval-gate (stub) only this: a job blocked on an approval must not keep local generation
+//                   capacity — a second job runs to completion meanwhile — and after an app restart
+//                   the first is still blocked with the same approval, resumes once the owner has
+//                   done the step, and completes without a second approval.
 // Every observation is printed with its timestamp; the JSON summary is the evidence.
 const argv = process.argv.slice(2)
 const flag = name => argv.some(arg => arg === `--${name}` || arg.startsWith(`--${name}=`))
@@ -70,6 +74,8 @@ git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '
 
 // --- Stub model: slow enough that a stage is observably running, scripted by prompt markers -----
 const stubRequests = []
+// --approval-gate: set once the "owner" has done the refused step; the approval case then finishes.
+let approvalGranted = false
 const stub = realModel ? null : createServer((request, response) => {
   const chunks = []
   request.on('data', chunk => chunks.push(chunk))
@@ -92,7 +98,8 @@ const stub = realModel ? null : createServer((request, response) => {
     const appending = stageObjective.includes('Append the line')
     // STALL-CASE never answers; LOOP-CASE repeats one identical read forever.
     if (prompt.includes('STALL-CASE')) return
-    const reply = prompt.includes('APPROVAL-CASE') ? call('run_command', { command: 'npm install left-pad --save' })
+    const reply = prompt.includes('APPROVAL-CASE') && approvalGranted ? { content: 'left-pad is installed; the owner ran the install.\nJOB STATUS: DONE' }
+      : prompt.includes('APPROVAL-CASE') ? call('run_command', { command: 'npm install left-pad --save' })
       : prompt.includes('LOOP-CASE') ? call('read_file', { path: 'README.md' })
       : afterTool ? { content: appending ? 'Appended "durable smoke" to notes.txt.\nJOB STATUS: CONTINUE: verify the line' : 'notes.txt ends with the line durable smoke.\nJOB STATUS: DONE' }
       : appending ? call('write_file', { path: 'notes.txt', content: 'durable smoke\n', append: true })
@@ -175,6 +182,48 @@ try {
   const refused = await call('jobs.create', { objective: 'x', model: 'opus' }, { expectError: true })
   assert.match(refused, /local model only/)
   observe('cloud model refused', { error: refused })
+
+  // --- Approval gate: a blocked job releases generation capacity and survives a restart --------
+  if (flag('approval-gate')) {
+    if (!stub) throw new Error('--approval-gate scripts the stub model; run it without --real-model')
+    const approvals = async jobId => (await call('jobs.events', { jobId, limit: 500 })).filter(event => event.kind === 'approval')
+    const gated = await call('jobs.create', {
+      title: 'Smoke: approval gate', model,
+      objective: 'APPROVAL-CASE: install the left-pad package from the network with npm install left-pad --save.',
+      stages: [{ title: 'Install', objective: 'APPROVAL-CASE: run npm install left-pad --save', completionCriteria: ['left-pad is installed'] }]
+    })
+    const blocked = await waitFor(gated.id, s => s.status === 'blocked', 'approval job blocked', STAGE_TIMEOUT)
+    assert.match(blocked.statusReason ?? '', /approv|permission|owner/i, `blocked for an unexpected reason: ${blocked.statusReason}`)
+    const approvalsBefore = await approvals(gated.id)
+    assert.equal(approvalsBefore.length, 1, 'one approval event for the block')
+    observe('approval recorded', { statusReason: blocked.statusReason, approval: approvalsBefore[0].message.slice(0, 200) })
+
+    // Before the fix a blocked job could keep the generation gate and this job showed running forever.
+    const second = await call('jobs.create', { title: 'Smoke: runs while the other is blocked', model, objective: 'Report that nothing needs doing.', stages: [{ title: 'Report', objective: 'Report that nothing needs doing', completionCriteria: ['An answer'] }] })
+    await waitFor(second.id, s => s.status === 'completed', 'second job completed while the first stays blocked', STAGE_TIMEOUT)
+    assert.equal((await status(gated.id)).status, 'blocked', 'the blocked job moved while the second ran')
+
+    await Promise.race([app.close().catch(() => {}), new Promise(done => setTimeout(done, 20_000))])
+    try { app.process().kill() } catch { /* exited */ }
+    observe('app closed with the approval job blocked')
+    await launch('app relaunched on the same profile')
+    owner = await credential()
+    const relaunched = await status(gated.id)
+    assert.equal(relaunched.status, 'blocked', 'the approval block did not survive the restart')
+    assert.equal(relaunched.statusReason, blocked.statusReason, 'the approval reason changed across the restart')
+    assert.deepEqual((await approvals(gated.id)).map(event => event.id), approvalsBefore.map(event => event.id), 'the approval events changed across the restart')
+    observe('approval intact after restart', { status: relaunched.status, statusReason: relaunched.statusReason })
+
+    approvalGranted = true
+    const requestsBefore = stubRequests.length
+    await call('jobs.resume', { jobId: gated.id })
+    const resumed = await waitFor(gated.id, s => s.status === 'completed', 'approval job resumed after the restart and completed', STAGE_TIMEOUT)
+    const approvalsAfter = await approvals(gated.id)
+    assert.equal(approvalsAfter.length, 1, 'the resumed job raised the approval again')
+    assert.ok(stubRequests.slice(requestsBefore).some(entry => entry.approvalCase), 'the resumed job never generated')
+    observe('approval gate verified', { secondJob: second.id, firstJob: gated.id, attempts: resumed.currentStage?.attempt ?? null, counters: resumed.counters, approvals: approvalsAfter.length, requestsAfterResume: stubRequests.length - requestsBefore })
+    throw Object.assign(new Error('approval gate only'), { skipped: true })
+  }
 
   // --- 1. Create and watch it run -------------------------------------------------------------
   const pair = (a, b) => ({ title: `Write notes for ${a} and ${b}`, objective: `Read modules/${a}.js and modules/${b}.js in line ranges (never whole) and write notes/${a}.md and notes/${b}.md: for each module, the exported function name families, how many functions it defines, and every import from another module with the functions it uses.`, completionCriteria: [`notes/${a}.md and notes/${b}.md exist and list the imports of each module`] })
@@ -304,7 +353,7 @@ try {
   await page.screenshot({ path: join(output, 'jobs-panel.png') })
   observe('done', { jobs: (await call('jobs.list')).map(entry => ({ id: entry.id, status: entry.status })) })
 } catch (error) {
-  if (error?.skipped) observe('extras skipped (--extras=none)')
+  if (error?.skipped) observe(flag('approval-gate') ? 'approval gate scenario done; main job skipped' : 'extras skipped (--extras=none)')
   else {
     failed = error
     observe('FAILED', { message: String(error?.message ?? error).slice(0, 800) })

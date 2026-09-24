@@ -25,7 +25,9 @@ import type { WorktreeOps } from './worktree'
 
 export interface ControllerOptions {
   store: DurableJobStore
-  runtime: StageRuntime
+  /** `reattach` (wiring.ts gatedRuntime) takes local generation capacity again before a resumed
+   *  attempt is watched; a runtime without a generation gate leaves it out. */
+  runtime: StageRuntime & { reattach?(agentSessionId: string): Promise<void> }
   handoff: HandoffPort
   watchdog: WatchdogPort
   server: ServerLifecyclePort
@@ -244,7 +246,13 @@ export class DurableJobController {
       const observation = this.options.runtime.observe(stage.agentSessionId)
       if (ACTIVE.has(observation.phase) && !this.lost.has(stage.agentSessionId)) {
         run.agentSessionId = stage.agentSessionId
-        return this.withSlot(async () => this.conclude(run, job, stage, stages, await this.wait(run, job, stage, stage.agentSessionId!, observation.stopSequence, true), false))
+        return this.withSlot(async () => {
+          if (!this.owned(run)) return 'stop'
+          // A block released the generation gate; the same conversation carries on only under it
+          // again, and its prompt is never resubmitted.
+          await this.options.runtime.reattach?.(stage.agentSessionId!)
+          return this.conclude(run, job, stage, stages, await this.wait(run, job, stage, stage.agentSessionId!, observation.stopSequence, true), false)
+        })
       }
       const lost = this.lost.has(stage.agentSessionId) || ACTIVE.has(observation.phase)
       return this.conclude(run, job, stage, stages, { kind: 'settled', observation, ...(lost && !stageSucceeded(observation) ? { interruptedFor: 'The stage conversation was cut off when Conductor stopped.' } : {}) }, false)
