@@ -544,3 +544,23 @@ describe('notifications', () => {
     expect(fix.service.self(phone.id).vapidPublicKey).toBeNull()
   })
 })
+
+describe('B1: the phone shows the conversation the desktop shows', () => {
+  it('drops the runtime diagnostics the desktop hides, such as stacked Claude thinking_tokens notices', () => {
+    const fix = fixture()
+    const thinking = (sequence: number) => item(sequence, { type: 'notice', message: 'Claude system / thinking_tokens', payload: { type: 'system', subtype: 'thinking_tokens', tokens: sequence * 100 } })
+    openConversation(fix, 'agent-1', {
+      phase: 'running',
+      items: [
+        item(1, { type: 'text', role: 'user', text: 'Start', mode: 'snapshot' }),
+        thinking(2), thinking(3), thinking(4),
+        item(5, { type: 'notice', message: 'Claude process diagnostic', payload: { stderr: 'x' } }),
+        item(6, { type: 'notice', message: 'Interruption requested; waiting for the runtime.' }),
+        item(7, { type: 'text', role: 'assistant', text: 'Working on it.', mode: 'snapshot' })
+      ]
+    })
+    const conversation = fix.service.conversation('agent-1')
+    expect(conversation.items.map(entry => entry.id)).toEqual(['item-1', 'item-6', 'item-7'])
+    expect(JSON.stringify(conversation.items)).not.toContain('thinking_tokens')
+  })
+})

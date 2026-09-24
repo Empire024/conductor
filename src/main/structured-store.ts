@@ -73,6 +73,7 @@ export class StructuredAgentStore {
         project_id TEXT NOT NULL, provider TEXT NOT NULL, spec_json TEXT NOT NULL,
         projection_json TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', archived INTEGER NOT NULL DEFAULT 0
       );
+      CREATE INDEX IF NOT EXISTS structured_sessions_project ON structured_sessions(project_id);
       CREATE TABLE IF NOT EXISTS structured_events (
         session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
         sequence INTEGER NOT NULL, event_json TEXT NOT NULL, PRIMARY KEY(session_id, sequence)
@@ -168,6 +169,11 @@ export class StructuredAgentStore {
   spec<T>(id: string): T | null {
     const row = this.db.prepare('SELECT spec_json FROM structured_sessions WHERE id=?').get(id) as { spec_json: string } | undefined
     return row ? JSON.parse(row.spec_json) as T : null
+  }
+  /** Project-scoped specs, without touching the potentially multi-GB event journal. */
+  projectSpecs<T>(projectId: string): T[] {
+    const rows = this.db.prepare('SELECT spec_json FROM structured_sessions WHERE project_id=?').all(projectId) as Array<{ spec_json: string }>
+    return rows.map(row => JSON.parse(row.spec_json) as T)
   }
   rebindWorkspace(id: string, sessionId: string): void {
     const spec = this.spec<Record<string, unknown>>(id)

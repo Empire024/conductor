@@ -89,20 +89,23 @@ export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element 
 }
 
 function StructuredRuntime(props: RuntimeTerminalProps): React.JSX.Element {
+  const latest = useRef(props)
+  latest.current = props
   const [view, setView] = useState(props.viewMode ?? 'visual')
   const [conversation, setConversation] = useState(props.resourceId)
-  const changeView = (next: 'visual' | 'cli'): void => { setView(next); props.onViewModeChange?.(next) }
+  const changeView = (next: 'visual' | 'cli'): void => { setView(next); latest.current.onViewModeChange?.(next) }
   useEffect(() => {
+    let mounted = true
     const off = window.conductor.structured.onEvents((events) => {
       const event = events.filter((item) => item.sessionId === conversation && item.data.type === 'session' && item.data.view).at(-1)
       if (event?.data.type === 'session' && event.data.view) changeView(event.data.view)
     })
-    void window.conductor.structured.snapshot(conversation).then((state) => { if (state?.view) changeView(state.view) })
-    return off
+    void window.conductor.structured.snapshot(conversation).then((state) => { if (mounted && state?.view) changeView(state.view) })
+    return () => { mounted = false; off() }
   }, [conversation])
   return view === 'cli' ? <NativeCliPane {...props} resourceId={conversation} onChat={async () => { await window.conductor.nativeCli.chat(conversation); changeView('visual') }} />
     : <StructuredAgentPane {...props} conversationId={conversation} onConversationChange={async identity => {
-      await props.onConversationChange?.(identity)
+      await latest.current.onConversationChange?.(identity)
       setConversation(identity.id)
     }} onRequestCli={props.provider === 'local' ? undefined : (id) => {
       // Local models have no native CLI of their own to continue the conversation in.

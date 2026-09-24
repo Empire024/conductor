@@ -1,3 +1,4 @@
+import type { RestartInitiator } from './restart-initiator'
 import { BrowserWindow } from 'electron'
 import { NsisUpdater } from 'electron-updater'
 import type { ProgressInfo, UpdateInfo } from 'builder-util-runtime'
@@ -12,7 +13,7 @@ interface UpdateManagerOptions {
   allowDevelopmentUpdates?: boolean
   localBuildDirectory?: string
   /** `force` is the owner's own credential asking: no running-work dialog, drafts kept for recovery. */
-  beforeInstall(force: boolean): void | Promise<void>
+  beforeInstall(force: boolean, initiator?: Omit<RestartInitiator, 'at'>): void | Promise<void>
 }
 interface PendingPrepare {
   requestId: string
@@ -143,12 +144,12 @@ export class UpdateManager {
     catch (reason) { if (this.updater === updater) this.setState({ ...this.state, phase: 'error', message: errorMessage(reason) }) }
     return this.getState()
   }
-  async install(options: { force?: boolean } = {}): Promise<void> {
+  async install(options: { force?: boolean } = {}, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> {
     if (!this.updater || this.state.phase !== 'ready') return
     this.setState({ ...this.state, phase: 'installing', message: 'Saving windows and stopping processes…' })
     try {
       await this.prepareRenderers()
-      await this.options.beforeInstall(options.force === true)
+      await (initiator ? this.options.beforeInstall(options.force === true, initiator) : this.options.beforeInstall(options.force === true))
       this.updater.quitAndInstall(true, true)
     } catch (reason) {
       if (reason && typeof reason === 'object' && 'code' in reason && reason.code === 'UPDATE_CANCELLED') { this.setState({ ...this.state, phase: 'ready', message: 'Update ready. Restart whenever you are ready.' }); return }

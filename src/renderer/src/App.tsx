@@ -1,3 +1,5 @@
+import { applyLayoutUpdate, restoreTabs, type LayoutUpdate } from './layout/layout-update'
+import { releaseHiddenModals } from './panes/modal-guard'
 import { useAgentControl } from './use-agent-control'
 import { ListTodo } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -180,6 +182,13 @@ export function App(): React.JSX.Element {
 
   const activeProject = projects.find((project) => project.id === activeProjectId) ?? null
   const activeSession = sessions.find((session) => session.id === activeSessionId) ?? null
+  const activeTabIds = activeSession ? listGroups(activeSession.layout.root).map(group => group.activeTabId).join(',') : ''
+  useEffect(() => {
+    const release = (): void => { releaseHiddenModals(document) }
+    document.addEventListener('pointerdown', release, true)
+    return () => document.removeEventListener('pointerdown', release, true)
+  }, [])
+  useEffect(() => { releaseHiddenModals(document) }, [activeSessionId, activeTabIds, activeSession?.maximizedGroupId])
   /**
    * The machine the chip beside the workspace header names. A project that lives on another
    * machine always runs there, whatever the owner last chose for a local workspace, so the chip
@@ -315,6 +324,22 @@ export function App(): React.JSX.Element {
       : listGroups(session.layout.root)[0]?.id ?? '')
   }, [])
 
+  const applyLayoutRepairs = useCallback((repairs: Array<{ sessionId: string; restoredTabIds: string[]; layout: WorkspaceLayout }>): void => {
+    if (!repairs.length) return
+    const bySession = new Map(repairs.map(repair => [repair.sessionId, repair]))
+    setSessions(current => current.map(session => {
+      const repair = bySession.get(session.id)
+      if (!repair) return session
+      const layout = restoreTabs(session.layout, repair.layout, repair.restoredTabIds, session.closedTabs)
+      return layout === session.layout ? session : { ...session, layout }
+    }))
+  }, [])
+
+  const saveSessionLayout = useCallback(async (sessionId: string, layout: WorkspaceLayout, maximizedGroupId: string | null, closedTabs: PaneTab[]): Promise<void> => {
+    const repaired = await window.conductor.sessions.save(sessionId, layout, maximizedGroupId, closedTabs)
+    if (repaired) applyLayoutRepairs([{ sessionId, ...repaired }])
+  }, [applyLayoutRepairs])
+
   const loadProject = useCallback(async (projectId: string, preferredSessionId?: string) => {
     if (recoveryReadyRef.current) window.conductor.recovery.flush(recoveryCheckpoint())
     // Layout edits (a freshly opened tab, a split, a close) only live in React state until some
@@ -325,8 +350,7 @@ export function App(): React.JSX.Element {
       const outgoing = sessionsRef.current.filter((session) => session.projectId === activeProjectIdRef.current)
       // A store that refuses one workspace must not strand the owner on the project they are leaving.
       await Promise.all(outgoing.map((session) =>
-        window.conductor.sessions
-          .save(session.id, session.layout, session.maximizedGroupId, session.closedTabs)
+        saveSessionLayout(session.id, session.layout, session.maximizedGroupId, session.closedTabs)
           .catch(() => undefined)
       ))
     }
@@ -334,15 +358,15 @@ export function App(): React.JSX.Element {
     setActiveSessionId(null)
     setFocusedGroupId('')
     const persisted = await window.conductor.sessions.list(projectId)
-    const loaded = persisted.map((session) => {
+    const loaded = await Promise.all(persisted.map(async (session) => {
       const layout = migrateLegacyCodexModels(stripWorkspaceUtilityTabs(session.layout))
       const retainedClosedTabs = session.closedTabs.filter((tab) => RUNTIME_TAB_KINDS.includes(tab.kind))
       const closedTabs = retainedClosedTabs.map(migrateLegacyCodexTab)
       const closedTabsChanged = closedTabs.some((tab, index) => tab !== retainedClosedTabs[index])
       if (layout === session.layout && closedTabs.length === session.closedTabs.length && !closedTabsChanged) return session
-      void window.conductor.sessions.save(session.id, layout, session.maximizedGroupId, closedTabs)
-      return { ...session, layout, closedTabs }
-    })
+      const repaired = await window.conductor.sessions.save(session.id, layout, session.maximizedGroupId, closedTabs)
+      return { ...session, layout: repaired?.layout ?? layout, closedTabs }
+    }))
     const layouts = await window.conductor.sessions.listTemplates(projectId)
     setSessions(loaded)
     setTemplates(layouts)
@@ -614,7 +638,7 @@ export function App(): React.JSX.Element {
       }
       setSaveStatus('saving')
       try {
-        await window.conductor.recovery.checkpoint(snapshot)
+        applyLayoutRepairs(await window.conductor.recovery.checkpoint(snapshot))
         lastCheckpointRef.current = snapshot
         if (saveRevisionRef.current === revision) {
           setLastSavedAt(Date.now())
@@ -625,7 +649,7 @@ export function App(): React.JSX.Element {
         debugLog('workspace', 'Autosave failed', reason, 'error')
       }
     })())
-  }, [activeProjectId, activeSessionId, loading, recoveryCheckpoint, sessions])
+  }, [activeProjectId, activeSessionId, applyLayoutRepairs, loading, recoveryCheckpoint, sessions])
 
   useEffect(() => {
     const flushRecovery = (): void => {
@@ -669,7 +693,7 @@ export function App(): React.JSX.Element {
     setSaveStatus('saving')
     try {
       const snapshot = recoveryCheckpoint()
-      await window.conductor.recovery.checkpoint(snapshot)
+      applyLayoutRepairs(await window.conductor.recovery.checkpoint(snapshot))
       lastCheckpointRef.current = snapshot
       if (saveRevisionRef.current === revision) {
         setLastSavedAt(Date.now())
@@ -681,7 +705,7 @@ export function App(): React.JSX.Element {
       setToast('Workspace save failed')
       debugLog('workspace', 'Manual save failed', reason, 'error')
     }
-  }, [recoveryCheckpoint])
+  }, [applyLayoutRepairs, recoveryCheckpoint])
 
   useEffect(() => {
     if (!activeSession) return
@@ -694,8 +718,11 @@ export function App(): React.JSX.Element {
     setSessions((current) => current.map((session) => session.id === activeSessionId ? update(session) : session))
   }, [activeSessionId])
 
-  const setLayout = useCallback((layout: WorkspaceLayout) => {
-    patchActiveSession((session) => ({ ...session, layout }))
+  const setLayout = useCallback((update: LayoutUpdate) => {
+    patchActiveSession((session) => {
+      const layout = applyLayoutUpdate(session.layout, update)
+      return layout === session.layout ? session : { ...session, layout }
+    })
   }, [patchActiveSession])
 
   const setMaximized = useCallback((maximizedGroupId: string | null) => {
@@ -907,7 +934,7 @@ export function App(): React.JSX.Element {
       if (!await window.conductor.files.confirmClose(workspaceFileIds(undefined, sessionId))) return
       // Commit the exact current layout before hiding the workspace, retaining its IDs and drafts.
       const latest = sessionsRef.current.find(session => session.id === sessionId) ?? closing
-      await window.conductor.sessions.save(sessionId, latest.layout, latest.maximizedGroupId, latest.closedTabs)
+      await saveSessionLayout(sessionId, latest.layout, latest.maximizedGroupId, latest.closedTabs)
       await window.conductor.sessions.delete(sessionId)
       setClosedWorkspaces(await window.conductor.sessions.closed())
       if (activeProjectIdRef.current === closing.projectId) {
@@ -1155,7 +1182,7 @@ export function App(): React.JSX.Element {
       for (const closed of result.session.closedTabs.slice(session.closedTabs.length)) closePlacedTab(closed, setToast)
       setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
       selectSession(result.session)
-      void window.conductor.sessions.save(result.session.id, result.session.layout, result.session.maximizedGroupId, result.session.closedTabs)
+      void saveSessionLayout(result.session.id, result.session.layout, result.session.maximizedGroupId, result.session.closedTabs)
     } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
   }, [sessions, selectSession])
 
@@ -1171,7 +1198,7 @@ export function App(): React.JSX.Element {
         sessionsRef.current = sessionsRef.current.map(item => item.id === session.id ? session : item)
         flushSync(() => setSessions(sessionsRef.current))
       }
-      await window.conductor.sessions.save(session.id, session.layout, session.maximizedGroupId, session.closedTabs)
+      await saveSessionLayout(session.id, session.layout, session.maximizedGroupId, session.closedTabs)
       if (reveal) {
         if (activeProjectIdRef.current !== session.projectId) await loadProject(session.projectId, session.id)
         flushSync(() => { selectSession(session); setFocusedGroupId(groupId); setUtilityPanel(null) })
@@ -1512,7 +1539,7 @@ export function App(): React.JSX.Element {
                           focusedGroupId={focusedGroupId}
                           maximizedGroupId={activeSession.maximizedGroupId}
                           onLayout={setLayout}
-                          onPersistLayout={layout => window.conductor.sessions.save(activeSession.id, layout, activeSession.maximizedGroupId, activeSession.closedTabs)}
+                          onPersistLayout={layout => saveSessionLayout(activeSession.id, layout, activeSession.maximizedGroupId, activeSession.closedTabs)}
                           onFocus={setFocusedGroupId}
                           onMaximize={setMaximized}
                           onClosed={rememberClosed}

@@ -128,7 +128,7 @@ artifacts/overseer/runs/<YYYYMMDD-HHMMSS>-<goal ids>/      (or --run-dir)
 
 ## Running it visibly from a wizard tab
 
-The dev target is invisible by design. To watch the swarm in your own Conductor, turn the wand on in a frontier-model tab (Claude Opus or Fable, GPT-6 Astra) and ask it to run the loop with `--target installed`: the worker and fixer tabs then open in the owner's window, the wizard tab answers its coworkers' approvals, and `app.update` plus `--restart-installed` land the fix in the running app. The wizard tab is brought back after that restart and told to continue, so it can read `run.json` and carry on. Start the overseer detached all the same (below), because the tab's own shell dies with the app; the wizard's job is to launch it, watch it, and take over when it stops.
+The dev target is invisible by design. To watch the swarm in your own Conductor, turn the wand on in a frontier-model tab (Claude Opus or Fable, GPT-6 Astra) and ask it to run the loop with `--target installed`: the worker and fixer tabs then open in the owner's window, the wizard tab answers its coworkers' approvals, and `app.update` plus `--restart-installed` land the fix in the running app. Only a wizard tab that itself called `app.restart` or `app.update.install` is brought back and told to continue; an overseer or owner restart restores the windows without resuming wizard turns. Start the overseer detached all the same (below), because the tab's own shell dies with the app; the wizard's job is to launch it, watch it, and take over when it stops.
 
 ## Starting it from an agent inside Conductor
 

@@ -1,3 +1,4 @@
+import { patchTabState, type LayoutUpdate } from './layout-update'
 import { bindConversationTab, type ConversationIdentity } from '../panes/conversation-tab'
 import { AgentControlLinks } from '../components/AgentControlLinks'
 import { useAgentControlLinks } from '../components/useAgentControlLinks'
@@ -47,6 +48,7 @@ import {
   closeTab,
   collapseTabGroup,
   findGroup,
+  listGroups,
   insertForeignTab,
   resizeSplit,
   tabDropLands,
@@ -94,7 +96,7 @@ interface PaneWorkspaceProps {
   detachedId?: string
   focusedGroupId: string
   maximizedGroupId: string | null
-  onLayout(layout: WorkspaceLayout): void
+  onLayout(update: LayoutUpdate): void
   onPersistLayout(layout: WorkspaceLayout): Promise<void>
   onFocus(groupId: string): void
   onMaximize(groupId: string | null): void
@@ -411,14 +413,21 @@ function PaneGroup({
   }
 
   const runGroupAction = (action: TabGroupAction, tab: PaneTab): void => {
-    const result = applyTabGroupAction({ ...workspace.session, layout: workspace.layout }, group.id, tab.id, action)
-    workspace.onLayout(result.session.layout)
-    for (const closed of result.session.closedTabs.slice(workspace.session.closedTabs.length)) {
-      workspace.onClosed(closed)
-      // Closing a whole group closes each placed tab in it where it runs, exactly as closing one tab does.
+    const current = workspaceRef.current
+    const applied: { result?: ReturnType<typeof applyTabGroupAction>; closed: PaneTab[] } = { closed: [] }
+    flushSync(() => current.onLayout(layout => {
+      if (!findGroup(layout.root, group.id)?.tabs.some(item => item.id === tab.id)) return layout
+      const result = applyTabGroupAction({ ...current.session, layout }, group.id, tab.id, action)
+      const remaining = new Set(listGroups(result.session.layout.root).flatMap(group => group.tabs.map(tab => tab.id)))
+      applied.closed = listGroups(layout.root).flatMap(group => group.tabs).filter(tab => !remaining.has(tab.id))
+      applied.result = result
+      return result.session.layout
+    }))
+    for (const closed of applied.closed) {
+      current.onClosed(closed)
       closePlacedTab(closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
     }
-    if (result.tabGroupId) setPendingRename(result.tabGroupId)
+    if (applied.result?.tabGroupId) setPendingRename(applied.result.tabGroupId)
   }
 
   /**
@@ -437,7 +446,7 @@ function PaneGroup({
     // Placing a tab on another machine has to reach that machine first, so the launcher stays put
     // until it answers; a refusal leaves the launcher open with the reason rather than a dead tab.
     void createPlacedTab(request)
-      .then(tab => workspace.onLayout(replaceTab(workspace.layout, group.id, activeTab.id, tab)))
+      .then(tab => workspace.onLayout(layout => replaceTab(layout, group.id, activeTab.id, tab)))
       .catch((reason: unknown) => setPlacementError(String(reason instanceof Error ? reason.message : reason)))
   }
 
@@ -470,13 +479,7 @@ function PaneGroup({
   // latest layout. Writing back that render's layout would undo every change made since: a tab
   // opened or closed in the meantime, another tab selected. An unchanged patch writes nothing.
   const setTabState = (tabId: string, patch: Record<string, unknown>): void => {
-    const current = workspaceRef.current
-    const tab = findGroup(current.layout.root, group.id)?.tabs.find((item) => item.id === tabId)
-    if (!tab || Object.entries(patch).every(([key, value]) => tab.state?.[key] === value)) return
-    const layout = updateTab(current.layout, group.id, tabId, (item) => ({ ...item, state: { ...item.state, ...patch } }))
-    // Until the next render, a second patch builds on this one rather than on the older layout.
-    workspaceRef.current = { ...current, layout }
-    current.onLayout(layout)
+    workspace.onLayout(patchTabState(group.id, tabId, patch))
   }
 
 
@@ -487,9 +490,12 @@ function PaneGroup({
     await window.conductor.structured.bindWorkspace(conversation.id, current.session.id)
     const latest = workspaceRef.current
     if (latest.session.id !== current.session.id || !findGroup(latest.layout.root, group.id)?.tabs.some(tab => tab.id === tabId)) throw new Error('This conversation tab is no longer open.')
-    const layout = updateTab(latest.layout, group.id, tabId, tab => bindConversationTab(tab, conversation))
-    flushSync(() => latest.onLayout(layout))
-    await latest.onPersistLayout(layout)
+    let persisted = latest.layout
+    flushSync(() => latest.onLayout(layout => {
+      persisted = updateTab(layout, group.id, tabId, tab => bindConversationTab(tab, conversation))
+      return persisted
+    }))
+    await latest.onPersistLayout(persisted)
   }
 
   const close = (tab: PaneTab): void => {
@@ -512,14 +518,18 @@ function PaneGroup({
         return
       }
       const apply = (): void => {
-        const result = closeTab(currentWorkspace.layout, requestedGroupId, tab.id)
-        currentWorkspace.onLayout(result.layout)
+        const applied: { closed?: PaneTab } = {}
+        flushSync(() => currentWorkspace.onLayout(layout => {
+          const result = closeTab(layout, requestedGroupId, tab.id)
+          applied.closed = result.closed ?? undefined
+          return result.layout
+        }))
         setClosingTabIds(current => { const next = new Set(current); next.delete(tab.id); return next })
-        if (result.closed) {
-          currentWorkspace.onClosed(result.closed)
+        if (applied.closed) {
+          currentWorkspace.onClosed(applied.closed)
           // A tab placed on another machine is closed there too; only the owner closing a tab does
           // this, never a tab moving between groups or windows, which also goes through closeTab.
-          closePlacedTab(result.closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
+          closePlacedTab(applied.closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
           debugLog('tabs', 'Tab closed', { sessionId: requestedSessionId, groupId: requestedGroupId, tabId: tab.id }, 'info')
         }
       }
@@ -546,7 +556,7 @@ function PaneGroup({
         {...(dropSlot ? { 'data-drop-slot-id': tab.id } : {})}
         className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
         style={{ marginLeft: gapHere ? dragging!.width : undefined }}
-        onClick={() => workspace.onLayout(activateTab(workspace.layout, group.id, tab.id))}
+        onClick={() => workspace.onLayout(layout => activateTab(layout, group.id, tab.id))}
         onContextMenu={event => showContextMenu(event, tab)}
         onPointerDown={(event) => {
           if (event.button !== 1) return
@@ -654,7 +664,7 @@ function PaneGroup({
                   data-tab-group-id={slot.group.id}
                   aria-expanded={!slot.collapsed}
                   title={`${slot.group.title || 'Unnamed group'} - ${count} tab${count === 1 ? '' : 's'}`}
-                  onClick={() => workspace.onLayout(collapseTabGroup(workspace.layout, group.id, slot.group.id, !slot.collapsed))}
+                  onClick={() => workspace.onLayout(layout => collapseTabGroup(layout, group.id, slot.group.id, !slot.collapsed))}
                   onContextMenu={(event) => showGroupMenu(event, slot.group.id)}
                 >
                   <i className="tab-group-dot" data-tab-group-color={slot.group.color} />
@@ -666,7 +676,7 @@ function PaneGroup({
               </div>
             )
           })}
-          <button className="pane-add-tab" style={{ marginLeft: barIndex !== null && gapBeforeId === null ? dragging!.width : undefined }} title="New tab" onClick={() => workspace.onLayout(addTab(workspace.layout, group.id, makeLauncherTab()))}>
+          <button className="pane-add-tab" style={{ marginLeft: barIndex !== null && gapBeforeId === null ? dragging!.width : undefined }} title="New tab" onClick={() => workspace.onLayout(layout => addTab(layout, group.id, makeLauncherTab()))}>
             <Plus size={13} />
           </button>
         </div>
@@ -699,10 +709,18 @@ function PaneGroup({
         if (action === 'close') { close(menuTab); return }
         if (action === 'detach' || action === 'show') { workspace.onDetach(group.id, menuTab, { alwaysOnTop: action === 'show' }); return }
         if (action === 'reopen') { workspace.onReopen(group.id); return }
-        const result = applyWorkspaceTabAction({ ...workspace.session, layout: workspace.layout, maximizedGroupId: workspace.maximizedGroupId }, group.id, menuTab.id, action)
-        workspace.onLayout(result.session.layout)
-        workspace.onMaximize(result.session.maximizedGroupId)
-        workspace.onFocus(result.focusedGroupId)
+        const current = workspaceRef.current
+        const applied: { result?: ReturnType<typeof applyWorkspaceTabAction> } = {}
+        flushSync(() => current.onLayout(layout => {
+          if (!findGroup(layout.root, group.id)?.tabs.some(tab => tab.id === menuTab.id)) return layout
+          const result = applyWorkspaceTabAction({ ...current.session, layout, maximizedGroupId: current.maximizedGroupId }, group.id, menuTab.id, action)
+          applied.result = result
+          return result.session.layout
+        }))
+        if (applied.result) {
+          current.onMaximize(applied.result.session.maximizedGroupId)
+          current.onFocus(applied.result.focusedGroupId)
+        }
       }} />}
     {groupMenu && menuGroup && <TabGroupMenu x={groupMenu.x} y={groupMenu.y} group={menuGroup}
       tabCount={group.tabs.filter(tab => tab.tabGroupId === menuGroup.id).length}
@@ -806,7 +824,7 @@ function SplitView({
       if (finished) return
       finished = true
       if (animationFrame) cancelAnimationFrame(animationFrame)
-      workspace.onLayout(resizeSplit(workspace.layout, split.id, [pendingFirst, 100 - pendingFirst]))
+      workspace.onLayout(layout => resizeSplit(layout, split.id, [pendingFirst, 100 - pendingFirst]))
       if (gutter.hasPointerCapture(upEvent.pointerId)) gutter.releasePointerCapture(upEvent.pointerId)
       window.removeEventListener('pointermove', move)
       window.removeEventListener('pointerup', stop)
@@ -833,7 +851,7 @@ function SplitView({
     event.preventDefault()
     const decreasing = event.key === 'ArrowLeft' || event.key === 'ArrowUp'
     const first = Math.min(90, Math.max(10, split.sizes[0] + (decreasing ? -2 : 2)))
-    workspace.onLayout(resizeSplit(workspace.layout, split.id, [first, 100 - first]))
+    workspace.onLayout(layout => resizeSplit(layout, split.id, [first, 100 - first]))
   }
 
   const renderChild = (side: 0 | 1): React.JSX.Element | null => {
@@ -849,7 +867,7 @@ function SplitView({
         className={`split-gutter ${resizing ? 'active' : ''}`}
         style={{ display: split ? undefined : 'none' }}
         onPointerDown={startResize}
-        onDoubleClick={() => split && workspace.onLayout(resizeSplit(workspace.layout, split.id, [50, 50]))}
+        onDoubleClick={() => split && workspace.onLayout(layout => resizeSplit(layout, split.id, [50, 50]))}
         onKeyDown={nudgeResize}
         role="separator"
         aria-hidden={!split}
@@ -950,8 +968,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
           // Conductor window just grafted this tab into its own layout, so this window's copy
           // has to go, and with it a detached window that has nothing left to show.
           const current = propsRef.current
-          const result = closeTab(current.layout, drag.sourceGroupId, drag.tab.id)
-          if (result.closed) current.onLayout(result.layout)
+          current.onLayout(layout => closeTab(layout, drag.sourceGroupId, drag.tab.id).layout)
         } else {
           // Native applications often zero out DragEvent screen coordinates when they accept
           // the drop. Electron's cursor position remains reliable across apps, and every
@@ -1002,7 +1019,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
         const target = latestTargetRef.current
         if (target) {
           const current = propsRef.current
-          current.onLayout(applyTabDrop(current.layout, drag.sourceGroupId, drag.tab.id, target))
+          current.onLayout(layout => applyTabDrop(layout, drag.sourceGroupId, drag.tab.id, target))
           current.onFocus(target.groupId)
           if (target.kind === 'canvas') setSnapArrival({ groupId: target.groupId, edge: target.edge })
         }
@@ -1015,7 +1032,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
       if (payload && target) {
         event.preventDefault()
         const current = propsRef.current
-        current.onLayout(insertForeignTab(current.layout, payload.tab, target))
+        current.onLayout(layout => insertForeignTab(layout, payload.tab, target))
         current.onFocus(target.groupId)
         if (target.kind === 'canvas') setSnapArrival({ groupId: target.groupId, edge: target.edge })
       }
@@ -1069,7 +1086,7 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
           <div>
             <strong>No tabs open</strong>
           </div>
-          <button onClick={() => props.onLayout(addTab(props.layout, props.layout.root.id, makeLauncherTab()))}><Plus size={15} /> New tab</button>
+          <button onClick={() => props.onLayout(layout => addTab(layout, layout.root.id, makeLauncherTab()))}><Plus size={15} /> New tab</button>
           <button disabled={!props.canReopen} onClick={() => props.onReopen(props.layout.root.id)}><Undo2 size={14} /> Reopen</button>
         </div>
       ) : (

@@ -1069,3 +1069,7 @@ textarea.input { resize: none; line-height: 1.45; }
    not; align-items: center alone would push a tall card's top out of reach. */
 .scroll.centered { align-items: flex-start; }
 .scroll.centered > .pair-card { margin-top: auto; margin-bottom: auto; }
+
+.timeline-working { margin: 16px 0; color: var(--text-2); font-size: 13px; animation: working-breathe 2s ease-in-out infinite; }
+@keyframes working-breathe { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .timeline-working { animation: none; } }

@@ -1,3 +1,5 @@
+import { encodeRestartInitiator, RESTART_INITIATOR_KEY, takeRestartInitiator, wizardTabsToResume, type RestartInitiator } from './restart-initiator'
+import { guardLayoutSave } from './layout-save-guard'
 import { WeeklyUsageSummaryService } from './weekly-usage-summary'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { promises as fs, readFileSync } from 'node:fs'
@@ -24,7 +26,7 @@ import { installContextMenu } from './context-menu'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, screen, shell, webContents } from 'electron'
 import { SystemMetricsSampler } from './system-metrics.ts'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics.ts'
-import { CloseConfirmation, hasRunningWork } from './close-confirmation'
+import { CloseConfirmation, hasRunningWork, hasSessionWork } from './close-confirmation'
 import { readSessionArchive, writeSessionArchive } from './session-archive'
 import type {
   AgentSpec,
@@ -582,15 +584,15 @@ const disposeRuntimeServices = (): void => {
   }
 }
 
-/** After a restart Conductor started itself (an update install or app.restart), every open wizard
- *  tab is brought back and told to carry on: the "keeps itself running" half of wizard mode. A
- *  launch the owner made by hand does nothing here; they may have quit to stop everything. */
-const resumeWizardTabs = async (): Promise<void> => {
+/** Only the wizard tab that initiated this restart is brought back and told to continue.
+ *  Owner restarts restore windows without starting any conversations. */
+const resumeWizardTabs = async (initiator: RestartInitiator): Promise<void> => {
   for (const project of database.listDeskProjects()) for (const workspace of database.listSessions(project.id)) {
     const tabs: PaneTab[] = []
     const visit = (node: LayoutNode): void => { if (node.type === 'split') node.children.forEach(visit); else tabs.push(...node.tabs) }
     visit(workspace.layout.root)
-    for (const tab of tabs) {
+    for (const detached of database.listDetachedWindows()) if (detached.sessionId === workspace.id) visit(detached.layout.root)
+    for (const tab of wizardTabsToResume(tabs, initiator)) {
       if (tab.kind !== 'agent' || !tab.resourceId) continue
       const state = database.structured.snapshot(tab.resourceId), spec = database.structured.spec<AgentSpec>(tab.resourceId)
       if (!state || !spec || spec.provider === 'local' || !state.nativeSessionId || !wizardActive(state.settings, spec.provider)) continue
@@ -606,7 +608,7 @@ const resumeWizardTabs = async (): Promise<void> => {
 /** `force` is the owner's own control credential restarting the app unattended: running work is
  *  stopped without the dialog, and dirty editors are flushed into their recovery drafts instead of
  *  being asked about, so nothing typed is lost and nothing on disk is overwritten. */
-const prepareForUpdateInstall = async (force = false): Promise<void> => {
+const prepareForUpdateInstall = async (force = false, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> => {
   if (force) {
     try { await flushEditorWindows(editorWindows()) } catch (error) { console.warn('Editor drafts could not all be flushed before a forced restart', error) }
   } else {
@@ -615,6 +617,7 @@ const prepareForUpdateInstall = async (force = false): Promise<void> => {
   }
   database.setSetting(UPDATE_WINDOW_LAYOUT_KEY, JSON.stringify(captureWindowLayout()))
   database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'true')
+  database.setSetting(RESTART_INITIATOR_KEY, encodeRestartInitiator(initiator && { ...initiator, at: new Date().toISOString() }))
   // electron-updater closes windows before Electron emits before-quit. Mark the
   // close as intentional now so detached tabs remain detached for the relaunch.
   isQuitting = true
@@ -981,6 +984,44 @@ const resolveEditorPath = async (projectId: string, requested: string): Promise<
     const parent = await resolveExistingProjectPath(projectId, dirname(requested), 'The code editor')
     return join(await fs.realpath(parent), basename(target))
   }
+}
+
+/** Every renderer persistence route uses the same live-tab protection. */
+const guardSessionLayout = (sessionId: string, layout: WorkspaceLayout, closedTabs: PaneTab[]): ReturnType<typeof guardLayoutSave> => {
+  const previous = database.getSession(sessionId)?.layout ?? null
+  const hasLiveWork = (id: string): boolean => {
+    if (database.structured.spec<AgentSpec>(id)?.sessionId !== sessionId) return false
+    const state = database.structured.snapshot(id)
+    return Boolean(state && hasSessionWork(state))
+  }
+  // Almost every save drops nothing live, so the other layouts are only read when one would be restored.
+  const candidate = guardLayoutSave({ previous, next: layout, closedTabs, elsewhereTabIds: new Set(), hasLiveWork })
+  if (!candidate.restoredTabIds.length) return candidate
+  const elsewhereTabIds = new Set<string>(), elsewhereResourceIds = new Set<string>()
+  const collect = (node: LayoutNode): void => {
+    if (node.type === 'split') { node.children.forEach(collect); return }
+    for (const tab of node.tabs) {
+      elsewhereTabIds.add(tab.id)
+      if (tab.kind === 'agent' && tab.resourceId) elsewhereResourceIds.add(tab.resourceId)
+    }
+  }
+  for (const project of database.listProjects()) for (const session of database.listSessions(project.id)) {
+    if (session.id !== sessionId) collect(session.layout.root)
+  }
+  for (const detached of database.listDetachedWindows()) collect(detached.layout.root)
+  const repaired = guardLayoutSave({ previous, next: layout, closedTabs, elsewhereTabIds, elsewhereResourceIds, hasLiveWork })
+  if (repaired.restoredTabIds.length) console.warn('Restored live tabs dropped by a layout save:', repaired.restoredTabIds.join(', '))
+  return repaired
+}
+
+const guardRecoveryCheckpoint = (snapshot: WorkspaceRecoveryCheckpoint): { checkpoint: WorkspaceRecoveryCheckpoint; restored: Array<{ sessionId: string; restoredTabIds: string[]; layout: WorkspaceLayout }> } => {
+  const restored: Array<{ sessionId: string; restoredTabIds: string[]; layout: WorkspaceLayout }> = []
+  const sessions = snapshot.sessions.map(session => {
+    const repaired = guardSessionLayout(session.id, session.layout, session.closedTabs)
+    if (repaired.restoredTabIds.length) restored.push({ sessionId: session.id, ...repaired })
+    return { ...session, layout: repaired.layout }
+  })
+  return { checkpoint: { ...snapshot, sessions }, restored }
 }
 
 const registerIpc = (): void => {
@@ -1420,11 +1461,12 @@ const registerIpc = (): void => {
       maximizedGroupId: string | null,
       closedTabs: PaneTab[]
       ) => {
-      const saved = database.saveSession(sessionId, layout, maximizedGroupId, closedTabs)
+      const repaired = guardSessionLayout(sessionId, layout, closedTabs)
+      database.saveSession(sessionId, repaired.layout, maximizedGroupId, closedTabs)
       // A paired machine showing this workspace learns its tabs changed the way it learns anything.
       const projectId = database.getSession(sessionId)?.projectId
       if (projectId) remoteControl?.transport.host.notifyTabs(projectId, sessionId)
-      return saved
+      return repaired.restoredTabIds.length ? repaired : undefined
     }
   )
   ipcMain.handle('sessions:list-templates', (_event, projectId: string) =>
@@ -1437,11 +1479,13 @@ const registerIpc = (): void => {
   )
   ipcMain.handle('recovery:get', () => database.getWorkspaceRecoveryState())
   ipcMain.handle('recovery:checkpoint', (_event, snapshot: WorkspaceRecoveryCheckpoint) => {
-    database.saveRecoveryCheckpoint(snapshot)
+    const guarded = guardRecoveryCheckpoint(snapshot)
+    database.saveRecoveryCheckpoint(guarded.checkpoint)
+    return guarded.restored
   })
   ipcMain.on('recovery:flush', (event, snapshot: WorkspaceRecoveryCheckpoint) => {
     try {
-      database.saveRecoveryCheckpoint(snapshot)
+      database.saveRecoveryCheckpoint(guardRecoveryCheckpoint(snapshot).checkpoint)
       event.returnValue = true
     } catch (error) {
       console.error('Failed to flush the workspace recovery checkpoint', error)
@@ -2172,12 +2216,12 @@ app.whenReady().then(async () => {
     host: {
       version: app.getVersion(), pid: process.pid,
       openProject: registerProjectFolder,
-      updates: { state: () => updates.getState(), check: () => updates.check(), download: () => updates.download(), install: force => updates.install({ force }) },
-      relaunch: async force => {
+      updates: { state: () => updates.getState(), check: () => updates.check(), download: () => updates.download(), install: (force, initiator) => updates.install({ force }, initiator) },
+      relaunch: async (force, initiator) => {
         // A downloaded update installs and relaunches by itself; relaunching as well would start
         // Conductor twice.
-        if (updates.getState().phase === 'ready') { await updates.install({ force }); return }
-        await prepareForUpdateInstall(force)
+        if (updates.getState().phase === 'ready') { await updates.install({ force }, initiator); return }
+        await prepareForUpdateInstall(force, initiator)
         app.relaunch()
         app.quit()
       }
@@ -2320,6 +2364,8 @@ app.whenReady().then(async () => {
   disposeOrchestrationIpc = registerOrchestrationIpc(orchestration)
   scheduleRunner.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
+  const initiator = takeRestartInitiator(database.getSetting(RESTART_INITIATOR_KEY), new Date())
+  database.setSetting(RESTART_INITIATOR_KEY, '')
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
     ? parseSavedWindowLayout(database.getSetting(UPDATE_WINDOW_LAYOUT_KEY))
@@ -2333,7 +2379,7 @@ app.whenReady().then(async () => {
   if (restoreAfterUpdate) {
     database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'false')
     // The windows first, then the wizards: the panes must exist for the resumed turns to show in.
-    setTimeout(() => { void resumeWizardTabs() }, 4000)
+    if (initiator) setTimeout(() => { void resumeWizardTabs(initiator) }, 4000)
   }
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow()

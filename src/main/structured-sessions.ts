@@ -302,7 +302,7 @@ export class StructuredSessions {
         if (!nativeSessionId) {
           nativeSessionId = randomUUID()
           this.database.setSetting('newNative:' + id, 'true')
-          this.emit(live, { data: { type: 'session', phase: 'idle', nativeSessionId } })
+          this.emit(live, { data: { type: 'session', phase: state.phase, nativeSessionId } })
         }
         const history = live.spec.provider === 'claude' ? await readClaudeHistory(live.spec.cwd, nativeSessionId) : live.spec.provider === 'grok' ? await readGrokHistory(nativeSessionId) : await live.adapter?.history?.() ?? []
         const handoff = { id: randomUUID(), known: history.map((item) => item.id) }
@@ -316,20 +316,25 @@ export class StructuredSessions {
       live.adapter = undefined; live.closed = false
       state = store.snapshot(id)!
       const settings = settingsForRuntime(state.settings)
-      this.emit(live, { data: { type: 'session', phase: 'idle', view: 'cli', settings } })
+      this.emit(live, { data: { type: 'session', phase: state.phase, view: 'cli', settings } })
       return { spec: live.spec, nativeSessionId: state.nativeSessionId!, settings, fresh: this.database.getSetting('newNative:' + id) === 'true' && (live.spec.provider === 'claude' ? !hasClaudeHistory(live.spec.cwd, state.nativeSessionId!) : live.spec.provider === 'grok' && !hasGrokHistory(state.nativeSessionId!)) }
     } finally { live.handoff = false }
   }
   cancelCli(id: string): void {
     const live = this.get(id)
     this.database.removeSetting('cliHandoff:' + id)
-    this.emit(live, { data: { type: 'session', phase: live.adapter ? 'idle' : 'disconnected', view: 'visual' } })
+    const state = this.database.structured.snapshot(id)!
+    // A refused handoff may be cancelled while the original turn is still running.
+    // Returning to Chat is presentation, not evidence that its turn ended.
+    const phase = live.adapter || active.has(state.phase) ? state.phase : 'disconnected'
+    this.emit(live, { data: { type: 'session', phase, view: 'visual' } })
   }
   async finishCli(id: string): Promise<void> {
     const live = this.get(id)
     if (live.handoff) throw new Error('A view switch is already in progress')
     const serialized = this.database.getSetting('cliHandoff:' + id)
     if (!serialized) return
+    if (active.has(this.database.structured.snapshot(id)!.phase)) { this.cancelCli(id); return }
     live.handoff = true
     try {
       const handoff = JSON.parse(serialized) as { id: string; known: string[] }
@@ -346,7 +351,7 @@ export class StructuredSessions {
       // A failed/retried import reuses the handoff identity, so journal replay reconciles each item.
       for (const item of history) if (!known.has(item.id)) this.emit(live, historyEvent(item, handoff.id))
       this.database.removeSetting('cliHandoff:' + id)
-      this.emit(live, { data: { type: 'session', phase: state.phase, view: 'visual' } })
+      this.emit(live, { data: { type: 'session', phase: this.database.structured.snapshot(id)!.phase, view: 'visual' } })
     } finally { live.handoff = false }
   }
 

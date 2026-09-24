@@ -1,3 +1,4 @@
+import { isConversationActivity } from '../shared/conversation-activity'
 import { createHash, randomBytes, randomUUID, timingSafeEqual, X509Certificate } from 'node:crypto'
 import type { AgentControlUiRequest } from '../shared/agent-control'
 import { makeId, type AgentProviderInfo, type AgentSpec, type DetachedWindowRecord, type LayoutNode, type PaneTab, type ProjectRecord, type RuntimeEnsureResult, type RuntimeProcessSummary, type SessionRecord } from '../shared/models'
@@ -753,7 +754,7 @@ export class PhoneAccessService {
     const process = this.deps.database.listProcesses().find(candidate => candidate.id === id)
     const summary = this.summarize(id, project, workspace, tab, projection, activity, process, machines)
     const items = projection?.items ?? []
-    const roots = items.filter(item => !item.parentId && !['steering', 'queue', 'input_delivery'].includes(item.data.type))
+    const roots = items.filter(isConversationActivity).filter(item => !item.parentId && !['steering', 'queue', 'input_delivery'].includes(item.data.type))
     const kept = roots.slice(-PHONE_STATE_LIMITS.items)
     return {
       summary,

@@ -662,6 +662,16 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
 })
 
 describe('queued messages and native CLI handoff', () => {
+  it('cancelling a refused CLI switch preserves the running Chat turn and its runtime', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Keep working', settings)
+    const runtimeId = f.database.structured.snapshot(f.spec.id)!.runtimeId
+    await expect(f.manager.prepareCli(f.spec.id)).rejects.toThrow(/Finish or stop/)
+    f.manager.cancelCli(f.spec.id)
+    expect(f.database.structured.snapshot(f.spec.id)).toMatchObject({ phase: 'running', view: 'visual', runtimeId })
+    expect(f.current.disposed).toBe(false)
+    expect(f.current.submissions).toHaveLength(1)
+  })
   it('restores an interrupted queue after restart without submitting it', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'active', settings)

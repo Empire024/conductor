@@ -217,14 +217,14 @@ const bridge: ConductorBridge = {
       layout: WorkspaceLayout,
       maximizedGroupId: string | null,
       closedTabs: PaneTab[]
-    ) => ipcRenderer.invoke('sessions:save', sessionId, layout, maximizedGroupId, closedTabs),
+    ): Promise<{ restoredTabIds: string[]; layout: WorkspaceLayout } | void> => ipcRenderer.invoke('sessions:save', sessionId, layout, maximizedGroupId, closedTabs),
     listTemplates: (projectId) => ipcRenderer.invoke('sessions:list-templates', projectId),
     saveTemplate: (projectId, name, layout) =>
       ipcRenderer.invoke('sessions:save-template', projectId, name, layout)
   },
   recovery: {
     get: () => ipcRenderer.invoke('recovery:get'),
-    checkpoint: (snapshot: WorkspaceRecoveryCheckpoint) => ipcRenderer.invoke('recovery:checkpoint', snapshot),
+    checkpoint: (snapshot: WorkspaceRecoveryCheckpoint): Promise<Array<{ sessionId: string; restoredTabIds: string[]; layout: WorkspaceLayout }>> => ipcRenderer.invoke('recovery:checkpoint', snapshot),
     flush: (snapshot: WorkspaceRecoveryCheckpoint) => ipcRenderer.sendSync('recovery:flush', snapshot) === true
   },
   files: {

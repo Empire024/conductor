@@ -1,3 +1,4 @@
+import type { RestartInitiator } from './restart-initiator'
 import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
@@ -113,7 +114,7 @@ const toolSignatures = {
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
   'tabs.detach': '({tabId,projectId?,workspaceId?})',
   'tabs.close': '({tabId,projectId?,workspaceId?}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors; a coworker this caller controls in a sibling project closes under the same rule and its control link is released',
-  'agents.list': '() — visible native sessions with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
+  'agents.list': '() — visible native sessions plus live orphans in this workspace (orphaned:true, tabId:null; agents.resume reopens them), with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.artifact': '({agentSessionId,artifactId}) — the full text of a tool output the history only carries a tail of (the outputArtifactId on a tool event), up to 2 MiB',
@@ -124,7 +125,7 @@ const toolSignatures = {
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
   'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one',
   'agents.interrupt': '({agentSessionId}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. Interrupting does not take control, here or in a sibling project',
-  'agents.resume': '({agentSessionId}) — reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls',
+  'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls',
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.handoff': `({handoff,title?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop`,
@@ -170,8 +171,8 @@ export interface AgentControlHost {
   version: string
   pid: number
   openProject?(path: string, name?: string): Promise<ProjectRecord>
-  updates?: { state(): AppUpdateState; check(): Promise<AppUpdateState>; download(): Promise<AppUpdateState>; install(force: boolean): Promise<void> }
-  relaunch(force: boolean): Promise<void>
+  updates?: { state(): AppUpdateState; check(): Promise<AppUpdateState>; download(): Promise<AppUpdateState>; install(force: boolean, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> }
+  relaunch(force: boolean, initiator?: Omit<RestartInitiator, 'at'>): Promise<void>
 }
 
 /** The agentSessionId an owner-credential call carries. No conversation has this id. */
@@ -181,7 +182,7 @@ const ownerSignatures: Record<string, string> = {
   'projects.open': '({path,name?}) — owner credential or wizard tab only: register an existing folder as a project (idempotent) and return it with its workspaces',
   'app.update.check': '() — owner credential or wizard tab only: check the release and local update feeds now and return the update state (phase idle, checking, available, downloading, ready, installing, error or disabled)',
   'app.update.download': '() — owner credential or wizard tab only: download the pending update; poll app.update.check until phase is ready',
-  'app.update.install': '({force?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch; force skips the running-work confirmation and keeps unsaved editor drafts for recovery. A wizard tab is brought back afterwards and told to continue; an outside process waits for a new control-owner.json',
+  'app.update.install': '({force?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch; force skips the running-work confirmation and keeps unsaved editor drafts for recovery. Only the wizard tab that initiated this restart is brought back and told to continue; an outside process waits for a new control-owner.json',
   'app.restart': '({force?}) — owner credential or wizard tab only: relaunch this Conductor (a downloaded update installs on the way out); force as above'
 }
 const ownerMethods = new Set(Object.keys(ownerSignatures))
@@ -433,7 +434,7 @@ export class AgentControl {
    * reach; a conversation a paired machine drives keeps the bounds its pairing drew, on either
    * end; and a sandboxed local model does not steer outside its own project.
    */
-  private target(scope: AgentControlScope, id: string, mutate = false, reach: 'read' | 'steer' | null = null): { tab: AgentControlTab; scope: AgentControlScope } {
+  private target(scope: AgentControlScope, id: string, mutate = false, reach: 'read' | 'steer' | null = null, reopenOrphan = false): { tab: AgentControlTab; scope: AgentControlScope } {
     const spec = this.deps.database.structured.spec<AgentSpec>(id)
     const missing = new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name')
     if (!spec) throw missing
@@ -450,7 +451,11 @@ export class AgentControl {
       if (reach === 'steer' && this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)?.provider === 'local') throw new Error('A sandboxed local conversation cannot steer a tab in another project; a non-local coworker or the owner can')
     }
     const target = elsewhere ? { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId } : scope
-    const tab = this.tabs(target).find(tab => tab.kind === 'agent' && tab.resourceId === id)
+    let tab = this.tabs(target).find(tab => tab.kind === 'agent' && tab.resourceId === id)
+    if (!tab && reopenOrphan && !elsewhere) {
+      const state = this.deps.database.structured.snapshot(id)
+      if (state && hasSessionWork(state)) tab = { id: '', kind: 'agent', resourceId: id, title: state.title || spec.title, groupId: '', uri: '', state: { provider: spec.provider, model: state.settings.model || spec.model, viewMode: 'visual' } }
+    }
     if (!tab) throw missing
     if (sideways && reach === 'steer' && tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
     if (mutate) {
@@ -872,17 +877,25 @@ export class AgentControl {
     }
     if (method === 'agents.list') {
       const observedAt = new Date().toISOString()
-      const own = this.tabs(scope).filter(tab => tab.kind === 'agent').map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
+      const tabs = this.tabs(scope).filter(tab => tab.kind === 'agent')
+      const own = tabs.map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
+      const visible = new Set(tabs.map(tab => tab.resourceId))
+      const orphaned = database.structured.projectSpecs<AgentSpec>(scope.projectId).flatMap(spec => {
+        if (spec.sessionId !== scope.sessionId || visible.has(spec.id)) return []
+        const state = database.structured.snapshot(spec.id)
+        if (!state || !hasSessionWork(state)) return []
+        return [{ observedAt, source: 'native-session', projectId: scope.projectId, workspaceId: scope.sessionId, tabId: null, agentSessionId: spec.id, title: state.title || spec.title, provider: spec.provider, phase: state.phase, orphaned: true }]
+      })
       // A tab this caller handed to another open project is still its own work to follow, and it
       // would otherwise be unfindable after the id that came back from tabs.open is forgotten.
       // `controlled: false` marks a sibling-project tab nobody controls yet.
-      return [...own, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))]
+      return [...own, ...orphaned, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))]
     }
     if (method.startsWith('agents.')) {
       if (typeof args.agentSessionId !== 'string' || !args.agentSessionId.trim()) throw new Error(method + ' requires agentSessionId: the exact id of a visible conversation, as returned by agents.list or app.state')
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history', 'agents.artifact'].includes(method)
       const reach = ['agents.snapshot', 'agents.history', 'agents.status', 'agents.artifact'].includes(method) ? 'read' : ['agents.submit', 'agents.steer', 'agents.interrupt'].includes(method) ? 'steer' : null
-      const { tab, scope: target } = this.target(scope, id, mutate, reach), state = database.structured.snapshot(id)!
+      const { tab, scope: target } = this.target(scope, id, mutate, reach, method === 'agents.resume'), state = database.structured.snapshot(id)!
       if (method === 'agents.artifact') {
         const artifactId = text(args, 'artifactId', 200)
         let content: string
@@ -940,7 +953,17 @@ export class AgentControl {
       if (method === 'agents.grant') return this.grant(scope, source, id, args)
       if (method === 'agents.resume' || method === 'agents.fork') {
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings) && !restricted(state.settings)) throw new Error('A read-only controller cannot resume or fork a writable conversation')
-        if (method === 'agents.resume') { await sessions.resume(id, state.settings); return { agentSessionId: id, phase: database.structured.snapshot(id)?.phase } }
+        if (method === 'agents.resume') {
+          if (!tab.id) {
+            const reopened: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: id, title: tab.title, state: tab.state }
+            await this.ui(scope, 'tabs.open', { tab: reopened })
+            const opened = this.tab(scope, reopened.id)
+            this.relationship(scope, scope, opened, 'attached')
+            return { agentSessionId: id, reopened: true, tabId: opened.id, uri: opened.uri, phase: database.structured.snapshot(id)?.phase }
+          }
+          await sessions.resume(id, state.settings)
+          return { agentSessionId: id, phase: database.structured.snapshot(id)?.phase }
+        }
         const forkId = await sessions.fork(id)
         const forkTab: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: forkId, title: args.title === undefined ? tab.title + ' (fork)' : text(args, 'title', 120), state: { ...tab.state, viewMode: 'visual' } }
         await this.ui(target, 'tabs.open', { tab: forkTab })
@@ -1264,7 +1287,7 @@ export class AgentControl {
     const force = args.force === true
     const later = (label: string, work: () => Promise<void>): void => { setTimeout(() => { work().catch(error => console.warn(`${label} failed`, error)) }, 150) }
     if (method === 'app.restart') {
-      later('app.restart', () => host.relaunch(force))
+      later('app.restart', () => scope.owner ? host.relaunch(force) : host.relaunch(force, { agentSessionId: scope.agentSessionId, method: 'app.restart' }))
       return { restarting: true, force, note: 'Conductor relaunches; a downloaded update installs on the way out. Wait for a new control-owner.json (new pid) before calling again.' }
     }
     if (!host.updates) throw new Error('The updater is unavailable in this Conductor')
@@ -1273,7 +1296,7 @@ export class AgentControl {
     if (method === 'app.update.install') {
       const state = host.updates.state()
       if (state.phase !== 'ready') throw new Error(`No downloaded update to install (phase ${state.phase}). Call app.update.check, then app.update.download, and poll app.update.check until the phase is ready.`)
-      later('app.update.install', () => host.updates!.install(force))
+      later('app.update.install', () => scope.owner ? host.updates!.install(force) : host.updates!.install(force, { agentSessionId: scope.agentSessionId, method: 'app.update.install' }))
       return { installing: true, version: state.availableVersion ?? null, force, note: 'Conductor quits, installs and relaunches. Wait for a new control-owner.json (new pid) before calling again.' }
     }
     throw new Error('Unknown control method; use tools.list')

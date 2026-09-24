@@ -127,13 +127,13 @@ export interface ConductorBridge {
       layout: WorkspaceLayout,
       maximizedGroupId: string | null,
       closedTabs: PaneTab[]
-    ): Promise<void>
+    ): Promise<{ restoredTabIds: string[]; layout: WorkspaceLayout } | void>
     listTemplates(projectId: string): Promise<LayoutTemplateRecord[]>
     saveTemplate(projectId: string, name: string, layout: WorkspaceLayout): Promise<LayoutTemplateRecord>
   }
   recovery: {
     get(): Promise<WorkspaceRecoveryState>
-    checkpoint(snapshot: WorkspaceRecoveryCheckpoint): Promise<void>
+    checkpoint(snapshot: WorkspaceRecoveryCheckpoint): Promise<Array<{ sessionId: string; restoredTabIds: string[]; layout: WorkspaceLayout }>>
     flush(snapshot: WorkspaceRecoveryCheckpoint): boolean
   }
   files: {

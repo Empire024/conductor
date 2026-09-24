@@ -1847,6 +1847,10 @@
     root.appendChild(scroll)
     root.appendChild(footer)
 
+    let workingTimer = null
+    let workingStartedAt = null
+    const workingWords = ['Thinking…', 'Spelunking…', 'Working…', 'Considering…']
+    const stopWorking = () => { if (workingTimer !== null) { clearInterval(workingTimer); workingTimer = null } }
     let firstPaint = true
     let busy = false
 
@@ -1956,6 +1960,7 @@
     }
 
     const drawTimeline = () => {
+      stopWorking()
       const stick = firstPaint || atBottom()
       const top = scroll.scrollTop
       beginTicks()
@@ -1970,13 +1975,27 @@
       for (const interaction of conversation.pending || []) pendingIds[interaction.id] = true
       const items = (conversation.items || []).slice().sort((left, right) => left.sequence - right.sequence)
       let drawn = 0
-      for (const item of items) {
+      for (let index = 0; index < items.length; index++) {
+        const item = items[index], next = items[index + 1]
+        if (item.data.type === 'text' && item.data.role === 'status' && next && next.data.type === 'text' && next.data.role === 'status') continue
         const node = renderTimelineItem(item, pendingIds)
         if (!node) continue
         scroll.appendChild(node)
         drawn += 1
       }
-      if (!drawn) scroll.appendChild(emptyNote('Nothing said yet.', 'Send the first message below.'))
+      const working = ['running', 'starting'].includes(conversation.summary.phase)
+      if (!working) workingStartedAt = null
+      if (!drawn && !working) scroll.appendChild(emptyNote('Nothing said yet.', 'Send the first message below.'))
+      if (working) {
+        if (workingStartedAt === null) workingStartedAt = Date.now()
+        const word = () => workingWords[Math.floor((Date.now() - workingStartedAt) / 7000) % workingWords.length]
+        const line = el('p', 'timeline-working', word())
+        line.setAttribute('role', 'status')
+        scroll.appendChild(line)
+        workingTimer = setInterval(() => {
+          line.textContent = word()
+        }, 7000)
+      }
       if (stick) toBottom()
       else scroll.scrollTop = top
       firstPaint = false
@@ -2049,6 +2068,7 @@
       root: root,
       update: update,
       destroy: () => {
+        stopWorking()
         state.conversationId = null
         state.conversation = null
         if (refetchTimer) { clearTimeout(refetchTimer); refetchTimer = null }

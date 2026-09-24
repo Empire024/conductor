@@ -1375,7 +1375,7 @@ describe('wizard tabs', () => {
     expect(await control.call(f.scope, 'app.restart', { force: true })).toMatchObject({ restarting: true, force: true })
     await vi.runAllTimersAsync()
     vi.useRealTimers()
-    expect(host.relaunch).toHaveBeenCalledWith(true)
+    expect(host.relaunch).toHaveBeenCalledWith(true, { agentSessionId: f.spec.id, method: 'app.restart' })
     const opened = await control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Wizard’s worker', focus: false }) as { id: string; resourceId: string }
     expect(f.database.structured.snapshot(opened.resourceId)!.settings.permission).toBe('auto')
     expect(f.database.structured.spec<AgentSpec>(opened.resourceId)?.continueOnLimit).toBe(true)
@@ -1712,5 +1712,62 @@ describe('control catalog and dispatch repairs', () => {
     const kept = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Accepted worker', prompt: 'Runs', provider: 'codex', model: 'codex-synthetic' }] }) as Array<Record<string, unknown>>
     expect(kept[0]).toMatchObject({ accepted: true })
     expect(f.orchestration.listTasks(f.project.id).filter(task => task.title === 'Accepted worker')).toHaveLength(1)
+  })
+})
+
+describe('B1: orphaned live agents and the restart initiator', () => {
+  const append = (f: ReturnType<typeof fixture>, id: string, data: AgentEventData): void => {
+    const state = f.database.structured.snapshot(id)!, spec = f.database.structured.spec<AgentSpec>(id)!
+    f.database.structured.append({ schemaVersion: 1, id: 'b1-event-' + (state.sequence + 1), sequence: state.sequence + 1, sessionId: id, runtimeId: state.runtimeId || 'b1-runtime', provider: spec.provider as StructuredProvider, projectId: spec.projectId, workspaceId: spec.sessionId, cwd: spec.cwd, timestamp: new Date().toISOString(), data })
+  }
+  const asWizard = (f: ReturnType<typeof fixture>): void => {
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+  }
+
+  it('agents.list reports a running agent of this workspace that lost its tab, and agents.resume reopens a tab for it', async () => {
+    const f = fixture()
+    const orphan: AgentSpec = { id: 'orphan-coworker', projectId: f.project.id, sessionId: f.workspace.id, cwd: f.project.path, provider: 'claude', title: 'Lost coworker', model: 'claude-synthetic' }
+    f.sessions.ensure(orphan)
+    append(f, orphan.id, { type: 'session', phase: 'running' })
+    // A settled conversation without a tab is history, not an orphan.
+    const settled: AgentSpec = { ...orphan, id: 'settled-coworker', title: 'Settled' }
+    f.sessions.ensure(settled)
+    const listed = await f.control.call(f.scope, 'agents.list', {}) as Array<Record<string, unknown>>
+    expect(listed).toEqual(expect.arrayContaining([expect.objectContaining({ agentSessionId: orphan.id, orphaned: true, phase: 'running', tabId: null, workspaceId: f.workspace.id, title: 'Lost coworker' })]))
+    expect(listed.some(entry => entry.agentSessionId === settled.id)).toBe(false)
+    const reopened = await f.control.call(f.scope, 'agents.resume', { agentSessionId: orphan.id }) as Record<string, unknown>
+    const opened = f.requests.find(request => request.action === 'tabs.open' && (request.params.tab as PaneTab).resourceId === orphan.id)
+    expect(opened).toBeTruthy()
+    expect(opened!.params.focus).not.toBe(true)
+    expect(reopened).toMatchObject({ agentSessionId: orphan.id, reopened: true })
+    // Reopening does not restart a turn that is still running.
+    expect(f.database.structured.snapshot(orphan.id)!.phase).toBe('running')
+    const after = await f.control.call(f.scope, 'agents.list', {}) as Array<Record<string, unknown>>
+    const entry = after.find(item => item.agentSessionId === orphan.id)
+    expect(entry).toMatchObject({ tabId: (opened!.params.tab as PaneTab).id })
+    expect(entry).not.toHaveProperty('orphaned', true)
+  })
+
+  it('a wizard restart names its caller as the initiator; the owner credential names none', async () => {
+    const f = fixture()
+    const ready = () => ({ phase: 'ready' as const, currentVersion: '2.0.0', availableVersion: '2.0.1', configured: true })
+    const host = { version: '2.0.0', pid: 77, relaunch: vi.fn(async () => {}), updates: { state: vi.fn(ready), check: vi.fn(async () => ready()), download: vi.fn(async () => ready()), install: vi.fn(async () => {}) } }
+    const control = new AgentControl({ ...f.deps, host })
+    asWizard(f)
+    vi.useFakeTimers()
+    await control.call(f.scope, 'app.restart', { force: true })
+    await control.call(f.scope, 'app.update.install', {})
+    await vi.runAllTimersAsync()
+    expect(host.relaunch).toHaveBeenCalledWith(true, { agentSessionId: f.spec.id, method: 'app.restart' })
+    expect(host.updates.install).toHaveBeenCalledWith(false, { agentSessionId: f.spec.id, method: 'app.update.install' })
+    host.relaunch.mockClear(); host.updates.install.mockClear()
+    const owner = control.ownerScope({ projectId: f.project.id })
+    await control.call(owner, 'app.restart', {})
+    await control.call(owner, 'app.update.install', { force: true })
+    await vi.runAllTimersAsync()
+    expect(host.relaunch.mock.calls).toEqual([[false]])
+    expect(host.updates.install.mock.calls).toEqual([[true]])
+    vi.useRealTimers()
   })
 })

@@ -1,3 +1,5 @@
+import { applyLayoutUpdate, type LayoutUpdate } from './layout/layout-update'
+import { releaseHiddenModals } from './panes/modal-guard'
 import { useAgentControl } from './use-agent-control'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
 import { ListTodo } from 'lucide-react'
@@ -47,8 +49,16 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
   useEffect(() => { const refresh = (): void => { void window.conductor.projects.list().then(setLoadedProjects) }; refresh(); window.addEventListener('focus', refresh); return () => window.removeEventListener('focus', refresh) }, [])
   const [bundle, setBundle] = useState<DetachedBundle | null>(null)
-  const [layout, setLayout] = useState<WorkspaceLayout | null>(null)
+  const [layout, setLayoutState] = useState<WorkspaceLayout | null>(null)
+  const setLayout = useCallback((update: LayoutUpdate) => setLayoutState(current => current ? applyLayoutUpdate(current, update) : typeof update === 'function' ? current : update), [])
   const [maximizedGroupId, setMaximizedGroupId] = useState<string | null>(null)
+  const activeTabIds = layout ? listGroups(layout.root).map(group => group.activeTabId).join(',') : ''
+  useEffect(() => {
+    const release = (): void => { releaseHiddenModals(document) }
+    document.addEventListener('pointerdown', release, true)
+    return () => document.removeEventListener('pointerdown', release, true)
+  }, [])
+  useEffect(() => { releaseHiddenModals(document) }, [detachedId, bundle?.session.id, activeTabIds, maximizedGroupId])
   const [focusedGroupId, setFocusedGroupId] = useState('')
   const [closedTabs, setClosedTabs] = useState<PaneTab[]>([])
   const [settings, setSettings] = useState<AppSettings>(() => window.conductor.settings.getStartup())
