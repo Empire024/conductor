@@ -1,12 +1,13 @@
 import type { AgentActivityPhase } from '../shared/models'
 import type { PhoneAutoModeDenial, PhoneNotification, PhoneSessionState, PhoneSessionSummary } from '../shared/phone-access'
 import { autoModeDenialOf, autoModeDenialSummary } from '../shared/auto-mode-denial'
+import { isViewing } from '../shared/project-activity'
 import type { PendingInteraction, SessionPhase, TimelineItem } from '../shared/structured-agent'
 
 /** The projection fields the state word needs. Declared here rather than as a Pick so the rule
  *  reads the same whether or not the projection type in this tree already carries the usage
  *  window; a projection without one simply never reports it. */
-export interface PhoneStateSource { phase: SessionPhase; limitResumeAt?: string | null }
+export interface PhoneStateSource { phase: SessionPhase; limitResumeAt?: string | null; backgroundTasks?: number }
 /** Persisted phases, plus the background-work phase newer runtimes record. */
 export type PhoneActivity = AgentActivityPhase | 'waiting_background'
 
@@ -23,7 +24,8 @@ export function phoneSessionState(projection: PhoneStateSource | null, activity:
   const phase = projection?.phase
   if (phase === 'waiting_approval' || phase === 'waiting_input') return 'attention'
   if (activity === 'limited' || projection?.limitResumeAt) return 'limited'
-  if (phase === 'running' || phase === 'starting' || phase === 'interrupting' || activity === 'working' || activity === 'waiting_background') return 'working'
+  // A turn that ended while its own background tasks still run is viewing: ranked with working, never done.
+  if (phase === 'running' || phase === 'starting' || phase === 'interrupting' || activity === 'working' || activity === 'waiting_background' || isViewing(phase, projection?.backgroundTasks)) return 'working'
   if (phase === 'failed' || activity === 'failed') return 'failed'
   if (phase === 'disconnected') return 'disconnected'
   if (phase === 'interrupted' || activity === 'stopped') return 'stopped'

@@ -646,3 +646,21 @@ describe('sw.js', () => {
     expect(await sw.request('/api/health', 'cors')).toBeNull()
   })
 })
+
+describe('phone viewing state', () => {
+  const extract = (name: string) => {
+    const source = new RegExp(`function ${name}\\(([a-z]+)\\) \\{([\\s\\S]*?)\\r?\\n  \\}`).exec(appSource)
+    if (!source) throw new Error('missing ' + name)
+    return new Function(source[1]!, source[2]!) as (value: unknown) => unknown
+  }
+  it('says Viewing for a settled turn whose background tasks still run, and drops the turn timer', () => {
+    const viewing = extract('sessionViewing')
+    expect(viewing({ state: 'working', activity: 'waiting_background', phase: 'completed', backgroundTasks: 1 })).toBe(true)
+    expect(viewing({ state: 'working', activity: 'complete', phase: 'idle', backgroundTasks: 2 })).toBe(true)
+    expect(viewing({ state: 'working', activity: 'working', phase: 'running', backgroundTasks: 1 })).toBe(false)
+    expect(viewing({ state: 'done', activity: 'complete', phase: 'completed', backgroundTasks: 0 })).toBe(false)
+    expect(extract('viewingDescription')(1)).toBe('Turn ended; 1 background task still running; the agent continues when they finish')
+    expect(appSource).toContain("viewing ? 'Viewing' : STATE_WORDS[session.state]")
+    expect(appSource).toContain("session.state === 'working' && !viewing && session.turnStartedAt")
+  })
+})

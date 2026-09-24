@@ -1988,3 +1988,26 @@ describe('supervision and bounded recovery through app control', () => {
     expect(JSON.stringify(await f.control.call(f.scope, 'tools.list', {}))).toContain('agents.supersede')
   })
 })
+
+describe('viewing through app control', () => {
+  it('reports a settled turn whose background tasks still run as phase viewing with the count, never completed', async () => {
+    const f = fixture()
+    const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic' }) as AgentControlTab
+    const id = tab.resourceId!
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Run the smoke in the background and wait for it' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('completed'))
+    const before = await f.control.call(f.scope, 'agents.status', { agentSessionId: id }) as Record<string, any>
+    expect(before).toMatchObject({ phase: 'completed', backgroundTasks: 0 })
+    f.submissions.at(-1)!.options.emit({ data: { type: 'session', phase: 'completed', backgroundTasks: 1 } })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.backgroundTasks).toBe(1))
+    const listed = (await f.control.call(f.scope, 'agents.list', {}) as Array<Record<string, any>>).find(entry => entry.agentSessionId === id)
+    expect(listed).toMatchObject({ phase: 'viewing', backgroundTasks: 1 })
+    const status = await f.control.call(f.scope, 'agents.status', { agentSessionId: id }) as Record<string, any>
+    expect(status).toMatchObject({ phase: 'viewing', backgroundTasks: 1 })
+    // The watcher reporting back is a meaningful change for a supervising controller.
+    expect(status.cursor).not.toBe(before.cursor)
+    f.submissions.at(-1)!.options.emit({ data: { type: 'session', phase: 'completed', backgroundTasks: 0 } })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.backgroundTasks ?? 0).toBe(0))
+    expect(await f.control.call(f.scope, 'agents.status', { agentSessionId: id })).toMatchObject({ phase: 'completed', backgroundTasks: 0 })
+  })
+})

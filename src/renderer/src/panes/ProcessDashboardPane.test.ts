@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { RuntimeProcessSummary } from '../../../shared/models'
 import type { SessionProjection, TimelineItem } from '../../../shared/structured-agent'
-import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses } from './ProcessDashboardPane.helpers'
+import { createSerialPoller, currentTurnStartedAt, durationLabel, isProcessWorking, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses } from './ProcessDashboardPane.helpers'
 
 const process = (overrides: Partial<RuntimeProcessSummary> = {}): RuntimeProcessSummary => ({
   id: 'agent-1', projectId: 'project-1', sessionId: 'workspace-1', kind: 'agent', title: 'Agent',
@@ -89,5 +89,16 @@ describe('bounded cross-project process board', () => {
     }))
     expect(selectProcessBoardProcesses(processes, now, 25)).toMatchObject({ hiddenOlder: 35 })
     expect(selectProcessBoardProcesses(processes, now, 25).processes).toHaveLength(25)
+  })
+})
+
+describe('viewing on the Processes board', () => {
+  it('shows a settled turn with running background tasks as viewing, not working or finished', () => {
+    const base = { id: 'p', kind: 'agent', title: 'W13', projectId: 'project', sessionId: 'workspace', status: 'running', updatedAt: '2026-09-24T20:00:00.000Z' } as unknown as Parameters<typeof processTrackerState>[0]
+    expect(processTrackerState({ ...base, activityPhase: 'waiting_background' })).toBe('viewing')
+    // The snapshot knows before the persisted row does.
+    expect(processTrackerState({ ...base, status: 'complete', activityPhase: 'complete' }, { phase: 'completed', backgroundTasks: 1 })).toBe('viewing')
+    expect(processTrackerState({ ...base, status: 'complete', activityPhase: 'complete' }, { phase: 'completed', backgroundTasks: 0 })).toBe('finished')
+    expect(isProcessWorking({ ...base, activityPhase: 'waiting_background' })).toBe(true)
   })
 })

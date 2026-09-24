@@ -33,6 +33,7 @@
 .pd-runtime-icon { width: 26px; height: 26px; display: grid; flex: 0 0 auto; place-items: center; border: 1px solid var(--border-soft); border-radius: 8px; color: var(--accent-muted); background: var(--surface-2); }
 .pd-state-marker { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--text-3); box-shadow: 0 0 0 3px color-mix(in srgb, var(--text-3) 12%, transparent); }
 .pd-state-marker.working { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); animation: session-activity-pulse 1.4s ease-in-out infinite; }
+.pd-state-marker.viewing { background: color-mix(in srgb, var(--accent) 55%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 10%, transparent); animation: session-activity-pulse 2.8s ease-in-out infinite; }
 .pd-state-marker.attention, .pd-state-marker.paused { background: #e2b872; box-shadow: 0 0 0 3px color-mix(in srgb, #e2b872 14%, transparent); }
 .pd-state-marker.disconnected { background: #c792ea; box-shadow: 0 0 0 3px color-mix(in srgb, #c792ea 14%, transparent); }
 .pd-state-marker.finished { background: #85b866; box-shadow: 0 0 0 3px color-mix(in srgb, #85b866 12%, transparent); }
@@ -58,4 +59,4 @@
 .pd-presence article > span { color: var(--accent-muted); font-size: 7px; text-transform: uppercase; }.pd-presence article strong { overflow: hidden; color: var(--text-2); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }.pd-presence article small { color: var(--text-3); font-size: 7px; }
 .pd-footer { margin: 0 12px 12px; padding: 7px 9px; display: flex; align-items: center; gap: 6px; border-radius: 8px; color: #e2b872; background: color-mix(in srgb, #e2b872 7%, transparent); font-size: 8.5px; }.pd-footer svg:last-child { margin-left: auto; }
 @media (max-width: 900px) { .pd-overview { grid-template-columns: repeat(3, minmax(0, 1fr)); }.pd-overview > span:nth-child(3) { border-right: 0; }.pd-overview > span:nth-child(-n+3) { border-bottom: 1px solid var(--border-soft); }.pd-table-head { display: none; }.pd-row { grid-template-columns: minmax(160px, 2fr) minmax(105px, 1fr) minmax(90px, .8fr) auto; }.pd-progress-cell, .pd-usage { grid-row: 2; margin-top: 4px; }.pd-activity { display: none; } }
-@media (prefers-reduced-motion: reduce) { .pd-state-marker.working { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .pd-state-marker.working, .pd-state-marker.viewing { animation: none; } }

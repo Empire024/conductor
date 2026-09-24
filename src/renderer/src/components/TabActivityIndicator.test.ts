@@ -41,6 +41,15 @@ describe('tab activity indicator', () => {
     expect(new Set([ACTIVITY_LABEL.waiting_background, ACTIVITY_LABEL.working, ACTIVITY_LABEL.complete]).size).toBe(3)
   })
 
+  it('calls it Viewing and says why the ring still turns, with the task count when known', () => {
+    expect(ACTIVITY_LABEL.waiting_background).toBe('Viewing')
+    expect(render('waiting_background')).toContain('title="Viewing: Turn ended; background tasks still running; the agent continues when they finish"')
+    const counted = renderToStaticMarkup(createElement(TabActivityIndicator, { phase: 'waiting_background', title: 'Claude', spinEpoch: 0, backgroundTasks: 1 }))
+    expect(counted).toContain('Turn ended; 1 background task still running')
+    expect(counted).toContain('aria-label="Claude: Viewing"')
+    expect(render('working')).toContain('title="Working"')
+  })
+
   it('describes every phase', () => {
     const phases: AgentActivityPhase[] = ['idle', 'working', 'waiting_background', 'waiting_input', 'limited', 'complete', 'stopped', 'disconnected', 'failed']
     for (const phase of phases) expect(ACTIVITY_LABEL[phase]).toBeTruthy()

@@ -99,7 +99,7 @@ export function supervise(state: SessionProjection, reviews?: ReviewRecord[]): S
   // while a turn runs the answer is not a result yet.
   const settled = TERMINAL.has(state.phase) || state.phase === 'idle' ? state.items.filter(item => item.data.type === 'text' && item.data.role === 'assistant').sort((a, b) => a.sequence - b.sequence).at(-1)?.id ?? null : null
   const cursor = createHash('sha256').update(JSON.stringify([state.phase, pending.map(entry => [entry.requestId, entry.waitingOn, entry.review?.phase ?? null]), activeTool && [activeTool.name, activeTool.status, activeTool.since],
-    started && [started.promptItemId, started.state], waitingPrompts, artifacts, settled, errors])).digest('hex').slice(0, 16)
+    started && [started.promptItemId, started.state], waitingPrompts, artifacts, settled, errors, state.backgroundTasks ?? 0])).digest('hex').slice(0, 16)
   return { cursor, pending, activeTool, turnStart: started, waitingPrompts, artifacts, usage }
 }
 

@@ -33,6 +33,7 @@ import { createApprovalRouting } from './approval-review-routing'
 import { ApprovalReviews } from './approval-review'
 import { sinceCursor, supervise } from './agent-supervision'
 import { CoworkerRecovery } from './coworker-recovery'
+import { displaySessionPhase } from '../shared/project-activity'
 import { localStopOf } from '../shared/local-stop.ts'
 import { summarizeContext } from '../shared/usage-accounting'
 import { normaliseContract } from './local-models/completion.ts'
@@ -120,7 +121,7 @@ const toolSignatures = {
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
   'tabs.detach': '({tabId,projectId?,workspaceId?})',
   'tabs.close': '({tabId,projectId?,workspaceId?}) — closes settled agent tabs with history retained; other tabs and active work require owner confirmation; never closes the caller or its ancestors; a coworker this caller controls in a sibling project closes under the same rule and its control link is released',
-  'agents.list': '() — visible native sessions plus live orphans in this workspace (orphaned:true, tabId:null; agents.resume reopens them), with observedAt, workspace/tab IDs, phase and lastActivityAt, including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
+  'agents.list': '() — visible native sessions plus live orphans in this workspace (orphaned:true, tabId:null; agents.resume reopens them), with observedAt, workspace/tab IDs, phase and lastActivityAt (phase "viewing" with backgroundTasks N: the turn ended but background tasks it started still run and the agent continues when they finish - not done), including tabs this caller controls in a sibling project (controlled:true) and sibling-project tabs nobody controls (controlled:false); an uncontrolled one may be read with agents.snapshot/status/history and steered with submit/steer/interrupt, and submit/steer take control of it; a controlled one answers every agents.* and tabs.* method as a coworker in this workspace does',
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.artifact': '({agentSessionId,artifactId}) — the full text of a tool output the history only carries a tail of (the outputArtifactId on a tool event), up to 2 MiB',
@@ -448,7 +449,9 @@ export class AgentControl {
     return {
       observedAt, source: 'native-session' as const, projectId: scope.projectId, workspaceId: scope.sessionId,
       tabId: tab.id, agentSessionId: tab.resourceId, groupId: tab.groupId, detachedId: tab.detachedId,
-      title: tab.title, provider: tab.state?.provider, uri: tab.uri, phase: state?.phase ?? null,
+      title: tab.title, provider: tab.state?.provider, uri: tab.uri,
+      // A settled turn whose background tasks still run is 'viewing', never read as finished.
+      phase: state ? displaySessionPhase(state.phase, state.backgroundTasks) : null, backgroundTasks: state?.backgroundTasks ?? 0,
       wizard: wizardActive(state?.settings, typeof tab.state?.provider === 'string' ? tab.state.provider : undefined),
       lastActivityAt: lastEvent?.timestamp ?? null, sequence: state?.sequence ?? 0,
       lastEvent: lastEvent ? {
@@ -929,7 +932,7 @@ export class AgentControl {
         if (spec.sessionId !== scope.sessionId || visible.has(spec.id)) return []
         const state = database.structured.snapshot(spec.id)
         if (!state || !hasSessionWork(state)) return []
-        return [{ observedAt, source: 'native-session', projectId: scope.projectId, workspaceId: scope.sessionId, tabId: null, agentSessionId: spec.id, title: state.title || spec.title, provider: spec.provider, phase: state.phase, orphaned: true }]
+        return [{ observedAt, source: 'native-session', projectId: scope.projectId, workspaceId: scope.sessionId, tabId: null, agentSessionId: spec.id, title: state.title || spec.title, provider: spec.provider, phase: displaySessionPhase(state.phase, state.backgroundTasks), backgroundTasks: state.backgroundTasks ?? 0, orphaned: true }]
       })
       // A tab this caller handed to another open project is still its own work to follow, and it
       // would otherwise be unfindable after the id that came back from tabs.open is forgotten.

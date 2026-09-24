@@ -7,6 +7,7 @@ import { summarizeUsageRun, type UsageScopeReport } from '../../../shared/usage-
 import { evaluateUsageWarning, type UsageWarningLevel } from '../../../shared/usage-warning'
 import { processModelLabel } from '../agent-models'
 import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses, type ProcessTrackerState } from './ProcessDashboardPane.helpers'
+import { VIEWING_LABEL, viewingDescription } from '../../../shared/project-activity'
 import './ProcessDashboardPane.css'
 import { WeeklyUsage } from '../components/WeeklyUsage'
 
@@ -34,9 +35,9 @@ const relativeTime = (timestamp: string, now: number): string => {
 }
 const tokenLabel = (tokens: number): string => tokens >= 1_000_000 ? `${(tokens / 1_000_000).toFixed(1)}m` : tokens >= 1000 ? `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k` : String(tokens)
 const stateLabel: Record<ProcessTrackerState, string> = {
-  attention: 'Needs input', working: 'Working', paused: 'Limit pause', disconnected: 'Disconnected', ready: 'Connected · idle', finished: 'Finished'
+  attention: 'Needs input', working: 'Working', viewing: VIEWING_LABEL, paused: 'Limit pause', disconnected: 'Disconnected', ready: 'Connected · idle', finished: 'Finished'
 }
-const stateRank: Record<ProcessTrackerState, number> = { attention: 0, working: 1, paused: 2, disconnected: 3, ready: 4, finished: 5 }
+const stateRank: Record<ProcessTrackerState, number> = { attention: 0, working: 1, viewing: 1, paused: 2, disconnected: 3, ready: 4, finished: 5 }
 
 async function readFacts(process: RuntimeProcessSummary): Promise<readonly [string, ProcessFacts]> {
   if (process.kind !== 'agent') return [process.id, {}] as const
@@ -104,7 +105,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
   const counts = useMemo(() => rows.reduce((result, row) => {
     result[row.state] += 1
     return result
-  }, { attention: 0, working: 0, paused: 0, disconnected: 0, ready: 0, finished: 0 } as Record<ProcessTrackerState, number>), [rows])
+  }, { attention: 0, working: 0, viewing: 0, paused: 0, disconnected: 0, ready: 0, finished: 0 } as Record<ProcessTrackerState, number>), [rows])
   const totalUsage = useMemo(() => [...dashboard.facts.values()].reduce((total, facts) => ({
     tokens: total.tokens + (facts.usage?.tokens?.totalTokens ?? 0),
     cost: total.cost + (facts.usage?.costUsd ?? 0)
@@ -148,6 +149,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
     </header>
     <section className="pd-overview" aria-label="Project process summary">
       <span className={counts.working ? 'working' : ''}><b>{counts.working}</b><small>Working now</small></span>
+      {counts.viewing > 0 && <span title={viewingDescription()}><b>{counts.viewing}</b><small>{VIEWING_LABEL}</small></span>}
       <span className={counts.attention ? 'attention' : ''}><b>{counts.attention}</b><small>Need you</small></span>
       <span><b>{counts.paused}</b><small>Limit paused</small></span>
       <span><b>{counts.disconnected}</b><small>Disconnected</small></span>
@@ -175,7 +177,7 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
         const RuntimeIcon = process.kind === 'agent' ? Bot : TerminalSquare
         return <article key={process.id} role="row" data-process-id={process.id} className={`pd-row state-${state}`} onDoubleClick={() => focus(process)}>
           <div className="pd-runtime" role="cell"><span className="pd-runtime-icon"><RuntimeIcon size={15} /></span><span><strong>{process.title}</strong><small>{process.kind === 'agent' ? `${process.provider ?? 'agent'} · ${model ?? 'model unavailable'}` : 'PowerShell process'}</small></span></div>
-          <div className="pd-state" role="cell"><span className={`pd-state-marker ${state}`} title={`${stateLabel[state]}. ${state === 'ready' ? 'The adapter is connected but no turn is working.' : state === 'disconnected' ? 'Conversation history remains available; reconnect only when you choose.' : 'Reported by the runtime.'}`} /><span><strong>{stateLabel[state]}</strong>{finishedExecution ? <small>Last execution finished</small> : turnTime && state === 'working' ? <small>Latest prompt {turnTime} ago</small> : null}</span></div>
+          <div className="pd-state" role="cell"><span className={`pd-state-marker ${state}`} title={`${stateLabel[state]}. ${state === 'ready' ? 'The adapter is connected but no turn is working.' : state === 'viewing' ? viewingDescription(facts.snapshot?.backgroundTasks) + '.' : state === 'disconnected' ? 'Conversation history remains available; reconnect only when you choose.' : 'Reported by the runtime.'}`} /><span><strong>{stateLabel[state]}</strong>{finishedExecution ? <small>Last execution finished</small> : turnTime && state === 'working' ? <small>Latest prompt {turnTime} ago</small> : null}</span></div>
           <div className="pd-progress-cell" role="cell">{plan ? <><span>{plan.label}</span><progress max={plan.total} value={plan.completed} aria-label={`${process.title}: ${plan.label}`} /></> : <span className="pd-unreported">No plan reported</span>}</div>
           <div className={`pd-usage${facts.warning ? ` warning-${facts.warning}` : ''}`} role="cell" title={facts.warning ? `${process.title} usage is ${facts.warning === 'high' ? 'high' : 'rising'}` : undefined}><strong>{usageTokens === undefined ? '—' : `${tokenLabel(usageTokens)} tok`}</strong><small>{facts.usage?.costUsd ? `$${facts.usage.costUsd.toFixed(2)}` : 'No cost reported'}</small></div>
           <div className="pd-activity" role="cell"><strong>{relativeTime(process.updatedAt, now)}</strong><small>Last runtime change</small></div>

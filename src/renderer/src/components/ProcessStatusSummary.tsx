@@ -57,7 +57,8 @@ export function aggregateProjectProcessUsage(
     entry.processes += 1
     const usage = usageByProcessId.get(process.id)
     const state = processTrackerState(process, usage?.snapshotPhase ? { phase: usage.snapshotPhase } : undefined)
-    if (state === 'working') entry.running += 1
+    // A viewing agent's own background tasks are still running: it counts as running, not done.
+    if (state === 'working' || state === 'viewing') entry.running += 1
     if (state === 'attention') entry.attention += 1
     if (state === 'paused') entry.paused += 1
     if (state === 'disconnected') entry.disconnected += 1

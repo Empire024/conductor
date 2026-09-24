@@ -38,6 +38,16 @@
     idle: 'Idle'
   }
 
+  /* "Viewing": the turn ended but background tasks it started still run, and the agent continues
+     when they finish (src/shared/project-activity.ts). It stays in the working filter; only the
+     word and the missing turn timer tell it apart. */
+  function sessionViewing(session) {
+    return session.state === 'working' && (session.activity === 'waiting_background' || (session.backgroundTasks > 0 && (session.phase === 'completed' || session.phase === 'idle')))
+  }
+  function viewingDescription(count) {
+    return 'Turn ended; ' + (count > 0 ? count + ' background task' + (count === 1 ? '' : 's') : 'background tasks') + ' still running; the agent continues when they finish'
+  }
+
   const PROVIDER_WORDS = {
     codex: 'Codex',
     claude: 'Claude',
@@ -1264,9 +1274,12 @@
     const meta = el('div', 'session-meta')
     const parts = [providerWord(session.provider), session.model]
     if (session.machineId && session.machineId !== 'local') parts.push('on ' + session.machineName)
-    meta.appendChild(el('span', 'session-state tone-' + (session.state || 'idle'), STATE_WORDS[session.state] || 'Idle'))
+    const viewing = sessionViewing(session)
+    const stateWord = el('span', 'session-state tone-' + (session.state || 'idle') + (viewing ? ' viewing' : ''), viewing ? 'Viewing' : STATE_WORDS[session.state] || 'Idle')
+    if (viewing) stateWord.title = viewingDescription(session.backgroundTasks)
+    meta.appendChild(stateWord)
     meta.appendChild(el('span', 'session-facts', dotRow(parts)))
-    if (session.state === 'working' && session.turnStartedAt) {
+    if (session.state === 'working' && !viewing && session.turnStartedAt) {
       const timer = el('span', 'session-timer')
       onTick(() => { timer.textContent = elapsedSince(session.turnStartedAt) })
       meta.appendChild(timer)

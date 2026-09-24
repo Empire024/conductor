@@ -452,6 +452,9 @@ describe('notifications', () => {
   it('derives the phone state word from the projection and the persisted phase', () => {
     expect(phoneSessionState({ phase: 'completed' }, 'working')).toBe('working')
     expect(phoneSessionState({ phase: 'completed' }, 'waiting_background')).toBe('working')
+    // Viewing from the projection alone, before the persisted phase caught up: never 'done'.
+    expect(phoneSessionState({ phase: 'completed', backgroundTasks: 1 }, 'complete')).toBe('working')
+    expect(phoneSessionState({ phase: 'completed', backgroundTasks: 0 }, 'complete')).toBe('done')
     expect(phoneSessionState({ phase: 'completed' }, 'complete')).toBe('done')
     expect(phoneSessionState({ phase: 'idle', limitResumeAt: '2026-09-21T10:00:00Z' }, 'idle')).toBe('limited')
     expect(phoneSessionState({ phase: 'waiting_approval' }, 'working')).toBe('attention')

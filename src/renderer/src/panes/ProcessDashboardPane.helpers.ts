@@ -1,7 +1,9 @@
 import type { RuntimeProcessSummary } from '../../../shared/models'
 import type { SessionProjection, TimelineItem } from '../../../shared/structured-agent'
+import { isViewing } from '../../../shared/project-activity'
 
-export type ProcessTrackerState = 'attention' | 'working' | 'paused' | 'disconnected' | 'ready' | 'finished'
+/** 'viewing': the turn ended but background tasks it started still run (shared/project-activity.ts). */
+export type ProcessTrackerState = 'attention' | 'working' | 'viewing' | 'paused' | 'disconnected' | 'ready' | 'finished'
 
 export interface ReportedPlanProgress {
   completed: number
@@ -40,7 +42,7 @@ export function selectProcessBoardProcesses(
 
 /** Runtime state comes from the persisted process/activity record. A connected adapter is only
  * "working" when it is starting or its activity phase says work is being produced. */
-export function processTrackerState(process: RuntimeProcessSummary, snapshot?: Pick<SessionProjection, 'phase'> | null): ProcessTrackerState {
+export function processTrackerState(process: RuntimeProcessSummary, snapshot?: (Pick<SessionProjection, 'phase'> & Partial<Pick<SessionProjection, 'backgroundTasks'>>) | null): ProcessTrackerState {
   // Connection state and execution state are distinct. A completed turn can later lose its
   // adapter while retaining a resumable native conversation; that snapshot is authoritative for
   // whether the owner must explicitly reconnect it.
@@ -48,13 +50,15 @@ export function processTrackerState(process: RuntimeProcessSummary, snapshot?: P
   if (process.needsInput || process.status === 'waiting_input' || process.activityPhase === 'waiting_input') return 'attention'
   if (process.status === 'limited' || process.activityPhase === 'limited') return 'paused'
   if (process.activityPhase === 'disconnected') return 'disconnected'
+  // Background work the runtime will wake this conversation for is neither the adapter sitting
+  // idle nor a finished run: the turn ended while tasks it started still run.
+  if (process.activityPhase === 'waiting_background' || isViewing(snapshot?.phase, snapshot?.backgroundTasks)) return 'viewing'
   if (['complete', 'exited', 'error', 'unavailable'].includes(process.status) || ['complete', 'failed', 'stopped'].includes(process.activityPhase ?? '')) return 'finished'
-  // Background work the runtime will wake this conversation for is not the adapter sitting idle.
-  if (process.status === 'starting' || process.activityPhase === 'working' || process.activityPhase === 'waiting_background') return 'working'
+  if (process.status === 'starting' || process.activityPhase === 'working') return 'working'
   return 'ready'
 }
 
-export const isProcessWorking = (process: RuntimeProcessSummary, snapshot?: Pick<SessionProjection, 'phase'> | null): boolean => processTrackerState(process, snapshot) === 'working'
+export const isProcessWorking = (process: RuntimeProcessSummary, snapshot?: Pick<SessionProjection, 'phase'> | null): boolean => ['working', 'viewing'].includes(processTrackerState(process, snapshot))
 
 export function reportedPlanProgress(snapshot: SessionProjection | null | undefined): ReportedPlanProgress | undefined {
   if (!snapshot) return undefined

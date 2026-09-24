@@ -27,3 +27,18 @@ export const foldActivityStatuses = (statuses: Iterable<ActivityRollupStatus>): 
 /** What a row paints: a stalled roll-up is a warning like any other once nothing outranked it. */
 export const displayActivityStatus = (status: ActivityRollupStatus): ProjectActivityStatus =>
   status === 'stalled' ? 'waiting' : status
+
+/** "Viewing": the turn ended, but background tasks it started (a backgrounded shell running a
+ *  smoke test, an armed watcher) are still running, and the runtime wakes the agent again when
+ *  they report. It is not done, so every roll-up ranks it like working. The main process records
+ *  it as the activity phase 'waiting_background'; the control API reports it as phase 'viewing'. */
+export const VIEWING_LABEL = 'Viewing'
+export const viewingDescription = (backgroundTasks?: number): string =>
+  `Turn ended; ${backgroundTasks && backgroundTasks > 0 ? `${backgroundTasks} background task${backgroundTasks === 1 ? '' : 's'}` : 'background tasks'} still running; the agent continues when they finish`
+/** Whether a conversation phase (session or activity vocabulary) is a settled one that still has
+ *  background tasks running. */
+export const isViewing = (phase: string | null | undefined, backgroundTasks: number | null | undefined): boolean =>
+  (backgroundTasks ?? 0) > 0 && (phase === 'completed' || phase === 'complete' || phase === 'idle' || phase === 'waiting_background')
+/** The phase to report to a caller that must not read a viewing conversation as finished. */
+export const displaySessionPhase = <P extends string>(phase: P, backgroundTasks: number | null | undefined): P | 'viewing' =>
+  isViewing(phase, backgroundTasks) ? 'viewing' : phase

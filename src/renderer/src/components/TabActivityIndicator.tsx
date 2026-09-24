@@ -1,6 +1,7 @@
 import { Bell, CircleStop, TriangleAlert, Unplug } from 'lucide-react'
 import type { AgentActivityPhase } from '../../../shared/models'
 import { spinPhaseStyle } from '../spin-sync'
+import { VIEWING_LABEL, viewingDescription } from '../../../shared/project-activity'
 
 /** What each phase is called wherever it is shown: the tab strip's tooltip, the workspace
  * list's tooltip, and both screen-reader labels. One table so a state cannot be described two
@@ -8,7 +9,7 @@ import { spinPhaseStyle } from '../spin-sync'
 export const ACTIVITY_LABEL: Record<AgentActivityPhase, string> = {
   idle: 'Idle',
   working: 'Working',
-  waiting_background: 'Waiting on background work',
+  waiting_background: VIEWING_LABEL,
   waiting_input: 'Needs your attention',
   limited: 'Paused - usage limit reached',
   complete: 'Finished',
@@ -24,13 +25,17 @@ export const ACTIVITY_LABEL: Record<AgentActivityPhase, string> = {
  * filled circle wearing the ring's own dashed stroke, which read as a lumpy red blob and said
  * nothing about *what* had happened - and 'failed', 'disconnected' and 'stopped' were all
  * flattened into it. */
-export function TabActivityIndicator({ phase, title, spinEpoch }: {
+export function TabActivityIndicator({ phase, title, spinEpoch, backgroundTasks }: {
   phase: AgentActivityPhase
   /** The tab's own title, so the accessible name says which agent this is about. */
   title: string
   spinEpoch: number
+  /** Background tasks still running, when the caller knows; only worded into the Viewing tooltip. */
+  backgroundTasks?: number
 }): React.JSX.Element {
   const label = ACTIVITY_LABEL[phase]
+  // "Viewing" alone does not say why the ring still turns after the turn ended.
+  const tooltip = phase === 'waiting_background' ? `${label}: ${viewingDescription(backgroundTasks)}` : label
   const glyph =
     phase === 'waiting_input' ? <Bell className="tab-attention-bell" aria-hidden="true" />
     : phase === 'failed' ? <TriangleAlert className="tab-state-icon" aria-hidden="true" />
@@ -38,7 +43,7 @@ export function TabActivityIndicator({ phase, title, spinEpoch }: {
     : phase === 'stopped' ? <CircleStop className="tab-state-icon" aria-hidden="true" />
     : <svg className="tab-ring" viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="6" style={spinPhaseStyle(spinEpoch)} /><path d="M5.7 9.2 8 11.4l4.5-5" /></svg>
   return (
-    <span className={`tab-activity ${phase}`} aria-label={`${title}: ${label}`} title={phase === 'idle' ? undefined : label}>
+    <span className={`tab-activity ${phase}`} aria-label={`${title}: ${label}`} title={phase === 'idle' ? undefined : tooltip}>
       {glyph}
     </span>
   )
