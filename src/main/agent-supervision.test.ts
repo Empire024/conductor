@@ -59,7 +59,8 @@ describe('compact supervision view', () => {
     ] as unknown as ReviewRecord[])
     expect(measured.usage.tokens).toMatchObject({ inputTokens: 1200, outputTokens: 80 })
     expect(measured.usage.errors).toBe(1)
-    expect(measured.usage.measured.length).toBeGreaterThan(0)
+    expect(measured.usage.tokensEstimated).toBe(false)
+    expect(JSON.stringify(measured).length).toBeLessThan(900)
     // A review that never reached a reviewer turn costs nothing and is not counted.
     expect(measured.usage.reviewer).toEqual({ reviews: 2, elapsedMs: 7000, tokens: { inputTokens: 2700, outputTokens: 60 }, records: ['review-1', 'review-2'] })
     expect(measured.artifacts).toEqual({ applied: 1, rejected: 1, pending: 0, reverted: 0 })

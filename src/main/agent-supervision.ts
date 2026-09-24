@@ -21,12 +21,13 @@ export interface Supervision {
   /** Prompts accepted but not yet part of a turn: queued behind it or waiting to be steered in. */
   waitingPrompts: number
   artifacts: { applied: number; rejected: number; pending: number; reverted: number }
-  /** Provider-reported and Conductor-measured figures only; null where nothing was reported. */
+  /** Provider-reported and Conductor-measured figures only; null where nothing was reported.
+   *  Tokens and cost are the provider's (`*Estimated` when it marked them so); turns, wall time
+   *  and errors are counted from this timeline; reviewer figures come from the approval journal. */
   usage: {
     tokens: TokenFigures | null; tokensEstimated: boolean; costUsd: number | null; costEstimated: boolean
     turns: number; wallMs: number | null; errors: number
     reviewer: { reviews: number; elapsedMs: number | null; tokens: TokenFigures | null; records: string[] } | null
-    measured: string[]; derived: string[]
   }
 }
 
@@ -92,7 +93,7 @@ export function supervise(state: SessionProjection, reviews?: ReviewRecord[]): S
     tokens: report.conversation.tokens ?? null, tokensEstimated: report.conversation.tokensEstimated,
     costUsd: report.conversation.costUsd ?? null, costEstimated: report.conversation.costEstimated,
     turns: report.conversation.turns, wallMs: report.conversation.wallMs ?? null, errors,
-    reviewer: reviewerCost(reviews), measured: report.measured, derived: report.derived
+    reviewer: reviewerCost(reviews)
   }
   // The newest settled answer, by identity: a streaming answer changes its text, not its id, and
   // while a turn runs the answer is not a result yet.
