@@ -33,6 +33,15 @@ const TAILSCALE_CHECK_MS = 12 * 3600 * 1000
 
 export interface TailscaleCertificate { certificatePem: string; privateKeyPem: string; notAfter: string }
 
+/** A feature module's own /api/<prefix> routes (the Ideas screen, src/main/ideas/register.ts).
+ *  They run after the device is authenticated, exactly like the routes in PhoneAccessServer.route. */
+export type PhoneApiRoute = (method: string, path: string, body: Record<string, unknown>, query: URLSearchParams, device: PhoneDevice) => Promise<unknown>
+const phoneApiRoutes = new Map<string, PhoneApiRoute>()
+export function registerPhoneApiRoute(prefix: string, route: PhoneApiRoute): () => void {
+  phoneApiRoutes.set(prefix, route)
+  return () => { if (phoneApiRoutes.get(prefix) === route) phoneApiRoutes.delete(prefix) }
+}
+
 export interface PhoneAccessServerDependencies {
   service: PhoneAccessService
   tailscale?: TailscaleReader
@@ -423,6 +432,7 @@ export class PhoneAccessServer {
         return service.resume(id)
       }
     }
+    for (const [prefix, extension] of phoneApiRoutes) if (path === prefix || path.startsWith(prefix + '/')) return extension(method, path, body, query, device)
     throw new PhoneAccessError('Unknown route.', 404)
   }
 

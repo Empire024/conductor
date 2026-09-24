@@ -336,7 +336,9 @@
       headers: headers,
       body: body,
       cache: 'no-store',
-      signal: settings.signal
+      signal: settings.signal,
+      /* Lets a save started as the page is hidden or closed outlive the page. */
+      keepalive: Boolean(settings.keepalive)
     })
     if (response.status === 401) {
       handleUnauthorized()
@@ -554,6 +556,15 @@
     const hash = window.location.hash || '#/'
     const session = /^#\/session\/(.+)$/.exec(hash)
     if (session) return { name: 'session', id: decodeURIComponent(session[1]), key: 'session:' + session[1] }
+    /* #/ideas is a new note (bookmarkable: open, type, leave); #/ideas/<id> is the same editor on
+       one idea; #/ideas/list and #/ideas/search are the list, the latter with the search field up. */
+    const idea = /^#\/ideas(?:\/([^?]*))?$/.exec(hash)
+    if (idea) {
+      const rest = idea[1] || ''
+      if (rest === 'list' || rest === 'search') return { name: 'ideas', key: 'ideas', search: rest === 'search' }
+      if (!rest || rest === 'new') return { name: 'idea', id: null, key: 'idea:new' }
+      return { name: 'idea', id: decodeURIComponent(rest), key: 'idea:' + rest }
+    }
     if (hash.indexOf('#/tasks') === 0) return { name: 'tasks', key: 'tasks' }
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
     if (hash.indexOf('#/system') === 0) return { name: 'system', key: 'system' }
@@ -575,6 +586,13 @@
   const visit = hash => {
     state.returnTo = window.location.hash || '#/'
     go(hash)
+  }
+
+  /* iOS only raises the keyboard for a focus() made inside the tap itself, and hashchange arrives
+     after the tap has ended; screens that open with the cursor in a field are rendered right away. */
+  const goNow = hash => {
+    if (window.location.hash !== hash) window.location.hash = hash
+    render()
   }
 
   const goBack = () => {
@@ -602,12 +620,16 @@
     appRoot.appendChild(tabBar)
     updateTabBar(route)
     if (overlayPill) overlayPill.hidden = state.connected || !state.token
+    /* A field can only take focus once it is in the page. */
+    if (screen.onShown) screen.onShown()
   }
 
   const buildScreen = route => {
     if (route.name === 'pair') return pairScreen()
     if (route.name === 'session') return conversationScreen(route.id)
     if (route.name === 'tasks') return projectTasksScreen()
+    if (route.name === 'idea') return ideaEditorScreen(route.id)
+    if (route.name === 'ideas') return ideasListScreen(route)
     if (route.name === 'new') return newTaskScreen()
     if (route.name === 'system') return systemScreen()
     if (route.name === 'phone') return phoneScreen()
@@ -621,6 +643,7 @@
   const TAB_ICONS = {
     sessions: ['M4 7h16', 'M4 12h16', 'M4 17h11'],
     tasks: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M3.5 6h.01', 'M3.5 12h.01', 'M3.5 18h.01'],
+    ideas: ['M9.5 18h5', 'M10.5 21h3', 'M12 3a6 6 0 0 0-3.6 10.8c.7.5 1.1 1.3 1.1 2.1v.1h5v-.1c0-.8.4-1.6 1.1-2.1A6 6 0 0 0 12 3Z'],
     new: ['M12 5v14', 'M5 12h14'],
     system: ['M3 13h3.5l2.5-6 3.5 12 2.5-6H21'],
     phone: ['M8.5 2.75h7a1.75 1.75 0 0 1 1.75 1.75v15a1.75 1.75 0 0 1-1.75 1.75h-7A1.75 1.75 0 0 1 6.75 19.5v-15A1.75 1.75 0 0 1 8.5 2.75Z', 'M11 18.5h2']
@@ -632,12 +655,14 @@
     const tabs = [
       { id: 'sessions', label: 'Sessions', hash: '#/' },
       { id: 'tasks', label: 'Tasks', hash: '#/tasks' },
+      /* Opens a new note with the keyboard up, so it renders inside the tap (goNow). */
+      { id: 'ideas', label: 'Ideas', hash: '#/ideas', now: true },
       { id: 'new', label: 'New', hash: '#/new' },
       { id: 'system', label: 'System', hash: '#/system' },
       { id: 'phone', label: 'Phone', hash: '#/phone' }
     ]
     for (const tab of tabs) {
-      const node = button('tab', null, () => go(tab.hash))
+      const node = button('tab', null, () => (tab.now ? goNow(tab.hash) : go(tab.hash)))
       node.dataset.tab = tab.id
       const glyph = el('span', 'tab-icon')
       glyph.appendChild(icon(TAB_ICONS[tab.id], 22))
@@ -650,7 +675,7 @@
   }
 
   const updateTabBar = route => {
-    const hidden = route.name === 'pair' || route.name === 'session' || OPEN_ROUTES.indexOf(route.name) >= 0
+    const hidden = route.name === 'pair' || route.name === 'session' || route.name === 'idea' || OPEN_ROUTES.indexOf(route.name) >= 0
     tabBar.hidden = hidden
     const attention = state.phone && state.phone.counts ? state.phone.counts.attention : 0
     for (const node of tabBar.querySelectorAll('.tab')) {
@@ -2788,6 +2813,616 @@
     return { key: 'phone', root: root, update: draw }
   }
 
+  // ------------------------------------------------------------------ ideas
+
+  /* docs/ideas.md, contract in src/shared/ideas.ts. Capture asks for nothing but text: #/ideas opens
+     with the cursor in an empty note, the idea is created on the first words and autosaved after
+     that, and everything else (list, search, the idea's actions) sits on a bar under the note. */
+
+  const IDEA_STATUS_WORDS = { inbox: 'Inbox', untouched: 'Untouched', exploring: 'Exploring', active: 'Active', parked: 'Parked', converted: 'Converted', archived: 'Archived' }
+  const IDEA_LINK_GROUPS = [
+    { kind: 'agent-session', label: 'Conversations' },
+    { kind: 'task', label: 'Tasks' },
+    { kind: 'project', label: 'Projects' },
+    { kind: 'memory', label: 'Memories' },
+    { kind: 'artifact', label: 'Files and links' },
+    { kind: 'job', label: 'Jobs' }
+  ]
+  const IDEA_SAVE_DEBOUNCE_MS = 700
+  const IDEA_RETRY_MS = [2000, 5000, 10000, 30000]
+  const IDEA_SEARCH_DEBOUNCE_MS = 250
+  /* keepalive requests are capped at 64 KB of body by the browser. */
+  const IDEA_KEEPALIVE_MAX = 60000
+  const IDEA_ICONS = {
+    list: TAB_ICONS.ideas,
+    new: ['M12 20h8', 'M16.5 3.6a2.1 2.1 0 0 1 3 3L7.5 18.6 3.5 19.5l.9-4Z'],
+    search: ['M17.5 10.5a7 7 0 1 1-14 0 7 7 0 0 1 14 0Z', 'M20.5 20.5l-5-5'],
+    more: ['M5 12h.01', 'M12 12h.01', 'M19 12h.01'],
+    close: ['M6 6l12 12', 'M18 6L6 18']
+  }
+
+  /* The search text survives a trip into an idea and back. */
+  let ideaListQuery = ''
+  let ideaListArchived = false
+
+  const ideaTouch = idea => {
+    if (idea.exploring) return { word: 'Exploring', tone: 'exploring' }
+    if (idea.workedOn) return { word: 'Worked on', tone: 'worked' }
+    if (idea.lastExploredAt) return { word: 'Explored', tone: 'explored' }
+    return { word: 'Never touched', tone: 'untouched' }
+  }
+
+  /* Mirrors inferIdeaTitle: the first non-empty line, without Markdown markers. Runs per keystroke,
+     so it reads only that line, never the whole note. */
+  const ideaTitle = text => {
+    const match = /\S[^\r\n]*/.exec(String(text || ''))
+    const line = match ? match[0].trim() : ''
+    return line.replace(/^(#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|>\s*)/, '').trim() || 'New idea'
+  }
+
+  /* One request at a time, always carrying the latest text: keystrokes typed while a save is in
+     flight are sent by the next one, never dropped. Nothing is created until there are words. */
+  const ideaSaver = (initial, onChange, onSaved) => {
+    const saver = { id: initial.id || null, saved: initial.text || '', latest: initial.text || '', status: 'idle', problem: '' }
+    let timer = null
+    let retry = null
+    let inflight = false
+    let attempt = 0
+
+    const set = (status, problem) => {
+      saver.status = status
+      saver.problem = problem || ''
+      onChange(saver)
+    }
+    const dirty = () => saver.latest !== saver.saved && (saver.id !== null || Boolean(saver.latest.trim()))
+
+    const flush = async keepalive => {
+      if (timer) { clearTimeout(timer); timer = null }
+      if (inflight || !dirty()) return
+      const text = saver.latest
+      /* A note emptied by hand keeps its last words; archiving is how an idea goes away. */
+      if (!text.trim()) { set('empty'); return }
+      if (retry) { clearTimeout(retry); retry = null }
+      inflight = true
+      set('saving')
+      const options = { method: 'POST', body: { text: text }, keepalive: keepalive && text.length < IDEA_KEEPALIVE_MAX }
+      let detail = null
+      try {
+        detail = saver.id
+          ? await api('/api/ideas/' + encodeURIComponent(saver.id), options)
+          : await api('/api/ideas', options)
+      } catch (error) {
+        inflight = false
+        const offline = !error || !error.status
+        /* A refusal the computer will repeat (a bad request, unpaired) waits for the next edit. */
+        const retryable = offline || error.status >= 500 || error.status === 408 || error.status === 429
+        set(offline ? 'offline' : retryable ? 'failed' : 'refused', errorMessage(error))
+        if (!retryable) return
+        const delay = IDEA_RETRY_MS[Math.min(attempt, IDEA_RETRY_MS.length - 1)]
+        attempt += 1
+        retry = setTimeout(() => { retry = null; void flush(false) }, delay)
+        return
+      }
+      inflight = false
+      attempt = 0
+      if (!saver.id && detail && detail.id) saver.id = detail.id
+      saver.saved = text
+      if (detail) onSaved(detail)
+      if (dirty()) void flush(false)
+      else set('saved')
+    }
+
+    saver.type = text => {
+      saver.latest = text
+      if (timer) { clearTimeout(timer); timer = null }
+      if (!dirty()) {
+        if (!inflight && saver.status !== 'offline' && saver.status !== 'failed') set(saver.id ? 'saved' : 'idle')
+        return
+      }
+      if (!inflight && saver.status !== 'offline' && saver.status !== 'failed') set('pending')
+      timer = setTimeout(() => { timer = null; void flush(false) }, IDEA_SAVE_DEBOUNCE_MS)
+    }
+    saver.flush = keepalive => flush(Boolean(keepalive))
+    return saver
+  }
+
+  const ideaStatusWord = saver => {
+    if (saver.status === 'pending' || saver.status === 'saving') return 'Saving…'
+    if (saver.status === 'saved') return 'Saved'
+    if (saver.status === 'offline') return 'Offline — will retry'
+    if (saver.status === 'failed') return 'Not saved: ' + (saver.problem || 'the computer did not take it') + ' — will retry'
+    if (saver.status === 'refused') return 'Not saved: ' + (saver.problem || 'the computer refused it')
+    if (saver.status === 'empty') return 'An empty note is not saved'
+    return ''
+  }
+
+  const ideaBarButton = (label, glyph, word, onTap) => {
+    const node = button('idea-bar-button', null, onTap)
+    node.setAttribute('aria-label', label)
+    /* Keeps the keyboard up: the tap must not move focus out of the note before it acts. */
+    node.addEventListener('mousedown', event => event.preventDefault())
+    const mark = el('span', 'idea-bar-icon')
+    mark.appendChild(icon(glyph, 22))
+    node.appendChild(mark)
+    node.appendChild(el('span', 'idea-bar-label', word))
+    return node
+  }
+
+  const ideaEditorScreen = id => {
+    const root = el('div', 'screen idea-screen')
+    const header = topbar()
+    header.classList.add('idea-topbar')
+    const heading = el('h1', 'topbar-title idea-heading', id ? 'Idea' : 'New idea')
+    const status = el('span', 'idea-status')
+    status.setAttribute('role', 'status')
+    const done = button('idea-done', 'Done', () => input.blur())
+    done.hidden = true
+    header.appendChild(fill(el('div', 'topbar-main'), [heading, status, done]))
+
+    const body = el('div', 'idea-body')
+    const input = el('textarea', 'idea-editor')
+    input.placeholder = id ? 'Loading…' : 'What’s the idea?'
+    input.setAttribute('aria-label', 'Idea')
+    input.setAttribute('autocapitalize', 'sentences')
+    input.maxLength = 100000
+    input.readOnly = Boolean(id)
+    body.appendChild(input)
+
+    const sheet = el('div', 'idea-sheet')
+    sheet.hidden = true
+
+    const bar = el('nav', 'idea-bar')
+    bar.setAttribute('aria-label', 'Idea')
+    const more = ideaBarButton('More', IDEA_ICONS.more, 'More', () => void openSheet())
+    fill(bar, [
+      ideaBarButton('Ideas', IDEA_ICONS.list, 'Ideas', () => { void saver.flush(false); go('#/ideas/list') }),
+      ideaBarButton('New idea', IDEA_ICONS.new, 'New', () => {
+        if (!saver.id && !input.value.trim()) { input.focus(); return }
+        void saver.flush(false)
+        goNow('#/ideas')
+      }),
+      ideaBarButton('Search ideas', IDEA_ICONS.search, 'Search', () => { void saver.flush(false); goNow('#/ideas/search') }),
+      more
+    ])
+
+    root.appendChild(header)
+    root.appendChild(body)
+    root.appendChild(bar)
+    root.appendChild(sheet)
+
+    let alive = true
+    let detail = null
+    let loadProblem = ''
+
+    const paint = () => {
+      const word = loadProblem || ideaStatusWord(saver)
+      status.textContent = word
+      status.classList.toggle('warn', Boolean(loadProblem) || ['offline', 'failed', 'refused', 'empty'].indexOf(saver.status) >= 0)
+      more.disabled = !saver.id
+      heading.textContent = !saver.id ? 'New idea' : input.value.trim() ? ideaTitle(input.value) : 'Idea'
+    }
+
+    const self = {
+      key: id ? 'idea:' + id : 'idea:new',
+      root: root,
+      update: () => { if (!sheet.hidden) drawSheet() },
+      onShown: () => { if (!id) input.focus() },
+      onVisibility: visible => {
+        if (!visible) { void saver.flush(true); return }
+        if (!saver.id && !input.value.trim() && sheet.hidden) input.focus()
+      },
+      onPageHide: () => { void saver.flush(true) },
+      destroy: () => {
+        alive = false
+        void saver.flush(false)
+      }
+    }
+
+    const saver = ideaSaver({ id: id, text: '' }, () => { if (alive) paint() }, saved => {
+      detail = saved
+      if (!alive) return
+      /* The new note gets its own address without a rebuild, which would drop the keyboard. */
+      if (self.key === 'idea:new' && saved.id && window.location.hash === '#/ideas' && window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.search + '#/ideas/' + encodeURIComponent(saved.id))
+        /* render() compares keys, so the screen answers to its new address from now on. */
+        self.key = 'idea:' + encodeURIComponent(saved.id)
+      }
+    })
+
+    input.addEventListener('input', () => {
+      saver.type(input.value)
+      scrollCaretIntoView(input)
+    })
+    input.addEventListener('focus', () => {
+      done.hidden = false
+      root.classList.add('idea-typing')
+      scrollCaretIntoView(input)
+    })
+    input.addEventListener('blur', () => {
+      done.hidden = true
+      root.classList.remove('idea-typing')
+      void saver.flush(false)
+    })
+
+    const load = async () => {
+      try {
+        const found = await api('/api/ideas/' + encodeURIComponent(id))
+        if (!alive) return
+        detail = found || {}
+        const text = typeof detail.text === 'string' ? detail.text : ''
+        saver.saved = text
+        saver.latest = text
+        input.value = text
+        input.readOnly = false
+        input.placeholder = 'What’s the idea?'
+        loadProblem = ''
+        saver.status = 'saved'
+      } catch (error) {
+        if (!alive) return
+        loadProblem = errorMessage(error) || 'This idea could not be read.'
+        input.placeholder = 'This idea could not be read.'
+      }
+      paint()
+    }
+
+    // ---- the More sheet: the idea's actions, its latest brief, related work and timeline.
+
+    let sheetBusy = false
+    let sheetNotice = ''
+    let sheetProblem = ''
+    let sheetProject = ''
+
+    const closeSheet = () => {
+      sheet.hidden = true
+      sheetNotice = ''
+      sheetProblem = ''
+    }
+
+    const reloadDetail = async () => {
+      if (!saver.id) return
+      try {
+        const fresh = await api('/api/ideas/' + encodeURIComponent(saver.id))
+        if (fresh) detail = fresh
+      } catch (error) {
+        const message = errorMessage(error)
+        if (message) sheetProblem = message
+      }
+      if (alive && !sheet.hidden) drawSheet()
+    }
+
+    const openSheet = async () => {
+      if (!saver.id) return
+      input.blur()
+      sheet.hidden = false
+      drawSheet()
+      await saver.flush(false)
+      await reloadDetail()
+    }
+
+    const act = async work => {
+      if (sheetBusy) return
+      sheetBusy = true
+      sheetNotice = ''
+      sheetProblem = ''
+      drawSheet()
+      try {
+        await work()
+      } catch (error) {
+        sheetProblem = errorMessage(error) || 'That did not work.'
+      }
+      sheetBusy = false
+      if (alive && !sheet.hidden) drawSheet()
+    }
+
+    const pickedProject = () => {
+      const projects = (state.phone && state.phone.projects) || []
+      if (projects.some(project => project.id === sheetProject)) return sheetProject
+      const linked = ((detail && detail.links) || []).filter(link => link.kind === 'project' && projects.some(project => project.id === link.targetId))[0]
+      reconcileForm()
+      sheetProject = linked ? linked.targetId : state.form && state.form.projectId ? state.form.projectId : projects.length ? projects[0].id : ''
+      return sheetProject
+    }
+
+    const briefCard = section => {
+      const card = el('section', 'card idea-brief')
+      card.appendChild(el('h2', 'card-title', 'Latest brief'))
+      const brief = section.brief
+      if (brief) {
+        const part = (label, text) => {
+          if (!text) return
+          card.appendChild(el('span', 'idea-brief-label', label))
+          card.appendChild(el('p', 'idea-brief-text', text))
+        }
+        const list = (label, items) => {
+          if (!items || !items.length) return
+          card.appendChild(el('span', 'idea-brief-label', label))
+          const node = el('ul', 'idea-brief-list')
+          for (const item of items) node.appendChild(el('li', null, item))
+          card.appendChild(node)
+        }
+        part('Concept', brief.concept)
+        part('Next step', brief.nextStep)
+        list('Open questions', brief.openQuestions)
+        list('Observations', brief.observations)
+      } else {
+        const text = el('div', 'idea-brief-text')
+        appendRichText(text, section.body || '')
+        card.appendChild(text)
+      }
+      const by = section.createdBy || {}
+      card.appendChild(el('p', 'card-note', dotRow([by.label || by.model, by.machine, relativeTime(section.createdAt)])))
+      return card
+    }
+
+    const linksCard = links => {
+      if (!links || !links.length) return null
+      const card = el('section', 'card')
+      card.appendChild(el('h2', 'card-title', 'Related work'))
+      for (const group of IDEA_LINK_GROUPS) {
+        const entries = links.filter(link => link.kind === group.kind)
+        if (!entries.length) continue
+        card.appendChild(el('span', 'idea-brief-label', group.label))
+        for (const link of entries) {
+          const project = link.projectId ? projectById(link.projectId) : null
+          const label = link.label || link.targetId
+          if (link.kind === 'agent-session') {
+            const row = button('idea-link idea-link-open', null, () => { closeSheet(); go('#/session/' + encodeURIComponent(link.targetId)) })
+            row.appendChild(el('span', 'idea-link-label', label))
+            if (project) row.appendChild(el('span', 'idea-link-meta', project.name))
+            row.appendChild(el('span', 'chev', '›'))
+            card.appendChild(row)
+          } else {
+            const row = el('div', 'idea-link')
+            row.appendChild(el('span', 'idea-link-label', label))
+            if (project && link.kind !== 'project') row.appendChild(el('span', 'idea-link-meta', project.name))
+            card.appendChild(row)
+          }
+        }
+      }
+      return card
+    }
+
+    const timelineCard = events => {
+      if (!events || !events.length) return null
+      const card = el('section', 'card')
+      card.appendChild(el('h2', 'card-title', 'Timeline'))
+      for (const event of events.slice(0, 40)) {
+        const row = el('div', 'idea-event')
+        row.appendChild(el('span', 'idea-event-text', event.message || event.kind))
+        const actor = event.actor && event.actor.label ? event.actor.label : ''
+        row.appendChild(el('span', 'idea-event-meta', dotRow([actor, relativeTime(event.at)])))
+        card.appendChild(row)
+      }
+      return card
+    }
+
+    const drawSheet = () => {
+      clear(sheet)
+      const backdrop = el('div', 'idea-sheet-backdrop')
+      backdrop.addEventListener('click', closeSheet)
+      const panel = el('section', 'idea-sheet-panel')
+      panel.setAttribute('role', 'dialog')
+      panel.setAttribute('aria-label', 'Idea details')
+      const head = el('div', 'idea-sheet-head')
+      head.appendChild(el('h2', 'idea-sheet-title', detail && detail.title ? detail.title : ideaTitle(input.value)))
+      const close = button('idea-sheet-close', null, closeSheet)
+      close.setAttribute('aria-label', 'Close')
+      close.appendChild(icon(IDEA_ICONS.close, 20))
+      head.appendChild(close)
+      panel.appendChild(head)
+
+      const content = el('div', 'idea-sheet-body')
+      if (detail) {
+        const touch = ideaTouch(detail)
+        const facts = el('p', 'idea-facts')
+        facts.appendChild(el('span', 'idea-touch ' + touch.tone, touch.word))
+        facts.appendChild(el('span', null, ' · ' + dotRow([
+          IDEA_STATUS_WORDS[detail.status] || detail.status,
+          detail.lastExploredAt && !detail.exploring ? 'explored ' + relativeTime(detail.lastExploredAt) : '',
+          detail.capturedFrom ? 'from ' + detail.capturedFrom : '',
+          detail.createdAt ? 'created ' + relativeTime(detail.createdAt) : ''
+        ])))
+        content.appendChild(facts)
+      }
+
+      const actions = el('section', 'card idea-actions')
+      actions.appendChild(el('h2', 'card-title', 'Actions'))
+      const explore = button('ghost wide', detail && detail.exploring ? 'Exploring now…' : 'Explore with local model', () => act(async () => {
+        const run = await api('/api/ideas/' + encodeURIComponent(saver.id) + '/explore', { method: 'POST', body: {} })
+        sheetNotice = 'Exploring' + (run && run.model ? ' with ' + run.model : '') + ' on the computer. A brief appears here when it finishes.'
+        await reloadDetail()
+      }))
+      explore.disabled = sheetBusy || Boolean(detail && detail.exploring)
+      actions.appendChild(explore)
+
+      const projects = (state.phone && state.phone.projects) || []
+      if (!state.phone) {
+        actions.appendChild(el('p', 'card-note', 'Reading this computer’s projects…'))
+      } else if (!projects.length) {
+        actions.appendChild(el('p', 'card-note', 'Add a project on the computer to create a task or start work from this idea.'))
+      } else {
+        const projectId = pickedProject()
+        const picker = select(projects.map(project => ({ value: project.id, label: project.name })), projectId, value => { sheetProject = value })
+        picker.setAttribute('aria-label', 'Project')
+        actions.appendChild(field('Project', picker))
+        const row = el('div', 'idea-action-row')
+        const task = button('ghost', 'Create task', () => act(async () => {
+          const link = await api('/api/ideas/' + encodeURIComponent(saver.id) + '/task', { method: 'POST', body: { projectId: pickedProject() } })
+          const project = projectById(pickedProject())
+          sheetNotice = 'Task added' + (project ? ' to ' + project.name : '') + (link && link.label ? ': ' + link.label : '.')
+          await reloadDetail()
+        }))
+        const work = button('primary', 'Work on this idea', () => act(async () => {
+          const opened = await api('/api/ideas/' + encodeURIComponent(saver.id) + '/work', { method: 'POST', body: { projectId: pickedProject() } })
+          if (opened && opened.agentSessionId) {
+            closeSheet()
+            go('#/session/' + encodeURIComponent(opened.agentSessionId))
+            return
+          }
+          sheetNotice = 'Work started on the computer.'
+          await reloadDetail()
+        }))
+        task.disabled = sheetBusy
+        work.disabled = sheetBusy
+        row.appendChild(task)
+        row.appendChild(work)
+        actions.appendChild(row)
+      }
+
+      const archived = detail && detail.status === 'archived'
+      const archive = button('ghost wide idea-archive', archived ? 'Restore from archive' : 'Archive', () => act(async () => {
+        detail = await api('/api/ideas/' + encodeURIComponent(saver.id), { method: 'POST', body: { status: archived ? 'untouched' : 'archived' } }) || detail
+        if (archived) { sheetNotice = 'Restored.'; return }
+        closeSheet()
+        go('#/ideas/list')
+      }))
+      archive.disabled = sheetBusy
+      actions.appendChild(archive)
+      if (sheetNotice) actions.appendChild(el('p', 'good-note', sheetNotice))
+      if (sheetProblem) actions.appendChild(el('p', 'pending-error', sheetProblem))
+      content.appendChild(actions)
+
+      if (!detail) content.appendChild(emptyNote('Loading…'))
+      else {
+        if (detail.latestBrief) content.appendChild(briefCard(detail.latestBrief))
+        const links = linksCard(detail.links)
+        if (links) content.appendChild(links)
+        const timeline = timelineCard(detail.events)
+        if (timeline) content.appendChild(timeline)
+      }
+      panel.appendChild(content)
+      sheet.appendChild(backdrop)
+      sheet.appendChild(panel)
+    }
+
+    paint()
+    if (id) void load()
+    return self
+  }
+
+  const ideaRow = idea => {
+    const node = button('idea-row', null, () => go('#/ideas/' + encodeURIComponent(idea.id)))
+    const head = el('div', 'idea-row-head')
+    head.appendChild(el('span', 'idea-row-title', idea.title || 'New idea'))
+    const when = el('span', 'idea-row-when')
+    onTick(() => { when.textContent = relativeTime(idea.updatedAt) })
+    head.appendChild(when)
+    node.appendChild(head)
+    if (idea.preview) node.appendChild(el('p', 'idea-row-preview', idea.preview))
+    const touch = ideaTouch(idea)
+    const meta = el('div', 'idea-row-meta')
+    meta.appendChild(el('span', 'idea-touch ' + touch.tone, touch.word))
+    if (idea.status === 'parked' || idea.status === 'converted' || idea.status === 'archived') meta.appendChild(el('span', 'idea-row-status', IDEA_STATUS_WORDS[idea.status]))
+    node.appendChild(meta)
+    return node
+  }
+
+  const ideasListScreen = route => {
+    const root = el('div', 'screen')
+    const header = topbar()
+    const scroll = scroller()
+    root.appendChild(header)
+    root.appendChild(scroll)
+
+    const add = button('idea-new', null, () => goNow('#/ideas'))
+    add.setAttribute('aria-label', 'New idea')
+    add.appendChild(icon(IDEA_ICONS.new, 22))
+    header.appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title idea-list-title', 'Ideas'), add]))
+
+    const search = el('input', 'input idea-search')
+    search.type = 'search'
+    search.placeholder = 'Search ideas'
+    search.setAttribute('aria-label', 'Search ideas')
+    search.setAttribute('enterkeyhint', 'search')
+    search.value = ideaListQuery
+    header.appendChild(search)
+
+    const chips = el('div', 'chips')
+    const chip = (label, archived) => {
+      const node = button('chip' + (ideaListArchived === archived ? ' selected' : ''), label, () => {
+        if (ideaListArchived === archived) return
+        ideaListArchived = archived
+        for (const other of chips.querySelectorAll('.chip')) other.classList.toggle('selected', other === node)
+        void load()
+      })
+      return node
+    }
+    chips.appendChild(chip('Open', false))
+    chips.appendChild(chip('Archived', true))
+    header.appendChild(chips)
+
+    let ideas = null
+    let problem = ''
+    let run = 0
+    let searchTimer = null
+    let searching = Boolean(route && route.search)
+
+    const draw = () => {
+      const top = scroll.scrollTop
+      beginTicks()
+      clear(scroll)
+      if (problem && !ideas) {
+        scroll.appendChild(emptyNote('Could not read the ideas.', problem))
+        return
+      }
+      if (!ideas) {
+        scroll.appendChild(emptyNote('Loading…'))
+        return
+      }
+      if (!ideas.length) {
+        if (ideaListQuery.trim()) scroll.appendChild(emptyNote('Nothing matches “' + ideaListQuery.trim() + '”.'))
+        else if (ideaListArchived) scroll.appendChild(emptyNote('No archived ideas.'))
+        else scroll.appendChild(emptyNote('No ideas yet.', 'Tap the pencil and type. It saves as you go.'))
+      } else {
+        const list = el('div', 'list idea-rows')
+        for (const idea of ideas) list.appendChild(ideaRow(idea))
+        scroll.appendChild(list)
+      }
+      if (problem) scroll.appendChild(el('p', 'pending-error', problem))
+      scroll.scrollTop = top
+    }
+
+    const load = async () => {
+      const mine = ++run
+      const query = '/api/ideas?search=' + encodeURIComponent(ideaListQuery.trim()) + (ideaListArchived ? '&status=archived' : '')
+      try {
+        const data = await api(query)
+        if (mine !== run) return
+        ideas = (data && data.ideas) || []
+        problem = ''
+      } catch (error) {
+        if (mine !== run) return
+        const message = errorMessage(error)
+        if (message) problem = message
+      }
+      if (screen && screen.key === 'ideas') draw()
+    }
+
+    search.addEventListener('input', () => {
+      ideaListQuery = search.value
+      if (searchTimer) clearTimeout(searchTimer)
+      searchTimer = setTimeout(() => { searchTimer = null; void load() }, IDEA_SEARCH_DEBOUNCE_MS)
+    })
+    search.addEventListener('focus', () => scrollCaretIntoView(search))
+    search.addEventListener('keydown', event => { if (event.key === 'Enter') search.blur() })
+
+    draw()
+    void load()
+    return {
+      key: 'ideas',
+      root: root,
+      onShown: () => { if (searching) search.focus() },
+      update: next => {
+        /* Every stream tick lands here; only a move from the list to #/ideas/search focuses. */
+        const wantsSearch = Boolean(next && next.search)
+        if (wantsSearch && !searching) search.focus()
+        searching = wantsSearch
+      },
+      onVisibility: visible => { if (visible) void load() },
+      destroy: () => { if (searchTimer) clearTimeout(searchTimer) }
+    }
+  }
+
   // ------------------------------------------------------------------ boot
 
   const registerServiceWorker = () => {
@@ -2855,6 +3490,8 @@
       state.offerInstall = false
     })
     window.addEventListener('hashchange', () => render())
+    /* The last chance to save a half-written idea when the page is closed or swapped out. */
+    window.addEventListener('pagehide', () => { if (screen && screen.onPageHide) screen.onPageHide() })
     window.addEventListener('online', () => { if (state.token) restartStream() })
     window.addEventListener('resize', applyViewport)
     if (window.visualViewport) {

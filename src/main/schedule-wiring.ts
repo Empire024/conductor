@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
 import { makeId, type AgentProviderInfo, type AgentSpec, type PaneTab } from '../shared/models'
 import { DEFAULT_LOCAL_MODEL } from '../shared/local-models'
-import { SCHEDULE_AGENT_PROVIDERS, type ScheduleAgentOption, type ScheduleDefinition } from '../shared/schedules'
+import { SCHEDULE_AGENT_PROVIDERS, type ScheduleAgentOption, type ScheduleDefinition, type ScheduleKind } from '../shared/schedules'
 import type { AgentControlUiRequest } from '../shared/agent-control'
 import type { AccountLimitsReport } from '../shared/usage-accounting'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics'
@@ -17,7 +17,7 @@ import { runScheduledAgentTurn } from './schedule-agent-turn'
 import { LATEST_MODELS_BUILTIN } from './schedule-builtins/latest-models'
 import { createLocalChurn, type LocalChurnDeps } from './schedule-churn'
 import type { ScheduleControlService } from './schedule-control'
-import { createScheduleExecutor } from './schedule-executor'
+import { createScheduleExecutor, type ScheduleExecutor } from './schedule-executor'
 import { ScheduleGateProbe } from './schedule-gate'
 import { scriptBrief } from './schedule-ipc'
 import { ScheduleRunner } from './schedule-runner'
@@ -39,6 +39,14 @@ export function allowanceNote(report: AccountLimitsReport | undefined, maxUsedPe
 
 /** The built-in "latest models and CLI compatibility" task, reviewed by Claude Opus by default. */
 export const latestModelsBuiltin = (): BuiltinSchedule => ({ ...LATEST_MODELS_BUILTIN, agent: { provider: 'claude', model: 'opus[1m]' } })
+
+/** Built-in kinds whose run is Conductor's own code instead of the script pipeline (the Idea
+ *  Incubator, src/main/ideas/register.ts). The runner, gate and run history stay the same. */
+const kindExecutors = new Map<ScheduleKind, ScheduleExecutor>()
+export function registerScheduleKindExecutor(kind: ScheduleKind, executor: ScheduleExecutor): () => void {
+  kindExecutors.set(kind, executor)
+  return () => { if (kindExecutors.get(kind) === executor) kindExecutors.delete(kind) }
+}
 
 export interface ScheduledTasksWiring {
   store: ScheduleStore
@@ -101,7 +109,7 @@ export function createScheduledTasks(wiring: ScheduledTasksWiring): {
   assignScripts(projectId: string, schedule: ScheduleDefinition): Promise<{ agentSessionId: string; tabId: string }>
 } {
   const { store, database, sessions, control } = wiring
-  const execute = createScheduleExecutor({
+  const pipeline = createScheduleExecutor({
     store,
     projectPath: projectId => { const project = database.getProject(projectId); return project && !project.remote ? project.path : null },
     dataDirectory: join(wiring.userData, 'schedule-tasks'),
@@ -112,6 +120,7 @@ export function createScheduledTasks(wiring: ScheduledTasksWiring): {
     allowance: provider => allowanceNote(sessions.usageLimits(provider as StructuredProvider)[0]),
     environment: () => scriptEnvironment(wiring.providers())
   })
+  const execute: ScheduleExecutor = context => (kindExecutors.get(context.schedule.kind) ?? pipeline)(context)
   const probe = new ScheduleGateProbe({
     idleSeconds: wiring.idleSeconds, screenLocked: wiring.screenLocked, sample: wiring.metrics,
     conductorTurns: () => sessions.turnsInFlight(), deliveryRunning: wiring.deliveryRunning,

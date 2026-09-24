@@ -17,12 +17,18 @@ const IPHONE_CHROME = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) Ap
 
 type Listener = (event: any) => void
 
+/* The one element that has focus in whichever app page a test booted; boot.js never focuses. */
+let focusedNode: FakeNode | null = null
+
 class FakeNode {
   tagName: string
   className = ''
   hidden = false
   type = ''
   src = ''
+  value = ''
+  dataset: Record<string, string> = {}
+  style: Record<string, unknown> = { setProperty: () => undefined }
   children: FakeNode[] = []
   parentNode: FakeNode | null = null
   attributes: Record<string, string> = {}
@@ -32,6 +38,22 @@ class FakeNode {
   constructor(tag: string) { this.tagName = tag.toUpperCase() }
 
   get firstChild(): FakeNode | null { return this.children[0] ?? null }
+  get childNodes(): FakeNode[] { return this.children }
+  get classList() {
+    const names = () => this.className.split(' ').filter(Boolean)
+    const add = (name: string) => { if (!names().includes(name)) this.className = names().concat([name]).join(' ') }
+    const remove = (name: string) => { this.className = names().filter(entry => entry !== name).join(' ') }
+    return {
+      add,
+      remove,
+      contains: (name: string) => names().includes(name),
+      toggle: (name: string, force?: boolean) => {
+        const on = force === undefined ? !names().includes(name) : force
+        if (on) add(name); else remove(name)
+        return on
+      }
+    }
+  }
   get textContent(): string { return this.text + this.children.map(child => child.textContent).join(' ') }
   set textContent(value: string) { this.text = String(value); this.children = [] }
 
@@ -58,14 +80,21 @@ class FakeNode {
   setAttribute(name: string, value: string): void { this.attributes[name] = String(value) }
   getAttribute(name: string): string | null { return this.attributes[name] ?? null }
   addEventListener(type: string, fn: Listener): void { (this.listeners[type] ??= []).push(fn) }
+  removeEventListener(type: string, fn: Listener): void { this.listeners[type] = (this.listeners[type] ?? []).filter(entry => entry !== fn) }
+  dispatch(type: string, event: Record<string, unknown> = {}): void { for (const fn of this.listeners[type] ?? []) fn({ target: this, preventDefault: () => undefined, ...event }) }
 
   all(): FakeNode[] { return this.children.flatMap(child => [child, ...child.all()]) }
   querySelectorAll(selector: string): FakeNode[] {
     const wanted = selector.replace(/^\./, '')
     return this.all().filter(node => node.className.split(' ').includes(wanted))
   }
+  querySelector(selector: string): FakeNode | null { return this.querySelectorAll(selector)[0] ?? null }
   find(predicate: (node: FakeNode) => boolean): FakeNode | undefined { return this.all().find(predicate) }
   click(): void { for (const fn of this.listeners.click ?? []) fn({ target: this }) }
+  focus(): void { focusedNode = this; this.dispatch('focus') }
+  blur(): void { if (focusedNode === this) focusedNode = null; this.dispatch('blur') }
+  /* What typing does to a field: the value changes, then 'input' fires. */
+  typeText(value: string): void { this.value = value; this.dispatch('input') }
 }
 
 interface BootOptions {
@@ -319,8 +348,245 @@ describe('phone notification preferences', () => {
   })
 })
 
+/* app.js itself, booted on a paired phone at a given hash, with the same stub DOM. The server is a
+   function from each request to its JSON answer; throwing from it is a network failure. */
+interface AppCall { path: string; method: string; body: any; keepalive: boolean }
+
+const bootApp = (hash: string, respond: (call: AppCall) => unknown) => {
+  focusedNode = null
+  const timers: Array<{ at: number; fn: () => void; id: number }> = []
+  let now = 0
+  let nextId = 1
+  const windowListeners: Record<string, Listener[]> = {}
+  const documentListeners: Record<string, Listener[]> = {}
+  const calls: AppCall[] = []
+  const app = new FakeNode('div')
+  const pill = new FakeNode('div')
+  const toasts = new FakeNode('div')
+  const setTimer = (fn: () => void, ms: number) => { const id = nextId++; timers.push({ at: now + (ms || 0), fn, id }); return id }
+  const clearTimer = (id: number) => { const index = timers.findIndex(timer => timer.id === id); if (index >= 0) timers.splice(index, 1) }
+  const fire = (host: Record<string, Listener[]>, type: string, event: any = {}) => { for (const fn of host[type] ?? []) fn(event) }
+
+  let currentHash = hash
+  const location = {
+    origin: ORIGIN,
+    pathname: '/',
+    search: '',
+    get hash() { return currentHash },
+    set hash(value: string) {
+      currentHash = value
+      setTimer(() => fire(windowListeners, 'hashchange'), 0)
+    },
+    reload: () => undefined,
+    assign: () => undefined
+  }
+  const document = {
+    readyState: 'complete',
+    visibilityState: 'visible',
+    body: new FakeNode('body'),
+    documentElement: { style: { setProperty: () => undefined } },
+    get activeElement() { return focusedNode },
+    createElement: (tag: string) => new FakeNode(tag),
+    createElementNS: (_ns: string, tag: string) => new FakeNode(tag),
+    getElementById: (id: string) => ({ app, pill, toasts } as Record<string, FakeNode>)[id] ?? null,
+    addEventListener: (type: string, fn: Listener) => { (documentListeners[type] ??= []).push(fn) },
+    removeEventListener: () => undefined
+  }
+  const fetch = async (path: string, init: any = {}) => {
+    if (path === '/api/stream') return new Promise(() => undefined)
+    const call: AppCall = { path, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : undefined, keepalive: Boolean(init.keepalive) }
+    calls.push(call)
+    const answer = await respond(call)
+    return { status: 200, ok: true, text: async () => JSON.stringify(answer ?? null) }
+  }
+  const window: Record<string, any> = {
+    document,
+    location,
+    navigator: { userAgent: IPHONE_SAFARI, maxTouchPoints: 5, onLine: true, standalone: true },
+    history: { replaceState: (_state: unknown, _title: string, url: string) => { currentHash = url.slice(url.indexOf('#')) } },
+    localStorage: { getItem: (key: string) => (key === 'conductor.phone.token' ? 'phone-token' : null), setItem: () => undefined, removeItem: () => undefined },
+    innerHeight: 800,
+    isSecureContext: false,
+    setTimeout: setTimer,
+    clearTimeout: clearTimer,
+    setInterval: () => 0,
+    clearInterval: () => undefined,
+    addEventListener: (type: string, fn: Listener) => { (windowListeners[type] ??= []).push(fn) },
+    fetch,
+    AbortController
+  }
+  runInNewContext(appSource, {
+    window, document, navigator: window.navigator, fetch, setTimeout: setTimer, clearTimeout: clearTimer,
+    setInterval: () => 0, clearInterval: () => undefined, AbortController, TextDecoder, Response, URL
+  })
+
+  const advance = (ms: number) => {
+    now += ms
+    for (;;) {
+      const due = timers.filter(timer => timer.at <= now).sort((a, b) => a.at - b.at)[0]
+      if (!due) break
+      timers.splice(timers.indexOf(due), 1)
+      due.fn()
+    }
+  }
+  const setVisibility = (value: 'visible' | 'hidden') => {
+    document.visibilityState = value
+    fire(documentListeners, 'visibilitychange')
+  }
+  const editor = () => app.find(node => node.tagName === 'TEXTAREA')
+  const posts = () => calls.filter(call => call.method === 'POST')
+  return { window, document, app, calls, posts, advance, setVisibility, editor, fireWindow: (type: string) => fire(windowListeners, type) }
+}
+
+const ideaDetail = (id: string, text: string) => ({
+  id, title: text.split('\n')[0] || 'New idea', preview: '', status: 'inbox', workedOn: false, capturedFrom: 'phone',
+  createdAt: '2026-09-24T10:00:00.000Z', updatedAt: '2026-09-24T10:00:00.000Z', exploring: false, linkCounts: {}, tags: [],
+  text, originalText: text, links: [], events: [], sections: [], explorations: []
+})
+
+const settleAll = async () => { for (let index = 0; index < 6; index += 1) await settle() }
+
+describe('phone Ideas screen', () => {
+  it('#/ideas opens a full-screen new note with the cursor already in it and no tab bar', () => {
+    const page = bootApp('#/ideas', () => ({}))
+    const editor = page.editor()
+    expect(editor).toBeDefined()
+    expect(page.document.activeElement).toBe(editor)
+    expect(editor!.value).toBe('')
+    expect(page.app.querySelector('.tabbar')!.hidden).toBe(true)
+    const labels = page.app.querySelectorAll('.idea-bar-button').map(node => node.getAttribute('aria-label'))
+    expect(labels).toEqual(['Ideas', 'New idea', 'Search ideas', 'More'])
+  })
+
+  it('creates the idea once on the first words, then autosaves the rest to that idea', async () => {
+    let created = 0
+    const page = bootApp('#/ideas', call => {
+      if (call.path === '/api/ideas' && call.method === 'POST') { created += 1; return ideaDetail('idea-1', call.body.text) }
+      if (call.path === '/api/ideas/idea-1' && call.method === 'POST') return ideaDetail('idea-1', call.body.text)
+      return {}
+    })
+    const editor = page.editor()!
+    editor.typeText('Solar')
+    editor.typeText('Solar kettle')
+    page.advance(699)
+    expect(page.posts()).toHaveLength(0)
+    page.advance(1)
+    await settleAll()
+    expect(page.posts()).toEqual([{ path: '/api/ideas', method: 'POST', body: { text: 'Solar kettle' }, keepalive: false }])
+    expect(page.app.textContent).toContain('Saved')
+    // The note now has an address of its own, without rebuilding the editor under the keyboard.
+    expect(page.window.location.hash).toBe('#/ideas/idea-1')
+    expect(page.editor()).toBe(editor)
+
+    editor.typeText('Solar kettle\nthat boils with a lens')
+    page.advance(700)
+    await settleAll()
+    expect(created).toBe(1)
+    expect(page.posts().slice(1)).toEqual([{ path: '/api/ideas/idea-1', method: 'POST', body: { text: 'Solar kettle\nthat boils with a lens' }, keepalive: false }])
+    page.fireWindow('hashchange')
+    expect(page.editor()).toBe(editor)
+  })
+
+  it('never creates an empty idea, even when the app goes to the background', async () => {
+    const page = bootApp('#/ideas', () => ideaDetail('idea-1', ''))
+    const editor = page.editor()!
+    editor.typeText('   ')
+    editor.typeText('  \n ')
+    page.advance(5000)
+    page.setVisibility('hidden')
+    page.fireWindow('pagehide')
+    await settleAll()
+    expect(page.posts()).toHaveLength(0)
+  })
+
+  it('keeps every keystroke typed while a save is in flight and sends one request at a time', async () => {
+    const answers: Array<() => void> = []
+    const page = bootApp('#/ideas', call => new Promise(resolve => {
+      answers.push(() => resolve(ideaDetail('idea-7', call.body ? call.body.text : '')))
+    }))
+    const editor = page.editor()!
+    editor.typeText('a')
+    page.advance(700)
+    await settleAll()
+    expect(page.posts()).toHaveLength(1)
+    editor.typeText('ab')
+    page.advance(700)
+    editor.typeText('abc')
+    page.advance(700)
+    await settleAll()
+    expect(page.posts()).toHaveLength(1)
+    answers.shift()!()
+    await settleAll()
+    expect(page.posts().map(call => [call.path, call.body.text])).toEqual([['/api/ideas', 'a'], ['/api/ideas/idea-7', 'abc']])
+    answers.shift()!()
+    await settleAll()
+    expect(page.posts()).toHaveLength(2)
+    expect(page.app.textContent).toContain('Saved')
+  })
+
+  it('flushes at once when the phone leaves the app, and retries when offline', async () => {
+    let online = false
+    const page = bootApp('#/ideas', call => {
+      if (!online) throw new TypeError('Failed to fetch')
+      return ideaDetail('idea-3', call.body.text)
+    })
+    page.editor()!.typeText('Call the plumber')
+    page.setVisibility('hidden')
+    await settleAll()
+    expect(page.posts()).toEqual([{ path: '/api/ideas', method: 'POST', body: { text: 'Call the plumber' }, keepalive: true }])
+    expect(page.app.textContent).toContain('Offline — will retry')
+    online = true
+    page.advance(2000)
+    await settleAll()
+    expect(page.posts()).toHaveLength(2)
+    expect(page.app.textContent).toContain('Saved')
+  })
+
+  it('loads an existing idea into the same editor and saves edits to it', async () => {
+    const page = bootApp('#/ideas/idea-9', call => {
+      if (call.path === '/api/ideas/idea-9') return ideaDetail('idea-9', call.method === 'POST' ? call.body.text : 'Old thought')
+      return {}
+    })
+    await settleAll()
+    const editor = page.editor()!
+    expect(editor.value).toBe('Old thought')
+    editor.typeText('Old thought, sharpened')
+    page.advance(700)
+    await settleAll()
+    expect(page.posts()).toEqual([{ path: '/api/ideas/idea-9', method: 'POST', body: { text: 'Old thought, sharpened' }, keepalive: false }])
+  })
+
+  it('lists ideas with what has happened to each, and has an Ideas tab', async () => {
+    const page = bootApp('#/ideas/list', call => {
+      if (call.path.indexOf('/api/ideas?') === 0) {
+        return {
+          ideas: [
+            { ...ideaDetail('a', 'Worked one'), workedOn: true },
+            { ...ideaDetail('b', 'Explored one'), lastExploredAt: '2026-09-24T11:00:00.000Z' },
+            ideaDetail('c', 'Fresh one')
+          ]
+        }
+      }
+      return {}
+    })
+    await settleAll()
+    expect(page.calls[0]!.path).toBe('/api/ideas?search=')
+    const text = page.app.textContent
+    expect(text).toContain('Worked one')
+    expect(text).toContain('Worked on')
+    expect(text).toContain('Explored')
+    expect(text).toContain('Never touched')
+    expect(page.app.querySelector('.tabbar')!.hidden).toBe(false)
+    const tab = page.app.querySelectorAll('.tab').find(node => node.dataset.tab === 'ideas')!
+    expect(tab.classList.contains('active')).toBe(true)
+    page.app.querySelectorAll('.idea-row')[2]!.click()
+    page.advance(0)
+    expect(page.window.location.hash).toBe('#/ideas/c')
+  })
+})
+
 describe('sw.js', () => {
-  const worker = (cached: Record<string, string>, network: (url: string) => Promise<Response>) => {
+  const worker =(cached: Record<string, string>, network: (url: string) => Promise<Response>) => {
     const listeners: Record<string, Listener> = {}
     const added: string[] = []
     const store = new Map(Object.entries(cached).map(([path, body]) => [path, new Response(body, { headers: { 'Content-Type': 'text/html' } })]))
