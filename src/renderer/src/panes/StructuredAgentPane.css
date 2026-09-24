@@ -462,3 +462,18 @@
 .sa-find-current { box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 60%, transparent); border-radius: 8px; }
 ::highlight(conductor-find) { background-color: color-mix(in srgb, var(--accent) 34%, transparent); color: var(--text); }
 ::highlight(conductor-find-current) { background-color: var(--accent); color: var(--surface-0); }
+/* Chat and its CLI drawer share the tab, like an editor and its terminal panel: the conversation
+   takes whatever height the drawer leaves. The drawer is hidden, never unmounted, while the native
+   CLI holds the conversation, so its PTY and scrollback survive every toggle. */
+.sa-runtime-split { height: 100%; width: 100%; flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
+.sa-runtime-split > .structured-agent-pane { height: auto; flex: 1 1 0; min-height: 140px; }
+.sa-cli-drawer { flex: 0 0 42%; min-height: 96px; display: flex; flex-direction: column; position: relative; border-top: 1px solid var(--border); background: var(--surface-0); }
+.sa-cli-drawer[hidden] { display: none; }
+.sa-cli-resize { position: absolute; top: -3px; left: 0; right: 0; height: 6px; cursor: row-resize; z-index: 2; }
+.sa-cli-drawer .native-cli-pane > header button { display: inline-flex; align-items: center; gap: 5px; min-height: 22px; padding: 2px 7px; border: 1px solid transparent; border-radius: 5px; color: var(--text-2); background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
+.sa-cli-drawer .native-cli-pane > header button:hover:not(:disabled) { color: var(--text); background: var(--surface-2); }
+.sa-cli-drawer .native-cli-pane > header button:disabled { opacity: .45; cursor: default; }
+.sa-cli-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.sa-cli-owned { display: flex; align-items: center; gap: 8px; padding: 5px 8px; margin-bottom: 4px; border: 1px solid var(--border-soft); border-radius: 6px; color: var(--text-2); font-size: 11px; background: var(--surface-1); }
+.sa-cli-owned > span { flex: 1; min-width: 0; }
+.sa-history-note { margin: 6px auto; text-align: center; color: var(--text-3); font-size: 11px; }

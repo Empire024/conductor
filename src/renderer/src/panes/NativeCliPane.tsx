@@ -2,17 +2,20 @@ import { useEffect, useRef, useState } from 'react'
 import { copyText } from '../clipboard'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import { MessagesSquare, TerminalSquare } from 'lucide-react'
+import { ChevronDown, MessagesSquare, TerminalSquare } from 'lucide-react'
 import type { RuntimeTerminalProps } from './RuntimeTerminal'
 import type { AgentSpec } from '../../../shared/models'
-export function NativeCliPane({ onChat, ...props }: RuntimeTerminalProps & { onChat(): Promise<void> }): React.JSX.Element {
+/** The native CLI's PTY in the drawer under a conversation. `focusToken` changes each time the
+ *  drawer is shown again, which refits and focuses the terminal the PTY never stopped writing to. */
+export function NativeCliPane({ onChat, onHide, focusToken, ...props }: RuntimeTerminalProps & { onChat(): Promise<void>; onHide?(): void; focusToken?: number }): React.JSX.Element {
+  const fitRef = useRef<FitAddon | null>(null)
   const host = useRef<HTMLDivElement>(null), terminal = useRef<Terminal | null>(null)
   const [error, setError] = useState(''), [busy, setBusy] = useState(false), [exited, setExited] = useState(false)
   useEffect(() => {
     let disposed = false, attached = false, lastSequence = 0
     let buffered: Array<{ data: string; sequence: number }> = []
     const term = new Terminal({ fontFamily: 'Cascadia Code, Consolas, monospace', fontSize: 12.5, lineHeight: 1.15, cursorBlink: true, scrollback: 5000, theme: { background: '#011627', foreground: '#d6deeb', cursor: '#80a4c2' } })
-    const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current!); terminal.current = term
+    const fit = new FitAddon(); term.loadAddon(fit); term.open(host.current!); terminal.current = term; fitRef.current = fit
     const resize = (): void => { if (!host.current?.clientWidth || !host.current.clientHeight) return; fit.fit(); window.conductor.nativeCli.resize(props.resourceId, term.cols, term.rows) }
     const observer = new ResizeObserver(resize); observer.observe(host.current!)
     const receive = ({ data, sequence }: { data: string; sequence: number }): void => { if (sequence > lastSequence) { term.write(data); lastSequence = sequence } }
@@ -38,10 +41,18 @@ export function NativeCliPane({ onChat, ...props }: RuntimeTerminalProps & { onC
       term.options.theme = { background: style.getPropertyValue('--surface-0').trim() || '#011627', foreground: style.getPropertyValue('--text').trim() || '#d6deeb', cursor: style.getPropertyValue('--accent-muted').trim() || '#80a4c2' }
     }
     const theme = new MutationObserver(applyTheme); theme.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme', 'data-theme-id'] }); applyTheme()
-    return () => { disposed = true; observer.disconnect(); theme.disconnect(); offData(); offStatus(); input.dispose(); selection.dispose(); term.dispose(); terminal.current = null }
+    return () => { disposed = true; observer.disconnect(); theme.disconnect(); offData(); offStatus(); input.dispose(); selection.dispose(); term.dispose(); terminal.current = null; fitRef.current = null }
   }, [props.resourceId, props.project.id, props.session.id])
+  useEffect(() => {
+    if (!focusToken) return
+    requestAnimationFrame(() => {
+      const term = terminal.current
+      if (!term || !host.current?.clientWidth || !host.current.clientHeight) return
+      fitRef.current?.fit(); window.conductor.nativeCli.resize(props.resourceId, term.cols, term.rows); term.focus()
+    })
+  }, [focusToken, props.resourceId])
   return <div className="native-cli-pane">
-    <header><div className="agent-view-switch"><button title="Return to this conversation in Chat; stops the CLI process" disabled={busy} onClick={() => { setBusy(true); setError(''); void onChat().catch((reason: unknown) => setError(String(reason))).finally(() => setBusy(false)) }}><MessagesSquare size={14} /> Chat</button><button className="active" aria-pressed><TerminalSquare size={14} /> CLI</button></div><span>{props.provider === 'claude' ? 'Claude Code' : props.provider === 'grok' ? 'Grok' : 'Codex'} ·{exited ? 'Exited' : 'Native conversation'}</span></header>
+    <header><span className="sa-cli-title"><TerminalSquare size={13} aria-hidden="true" /> {props.provider === 'claude' ? 'Claude Code' : props.provider === 'grok' ? 'Grok' : 'Codex'} · {exited ? 'Exited' : 'Native CLI, holding this conversation'}</span><span className="sa-spacer" /><button type="button" title="Stop the CLI and continue this conversation in Chat" disabled={busy} onClick={() => { setBusy(true); setError(''); void onChat().catch((reason: unknown) => setError(String(reason))).finally(() => setBusy(false)) }}><MessagesSquare size={13} /> Continue in Chat</button>{onHide && <button type="button" aria-label="Hide CLI" title="Hide the CLI; it keeps running" onClick={onHide}><ChevronDown size={14} /></button>}</header>
     {error && <div className="sa-error-bar" role="alert">{error}</div>}
     <div className="native-cli-terminal" ref={host} onClick={() => terminal.current?.focus()} />
   </div>

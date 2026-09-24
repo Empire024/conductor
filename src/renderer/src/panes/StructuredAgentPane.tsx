@@ -2,7 +2,7 @@ import { conversationIdentity } from './conversation-tab'
 import { PromptImageUpload, PromptImageThumbnail } from '../components/PromptImageUpload'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Archive, ArrowDown, ArrowLeft, FileDiff, FilePlus2, GitBranch, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, Telescope, TerminalSquare, MessagesSquare, LoaderCircle, Undo2, WandSparkles, X } from 'lucide-react'
+import { Archive, ArrowDown, ArrowLeft, ClipboardCopy, FileDiff, FilePlus2, GitBranch, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, Telescope, TerminalSquare, MessagesSquare, LoaderCircle, Undo2, WandSparkles, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { isFrontierModel, MAX_PROMPT_CHARS, WIZARD_MODEL_HINT } from '../../../shared/structured-agent'
 import { permissionParity } from '../../../shared/permission-parity'
@@ -22,7 +22,8 @@ import { StructuredAgentTelemetry, StructuredLiveTokens, StructuredUsageSummary 
 import { distinguishSubagentLabels, subagentColorIndex, subagentIdentityId, summarizeSubagents } from './usage-summary'
 import { followsBottomAfterScroll, hasTimelineSelection, latestOwnerPrompt, truncatePromptPreview } from './conversation-scroll'
 import { ConversationFindBar } from './ConversationFindBar'
-import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, findReducer, paintFindRanges, type FindAction } from './conversation-find'
+import { CLOSED_FIND, clearFindRanges, collectQueryRanges, conversationMatches, findReducer, paintFindRanges, type ConversationMatch, type FindAction } from './conversation-find'
+import { useOlderHistory, withStoredMatches } from './conversation-paging'
 import { FileAttachmentInput } from '../components/FileAttachmentInput'
 import { composerChildKey, composerSendBlock, nextComposerSettings, promptCharacterCount, resolvedComposerSettings } from './composer-settings'
 import { activateBrowserMention, CommandAutocomplete } from './CommandAutocomplete'
@@ -181,6 +182,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const findScrolled = useRef('')
   const findWidened = useRef('')
   const promptFlashTimer = useRef(0)
+  const prependAnchor = useRef<{ node: Element; offset: number } | null>(null)
+  const showAfterLoad = useRef(false)
+  const earlierObserver = useRef<IntersectionObserver | null>(null)
+  const [transcriptBusy, setTranscriptBusy] = useState(false)
   const lastVisibleItems = useRef<TimelineItem[]>([])
   const timeline = useRef<HTMLDivElement>(null)
   const timelineContent = useRef<HTMLDivElement>(null)
@@ -566,7 +571,11 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
 
   const promptChars = promptCharacterCount(message, attachments)
   const sendBlocked = composerSendBlock(message, attachments)
-  const canSubmit = ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation || Boolean(projection.nativeSessionId))
+  // The native CLI holds the conversation while it is open in the drawer; Chat sends again once
+  // the owner continues here, which stops the CLI and brings its turns into this timeline.
+  const cliOwned = Boolean(props.cliDrawer?.owned)
+  const cliIdle = !activePhases.has(projection.phase) && !projection.queued
+  const canSubmit = !cliOwned && ready && !historical && !resuming && sendBlocked !== 'oversized' && (!activePhases.has(projection.phase) || ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) || (projection.phase === 'starting' && metadataConnectionId.current === activeId)) && !projection.archived && (projection.phase !== 'disconnected' || unstartedConversation || Boolean(projection.nativeSessionId))
   const steering = ['running', 'waiting_input', 'waiting_approval'].includes(projection.phase) && Boolean(projection.capabilities?.steering)
   const sendIntent = sendButtonIntent({ active: activePhases.has(projection.phase), interrupting: projection.phase === 'interrupting', draft: Boolean(message.trim()), needsResume, autoResumeOnSend: projection.phase === 'disconnected', steering, historical, canSubmit, submitting })
   const pendingSteering = projection.pendingSteering ?? []
@@ -575,7 +584,16 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const banner = runtimeBanner({ phase: projection.phase, historical, unstarted: unstartedConversation, archived: projection.archived, ready, resuming, canResume: Boolean(capabilities?.resume && projection.nativeSessionId) })
   const shownError = bannerAbsorbsError(banner, error) ? '' : cleanIpcError(error)
   const pending = useMemo(() => projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length, [projection.items])
-  const conversationItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
+  const residentItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
+  // The projection holds the latest 2000 items; anything older is paged in from the store as the
+  // owner scrolls or searches back to it, and sits in front of the resident items.
+  const residentBoundary = projection.items[0]?.sequence
+  const older = useOlderHistory(activeId, projection.truncated, residentBoundary)
+  const conversationItems = useMemo(() => {
+    if (!older.items.length) return residentItems
+    const cut = residentBoundary ?? Number.POSITIVE_INFINITY
+    return [...older.items.filter(item => item.sequence < cut), ...residentItems]
+  }, [older.items, residentItems, residentBoundary])
   // Independent of the windowed/reading-view slice below: the pin must reflect the true latest
   // prompt even while the visible window only covers older or newer activity. Coworker-only
   // tabs have no owner prompt, so retain their initiating coordinated prompt instead.
@@ -605,6 +623,12 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return readingWindow.map((item) => latest.get(item.id) ?? item)
   }, [projection.items, conversationItems, visibleCount, readingWindow])
   useLayoutEffect(() => { lastVisibleItems.current = visibleItems }, [visibleItems])
+  useLayoutEffect(() => {
+    const anchor = prependAnchor.current, element = timeline.current
+    prependAnchor.current = null
+    if (!anchor || !element || !anchor.node.isConnected) return
+    element.scrollTop += anchor.node.getBoundingClientRect().top - element.getBoundingClientRect().top - anchor.offset
+  }, [visibleItems])
   useLayoutEffect(() => {
     if (!ready) return
     restoredView.current = null
@@ -677,7 +701,22 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setReadingWindow(conversationItems.slice(-visibleCount))
     element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
   }, [conversationItems, ready, historical, projection.runtimeId, visibleCount])
-  const findMatches = useMemo(() => find.open ? conversationMatches(conversationItems, find.query) : [], [find.open, find.query, conversationItems])
+  const loadedMatches = useMemo(() => find.open ? conversationMatches(conversationItems, find.query) : [], [find.open, find.query, conversationItems])
+  // History older than what is loaded is searched where it is stored; its hits count and step like
+  // any other, and are paged in when the owner reaches one.
+  const [storedHits, setStoredHits] = useState<ConversationMatch[]>([])
+  const olderSearchable = older.status === 'idle' || older.status === 'loading'
+  useEffect(() => {
+    if (!find.open || find.query.trim().length < 2 || !olderSearchable) { setStoredHits(current => current.length ? [] : current); return }
+    let disposed = false
+    const timer = window.setTimeout(() => void window.conductor.conversationHistory.search(activeId, find.query)
+      .then(hits => { if (!disposed) setStoredHits(hits) })
+      .catch(() => { if (!disposed) setStoredHits([]) }), 180)
+    return () => { disposed = true; window.clearTimeout(timer) }
+  }, [find.open, find.query, olderSearchable, activeId])
+  const hasStoredHits = storedHits.length > 0
+  const loadedIds = useMemo(() => new Set(hasStoredHits ? conversationItems.map(item => item.id) : []), [hasStoredHits, conversationItems])
+  const findMatches = useMemo(() => withStoredMatches(storedHits, loadedMatches, loadedIds), [storedHits, loadedMatches, loadedIds])
   const currentMatch = findMatches[Math.min(find.index, findMatches.length - 1)]
   // Everything but this conversation is searched in the main process against the store, so no
   // other projection is ever shipped here; typing only costs one debounced call.
@@ -706,7 +745,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     if (!element || !card) {
       // The match is older than the rendered window; widen it once and scroll on the next commit.
       const index = conversationItems.findIndex(item => item.id === currentMatch.itemId)
-      if (index >= 0 && findWidened.current !== key) { findWidened.current = key; nearBottom.current = false; setReadingWindow(conversationItems.slice(Math.max(0, index - 5))) }
+      if (index >= 0 && findWidened.current !== key) { findWidened.current = key; nearBottom.current = false; setReadingWindow(conversationItems.slice(Math.max(0, index - 5), Math.max(0, index - 5) + 2000)) }
+      // A hit in history that is not loaded yet: page back to it; the next commit widens to it.
+      else if (index < 0 && findWidened.current !== key + ':' + older.items.length) { findWidened.current = key + ':' + older.items.length; void older.load(currentMatch.sequence) }
       return
     }
     findScrolled.current = key
@@ -714,7 +755,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     userScrollUntil.current = Date.now() + 800
     element.scrollTop += card.getBoundingClientRect().top - element.getBoundingClientRect().top - 12
     if (findJump === currentMatch.itemId) setFindJump(null)
-  }, [find.open, currentMatch, conversationItems, visibleItems, activeId, findJump])
+  }, [find.open, currentMatch, conversationItems, visibleItems, activeId, findJump, older.items.length, older.load])
   useLayoutEffect(() => {
     const element = timeline.current
     // Streaming output must not pay for find: with the bar closed and nothing painted, stop here.
@@ -745,15 +786,58 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setFindJump(itemId)
   }
   const earlierCount = readingWindow ? conversationItems.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).length : Math.max(0, conversationItems.length - visibleCount)
+  // Paging back keeps what the owner is reading in place: the card at the top of the view is
+  // remembered, and once the earlier cards commit the scroll moves by exactly what landed above it.
+  const anchorView = (): void => {
+    const element = timeline.current, content = timelineContent.current
+    if (!element || !content) return
+    const top = element.getBoundingClientRect().top
+    const node = [...content.children].find(child => !child.matches('.sa-load-earlier, .sa-history-note, .sa-empty') && child.getBoundingClientRect().bottom > top)
+    prependAnchor.current = node ? { node, offset: node.getBoundingClientRect().top - top } : null
+  }
   const showEarlier = (): void => {
-    const el = timeline.current
-    const height = el?.scrollHeight ?? 0
+    anchorView()
     if (readingWindow) {
       const earlier = conversationItems.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).slice(-250)
-      setReadingWindow([...earlier, ...readingWindow].slice(-2000))
+      // The window keeps its oldest end: reading back through a long history lets the newest cards
+      // go (the live view brings them back), so paging never stalls at the 2000-card cap.
+      setReadingWindow([...earlier, ...readingWindow].slice(0, 2000))
       setVisibleCount((count) => Math.min(2000, count + earlier.length))
     } else setVisibleCount((count) => Math.min(2000, count + 250))
-    requestAnimationFrame(() => { if (el) el.scrollTop += el.scrollHeight - height })
+  }
+  /** Everything loaded is shown already: fetch the next older page from the store, then show it. */
+  const loadEarlier = (): void => {
+    if (earlierCount > 0) { showEarlier(); return }
+    if (older.status !== 'idle') return
+    showAfterLoad.current = true
+    void older.load()
+  }
+  const loadEarlierRef = useRef(loadEarlier); loadEarlierRef.current = loadEarlier
+  useEffect(() => {
+    if (!showAfterLoad.current) return
+    if (earlierCount > 0) { showAfterLoad.current = false; showEarlier() }
+    else if (older.status !== 'loading') showAfterLoad.current = false
+  }, [earlierCount, older.status])
+  // Scrolling up towards the top of what is rendered pages earlier activity in before the owner
+  // gets there. The load-earlier control is the sentinel; it only acts once the owner has left
+  // the live end, so opening a conversation never pages anything in by itself.
+  const observeEarlier = useCallback((node: HTMLElement | null): void => {
+    earlierObserver.current?.disconnect()
+    earlierObserver.current = null
+    const root = node?.closest('.sa-timeline')
+    if (!node || !root) return
+    const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting) && !nearBottom.current) loadEarlierRef.current() }, { root, rootMargin: '600px 0px 0px 0px' })
+    observer.observe(node)
+    earlierObserver.current = observer
+  }, [])
+  const copyTranscript = async (): Promise<void> => {
+    setTranscriptBusy(true)
+    try {
+      const transcript = await window.conductor.conversationHistory.transcript(activeId)
+      const copied = await copyText(transcript.markdown)
+      window.dispatchEvent(new CustomEvent('conductor:toast', { detail: copied ? `Copied the whole conversation: ${transcript.messages.toLocaleString()} messages${transcript.olderUnavailable ? ' (the oldest activity is no longer stored)' : ''}.` :'The transcript could not be copied to the clipboard.' }))
+    } catch (reason) { setError('Cannot copy the transcript: ' + (reason instanceof Error ? reason.message : String(reason))) }
+    finally { setTranscriptBusy(false) }
   }
   const jumpToLatest = (): void => {
     setReadingWindow(null)
@@ -819,8 +903,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       else if (!hasTimelineSelection(el, window.getSelection())) { setReadingWindow(null); setNewOutput(false) }
     }}><div ref={timelineContent} className="sa-timeline-content">
       {(!ready || !conversationItems.length) && <div className="sa-empty"><strong>{ready ? 'What are we working on?' : 'Opening conversation…'}</strong>{ready && <p>Ask {name} about your code, or describe a change.</p>}</div>}
-      {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
-      {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
+      {(earlierCount > 0 || older.status === 'idle' || older.status === 'loading') && <button ref={observeEarlier} className="sa-load-earlier" disabled={earlierCount === 0 && older.status === 'loading'} onClick={() => loadEarlierRef.current()}>{earlierCount > 0 ? `Show earlier activities (${earlierCount})` :older.status === 'loading' ? 'Loading earlier activity…' : 'Load earlier activity'}</button>}
+      {earlierCount === 0 && older.status === 'unavailable' && <p className="sa-history-note">Earlier activity in this conversation is no longer stored.</p>}
       {ready && activityGroups.map(group => {
         const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} onSwitchPermission={historical || provider !== 'claude' ? undefined : switchPermission} />)
         // A recall belongs to the message it was injected with, so it renders directly under it.
@@ -834,15 +918,16 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
         return <details className="sa-completed-group" key={group[0]!.id}><summary><span>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</span>{latestTask && <span className="sa-completed-latest" title={latestTask}><b>Latest</b> {latestTask}{latestOutput && <code>OUT {latestOutput}</code>}</span>}</summary><div>{activities}</div></details>
       })}
       {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
-    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, readingWindow, projection.truncated, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput])
+    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, older.status, observeEarlier, readingWindow, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput])
 
   return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }}>
     <header className="sa-session-bar">
       <ProviderIcon provider={provider} size={15} />
-      {props.onRequestCli && <div className="agent-view-switch"><button className="active" aria-pressed title="Chat"><MessagesSquare size={13} /> Chat</button><button title="Continue the same conversation in the native CLI" disabled={!ready || historical || activePhases.has(projection.phase) || Boolean(projection.queued)} onClick={() => props.onRequestCli?.(activeId)}><TerminalSquare size={13} /> CLI</button></div>}
+      {props.cliDrawer && <div className="agent-view-switch"><button className={props.cliDrawer.open ? 'active' : undefined} aria-pressed={props.cliDrawer.open} title={props.cliDrawer.open ? 'Hide the CLI; nothing stops' : cliOwned ? 'Show the native CLI that holds this conversation' : cliIdle ? 'Continue this conversation in its native CLI, under the chat' : 'Watch this turn live in a CLI view under the chat'} disabled={!ready || historical} onClick={() => props.cliDrawer?.onToggle(activeId, { idle: cliIdle, sequence: projection.sequence })}><TerminalSquare size={13} /> CLI</button></div>}
       {activePhases.has(projection.phase) && <span className="sa-session-phase" role="status"><span className={'sa-session-dot status-' + projection.phase} />{projection.phase === 'starting' ? 'Connecting…' : projection.phase === 'running' ? ['Thinking', 'Spelunking', 'Working', 'Considering'][workingWord] : projection.items.some(item => item.data.type === 'interaction' && item.data.interaction.status === 'pending' && item.data.interaction.review?.phase === 'reviewing') ? 'Waiting for stronger review' : displayPhase(projection.phase)}</span>}
       {pending > 0 && <span className="sa-attention-badge" aria-label={pending + ' pending requests'}>{pending}</span>}
       <span className="sa-spacer" />
+      <button aria-label="Copy transcript" title="Copy the whole conversation as Markdown" disabled={transcriptBusy} onClick={() => void copyTranscript()}>{transcriptBusy ? <LoaderCircle size={15} className="spin" /> : <ClipboardCopy size={15} />}</button>
       <button aria-label="Local change history" title="Files this conversation changed, with revert" onClick={() => setChangesOpen(true)}><FileDiff size={15} /></button>
       <button aria-label="Conversation history" title="History" onClick={() => setHistoryOpen(true)}><History size={15} /></button>
       <button aria-label="Session settings" title="Conversation settings" aria-expanded={settingsOpen} onClick={() => setSettingsOpen(true)}><Settings2 size={15} /></button>
@@ -879,12 +964,13 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
           void window.conductor.structured.cancelQueued(activeId, input.id).then(queued => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments(current => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch(reason => setError(String(reason)))
         }}><Undo2 size={12} aria-hidden="true" />Restore to composer</button>}
       </div>)}</div>}
+      {cliOwned && <div className="sa-cli-owned" role="status"><TerminalSquare size={13} aria-hidden="true" /><span>{name} is continuing this conversation in its native CLI{props.cliDrawer?.open ? ' below' : ''}.</span>{!props.cliDrawer?.open && <button type="button" onClick={() => props.cliDrawer?.onToggle(activeId, { idle: cliIdle, sequence: projection.sequence })}>Show CLI</button>}<button type="button" title="Stop the CLI and continue this conversation in Chat" onClick={() => props.cliDrawer?.onReturnToChat()}><MessagesSquare size={13} /> Continue in Chat</button></div>}
       <QueuedMessageList prompts={queuedPrompts} onRemove={prompt => { void window.conductor.structured.cancelQueued(activeId, prompt.id).then(queued => { if (!queued) return; setMessage(draftRef.current.message ? draftRef.current.message + '\n\n' + queued.text : queued.text); setAttachments(current => [...current, ...queued.attachments].slice(-20)); composer.current?.focus() }).catch((reason: unknown) => setError(String(reason))) }} />
       {attachments.length > 0 && <div className="sa-context-chips">{attachments.map(attachment => <span key={attachment.id}><button type="button" title="Inspect attached context" onClick={() => setInspectAttachment(attachment)}>{attachment.kind === 'image' && <PromptImageThumbnail projectId={props.project.id} attachment={attachment} />}{attachment.name}{attachment.startLine ? ':' + attachment.startLine + (attachment.endLine ? '–' + attachment.endLine : '') : ''}</button><button type="button" aria-label={'Remove context ' + attachment.name} onClick={() => { if (isPastedText(attachment)) { const next = removePastedText(draftRef.current.message, draftRef.current.attachments, attachment.id); setDraft(next.message, next.attachments) } else setAttachments(current => current.filter(item => item.id !== attachment.id)) }}><X size={11} /></button></span>)}</div>}
       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
       {permissionParity(settings, capabilities) && <p className="sa-request-summary" role="status">{permissionParity(settings, capabilities)}</p>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
-      <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
+      <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={cliOwned ? 'The native CLI has this conversation. Continue in Chat to send here.' : historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived || cliOwned} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
         // Only an event that could have inserted a long run pays for diffing the whole draft.
         const input = event.nativeEvent as Partial<InputEvent>

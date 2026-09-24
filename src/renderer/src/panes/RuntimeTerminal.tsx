@@ -1,5 +1,5 @@
 import type { ConversationIdentity } from './conversation-tab'
-import { NativeCliPane } from './NativeCliPane'
+import { CliDrawer, storedDrawerHeight } from './CliDrawer'
 import { copyTextWithFeedback } from '../clipboard'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
@@ -40,7 +40,9 @@ export interface RuntimeTerminalProps {
   onModelChange?(model: string): void
   onEffortChange?(effort: AgentEffort): void
   onViewModeChange?(viewMode: 'visual' | 'cli'): void
-  onRequestCli?(id: string): void
+  /** The CLI drawer under a Chat conversation, owned by StructuredRuntime. `owned`: the native CLI
+   *  holds the conversation, so Chat cannot send until the owner continues there. */
+  cliDrawer?: { open: boolean; owned: boolean; onToggle(id: string, state: { idle: boolean; sequence: number }): void; onReturnToChat(): void }
   conversationId?: string
   onConversationChange?(conversation: ConversationIdentity): Promise<void>
 }
@@ -88,30 +90,70 @@ export function RuntimeTerminal(props: RuntimeTerminalProps): React.JSX.Element 
   return <TerminalRuntimePane {...props} />
 }
 
+/** Whether each tab's CLI drawer was showing, so a suspended tab comes back as the owner left it. */
+const drawerShown = new Map<string, boolean>()
+const activeSessionPhases = new Set(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 function StructuredRuntime(props: RuntimeTerminalProps): React.JSX.Element {
   const latest = useRef(props)
   latest.current = props
   const [view, setView] = useState(props.viewMode ?? 'visual')
+  const viewRef = useRef(view)
   const [conversation, setConversation] = useState(props.resourceId)
-  const changeView = (next: 'visual' | 'cli'): void => { setView(next); latest.current.onViewModeChange?.(next) }
+  // Chat stays mounted whatever the CLI does; the CLI lives in a drawer under it. The drawer opens
+  // by itself only when the native CLI takes the conversation (a restored tab, a handoff).
+  const [drawer, setDrawer] = useState(() => ({ open: drawerShown.get(props.resourceId) ?? view === 'cli', idle: true, starting: false, since: 0, height: storedDrawerHeight() }))
+  useEffect(() => { drawerShown.set(props.resourceId, drawer.open); if (drawerShown.size > 200) drawerShown.delete(drawerShown.keys().next().value!) }, [props.resourceId, drawer.open])
+  const changeView = (next: 'visual' | 'cli'): void => {
+    if (next === 'cli' && viewRef.current !== 'cli') setDrawer(current => ({ ...current, open: true, starting: false }))
+    viewRef.current = next
+    setView(next); latest.current.onViewModeChange?.(next)
+  }
   useEffect(() => {
     let mounted = true
     const off = window.conductor.structured.onEvents((events) => {
-      const event = events.filter((item) => item.sessionId === conversation && item.data.type === 'session' && item.data.view).at(-1)
+      const sessions = events.filter((item) => item.sessionId === conversation && item.data.type === 'session')
+      const phase = sessions.at(-1)
+      if (phase?.data.type === 'session') { const idle = !activeSessionPhases.has(phase.data.phase); setDrawer(current => current.idle === idle ? current : { ...current, idle }) }
+      const event = sessions.filter((item) => item.data.type === 'session' && item.data.view).at(-1)
       if (event?.data.type === 'session' && event.data.view) changeView(event.data.view)
     })
     void window.conductor.structured.snapshot(conversation).then((state) => { if (mounted && state?.view) changeView(state.view) })
     return () => { mounted = false; off() }
   }, [conversation])
-  return view === 'cli' ? <NativeCliPane {...props} resourceId={conversation} onChat={async () => { await window.conductor.nativeCli.chat(conversation); changeView('visual') }} />
-    : <StructuredAgentPane {...props} conversationId={conversation} onConversationChange={async identity => {
+  const toast = (reason: unknown): void => { window.dispatchEvent(new CustomEvent('conductor:toast', { detail: reason instanceof Error ? reason.message : String(reason) })) }
+  // Local models have no native CLI of their own to continue the conversation in.
+  const openNative = (id: string): void => {
+    if (props.provider === 'local') return
+    setConversation(id)
+    setDrawer(current => ({ ...current, starting: true }))
+    void window.conductor.nativeCli.ensure(id).then(() => changeView('cli')).catch((reason: unknown) => { setDrawer(current => ({ ...current, starting: false })); toast(reason) })
+  }
+  const returnToChat = async (): Promise<void> => {
+    await window.conductor.nativeCli.chat(conversation)
+    changeView('visual')
+    setDrawer(current => ({ ...current, open: false }))
+  }
+  const cliDrawer: RuntimeTerminalProps['cliDrawer'] = {
+    open: drawer.open,
+    owned: view === 'cli',
+    // Hiding never stops anything. Showing an idle Chat conversation hands it to the native CLI;
+    // showing one whose turn is running shows that turn live until it settles.
+    onToggle: (id, state) => {
+      if (drawer.open) { setDrawer(current => ({ ...current, open: false })); return }
+      setDrawer(current => ({ ...current, open: true, idle: state.idle, since: state.sequence }))
+      if (viewRef.current !== 'cli' && state.idle) openNative(id)
+    },
+    onReturnToChat: () => { void returnToChat().catch(toast) }
+  }
+  return <div className="sa-runtime-split">
+    <StructuredAgentPane {...props} conversationId={conversation} cliDrawer={cliDrawer} onConversationChange={async identity => {
       await latest.current.onConversationChange?.(identity)
       setConversation(identity.id)
-    }} onRequestCli={props.provider === 'local' ? undefined : (id) => {
-      // Local models have no native CLI of their own to continue the conversation in.
-      setConversation(id)
-      void window.conductor.nativeCli.ensure(id).then(() => changeView('cli')).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: String(reason) })))
     }} />
+    {(drawer.open || view === 'cli') && <CliDrawer runtime={props} conversation={conversation} owned={view === 'cli'} open={drawer.open} idle={drawer.idle} starting={drawer.starting} since={drawer.since} height={drawer.height}
+      onHeight={height => { setDrawer(current => ({ ...current, height })); localStorage.setItem('conductor.cli-drawer.height', String(Math.round(height))) }}
+      onHide={() => setDrawer(current => ({ ...current, open: false }))} onOpenNative={() => openNative(conversation)} onReturnToChat={returnToChat} />}
+  </div>
 }
 
 function TerminalRuntimePane(props: RuntimeTerminalProps): React.JSX.Element {
