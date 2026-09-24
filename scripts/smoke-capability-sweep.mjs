@@ -205,7 +205,7 @@ async function sweepProvider(provider) {
 
 /** One one-word prompt per advertised model family, in the tab that is on screen. Real inference. */
 async function runTurns(provider, tab) {
-  const families = { claude: ['opus[1m]', 'claude-fable-5-1[1m]', 'sonnet', 'haiku'], codex: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'] }
+  const families = { claude: ['opus[1m]', 'claude-fable-5-1', 'sonnet', 'haiku'], codex: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'] }
   for (const model of families[provider]) {
     const info = tab.report.capabilities.models.find(m => m.id === model)
     if (!info) { tab.report.turns.push({ model, skipped: 'not advertised' }); continue }
@@ -310,7 +310,7 @@ try {
     expect(usage.contextWindow).toBe('1,000,000 tokens')
     expect(usage.context).toContain('100,001 / 923,000')
     // The composer ring only paints once usage reaches its warning band; at 11% View usage is the evidence.
-    check(`claude: on opus[1m] (message model ${turn.effectiveSettings?.model}, modelUsage keyed claude-opus-5[1m]) the adapter learned a ${turn.limits.modelContextWindow.toLocaleString('en-US')}-token window with ${turn.limits.contextCapacityTokens.toLocaleString('en-US')} usable; View usage shows ${usage.contextWindow} (${usage.context}); composer ring ${controls.contextRing ? controls.contextRing.label : 'not painted below the warning band'}`)
+    check(`claude: on opus[1m] (message model ${turn.effectiveSettings?.model}, modelUsage keyed claude-opus-5-5[1m]) the adapter learned a ${turn.limits.modelContextWindow.toLocaleString('en-US')}-token window with ${turn.limits.contextCapacityTokens.toLocaleString('en-US')} usable; View usage shows ${usage.contextWindow} (${usage.context}); composer ring ${controls.contextRing ? controls.contextRing.label : 'not painted below the warning band'}`)
     await chooseModel(claude.pane, 'swarm-unknown-model')
     controls = await readControls(claude.pane)
     await shot('claude-16-unknown-metadata', claude.pane.locator('.sa-composer'))

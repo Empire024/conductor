@@ -81,10 +81,10 @@ export const CODEX_MODELS = [
 
 export const CLAUDE_MODELS = [
   { id: 'default', label: 'Default for account' },
-  { id: 'opus[1m]', label: 'Claude Opus (1M context)' },
-  { id: 'claude-fable-5-1[1m]', label: 'Claude Fable' },
-  { id: 'sonnet', label: 'Claude Sonnet' },
-  { id: 'haiku', label: 'Claude Haiku' }
+  { id: 'opus[1m]', label: 'Claude Opus 5.5 (1M context)' },
+  { id: 'claude-fable-5-1', label: 'Claude Fable 5.1' },
+  { id: 'sonnet', label: 'Claude Sonnet 5' },
+  { id: 'haiku', label: 'Claude Haiku 4.5' }
 ]
 
 /** What a signed-in Grok 1.0.41 advertised on 2026-09-24; the adapter replaces it on connect. */

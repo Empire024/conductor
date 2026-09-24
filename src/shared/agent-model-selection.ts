@@ -3,7 +3,7 @@ import type { ProviderCapabilities } from './structured-agent'
 
 export const explicitModel = (value: unknown): value is string => typeof value === 'string' && Boolean(value.trim()) && !['default', 'auto'].includes(value.trim().toLowerCase())
 /** What a Claude conversation runs on before discovery names anything: the account default on
- *  2026-09-21 resolves to `claude-opus-5[1m]`, and `opus[1m]` is the only Opus entry the CLI's
+ *  2026-09-24 (Claude Code 2.1.281) resolves to `claude-opus-5-5[1m]`, and `opus[1m]` is the only Opus entry the CLI's
  *  picker offers (a bare `opus` is not advertised). Passing it is the same model the CLI would
  *  choose on its own for this account. */
 export const CLAUDE_FALLBACK_MODEL = 'opus[1m]'

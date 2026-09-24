@@ -26,7 +26,7 @@ describe('Codex model catalog', () => {
 
 describe('Claude model catalog', () => {
   it('mirrors the ids Claude Code advertises: the 1M Opus entry, Fable, Sonnet and Haiku', () => {
-    expect(CLAUDE_MODELS.map((model) => model.id)).toEqual(['default', 'opus[1m]', 'claude-fable-5-1[1m]', 'sonnet', 'haiku'])
+    expect(CLAUDE_MODELS.map((model) => model.id)).toEqual(['default', 'opus[1m]', 'claude-fable-5-1', 'sonnet', 'haiku'])
     expect(CLAUDE_MODELS.some((model) => model.id === 'opus')).toBe(false)
   })
 })

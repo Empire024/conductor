@@ -1,21 +1,21 @@
 /** SYNTHETIC Claude Code control-protocol fixture for the capability sweep. Never contacts a
- *  provider. It answers `initialize` with the model catalog the installed Claude Code 2.1.278
- *  advertised to this account on 2026-09-21 (captured by scripts/probe-capability-sweep.mjs,
+ *  provider. It answers `initialize` with the model catalog the installed Claude Code 2.1.281
+ *  advertised to this account on 2026-09-24 (captured by scripts/probe-capability-sweep.mjs,
  *  field names and values verbatim) plus one deliberately under-described model, and it answers
  *  a handful of explicitly synthetic prompts with the usage, context-window and compaction frames
  *  the production adapter reads. Nothing here executes tools or writes files. */
 import readline from 'node:readline'
 import { randomUUID } from 'node:crypto'
 
-if (process.argv.includes('--version')) { console.log('2.1.278 (Claude Code)'); process.exit(0) }
+if (process.argv.includes('--version')) { console.log('2.1.281 (Claude Code)'); process.exit(0) }
 if (process.env.CONDUCTOR_OFFLINE_TESTS !== '1') throw new Error('Synthetic capability fixture requires CONDUCTOR_OFFLINE_TESTS=1')
 
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
-/** Verbatim shape of the 2026-09-21 initialize answer (descriptions shortened, no account data). */
+/** Verbatim shape of the 2026-09-24 initialize answer (descriptions shortened, no account data). */
 export const CLAUDE_MODELS = [
-  { value: 'default', resolvedModel: 'claude-opus-5[1m]', displayName: 'Default (recommended)', description: 'Opus 5 with 1M context · Best for everyday, complex tasks', supportsEffort: true, supportedEffortLevels: EFFORTS, supportsAdaptiveThinking: true, supportsFastMode: true, supportsAutoMode: true },
-  { value: 'opus[1m]', resolvedModel: 'claude-opus-5[1m]', displayName: 'Opus (1M context)', description: 'Opus 5 with 1M context · Best for everyday, complex tasks', supportsEffort: true, supportedEffortLevels: EFFORTS, supportsAdaptiveThinking: true, supportsFastMode: true, supportsAutoMode: true },
-  { value: 'claude-fable-5-1[1m]', resolvedModel: 'claude-fable-5-1', displayName: 'Fable', description: 'Fable 5.1 · Most capable for your hardest and longest-running tasks', supportsEffort: true, supportedEffortLevels: EFFORTS, supportsAdaptiveThinking: true, supportsAutoMode: true },
+  { value: 'default', resolvedModel: 'claude-opus-5-5[1m]', displayName: 'Default (recommended)', description: 'Opus 5.5 with 1M context · Best for everyday, complex tasks', supportsEffort: true, supportedEffortLevels: EFFORTS, supportsAdaptiveThinking: true, supportsFastMode: true, supportsAutoMode: true },
+  { value: 'opus[1m]', resolvedModel: 'claude-opus-5-5[1m]', displayName: 'Opus (1M context)', description: 'Opus 5.5 with 1M context · Best for everyday, complex tasks', supportsEffort: true, supportedEffortLevels: EFFORTS, supportsAdaptiveThinking: true, supportsFastMode: true, supportsAutoMode: true },
+  { value: 'claude-fable-5-1', resolvedModel: 'claude-fable-5-1', displayName: 'Fable', description: 'Fable 5.1 · Most capable for your hardest and longest-running tasks', supportsEffort: true, supportedEffortLevels: EFFORTS, supportsAdaptiveThinking: true, supportsAutoMode: true },
   { value: 'sonnet', resolvedModel: 'claude-sonnet-5', displayName: 'Sonnet', description: 'Sonnet 5 · Efficient for routine tasks', supportsEffort: true, supportedEffortLevels: EFFORTS, supportsAdaptiveThinking: true, supportsAutoMode: true },
   { value: 'haiku', resolvedModel: 'claude-haiku-4-5-20251001', displayName: 'Haiku', description: 'Haiku 4.5 · Fastest for quick answers' },
   // Not advertised by the real CLI: a model entry with nothing but an id, the shape a future
@@ -24,7 +24,7 @@ export const CLAUDE_MODELS = [
 ]
 /** Context windows the [1m] variants and the others reach, as the real result frames report them
  *  in `modelUsage`; a value here is a fixture figure, not a measurement. */
-const WINDOWS = { 'claude-opus-5[1m]': { contextWindow: 1_000_000, maxOutputTokens: 64_000 }, 'claude-fable-5-1': { contextWindow: 1_000_000, maxOutputTokens: 64_000 }, 'claude-sonnet-5': { contextWindow: 1_000_000, maxOutputTokens: 64_000 }, 'claude-haiku-4-5-20251001': { contextWindow: 200_000, maxOutputTokens: 64_000 } }
+const WINDOWS = { 'claude-opus-5-5[1m]': { contextWindow: 1_000_000, maxOutputTokens: 64_000 }, 'claude-fable-5-1': { contextWindow: 1_000_000, maxOutputTokens: 64_000 }, 'claude-sonnet-5': { contextWindow: 1_000_000, maxOutputTokens: 64_000 }, 'claude-haiku-4-5-20251001': { contextWindow: 200_000, maxOutputTokens: 64_000 } }
 
 const input = readline.createInterface({ input: process.stdin })
 const nativeSessionId = process.argv.includes('--resume') ? process.argv[process.argv.indexOf('--resume') + 1] : 'swarm-claude-native-1'
