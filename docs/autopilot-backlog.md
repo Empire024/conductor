@@ -2,24 +2,28 @@
 
 ## Live operational summary
 
-- Updated: 2026-09-24 00:03 UTC. Controller: `agent_muer8ymv_5sx2164`; workspace `session_muer689g_gcuiloy`.
-- Objective: complete the evidence-based Conductor sweep, then resolve reliability blockers through bounded Grok work, cheap local labor and selective Opus review.
-- Running: Grok S1 inventory recovery, S2 quota followup, S3a partial-audit correction and F1 event-history implementation. Baseline commands passed; no product completion accepted.
-- Stopped local worker: `agent_muerczw7_p9xz3df`, tab `tab_muercyyx_hgsngej`, allowed write only `docs/autopilot-evidence/local-inventory.md`. Interrupted after two report writes exceeded 2,560 output tokens (10,098 then 9,848 characters); no file was written. Runtime's corrective smaller-chunks instruction was not followed. Prior dispatch `agent_muercefs_o04vmv5` was rejected before execution because local read-only mode is unsupported.
-- Grok workers: S2 baseline `agent_muerh0kt_k3ncw1b` / `tab_muerh09q_69l97eo`; S3a core claims `agent_muerh3f2_2ehll4v` / `tab_muerh30z_yo5mg2c`. Both accepted on Auto. S2 owns heavy-check slot after controller's initial documentation delivery; S3a is source/evidence review only.
-- S1 recovery accepted: Grok `agent_muerr729_l3ugjmv` / `tab_muerr6uu_ryda8nr`, orchestration task `task_muerr7tb_foppu2f`, report `docs/autopilot-evidence/repository-inventory.md`. Local task `task_muerczx4_zw36w3u` marked blocked with explicit escalation evidence.
-- F1 implementation accepted: Grok `agent_muerw1fu_a33x86v` / `tab_muerw18w_edxi7e3`, orchestration task `task_muerw1jr_4mqtzu2`; exclusive production scope durable-jobs store/controller/wiring/index/report and their tests. Report `docs/autopilot-evidence/f1-event-history.md`. Do not dispatch overlapping F2/F3 until this scope is released. Worker may locally git.ship only its scoped files after checks; acceptance still needs independent Opus review and runtime/restart proof.
-- Verified completions: initial backlog/279-claim ledger delivered locally in `fc557b1cc9b48e808825ca7460e5e63b653e4695`; delivery `delivery-7fba8142-ca74-4df2-abd4-e33941f1cbde` passed full tests and production build in isolated requested-path checkout. Controller inspected current-tree logs: typecheck exit 0 at 00:02:15, 256 Vitest files / 3,020 tests plus 65 script tests exit 0 at 00:04:30, production build exit 0 at 00:05:38 UTC. Report/delivery of S2 pending. No product claim accepted yet.
-- Claims to verify: 314 checklist items: 279 done claims, 32 todo, 3 doing. All 279 done claims remain unverified until recorded against their acceptance requirements. No false-completion has yet been independently established or reopened.
-- Blockers: existing smoke-slot grant is stale (2026-09-21) and belongs to another agent/script; no Electron smoke authorized by that grant. Grok quota telemetry is still a capability gap, but no longer blocks dispatch.
-- Provider usage: Astra/Codex 79% weekly consumed at 00:04:53 UTC; hard stop 95%. Claude account 46% at 23:50:33; hard stop 60%. Fable-specific bucket 74% is separate, not universal Claude allowance; do not use Fable. Grok percentage unknown. **Owner override (2026-09-24): use Grok until it reports it cannot work anymore; this supersedes Grok's 95% ceiling and unknown-quota dispatch block.** Do not blindly retry exhaustion. Astra/Claude ceilings remain unchanged.
-- Owner clarification: investigate whether Grok itself exposes the ceiling. Continue while unknown under the override; use the original 95% threshold if an authoritative percentage becomes available. Never infer quota from context tokens or dollar spend.
-- Local compute: one existing llama-server PID 31984, model `local/qwen3.6-35b-a3b`, port 51436, started 23:35:45 UTC. Reuse it; no downloads, installs, second server, or model switch while in use. Machine profile read.
-- Capability gaps: G1 quota read/enforcement in app control; G2 local-server inventory/stop API (existing checklist task); G3 local read-only dispatch is advertised but rejected; G4 indexed file search returns recovery/artifact copies before source files.
-- Repository: initial HEAD `e3aa6645beb0ce3682c1aa5bc33e24d717e5a423`, main ahead 29. Preserve pre-existing `feature-list.md`, `src/main/agent-control.ts`, and owner-authored untracked `docs/autopilot-brief.md`. Controller owns this backlog and audit evidence only. Use scoped `git.ship`, never publish.
-- Next actions: verify S1 report and map all subsystems; finish S2 Grok-quota followup; accept S3a only as partial source triage (not 40 completed verifications); supervise F1 then request sparse Opus review (last account quota 46% <60%). Commit stable reports with backlog. Continue remaining 279-claim audit in small real inspections, including UI, remote/browser, scheduling, memory and update workflows. No checklist claim reopened without concrete contradiction.
-- Controller continuation: context now contains large discovery output. Checkpoint this state and use agents.handoff. Handoff does not reparent active coworkers automatically (agent-control.ts handoff only opens/submits receiver); release the four Grok relationships immediately before handoff, then the receiver may adopt them with agents.steer when needed. Do not rerun their prompts. Status reads need no takeover. Preserve all active scopes and release the stale failed local dispatch tasks when safe.
-- Checklist ownership: controller changed only `durable-jobs-review-fixes` from todo to doing with tasks.update at 00:07 UTC; marker now belongs to `agent_muer8ymv_5sx2164`. Entire feature-list.md still contains another agent's pre-existing edits and MUST NOT be shipped as a whole by autopilot. Aggregate remains incomplete until all findings and acceptance are handled; F1 is just one subtask.
+- Updated: 2026-09-24 00:38 UTC. Controller `agent_mues2ka2_oclznv3`, workspace `session_muer689g_gcuiloy`. Objective: complete full evidence-based sweep, then bounded reliability repairs with strict independent acceptance. Controller only; Grok implements, local cheap extraction, sparse Opus review.
+- Latest delivery: **F1 locally committed `cacfc742cd2aaec5f6543a8166860d1741a4ef36`**, delivery `delivery-dab93ed1-fa1f-44b4-a856-2f115990c5f7` settled00:37:13. Scoped14files, full tests/build passed in isolation, no push/release. Final focused suite44pass; controller inspected final collector and isolation/latest-note tests. First preflight failed because `.log` files are ignored; worker renamed evidence to `.txt`, corrected references and retried. Source fix delivered, **runtime acceptance still pending**. Historical pre-delivery bullets below describe earlier checkpoints.
+- Acceptance author: new independent Grok `agent_mueszf0s_sme7cnw` / `tab_mueszeu5_08khi6p` / task `task_mueszfih_4eg2uqw`. Owns ONLY scripts/smoke-durable-history.mjs and docs/autopilot-evidence/f1-runtime-acceptance.md. StageA writes deterministic isolated stub/Electron restart fixture; only node --check allowed, NO launch/build/test/ship. StageB requires controller's fresh exact smoke grant after script review and serialization check. No real llama-server operations; preserve existing PID31984. Assert completed late elapsed-resume job, single persisted replan budget, early/middle/late summarized report evidence, full jobs.events paging.
+- Source checkpoints now: S3b55/93 inspected,38unopened (worker still settling); S3c38/93,55unopened and next20 dispatched; S3d93/93,0unopened settled00:36:55, both earlier failure calls withdrawn. Controller sampled disputed claims and mapped all93 S3d rows to matrix source references; no product verdict accepted/reopened. S3d report is stable for checkpoint delivery. Full source sweep still incomplete in first two bands.
+- Active native workers: F1 Grok `agent_muerw1fu_a33x86v` (tab `tab_muerw18w_edxi7e3`, task `task_muerw1jr_4mqtzu2`); S3b `agent_muerr729_l3ugjmv` (tab `tab_muerr6uu_ryda8nr`); S3c `agent_muerh3f2_2ehll4v` (tab `tab_muerh30z_yo5mg2c`); S3d `agent_mues6gnf_z3dinjq` (tab `tab_mues6gg7_l1vovu5`, task `task_mues6h8v_8pope7a`). Maximum four native coworkers. All relationships adopted/created by this controller.
+- F1 exclusively owns durable-jobs store/controller/wiring/index/report, associated tests, f1-event-history.md and its three evidence logs. Original >1000 regression run: 6 failures / 34 passes; post-fix focused suite: 41 passes in four files, typecheck 0. Controller read actual diff and observed logs. No F1 commit yet. F2 gate/F3 watchdog stay queued; no overlapping production work.
+- F1 now incorporates Opus P2 pagination correction before its own delivery: stop collector only on empty page, throw on missing/nonadvancing cursor; capped-reader/stalled-reader tests and cheap cross-job/two-late-note guards. No schema/index migration or resume semantics change. F1 has heavy-check/delivery slot; controller docs delivery waits until F1 settles.
+- Opus `agent_muesglj7_muv9pi0` (tab `tab_muesgl6r_h17ojat`, task `task_muesgp3p_j2f4z03`) settled. No P0/P1 source finding on initial F1 diff; P2 collector issue sent to author. Report `f1-opus-review.md` includes exact reviewed hash; source verdict is not runtime acceptance. Its initial runtime recipe mistakenly expected raw fillers in summarized report; corrected to relevant early/middle/late records plus full events paging.
+- Review incident: despite explicit no-ship assignment, Opus initiated docs-only delivery `delivery-e2b72824-9af2-48df-a5b9-3cb052037e7c`, settled 00:29:30 UTC, local commit `d996eaeccc982067aee598fa6d3666b62ff40d62`, isolated tests/build passed, no publish. No cancellation method. F1 observed it and waited; no observed heavy overlap. Final reviewer corrections are uncommitted for controller checkpoint. Do not treat that build as F1 validation.
+- Source sweep reports: `sweep-claims-001-093.md` last checkpoint 35 inspected / 58 unopened; `sweep-claims-094-186.md` 18 / 75, now adding exactly 20 unopened ascending; `sweep-claims-187-279.md` 76 / 17, now completing all 17 and correcting allegations. Reports only: NO ship, tests/build, smoke or production edits. Source breadth is incomplete; no product claim accepted or reopened.
+- Audit corrections: obsolete Claude 2.1.265 rejection does not reproduce the former rejection of newer-than-baseline CLI (installed 2.1.281 is allowed by current source). Prompt-length guard/error presence does not establish the vague historical prompt bug; S3c must narrow its allegation. S3d's blue stop-button allegation is superseded by later owner clarification requesting blue button/red stopped indicator; bare effort fallback is not rendered when no effort choices exist, and model-name default is not effort. Actual guessed effort versus CLI configuration remains a precise question; no keyword-based reopening.
+- Claim matrix: original 314 checklist items = 279 done claims +32 todo +3 doing. All279 remain unverified. Controller integrated ten S3a source references and assigned each row to one source report. S3a corrected report accurately records10 inspected/30 not opened/40 unverified; original fifteen durable-job findings are triage, not accepted fixes. Initial full claims remain in feature-list.
+- S1 repository inventory settled and controller-sampled: 89 smoke scripts; generated TODO; local read-only sandbox mismatch; delivery catalog falsely describes routine publish; source-search ranking. All brief subsystem headings mapped. `repository-inventory.md` is useful navigation, not product evidence.
+- S2 `agent_muerh0kt_k3ncw1b` settled, no repeat tests requested. Current-tree baseline logs inspected: typecheck0 (00:02:15), 256 Vitest files/3020tests +65script tests0 (00:04:30), production build0 (00:05:38). No configured lint. Report `baseline.md` includes authoritative quota addendum; temporary worker credential/helpers removed.
+- Provider limits: Astra81% weekly at00:24:50 (stop95%); Opus general46% at00:24:01 (stop60%); Fable-specific74% separate, do not use Fable. **Grok authoritative weekly13% at~00:16**, installed Grok1.0.41 dashboard `/usage`, Usage limit tab: `Weekly limit (SuperGrok)`, reset displayed `October1,00:43` (zone unspecified). Original95% Grok stop restored per owner clarification. CLI-only unavailable conclusion superseded. Never infer quota from dollars/context.
+- Authoritative Grok read used text-only PTY `grok dashboard` then `/usage` and two Enter presses, no model prompt. Sandbox denied policy-lock access; approved escalated read succeeded. Exited cleanly with two consecutive Ctrl+C. No desktop window or billing change. Future controller uses its own credential; never copy old token.
+- Local server remains existing Qwen35 PID31984 port51436; no downloads, second server, installs or switching. Failed original inventory local `agent_muerczw7_p9xz3df` interrupted after two oversized 2560-token writes; first read-only dispatch rejected unsupported sandbox. Escalation evidence preserved.
+- Narrow local extraction `agent_muesal3x_uzv19z0` (tab `tab_muesakvj_b6sn1st`, task `task_muesalee_jvxz9ii`) settled using same server. File bound passed in5rounds; first content rejected for parking inference/bad references. One repair corrected substance; controller fixed three remaining references. `local-smoke-map.md` now source-checked; not unassisted factual success.
+- **Runtime acceptance remains:** existing smoke-durable-jobs.mjs restart branch permits blocked/failed and lacks >1000 fixture; insufficient for F1. Need independent late-history fixture, exact post-restart assertions for budget/replan and summarized report early/middle/late records. No smoke grant issued. electron-slot.json is stale Sept21. Controller checked Get-Process: no Electron, same server; CIM denied. Recheck immediately, then issue fresh exact generation/status/agent/script grant. Serialize smoke after delivery/build.
+- Deliveries already local: `fc557b1` initial backlog/matrix and `b959f3c` prior checkpoint (tests/build passed); `d996eae` review doc only. Controller's new backlog/matrix, baseline/inventory/core audit/local map and final review correction await scoped git.ship. Do not include still-active sweep reports until settled, or owner files.
+- Preserve pre-existing feature-list.md (large unrelated edits), src/main/agent-control.ts, and untracked owner docs/autopilot-brief.md. Only aggregate durable-jobs-review-fixes was marked doing with tasks.update under prior controller; do not ship whole checklist. No publish, app development window or npm run dev.
+- Next: finish source batches without counting unopened rows; verify stable reports and merge matrix; let F1 complete bounded review repair and scoped local delivery; inspect final diff; independent background runtime/restart acceptance; checkpoint controller reports via scoped git.ship. Then F2/F3 and other reliability findings. Before context grows costly, release active relationships then agents.handoff with backlog reference; reads need no adoption, steering does.
 
 ## Operating and evidence rules
 
@@ -50,15 +54,15 @@ No prior success is inferred. Initial policy: independently verify every task, r
 ## Sweep and capability tasks
 
 ### S1 — Repository and TODO inventory
-- Priority/state/assignee: P1 / local attempt rejected, escalation pending / former `agent_muerczw7_p9xz3df` (local Qwen 3.6 35B-A3B), next Grok.
+- Priority/state/assignee: P1 / report accepted as source inventory, delivery pending / Grok `agent_muerr729_l3ugjmv` after rejected local `agent_muerczw7_p9xz3df`.
 - Problem: subsystem coverage and actionable code markers are not inventoried.
 - Expected: concise file/line inventory across every section-1 subsystem, with unknowns distinguished from defects.
-- Area/files: `src/`, `scripts/`; report `docs/autopilot-evidence/local-inventory.md` only.
+- Area/files: `src/`, `scripts/`; recovered report `docs/autopilot-evidence/repository-inventory.md`; failed local report was never written.
 - Dependencies: existing local server; no cloud quota dependency.
 - Attempts: first local dispatch requested read-only and failed `Execution sandbox unsupported by this provider`; report-only contract accepted. After source scanning, write_file was cut at 2,560 output tokens twice (sequences 281 and 285), even after runtime instructed smaller chunks. Interrupted at 00:03 UTC. No report file created; no production writes. Escalation justified because the single corrective retry failed with the same output-shaping error; do not repeat the same local prompt.
 - Verification: controller independently samples referenced files/lines and reconciles coverage; inventory is not proof of feature completion.
 - Failures/blockers: local read-only mode unsupported; repeated oversized write loop. Evidence `artifacts/autopilot/local-recent.json`, `local-second-write-failure.json`. Grok should salvage useful source findings then independently verify references.
-- Changes/commits: none yet. Final verification: pending.
+- Changes/commits: repository-inventory.md pending delivery. Final verification: controller sampled concrete references and reconciled all brief subsystem headings; inventory PASS as navigation, no product acceptance.
 
 ### S2 — Reproducible test/typecheck/build baseline
 - Priority/state/assignee: P0 / baseline verified, report/quota followup pending delivery / Grok `agent_muerh0kt_k3ncw1b`.
@@ -71,14 +75,14 @@ No prior success is inferred. Initial policy: independently verify every task, r
 - Failures/blockers: no test/build failure; no lint configured/installed, so lint not run. Changes/commits: uncommitted docs/autopilot-evidence/baseline.md. Final verification: command baseline PASS; report delivery pending; no product behavior accepted.
 
 ### S3 — Audit all completed checklist claims
-- Priority/state/assignee: P1 / first batch dispatched / Grok `agent_muerh3f2_2ehll4v` (core workflow claims, max 40).
+- Priority/state/assignee: P1 / three full-ledger source batches running / Grok assignments in operational summary.
 - Problem: 279 completion claims have no fresh independent acceptance evidence.
 - Expected: one evidence matrix row per claim: ID, area, claimed behavior, source/test evidence, runtime evidence, result (verified/failed/unverified), precise next check. Reopen only established false claims.
 - Area/files: `feature-list.md`, affected source/tests/smokes; audit reports under `docs/autopilot-evidence/`.
 - Dependencies: S1 and S2 inform sequencing; live checks need current smoke lease.
 - Attempts: initial tasks.list captured 279 done claims. None accepted by this controller.
 - Verification: inspect each result against actual behavior; source presence or passing unrelated tests is insufficient. Lifecycle claims need restart proof.
-- Failures/blockers: scope needs bounded stages; Grok quota signal and runtime slots pending.
+- Failures/blockers: source coverage and actual runtime acceptance still pending; Grok quota resolved at 13%. Initial S3a covered only ten actual source inspections; remaining thirty were transparently not opened.
 - Changes/commits: none. Final verification: pending.
 
 ### G1 — Read provider quota cheaply through app control
@@ -87,9 +91,9 @@ No prior success is inferred. Initial policy: independently verify every task, r
 - Expected: bounded current per-provider/model quota with observation time, reset time, source and explicit unknowns; controllers can enforce 60% Claude and 95% Astra/Grok limits before dispatch.
 - Area/files: `src/main/agent-control.ts` (currently owned by another agent), provider usage APIs, `src/shared/usage-accounting.ts`.
 - Dependencies: coordinate file ownership; authoritative Grok source, no fabricated quota.
-- Attempts: inspected tools.list and Grok usage mapping; read recorded Codex/Claude usage via read-only SQLite; requested owner source for Grok.
+- Attempts: inspected tools.list and Grok usage mapping; read recorded Codex/Claude usage via read-only SQLite. Grok dashboard /usage directly reports weekly allowance (13% at 00:16 UTC), but no app-control quota method exists.
 - Verification: zero-turn read, model-specific buckets, stale/unknown behavior, no secrets; independent review of dispatch enforcement.
-- Failures/blockers: source for Grok percentage unknown. Changes/commits: none. Final verification: pending.
+- Failures/blockers: authoritative source now known; inexpensive programmatic access and model bucket handling remain unresolved. Changes/commits: none. Final verification: pending.
 
 ### G3 — Local read-only dispatch parity
 - Priority/state/assignee: P2 / reproduced / unassigned.
@@ -116,15 +120,16 @@ No prior success is inferred. Initial policy: independently verify every task, r
 S3a's report is a partial source audit, not acceptance of its 40 listed claims (many explicitly not opened). Fifteen open durable-job findings have source evidence; controller corroborated the gate/block path. The report refutes one older subfinding: the sent conductor tool schema is included in prompt overhead. Review the other findings independently before implementing. Corrected worker feedback: a watchdog regression must use a tool duration exceeding the model timeout but shorter than the tool timeout. Full-source audit remains open.
 
 ### F1 — Durable-job newest-event correctness
-- Priority/state/assignee: P0 / implementation dispatched / Grok `agent_muerw1fu_a33x86v`.
+- Priority/state/assignee: P0 / locally delivered, runtime acceptance pending / author Grok `agent_muerw1fu_a33x86v`; independent acceptance harness `agent_mueszf0s_sme7cnw`.
 - Problem: `events(id, undefined, 1000)` returns oldest rows, so late budget-reset, failure-loop, replan and report data disappear after 1,000 events.
 - Expected: latest matching records inform state decisions; complete reports page all required events; preserve forward pagination for clients. Never replace full reports with a silently truncated tail.
 - Area/files: `src/main/durable-jobs/{store,controller,wiring,index,report}.ts` and their focused tests; source report `docs/autopilot-evidence/core-claim-audit.md`.
 - Dependencies: S2 baseline passed; exclusive ownership before dispatch; strong independent review and persistence acceptance.
-- Attempts: Grok source review identified four oldest-1000 consumers; no fix yet.
+- Attempts: all four consumers fixed; first regression run6failed/34passed, initial fix41passed, reviewed collector follow-up44passed plus typecheck0. Independent Opus found no P0/P1; its P2 silent-short-page issue was repaired and controller checked the follow-up. Scoped full suite/build passed. Evidence f1-event-history.md and four committed .txt logs.
 - Verification: failing-then-passing tests with >1,000 events and late matching records for each affected consumer, complete report pagination, unchanged forward page semantics, SQLite reopen, targeted suite/typecheck/build, actual restart acceptance before product completion.
+- Controller acceptance preparation: existing smoke-durable-jobs.mjs:240–261 restarts the same profile and checks job identity/report files, but permits blocked/failed settlement and does not inject >1,000 events. Running that generic smoke alone cannot accept F1. Add an independently reviewed late-history fixture and explicit post-restart late-match/report assertions before accepting the repair; no grant issued yet.
 - Failures/blockers: none established beyond defect; production workflow verification still needed.
-- Changes/commits: none. Final verification: pending.
+- Changes/commits: cacfc742cd2aaec5f6543a8166860d1741a4ef36 (14scopedfiles, no publish). Final verification: automated/source checks pass; runtime/restart acceptance pending, no product completion or trust-table increment.
 
 ### F2 — Release local generation capacity on approval block
 - Priority/state/assignee: P0 / queued for design and implementation / unassigned.
@@ -158,6 +163,25 @@ S3a's report is a partial source audit, not acceptance of its 40 listed claims (
 - Failures/blockers: root cause not isolated between model instruction-following and recovery mechanism. Changes/commits: none. Final verification: pending.
 
 ## Imported open product tasks
+
+### G6 — Accurate local-delivery control catalog
+- Priority/state/assignee: P2 / independently corroborated / unassigned.
+- Problem: agent-control.ts:147 describes every git.ship as push plus release; delivery.ts:417/480 defaults to a local commit. The local-provider approval text at agent-control.ts:1186 also always says publish.
+- Expected: discovery and approval copy accurately distinguish local delivery from explicit publish; no changed authorization semantics.
+- Area/files: src/main/agent-control.ts and relevant tests; currently contains owner/pre-existing Grok edits, so coordinate before editing.
+- Dependencies: preserve existing agent-control work; do not ship the file wholesale until its scope is reconciled.
+- Attempts/verification: controller read both catalog and delivery branch at 00:14 UTC; no repair dispatched. Verify text for both publish modes against execution.
+- Changes/commits/final result: none; open.
+
+### F4 — Durable-job detail must show the newest tail beyond 20,000 events
+- Priority/state/assignee: P1 / independently source-corroborated, queued / unassigned.
+- Problem: durable-jobs-ipc.ts:50–57 pages the oldest history up to20,000 then slices the last200 of that prefix, so a long-running job's detail hides the actual newest events.
+- Expected: fetch an efficiently bounded newest tail; retain ordinary forward event paging and chronological display.
+- Area/files: src/main/durable-jobs-ipc.ts and tests; store helper only after F1 scope release.
+- Dependencies: F1 owns store; do not expand its current fix or overlap files.
+- Attempts: S3a flagged expensive repeated20k reads; Opus F1 review additionally identified stale-tail correctness beyond20k. Controller read the handler; no runtime reproduction or repair yet.
+- Verification: >20k fixture with late marker, exact newest200 in chronological order, bounded reads; real detail view reflects late event after restart. No acceptance until these run.
+- Changes/commits/final result: none; open.
 
 These entries are planning records, not newly claimed work. Full original descriptions remain in `feature-list.md` under the matching conductor-task ID. No original owner/status has been changed.
 
