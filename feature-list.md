@@ -1,5 +1,10 @@
 Bug list:
-- [~] Local file-processing execution: harness repairs and ordinary Ornith/UI validation delivered; short-segment model reliability remains limited (docs/local-file-execution.md). <!-- conductor-task:local-file-processing-e2e agent=agent_mueje2l6_f2wbi6y -->
+- [x] Durable jobs: fix the independent Opus review findings on commits 03aed7b + 51d2fb7 (src/main/durable-jobs/): (1) an approval block never releases the LocalGenerationGate so the next job waits forever showing running (wiring.ts ~289-303, controller.ts ~348-352); (2) only model-call watches are started so a quiet tool run (test/build) is killed as a stall and toolCallTimeoutMs is never applied (wiring.ts ~145-167); (3) ServerSupervisor.ensureReady gets no AbortSignal so pause->resume can hang up to waitForModelMs 2h and a cancelled job can still switch models (controller.ts ~299-311, wiring.ts ~239-249); (4) store.events(id, undefined, 1000) returns the OLDEST 1000 events and is used for the elapsed-budget note, the same-failure-3x check, replan-count restore and the report; add latest-matching/tail queries and page the report; (5) redactSensitive is not applied to tool arguments, lastError, last answer, next-action text, handoffs or report.md so credentials leak; redact in store.intend/event/saveStage/transition, extractHandoff and the report builder; (6) pause mid-tool marks operations failed and skips the pending-tool check so a half-finished side effect is not recorded unknown, and the jobs.pause description (finishes at a safe point) is wrong; (7) reconcile.ts ~86 skips blocked jobs whose stage is still running, so a job blocked on approval re-blocks on every resume after a restart; (8) contextRolloverFraction is only evaluated between stages, never during one; pass it into the local agent context budget or have the watchdog hand off when prompt tokens pass it; (9) the job worktree has no node_modules so verify stages on a Node project cannot run tests; document or provision read-only deps (never a junction for builds). Smaller: job view reloads 20k events per change (durable-jobs-ipc.ts ~49-58); reconciliation adds downtime to activeMs (store.ts ~329); research stages get no web_search grant and the conductor tool schema is not budgeted (handoff.ts ~444); pause/cancel in the 3 s before reconciliation bypasses it (index.ts); stageSucceeded counts a <think>-only answer as success (controller.ts ~74); non-git checkpoints copy only already-changed files. <!-- conductor-task:durable-jobs-review-fixes agent=agent_muer8ymv_5sx2164 -->
+- [ ] Durable jobs: finish verification. Done and passing: unit suites, real qwen3.6-35b-a3b 4-stage job in fresh contexts (peaks 18.9k-21.6k of 32,768, no overflow, no cloud escalation), stub smokes for tab close/reopen, renderer reload, pause/resume/cancel, approval->blocked, app restart with reconciliation. NOT RUN: real-model --kill-server and --restart-app faults, the approval case against the real model, stub --loop-case and --stall-case, and the 6-hour unattended soak with multiple context rollovers (scripts/smoke-durable-jobs.mjs; docs/durable-jobs.md). Record commands, timestamps, log paths and outcomes as an acceptance matrix. <!-- conductor-task:durable-jobs-verification -->
+- [x] Commit the Grok provider hunks still uncommitted in src/main/agent-control.ts (bb9b8f2 landed the rest of Grok; the working-tree hunks are in local build 0.1.53-local.1790206266727 but in no commit), together with the durable-jobs createdBy hunk in the same file; stage by hunk, do not commit unrelated work. <!-- conductor-task:grok-agent-control-hunks -->
+- [ ] Stop asking the owner to confirm app.update from a coworker running in Auto. Building a local update only publishes "Update pending" to the local feed; it cannot install itself, and only the owner credential or a wizard tab (which is trusted for exactly that) may run app.update.install or app.restart. So app.update from a native Claude/Codex coworker in Auto should just run, without the owner dialog and without needing app.update.authorize; keep the dialog for local models and for tabs below Auto. Update AGENTS.md and docs to say so. <!-- conductor-task:app-update-no-dialog-in-auto -->
+- [ ] Speed up git.ship deliveries: a routine local delivery takes ~4 min (153 s full vitest + script tests, 72 s tsc + electron-vite). Run the test and build stages in parallel, select affected tests by import graph when paths are given (full suite only on publish), skip test:scripts unless scripts/ changed, make the typecheck incremental and run it beside electron-vite, and skip the isolated-worktree copy when the tree is clean. Target: about one minute. <!-- conductor-task:ship-delivery-speed -->
+- [x] Local file-processing execution: harness repairs and ordinary Ornith/UI validation delivered; short-segment model reliability remains limited (docs/local-file-execution.md). <!-- conductor-task:local-file-processing-e2e agent=agent_muentcdm_kiliiv4 -->
 1. [Implemented] Double clicking to copy will only work inside terminals.
 2. [Implemented] Bug with long text going over parts of UI like scrollbar & cursor position
 3. [Implemented] Add button to easily toggle breaking of words inside editors based on current tab/window size
@@ -58,7 +63,7 @@ models they want
 
 41. [x] when claude is using codex in a tab, it all should be visual as if a user was using it. <!-- conductor-task:bug-41 agent=agent_mtsnb9sd_pe77gi7 -->
 
-42. [x] Claude messages are still doubled.. <!-- conductor-task:bug-42 agent=agent_mtsnb9sd_pe77gi7 -->
+42. [x] Claude messages are still doubled.. <!-- conductor-task:bug-42 agent=agent_muentcdm_kiliiv4 -->
 
 43. [x] scrolling broken when questions appear and sometimes when new output is still going on. <!-- conductor-task:bug-43 agent=agent_mtsnb9sd_pe77gi7 -->
 
@@ -449,7 +454,7 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 
 - [x] Task circles select one or multiple tasks; completing a task uses its status selector and moves it to Done. Selected tasks can be assigned to an open native agent tab or a new tab with model and effort choices. Auto opens a main Fixer that chooses suitable models and efforts per task and delegates to visible native coworkers. <!-- conductor-task:task-selection-dispatch agent=agent_mtsqk737_52vftmy -->
 
-- [x] Match VS Code file type colors/icons for every language and extension (.mjs, .cjs, .ts, .tsx, .json, .css, .md, .ps1, .yml, dotfiles, ...), applied consistently in the explorer, file tabs, Ctrl+E picker and agent file links. <!-- conductor-task:feature-file-type-colors agent=agent_mtu4f5v5_4ia8e4w -->
+- [ ] Match VS Code file type colors/icons for every language and extension (.mjs, .cjs, .ts, .tsx, .json, .css, .md, .ps1, .yml, dotfiles, ...), applied consistently in the explorer, file tabs, Ctrl+E picker and agent file links. <!-- conductor-task:feature-file-type-colors agent=agent_mtu4f5v5_4ia8e4w -->
 
 - [x] Subagents view currently shows almost nothing. Per subagent, show the model/provider it runs on (with effort), which tab and workspace it belongs to when that differs from the calling tab or is another company's model, live status, token usage, and a click-through to open it. It should render like the real agent view, with real designed steps rather than plain text. <!-- conductor-task:feature-subagents-view-detail agent=agent_mtu49or3_7l3m8st -->
 
@@ -652,3 +657,949 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] A controller on Auto spawns coworkers on Auto, and "Review coworkers" makes Auto more automatic instead of less: the opt-in no longer drops a Claude coworker to native manual mode or turns Codex's unattended answers off; every request a reviewed coworker still raises is reviewed by a stronger model and answered, reviews queue instead of pausing, and only an explicit ask rule or an owner-only reach (system, credentials, recursive deletion) still lands on the owner. Delivered as commit 18312fd and local update 0.1.53-local.1790160137286. <!-- conductor-task:review-coworkers-auto agent=agent_mudb8nhm_wvc846v -->
 
 - [ ] typing in web app is broken on phone , content is too way up and we can’t see text. Make it easy to see what we’re typing no matter where. <!-- conductor-task:f0f8aaf7-80a2-41b2-968d-58c95a89c92f -->
+
+- [ ] Closing main tab needs to close all coworkers as well. In right click, close this tab only needs to exist. Default will be close tab group <!-- conductor-task:96d8efee-1cf5-403b-b9e4-28c5c602421e -->
+
+- [ ] Clicking CLI should let us actually see what's going behind the Chat window, currently it's unavailable when Chat is open. Chat open → click CLI → show the live CLI for that same agent <!-- conductor-task:764a7740-1109-4a61-a343-2310bf50ebab -->
+  Ideally as a bottom drawer / split pane under the chat, similar to VS Code's terminal.
+  Clicking CLI again hides it.
+  Chat stays fully alive and visible.
+  CLI keeps rendering stdout/stderr in real time.
+  User can type directly into it if the underlying provider allows interactive stdin.
+  Opening/closing it must not restart the agent process or PTY.
+  The same CLI view should also be movable into another pane later, consistent with Conductor's "tabs are views of durable resources" rule.
+  Being able to hit CLI and see exactly what the agent is doing underneath the pretty chat UI is precisely the sort of debugging visibility Conductor should have.
+
+- [ ] to add to refine way we queue messages task <!-- conductor-task:f15c9164-a4d8-49c4-89d7-bbbbca87885d -->
+  
+  ![image.png](.conductor/prompt-images/5d3c199c-ac6a-4cb0-948c-9d331c90c0ea.png)
+
+- [ ] There are real renderer-side performance problems that can explain laggy typing even with Qwen completely stopped. I would not blame your PC first. <!-- conductor-task:141e0a02-adfa-4710-8600-bc1eec348e3d -->
+  
+  The two biggest ones are especially convincing:
+  
+  Every keystroke synchronously writes the entire composer draft to localStorage. The textarea calls setMessage() on every change; that calls ComposerDraftStore.update(), which does JSON.stringify(), localStorage.setItem(), generates a revision UUID, and then notifies every draft-store subscriber. localStorage is synchronous, so all of that happens directly in the renderer's input path.
+  Inactive tabs are not actually suspended. Conductor maps over every tab and mounts its full PaneBody; inactive tabs merely receive display: none. That means hidden agent tabs remain subscribed to events, keep React state/effects alive, and hidden terminal tabs can retain full xterm instances. A structured agent pane alone subscribes to the global structured-event feed and maintains a sizeable conversation/timeline state.
+  
+  That combination is nasty: more tabs → more hidden React trees/subscribers → each keystroke's global draft notification has more work around it.
+  
+  There's another typing-specific inefficiency. Every textarea change calls foldInsertedText(), which scans the old and new strings from the beginning and end to determine what was inserted. On a long prompt, ordinary typing therefore becomes roughly O(message length) work per character, even though this mechanism really exists to detect large pastes.
+  
+  I would fix Conductor in this order:
+  
+  P0 — Fix the composer hot path. Keep draft text immediately in memory. Debounce persistence to ~250–500 ms or an idle callback, then force-flush on blur, tab/project switch, pagehide, beforeunload, etc. Also replace the single global listeners set with listeners keyed by draft key. A keystroke in conversation A should not wake the draft subscription for conversations B–Z.
+  P0 — Suspend inactive tab views. The agent/PTY/session itself stays alive in src/main; only the React view gets unmounted/suspended. Agent panes can reconstruct themselves from the durable snapshot when selected again. For Monaco/xterm/browser panes where remounting is more expensive, use a small LRU keep-alive pool rather than keeping every tab alive forever. This fits Conductor's own architecture: tabs are supposed to be views of durable resources, not owners of those resources.
+  P1 — Move paste detection off ordinary typing. Use onPaste / beforeinput with inputType === "insertFromPaste" for the expensive folding logic. A normal "a" keystroke shouldn't diff two 30,000-character strings.
+  P1 — Reduce recovery checkpoint work. App currently schedules recovery after only 100 ms, and constructing the checkpoint scans localStorage for workspace documents and copies session/layout data. Make it dirty/incremental and idle-debounced—say 750–1500 ms—with the existing forced flushes retaining crash/reload safety.
+  P2 — Audit background polls/listeners and broad React rerenders. After those first fixes, profile App, PaneWorkspace, telemetry, process monitoring, Monaco/xterm resize observers, etc. Don't start by randomly memoizing everything; first remove work that plainly shouldn't happen.
+  Add a typing benchmark. You already have perf-streaming.mjs, which runs Electron under 4× CPU throttling and records frame intervals, long tasks, scripting and layout time—but it currently has no thresholds and targets streaming rather than input latency. Add perf-input.mjs: test 1 tab vs 10/25 inactive agent tabs, type 300 characters, and record input→next-paint p50/p95/p99, long tasks, React commits and localStorage.setItem count. That makes this impossible to regress later.
+  One very easy confirmation right now
+  
+  Before changing code, open a fresh workspace with one single agent tab, restart Conductor, and type. Then compare it with your usual workspace containing lots of old tabs.
+  
+  If the fresh workspace is dramatically smoother, the display:none tab architecture is almost certainly contributing. If even the one-tab workspace stutters, the synchronous draft persistence + per-character paste diffing become the prime suspects.
+  
+  And importantly, these aren't vague "maybe Electron is slow" theories. The current code literally does synchronous persistent storage in the keystroke path and keeps hidden heavy panes mounted. Those are worth fixing regardless of what profiling subsequently finds. Your earlier architecture spec already called for batched storage/UI updates and bounded renderer state, so these optimizations are consistent with the design rather than a hack.
+  
+  I would have Codex/Opus attack P0 + the benchmark first, measure before/after, and only then touch the rest.
+
+- [ ] # Build: Conductor Ideas / Notes System <!-- conductor-task:9b15feab-3e3b-4e9a-b23a-76ce29538e4d weight=heavy -->
+  
+  ## Goal
+  
+  Conductor needs a lightweight **Ideas** system that lets me capture thoughts instantly and then gradually turns those thoughts into useful, connected work.
+  
+  The core use case is extremely simple:
+  
+  > I'm outside with friends, suddenly think "what if I started this clothing company?", open Conductor on my phone, type the thought in a few seconds, close it, and forget about it.
+  
+  I should not have to organize it, choose a project, select tags, create a task, or start an agent.
+  
+  Conductor should preserve the idea, understand how it evolves over time, connect future work back to it, and optionally let local agents make small amounts of progress on untouched ideas while my machines are idle.
+  
+  The system should feel like a combination of:
+  
+  * Apple Notes for capture
+  * Conductor memory for context
+  * a project/idea history tracker
+  * a lightweight incubator powered by local agents
+  
+  But it must remain extremely simple from the user's perspective.
+  
+  ---
+  
+  # 1. Ideas as a first-class Conductor resource
+  
+  Add an **Ideas** section to Conductor.
+  
+  An idea should be a durable resource, not merely a text document.
+  
+  Each idea should have:
+  
+  * original note/content
+  * created date
+  * last modified date
+  * status
+  * whether it has ever been worked on
+  * linked Conductor projects
+  * linked agent conversations/tabs
+  * linked tasks
+  * linked memories
+  * linked files/artifacts
+  * generated summaries / compactions
+  * agent activity related to the idea
+  * optional user tags
+  * optional agent-inferred tags/topics
+  
+  Possible statuses could include:
+  
+  * Inbox
+  * Untouched
+  * Exploring
+  * Active
+  * Parked
+  * Converted to Task
+  * Converted to Project
+  * Archived
+  
+  Do not make the user manually maintain all of this.
+  
+  Most relationships should be detected and maintained automatically by Conductor.
+  
+  ---
+  
+  # 2. Track whether an idea has actually been worked on
+  
+  This is important.
+  
+  For every idea, Conductor should make it obvious whether anything ever happened after I wrote it down.
+  
+  For example:
+  
+  **Clothing brand idea**
+  
+  Created 14 days ago
+  
+  Worked on: Yes
+  
+  Related activity:
+  
+  * Claude tab: "Clothing brand positioning"
+  * Codex tab: "Landing page experiment"
+  * Qwen overnight exploration
+  * 3 related memories
+  * 2 generated files
+  * 1 prototype page
+  * Task created: "Research Czech manufacturers"
+  
+  I should be able to open the idea and see its complete history.
+  
+  If I mentioned the idea in a Claude/Codex/Qwen conversation later, Conductor should ideally detect that relationship and associate the tab with the idea.
+  
+  Likewise, if an agent produces:
+  
+  * code fragments
+  * mockups
+  * HTML pages
+  * research
+  * plans
+  * documents
+  * assets
+  * files
+  * architecture notes
+  * task lists
+  
+  those should be discoverable from the original idea.
+  
+  The idea becomes the root object tying all of that work together.
+  
+  ---
+  
+  # 3. Related memories
+  
+  Ideas should integrate deeply with Conductor's memory system.
+  
+  Opening an idea should show relevant memories such as:
+  
+  * decisions previously made
+  * preferences
+  * previous explorations
+  * conclusions agents reached
+  * abandoned approaches
+  * people/companies/tools related to the idea
+  * previous project context
+  
+  Agents working on an idea should be able to retrieve these memories automatically.
+  
+  If an agent learns something durable while exploring the idea, it should be able to create or update a memory associated with it.
+  
+  This avoids rediscovering the same information every time the idea resurfaces.
+  
+  ---
+  
+  # 4. Idea activity timeline
+  
+  Each idea should have a clean timeline.
+  
+  Example:
+  
+  ```text
+  September 3
+  Idea created from phone
+  
+  September 4
+  Qwen automatically explored the idea overnight
+  
+  September 4
+  Generated "Idea Brief v1"
+  
+  September 7
+  Idea mentioned in Claude tab "Fashion brand"
+  
+  September 7
+  Claude created landing-page copy
+  
+  September 10
+  Task created: Find manufacturers
+  
+  September 14
+  Codex created prototype landing page
+  
+  September 18
+  Idea marked Active
+  ```
+  
+  The timeline should mostly build itself from existing Conductor events.
+  
+  ---
+  
+  # 5. Extremely fast capture
+  
+  Creating an idea must have effectively zero friction.
+  
+  Desktop:
+  
+  * keyboard shortcut
+  * open Ideas
+  * immediately start typing
+  
+  Phone / Conductor web app:
+  
+  When I open Notes/Ideas, it should behave almost like native iOS Notes.
+  
+  Do **not** initially show me a form.
+  
+  No giant:
+  
+  * title input
+  * tag selector
+  * status dropdown
+  * project picker
+  * agent picker
+  
+  The primary interaction should simply be:
+  
+  ```text
+  Open page
+  → cursor is already active
+  → keyboard appears
+  → type
+  → leave
+  ```
+  
+  Autosave everything.
+  
+  Infer the title later from the first line or content if necessary.
+  
+  The goal is that capturing a thought takes approximately as much effort as writing something in Apple Notes.
+  
+  ---
+  
+  # 6. Mobile UX
+  
+  The mobile web app should feel deliberately designed for quick capture rather than like a desktop UI squeezed onto a phone.
+  
+  The note editor should be:
+  
+  * full-screen
+  * fast
+  * native-feeling
+  * touch friendly
+  * distraction free
+  * immediately editable
+  
+  Controls should sit unobtrusively along the bottom using familiar icons.
+  
+  Possible controls:
+  
+  * Ideas
+  * Search
+  * Tasks
+  * Agent
+  * More/settings
+  
+  Inside an idea, secondary controls can provide:
+  
+  * convert to task
+  * ask agent
+  * link to project
+  * archive
+  * view related activity
+  * memories
+  * attachments
+  
+  But they should not interfere with typing.
+  
+  Typing is the primary action.
+  
+  ---
+  
+  # 7. Idea Inbox
+  
+  New notes should initially enter an **Idea Inbox**.
+  
+  I should be able to dump dozens of thoughts into it without organizing anything.
+  
+  Examples:
+  
+  ```text
+  Clothing company with drops based on European cities
+  
+  Maybe Conductor should record screen context when starting tasks
+  
+  Need to fix Blaze webhook retries tomorrow
+  
+  Would AI-generated custom ski graphics be a business?
+  
+  Look into that weird KRK speaker issue
+  ```
+  
+  Some of these are ideas.
+  
+  Some are tasks.
+  
+  Some are reminders.
+  
+  Some are random thoughts.
+  
+  Conductor should not force me to decide which at capture time.
+  
+  ---
+  
+  # 8. Let agents classify messy notes later
+  
+  A local agent should periodically be able to review the Inbox and determine:
+  
+  * likely idea
+  * likely task
+  * likely reminder
+  * reference/note
+  * duplicate of an existing idea
+  * related to an existing project
+  * unclear
+  
+  It should make suggestions rather than silently making destructive decisions.
+  
+  Example:
+  
+  > "Need to email Jack about payments tomorrow"
+  
+  Conductor might suggest:
+  
+  **This looks more like a task than an idea.**
+  
+  [Move to Tasks]
+  
+  [Keep as Idea]
+  
+  [Ignore]
+  
+  For obvious cases, we can eventually support configurable automatic handling.
+  
+  ---
+  
+  # 9. Local Idea Incubator
+  
+  This is one of the most important parts.
+  
+  If I have accumulated ideas that have never been touched, Conductor should be able to let **local agents** gently explore them while compute is otherwise available.
+  
+  This should not become an uncontrolled autonomous system.
+  
+  Think of it as an **Idea Incubator**.
+  
+  Example:
+  
+  I have 30 untouched ideas.
+  
+  At night, Conductor notices that:
+  
+  * my main PC is online
+  * no important local inference job is running
+  * a suitable local model is available
+  * enough RAM/VRAM is free
+  
+  It can select one or several untouched ideas and perform bounded lightweight exploration.
+  
+  For example:
+  
+  ```text
+  Idea:
+  "Premium jam company using seasonal farm fruit"
+  
+  Local agent could:
+  
+  - organize the raw note
+  - identify what the actual concept is
+  - create a short summary
+  - identify obvious unanswered questions
+  - suggest possible business models
+  - identify related existing memories
+  - find related Conductor work
+  - suggest a few next actions
+  - flag obvious problems
+  ```
+  
+  It should NOT suddenly spend eight hours building an entire company unless explicitly instructed.
+  
+  The default should be small, useful progress.
+  
+  ---
+  
+  # 10. Device selection
+  
+  Idea incubation should integrate with Conductor's multi-device system.
+  
+  I should be able to choose:
+  
+  **Run on**
+  
+  * Main PC
+  * Laptop
+  * Mac
+  * Any suitable device
+  * Automatically choose
+  
+  The automatic option should choose an available device based on things like:
+  
+  * device online/offline
+  * local model availability
+  * available RAM
+  * available VRAM
+  * current inference load
+  * CPU/GPU utilization
+  * configured power policy
+  * whether another important job is running
+  
+  There should also be a very easy:
+  
+  **Explore with available local agent**
+  
+  button.
+  
+  One click.
+  
+  Conductor finds suitable compute and handles the rest.
+  
+  ---
+  
+  # 11. Idle / overnight incubation
+  
+  I want an optional mode where Conductor can make tiny amounts of progress on ideas while I am sleeping.
+  
+  For example:
+  
+  ```text
+  Idea Incubator
+  
+  Enabled: Yes
+  
+  When:
+  Device idle for 20 minutes
+  OR
+  between 01:00-07:00
+  
+  Maximum:
+  3 ideas per night
+  
+  Compute:
+  Local models only
+  
+  Intensity:
+  Light
+  ```
+  
+  Possible levels:
+  
+  ### Light
+  
+  Summarize, classify, connect memories, suggest next steps.
+  
+  ### Explore
+  
+  Do some bounded research/reasoning and produce an idea brief.
+  
+  ### Develop
+  
+  Allow more substantial agent work.
+  
+  "Develop" should probably require explicit configuration because it can consume significant compute.
+  
+  ---
+  
+  # 12. Never silently use expensive cloud models
+  
+  Background idea incubation should default to:
+  
+  **LOCAL MODELS ONLY.**
+  
+  If a local model cannot complete something, record that.
+  
+  Example:
+  
+  ```text
+  Incubation stopped.
+  
+  Qwen attempted:
+  - idea structuring
+  - market questions
+  - related-memory lookup
+  
+  Could not confidently complete:
+  - technical feasibility analysis
+  
+  Reason:
+  Model confidence / capability threshold not met.
+  
+  [Continue with Claude]
+  [Continue with Codex]
+  [Leave it]
+  ```
+  
+  Do not silently escalate to paid cloud models.
+  
+  ---
+  
+  # 13. Generate compact idea briefs
+  
+  Raw notes may be messy.
+  
+  Agents should be able to create a compact structured representation without destroying the original note.
+  
+  For example:
+  
+  ```text
+  ORIGINAL
+  
+  "fashion thing where each city has limited shirt and you can only
+  buy it there maybe qr codes and each drop becomes collectible etc"
+  
+  
+  COMPACT IDEA
+  
+  Concept:
+  Location-exclusive clothing drops tied to specific cities.
+  
+  Core mechanic:
+  Each city receives a limited design that is only purchasable locally.
+  
+  Potential differentiator:
+  Physical location becomes part of product scarcity.
+  
+  Open questions:
+  - Manufacturing economics
+  - Authentication / location verification
+  - Drop frequency
+  - Brand positioning
+  - Resale implications
+  
+  Possible next step:
+  Create a single Prague drop concept and test landing page.
+  ```
+  
+  The original text must always remain available.
+  
+  The compact version is agent-generated interpretation, not replacement content.
+  
+  ---
+  
+  # 14. Improvements and challenges
+  
+  Agents should be encouraged to make useful observations.
+  
+  Not generic AI filler such as:
+  
+  > "Consider your target audience."
+  
+  Instead, they should surface specific things such as:
+  
+  * contradiction with previous decisions
+  * idea overlaps something already being built
+  * obvious technical blocker
+  * simpler variant exists
+  * important missing assumption
+  * potential connection between two separate ideas
+  * idea could reuse an existing Conductor component
+  * idea might actually just be a task
+  
+  Example:
+  
+  > You have three separate ideas involving background local-agent jobs. These may belong to one "Idle Compute Scheduler" feature rather than three independent systems.
+  
+  That is valuable.
+  
+  ---
+  
+  # 15. Related-idea discovery
+  
+  Conductor should identify potentially related ideas.
+  
+  Example:
+  
+  ```text
+  You may want to merge these:
+  
+  - Overnight Qwen jobs
+  - Idle GPU task scheduler
+  - Autonomous idea exploration
+  ```
+  
+  But merging should require user confirmation.
+  
+  The system should avoid destroying or rewriting the user's original notes.
+  
+  ---
+  
+  # 16. Remind me about genuinely interesting forgotten ideas
+  
+  Conductor can occasionally surface ideas that have been sitting untouched.
+  
+  Not constant annoying notifications.
+  
+  Instead, something like:
+  
+  ```text
+  3 ideas worth revisiting
+  
+  Clothing drops by city
+  Added 47 days ago
+  Qwen explored it once; no follow-up.
+  
+  Local AI invoice parser
+  Added 22 days ago
+  Related prototype already exists.
+  
+  Custom ski graphics
+  Added 63 days ago
+  Never explored.
+  ```
+  
+  The agent can explain **why** it thinks an idea is worth resurfacing.
+  
+  There should be:
+  
+  * snooze
+  * archive
+  * explore
+  * create task
+  * open
+  * never remind me about this
+  
+  ---
+  
+  # 17. Search across ideas and their descendants
+  
+  Search should not only search the original note.
+  
+  Searching:
+  
+  ```text
+  clothing
+  ```
+  
+  should be able to find:
+  
+  * the idea
+  * Claude discussions about it
+  * Codex code produced for it
+  * associated memories
+  * generated files
+  * tasks
+  * agent summaries
+  * related projects
+  
+  Ideas effectively become semantic anchors across Conductor.
+  
+  ---
+  
+  # 18. Agent context
+  
+  When I explicitly launch an agent from an idea:
+  
+  **Work on this idea**
+  
+  the agent should automatically receive useful context:
+  
+  * original note
+  * latest compact summary
+  * associated memories
+  * prior agent work
+  * relevant files
+  * previous decisions
+  * current tasks
+  * unresolved questions
+  
+  This should prevent the classic problem where each new agent starts from zero.
+  
+  ---
+  
+  # 19. Ideas can graduate
+  
+  An idea should be able to naturally evolve into something larger.
+  
+  Possible transitions:
+  
+  ```text
+  Idea
+  → Task
+  
+  Idea
+  → Project
+  
+  Idea
+  → Agent Job
+  
+  Idea
+  → Scheduled exploration
+  
+  Idea
+  → Archived note
+  ```
+  
+  When this happens, preserve the original idea and its history.
+  
+  Do not simply delete it because it became a project.
+  
+  The provenance is valuable.
+  
+  ---
+  
+  # 20. Architecture principle
+  
+  Treat ideas the same way Conductor treats other durable resources.
+  
+  The UI is only a view.
+  
+  The actual idea and its relationships must survive:
+  
+  * application restarts
+  * device changes
+  * agent crashes
+  * tab closure
+  * layout changes
+  * context compaction
+  
+  Agent conversations should reference the Idea ID rather than the relationship existing only inside UI state.
+  
+  Likewise, generated artifacts should be able to carry provenance such as:
+  
+  ```text
+  createdFromIdeaId
+  relatedIdeaIds
+  createdByAgentSessionId
+  createdByJobId
+  ```
+  
+  Do not build the system around fuzzy text matching alone.
+  
+  Fuzzy/semantic matching can discover relationships, but once confirmed or strongly established, relationships should become explicit durable records.
+  
+  ---
+  
+  # 21. Background-agent reliability
+  
+  Idea incubation should use Conductor's durable-job architecture.
+  
+  Do NOT implement:
+  
+  ```text
+  idea
+  → one giant Qwen conversation
+  → keep context growing forever
+  ```
+  
+  Instead:
+  
+  ```text
+  Idea
+  → create incubation job
+  → bounded stage
+  → persist output
+  → checkpoint
+  → compact
+  → fresh context if necessary
+  → next bounded stage
+  → finish
+  ```
+  
+  If the machine restarts, the work should not disappear.
+  
+  If Qwen crashes, the idea should not become corrupted.
+  
+  If an agent reaches its context limit, the job should remain resumable.
+  
+  ---
+  
+  # 22. User control
+  
+  The user should always be able to see:
+  
+  * which agent touched an idea
+  * what it changed/created
+  * which device ran it
+  * when it ran
+  * how long it ran
+  * whether it completed
+  * what artifacts it produced
+  
+  Agent-generated modifications to the original note should not silently overwrite user text.
+  
+  Prefer additive generated sections, suggestions, or structured metadata.
+  
+  ---
+  
+  # 23. The intended feeling
+  
+  This should not feel like project-management software.
+  
+  It should feel like:
+  
+  > I dump thoughts into Conductor, and Conductor quietly remembers them.
+  
+  Then later:
+  
+  > Oh, I actually did something about this.
+  
+  Or:
+  
+  > Nice, Qwen spent twenty minutes organizing this while I slept and found that it connects to something I already built.
+  
+  The act of capturing an idea must remain almost frictionless.
+  
+  The sophistication belongs behind the scenes.
+  
+  ---
+  
+  # Example end-to-end flow
+  
+  I'm outside and think:
+  
+  > Clothing brand where every European city gets one exclusive design and you can only buy it while physically there.
+  
+  I open Conductor on my phone.
+  
+  The Notes/Ideas screen opens immediately with the keyboard.
+  
+  I type that sentence.
+  
+  Close phone.
+  
+  Done.
+  
+  At night, my PC is idle.
+  
+  Conductor's Idea Incubator chooses the note.
+  
+  A local Qwen agent:
+  
+  1. classifies it as a business/product idea
+  2. creates a short structured summary
+  3. identifies two related memories
+  4. notices I previously discussed location-based products
+  5. creates five specific questions worth answering
+  6. suggests testing the concept with one Prague design
+  7. stores the output under the idea
+  8. stops
+  
+  The next morning I see:
+  
+  **Clothing brand - city-exclusive drops**
+  
+  > Explored overnight by Qwen on MAIN
+  
+  **New**
+  
+  * Idea brief
+  * 2 related memories
+  * 5 open questions
+  * 1 suggested experiment
+  
+  [Open]
+  
+  [Continue with local agent]
+  
+  [Ask Claude]
+  
+  [Turn into project]
+  
+  [Create task]
+  
+  That is the product experience we are aiming for.
+  
+  ---
+  
+  # Implementation approach
+  
+  Before coding, inspect the current Conductor architecture and determine how this should integrate with:
+  
+  * tabs/resources
+  * SQLite
+  * memories
+  * projects
+  * tasks
+  * agent sessions
+  * generated artifacts
+  * durable jobs
+  * device discovery
+  * local-model runtime
+  * remote/web app
+  * scheduling
+  * idle/compute monitoring
+  
+  Reuse existing abstractions rather than creating a parallel system where possible.
+  
+  Then produce:
+  
+  1. architecture proposal
+  2. database/data-model changes
+  3. IPC/API changes
+  4. desktop UI design
+  5. mobile/web quick-capture design
+  6. relationship/provenance model
+  7. Idea Incubator job architecture
+  8. compute/device-selection logic
+  9. migration plan
+  10. implementation phases
+  11. tests and acceptance criteria
+  
+  Once the architecture is coherent, implement it incrementally rather than building the entire feature as one monolithic change.
+  
+  The highest-priority MVP is:
+  
+  **frictionless capture + durable Ideas + related-work tracking + local bounded exploration.**
+  
+  Everything else can grow naturally from that foundation.
+
+- [ ] web app - need to select what notifications i get - currently i get notifications i dont really need like coworkers getting finished when they dont need my attention - main tasks Done only i <!-- conductor-task:3775a5ec-84bc-4bf9-8f2c-00a13274e007 -->
+
+- [ ] coworker tab groups need to be able to be dragged to the side, so we can see the main & the coworker tabs side to side <!-- conductor-task:53cd24fb-8c88-495c-bbd1-4d76128e5263 -->
+
+- [ ] Stopping the local model server must be one easy app-control call for an agent, not eight tool calls: an agent that found a Conductor-started llama.cpp server (e.g. Dolphin X1 8B, pid 62380, port 51438) holding the GPU spent nine actions hunting for a stop path through tools.list, the CLI and the stop script. Add a first-class control method (e.g. `local.servers` to list the running Conductor-started model servers with model, pid, port, start time and which conversations use them, and `local.stop({model?|pid?})` to stop one cleanly, refusing while a turn is using it unless forced) and name it in the briefing's machine-limits line so agents reach for it first. <!-- conductor-task:local-server-stop-control -->
+
+- [x] Add Grok (xAI Grok Build CLI, `grok agent stdio` over ACP) as a native Conductor provider alongside Claude and Codex: launcher tile, models/efforts from the runtime, Ask/Edit/Auto approvals, interrupt, resume, CLI switch, browser MCP, app control and wizard eligibility for Grok 4.6+; verified with real turns (scripts/smoke-grok-live.mjs). Delivered in bb9b8f2 and local update 0.1.53-local.1790205702714; the src/main/agent-control.ts hunks (Grok in models.list/tabs.open/router.dispatch) ship with the durable-jobs delivery that shares the file. <!-- conductor-task:grok-provider agent=agent_mueoox1f_w1m0auz -->
+
+- [ ] tasks must only show a part (when long tasks are visible, we scrollll like madmen) and be able to expand / hide again on click.. <!-- conductor-task:9afebc80-8949-4a74-bbda-3475894d2ca0 -->
+
+- [ ] tasklist - done tasks are hidden by default & the archive thingy i mentioned - currently we load waay too many tasks.. same for messages, we don't need to load all of them, just load some and then load them when i scroll up - also enable me one click to just copy the entire chat transcript without scrolling up - its what i do often anyways and thats why i scroll up to see all messages.. and allow me to search in chat super efficiently. <!-- conductor-task:24e307fa-1777-402d-a4e3-5dad3c93441f -->
+
+- [ ] A wizard tab must be able to get past the "Quit Conductor? / Restart Conductor? — Work is still running in Conductor" confirmation. It is a native dialog.showMessageBox (src/main/index.ts confirmApplicationStop, reached from before-quit and from prepareForUpdateInstall when force is false), so no agent can see or answer it and an unattended overnight wizard stalls behind it. A sovereign scope (wizard tab or owner credential) should (a) never raise it for a quit/restart/update it started itself (treat its app.restart/app.update.install as force unless it passes force:false), and (b) be able to answer one that is already open, e.g. an `app.quit.confirm({stopWork:true|false})` control method plus the pending confirmation shown in app.state, so a dialog the owner or some other path raised can be closed by the wizard too. <!-- conductor-task:wizard-answers-quit-dialog priority=high -->
