@@ -114,13 +114,78 @@ host runtime nobody owns: its app crashed, so no adapter state exists to continu
 The host exits by itself once no runtime is alive and no client is connected for 5 minutes
 (`CONDUCTOR_RUNTIME_HOST_IDLE_MS`). A client that disconnects without detaching (a crash) takes its
 runtimes with it; a detached runtime nobody reattaches within 12 hours is closed. Local model
-*servers* already outlive the app (llama.cpp is spawned detached and adopted by its run record).
+*servers* already outlive the app (llama.cpp is spawned detached and adopted by its run record);
+local *turns* pause and resume instead (below).
+
+## Local model turns: paused at a safe point, not hosted
+
+Item `local-turns-survive-restart`. The llama.cpp server already outlives the app; the agent loop
+(`src/main/local-models/agent.ts`) runs in the main process. Two designs were possible: (a) run
+the loop in the host as its own runtime kind, or (b) pause it at a safe point and resume it after
+the relaunch. **(b) is the one built**, because it is much smaller and it is correct:
+
+- The loop already writes a durable checkpoint (task state, transcript, budgets, and the
+  identity of every mutation it ran) to the conversation's settings key before every request,
+  before every tool call and after every result. A restart only needs a pause point on top.
+- (a) would move the tools, the Docker sandbox, the artifact hooks (`beforeTool`/`afterTool`)
+  and the `localControl` bridge into the host. The host bundle is deliberately `node:`-only and
+  protocol-agnostic, and every one of those calls reaches back into main, so (a) would need a
+  second RPC channel from the host into a main process that is gone during the restart.
+- Nothing is lost by pausing: the model server keeps its weights loaded, so the resumed request
+  costs one prompt re-evaluation (llama.cpp's prompt cache usually covers most of it).
+
+How it works:
+
+- `LocalAdapter.detach()` aborts the turn with a `LocalTurnSuspension` reason and waits up to 5 s
+  (`LOCAL_PAUSE_SETTLE_MS`) for the loop to reach its next safe point. Events the turn reports
+  meanwhile are held, not shown. Every stop path in the loop (`finish('interrupted')`) writes
+  the pause point instead: `{id, ledger, finalText, processing}` beside the task state in the
+  same checkpoint, with the lifecycle left `running`. The detachment names that id. Its
+  `transport.runtimeId` is `local:<runtimeId>`, which the host never lists.
+- **In mid-generation**, the partial reply was never stored, so the resumed run sends the same
+  request again. The tab keeps the text it had already streamed, as a separate item above the
+  resumed reply. **During a tool call**, the call is stopped. Its result in the transcript says it
+  was interrupted by the restart and will not be run again, and its id is recorded as executed, so
+  it cannot be replayed. Calls later in that round get "Interrupted before execution". The round
+  counts as taken. **During the acceptance command**, the run is not treated as a verdict and
+  runs again after the resume. **Before the model was reached** (the server still loading), the
+  detachment carries the prompt and the turn starts again from it.
+- The pause point holds the run ledger: segment, stage, request count, evidence, the
+  stagnation detector (`StagnationDetector.snapshot()`), truncated calls and the finish phase.
+  The resumed run carries on in the same segment. No round is lost and none is taken twice.
+- If the turn finishes by itself while it is being paused, or does not settle in 5 s, `detach()`
+  returns null. The held events are shown and the runtime is stopped as before.
+- On launch, `reattachKeptRuntimes` does not ask the host about a local record: it calls
+  `reattach` directly. `LocalAdapter.start()` with `attach` restores the session from the
+  checkpoint and checks that its pause point is the one the detachment names. If it is not,
+  nothing is replayed and the conversation is marked disconnected. Otherwise the adapter shows the
+  held events and a notice ("paused after tool round N and continues here"). It then runs the turn
+  under its original `turnId`, with fresh item ids for the new text. It is not re-briefed about
+  app control, because a local model reaches app control only through the in-process
+  `localControl` bridge.
+- **It resumes only when it may.** The conversation must still exist
+  (`detachedRuntimes()` skips deleted specs). Its model must still be loaded or loadable: the
+  resumed turn goes through `ready()`, so `ensureServer` applies the one-server rule of
+  `docs/machine-profile.md` under the admission lock. If that fails, the tab shows why, the turn
+  ends failed, and the progress up to the pause stays saved. The owner's next message continues
+  from it, as after any stop.
+- A pause point is used once: the next ordinary checkpoint drops it. If the app does not
+  reattach (it crashed, or the detached record was lost), the restored task reads as blocked,
+  and the next message starts a turn instead of resuming the old one.
+- The quit dialog's **Keep running in background** covers local turns through the same
+  `detachForRestart()`, and so does a forced (wizard or owner credential) restart. Like the other
+  runtimes, this needs the runtime host setting on. Time spent while Conductor is closed still
+  counts against the task's cumulative time budget.
+
+Tests: `src/main/local-models/restart-resume.test.ts` (pause mid-generation and mid-tool, no
+replay, one-shot pause points, detector snapshot) and `src/main/providers/local.test.ts` (adapter
+detach and reattach in a new instance, same turn, one prompt). `scripts/smoke-local-restart.mjs`
+runs the built app parked, with a stand-in llama.cpp endpoint through the unpackaged
+`CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT` override, calls an owner `app.restart` during round 2,
+and checks that the relaunched app sends that same request once more and completes the turn.
 
 ## Not covered (yet)
 
-- **Local model turns.** The local agent loop runs in the main process, not in a child, so a
-  restart still ends a local turn; the server itself survives. Moving the loop into the host is
-  a separate item.
 - **Crash reattach.** After a crash no adapter state exists, so orphaned runtimes are closed.
 - **Browser MCP after reattach.** The CLI keeps the previous process's browser-tool endpoint;
   browser tools come back with the conversation's next runtime.

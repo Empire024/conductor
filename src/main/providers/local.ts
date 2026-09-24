@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import type { AdapterOptions, ProviderAdapter } from './adapter'
+import type { AdapterOptions, ProviderAdapter, RuntimeDetachment } from './adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL, localModelLabel } from '../../shared/local-models'
-import { LocalAgentSession } from '../local-models/agent.ts'
+import { LocalAgentSession, LocalTurnSuspension, type LocalAgentEvents } from '../local-models/agent.ts'
 import { normaliseContract } from '../local-models/completion.ts'
 import { localStopPayload, localStopSummary, type LocalStopReport } from '../../shared/local-stop.ts'
 import { endpointFor, loadConfig, modelFilePath, readApiKey } from '../local-models/config.ts'
@@ -138,6 +138,8 @@ export async function localModelAvailability(modelId: string): Promise<{ availab
   const stack = readConfig()
   const model = stack?.models[modelId]
   if (!model) return { available: false, reason: `${localModelLabel(modelId)} is not configured on this machine` }
+  // The test endpoint stands in for every server and starts none, so there is nothing to admit.
+  if (endpointOverride) return { available: true, note: 'test endpoint override' }
   let apiKey: string
   try { apiKey = readApiKey() } catch { return { available: false, reason: 'Local model credentials are missing; run scripts/local-models/setup.ps1 to regenerate them' } }
   try {
@@ -201,6 +203,19 @@ export function phaseFor(outcome: { stopReason: LocalStopReport['reason']; text:
   return 'failed'
 }
 
+/** One turn as the adapter streams it: where its items go and how far it got. */
+interface LocalTurn { turnId: string; prompt: string; items: string; round: number; usage: number; started: boolean; suspended?: string }
+
+/** What a local turn paused for a restart leaves the next process (docs/runtime-host.md, "Local
+ *  model turns"). The loop's progress is in the conversation's checkpoint; this names the pause
+ *  point there, or carries the prompt of a turn that had not reached its model yet, and holds
+ *  what the turn reported while it paused, which the tab has not been shown. */
+interface LocalTurnDetachment { kind: 'local-turn'; version: 1; turnId: string; items: string; round: number; usage: number; pausePoint?: string; prompt?: string; events: AdapterEvent[] }
+
+/** How long a pausing turn gets to reach its next safe point before the restart stops it as before. */
+export const LOCAL_PAUSE_SETTLE_MS = 5000
+const MAX_HELD_EVENTS = 200
+
 export class LocalAdapter implements ProviderAdapter {
   readonly provider = 'local' as const
   private readonly options: AdapterOptions
@@ -212,6 +227,9 @@ export class LocalAdapter implements ProviderAdapter {
   private controller?: AbortController
   /** The turn in flight, so stopping the session can wait for it to unwind. */
   private turn?: Promise<void>
+  private current?: LocalTurn
+  /** Events the turn reports while it pauses for a restart, kept for the next process. */
+  private held?: AdapterEvent[]
   private disposed = false
   private endpointContext?: LocalEndpointContext
   private readonly providerCapabilities: ProviderCapabilities
@@ -240,7 +258,7 @@ export class LocalAdapter implements ProviderAdapter {
         'Commands run in a non-root Docker container with no network access; when the sandbox is unavailable, execution is refused rather than run on Windows.',
         'Nothing asks for approval: choose Read only for a turn that must not write files or run commands.',
         'Repository writes and web search are off unless the owner turns them on for the conversation. The container has no network even when granted: it commits locally, and a plain push of the checked-out branch to an existing remote is run on the host for it.',
-        'Registered conversations preserve local checkpoints. Reopening restores state without executing pending work; continuation requires an explicit input.',
+        'Registered conversations preserve local checkpoints. Reopening restores state without executing pending work; continuation requires an explicit input, except for a turn Conductor paused for its own restart, which continues by itself after the relaunch.',
         'Approvals, questions, plan mode and effort levels are not part of this runtime.',
         'The active prompt is managed: tool results are shaped before they enter it, old rounds are folded into a durable task state as the window fills, tool rounds are paced to a hard cap, repetition is noticed, and a task contract (allowedPaths, acceptance command) is enforced by the runtime rather than the prompt.'
       ]
@@ -263,7 +281,11 @@ export class LocalAdapter implements ProviderAdapter {
     catch { throw new Error('Local model credentials are missing; run scripts/local-models/setup.ps1 to regenerate them') }
   }
 
-  private emit(event: AdapterEvent): void { if (!this.disposed) this.options.emit(event) }
+  private emit(event: AdapterEvent): void {
+    if (this.disposed) return
+    if (this.held) { if (this.held.length < MAX_HELD_EVENTS) this.held.push(event); return }
+    this.options.emit(event)
+  }
 
   /** Health-check the model this conversation is set to, starting its server when it is down.
    *  Runs before the first connection and before every turn, so a server that was stopped or
@@ -285,6 +307,7 @@ export class LocalAdapter implements ProviderAdapter {
   }
 
   async start(): Promise<void> {
+    if (this.options.attach) return this.reattach(this.options.attach)
     // Connecting a tab validates setup but does not load model weights. The first actual dispatch
     // calls ready(), so an unused local conversation consumes no GPU, RAM or server process.
     const model = this.model()
@@ -337,21 +360,23 @@ export class LocalAdapter implements ProviderAdapter {
   async submit(text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
     if (this.controller) throw new Error('Local model already has a running turn')
     this.settings = settings
-    this.turn = this.runTurn(text, attachments)
+    const turnId = randomUUID()
+    const prompt = attachments.filter(item => item.content).map(item => `[Attached ${item.kind}: ${item.name}]\n${item.content}`).concat(text).join('\n\n')
+    this.turn = this.runTurn({ turnId, prompt, items: turnId, round: 0, usage: 0, started: false })
     await Promise.resolve()
   }
 
-  private async runTurn(text: string, attachments: ContextAttachment[]): Promise<void> {
-    const turnId = randomUUID()
+  /** Runs a new turn, or with `pausePoint` continues the one a restart paused. */
+  private async runTurn(turn: LocalTurn, pausePoint?: string): Promise<void> {
+    const { turnId } = turn
+    this.current = turn
     this.emit({ turnId, data: { type: 'session', phase: 'running' } })
     const controller = new AbortController()
     this.controller = controller
     // Each tool round gets its own text and reasoning items so thinking, answer text and tool
     // calls stay in the order they happened instead of collapsing into one block.
-    let round = 0
-    let usageIndex = 0
-    const textItem = (): string => `${turnId}:text:${round}`
-    const reasoningItem = (): string => `${turnId}:reasoning:${round}`
+    const textItem = (): string => `${turn.items}:text:${turn.round}`
+    const reasoningItem = (): string => `${turn.items}:reasoning:${turn.round}`
     let releaseTurn = (): void => {}
     try {
       // Claimed before the server is even checked, so a switch decided in another conversation
@@ -360,8 +385,7 @@ export class LocalAdapter implements ProviderAdapter {
       const model = await this.ready(turnId)
       controller.signal.throwIfAborted()
       const session = this.ensureSession(model)
-      const prompt = attachments.filter(item => item.content).map(item => `[Attached ${item.kind}: ${item.name}]\n${item.content}`).concat(text).join('\n\n')
-      const outcome = await session.run(prompt, {
+      const events: LocalAgentEvents = {
         text: delta => this.emit({ turnId, itemId: textItem(), data: { type: 'text', role: 'assistant', text: delta, mode: 'delta' } }),
         // Provider-emitted reasoning is presented as a status item
         // in the timeline, never raw protocol dumped into the answer.
@@ -374,30 +398,92 @@ export class LocalAdapter implements ProviderAdapter {
         },
         toolEnd: call => {
           this.emit({ turnId, itemId: call.id, data: { type: 'tool', name: call.name, status: call.failed ? 'failed' : 'completed', output: call.output, outputMode: 'snapshot', durationMs: call.durationMs } })
-          round++
+          turn.round++
         },
         // The context figures give the composer ring and "Model context window" the same data the
         // CLIs report: the window, and the room left once this round's answer reserve is held
         // back. Used is what the server counted for the request just made plus what it wrote,
         // which is what the next request will carry before its own shaping.
-        usage: (usage, context) => this.emit({ turnId, itemId: `${turnId}:usage:${usageIndex++}`, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'message', source: 'provider',
+        usage: (usage, context) => this.emit({ turnId, itemId: `${turn.items}:usage:${turn.usage++}`, data: { type: 'usage', inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cachedTokens: usage.cachedTokens, totalTokens: usage.totalTokens, scope: 'message', source: 'provider',
           limits: { contextUsedTokens: usage.inputTokens !== undefined && usage.outputTokens !== undefined ? usage.inputTokens + usage.outputTokens : null, contextCapacityTokens: Math.max(0, model.contextTokens - context.reserveTokens), contextReserveTokens: context.reserveTokens, modelContextWindow: model.contextTokens, contextRound: context.round, contextMeasurement: usage.inputTokens !== undefined && usage.outputTokens !== undefined ? 'llama.cpp usage, exact for the last request' : 'llama.cpp usage incomplete; context occupancy unknown' } }, ...(usage.timings ? { native: { method: 'llama.cpp/timings', payload: { ...usage.timings } } } : {}) }),
         notice: message => this.emit({ turnId, data: { type: 'notice', message } }),
         // Structured, debug-level: a payload keeps these out of the conversation and in the
         // event log, where a usage timeline can be built from them later.
         telemetry: entry => { if (entry.kind !== 'usage' && entry.kind !== 'request' && entry.kind !== 'tool' && entry.kind !== 'stop') this.emit({ turnId, data: { type: 'notice', message: `Local run telemetry: ${entry.kind}`, payload: { localTelemetry: entry as unknown as Json } } }) }
-      }, controller.signal)
+      }
+      turn.started = true
+      const outcome = pausePoint ? await session.resume(pausePoint, events, controller.signal) : await session.run(turn.prompt, events, controller.signal)
+      // Paused for a restart: the next process continues it, so nothing here ends the turn.
+      if (outcome.suspended) { turn.suspended = outcome.suspended; return }
       if (outcome.stopReason === 'provider_error' || outcome.stopReason === 'context_limit') this.emit({ turnId, data: { type: 'error', message: outcome.report.detail } })
       this.emit({ turnId, itemId: `${turnId}:stop`, data: { type: 'notice', message: localStopSummary(outcome.report), payload: localStopPayload(outcome.report) } })
       this.emit({ turnId, data: { type: 'session', phase: phaseFor(outcome) } })
     } catch (error) {
+      // Paused before the model was reached: the next process starts this turn from its prompt.
+      if (controller.signal.reason instanceof LocalTurnSuspension) return
       if (controller.signal.aborted) { this.emit({ turnId, data: { type: 'session', phase: 'interrupted' } }); return }
-      this.emit({ turnId, data: { type: 'error', message: error instanceof Error ? error.message : 'Local model request failed' } })
+      const detail = error instanceof Error ? error.message : 'Local model request failed'
+      this.emit({ turnId, data: { type: 'error', message: pausePoint ? `The turn paused for the restart could not continue: ${detail} Its progress up to the pause is saved; send a message to continue from it.` : detail } })
       this.emit({ turnId, data: { type: 'session', phase: 'failed' } })
     } finally {
       releaseTurn()
       if (this.controller === controller) this.controller = undefined
     }
+  }
+
+  /** Pause the running turn for a Conductor restart (docs/runtime-host.md, "Local model turns").
+   *  The loop stops at its next safe point and writes a pause point into the conversation's
+   *  checkpoint; a tool it cut short is reported, not run again. Null when there is nothing to
+   *  keep: no turn, an unregistered conversation, a turn that finished while asked to pause, or
+   *  one that will not stop in time. The caller then stops the runtime as before. */
+  async detach(): Promise<RuntimeDetachment | null> {
+    const turn = this.current, controller = this.controller, running = this.turn
+    if (this.disposed || !turn || !controller || !running || !this.options.localCheckpoint) return null
+    const held: AdapterEvent[] = []
+    this.held = held
+    controller.abort(new LocalTurnSuspension(randomUUID()))
+    let timer: NodeJS.Timeout | undefined
+    const settled = await Promise.race([running.then(() => true, () => true), new Promise<boolean>(done => { timer = setTimeout(() => done(false), LOCAL_PAUSE_SETTLE_MS) })])
+    clearTimeout(timer)
+    const base = { kind: 'local-turn' as const, version: 1 as const, turnId: turn.turnId, items: turn.items, round: turn.round, usage: turn.usage, events: held }
+    const state: LocalTurnDetachment | undefined = !settled ? undefined : turn.suspended ? { ...base, pausePoint: turn.suspended } : !turn.started ? { ...base, prompt: turn.prompt } : undefined
+    this.held = undefined
+    if (!state) {
+      // Not kept: the tab sees what the turn reported, exactly as if nothing had been asked.
+      for (const event of held) this.emit(event)
+      return null
+    }
+    // Inert from here: nothing runs in this container again, and the next process makes its own.
+    this.disposed = true
+    const sandbox = this.sandbox
+    this.sandbox = null
+    this.session = undefined
+    if (sandbox) void sandbox.stop().catch(() => { /* The container is removed on the next start as well. */ })
+    return { state: state as unknown as Json, transport: { runtimeId: `local:${this.options.runtimeId}`, seq: 0 } }
+  }
+
+  /** Continue a turn the previous process paused for its restart. Like submit, this returns once
+   *  the turn is under way; it goes on to bring the model up within the machine's one-server
+   *  rule and reports a model that cannot be loaded in the tab, with the progress kept. */
+  private async reattach(detachment: RuntimeDetachment): Promise<void> {
+    const saved = detachment.state as unknown as Partial<LocalTurnDetachment> | null
+    if (saved?.kind !== 'local-turn' || saved.version !== 1 || typeof saved.turnId !== 'string' || typeof saved.items !== 'string' || (typeof saved.pausePoint !== 'string' && typeof saved.prompt !== 'string'))
+      throw new Error('The kept local turn is not one this version can continue; nothing was replayed.')
+    const model = this.model()
+    this.key()
+    if (!endpointOverride && !existsSync(modelFilePath(model))) throw new LocalSetupError(`${localModelLabel(model.id)} is not installed.`)
+    let pausedAfter = 0
+    if (saved.pausePoint) {
+      const point = this.ensureSession(model, false).pausePoint()
+      if (point?.id !== saved.pausePoint) throw new Error('The saved pause point of this local turn is gone; nothing was replayed.')
+      pausedAfter = point.round
+    }
+    const turn: LocalTurn = { turnId: saved.turnId, prompt: saved.prompt ?? '', items: saved.pausePoint ? `${saved.items}:resumed-${saved.pausePoint.slice(0, 8)}` : saved.items, round: saved.round ?? 0, usage: saved.usage ?? 0, started: false }
+    for (const event of Array.isArray(saved.events) ? saved.events : []) this.emit(event)
+    this.emit({ turnId: turn.turnId, data: { type: 'notice', message: saved.pausePoint
+      ? `Conductor restarted during this turn. It paused after tool round ${pausedAfter} and continues here from its saved progress; nothing that already ran is sent or run again.`
+      : 'Conductor restarted while this turn was still starting its model; it starts again here.' } })
+    this.turn = this.runTurn(turn, saved.pausePoint)
   }
 
   async compactContext(): Promise<Json | null> {

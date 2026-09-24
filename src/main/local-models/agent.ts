@@ -6,7 +6,7 @@ import { boundedToolResult, ContextBudgetError } from './context-budget.ts'
 import { DEFAULT_LOCAL_AGENT_POLICY, resolveLocalAgentPolicy, RESEARCH_ROUNDS, type LocalAgentPolicy, type LocalAgentPolicyOverrides } from './agent-policy.ts'
 import { compactHistory, emptyTaskState, measureContext, noteCommand, noteConclusion, noteDiscovery, noteFailure, noteFileChanged, notePass, renderTaskState, type CompactionResult, type ContextLevel, type ContextMeasure, type TaskState } from './context-manager.ts'
 import { detectsTestRun, shapeTestOutput, shapeToolOutput } from './tool-output.ts'
-import { roundStage, roundStageMessage, StagnationDetector, type RoundStage } from './progress.ts'
+import { roundStage, roundStageMessage, StagnationDetector, type RoundStage, type StagnationSnapshot } from './progress.ts'
 import { completionEstablished, contractConstraints, emptyEvidence, finalizeNow, recordCommand, recordWrite, unverifiedClaim, type AcceptanceResult, type RunEvidence, type TaskContract } from './completion.ts'
 import type { LocalRoundEntry, LocalStopReason, LocalStopReport } from '../../shared/local-stop.ts'
 import { join, relative } from 'node:path'
@@ -74,7 +74,24 @@ export interface LocalAgentOptions {
   afterTool?(paths: string[], success: boolean): Promise<void>
 }
 
-export interface LocalRunOutcome { text: string; stopReason: LocalStopReason; report: LocalStopReport }
+export interface LocalRunOutcome {
+  text: string
+  stopReason: LocalStopReason
+  report: LocalStopReport
+  /** Set when the turn paused for a Conductor restart instead of ending: its pause point's id. */
+  suspended?: string
+}
+
+/** The abort reason that pauses a turn for a Conductor restart instead of ending it
+ *  (docs/runtime-host.md, "Local model turns"). The loop stops at its next safe point, writes a
+ *  pause point into the same checkpoint as its task state and returns; `resume(id)` in the next
+ *  process carries on from there. */
+export class LocalTurnSuspension extends Error {
+  constructor(readonly id: string) { super('Conductor is restarting; this turn pauses at its next safe point.'); this.name = 'LocalTurnSuspension' }
+}
+
+const suspendedBy = (signal: AbortSignal | undefined): LocalTurnSuspension | undefined =>
+  signal?.aborted && signal.reason instanceof LocalTurnSuspension ? signal.reason : undefined
 
 export const systemPrompt = (workspace: string, readOnly: boolean, grants: LocalGrants = NO_GRANTS, scope: ToolScope = 'full'): string => [
   'You are a local coding assistant running inside Conductor on the owner machine.',
@@ -293,6 +310,26 @@ interface RunLedger {
   detector: StagnationDetector
   /** Argument characters of every call the output limit cut off this turn, by tool. */
   truncatedCalls: Map<string, number[]>
+  /** Whether an overflowing request already had its one aggressive compaction. */
+  compactedForOverflow: boolean
+}
+
+/** A turn paused for a restart: the run's own record, saved beside the durable task state. With
+ *  it the resumed run continues the same segment, stage and repetition count, so no round is
+ *  lost or taken twice. */
+interface SuspendedTurn {
+  id: string
+  at: string
+  finalText: string
+  nextAction: string
+  ledger: Omit<RunLedger, 'detector' | 'truncatedCalls'> & { detector: StagnationSnapshot; truncatedCalls: Array<[string, number[]]> }
+  processing: { active: boolean; planHint: string; attempted: boolean; processed?: ProcessingRun }
+}
+
+const validSuspension = (value: unknown): value is SuspendedTurn => {
+  const turn = value as Partial<SuspendedTurn> | undefined
+  return typeof turn?.id === 'string' && typeof turn.finalText === 'string' && typeof turn.nextAction === 'string' && Boolean(turn.processing)
+    && Array.isArray(turn.ledger?.timeline) && Number.isSafeInteger(turn.ledger?.round) && Boolean(turn.ledger?.detector) && Array.isArray(turn.ledger?.truncatedCalls)
 }
 
 export class LocalAgentSession {
@@ -302,6 +339,10 @@ export class LocalAgentSession {
   /** Durable across turns: what the conversation has established, apart from the transcript. */
   private taskState?: TaskState
   private restoredPending = false
+  /** A pause point a restart left in the checkpoint, until the turn resumes or a new one starts. */
+  private suspendedTurn?: SuspendedTurn
+  /** The running turn's signal, so every way out of the loop can tell a pause from a stop. */
+  private runSignal?: AbortSignal
   private readonly taskId: string
   private active = false
   private processing = false
@@ -351,14 +392,20 @@ export class LocalAgentSession {
   reset(): void {
     this.messages = [{ role: 'system', content: this.systemPrompt() }]
     this.taskState = undefined
+    this.suspendedTurn = undefined
     this.controlWanted = false
   }
 
   /** The durable task state, for a controller that wants to see it or restart from it. */
   state(): TaskState | undefined { return this.taskState ? structuredClone(this.taskState) : undefined }
 
+  /** The pause point a restart left, which `resume` continues from. */
+  pausePoint(): { id: string; round: number; at: string } | undefined {
+    return this.suspendedTurn ? { id: this.suspendedTurn.id, round: this.suspendedTurn.ledger.round, at: this.suspendedTurn.at } : undefined
+  }
+
   private restore(): void {
-    const saved = this.options.checkpoint?.load() as { version?: unknown; workspace?: unknown; taskId?: unknown; state?: TaskState; messages?: ChatMessage[] } | undefined
+    const saved = this.options.checkpoint?.load() as { version?: unknown; workspace?: unknown; taskId?: unknown; state?: TaskState; messages?: ChatMessage[]; suspended?: unknown } | undefined
     if (!saved) return
     if (saved.version !== 1 || saved.workspace !== this.options.workspace || saved.taskId !== this.taskId || !saved.state?.execution || !Array.isArray(saved.messages) || JSON.stringify(saved).length > 2_000_000) throw new Error('Invalid or mismatched local task checkpoint; no pending action was replayed.')
     const execution = saved.state.execution
@@ -374,13 +421,32 @@ export class LocalAgentSession {
     } else if (execution.lifecycle === 'running' || execution.lifecycle === 'recovering') {
       this.taskState.execution!.lifecycle = 'blocked'
       this.taskState.execution!.nextAction = 'The process stopped between requests. Recorded evidence is restored; no command was automatically resubmitted.'
+      // Paused for a restart rather than cut off: `resume` may continue it, and only it.
+      if (validSuspension(saved.suspended)) this.suspendedTurn = saved.suspended
     }
   }
 
-  private async checkpoint(): Promise<void> {
+  /** Every ordinary checkpoint drops the pause point, so a turn can be resumed at most once. */
+  private async checkpoint(suspended?: SuspendedTurn): Promise<void> {
     if (!this.taskState?.execution) return
     this.taskState.execution.budgets.checkpoints++
-    await this.options.checkpoint?.save({ version: 1, workspace: this.options.workspace, taskId: this.taskId, state: this.taskState, messages: this.messages })
+    await this.options.checkpoint?.save({ version: 1, workspace: this.options.workspace, taskId: this.taskId, state: this.taskState, messages: this.messages, ...(suspended ? { suspended } : {}) })
+  }
+
+  /** Write the pause point. Nothing is pending here: a tool the pause cut short already has its
+   *  result in the transcript, saying it was interrupted and will not run again. Undefined when
+   *  it cannot be saved, and the turn then ends as an ordinary interruption. */
+  private async pause(ledger: RunLedger, text: string, suspension: LocalTurnSuspension): Promise<LocalRunOutcome | undefined> {
+    const execution = this.taskState!.execution!
+    const record: SuspendedTurn = {
+      id: suspension.id, at: new Date().toISOString(), finalText: text, nextAction: execution.nextAction,
+      ledger: { ...ledger, timeline: ledger.timeline.slice(-64), detector: ledger.detector.snapshot(), truncatedCalls: [...ledger.truncatedCalls] },
+      processing: { active: this.processing, planHint: this.processingPlanHint, attempted: this.processingAttempted, ...(this.processed ? { processed: this.processed } : {}) }
+    }
+    execution.lifecycle = 'running'
+    try { await this.checkpoint(record) } catch { return undefined }
+    this.active = false
+    return { text, stopReason: 'interrupted', report: this.buildReport(ledger, 'interrupted', 'Paused for a Conductor restart; the turn continues after the relaunch.'), suspended: suspension.id }
   }
 
   private exhausted(state: ExecutionState): string | undefined {
@@ -504,6 +570,11 @@ export class LocalAgentSession {
 
   private async finish(ledger: RunLedger, events: LocalAgentEvents, text: string, reason: LocalStopReason, detail: string, unverified?: string): Promise<LocalRunOutcome> {
     const state = this.taskState!.execution!
+    const suspension = suspendedBy(this.runSignal)
+    if (suspension && reason === 'interrupted' && !state.pending) {
+      const paused = await this.pause(ledger, text, suspension)
+      if (paused) return paused
+    }
     if(reason==='interrupted'&&Date.now()-state.budgets.startedAt>=this.policy.task.maxMilliseconds){reason='round_limit';detail='The cumulative task time budget expired; no automatic restart was attempted.'}
     state.lifecycle = reason === 'completed' ? 'completed' : reason === 'interrupted' ? 'cancelled' : reason === 'provider_error' ? 'failed' : 'blocked'
     state.nextAction = reason === 'completed' ? 'Completed.' : detail
@@ -538,6 +609,8 @@ export class LocalAgentSession {
     } catch (error) {
       result = { command: acceptance.command, passed: false, exitCode: -1, report: `acceptance could not run: ${error instanceof Error ? error.message : 'unknown error'}`, at: new Date().toISOString() }
     }
+    // Cut short by a restart it is no verdict at all: it runs again once the turn resumes.
+    if (suspendedBy(signal)) { ledger.acceptanceStale = true; return undefined }
     ledger.evidence.acceptance = result
     if (result.passed) notePass(this.taskState!, `acceptance: ${acceptance.command}`)
     else noteFailure(this.taskState!, `acceptance: ${acceptance.command}`, result.report)
@@ -581,6 +654,20 @@ export class LocalAgentSession {
 
   async run(prompt: string, events: LocalAgentEvents, signal?: AbortSignal): Promise<LocalRunOutcome> {
     if (this.active) throw new Error('This local task is already running; no duplicate submission was started.')
+    // A new message supersedes a pause point nobody resumed; its progress stays in the state.
+    this.suspendedTurn = undefined
+    return this.drive(events, signal, prompt)
+  }
+
+  /** Continue a turn a Conductor restart paused, from the pause point `id` names: the next
+   *  request of the same segment, with nothing that already ran sent or run again. */
+  async resume(id: string, events: LocalAgentEvents, signal?: AbortSignal): Promise<LocalRunOutcome> {
+    if (this.active) throw new Error('This local task is already running; no duplicate submission was started.')
+    if (this.suspendedTurn?.id !== id) throw new Error('This conversation has no saved pause point matching the turn Conductor kept; nothing was replayed.')
+    return this.drive(events, signal)
+  }
+
+  private async drive(events: LocalAgentEvents, signal: AbortSignal | undefined, prompt?: string): Promise<LocalRunOutcome> {
     this.active = true
     const limit = new AbortController()
     const old=this.taskState?.execution
@@ -590,16 +677,21 @@ export class LocalAgentSession {
     finally { clearTimeout(timeout); this.active = false }
   }
 
-  private async runTask(prompt: string, events: LocalAgentEvents, signal?: AbortSignal): Promise<LocalRunOutcome> {
-    this.messages.push({ role: 'user', content: prompt })
-    const state = this.beginTurn(prompt)
+  /** One turn: a new owner message, or (no prompt) the paused turn resumed where it stopped. */
+  private async runTask(prompt: string | undefined, events: LocalAgentEvents, signal?: AbortSignal): Promise<LocalRunOutcome> {
+    const resumed = prompt === undefined ? this.suspendedTurn : undefined
+    this.suspendedTurn = undefined
+    this.runSignal = signal
+    if (prompt !== undefined) this.messages.push({ role: 'user', content: prompt })
+    const state = prompt === undefined ? this.taskState! : this.beginTurn(prompt)
     const execution = state.execution!
-    this.processed = undefined
-    this.processing = isFileProcessingTask(execution.objective)
-    this.processingAttempted = false
+    this.processed = resumed?.processing.processed
+    this.processing = resumed ? resumed.processing.active : isFileProcessingTask(execution.objective)
+    this.processingAttempted = resumed?.processing.attempted ?? false
+    if (resumed) { this.processingPlanHint = resumed.processing.planHint; execution.nextAction = resumed.nextAction }
     this.options.sandbox?.setAnalysisMode?.(this.processing)
     this.messages[0] = { role:'system',content:this.systemPrompt() }
-    if(this.processing) {
+    if(this.processing && !resumed) {
       const paths=[...new Set(execution.objective.match(/[^\s"'<>]+\.(?:txt|csv|tsv|psv)\b/gi)??[])].slice(0,2)
       this.processingPlanHint = await observedPlanHint(this.options.workspace,paths)
       this.messages.push({role:'user',content:`[Conductor selected file-processing recipe]\n${this.processingPlanHint ? 'Inspect both inputs independently, then use process_files with the target and source paths below. The helper parses all bytes in local code and validates coverage and results. Use its structured failure to repair an unsupported interpretation; a shell exit code is not completion.' : PROCESSING_GUIDE}\n${this.processingPlanHint}`})
@@ -607,11 +699,12 @@ export class LocalAgentSession {
     let tools = this.tools()
     // The schemas ride along on every request and come out of the same window as the messages.
     let overheadTokens = Math.ceil(JSON.stringify(tools).length / 3)
-    const ledger: RunLedger = { segmentStart: execution.budgets.rounds, round: execution.budgets.rounds, requests: 0, evidence: emptyEvidence(), stage: 'normal', contextWarned: false, compactions: 0, recoveredTokens: 0, excludedOutputChars: 0, timeline: [], acceptanceStale: false, finalizing: false, ruminations: 0, nudged: false, detector: new StagnationDetector(this.policy.stagnation), truncatedCalls: new Map() }
+    const ledger: RunLedger = resumed
+      ? { ...resumed.ledger, detector: StagnationDetector.restore(this.policy.stagnation, resumed.ledger.detector), truncatedCalls: new Map(resumed.ledger.truncatedCalls) }
+      : { segmentStart: execution.budgets.rounds, round: execution.budgets.rounds, requests: 0, evidence: emptyEvidence(), stage: 'normal', contextWarned: false, compactions: 0, recoveredTokens: 0, excludedOutputChars: 0, timeline: [], acceptanceStale: false, finalizing: false, ruminations: 0, nudged: false, detector: new StagnationDetector(this.policy.stagnation), truncatedCalls: new Map(), compactedForOverflow: false }
     if (this.restoredPending) return this.finish(ledger, events, '', 'stagnation', execution.nextAction)
     execution.lifecycle = 'running'
-    let finalText = ''
-    let compactedForOverflow = false
+    let finalText = resumed?.finalText ?? ''
     // Every path through the loop below either sends a request or returns, and the stages bound
     // the requests; the extra allowance covers the bounded nudges that cost a request each.
     const requestCeiling = this.policy.task.maxRequests
@@ -660,8 +753,8 @@ export class LocalAgentSession {
         if (signal?.aborted) return this.finish(ledger, events, finalText, 'interrupted', 'The turn was stopped.')
         // A request that cannot fit gets one aggressive compaction and one more try; a
         // conversation with nothing left to fold ends here with the figures, not a bare error.
-        if ((error instanceof ContextBudgetError || error instanceof ContextExceededError) && !compactedForOverflow && this.messages.length > 3) {
-          compactedForOverflow = true
+        if ((error instanceof ContextBudgetError || error instanceof ContextExceededError) && !ledger.compactedForOverflow && this.messages.length > 3) {
+          ledger.compactedForOverflow = true
           events.notice?.('The next request would not fit the context window; compacting aggressively and retrying once.')
           await this.manageContext(ledger, events, tools, reserve, 'aggressive')
           continue
@@ -859,6 +952,8 @@ export class LocalAgentSession {
         } catch (error) {
           outcome = { output: `failed: ${error instanceof Error ? error.message : 'the tool could not run'}`, failed: true, paths: [] }
         }
+        // Stopped by a restart's pause: reported as such, and never run again after the resume.
+        if (outcome.failed && suspendedBy(signal)) outcome = { ...outcome, output: `Interrupted: Conductor restarted while this ${call.name} call was running, so it was stopped. It will not be run again; whatever it did before it stopped may be partial, so check the current state before repeating it.\n${outcome.output}` }
         // The timeline gets the whole result; the prompt gets its shaped form.
         events.toolEnd?.({ id: call.id, name: call.name, output: outcome.output, failed: outcome.failed, durationMs: Date.now() - started })
         const args = parseArguments(call.arguments)

@@ -74,6 +74,19 @@ export function comparableFailure(output: string): string {
 /** Notices repetition without semantics: the same call again, the same failing result again,
  *  an edit that changed nothing, or a run of rounds that produced no new file change or command
  *  result. Warned once per pattern; stopped only when the pattern goes on past the policy. */
+export interface StagnationSnapshot {
+  lastFingerprint: string
+  repeats: number
+  lastOutcome: string
+  outcomeRepeats: number
+  idleRounds: number
+  warned: string[]
+  seenEvidence: string[]
+  failedApproaches: Array<[string, number]>
+  crossToolFailures: Array<[string, { count: number; tools: string[] }]>
+  warnings: number
+}
+
 export class StagnationDetector {
   private readonly policy: StagnationPolicy
   private lastFingerprint = ''
@@ -90,6 +103,32 @@ export class StagnationDetector {
   warnings = 0
 
   constructor(policy: StagnationPolicy) { this.policy = policy }
+
+  /** Everything the detector has seen, as plain JSON, so a turn paused for a Conductor restart
+   *  goes on noticing the repetition it had already counted (docs/runtime-host.md). */
+  snapshot(): StagnationSnapshot {
+    return {
+      lastFingerprint: this.lastFingerprint, repeats: this.repeats, lastOutcome: this.lastOutcome, outcomeRepeats: this.outcomeRepeats, idleRounds: this.idleRounds,
+      warned: [...this.warned], seenEvidence: [...this.seenEvidence], failedApproaches: [...this.failedApproaches],
+      crossToolFailures: [...this.crossToolFailures].map(([key, entry]) => [key, { count: entry.count, tools: [...entry.tools] }]),
+      warnings: this.warnings
+    }
+  }
+
+  static restore(policy: StagnationPolicy, saved: StagnationSnapshot): StagnationDetector {
+    const detector = new StagnationDetector(policy)
+    detector.lastFingerprint = saved.lastFingerprint
+    detector.repeats = saved.repeats
+    detector.lastOutcome = saved.lastOutcome
+    detector.outcomeRepeats = saved.outcomeRepeats
+    detector.idleRounds = saved.idleRounds
+    detector.warned = new Set(saved.warned)
+    detector.seenEvidence = new Set(saved.seenEvidence)
+    detector.failedApproaches = new Map(saved.failedApproaches)
+    detector.crossToolFailures = new Map(saved.crossToolFailures.map(([key, entry]) => [key, { count: entry.count, tools: new Set(entry.tools) }]))
+    detector.warnings = saved.warnings
+    return detector
+  }
 
   observe(call: ObservedCall): StagnationVerdict {
     const fingerprint = callFingerprint(call.name, call.arguments)

@@ -4,7 +4,7 @@ import { createServer as createTcpServer } from 'node:net'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { LocalAdapter, LocalSetupError, localModelAvailability, phaseFor, releaseVerdict } from './local'
+import { LocalAdapter, LocalSetupError, localModelAvailability, phaseFor, releaseVerdict, setLocalEndpointOverride } from './local'
 import { DEFAULT_SANDBOX, QWEN_35B, QWEN_9B, modelDir, runFile } from '../local-models/config.ts'
 import type { LocalModelConfig } from '../local-models/config.ts'
 import * as localPaths from '../local-models/paths.ts'
@@ -399,6 +399,60 @@ describe('local provider adapter', () => {
     expect(await settled(events)).toBe('failed')
     expect(events.some(event => event.data.type === 'error' && /Local model failed to start|not answering|llama/i.test(event.data.message))).toBe(true)
     expect(JSON.stringify(events)).not.toContain(KEY)
+  })
+
+  it('pauses a running turn for a restart and a new process continues it in the same tab without a second prompt', async () => {
+    let ready: Awaited<ReturnType<typeof stack>>
+    try { ready = await stack([frame({ content: 'Paused ' }), frame({ content: 'and resumed.' }), frame({}, 'stop')], 150) } catch (reason) { return guard(reason) }
+    let saved: unknown
+    const checkpoint = { load: () => structuredClone(saved), save: async (value: unknown) => { saved = structuredClone(value) } }
+    const before: AdapterEvent[] = []
+    const first = new LocalAdapter({ executable: '', cwd: ready.workspace, runtimeId: 'kept-runtime', localTaskId: 'registered-task', localCheckpoint: checkpoint, settings: settings({ permission: 'read-only' }), emit: event => before.push(event) })
+    cleanup.push(() => first.dispose())
+    expect(await first.detach()).toBeNull()
+    await first.start()
+    await first.submit('Finish the sentence.', settings({ permission: 'read-only' }))
+    for (let tick = 0; tick < 100 && ready.small.requests.length === 0; tick++) await new Promise(done => setTimeout(done, 10))
+    const kept = await first.detach()
+    expect(kept).not.toBeNull()
+    expect(kept!.transport.runtimeId).toBe('local:kept-runtime')
+    expect(kept!.state).toMatchObject({ kind: 'local-turn', pausePoint: expect.any(String) })
+    // The paused turn neither ended nor failed in the old process.
+    expect(before.some(event => event.data.type === 'session' && ['interrupted', 'failed', 'completed'].includes(event.data.phase))).toBe(false)
+    const turnId = before.find(event => event.data.type === 'session' && event.data.phase === 'running')!.turnId
+
+    const after: AdapterEvent[] = []
+    const second = new LocalAdapter({ executable: '', cwd: ready.workspace, runtimeId: 'kept-runtime', localTaskId: 'registered-task', localCheckpoint: checkpoint, settings: settings({ permission: 'read-only' }), emit: event => after.push(event), attach: JSON.parse(JSON.stringify(kept)) })
+    cleanup.push(() => second.dispose())
+    await second.start()
+    expect(await settled(after)).toBe('completed')
+    expect(after.some(event => event.data.type === 'notice' && /paused after tool round 0 and continues here/.test(event.data.message))).toBe(true)
+    expect(after.filter(event => event.data.type === 'session').every(event => event.turnId === turnId)).toBe(true)
+    expect(texts(after, 'assistant')).toBe('Paused and resumed.')
+    // One prompt, sent once more after the pause; no second owner message.
+    expect(ready.small.requests).toHaveLength(2)
+    expect(ready.small.prompts[1]).toEqual(ready.small.prompts[0])
+    expect(second.runStatus()).toMatchObject({ execution: { lifecycle: 'completed' } })
+  })
+
+  it('admits any configured model under the unpackaged test endpoint, which starts no server', async () => {
+    try { await stack([frame({ content: 'unused' }, 'stop')]) } catch (reason) { return guard(reason) }
+    setLocalEndpointOverride('http://127.0.0.1:9')
+    try {
+      expect(await localModelAvailability(QWEN_9B)).toEqual({ available: true, note: 'test endpoint override' })
+      expect(await localModelAvailability('local/not-configured')).toMatchObject({ available: false })
+    } finally { setLocalEndpointOverride(null) }
+  })
+
+  it('refuses to continue a kept turn whose pause point is no longer in the checkpoint', async () => {
+    let ready: Awaited<ReturnType<typeof stack>>
+    try { ready = await stack([frame({ content: 'never' }, 'stop')]) } catch (reason) { return guard(reason) }
+    const checkpoint = { load: () => undefined, save: async () => {} }
+    const instance = new LocalAdapter({ executable: '', cwd: ready.workspace, runtimeId: 'kept-runtime', localTaskId: 'registered-task', localCheckpoint: checkpoint, settings: settings({ permission: 'read-only' }), emit: () => {},
+      attach: { state: { kind: 'local-turn', version: 1, turnId: 'turn', items: 'turn', round: 0, usage: 0, pausePoint: 'gone', events: [] }, transport: { runtimeId: 'local:kept-runtime', seq: 0 } } })
+    cleanup.push(() => instance.dispose())
+    await expect(instance.start()).rejects.toThrow(/pause point .* is gone; nothing was replayed/)
+    expect(ready.small.requests).toHaveLength(0)
   })
 })
 
