@@ -237,6 +237,60 @@ Run it.
     await expect(f.control.call(f.scope, 'loops.run', { id: 'sample', inputs: {} })).rejects.toThrow(/taskId/)
     await expect(f.control.call(f.scope, 'loops.record', { runId: 'outside', stepId: 'inspect', model: 'x', startedAt: '2026-09-24T10:00:00.000Z', finishedAt: '2026-09-24T10:01:00.000Z', outcome: 'success' })).rejects.toThrow(/run/i)
   })
+  it('proposes and applies an unlocked change directly, but a locked/budget change only for the owner or a wizard tab', async () => {
+    const f = fixture()
+    mkdirSync(join(f.project.path, '.conductor', 'loops'), { recursive: true })
+    const loopPath = join(f.project.path, '.conductor', 'loops', 'proposed.md')
+    const source = `---
+id: proposed
+version: 1
+title: Proposed
+trigger: [manual]
+inputs: []
+budget:
+  claudeWeeklyMax: 75
+steps:
+  - id: implement
+    role: implementer
+    model: claude:sonnet
+locked: [budget]
+---
+
+# Proposed
+
+## Run log
+
+- seed
+`
+    writeFileSync(loopPath, source)
+    const tools = await f.control.call(f.scope, 'tools.list') as Record<string, string>
+    expect(Object.keys(tools)).toEqual(expect.arrayContaining(['loops.propose', 'loops.apply', 'loops.reject', 'loops.proposals']))
+    const unlocked = await f.control.call(f.scope, 'loops.propose', { id: 'proposed', change: source.replace('model: claude:sonnet', 'model: claude:opus[1m]'), evidence: 'Opus did better' }) as { id: string }
+    const applied = await f.control.call(f.scope, 'loops.apply', { proposalId: unlocked.id }) as { status: string; appliedVersion: number }
+    expect(applied).toMatchObject({ status: 'applied', appliedVersion: 2 })
+    expect(readFileSync(loopPath, 'utf8')).toContain('model: claude:opus[1m]')
+
+    const budgetChange = await f.control.call(f.scope, 'loops.propose', { id: 'proposed', change: source.replace('claudeWeeklyMax: 75', 'claudeWeeklyMax: 90').replace('version: 1', 'version: 2'), evidence: 'Raise the cap' }) as { id: string }
+    await expect(f.control.call(f.scope, 'loops.apply', { proposalId: budgetChange.id })).rejects.toThrow(/owner or a wizard tab/)
+    const owner = f.control.ownerScope({ projectId: f.project.id })
+    expect(await f.control.call(owner, 'loops.apply', { proposalId: budgetChange.id })).toMatchObject({ status: 'applied', appliedBy: 'owner' })
+
+    const rejectable = await f.control.call(f.scope, 'loops.propose', { id: 'proposed', change: readFileSync(loopPath, 'utf8').replace('model: claude:opus[1m]', 'model: claude:haiku'), evidence: 'try haiku' }) as { id: string }
+    expect(await f.control.call(f.scope, 'loops.reject', { proposalId: rejectable.id })).toMatchObject({ status: 'rejected' })
+    await expect(f.control.call(f.scope, 'loops.apply', { proposalId: rejectable.id })).rejects.toThrow(/already rejected/)
+    expect(await f.control.call(f.scope, 'loops.proposals', { id: 'proposed' })).toHaveLength(3)
+  })
+  it('agents.report delivers text only to the tab that opened this one, never anywhere else', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const childScope = { ...f.scope, agentSessionId: child.resourceId! }
+    await expect(f.control.call(f.scope, 'agents.report', { text: 'not controlled by anyone' })).rejects.toThrow(/No controlling conversation/)
+    await expect(f.control.call(childScope, 'agents.report', { text: 'x', extra: 1 })).rejects.toThrow(/accepts only text/)
+    await expect(f.control.call(childScope, 'agents.report', { text: 'x'.repeat(2001) })).rejects.toThrow()
+    const result = await f.control.call(childScope, 'agents.report', { text: 'UPDATE OK 1.2.3' }) as { agentSessionId: string; delivery: string }
+    expect(result).toEqual({ agentSessionId: f.scope.agentSessionId, delivery: 'started' })
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: 'UPDATE OK 1.2.3' })
+  })
   it('advertises configured local models and dispatches native local coworkers within inherited read-only permissions', async () => {
     const f = fixture(false, { local: ['accept-edits', 'read-only'] })
     f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })

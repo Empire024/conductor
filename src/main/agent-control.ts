@@ -131,6 +131,7 @@ const toolSignatures = {
   'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls',
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
+  'agents.report': '({text}) — deliver up to 2000 characters to the conversation that opened this tab (its controller, whoever that is), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
   'agents.handoff': `({handoff,title?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
@@ -158,7 +159,11 @@ const toolSignatures = {
   'loops.get': '({id}) — one validated logic loop including its instructions and exact model/effort/action steps',
   'loops.history': '({id}) — the loop file’s git history: commit, timestamp and subject',
   'loops.run': '({id,inputs}) — record a v1 loop run, check current usage windows against its budget, and return ordered steps with exact model/effort for the caller to execute; no autonomous runner yet',
-  'loops.record': '({runId,stepId,model,startedAt,finishedAt,outcome,tokens?,note?}) — record one caller-executed step in loop_runs/loop_step_runs',
+  'loops.record': '({runId,stepId,model,startedAt,finishedAt,outcome,tokens?,note?}) — record one caller-executed step in loop_runs/loop_step_runs; after recording, a loop with an applied proposal whose next two recorded runs are worse on its cited metric is reverted automatically',
+  'loops.propose': '({id,change,evidence,metric?:"tokens"|"wallTime"|"rounds"|"reviewFindings"}) — id names the loop; change is the complete proposed .conductor/loops/<id>.md text authored against the loop’s current version (loops.apply bumps it); evidence is the run metrics that justify it; metric names what proves the change out, for automatic revert. Returns the stored proposal, pending until loops.apply or loops.reject',
+  'loops.apply': '({proposalId}) — applies a pending proposal: model/effort, thresholds inside the owner’s caps, order among unlocked steps, wording, and dropping an optional step apply for any caller; anything in the loop’s locked list, a budget change, removing a review/test/ship step or adding a step needs the owner or a wizard tab. Bumps the loop’s version and appends a Run log line',
+  'loops.reject': '({proposalId}) — marks a pending proposal rejected so it cannot be applied',
+  'loops.proposals': '({id?}) — proposals in this project, optionally filtered to one loop id, each with its status (pending, applied, rejected, reverted)',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
   'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
@@ -915,6 +920,20 @@ export class AgentControl {
       // `controlled: false` marks a sibling-project tab nobody controls yet.
       return [...own, ...orphaned, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))]
     }
+    if (method === 'agents.report') {
+      if (Object.keys(args).some(key => key !== 'text')) throw new Error('agents.report accepts only text')
+      if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+      const reportText = text(args, 'text', 2000)
+      // The only reachable target is whoever opened this tab (AgentControl.linkFor), never a
+      // caller-named agentSessionId: a coworker reports to its controller, not to anyone it picks.
+      const link = this.linkFor(scope.agentSessionId)
+      const controllerState = link ? database.structured.snapshot(link.controllerAgentSessionId) : null
+      if (!link || !controllerState) throw new Error('No controlling conversation is open for this tab')
+      const reporter = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
+      const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: reporter?.title || 'Local coworker' }
+      const delivery = await sessions.steerOrStart(link.controllerAgentSessionId, reportText, controllerState.settings, [], origin)
+      return { agentSessionId: link.controllerAgentSessionId, delivery }
+    }
     if (method.startsWith('agents.')) {
       if (typeof args.agentSessionId !== 'string' || !args.agentSessionId.trim()) throw new Error(method + ' requires agentSessionId: the exact id of a visible conversation, as returned by agents.list or app.state')
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history', 'agents.artifact'].includes(method)
@@ -1079,6 +1098,21 @@ export class AgentControl {
         if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
         if (Object.keys(args).some(key => !['runId', 'stepId', 'model', 'startedAt', 'finishedAt', 'outcome', 'tokens', 'note'].includes(key))) throw new Error('loops.record received an unknown argument')
         return loops.record(args as unknown as LoopRecordInput)
+      }
+      if (method === 'loops.propose') {
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (Object.keys(args).some(key => !['id', 'change', 'evidence', 'metric'].includes(key))) throw new Error('loops.propose accepts only id, change, evidence and metric')
+        return loops.propose(args as unknown as { id: string; change: string; evidence: string; metric?: string })
+      }
+      if (method === 'loops.apply' || method === 'loops.reject') {
+        if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+        if (Object.keys(args).some(key => key !== 'proposalId')) throw new Error(`${method} accepts only proposalId`)
+        const proposalId = text(args, 'proposalId', 200)
+        return method === 'loops.reject' ? loops.reject(proposalId) : loops.apply(proposalId, sovereign(scope), scope.owner ? 'owner' : scope.wizard ? 'wizard' : 'agent')
+      }
+      if (method === 'loops.proposals') {
+        if (Object.keys(args).some(key => key !== 'id')) throw new Error('loops.proposals accepts only id')
+        return loops.listProposals(args.id === undefined ? undefined : text(args, 'id', 80))
       }
       throw new Error('Unknown loops method; use tools.list')
     }

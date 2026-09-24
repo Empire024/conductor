@@ -12,12 +12,13 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'files.list', 'files.read', 'tasks.list', 'memory.recall', 'orchestration.snapshot',
     'app.update.status', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
-    'loops.list', 'loops.get', 'loops.history'
+    'loops.list', 'loops.get', 'loops.history', 'loops.proposals'
   ].map(method => `read:${method}` as const),
   ...[
     'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close',
     'agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer',
     'agents.interrupt', 'agents.resume', 'agents.fork', 'agents.release', 'agents.handoff',
+    'agents.report',
     'files.write', 'files.open', 'tasks.update', 'memory.remember', 'memory.forget',
     'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save',
     'workspace.rename', 'app.update', 'app.update.authorize', 'git.ship', 'local.stop',
@@ -25,7 +26,8 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'jobs.report', 'schedules.create', 'schedules.update', 'schedules.pause', 'schedules.resume',
     'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',
     'projects.open', 'app.update.check', 'app.update.download', 'app.update.install',
-    'app.restart', 'app.restart.request', 'app.quit.confirm', 'loops.run', 'loops.record'
+    'app.restart', 'app.restart.request', 'app.quit.confirm', 'loops.run', 'loops.record',
+    'loops.propose', 'loops.apply', 'loops.reject'
   ].map(method => `mutation:${method}` as const)
 ])
 

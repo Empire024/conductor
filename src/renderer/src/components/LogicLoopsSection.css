@@ -1,0 +1,34 @@
+/* Logic loops (docs/logic-loops.md), mounted inside SchedulesPane and ProjectBacklogPane. */
+
+.logic-loops-section { display: grid; gap: 6px; font-size: 11px; color: var(--text-2); border-top: 1px solid var(--border-soft); padding-top: 8px; margin-top: 4px; }
+.logic-loops-toggle { display: inline-flex; align-items: center; gap: 5px; border: 0; background: none; padding: 2px 0; color: var(--text-2); font-size: 11px; cursor: pointer; justify-self: start; }
+.logic-loops-toggle:hover { color: var(--text); }
+.logic-loops-toggle span:not(.logic-loops-pending-dot) { color: var(--text-3); }
+.logic-loops-pending-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
+.logic-loops-error { margin: 0; color: var(--danger); font-size: 11px; line-height: 1.4; }
+.logic-loops-list { display: grid; gap: 8px; }
+
+.logic-loop-card { border: 1px solid var(--border); background: var(--surface-1); border-radius: 6px; padding: 8px; display: grid; gap: 6px; min-width: 0; }
+.logic-loop-card header { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.logic-loop-card header strong { color: var(--text); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.logic-loop-version { color: var(--text-3); font-size: 10px; }
+.logic-loop-empty { margin: 0; color: var(--text-3); font-size: 10px; }
+
+.logic-loop-runs { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.logic-loop-runs li { display: grid; gap: 2px; }
+.logic-loop-run-time { color: var(--text-3); font-size: 9px; }
+.logic-loop-run-steps { display: flex; flex-wrap: wrap; gap: 4px; }
+.logic-loop-step { border: 1px solid var(--border); border-radius: 9px; padding: 1px 6px; font-size: 9px; color: var(--text-2); }
+.logic-loop-step.is-failure { color: var(--danger); border-color: var(--danger); }
+.logic-loop-step-empty { color: var(--text-3); font-size: 9px; }
+
+.logic-loop-proposal { border: 1px solid var(--accent-muted); border-radius: 5px; background: var(--accent-bg); padding: 6px 8px; display: grid; gap: 5px; }
+.logic-loop-proposal-evidence { margin: 0; color: var(--text); line-height: 1.4; }
+.logic-loop-proposal details summary { cursor: pointer; color: var(--text-3); font-size: 10px; }
+.logic-loop-proposal pre { margin: 4px 0 0; max-height: 220px; overflow: auto; background: var(--surface-0); border-radius: 4px; padding: 6px; font-size: 10px; white-space: pre-wrap; word-break: break-word; }
+.logic-loop-proposal-actions { display: flex; gap: 6px; }
+.logic-loop-proposal-actions button { border: 1px solid var(--border); border-radius: 5px; background: var(--surface-2); color: var(--text); padding: 4px 9px; font-size: 10px; cursor: pointer; }
+.logic-loop-proposal-actions button:disabled { opacity: .55; cursor: default; }
+.logic-loop-proposal-actions button.danger:hover:not(:disabled) { border-color: var(--danger); color: var(--danger); }
+
+.logic-loop-history { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; color: var(--text-3); font-size: 9px; }

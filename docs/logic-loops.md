@@ -74,8 +74,8 @@ and a short note).
   runner downgrades the step to the fallback the loop names, or pauses the run with a readable reason. It
   never silently skips a review or a ship check.
 - A local step reports in a fixed last-line format (`OK …` / `FAILED <stage>` + ≤20 lines); the parent
-  wakes up only when there is a problem. Until local models get `agents.report`, a zero-token shell watcher
-  polls `agents.status`.
+  wakes up only when there is a problem. A local model delivers that report straight to the conversation
+  that opened its tab with `agents.report({text})` (v2), so nothing needs to poll `agents.status` for it.
 
 ## Refinement: agents improve loops, within limits
 
@@ -95,10 +95,20 @@ and a short note).
   `loops.record({runId, stepId, model, startedAt, finishedAt, outcome, tokens?, note?})`. `loops.run`
   records the plan, checks current reported usage against the loop budget, applies an allowed fallback, and returns
   exact model/effort steps for the caller to execute. It does not autonomously dispatch them.
-- `loops.status`, `loops.propose`, and `loops.apply` (owner or wizard only) remain v2 work.
+- v2 adds `loops.propose({id, change, evidence, metric?})`, which stores the complete proposed loop file (authored
+  against the loop's current version) plus the run metrics that justify it; `loops.apply({proposalId})`, which
+  parses the proposal, classifies it against the auto-apply rules below, applies it if either every touched field
+  is auto-safe or the caller is the owner or a wizard tab, bumps the loop's version, and appends a Run log line;
+  and `loops.reject({proposalId})`. `loops.proposals({id?})` lists proposals with their status (pending, applied,
+  rejected, reverted). After every `loops.record`, once two runs have landed since an applied change, both worse
+  on the metric its proposal cited than the run recorded just before it, the file is reverted to the previous
+  version's content (as a new, higher version) and the Run log says why — a pure function over `loop_step_runs`
+  (`evaluateAutoRevert` in `src/main/logic-loops/index.ts`), no polling involved.
 - No new sidebar tab (see the owner's durable-jobs note). Loops appear in the **Scheduled tasks** panel, where a
-  schedule can trigger one, and in **Project tasks**, where "Run task-triage" produces the grouped plan. A run shows
-  its steps inline with model, time, tokens and outcome, and a pending proposal shows as a reviewable diff.
+  schedule can trigger one, and in **Project tasks**, where "Run task-triage" produces the grouped plan. A
+  **Logic loops** section lists each loop's version and recent runs (steps with model, time, tokens, outcome) and
+  any pending proposals as a reviewable diff with Apply and Reject; Apply is refused client-side for a
+  locked/budget change unless the owner or a wizard tab is driving.
 - Scheduled tasks run their local churn and script steps the same way, so both features share the durable-job
   runner and the step metrics table.
 
@@ -119,4 +129,7 @@ and a short note).
    `loops.list/get/history/run/record` are registered in app control; `loop_runs` and `loop_step_runs` store plans and
    caller-recorded outcomes; and the budget helper reads current usage windows, selects a declared fallback, or pauses
    a plan at a hard cap. The Auto Fixer reads these files and records every executed step.
-3. **v2.** `loops.propose` / apply / auto-revert, the UI inside Scheduled tasks and Project tasks, and `agents.report` for local models.
+3. **v2 (done 2026-09-24).** `loops.propose`/`apply`/`reject` and the auto-revert check are registered in app
+   control (`src/main/logic-loops/index.ts`, `src/main/agent-control.ts`); the Scheduled tasks and Project tasks
+   panels each mount a `LogicLoopsSection`; and `agents.report` lets a local model deliver its result straight to
+   the conversation that opened its tab, so `update-readback.md` (bumped to v2) no longer needs the shell watcher.

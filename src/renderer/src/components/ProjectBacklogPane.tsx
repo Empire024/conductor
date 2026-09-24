@@ -11,6 +11,7 @@ import { AgentDialog } from '../panes/StructuredAgentRenderers'
 import { openWorkspaceFile } from './workspace-files-state'
 import { ProjectTaskAssignment, type ProjectTaskAssignmentMode } from './ProjectTaskAssignment'
 import { PromptImageThumbnail, PromptImageUpload } from './PromptImageUpload'
+import { LogicLoopsSection } from './LogicLoopsSection'
 import '../panes/StructuredAgentPane.css'
 import './ProjectBacklogPane.css'
 
@@ -422,6 +423,7 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
       {showArchived&&<section aria-label="Archived tasks"><h3><Check size={13}/> Archived <span>{archived.length}</span></h3>{archived.map(row)}</section>}
       {board?.page?.hasMore&&<button className="project-task-more" disabled={writing.current} onClick={()=>void loadMore()}>Load more</button>}
     </div>
+    <LogicLoopsSection projectId={project.id}/>
     <footer>Saved in your project. Agent edits appear automatically.</footer>
     {assignment&&<ProjectTaskAssignment project={project} tasks={assignment.tasks} mode={assignment.mode} onDispatch={dispatch} onClose={()=>setAssignment(null)}/>}
     {diffTask&&<TaskChanges project={project} task={diffTask} onClose={()=>setDiffTask(null)}/>}

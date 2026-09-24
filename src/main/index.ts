@@ -23,6 +23,7 @@ import { AgentControl } from './agent-control'
 import { AgentControlServer } from './agent-control-server'
 import { AgentControlUi } from './agent-control-ui'
 import { BrowserMcpServer } from './browser-mcp'
+import { startLocalAssist, type LocalAssist } from './local-assist/wiring'
 import { BrowserViews } from './browser-views'
 import { RemoteControlService } from './remote-control-ipc'
 import { safeStorageCipher } from './safe-storage-vault'
@@ -101,6 +102,7 @@ import { LocalUpdateBuilder } from './local-update-build'
 import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, releaseVerdict, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
 import { registerDeliveryIpc } from './delivery-ipc'
+import { registerLogicLoopsIpc } from './logic-loops/ipc'
 import { gitHubCredential } from './github-credential'
 import { normalizeUpdateFeedUrl } from './update-config'
 import { createUntitledEditorFile, EDITOR_CONFLICT_MESSAGE, readEditorFile, saveEditorCopy, writeEditorFile } from './editor-files'
@@ -134,6 +136,7 @@ let disposeDurableJobsIpc: (() => void) | undefined
 let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
+let disposeLogicLoopsIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
 let disposeProjectActivity: (() => void) | undefined
@@ -150,6 +153,7 @@ let disposePhoneIpc: (() => void) | undefined
 let disposePhoneBroadcast: (() => void) | undefined
 let agentControlUi: AgentControlUi | undefined
 let browserMcp: BrowserMcpServer | undefined
+let localAssist: LocalAssist | undefined
 let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
 /** The catalog a local update build records for its compatibility report: the configured model
@@ -580,12 +584,13 @@ const disposeRuntimeServices = (): void => {
     // app quit is never recorded as a failed stage. The jobs stay running and are reconciled on
     // the next launch.
     ['durable jobs', () => { durableJobs?.dispose(); disposeDurableJobsGate?.(); disposeDurableJobsIpc?.() }],
-    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
+    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
     ['schedule runner', () => scheduleRunner?.stop()],
     ['schedule IPC', () => disposeScheduleIpc?.()],
     ['delivery IPC', () => disposeDeliveryIpc?.()],
+    ['logic loops IPC', () => disposeLogicLoopsIpc?.()],
     ['orchestration IPC', () => disposeOrchestrationIpc?.()],
     ['collaboration IPC', () => disposeCollaborationIpc?.()],
     ['project activity', () => { disposeProjectActivity?.(); if (projectActivityTimer) clearTimeout(projectActivityTimer); projectActivityTimer = null }],
@@ -692,12 +697,13 @@ const reattachKeptRuntimes = async (): Promise<void> => {
   const listed = client ? await client.list().catch(() => []) : []
   for (const { id, record } of kept) {
     const runtime = listed.find(entry => entry.runtimeId === record.adapter.transport.runtimeId)
-    if (!client || !runtime) {
+    // A local turn has no process in the host: it paused at its checkpoint and resumes here.
+    if (record.provider !== 'local' && (!client || !runtime)) {
       agents.structured.abandonDetached(id, 'The turn this conversation was running when Conductor closed ended while it was closed. Its native conversation resumes as usual.')
       continue
     }
     try {
-      await agents.structured.reattach(id, runtime.lostFrames)
+      await agents.structured.reattach(id, runtime?.lostFrames ?? 0)
       reattachedRuntimes.add(id)
       console.log(`Conversation ${id} reattached to its kept runtime`)
     } catch (error) { console.warn(`Conversation ${id} could not be reattached to its kept runtime`, error) }
@@ -708,7 +714,7 @@ const reattachKeptRuntimes = async (): Promise<void> => {
 const briefReattachedRuntimes = (): void => {
   for (const id of reattachedRuntimes) {
     const spec = database.structured.spec<AgentSpec>(id), state = database.structured.snapshot(id)
-    if (!spec || !state || !agentControlServer || !['running', 'waiting_approval', 'waiting_input'].includes(state.phase)) continue
+    if (!spec || spec.provider === 'local' || !state || !agentControlServer || !['running', 'waiting_approval', 'waiting_input'].includes(state.phase)) continue
     void agents.structured.steer(id, `[Conductor] Conductor restarted (now ${app.getVersion()}) while this turn kept running. App control moved to a new endpoint and credential; use these from now on.\n\n${agentControlServer.briefing(spec)}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
       .catch(error => console.warn(`Reattached conversation ${id} could not be briefed`, error))
   }
@@ -923,7 +929,7 @@ const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit
     type: 'warning', title: action === 'restart' ? 'Restart Conductor?' : 'Quit Conductor?',
     message: 'Work is still running in Conductor.',
     detail: `${running.length ? running.map(process => process.title).join('\n') : 'A native CLI command is still running.'}\n\n${background
-      ? 'Keep running in background: the running turns carry on while Conductor is closed and reappear in their tabs when it starts again. Terminal CLI tabs still stop.\nStop all: interrupts work in every project and window.'
+      ? 'Keep running in background: the running turns carry on while Conductor is closed and reappear in their tabs when it starts again (local-model turns pause and continue then). Terminal CLI tabs still stop.\nStop all: interrupts work in every project and window.'
       : 'Stopping the application interrupts work in every project and window.'}`,
     buttons: background ? [`Keep running in background and ${verb}`, `Stop all and ${verb}`, 'Cancel'] : [`Stop work and ${verb}`, 'Cancel'],
     defaultId: background ? 0 : 1, cancelId: choices.length - 1, noLink: true, signal
@@ -1411,6 +1417,10 @@ const registerIpc = (): void => {
   disposeDeliveryIpc = registerDeliveryIpc({ service: delivery,
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control') },
     projectPath: projectId => localProject(database, projectId, 'Source control').path })
+  disposeLogicLoopsIpc = registerLogicLoopsIpc({ database, usage: () => agents.structured.usageLimits(),
+    authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Logic loops') },
+    projectPath: projectId => localProject(database, projectId, 'Logic loops').path,
+    changed: projectId => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed()) window.webContents.send('logic-loops:changed', projectId) } })
   ipcMain.handle('projects:list', () => database.listDeskProjects())
   ipcMain.handle('projects:open-folder', async () => {
     const result = await dialog.showOpenDialog({
@@ -1984,7 +1994,10 @@ const registerIpc = (): void => {
   ipcMain.handle('agent:list-events', (_event, id: string) => database.listAgentEvents(id))
   ipcMain.handle('agent:list-providers', () => agents.listProviders())
   ipcMain.handle('runtime:list-processes', (_event, projectId?: string) => database.listProcesses(projectId))
-  ipcMain.handle('usage:weekly', () => weeklyUsage.readAsync())
+  ipcMain.handle('usage:weekly', async () => {
+    const report = await weeklyUsage.readAsync(), saved = localAssist?.savings(report.days)
+    return saved ? { ...report, localSavings: { tokensSaved: saved.tokensSaved, calls: saved.calls, modelCalls: saved.modelCalls, localInputTokens: saved.localInputTokens, localOutputTokens: saved.localOutputTokens } } : report
+  })
   ipcMain.handle('activity:projects', () => projectActivitySnapshot())
   // A smoke run has to be able to show the chip a machine it is not on: an idle host, then a
   // loaded one. The fixture is re-read per call so one launch can walk through both.
@@ -2470,6 +2483,9 @@ app.whenReady().then(async () => {
   agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '', { path: join(app.getPath('userData'), 'control-owner.json'), appVersion: app.getVersion(), packaged: app.isPackaged })
   await agentControlServer.start()
   await browserMcp.start()
+  // conductor-local MCP tools (src/main/local-assist): every Claude and Codex launch from here on.
+  localAssist = await startLocalAssist({ structured: database.structured, userData: app.getPath('userData'), sessions: agents.structured })
+    .catch(error => { console.warn('Local assist is unavailable', error); return undefined })
   remoteControl.registerIpc()
   await remoteControl.start()
   // Phones reach this Conductor through their own listener, built on the same stores and the

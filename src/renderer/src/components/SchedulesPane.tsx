@@ -5,6 +5,7 @@ import { SchedulerStatus } from './schedules/SchedulerStatus'
 import { ScheduleTaskCard } from './schedules/ScheduleTaskCard'
 import { ScheduleTaskForm } from './schedules/ScheduleTaskForm'
 import { agentLabel, busyKey, deleteScriptQuestion, deleteTaskQuestion, sortRuns, type TaskFormValue } from './schedules/schedule-helpers'
+import { LogicLoopsSection } from './LogicLoopsSection'
 import './SchedulesPane.css'
 
 /**
@@ -144,5 +145,6 @@ export function SchedulesPane({ projectId }: { projectId: string }): React.JSX.E
         editing={editing === schedule.id}
         {...handlers(schedule)} />)}
     </div>
+    <LogicLoopsSection projectId={projectId}/>
   </div>
 }
