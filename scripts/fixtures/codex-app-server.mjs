@@ -30,6 +30,15 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line)
   if (!message.method) {
     if (!approval || message.id !== approval.id) { process.exitCode = 9; return }
+    // A client that refuses a reissued request identity answers with an error; the turn ends
+    // without running anything, as Codex does when its request is rejected.
+    if (message.error && approval.reissue) {
+      approval = undefined
+      itemEvent('item/completed', command('command-1', 'declined', '', null))
+      itemEvent('item/completed', { type: 'agentMessage', id: 'reissue-refused', text: 'Synthetic: the client refused the reissued request: ' + message.error.message, phase: null, memoryCitation: null, delivery: null, questions: null })
+      finish()
+      return
+    }
     const pending = approval
     approval = undefined
     notify('serverRequest/resolved', { threadId, requestId: message.id })
@@ -324,6 +333,24 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
     // Exactly what codex-cli 0.155.1 sends for an MCP tool that is not annotated read-only under on-request.
     approval = { id: 502, mcp: true }
     send({ id: 502, method: 'mcpServer/elicitation/request', params: { threadId, turnId: currentTurn, serverName: 'conductor-browser', mode: 'form', _meta: { codex_approval_kind: 'mcp_tool_call', persist: ['session', 'always'], tool_description: 'Read the page', tool_params: { maxChars: 1000 } }, message: 'Allow the conductor-browser MCP server to run tool "browser_snapshot"?', requestedSchema: { type: 'object', properties: {} } } })
+    return
+  }
+  // Escalations shaped like codex-cli 0.155.1 on Windows: the command wrapped in the interpreter's
+  // absolute path with doubled separators, and the decisions it offers there. `outside` is the
+  // invoice incident's read-only port query, `boundary` reaches a system directory, `reissue`
+  // delivers the boundary request twice and then again under the same id with other arguments.
+  const escalation = /^synthetic:escalation:(outside|boundary|reissue)$/.exec(scenario)?.[1]
+  if (escalation) {
+    const acted = escalation === 'outside' ? 'Get-NetTCPConnection -LocalPort 8765 -State Listen' : 'Get-Content C:\\Windows\\System32\\drivers\\etc\\hosts'
+    const request = (script, reason) => ({ id: 500, method: 'item/commandExecution/requestApproval', params: { threadId, turnId: currentTurn, itemId: 'command-1', reason, command: '"C:\\\\WINDOWS\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe" -Command \'' + script + '\'', cwd: process.cwd(), kind: 'command', environmentId: null, startedAtMs: Date.now(), availableDecisions: ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: [script.split(' ')[0]] } }, 'cancel'] } })
+    itemEvent('item/started', command('command-1'))
+    approval = { id: 500, reissue: escalation === 'reissue' }
+    const first = request(acted, 'Synthetic escalation outside the workspace sandbox')
+    send(first)
+    if (escalation === 'reissue') {
+      setTimeout(() => send(first), 40)
+      setTimeout(() => send(request('Get-Content C:\\Windows\\System32\\config\\SAM','Synthetic escalation outside the workspace sandbox')), 400)
+    }
     return
   }
   if (scenario.startsWith('synthetic:approval') || scenario.startsWith('SYNTHETIC A')) {

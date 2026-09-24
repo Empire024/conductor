@@ -28,8 +28,8 @@ export interface ApprovalReviewRouting {
   enabled(spec: AgentSpec): boolean
   authorization(spec: AgentSpec): { text: string; id: string; ownerTaskId?: string }
   run(spec: AgentSpec, action: ReviewAction, digest: string): Promise<ReviewResult>
-  /** Trusted executor contract, never read from a worker or a native request payload.
-   * No current production adapter establishes atomic preconditions/cross-route fencing. */
+  /** @deprecated Never consulted since 18312fd: the owner accepted review without execution-time
+   *  enforcement of the reviewed preconditions for their own coworkers. Kept so older fixtures type-check. */
   supportsExactExecution?(spec: AgentSpec): boolean
 }
 type Binding = { spec: AgentSpec; runtimeId: string; source: AdapterEvent; interaction: PendingInteraction; action?: ReviewAction; record?: ReviewRecord; settled?: 'owner' }

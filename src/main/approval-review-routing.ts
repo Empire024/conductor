@@ -117,7 +117,10 @@ export function createApprovalRouting(deps: AgentControlDependencies, host: Revi
           const result = state.items.filter(item => item.runtimeId === state.runtimeId && item.data.type === 'text' && item.data.role === 'assistant').at(-1)
           if (!result || result.data.type !== 'text' || !result.turnId) throw new Error('No completed native reviewer answer with turn identity')
           const parsed = JSON.parse(result.data.text)
-          if (!parsed || Object.keys(parsed).sort().join(',') !== 'decision,digest,rationale' || typeof parsed.rationale !== 'string' || parsed.rationale.length > 1600) throw new Error('Reviewer result does not match the strict decision schema')
+          // Checked here rather than only in the journal, so a malformed answer still records which
+          // reviewer turn gave it, its model and its usage.
+          if (!parsed || Object.keys(parsed).sort().join(',') !== 'decision,digest,rationale' || typeof parsed.rationale !== 'string' || parsed.rationale.length > 1600
+            || !['allow', 'deny', 'escalate'].includes(parsed.decision) || parsed.digest !== digest) throw new Error('Reviewer result does not match the strict decision schema')
           return { ...parsed, reviewerId, model: actualModel, turnId: result.turnId, elapsedMs: Date.now() - startedAt, usage: JSON.parse(JSON.stringify(summarizeUsageRun(state.items, state.runtimeId, actualModel))) }
         }
         await new Promise(resolve => setTimeout(resolve, 200))

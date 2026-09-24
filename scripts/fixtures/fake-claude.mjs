@@ -106,6 +106,16 @@ for await (const line of input) {
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
       text('Synthetic native images received: ' + images.length); finish(); continue
     }
+    // An isolated approval reviewer's one turn (src/main/approval-review-routing.ts), answered with
+    // the decision the test chose, as the Opus model the routing requires. Only when a test asks.
+    const reviewerDecision = process.env.CONDUCTOR_TEST_REVIEWER_DECISION
+    if (reviewerDecision && typeof prompt === 'string' && prompt.startsWith('You are an isolated approval reviewer')) {
+      const digest = /"digest":"([0-9a-f]+)"/.exec(prompt)?.[1]
+      emit({ type: 'system', subtype: 'init', model: 'claude-opus-5-5', claude_code_version: '2.1.263', permissionMode })
+      text(JSON.stringify({ digest, decision: reviewerDecision, rationale: `SYNTHETIC reviewer: ${reviewerDecision} for this one action.` }))
+      emit({ type: 'result', subtype: 'success', is_error: false, usage: { input_tokens: 1800, output_tokens: 40 } })
+      continue
+    }
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
     if (prompt.startsWith('SYNTHETIC STEERING ')) {
       const scenario = prompt.split(/\s+/)[2]
