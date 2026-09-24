@@ -18,11 +18,11 @@
  *   shouldRollover(usage: { promptTokens }, capacity: ModelWindow, budgets: DurableJobBudgets): RolloverDecision
  *   usageFromStopReport(report: LocalStopReport): { promptTokens: number }
  *   buildStagePrompt(job, stage, handoff, model, options?): StagePromptResult  ({ ok: true, prompt, tokens, budgetTokens, trimmed } | { ok: false, error: StageTooLargeError })
- *   extractHandoff(previous, stopReport, taskState, evidence, options?): DurableJobHandoff
+ *   extractHandoff(previous, stopReport, taskState, evidence, options?): DurableJobHandoff  (redacted: see watchdog.ts redactHandoff)
  *   excerpt({ logDir, name, raw, ... }): Promise<ExcerptResult>
  *   readRange(path, range, options?): Promise<{ text; ref }>
  *   stageKind(stage): DurableStageKind
- *   stageTooling(kind, workspace, grants?): StageTooling  ({ kind, scope, readOnly, grants, contract, systemPrompt, tools, schemaTokens })
+ *   stageTooling(kind, workspace, grants?, contract?, control?): StageTooling  ({ kind, scope, readOnly, grants, contract, systemPrompt, tools, schemaTokens })
  *   classifyResponse(completion): ResponseClassification
  *   classifyStageOutcome(outcome: { text; stopReason | report }): StageOutcomeClassification
  */
@@ -42,6 +42,7 @@ import type { LocalModelConfig } from '../local-models/config.ts'
 import type { LocalResultStore } from '../local-models/result-artifacts.ts'
 import { detectsTestRun, headAndTail, shapeToolOutput } from '../local-models/tool-output.ts'
 import { NO_GRANTS, toolSpecs, type LocalGrants, type ToolScope } from '../local-models/tools.ts'
+import { redactHandoff, redactSensitive } from './watchdog.ts'
 
 // ---------------------------------------------------------------------------------------------
 // 1. Whole-request estimate against the live model's window
@@ -273,10 +274,12 @@ export interface ExtractHandoffOptions {
 /** Prefixes of issues this module generates; a later clean stage replaces them. */
 const AUTO_ISSUE = /^(Failing: |Stage \d+ stopped: |Repeated failure: |Unverified claim: )/
 
-function merge(into: string[], add: Iterable<string>, max: number, itemChars = 400): string[] {
+function merge(into: string[], add: Iterable<string>, max: number, itemChars = 400, redact = true): string[] {
   const out = [...into]
   for (const raw of add) {
-    const item = clip(raw, itemChars)
+    // Redacted before comparing, so an entry matches its already-redacted earlier copy. Paths
+    // (redact false) are evidence and stay verbatim, as in redactHandoff.
+    const item = clip(redact ? redactSensitive(raw) : raw, itemChars)
     if (!item) continue
     const at = out.indexOf(item)
     if (at >= 0) out.splice(at, 1)
@@ -297,7 +300,7 @@ export function extractHandoff(previous: DurableJobHandoff, stopReport: LocalSto
   const constraints = merge(previous.constraints, taskState?.constraints ?? [], max)
   const decisions = merge(previous.decisions, [...(execution?.corrections ?? []).map(c => `Owner correction: ${c}`), ...(taskState?.discoveries ?? [])], max)
 
-  const filesChanged = merge(previous.filesChanged, [...(taskState?.filesChanged ?? []), ...(stopReport?.filesChanged ?? []), ...(evidence?.writes ?? []).map(w => w.path)], 200)
+  const filesChanged = merge(previous.filesChanged, [...(taskState?.filesChanged ?? []), ...(stopReport?.filesChanged ?? []), ...(evidence?.writes ?? []).map(w => w.path)], 200, 400, false)
 
   const tests: string[] = []
   const commands = [...(taskState?.commands ?? []), ...(evidence?.commands ?? [])]
@@ -305,7 +308,7 @@ export function extractHandoff(previous: DurableJobHandoff, stopReport: LocalSto
   const acceptance = evidence?.acceptance ?? stopReport?.acceptance
   if (acceptance) tests.push(`${acceptance.passed ? 'pass' : `fail (exit ${acceptance.exitCode})`}: ${acceptance.command}`)
   let testResults = [...previous.testResults]
-  for (const entry of tests) { const key = testKey(clip(entry, 400)); testResults = testResults.filter(existing => testKey(existing) !== key); testResults.push(clip(entry, 400)) }
+  for (const raw of tests) { const entry = clip(redactSensitive(raw), 400), key = testKey(entry); testResults = testResults.filter(existing => testKey(existing) !== key); testResults.push(entry) }
   testResults = testResults.slice(-max)
 
   const workLine = stopReport
@@ -337,7 +340,9 @@ export function extractHandoff(previous: DurableJobHandoff, stopReport: LocalSto
   else if (outcome) nextAction = `Resume the unfinished stage (${outcome.reason}). Work in smaller steps: read ranges, not whole files.`
   else nextAction = previous.nextAction
 
-  return { objective: previous.objective, constraints, decisions, workDone, filesChanged, testResults, unresolvedIssues, nextAction, artifacts: artifacts.slice(-max), updatedAt: (options.now?.() ?? new Date()).toISOString() }
+  // Stop details, failure excerpts and next actions are model and tool text: a credential a
+  // command printed must not ride the handoff into the store, the next prompt or the report.
+  return redactHandoff({ objective: previous.objective, constraints, decisions, workDone, filesChanged, testResults, unresolvedIssues, nextAction, artifacts: artifacts.slice(-max), updatedAt: (options.now?.() ?? new Date()).toISOString() })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -441,10 +446,14 @@ export function stageKind(stage: Pick<DurableJobStage, 'title' | 'objective'>): 
 
 export interface StageTooling { kind: DurableStageKind; scope: ToolScope; readOnly: boolean; grants: LocalGrants; contract?: TaskContract; systemPrompt: string; tools: ToolSpec[]; schemaTokens: number }
 
-export function stageTooling(kind: DurableStageKind, workspace: string, grants: LocalGrants = NO_GRANTS, contract: TaskContract = {}): StageTooling {
+/** The tools a stage conversation is really offered, so the stage prompt budget counts all of
+ *  their schemas. A research stage carries the research grant (web_search) by its kind; no other
+ *  kind gets it. `control`: every local conversation gets the conductor bridge (structured
+ *  sessions always pass one), and agent.ts offers its schema in the full scope. */
+export function stageTooling(kind: DurableStageKind, workspace: string, grants: LocalGrants = NO_GRANTS, contract: TaskContract = {}, control = true): StageTooling {
   const entry = STAGE_TOOL_MAP[kind]
-  const effective: LocalGrants = { git: grants.git, research: entry.research && grants.research }
-  const tools = toolSpecs(entry.readOnly, false, effective, entry.scope)
+  const effective: LocalGrants = { git: grants.git, research: entry.research }
+  const tools = toolSpecs(entry.readOnly, control && entry.scope === 'full', effective, entry.scope)
   return { kind, scope: entry.scope, readOnly: entry.readOnly, grants: effective, ...(entry.scope === 'coding' ? { contract } : {}), systemPrompt: systemPrompt(workspace, entry.readOnly, effective, entry.scope), tools, schemaTokens: tools.length ? jsonTokens({ tools, tool_choice: 'auto' }) : 0 }
 }
 

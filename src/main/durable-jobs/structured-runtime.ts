@@ -115,11 +115,12 @@ export function structuredStageRuntime(deps: StructuredRuntimeDeps): StageRuntim
       const created = database.structured.snapshot(spec.id)
       if (!created) throw new Error('The stage conversation was not registered')
       // Local models have no Auto; accept-edits is their working mode (the sandbox still applies).
-      // No grants are widened here: no repository writes, no research, no bypassed approvals.
-      // The stage kind picks the tool scope (handoff.ts STAGE_TOOL_MAP): read-only kinds get no
-      // mutating tool, and a coding-scope kind gets the coding tool set through an empty contract.
+      // No repository writes and no bypassed approvals. The stage kind picks the tool scope
+      // (handoff.ts STAGE_TOOL_MAP): read-only kinds get no mutating tool, a coding-scope kind gets
+      // the coding tool set through an empty contract, and only a research stage (read-only) gets
+      // the research grant, so it can web_search as its prompt budget assumes.
       const tools = STAGE_TOOL_MAP[request.stage.kind ?? stageKind(request.stage)]
-      database.structured.update(spec.id, { settings: { ...created.settings, model, permission: tools.readOnly ? 'read-only' : 'accept-edits', plan: false, localGit: false, localResearch: false, ...(tools.scope === 'coding' ? { localContract: {} } : {}) } })
+      database.structured.update(spec.id, { settings: { ...created.settings, model, permission: tools.readOnly ? 'read-only' : 'accept-edits', plan: false, localGit: false, localResearch: tools.research, ...(tools.scope === 'coding' ? { localContract: {} } : {}) } })
       void deps.showTab?.({ projectId: project.id, workspaceId, agentSessionId: spec.id, title: spec.title, model, jobId: request.job.id }).catch(error => console.warn('Durable job tab could not be shown', error))
       return { agentSessionId: spec.id }
     },

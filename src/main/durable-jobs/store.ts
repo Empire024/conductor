@@ -3,6 +3,7 @@ import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { makeId } from '../../shared/models'
 import { canTransition, TERMINAL_JOB_STATUSES, type DurableJob, type DurableJobCheckpoint, type DurableJobEvent, type DurableJobLease, type DurableJobOperation, type DurableJobStage, type DurableJobStatus } from '../../shared/durable-jobs'
+import { redactData, redactHandoff, redactSensitive } from './watchdog'
 
 type Row = Record<string, unknown>
 
@@ -42,6 +43,15 @@ export interface StoredJob extends DurableJob {
 }
 
 const json = <T>(value: unknown): T => JSON.parse(String(value)) as T
+
+/** Model and tool text never reaches the store unredacted: handoffs, stage results and errors,
+ *  status reasons, operation descriptions and every event (watchdog.ts redaction). */
+const cleanPatch = <T extends { handoff?: DurableJob['handoff'] }>(patch: T): T => patch.handoff ? { ...patch, handoff: redactHandoff(patch.handoff) } : patch
+const cleanStage = (stage: DurableJobStage, text: Array<'title' | 'objective'> = []): DurableJobStage => {
+  const clean: DurableJobStage = { ...stage, ...(stage.result !== undefined ? { result: redactSensitive(stage.result) } : {}), ...(stage.error !== undefined ? { error: redactSensitive(stage.error) } : {}) }
+  for (const key of text) clean[key] = redactSensitive(stage[key])
+  return clean
+}
 
 const eventField = (key: string): string => {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid event data field: ${key}`)
@@ -191,7 +201,7 @@ export class DurableJobStore {
   }
 
   private insertEvent(jobId: string, kind: DurableJobEvent['kind'], message: string, data?: Record<string, unknown>): DurableJobEvent {
-    const event: DurableJobEvent = { id: makeId('jobevt'), jobId, at: this.now(), kind, message: message.slice(0, 4_000), ...(data ? { data } : {}) }
+    const event: DurableJobEvent = { id: makeId('jobevt'), jobId, at: this.now(), kind, message: redactSensitive(message).slice(0, 4_000), ...(data ? { data: redactData(data) } : {}) }
     this.db.prepare('INSERT INTO durable_job_events (id, job_id, at, kind, data) VALUES (?, ?, ?, ?, ?)').run(event.id, jobId, event.at, kind, JSON.stringify(event))
     return event
   }
@@ -368,9 +378,11 @@ export class DurableJobStore {
   /**
    * The one way a job's status changes. Illegal moves throw without writing. Active time is
    * accumulated when leaving `running`; startedAt is set on the first run and finishedAt on a
-   * terminal status. The event is written in the same transaction.
+   * terminal status. The event is written in the same transaction. `activeUntil` (epoch ms) ends
+   * the running span earlier than now: reconciliation passes when the dead process was last seen,
+   * so the time Conductor was down is not counted as active.
    */
-  transition(jobId: string, to: DurableJobStatus, reason: string, guard: WriteGuard, patch: Partial<Pick<DurableJob, 'currentStageId' | 'handoff' | 'counters' | 'reportPath'>> = {}, data?: Record<string, unknown>): StoredJob {
+  transition(jobId: string, to: DurableJobStatus, reason: string, guard: WriteGuard, patch: Partial<Pick<DurableJob, 'currentStageId' | 'handoff' | 'counters' | 'reportPath'>> = {}, data?: Record<string, unknown>, activeUntil?: number): StoredJob {
     return this.transaction(jobId, () => {
       const row = this.check(jobId, guard)
       const job = this.mapJob(row)
@@ -379,8 +391,8 @@ export class DurableJobStore {
       const at = now.toISOString()
       const runningSince = row.running_since ? Date.parse(String(row.running_since)) : undefined
       const next: DurableJob = {
-        ...job, ...patch, status: to, statusReason: reason, updatedAt: at,
-        activeMs: job.activeMs + (job.status === 'running' && runningSince !== undefined ? Math.max(0, now.getTime() - runningSince) : 0),
+        ...job, ...cleanPatch(patch), status: to, statusReason: redactSensitive(reason), updatedAt: at,
+        activeMs: job.activeMs + (job.status === 'running' && runningSince !== undefined ? Math.max(0, Math.min(now.getTime(), activeUntil ?? Infinity) - runningSince) : 0),
         ...(to === 'running' && !job.startedAt ? { startedAt: at } : {}),
         ...(TERMINAL_JOB_STATUSES.includes(to) ? { finishedAt: at } : {})
       }
@@ -397,7 +409,7 @@ export class DurableJobStore {
       const row = this.check(jobId, guard)
       const job = this.mapJob(row)
       if (TERMINAL_JOB_STATUSES.includes(job.status) && Object.keys(patch).some(key => key !== 'reportPath')) throw new Error(`Durable job ${jobId} is ${job.status}`)
-      this.saveJob({ ...job, ...patch, updatedAt: this.now() }, row)
+      this.saveJob({ ...job, ...cleanPatch(patch), updatedAt: this.now() }, row)
       return this.get(jobId)
     })
   }
@@ -416,7 +428,9 @@ export class DurableJobStore {
     this.db.prepare('INSERT INTO durable_job_stages (id, job_id, stage_index, status, data) VALUES (?, ?, ?, ?, ?)').run(stage.id, stage.jobId, stage.index, stage.status, JSON.stringify(stage))
   }
 
-  addStage(jobId: string, guard: WriteGuard, stage: DurableJobStage, message?: string): DurableJobStage {
+  addStage(jobId: string, guard: WriteGuard, planned: DurableJobStage, message?: string): DurableJobStage {
+    // A stage the job planned for itself carries model text in its title and objective.
+    const stage = cleanStage(planned, ['title', 'objective'])
     return this.transaction(jobId, () => {
       this.check(jobId, guard)
       this.insertStage(stage)
@@ -425,7 +439,8 @@ export class DurableJobStore {
     })
   }
 
-  saveStage(jobId: string, guard: WriteGuard, stage: DurableJobStage, event?: { kind: DurableJobEvent['kind']; message: string; data?: Record<string, unknown> }): DurableJobStage {
+  saveStage(jobId: string, guard: WriteGuard, saved: DurableJobStage, event?: { kind: DurableJobEvent['kind']; message: string; data?: Record<string, unknown> }): DurableJobStage {
+    const stage = cleanStage(saved)
     return this.transaction(jobId, () => {
       this.check(jobId, guard)
       this.db.prepare('UPDATE durable_job_stages SET status = ?, data = ? WHERE id = ? AND job_id = ?').run(stage.status, JSON.stringify(stage), stage.id, jobId)
@@ -439,7 +454,7 @@ export class DurableJobStore {
   intend(jobId: string, guard: WriteGuard, operation: Pick<DurableJobOperation, 'stageId' | 'kind' | 'description'>): DurableJobOperation {
     return this.transaction(jobId, () => {
       this.check(jobId, guard)
-      const op: DurableJobOperation = { id: makeId('jobop'), jobId, ...operation, description: operation.description.slice(0, 2_000), status: 'intended', intendedAt: this.now() }
+      const op: DurableJobOperation = { id: makeId('jobop'), jobId, ...operation, description: redactSensitive(operation.description).slice(0, 2_000), status: 'intended', intendedAt: this.now() }
       this.db.prepare('INSERT INTO durable_job_operations (id, job_id, stage_id, status, intended_at, data) VALUES (?, ?, ?, ?, ?, ?)').run(op.id, jobId, op.stageId, op.status, op.intendedAt, JSON.stringify(op))
       return op
     })
@@ -451,7 +466,7 @@ export class DurableJobStore {
       this.check(jobId, guard)
       const row = this.db.prepare('SELECT data FROM durable_job_operations WHERE id = ? AND job_id = ?').get(operationId, jobId) as Row | undefined
       if (!row) throw new Error(`Durable job operation not found: ${operationId}`)
-      const op: DurableJobOperation = { ...json<DurableJobOperation>(row.data), status, settledAt: this.now(), ...(reconciliation ? { reconciliation: reconciliation.slice(0, 2_000) } : {}) }
+      const op: DurableJobOperation = { ...json<DurableJobOperation>(row.data), status, settledAt: this.now(), ...(reconciliation ? { reconciliation: redactSensitive(reconciliation).slice(0, 2_000) } : {}) }
       this.db.prepare('UPDATE durable_job_operations SET status = ?, data = ? WHERE id = ?').run(status, JSON.stringify(op), operationId)
       return op
     })

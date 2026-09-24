@@ -250,3 +250,35 @@ describe('DurableJobStore', () => {
     } finally { second.close() }
   })
 })
+
+describe('DurableJobStore redaction', () => {
+  const BEARER = 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'
+  const API_KEY = 'sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP'
+  const CONTROL = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+  const planted = `curl -H "Authorization: Bearer ${BEARER}" --api-key ${API_KEY} -d '{"token":"${CONTROL}"}'`
+
+  it('never stores a bearer token, an API key or a control credential from tool arguments, errors, answers, next actions or handoffs', () => {
+    const db = new DatabaseSync(':memory:')
+    const store = new DurableJobStore(db)
+    store.create(job(), [stage()], false)
+    const guard = { owner: true } as const
+    const operation = store.intend('job_1', guard, { stageId: 'job_1_s0', kind: 'shell', description: `run_command ${JSON.stringify({ command: planted })}` })
+    store.settle('job_1', guard, operation.id, 'failed', `exit 1: ${planted}`)
+    store.event('job_1', guard, 'note', `Tool output: ${planted}`, { stageId: 'job_1_s0', output: planted, nested: [{ args: { command: planted } }], apiKey: 'plain', token: CONTROL })
+    store.saveStage('job_1', guard, { ...stage(), status: 'running', attempt: 1, result: `Answer: ${planted}`, error: `lastError: ${planted}` }, { kind: 'retry', message: `Stage failed: ${planted}`, data: { error: planted } })
+    store.addStage('job_1', guard, { ...stage('job_1', 1), title: `Next ${API_KEY}`, objective: `Continue with ${planted}` })
+    const handoff = { ...job().handoff, decisions: [planted], workDone: [planted], testResults: [`fail: ${planted}`], unresolvedIssues: [planted], nextAction: `Next: ${planted}`, artifacts: [{ path: 'C:/logs/a.log', kind: 'log' as const, note: planted }] }
+    store.transition('job_1', 'running', `Resumed after ${planted}`, guard, { handoff }, { reason: planted })
+    store.update('job_1', guard, { handoff: { ...handoff, nextAction: `Then ${planted}` } })
+    store.transition('job_1', 'blocked', `Blocked: ${planted}`, guard)
+    const rows = ['durable_jobs', 'durable_job_stages', 'durable_job_operations', 'durable_job_events', 'durable_job_checkpoints'].map(table => JSON.stringify(db.prepare(`SELECT * FROM ${table}`).all())).join('\n')
+    for (const secret of [BEARER, API_KEY, '4f9QzX2mL8kV7nB3cR6tY1wP', CONTROL]) expect(rows).not.toContain(secret)
+    // What is left is still the useful part of the record.
+    expect(store.get('job_1').handoff.filesChanged).toEqual([])
+    expect(store.get('job_1').handoff.artifacts[0]!.path).toBe('C:/logs/a.log')
+    expect(store.stage('job_1_s0').error).toContain('lastError: curl -H "Authorization: [redacted]')
+    expect(store.operations('job_1')[0]!.description).toContain('run_command')
+    expect(store.events('job_1').some(event => event.message.startsWith('Tool output: curl'))).toBe(true)
+    store.close()
+  })
+})

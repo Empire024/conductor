@@ -1,4 +1,5 @@
-import type { DurableJobBudgets, DurableJobEvent } from '../../shared/durable-jobs.ts'
+import type { DurableJobBudgets, DurableJobEvent, DurableJobHandoff } from '../../shared/durable-jobs.ts'
+import type { TimelineItem } from '../../shared/structured-agent.ts'
 
 /**
  * Bounded waits for a durable local-model job: one watch per model call, tool call or stage,
@@ -28,7 +29,11 @@ import type { DurableJobBudgets, DurableJobEvent } from '../../shared/durable-jo
  *     active(): WatchSnapshot[]                    -> for diagnostics / status
  *   function redactSensitive(text: string, secrets?: string[]): string
  *   function redactData<T>(value: T, secrets?: string[]): T
+ *   function redactHandoff(handoff: DurableJobHandoff, secrets?: string[]): DurableJobHandoff
  *   function boundedExcerpt(text: string, maxChars?: number, secrets?: string[]): string
+ *   class ContextRolloverWatch(contextTokens, fraction)
+ *     observe(promptTokens?, toolRunning?): ContextRolloverCrossing | null -> once per attempt
+ *   function latestContextTokens(items: TimelineItem[]): number | undefined
  *
  * The ladder, per watch on each tick: a clock jump (sleep/wake) is subtracted and reported as
  * 'reconcile', never counted as a stall. Past the deadline or past `stallAfterMs` without any
@@ -275,6 +280,60 @@ export class Watchdog {
   }
 }
 
+// --- In-stage context rollover ---------------------------------------------------------------
+
+export interface ContextRolloverCrossing {
+  promptTokens: number
+  /** floor(contextTokens * fraction), the same threshold handoff.ts shouldRollover uses between stages. */
+  thresholdTokens: number
+  contextTokens: number
+  fraction: number
+}
+
+/**
+ * contextRolloverFraction inside a stage. Between stages handoff.ts shouldRollover decides; this
+ * watches the prompt size of each model request while the stage runs and says, once per attempt,
+ * that the stage has crossed the fraction and should continue in a fresh context from the
+ * handoff. A crossing seen while a tool runs is held until the tool has finished, so the hand-off
+ * never cuts a side effect in half.
+ */
+export class ContextRolloverWatch {
+  readonly thresholdTokens: number
+  private crossed: ContextRolloverCrossing | null = null
+  private fired = false
+
+  constructor(readonly contextTokens: number, readonly fraction: number) {
+    if (!Number.isInteger(contextTokens) || contextTokens <= 0) throw new Error('contextTokens must be a positive integer')
+    if (!(fraction > 0 && fraction <= 1)) throw new Error('contextRolloverFraction must be a fraction between 0 and 1')
+    this.thresholdTokens = Math.floor(contextTokens * fraction)
+  }
+
+  /** Feed the newest request's prompt tokens (undefined: nothing new). Returns the crossing the
+   *  first time it may be acted on, then never again. */
+  observe(promptTokens: number | undefined, toolRunning = false): ContextRolloverCrossing | null {
+    if (this.fired) return null
+    if (!this.crossed && promptTokens !== undefined && Number.isFinite(promptTokens) && promptTokens >= this.thresholdTokens) {
+      this.crossed = { promptTokens, thresholdTokens: this.thresholdTokens, contextTokens: this.contextTokens, fraction: this.fraction }
+    }
+    if (!this.crossed || toolRunning) return null
+    this.fired = true
+    return this.crossed
+  }
+}
+
+/** The context a stage conversation occupied after its newest model request, from the usage
+ *  items the local adapter records per request (prompt plus answer, as the stop report counts). */
+export function latestContextTokens(items: readonly TimelineItem[]): number | undefined {
+  let newest: { sequence: number; tokens: number } | undefined
+  for (const item of items) {
+    const data = item.data
+    if (data.type !== 'usage' || typeof data.inputTokens !== 'number') continue
+    const sequence = item.updatedSequence ?? item.sequence
+    if (!newest || sequence >= newest.sequence) newest = { sequence, tokens: data.inputTokens + (typeof data.outputTokens === 'number' ? data.outputTokens : 0) }
+  }
+  return newest?.tokens
+}
+
 // --- Redaction -------------------------------------------------------------------------------
 
 const REDACTED = '[redacted]'
@@ -317,6 +376,18 @@ export function redactData<T>(value: T, secrets: string[] = []): T {
     return item
   }
   return walk(value, 0) as T
+}
+
+/** A handoff with every piece of free text redacted: decisions, work done, test lines, issues,
+ *  next action, artifact notes. File and artifact paths are evidence and stay verbatim. */
+export function redactHandoff(handoff: DurableJobHandoff, secrets: string[] = []): DurableJobHandoff {
+  const text = (value: string): string => redactSensitive(value, secrets)
+  return {
+    ...handoff,
+    objective: text(handoff.objective), constraints: handoff.constraints.map(text), decisions: handoff.decisions.map(text), workDone: handoff.workDone.map(text),
+    testResults: handoff.testResults.map(text), unresolvedIssues: handoff.unresolvedIssues.map(text), nextAction: text(handoff.nextAction),
+    artifacts: handoff.artifacts.map(ref => ref.note ? { ...ref, note: text(ref.note) } : ref)
+  }
 }
 
 /** A bounded, redacted excerpt of raw output (a tool result, a server log tail): the head and

@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import { DEFAULT_DURABLE_JOB_BUDGETS, type DurableJob } from '../../shared/durable-jobs'
 import { FakeDurableJobsService } from '../../shared/durable-jobs-fake'
@@ -179,5 +180,36 @@ describe('durable job report', () => {
     expect(markdown).toContain('LATE-RECOVERY-MARKER')
     expect(markdown).toContain('middle-suite')
     expect(markdown).toContain('LATE-CLOUD-MARKER')
+  })
+
+  it('keeps a bearer token, an API key and a control credential out of jobs.report, report.json and report.md, even from rows written before redaction', async () => {
+    const BEARER = 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd', API_KEY = 'sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP', CONTROL = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    const planted = `curl -H "Authorization: Bearer ${BEARER}" --api-key ${API_KEY} -d '{"token":"${CONTROL}"}'`
+    const root = mkdtempSync(join(tmpdir(), 'conductor-job-report-redact-'))
+    roots.push(root)
+    const db = new DatabaseSync(':memory:')
+    const store = new DurableJobStore(db)
+    const runtime = new FakeRuntime([{ kind: 'hang' }])
+    const service = new DurableJobsServiceImpl({ store, runtime, worktrees: new FakeWorktrees(), logRoot: root, projectPath: () => root, sleep: tick, pollMs: 0, report: reportPort })
+    services.push(service)
+    const created = await service.create({ projectId: 'p1', title: 'Probe the API', objective: 'Find why the upload is refused', model: 'local/qwen' })
+    await until(() => runtime.opened.length === 1)
+    // Through the store: redacted as it is written.
+    store.event(created.id, { owner: true }, 'recovery', `Recovered after ${planted}`)
+    store.event(created.id, { owner: true }, 'note', 'Test fail', { test: { command: planted, outcome: 'fail', detail: planted } })
+    // Rows a build without redaction wrote: the report must still not carry them.
+    db.prepare("UPDATE durable_jobs SET data = json_set(data, '$.statusReason', ?, '$.handoff.nextAction', ?, '$.handoff.unresolvedIssues', json_array(?), '$.handoff.testResults', json_array(?)) WHERE id = ?").run(`Waiting: ${planted}`, `Next: ${planted}`, `Issue: ${planted}`, `fail: ${planted}`, created.id)
+    db.prepare("UPDATE durable_job_stages SET data = json_set(data, '$.result', ?) WHERE job_id = ?").run(`Answer: ${planted}`, created.id)
+    const legacy = (kind: string, message: string, data: Record<string, unknown>) => db.prepare('INSERT INTO durable_job_events (id, job_id, at, kind, data) VALUES (?, ?, ?, ?, ?)').run(`legacy_${kind}`, created.id, '2026-09-24T23:00:00.000Z', kind, JSON.stringify({ id: `legacy_${kind}`, jobId: created.id, at: '2026-09-24T23:00:00.000Z', kind, message, data }))
+    legacy('recovery', `Legacy recovery ${planted}`, {})
+    legacy('escalation', `Legacy escalation ${planted}`, { occurred: true })
+    legacy('note', 'Legacy test', { test: { command: `legacy ${planted}`, outcome: 'pass', detail: planted } })
+    const report = await service.report(created.id)
+    const outputs = { 'jobs.report': JSON.stringify(report), 'report.json': readFileSync(report.reportPath.replace(/report\.md$/, 'report.json'), 'utf8'), 'report.md': readFileSync(report.reportPath, 'utf8') }
+    for (const [name, text] of Object.entries(outputs)) for (const secret of [BEARER, API_KEY, '4f9QzX2mL8kV7nB3cR6tY1wP', CONTROL]) expect(text, `${name} leaks ${secret}`).not.toContain(secret)
+    // Redacted, not dropped: the evidence around the credential stays.
+    expect(outputs['report.md']).toContain('Legacy recovery curl -H "Authorization: [redacted]')
+    expect(report.cloudEscalation.occurred).toBe(true)
+    expect(report.remainingWork.some(entry => entry.startsWith('Next action: Next: curl'))).toBe(true)
   })
 })

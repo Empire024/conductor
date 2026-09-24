@@ -1,0 +1,37 @@
+
+ RUN  v3.2.7 C:/Claude/conductor
+
+ ✓ src/main/durable-jobs/watchdog.test.ts (13 tests) 8ms
+ ✓ src/main/durable-jobs/loop-guard.test.ts (10 tests) 19ms
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+ ✓ src/main/durable-jobs/server-lifecycle.test.ts (15 tests) 241ms
+ ✓ src/main/durable-jobs/structured-runtime.test.ts (4 tests) 4ms
+ ✓ src/main/durable-jobs/handoff.test.ts (17 tests) 107ms
+ ✓ src/main/durable-jobs/context-rollover.test.ts (1 test) 153ms
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'a.txt', LF will be replaced by CRLF the next time Git touches it
+ ✓ src/main/durable-jobs/report.test.ts (9 tests) 550ms
+warning: in the working copy of 'package.json', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'a.txt', LF will be replaced by CRLF the next time Git touches it
+ ✓ src/main/durable-jobs/controller.test.ts (20 tests) 1058ms
+ ✓ src/main/durable-jobs/worktree.test.ts (8 tests) 1518ms
+   ✓ dependencies in a job worktree > does not link the owner's node_modules by default and says why tests cannot run  387ms
+   ✓ dependencies in a job worktree > copies real files on opt-in, skips links, and a write in the copy never reaches the owner  391ms
+   ✓ dependencies in a job worktree > refuses to copy node_modules a checkpoint commit would pick up  343ms
+   ✓ dependencies in a job worktree > reports nothing for a project without package.json  331ms
+ ✓ src/main/durable-jobs/reconcile.test.ts (11 tests) 1218ms
+   ✓ git worktree checkpoints > works in its own worktree from HEAD, never touches the owner's dirty tree and finds its checkpoint commit  738ms
+ ✓ src/main/durable-jobs/store.test.ts (13 tests) 1908ms
+   ✓ DurableJobStore > returns the exact newest events beyond 20,000, oldest first, from one indexed bounded query  778ms
+   ✓ DurableJobStore > reads the newest tail again after the database file is reopened  768ms
+ ✓ src/main/durable-jobs/wiring.test.ts (17 tests) 2359ms
+   ✓ supervision ports > gives a quiet running tool the tool budget, past the model timeout, then watches the model again  591ms
+   ✓ supervision ports > stops a tool that runs past the tool budget, and not before  564ms
+
+ Test Files  12 passed (12)
+      Tests  138 passed (138)
+   Start at  11:59:07
+   Duration  3.23s (transform 1.06s, setup 0ms, collect 3.99s, tests 9.14s, environment 2ms, prepare 1.85s)
+

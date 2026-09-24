@@ -1,0 +1,364 @@
+﻿
+ RUN  v3.2.7 C:/Users/stilj/AppData/Local/Temp/rev58-head
+
+ ❯ src/main/durable-jobs/structured-runtime.test.ts (4 tests | 1 failed) 9ms
+   ✓ structured stage runtime helpers > reads the stop report, last answer and changed files from the durable projection 2ms
+   ✓ structured stage runtime helpers > reads the pending tool call from the local session checkpoint and never reads a corrupt one as clean 0ms
+   ✓ structured stage runtime helpers > keeps the closing instructions when a prompt is too long and keeps the full local model id 0ms
+   × structured stage runtime helpers > opens a research stage with the research grant and every other kind without it 6ms
+     → expected [ [ false, 'read-only', false ], …(2) ] to deeply equal [ [ true, 'read-only', false ], …(2) ]
+ ❯ src/main/durable-jobs/handoff.test.ts (17 tests | 2 failed) 99ms
+   ✓ whole-request estimate > counts system prompt, tool schemas and large tool results, and fits a many-tools large-file request under 32,768 with 4,096 reserved 9ms
+   ✓ whole-request estimate > reproduces the overnight failure with the runtime tokenizer count and demands a rollover 1ms
+   ✓ whole-request estimate > takes the window from the live model config 1ms
+   ✓ shouldRollover > triggers at the rollover fraction, then at the headroom for the next tool response, then overflow 0ms
+   ✓ shouldRollover > lets the safety margin win when the fraction is set high 0ms
+   ✓ buildStagePrompt > renders every durable section, artifacts as path and range only 1ms
+   ✓ buildStagePrompt > trims lowest-value sections first, oldest entries first, and never the required ones 2ms
+   ✓ buildStagePrompt > returns a typed error when the stage itself cannot fit 4ms
+   ✓ buildStagePrompt > shrinks the budget so system prompt, tools and stage prompt start below the rollover fraction 1ms
+   ✓ extractHandoff > lets a second worker continue from the handoff alone, without the prior transcript 55ms
+   ✓ extractHandoff > records failures, tests and repeated errors, and does not call an unfinished stage clean 1ms
+   × extractHandoff > never carries a bearer token, an API key or a control credential into the handoff 7ms
+     → expected '{"objective":"Port the invoice parser…' not to contain 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'
+   ✓ excerpt and selective reads > keeps the raw log on disk and hands over the window around the first failure with its line range 9ms
+   ✓ excerpt and selective reads > shapes test output, keeps short output whole, and reads a large file by range 6ms
+   × stage tooling > narrows tools by stage kind and counts their schema cost 1ms
+     → expected false to be true // Object.is equality
+   ✓ response classification > never treats empty, reasoning-only, truncated or stub responses as usable 1ms
+   ✓ response classification > does not report a stage successful on an empty or truncated final answer 0ms
+ ❯ src/main/durable-jobs/report.test.ts (9 tests | 1 failed) 500ms
+   ✓ durable job report > reads test outcomes from handoff lines without inventing a pass 32ms
+   ✓ durable job report > writes a factual report.json and report.md with checkpoints, recoveries, models and log paths, never raw logs 46ms
+   ✓ durable job report > reports a cloud escalation only when one was recorded 46ms
+   ✓ durable job report > prefers the store checkpoints when given and reports a queued job with zero elapsed time 32ms
+   ✓ durable job report > pages until an empty page, including a history that fills its pages exactly 46ms
+   ✓ durable job report > keeps reading when the reader returns fewer rows than requested 93ms
+   ✓ durable job report > throws when an event page has no id or does not advance 46ms
+   ✓ durable job report > pages the service report through a history longer than 1000 events, keeping both ends 110ms
+   × durable job report > keeps a bearer token, an API key and a control credential out of jobs.report, report.json and report.md, even from rows written before redaction 47ms
+     → jobs.report leaks Zq8vT3kLm9Wx2Rb7Np4Hs6Jd: expected '{"jobId":"job_mufcxj97_xjyzlz2","stat…' not to contain 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'
+ ❯ src/main/durable-jobs/store.test.ts (13 tests | 1 failed) 1867ms
+   ✓ DurableJobStore > allows exactly the contract transitions and records each with its reason 32ms
+   ✓ DurableJobStore > accumulates active time only while running and stamps start and finish 1ms
+   ✓ DurableJobStore > round-trips jobs, stages, checkpoints, operations and events through the database file 72ms
+   ✓ DurableJobStore > gives one owner per job: another owner is refused, a takeover bumps the epoch and stale writers are rejected 2ms
+   ✓ DurableJobStore > records an operation before execution and its outcome after 1ms
+   ✓ DurableJobStore > notifies once per committed batch and not for a rolled-back one 1ms
+   ✓ DurableJobStore > pages events oldest-forward from afterId when the history is longer than one page 46ms
+   ✓ DurableJobStore > finds a matching event that lands after the oldest 1000, filtered by stage and data 38ms
+   ✓ DurableJobStore > reloads the newest match after the database file is reopened 96ms
+   ✓ DurableJobStore > does not return matching events from another job 40ms
+   ✓ DurableJobStore > returns the exact newest events beyond 20,000, oldest first, from one indexed bounded query  683ms
+   ✓ DurableJobStore > reads the newest tail again after the database file is reopened  847ms
+   × DurableJobStore redaction > never stores a bearer token, an API key or a control credential from tool arguments, errors, answers, next actions or handoffs 7ms
+     → expected '[{"id":"job_1","project_id":"project_…' not to contain 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'
+ ❯ src/main/durable-jobs/watchdog.test.ts (14 tests | 4 failed) 4601ms
+   ✓ watchdog > lets slow inference that keeps streaming run past its budget once, then interrupts 35ms
+   ✓ watchdog > interrupts a call that stopped streaming on a healthy server as stalled 31ms
+   ✓ watchdog > treats a silent call whose slot is evaluating the prompt as slow, not stalled 31ms
+   ✓ watchdog > interrupts at once with a server event when the server is unhealthy 47ms
+   ✓ watchdog > does not treat a quiet tool call as stalled before its deadline 32ms
+   ✓ watchdog > reconciles a sleep/wake clock jump instead of counting it as a stall 31ms
+   ✓ watchdog > excludes owner pauses from the budget 31ms
+   ✓ watchdog > retries within the budget and then blocks with diagnostics 31ms
+   ✓ redaction > removes keys, tokens and credentials but keeps commit hashes and ordinary text 31ms
+   ✓ redaction > redacts nested data and credential-named keys, and bounds excerpts 46ms
+   × redaction > redacts the free text of a handoff and keeps its paths 46ms
+     → (0 , redactHandoff) is not a function
+   × in-stage context rollover > crosses contextRolloverFraction once, waits for a running tool, and ignores later growth 31ms
+     → ContextRolloverWatch is not a constructor
+   × in-stage context rollover > reads the context of the newest request from the usage items 32ms
+     → (0 , latestContextTokens) is not a function
+   × in-stage context rollover > rolls a stage that crosses the fraction mid-stage into a fresh context exactly once and continues 4146ms
+     → Condition not reached in time
+node.exe : 
+At line:1 char:1
++ & "C:\Program Files\nodejs/node.exe" "C:\Program Files\nodejs/node_mo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 9 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/main/durable-jobs/handoff.test.ts > extractHandoff > never carries a bearer token, an API key or a control 
+credential into the handoff
+AssertionError: expected '{"objective":"Port the invoice parser…' not to contain 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'
+
+Expected: "Zq8vT3kLm9Wx2Rb7Np4Hs6Jd"
+Received: "{"objective":"Port the invoice parser to the new format and keep every test green.","constraints":["Use 
+Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd"],"decisions":["Owner correction: curl -H \"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","The control token is 
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"],"workDone":["Stage 1 \"Probe\": round_limit - Last 
+tool call failed: curl -H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}' 
+Changed 1 file(s). Ran 2 command(s)."],"filesChanged":["src/parser/a.ts"],"testResults":["fail (exit 1): npx vitest 
+run --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP","fail (exit 1): npm test -- 
+--token=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","fail (exit 1): npm test 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP"],"unresolvedIssues":["Failing: curl -H \"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}' - Error: 401 for curl -H 
+\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","Repeated failure: run_command 
+(2x) - curl -H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","Unverified claim: claimed curl -H 
+\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","Stage 1 stopped: round_limit: 
+Last tool call failed: curl -H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852..."],"nextAction":"Fix the failure from 
+curl -H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649..., then rerun that 
+check.","artifacts":[{"path":"C:/logs/excerpts/curl.log","kind":"log","note":"curl -H \"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\"token\":\"e3b0c44298fc1c149afbf4c8996fb924
+27ae41e4649b934ca495991b7852b855\"}'"}],"updatedAt":"2026-09-24T09:56:32.410Z"}"
+
+ ❯ src/main/durable-jobs/handoff.test.ts:224:101
+    222|     for (const handoff of [first, second]) {
+    223|       const text = JSON.stringify(handoff)
+    224|       for (const secret of [BEARER, API_KEY, '4f9QzX2mL8kV7nB3cR6tY1wP…
+       |                                                                                                     ^
+    225|     }
+    226|     // Redacted before merging: the same failing command is one entry …
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/9]⎯
+
+ FAIL  src/main/durable-jobs/handoff.test.ts > stage tooling > narrows tools by stage kind and counts their schema cost
+AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ src/main/durable-jobs/handoff.test.ts:286:44
+    284|     // A research stage carries the research grant by its kind; no oth…
+    285|     const researchByKind = stageTooling('research', 'C:/work')
+    286|     expect(researchByKind.grants.research).toBe(true)
+       |                                            ^
+    287|     expect(researchByKind.tools.map(t => t.function.name)).toEqual(['r…
+    288|     expect(stageTooling('implement', 'C:/work', { git: false, research…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/9]⎯
+
+ FAIL  src/main/durable-jobs/report.test.ts > durable job report > keeps a bearer token, an API key and a control 
+credential out of jobs.report, report.json and report.md, even from rows written before redaction
+AssertionError: jobs.report leaks Zq8vT3kLm9Wx2Rb7Np4Hs6Jd: expected '{"jobId":"job_mufcxj97_xjyzlz2","stat…' not to 
+contain 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'
+
+Expected: "Zq8vT3kLm9Wx2Rb7Np4Hs6Jd"
+Received: 
+"{"jobId":"job_mufcxj97_xjyzlz2","status":"running","elapsedMs":3,"activeMs":0,"modelsByStage":[{"stage":"Stage 
+1","model":"local/qwen","attempts":1}],"filesChanged":[],"results":["Stage 1: Answer: curl -H \"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","Job running: Waiting: curl -H 
+\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'"],"tests":[{"command":"fail: curl 
+-H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\"token\":\"e3b0c
+44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","outcome":"not-run","detail":"Outcome not 
+recorded"},{"command":"curl -H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","outcome":"fail","detail":"curl -H 
+\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'"},{"command":"legacy curl -H 
+\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","outcome":"pass","detail":"curl -H 
+\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\"token\":\"e3b0c442
+98fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'"}],"checkpoints":[],"recoveries":[{"at":"2026-09-24T09:56:
+32.830Z","message":"Recovered after curl -H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'"
+},{"at":"2026-09-24T23:00:00.000Z","message":"Legacy recovery curl -H \"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'"}],"remainingWork":["Issue: curl -H 
+\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'","Stage 1 “Stage 1” is 
+running","Next action: Next: curl -H \"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\"token\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}'"
+],"cloudEscalation":{"occurred":true,"detail":"Legacy escalation curl -H \"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\"token\":\"e3b0c44298fc1c149afbf4c8996fb924
+27ae41e4649b934ca495991b7852b855\"}'"},"logPaths":["C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-job-report-redact
+-mIDsfY\\job_mufcxj97_xjyzlz2","C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-job-report-redact-mIDsfY\\job_mufcxj9
+7_xjyzlz2\\report.json","C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-job-report-redact-mIDsfY\\job_mufcxj97_xjyzl
+z2\\report.md"],"generatedAt":"2026-09-24T09:56:32.831Z","reportPath":"C:\\Users\\stilj\\AppData\\Local\\Temp\\conducto
+r-job-report-redact-mIDsfY\\job_mufcxj97_xjyzlz2\\report.md"}"
+
+ ❯ src/main/durable-jobs/report.test.ts:209:178
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/9]⎯
+
+ FAIL  src/main/durable-jobs/store.test.ts > DurableJobStore redaction > never stores a bearer token, an API key or a 
+control credential from tool arguments, errors, answers, next actions or handoffs
+AssertionError: expected '[{"id":"job_1","project_id":"project_…' not to contain 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'
+
+- Expected
++ Received
+
+- Zq8vT3kLm9Wx2Rb7Np4Hs6Jd
++ [{"id":"job_1","project_id":"project_1","status":"blocked","planned":0,"lease_epoch":0,"lease_owner":null,"lease_expi
+res":null,"running_since":null,"created_at":"2026-09-24T00:00:00.000Z","updated_at":"2026-09-24T09:56:33.975Z","data":"
+{\"id\":\"job_1\",\"projectId\":\"project_1\",\"cwd\":\"C:/work\",\"title\":\"Overnight\",\"objective\":\"Do the thing\
+",\"status\":\"blocked\",\"model\":{\"provider\":\"local\",\"model\":\"local/qwen\",\"escalation\":\"never\"},\"budgets
+\":{\"maxElapsedMs\":0,\"modelCallTimeoutMs\":600000,\"toolCallTimeoutMs\":900000,\"stageTimeoutMs\":5400000,\"maxStage
+Attempts\":3,\"contextRolloverFraction\":0.7,\"contextSafetyMarginTokens\":2048},\"handoff\":{\"objective\":\"Do the 
+thing\",\"constraints\":[],\"decisions\":[\"curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"],\"workDone\":[\"curl -H 
+\\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\
+\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"],\"filesChanged\":[],\"testResults\":[\"fail
+: curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"to
+ken\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"],\"unresolvedIssues\":[\"curl -H 
+\\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"],\"nextAction\":\"Then 
+curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"toke
+n\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"artifacts\":[{\"path\":\"C:/logs/a
+.log\",\"kind\":\"log\",\"note\":\"curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
+5\\\"}'\"}],\"updatedAt\":\"2026-09-24T00:00:00.000Z\"},\"createdAt\":\"2026-09-24T00:00:00.000Z\",\"updatedAt\":\"2026
+-09-24T09:56:33.975Z\",\"activeMs\":1,\"counters\":{\"stagesCompleted\":0,\"retries\":0,\"recoveries\":0,\"contextRollo
+vers\":0,\"loopsDetected\":0,\"cloudEscalations\":0},\"logDir\":\"C:/logs/job_1\",\"statusReason\":\"Blocked: curl -H 
+\\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\
+\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"startedAt\":\"2026-09-24T09:56:33.974Z\"}"
+}]
++ [{"id":"job_1_s0","job_id":"job_1","stage_index":0,"status":"running","attempt_base":0,"data":"{\"id\":\"job_1_s0\",\
+"jobId\":\"job_1\",\"index\":0,\"title\":\"Stage 1\",\"objective\":\"x\",\"completionCriteria\":[],\"inputs\":[],\"stat
+us\":\"running\",\"attempt\":1,\"result\":\"Answer: curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" 
+--api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"error\":\"lastError: 
+curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"toke
+n\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"}"},{"id":"job_1_s1","job_id":"job_1"
+,"stage_index":1,"status":"pending","attempt_base":0,"data":"{\"id\":\"job_1_s1\",\"jobId\":\"job_1\",\"index\":1,\"tit
+le\":\"Next sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP\",\"objective\":\"Continue with curl -H \\\"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8
+996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"completionCriteria\":[],\"inputs\":[],\"status\":\"pending\",\"attem
+pt\":0}"}]
++ [{"id":"jobop_mufcxk52_jssbgyi","job_id":"job_1","stage_id":"job_1_s0","status":"failed","intended_at":"2026-09-24T09
+:56:33.974Z","data":"{\"id\":\"jobop_mufcxk52_jssbgyi\",\"jobId\":\"job_1\",\"stageId\":\"job_1_s0\",\"kind\":\"shell\"
+,\"description\":\"run_command {\\\"command\\\":\\\"curl -H \\\\\\\"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\\\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\\\\\"token\\\\\\\":\\\\\\\"e3b0c442
+98fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\\\\\"}'\\\"}\",\"status\":\"failed\",\"intendedAt\":\"2026-0
+9-24T09:56:33.974Z\",\"settledAt\":\"2026-09-24T09:56:33.974Z\",\"reconciliation\":\"exit 1: curl -H 
+\\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d 
+'{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"}"}]
++ [{"seq":1,"id":"jobevt_mufcxk52_a9zpr6m","job_id":"job_1","at":"2026-09-24T09:56:33.974Z","kind":"transition","data":
+"{\"id\":\"jobevt_mufcxk52_a9zpr6m\",\"jobId\":\"job_1\",\"at\":\"2026-09-24T09:56:33.974Z\",\"kind\":\"transition\",\"
+message\":\"Created as queued\",\"data\":{\"to\":\"queued\"}}"},{"seq":2,"id":"jobevt_mufcxk52_e0t0f36","job_id":"job_1
+","at":"2026-09-24T09:56:33.974Z","kind":"note","data":"{\"id\":\"jobevt_mufcxk52_e0t0f36\",\"jobId\":\"job_1\",\"at\":
+\"2026-09-24T09:56:33.974Z\",\"kind\":\"note\",\"message\":\"Tool output: curl -H \\\"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8
+996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"data\":{\"stageId\":\"job_1_s0\",\"output\":\"curl -H 
+\\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\
+\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"nested\":[{\"args\":{\"command\":\"curl 
+-H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\"
+:\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"}}],\"apiKey\":\"plain\",\"token\":\"e3b0c
+44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}}"},{"seq":3,"id":"jobevt_mufcxk52_mdj8yl4","job_id":"job
+_1","at":"2026-09-24T09:56:33.974Z","kind":"retry","data":"{\"id\":\"jobevt_mufcxk52_mdj8yl4\",\"jobId\":\"job_1\",\"at
+\":\"2026-09-24T09:56:33.974Z\",\"kind\":\"retry\",\"message\":\"Stage failed: curl -H \\\"Authorization: Bearer 
+Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8
+996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"data\":{\"stageId\":\"job_1_s0\",\"error\":\"curl -H 
+\\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\
+\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\"}}"},{"seq":4,"id":"jobevt_mufcxk52_o5bgkpo",
+"job_id":"job_1","at":"2026-09-24T09:56:33.974Z","kind":"stage","data":"{\"id\":\"jobevt_mufcxk52_o5bgkpo\",\"jobId\":\
+"job_1\",\"at\":\"2026-09-24T09:56:33.974Z\",\"kind\":\"stage\",\"message\":\"Planned stage 2: Next sk-proj-4f9QzX2mL8k
+V7nB3cR6tY1wP\",\"data\":{\"stageId\":\"job_1_s1\"}}"},{"seq":5,"id":"jobevt_mufcxk52_ywk9pp0","job_id":"job_1","at":"2
+026-09-24T09:56:33.974Z","kind":"transition","data":"{\"id\":\"jobevt_mufcxk52_ywk9pp0\",\"jobId\":\"job_1\",\"at\":\"2
+026-09-24T09:56:33.974Z\",\"kind\":\"transition\",\"message\":\"queued → running: Resumed after curl -H 
+\\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\
+\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\\\"}'\",\"data\":{\"from\":\"queued\",\"to\":\"runni
+ng\",\"reason\":\"curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" --api-key 
+sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b85
+5\\\"}'\"}}"},{"seq":6,"id":"jobevt_mufcxk53_fcoov3s","job_id":"job_1","at":"2026-09-24T09:56:33.975Z","kind":"transiti
+on","data":"{\"id\":\"jobevt_mufcxk53_fcoov3s\",\"jobId\":\"job_1\",\"at\":\"2026-09-24T09:56:33.975Z\",\"kind\":\"tran
+sition\",\"message\":\"running → blocked: Blocked: curl -H \\\"Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd\\\" 
+--api-key sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP -d '{\\\"token\\\":\\\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca4959
+91b7852b855\\\"}'\",\"data\":{\"from\":\"running\",\"to\":\"blocked\"}}"}]
++ []
+
+ ❯ src/main/durable-jobs/store.test.ts:275:99
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/9]⎯
+
+ FAIL  src/main/durable-jobs/structured-runtime.test.ts > structured stage runtime helpers > opens a research stage 
+with the research grant and every other kind without it
+AssertionError: expected [ [ false, 'read-only', false ], …(2) ] to deeply equal [ [ true, 'read-only', false ], …(2) ]
+
+- Expected
++ Received
+
+@@ -1,8 +1,8 @@
+  [
+    [
+-     true,
++     false,
+      "read-only",
+      false,
+    ],
+    [
+      false,
+
+ ❯ src/main/durable-jobs/structured-runtime.test.ts:57:101
+     55|     const stage = (kind: DurableJobStage['kind']) => ({ id: 's', title…
+     56|     for (const kind of ['research', 'implement', 'investigate'] as con…
+     57|     expect(saved.map(settings => [settings.localResearch, settings.per…
+       |                                                                                                     ^
+     58|   })
+     59| })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/9]⎯
+
+ FAIL  src/main/durable-jobs/watchdog.test.ts > redaction > redacts the free text of a handoff and keeps its paths
+TypeError: (0 , redactHandoff) is not a function
+ ❯ src/main/durable-jobs/watchdog.test.ts:146:21
+    144| 
+    145|   it('redacts the free text of a handoff and keeps its paths', () => {
+    146|     const handoff = redactHandoff({
+       |                     ^
+    147|       objective: 'Fix the parser', constraints: ['never print api_key=…
+    148|       filesChanged: ['src/parser.ts'], testResults: ['fail: curl -H "A…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/9]⎯
+
+ FAIL  src/main/durable-jobs/watchdog.test.ts > in-stage context rollover > crosses contextRolloverFraction once, 
+waits for a running tool, and ignores later growth
+TypeError: ContextRolloverWatch is not a constructor
+ ❯ src/main/durable-jobs/watchdog.test.ts:160:19
+    158| describe('in-stage context rollover', () => {
+    159|   it('crosses contextRolloverFraction once, waits for a running tool, …
+    160|     const watch = new ContextRolloverWatch(32_768, 0.7)
+       |                   ^
+    161|     expect(watch.thresholdTokens).toBe(22_937)
+    162|     expect(watch.observe(undefined)).toBeNull()
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/9]⎯
+
+ FAIL  src/main/durable-jobs/watchdog.test.ts > in-stage context rollover > reads the context of the newest request 
+from the usage items
+TypeError: (0 , latestContextTokens) is not a function
+ ❯ src/main/durable-jobs/watchdog.test.ts:174:12
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/9]⎯
+
+ FAIL  src/main/durable-jobs/watchdog.test.ts > in-stage context rollover > rolls a stage that crosses the fraction 
+mid-stage into a fresh context exactly once and continues
+Error: Condition not reached in time
+ ❯ until src/main/durable-jobs/test-fakes.ts:96:49
+     94|   const started = Date.now()
+     95|   while (!check()) {
+
+ Test Files  5 failed (5)
+      Tests  9 failed | 48 passed (57)
+   Start at  11:56:31
+   Duration  5.30s (transform 502ms, setup 0ms, collect 1.52s, tests 7.08s, environment 1ms, prepare 617ms)
+
+     96|     if (Date.now() - started > timeoutMs) throw new Error('Condition n…
+       |                                                 ^
+     97|     await new Promise(resolve => setTimeout(resolve, 2))
+     98|   }
+ ❯ src/main/durable-jobs/watchdog.test.ts:209:5
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/9]⎯
+

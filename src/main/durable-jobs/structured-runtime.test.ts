@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import type { SessionProjection } from '../../shared/structured-agent'
+import type { DurableJob, DurableJobStage } from '../../shared/durable-jobs'
+import type { ProjectRecord, SessionRecord } from '../../shared/models'
+import type { SessionProjection, SessionSettings } from '../../shared/structured-agent'
 import { localStopPayload, type LocalStopReport } from '../../shared/local-stop'
-import { clampPrompt, localModelId, observeProjection, readLocalExecution } from './structured-runtime'
+import { clampPrompt, localModelId, observeProjection, readLocalExecution, structuredStageRuntime } from './structured-runtime'
 
 const report = (reason: LocalStopReport['reason'], filesChanged: string[] = []): LocalStopReport => ({ reason, detail: `${reason} detail`, rounds: 3, hardLimit: 16, context: { usedTokens: 1, capacityTokens: 2, reserveTokens: 0, windowTokens: 2, percent: 50, estimated: false }, compactions: 0, recoveredTokens: 0, loopWarnings: 0, filesChanged, commandsRun: 0, excludedOutputChars: 0, timeline: [] })
 
@@ -37,5 +39,21 @@ describe('structured stage runtime helpers', () => {
     expect(clamped.endsWith('JOB STATUS line')).toBe(true)
     expect(localModelId('local/qwen3.6-35b-a3b')).toBe('local/qwen3.6-35b-a3b')
     expect(localModelId('qwen')).toBe('local/qwen')
+  })
+
+  it('opens a research stage with the research grant and every other kind without it', async () => {
+    const saved: SessionSettings[] = []
+    const runtime = structuredStageRuntime({
+      sessions: { ensure: () => ({ available: true }), submit: async () => undefined, interrupt: async () => undefined },
+      database: {
+        structured: { snapshot: () => projection('idle', []), spec: () => null, update: (_id, values) => { if (values.settings) saved.push(values.settings) } },
+        getSetting: () => null, getProject: () => ({ id: 'p', path: 'C:/work', name: 'Work' }) as ProjectRecord, upsertProject: () => ({ id: 'p', path: 'C:/work', name: 'Work' }) as ProjectRecord,
+        listSessions: () => [{ id: 'w' } as SessionRecord], createSession: () => { throw new Error('unused') }
+      }
+    })
+    const job = { id: 'job_1', projectId: 'p', cwd: 'C:/work', title: 'Job', model: { model: 'local/qwen' } } as DurableJob
+    const stage = (kind: DurableJobStage['kind']) => ({ id: 's', title: 'Stage', objective: 'x', kind }) as DurableJobStage
+    for (const kind of ['research', 'implement', 'investigate'] as const) await runtime.open({ job, stage: stage(kind), title: kind })
+    expect(saved.map(settings => [settings.localResearch, settings.permission, settings.localGit])).toEqual([[true, 'read-only', false], [false, 'accept-edits', false], [false, 'read-only', false]])
   })
 })

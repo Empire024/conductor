@@ -7,7 +7,9 @@ import { DEFAULT_DURABLE_JOB_BUDGETS, type DurableJobHandoff, type DurableJobSta
 import type { LocalStopReport } from '../../shared/local-stop.ts'
 import { LocalAgentSession, systemPrompt } from '../local-models/agent.ts'
 import type { ChatMessage } from '../local-models/client.ts'
-import { toolSpecs } from '../local-models/tools.ts'
+import type { RunEvidence } from '../local-models/completion.ts'
+import type { TaskState } from '../local-models/context-manager.ts'
+import { NO_GRANTS, toolSpecs } from '../local-models/tools.ts'
 import { buildStagePrompt, classifyResponse, classifyStageOutcome, estimateRequest, excerpt, extractHandoff, fitRequest, measureRequest, modelWindow, readRange, shouldRollover, StageTooLargeError, stageKind, stageTooling, textTokens, TRIM_ORDER } from './handoff.ts'
 
 const cleanup: Array<() => void> = []
@@ -208,6 +210,24 @@ describe('extractHandoff', () => {
     expect(next.testResults).toEqual(['pass: npx vitest run parser'])
     expect(next.workDone.at(-1)).toMatch(/^Stage 3 "Fix" \(attempt 2\): completed/)
   })
+
+  it('never carries a bearer token, an API key or a control credential into the handoff', () => {
+    const BEARER = 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd', API_KEY = 'sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP', CONTROL = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    const planted = `curl -H "Authorization: Bearer ${BEARER}" --api-key ${API_KEY} -d '{"token":"${CONTROL}"}'`
+    const report = { reason: 'round_limit', detail: `Last tool call failed: ${planted}`, rounds: 24, hardLimit: 24, context: { usedTokens: 20000, capacityTokens: 28672, reserveTokens: 4096, windowTokens: 32768, percent: 70, estimated: false }, compactions: 1, recoveredTokens: 0, loopWarnings: 0, filesChanged: ['src/parser/a.ts'], commandsRun: 2, excludedOutputChars: 0, timeline: [], unverified: `claimed ${planted}` } satisfies LocalStopReport
+    const state = { task: 't', constraints: [`Use Authorization: Bearer ${BEARER}`], filesChanged: [], commands: [{ command: `npx vitest run --api-key ${API_KEY}`, exitCode: 1, ok: false }], currentFailure: { source: planted, excerpt: `Error: 401 for ${planted}` }, discoveries: [`The control token is ${CONTROL}`], compactions: 0,
+      execution: { failures: [{ method: 'run_command', count: 2, error: planted }], corrections: [planted], artifacts: [], nextAction: `retry ${planted}` } } as unknown as TaskState
+    const first = extractHandoff(emptyHandoff(), report, state, { writes: [], commands: [{ command: `npm test -- --token=${CONTROL}`, exitCode: 1, ok: false }], acceptance: { command: `npm test ${API_KEY}`, passed: false, exitCode: 1 } } as unknown as RunEvidence, { stage: stage(0, 'Probe', 'probe'), artifacts: [{ path: 'C:/logs/excerpts/curl.log', kind: 'log', note: planted }], finalText: planted })
+    const second = extractHandoff(first, report, state, undefined, { stage: stage(0, 'Probe', 'probe', { attempt: 2 }), finalText: planted })
+    for (const handoff of [first, second]) {
+      const text = JSON.stringify(handoff)
+      for (const secret of [BEARER, API_KEY, '4f9QzX2mL8kV7nB3cR6tY1wP', CONTROL]) expect(text).not.toContain(secret)
+    }
+    // Redacted before merging: the same failing command is one entry across attempts, not two.
+    expect(second.testResults.filter(entry => entry.includes('npx vitest run'))).toHaveLength(1)
+    expect(second.filesChanged).toEqual(['src/parser/a.ts'])
+    expect(first.nextAction).toMatch(/^Fix the failure from curl -H "Authorization: \[redacted\]/)
+  })
 })
 
 describe('excerpt and selective reads', () => {
@@ -261,6 +281,21 @@ describe('stage tooling', () => {
     expect(research.tools.map(t => t.function.name)).toContain('web_search')
     expect(research.contract).toBeUndefined()
     expect(investigate.schemaTokens).toBeLessThan(implement.schemaTokens)
+    // A research stage carries the research grant by its kind; no other kind gets it.
+    const researchByKind = stageTooling('research', 'C:/work')
+    expect(researchByKind.grants.research).toBe(true)
+    expect(researchByKind.tools.map(t => t.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'conductor'])
+    expect(stageTooling('implement', 'C:/work', { git: false, research: true }).grants.research).toBe(false)
+    // The conductor bridge every local conversation gets is budgeted with the other schemas.
+    const noBridge = stageTooling('research', 'C:/work', NO_GRANTS, {}, false)
+    expect(noBridge.tools.map(t => t.function.name)).not.toContain('conductor')
+    expect(researchByKind.schemaTokens).toBeGreaterThan(noBridge.schemaTokens + 200)
+    const researchStage = { ...stage(0, 'Research the format', 'look up the spec'), attempt: 1 }
+    const withBridge = buildStagePrompt(job, researchStage, emptyHandoff(), QWEN, { systemPrompt: researchByKind.systemPrompt, tools: researchByKind.tools })
+    const without = buildStagePrompt(job, researchStage, emptyHandoff(), QWEN, { systemPrompt: noBridge.systemPrompt, tools: noBridge.tools, budgetTokens: 100_000 })
+    const unbounded = buildStagePrompt(job, researchStage, emptyHandoff(), QWEN, { systemPrompt: researchByKind.systemPrompt, tools: researchByKind.tools, budgetTokens: 100_000 })
+    expect(withBridge.ok && without.ok && unbounded.ok).toBe(true)
+    if (without.ok && unbounded.ok) expect(unbounded.budgetTokens).toBeLessThan(without.budgetTokens - 200)
     expect(stageKind({ title: 'Verify the fix', objective: 'run tests' })).toBe('verify')
     expect(stageKind({ title: 'Investigate the parser', objective: 'read' })).toBe('investigate')
     expect(stageKind({ title: 'Add currency support', objective: 'edit the mapper' })).toBe('implement')

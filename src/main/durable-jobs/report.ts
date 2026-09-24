@@ -2,6 +2,7 @@ import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DurableJob, DurableJobCheckpoint, DurableJobEvent, DurableJobReport, DurableJobsService, DurableJobStage } from '../../shared/durable-jobs'
 import { checkpointsFromEvents } from '../../shared/durable-jobs-bridge'
+import { redactSensitive } from './watchdog'
 
 /**
  * The final report of a durable job: a short factual account written beside the job's logs as
@@ -13,9 +14,11 @@ import { checkpointsFromEvents } from '../../shared/durable-jobs-bridge'
 
 type JobWithStages = DurableJob & { stages: DurableJobStage[] }
 
-/** One line of evidence, never a log: long messages are cut rather than carried into the report. */
+/** One line of evidence, never a log: long messages are cut rather than carried into the report.
+ *  Every line is redacted, so a credential in a job recorded before the store redacted its writes
+ *  still never reaches report.json, report.md or jobs.report. */
 const line = (value: string, maximum = 300): string => {
-  const flat = value.replace(/\s+/g, ' ').trim()
+  const flat = redactSensitive(value).replace(/\s+/g, ' ').trim()
   return flat.length > maximum ? flat.slice(0, maximum - 1) + '…' : flat
 }
 const unique = (values: Iterable<string>): string[] => [...new Set([...values].filter(Boolean))]
@@ -53,9 +56,9 @@ export function buildDurableJobReport({ job, events, checkpoints, now = Date.now
   const elapsedMs = job.startedAt ? Math.max(0, end - Date.parse(job.startedAt)) : 0
 
   const results = stages.flatMap(stage => {
-    if (stage.result) return [`${stage.title}: ${line(stage.result)}`]
-    if (stage.status === 'failed' && stage.error) return [`${stage.title}: failed — ${line(stage.error)}`]
-    if (stage.status === 'skipped') return [`${stage.title}: skipped`]
+    if (stage.result) return [`${line(stage.title, 200)}: ${line(stage.result)}`]
+    if (stage.status === 'failed' && stage.error) return [`${line(stage.title, 200)}: failed — ${line(stage.error)}`]
+    if (stage.status === 'skipped') return [`${line(stage.title, 200)}: skipped`]
     return []
   })
   if (job.statusReason && !['completed'].includes(job.status)) results.push(`Job ${job.status}: ${line(job.statusReason)}`)
@@ -78,7 +81,7 @@ export function buildDurableJobReport({ job, events, checkpoints, now = Date.now
 
   const remainingWork = unique([
     ...job.handoff.unresolvedIssues.map(value => line(value)),
-    ...stages.filter(stage => stage.status === 'pending' || stage.status === 'running' || stage.status === 'failed').map(stage => `Stage ${stage.index + 1} “${stage.title}” is ${stage.status}`),
+    ...stages.filter(stage => stage.status === 'pending' || stage.status === 'running' || stage.status === 'failed').map(stage => `Stage ${stage.index + 1} “${line(stage.title, 200)}” is ${stage.status}`),
     ...(job.status !== 'completed' && job.handoff.nextAction ? [`Next action: ${line(job.handoff.nextAction)}`] : [])
   ])
 
@@ -94,7 +97,7 @@ export function buildDurableJobReport({ job, events, checkpoints, now = Date.now
     status: job.status,
     elapsedMs,
     activeMs: job.activeMs,
-    modelsByStage: stages.filter(stage => stage.attempt > 0 || stage.model).map(stage => ({ stage: stage.title, model: stage.model ?? job.model.model, attempts: stage.attempt })),
+    modelsByStage: stages.filter(stage => stage.attempt > 0 || stage.model).map(stage => ({ stage: line(stage.title, 200), model: stage.model ?? job.model.model, attempts: stage.attempt })),
     filesChanged: unique(job.handoff.filesChanged),
     results,
     tests: [...tests.values()],
@@ -117,7 +120,7 @@ export const formatDuration = (ms: number): string => {
 export function renderDurableJobReportMarkdown(report: DurableJobReport, job: Pick<DurableJob, 'title' | 'objective' | 'model' | 'statusReason' | 'worktree' | 'cwd'>): string {
   const list = (items: string[], empty: string): string => items.length ? items.map(item => `- ${item}`).join('\n') : `- ${empty}`
   return [
-    `# ${job.title}`,
+    `# ${line(job.title)}`,
     '',
     `- Status: **${report.status}**${job.statusReason ? ` — ${line(job.statusReason)}` : ''}`,
     `- Elapsed: ${formatDuration(report.elapsedMs)} (active ${formatDuration(report.activeMs)})`,

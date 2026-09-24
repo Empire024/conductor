@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { DEFAULT_DURABLE_JOB_BUDGETS } from '../../shared/durable-jobs.ts'
-import { Watchdog, boundedExcerpt, redactData, redactSensitive, type DurableJobEventDraft, type HealthProbe } from './watchdog.ts'
+import type { TimelineItem } from '../../shared/structured-agent.ts'
+import { ContextRolloverWatch, Watchdog, boundedExcerpt, latestContextTokens, redactData, redactHandoff, redactSensitive, type DurableJobEventDraft, type HealthProbe } from './watchdog.ts'
 
 const MIN = 60_000
 const budgets = { ...DEFAULT_DURABLE_JOB_BUDGETS, modelCallTimeoutMs: 10 * MIN, toolCallTimeoutMs: 5 * MIN, stageTimeoutMs: 60 * MIN, maxStageAttempts: 2 }
@@ -122,5 +123,38 @@ describe('redaction', () => {
     const excerpt = boundedExcerpt('x'.repeat(5000) + ' error at the end', 300)
     expect(excerpt.length).toBeLessThan(400)
     expect(excerpt).toContain('error at the end')
+  })
+
+  it('redacts the free text of a handoff and keeps its paths', () => {
+    const handoff = redactHandoff({
+      objective: 'Fix the parser', constraints: ['never print api_key=plainsecretvalue'], decisions: ['Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd'], workDone: [`ran with --api-key ${key}`],
+      filesChanged: ['src/parser.ts'], testResults: ['fail: curl -H "Authorization: Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd"'], unresolvedIssues: ['sk-proj-4f9QzX2mL8kV7nB3cR6tY1wP rejected'],
+      nextAction: `retry with token=${key}`, artifacts: [{ path: 'C:/logs/out-1a2b3c4d5e6f.log', kind: 'log', note: 'Bearer Zq8vT3kLm9Wx2Rb7Np4Hs6Jd' }], updatedAt: ''
+    })
+    const text = JSON.stringify(handoff)
+    for (const secret of ['plainsecretvalue', 'Zq8vT3kLm9Wx2Rb7Np4Hs6Jd', key, '4f9QzX2mL8kV7nB3cR6tY1wP']) expect(text).not.toContain(secret)
+    expect(handoff.filesChanged).toEqual(['src/parser.ts'])
+    expect(handoff.artifacts[0]!.path).toBe('C:/logs/out-1a2b3c4d5e6f.log')
+  })
+})
+
+describe('in-stage context rollover', () => {
+  it('crosses contextRolloverFraction once, waits for a running tool, and ignores later growth', () => {
+    const watch = new ContextRolloverWatch(32_768, 0.7)
+    expect(watch.thresholdTokens).toBe(22_937)
+    expect(watch.observe(undefined)).toBeNull()
+    expect(watch.observe(12_000)).toBeNull()
+    expect(watch.observe(22_936)).toBeNull()
+    expect(watch.observe(23_500, true)).toBeNull()
+    expect(watch.observe(undefined, true)).toBeNull()
+    expect(watch.observe(undefined, false)).toEqual({ promptTokens: 23_500, thresholdTokens: 22_937, contextTokens: 32_768, fraction: 0.7 })
+    expect(watch.observe(30_000)).toBeNull()
+    expect(() => new ContextRolloverWatch(32_768, 0)).toThrow(/fraction/)
+  })
+
+  it('reads the context of the newest request from the usage items', () => {
+    const usage = (sequence: number, inputTokens: number, outputTokens?: number): TimelineItem => ({ id: `u${sequence}`, runtimeId: 'r', sequence, timestamp: '', data: { type: 'usage', inputTokens, ...(outputTokens === undefined ? {} : { outputTokens }), scope: 'message', source: 'provider' } })
+    expect(latestContextTokens([])).toBeUndefined()
+    expect(latestContextTokens([usage(3, 9_000, 500), usage(1, 20_000, 10), { id: 't', runtimeId: 'r', sequence: 4, timestamp: '', data: { type: 'text', role: 'assistant', text: 'x', mode: 'snapshot' } }])).toBe(9_500)
   })
 })
