@@ -1,0 +1,229 @@
+[2026-09-24T09:33:01.323Z] app launched (parked) {"pid":61392}
+[2026-09-24T09:33:04.532Z] A running a stage {"jobId":"job_mufc3bnk_6gh3g2q","status":"running","statusReason":"Started from the queue","stage":"Append","attempt":1}
+[2026-09-24T09:33:06.023Z] jobs before restart {"A":{"id":"job_mufc3bnk_6gh3g2q","status":"running","stage":"Append","attempt":1},"B":{"id":"job_mufc3d11_ichddel","status":"queued"},"C":{"id":"job_mufc3dld_fd2yoqd","status":"queued"}}
+[2026-09-24T09:33:06.758Z] app stopped (process tree killed) with A mid-stage {"pid":61392,"remainingProfileProcesses":0}
+[2026-09-24T09:33:06.787Z] history seeded {"A":1106,"B":1101,"C":1101}
+[2026-09-24T09:33:07.401Z] app relaunched on the same profile {"pid":57356}
+[2026-09-24T09:33:07.408Z] A after relaunch {"status":"running","recoveries":0,"lastEvent":{"at":"2026-09-24T09:33:05.763Z","kind":"escalation","message":"F1 seed: late escalation"}}
+[2026-09-24T09:33:10.457Z] A settled {"jobId":"job_mufc3bnk_6gh3g2q","status":"blocked","statusReason":"Reached the job's elapsed-time budget of 60 minutes","stage":"Append","attempt":1}
+[2026-09-24T09:33:10.459Z] B settled {"jobId":"job_mufc3d11_ichddel","status":"blocked","statusReason":"Reached the job's elapsed-time budget of 60 minutes"}
+[2026-09-24T09:33:24.997Z] C settled {"jobId":"job_mufc3dld_fd2yoqd","status":"blocked","statusReason":"Loop detected in stage 1: Stage jobstage_mufc3dpt_b72x92f looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned.","stage":"Loop","attempt":2}
+[2026-09-24T09:33:25.060Z] outcomes {"A":"blocked","B":"blocked","C":"blocked","replanEvents":2}
+[2026-09-24T09:33:25.061Z] FAILED {"message":"A must complete under the late elapsed reset, got blocked: Reached the job's elapsed-time budget of 60 minutes\n+ actual - expected\n\n+ 'blocked'\n- 'completed'\n"}
+{
+  "result": "FAIL",
+  "root": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-durable-history-iRNuxp",
+  "profile": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-durable-history-iRNuxp\\profile",
+  "stubEndpoint": "http://127.0.0.1:60185",
+  "build": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-f1-prefix-build\\out\\main\\index.js",
+  "seeded": {
+    "A": {
+      "jobId": "job_mufc3bnk_6gh3g2q",
+      "events": 1106,
+      "ids": {
+        "early-note": "jobevt_f1seed_A_0000",
+        "early": "jobevt_f1seed_A_0001",
+        "middle": "jobevt_f1seed_A_0552",
+        "late-note": "jobevt_f1seed_A_1103",
+        "late": "jobevt_f1seed_A_1104",
+        "escalation": "jobevt_f1seed_A_1105"
+      }
+    },
+    "B": {
+      "jobId": "job_mufc3d11_ichddel",
+      "events": 1101,
+      "ids": {
+        "early-note": "jobevt_f1seed_B_0000"
+      }
+    },
+    "C": {
+      "jobId": "job_mufc3dld_fd2yoqd",
+      "events": 1101,
+      "ids": {
+        "replan": "jobevt_f1seed_C_1100"
+      }
+    }
+  },
+  "B": {
+    "status": "blocked",
+    "statusReason": "Reached the job's elapsed-time budget of 60 minutes",
+    "stubRequests": 0
+  },
+  "C": {
+    "status": "blocked",
+    "statusReason": "Loop detected in stage 1: Stage jobstage_mufc3dpt_b72x92f looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned.",
+    "events": 1114,
+    "stubRequests": 12,
+    "loops": [
+      {
+        "id": "jobevt_f1seed_C_1100",
+        "at": "2026-09-24T09:33:05.763Z",
+        "message": "Loop detected in stage jobstage_mufc3dpt_b72x92f: F1 seed replan. Replanning once with a fresh worker context.",
+        "replan": 1
+      },
+      {
+        "id": "jobevt_mufc3ni2_scr04z7",
+        "at": "2026-09-24T09:33:18.650Z",
+        "message": "Loop detected in stage jobstage_mufc3dpt_b72x92f: near-identical calls read_file on README.md 4 times with nothing new learned. Replanning once with a fresh worker context.",
+        "replan": 1
+      },
+      {
+        "id": "jobevt_mufc3s8o_kvycz8e",
+        "at": "2026-09-24T09:33:24.792Z",
+        "message": "Stage jobstage_mufc3dpt_b72x92f looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned. Blocking the job with evidence.",
+        "replans": 1,
+        "blocked": true
+      },
+      {
+        "id": "jobevt_mufc3s8z_roexha4",
+        "at": "2026-09-24T09:33:24.803Z",
+        "message": "Loop detected in stage 1: Stage jobstage_mufc3dpt_b72x92f looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned."
+      }
+    ]
+  },
+  "stubRequests": [
+    {
+      "at": "2026-09-24T09:33:03.607Z",
+      "launch": 1,
+      "job": "A",
+      "held": true
+    },
+    {
+      "at": "2026-09-24T09:33:10.458Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:33:11.665Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:33:12.649Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:33:13.625Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:33:14.633Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:33:15.622Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    }
+  ],
+  "observations": [
+    {
+      "at": "2026-09-24T09:33:01.323Z",
+      "label": "app launched (parked)",
+      "pid": 61392
+    },
+    {
+      "at": "2026-09-24T09:33:04.532Z",
+      "label": "A running a stage",
+      "jobId": "job_mufc3bnk_6gh3g2q",
+      "status": "running",
+      "statusReason": "Started from the queue",
+      "stage": "Append",
+      "attempt": 1
+    },
+    {
+      "at": "2026-09-24T09:33:06.023Z",
+      "label": "jobs before restart",
+      "A": {
+        "id": "job_mufc3bnk_6gh3g2q",
+        "status": "running",
+        "stage": "Append",
+        "attempt": 1
+      },
+      "B": {
+        "id": "job_mufc3d11_ichddel",
+        "status": "queued"
+      },
+      "C": {
+        "id": "job_mufc3dld_fd2yoqd",
+        "status": "queued"
+      }
+    },
+    {
+      "at": "2026-09-24T09:33:06.758Z",
+      "label": "app stopped (process tree killed) with A mid-stage",
+      "pid": 61392,
+      "remainingProfileProcesses": 0
+    },
+    {
+      "at": "2026-09-24T09:33:06.787Z",
+      "label": "history seeded",
+      "A": 1106,
+      "B": 1101,
+      "C": 1101
+    },
+    {
+      "at": "2026-09-24T09:33:07.401Z",
+      "label": "app relaunched on the same profile",
+      "pid": 57356
+    },
+    {
+      "at": "2026-09-24T09:33:07.408Z",
+      "label": "A after relaunch",
+      "status": "running",
+      "recoveries": 0,
+      "lastEvent": {
+        "at": "2026-09-24T09:33:05.763Z",
+        "kind": "escalation",
+        "message": "F1 seed: late escalation"
+      }
+    },
+    {
+      "at": "2026-09-24T09:33:10.457Z",
+      "label": "A settled",
+      "jobId": "job_mufc3bnk_6gh3g2q",
+      "status": "blocked",
+      "statusReason": "Reached the job's elapsed-time budget of 60 minutes",
+      "stage": "Append",
+      "attempt": 1
+    },
+    {
+      "at": "2026-09-24T09:33:10.459Z",
+      "label": "B settled",
+      "jobId": "job_mufc3d11_ichddel",
+      "status": "blocked",
+      "statusReason": "Reached the job's elapsed-time budget of 60 minutes"
+    },
+    {
+      "at": "2026-09-24T09:33:24.997Z",
+      "label": "C settled",
+      "jobId": "job_mufc3dld_fd2yoqd",
+      "status": "blocked",
+      "statusReason": "Loop detected in stage 1: Stage jobstage_mufc3dpt_b72x92f looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned.",
+      "stage": "Loop",
+      "attempt": 2
+    },
+    {
+      "at": "2026-09-24T09:33:25.060Z",
+      "label": "outcomes",
+      "A": "blocked",
+      "B": "blocked",
+      "C": "blocked",
+      "replanEvents": 2
+    },
+    {
+      "at": "2026-09-24T09:33:25.061Z",
+      "label": "FAILED",
+      "message": "A must complete under the late elapsed reset, got blocked: Reached the job's elapsed-time budget of 60 minutes\n+ actual - expected\n\n+ 'blocked'\n- 'completed'\n"
+    }
+  ]
+}

@@ -1,0 +1,329 @@
+[2026-09-24T09:35:19.243Z] app launched (parked) {"pid":10788}
+[2026-09-24T09:35:22.609Z] A running a stage {"jobId":"job_mufc6a63_de69q09","status":"running","statusReason":"Started from the queue","stage":"Append","attempt":1}
+[2026-09-24T09:35:24.145Z] jobs before restart {"A":{"id":"job_mufc6a63_de69q09","status":"running","stage":"Append","attempt":1},"B":{"id":"job_mufc6bkq_yhg28nr","status":"queued"},"C":{"id":"job_mufc6c50_9f3vwcu","status":"queued"}}
+[2026-09-24T09:35:24.928Z] app stopped (process tree killed) with A mid-stage {"pid":10788,"remainingProfileProcesses":0}
+[2026-09-24T09:35:24.964Z] history seeded {"A":1106,"B":1101,"C":1101}
+[2026-09-24T09:35:25.604Z] app relaunched on the same profile {"pid":38328}
+[2026-09-24T09:35:25.611Z] A after relaunch {"status":"running","recoveries":0,"lastEvent":{"at":"2026-09-24T09:35:23.932Z","kind":"escalation","message":"F1 seed: late escalation"}}
+[2026-09-24T09:35:34.570Z] A settled {"jobId":"job_mufc6a63_de69q09","status":"completed","statusReason":"Every stage completed"}
+[2026-09-24T09:35:34.579Z] B settled {"jobId":"job_mufc6bkq_yhg28nr","status":"blocked","statusReason":"Reached the job's elapsed-time budget of 60 minutes"}
+[2026-09-24T09:35:39.723Z] C settled {"jobId":"job_mufc6c50_9f3vwcu","status":"blocked","statusReason":"Loop detected in stage 1: Stage jobstage_mufc6cab_88o3vx0 looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned.","stage":"Loop","attempt":1}
+[2026-09-24T09:35:39.770Z] outcomes {"A":"completed","B":"blocked","C":"blocked","replanEvents":1}
+[2026-09-24T09:35:39.886Z] A report verified {"reportPath":"C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-durable-history-bYtUOc\\profile\\durable-jobs\\job_mufc6a63_de69q09\\report.md","tests":3,"recoveries":4}
+[2026-09-24T09:35:39.987Z] PASS
+{
+  "result": "PASS",
+  "root": "(removed)",
+  "profile": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-durable-history-bYtUOc\\profile",
+  "stubEndpoint": "http://127.0.0.1:51154",
+  "build": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-f1-head-build\\out\\main\\index.js",
+  "seeded": {
+    "A": {
+      "jobId": "job_mufc6a63_de69q09",
+      "events": 1106,
+      "ids": {
+        "early-note": "jobevt_f1seed_A_0000",
+        "early": "jobevt_f1seed_A_0001",
+        "middle": "jobevt_f1seed_A_0552",
+        "late-note": "jobevt_f1seed_A_1103",
+        "late": "jobevt_f1seed_A_1104",
+        "escalation": "jobevt_f1seed_A_1105"
+      }
+    },
+    "B": {
+      "jobId": "job_mufc6bkq_yhg28nr",
+      "events": 1101,
+      "ids": {
+        "early-note": "jobevt_f1seed_B_0000"
+      }
+    },
+    "C": {
+      "jobId": "job_mufc6c50_9f3vwcu",
+      "events": 1101,
+      "ids": {
+        "replan": "jobevt_f1seed_C_1100"
+      }
+    }
+  },
+  "B": {
+    "status": "blocked",
+    "statusReason": "Reached the job's elapsed-time budget of 60 minutes",
+    "stubRequests": 0
+  },
+  "C": {
+    "status": "blocked",
+    "statusReason": "Loop detected in stage 1: Stage jobstage_mufc6cab_88o3vx0 looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned.",
+    "events": 1111,
+    "stubRequests": 6,
+    "loops": [
+      {
+        "id": "jobevt_f1seed_C_1100",
+        "at": "2026-09-24T09:35:23.932Z",
+        "message": "Loop detected in stage jobstage_mufc6cab_88o3vx0: F1 seed replan. Replanning once with a fresh worker context.",
+        "replan": 1
+      },
+      {
+        "id": "jobevt_mufc6oa3_39hrvoy",
+        "at": "2026-09-24T09:35:39.627Z",
+        "message": "Stage jobstage_mufc6cab_88o3vx0 looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned. Blocking the job with evidence.",
+        "replans": 1,
+        "blocked": true
+      },
+      {
+        "id": "jobevt_mufc6oag_5jor2mw",
+        "at": "2026-09-24T09:35:39.640Z",
+        "message": "Loop detected in stage 1: Stage jobstage_mufc6cab_88o3vx0 looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned."
+      }
+    ]
+  },
+  "A": {
+    "status": "completed",
+    "recoveries": 1,
+    "events": 1126,
+    "pages": 6,
+    "positions": {
+      "early-note": 6,
+      "early": 7,
+      "middle": 558,
+      "late-note": 1109,
+      "late": 1110,
+      "escalation": 1111
+    },
+    "tail": [
+      {
+        "at": "2026-09-24T09:35:28.724Z",
+        "kind": "stage",
+        "message": "Stage 1 \"Append\" attempt 2 started on local/qwen3.6-35b-a3b"
+      },
+      {
+        "at": "2026-09-24T09:35:31.220Z",
+        "kind": "checkpoint",
+        "message": "Checkpoint: After stage 1 \"Append\" (da82bb55d655)"
+      },
+      {
+        "at": "2026-09-24T09:35:31.223Z",
+        "kind": "stage",
+        "message": "Stage 1 \"Append\" completed after 2 attempt(s)"
+      },
+      {
+        "at": "2026-09-24T09:35:31.288Z",
+        "kind": "stage",
+        "message": "Stage 2 \"Verify\" attempt 1 started on local/qwen3.6-35b-a3b"
+      },
+      {
+        "at": "2026-09-24T09:35:33.442Z",
+        "kind": "stage",
+        "message": "Stage 2 \"Verify\" completed after 1 attempt(s)"
+      },
+      {
+        "at": "2026-09-24T09:35:33.445Z",
+        "kind": "transition",
+        "message": "running → completed: Every stage completed"
+      }
+    ]
+  },
+  "report": {
+    "reportPath": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-durable-history-bYtUOc\\profile\\durable-jobs\\job_mufc6a63_de69q09\\report.md",
+    "status": "completed",
+    "tests": [
+      {
+        "command": "f1-early-marker",
+        "outcome": "pass",
+        "detail": "seeded before 1,100 fillers"
+      },
+      {
+        "command": "f1-middle-marker",
+        "outcome": "pass",
+        "detail": "seeded between the filler halves"
+      },
+      {
+        "command": "f1-late-marker",
+        "outcome": "pass",
+        "detail": "seeded after 1,100 fillers"
+      }
+    ],
+    "recoveries": [
+      "F1 seed: early recovery",
+      "F1 seed: late recovery",
+      "Reconciling after restart; previous owner 16744:f8b9b786-9b4e-490f-87b9-d3cd83a682d6 (epoch 1)",
+      "model-call \"Stage 1 attempt 1: fresh local/qwen3.6-35b-a3b conversation\": failed. The conversation was cut off by the restart (last phase disconnected) with no tool call pending; the stage restarts in a fresh conversation from the last handoff."
+    ],
+    "cloudEscalation": {
+      "occurred": true,
+      "detail": "F1 seed: late escalation"
+    }
+  },
+  "stubRequests": [
+    {
+      "at": "2026-09-24T09:35:21.708Z",
+      "launch": 1,
+      "job": "A",
+      "held": true
+    },
+    {
+      "at": "2026-09-24T09:35:28.834Z",
+      "launch": 2,
+      "job": "A",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:30.030Z",
+      "launch": 2,
+      "job": "A",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:31.359Z",
+      "launch": 2,
+      "job": "A",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:32.314Z",
+      "launch": 2,
+      "job": "A",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:33.603Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:34.591Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:35.570Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:36.607Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:37.590Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    },
+    {
+      "at": "2026-09-24T09:35:38.606Z",
+      "launch": 2,
+      "job": "C",
+      "held": false
+    }
+  ],
+  "observations": [
+    {
+      "at": "2026-09-24T09:35:19.243Z",
+      "label": "app launched (parked)",
+      "pid": 10788
+    },
+    {
+      "at": "2026-09-24T09:35:22.609Z",
+      "label": "A running a stage",
+      "jobId": "job_mufc6a63_de69q09",
+      "status": "running",
+      "statusReason": "Started from the queue",
+      "stage": "Append",
+      "attempt": 1
+    },
+    {
+      "at": "2026-09-24T09:35:24.145Z",
+      "label": "jobs before restart",
+      "A": {
+        "id": "job_mufc6a63_de69q09",
+        "status": "running",
+        "stage": "Append",
+        "attempt": 1
+      },
+      "B": {
+        "id": "job_mufc6bkq_yhg28nr",
+        "status": "queued"
+      },
+      "C": {
+        "id": "job_mufc6c50_9f3vwcu",
+        "status": "queued"
+      }
+    },
+    {
+      "at": "2026-09-24T09:35:24.928Z",
+      "label": "app stopped (process tree killed) with A mid-stage",
+      "pid": 10788,
+      "remainingProfileProcesses": 0
+    },
+    {
+      "at": "2026-09-24T09:35:24.964Z",
+      "label": "history seeded",
+      "A": 1106,
+      "B": 1101,
+      "C": 1101
+    },
+    {
+      "at": "2026-09-24T09:35:25.604Z",
+      "label": "app relaunched on the same profile",
+      "pid": 38328
+    },
+    {
+      "at": "2026-09-24T09:35:25.611Z",
+      "label": "A after relaunch",
+      "status": "running",
+      "recoveries": 0,
+      "lastEvent": {
+        "at": "2026-09-24T09:35:23.932Z",
+        "kind": "escalation",
+        "message": "F1 seed: late escalation"
+      }
+    },
+    {
+      "at": "2026-09-24T09:35:34.570Z",
+      "label": "A settled",
+      "jobId": "job_mufc6a63_de69q09",
+      "status": "completed",
+      "statusReason": "Every stage completed"
+    },
+    {
+      "at": "2026-09-24T09:35:34.579Z",
+      "label": "B settled",
+      "jobId": "job_mufc6bkq_yhg28nr",
+      "status": "blocked",
+      "statusReason": "Reached the job's elapsed-time budget of 60 minutes"
+    },
+    {
+      "at": "2026-09-24T09:35:39.723Z",
+      "label": "C settled",
+      "jobId": "job_mufc6c50_9f3vwcu",
+      "status": "blocked",
+      "statusReason": "Loop detected in stage 1: Stage jobstage_mufc6cab_88o3vx0 looped again after a replan: near-identical calls read_file on README.md 4 times with nothing new learned.",
+      "stage": "Loop",
+      "attempt": 1
+    },
+    {
+      "at": "2026-09-24T09:35:39.770Z",
+      "label": "outcomes",
+      "A": "completed",
+      "B": "blocked",
+      "C": "blocked",
+      "replanEvents": 1
+    },
+    {
+      "at": "2026-09-24T09:35:39.886Z",
+      "label": "A report verified",
+      "reportPath": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-durable-history-bYtUOc\\profile\\durable-jobs\\job_mufc6a63_de69q09\\report.md",
+      "tests": 3,
+      "recoveries": 4
+    },
+    {
+      "at": "2026-09-24T09:35:39.987Z",
+      "label": "PASS"
+    }
+  ]
+}
