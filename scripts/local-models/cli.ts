@@ -18,7 +18,7 @@ import {
 } from '../../src/main/local-models/paths.ts'
 import { downloadModel, downloadUrl, migrateModelFile, readProvenance, verifyModel } from '../../src/main/local-models/provenance.ts'
 import { health, resolveLlamaServer, serverStatus, startServer, stopServer } from '../../src/main/local-models/llama.ts'
-import { DockerSandbox, dockerAvailable, dockerExecutable, sandboxImageExists } from '../../src/main/local-models/sandbox.ts'
+import { DockerSandbox, dockerAvailable, dockerExecutable, linuxDepsStatus, prepareLinuxDependencies, sandboxImageExists } from '../../src/main/local-models/sandbox.ts'
 import { LocalAgentSession } from '../../src/main/local-models/agent.ts'
 import { chatCompletion, type CompletionResult } from '../../src/main/local-models/client.ts'
 import { runSecuritySuite } from './security.ts'
@@ -316,6 +316,19 @@ async function main(): Promise<void> {
       if (!ok) process.exitCode = 1
       return
     }
+    case 'prepare-deps': {
+      // The one step that gives a sandbox container the network (docs/local-assist.md): it
+      // downloads the lockfile's packages, so it runs only when the owner types this command.
+      const workspace = flag('cwd') ?? process.cwd()
+      const config = loadConfig()
+      const current = await linuxDepsStatus(workspace, config.sandbox)
+      if (current.state === 'no-lockfile') return void fail(`${workspace} has no package-lock.json; nothing to prepare`)
+      if (current.state === 'ready' && !has('force')) { log(`Linux dependencies already prepared in ${current.volume} (${current.preparedAt ?? 'unknown time'}); pass --force to rebuild`); return }
+      log(`Installing ${join(workspace, 'package-lock.json')} into Docker volume ${current.volume} from the network (one-time; the sandbox itself stays offline) ...`)
+      const prepared = await prepareLinuxDependencies(workspace, config.sandbox, { onProgress: line => log(line) })
+      log(`Prepared ${prepared.volume} (install scripts ${prepared.scripts}). Local sandboxes for this lockfile now run tsc and vitest against Linux dependencies.`)
+      return
+    }
     case 'where': {
       const root = readPointer()
       if (!root) return void fail(`Local root is not configured; run setup or set ${LOCAL_ROOT_ENV}`)
@@ -329,7 +342,8 @@ async function main(): Promise<void> {
       return
     }
     default:
-      log('usage: node scripts/local-models/cli.ts <setup|start|stop|status|smoke|run|security-test|where|models> [options]')
+      log('usage: node scripts/local-models/cli.ts <setup|start|stop|status|smoke|run|security-test|prepare-deps|where|models> [options]')
+      log('       prepare-deps [--cwd <project>] [--force]   build the Linux node_modules volume the local sandbox mounts (downloads packages)')
       log('       setup [--root <dir on a non-system drive>] [--llama-server <path>] [--quant-9b Q4_K_M|Q6_K] [--context 32768] [--skip-models] [--skip-image]')
       process.exitCode = 1
   }

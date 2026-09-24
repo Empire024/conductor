@@ -1,16 +1,18 @@
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, writeFileSync } from 'node:fs'
-import { mkdir, readdir, stat, writeFile } from 'node:fs/promises'
+import { copyFile, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { dirname, join, parse, relative, resolve } from 'node:path'
 import type { SandboxConfig } from './config.ts'
-import { runDir } from './config.ts'
+import { runDir, tempDir } from './config.ts'
 import { isSecretPath, resolveInWorkspace } from './workspace.ts'
 
 /** The sandbox could not be used. Every tool that needs execution turns this into a refusal;
- *  nothing in this module or its callers ever falls back to a host shell. That is the whole
- *  point of the boundary: a stopped or broken Docker sandbox means execution is unavailable,
- *  not that the command runs on Windows instead. */
+ *  nothing in this module or its callers ever falls back to a host shell for a model's command.
+ *  That is the whole point of the boundary: a stopped or broken Docker sandbox means execution
+ *  is unavailable, not that the command runs on Windows instead. The one host run is the task
+ *  contract's own acceptance command, in an isolated copy: see `runHostAcceptance`. */
 export class SandboxUnavailableError extends Error {}
 
 /** A command the sandbox refuses on policy rather than on capability, with an explanation the
@@ -75,6 +77,7 @@ export interface SandboxResult {
 
 const NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,110}$/
 const IMAGE = /^[a-z0-9][a-z0-9._/-]*(:[A-Za-z0-9._-]+)?$/
+const LINUX_DEPS_VOLUME = /^conductor-linux-deps-[0-9a-f]{16}$/
 
 export const sandboxContainerName = (sessionId: string): string => {
   const name = `conductor-local-${sessionId}`.replace(/[^a-zA-Z0-9_.-]/g, '-')
@@ -87,20 +90,38 @@ export const sandboxContainerName = (sessionId: string): string => {
  *  model-produced text is ever parsed by PowerShell or cmd.exe. */
 export const dockerExecutable = (): string => process.env.CONDUCTOR_DOCKER_PATH?.trim() || 'docker'
 
-interface RunOutcome { code: number | null; stdout: string; stderr: string; timedOut: boolean; truncated: boolean; spawnError?: Error }
+export interface RunOutcome { code: number | null; stdout: string; stderr: string; timedOut: boolean; truncated: boolean; cancelled?: boolean; spawnError?: Error }
 
-function runDocker(args: string[], timeoutMs: number, maxBytes: number): Promise<RunOutcome> {
+/** Extras for a long docker run: cancellation, live output, and keeping the tail of an output
+ *  larger than `maxBytes` instead of killing the client over it. */
+export interface DockerRunControls { signal?: AbortSignal; onData?: (text: string, stream: 'out' | 'err') => void; keepTail?: boolean }
+
+/** The docker CLI as a function, so the Linux dependency paths can be exercised with a fake. */
+export type DockerRun = (args: string[], timeoutMs: number, maxBytes: number, controls?: DockerRunControls) => Promise<RunOutcome>
+
+function runDocker(args: string[], timeoutMs: number, maxBytes: number, controls: DockerRunControls = {}): Promise<RunOutcome> {
   return new Promise(resolvePromise => {
-    let stdout = '', stderr = '', bytes = 0, timedOut = false, truncated = false, settled = false
+    let stdout = '', stderr = '', bytes = 0, timedOut = false, truncated = false, cancelled = false, settled = false
     const outChunks: Buffer[] = [], errChunks: Buffer[] = []
+    const kept = { out: 0, err: 0 }
     const child = spawn(dockerExecutable(), args, { shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const abort = (): void => { cancelled = true; child.kill('SIGKILL') }
     const finish = (outcome: RunOutcome): void => {
       if (settled) return
-      settled = true; clearTimeout(timer)
-      resolvePromise({ ...outcome, stdout: Buffer.concat(outChunks).toString('utf8'), stderr: Buffer.concat(errChunks).toString('utf8') })
+      settled = true; clearTimeout(timer); controls.signal?.removeEventListener('abort', abort)
+      resolvePromise({ ...outcome, cancelled, stdout: Buffer.concat(outChunks).toString('utf8'), stderr: Buffer.concat(errChunks).toString('utf8') })
     }
     const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, timeoutMs)
+    if (controls.signal?.aborted) abort()
+    else controls.signal?.addEventListener('abort', abort, { once: true })
     const capture = (chunk: Buffer, target: 'out' | 'err'): void => {
+      controls.onData?.(chunk.toString('utf8'), target)
+      if (controls.keepTail) {
+        const chunks = target === 'out' ? outChunks : errChunks
+        chunks.push(chunk); kept[target] += chunk.length
+        while (kept[target] > maxBytes && chunks.length > 1) { kept[target] -= chunks.shift()!.length; truncated = true }
+        return
+      }
       const remaining = Math.max(0, maxBytes - bytes)
       bytes += chunk.length
       const captured = chunk.subarray(0, remaining)
@@ -428,9 +449,16 @@ export function containerRunArgs(options: {
   gitWritable?: boolean
   /** The host repository's own `core.autocrlf`, mirrored into a granted container: see below. */
   gitAutocrlf?: string
+  /** A prepared Linux dependency volume (`prepareLinuxDependencies`) that stands in for the
+   *  host's Windows node_modules. */
+  linuxDeps?: string
 }): string[] {
   if (!NAME.test(options.name)) throw new SandboxUnavailableError('Invalid sandbox container name')
   if (!IMAGE.test(options.image)) throw new SandboxUnavailableError('Invalid sandbox image reference')
+  if (options.linuxDeps !== undefined && !LINUX_DEPS_VOLUME.test(options.linuxDeps)) throw new SandboxUnavailableError('Invalid Linux dependency volume name')
+  // Only over a node_modules the host already has: the mountpoint then exists in the bind, and
+  // Docker never creates an empty node_modules in the owner's checkout on the container's behalf.
+  const linuxDeps = options.linuxDeps && existsSync(join(options.workspace, 'node_modules')) ? options.linuxDeps : undefined
   const workspace = dockerPath(options.workspace)
   if (/[,=]/.test(workspace)) throw new SandboxUnavailableError('Workspace path contains a character Docker mount syntax cannot carry')
   // Only a specific workspace directory ever crosses the boundary. A drive root or the Windows
@@ -468,14 +496,16 @@ export function containerRunArgs(options: {
     // down *before* they discover that, and a plain `npx tsc` in this repo removed the owner's
     // node_modules and package-lock.json mid-run. Read-only is the only state in which those two
     // paths are safe to expose at all.
-    ...DEPENDENCY_PATHS.flatMap(relative => existsSync(join(options.workspace, relative))
-      ? ['--mount', `type=bind,source=${workspace}/${relative},target=/workspace/${relative},readonly`]
-      : []),
+    // With a prepared Linux tree, that volume replaces the host's Windows binaries, read-only too.
+    ...DEPENDENCY_PATHS.flatMap(relative => !existsSync(join(options.workspace, relative)) ? []
+      : relative === 'node_modules' && linuxDeps ? ['--mount', `type=volume,source=${linuxDeps},target=/workspace/node_modules,readonly,volume-nocopy`]
+        : ['--mount', `type=bind,source=${workspace}/${relative},target=/workspace/${relative},readonly`]),
     // Build tools cache inside the tree they read. These stay writable so a sandboxed build still
     // works, without the rest of node_modules being writable with it. Only a cache directory that
     // already exists is mounted: the mountpoint would have to be created inside the read-only
     // node_modules bind, which Docker cannot do, and the whole container then fails to start.
-    ...DEPENDENCY_CACHES.flatMap(relative => existsSync(join(options.workspace, relative))
+    // The Linux volume is built with both directories, so there they are always mounted.
+    ...DEPENDENCY_CACHES.flatMap(relative => linuxDeps || existsSync(join(options.workspace, relative))
       ? ['--tmpfs', `/workspace/${relative}:rw,nosuid,nodev,size=256m`]
       : [])
   ]
@@ -554,6 +584,365 @@ export async function hostAutocrlf(workspace: string): Promise<string> {
   return value === 'true' || value === 'input' ? 'input' : 'false'
 }
 
+/** The Linux dependency tree is keyed on the lockfile alone: the same lock always names the same
+ *  volume, and a changed lock is simply a volume nobody has prepared yet. */
+const lockKeyCache = new Map<string, { mtimeMs: number; size: number; key: string }>()
+
+export async function linuxDepsKey(workspace: string): Promise<string | null> {
+  const path = join(resolve(workspace), 'package-lock.json')
+  let info: import('node:fs').Stats
+  try { info = await stat(path) } catch { return null }
+  if (!info.isFile()) return null
+  const cached = lockKeyCache.get(path)
+  if (cached && cached.mtimeMs === info.mtimeMs && cached.size === info.size) return cached.key
+  let bytes: Buffer
+  try { bytes = await readFile(path) } catch { return null }
+  const key = createHash('sha256').update(bytes).digest('hex').slice(0, 16)
+  lockKeyCache.set(path, { mtimeMs: info.mtimeMs, size: info.size, key })
+  return key
+}
+
+export const linuxDepsVolume = (key: string): string => {
+  const volume = `conductor-linux-deps-${key}`
+  if (!LINUX_DEPS_VOLUME.test(volume)) throw new SandboxUnavailableError('Invalid Linux dependency key')
+  return volume
+}
+
+/** Written on the host only after a prepare finished, so a half-built volume never counts. */
+export interface LinuxDepsMarker { key: string; volume: string; preparedAt: string; scripts: 'ran' | 'skipped'; image: string }
+export interface LinuxDepsStatus { state: 'ready' | 'missing' | 'no-lockfile'; key?: string; volume?: string; preparedAt?: string }
+
+export interface LinuxDepsDependencies {
+  docker: DockerRun
+  /** Directory of the host-side readiness markers. */
+  markerRoot(): string
+  ensureDocker(): Promise<DockerAvailability>
+}
+
+const defaultLinuxDeps: LinuxDepsDependencies = {
+  docker: runDocker,
+  markerRoot: () => join(runDir(), 'linux-deps'),
+  ensureDocker: () => ensureDockerAvailable()
+}
+
+/** Volumes `docker volume inspect` confirmed recently, so a command does not pay a docker round
+ *  trip before every run. A volume removed by hand is noticed within the minute. */
+const confirmedVolumes = new Map<string, number>()
+const VOLUME_CONFIRM_TTL_MS = 60_000
+
+export function resetLinuxDepsCacheForTests(): void { confirmedVolumes.clear(); lockKeyCache.clear() }
+
+async function readLinuxDepsMarker(root: string, key: string): Promise<LinuxDepsMarker | null> {
+  try {
+    const marker = JSON.parse(await readFile(join(root, `${key}.json`), 'utf8')) as Partial<LinuxDepsMarker> | null
+    return marker && marker.key === key && typeof marker.preparedAt === 'string' ? marker as LinuxDepsMarker : null
+  } catch { return null }
+}
+
+/** Ready only when the host marker exists for this lockfile and this image *and* Docker still has
+ *  the volume. Either one alone is an interrupted prepare or a volume removed by hand. */
+export async function linuxDepsStatus(workspace: string, sandbox: SandboxConfig, deps: Partial<LinuxDepsDependencies> = {}): Promise<LinuxDepsStatus> {
+  const { docker, markerRoot } = { ...defaultLinuxDeps, ...deps }
+  const key = await linuxDepsKey(workspace)
+  if (!key) return { state: 'no-lockfile' }
+  const volume = linuxDepsVolume(key)
+  const marker = await readLinuxDepsMarker(markerRoot(), key)
+  if (!marker || marker.volume !== volume || marker.image !== sandbox.image) return { state: 'missing', key, volume }
+  const confirmed = confirmedVolumes.get(volume)
+  if (confirmed === undefined || Date.now() - confirmed > VOLUME_CONFIRM_TTL_MS) {
+    const inspected = await docker(['volume', 'inspect', '--format', '{{.Name}}', volume], 20_000, 16 * 1024)
+    if (inspected.spawnError || inspected.code !== 0) { confirmedVolumes.delete(volume); return { state: 'missing', key, volume } }
+    confirmedVolumes.set(volume, Date.now())
+  }
+  return { state: 'ready', key, volume, preparedAt: marker.preparedAt }
+}
+
+const PREPARE_TIMEOUT_MS = 20 * 60_000
+
+/** Runs as root in the throwaway install container. The build happens in the container's own
+ *  filesystem (not a size-limited tmpfs); only the finished tree is copied into the volume. Install
+ *  scripts are tried first and skipped only if they fail, and which one happened is reported back.
+ *  The tree is world-readable, and only the two build caches belong to the sandbox user. */
+const PREPARE_SCRIPT = [
+  'set -eu',
+  'export ELECTRON_SKIP_BINARY_DOWNLOAD=1',
+  'rm -rf /tmp/linux-deps && mkdir -p /tmp/linux-deps && cd /tmp/linux-deps',
+  'cp /src/package.json /src/package-lock.json .',
+  'if npm ci --no-audit --no-fund; then echo ran > /tmp/linux-deps.scripts',
+  "else echo 'npm ci with install scripts failed; retrying with --ignore-scripts' >&2; npm ci --ignore-scripts --no-audit --no-fund; echo skipped > /tmp/linux-deps.scripts; fi",
+  'find /out -mindepth 1 -maxdepth 1 -exec rm -rf {} +',
+  'cp -a node_modules/. /out/',
+  'mkdir -p /out/.cache /out/.vite',
+  'chmod -R a+rX /out',
+  'chown -R 10001:10001 /out/.cache /out/.vite',
+  'echo "CONDUCTOR_LINUX_DEPS_SCRIPTS=$(cat /tmp/linux-deps.scripts)"'
+].join('\n')
+
+/** Argv for the install container. Unlike the runtime container it has the default network and
+ *  runs as root, so it sees nothing of the workspace but the two package files, read-only. */
+export function linuxDepsPrepareArgs(options: { name: string; workspace: string; sandbox: SandboxConfig; key: string }): string[] {
+  if (!NAME.test(options.name)) throw new SandboxUnavailableError('Invalid install container name')
+  if (!IMAGE.test(options.sandbox.image)) throw new SandboxUnavailableError('Invalid sandbox image reference')
+  const volume = linuxDepsVolume(options.key)
+  const workspace = dockerPath(options.workspace)
+  if (/[,=\r\n]/.test(workspace)) throw new SandboxUnavailableError('Workspace path contains a character Docker mount syntax cannot carry')
+  return [
+    'run', '--rm', '--name', options.name,
+    '--label', `conductor.linux-deps=${options.key}`,
+    '--user', '0:0',
+    '--security-opt', 'no-new-privileges',
+    '--pids-limit', String(Math.max(options.sandbox.pids, 1024)),
+    '--memory', options.sandbox.memory,
+    '--memory-swap', options.sandbox.memory,
+    '--cpus', options.sandbox.cpus,
+    '--workdir', '/tmp',
+    '--mount', `type=bind,source=${workspace}/package.json,target=/src/package.json,readonly`,
+    '--mount', `type=bind,source=${workspace}/package-lock.json,target=/src/package-lock.json,readonly`,
+    '--mount', `type=volume,source=${volume},target=/out`,
+    ...['HOME=/root', 'NPM_CONFIG_CACHE=/tmp/npm-cache', 'NPM_CONFIG_OFFLINE=false', 'NPM_CONFIG_UPDATE_NOTIFIER=false', 'CI=1'].flatMap(variable => ['--env', variable]),
+    options.sandbox.image, 'bash', '-c', PREPARE_SCRIPT
+  ]
+}
+
+/** Whole lines from a stream of chunks, per stream, so interleaved stdout/stderr stay readable. */
+function progressLines(onProgress?: (line: string) => void): { push(text: string, stream?: 'out' | 'err'): void; flush(): void } {
+  const pending = { out: '', err: '' }
+  const emit = (line: string): void => { if (line.trim()) onProgress?.(line) }
+  return {
+    push(text, stream = 'out') {
+      if (!onProgress) return
+      const parts = (pending[stream] + text).split(/\r?\n|\r/)
+      pending[stream] = parts.pop() ?? ''
+      parts.forEach(emit)
+    },
+    flush() { emit(pending.out); emit(pending.err); pending.out = pending.err = '' }
+  }
+}
+
+const preparing = new Map<string, Promise<{ volume: string; key: string; scripts: 'ran' | 'skipped' }>>()
+
+/** Build a Linux node_modules for this workspace's lockfile into a named Docker volume, so the
+ *  sandbox can run vitest, tsc and builds whose host tree carries Windows-only native binaries.
+ *
+ *  THIS IS THE ONLY SANDBOX PATH THAT USES THE NETWORK. Call it only from an explicit owner
+ *  action — a button the owner pressed for this workspace. Never from a model turn, a tool, a
+ *  schedule, an acceptance run or an automatic retry: the install container reaches the npm
+ *  registry and runs the lockfile's install scripts as root. It never sees the workspace, only
+ *  package.json and package-lock.json read-only, and never touches the owner's own node_modules.
+ *
+ *  On failure it throws `SandboxUnavailableError` with the tail of the install output and leaves
+ *  the volume as it is; without a marker it does not count as ready. */
+export async function prepareLinuxDependencies(workspace: string, sandbox: SandboxConfig, options: { signal?: AbortSignal; onProgress?(line: string): void } = {}, deps: Partial<LinuxDepsDependencies> = {}): Promise<{ volume: string; key: string; scripts: 'ran' | 'skipped' }> {
+  const key = await linuxDepsKey(workspace)
+  if (!key) throw new SandboxUnavailableError('This workspace has no package-lock.json, so there is no Linux dependency tree to prepare')
+  if (!existsSync(join(workspace, 'package.json'))) throw new SandboxUnavailableError('This workspace has no package.json beside its package-lock.json')
+  const volume = linuxDepsVolume(key)
+  const running = preparing.get(volume)
+  if (running) return running
+  const job = prepareVolume(workspace, sandbox, key, volume, options, { ...defaultLinuxDeps, ...deps }).finally(() => { preparing.delete(volume) })
+  preparing.set(volume, job)
+  return job
+}
+
+async function prepareVolume(workspace: string, sandbox: SandboxConfig, key: string, volume: string, options: { signal?: AbortSignal; onProgress?(line: string): void }, deps: LinuxDepsDependencies): Promise<{ volume: string; key: string; scripts: 'ran' | 'skipped' }> {
+  options.signal?.throwIfAborted()
+  const docker = await deps.ensureDocker()
+  if (!docker.available) throw new SandboxUnavailableError(docker.reason ?? 'Docker unavailable')
+  const root = deps.markerRoot()
+  const markerPath = join(root, `${key}.json`)
+  // A rebuild clears the volume first, so its old marker stops vouching for it right away.
+  await rm(markerPath, { force: true })
+  confirmedVolumes.delete(volume)
+  const created = await deps.docker(['volume', 'create', '--label', `conductor.linux-deps=${key}`, volume], 60_000, 16 * 1024)
+  if (created.spawnError || created.code !== 0) throw new SandboxUnavailableError(`Could not create the Linux dependency volume: ${(created.stderr || created.stdout).trim().slice(0, 400) || 'docker volume create failed'}`)
+  const name = `conductor-linux-deps-prep-${key}`
+  await deps.docker(['rm', '--force', name], 30_000, 16 * 1024)
+  const lines = progressLines(options.onProgress)
+  const run = await deps.docker(linuxDepsPrepareArgs({ name, workspace, sandbox, key }), PREPARE_TIMEOUT_MS, 256 * 1024, { signal: options.signal, keepTail: true, onData: (text, stream) => lines.push(text, stream) })
+  lines.flush()
+  // Killing the docker client leaves the install container running; `--rm` only fires on exit.
+  if (run.cancelled || run.timedOut) await deps.docker(['rm', '--force', name], 60_000, 16 * 1024)
+  if (run.cancelled || options.signal?.aborted) throw new SandboxUnavailableError('Linux dependency install cancelled')
+  const output = `${run.stderr}\n${run.stdout}`.trim()
+  if (run.spawnError || run.timedOut || run.code !== 0) throw new SandboxUnavailableError(`Linux dependency install ${run.timedOut ? 'timed out after 20 minutes' : 'failed'}: ${output.slice(-2000) || 'docker run failed'}`)
+  const scripts = /CONDUCTOR_LINUX_DEPS_SCRIPTS=(ran|skipped)/.exec(run.stdout)?.[1] as 'ran' | 'skipped' | undefined
+  if (!scripts) throw new SandboxUnavailableError(`Linux dependency install finished without its completion line: ${output.slice(-2000)}`)
+  // The lockfile was bound live; a tree built from a lock that changed meanwhile is not this key's.
+  if (await linuxDepsKey(workspace) !== key) throw new SandboxUnavailableError('package-lock.json changed while the Linux dependencies were being prepared; prepare them again')
+  await mkdir(root, { recursive: true })
+  const marker: LinuxDepsMarker = { key, volume, preparedAt: new Date().toISOString(), scripts, image: sandbox.image }
+  await writeFile(markerPath, JSON.stringify(marker, null, 2), 'utf8')
+  confirmedVolumes.set(volume, Date.now())
+  return { volume, key, scripts }
+}
+
+/** Ceilings for the host acceptance copy and its output. */
+const MAX_ACCEPTANCE_COPY_BYTES = 500 * 1024 * 1024
+const ACCEPTANCE_OUTPUT_BYTES = 8 * 1024 * 1024
+/** Stripped from the host run's environment: the code under test is the local model's. */
+const CREDENTIAL_VARIABLE = /KEY|TOKEN|SECRET|PASSW|CREDENTIAL|COOKIE|AUTH/i
+
+type AcceptanceFs = Pick<typeof import('node:fs/promises'), 'mkdir' | 'mkdtemp' | 'copyFile' | 'lstat' | 'symlink' | 'unlink' | 'rm'>
+
+export interface HostAcceptanceDependencies {
+  platform: NodeJS.Platform
+  spawn: typeof spawn
+  /** Workspace-relative paths to copy; by default `git ls-files -z -co --exclude-standard`. */
+  listFiles(workspace: string): Promise<string[]>
+  tempRoot(): string
+  fs: AcceptanceFs
+  maxCopyBytes: number
+  killGraceMs: number
+}
+
+async function gitListFiles(workspace: string): Promise<string[]> {
+  const listed = await runGit(workspace, ['ls-files', '-z', '-co', '--exclude-standard'], 64 * 1024 * 1024)
+  if (listed.spawnError || listed.code !== 0) throw new SandboxUnavailableError('The acceptance copy lists the workspace with git, and git could not list it')
+  return listed.stdout.toString('utf8').split('\0').filter(Boolean)
+}
+
+const defaultHostAcceptance: HostAcceptanceDependencies = {
+  platform: process.platform,
+  spawn,
+  listFiles: gitListFiles,
+  tempRoot: () => { try { return join(tempDir(), 'acceptance') } catch { return join(tmpdir(), 'conductor-acceptance') } },
+  fs: { mkdir, mkdtemp, copyFile, lstat, symlink, unlink, rm },
+  maxCopyBytes: MAX_ACCEPTANCE_COPY_BYTES,
+  killGraceMs: 10_000
+}
+
+async function eachLimited<T>(items: T[], limit: number, work: (item: T) => Promise<void>): Promise<void> {
+  let next = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => { while (next < items.length) await work(items[next++]!) }))
+}
+
+export interface HostAcceptanceCopy { root: string; junction?: string; files: number; bytes: number; cleanup(): Promise<void> }
+
+/** A throwaway copy of the workspace's own files, with a junction to the host node_modules. No
+ *  .git, no dependency trees, nothing the secret policy withholds, and a hard size budget. */
+export async function hostAcceptanceCopy(workspace: string, deps: Partial<HostAcceptanceDependencies> = {}): Promise<HostAcceptanceCopy> {
+  const d = { ...defaultHostAcceptance, ...deps }
+  const listed = [...new Set(await d.listFiles(workspace))]
+  const base = d.tempRoot()
+  await d.fs.mkdir(base, { recursive: true })
+  const root = await d.fs.mkdtemp(join(base, 'acceptance-'))
+  let junction: string | undefined
+  const cleanup = async (): Promise<void> => {
+    if (junction) {
+      // The link alone, never a recursive delete through it: its target is the owner's real tree.
+      await d.fs.unlink(junction).catch(() => undefined)
+      if (await d.fs.lstat(junction).then(() => true, () => false)) throw new SandboxUnavailableError(`The acceptance copy's node_modules junction could not be removed, so ${root} was left in place rather than deleted through it`)
+      junction = undefined
+    }
+    await d.fs.rm(root, { recursive: true, force: true, maxRetries: 3 })
+  }
+  try {
+    const wanted: Array<{ parts: string[]; size: number }> = []
+    await eachLimited(listed, 16, async raw => {
+      const rel = raw.replace(/\\/g, '/')
+      const parts = rel.split('/')
+      if (!rel || rel.startsWith('/') || /^[a-zA-Z]:/.test(rel) || parts.some(part => !part || part === '.' || part === '..')) return
+      if (parts[0] === '.git' || parts.some(part => part.toLowerCase() === 'node_modules') || isSecretPath(rel)) return
+      const info = await d.fs.lstat(join(workspace, ...parts)).catch(() => undefined)
+      if (info?.isFile()) wanted.push({ parts, size: info.size })
+    })
+    const bytes = wanted.reduce((sum, file) => sum + file.size, 0)
+    if (bytes > d.maxCopyBytes) throw new SandboxUnavailableError(`The acceptance copy would be ${Math.ceil(bytes / 1048576)} MB, over its ${Math.floor(d.maxCopyBytes / 1048576)} MB limit; prepare the Linux dependencies so acceptance runs in the sandbox instead`)
+    await eachLimited(wanted, 16, async file => {
+      const target = join(root, ...file.parts)
+      await d.fs.mkdir(dirname(target), { recursive: true })
+      await d.fs.copyFile(join(workspace, ...file.parts), target)
+    })
+    const modules = resolve(workspace, 'node_modules')
+    if (await d.fs.lstat(modules).then(() => true, () => false)) {
+      junction = join(root, 'node_modules')
+      await d.fs.symlink(modules, junction, 'junction')
+    }
+    return { root, junction, files: wanted.length, bytes, cleanup }
+  } catch (error) {
+    await cleanup().catch(() => undefined)
+    throw error
+  }
+}
+
+function acceptanceEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {}
+  for (const [name, value] of Object.entries(process.env)) if (value !== undefined && !CREDENTIAL_VARIABLE.test(name)) environment[name] = value
+  return { ...environment, CI: '1', CONDUCTOR_ACCEPTANCE_COPY: '1' }
+}
+
+function runHostCommand(cwd: string, command: string, timeoutMs: number, maxBytes: number, signal: AbortSignal | undefined, d: HostAcceptanceDependencies): Promise<RunOutcome> {
+  return new Promise(resolvePromise => {
+    let bytes = 0, timedOut = false, truncated = false, cancelled = false, settled = false, killing = false
+    let timer: NodeJS.Timeout | undefined, grace: NodeJS.Timeout | undefined
+    const outChunks: Buffer[] = [], errChunks: Buffer[] = []
+    const finish = (code: number | null, spawnError?: Error): void => {
+      if (settled) return
+      settled = true; clearTimeout(timer); clearTimeout(grace); signal?.removeEventListener('abort', onAbort)
+      resolvePromise({ code, stdout: Buffer.concat(outChunks).toString('utf8'), stderr: Buffer.concat(errChunks).toString('utf8'), timedOut, truncated, cancelled, spawnError })
+    }
+    let child: ChildProcess
+    const options: SpawnOptions = { cwd, shell: true, windowsHide: true, env: acceptanceEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], detached: d.platform !== 'win32' }
+    try { child = d.spawn(command, [], options) } catch (error) { finish(null, error as Error); return }
+    // A shell's children outlive a kill of the shell alone; take the whole tree down.
+    const killTree = (): void => {
+      if (killing) return
+      killing = true
+      if (d.platform === 'win32' && child.pid) {
+        const killer = d.spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore' })
+        killer.on('error', () => child.kill('SIGKILL'))
+      } else if (child.pid) {
+        try { process.kill(-child.pid, 'SIGKILL') } catch { child.kill('SIGKILL') }
+      } else child.kill('SIGKILL')
+      grace = setTimeout(() => finish(null), d.killGraceMs)
+    }
+    const onAbort = (): void => { cancelled = true; killTree() }
+    timer = setTimeout(() => { timedOut = true; killTree() }, timeoutMs)
+    if (signal?.aborted) onAbort()
+    else signal?.addEventListener('abort', onAbort, { once: true })
+    const capture = (chunk: Buffer, target: Buffer[]): void => {
+      const remaining = Math.max(0, maxBytes - bytes)
+      bytes += chunk.length
+      const captured = chunk.subarray(0, remaining)
+      if (captured.length) target.push(captured)
+      if (bytes > maxBytes) { truncated = true; killTree() }
+    }
+    child.stdout?.on('data', chunk => capture(chunk as Buffer, outChunks))
+    child.stderr?.on('data', chunk => capture(chunk as Buffer, errChunks))
+    child.on('error', error => finish(null, error as Error))
+    child.on('close', code => finish(code))
+  })
+}
+
+/** Run the task contract's acceptance command on the Windows host, in a throwaway copy of the
+ *  workspace whose node_modules is a junction to the host's own tree. Used only while the sandbox
+ *  has no Linux dependency tree, where the bound Windows binaries (Rollup, esbuild) would fail
+ *  the run before a single test did. The command is set by the task contract the frontier
+ *  controller wrote, never by the local model, which is why running it on the host is acceptable
+ *  at all; the code it exercises is the model's, so credentials are stripped from its environment,
+ *  package installs are refused, and the copy never holds .git or a withheld file. */
+export async function runHostAcceptance(workspace: string, command: string, timeoutSec: number, options: { signal?: AbortSignal; maxBytes?: number } = {}, deps: Partial<HostAcceptanceDependencies> = {}): Promise<SandboxResult> {
+  if (typeof command !== 'string' || !command.trim()) throw new SandboxUnavailableError('An acceptance command is required')
+  if (command.includes('\0')) throw new SandboxUnavailableError('Command contains a NUL byte')
+  if (!Number.isFinite(timeoutSec) || timeoutSec <= 0 || timeoutSec > 3600) throw new SandboxUnavailableError('Invalid command timeout')
+  // The junction is the owner's real tree; an install through it would rewrite that tree.
+  assertNoPackageInstall(command)
+  options.signal?.throwIfAborted()
+  const d = { ...defaultHostAcceptance, ...deps }
+  const copy = await hostAcceptanceCopy(workspace, d)
+  const started = Date.now()
+  const outcome = await runHostCommand(copy.root, command, timeoutSec * 1000, options.maxBytes ?? ACCEPTANCE_OUTPUT_BYTES, options.signal, d)
+  const cleanupNote = await copy.cleanup().then(() => '', (error: unknown) => `\n[acceptance copy cleanup: ${error instanceof Error ? error.message : 'failed'}]`)
+  if (outcome.spawnError) throw new SandboxUnavailableError(`The acceptance command could not be started on the host: ${outcome.spawnError.message}`)
+  const failed = outcome.cancelled || outcome.truncated || outcome.timedOut
+  return { cancelled: outcome.cancelled ?? false, exitCode: failed ? -1 : outcome.code ?? -1, stdout: outcome.stdout, stderr: outcome.stderr + cleanupNote, truncated: outcome.truncated, timedOut: outcome.timedOut, durationMs: Date.now() - started }
+}
+
+export interface DockerSandboxDependencies {
+  linuxDeps?: Partial<LinuxDepsDependencies>
+  hostAcceptance?: typeof runHostAcceptance
+}
+
 export class DockerSandbox {
   readonly name: string
   private readonly workspace: string
@@ -573,32 +962,50 @@ export class DockerSandbox {
   }
   private gitAutocrlf?: string
 
-  constructor(sessionId: string, workspace: string, sandbox: SandboxConfig) {
+  private readonly deps: DockerSandboxDependencies
+
+  constructor(sessionId: string, workspace: string, sandbox: SandboxConfig, deps: DockerSandboxDependencies = {}) {
     this.name = sandboxContainerName(sessionId)
     this.workspace = workspace
     this.sandbox = sandbox
+    this.deps = deps
   }
 
   /** The owner can grant or withdraw repository write access between turns. A running container's
    *  bind mounts cannot change, so the grant only becomes real on the next container. */
   setGitAccess(writable: boolean): void { this.gitWritable = writable }
 
-  private signature(masks: SecretMask[]): string {
-    return JSON.stringify({ masks, analysis: this.analysis, analysisScratch: this.analysisScratch, git: this.gitWritable, autocrlf: this.gitAutocrlf ?? null, workspace: resolve(this.workspace) })
+  private signature(masks: SecretMask[], linuxDeps?: string): string {
+    return JSON.stringify({ masks, analysis: this.analysis, analysisScratch: this.analysisScratch, git: this.gitWritable, autocrlf: this.gitAutocrlf ?? null, workspace: resolve(this.workspace), ...(linuxDeps ? { linuxDeps } : {}) })
+  }
+
+  /** Whether an owner-prepared Linux dependency volume matches this workspace's lockfile. */
+  async linuxDepsReady(): Promise<boolean> {
+    return (await this.plannedLinuxDeps()) !== undefined
+  }
+
+  /** Only ever resolves a volume the owner already prepared; nothing here prepares one. */
+  private async plannedLinuxDeps(): Promise<string | undefined> {
+    try {
+      const status = await linuxDepsStatus(this.workspace, this.sandbox, this.deps.linuxDeps)
+      return status.state === 'ready' ? status.volume : undefined
+    } catch { return undefined }
   }
 
   /** The mounts this session should be running with right now: the cached secret scan, plus the
-   *  index-backed replicas that keep a granted `git` from committing a mask as a deletion. Plans
-   *  only — nothing is written to disk until the container is actually created. */
-  private async plannedMasks(): Promise<{ masks: SecretMask[]; writes: TrackedMaskWrite[] }> {
+   *  index-backed replicas that keep a granted `git` from committing a mask as a deletion, plus a
+   *  prepared Linux dependency volume once one is ready — which changes the signature, so the
+   *  container is recreated onto it. Plans only — nothing is written to disk until the container
+   *  is actually created. */
+  private async plannedMasks(): Promise<{ masks: SecretMask[]; writes: TrackedMaskWrite[]; linuxDeps?: string }> {
     if (this.analysisScratch) {
       const scratch = await resolveInWorkspace(this.workspace, this.analysisScratch)
       if (scratch.relative !== this.analysisScratch || !(await stat(scratch.path)).isDirectory()) throw new SandboxUnavailableError('Analysis scratch must be a canonical task directory')
     }
-    const masks = await secretPathsFor(this.workspace)
-    if (!this.gitWritable || this.analysis) return { masks, writes: [] }
+    const [masks, linuxDeps] = await Promise.all([secretPathsFor(this.workspace), this.plannedLinuxDeps()])
+    if (!this.gitWritable || this.analysis) return { masks, writes: [], linuxDeps }
     this.gitAutocrlf = await hostAutocrlf(this.workspace)
-    return trackedMaskPlan(this.workspace, masks, join(runDir(), 'masked-tracked'))
+    return { ...(await trackedMaskPlan(this.workspace, masks, join(runDir(), 'masked-tracked'))), linuxDeps }
   }
 
   /** Bring the container up, or refuse with the specific reason. Never returns without a
@@ -615,7 +1022,7 @@ export class DockerSandbox {
     if (!docker.available) throw new SandboxUnavailableError(docker.reason ?? 'Docker unavailable')
     if (!await sandboxImageExists(this.sandbox.image)) throw new SandboxUnavailableError(`Sandbox image missing: build ${this.sandbox.image} with scripts/local-models/setup.ps1`)
     const planned = await this.plannedMasks()
-    const signature = this.signature(planned.masks)
+    const signature = this.signature(planned.masks, planned.linuxDeps)
     const digest = mountDigest(signature)
     const existing = await runDocker(['inspect', '--format', `{{.State.Running}}\t{{index .Config.Labels "${MOUNT_LABEL}"}}\t{{json .Mounts}}`, this.name], 20_000, 256 * 1024)
     if (existing.code === 0) {
@@ -632,7 +1039,7 @@ export class DockerSandbox {
     const emptyFile = join(runDir(), 'masked-empty')
     if (!existsSync(emptyFile)) writeFileSync(emptyFile, '', 'utf8')
     await materializeMaskSources(this.workspace, planned.writes)
-    const args = containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks: planned.masks, emptyFile, analysis: this.analysis, analysisScratch: this.analysisScratch, gitWritable: this.gitWritable, gitAutocrlf: this.gitAutocrlf })
+    const args = containerRunArgs({ name: this.name, image: this.sandbox.image, workspace: this.workspace, sandbox: this.sandbox, masks: planned.masks, emptyFile, analysis: this.analysis, analysisScratch: this.analysisScratch, gitWritable: this.gitWritable, gitAutocrlf: this.gitAutocrlf, linuxDeps: planned.linuxDeps })
     args.splice(args.indexOf('--label'), 0, '--label', `${MOUNT_LABEL}=${digest}`)
     const created = await runDocker(args, 120_000, 256 * 1024)
     if (created.spawnError || created.code !== 0) throw new SandboxUnavailableError(`Sandbox failed to start: ${(created.stderr || created.stdout).trim().slice(0, 400) || 'docker run failed'}`)
@@ -645,7 +1052,10 @@ export class DockerSandbox {
     // Other coworkers may create credential files between commands, and the owner may have
     // granted or withdrawn repository writes. A running container's bind mounts cannot change;
     // recreate it before executing against a different set of them.
-    if (this.started && this.signature((await this.plannedMasks()).masks) !== this.mountSignature) await this.stop()
+    if (this.started) {
+      const planned = await this.plannedMasks()
+      if (this.signature(planned.masks, planned.linuxDeps) !== this.mountSignature) await this.stop()
+    }
     await this.start()
     signal?.throwIfAborted()
     const started = Date.now()
@@ -665,6 +1075,18 @@ export class DockerSandbox {
     // container removal also prevents escaped/delayed children surviving a command timeout.
     if (truncated || timedOut) await this.stop()
     return { cancelled: signal?.aborted ?? false, exitCode: signal?.aborted ? -1 : truncated ? -1 : outcome.code ?? -1, stdout: outcome.stdout, stderr: outcome.stderr, truncated, timedOut, durationMs: Date.now() - started }
+  }
+
+  /** The task contract's acceptance command. In the sandbox whenever it can really run there: no
+   *  lockfile or no host node_modules (nothing native to break), or a prepared Linux tree.
+   *  Otherwise the bound Windows node_modules fails on its native binaries before a single test
+   *  runs, so it runs in an isolated host copy instead. The command is set by the task contract
+   *  (the frontier controller), never by the local model; see `runHostAcceptance`. */
+  async runAcceptance(command: string, timeoutSec: number, signal?: AbortSignal): Promise<SandboxResult & { where: 'sandbox' | 'host-copy' }> {
+    const windowsTree = existsSync(join(this.workspace, 'package-lock.json')) && existsSync(join(this.workspace, 'node_modules'))
+    if (!windowsTree || await this.linuxDepsReady()) return { ...(await this.exec(command, timeoutSec, signal)), where: 'sandbox' }
+    const host = this.deps.hostAcceptance ?? runHostAcceptance
+    return { ...(await host(this.workspace, command, timeoutSec, { signal })), where: 'host-copy' }
   }
 
   async stop(): Promise<void> {
