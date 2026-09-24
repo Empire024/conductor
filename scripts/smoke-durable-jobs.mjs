@@ -394,6 +394,12 @@ try {
   const gated = await call('jobs.create', {
     title: 'Smoke: approval required', model,
     objective: 'APPROVAL-CASE: install the left-pad package from the network with npm install left-pad --save.',
+    // Against the real model (no stub marker matching): a model with file-write tools can satisfy
+    // a check like "left-pad is in package.json" by writing the file directly, never attempting
+    // the disallowed command and never getting refused. Naming that shortcut in a constraint (the
+    // real model reliably honors it, same as the crossref fixture's write constraints) is what
+    // makes this case provable against a real model rather than only the scripted stub.
+    constraints: ['You must run npm install left-pad --save through the shell/run_command tool to install it; do not create or edit package.json or node_modules by hand to satisfy this'],
     stages: [{ title: 'Install', objective: 'APPROVAL-CASE: run npm install left-pad --save', completionCriteria: ['left-pad is in package.json'] }]
   })
   const blocked = await waitFor(gated.id, s => s.status === 'blocked', 'approval case blocked', STAGE_TIMEOUT)

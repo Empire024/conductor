@@ -236,6 +236,13 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
       if (verdict) { guards.get(stage.id)!.verdict = undefined; return { loop: true, detail: verdict.detail, kind: verdict.kind } }
       // Across attempts: the same failure three attempts running is a loop, as before.
       if (error && previousErrors.length >= 2 && previousErrors.slice(-2).every(previous => previous === error)) return { loop: true, detail: `The same failure repeated on three attempts: ${clip(error, 300)}` }
+      // A stage that keeps declining the same disallowed step in its own words (rather than
+      // calling the tool and being refused) never produces the same error text twice, so the
+      // exact-match check above never fires; three stages naming a permission refusal is close
+      // enough to call it the same block.
+      if (error && PERMISSION_REFUSAL.test(error) && previousErrors.filter(previous => PERMISSION_REFUSAL.test(previous)).length >= 2) {
+        return { loop: true, detail: `The same permission refusal repeated across stages: ${clip(error, 300)}`, kind: 'approval' }
+      }
       return { loop: false }
     }
   }

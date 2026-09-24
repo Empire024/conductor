@@ -79,6 +79,14 @@ describe('supervision ports', () => {
     expect(ports.loopGuard.assess({ job: job(), stage: stage(), stages: [stage()], observation: observed(''), error: 'x', previousErrors: [] })).toMatchObject({ loop: true, kind: 'approval' })
   })
 
+  it('treats three differently-worded permission refusals in a row as the same block', () => {
+    const ports = supervisionPorts({ store: store(), snapshot: () => projection([]), modelConfig: window.modelConfig, probeHealth: async () => ({ healthy: true }), serverPorts: async () => { throw new Error('unused') }, endpointOverride: () => null, gate: new LocalGenerationGate({ now: Date.now, sleep: tick, interactiveActive: async () => null }), watchdog: { tickMs: 5 } })
+    const previousErrors = ['I cannot run npm install: no network access in this sandbox.', 'The install is not permitted here; the host must run it with network access.']
+    expect(ports.loopGuard.assess({ job: job(), stage: stage(), stages: [stage()], observation: observed(''), error: 'This step requires the owner\'s approval to install left-pad.', previousErrors })).toMatchObject({ loop: true, kind: 'approval' })
+    // Two unrelated failures do not trip it.
+    expect(ports.loopGuard.assess({ job: job(), stage: stage(), stages: [stage()], observation: observed(''), error: 'This step requires the owner\'s approval to install left-pad.', previousErrors: ['a.ts has a syntax error', 'still a syntax error'] })).toMatchObject({ loop: false })
+  })
+
   it('replans once on a repeated identical call, then blocks the stage with evidence', async () => {
     const jobs = store()
     const service = new DurableJobsServiceImpl({ store: jobs, runtime: new FakeRuntime([{ kind: 'hang' }]), worktrees: new FakeWorktrees(), logRoot: mkdtempSync(join(tmpdir(), 'wiring-')), projectPath: () => 'C:/p', sleep: tick, pollMs: 0 })

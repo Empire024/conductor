@@ -392,6 +392,18 @@ export class DurableJobController {
           this.block(run, `The job planned ${allStages.length} stages for itself, the most it may without the owner`, decision.handoff.nextAction || 'Review the report so far and resume to allow more stages, or cancel.')
           return 'stop'
         }
+        // A stage that just declines a disallowed step in its own words (CONTINUE, no files
+        // touched) never fails an attempt, so it never reaches the loop guard below or the retry
+        // budget: each decline is a fresh implicit stage. Ask the guard here too, using the
+        // completed stage's own result as the "error" and its immediate predecessors as history.
+        if (observation.filesChanged.length === 0) {
+          const priorResults = allStages.filter(candidate => candidate.status === 'completed' && candidate.index < stage.index).slice(-2).map(candidate => candidate.result ?? '')
+          const stall = this.options.loopGuard.assess({ job: latest, stage: completed, stages: allStages, observation, error: completed.result ?? '', previousErrors: priorResults })
+          if (stall.loop) {
+            this.block(run, `Stage ${stage.index + 1} is not making progress: ${stall.detail}`, decision.handoff.nextAction || `Grant or perform the step yourself (the job never widens its own permissions), then resume the job.`, stall.kind === 'approval' ? 'approval' : 'loop-detected')
+            return 'stop'
+          }
+        }
         const index = Math.max(...allStages.map(candidate => candidate.index)) + 1
         this.store.addStage(job.id, guard, { id: makeId('jobstage'), jobId: job.id, index, title: decision.nextStage.title, objective: decision.nextStage.objective, completionCriteria: decision.nextStage.completionCriteria, inputs: decision.nextStage.inputs ?? [], status: 'pending', attempt: 0 })
         return 'continue'

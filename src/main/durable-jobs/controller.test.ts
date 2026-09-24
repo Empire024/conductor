@@ -101,6 +101,17 @@ describe('durable job controller', () => {
     expect(runtime.opened).toHaveLength(2)
   })
 
+  it('blocks instead of spawning implicit stages forever when the model keeps declining the same step without touching a file', async () => {
+    const decline = { kind: 'answer' as const, text: 'The sandbox refuses npm install: there is no network access.\nJOB STATUS: CONTINUE: ask the owner to install it' }
+    const { service, runtime } = setup([decline, decline, decline, decline])
+    const created = await service.create(input())
+    await until(() => service.status(created.id).status === 'blocked')
+    const job = service.get(created.id)
+    expect(job.stages).toHaveLength(3)
+    expect(job.statusReason).toContain('not making progress')
+    expect(runtime.opened).toHaveLength(3)
+  })
+
   it('blocks an open-ended job whose stage reports no status instead of guessing', async () => {
     const { service } = setup([{ kind: 'answer', text: 'I did some things.' }])
     const created = await service.create(input())
