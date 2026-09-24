@@ -149,7 +149,14 @@ let agentControlUi: AgentControlUi | undefined
 let browserMcp: BrowserMcpServer | undefined
 let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
-const localUpdateBuilder = new LocalUpdateBuilder()
+/** The catalog a local update build records for its compatibility report: the configured model
+ *  catalog models.list answers (runtime-discovered models need a caller's tabs). Read lazily,
+ *  because the agent manager exists only once the app is ready. */
+const configuredModelCatalog = (): unknown => agents?.listProviders().filter(provider => ['codex', 'claude', 'grok', 'local'].includes(provider.id)).map(provider => ({
+  provider: provider.id, available: provider.available, source: 'configured',
+  models: provider.models.filter(model => !['default', 'auto'].includes(model.id)).map(model => ({ ...model, effort: provider.efforts.map(effort => effort.id).filter(id => id !== 'auto') }))
+})) ?? []
+const localUpdateBuilder = new LocalUpdateBuilder({ modelsList: configuredModelCatalog })
 const delivery = new DeliveryService({ githubToken: () => gitHubCredential(homedir()) })
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
@@ -1472,6 +1479,9 @@ const registerIpc = (): void => {
   })
   ipcMain.handle('updates:get-state', (event) => { trustedStructured(event); return updates.getState() })
   ipcMain.handle('updates:check', (event) => { trustedStructured(event); return updates.check() })
+  ipcMain.handle('updates:versions', (event) => { trustedStructured(event); return updates.versions() })
+  ipcMain.handle('updates:pin-version', (event, version: string, pinned: boolean) => { trustedStructured(event); return updates.pinVersion(version, pinned) })
+  ipcMain.handle('updates:rollback', (event, version: string) => { trustedStructured(event); return updates.rollback(version) })
   ipcMain.handle('updates:download', (event) => { trustedStructured(event); return updates.download() })
   ipcMain.handle('updates:install', (event) => { trustedStructured(event); return updates.install() })
   // The owner answering a wizard's restart request when no update is waiting to install.
@@ -2270,7 +2280,12 @@ app.whenReady().then(async () => {
     quit: () => { isQuitting = true; app.quit() },
     createTray: () => electronTray(ensureTrayIconFile(app.getPath('userData')))
   })
-  delivery.onChanged(run => publish('delivery:changed', run))
+  // A failed delivery marks this build's restore point, once per run.
+  const failedShips = new Set<string>()
+  delivery.onChanged(run => {
+    publish('delivery:changed', run)
+    if (run.state === 'failed' && !failedShips.has(run.id)) { failedShips.add(run.id); updates?.recordFailedShip() }
+  })
   // Annotated because the browser bridge is built earlier and reaches back through this handle;
   // without it the two initializers form an inference cycle.
   const control: AgentControl = new AgentControl({ database, sessions: agents.structured, orchestration, collaboration, backlogs: projectBacklogs,
