@@ -12,6 +12,7 @@ import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import { createProviderAdapter } from './providers/factory'
+import type { RuntimeDetachment } from './providers/adapter'
 import { validateLiveTurn } from './live-test-policy'
 import { activeUsageCap, parseUsageLimitReset, usageCapKey } from './usage-limit'
 import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluateUsageCap, recordAccountLimits, summarizeContext, summarizeUsageRun, type AccountLimitRecord, type AccountLimitsReport, type UsageCapStatus } from '../shared/usage-accounting'
@@ -68,6 +69,17 @@ interface LiveSession {
   refusalFallback?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; model: string; notice: string }
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
+/** Settings key of the conversations whose provider processes the runtime host kept running
+ *  while this app restarted, by agent session id (docs/runtime-host.md). */
+export const DETACHED_RUNTIMES_KEY = 'runtimeHost:detached'
+export interface DetachedRuntimeRecord {
+  version: 1
+  runtimeId: string
+  provider: string
+  adapter: RuntimeDetachment
+  live: { turnId?: string; activityPhase?: AgentActivityPhase; backgroundTasks?: number; currentTurn?: LiveSession['currentTurn'] }
+  at: string
+}
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 /** Settings row holding the newest reported allowance per provider and bucket (`usageLimits`). */
 const ACCOUNT_LIMITS_KEY = 'usageLimits.latest'
@@ -1438,4 +1450,81 @@ export class StructuredSessions {
     return active.has(this.database.structured.snapshot(live.spec.id)!.phase) || (live.backgroundTasks ?? 0) > 0
   }
   dispose(): void { this.killWhere(() => true); this.database.structured.flush() }
+
+  /** Keeps every conversation whose turn is still running alive in the runtime host across an
+   *  app restart (docs/runtime-host.md): its adapter lets go of the provider process, and what it
+   *  needs to carry on is recorded for the next launch. It is dropped without being told it
+   *  disconnected, so its phase stays what it was. A conversation in the middle of a host-side
+   *  step (a submit, a steer, a view switch), an idle one, or one whose adapter cannot let go is
+   *  left for dispose() to stop exactly as before. */
+  async detachForRestart(): Promise<string[]> {
+    const kept: string[] = []
+    for (const [id, live] of [...this.live]) {
+      const adapter = live.adapter
+      if (!adapter?.detach || live.closed || live.submitting || live.handoff || live.starting || live.queueing || live.steering || live.interrupting || live.dispatchingQueue || live.nativeAcceptance?.size || !this.wasCutOff(live)) continue
+      let detachment: RuntimeDetachment | null = null
+      try { detachment = await adapter.detach() } catch (error) { console.warn(`Conversation ${id} could not keep its runtime running`, error) }
+      if (!detachment || this.live.get(id) !== live) continue
+      const record: DetachedRuntimeRecord = { version: 1, runtimeId: live.runtimeId, provider: live.spec.provider, adapter: detachment, live: { turnId: live.turnId, activityPhase: live.activityPhase, backgroundTasks: live.backgroundTasks, currentTurn: live.currentTurn }, at: new Date().toISOString() }
+      this.writeDetached({ ...this.readDetached(), [id]: record })
+      this.cancelContinuation(id)
+      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer)
+      live.adapter = undefined
+      this.live.delete(id); this.mcp?.release(id)
+      kept.push(id)
+    }
+    this.flush()
+    return kept
+  }
+
+  /** Conversations a previous app process left running in the runtime host. */
+  detachedRuntimes(): Array<{ id: string; record: DetachedRuntimeRecord }> {
+    return Object.entries(this.readDetached()).filter(([id]) => this.database.structured.spec<AgentSpec>(id)).map(([id, record]) => ({ id, record }))
+  }
+  private readDetached(): Record<string, DetachedRuntimeRecord> {
+    try { const value = JSON.parse(this.database.getSetting(DETACHED_RUNTIMES_KEY) ?? '{}') as unknown; return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, DetachedRuntimeRecord> : {} } catch { return {} }
+  }
+  private writeDetached(records: Record<string, DetachedRuntimeRecord>): void {
+    if (Object.keys(records).length) this.database.setSetting(DETACHED_RUNTIMES_KEY, JSON.stringify(records))
+    else this.database.removeSetting(DETACHED_RUNTIMES_KEY)
+  }
+  private takeDetached(id: string): DetachedRuntimeRecord | undefined {
+    const records = this.readDetached(), record = records[id]
+    if (record) { delete records[id]; this.writeDetached(records) }
+    return record
+  }
+
+  /** Continues a conversation whose provider process the runtime host kept running: the same
+   *  runtime identity, so its pending approvals and temporary permissions stay valid, and every
+   *  frame the host buffered while no app listened is handled in order, as if live. */
+  async reattach(id: string, lostFrames = 0): Promise<void> {
+    const record = this.takeDetached(id)
+    if (!record) throw new Error('No runtime was kept running for this conversation')
+    const live = this.get(id)
+    if (live.adapter || live.starting) throw new Error('This conversation already has a runtime')
+    if (record.provider !== live.spec.provider) throw new Error('The kept runtime belongs to another provider')
+    live.runtimeId = record.runtimeId; live.closed = false; live.responses.clear()
+    live.turnId = record.live.turnId; live.backgroundTasks = record.live.backgroundTasks; live.currentTurn = record.live.currentTurn
+    if (record.live.activityPhase) this.recordActivityPhase(live, record.live.activityPhase)
+    live.adapter = this.factory(live.spec.provider as StructuredProvider, { ...this.options(live, live.runtimeId), attach: record.adapter })
+    live.starting = live.adapter.start().catch(error => {
+      this.emit(live, { data: { type: 'error', message: error instanceof Error ? error.message : 'The kept runtime could not be reattached' } })
+      this.emit(live, { data: { type: 'session', phase: 'disconnected' } })
+      live.adapter?.dispose(); live.adapter = undefined
+      throw error
+    }).finally(() => { live.starting = undefined })
+    await live.starting
+    this.emit(live, { data: { type: 'notice', message: lostFrames
+      ? `Conductor restarted while this turn kept running. ${lostFrames} provider events from while it was closed exceeded the buffer and are missing here; the native conversation has them.`
+      : 'Conductor restarted while this turn kept running; it is reattached and continues here.' } })
+  }
+
+  /** A conversation whose kept runtime is gone: the turn it was running ended while no app was
+   *  there to see it. Its native conversation still resumes explicitly, as after any restart. */
+  abandonDetached(id: string, reason: string): void {
+    this.takeDetached(id)
+    const live = this.get(id), state = this.database.structured.snapshot(id)
+    if (state && active.has(state.phase)) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: reason } })
+    this.flush()
+  }
 }

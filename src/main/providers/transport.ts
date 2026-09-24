@@ -1,6 +1,13 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import type { Json } from '../../shared/structured-agent'
+import type { RuntimeHostClient } from '../runtime-host/client'
+import type { RuntimeMeta } from '../runtime-host/protocol'
+
+/** A running provider process held by the runtime host (docs/runtime-host.md): which one, and
+ *  the last frame of it this process handled. */
+export interface HostedRuntimeHandle { runtimeId: string; seq: number }
 
 export interface TransportOptions {
   executable: string
@@ -11,7 +18,15 @@ export interface TransportOptions {
   onStderr?(text: string): void
   onExit?(code: number | null, signal: NodeJS.Signals | null): void
   onError?(error: Error): void
+  /** Continue a process the runtime host kept running instead of spawning one. */
+  attach?: HostedRuntimeHandle
 }
+
+let runtimeHost: RuntimeHostClient | null = null
+/** Every transport started while a connected host is installed spawns through it and can be
+ *  detached; with none (the setting is off, the host is unavailable, tests) it spawns directly. */
+export function setRuntimeHost(client: RuntimeHostClient | null): void { runtimeHost = client }
+export function currentRuntimeHost(): RuntimeHostClient | null { return runtimeHost?.connected ? runtimeHost : null }
 
 /** Newline-framed JSON with incremental UTF-8 decoding, separate stderr, and hard limits. */
 export class JsonLineDecoder {
@@ -42,13 +57,28 @@ export class JsonLineDecoder {
   private fail(message: string): void { this.failed = true; this.pending = ''; this.error(new Error(message)) }
 }
 
+interface Hosted { client: RuntimeHostClient; runtimeId: string; seq: number; acked: number; ackTimer?: NodeJS.Timeout; closing: boolean; detached: boolean }
+
 export class JsonLineTransport {
   private child?: ChildProcessWithoutNullStreams
   private exited = false
-  get connected(): boolean { return Boolean(this.child && !this.exited && !this.child.killed && this.child.stdin.writable) }
+  private hosted?: Hosted
+  private exitWaiters: Array<() => void> = []
+  get connected(): boolean {
+    if (this.hosted) return !this.exited && !this.hosted.closing && !this.hosted.detached && this.hosted.client.connected
+    return Boolean(this.child && !this.exited && !this.child.killed && this.child.stdin.writable)
+  }
+  /** Whether this process lives in the runtime host, and so can outlive the app. */
+  get detachable(): boolean { return Boolean(this.hosted && this.connected) }
   constructor(private options: TransportOptions) {}
   start(): void {
-    if (this.child) throw new Error('Transport already started')
+    if (this.child || this.hosted) throw new Error('Transport already started')
+    const host = currentRuntimeHost()
+    if (this.options.attach) {
+      if (!host) throw new Error('The runtime host is not connected, so the running provider process cannot be reattached')
+      return this.startHosted(host, this.options.attach)
+    }
+    if (host) return this.startHosted(host)
     // .cmd/.bat need a shell and unsafe quoting; callers must resolve the native exe or JS entry point.
     if (/\.(cmd|bat)$/i.test(this.options.executable)) throw new Error('A native executable is required for structured agent transport')
     const child = spawn(this.options.executable, this.options.args, {
@@ -65,13 +95,84 @@ export class JsonLineTransport {
     child.on('error', (error) => { this.exited = true; this.options.onError?.(error) })
     child.on('close', (code, signal) => { this.exited = true; this.options.onExit?.(code, signal) })
   }
+  private startHosted(client: RuntimeHostClient, attach?: HostedRuntimeHandle): void {
+    // .cmd/.bat need a shell and unsafe quoting; callers must resolve the native exe or JS entry point.
+    if (!attach && /\.(cmd|bat)$/i.test(this.options.executable)) throw new Error('A native executable is required for structured agent transport')
+    const runtimeId = attach?.runtimeId ?? randomUUID()
+    const hosted: Hosted = this.hosted = { client, runtimeId, seq: attach?.seq ?? 0, acked: attach?.seq ?? 0, closing: false, detached: false }
+    const decoder = new JsonLineDecoder(this.options.onMessage, (error) => { this.options.onError?.(error); this.close() })
+    const listener = {
+      frame: (seq: number, stream: string, data: string): void => {
+        if (hosted.detached) return
+        // A replayed frame this process already handled is never handled twice.
+        if (seq) { if (seq <= hosted.seq) return; hosted.seq = seq }
+        if (stream === 'stdout') decoder.push(data + '\n')
+        else if (stream === 'stderr') this.options.onStderr?.(data.slice(-32_768))
+        else this.options.onError?.(new Error(data))
+        this.scheduleAck()
+      },
+      exit: (seq: number, code: number | null, signal: string | null): void => {
+        if (hosted.detached || this.exited) return
+        if (seq > hosted.seq) hosted.seq = seq
+        this.exited = true
+        if (hosted.ackTimer) clearTimeout(hosted.ackTimer)
+        if (seq) client.ack(runtimeId, seq)
+        this.options.onExit?.(code, signal as NodeJS.Signals | null)
+        for (const waiter of this.exitWaiters.splice(0)) waiter()
+      }
+    }
+    const failed = (error: unknown): void => {
+      if (hosted.detached || this.exited) return
+      listener.frame(0, 'error', error instanceof Error ? error.message : String(error))
+      listener.exit(0, null, null)
+    }
+    if (attach) { client.attach(runtimeId, attach.seq, listener).catch(failed); return }
+    const env = Object.fromEntries(Object.entries(this.options.environment ?? process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+    client.spawn({ runtimeId, executable: this.options.executable, args: this.options.args, cwd: this.options.cwd, env }, listener).catch(failed)
+  }
+  private scheduleAck(): void {
+    const hosted = this.hosted
+    if (!hosted || hosted.ackTimer || hosted.detached) return
+    hosted.ackTimer = setTimeout(() => {
+      hosted.ackTimer = undefined
+      if (!hosted.detached && hosted.seq > hosted.acked) { hosted.acked = hosted.seq; hosted.client.ack(hosted.runtimeId, hosted.seq) }
+    }, 500)
+    hosted.ackTimer.unref?.()
+  }
+  /** Lets go of a hosted process without ending it, so a later app can continue it. Nothing
+   *  reaches this transport's callbacks afterwards. Null when there is nothing to keep. */
+  async detach(meta?: RuntimeMeta): Promise<HostedRuntimeHandle | null> {
+    const hosted = this.hosted
+    if (!hosted || !this.detachable) return null
+    hosted.detached = true
+    if (hosted.ackTimer) clearTimeout(hosted.ackTimer)
+    const handle = { runtimeId: hosted.runtimeId, seq: hosted.seq }
+    await hosted.client.detach(hosted.runtimeId, hosted.seq, meta)
+    return handle
+  }
   send(message: Json): void {
+    if (this.hosted) {
+      if (!this.connected) throw new Error('Provider transport disconnected')
+      const line = JSON.stringify(message)
+      if (Buffer.byteLength(line) > 8 * 1024 * 1024) throw new Error('Provider input queue exceeded limit')
+      this.hosted.client.send(this.hosted.runtimeId, line)
+      return
+    }
     if (!this.connected || !this.child) throw new Error('Provider transport disconnected')
     const line = JSON.stringify(message) + '\n'
     if (Buffer.byteLength(line) > 8 * 1024 * 1024 || this.child.stdin.writableLength > 8 * 1024 * 1024) throw new Error('Provider input queue exceeded limit')
     this.child.stdin.write(line)
   }
   async closeAndWait(): Promise<void> {
+    if (this.hosted) {
+      if (this.exited || this.hosted.detached) return
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('The previous provider process has not exited. Try switching again.')), 5000)
+        this.exitWaiters.push(() => { clearTimeout(timer); resolve() })
+        this.close()
+      })
+      return
+    }
     const child = this.child
     if (!child || this.exited) return
     await new Promise<void>((resolve, reject) => {
@@ -82,6 +183,12 @@ export class JsonLineTransport {
     })
   }
   close(): void {
+    if (this.hosted) {
+      if (this.exited || this.hosted.closing || this.hosted.detached) return
+      this.hosted.closing = true
+      this.hosted.client.close(this.hosted.runtimeId)
+      return
+    }
     const child = this.child
     if (!child || this.exited || child.killed) return
     child.stdin.end()

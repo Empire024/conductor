@@ -1,4 +1,9 @@
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings, StructuredProvider } from '../../shared/structured-agent'
+import type { HostedRuntimeHandle } from './transport'
+
+/** What an adapter hands the next app process so it can continue a provider process the
+ *  runtime host kept running (docs/runtime-host.md): its own protocol state and the process. */
+export interface RuntimeDetachment { state: Json; transport: HostedRuntimeHandle }
 
 export interface AdapterOptions {
   executable: string
@@ -27,6 +32,9 @@ export interface AdapterOptions {
   authorizeTool?(name: string, input: Json): Promise<string | undefined>
   /** Trusted, registered-session broker for the Local runtime only. Never a bearer token. */
   localControl?(method: string, args: Record<string, unknown>): Promise<unknown>
+  /** Continue this provider process instead of starting one: start() restores the state and
+   *  attaches, with no spawn and no handshake. */
+  attach?: RuntimeDetachment
 }
 export interface ProviderAdapter {
   readonly provider: StructuredProvider
@@ -55,6 +63,11 @@ export interface ProviderAdapter {
    *  files changed. Null when the runtime does not keep one. */
   runStatus?(): Json | null
   stop?(): Promise<void>
+  /** Let go of the provider process without ending it, so the next app process can continue it
+   *  (docs/runtime-host.md). Null when the process is not held by the runtime host or a host
+   *  call will not settle; the caller then stops the runtime as before. Afterwards the adapter
+   *  is inert and must not be disposed of or used. */
+  detach?(): Promise<RuntimeDetachment | null>
   history?(): Promise<import('../native-history').NativeHistoryItem[]>
   dispose(): void
 }

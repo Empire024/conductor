@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
-import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
-import { JsonLineTransport, type TransportOptions } from './transport'
+import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, type RuntimeDetachment } from './adapter'
+import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
+import { JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { PROVIDER_SAFEGUARD_REFUSAL } from '../../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import type { ClientRequest } from './generated/codex/ClientRequest'
@@ -32,7 +33,9 @@ import { canonicalAction } from '../approval-review'
 
 export const CODEX_PROTOCOL_BASELINE = '0.155.1'
 const safeguardRefusal = (message: string): boolean => /(?:safeguards? flagged this message|safety (?:policy|classifier).*(?:blocked|refused)|request (?:was )?refused by.*safety)/i.test(message)
-type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait'>>
+type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait' | 'detach' | 'detachable'>>
+/** Adapter fields that hold promises, timers or callbacks, and never travel in a detachment. */
+const CODEX_TRANSIENT = ['rpc', 'starting', 'mcpStartupWaiters'] as const
 /** Injectable only in backend contract tests; no renderer can supply a transport. */
 export interface CodexAdapterDependencies {
   transport?: (options: TransportOptions) => WireTransport
@@ -316,7 +319,49 @@ export class CodexAdapter implements ProviderAdapter {
 
   start(): Promise<void> {
     if (this.disposed) return Promise.reject(new Error('Codex adapter has been disposed'))
-    return this.starting ??= this.initialize()
+    return this.starting ??= this.options.attach ? this.attachRunning(this.options.attach) : this.initialize()
+  }
+
+  private createTransport(attach?: HostedRuntimeHandle): WireTransport {
+    const factory = this.dependencies.transport ?? (options => new JsonLineTransport(options))
+    return factory({
+      executable: this.options.executable, args: codexLaunchArguments(this.options.environment ?? process.env),
+      cwd: this.options.cwd, environment: this.options.environment, ...(attach ? { attach } : {}),
+      onMessage: message => this.receive(message),
+      onStderr: output => this.emit({ data: { type: 'notice', message: 'Codex process diagnostic (stderr)', payload: output }, native: { method: 'process/stderr' } }),
+      onError: error => this.disconnect(error.message),
+      onExit: (code, signal) => this.disconnect(`Codex App Server exited (${signal ?? code ?? 'unknown'}). Any unfinished execution is uncertain.`)
+    })
+  }
+
+  /** Lets the runtime host keep this App Server running for the next app process (docs/runtime-host.md). */
+  async detach(): Promise<RuntimeDetachment | null> {
+    const transport = this.transport
+    if (this.disposed || this.failed || !this.threadId || !transport?.detachable || !transport.detach) return null
+    if (!await settled(() => this.rpc.size === 0 && !this.dispatching) || this.disposed || this.failed || !transport.detachable) return null
+    // Detaching stops delivery synchronously, so the state below is exactly what the next process
+    // continues from: the first frame it handles is the first one this process did not.
+    const handle = transport.detach()
+    const state = captureAdapterState(this, CODEX_TRANSIENT)
+    this.disposed = true
+    const detached = await handle
+    return detached ? { state, transport: detached } : null
+  }
+
+  private async attachRunning(detachment: RuntimeDetachment): Promise<void> {
+    restoreAdapterState(this, detachment.state)
+    this.disposed = false
+    this.transport = this.createTransport(detachment.transport)
+    this.transport.start()
+    // The store closed this conversation's open work when it loaded (an app that stopped is
+    // assumed to have ended its turn), so the adapter restates what is still live.
+    for (const [key, item] of this.items) {
+      if (item.status !== 'preparing' && item.status !== 'running' && item.status !== 'awaiting_approval') continue
+      const [nativeSessionId, turnId, itemId] = JSON.parse(key) as [string | undefined, string | undefined, string | undefined]
+      if (itemId) this.emit({ nativeSessionId: nativeSessionId ?? undefined, turnId: turnId ?? undefined, itemId, data: { type: 'tool', name: item.name, status: item.status } })
+    }
+    for (const pending of this.pending.values()) this.emitInteraction(pending.request, pending.interaction)
+    this.emitPhase(true)
   }
 
   private async initialize(): Promise<void> {
@@ -331,15 +376,7 @@ export class CodexAdapter implements ProviderAdapter {
       if (this.capabilities.runtimeVersion !== CODEX_PROTOCOL_BASELINE) this.capabilities.limitations.push(`Runtime ${this.capabilities.runtimeVersion} is not fixture-verified; baseline is ${CODEX_PROTOCOL_BASELINE}. Experimental features are disabled.`)
       this.experimental = (this.options.environment ?? process.env).CONDUCTOR_CODEX_EXPERIMENTAL === '1' && this.capabilities.runtimeVersion === CODEX_PROTOCOL_BASELINE
       this.capabilities.plans = this.experimental
-      const factory = this.dependencies.transport ?? (options => new JsonLineTransport(options))
-      this.transport = factory({
-        executable: this.options.executable, args: codexLaunchArguments(this.options.environment ?? process.env),
-        cwd: this.options.cwd, environment: this.options.environment,
-        onMessage: message => this.receive(message),
-        onStderr: output => this.emit({ data: { type: 'notice', message: 'Codex process diagnostic (stderr)', payload: output }, native: { method: 'process/stderr' } }),
-        onError: error => this.disconnect(error.message),
-        onExit: (code, signal) => this.disconnect(`Codex App Server exited (${signal ?? code ?? 'unknown'}). Any unfinished execution is uncertain.`)
-      })
+      this.transport = this.createTransport()
       this.transport.start()
       // No initialized notification, metadata request, or thread request may precede this response.
       const initialized = await this.request<InitializeResponse>('initialize', {

@@ -3,10 +3,12 @@ import { execFile } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
 import { workspacePath } from '../agent-artifacts'
-import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
-import { JsonLineTransport, type TransportOptions } from './transport'
+import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, type RuntimeDetachment } from './adapter'
+import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
+import { JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, parseAutoModeDenialReason } from '../../shared/auto-mode-denial'
+import { modelEfforts } from '../../shared/model-effort'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -49,7 +51,9 @@ export function claudeTaskKind(taskType: string | undefined): ClaudeTaskKind {
   if (taskType === 'local_bash') return 'shell'
   return 'other'
 }
-interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean }
+interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean; readonly detachable?: boolean; detach?(): Promise<HostedRuntimeHandle | null> }
+/** Adapter fields that hold promises, timers or callbacks, and never travel in a detachment. */
+const CLAUDE_TRANSIENT = ['controls', 'receiving'] as const
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; detached?: boolean; captured?: boolean }
 interface Block { id: string; kind: string; input: string; text: string }
@@ -111,6 +115,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private contextTokens?: number
   private contextWindow?: number
   private maxOutputTokens?: number
+  /** Provider frames whose asynchronous handling (a host hook, an approval guard) is running. */
+  private receiving = 0
 
   constructor(private options: AdapterOptions, private dependencies: Dependencies = {}) {
     if (options.approvalReviewer || options.reviewApprovals) this.providerCapabilities.approvalRouting = options.approvalReviewer ? 'isolated-reviewer' : 'stronger-review'
@@ -150,6 +156,7 @@ export class ClaudeAdapter implements ProviderAdapter {
 
   async start(): Promise<void> {
     if (this.transport || this.disposed) throw new Error('Claude runtime already started or disposed')
+    if (this.options.attach) return this.attachRunning(this.options.attach)
     this.validateSettings(this.settings)
     const version = await (this.dependencies.version ?? readVersion)(this.options.executable)
     this.capabilities.runtimeVersion = version
@@ -176,13 +183,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // No --bare, --system-prompt, --setting-sources, or environment auth mutation:
     // CLI defaults retain the coding-agent prompt, user/project/local configuration and policy.
-    this.transport = (this.dependencies.createTransport ?? ((options) => new JsonLineTransport(options)))({
-      executable: this.options.executable, args, cwd: this.options.cwd, environment: this.options.environment,
-      onMessage: (message) => { void this.receive(message).catch((error: unknown) => this.fail(error)) },
-      onStderr: (text) => this.emit({ data: { type: 'notice', message: 'Claude process diagnostic', payload: { stderr: text } }, native: { method: 'stderr' } }),
-      onError: (error) => this.fail(error),
-      onExit: (code, signal) => this.disconnected(`Claude runtime exited${code === null ? '' : ` (${code})`}${signal ? `: ${signal}` : ''}`)
-    })
+    this.transport = this.createTransport(args)
     this.emit({ data: { type: 'session', phase: 'starting', capabilities: this.capabilities } })
     this.transport.start()
     try {
@@ -210,11 +211,50 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
   }
 
+  private createTransport(args: string[], attach?: HostedRuntimeHandle): Transport {
+    return (this.dependencies.createTransport ?? ((options) => new JsonLineTransport(options)))({
+      executable: this.options.executable, args, cwd: this.options.cwd, environment: this.options.environment, ...(attach ? { attach } : {}),
+      onMessage: (message) => { this.receiving++; void this.receive(message).catch((error: unknown) => this.fail(error)).finally(() => { this.receiving-- }) },
+      onStderr: (text) => this.emit({ data: { type: 'notice', message: 'Claude process diagnostic', payload: { stderr: text } }, native: { method: 'stderr' } }),
+      onError: (error) => this.fail(error),
+      onExit: (code, signal) => this.disconnected(`Claude runtime exited${code === null ? '' : ` (${code})`}${signal ? `: ${signal}` : ''}`)
+    })
+  }
+
+  /** Lets the runtime host keep this CLI running for the next app process (docs/runtime-host.md). */
+  async detach(): Promise<RuntimeDetachment | null> {
+    const transport = this.transport
+    if (this.disposed || !this.ready || !transport?.detachable || !transport.detach) return null
+    if (!await settled(() => this.controls.size === 0 && this.receiving === 0) || this.disposed || !transport.detachable) return null
+    // Detaching stops delivery synchronously, so the state below is exactly what the next process
+    // continues from: the first frame it handles is the first one this process did not.
+    const handle = transport.detach()
+    const state = captureAdapterState(this, CLAUDE_TRANSIENT)
+    this.disposed = true
+    const detached = await handle
+    return detached ? { state, transport: detached } : null
+  }
+
+  private attachRunning(detachment: RuntimeDetachment): void {
+    restoreAdapterState(this, detachment.state)
+    this.disposed = false
+    this.transport = this.createTransport([], detachment.transport)
+    this.transport.start()
+    // The store closed this conversation's open work when it loaded (an app that stopped is
+    // assumed to have ended its turn), so the adapter restates what is still live.
+    for (const [id, tool] of this.tools) if (tool.status === 'preparing' || tool.status === 'running' || tool.status === 'awaiting_approval') this.updateTool(id, {})
+    for (const [id, request] of this.requests) this.emit({ requestId: id, itemId: request.toolId, data: { type: 'interaction', interaction: request.interaction } })
+    this.emit({ data: { type: 'session', phase: this.phase, nativeSessionId: this.nativeSessionId } })
+  }
+
   async submit(text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
     if (!this.ready || !this.transport?.connected || this.disposed) throw new Error('Claude runtime is disconnected')
     if (this.active || this.requests.size) throw new Error('Claude is already processing a turn')
     settings = settingsForRuntime(settings, this.options.runtimeId)
     this.validateSettings(settings)
+    // A model the native catalog lists with no effort levels (Haiku) gets none: an effort carried
+    // over from another model is neither sent nor reported as effective.
+    if (settings.effort && modelEfforts(this.capabilities, settings.model)?.length === 0) settings = { ...settings, effort: undefined }
     const messageId = randomUUID()
     const message = await this.userMessage(text, attachments, messageId)
     try {

@@ -3,8 +3,9 @@ import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { createTwoFilesPatch } from 'diff'
-import type { AdapterOptions, ProviderAdapter } from './adapter'
-import { JsonLineTransport, type TransportOptions } from './transport'
+import type { AdapterOptions, ProviderAdapter, RuntimeDetachment } from './adapter'
+import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
+import { JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { ownerOnlyEscalation } from './codex'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
@@ -14,7 +15,9 @@ import { canonicalAction } from '../approval-review'
 export const GROK_BASELINE = '1.0.41'
 /** ACP protocol version Grok answered `initialize` with on the baseline. */
 const ACP_PROTOCOL_VERSION = 1
-type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait'>>
+type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait' | 'detach' | 'detachable'>>
+/** Adapter fields that hold promises, timers or callbacks, and never travel in a detachment. */
+const GROK_TRANSIENT = ['rpc', 'starting'] as const
 /** Injectable only in backend contract tests; no renderer can supply a transport. */
 export interface GrokAdapterDependencies {
   transport?: (options: TransportOptions) => WireTransport
@@ -219,7 +222,46 @@ export class GrokAdapter implements ProviderAdapter {
 
   start(): Promise<void> {
     if (this.disposed) return Promise.reject(new Error('Grok adapter has been disposed'))
-    return this.starting ??= this.initialize()
+    return this.starting ??= this.options.attach ? this.attachRunning(this.options.attach) : this.initialize()
+  }
+
+  private createTransport(environment: NodeJS.ProcessEnv, attach?: HostedRuntimeHandle): WireTransport {
+    const factory = this.dependencies.transport ?? (options => new JsonLineTransport(options))
+    return factory({
+      executable: this.options.executable, args: grokLaunchArguments(), cwd: this.options.cwd, environment, ...(attach ? { attach } : {}),
+      onMessage: message => this.receive(message),
+      onStderr: output => this.emit({ data: { type: 'notice', message: 'Grok process diagnostic (stderr)', payload: output }, native: { method: 'process/stderr' } }),
+      onError: error => this.disconnect(error.message),
+      onExit: (code, signal) => this.disconnect(`Grok exited (${signal ?? code ?? 'unknown'}). Any unfinished execution is uncertain.`)
+    })
+  }
+
+  /** Lets the runtime host keep this Grok process running for the next app process (docs/runtime-host.md). */
+  async detach(): Promise<RuntimeDetachment | null> {
+    const transport = this.transport
+    if (this.disposed || this.failed || !this.sessionId || !transport?.detachable || !transport.detach) return null
+    if (!await settled(() => this.rpc.size === 0 && !this.dispatching && !this.replaying) || this.disposed || this.failed || !transport.detachable) return null
+    // Detaching stops delivery synchronously, so the state below is exactly what the next process
+    // continues from: the first frame it handles is the first one this process did not.
+    const handle = transport.detach()
+    const state = captureAdapterState(this, GROK_TRANSIENT)
+    this.disposed = true
+    const detached = await handle
+    return detached ? { state, transport: detached } : null
+  }
+
+  private async attachRunning(detachment: RuntimeDetachment): Promise<void> {
+    restoreAdapterState(this, detachment.state)
+    this.disposed = false
+    this.transport = this.createTransport({ ...(this.options.environment ?? process.env), GROK_DISABLE_AUTOUPDATER: '1' }, detachment.transport)
+    this.transport.start()
+    // The store closed this conversation's open work when it loaded (an app that stopped is
+    // assumed to have ended its turn), so the adapter restates what is still live.
+    for (const [itemId, tool] of this.tools) {
+      if (tool.status === 'preparing' || tool.status === 'running' || tool.status === 'awaiting_approval') this.emit({ itemId, data: { type: 'tool', name: tool.name, status: tool.status, ...(tool.input !== undefined ? { input: tool.input } : {}) } })
+    }
+    for (const pending of this.pending.values()) this.emitInteraction(pending, pending.interaction)
+    this.emitPhase(true)
   }
 
   private async initialize(): Promise<void> {
@@ -233,14 +275,7 @@ export class GrokAdapter implements ProviderAdapter {
       this.capabilities.runtimeVersion = /(\d+\.\d+\.\d+)/.exec(version)?.[1] ?? version
       if (!/^1\./.test(this.capabilities.runtimeVersion)) throw new Error(`Grok ${this.capabilities.runtimeVersion} is outside the tested 1.x ACP baseline; verify the adapter before connecting`)
       if (this.capabilities.runtimeVersion !== GROK_BASELINE) this.capabilities.limitations.push(`Runtime ${this.capabilities.runtimeVersion} is not fixture-verified; baseline is ${GROK_BASELINE}.`)
-      const factory = this.dependencies.transport ?? (options => new JsonLineTransport(options))
-      this.transport = factory({
-        executable: this.options.executable, args: grokLaunchArguments(), cwd: this.options.cwd, environment,
-        onMessage: message => this.receive(message),
-        onStderr: output => this.emit({ data: { type: 'notice', message: 'Grok process diagnostic (stderr)', payload: output }, native: { method: 'process/stderr' } }),
-        onError: error => this.disconnect(error.message),
-        onExit: (code, signal) => this.disconnect(`Grok exited (${signal ?? code ?? 'unknown'}). Any unfinished execution is uncertain.`)
-      })
+      this.transport = this.createTransport(environment)
       this.transport.start()
       const initialized = await this.request('initialize', {
         protocolVersion: ACP_PROTOCOL_VERSION,

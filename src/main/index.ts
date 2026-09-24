@@ -1,5 +1,8 @@
 import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, wizardTabsToResume, type RestartInitiator, type RestartRequest } from './restart-initiator'
-import { StopConfirmations } from './stop-confirmation'
+import { StopConfirmations, type StopDecision } from './stop-confirmation'
+import { connectRuntimeHost } from './runtime-host/launcher'
+import type { RuntimeHostClient } from './runtime-host/client'
+import { setRuntimeHost } from './providers/transport'
 import { ConversationHistory, registerConversationHistoryIpc } from './conversation-history'
 import { guardLayoutSave } from './layout-save-guard'
 import { WeeklyUsageSummaryService } from './weekly-usage-summary'
@@ -196,6 +199,8 @@ let debugSourceWindow: BrowserWindow | null = null
 let latestDebugSnapshot: DebugConsoleSnapshot | null = null
 let lastDebugScreenshot: Electron.NativeImage | null = null
 let isQuitting = false
+/** The runtime host that keeps provider processes alive across a restart (docs/runtime-host.md). */
+let runtimeHostClient: RuntimeHostClient | null = null
 /** Keeps a hosting machine alive with no window, and asks before a quit would cut its peers off. */
 let hostLifecycle: HostLifecycleController | null = null
 let servicesDisposed = false
@@ -610,6 +615,8 @@ const resumeWizardTabs = async (initiator: RestartInitiator): Promise<void> => {
       if (tab.kind !== 'agent' || !tab.resourceId) continue
       const state = database.structured.snapshot(tab.resourceId), spec = database.structured.spec<AgentSpec>(tab.resourceId)
       if (!state || !spec || spec.provider === 'local' || !state.nativeSessionId || !wizardActive(state.settings, spec.provider)) continue
+      // Its turn was kept running through the restart and has been told so on reattach.
+      if (reattachedRuntimes.has(tab.resourceId)) continue
       try {
         await agents.structured.resume(tab.resourceId, state.settings)
         await agents.structured.submit(tab.resourceId, `[Conductor] ${initiator.method === 'app.restart.request' ? 'The owner restarted Conductor as you requested' : 'Conductor restarted itself'} (now ${app.getVersion()}) and brought this wizard tab back. Continue your work from where you left off; check app.state and agents.list first, since your coworkers may need resuming too.`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
@@ -648,6 +655,87 @@ const stopRunningLocalServer = (request: LocalStopRequest): ReturnType<typeof st
   })
 }
 
+/** Whether provider processes are kept by the runtime host. The owner's setting `runtimeHost`
+ *  ('on' / 'off') decides; an automation profile (CONDUCTOR_TEST_USER_DATA) leaves it off unless
+ *  CONDUCTOR_RUNTIME_HOST=1 asks for it, so smokes never leave a host behind. */
+const runtimeHostEnabled = (): boolean => {
+  if (process.env.CONDUCTOR_RUNTIME_HOST === '0') return false
+  if (process.env.CONDUCTOR_RUNTIME_HOST === '1') return true
+  const setting = database.getSetting('runtimeHost')
+  if (setting === 'on' || setting === 'off') return setting === 'on'
+  return !process.env.CONDUCTOR_TEST_USER_DATA
+}
+const runtimeHostLaunch = (start: boolean): Parameters<typeof connectRuntimeHost>[0] => ({
+  userData: app.getPath('userData'), hostScript: join(__dirname, 'runtime-host.js'), packaged: app.isPackaged, start,
+  log: message => console.log(`[runtime host] ${message}`)
+})
+const installRuntimeHost = (client: RuntimeHostClient): void => {
+  runtimeHostClient = client
+  setRuntimeHost(client)
+  client.onLost(() => {
+    if (runtimeHostClient !== client) return
+    runtimeHostClient = null
+    setRuntimeHost(null)
+    console.warn('The runtime host connection was lost; new runtimes start inside Conductor until the next launch')
+  })
+}
+/** Conversations this launch reattached to a turn the previous process kept running. */
+const reattachedRuntimes = new Set<string>()
+/** Rebinds every conversation whose turn the previous process kept running in the host, before
+ *  any window asks for it; a record whose runtime is gone becomes an ordinary disconnect. */
+const reattachKeptRuntimes = async (): Promise<void> => {
+  const kept = agents.structured.detachedRuntimes()
+  if (!kept.length) return
+  let client: RuntimeHostClient | null = null
+  try { client = await connectRuntimeHost(runtimeHostLaunch(false)) } catch (error) { console.warn('The runtime host holding kept turns is unreachable', error) }
+  if (client) installRuntimeHost(client)
+  const listed = client ? await client.list().catch(() => []) : []
+  for (const { id, record } of kept) {
+    const runtime = listed.find(entry => entry.runtimeId === record.adapter.transport.runtimeId)
+    if (!client || !runtime) {
+      agents.structured.abandonDetached(id, 'The turn this conversation was running when Conductor closed ended while it was closed. Its native conversation resumes as usual.')
+      continue
+    }
+    try {
+      await agents.structured.reattach(id, runtime.lostFrames)
+      reattachedRuntimes.add(id)
+      console.log(`Conversation ${id} reattached to its kept runtime`)
+    } catch (error) { console.warn(`Conversation ${id} could not be reattached to its kept runtime`, error) }
+  }
+}
+/** A reattached turn still holds the previous process's app-control endpoint and credential, so it
+ *  is told where app control lives now. */
+const briefReattachedRuntimes = (): void => {
+  for (const id of reattachedRuntimes) {
+    const spec = database.structured.spec<AgentSpec>(id), state = database.structured.snapshot(id)
+    if (!spec || !state || !agentControlServer || !['running', 'waiting_approval', 'waiting_input'].includes(state.phase)) continue
+    void agents.structured.steer(id, `[Conductor] Conductor restarted (now ${app.getVersion()}) while this turn kept running. App control moved to a new endpoint and credential; use these from now on.\n\n${agentControlServer.briefing(spec)}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+      .catch(error => console.warn(`Reattached conversation ${id} could not be briefed`, error))
+  }
+}
+/** Starts (or joins) the runtime host for runtimes started from now on. */
+const startRuntimeHost = async (): Promise<void> => {
+  if (!runtimeHostEnabled() || runtimeHostClient?.connected) return
+  try {
+    const client = await connectRuntimeHost(runtimeHostLaunch(true))
+    if (!client) return
+    installRuntimeHost(client)
+    // A host runtime no conversation of this app owns was left by a process that could not save
+    // how to continue it (a crash); nobody can, so it stops.
+    const owned = new Set([...reattachedRuntimes].map(id => database.structured.snapshot(id)?.runtimeId))
+    for (const runtime of await client.list()) if (!runtime.attached && !owned.has(runtime.runtimeId)) client.close(runtime.runtimeId)
+  } catch (error) { console.warn('The runtime host could not start; runtimes stay inside Conductor', error) }
+}
+/** Hands every running turn to the runtime host for the next launch to continue. */
+const keepRunningInBackground = async (): Promise<void> => {
+  if (!runtimeHostClient?.connected) return
+  try {
+    const kept = await agents.structured.detachForRestart()
+    await runtimeHostClient.flush()
+    if (kept.length) console.log(`Kept ${kept.length} running turn(s) in the runtime host`)
+  } catch (error) { console.warn('Running turns could not all be kept in the background', error) }
+}
+
 /** Restart Conductor the way app.restart does; a downloaded update installs on the way out. */
 const relaunchConductor = async (force: boolean, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> => {
   // A downloaded update installs and relaunches by itself; relaunching as well would start
@@ -672,9 +760,13 @@ const takeLaunchInitiator = (): RestartInitiator | null => {
 const prepareForUpdateInstall = async (force = false, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> => {
   if (force) {
     try { await flushEditorWindows(editorWindows()) } catch (error) { console.warn('Editor drafts could not all be flushed before a forced restart', error) }
+    // A wizard's or the owner credential's restart keeps running turns alive without asking.
+    await keepRunningInBackground()
   } else {
-    if (!await confirmApplicationStop(mainWindow, 'restart')) throw Object.assign(new Error('Update restart cancelled. Running work is unchanged.'), { code: 'UPDATE_CANCELLED' })
+    const decision = await confirmApplicationStop(mainWindow, 'restart')
+    if (decision === 'cancel') throw Object.assign(new Error('Update restart cancelled. Running work is unchanged.'), { code: 'UPDATE_CANCELLED' })
     if (!await resolveUnsavedEditors(mainWindow)) throw Object.assign(new Error('Update restart cancelled. Your edits are still open.'), { code: 'UPDATE_CANCELLED' })
+    if (decision === 'background') await keepRunningInBackground()
   }
   database.setSetting(UPDATE_WINDOW_LAYOUT_KEY, JSON.stringify(captureWindowLayout()))
   database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'true')
@@ -818,16 +910,24 @@ const runningWork = (): ReturnType<ConductorDatabase['listProcesses']> => databa
   hasRunningWork(process, process.kind === 'agent' ? database.structured.snapshot(process.id) : null, process.kind === 'agent' ? agents.structured.hasRuntime(process.id) : undefined)
 )
 
-const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit' | 'restart'): Promise<boolean> => {
+const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit' | 'restart'): Promise<StopDecision> => {
   const active = runningWork()
-  if (!active.length && !agents.nativeCli.hasSubmittedInput()) return true
+  if (!active.length && !agents.nativeCli.hasSubmittedInput()) return 'stop'
   const running = active.slice(0, 8).map(process => ({ id: process.id, title: process.title }))
-  return closeConfirmation.request(() => stopConfirmations.ask({ action, running }, async signal => (await showDecision(liveWindow(owner), {
+  // Conversation turns can outlive the app in the runtime host (docs/runtime-host.md); terminal
+  // CLI tabs cannot, so they are named apart.
+  const background = Boolean(runtimeHostClient?.connected) && active.some(process => process.kind === 'agent')
+  const choices: StopDecision[] = background ? ['background', 'stop', 'cancel'] : ['stop', 'cancel']
+  const verb = action === 'restart' ? 'restart' : 'quit'
+  return closeConfirmation.decide(() => stopConfirmations.ask({ action, running, choices }, async signal => choices[await showDecision(liveWindow(owner), {
     type: 'warning', title: action === 'restart' ? 'Restart Conductor?' : 'Quit Conductor?',
     message: 'Work is still running in Conductor.',
-    detail: `${running.length ? running.map(process => process.title).join('\n') : 'A native CLI command is still running.'}\n\nStopping the application interrupts work in every project and window.`,
-    buttons: [action === 'restart' ? 'Stop work and restart' : 'Stop work and quit', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true, signal
-  })) === 0))
+    detail: `${running.length ? running.map(process => process.title).join('\n') : 'A native CLI command is still running.'}\n\n${background
+      ? 'Keep running in background: the running turns carry on while Conductor is closed and reappear in their tabs when it starts again. Terminal CLI tabs still stop.\nStop all: interrupts work in every project and window.'
+      : 'Stopping the application interrupts work in every project and window.'}`,
+    buttons: background ? [`Keep running in background and ${verb}`, `Stop all and ${verb}`, 'Cancel'] : [`Stop work and ${verb}`, 'Cancel'],
+    defaultId: background ? 0 : 1, cancelId: choices.length - 1, noLink: true, signal
+  })] ?? 'cancel'))
 }
 
 const broadcastSessionArchive = (result: SessionArchiveResult): void => {
@@ -2440,6 +2540,10 @@ app.whenReady().then(async () => {
   disposeOrchestrationIpc = registerOrchestrationIpc(orchestration)
   scheduleRunner.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
+  // Turns the previous process kept running are rebound before any window asks for their tabs.
+  try { await reattachKeptRuntimes() } catch (error) { console.error('Kept runtimes could not be reattached', error) }
+  briefReattachedRuntimes()
+  void startRuntimeHost()
   const initiator = takeLaunchInitiator()
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
@@ -2471,8 +2575,10 @@ app.on('before-quit', (event) => {
   if (quitRequest) return
   const request = (async (): Promise<void> => {
     if (hostLifecycle && !await hostLifecycle.confirmStopHosting()) return
-    if (!await confirmApplicationStop(mainWindow, 'quit')) return
+    const decision = await confirmApplicationStop(mainWindow, 'quit')
+    if (decision === 'cancel') return
     if (!await resolveUnsavedEditors(mainWindow)) return
+    if (decision === 'background') await keepRunningInBackground()
     isQuitting = true
     app.quit()
   })().finally(() => { if (quitRequest === request) quitRequest = null })
@@ -2490,4 +2596,8 @@ app.on('will-quit', () => {
   projectPreview.close()
   updates?.dispose()
   disposeRuntimeServices()
+  // After the agents: every runtime not kept has been told to close, and the host ends any that
+  // were not by itself once this client is gone.
+  setRuntimeHost(null)
+  runtimeHostClient?.dispose()
 })
