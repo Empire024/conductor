@@ -105,7 +105,7 @@ export function describeTransition(previous: Pick<PhoneSessionSummary, 'state' |
     return { ...base, kind: 'attention', title: `Needs you: ${title}`, body: next.pendingTitle ? previewText(next.pendingTitle, 160) : next.needs === 'approval' ? 'Waiting for your approval' : 'Waiting for your answer' }
   }
   if (next.state === previous.state) return null
-  if (next.state === 'done') return { ...base, kind: 'done', title: `Done: ${title}`, body: next.lastRole === 'assistant' && next.lastText ? previewText(next.lastText, 180) : 'The turn finished.' }
+  if (next.state === 'done') return { ...base, kind: 'done', title: `Done: ${title}`, body: next.lastRole === 'assistant' && next.lastText ? previewText(next.lastText, 180) : 'The turn finished.', isCoworker: Boolean(next.controllerId) }
   if (next.state === 'failed') return { ...base, kind: 'failed', title: `Failed: ${title}`, body: next.lastText ? previewText(next.lastText, 180) : 'The conversation reported an error.' }
   if (next.state === 'limited') {
     const when = next.limitResumeAt ? clock(next.limitResumeAt) : ''

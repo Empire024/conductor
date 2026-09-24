@@ -211,6 +211,7 @@ export interface PhoneAccessBridge {
  *   POST /api/push/subscribe              { subscription }          -> { ok: true }
  *   POST /api/push/unsubscribe                                      -> { ok: true }
  *   POST /api/push/test                                             -> { ok: true }
+ *   POST /api/notifications               { prefs: PhoneNotificationPrefs } -> PhoneSelf
  *   GET  /api/health                      no auth                   -> PhoneHealth
  *   GET  /ca.crt                          the CA certificate, PEM, no auth
  *
@@ -241,6 +242,20 @@ export interface PhoneHealth {
   viaTailscale: boolean
 }
 
+/**
+ * Which notification categories this device wants, chosen on the phone and stored per device.
+ * `taskDone` covers a controller or main (non-coworker) conversation finishing; `needsYou` covers
+ * an approval, a question, or an error; `coworkerDone` covers a dispatched coworker finishing,
+ * which is off by default since a controller already hears about it.
+ */
+export interface PhoneNotificationPrefs {
+  taskDone: boolean
+  needsYou: boolean
+  coworkerDone: boolean
+}
+
+export const DEFAULT_PHONE_NOTIFICATION_PREFS: PhoneNotificationPrefs = { taskDone: true, needsYou: true, coworkerDone: false }
+
 /** The phone's own record, as the app shows it in its settings. */
 export interface PhoneSelf {
   id: string
@@ -251,6 +266,7 @@ export interface PhoneSelf {
   pushEnabled: boolean
   /** The desktop's master notification switch; the app explains itself when it is off. */
   notificationsAllowed: boolean
+  notificationPrefs: PhoneNotificationPrefs
   version: string
 }
 
@@ -411,6 +427,9 @@ export interface PhoneNotification {
   at: string
   /** Where a tap should land: the conversation, or the session list. */
   url: string
+  /** A dispatched coworker's conversation rather than a controller or main task; drives which
+   *  device wants a 'done' notification about it. Absent for kinds other than 'done'. */
+  isCoworker?: boolean
 }
 
 /** What PushSubscription.toJSON() gives the app, stored per phone. */

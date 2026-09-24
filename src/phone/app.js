@@ -1889,7 +1889,9 @@
       state.drafts[id] = input.value
       grow()
       paintComposer()
+      scrollCaretIntoView(input)
     })
+    input.addEventListener('focus', () => scrollCaretIntoView(input))
 
     const atBottom = () => scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 64
     const toBottom = () => { scroll.scrollTop = scroll.scrollHeight }
@@ -2202,12 +2204,35 @@
   const machineUsable = (machine, projectId) =>
     machine.status === 'online' && (machine.projectIds || []).indexOf(projectId) >= 0
 
+  /* How much of its weekly window each provider has left, from the usage data the phone already
+     receives. A provider with no reported window yet is assumed untouched, not exhausted. */
+  const usageRemainingByProvider = () => {
+    const remaining = new Map()
+    for (const window_ of (state.phone && state.phone.usage) || []) {
+      if (window_.kind !== 'weekly') continue
+      const left = 100 - window_.usedPercent
+      remaining.set(window_.provider, Math.min(remaining.has(window_.provider) ? remaining.get(window_.provider) : 100, left))
+    }
+    return remaining
+  }
+
+  /* A phone task is usually a quick ask, so the pick is a mid-tier model - Sonnet, or GPT's
+     Terra/Sol tier - never the frontier one, which a phone default should not spend on its own. */
+  const FRONTIER_MODEL = /opus|astra|frontier/i
+  const MID_TIER_MODEL = /sonnet|terra|\bsol\b/i
+  const preferredModel = models => {
+    const affordable = models.filter(model => !FRONTIER_MODEL.test(model.label))
+    return affordable.filter(model => MID_TIER_MODEL.test(model.label))[0] ||
+      affordable.filter(model => model.isDefault)[0] || affordable[0] ||
+      models.filter(model => model.isDefault)[0] || models[0]
+  }
+
   /* The form is rebuilt from every fresh PhoneState, so it must forget any choice the desktop no
      longer offers - a project removed, a machine gone offline - without losing the rest. */
   const reconcileForm = () => {
     const phone = state.phone
     if (!phone) return
-    const form = state.form || (state.form = { projectId: '', workspaceId: '', machineId: '', provider: '', model: '', effort: '', title: '', prompt: '', taskTitle: '', taskKind: 'task', taskPriority: 'normal', taskWeight: 'medium' })
+    const form = state.form || (state.form = { projectId: '', workspaceId: '', machineId: '', provider: '', model: '', effort: '', title: '', prompt: '', taskTitle: '', taskKind: 'task', taskPriority: 'normal', taskWeight: 'medium', settingsOpen: false })
     const projects = phone.projects || []
     if (!projectById(form.projectId)) form.projectId = projects.length ? projects[0].id : ''
     const project = projectById(form.projectId)
@@ -2219,11 +2244,15 @@
       form.machineId = own ? own.id : machines.length ? machines[0].id : ''
     }
     const providers = (phone.providers || []).filter(provider => provider.available)
-    if (!providers.some(provider => provider.id === form.provider)) form.provider = providers.length ? providers[0].id : ''
+    if (!providers.some(provider => provider.id === form.provider)) {
+      const remaining = usageRemainingByProvider()
+      const ranked = providers.slice().sort((a, b) => (remaining.has(b.id) ? remaining.get(b.id) : 100) - (remaining.has(a.id) ? remaining.get(a.id) : 100))
+      form.provider = ranked.length ? ranked[0].id : ''
+    }
     const provider = providerById(form.provider)
     const models = provider ? provider.models || [] : []
     if (!models.some(model => model.id === form.model)) {
-      const preferred = models.filter(model => model.isDefault)[0] || models[0]
+      const preferred = preferredModel(models)
       form.model = preferred ? preferred.id : ''
     }
     const model = models.filter(entry => entry.id === form.model)[0]
@@ -2257,14 +2286,29 @@
       const model = models.filter(entry => entry.id === form.model)[0] || null
       const body = el('div', 'form')
 
-      body.appendChild(field('Project', select(
+      const prompt = el('textarea', 'input prompt')
+      prompt.rows = 5
+      prompt.placeholder = 'What should it do?'
+      prompt.value = form.prompt
+      prompt.addEventListener('input', () => { form.prompt = prompt.value; paint() })
+      body.appendChild(field('Prompt', prompt, 'Leave this empty to just open an idle tab.'))
+
+      const summary = (project ? project.name : 'No project') + ' · ' + (provider ? provider.displayName : 'No agent') + (model ? ' · ' + model.label : '')
+      const settingsToggle = button('ghost wide settings-toggle', (form.settingsOpen ? 'Hide settings' : 'Settings') + ' · ' + summary,
+        () => { form.settingsOpen = !form.settingsOpen; draw() })
+      body.appendChild(settingsToggle)
+
+      const settings = el('div', 'form')
+      settings.hidden = !form.settingsOpen
+
+      settings.appendChild(field('Project', select(
         (phone.projects || []).map(entry => ({ value: entry.id, label: entry.name })),
         form.projectId,
         value => { form.projectId = value; form.workspaceId = ''; form.machineId = ''; draw() }
       )))
 
       const workspaces = project ? project.workspaces || [] : []
-      body.appendChild(field('Workspace', select(
+      settings.appendChild(field('Workspace', select(
         workspaces.map(entry => ({ value: entry.id, label: entry.name })),
         form.workspaceId,
         value => { form.workspaceId = value; draw() }
@@ -2276,17 +2320,17 @@
         label: machine.name + ' (' + machine.status + (machineUsable(machine, form.projectId) ? '' : ', no copy of this project') + ')',
         disabled: !machineUsable(machine, form.projectId)
       }))
-      body.appendChild(field('Run on', select(machineOptions, form.machineId, value => { form.machineId = value; draw() }),
+      settings.appendChild(field('Run on', select(machineOptions, form.machineId, value => { form.machineId = value; draw() }),
         'The task runs on that computer. This phone only watches it.'))
 
       const providers = (phone.providers || []).filter(entry => entry.available)
-      body.appendChild(field('Agent', select(
+      settings.appendChild(field('Agent', select(
         providers.map(entry => ({ value: entry.id, label: entry.displayName })),
         form.provider,
         value => { form.provider = value; form.model = ''; form.effort = ''; draw() }
       )))
 
-      body.appendChild(field('Model', select(
+      settings.appendChild(field('Model', select(
         models.map(entry => ({ value: entry.id, label: entry.label })),
         form.model,
         value => { form.model = value; form.effort = ''; draw() }
@@ -2294,7 +2338,7 @@
 
       const efforts = model && model.effort ? model.effort : []
       if (efforts.length) {
-        body.appendChild(field('Effort', select(
+        settings.appendChild(field('Effort', select(
           efforts.map(entry => ({ value: entry, label: entry })),
           form.effort,
           value => { form.effort = value }
@@ -2306,14 +2350,9 @@
       title.placeholder = 'Optional'
       title.value = form.title
       title.addEventListener('input', () => { form.title = title.value })
-      body.appendChild(field('Title', title))
+      settings.appendChild(field('Title', title))
 
-      const prompt = el('textarea', 'input prompt')
-      prompt.rows = 5
-      prompt.placeholder = 'What should it do?'
-      prompt.value = form.prompt
-      prompt.addEventListener('input', () => { form.prompt = prompt.value; paint() })
-      body.appendChild(field('Prompt', prompt, 'Leave this empty to just open an idle tab.'))
+      body.appendChild(settings)
 
       const problem = el('p', 'pending-error')
       problem.hidden = true
@@ -2693,6 +2732,25 @@
           notice = 'Test sent. It can take a few seconds.'
         })))
       }
+      const prefs = (me && me.notificationPrefs) || { taskDone: true, needsYou: true, coworkerDone: false }
+      const prefRow = (label, key) => {
+        const line = el('div', 'switch-row')
+        line.appendChild(el('span', 'switch-label', label))
+        const on = Boolean(prefs[key])
+        const flip = button('switch' + (on ? ' on' : ''), null, () => act(async () => {
+          state.me = await api('/api/notifications', { method: 'POST', body: { prefs: Object.assign({}, prefs, { [key]: !on }) } })
+        }))
+        flip.setAttribute('role', 'switch')
+        flip.setAttribute('aria-checked', on ? 'true' : 'false')
+        flip.setAttribute('aria-label', label)
+        flip.appendChild(el('span', 'knob'))
+        flip.disabled = working
+        line.appendChild(flip)
+        return line
+      }
+      notifications.appendChild(prefRow('A controller or main task is done', 'taskDone'))
+      notifications.appendChild(prefRow('Something needs you (approval, question, error)', 'needsYou'))
+      notifications.appendChild(prefRow('A coworker finishes', 'coworkerDone'))
       body.appendChild(notifications)
 
       if (notice) body.appendChild(el('p', 'good-note', notice))
@@ -2755,10 +2813,23 @@
 
   const applyViewport = () => {
     /* iOS shrinks the visual viewport for the keyboard but not the layout viewport, which would
-       hide a bottom-pinned composer behind it. */
+       hide a bottom-pinned composer behind it. Safari also scrolls the layout viewport to bring a
+       focused field into view, which drags a position:fixed shell along with it unless the shell
+       is pulled back by exactly that offset. */
     const viewport = window.visualViewport
     const height = viewport ? viewport.height : window.innerHeight
+    const offset = viewport ? viewport.offsetTop : 0
     document.documentElement.style.setProperty('--app-height', Math.round(height) + 'px')
+    document.documentElement.style.setProperty('--app-offset', Math.round(offset) + 'px')
+    if (window.scrollTo) window.scrollTo(0, 0)
+  }
+
+  /* Once the keyboard has finished opening and the fixed shell has been pulled back into place,
+     make sure the caret itself is not left under the keyboard, e.g. after growing a multi-line
+     draft or focusing lower on the page. */
+  const scrollCaretIntoView = field => {
+    if (!field || typeof field.scrollIntoView !== 'function') return
+    setTimeout(() => field.scrollIntoView({ block: 'end', inline: 'nearest' }), 60)
   }
 
   const boot = () => {

@@ -10,9 +10,9 @@ import { settingsForRuntime } from '../shared/structured-agent'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics'
 import { normalizeUsageWindows, summarizeUsage, updatedSequence, usageWindowAppliesToModel, type UsageWindow } from '../shared/usage-accounting'
 import {
-  DEFAULT_PHONE_SETTINGS, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
+  DEFAULT_PHONE_NOTIFICATION_PREFS, DEFAULT_PHONE_SETTINGS, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
   type PhoneAccessSettings, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
-  type PhoneNotification, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskPage, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
+  type PhoneNotification, type PhoneNotificationPrefs, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskPage, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
   type PhoneSelf, type PhoneSessionSummary, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
 } from '../shared/phone-access'
 import { rememberedPermission } from './app-settings'
@@ -59,6 +59,7 @@ interface StoredDevice {
   userAgent: string
   subscription: PhonePushSubscription | null
   pushFailures: number
+  notificationPrefs?: PhoneNotificationPrefs
 }
 
 /** The slice of the database this feature reads; narrow so a test can hand in plain objects. */
@@ -196,6 +197,15 @@ export function normalizePhoneSettings(value: unknown): PhoneAccessSettings {
     notifications: raw.notifications !== false,
     tailscaleCertificate: raw.tailscaleCertificate === true
   }
+}
+
+/** Whether a device's stored preference covers this notification's category. A device with no
+ *  preference recorded yet gets the defaults, same as `self()` reports before any choice is made. */
+const wantsNotification = (prefs: PhoneNotificationPrefs | undefined, notification: PhoneNotification): boolean => {
+  const chosen = prefs ?? DEFAULT_PHONE_NOTIFICATION_PREFS
+  if (notification.kind === 'done') return notification.isCoworker ? chosen.coworkerDone : chosen.taskDone
+  if (notification.kind === 'attention' || notification.kind === 'failed' || notification.kind === 'limited') return chosen.needsYou
+  return true
 }
 
 const activeSessionPhases: ReadonlySet<SessionProjection['phase']> = new Set(['running', 'starting', 'waiting_approval', 'waiting_input', 'interrupting'])
@@ -366,8 +376,22 @@ export class PhoneAccessService {
     return {
       id: device.id, name: device.name, machineName: this.deps.machineName(),
       vapidPublicKey: this.settings.notifications ? this.vapid()?.publicKey ?? null : null,
-      pushEnabled: Boolean(device.subscription), notificationsAllowed: this.settings.notifications, version: this.deps.version
+      pushEnabled: Boolean(device.subscription), notificationsAllowed: this.settings.notifications,
+      notificationPrefs: device.notificationPrefs ?? DEFAULT_PHONE_NOTIFICATION_PREFS,
+      version: this.deps.version
     }
+  }
+
+  setNotificationPrefs(deviceId: string, prefs: unknown): PhoneSelf {
+    const device = this.stored(deviceId)
+    const raw = (prefs && typeof prefs === 'object' ? prefs : {}) as Record<string, unknown>
+    device.notificationPrefs = {
+      taskDone: raw.taskDone !== false,
+      needsYou: raw.needsYou !== false,
+      coworkerDone: raw.coworkerDone === true
+    }
+    this.saveDevices()
+    return this.self(device)
   }
 
   rename(deviceId: string, name: unknown): PhoneSelf {
@@ -473,7 +497,8 @@ export class PhoneAccessService {
     if (!this.settings.notifications && notification.kind !== 'test') return { sent: 0, message: 'Notifications are switched off.' }
     const keys = this.vapid()
     if (!keys) return { sent: 0, message: 'Push keys need the OS credential store, which is unavailable.' }
-    const targets = this.devices.filter(device => device.subscription && (!deviceIds || deviceIds.includes(device.id)))
+    const targets = this.devices.filter(device => device.subscription && (!deviceIds || deviceIds.includes(device.id)) &&
+      (notification.kind === 'test' || wantsNotification(device.notificationPrefs, notification)))
     if (!targets.length) return { sent: 0, message: deviceIds ? 'That phone has not turned notifications on.' : 'No phone has notifications on.' }
     const payload = JSON.stringify(notification)
     const send = this.deps.push ?? sendWebPush

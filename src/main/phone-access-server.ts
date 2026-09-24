@@ -411,6 +411,7 @@ export class PhoneAccessServer {
     if (path === '/api/push/subscribe' && post) { service.setSubscription(device.id, body.subscription); return { ok: true } }
     if (path === '/api/push/unsubscribe' && post) { service.setSubscription(device.id, null); return { ok: true } }
     if (path === '/api/push/test' && post) return { ok: true, ...await service.testNotification(device.id) }
+    if (path === '/api/notifications' && post) return service.setNotificationPrefs(device.id, body.prefs)
     const session = path.match(/^\/api\/sessions\/([^/]+)(?:\/(message|respond|interrupt|resume))?$/)
     if (session) {
       const id = decodeURIComponent(session[1]!), action = session[2]

@@ -554,6 +554,23 @@ describe('notifications', () => {
     expect(await fix.service.testNotification(phone.id)).toEqual({ sent: 1, message: null })
     expect(fix.service.self(phone.id).vapidPublicKey).toBeNull()
   })
+
+  it('defaults notification preferences to task-done and needs-you on, coworker-done off, and honors a stored choice', async () => {
+    const fix = fixture()
+    const phone = pairPhone(fix.service)
+    fix.service.setSubscription(phone.id, { endpoint: 'https://push.example/sub', keys: { p256dh: 'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } })
+    expect(fix.service.self(phone.id).notificationPrefs).toEqual({ taskDone: true, needsYou: true, coworkerDone: false })
+
+    // A coworker finishing is muted by default, a main task finishing is not.
+    expect(await fix.service.sendNotification({ id: 'n1', kind: 'done', sessionId: 'a', title: 't', body: 'b', at: 'now', url: '/', isCoworker: true })).toEqual({ sent: 0, message: 'No phone has notifications on.' })
+    expect(await fix.service.sendNotification({ id: 'n2', kind: 'done', sessionId: 'a', title: 't', body: 'b', at: 'now', url: '/', isCoworker: false })).toEqual({ sent: 1, message: null })
+
+    const updated = fix.service.setNotificationPrefs(phone.id, { taskDone: false, needsYou: false, coworkerDone: true })
+    expect(updated.notificationPrefs).toEqual({ taskDone: false, needsYou: false, coworkerDone: true })
+    expect(await fix.service.sendNotification({ id: 'n3', kind: 'done', sessionId: 'a', title: 't', body: 'b', at: 'now', url: '/', isCoworker: true })).toEqual({ sent: 1, message: null })
+    expect(await fix.service.sendNotification({ id: 'n4', kind: 'done', sessionId: 'a', title: 't', body: 'b', at: 'now', url: '/', isCoworker: false })).toEqual({ sent: 0, message: 'No phone has notifications on.' })
+    expect(await fix.service.sendNotification({ id: 'n5', kind: 'attention', sessionId: 'a', title: 't', body: 'b', at: 'now', url: '/' })).toEqual({ sent: 0, message: 'No phone has notifications on.' })
+  })
 })
 
 describe('B1: the phone shows the conversation the desktop shows', () => {

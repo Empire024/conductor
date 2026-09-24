@@ -281,6 +281,44 @@ describe('phone task section', () => {
   })
 })
 
+describe('phone keyboard viewport', () => {
+  it('pulls the fixed shell back by the visual viewport offset, not only its height, and settles the caret', () => {
+    expect(appSource).toContain("document.documentElement.style.setProperty('--app-height'")
+    expect(appSource).toContain("document.documentElement.style.setProperty('--app-offset'")
+    expect(appSource).toContain('scrollCaretIntoView')
+    expect(appSource).toContain("window.visualViewport.addEventListener('resize', applyViewport)")
+    expect(appSource).toContain("window.visualViewport.addEventListener('scroll', applyViewport)")
+  })
+  it('sizes and translates the app shell from those custom properties in CSS', () => {
+    const css = readFileSync(new URL('./app.css', import.meta.url), 'utf8')
+    expect(css).toContain('height: var(--app-height, 100dvh)')
+    expect(css).toContain('transform: translateY(var(--app-offset, 0px))')
+  })
+})
+
+describe('new conversation defaults', () => {
+  it('shows the prompt first with settings folded behind a toggle', () => {
+    expect(appSource).toContain('settingsToggle')
+    expect(appSource).toContain('form.settingsOpen')
+    expect(appSource).toContain('settings.hidden = !form.settingsOpen')
+  })
+  it('picks the provider with the most weekly usage left and a mid-tier model, never the frontier one', () => {
+    expect(appSource).toContain('usageRemainingByProvider')
+    expect(appSource).toContain('FRONTIER_MODEL')
+    expect(appSource).toContain('MID_TIER_MODEL')
+    expect(appSource).toContain('preferredModel')
+  })
+})
+
+describe('phone notification preferences', () => {
+  it('offers per-category toggles and saves them to the device', () => {
+    expect(appSource).toContain("api('/api/notifications', { method: 'POST'")
+    expect(appSource).toContain("prefRow('A controller or main task is done', 'taskDone')")
+    expect(appSource).toContain("prefRow('Something needs you (approval, question, error)', 'needsYou')")
+    expect(appSource).toContain("prefRow('A coworker finishes', 'coworkerDone')")
+  })
+})
+
 describe('sw.js', () => {
   const worker = (cached: Record<string, string>, network: (url: string) => Promise<Response>) => {
     const listeners: Record<string, Listener> = {}

@@ -50,6 +50,7 @@ button { cursor: pointer; }
   left: 0;
   right: 0;
   height: var(--app-height, 100dvh);
+  transform: translateY(var(--app-offset, 0px));
   display: flex;
   flex-direction: column;
   overflow: hidden;
