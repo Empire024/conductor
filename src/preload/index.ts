@@ -121,8 +121,8 @@ const bridge: ConductorBridge = {
     onState: (callback) => subscribe('remote:changed', callback)
   },
   projectTasks: {
-    get: (projectId) => ipcRenderer.invoke('project-tasks:get', projectId),
-    edit: (projectId, revision, edit) => ipcRenderer.invoke('project-tasks:edit', projectId, revision, edit),
+    get: (projectId, query) => ipcRenderer.invoke('project-tasks:get', projectId, query),
+    edit: (projectId, revision, edit, query) => ipcRenderer.invoke('project-tasks:edit', projectId, revision, edit, query),
     setSourceControl: (projectId, enabled) => ipcRenderer.invoke('project-tasks:set-source-control', projectId, enabled),
     changes: (projectId, taskId) => ipcRenderer.invoke('project-tasks:changes', projectId, taskId),
     dispatchOptions: projectId => ipcRenderer.invoke('project-tasks:dispatch-options', projectId),
