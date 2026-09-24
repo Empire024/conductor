@@ -100,9 +100,14 @@ createInterface({ input: process.stdin }).on('line', async line => {
     case 'session/set_config_option': {
       const session = sessions.get(params.sessionId)
       if (!session) return fail(-32602, 'Invalid params', 'unknown session')
-      if (params.configId === 'model') session.model = params.value?.value
-      else if (params.configId === 'reasoning_effort') session.effort = params.value?.value
-      else return fail(-32602, 'Invalid params', 'data did not match any variant of untagged enum SessionConfigOptionValue')
+      // Grok 1.0.41 takes the value id as a plain string; an object such as `{ value }` fails
+      // deserialization before the option is looked at (zero-turn probe, docs/autopilot-evidence/g8-grok-config.md).
+      if (typeof params.value !== 'string') return fail(-32602, 'Invalid params', 'data did not match any variant of untagged enum SessionConfigOptionValue at line 1 column 111')
+      const option = configOptions(session).find(entry => entry.id === params.configId)
+      if (!option) return fail(-32602, 'Invalid params', 'unknown config option')
+      if (!option.options.some(choice => choice.value === params.value)) return fail(-32602, 'Invalid params', params.configId === 'model' ? 'unknown model id' : `unknown ${params.configId} value`)
+      if (params.configId === 'model') session.model = params.value
+      else session.effort = params.value
       return reply({ configOptions: configOptions(session) })
     }
     case 'session/prompt': {

@@ -277,7 +277,13 @@ export class GrokAdapter implements ProviderAdapter {
         this.sessionId = session.sessionId
       }
       this.adoptSession(session)
-      await this.applySettings(this.options.settings)
+      // A choice Grok refuses must not cost the conversation its session: it stays on the settings
+      // Grok confirmed, and the next turn asks for the choice again and fails on its own.
+      try { await this.applySettings(this.options.settings) } catch (error) {
+        if (!(error instanceof GrokRpcError) && !/does not offer the model|is not offered for/.test(error instanceof Error ? error.message : '')) throw error
+        this.capabilities.effectiveSettings = this.effective()
+        this.emit({ data: { type: 'notice', message: `Grok kept model ${this.currentModel ?? 'default'} with ${this.currentEffort ?? 'default'} effort: ${error instanceof Error ? error.message : 'the requested settings were refused'}` } })
+      }
       this.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: this.sessionId, capabilities: this.capabilities } })
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Grok connection failed'
@@ -327,19 +333,27 @@ export class GrokAdapter implements ProviderAdapter {
     this.capabilities.effectiveSettings = this.effective()
   }
 
+  /** Set one session config option. Grok 1.0.41 takes the value id as a plain string; `{ value }`
+   *  fails with -32602 "untagged enum SessionConfigOptionValue" (zero-turn probe, 2026-09-24).
+   *  The configOptions Grok answers with are the confirmed settings. */
+  private async setConfigOption(configId: 'model' | 'reasoning_effort', value: string): Promise<void> {
+    const result = await this.request('session/set_config_option', { sessionId: this.sessionId!, configId, value })
+    if (configId === 'model') this.currentModel = value
+    else this.currentEffort = value
+    this.adoptConfigOptions(record(result) ? result.configOptions : undefined)
+  }
+
   /** Bring the live Grok session to the composer's model, effort and permission mode. */
   private async applySettings(settings: SessionSettings): Promise<void> {
     if (!this.sessionId) return
     if (settings.model && settings.model !== this.currentModel) {
       if (this.capabilities.models.length && !this.capabilities.models.some(model => model.id === settings.model)) throw new Error(`Grok does not offer the model ${settings.model}`)
-      this.adoptConfigOptions(await this.request('session/set_config_option', { sessionId: this.sessionId, configId: 'model', value: { value: settings.model } }))
-      this.currentModel = settings.model
+      await this.setConfigOption('model', settings.model)
     }
     if (settings.effort && settings.effort !== this.currentEffort) {
       const model = this.capabilities.models.find(candidate => candidate.id === (settings.model || this.currentModel))
       if (model?.effort && !model.effort.includes(settings.effort)) throw new Error(`Reasoning effort ${settings.effort} is not offered for ${model.id}`)
-      this.adoptConfigOptions(await this.request('session/set_config_option', { sessionId: this.sessionId, configId: 'reasoning_effort', value: { value: settings.effort } }))
-      this.currentEffort = settings.effort
+      await this.setConfigOption('reasoning_effort', settings.effort)
     }
     this.policy = grokApprovalPolicy(settings, this.options.approvalReviewer)
     // Grok's auto mode is chosen when a session is attached; re-attaching the live session is how a

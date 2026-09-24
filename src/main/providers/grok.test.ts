@@ -65,14 +65,45 @@ describe('Grok ACP adapter against the scripted fixture (zero inference)', () =>
     expect(usage).toContainEqual(expect.objectContaining({ scope: 'session', limits: { contextCapacityTokens: 500000, modelContextWindow: 500000, contextUsedTokens: 19457 } }))
   })
 
-  it('applies model and effort through session config options, never set_mode', async () => {
+  // G8: Grok 1.0.41 takes a plain-string value id and rejects `{ value }` with -32602 (the fixture
+  // answers exactly as the installed CLI did in the zero-turn probe, docs/autopilot-evidence/g8-grok-config.md).
+  const configCalls = (sent: Json[]) => sent.filter(message => (message as { method?: string }).method === 'session/set_config_option').map(message => (message as { params: { configId: string; value: unknown } }).params)
+
+  it('applies model and effort as plain-string session config values and adopts what Grok confirms, never set_mode', async () => {
     const { adapter, events, sent } = create()
     await adapter.submit('hello', { ...ask, model: 'grok-4.5', effort: 'low' })
     await waitFor(() => phase(events, 'completed'))
-    expect(sent.filter(message => (message as { method?: string }).method === 'session/set_config_option').map(message => (message as { params: { configId: string; value: unknown } }).params)).toEqual([
-      expect.objectContaining({ configId: 'model', value: { value: 'grok-4.5' } }), expect.objectContaining({ configId: 'reasoning_effort', value: { value: 'low' } })])
+    expect(configCalls(sent)).toEqual([expect.objectContaining({ configId: 'model', value: 'grok-4.5' }), expect.objectContaining({ configId: 'reasoning_effort', value: 'low' })])
+    expect(adapter.capabilities.effectiveSettings).toMatchObject({ model: 'grok-4.5', effort: 'low' })
     expect(methods(sent)).not.toContain('session/set_mode')
+    // High to medium on the same session, the owner's failing change.
+    await adapter.submit('hello', { ...ask, model: 'grok-4.5', effort: 'medium' })
+    await waitFor(() => events.filter(event => event.data.type === 'session' && event.data.phase === 'completed').length === 2)
+    expect(configCalls(sent).at(-1)).toMatchObject({ configId: 'reasoning_effort', value: 'medium' })
+    expect(adapter.capabilities.effectiveSettings).toMatchObject({ model: 'grok-4.5', effort: 'medium' })
     await expect(adapter.submit('hello', { ...ask, model: 'grok-9' })).rejects.toThrow(/does not offer the model grok-9/)
+  })
+
+  it('opens Grok Fast at medium effort as a new session and as a resumed one', async () => {
+    const fast: SessionSettings = { ...ask, model: 'grok-4.7-build-fast', effort: 'medium' }
+    for (const nativeSessionId of [undefined, '01a0d07c-046f-7402-8f63-5411cc054ae9']) {
+      const { adapter, events, sent } = create(fast, { nativeSessionId })
+      await adapter.start()
+      expect(configCalls(sent)).toEqual([expect.objectContaining({ configId: 'model', value: 'grok-4.7-build-fast' }), expect.objectContaining({ configId: 'reasoning_effort', value: 'medium' })])
+      expect(adapter.capabilities.effectiveSettings).toMatchObject({ model: 'grok-4.7-build-fast', effort: 'medium' })
+      expect(phase(events, 'disconnected')).toBe(false)
+    }
+  })
+
+  it('a refused setting on resume keeps the conversation on Grok\'s confirmed settings instead of failing to connect', async () => {
+    const { adapter, events } = create({ ...ask, model: 'grok-9' }, { nativeSessionId: '01a0d07c-046f-7402-8f63-5411cc054ae9' })
+    await adapter.start()
+    expect(phase(events, 'idle')).toBe(true)
+    expect(phase(events, 'disconnected')).toBe(false)
+    expect(notices(events).some(message => /kept model grok-4\.7 with high effort: .*does not offer the model grok-9/.test(message))).toBe(true)
+    await expect(adapter.submit('hello', { ...ask, model: 'grok-9' })).rejects.toThrow(/does not offer the model grok-9/)
+    await adapter.submit('hello', ask)
+    await waitFor(() => phase(events, 'completed'))
   })
 
   it('Ask holds an edit for the owner, with Grok\'s options, and forwards the chosen option', async () => {
