@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
+import { PROVIDER_SAFEGUARD_REFUSAL } from '../../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import type { ClientRequest } from './generated/codex/ClientRequest'
 import type { InitializeResponse } from './generated/codex/InitializeResponse'
@@ -30,6 +31,7 @@ import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
 import { canonicalAction } from '../approval-review'
 
 export const CODEX_PROTOCOL_BASELINE = '0.155.1'
+const safeguardRefusal = (message: string): boolean => /(?:safeguards? flagged this message|safety (?:policy|classifier).*(?:blocked|refused)|request (?:was )?refused by.*safety)/i.test(message)
 type WireTransport = Pick<JsonLineTransport, 'start' | 'send' | 'close' | 'connected'> & Partial<Pick<JsonLineTransport, 'closeAndWait'>>
 /** Injectable only in backend contract tests; no renderer can supply a transport. */
 export interface CodexAdapterDependencies {
@@ -696,7 +698,7 @@ export class CodexAdapter implements ProviderAdapter {
           // snapshots above reconcile any input already consumed before cancellation.
           for (const [id, turnId] of this.steeringInputs) if (turnId === params.turn.id) this.inputDelivery(id, params.turn.status === 'interrupted' ? 'cancelled' : 'uncertain', native)
           this.turnId = undefined
-          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send({ type: 'error', message: params.turn.error.message }) }
+          if (params.turn.error) { this.sandboxSetupNotice(params.turn.error.message, context); send({ type: 'error', message: params.turn.error.message, ...(safeguardRefusal(params.turn.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) }) }
           send({ type: 'session', phase: completedPhase }, { turnId: params.turn.id })
         }
         return
@@ -771,7 +773,7 @@ export class CodexAdapter implements ProviderAdapter {
         return
       case 'error':
         this.sandboxSetupNotice(params.error.message, context)
-        send({ type: 'error', message: params.error.message })
+        send({ type: 'error', message: params.error.message, ...(safeguardRefusal(params.error.message) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) })
         if (params.willRetry && (this.options.environment ?? process.env).CONDUCTOR_LIVE_TESTS === '1' && !this.liveRetryStopped) {
           this.liveRetryStopped = true
           this.interrupted = true

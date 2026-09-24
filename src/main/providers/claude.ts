@@ -5,7 +5,7 @@ import { open } from 'node:fs/promises'
 import { workspacePath } from '../agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './adapter'
 import { JsonLineTransport, type TransportOptions } from './transport'
-import { settingsForRuntime } from '../../shared/structured-agent'
+import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, parseAutoModeDenialReason } from '../../shared/auto-mode-denial'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
@@ -33,6 +33,7 @@ const object = (value: Json | undefined): ObjectValue => value && typeof value =
 const string = (value: Json | undefined): string | undefined => typeof value === 'string' ? value : undefined
 const number = (value: Json | undefined): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined
 const array = (value: Json | undefined): Json[] => Array.isArray(value) ? value : []
+const safeguardRefusal = (message: string): boolean => /API Error:\s*.+?s safeguards flagged this message/i.test(message)
 const display = (value: Json | undefined): string => typeof value === 'string' ? value : value === undefined ? '' : JSON.stringify(value, null, 2)
 /** A roster name is a one-line label, but a task summary can be an agent's entire final
  *  report, which would otherwise be pasted verbatim into the subagent list heading. */
@@ -565,7 +566,10 @@ export class ClaudeAdapter implements ProviderAdapter {
       this.active = false
       this.expireRequests('Turn ended')
       this.confirmAutoModeDenials(array(message.permission_denials))
-      if (failure && !this.stopRequested) this.emit({ data: { type: 'error', message: this.visibleText(array(message.errors).map(display).join('\n')) || resultText || string(message.subtype) || 'Claude turn failed' } })
+      if (failure && !this.stopRequested) {
+        const error = this.visibleText(array(message.errors).map(display).join('\n')) || resultText || string(message.subtype) || 'Claude turn failed'
+        this.emit({ data: { type: 'error', message: error, ...(safeguardRefusal(error) ? { code: PROVIDER_SAFEGUARD_REFUSAL } : {}) } })
+      }
       for (const [id, tool] of this.tools) if (!tool.detached && ['preparing', 'running', 'awaiting_approval'].includes(tool.status)) this.updateTool(id, { status: this.stopRequested ? 'interrupted' : 'failed' })
       this.emit({ data: { type: 'session', phase: this.stopRequested ? 'interrupted' : failure ? 'failed' : 'completed', nativeSessionId: this.nativeSessionId }, native: { method: 'result', payload: message } })
       return

@@ -667,7 +667,7 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(original.submissions).toHaveLength(1)
     expect(f.database.structured.snapshot(f.spec.id)?.nativeSessionId).toBe('native-arrived-during-context-read')
   })
-  it('applies each queued effort to the same native Claude conversation', async () => {
+  it('applies the latest queued settings to the one combined followup on the same native Claude conversation', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'Original turn', settings)
     const original = f.current, nativeId = f.database.structured.snapshot(f.spec.id)!.nativeSessionId
@@ -675,9 +675,9 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     await f.manager.queue(f.spec.id, 'Inherited effort followup', settings)
     original.finish()
     await vi.waitFor(() => expect(original.submissions).toHaveLength(2))
-    original.finish()
-    await vi.waitFor(() => expect(original.submissions).toHaveLength(3))
-    expect(original.submissions.map(submission => submission.settings.effort)).toEqual([undefined, 'low', undefined])
+    expect(original.submissions.map(submission => submission.settings.effort)).toEqual([undefined, undefined])
+    expect(original.submissions[1]?.text).toContain('Low effort followup')
+    expect(original.submissions[1]?.text).toContain('Inherited effort followup')
     expect(f.current).toBe(original)
     expect(original.disposed).toBe(false)
     expect(f.database.structured.snapshot(f.spec.id)?.nativeSessionId).toBe(nativeId)
@@ -810,21 +810,45 @@ describe('queued messages and native CLI handoff', () => {
     expect(state.items.some(item => item.data.type === 'tool' && item.data.status === 'completed' && item.data.output === 'file content')).toBe(true)
     expect(state.nativeSessionId).toBe(nativeId)
   })
-  it('owns a queued message across views and dispatches it exactly once after completion', async () => {
+  it('drains every queued message as one clearly separated turn in original order', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'first', settings)
     await f.manager.queue(f.spec.id, 'second', settings)
-    expect(f.database.structured.snapshot(f.spec.id)?.queued?.text).toBe('second')
     await f.manager.queue(f.spec.id, 'third', settings)
-    expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts?.map(prompt => prompt.text)).toEqual(['second', 'third'])
+    await f.manager.queue(f.spec.id, 'fourth', settings)
+    await f.manager.queue(f.spec.id, 'fifth', settings)
     f.current.finish()
     await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
-    expect(f.current.submissions.map((item) => item.text)).toEqual(['first', 'second'])
-    expect(f.database.structured.snapshot(f.spec.id)?.queued?.text).toBe('third')
-    f.current.finish()
-    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(3))
-    expect(f.current.submissions.map(item => item.text)).toEqual(['first', 'second', 'third'])
+    expect(f.current.submissions[1]?.text).toBe([
+      '--- Queued message 1 of 4 ---', 'second',
+      '--- Queued message 2 of 4 ---', 'third',
+      '--- Queued message 3 of 4 ---', 'fourth',
+      '--- Queued message 4 of 4 ---', 'fifth'
+    ].join('\n\n'))
+    const userMessages = f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user') ?? []
+    expect(userMessages).toHaveLength(2)
+    expect(userMessages.at(-1)?.data).toMatchObject({ type: 'text', text: f.current.submissions[1]?.text })
     expect(f.database.structured.snapshot(f.spec.id)?.queued).toBeNull()
+  })
+
+  it.each([
+    ['claude', 'claude-fable-5-1', 'opus[1m]', 'Fable refused this turn; continuing on Opus 5.5'],
+    ['codex', 'gpt-6-astra', 'gpt-5.6-sol', 'Astra refused this turn; continuing on Sol']
+  ] as const)('continues one refused %s turn once on the next model', async (provider, model, fallback, notice) => {
+    const f = fixture(provider)
+    await f.manager.submit(f.spec.id, 'Safe ordinary request', { ...settings, model })
+    f.current.emit({ data: { type: 'error', code: 'provider_safeguard_refusal', message: 'Provider safeguards flagged this message' } })
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+
+    await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+    expect(f.current.submissions[1]).toMatchObject({ text: 'Safe ordinary request', settings: { model: fallback } })
+    expect(f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user')).toHaveLength(1)
+    expect(f.database.structured.snapshot(f.spec.id)?.items.some(item => item.data.type === 'notice' && item.data.message === notice)).toBe(true)
+
+    f.current.emit({ data: { type: 'error', code: 'provider_safeguard_refusal', message: 'Fallback also refused' } })
+    f.current.emit({ data: { type: 'session', phase: 'failed' } })
+    await new Promise(resolve => setTimeout(resolve, 25))
+    expect(f.current.submissions).toHaveLength(2)
   })
   it('dispatches a queued message after a turn fails instead of holding it forever', async () => {
     const f = fixture()
@@ -1371,9 +1395,13 @@ it('Escape flushes every queued message in original order after interruption', a
   await f.manager.queue(f.spec.id, 'Queued third', settings)
   f.current.capabilities.steering = true
   await f.manager.interrupt(f.spec.id, true)
-  await vi.waitFor(() => expect(f.current.submissions.length + f.current.steers.length).toBe(4))
-  expect(f.current.submissions.map(input => input.text)).toEqual(['Original', 'Queued first'])
-  expect(f.current.steers.map(input => input.text)).toEqual(['Queued second', 'Queued third'])
+  await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
+  expect(f.current.submissions[1]?.text).toBe([
+    '--- Queued message 1 of 3 ---', 'Queued first',
+    '--- Queued message 2 of 3 ---', 'Queued second',
+    '--- Queued message 3 of 3 ---', 'Queued third'
+  ].join('\n\n'))
+  expect(f.current.steers).toEqual([])
   expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toEqual([])
 })
 

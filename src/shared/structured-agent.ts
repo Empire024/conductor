@@ -6,6 +6,9 @@ export type SessionPhase = 'idle' | 'starting' | 'running' | 'waiting_approval' 
 /** The true native CLI/API ceiling. Text, attachment expansion and recalled memory context
  *  together must stay under this or the provider refuses the whole turn with an opaque error. */
 export const MAX_PROMPT_CHARS = 600_000
+/** Stable adapter-to-host classification for a provider policy refusal. It is intentionally
+ * distinct from quota/usage-limit failures, which have their own timed continuation path. */
+export const PROVIDER_SAFEGUARD_REFUSAL = 'provider_safeguard_refusal'
 export type ActivityStatus = 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'
 export interface ProviderCapabilities {
   provider: StructuredProvider

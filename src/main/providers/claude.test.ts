@@ -49,6 +49,17 @@ function hook(requestId: string, callback: string, toolId: string, name: string,
 }
 
 describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
+  it('classifies a safeguards result as a refusal without mistaking a usage limit for one', async () => {
+    const refused = fixture()
+    await refused.adapter.start(); await refused.adapter.submit('Safe ordinary request', { ...settings, model: 'claude-fable-5-1' })
+    refused.transport.receive({ type: 'result', subtype: 'error_during_execution', is_error: true, result: "API Error: Fable 5.1's safeguards flagged this message. This sometimes happens with safe, normal conversations.", usage: {} })
+    expect(refused.events.find(event => event.data.type === 'error')?.data).toMatchObject({ type: 'error', code: 'provider_safeguard_refusal' })
+
+    const limited = fixture()
+    await limited.adapter.start(); await limited.adapter.submit('Long request', settings)
+    limited.transport.receive({ type: 'result', subtype: 'error_during_execution', is_error: true, result: "You've hit your session limit · resets in 2 hours", usage: {} })
+    expect(limited.events.find(event => event.data.type === 'error')?.data).not.toHaveProperty('code')
+  })
   it('isolates a host reviewer before startup and refuses a resumed reviewer', async () => {
     const f = fixture({ approvalReviewer: true, mcpConfig: '{"mcpServers":{"unwanted":{}}}' })
     await f.adapter.start()

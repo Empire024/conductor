@@ -5,8 +5,8 @@ import { readClaudeHistory, hasClaudeHistory, readGrokHistory, hasGrokHistory, h
 import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
-import { isFrontierModel, MAX_PROMPT_CHARS, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
-import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptDispatchAuthority, PromptOrigin, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
+import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
@@ -33,6 +33,7 @@ interface LiveSession {
   handoff?: boolean
   dispatchingQueue?: boolean
   dispatchingPromptId?: string
+  dispatchingPromptIds?: Set<string>
   queueing?: Promise<void>
   steering?: boolean
   interrupting?: Promise<void>
@@ -63,6 +64,8 @@ interface LiveSession {
   capTimer?: NodeJS.Timeout
   /** Set while the provider's own usage window is closed; the moment it reopens, in ISO. */
   limitResumeAt?: string
+  currentTurn?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; fallbackAttempted: boolean }
+  refusalFallback?: { text: string; settings: SessionSettings; attachments: ContextAttachment[]; origin?: PromptOrigin; model: string; notice: string }
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
@@ -82,6 +85,17 @@ const activityPhaseOf = (phase: SessionPhase): AgentActivityPhase =>
         : phase === 'failed' ? 'failed'
           : phase === 'disconnected' ? 'disconnected'
             : phase === 'interrupted' ? 'stopped' : 'idle'
+
+const queuedText = (prompts: QueuedPrompt[]): string => prompts.length === 1 ? prompts[0]!.text.trim() : prompts
+  .map((prompt, index) => `--- Queued message ${index + 1} of ${prompts.length}${prompt.origin ? ` (${prompt.origin.label})` : ''} ---\n\n${prompt.text.trim()}`)
+  .join('\n\n')
+
+const fallbackAfterRefusal = (provider: StructuredProvider, model: string): { model: string; notice: string } | null => {
+  if (provider === 'claude' && /fable/i.test(model)) return { model: 'opus[1m]', notice: 'Fable refused this turn; continuing on Opus 5.5' }
+  if (provider === 'claude' && /opus/i.test(model)) return { model: 'sonnet', notice: 'Opus 5.5 refused this turn; continuing on Sonnet 5' }
+  if (provider === 'codex' && /astra/i.test(model)) return { model: 'gpt-5.6-sol', notice: 'Astra refused this turn; continuing on Sol' }
+  return null
+}
 
 /** Only a public, renderer-understood error code crosses the adapter boundary. Provider errors
  *  can carry arbitrary fields, so never project an unrecognised value into durable history. */
@@ -709,13 +723,13 @@ export class StructuredSessions {
     }
     const prompts = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
     const queued = promptId ? prompts.find(prompt => prompt.id === promptId) ?? null : prompts[0] ?? null
-    if (live.dispatchingQueue && queued?.id === live.dispatchingPromptId) throw new Error('The queued message is already being sent')
+    if (live.dispatchingQueue && queued && (live.dispatchingPromptIds?.has(queued.id) || queued.id === live.dispatchingPromptId)) throw new Error('The queued message is already being sent')
     if (queued) this.setQueue(live, prompts.filter(prompt => prompt.id !== queued.id))
     return queued
   }
   private async drainQueue(live: LiveSession): Promise<void> {
     let state = this.database.structured.snapshot(live.spec.id)
-    if (!state || live.closed || live.submitting || live.steering || live.dispatchingQueue || !live.adapter) return
+    if (!state || live.closed || live.submitting || live.steering || live.dispatchingQueue || live.refusalFallback || !live.adapter) return
     if (live.capStop && this.capSetting(live)?.key === live.capStop.capKey) return
     if (live.expediteReady && ['interrupted', 'completed'].includes(state.phase)) {
       const recovered = (state.pendingSteering ?? []).filter(input => live.expediteInput?.has(input.id) && input.status === 'cancelled')
@@ -734,6 +748,19 @@ export class StructuredSessions {
     const steerable = live.adapter.capabilities.steering && ['running', 'waiting_input', 'waiting_approval'].includes(state.phase)
     const queued = (steerable && state.queuedPrompts?.find(input => input.steer)) || state.queued
     const canSteer = queued.steer && steerable
+    const allQueued = state.queuedPrompts ?? (state.queued ? [state.queued] : [])
+    const batch: QueuedPrompt[] = canSteer ? [queued] : []
+    if (!canSteer) {
+      const origin = JSON.stringify(queued.origin ?? null)
+      for (const prompt of allQueued) {
+        if (JSON.stringify(prompt.origin ?? null) !== origin) break
+        const candidate = [...batch, prompt]
+        if (candidate.flatMap(item => item.attachments).length > 20 || queuedText(candidate).length > 60_000) break
+        batch.push(prompt)
+      }
+    }
+    const dispatch = batch.length ? batch : [queued]
+    const dispatchIds = new Set(dispatch.map(prompt => prompt.id))
     // A turn that ended in error is as settled as one that completed, and the queued message is
     // usually the continuation that recovers it — a local model fails its whole turn on a single
     // bad request. Without this the message waits behind a phase that never comes back.
@@ -741,28 +768,34 @@ export class StructuredSessions {
     // this drain from its own failure event cannot spin on the same text.
     const afterFailure = state.phase === 'failed' && !live.failedDrain?.has(queued.id)
     if (!canSteer && !['completed', 'idle'].includes(state.phase) && !afterFailure && !(state.phase === 'interrupted' && live.sendAfterInterrupt)) return
-    if (afterFailure) (live.failedDrain ??= new Set()).add(queued.id)
+    if (afterFailure) for (const prompt of dispatch) (live.failedDrain ??= new Set()).add(prompt.id)
     live.dispatchingQueue = true
     live.dispatchingPromptId = queued.id
+    live.dispatchingPromptIds = dispatchIds
     let sent = false
     try {
       if (canSteer) await this.followup(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments), true, queued.id, queued.origin)
-      else { live.sendAfterInterrupt = false; await this.submit(live.spec.id, queued.text, queued.settings, structuredClone(queued.attachments), queued.origin) }
+      else {
+        live.sendAfterInterrupt = false
+        const latest = dispatch.at(-1)!
+        await this.submit(live.spec.id, queuedText(dispatch), latest.settings, structuredClone(dispatch.flatMap(prompt => prompt.attachments)), latest.origin)
+      }
       const latest = this.database.structured.snapshot(live.spec.id)!
-      this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(prompt => prompt.id !== queued.id))
+      this.setQueue(live, (latest.queuedPrompts ?? (latest.queued ? [latest.queued] : [])).filter(prompt => !dispatchIds.has(prompt.id)))
       sent = true
     } catch (reason) {
-      const retained = this.database.structured.snapshot(live.spec.id)?.queuedPrompts?.some(input => input.id === queued.id)
+      const retained = this.database.structured.snapshot(live.spec.id)?.queuedPrompts?.some(input => dispatchIds.has(input.id))
       this.emit(live, { data: { type: 'notice', message: (retained ? 'Queued message was not sent. It is still available above the composer: ' : 'Steering delivery was not confirmed. Check the retained pending message above the composer: ') + (reason instanceof Error ? reason.message : String(reason)) } })
     } finally {
       live.dispatchingQueue = false
       live.dispatchingPromptId = undefined
+      live.dispatchingPromptIds = undefined
       // Some runtimes finish before submit resolves; that completion still drains the next item.
       if (sent) queueMicrotask(() => { void this.drainQueue(live) })
     }
   }
 
-  async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
+  async submit(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin, refusalRetry = false): Promise<void> {
     const live = this.get(id), store = this.database.structured
     let state = store.snapshot(id)!
     if (live.handoff || this.cliOwned(id)) throw new Error('Switch this conversation from CLI to Chat first')
@@ -812,6 +845,10 @@ export class StructuredSessions {
         ? composeLocalPrompt(`${text.trim()}${context}`, recalled)
         : `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.assertPromptWithinLimit(submitted.length)
+      if (!refusalRetry) {
+        live.refusalFallback = undefined
+        live.currentTurn = { text: text.trim(), settings: structuredClone(settings), attachments: structuredClone(attachments), ...(origin ? { origin: structuredClone(origin) } : {}), fallbackAttempted: false }
+      }
       // A queued message may have captured settings before the owner revoked browser access.
       // Never let that per-message snapshot overwrite the explicit, newer session authority.
       state = store.snapshot(id)!
@@ -827,7 +864,7 @@ export class StructuredSessions {
       // itself from (see conversation-tab.ts's bindConversationTab).
       store.update(id, { settings, title: state.title || deriveConversationTitle(text) })
       // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
-      this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(origin ? { origin } : {}) } })
+      if (!refusalRetry) this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(origin ? { origin } : {}) } })
       this.emit(live, { data: { type: 'session', phase: 'running' } })
       if (process.env.CONDUCTOR_LIVE_TESTS === '1') live.budget = new LiveRuntimeBudget(boundary => this.stopLive(live, boundary === 'active-runtime' ? 'Live prompt reached its 90 second active runtime allowance' : 'Live prompt reached its 30 second cumulative human-input wait allowance'))
       const dispatch = live.adapter.submit(submitted, settings, attachments.filter(item => item.kind === 'image'))
@@ -1053,6 +1090,37 @@ export class StructuredSessions {
    * ever lives in this process, and is re-armed from SQLite by `ensure`.
    * ---------------------------------------------------------------------- */
 
+  private noteSafeguardRefusal(live: LiveSession): void {
+    const turn = live.currentTurn
+    if (!turn || turn.fallbackAttempted || live.refusalFallback) return
+    const state = this.database.structured.snapshot(live.spec.id)
+    const currentModel = concreteModel(live.spec.provider, turn.settings.model, state?.capabilities)
+    const fallback = fallbackAfterRefusal(live.spec.provider as StructuredProvider, currentModel)
+    if (!fallback) return
+    turn.fallbackAttempted = true
+    live.refusalFallback = {
+      text: turn.text,
+      settings: { ...structuredClone(turn.settings), model: fallback.model },
+      attachments: structuredClone(turn.attachments),
+      ...(turn.origin ? { origin: structuredClone(turn.origin) } : {}),
+      ...fallback
+    }
+  }
+
+  private async runSafeguardFallback(live: LiveSession): Promise<void> {
+    const retry = live.refusalFallback
+    if (!retry || live.closed || this.live.get(live.spec.id) !== live) return
+    live.refusalFallback = undefined
+    this.emit(live, { data: { type: 'notice', message: retry.notice } })
+    this.flush()
+    try {
+      await this.submit(live.spec.id, retry.text, retry.settings, retry.attachments, retry.origin, true)
+    } catch (error) {
+      this.emit(live, { data: { type: 'notice', message: `Refusal fallback could not be sent: ${error instanceof Error ? error.message : String(error)}` } })
+      this.flush()
+    }
+  }
+
   /** Recognize the provider's own "you are out of quota until X" message and turn it into a
    *  durable wait. Read only from `error` events: a tool's output or a page the agent fetched
    *  can quote the same sentence without this conversation being limited at all. */
@@ -1274,8 +1342,14 @@ export class StructuredSessions {
     // between appending the error and recording the phase it produces, so the phase below can
     // report the wait rather than a dead end. `noteUsageLimit` re-enters `emit` for its own
     // notice; `live.limitResumeAt` is set first, so that pass is inert.
-    if (data.type === 'error') this.noteUsageLimit(live, data.message)
-    if (data.type === 'session') queueMicrotask(() => { void this.drainQueue(live) })
+    if (data.type === 'error') {
+      this.noteUsageLimit(live, data.message)
+      if (data.code === PROVIDER_SAFEGUARD_REFUSAL) this.noteSafeguardRefusal(live)
+    }
+    if (data.type === 'session') queueMicrotask(() => {
+      if (data.phase === 'failed' && live.refusalFallback) void this.runSafeguardFallback(live)
+      else void this.drainQueue(live)
+    })
     if (data.type === 'session') {
       const reported = activityPhaseOf(data.phase)
       // A lost connection says nothing on its own about whether output was cut off, so only a
