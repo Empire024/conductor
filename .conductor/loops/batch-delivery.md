@@ -1,6 +1,6 @@
 ---
 id: batch-delivery
-version: 2
+version: 3
 title: Deliver one batch of related tasks with the least tokens at the highest quality
 trigger: [manual, after:task-triage]
 inputs: [batchId, taskIds, allowedPaths]
@@ -12,8 +12,9 @@ budget:
 steps:
   - id: contract
     role: architect
-    model: claude:opus[1m]
-    effort: high          # xhigh only for a root cause that is not yet known
+    model: codex:gpt-6-astra   # owner rule 2026-09-24: Astra and Fable are the brains
+    alternate: claude:claude-fable-5-1   # for the hardest designs; Fable has its own weekly window
+    effort: high
     output: failing tests + acceptance (commands, allowedPaths)
   - id: implement
     role: implementer
@@ -28,7 +29,8 @@ steps:
     output: last line `OK` or `FAILED <stage>` + ≤20 lines
   - id: review
     role: reviewer
-    model: claude:opus[1m]
+    model: claude:claude-fable-5-1   # the frontier model that did not write the contract; Astra if Fable is limited
+    alternate: codex:gpt-6-astra
     effort: high
     input: git diff limited to allowedPaths, once
   - id: ship
@@ -39,7 +41,7 @@ locked: [budget, steps.review, steps.ship]
 
 # Batch delivery
 
-1. **Contract.** Opus writes the failing tests and an acceptance list: the commands that must pass and the
+1. **Contract.** Astra (or Fable for the hardest designs) writes the failing tests and an acceptance list: the commands that must pass and the
    allowed paths. Keep it short; point to code by file:line; no broad exploration.
 2. **Implement.** One fresh Opus tab per batch (Sonnet for exact-spec UI batches), dispatched with `projectTaskIds`. It makes
    the tests pass within `allowedPaths` and does not choose scope. Check `agents.snapshot` → `settings.permission` is `auto`
@@ -47,12 +49,12 @@ locked: [budget, steps.review, steps.ship]
    session file the fix path crosses, not only the files the bug shows in; a missing path costs a full stop-and-ask round.
 3. **Churn.** A local durable job runs the suites and benchmarks and summarizes failures. Frontier models read only
    the summary.
-4. **Review.** Opus reads the diff once and answers approve or a specific list of changes. At most one corrective
+4. **Review.** The frontier model that did not write the contract (Fable ↔ Astra) reads the diff once and answers approve or a specific list of changes. At most one corrective
    round, then escalate to the owner.
 5. **Ship.** `git.ship({message, paths})` with the batch's files only; wait on `git.ship.status`. Do not publish;
    publish once per set of batches.
-6. Before every dispatch, read `usage.limits`. At 70% Claude weekly or more, Opus only reviews. At 73%, Claude work
-   stops and Astra plus local finish. Astra stops at 95%.
+6. Before every dispatch, read `usage.limits`. At 70% Claude weekly or more, implementation moves to Sonnet/Haiku with a
+   tighter contract. At 73%, Claude work stops; Astra plus local finish. Astra stops at 95%.
 
 Known hazard (2026-09-24): a coworker whose tab disappears loses app control and cannot `git.ship`. Its controller
 ships for it from the coworker's handoff, which must list the exact paths and message.
@@ -72,3 +74,6 @@ ships for it from the coworker's handoff, which must list the exact paths and me
   (one whole round); reading a Codex report via agents.history paged ~120 × 100 events (needs a tail/last-message
   read); the effectiveSettings.permissionMode check does not exist for Codex. Owner rule from this run: the
   implementer role moves from Astra to Opus from B2 on (applied as v2).
+- 2026-09-24 v3 (owner rule, applied by the controller): contract moves to Astra (Fable for the hardest designs) and review
+  to the frontier model that did not write the contract. The owner approved changing the locked review step. Opus/Sonnet/Haiku
+  implement; local helps.

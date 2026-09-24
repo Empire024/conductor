@@ -196,3 +196,19 @@ Spec: docs/logic-loops.md. Seed loops: `.conductor/loops/task-triage.md`, `batch
 which record this document's procedure. Phase v0 costs nothing: the loop files exist, and the Auto Fixer's
 instructions point to them. Run it right after B1. v1 (control methods, metrics, budget gate) is batch **B2.5**,
 because every later batch then runs through `batch-delivery` and produces the metrics that refine it.
+
+## Role change (owner, 2026-09-24 18:05), replacing the Roles table above
+
+Astra and Fable are the **high-level thinkers only**. Opus and cheaper models do the implementation; local models help.
+
+| Role | Model | Effort |
+| --- | --- | --- |
+| Contract / architecture (failing tests, acceptance, allowedPaths) | GPT-6 Astra (first choice; Codex allowance to 95%) or Fable 5.1 (hardest designs; its own weekly window was 79% on 09-24) | high |
+| Review (one pass over the batch diff) | The frontier model that did **not** write the contract (Astra ↔ Fable), otherwise Astra | high |
+| Implementation | Claude Opus 5.5; Sonnet 5 for P2 UI with an exact spec; Haiku for mechanical edits | Opus medium/high, Sonnet medium |
+| Churn helpers | Local Qwen 3.6 35B-A3B (durable jobs: test runs, log summaries, tables, update/read-back) | – |
+| Controller | Wizard tab | – |
+
+Budget gates are unchanged (Claude weekly 75% cap, gates at 70/73%; Astra 95%). Opus now carries the implementation,
+so the controller reads `usage.limits` before every Opus dispatch. At 70% Claude weekly or more, implementation moves
+to Sonnet or Haiku with a tighter contract. B1 finishes on the old roles (Astra had already implemented it); B2 on uses these.
