@@ -101,6 +101,41 @@ describe('supervision ports', () => {
     expect(await runStage()).toMatch(/^loop: /)
     expect(ports.loopGuard.assess({ job: running, stage: service.get(created.id).stages[0]!, stages: [], observation: observed(''), error: 'x', previousErrors: [] })).toMatchObject({ loop: true, kind: 'loop' })
   })
+
+  it('restores a late replan for this stage and ignores a late replan for another stage', async () => {
+    const fill = (jobs: DurableJobStore, extra: () => void) => {
+      jobs.create(job(), [stage()], false)
+      jobs.batch('job_1', () => {
+        for (let i = 0; i < 1_000; i++) jobs.event('job_1', { owner: true }, 'note', `filler ${i}`)
+        extra()
+      })
+    }
+    const drive = async (jobs: DurableJobStore): Promise<string> => {
+      const items: TimelineItem[] = []
+      const ports = supervisionPorts({ store: jobs, snapshot: () => projection(items), modelConfig: window.modelConfig, probeHealth: async () => ({ healthy: true }), serverPorts: async () => { throw new Error('unused') }, endpointOverride: () => null, gate: new LocalGenerationGate({ now: Date.now, sleep: tick, interactiveActive: async () => null }), watchdog: { tickMs: 5 } })
+      const stuck: string[] = []
+      const watch = ports.watchdog.watch({ job: jobs.get('job_1'), stage: stage(), agentSessionId: 's' }, reason => stuck.push(reason))
+      for (let i = 0; i < 8 && !stuck.length; i++) { items.push(toolItem(`c${items.length}`, 'read_file', { path: 'a.ts' }, 'same content', false, items.length + 1)); await new Promise(resolve => setTimeout(resolve, 15)) }
+      await until(() => stuck.length > 0)
+      watch.dispose()
+      return stuck[0]!
+    }
+    const blocked = store()
+    fill(blocked, () => {
+      blocked.event('job_1', { owner: true }, 'loop-detected', 'other stage replan', { stageId: 'other', replan: 1 })
+      blocked.event('job_1', { owner: true }, 'loop-detected', 'plural does not count', { stageId: 'stage_1', replans: 9, blocked: true })
+      blocked.event('job_1', { owner: true }, 'loop-detected', 'late replan for this stage', { stageId: 'stage_1', replan: 1 })
+    })
+    expect(blocked.events('job_1', undefined, 1_000).some(event => event.message === 'late replan for this stage')).toBe(false)
+    expect(await drive(blocked)).toMatch(/^loop: /)
+    blocked.close()
+
+    const otherOnly = store()
+    fill(otherOnly, () => { otherOnly.event('job_1', { owner: true }, 'loop-detected', 'late replan for another stage', { stageId: 'other', replan: 1 }) })
+    expect(otherOnly.events('job_1', undefined, 1_000).some(event => event.message === 'late replan for another stage')).toBe(false)
+    expect(await drive(otherOnly)).toMatch(/loop guard replan/)
+    otherOnly.close()
+  })
 })
 
 describe('server port and generation gate', () => {

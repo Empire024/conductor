@@ -6,6 +6,7 @@ import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_STAGE_KINDS, TERMINAL_JOB_STATUSES
 import { DurableJobController } from './controller'
 import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type HandoffPort, type LoopGuardPort, type ReportPort, type ServerLifecyclePort, type StageRuntime, type WatchdogPort } from './ports'
 import { reconcileJobs, type ReconcileOutcome } from './reconcile'
+import { collectDurableJobEvents } from './report'
 import { DurableJobStore, type StoredJob } from './store'
 import { gitWorktrees, type JobWorktree, type WorktreeOps } from './worktree'
 
@@ -246,7 +247,8 @@ export class DurableJobsServiceImpl implements DurableJobsService {
 
   async report(jobId: string): Promise<DurableJobReport & { reportPath: string }> {
     const { planned: _planned, ...job } = this.store.get(jobId)
-    const report = await this.report_.write({ job, stages: this.store.stages(jobId), events: this.store.events(jobId, undefined, 1_000), checkpoints: this.store.checkpoints(jobId), operations: this.store.operations(jobId), now: this.clock() })
+    const events = collectDurableJobEvents((after, limit) => this.store.events(jobId, after, limit))
+    const report = await this.report_.write({ job, stages: this.store.stages(jobId), events, checkpoints: this.store.checkpoints(jobId), operations: this.store.operations(jobId), now: this.clock() })
     if (this.store.get(jobId).reportPath !== report.reportPath) this.store.update(jobId, { owner: true }, { reportPath: report.reportPath })
     return report
   }

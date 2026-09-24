@@ -125,7 +125,7 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
   const guards = new Map<string, StageGuards>()
   /** The loop guard's replan count survives a restart through its loop-detected events. */
   const restore = (job: DurableJob, stage: DurableJobStage): LoopGuardSnapshot | undefined => {
-    const replans = options.store.events(job.id, undefined, 1_000).filter(event => event.kind === 'loop-detected' && event.data?.stageId === stage.id && typeof event.data.replan === 'number').length
+    const replans = options.store.matchingEvents(job.id, { kind: 'loop-detected', stageId: stage.id, dataType: { replan: 'number' } }).length
     return replans ? { stageId: stage.id, replans, lastProgressAt: now() } : undefined
   }
   const guardFor = (job: DurableJob, stage: DurableJobStage): StageGuards => {

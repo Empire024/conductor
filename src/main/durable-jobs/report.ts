@@ -182,17 +182,33 @@ export function writeDurableJobReport(report: DurableJobReport, job: JobWithStag
 }
 
 /**
+ * Reads every event oldest-forward. A single events() call is capped, so a short page is not the
+ * end: the read stops only when the next page is empty. A page with no id, or a cursor that does
+ * not move past one already seen, throws instead of returning a partial history.
+ */
+export function collectDurableJobEvents(read: (afterId?: string, limit?: number) => readonly DurableJobEvent[], pageSize = 500): DurableJobEvent[] {
+  const size = Math.max(1, Math.floor(pageSize))
+  const events: DurableJobEvent[] = []
+  const seen = new Set<string>()
+  let after: string | undefined
+  for (;;) {
+    const page = read(after, size)
+    if (page.length === 0) return events
+    const cursor = page[page.length - 1]?.id
+    if (!cursor) throw new Error('Durable job event page is missing an id')
+    if (cursor === after || seen.has(cursor)) throw new Error('Durable job event page did not advance')
+    seen.add(cursor)
+    events.push(...page)
+    after = cursor
+  }
+}
+
+/**
  * The whole path for a job the service knows: read it, build, write. The service's own report()
  * may call this with its store's checkpoints; the control protocol and IPC call service.report().
  */
 export function generateDurableJobReport(service: Pick<DurableJobsService, 'get' | 'events'> & Partial<Pick<DurableJobsService, 'checkpoints'>>, jobId: string, options: { checkpoints?: readonly DurableJobCheckpoint[]; now?: number } = {}): DurableJobReport & { reportPath: string } {
   const job = service.get(jobId)
-  const events: DurableJobEvent[] = []
-  for (let after: string | undefined; ;) {
-    const page = service.events(jobId, after, 500)
-    events.push(...page)
-    if (page.length < 500) break
-    after = page[page.length - 1]!.id
-  }
+  const events = collectDurableJobEvents((after, limit) => service.events(jobId, after, limit))
   return writeDurableJobReport(buildDurableJobReport({ job, events, checkpoints: options.checkpoints ?? service.checkpoints?.(jobId), now: options.now }), job)
 }

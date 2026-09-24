@@ -1,0 +1,166 @@
+RUN  v3.2.7 C:/Claude/conductor
+
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > runs planned stages sequentially, each in a fresh local conversation on the same model, and completes 68ms
+ ✓ src/main/durable-jobs/wiring.test.ts > handoff port > builds a bounded fresh-context prompt that asks for the status line and carries the retry reason 34ms
+ ✓ src/main/durable-jobs/wiring.test.ts > handoff port > refuses a stage whose fixed part cannot fit a fresh context 46ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > never treats an empty or truncated answer as success, retries in fresh conversations and blocks when attempts run out 51ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > treats an output-limit stop as unfinished even when text exists 40ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > plans further stages for an open-ended job until the model reports done 47ms
+ ✓ src/main/durable-jobs/wiring.test.ts > handoff port > turns a CONTINUE line into the next stage, records tests and counts a rollover past the threshold 46ms
+ ✓ src/main/durable-jobs/wiring.test.ts > supervision ports > blocks for the owner when the same step keeps being refused, instead of retrying it 61ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > blocks an open-ended job whose stage reports no status instead of guessing 46ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > blocks with an approval event when the conversation needs an approval, never answering it 47ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > pauses cooperatively: interrupts the conversation, does not charge the attempt, and resumes in a fresh conversation 63ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > cancels authoritatively and never continues 47ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > interrupts a stage that exceeds its timeout and retries it 46ms
+ ✓ src/main/durable-jobs/wiring.test.ts > supervision ports > replans once on a repeated identical call, then blocks the stage with evidence 125ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > detects a repeating failure as a loop and blocks 47ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > keeps the model policy: refuses a non-local model and records the policy 47ms
+ × src/main/durable-jobs/wiring.test.ts > supervision ports > restores a late replan for this stage and ignores a late replan for another stage 187ms
+   → expected 'loop guard replan: The previous attem…' to match /^loop: /
+ ✓ src/main/durable-jobs/wiring.test.ts > server port and generation gate > skips the server when a test endpoint stands in for llama-server 46ms
+ ✓ src/main/durable-jobs/wiring.test.ts > server port and generation gate > holds the gate for a stage and releases it when the conversation settles 46ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > isolates a git project in its own worktree and commits checkpoints there 46ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > snapshots changed files under logDir for a folder without git 46ms
+ ✓ src/main/durable-jobs/wiring.test.ts > service with the real ports > persists the creator and stage kinds, lists checkpoints and writes report.md, and blocks (not fails) at the elapsed budget 64ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > fires onChange with a summary on every persisted change 46ms
+ ✓ src/main/durable-jobs/controller.test.ts > durable job controller > queues a second job behind the first 48ms
+ × src/main/durable-jobs/controller.test.ts > durable job controller > restarts the elapsed budget from a resume note recorded after the first 1000 events 156ms
+   → expected 1 to be greater than or equal to 2
+ × src/main/durable-jobs/controller.test.ts > durable job controller > counts a repeated failure past the first 1000 events and ignores another stage 157ms
+   → expected 'Stage 1 "Stage 1" used all 6 attempts…' to match /Loop detected/
+ ✓ src/main/durable-jobs/store.test.ts > DurableJobStore > allows exactly the contract transitions and records each with its reason 55ms
+ ✓ src/main/durable-jobs/store.test.ts > DurableJobStore > accumulates active time only while running and stamps start and finish 2ms
+ ✓ src/main/durable-jobs/store.test.ts > DurableJobStore > round-trips jobs, stages, checkpoints, operations and events through the database file 64ms
+ ✓ src/main/durable-jobs/store.test.ts > DurableJobStore > gives one owner per job: another owner is refused, a takeover bumps the epoch and stale writers are rejected 3ms
+ ✓ src/main/durable-jobs/store.test.ts > DurableJobStore > records an operation before execution and its outcome after 2ms
+ ✓ src/main/durable-jobs/store.test.ts > DurableJobStore > notifies once per committed batch and not for a rolled-back one 3ms
+ ✓ src/main/durable-jobs/store.test.ts > DurableJobStore > pages events oldest-forward from afterId when the history is longer than one page 97ms
+ × src/main/durable-jobs/store.test.ts > DurableJobStore > finds a matching event that lands after the oldest 1000, filtered by stage and data 66ms
+   → store.matchingEvents is not a function
+ × src/main/durable-jobs/store.test.ts > DurableJobStore > reloads the newest match after the database file is reopened 127ms
+   → second.matchingEvents is not a function
+   → EPERM, Permission denied: \\?\C:\Users\stilj\AppData\Local\Temp\durable-store-oM8YQr '\\?\C:\Users\stilj\AppData\Local\Temp\durable-store-oM8YQr'
+ ✓ src/main/durable-jobs/report.test.ts > durable job report > reads test outcomes from handoff lines without inventing a pass 39ms
+ ✓ src/main/durable-jobs/report.test.ts > durable job report > writes a factual report.json and report.md with checkpoints, recoveries, models and log paths, never raw logs 48ms
+ ✓ src/main/durable-jobs/report.test.ts > durable job report > reports a cloud escalation only when one was recorded 45ms
+ ✓ src/main/durable-jobs/report.test.ts > durable job report > prefers the store checkpoints when given and reports a queued job with zero elapsed time 32ms
+ × src/main/durable-jobs/report.test.ts > durable job report > pages the service report through a history longer than 1000 events, keeping both ends 234ms
+   → expected [ 'EARLY-RECOVERY-MARKER' ] to deeply equal [ 'EARLY-RECOVERY-MARKER', …(1) ]
+
+ Test Files  4 failed (4)
+      Tests  6 failed | 34 passed (40)
+   Start at  02:20:19
+   Duration  3.82s (transform 586ms, setup 0ms, collect 1.75s, tests 2.53s, environment 1ms, prepare 1.74s)
+
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 6 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/main/durable-jobs/controller.test.ts > durable job controller > restarts the elapsed budget from a resume note recorded after the first 1000 events
+AssertionError: expected 1 to be greater than or equal to 2
+ ❯ src/main/durable-jobs/controller.test.ts:236:35
+    234|     expect(restartAt).toBeGreaterThanOrEqual(1_000)
+    235|     await until(() => runtime.opened.length >= 2 || service.status(cre…
+    236|     expect(runtime.opened.length).toBeGreaterThanOrEqual(2)
+       |                                   ^
+    237|     expect(service.status(created.id).statusReason ?? '').not.toMatch(…
+    238|   })
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/7]⎯
+
+ FAIL  src/main/durable-jobs/controller.test.ts > durable job controller > counts a repeated failure past the first 1000 events and ignores another stage
+AssertionError: expected 'Stage 1 "Stage 1" used all 6 attempts…' to match /Loop detected/
+
+- Expected: 
+/Loop detected/
+
++ Received: 
+"Stage 1 \"Stage 1\" used all 6 attempts. Last error: stagnation: stagnation detail"
+
+ ❯ src/main/durable-jobs/controller.test.ts:254:53
+    252|     runtime.set(runtime.opened[0]!, { phase: 'failed', stopSequence: 1…
+    253|     await until(() => service.status(created.id).status === 'blocked')
+    254|     expect(service.status(created.id).statusReason).toMatch(/Loop dete…
+       |                                                     ^
+    255|     expect(service.get(created.id).stages[0]!.attempt).toBe(3)
+    256|     expect(service.status(created.id).counters.loopsDetected).toBe(1)
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/7]⎯
+
+ FAIL  src/main/durable-jobs/report.test.ts > durable job report > pages the service report through a history longer than 1000 events, keeping both ends
+AssertionError: expected [ 'EARLY-RECOVERY-MARKER' ] to deeply equal [ 'EARLY-RECOVERY-MARKER', …(1) ]
+
+- Expected
++ Received
+
+  [
+    "EARLY-RECOVERY-MARKER",
+-   "LATE-RECOVERY-MARKER",
+  ]
+
+ ❯ src/main/durable-jobs/report.test.ts:135:59
+    133|     expect(head.some(event => event.message === 'LATE-RECOVERY-MARKER'…
+    134|     const report = await service.report(created.id)
+    135|     expect(report.recoveries.map(entry => entry.message)).toEqual(['EA…
+       |                                                           ^
+    136|     expect(report.tests).toEqual(expect.arrayContaining([{ command: 'm…
+    137|     expect(report.cloudEscalation).toEqual({ occurred: true, detail: '…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/7]⎯
+
+ FAIL  src/main/durable-jobs/store.test.ts > DurableJobStore > finds a matching event that lands after the oldest 1000, filtered by stage and data
+TypeError: store.matchingEvents is not a function
+ ❯ src/main/durable-jobs/store.test.ts:164:18
+    162|     expect(oldest).toHaveLength(1_000)
+    163|     expect(oldest.some(event => event.message === 'budget restarted' |…
+    164|     expect(store.matchingEvents('job_1', { kind: 'note', dataEquals: {…
+       |                  ^
+    165|     expect(store.matchingEvents('job_1', { kind: 'note', dataEquals: {…
+    166|     expect(store.matchingEvents('job_1', { kind: 'retry', stageId: 'jo…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/7]⎯
+
+ FAIL  src/main/durable-jobs/store.test.ts > DurableJobStore > reloads the newest match after the database file is reopened
+TypeError: second.matchingEvents is not a function
+ ❯ src/main/durable-jobs/store.test.ts:185:19
+    183|     const head = second.events('job_1', undefined, 1_000)
+    184|     expect(head.some(event => event.message === 'persisted restart')).…
+    185|     expect(second.matchingEvents('job_1', { kind: 'note', dataEquals: …
+       |                   ^
+    186|     expect(second.events('job_1', head.at(-1)!.id, 1_000).at(-1)?.mess…
+    187|     second.close()
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/7]⎯
+
+ FAIL  src/main/durable-jobs/store.test.ts > DurableJobStore > reloads the newest match after the database file is reopened
+Error: EPERM, Permission denied: \\?\C:\Users\stilj\AppData\Local\Temp\durable-store-oM8YQr '\\?\C:\Users\stilj\AppData\Local\Temp\durable-store-oM8YQr'
+ ❯ src/main/durable-jobs/store.test.ts:9:53
+      7| 
+      8| const dirs: string[] = []
+      9| afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recu…
+       |                                                     ^
+     10| 
+     11| function job(id = 'job_1', at = '2026-09-24T00:00:00.000Z'): DurableJo…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+Serialized Error: { errno: 1, code: 'EPERM', path: '\\?\C:\Users\stilj\AppData\Local\Temp\durable-store-oM8YQr', syscall: 'rm' }
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/7]⎯
+
+ FAIL  src/main/durable-jobs/wiring.test.ts > supervision ports > restores a late replan for this stage and ignores a late replan for another stage
+AssertionError: expected 'loop guard replan: The previous attem…' to match /^loop: /
+
+- Expected: 
+/^loop: /
+
++ Received: 
+"loop guard replan: The previous attempt at this stage looped: near-identical calls read_file on a.ts 4 times with nothing new learned. Do not repeat that approach. State in one line why it failed, choose a materially different approach (different file, different command, or a smaller step whose result you can check), and record the decision before acting."
+
+ ❯ src/main/durable-jobs/wiring.test.ts:130:34
+    128|     })
+    129|     expect(blocked.events('job_1', undefined, 1_000).some(event => eve…
+    130|     expect(await drive(blocked)).toMatch(/^loop: /)
+       |                                  ^
+    131|     blocked.close()
+    132| 
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/7]⎯

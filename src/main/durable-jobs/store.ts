@@ -43,6 +43,22 @@ export interface StoredJob extends DurableJob {
 
 const json = <T>(value: unknown): T => JSON.parse(String(value)) as T
 
+const eventField = (key: string): string => {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) throw new Error(`Invalid event data field: ${key}`)
+  return key
+}
+
+/** A predicate over durable job events. Matching is done in the query, not by discarding a prefix. */
+export interface DurableJobEventMatch {
+  kind: DurableJobEvent['kind']
+  /** Only events whose data.stageId equals this id. */
+  stageId?: string
+  /** Each value must equal event.data[key]. */
+  dataEquals?: Record<string, string | number>
+  /** event.data[key] must be this JSON type. `number` matches integer or real. */
+  dataType?: Record<string, 'string' | 'number' | 'boolean'>
+}
+
 /**
  * Durable jobs live in the app's own conductor.db beside orchestration and schedules. Every row
  * carries its full contract object as JSON plus the columns the queries index on. Every mutation
@@ -246,6 +262,35 @@ export class DurableJobStore {
     const after = afterId ? (this.db.prepare('SELECT seq FROM durable_job_events WHERE id = ? AND job_id = ?').get(afterId, jobId) as Row | undefined)?.seq : 0
     if (after === undefined) throw new Error('Unknown event id for this job')
     return (this.db.prepare('SELECT data FROM durable_job_events WHERE job_id = ? AND seq > ? ORDER BY seq LIMIT ?').all(jobId, Number(after), bounded) as Row[]).map(row => json<DurableJobEvent>(row.data))
+  }
+
+  /**
+   * Events that match, oldest first. `limit` keeps the newest matches and still returns them
+   * oldest first, so a later budget note, retry or replan is not hidden behind earlier rows.
+   * Omit `limit` to return every match. Clients that page with afterId keep using events().
+   */
+  matchingEvents(jobId: string, match: DurableJobEventMatch, limit?: number): DurableJobEvent[] {
+    const clauses = ['job_id = ?', 'kind = ?']
+    const params: Array<string | number> = [jobId, match.kind]
+    if (match.stageId !== undefined) {
+      clauses.push(`json_extract(data, '$.data.stageId') = ?`)
+      params.push(match.stageId)
+    }
+    for (const [key, value] of Object.entries(match.dataEquals ?? {})) {
+      clauses.push(`json_extract(data, '$.data.${eventField(key)}') = ?`)
+      params.push(value)
+    }
+    for (const [key, type] of Object.entries(match.dataType ?? {})) {
+      const path = `$.data.${eventField(key)}`
+      if (type === 'string') clauses.push(`json_type(data, '${path}') = 'text'`)
+      else if (type === 'number') clauses.push(`json_type(data, '${path}') IN ('integer', 'real')`)
+      else if (type === 'boolean') clauses.push(`json_type(data, '${path}') IN ('true', 'false')`)
+      else throw new Error(`Unsupported event data type: ${type}`)
+    }
+    const capped = limit === undefined || !Number.isFinite(limit) ? undefined : Math.max(1, Math.floor(limit))
+    const sql = `SELECT data FROM durable_job_events WHERE ${clauses.join(' AND ')} ORDER BY seq DESC${capped === undefined ? '' : ' LIMIT ?'}`
+    if (capped !== undefined) params.push(capped)
+    return (this.db.prepare(sql).all(...params) as Row[]).reverse().map(row => json<DurableJobEvent>(row.data))
   }
 
   lastEvent(jobId: string): DurableJobEvent | undefined {

@@ -2,11 +2,22 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
+import { DEFAULT_DURABLE_JOB_BUDGETS, type DurableJob } from '../../shared/durable-jobs'
 import { FakeDurableJobsService } from '../../shared/durable-jobs-fake'
-import { buildDurableJobReport, generateDurableJobReport, parseTestResult, renderDurableJobReportMarkdown } from './report'
+import { DurableJobsServiceImpl } from './index'
+import { buildDurableJobReport, collectDurableJobEvents, generateDurableJobReport, parseTestResult, renderDurableJobReportMarkdown } from './report'
+import { DurableJobStore } from './store'
+import { FakeRuntime, FakeWorktrees, tick, until } from './test-fakes'
+import { reportPort } from './wiring'
+
+const services: DurableJobsServiceImpl[] = []
 
 const roots: string[] = []
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
+afterEach(async () => {
+  for (const service of services.splice(0)) service.dispose()
+  await new Promise(resolve => setTimeout(resolve, 30))
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
+})
 
 const T0 = Date.parse('2026-09-24T22:00:00.000Z')
 function overnightJob() {
@@ -98,5 +109,75 @@ describe('durable job report', () => {
     expect(report.elapsedMs).toBe(0)
     expect(report.checkpoints).toEqual([{ id: 'c1', createdAt: '2026-09-24T22:05:00.000Z', reason: 'Before broad edit' }])
     expect(report.modelsByStage).toEqual([])
+  })
+
+  it('pages until an empty page, including a history that fills its pages exactly', () => {
+    const rows = Array.from({ length: 1_000 }, (_, index) => ({ id: `e${index}`, jobId: 'job', at: '2026-09-24T00:00:00.000Z', kind: 'note' as const, message: `n${index}` }))
+    const read = (after?: string, limit = 500) => {
+      const start = after ? rows.findIndex(event => event.id === after) + 1 : 0
+      return rows.slice(start, start + limit)
+    }
+    expect(collectDurableJobEvents(read).map(event => event.id)).toEqual(rows.map(event => event.id))
+    expect(collectDurableJobEvents(read, 500).at(-1)?.id).toBe('e999')
+    expect(collectDurableJobEvents(() => []).map(event => event.id)).toEqual([])
+  })
+
+  it('keeps reading when the reader returns fewer rows than requested', () => {
+    const at = '2026-09-24T00:00:00.000Z'
+    const stored: DurableJob = {
+      id: 'job_cap', projectId: 'p', cwd: 'C:/work', title: 'Cap', objective: 'O', status: 'queued',
+      model: { provider: 'local', model: 'local/qwen', escalation: 'never' }, budgets: DEFAULT_DURABLE_JOB_BUDGETS,
+      handoff: { objective: 'O', constraints: [], decisions: [], workDone: [], filesChanged: [], testResults: [], unresolvedIssues: [], nextAction: '', artifacts: [], updatedAt: at },
+      createdAt: at, updatedAt: at, activeMs: 0,
+      counters: { stagesCompleted: 0, retries: 0, recoveries: 0, contextRollovers: 0, loopsDetected: 0, cloudEscalations: 0 },
+      logDir: 'C:/logs/job_cap'
+    }
+    const store = new DurableJobStore(':memory:')
+    store.create(stored, [], false)
+    store.batch('job_cap', () => { for (let i = 0; i < 1_500; i++) store.event('job_cap', { owner: true }, 'note', `n${i}`) })
+    const events = collectDurableJobEvents((after, limit) => store.events('job_cap', after, limit), 2_000)
+    expect(store.events('job_cap', undefined, 2_000)).toHaveLength(1_000)
+    expect(events).toHaveLength(1_501)
+    expect(events[0]?.kind).toBe('transition')
+    expect(events.at(-1)?.message).toBe('n1499')
+    store.close()
+  })
+
+  it('throws when an event page has no id or does not advance', () => {
+    const stuck = { id: 'e0', jobId: 'job', at: '2026-09-24T00:00:00.000Z', kind: 'note' as const, message: 'stuck' }
+    expect(() => collectDurableJobEvents(() => [stuck], 10)).toThrow(/did not advance/)
+    expect(() => collectDurableJobEvents(() => [{ ...stuck, id: '' }], 10)).toThrow(/missing an id/)
+  })
+
+  it('pages the service report through a history longer than 1000 events, keeping both ends', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-job-report-')); roots.push(root)
+    const store = new DurableJobStore(':memory:')
+    const runtime = new FakeRuntime([{ kind: 'hang' }])
+    const service = new DurableJobsServiceImpl({ store, runtime, worktrees: new FakeWorktrees(), logRoot: root, projectPath: () => root, sleep: tick, pollMs: 0, report: reportPort })
+    services.push(service)
+    const created = await service.create({ projectId: 'p1', title: 'Long history', objective: 'Keep every record', model: 'local/qwen' })
+    await until(() => runtime.opened.length === 1)
+    store.batch(created.id, () => {
+      store.event(created.id, { owner: true }, 'recovery', 'EARLY-RECOVERY-MARKER')
+      store.event(created.id, { owner: true }, 'escalation', 'not a cloud run', { occurred: false })
+      for (let i = 0; i < 2_500; i++) {
+        if (i === 1_250) store.event(created.id, { owner: true }, 'note', 'middle test', { test: { command: 'middle-suite', outcome: 'pass', detail: 'kept' } })
+        else store.event(created.id, { owner: true }, 'note', `filler ${i}`)
+      }
+      store.event(created.id, { owner: true }, 'recovery', 'LATE-RECOVERY-MARKER')
+      store.event(created.id, { owner: true }, 'escalation', 'LATE-CLOUD-MARKER', { occurred: true })
+    })
+    const head = service.events(created.id, undefined, 1_000)
+    expect(head.some(event => event.message === 'EARLY-RECOVERY-MARKER')).toBe(true)
+    expect(head.some(event => event.message === 'LATE-RECOVERY-MARKER' || event.message === 'middle test')).toBe(false)
+    const report = await service.report(created.id)
+    expect(report.recoveries.map(entry => entry.message)).toEqual(['EARLY-RECOVERY-MARKER', 'LATE-RECOVERY-MARKER'])
+    expect(report.tests).toEqual(expect.arrayContaining([{ command: 'middle-suite', outcome: 'pass', detail: 'kept' }]))
+    expect(report.cloudEscalation).toEqual({ occurred: true, detail: 'LATE-CLOUD-MARKER' })
+    const markdown = readFileSync(report.reportPath, 'utf8')
+    expect(markdown).toContain('EARLY-RECOVERY-MARKER')
+    expect(markdown).toContain('LATE-RECOVERY-MARKER')
+    expect(markdown).toContain('middle-suite')
+    expect(markdown).toContain('LATE-CLOUD-MARKER')
   })
 })

@@ -17,14 +17,25 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-function setup(script: ScriptedOutcome[] = [], options: { worktrees?: FakeWorktrees; store?: DurableJobStore; runtime?: FakeRuntime; ownerId?: string } = {}) {
+function setup(script: ScriptedOutcome[] = [], options: { worktrees?: FakeWorktrees; store?: DurableJobStore; runtime?: FakeRuntime; ownerId?: string; clock?: () => Date } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'durable-controller-')); dirs.push(dir)
-  const store = options.store ?? new DurableJobStore(':memory:')
+  const store = options.store ?? new DurableJobStore(':memory:', options.clock)
   const runtime = options.runtime ?? new FakeRuntime(script)
   const worktrees = options.worktrees ?? new FakeWorktrees()
-  const service = new DurableJobsServiceImpl({ store, runtime, worktrees, logRoot: dir, projectPath: () => dir, ownerId: options.ownerId ?? 'pid:test', sleep: tick, pollMs: 0, interruptGraceMs: 200 })
+  const service = new DurableJobsServiceImpl({ store, runtime, worktrees, logRoot: dir, projectPath: () => dir, ownerId: options.ownerId ?? 'pid:test', sleep: tick, pollMs: 0, interruptGraceMs: 200, ...(options.clock ? { clock: options.clock } : {}) })
   services.push(service)
   return { service, store, runtime, worktrees, dir }
+}
+
+/** Oldest-forward pages until a short page, so a test can see past the 1,000-row read cap. */
+function allEvents(store: DurableJobStore, jobId: string) {
+  const events: ReturnType<DurableJobStore['events']> = []
+  for (let after: string | undefined; ;) {
+    const page = store.events(jobId, after, 500)
+    events.push(...page)
+    if (page.length < 500) return events
+    after = page[page.length - 1]!.id
+  }
 }
 
 const input = (extra: Partial<CreateDurableJobInput> = {}): CreateDurableJobInput => ({ projectId: 'project_1', title: 'Overnight', objective: 'Refactor the parser', model: 'local/qwen3.6-35b-a3b', ...extra })
@@ -205,5 +216,44 @@ describe('durable job controller', () => {
     expect(service.status(second.id).status).toBe('queued')
     await service.cancel(first.id)
     await until(() => service.status(second.id).status === 'completed')
+  })
+
+  it('restarts the elapsed budget from a resume note recorded after the first 1000 events', async () => {
+    let now = Date.parse('2026-09-24T00:00:00.000Z')
+    const { service, store, runtime } = setup([{ kind: 'hang' }, { kind: 'answer', text: 'step two done' }], { clock: () => new Date(now) })
+    const created = await service.create(input({ budgets: { maxElapsedMs: 60_000 }, stages: planned(2) }))
+    await until(() => runtime.opened.length === 1 && runtime.observe(runtime.opened[0]!).phase === 'running')
+    now += 120_000
+    runtime.set(runtime.opened[0]!, { phase: 'completed', stopSequence: 1, stop: { reason: 'completed', detail: '', filesChanged: [] }, lastAnswer: 'step one done', filesChanged: [] })
+    await until(() => service.status(created.id).status === 'blocked')
+    expect(service.status(created.id).statusReason).toMatch(/elapsed-time budget/)
+    store.batch(created.id, () => { for (let i = 0; i < 1_000; i++) store.event(created.id, { owner: true }, 'note', `filler ${i}`) })
+    expect(allEvents(store, created.id).length).toBeGreaterThan(1_000)
+    await service.resume(created.id)
+    const restartAt = allEvents(store, created.id).findIndex(event => event.kind === 'note' && event.data?.elapsedBudget === 'restarted')
+    expect(restartAt).toBeGreaterThanOrEqual(1_000)
+    await until(() => runtime.opened.length >= 2 || service.status(created.id).status === 'blocked')
+    expect(runtime.opened.length).toBeGreaterThanOrEqual(2)
+    expect(service.status(created.id).statusReason ?? '').not.toMatch(/elapsed-time budget/)
+  })
+
+  it('counts a repeated failure past the first 1000 events and ignores another stage', async () => {
+    const fail: ScriptedOutcome = { kind: 'answer', text: '', reason: 'stagnation' }
+    const { service, store, runtime } = setup([{ kind: 'hang' }, fail, fail, fail, fail, fail])
+    const created = await service.create(input({ budgets: { maxStageAttempts: 6 } }))
+    await until(() => runtime.opened.length === 1 && runtime.observe(runtime.opened[0]!).phase === 'running')
+    const stageId = service.get(created.id).stages[0]!.id
+    const error = 'stagnation: stagnation detail'
+    store.batch(created.id, () => {
+      for (let i = 0; i < 1_000; i++) store.event(created.id, { owner: true }, 'note', `filler ${i}`)
+      store.event(created.id, { owner: true }, 'retry', 'other stage', { stageId: `${stageId}-other`, error })
+      store.event(created.id, { owner: true }, 'retry', 'other stage again', { stageId: `${stageId}-other`, error })
+    })
+    runtime.set(runtime.opened[0]!, { phase: 'failed', stopSequence: 1, stop: { reason: 'stagnation', detail: 'stagnation detail', filesChanged: [] }, lastAnswer: '', filesChanged: [] })
+    await until(() => service.status(created.id).status === 'blocked')
+    expect(service.status(created.id).statusReason).toMatch(/Loop detected/)
+    expect(service.get(created.id).stages[0]!.attempt).toBe(3)
+    expect(service.status(created.id).counters.loopsDetected).toBe(1)
+    expect(runtime.opened).toHaveLength(3)
   })
 })

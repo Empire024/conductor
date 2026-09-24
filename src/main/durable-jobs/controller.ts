@@ -225,7 +225,7 @@ export class DurableJobController {
   /** Start of the current elapsed-time budget: the job's start, or the owner's latest resume. */
   private elapsedSince(job: StoredJob): number | undefined {
     if (!job.budgets.maxElapsedMs || !job.startedAt) return undefined
-    const restarted = this.store.events(job.id, undefined, 1_000).filter(event => event.kind === 'note' && event.data?.elapsedBudget === 'restarted').at(-1)
+    const restarted = this.store.matchingEvents(job.id, { kind: 'note', dataEquals: { elapsedBudget: 'restarted' } }, 1).at(-1)
     return Date.parse(restarted?.at ?? job.startedAt)
   }
 
@@ -392,7 +392,7 @@ export class DurableJobController {
     // Failed attempt.
     const error = describeFailure(observation, wait.interruptedFor)
     const failed: DurableJobStage = { ...stage, status: 'pending', error, agentSessionId: stage.agentSessionId }
-    const previousErrors = this.store.events(job.id, undefined, 1_000).filter(event => event.kind === 'retry' && event.data?.stageId === stage.id && typeof event.data.error === 'string').map(event => String(event.data!.error))
+    const previousErrors = this.store.matchingEvents(job.id, { kind: 'retry', stageId: stage.id, dataType: { error: 'string' } }).map(event => String(event.data!.error))
     this.store.batch(job.id, () => {
       this.store.update(job.id, guard, { handoff: decision.handoff })
       this.store.saveStage(job.id, guard, failed, { kind: 'retry', message: `Stage ${stage.index + 1} attempt ${stage.attempt} did not finish: ${error}`, data: { error, attempt: stage.attempt, stop: observation.stop?.reason ?? null, promptTokens: observation.report?.context.usedTokens ?? null } })
