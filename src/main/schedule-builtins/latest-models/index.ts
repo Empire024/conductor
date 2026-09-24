@@ -3,6 +3,7 @@ import conductorPins from './conductor-pins.mjs?raw'
 import primarySources from './primary-sources.mjs?raw'
 import compatibilityReport from './compatibility-report.mjs?raw'
 import offlineTests from './offline-tests.mjs?raw'
+import restorePointBaseline from './restore-point-baseline.mjs?raw'
 import type { ScheduleScriptFormat, ScheduleScriptRunWhen, ScheduleTiming } from '../../../shared/schedules'
 
 export interface BuiltinScheduleScript { name: string; description: string; language: 'node'; format: ScheduleScriptFormat; runWhen: ScheduleScriptRunWhen; timeoutSec: number; order: number; content: string }
@@ -36,7 +37,8 @@ export const LATEST_MODELS_BUILTIN: BuiltinScheduleSpec = {
     script(1, 'cli-catalogs', 'Versions and model catalogs the installed Claude Code (initialize) and Codex (app-server model/list) advertise; no inference.', cliCatalogs, 180),
     script(2, 'conductor-pins', 'Catalogs, version pins, effort ladders, fixtures and hard-coded model ids in the Conductor checkout, read from source text.', conductorPins, 30),
     script(3, 'primary-sources', 'Model ids and release facts from the OpenAI, Anthropic, llama.cpp and Qwen primary sources (conditional GET, cached).', primarySources, 90),
-    script(4, 'compatibility-report', 'Findings with proposed edits: CLI versus Conductor pins, fixtures and primary sources.', compatibilityReport, 30),
-    script(5, 'offline-tests', 'The offline vitest files the report names, run only when something moved.', offlineTests, 900, 'changed')
+    script(4, 'restore-point-baseline', 'CLI versions captured by the latest known-good local restore point.', restorePointBaseline, 10),
+    script(5, 'compatibility-report', 'Findings with proposed edits: CLI versus Conductor pins, fixtures, primary sources and the latest known-good restore point.', compatibilityReport, 30),
+    script(6, 'offline-tests', 'The offline vitest files the report names, run only when something moved.', offlineTests, 900, 'changed')
   ]
 }

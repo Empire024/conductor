@@ -6,6 +6,8 @@ import { gt, valid } from 'semver'
 import type { AppUpdateState } from '../shared/models'
 import { DEFAULT_GITHUB_UPDATE_URL, normalizeUpdateFeedUrl, resolveUpdateProvider, type ConductorUpdateProvider } from './update-config'
 import { LocalUpdateFeed } from './local-update-feed'
+import { RestorePointStore } from './restore-points'
+import type { RestorePoint } from '../shared/models'
 
 interface UpdateManagerOptions {
   currentVersion: string
@@ -31,6 +33,7 @@ export class UpdateManager {
   private remoteUpdater: NsisUpdater | null = null
   private localUpdater: NsisUpdater | null = null
   private localFeed?: LocalUpdateFeed
+  private restorePoints?: RestorePointStore
   private localUrl?: string
   private includeLocal = true
   private epoch = 0
@@ -41,7 +44,11 @@ export class UpdateManager {
 
   constructor(private readonly options: UpdateManagerOptions) {
     this.state = { phase: 'disabled', currentVersion: options.currentVersion, configured: false, message: 'Connecting to update sources.' }
-    if (options.localBuildDirectory) this.localFeed = new LocalUpdateFeed(options.localBuildDirectory)
+    if (options.localBuildDirectory) {
+      this.localFeed = new LocalUpdateFeed(options.localBuildDirectory)
+      this.restorePoints = new RestorePointStore(options.localBuildDirectory)
+      this.restorePoints.beginRun(options.currentVersion)
+    }
   }
   getState(): AppUpdateState {
     const request = this.restartRequest
@@ -50,6 +57,12 @@ export class UpdateManager {
   }
   /** A wizard's app.restart.request, shown on the owner's update control until the next launch. */
   setRestartRequest(request: RestartRequest | null): void { this.restartRequest = request; this.setState(this.state) }
+  versions(): RestorePoint[] { return this.restorePoints?.list() ?? [] }
+  pinVersion(version: string, pinned: boolean): RestorePoint {
+    if (!this.restorePoints) throw new Error('Local restore points are unavailable')
+    return this.restorePoints.pin(version, pinned)
+  }
+  recordFailedShip(): void { this.restorePoints?.recordFailedShip(this.options.currentVersion) }
 
   configure(requestedUrl: string, includeLocal = this.includeLocal): string {
     if (busy(this.state.phase)) throw new Error('Finish the downloaded update before changing update sources')
@@ -72,7 +85,7 @@ export class UpdateManager {
     this.scheduleChecks()
     return feedUrl
   }
-  private createUpdater(provider: ConductorUpdateProvider): NsisUpdater {
+  private createUpdater(provider: ConductorUpdateProvider, allowDowngrade = false): NsisUpdater {
     const updater = new NsisUpdater(provider)
     const epoch = this.epoch
     const current = (): boolean => epoch === this.epoch && this.updater === updater
@@ -80,7 +93,7 @@ export class UpdateManager {
     updater.autoInstallOnAppQuit = true
     updater.autoRunAppAfterInstall = true
     updater.disableWebInstaller = true
-    updater.allowDowngrade = false
+    updater.allowDowngrade = allowDowngrade
     updater.allowPrerelease = false // Local generic feeds still accept their explicitly versioned build.
     updater.forceDevUpdateConfig = Boolean(this.options.allowDevelopmentUpdates)
     updater.logger = console
@@ -151,6 +164,25 @@ export class UpdateManager {
     catch (reason) { if (this.updater === updater) this.setState({ ...this.state, phase: 'error', message: errorMessage(reason) }) }
     return this.getState()
   }
+  /** Selects an immutable historical build in the same loopback feed, downloads it through the
+   * normal updater, then takes the existing guarded restart path. */
+  async rollback(version: string): Promise<void> {
+    if (!this.restorePoints || !this.localFeed) throw new Error('Local restore points are unavailable')
+    if (busy(this.state.phase)) throw new Error('Finish the current update before rolling back')
+    const point = this.restorePoints.activate(version)
+    const local = await this.localFeed.refresh()
+    if (!local || local.version !== point.version) throw new Error(`Restore point ${version} could not be opened by the local update feed`)
+    this.localUpdater?.removeAllListeners()
+    const updater = this.localUpdater = this.createUpdater({ provider: 'generic', url: local.url, useMultipleRangeRequest: false }, true)
+    this.localUrl = local.url
+    this.updater = updater
+    const result = await updater.checkForUpdates()
+    if (!result?.isUpdateAvailable) throw new Error(`Restore point ${version} is not installable`)
+    this.setState({ phase: 'available', currentVersion: this.options.currentVersion, availableVersion: version, source: 'local', configured: true, message: `Rolling back to Conductor ${version}.` })
+    await this.download()
+    if (this.state.phase !== 'ready') throw new Error(this.state.message ?? `Could not download restore point ${version}`)
+    await this.install()
+  }
   async install(options: { force?: boolean } = {}, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> {
     if (!this.updater || this.state.phase !== 'ready') return
     this.setState({ ...this.state, phase: 'installing', message: 'Saving windows and stopping processes…' })
@@ -180,6 +212,7 @@ export class UpdateManager {
     this.localUpdater?.on('error', () => {})
     this.updater = this.remoteUpdater = this.localUpdater = null
     this.localFeed?.dispose()
+    this.restorePoints?.endRun(this.options.currentVersion)
     this.pendingPrepare?.finish()
   }
 

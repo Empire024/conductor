@@ -4,7 +4,7 @@ import { useAgentControl } from './use-agent-control'
 import { ListTodo } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import { Bot, Brain, Clock3, Gauge, GitBranch, Globe2, HardDrive, Hourglass, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
+import { Bot, Brain, Clock3, Gauge, GitBranch, Globe2, HardDrive, LayoutPanelTop, PanelLeft, PanelRight, Plus, Radio, Workflow, X, Zap } from 'lucide-react'
 import type {
   AgentActivityPhase,
   AgentProviderId,
@@ -65,7 +65,6 @@ import { ProcessDashboardPane } from './panes/ProcessDashboardPane'
 import { SourceControlPane } from './components/SourceControlPane'
 import { OrchestrationHub } from './components/OrchestrationHub'
 import { SchedulesPane } from './components/SchedulesPane'
-import { DurableJobsPane } from './components/DurableJobsPane'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile, changeWorkspacePath, loadWorkspaceFiles, workspaceFileIds, workspaceFileMachine } from './components/workspace-files-state'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
@@ -137,7 +136,8 @@ export function App(): React.JSX.Element {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [utilityPanel, setUtilityPanel] = useState<SidebarUtilityPanel | null>(() => {
     const saved = localStorage.getItem('conductor.utilityPanel')
-    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules', 'source-control', 'jobs'].includes(saved ?? '')
+    if (saved === 'jobs') { localStorage.removeItem('conductor.utilityPanel'); return null }
+    return ['agents', 'tasks', 'routines', 'memory', 'processes', 'backlog', 'schedules', 'source-control'].includes(saved ?? '')
       ? saved as SidebarUtilityPanel
       : null
   })
@@ -296,8 +296,6 @@ export function App(): React.JSX.Element {
         ? { label: 'Scheduled tasks', aria: 'Scheduled tasks, their scripts and run history', icon: Clock3 }
       : utilityPanel === 'source-control'
         ? { label: 'Source control', aria: 'Repository status and delivery', icon: GitBranch }
-      : utilityPanel === 'jobs'
-        ? { label: 'Durable jobs', aria: 'Durable overnight local-model jobs', icon: Hourglass }
       : utilityPanel === 'routines'
         ? { label: 'Automation', aria: 'Project automation', icon: Workflow }
       : { label: 'Automation', aria: 'Agents, tasks, and routines', icon: Bot }
@@ -1547,6 +1545,7 @@ export function App(): React.JSX.Element {
                           canReopen={activeSession.closedTabs.length > 0}
                           onReopen={reopenClosed}
                           onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(activeProject.id, path, mode ?? 'auto', line, allowBinary)}
+                          onOpenJob={openJobTab}
                           correctedActivityPhases={correctedActivityPhases}
                         />
                         <WorkspaceFiles key={'files:' + activeSession.id} projects={projects} projectId={activeProject.id} workspaceId={activeSession.id} showHiddenFilesDefault={appSettings.showHiddenFiles} />
@@ -1608,8 +1607,6 @@ export function App(): React.JSX.Element {
                           ? <ProcessDashboardPane project={activeProject} />
                           : utilityPanel === 'schedules'
                             ? <SchedulesPane projectId={activeProject.id} />
-                          : utilityPanel === 'jobs'
-                            ? <DurableJobsPane key={activeProject.id} projectId={activeProject.id} workspaceId={activeSession?.id} onOpenJob={openJobTab} />
                           : utilityPanel === 'source-control'
                             ? <SourceControlPane key={activeProject.id} project={activeProject} />
                           : <OrchestrationHub

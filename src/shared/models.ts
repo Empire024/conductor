@@ -211,6 +211,23 @@ export interface AppUpdateState {
   restartRequest?: { title: string; reason: string; at: string }
 }
 
+/** One immutable locally built Conductor package and the runtime environment captured with it. */
+export interface RestorePoint {
+  version: string
+  commit: string | null
+  createdAt: string
+  dirty: boolean
+  cliVersions: { claude: string | null; codex: string | null; grok: string | null }
+  models: Array<{ provider: string; available?: boolean; models: Array<{ id: string; label?: string; effort?: string[] }> }>
+  installer: string
+  blockmap: string
+  pinned: boolean
+  knownGood: boolean
+  crashCount: number
+  failedShipCount: number
+  firstLaunchedAt?: string
+}
+
 export interface AppDiagnostics {
   appVersion: string
   electronVersion: string

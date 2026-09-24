@@ -16,6 +16,7 @@ import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import type { RemoteTerminalSummary } from '../../../shared/remote-terminals'
 import { checkRemoteProjectPlacement } from '../../../shared/project-identity'
 import { checkProjectPlacement, requiredMachineId } from '../layout/machine-placement'
+import { DurableJobLauncherOption } from '../components/DurableJobsPane'
 
 interface LauncherPaneProps {
   projectId: string
@@ -27,6 +28,8 @@ interface LauncherPaneProps {
   error?: string
   onSelectMachine?(machineId: string): void
   onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
+  workspaceId?: string
+  onOpenJob?(job: { id: string; title: string }): void
   /** Binds a tab to a shell already running on that machine instead of starting another. */
   onAttachTerminal?(machineId: string, remoteTerminalId: string, title: string): void
 }
@@ -89,11 +92,14 @@ export function machinePlacementOptions(
     })
 }
 
-export function LauncherPane({ projectId, project, machineId, error, onSelectMachine, onOpen, onAttachTerminal }: LauncherPaneProps): React.JSX.Element {
+export function LauncherPane({ projectId, project, machineId, error, onSelectMachine, onOpen, workspaceId, onOpenJob, onAttachTerminal }: LauncherPaneProps): React.JSX.Element {
   const [machines, setMachines] = useState<MachineDescriptor[]>([])
   const [checking, setChecking] = useState(false)
   const [running, setRunning] = useState<RemoteTerminalSummary[] | null>(null)
   const [runningError, setRunningError] = useState('')
+  const [durableModel, setDurableModel] = useState(LOCAL_MODELS[0]!)
+  const [creatingJob, setCreatingJob] = useState(false)
+  const [jobError, setJobError] = useState('')
   const host = requiredMachineId(project)
   const selected = host ?? machineId ?? LOCAL_MACHINE_ID
 
@@ -216,6 +222,18 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
           )
         })}
       </div>
+      {selected === LOCAL_MACHINE_ID && onOpenJob && <div className="launcher-durable-option">
+        <label>Local model for durable work<select aria-label="Durable job local model" value={durableModel.id} onChange={event => setDurableModel(LOCAL_MODELS.find(model => model.id === event.target.value) ?? LOCAL_MODELS[0]!)}>
+          {LOCAL_MODELS.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}
+        </select></label>
+        <DurableJobLauncherOption model={durableModel} busy={creatingJob} error={jobError} onCreate={input => {
+          setCreatingJob(true); setJobError('')
+          void window.conductor.durableJobs.create({ projectId, ...(workspaceId ? { workspaceId } : {}), ...input })
+            .then(summary => onOpenJob({ id: summary.id, title: summary.title }))
+            .catch(reason => setJobError(reason instanceof Error ? reason.message : String(reason)))
+            .finally(() => setCreatingJob(false))
+        }} />
+      </div>}
       {/*
         A shell on the host outlives the tab that was watching it - closing a view is not stopping a
         process - so after a reconnect, a restart or a closed tab there may well be one still

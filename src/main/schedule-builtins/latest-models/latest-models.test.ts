@@ -465,13 +465,29 @@ describe('latest models: offline-tests', { timeout: 30_000 }, () => {
   })
 })
 
+describe('latest models: restore point baseline', () => {
+  it('reports CLI drift from the latest known-good local build', async () => {
+    const root = checkout(CLAUDE_AFTER_818C29B), runDir = temp('restore-drift')
+    writeFileSync(join(runDir, 'cli-catalogs.out'), catalogsOut({ version: '2.1.281', models: claude281() }, { version: '0.156.0', models: codex1551() }))
+    writeFileSync(join(runDir, 'conductor-pins.out'), JSON.stringify({ checkout: false }))
+    writeFileSync(join(runDir, 'primary-sources.out'), SOURCES_OUT)
+    writeFileSync(join(runDir, 'restore-point-baseline.out'), JSON.stringify({ knownGood: { version: '0.2.0-local.8', createdAt: '2026-09-23T12:00:00Z', cliVersions: { claude: '2.1.278', codex: '0.155.1', grok: '1.0.41' } } }))
+    const result = await run('compatibility-report.mjs', root, { CONDUCTOR_SCHEDULE_RUN_DIR: runDir })
+    const out = JSON.parse(result.stdout) as Report
+    expect(out.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ area: 'restore-point', finding: expect.stringContaining('CLI Claude Code changed since the last known-good build 0.2.0-local.8') }),
+      expect.objectContaining({ area: 'restore-point', finding: expect.stringContaining('CLI Codex changed since the last known-good build 0.2.0-local.8') })
+    ]))
+  })
+})
+
 // ---------------------------------------------------------------------------------------------
 // The built-in task spec
 // ---------------------------------------------------------------------------------------------
 describe('LATEST_MODELS_BUILTIN', () => {
-  it('ships the five scripts in order, byte for byte, within the store limits', () => {
+  it('ships the scripts in order, byte for byte, within the store limits', () => {
     const scripts = LATEST_MODELS_BUILTIN.scripts
-    expect(scripts.map(script => script.name)).toEqual(['cli-catalogs', 'conductor-pins', 'primary-sources', 'compatibility-report', 'offline-tests'])
+    expect(scripts.map(script => script.name)).toEqual(['cli-catalogs', 'conductor-pins', 'primary-sources', 'restore-point-baseline', 'compatibility-report', 'offline-tests'])
     expect(new Set(scripts.map(script => script.name)).size).toBe(scripts.length)
     expect(scripts.map(script => script.order)).toEqual([...scripts.map(script => script.order)].sort((a, b) => a - b))
     expect(new Set(scripts.map(script => script.order)).size).toBe(scripts.length)

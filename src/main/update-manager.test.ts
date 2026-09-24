@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 const f = vi.hoisted(() => ({
   instances: [] as Array<any>, local: vi.fn(), remoteVersion: '0.1.4', localVersion: '0.1.5-local.1',
   remoteGate: undefined as Promise<void> | undefined, downloadGate: undefined as Promise<void> | undefined,
@@ -31,9 +34,12 @@ vi.mock('electron-updater', async () => {
   } }
 })
 import { UpdateManager } from './update-manager'
+import { RestorePointStore } from './restore-points'
 const managers: UpdateManager[] = []
+const roots: string[] = []
+const updateDir = (): string => { const root = mkdtempSync(join(tmpdir(), 'conductor-update-manager-')); roots.push(root); return root }
 function manager() {
-  const result = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: 'fixture', beforeInstall: vi.fn() })
+  const result = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall: vi.fn() })
   managers.push(result)
   result.configure('')
   return result
@@ -43,7 +49,7 @@ beforeEach(() => {
   f.remoteGate = f.downloadGate = undefined; f.remoteError = false
   f.local.mockReset().mockImplementation(async () => ({ version: f.localVersion, url: 'http://127.0.0.1:9370/fixture/' }))
 })
-afterEach(() => { managers.splice(0).forEach(value => value.dispose()); vi.useRealTimers() })
+afterEach(() => { managers.splice(0).forEach(value => value.dispose()); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); vi.useRealTimers() })
 describe('installed updater source ownership — mocked transport, no installation', () => {
   it('discovers local builds automatically shortly after startup', async () => {
     vi.useFakeTimers()
@@ -105,10 +111,27 @@ describe('installed updater source ownership — mocked transport, no installati
     expect(f.instances[1].downloadUpdate).toHaveBeenCalledTimes(1)
     finish(); await first
   })
+
+  it('rolls back through the same local feed with downgrades enabled', async () => {
+    const directory = updateDir(), version = '0.1.3-local.1'
+    const store = new RestorePointStore(directory)
+    store.record({ version, commit: 'a'.repeat(40), createdAt: '2026-09-23T12:00:00Z', dirty: false,
+      cliVersions: { claude: '2.1.278', codex: '0.155.1', grok: '1.0.41' }, models: [],
+      installer: `Conductor-Setup-${version}.exe`, blockmap: `Conductor-Setup-${version}.exe.blockmap` })
+    writeFileSync(join(directory, `restore-point-${version}.json`), JSON.stringify({ schemaVersion: 1, version }))
+    f.localVersion = version
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: directory, beforeInstall: vi.fn() })
+    managers.push(m); m.configure('')
+    await m.rollback(version)
+    const rollbackUpdater = f.instances.at(-1)
+    expect(rollbackUpdater.allowDowngrade).toBe(true)
+    expect(rollbackUpdater.downloadUpdate).toHaveBeenCalledOnce()
+    expect(rollbackUpdater.quitAndInstall).toHaveBeenCalledExactlyOnceWith(true, true)
+  })
 })
 
 it('keeps a downloaded update ready when the owner cancels closing dirty editors', async () => {
-  const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: 'fixture', beforeInstall: () => { throw Object.assign(new Error('Cancelled'), { code: 'UPDATE_CANCELLED' }) } })
+  const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall: () => { throw Object.assign(new Error('Cancelled'), { code: 'UPDATE_CANCELLED' }) } })
   managers.push(m); m.configure('')
   await m.check(); await m.download(); await m.install()
   expect(m.getState().phase).toBe('ready')

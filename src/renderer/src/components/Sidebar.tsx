@@ -15,7 +15,6 @@ import {
   ChevronDown,
   ChevronRight,
   Clock3,
-  Hourglass,
   FolderInput,
   FolderOpen,
   FolderGit2,
@@ -94,7 +93,7 @@ interface SidebarProps {
 }
 
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
-export type SidebarUtilityPanel = WorkspacePanel | 'schedules' | 'source-control' | 'jobs'
+export type SidebarUtilityPanel = WorkspacePanel | 'schedules' | 'source-control'
 
 export const SIDEBAR_MIN_WIDTH = 200
 export const SIDEBAR_MAX_WIDTH = 480
@@ -129,8 +128,7 @@ const railItems: Array<{
   { icon: MemoryStick, label: 'Memory', utility: 'memory', group: 'secondary' },
   { icon: Gauge, label: 'Processes', utility: 'processes', group: 'secondary' },
   { icon: GitBranch, label: 'Source control', utility: 'source-control', group: 'secondary' },
-  { icon: Clock3, label: 'Scheduled tasks', utility: 'schedules', group: 'secondary' },
-  { icon: Hourglass, label: 'Durable jobs', utility: 'jobs', group: 'secondary' }
+  { icon: Clock3, label: 'Scheduled tasks', utility: 'schedules', group: 'secondary' }
 ]
 
 export function Sidebar(props: SidebarProps): React.JSX.Element {

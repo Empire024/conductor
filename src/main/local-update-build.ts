@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
+import { RestorePointStore } from './restore-points'
 
 /** What a caller can learn about the local update build without watching the console. The log is
  *  a bounded tail: a full electron-builder run is tens of thousands of lines, and the last of them
@@ -69,6 +70,8 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
   private current: LocalUpdateBuildStatus = idle()
   private child: ChildProcess | null = null
 
+  constructor(private readonly options: { modelsList?: () => unknown } = {}) {}
+
   unsupported(workspace: string): string | null {
     if (process.platform !== 'win32') return 'Local installed-app updates currently require Windows x64.'
     if (!process.env.APPDATA) return 'APPDATA is unavailable, so the installed app’s local update feed cannot be located.'
@@ -95,7 +98,11 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     this.current = { state: 'running', workspace: root, startedAt: started, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'Building a local Conductor update; this takes several minutes.', log: [] }
     const child = spawn(node.executable, [join(root, 'scripts', 'build-local-update.mjs')], {
       cwd: root, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, npm_execpath: npm, ...(node.asNode ? { ELECTRON_RUN_AS_NODE: '1' } : {}) }
+      env: {
+        ...process.env, npm_execpath: npm,
+        ...(this.options.modelsList ? { CONDUCTOR_MODELS_LIST_JSON: JSON.stringify(this.options.modelsList()) } : {}),
+        ...(node.asNode ? { ELECTRON_RUN_AS_NODE: '1' } : {})
+      }
     })
     this.child = child
     const timer = setTimeout(() => child.kill('SIGKILL'), BUILD_TIMEOUT_MS)
@@ -112,6 +119,10 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     child.on('close', code => {
       if (!mine()) return
       clearTimeout(timer); this.child = null
+      if (code === 0 && this.current.feedDirectory) {
+        try { new RestorePointStore(this.current.feedDirectory).prune() }
+        catch (error) { this.append(`Restore point pruning warning: ${error instanceof Error ? error.message : String(error)}`) }
+      }
       this.finish(code, code === 0
         ? `Local update ${this.current.version ?? 'build'} published. Open Conductor’s update control — it offers “Update pending”; nothing has been installed for you.`
         : `The local update build failed (exit ${code ?? -1}). The log tail says why.`)

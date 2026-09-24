@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { existsSync, lstatSync } from 'node:fs'
-import { mkdir, readFile } from 'node:fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { builderArguments, localFeedDirectory, parseVersion, publishLocalPackage, readPreviousDescriptor, selectLocalVersion } from './local-update-package.mjs'
@@ -68,6 +68,41 @@ try {
   dirty = Boolean(execFileSync('git', [...gitArguments, 'status', '--porcelain'], { cwd: workspace, encoding: 'utf8', windowsHide: true }).trim())
 } catch { console.warn('Git metadata unavailable; local build will not claim a clean commit.') }
 
+const cliVersion = (command, args = ['--version']) => {
+  try { return execFileSync(command, args, { cwd: workspace, encoding: 'utf8', windowsHide: true, timeout: 10_000 }).trim().split(/\r?\n/)[0] || null }
+  catch { return null }
+}
+const parseModels = () => {
+  try {
+    const value = JSON.parse(process.env.CONDUCTOR_MODELS_LIST_JSON || '[]')
+    return Array.isArray(value) ? value : []
+  } catch { return [] }
+}
+const captureRestorePoint = async descriptor => {
+  const catalogPath = resolve(feedDirectory, 'restore-points.json')
+  let catalog = { schemaVersion: 1, points: [] }
+  try {
+    const value = JSON.parse(await readFile(catalogPath, 'utf8'))
+    if (value?.schemaVersion === 1 && Array.isArray(value.points)) catalog = value
+  } catch {}
+  const existing = catalog.points.find(point => point.version === version)
+  const point = {
+    version, commit, createdAt: descriptor.createdAt, dirty,
+    cliVersions: { claude: cliVersion('claude'), codex: cliVersion('codex'), grok: cliVersion('grok') },
+    models: parseModels(), installer: descriptor.installer, blockmap: descriptor.blockmap,
+    pinned: existing?.pinned === true, knownGood: existing?.knownGood === true,
+    crashCount: existing?.crashCount || 0, failedShipCount: existing?.failedShipCount || 0,
+    ...(existing?.firstLaunchedAt ? { firstLaunchedAt: existing.firstLaunchedAt } : {})
+  }
+  catalog.points = [point, ...catalog.points.filter(entry => entry.version !== version)]
+  const descriptorCopy = resolve(feedDirectory, `restore-point-${version}.json`)
+  await writeFile(descriptorCopy, `${JSON.stringify(descriptor, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+  const temporary = resolve(feedDirectory, `.restore-points-${process.pid}-${Date.now()}.tmp`)
+  await writeFile(temporary, `${JSON.stringify(catalog, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+  await rename(temporary, catalogPath)
+  return point
+}
+
 const npmCandidates = [process.env.npm_execpath, resolve(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')]
 const npmCli = npmCandidates.find(path => path && path.endsWith('.js') && existsSync(path))
 if (!npmCli) throw new Error('Could not resolve npm-cli.js; invoke with npm.cmd run update:local')
@@ -82,4 +117,6 @@ console.log(`Building ${version}; the source package version and Git tags remain
 await runNode([npmCli, 'run', 'build'])
 await runNode([resolve(workspace, 'node_modules', 'electron-builder', 'cli.js'), ...builderArguments(version, outputDirectory)])
 const descriptor = await publishLocalPackage({ version, outputDirectory, feedDirectory, commit, dirty })
+const restorePoint = await captureRestorePoint(descriptor)
 console.log(`Local update ready: ${descriptor.version}\nFeed: ${feedDirectory}\nThe installed app's Include local test builds option must be enabled (the default). It will offer Update pending; no installer needs to be run manually.`)
+console.log(`Restore point: ${restorePoint.version}; Claude ${restorePoint.cliVersions.claude ?? 'unknown'}, Codex ${restorePoint.cliVersions.codex ?? 'unknown'}, Grok ${restorePoint.cliVersions.grok ?? 'unknown'}; ${restorePoint.models.length} provider catalogs captured.`)

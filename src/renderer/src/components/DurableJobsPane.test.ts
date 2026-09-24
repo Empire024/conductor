@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { FakeDurableJobsService } from '../../../shared/durable-jobs-fake'
 import { checkpointsFromEvents, type DurableJobDetail } from '../../../shared/durable-jobs-bridge'
-import { DurableJobCreateForm, DurableJobList, DurableJobView, elapsedMs, formatDuration, jobControls, problems, type DurableJobViewProps } from './DurableJobsPane'
+import { DurableJobCreateForm, DurableJobLauncherOption, DurableJobList, DurableJobView, elapsedMs, formatDuration, jobControls, problems, type DurableJobViewProps } from './DurableJobsPane'
 
 const T0 = Date.parse('2026-09-24T21:00:00.000Z')
 const noop = (): void => {}
@@ -95,5 +95,14 @@ describe('durable job view', () => {
     expect(formatDuration(0)).toBe('0 s')
     expect(formatDuration(65_000)).toBe('1 min 05 s')
     expect(formatDuration(8 * 3_600_000 + 7 * 60_000)).toBe('8 h 07 min')
+  })
+
+  it('offers durable execution beside local model selection and keeps its model fixed', () => {
+    const html = renderToStaticMarkup(createElement(DurableJobLauncherOption, {
+      model: { id: 'local/qwen3.6-35b-a3b', label: 'Qwen 35B' }, busy: false, onCreate: noop
+    }))
+    expect(html).toContain('Run as durable job (staged, resumable, overnight)')
+    expect(html).toContain('value="local/qwen3.6-35b-a3b"')
+    expect(html).toContain('Job objective')
   })
 })

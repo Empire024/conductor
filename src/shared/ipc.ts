@@ -7,6 +7,7 @@ import type {
   AppUpdateState,
   AppDiagnostics,
   AppPerformanceSnapshot,
+  RestorePoint,
   DebugConsoleSnapshot,
   DebugScreenshot,
   AgentMemory,
@@ -109,6 +110,9 @@ export interface ConductorBridge {
     check(): Promise<AppUpdateState>
     download(): Promise<AppUpdateState>
     install(): Promise<void>
+    versions(): Promise<RestorePoint[]>
+    pinVersion(version: string, pinned: boolean): Promise<RestorePoint>
+    rollback(version: string): Promise<void>
     /** Restart for a wizard's restart request when no update is waiting to install. */
     restart(): Promise<void>
     acknowledgePrepare(requestId: string): void

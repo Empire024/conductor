@@ -32,9 +32,10 @@ const parseVersion = value => { const m = /^(\d+)\.(\d+)\.(\d+)/.exec(value ?? '
 const compareVersions = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2]
 const compareTuples = (a, b) => a[0] - b[0] || a[1] - b[1]
 
-function input(name, what) {
+function input(name, what, optional = false) {
   let text
   try { text = readFileSync(join(runDir, `${name}.out`), 'utf8') } catch {
+    if (optional) return null
     add('watch', 'inputs', `${name}.out is missing, so ${what} could not be compared this run.`, `${name} did not run, failed before printing, or its output was not saved`)
     return null
   }
@@ -46,9 +47,16 @@ function input(name, what) {
 const catalogs = input('cli-catalogs', 'what the installed CLIs advertise')
 const pinsInput = input('conductor-pins', "Conductor's hard-coded catalogs and version pins")
 const sourcesInput = input('primary-sources', "the providers' own model pages")
+const restoreBaseline = input('restore-point-baseline', 'installed CLI versions against the latest known-good restore point', true)?.knownGood ?? null
 if (pinsInput && !pinsInput.checkout) add('info', 'inputs', 'The project folder is not a Conductor checkout, so only the CLI catalogs and primary sources are reported.', 'conductor-pins printed {"checkout":false}')
 const pins = pinsInput?.checkout ? pinsInput : null
 const refs = Array.isArray(pins?.references) ? pins.references : []
+
+for (const [provider, label] of [['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok']]) {
+  const installed = catalogs?.[provider]?.version ?? null
+  const known = restoreBaseline?.cliVersions?.[provider] ?? null
+  if (installed && known && installed !== known) add('info', 'restore-point', `CLI ${label} changed since the last known-good build ${restoreBaseline.version}: ${known} -> ${installed}.`, `Restore point ${restoreBaseline.version} (${restoreBaseline.createdAt ?? 'unknown time'}) recorded ${label} ${known}; installed now ${installed}.`)
+}
 /** Every file that mentions `id` (code and comments), for the files list of an edit. */
 const filesFor = id => unique(refs.filter(ref => ref.id === id && !ref.retired).map(ref => ref.file))
 

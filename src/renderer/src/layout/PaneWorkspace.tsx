@@ -108,6 +108,7 @@ interface PaneWorkspaceProps {
   onReopen(groupId: string): void
   onOpenFile?(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   onMachinePlacement?(machineId: string): void
+  onOpenJob?(job: { id: string; title: string }): void
   /** App.tsx's phase map, already downgraded away from 'complete' while a tab still owns active
    *  subagent work (see resolveActivityPhases in attention.ts). Falls back to this pane's own raw
    *  per-tab listener when absent, e.g. in a detached window that doesn't thread this prop. */
@@ -173,7 +174,8 @@ const PaneBody = ({
   placement,
   placementError,
   onSelectMachine,
-  onAttachTerminal
+  onAttachTerminal,
+  onOpenJob
 }: {
   tab: PaneTab
   groupId: string
@@ -183,6 +185,7 @@ const PaneBody = ({
   placementError: string
   onSelectMachine(machineId: string): void
   onAttachTerminal(machineId: string, remoteTerminalId: string, title: string): void
+  onOpenJob?(job: { id: string; title: string }): void
   onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
   onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   /** Merges `patch` into the tab's latest state. */
@@ -195,7 +198,7 @@ const PaneBody = ({
   // keying a remote project by machine id exists to prevent.
   const host = requiredMachineId(project)
   if (host && !REMOTE_CAPABLE_PANES.has(tab.kind)) return <RemoteOnlyPane kind={tab.kind} machineName={projectHostName(project)} />
-  if (tab.kind === 'launcher') return <LauncherPane projectId={project.id} project={project} machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} onAttachTerminal={onAttachTerminal} />
+  if (tab.kind === 'launcher') return <LauncherPane projectId={project.id} project={project} workspaceId={session.id} machineId={placement} error={placementError} onSelectMachine={onSelectMachine} onOpen={onOpen} onOpenJob={onOpenJob} onAttachTerminal={onAttachTerminal} />
   if (tab.kind === 'terminal') {
     return (
       <TerminalPane
@@ -737,7 +740,7 @@ function PaneGroup({
         {group.tabs.filter((tab) => mountedIds.has(tab.id)).map((tab) => (
           <div key={tab.id} className="pane-tab-content" data-performance-tab-id={tab.id} style={{ display: tab.id === activeTab.id ? 'flex' : 'none' }}>
             <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={(path, line, mode, allowBinary) => openFile(path, line, mode, allowBinary, tab.state?.machineId as string | undefined)} onUpdateTab={setTabState} onConversationChange={changeConversation}
-              placement={placement} placementError={placementError} onSelectMachine={choose} onAttachTerminal={attachTerminal} />
+              placement={placement} placementError={placementError} onSelectMachine={choose} onOpenJob={workspace.onOpenJob} onAttachTerminal={attachTerminal} />
           </div>
         ))}
       </div>

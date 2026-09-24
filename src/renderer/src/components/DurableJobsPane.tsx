@@ -158,6 +158,28 @@ export function DurableJobCreateForm({ models, busy, onCreate }: { models: Array
   </form>
 }
 
+/** Compact launcher-local creation UI. The selected tile supplies the exact local model, while
+ * the resulting job immediately replaces the launcher with its durable conversation tab. */
+export function DurableJobLauncherOption({ model, busy, error = '', onCreate }: {
+  model: { id: string; label: string }
+  busy: boolean
+  error?: string
+  onCreate(input: { title: string; objective: string; model: string; constraints: string[] }): void
+}): React.JSX.Element {
+  const [objective, setObjective] = useState(''), [title, setTitle] = useState('')
+  return <details className="durable-job-launcher">
+    <summary>Run as durable job (staged, resumable, overnight)</summary>
+    <form onSubmit={event => { event.preventDefault(); if (objective.trim()) onCreate({ title: title.trim(), objective: objective.trim(), model: model.id, constraints: [] }) }}>
+      <input type="hidden" name="model" value={model.id} />
+      <strong>{model.label}</strong>
+      <label>Job objective<textarea aria-label="Job objective" rows={3} value={objective} onChange={event => setObjective(event.target.value)} placeholder="What should this local model finish?" /></label>
+      <label>Title<input aria-label="Job title" value={title} onChange={event => setTitle(event.target.value)} placeholder="Optional" /></label>
+      {error && <p className="durable-job-error" role="alert">{error}</p>}
+      <button type="submit" disabled={busy || !objective.trim()}><Plus size={13} />{busy ? 'Startingâ€¦' : 'Start durable job'}</button>
+    </form>
+  </details>
+}
+
 /** Loads one job and follows it: the detail refreshes on every change the service publishes. */
 function useDurableJob(projectId: string, jobId: string | null) {
   const [detail, setDetail] = useState<DurableJobDetail | null>(null)
