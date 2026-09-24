@@ -1,5 +1,5 @@
 import { useAnimatedCount } from './use-animated-count'
-import { useEffect, useMemo, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { ChevronDown, Flame, Search, Users } from 'lucide-react'
 import type { ContextAttachment, FileChange, SessionPhase, TimelineItem } from '../../../shared/structured-agent'
 import { AgentDialog, coalescedEditLabel, coalescedEditSummary, groupConversationActivities, isConversationActivity, StructuredActivity, StructuredMarkdown } from './StructuredAgentRenderers'
@@ -10,14 +10,14 @@ import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import './StructuredAgentTelemetry.css'
 import type { SubagentSummary, UsageCapSetting } from './usage-summary'
 
-export function StructuredLiveTokens({ items }: { items: TimelineItem[] }): React.JSX.Element {
+export const StructuredLiveTokens = memo(function StructuredLiveTokens({ items }: { items: TimelineItem[] }): React.JSX.Element {
   const summary = useMemo(() => summarizeWorkingUsage(items), [items])
   const user = items.filter(item => item.data.type === 'text' && item.data.role === 'user' && !item.parentId).at(-1)
   const count = useAnimatedCount(summary.tokens?.outputTokens, JSON.stringify([items.at(-1)?.runtimeId, user?.id]))
   const display = { ...summary, tokens: count === undefined ? undefined : { outputTokens: count } }
   const label = liveTokenLabel(display)
   return <span className="sa-live-tokens" title={summary.tokens ? 'Output tokens reported for the current response, including reasoning when reported. Input and cached context are shown separately.' : 'Waiting for the provider to report output tokens for this response.'}>{label ?? <span className="sa-token-pending" role="status" aria-label="Output tokens pending"><i /><i /><i /></span>}</span>
-}
+})
 
 interface SubagentDetailContext {
   sessionId: string
@@ -29,7 +29,7 @@ interface SubagentDetailContext {
   onDiff(change: FileChange): void
   onRespond(item: TimelineItem, decision?: string, answers?: Record<string, string[]>): Promise<void>
 }
-export function StructuredAgentTelemetry({ items, runtimeId, phase, truncated = false, sessionId, cwd, projectId, interactive = true, onInspectAttachment, onOpenFile, onDiff, onRespond }: { items: TimelineItem[]; runtimeId: string; phase: SessionPhase; truncated?: boolean } & Partial<SubagentDetailContext>): React.JSX.Element {
+export const StructuredAgentTelemetry = memo(function StructuredAgentTelemetry({ items, runtimeId, phase, truncated = false, sessionId, cwd, projectId, interactive = true, onInspectAttachment, onOpenFile, onDiff, onRespond }: { items: TimelineItem[]; runtimeId: string; phase: SessionPhase; truncated?: boolean } & Partial<SubagentDetailContext>): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const agents = useMemo(() => summarizeSubagents(items, runtimeId, phase, open), [items, runtimeId, phase, open])
   const countLabel = subagentCountLabel(agents)
@@ -43,10 +43,10 @@ export function StructuredAgentTelemetry({ items, runtimeId, phase, truncated = 
       <SubagentExplorer agents={agents} truncated={truncated} runtimeId={runtimeId} detail={detail} />
     </AgentDialog>}
   </div>
-}
+})
 
 /** Usage % and the view-usage entry point live on the composer control line, beside effort/model/mode. */
-export function StructuredUsageSummary({ items, runtimeId, truncated = false, modelLabel, agentSessionId, workspaceId }: { items: TimelineItem[]; runtimeId: string; truncated?: boolean; modelLabel?: string; agentSessionId?: string; workspaceId?: string }): React.JSX.Element {
+export const StructuredUsageSummary = memo(function StructuredUsageSummary({ items, runtimeId, truncated = false, modelLabel, agentSessionId, workspaceId }: { items: TimelineItem[]; runtimeId: string; truncated?: boolean; modelLabel?: string; agentSessionId?: string; workspaceId?: string }): React.JSX.Element {
   const [open, setOpen] = useState(false)
   const context = useMemo(() => summarizeContext(items, runtimeId), [items, runtimeId])
   // Polled rather than read once: the cap that applies here can change from this same dialog,
@@ -74,7 +74,7 @@ export function StructuredUsageSummary({ items, runtimeId, truncated = false, mo
     <button type="button" className="sa-usage-link" aria-expanded={open} onClick={() => setOpen(current => !current)}>View usage</button>
     {open && <AgentDialog title="Usage" onClose={() => setOpen(false)}><StructuredUsageContent items={items} truncated={truncated} modelLabel={modelLabel} agentSessionId={agentSessionId} workspaceId={workspaceId} /></AgentDialog>}
   </div>
-}
+})
 
 function activityText(item: TimelineItem): string {
   const data = item.data

@@ -286,7 +286,11 @@
 .sa-session-bar .agent-view-switch button { min-height: 20px; height: 20px !important; padding: 0 5px !important; }
 .sa-session-bar .agent-view-switch svg { width: 11px; height: 11px; }
 .sa-timeline-content { min-width: 0; display: flow-root; }
-.sa-timeline { overflow-anchor: none; }
+/* Strict containment makes the scroll container a layout and paint boundary: the composer growing
+   or taking a keystroke never re-lays out or repaints the timeline's cards. Its size comes from
+   the flex column, never from its content; nothing inside relies on position: fixed (menus are
+   portaled, dialogs use the top layer). */
+.sa-timeline { overflow-anchor: none; contain: strict; }
 .sa-composer .sa-mode-control { padding: 3px 4px; height: 25px; max-width: 88px; font-size: 10px; background: transparent; border-color: var(--border-soft); cursor: pointer; }
 .sa-queue-list { max-height: 105px; overflow-y: auto; }
 .sa-queue small { white-space: nowrap; color: var(--text-3); font-size: 9px; }
@@ -384,8 +388,10 @@
 /* Measured activity heights keep scroll positions stable while questions and output grow. */
 .sa-activity { content-visibility: visible; contain-intrinsic-size: none; }
 /* Each item mounts once and is memoized, so this plays a single time per new activity, never
-   per streamed token; opacity/transform only, so it costs a compositor layer, not layout. */
-.sa-activity { animation: sa-activity-in 120ms cubic-bezier(.2,.8,.2,1) both; }
+   per streamed token. Backwards fill only: a finished animation must let go of the card. A
+   forwards fill kept an opacity/transform effect on every card for good, and the compositor then
+   re-layerized hundreds of cards on every keystroke in a long conversation. */
+.sa-activity { animation: sa-activity-in 120ms cubic-bezier(.2,.8,.2,1) backwards; }
 @keyframes sa-activity-in { from { opacity: 0; transform: translateY(3px); } }
 .sa-history-banner > span { min-width: 0; display: flex; flex-direction: column; }
 .sa-history-banner strong { font-size: 11px; font-weight: 600; }

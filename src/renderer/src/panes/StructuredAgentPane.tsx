@@ -164,9 +164,11 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const starterChoices = useMemo(() => composerStarterChoices(projection.capabilities, commandDiscovery), [projection.capabilities, commandDiscovery])
   const commandsOpen = !commandDismissed && !addFileOpen && !historical && commands.length > 0
   const [newOutput, setNewOutput] = useState(false)
+  const newOutputRef = useRef(newOutput); newOutputRef.current = newOutput
   const [dockedQuestions, setDockedQuestions] = useState<ReadonlySet<string>>(() => new Set())
   const [visibleCount, setVisibleCount] = useState(250)
   const [readingWindow, setReadingWindow] = useState<TimelineItem[] | null>(null)
+  const readingWindowRef = useRef(readingWindow); readingWindowRef.current = readingWindow
   const [pendingPromptScroll, setPendingPromptScroll] = useState<string | null>(null)
   const [find, setFind] = useState(CLOSED_FIND)
   const dispatchFind = useCallback((action: FindAction): void => setFind(current => findReducer(current, action)), [])
@@ -315,7 +317,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     const pinSelection = (): void => {
       const selection = window.getSelection()
       if (hasTimelineSelection(timeline.current, selection)) setReadingWindow((current) => current ?? lastVisibleItems.current)
-      else if (nearBottom.current) { setReadingWindow(null); setNewOutput(false) }
+      // Every caret move in the composer is a selectionchange; one that changes nothing must not
+      // cost the pane a second render per keystroke.
+      else if (nearBottom.current && (readingWindowRef.current || newOutputRef.current)) { setReadingWindow(null); setNewOutput(false) }
     }
     document.addEventListener('selectionchange', pinSelection)
     return () => document.removeEventListener('selectionchange', pinSelection)
@@ -569,7 +573,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const capabilities = projection.capabilities
   const banner = runtimeBanner({ phase: projection.phase, historical, unstarted: unstartedConversation, archived: projection.archived, ready, resuming, canResume: Boolean(capabilities?.resume && projection.nativeSessionId) })
   const shownError = bannerAbsorbsError(banner, error) ? '' : cleanIpcError(error)
-  const pending = projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length
+  const pending = useMemo(() => projection.items.filter((item) => item.data.type === 'interaction' && item.data.interaction.status === 'pending').length, [projection.items])
   const conversationItems = useMemo(() => projection.items.filter(isConversationActivity), [projection.items])
   // Independent of the windowed/reading-view slice below: the pin must reflect the true latest
   // prompt even while the visible window only covers older or newer activity. Coworker-only
@@ -799,6 +803,38 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     else if (command.name === 'fork' && !activePhases.has(projection.phase)) void fork()
   }
 
+  // The timeline is the expensive part of this pane: hundreds of cards and one scroll container
+  // Chrome must lay out and layerize. Typing re-renders this component on every key (the draft is
+  // an external store), so the timeline is memoized on what it actually shows; a keystroke
+  // reconciles only the composer. Handlers in here read refs and stable setters, and every value
+  // the closures below read (pinned prompt, reading window, visible count) is a dependency.
+  const timelineView = useMemo(() => <div className="sa-timeline-wrap">{pinnedPrompt && <button type="button" className="sa-pinned-prompt" title={pinnedPrompt.text} aria-label={'Scroll to ' + (pinnedPrompt.origin ? pinnedPrompt.origin.label + '\'s initiating message' : 'your last message') + ': ' + pinnedPrompt.text} onClick={scrollToPinnedPrompt}><Pin size={11} aria-hidden="true" /><span>{truncatePromptPreview(pinnedPrompt.text)}</span></button>}<div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
+      const el = timeline.current
+      // Layout and content growth can emit scroll events too. Only user input
+      // should release automatic following while the view is pinned to the end.
+      if (nearBottom.current && Date.now() > userScrollUntil.current) return
+      nearBottom.current = Boolean(el && followsBottomAfterScroll(nearBottom.current, el))
+      if (!nearBottom.current) setReadingWindow((current) => current ?? lastVisibleItems.current)
+      else if (!hasTimelineSelection(el, window.getSelection())) { setReadingWindow(null); setNewOutput(false) }
+    }}><div ref={timelineContent} className="sa-timeline-content">
+      {(!ready || !conversationItems.length) && <div className="sa-empty"><strong>{ready ? 'What are we working on?' : 'Opening conversation…'}</strong>{ready && <p>Ask {name} about your code, or describe a change.</p>}</div>}
+      {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
+      {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
+      {ready && activityGroups.map(group => {
+        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} onSwitchPermission={historical || provider !== 'claude' ? undefined : switchPermission} />)
+        // A recall belongs to the message it was injected with, so it renders directly under it.
+        const recall = group.length === 1 && group[0]!.nativeItemId ? recallByItem.get(group[0]!.nativeItemId) : undefined
+        if (recall) return <div className="sa-turn" key={group[0]!.id}>{activities[0]}<MemoryRecallStrip recall={recall} onChanged={loadTurnRecalls} /></div>
+        if (group.length === 1) return activities[0]
+        const coalesced = coalescedEditSummary(group)
+        const latest = group.at(-1)!
+        const latestTask = latest.data.type === 'tool' ? toolPresentation(latest.data).title : ''
+        const latestOutput = latest.data.type === 'tool' ? toolInlinePreview(latest.data) : ''
+        return <details className="sa-completed-group" key={group[0]!.id}><summary><span>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</span>{latestTask && <span className="sa-completed-latest" title={latestTask}><b>Latest</b> {latestTask}{latestOutput && <code>OUT {latestOutput}</code>}</span>}</summary><div>{activities}</div></details>
+      })}
+      {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
+    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>, [pinnedPrompt, conversationItems, name, ready, earlierCount, readingWindow, projection.truncated, projection.items, projection.runtimeId, projection.phase, activityGroups, activeId, props.project.id, fileCwd, expansion, historical, dockedQuestions, labelAnchors, parentLabels, onExpand, onOpenFile, onRespond, focusOrigin, setQuestionDocked, provider, switchPermission, recallByItem, loadTurnRecalls, workingWord, newOutput])
+
   return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }}>
     <header className="sa-session-bar">
       <ProviderIcon provider={provider} size={15} />
@@ -831,32 +867,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     {historical && <div className="sa-history-banner" role="status"><span><strong>{resuming ? 'Reconnecting conversation...' : 'Previewing saved conversation'}</strong><small>{projection.title || 'Saved messages'} ? Resume to continue from here.</small></span><button disabled={resuming} onClick={() => { setReady(false); setActiveId(props.resourceId); setHistorical(false) }}><ArrowLeft size={13} /> Back to current</button>{capabilities?.resume && projection.nativeSessionId && <button disabled={!ready || resuming || projection.archived} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume this conversation'}</button>}</div>}
     {banner && <div className={'sa-runtime-banner sa-runtime-' + projection.phase} role="status"><PlugZap size={15} aria-hidden="true" /><span><strong>{banner.title}</strong><small>{banner.detail}</small></span>{banner.resume && <button className="sa-runtime-resume" disabled={banner.disabled} onClick={() => void resume()}>{resuming ? <LoaderCircle size={13} className="spin" /> : <Play size={13} />}{resuming ? 'Reconnecting...' : 'Resume conversation'}</button>}</div>}
     {find.open && <ConversationFindBar query={find.query} count={findMatches.length} index={find.index} results={findResults} searching={findSearching} focusToken={findFocus} onQuery={query => dispatchFind({ type: 'query', query })} onStep={direction => dispatchFind({ type: 'step', direction, count: findMatches.length })} onOpenHit={openFindHit} onClose={() => { dispatchFind({ type: 'close' }); if (composer.current && !composer.current.disabled) composer.current.focus(); else timeline.current?.focus() }} />}
-    <div className="sa-timeline-wrap">{pinnedPrompt && <button type="button" className="sa-pinned-prompt" title={pinnedPrompt.text} aria-label={'Scroll to ' + (pinnedPrompt.origin ? pinnedPrompt.origin.label + '\'s initiating message' : 'your last message') + ': ' + pinnedPrompt.text} onClick={scrollToPinnedPrompt}><Pin size={11} aria-hidden="true" /><span>{truncatePromptPreview(pinnedPrompt.text)}</span></button>}<div className="sa-timeline" ref={timeline} role="region" aria-label={name + ' conversation'} tabIndex={0} onWheel={event => { userScrollUntil.current = Date.now() + 800; if (event.deltaY < 0) { nearBottom.current = false; setReadingWindow(current => current ?? lastVisibleItems.current) } }} onTouchMove={() => { userScrollUntil.current = Date.now() + 800 }} onPointerDown={event => { if (event.target === timeline.current) userScrollUntil.current = Date.now() + 2000 }} onKeyDown={event => { if (event.target === timeline.current && ['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) { userScrollUntil.current = Date.now() + 800; if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) nearBottom.current = false } }} onScroll={() => {
-      const el = timeline.current
-      // Layout and content growth can emit scroll events too. Only user input
-      // should release automatic following while the view is pinned to the end.
-      if (nearBottom.current && Date.now() > userScrollUntil.current) return
-      nearBottom.current = Boolean(el && followsBottomAfterScroll(nearBottom.current, el))
-      if (!nearBottom.current) setReadingWindow((current) => current ?? lastVisibleItems.current)
-      else if (!hasTimelineSelection(el, window.getSelection())) { setReadingWindow(null); setNewOutput(false) }
-    }}><div ref={timelineContent} className="sa-timeline-content">
-      {(!ready || !conversationItems.length) && <div className="sa-empty"><strong>{ready ? 'What are we working on?' : 'Opening conversation…'}</strong>{ready && <p>Ask {name} about your code, or describe a change.</p>}</div>}
-      {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
-      {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
-      {ready && activityGroups.map(group => {
-        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} onSwitchPermission={historical || provider !== 'claude' ? undefined : switchPermission} />)
-        // A recall belongs to the message it was injected with, so it renders directly under it.
-        const recall = group.length === 1 && group[0]!.nativeItemId ? recallByItem.get(group[0]!.nativeItemId) : undefined
-        if (recall) return <div className="sa-turn" key={group[0]!.id}>{activities[0]}<MemoryRecallStrip recall={recall} onChanged={loadTurnRecalls} /></div>
-        if (group.length === 1) return activities[0]
-        const coalesced = coalescedEditSummary(group)
-        const latest = group.at(-1)!
-        const latestTask = latest.data.type === 'tool' ? toolPresentation(latest.data).title : ''
-        const latestOutput = latest.data.type === 'tool' ? toolInlinePreview(latest.data) : ''
-        return <details className="sa-completed-group" key={group[0]!.id}><summary><span>{coalesced ? coalescedEditLabel(coalesced) : `${group.length} completed actions`}</span>{latestTask && <span className="sa-completed-latest" title={latestTask}><b>Latest</b> {latestTask}{latestOutput && <code>OUT {latestOutput}</code>}</span>}</summary><div>{activities}</div></details>
-      })}
-      {(projection.phase === 'running' || projection.phase === 'starting') && <div className="sa-working" role="status"><i />{projection.phase === 'starting' ? 'Connecting…' : ['Thinking…', 'Spelunking…', 'Working…', 'Considering…'][workingWord]}<StructuredLiveTokens items={projection.items} /></div>}
-    </div></div>{newOutput && <button className="sa-jump" onClick={jumpToLatest}><ArrowDown size={13} /> New output · Jump to latest</button>}</div>
+    {timelineView}
     <StructuredAgentTelemetry key={activeId} items={projection.items} runtimeId={projection.runtimeId} phase={projection.phase} truncated={projection.truncated} sessionId={activeId} cwd={fileCwd} projectId={props.project.id} interactive={!historical} onInspectAttachment={setInspectAttachment} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} />
     <form className="sa-composer agent-prompt-surface" onSubmit={event => { event.preventDefault(); void submit() }} onDragOver={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = 'copy' }} onDrop={event => { if (!isComposerFileDrag(event.dataTransfer.types)) return; event.preventDefault(); event.stopPropagation(); void dropComposerFiles(event.dataTransfer) }}>
       {pendingSteering.length > 0 && <div className="sa-queue-list" aria-label="Pending steering messages">{pendingSteering.map(input => <div className="sa-queue sa-steering-prompt" key={input.id}>

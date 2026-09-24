@@ -15,11 +15,22 @@ import { join, resolve } from 'node:path'
 //   - longtasks, React commits (a DevTools-style hook installed before React loads), and
 //     localStorage.setItem/getItem calls during typing plus a settle window for debounced writes
 //   - CDP Performance deltas (script/layout/style time) and DOM node / listener counts
+//   - DOM mutations inside the active timeline while typing: a keystroke must not touch it, so
+//     anything above zero on a settled conversation means the timeline re-rendered per key
 // No thresholds: this is a measurement harness. Usage:
 //   node scripts/smoke-lock.mjs -- node scripts/perf-input.mjs [--label=baseline] [--tabs=1,11,26]
 //     [--chars=300] [--delay=50] [--throttle=4] [--prefill=0] [--history=150] [--profile]
+//     [--provider=claude --events=10000]
+// --provider=claude makes every tab a Claude conversation, and the active one replays the offline
+// fixture's "SYNTHETIC LONG <events>" turn: <events> provider messages of long Markdown, hidden
+// thinking, Bash/Read/Grep/Edit calls with multi-line output and diffs, and per-message usage,
+// the owner's long 1M-context conversation rather than the 150-activity Codex one.
 // --profile also samples a CPU profile while typing, writes <label>-<tabs>.cpuprofile (open it in
 // Chrome DevTools' Performance panel) and adds the top functions by self time to the results.
+// --trace records a devtools.timeline trace while typing and adds the renderer main thread's time by
+// trace event (Paint, Layout, UpdateLayoutTree, accessibility...), which is where "(program)" in a
+// CPU profile goes: browser work outside JavaScript.
+// --css="<rules>" injects a stylesheet before typing, to try a rendering hypothesis without a rebuild.
 const args = Object.fromEntries(process.argv.slice(2).filter(arg => arg.startsWith('--')).map(arg => {
   const [key, value = 'true'] = arg.slice(2).split('=')
   return [key, value]
@@ -32,6 +43,11 @@ const throttle = Number(args.throttle ?? 4)
 const prefill = Number(args.prefill ?? 0)
 const history = Number(args.history ?? 150)
 const profile = args.profile === 'true'
+const trace = args.trace === 'true'
+const css = args.css
+const provider = args.provider === 'claude' ? 'claude' : 'codex'
+const events = Number(args.events ?? 3000)
+const providerTitle = provider === 'claude' ? 'Claude' : 'Codex'
 const output = resolve('artifacts/perf-input')
 await mkdir(output, { recursive: true })
 
@@ -80,15 +96,15 @@ async function scenario(tabCount) {
     await page.evaluate(async () => { await window.conductor.settings.setZoom(1); await window.conductor.settings.setThemeAuto(false); await window.conductor.settings.setThemeVariant('night') })
     const project = await page.evaluate(() => window.conductor.projects.create('Perf input fixture'))
     const ids = Array.from({ length: tabCount }, (_, index) => 'perf-input-' + (index + 1))
-    await page.evaluate(async ({ projectId, ids }) => {
+    await page.evaluate(async ({ projectId, ids, provider, providerTitle }) => {
       const [session] = await window.conductor.sessions.list(projectId)
       const layout = JSON.parse(JSON.stringify(session.layout))
       const find = node => Array.isArray(node?.tabs) ? node : (node?.children ?? []).map(find).find(Boolean)
       const group = find(layout.root)
-      group.tabs = ids.map((id, index) => ({ id: 'pane-' + id, kind: 'agent', title: 'Codex ' + (index + 1), resourceId: 'agent-' + id, state: { provider: 'codex', resume: false, model: 'default', effort: 'auto' } }))
+      group.tabs = ids.map((id, index) => ({ id: 'pane-' + id, kind: 'agent', title: providerTitle + ' ' + (index + 1), resourceId: 'agent-' + id, state: { provider, resume: false, model: 'default', effort: 'auto' } }))
       group.activeTabId = 'pane-' + ids[0]
       await window.conductor.sessions.save(session.id, layout, session.maximizedGroupId, session.closedTabs)
-    }, { projectId: project.id, ids })
+    }, { projectId: project.id, ids, provider, providerTitle })
     const open = async () => {
       await page.reload()
       await page.waitForFunction(() => Boolean(window.conductor?.structured))
@@ -102,20 +118,20 @@ async function scenario(tabCount) {
     const phase = id => page.evaluate(agent => window.conductor.structured.snapshot(agent).then(state => state?.phase), id)
 
     // The active conversation's history, sent through the real composer.
-    await composer().fill('synthetic:perf-stream')
+    await composer().fill(provider === 'claude' ? 'SYNTHETIC LONG ' + events : 'synthetic:perf-stream')
     await visible.getByRole('button', { name: 'Send message', exact: true }).click()
-    await expect.poll(() => phase(activeId), { timeout: 120_000, intervals: [100] }).toBe('completed')
+    await expect.poll(() => phase(activeId), { timeout: 600_000, intervals: [250] }).toBe('completed')
     // Every inactive conversation gets one short exchange straight through main, the same path a
     // controller's tabs.send takes, so it works whether or not the tab's view is mounted.
     for (const id of ids.slice(1)) {
       const agent = 'agent-' + id
-      await page.evaluate(async ({ agent, projectId }) => {
+      await page.evaluate(async ({ agent, projectId, provider }) => {
         const [session] = await window.conductor.sessions.list(projectId)
         const project = (await window.conductor.projects.list()).find(item => item.id === projectId)
-        await window.conductor.agents.ensure({ id: agent, projectId, sessionId: session.id, title: agent, cwd: project.path, provider: 'codex', model: 'default', effort: 'auto' })
+        await window.conductor.agents.ensure({ id: agent, projectId, sessionId: session.id, title: agent, cwd: project.path, provider, model: 'default', effort: 'auto' })
         const state = await window.conductor.structured.snapshot(agent)
         await window.conductor.structured.submit(agent, 'SYNTHETIC B perf input history', state.settings, [])
-      }, { agent, projectId: project.id })
+      }, { agent, projectId: project.id, provider })
       await expect.poll(() => phase(agent), { timeout: 60_000, intervals: [100] }).toBe('completed')
     }
 
@@ -126,6 +142,7 @@ async function scenario(tabCount) {
     if (prefill > 0) {
       await composerBox.fill('x'.repeat(prefill - 1) + ' ')
     }
+    if (css) await page.addStyleTag({ content: css })
     await composerBox.click()
     await page.keyboard.press('Control+End')
     // Let startup work (snapshot loads, catalog probes, recovery checkpoints) settle first.
@@ -162,10 +179,19 @@ async function scenario(tabCount) {
         for (const entry of list.getEntries()) perf.events.push({ name: entry.name, duration: entry.duration, inputDelay: entry.processingStart - entry.startTime, processing: entry.processingEnd - entry.processingStart })
       })
       perf.eventObserver.observe({ type: 'event', durationThreshold: 16 })
+      perf.timelineMutations = 0
+      perf.mutationObserver = new MutationObserver(records => { perf.timelineMutations += records.length })
+      const timeline = [...document.querySelectorAll('.sa-timeline')].find(element => element.offsetParent !== null)
+      if (timeline) perf.mutationObserver.observe(timeline, { subtree: true, childList: true, attributes: true, characterData: true })
       perf.commitsAtStart = window.__inputPerfCommits ?? 0
       perf.active = true
     })
     await cdp.send('Emulation.setCPUThrottlingRate', { rate: throttle })
+    const traceEvents = []
+    if (trace) {
+      cdp.on('Tracing.dataCollected', ({ value }) => traceEvents.push(...value))
+      await cdp.send('Tracing.start', { transferMode: 'ReportEvents', traceConfig: { includedCategories: ['devtools.timeline', 'disabled-by-default-devtools.timeline', 'blink', 'cc', 'accessibility', 'toplevel', 'v8', 'renderer.scheduler'] } })
+    }
     if (profile) {
       await cdp.send('Profiler.enable')
       await cdp.send('Profiler.setSamplingInterval', { interval: 250 })
@@ -184,13 +210,21 @@ async function scenario(tabCount) {
       await writeFile(join(output, `${label}-${tabCount}.cpuprofile`), JSON.stringify(samples))
       hotspots = selfTimeHotspots(samples)
     }
+    let traceSummary
+    if (trace) {
+      const complete = new Promise(done => cdp.once('Tracing.tracingComplete', done))
+      await cdp.send('Tracing.end')
+      await complete
+      traceSummary = summarizeTrace(traceEvents)
+    }
     await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 })
     const collected = await page.evaluate(() => {
       const perf = window.__inputPerf
       perf.active = false
       perf.longtaskObserver.disconnect()
       perf.eventObserver.disconnect()
-      return { samples: perf.samples, longtasks: perf.longtasks, events: perf.events, setItem: perf.setItem, getItem: perf.getItem, removeItem: perf.removeItem, commits: (window.__inputPerfCommits ?? 0) - perf.commitsAtStart }
+      perf.mutationObserver.disconnect()
+      return { timelineMutations: perf.timelineMutations, samples: perf.samples, longtasks: perf.longtasks, events: perf.events, setItem: perf.setItem, getItem: perf.getItem, removeItem: perf.removeItem, commits: (window.__inputPerfCommits ?? 0) - perf.commitsAtStart }
     })
     const value = await composerBox.inputValue()
     const expected = (prefill > 0 ? 'x'.repeat(prefill - 1) + ' ' : '') + typed
@@ -220,7 +254,7 @@ async function scenario(tabCount) {
         return Date.now() - started
       }
       switching.toShortConversationMs = await select(ids[1], () => expect(visible.locator('.structured-agent-pane')).toHaveAttribute('data-structured-session', 'agent-' + ids[1]))
-      switching.backToLongConversationMs = await select(ids[0], () => expect(visible.getByText(/^Paragraph 50:/).first()).toBeVisible({ timeout: 30_000 }))
+      switching.backToLongConversationMs = await select(ids[0], () => expect(visible.getByText(provider === 'claude' ? /Synthetic long conversation:/ : /^Paragraph 50:/).first()).toBeVisible({ timeout: 30_000 }))
       switching.draftKept = (await composer().inputValue()) === expected
     }
     const latencies = collected.samples.map(sample => sample.painted - sample.start).sort((a, b) => a - b)
@@ -228,8 +262,13 @@ async function scenario(tabCount) {
     const delta = {}
     for (const name of ['ScriptDuration', 'TaskDuration', 'LayoutDuration', 'RecalcStyleDuration']) delta[name + 'Ms'] = round((metric(after, name) - metric(before, name)) * 1000)
     const slowEvents = collected.events.filter(entry => ['keydown', 'keypress', 'keyup', 'beforeinput', 'input'].includes(entry.name))
+    const timelineItems = await page.evaluate(id => window.conductor.structured.snapshot(id).then(state => state?.items.length ?? 0), activeId)
+    const renderedActivities = await visible.locator('[data-item-id]').count()
     return {
       tabs: tabCount,
+      provider,
+      timelineItems,
+      renderedActivities,
       inactiveTabs: tabCount - 1,
       mountedStructuredPanes: panes,
       typedChars: chars,
@@ -255,6 +294,7 @@ async function scenario(tabCount) {
         maxMs: round(collected.longtasks.reduce((max, entry) => Math.max(max, entry.duration), 0))
       },
       reactCommits: collected.commits,
+      timelineMutations: collected.timelineMutations,
       localStorage: { setItem: collected.setItem, getItem: collected.getItem, removeItem: collected.removeItem },
       cdpDelta: delta,
       domNodes: metric(after, 'Nodes'),
@@ -263,6 +303,7 @@ async function scenario(tabCount) {
       switching,
       animations,
       hotspots,
+      trace: traceSummary,
       errors
     }
   } finally {
@@ -270,18 +311,38 @@ async function scenario(tabCount) {
   }
 }
 
-const results = { label, synthetic: true, recordedAt: new Date().toISOString(), config: { chars, delay, throttle, prefill, history }, scenarios: [], failures: [] }
+const results = { label, synthetic: true, recordedAt: new Date().toISOString(), config: { chars, delay, throttle, prefill, history, provider, events, css }, scenarios: [], failures: [] }
 try {
   for (const count of tabCounts) {
     const result = await scenario(count)
     results.scenarios.push(result)
-    console.log(`${count} tab(s): input->paint p50 ${result.inputToNextPaintMs.p50} / p95 ${result.inputToNextPaintMs.p95} / p99 ${result.inputToNextPaintMs.p99} ms; longtasks ${result.longtasks.count} (${result.longtasks.totalMs} ms); commits ${result.reactCommits}; setItem ${result.localStorage.setItem}; getItem ${result.localStorage.getItem}; panes ${result.mountedStructuredPanes}; intact ${result.textIntact}; switch ${JSON.stringify(result.switching)}`)
+    console.log(`${provider}${provider === 'claude' ? ' ' + events + ' events' : ''}, ${count} tab(s), ${result.timelineItems} items (${result.renderedActivities} rendered): input->paint p50 ${result.inputToNextPaintMs.p50} / p95 ${result.inputToNextPaintMs.p95} / p99 ${result.inputToNextPaintMs.p99} ms; longtasks ${result.longtasks.count} (${result.longtasks.totalMs} ms); commits ${result.reactCommits}; timeline mutations ${result.timelineMutations}; setItem ${result.localStorage.setItem}; getItem ${result.localStorage.getItem}; panes ${result.mountedStructuredPanes}; intact ${result.textIntact}; switch ${JSON.stringify(result.switching)}`)
   }
 } catch (error) {
   results.failures.push(error.stack ?? String(error))
   throw error
 } finally {
   await writeFile(join(output, label + '.json'), JSON.stringify(results, null, 2))
+}
+
+/** Main-thread time of the busiest renderer main thread (CrRendererMain) by trace event name: total (nested events
+ *  included) and top-level only (children of a task), heaviest first. */
+function summarizeTrace(events, count = 30) {
+  const mains = new Set(events.filter(event => event.ph === 'M' && event.name === 'thread_name' && event.args?.name === 'CrRendererMain').map(event => event.pid + ':' + event.tid))
+  const busy = new Map()
+  for (const event of events) if (event.ph === 'X' && event.name === 'RunTask' && (!mains.size || mains.has(event.pid + ':' + event.tid))) { const key = event.pid + ':' + event.tid; busy.set(key, (busy.get(key) ?? 0) + (event.dur ?? 0)) }
+  const main = [...busy].sort((a, b) => b[1] - a[1])[0]?.[0]
+  const thread = events.filter(event => event.ph === 'X' && event.pid + ':' + event.tid === main && typeof event.dur === 'number').sort((a, b) => a.ts - b.ts || b.dur - a.dur)
+  const total = new Map(), topLevel = new Map()
+  const stack = []
+  for (const event of thread) {
+    while (stack.length && stack.at(-1).ts + stack.at(-1).dur <= event.ts) stack.pop()
+    total.set(event.name, (total.get(event.name) ?? 0) + event.dur / 1000)
+    if (stack.length === 1 && stack[0].name === 'RunTask') topLevel.set(event.name, (topLevel.get(event.name) ?? 0) + event.dur / 1000)
+    stack.push(event)
+  }
+  const top = map => [...map].sort((a, b) => b[1] - a[1]).slice(0, count).map(([name, ms]) => ({ name, ms: Number(ms.toFixed(1)) }))
+  return { runTaskMs: Number(((busy.get(main) ?? 0) / 1000).toFixed(1)), topLevel: top(topLevel), total: top(total) }
 }
 
 /** Self time per function across the sampled profile, heaviest first. */
