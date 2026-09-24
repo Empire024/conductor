@@ -151,9 +151,14 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--accent-mute
 .app-body { flex: 1; min-height: 0; display: flex; }
 
 /* Left navigation */
-.left-shell { width: 280px; min-width: 280px; display: flex; border-right: 1px solid var(--border); background: #0d1014; }
+.left-shell { width: calc(48px + var(--sidebar-width)); min-width: calc(48px + var(--sidebar-width)); display: flex; position: relative; border-right: 1px solid var(--border); background: #0d1014; }
 .left-shell.rail-only { width: 48px; min-width: 48px; }
 .left-shell.rail-only .sidebar { width: 0; visibility: hidden; overflow: hidden; }
+.left-shell.sidebar-resizing { user-select: none; }
+
+.sidebar-resizer { position: absolute; top: 0; bottom: 0; left: calc(48px + var(--sidebar-width) - 3px); width: 6px; cursor: col-resize; z-index: 5; background: transparent; }
+.sidebar-resizer:hover, .sidebar-resizing .sidebar-resizer, .sidebar-resizer:focus-visible { background: var(--accent-muted); opacity: .5; }
+.sidebar-resizer:focus-visible { outline: none; opacity: .8; }
 .activity-rail {
   width: 48px;
   min-width: 48px;

@@ -1,4 +1,5 @@
-import { Fragment, useEffect, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import { WorkspaceTabList, WorkspaceTabToggle } from './WorkspaceTabList'
 import { RemoveProjectDialog } from './RemoveProjectDialog'
 import { ProcessStatusSummary } from './ProcessStatusSummary'
@@ -95,6 +96,19 @@ interface SidebarProps {
 export type WorkspacePanel = 'backlog' | 'agents' | 'tasks' | 'routines' | 'memory' | 'processes'
 export type SidebarUtilityPanel = WorkspacePanel | 'schedules' | 'source-control' | 'jobs'
 
+export const SIDEBAR_MIN_WIDTH = 200
+export const SIDEBAR_MAX_WIDTH = 480
+export const SIDEBAR_DEFAULT_WIDTH = 232
+const SIDEBAR_WIDTH_KEY = 'conductor.sidebarWidth'
+
+export const clampSidebarWidth = (width: number): number =>
+  Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, width))
+
+const readStoredSidebarWidth = (): number => {
+  const raw = Number(localStorage.getItem(SIDEBAR_WIDTH_KEY))
+  return Number.isFinite(raw) && raw > 0 ? clampSidebarWidth(raw) : SIDEBAR_DEFAULT_WIDTH
+}
+
 // "Workspace", "Explorer" and "Browser" are the primary destinations; the rest open utility
 // panels beside the workspace. An item marked `unfinished` has nothing wired up yet, so it is
 // pinned to the bottom and rendered disabled rather than opening a dead button.
@@ -125,6 +139,34 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
     return saved === 'explorer' || saved === 'browser' ? saved : 'workspace'
   })
   const [tabListOverrides, setTabListOverrides] = useState<Record<string, boolean>>({})
+  const [sidebarWidth, setSidebarWidth] = useState<number>(readStoredSidebarWidth)
+  const resizeState = useRef<{ startX: number; startWidth: number } | null>(null)
+  const [resizing, setResizing] = useState(false)
+
+  const beginSidebarResize = (event: React.PointerEvent): void => {
+    event.preventDefault()
+    resizeState.current = { startX: event.clientX, startWidth: sidebarWidth }
+    setResizing(true)
+    const onMove = (moveEvent: PointerEvent): void => {
+      const state = resizeState.current
+      if (!state) return
+      setSidebarWidth(clampSidebarWidth(state.startWidth + (moveEvent.clientX - state.startX)))
+    }
+    const onUp = (): void => {
+      resizeState.current = null
+      setResizing(false)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      setSidebarWidth((width) => { localStorage.setItem(SIDEBAR_WIDTH_KEY, String(width)); return width })
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
+  const resetSidebarWidth = (): void => {
+    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(SIDEBAR_DEFAULT_WIDTH))
+  }
   const [menu, setMenu] = useState<
     | { kind: 'project'; project: ProjectRecord; x: number; y: number }
     | { kind: 'projects'; x: number; y: number }
@@ -269,7 +311,10 @@ export function Sidebar(props: SidebarProps): React.JSX.Element {
   }
 
   return (
-    <div className={`left-shell${props.collapsed ? ' rail-only' : ''}${sidebarMode === 'browser' ? ' browser-active' : ''}`}>
+    <div
+      className={`left-shell${props.collapsed ? ' rail-only' : ''}${sidebarMode === 'browser' ? ' browser-active' : ''}${resizing ? ' sidebar-resizing' : ''}`}
+      style={{ '--sidebar-width': `${sidebarWidth}px` } as CSSProperties}
+    >
       {workspaceMenu && <WorkspaceSessionMenu x={workspaceMenu.x} y={workspaceMenu.y} canRestore={props.canRestoreWorkspace} onRename={() => renameSession(workspaceMenu.session)} onNew={props.onNewSession} onRestore={props.onRestoreWorkspace} onCloseWorkspace={() => props.onCloseSession(workspaceMenu.session.id)} onDismiss={() => setWorkspaceMenu(null)} />}<nav className="activity-rail" aria-label="Activity">
         <div className="rail-primary">
           {railItems.filter((item) => item.group === 'primary').map(renderRailItem)}
@@ -448,6 +493,25 @@ ${project.path} (on ${project.remote!.machineName})` : project.path}
           </>}
         />
       </aside>
+      {!props.collapsed && sidebarMode !== 'browser' && (
+        <div
+          className="sidebar-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize sidebar"
+          aria-valuemin={SIDEBAR_MIN_WIDTH}
+          aria-valuemax={SIDEBAR_MAX_WIDTH}
+          aria-valuenow={sidebarWidth}
+          tabIndex={0}
+          onPointerDown={beginSidebarResize}
+          onDoubleClick={resetSidebarWidth}
+          onKeyDown={(event) => {
+            if (event.key === 'ArrowLeft') { event.preventDefault(); setSidebarWidth((width) => { const next = clampSidebarWidth(width - 16); localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next)); return next }) }
+            if (event.key === 'ArrowRight') { event.preventDefault(); setSidebarWidth((width) => { const next = clampSidebarWidth(width + 16); localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next)); return next }) }
+            if (event.key === 'Enter') resetSidebarWidth()
+          }}
+        />
+      )}
       {confirmingRemoval && <RemoveProjectDialog project={confirmingRemoval} onRemove={() => props.onRemoveProject(confirmingRemoval.id)} onDismiss={() => setConfirmingRemoval(null)} />}
       {menu && createPortal(
         <div

@@ -24,6 +24,7 @@ import {
   Plus,
   TerminalSquare,
   TimerReset,
+  TriangleAlert,
   Undo2,
   X
 } from 'lucide-react'
@@ -47,6 +48,7 @@ import {
   applyTabDrop,
   closeTab,
   collapseTabGroup,
+  dockTabsBeside,
   findGroup,
   listGroups,
   insertForeignTab,
@@ -83,7 +85,7 @@ import { SessionArchiveDormantPane } from '../components/SessionArchiveDormantPa
 import { debugLog } from '../debug-log'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
-import { coworkerTabGroups } from './coworker-tab-groups'
+import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import './coworker-tab-groups.css'
 
 interface PaneWorkspaceProps {
@@ -112,10 +114,20 @@ interface PaneWorkspaceProps {
   correctedActivityPhases?: ReadonlyMap<string, AgentActivityPhase>
 }
 
-interface TabDragState { sourceGroupId: string; tab: PaneTab; width: number; x: number; y: number }
+interface TabDragState {
+  sourceGroupId: string
+  tab: PaneTab
+  width: number
+  x: number
+  y: number
+  /** Set when the whole coworker group is being dragged rather than one tab: every id in it
+   *  moves together, and the drag is restricted to a pane edge (a side-by-side split) rather
+   *  than a tab-bar reorder or a cross-window move. */
+  groupTabIds?: string[]
+}
 
 interface PaneDragActions {
-  start(groupId: string, tab: PaneTab, width: number, point: { x: number; y: number }): void
+  start(groupId: string, tab: PaneTab, width: number, point: { x: number; y: number }, groupTabIds?: string[]): void
 }
 
 const iconFor = (tab: PaneTab): typeof Bot => {
@@ -297,6 +309,8 @@ function PaneGroup({
   useSuspendedConversations(group.tabs, mountedIds, workspace.project, workspace.session)
   const menuTab = group.tabs.find(tab => tab.id === menuPosition?.tabId) ?? activeTab
   const menuGroup = tabGroupsOf(group).find(item => item.id === groupMenu?.tabGroupId)
+  const coworkerPresentation = coworkerTabGroups(group.tabs, controlLinks)
+  const [pendingGroupClose, setPendingGroupClose] = useState<PaneTab[] | null>(null)
   const focused = workspace.focusedGroupId === group.id
   const isSourceGroup = dragging?.sourceGroupId === group.id
   const barIndex = dropTarget?.kind === 'bar' && dropTarget.groupId === group.id ? dropTarget.index : null
@@ -376,20 +390,24 @@ function PaneGroup({
     closeTimersRef.current.clear()
   }, [])
 
-  const beginDrag = (event: React.DragEvent, tab: PaneTab): void => {
+  const beginDrag = (event: React.DragEvent, tab: PaneTab, groupTabIds?: string[]): void => {
     event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData(CROSS_WINDOW_TAB_MIME, encodeCrossWindowTab({
-      tab,
-      sourceGroupId: group.id,
-      projectId: workspace.project.id,
-      sessionId: workspace.session.id,
-      ...(workspace.detachedId ? { detachedId: workspace.detachedId } : {})
-    }))
+    // A group drag moves several tabs at once and only ever lands as a pane split within this
+    // window, so there is nothing coherent to hand a cross-window drop - it simply is not offered.
+    if (!groupTabIds) {
+      event.dataTransfer.setData(CROSS_WINDOW_TAB_MIME, encodeCrossWindowTab({
+        tab,
+        sourceGroupId: group.id,
+        projectId: workspace.project.id,
+        sessionId: workspace.session.id,
+        ...(workspace.detachedId ? { detachedId: workspace.detachedId } : {})
+      }))
+    }
     const transparentImage = document.createElement('canvas')
     transparentImage.width = 1
     transparentImage.height = 1
     event.dataTransfer.setDragImage(transparentImage, 0, 0)
-    dragActions.start(group.id, tab, event.currentTarget.getBoundingClientRect().width, { x: event.clientX, y: event.clientY })
+    dragActions.start(group.id, tab, event.currentTarget.getBoundingClientRect().width, { x: event.clientX, y: event.clientY }, groupTabIds)
   }
 
   const showContextMenu = (event: React.MouseEvent, tab: PaneTab = activeTab): void => {
@@ -540,6 +558,24 @@ function PaneGroup({
     closeTimersRef.current.set(tab.id, timer)
   }
 
+  /** A running coworker's turn is worth the same "are you sure" the app already gives active
+   *  work elsewhere (see UpdateQuitConfirm), not a silent kill. */
+  const isTabRunning = (tab: PaneTab): boolean => {
+    const phase = activity[tab.id] ?? 'idle'
+    return phase === 'working' || phase === 'waiting_background'
+  }
+
+  /** Closing a controller tab takes its whole coworker group with it by default - the group
+   *  reads as one unit of work, and leaving orphaned coworker tabs behind would be confusing.
+   *  "Close this tab only" (closeTabOnly) opts out and always closes just the one tab. */
+  const closeTabOnly = (tab: PaneTab): void => close(tab)
+
+  const requestClose = (tab: PaneTab): void => {
+    const targets = coworkerCloseTargets(tab, coworkerPresentation)
+    if (targets.length > 1 && targets.some(isTabRunning)) { setPendingGroupClose(targets); return }
+    targets.forEach(close)
+  }
+
   /** One tab button. `gapHere` opens the drag insertion gap in front of it; for the first tab
    * of a group the gap belongs on the group wrapper instead, so the tab never detaches from
    * its own chip mid-drag. */
@@ -562,14 +598,14 @@ function PaneGroup({
           if (event.button !== 1) return
           event.preventDefault()
           event.stopPropagation()
-          close(tab)
+          requestClose(tab)
         }}
         onAuxClick={(event) => event.preventDefault()}
         data-autoscroll="off"
         draggable
         onDragStart={(event) => beginDrag(event, tab)}
       >
-        {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
+        {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
         <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
         {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (
           <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
@@ -578,13 +614,11 @@ function PaneGroup({
         <i
           className="tab-close"
           role="button"
-          onClick={(event) => { event.stopPropagation(); close(tab) }}
+          onClick={(event) => { event.stopPropagation(); requestClose(tab) }}
         ><X size={11} /></i>
       </button>
     )
   }
-
-  const coworkerPresentation = coworkerTabGroups(group.tabs, controlLinks)
 
   return (
     <>
@@ -607,7 +641,7 @@ function PaneGroup({
           if (event.button !== 1 || (event.target as HTMLElement).closest('.pane-controls')) return
           event.preventDefault()
           event.stopPropagation()
-          close(activeTab)
+          requestClose(activeTab)
         }}
       >
         <div className="pane-tabs">
@@ -628,6 +662,14 @@ function PaneGroup({
                 style={{ marginLeft: gapBeforeId === coworkerGroup.insertionTabId ? dragging!.width : undefined }}
               >
                 {renderTab(coworkerGroup.controller, false, expanded)}
+                <button
+                  type="button"
+                  className="coworker-tab-drag-handle"
+                  draggable
+                  onDragStart={(event) => beginDrag(event, coworkerGroup.coworkers[0]!, coworkerGroup.coworkers.map(tab => tab.id))}
+                  title={`Drag ${coworkerGroup.coworkers.length} coworker tab${coworkerGroup.coworkers.length === 1 ? '' : 's'} beside this pane`}
+                  aria-label={`Drag ${coworkerGroup.coworkers.length} coworker tab${coworkerGroup.coworkers.length === 1 ? '' : 's'} beside this pane`}
+                ><GripVertical size={11} /></button>
                 <button
                   type="button"
                   className="coworker-tab-toggle"
@@ -688,7 +730,7 @@ function PaneGroup({
             title="Drag tab area"
           ><GripVertical size={17} /></button>
           <button className="pane-menu-button" onClick={(event) => showContextMenu(event)} title="Tab actions"><MoreHorizontal size={19} /></button>
-          <button className="pane-close-button" onClick={() => close(activeTab)} title="Close tab"><X size={17} /></button>
+          <button className="pane-close-button" onClick={() => requestClose(activeTab)} title="Close tab"><X size={17} /></button>
         </div>
       </header>
       <div className="pane-content">
@@ -704,9 +746,11 @@ function PaneGroup({
       maximized={workspace.maximizedGroupId === group.id}
       continuation={menuTab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(menuTab.state.continueOnLimit)}
       groups={tabGroupsOf(group)}
+      isCoworkerController={coworkerPresentation.groupByTabId.get(menuTab.id)?.controller.id === menuTab.id}
       onGroupAction={action => runGroupAction(action, menuTab)}
       canReopen={workspace.canReopen} onDismiss={() => setMenuPosition(null)} onAction={action => {
-        if (action === 'close') { close(menuTab); return }
+        if (action === 'close') { requestClose(menuTab); return }
+        if (action === 'close-tab-only') { closeTabOnly(menuTab); return }
         if (action === 'detach' || action === 'show') { workspace.onDetach(group.id, menuTab, { alwaysOnTop: action === 'show' }); return }
         if (action === 'reopen') { workspace.onReopen(group.id); return }
         const current = workspaceRef.current
@@ -726,6 +770,24 @@ function PaneGroup({
       tabCount={group.tabs.filter(tab => tab.tabGroupId === menuGroup.id).length}
       onDismiss={() => setGroupMenu(null)}
       onAction={action => runGroupAction(action, activeTab)} />}
+    {pendingGroupClose && createPortal(
+      <div className="close-coworkers-confirm-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPendingGroupClose(null) }}>
+        <section className="close-coworkers-confirm" role="alertdialog" aria-modal="true" aria-labelledby="close-coworkers-confirm-title">
+          <header>
+            <span className="close-coworkers-confirm-icon"><TriangleAlert size={17} /></span>
+            <strong id="close-coworkers-confirm-title">Close while work is in progress?</strong>
+          </header>
+          <p>{pendingGroupClose.length === 2 ? 'This coworker is still running:' : `${pendingGroupClose.length - 1} coworkers are still running:`}</p>
+          <ul className="close-coworkers-confirm-list">{pendingGroupClose.filter(isTabRunning).map((tab) => <li key={tab.id}>{tab.title}</li>)}</ul>
+          <p>Closing this tab group now will interrupt them.</p>
+          <footer>
+            <button type="button" onClick={() => setPendingGroupClose(null)}>Keep working</button>
+            <button type="button" className="primary" onClick={() => { const targets = pendingGroupClose; setPendingGroupClose(null); targets.forEach(close) }}>Close tab group</button>
+          </footer>
+        </section>
+      </div>,
+      document.body
+    )}
 
     </>
   )
@@ -962,7 +1024,10 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
     const endDrag = (event: DragEvent): void => {
       window.clearTimeout(foreignStaleTimer)
       const drag = draggingRef.current
-      if (drag && !consumedRef.current) {
+      if (drag && !consumedRef.current && drag.groupTabIds) {
+        // A rejected or off-window drop of a coworker group simply snaps back: there is no
+        // cross-window payload for it to have landed anywhere else, and it never detaches.
+      } else if (drag && !consumedRef.current) {
         if (event.dataTransfer?.dropEffect === 'move') {
           // Nothing in this window accepted the drop, yet it was accepted somewhere: another
           // Conductor window just grafted this tab into its own layout, so this window's copy
@@ -993,7 +1058,11 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
         if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
         if (dragGhostRef.current) dragGhostRef.current.style.transform = `translate3d(${event.clientX + 14}px, ${event.clientY + 14}px, 0)`
         const found = resolveDropTarget(event.clientX, event.clientY, drag.sourceGroupId, drag.tab.id)
-        const resolved = found && tabDropLands(propsRef.current.layout, drag.sourceGroupId, drag.tab.id, found) ? found : null
+        // A group drag only ever peels into its own pane at an edge - never a tab-bar reorder,
+        // which single-tab semantics like "insert at index" don't extend to several tabs at once.
+        const resolved = drag.groupTabIds
+          ? (found?.kind === 'canvas' ? found : null)
+          : found && tabDropLands(propsRef.current.layout, drag.sourceGroupId, drag.tab.id, found) ? found : null
         latestTargetRef.current = resolved
         setDropTarget((current) => sameDropTarget(current, resolved) ? current : resolved)
         return
@@ -1017,7 +1086,13 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
         event.preventDefault()
         consumedRef.current = true
         const target = latestTargetRef.current
-        if (target) {
+        if (target && drag.groupTabIds && target.kind === 'canvas') {
+          const current = propsRef.current
+          const groupTabIds = drag.groupTabIds
+          current.onLayout(layout => dockTabsBeside(layout, drag.sourceGroupId, groupTabIds, target.groupId, target.edge))
+          current.onFocus(target.groupId)
+          setSnapArrival({ groupId: target.groupId, edge: target.edge })
+        } else if (target && !drag.groupTabIds) {
           const current = propsRef.current
           current.onLayout(layout => applyTabDrop(layout, drag.sourceGroupId, drag.tab.id, target))
           current.onFocus(target.groupId)
@@ -1059,8 +1134,8 @@ export function PaneWorkspace(props: PaneWorkspaceProps): React.JSX.Element {
   }, [snapArrival])
 
   const dragActions: PaneDragActions = {
-    start: (sourceGroupId, tab, width, point) => {
-      draggingRef.current = { sourceGroupId, tab, width, ...point }
+    start: (sourceGroupId, tab, width, point, groupTabIds) => {
+      draggingRef.current = { sourceGroupId, tab, width, ...point, ...(groupTabIds ? { groupTabIds } : {}) }
       consumedRef.current = false
       setDragging(draggingRef.current)
       if (props.maximizedGroupId) {

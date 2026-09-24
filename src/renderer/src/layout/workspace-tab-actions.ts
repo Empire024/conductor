@@ -3,7 +3,7 @@ import { makeLauncherTab } from '../../../shared/models'
 import { activateTab, addTab, assignTabsToGroup, closeTab, closeTabGroup, collapseTabGroup, duplicateTab, editTabGroup, findGroup, groupTabs, listGroups, splitGroup, ungroupTabGroup, updateTab } from './layout-operations'
 import type { TabGroupAction } from './tab-groups'
 
-export type WorkspaceTabAction = 'focus' | 'left' | 'right' | 'above' | 'below' | 'duplicate' | 'detach' | 'show' | 'maximize' | 'continuation' | 'reopen' | 'close'
+export type WorkspaceTabAction = 'focus' | 'left' | 'right' | 'above' | 'below' | 'duplicate' | 'detach' | 'show' | 'maximize' | 'continuation' | 'reopen' | 'close' | 'close-tab-only'
 
 /** Operates on the requested workspace, even when another workspace is active. */
 export function applyWorkspaceTabAction(session: SessionRecord, groupId: string, tabId: string, action: WorkspaceTabAction): { session: SessionRecord; focusedGroupId: string } {

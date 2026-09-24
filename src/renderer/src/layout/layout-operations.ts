@@ -249,6 +249,43 @@ export const dockTab = (
   return splitGroup(withoutSource, targetGroupId, edge, removal.tab)
 }
 
+/** Moves every tab in `tabIds` (in their current strip order) out of `sourceGroupId` and into a
+ * brand new pane split off `targetGroupId`'s edge - dragging a whole coworker group to the side
+ * peels its tabs into one sibling pane together, rather than one at a time. A tab id missing from
+ * the source (already closed under the drag) is skipped rather than failing the whole move. */
+export const dockTabsBeside = (
+  layout: WorkspaceLayout,
+  sourceGroupId: string,
+  tabIds: readonly string[],
+  targetGroupId: string,
+  edge: Exclude<DockEdge, 'center'>
+): WorkspaceLayout => {
+  const source = findGroup(layout.root, sourceGroupId)
+  if (!source) return layout
+  const wanted = new Set(tabIds)
+  const ordered = source.tabs.filter((tab) => wanted.has(tab.id))
+  if (!ordered.length) return layout
+
+  let next = layout
+  const removed: PaneTab[] = []
+  for (const tab of ordered) {
+    const removal = removeFromNode(next.root, sourceGroupId, tab.id)
+    if (!removal.tab) continue
+    next = removal.node
+      ? { ...next, root: removal.node }
+      : { ...next, root: { type: 'group', id: (next.root.type === 'group' ? next.root.id : makeId('group')), tabs: [], activeTabId: '' } }
+    removed.push(removal.tab)
+  }
+  if (!removed.length) return layout
+
+  const [first, ...rest] = removed
+  next = splitGroup(next, targetGroupId, edge, first!)
+  const newGroupId = listGroups(next.root).find((candidate) => candidate.tabs.some((tab) => tab.id === first!.id))?.id
+  if (!newGroupId) return next
+  for (const tab of rest) next = addTab(next, newGroupId, tab)
+  return next
+}
+
 /** Moves a tab into a specific slot of `targetGroupId`, reordering in place when the
  * target is the tab's own group and relocating (collapsing the source, same as dockTab)
  * otherwise. The tab becomes active in whichever group it ends up in when it crosses groups. */

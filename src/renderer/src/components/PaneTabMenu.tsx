@@ -59,9 +59,12 @@ function ColorRow({ selected, onPick }: { selected: TabGroupColor; onPick(color:
   )
 }
 
-export function PaneTabMenu({ x, y, tab, maximized, continuation, canReopen, groups, onAction, onGroupAction, onDismiss }: {
+export function PaneTabMenu({ x, y, tab, maximized, continuation, canReopen, groups, isCoworkerController, onAction, onGroupAction, onDismiss }: {
   x: number; y: number; tab: PaneTab; maximized: boolean; continuation: boolean; canReopen: boolean
   groups: TabGroup[]
+  /** This tab is a controller with coworkers, so closing it closes its whole group by default
+   *  and the menu offers "Close this tab only" as the opt-out. */
+  isCoworkerController?: boolean
   onAction(action: WorkspaceTabAction): void; onGroupAction(action: TabGroupAction): void; onDismiss(): void
 }): React.JSX.Element {
   const run = (action: WorkspaceTabAction): void => { onDismiss(); onAction(action) }
@@ -90,7 +93,8 @@ export function PaneTabMenu({ x, y, tab, maximized, continuation, canReopen, gro
       {tab.kind === 'agent' && <button role="menuitem" onClick={() => run('continuation')}><TimerReset size={13} /> {continuation ? 'Disable' : 'Enable'} limit continuation</button>}
       <button role="menuitem" disabled={!canReopen} onClick={() => run('reopen')}><Undo2 size={13} /> Retrieve closed tab</button>
       <div role="separator" />
-      <button role="menuitem" className="danger" onClick={() => run('close')}><X size={13} /> Close tab</button>
+      {isCoworkerController && <button role="menuitem" onClick={() => run('close-tab-only')}><X size={13} /> Close this tab only</button>}
+      <button role="menuitem" className="danger" onClick={() => run('close')}><X size={13} /> {isCoworkerController ? 'Close tab group' : 'Close tab'}</button>
     </MenuShell>
   )
 }

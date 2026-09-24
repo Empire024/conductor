@@ -62,3 +62,11 @@ export function coworkerTabGroups(tabs: readonly PaneTab[], links: readonly Agen
   groups.sort((a, b) => (index.get(a.insertionTabId) ?? 0) - (index.get(b.insertionTabId) ?? 0))
   return { groups, groupByTabId }
 }
+
+/** Closing a controller closes its whole coworker group by default, the way closing a browser
+ *  window closes its tabs - the group reads as one unit of work. Closing any other tab, or a
+ *  controller through the "close this tab only" opt-out, affects only that one tab. */
+export function coworkerCloseTargets(tab: PaneTab, presentation: CoworkerTabPresentation): PaneTab[] {
+  const group = presentation.groupByTabId.get(tab.id)
+  return group && group.controller.id === tab.id ? [group.controller, ...group.coworkers] : [tab]
+}

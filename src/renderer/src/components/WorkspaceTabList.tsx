@@ -47,7 +47,7 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
     return <div key={tab.id} className={`workspace-tab-row${coworker ? ' coworker-child' : ''}${active && group.activeTabId === tab.id ? ' selected' : ''}`} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); setMenu({ x: event.clientX, y: event.clientY, groupId: group.id, tab }) }}>
       <button className="workspace-tab-select" title={tab.title} onClick={() => onAction(group.id, tab.id, 'focus')}>
         {tabGroup && <i className="tab-group-dot" data-tab-group-color={tabGroup.color} title={`In ${tabGroup.title || 'unnamed group'}`} />}
-        {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} size={12} /> : tab.kind === 'terminal' ? <TerminalSquare size={12} /> : <FileText size={12} />}
+        {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={12} /> : tab.kind === 'terminal' ? <TerminalSquare size={12} /> : <FileText size={12} />}
         <span className="ellipsis">{tab.title}</span>
         {tab.kind === 'agent' && <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />}
       </button>

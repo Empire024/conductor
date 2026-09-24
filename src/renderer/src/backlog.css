@@ -97,6 +97,8 @@
 
 .provider-logo { display: inline-block; flex: 0 0 auto; background: currentColor; mask-image: var(--provider-logo); mask-repeat: no-repeat; mask-size: contain; mask-position: center; vertical-align: middle; }
 .provider-claude { color: #d97757; }.provider-gemini { color: #779bea; }.provider-qwen { color: #9580ff; }.provider-kimi { color: #729eff; }
+.provider-logo-icon { display: inline-block; flex: 0 0 auto; vertical-align: middle; }
+.provider-logo-icon.provider-local { color: #9580ff; }
 .native-cli-pane { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; width: 100%; height: 100%; }
 .native-cli-pane > header { display: flex; flex: 0 0 34px; gap: 10px; padding: 0 8px; align-items: center; border-bottom: 1px solid var(--border-soft); color: var(--text-3); font-size: 10px; }
 .native-cli-terminal { flex: 1; min-width: 0; min-height: 0; overflow: hidden; padding: 6px 7px; }

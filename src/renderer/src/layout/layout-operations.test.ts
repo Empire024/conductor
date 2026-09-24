@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { PaneGroupNode, SplitNode } from '../../../shared/models'
 import { createDefaultLayout, makeLauncherTab } from '../../../shared/models'
-import { addTab, applyTabDrop, closeTab, dockTab, findGroup, insertForeignTab, instantiateLayout, listGroups, moveTabToGroup, reorderTab, splitGroup, stripWorkspaceUtilityTabs, tabDropLands } from './layout-operations'
+import { addTab, applyTabDrop, closeTab, dockTab, dockTabsBeside, findGroup, insertForeignTab, instantiateLayout, listGroups, moveTabToGroup, reorderTab, splitGroup, stripWorkspaceUtilityTabs, tabDropLands } from './layout-operations'
 import { gapAnchorId } from './tab-drag'
 
 describe('layout operations', () => {
@@ -90,6 +90,41 @@ describe('layout operations', () => {
     layout.root.tabs.push(second)
     const moved = dockTab(layout, groupId, second.id, groupId, 'below')
     expect(listGroups(moved.root)).toHaveLength(2)
+  })
+
+  it('docks several tabs beside their group together, in one new pane', () => {
+    const layout = createDefaultLayout()
+    const groupId = layout.root.id
+    if (layout.root.type !== 'group') throw new Error('Expected group')
+    const [child, grandchild] = [makeLauncherTab(), makeLauncherTab()]
+    layout.root.tabs.push(child, grandchild)
+    const docked = dockTabsBeside(layout, groupId, [child.id, grandchild.id], groupId, 'right')
+    const groups = listGroups(docked.root)
+    expect(groups).toHaveLength(2)
+    const main = groups.find((g) => g.id === groupId)!
+    const newGroup = groups.find((g) => g.id !== groupId)!
+    expect(main.tabs.map((tab) => tab.id)).not.toContain(child.id)
+    expect(main.tabs.map((tab) => tab.id)).not.toContain(grandchild.id)
+    expect(newGroup.tabs.map((tab) => tab.id)).toEqual([child.id, grandchild.id])
+  })
+
+  it('skips a tab id that is no longer in the source group', () => {
+    const layout = createDefaultLayout()
+    const groupId = layout.root.id
+    if (layout.root.type !== 'group') throw new Error('Expected group')
+    const child = makeLauncherTab()
+    layout.root.tabs.push(child)
+    const docked = dockTabsBeside(layout, groupId, [child.id, 'missing-tab'], groupId, 'left')
+    const groups = listGroups(docked.root)
+    expect(groups).toHaveLength(2)
+    expect(groups.some((g) => g.tabs.some((tab) => tab.id === child.id))).toBe(true)
+  })
+
+  it('leaves the layout untouched when none of the requested tabs exist', () => {
+    const layout = createDefaultLayout()
+    const groupId = layout.root.id
+    const docked = dockTabsBeside(layout, groupId, ['missing-a', 'missing-b'], groupId, 'right')
+    expect(docked).toBe(layout)
   })
 
   it('instantiates templates without reusing runtime identities', () => {
