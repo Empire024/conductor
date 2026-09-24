@@ -1951,3 +1951,40 @@ describe('B1: orphaned live agents and the restart initiator', () => {
     expect(host.relaunch).not.toHaveBeenCalled()
   })
 })
+
+describe('supervision and bounded recovery through app control', () => {
+  it('reports the observed turn start and an unchanged cursor, bounds recovery of a failed coworker and records a superseded one', async () => {
+    const f = fixture()
+    const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic' }) as AgentControlTab
+    const id = tab.resourceId!, phase = () => f.database.structured.snapshot(id)!.phase
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Do the work' })
+    await vi.waitFor(() => expect(phase()).toBe('completed'))
+    const status = await f.control.call(f.scope, 'agents.status', { agentSessionId: id }) as Record<string, any>
+    expect(status.turnStart).toMatchObject({ state: 'started', evidence: 'assistant text', from: 'Controller' })
+    expect(status).toMatchObject({ pending: [], activeTool: null, recovery: { attempts: 0, remaining: 3, superseded: null } })
+    expect(status.usage.reviewer).toBeNull()
+    expect(JSON.stringify(status).length).toBeLessThan(2500)
+    expect(await f.control.call(f.scope, 'agents.status', { agentSessionId: id, since: status.cursor })).toEqual({ agentSessionId: id, unchanged: true, cursor: status.cursor, phase: 'completed', observedAt: expect.any(String) })
+    // A routine reconnect of a settled conversation is not a recovery.
+    expect(await f.control.call(f.scope, 'agents.resume', { agentSessionId: id })).toMatchObject({ recovery: { attempts: 0 } })
+    const fail = async () => { f.submissions.at(-1)!.options.emit({ data: { type: 'session', phase: 'failed' } }); await vi.waitFor(() => expect(phase()).toBe('failed')) }
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Try again' })
+      await vi.waitFor(() => expect(phase()).toBe('completed'))
+      await fail()
+      expect(await f.control.call(f.scope, 'agents.resume', { agentSessionId: id })).toMatchObject({ recovery: { attempts: attempt, remaining: 3 - attempt } })
+    }
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Once more' })
+    await vi.waitFor(() => expect(phase()).toBe('completed'))
+    await fail()
+    await expect(f.control.call(f.scope, 'agents.resume', { agentSessionId: id })).rejects.toThrow(/tell the owner/)
+    const replacement = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic' }) as AgentControlTab
+    await expect(f.control.call(f.scope, 'agents.supersede', { agentSessionId: id, by: 'someone-else', reason: 'Redone' })).rejects.toThrow(/took this work over/)
+    expect(await f.control.call(f.scope, 'agents.supersede', { agentSessionId: id, by: replacement.resourceId, reason: 'Replacement passed the acceptance test' })).toMatchObject({ agentSessionId: id, superseded: { by: replacement.resourceId } })
+    const listed = await f.control.call(f.scope, 'agents.list', {}) as Array<Record<string, any>>
+    expect(listed.find(entry => entry.agentSessionId === id)?.superseded).toMatchObject({ by: replacement.resourceId })
+    expect(listed.find(entry => entry.agentSessionId === replacement.resourceId)).not.toHaveProperty('superseded')
+    await expect(f.control.call(f.scope, 'agents.resume', { agentSessionId: id })).rejects.toThrow(/superseded by/)
+    expect(JSON.stringify(await f.control.call(f.scope, 'tools.list', {}))).toContain('agents.supersede')
+  })
+})

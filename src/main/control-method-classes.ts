@@ -17,7 +17,7 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
   ...[
     'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close',
     'agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer',
-    'agents.interrupt', 'agents.resume', 'agents.fork', 'agents.release', 'agents.handoff',
+    'agents.interrupt', 'agents.resume', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.supersede',
     'agents.report',
     'files.write', 'files.open', 'tasks.update', 'memory.remember', 'memory.forget',
     'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save',

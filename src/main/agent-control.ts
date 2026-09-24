@@ -30,6 +30,9 @@ import type { LocalUpdateBuildService } from './local-update-build'
 import type { DeliveryRequester, DeliveryRun, RepositoryStatus } from '../shared/delivery'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import { createApprovalRouting } from './approval-review-routing'
+import { ApprovalReviews } from './approval-review'
+import { sinceCursor, supervise } from './agent-supervision'
+import { CoworkerRecovery } from './coworker-recovery'
 import { localStopOf } from '../shared/local-stop.ts'
 import { summarizeContext } from '../shared/usage-accounting'
 import { normaliseContract } from './local-models/completion.ts'
@@ -121,14 +124,15 @@ const toolSignatures = {
   'agents.snapshot': '({agentSessionId}) — agentSessionId is required and must be one listed by agents.list; observed native state, pending/running tools and recent output/results; refresh to verify older briefing intents',
   'agents.history': '({agentSessionId,afterSequence?}) — incremental native events',
   'agents.artifact': '({agentSessionId,artifactId}) — the full text of a tool output the history only carries a tail of (the outputArtifactId on a tool event), up to 2 MiB',
-  'agents.status': '({agentSessionId}) — the compact supervision view of one visible conversation: phase, model, last stop reason with its figures (rounds used of the hard cap, context used / capacity / reserve, compactions, loop warnings, acceptance result, files changed), last tool and its status, and the durable task state a local worker keeps. A few hundred bytes; use it instead of agents.snapshot to poll a local worker',
+  'agents.status': '({agentSessionId}) — the compact supervision view of one visible conversation: phase, model, last stop reason with its figures (rounds used of the hard cap, context used / capacity / reserve, compactions, loop warnings, acceptance result, files changed), last tool and its status, and the durable task state a local worker keeps; plus pending requests and whether each waits on the stronger reviewer or the owner, turnStart (the newest accepted prompt and whether the native runtime actually started a turn for it: started / awaiting-native / not-started), the active tool, artifact counts, measured usage only (provider-reported tokens and cost, turns, wall time, errors, and the stronger reviewer\'s cost for this worker from the approval journal), recovery (attempts left, superseded) and a cursor. Pass the cursor back as since and an unchanged view returns {unchanged:true} instead; it never moves on a streamed token. A few hundred bytes; use it instead of agents.snapshot to poll a worker',
   'agents.compact': '({agentSessionId}) — fold an idle local-model coworker’s transcript into its durable task state (task, constraints, files changed, recent commands, current failure, remaining work) inside the same conversation, so its next turn starts from compact state without a new tab; only a coworker this caller controls, only between turns; returns the tokens recovered',
   'agents.configure': '({agentSessionId,model,effort?}) — while the controlled coworker is idle with no queued input, persist an exact models.list model/effort for its next turn and update its visible tab; provider and permissions never change',
   'agents.grant': '({agentSessionId,repository?,research?}) — switch a local-model coworker’s per-conversation grants: repository (the sandbox may commit and branch, and a plain git push runs for it on the host) and research (web_search plus a larger tool-round budget). These are the conversation’s durable settings, the same toggles as its composer, so its own buttons show the change and it applies from its next turn. Only a non-local coworker may grant, only to a provider-local tab it already controls on this machine, never to itself or an ancestor; an omitted field is left alone, false revokes; returns what is now on and off',
   'agents.submit': '({agentSessionId,prompt}) — dispatch to a visible native tab with its existing permission settings',
   'agents.steer': '({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. The result says which: delivery "started" for a new turn, "queued" for a message steered into or queued behind the running one',
   'agents.interrupt': '({agentSessionId}) — stops the running turn, including one waiting on an approval; queued messages stay held above its composer, as after the owner’s Stop. Interrupting does not take control, here or in a sibling project',
-  'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls',
+  'agents.resume': '({agentSessionId}) — reopen a live orphan in this workspace without restarting its turn, or reconnect an idle/disconnected native conversation with its existing settings; outside this workspace only a coworker this caller controls. Resuming a failed, interrupted or disconnected one is a recovery: three per conversation in six hours (the owner is not counted), never while it waits on a request, never once it is superseded',
+  'agents.supersede': '({agentSessionId,by,reason}) - mark a stopped coworker whose work another conversation (by) took over and delivered, so it reads as superseded rather than unfinished work and is not resumed again; reason up to 300 characters, e.g. what accepted the replacement',
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver up to 2000 characters to the conversation that opened this tab (its controller, whoever that is), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
@@ -433,7 +437,9 @@ export class AgentControl {
       lastError: lastError && lastError.data.type === 'error' ? lastError.data.message.slice(0, 400) : null,
       lastAnswer: lastText && lastText.data.type === 'text' ? lastText.data.text.slice(-600) : null,
       filesChanged: [...changed].slice(0, 100),
-      taskState: this.deps.sessions.runStatus(tab.resourceId!)
+      taskState: this.deps.sessions.runStatus(tab.resourceId!),
+      ...supervise(state, this.reviewsFor(scope.projectId, tab.resourceId!)),
+      recovery: this.recovery().status(scope.projectId, tab.resourceId!)
     }
   }
 
@@ -723,6 +729,13 @@ export class AgentControl {
     return this.deps.ui({ ...scope, id: randomUUID(), action, params })
   }
 
+  private recoveryLedger?: CoworkerRecovery
+  private recovery(): CoworkerRecovery { return this.recoveryLedger ??= new CoworkerRecovery(this.deps.database) }
+  /** The approval reviews raised for a worker's requests; none when the journal cannot be read. */
+  private reviewsFor(projectId: string, workerId: string) {
+    try { return new ApprovalReviews(this.deps.database).forWorker(projectId, workerId) } catch { return undefined }
+  }
+
   private catalog(scope: AgentControlScope): Array<{ provider: StructuredProvider; available: boolean; source: 'runtime' | 'configured'; models: Array<{ id: string; label: string; effort?: string[]; defaultEffort?: string; isDefault?: boolean }> }> {
     return this.deps.providers().filter(provider => provider.id === 'codex' || provider.id === 'claude' || provider.id === 'grok' || provider.id === 'local').map(provider => {
       const runtime = this.tabs(scope).filter(tab => tab.kind === 'agent' && tab.state?.provider === provider.id).map(tab => this.deps.database.structured.snapshot(tab.resourceId!)?.capabilities).find(capabilities => capabilities?.models.length)
@@ -907,7 +920,10 @@ export class AgentControl {
     if (method === 'agents.list') {
       const observedAt = new Date().toISOString()
       const tabs = this.tabs(scope).filter(tab => tab.kind === 'agent')
-      const own = tabs.map(tab => this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt))
+      const own = tabs.map(tab => {
+        const superseded = this.recovery().status(scope.projectId, tab.resourceId!).superseded
+        return { ...this.observation(scope, tab, database.structured.snapshot(tab.resourceId!), observedAt), ...(superseded ? { superseded: { by: superseded.by, at: superseded.at } } : {}) }
+      })
       const visible = new Set(tabs.map(tab => tab.resourceId))
       const orphaned = database.structured.projectSpecs<AgentSpec>(scope.projectId).flatMap(spec => {
         if (spec.sessionId !== scope.sessionId || visible.has(spec.id)) return []
@@ -952,7 +968,12 @@ export class AgentControl {
         return { ...this.observation(target, tab, state, new Date().toISOString()), ...state, activeTools, items: recent.sort((a, b) => a.sequence - b.sequence), truncated: state.truncated || state.items.length > recent.length }
       }
       if (method === 'agents.history') return database.structured.events(id, typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0).slice(0, 100)
-      if (method === 'agents.status') return this.status(target, tab, state)
+      if (method === 'agents.status') return sinceCursor(this.status(target, tab, state), args.since)
+      if (method === 'agents.supersede') {
+        const by = text(args, 'by', 160)
+        if (database.structured.spec<AgentSpec>(by)?.projectId !== target.projectId) throw new Error('by must name the conversation in this project that took this work over')
+        return { agentSessionId: id, ...this.recovery().supersede({ ...scope, projectId: target.projectId }, id, state.phase, by, text(args, 'reason', 300)) }
+      }
       if (method === 'agents.compact') {
         if (Object.keys(args).some(key => key !== 'agentSessionId')) throw new Error('agents.compact accepts only agentSessionId')
         if (database.structured.spec<AgentSpec>(id)?.provider !== 'local') throw new Error('Only a local-model conversation keeps a task state Conductor can compact; native CLIs compact themselves')
@@ -1004,8 +1025,10 @@ export class AgentControl {
             this.relationship(scope, scope, opened, 'attached')
             return { agentSessionId: id, reopened: true, tabId: opened.id, uri: opened.uri, phase: database.structured.snapshot(id)?.phase }
           }
+          const recoverer = { ...scope, projectId: target.projectId }
+          this.recovery().admit(recoverer, id, state.phase)
           await sessions.resume(id, state.settings)
-          return { agentSessionId: id, phase: database.structured.snapshot(id)?.phase }
+          return { agentSessionId: id, phase: database.structured.snapshot(id)?.phase, recovery: this.recovery().record(recoverer, id, state.phase) }
         }
         const forkId = await sessions.fork(id)
         const forkTab: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: forkId, title: args.title === undefined ? tab.title + ' (fork)' : text(args, 'title', 120), state: { ...tab.state, viewMode: 'visual' } }
