@@ -18,10 +18,12 @@ import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
 import { FakeDurableJobsService } from '../shared/durable-jobs-fake'
 import type { DurableJobEvent, DurableJobSummary } from '../shared/durable-jobs'
 import { assertLocalControlAllowed, assertToolAllowed, toolSpecs } from './local-models/tools'
+import { SUCCESSION_NUDGE, SUCCESSION_TURNS, TurnBriefings } from './turn-briefing'
+import { encodeRestartInitiator, encodeRestartRequest, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, takeRestartInitiator } from './restart-initiator'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
-function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['permissions']>>, sandboxByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['sandboxModes']>>) {
+function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['permissions']>>, sandboxByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['sandboxModes']>>, extraModels: ProviderCapabilities['models'] = [], briefing?: ConstructorParameters<typeof StructuredSessions>[4]) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0'); vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
   const root = mkdtempSync(join(tmpdir(), 'conductor-control-')), canonicalProjectPath = join(root, 'project')
   mkdirSync(canonicalProjectPath)
@@ -36,10 +38,10 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   const submissions: Array<{ provider: StructuredProvider; prompt: string; settings: import('../shared/structured-agent').SessionSettings; options: AdapterOptions }> = []
   const broadcast = vi.fn()
   const sessions = new StructuredSessions(database, () => 'synthetic-provider', broadcast, (provider, options): ProviderAdapter => {
-    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: sandboxByProvider && provider in sandboxByProvider ? sandboxByProvider[provider] : ['inherit', 'read-only', 'workspace-write'], effort: ['low', 'high'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }, { id: provider + '-advanced', label: provider + ' Advanced', effort: ['high'], defaultEffort: 'high' }], limitations: ['Zero inference fixture'] }
+    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: sandboxByProvider && provider in sandboxByProvider ? sandboxByProvider[provider] : ['inherit', 'read-only', 'workspace-write'], effort: ['low', 'high'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }, { id: provider + '-advanced', label: provider + ' Advanced', effort: ['high'], defaultEffort: 'high' }, ...extraModels], limitations: ['Zero inference fixture'] }
     return { provider, capabilities, start: async () => { options.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: 'native-' + options.runtimeId } }) },
       submit: async (prompt, settings) => { submissions.push({ provider, prompt, settings: structuredClone(settings), options }); options.emit({ itemId: 'result', data: { type: 'text', role: 'assistant', text: 'Native fixture result', mode: 'snapshot' } }); options.emit({ data: { type: 'session', phase: 'completed' } }) }, respond: async () => {}, interrupt: async () => {}, dispose: () => {} }
-  })
+  }, briefing)
   dispose.push(() => sessions.dispose())
   const scope = { projectId: project.id, sessionId: workspace.id, agentSessionId: 'controller' }
   const spec: AgentSpec = { id: scope.agentSessionId, projectId: project.id, sessionId: workspace.id, cwd: project.path, provider: 'codex', title: 'Controller', model: 'codex-synthetic' }
@@ -1230,6 +1232,124 @@ describe('context handoff to a fresh tab', () => {
     const tools = await f.control.call(f.scope, 'tools.list') as Record<string, string>
     expect(tools['agents.handoff']).toContain('Objective, Constraints, Owned files, Verified findings, Remaining work, Artifact references')
     expect(tools['agents.handoff']).toContain('no agentSessionId')
+  })
+})
+
+// conductor-task:main-brain-succession
+describe('main-brain succession: agents.handoff successor:true', () => {
+  const astra = [{ id: 'gpt-6-astra', label: 'GPT-6 Astra', effort: ['high'], defaultEffort: 'high' }]
+  const asWizard = (f: ReturnType<typeof fixture>) => {
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra', effort: 'high', permission: 'accept-edits' } })
+  }
+  type Succession = { handedOff: boolean; successor: boolean; agentSessionId: string; tabId: string; title: string; wizard: boolean; continueOnLimit: boolean; coworkers: string[]; controller: string | null; restart: { initiator: boolean; request: boolean }; note: string }
+
+  it('opens the successor as a root wizard, moves every coworker to it and leaves one wizard in the workspace', async () => {
+    const f = fixture(false, undefined, undefined, astra)
+    asWizard(f)
+    const first = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    const second = await f.control.call(f.scope, 'tabs.open', { title: 'W2' }) as AgentControlTab
+    // A restart this wizard asked the owner for, and one it started, both name it.
+    f.database.setSetting(RESTART_REQUEST_KEY, encodeRestartRequest({ agentSessionId: f.spec.id, title: 'Controller', reason: 'Install the batch', at: new Date().toISOString() }))
+    f.database.setSetting(RESTART_INITIATOR_KEY, encodeRestartInitiator({ agentSessionId: f.spec.id, method: 'app.restart', at: new Date().toISOString() }))
+    const body = handoff()
+    const result = await f.control.call(f.scope, 'agents.handoff', { handoff: body, successor: true }) as Succession
+    expect(result).toMatchObject({ handedOff: true, successor: true, title: 'Controller (continued)', wizard: true, continueOnLimit: true, controller: null, restart: { initiator: true, request: true } })
+    expect(result.coworkers.sort()).toEqual([first.resourceId, second.resourceId].sort())
+    const successor = result.agentSessionId, successorScope = { ...f.scope, agentSessionId: successor }
+    // A root: nobody controls it, least of all the conversation it continues.
+    const links = f.control.listLinks(f.project.id, f.workspace.id)
+    expect(links.find(link => link.targetAgentSessionId === successor)).toBeUndefined()
+    // Every link moved, to the successor's own tab.
+    expect(links.filter(link => [first.resourceId, second.resourceId].includes(link.targetAgentSessionId)).map(link => [link.controllerAgentSessionId, link.controllerTabId])).toEqual([[successor, result.tabId], [successor, result.tabId]])
+    // Same brain: wizard, model, effort, mode and limit continuation.
+    expect(f.database.structured.snapshot(successor)?.settings).toMatchObject({ wizard: true, model: 'gpt-6-astra', effort: 'high', permission: 'accept-edits' })
+    expect(f.database.structured.spec<AgentSpec>(successor)?.continueOnLimit).toBe(true)
+    // One owner-authority main: the caller lost the wand, the successor holds it.
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.wizard).toBe(false)
+    const listed = await f.control.call(successorScope, 'agents.list', {}) as Array<{ agentSessionId: string; wizard: boolean; superseded?: { by: string } }>
+    expect(listed.filter(entry => entry.wizard).map(entry => entry.agentSessionId)).toEqual([successor])
+    await expect(f.control.call(f.scope, 'app.state', {})).resolves.not.toHaveProperty('wizard')
+    expect(await f.control.call(successorScope, 'app.state', {})).toMatchObject({ wizard: true })
+    // The caller is superseded by its successor and says so in its own tab.
+    expect(listed.find(entry => entry.agentSessionId === f.spec.id)?.superseded).toMatchObject({ by: successor })
+    const notice = f.database.structured.snapshot(f.spec.id)!.items.map(item => item.data).find(data => data.type === 'notice' && typeof data.payload === 'object' && data.payload !== null && 'succession' in data.payload)
+    expect(notice).toMatchObject({ message: expect.stringContaining('Continued in “Controller (continued)”'), payload: { succession: { agentSessionId: successor, tabId: result.tabId, title: 'Controller (continued)' } } })
+    // The handoff is the successor's first prompt, followed by who it now is.
+    expect(f.submissions).toHaveLength(1)
+    expect(f.submissions[0]!.prompt.startsWith(body)).toBe(true)
+    expect(f.submissions[0]!.prompt).toContain(`successor of “Controller” (${f.spec.id})`)
+    // The restart that would have brought the caller back brings the successor back.
+    expect(parseRestartRequest(f.database.getSetting(RESTART_REQUEST_KEY), new Date())).toMatchObject({ agentSessionId: successor, title: 'Controller (continued)', reason: 'Install the batch' })
+    expect(takeRestartInitiator(f.database.getSetting(RESTART_INITIATOR_KEY), new Date())).toMatchObject({ agentSessionId: successor, method: 'app.restart' })
+    // Recorded for the audit trail.
+    const recorded = f.collaboration.listMessages({ projectId: f.project.id, sessionId: f.workspace.id }).filter(message => message.metadata?.handoff === 'successor')
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0]).toMatchObject({ agentSessionId: f.spec.id, toAgentSessionId: successor })
+    expect(result.note).toMatch(/no longer control/)
+  })
+
+  it('sends coworker reports, steering and configuration to the successor, and no longer to the caller', async () => {
+    const f = fixture(false, undefined, undefined, astra)
+    asWizard(f)
+    const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    const workerScope = { ...f.scope, agentSessionId: worker.resourceId! }
+    expect(await f.control.call(workerScope, 'agents.report', { text: 'before' })).toMatchObject({ agentSessionId: f.spec.id })
+    const result = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    const successorScope = { ...f.scope, agentSessionId: result.agentSessionId }
+    expect(await f.control.call(workerScope, 'agents.report', { text: 'W1 DONE abc123' })).toEqual({ agentSessionId: result.agentSessionId, delivery: expect.any(String) })
+    expect(f.submissions.at(-1)).toMatchObject({ prompt: 'W1 DONE abc123' })
+    // The superseded caller, no longer a wizard, cannot steer or configure what it handed over.
+    await expect(f.control.call(f.scope, 'agents.submit', { agentSessionId: worker.resourceId, prompt: 'from the old main' })).rejects.toThrow('Another agent already controls this tab')
+    await expect(f.control.call(f.scope, 'agents.configure', { agentSessionId: worker.resourceId, model: 'codex-advanced', effort: 'high' })).rejects.toThrow()
+    await expect(f.control.call(successorScope, 'agents.submit', { agentSessionId: worker.resourceId, prompt: 'from the successor' })).resolves.toBeTruthy()
+    expect((await f.control.call(successorScope, 'agents.list', {}) as Array<{ agentSessionId: string; controlledBy?: string | null }>).some(entry => entry.agentSessionId === worker.resourceId)).toBe(true)
+  })
+
+  it('is for a main brain only, and says what to use instead', async () => {
+    const f = fixture()
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: 'yes' })).rejects.toThrow('successor must be true or false')
+    // Neither a wizard nor a controller: nothing is opened.
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true })).rejects.toThrow(/main brain.*without successor/)
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(1)
+    // A controller with a live coworker is one, wand or not; it keeps its limit continuation.
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.sessions.setContinueOnLimit(f.spec.id, true)
+    const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    const result = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    expect(result).toMatchObject({ successor: true, wizard: false, continueOnLimit: true, coworkers: [worker.resourceId] })
+    expect(f.database.structured.snapshot(result.agentSessionId)?.settings.wizard).toBeFalsy()
+    expect(f.database.structured.spec<AgentSpec>(result.agentSessionId)?.continueOnLimit).toBe(true)
+    expect(state.settings.wizard).toBeFalsy()
+  })
+
+  it('keeps a sub-controller’s successor under the same controller, so its reports still go up', async () => {
+    const f = fixture()
+    const middle = await f.control.call(f.scope, 'tabs.open', { title: 'Lead' }) as AgentControlTab
+    const middleScope = { ...f.scope, agentSessionId: middle.resourceId! }
+    const worker = await f.control.call(middleScope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    const result = await f.control.call(middleScope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    expect(result).toMatchObject({ controller: f.spec.id, coworkers: [worker.resourceId] })
+    const links = f.control.listLinks(f.project.id, f.workspace.id)
+    expect(links.find(link => link.targetAgentSessionId === result.agentSessionId)?.controllerAgentSessionId).toBe(f.spec.id)
+    expect(links.find(link => link.targetAgentSessionId === worker.resourceId)?.controllerAgentSessionId).toBe(result.agentSessionId)
+    expect(await f.control.call({ ...f.scope, agentSessionId: result.agentSessionId }, 'agents.report', { text: 'Lead handed on' })).toMatchObject({ agentSessionId: f.spec.id })
+  })
+  it('nudges a wizard once, as a Conductor notice in its tab, when it passes the succession threshold', async () => {
+    let briefings: TurnBriefings | undefined
+    const f = fixture(false, undefined, undefined, astra, (spec, prompt, itemId, runtimeId, context) => briefings!.compose(spec, prompt, itemId, runtimeId, context))
+    briefings = new TurnBriefings({ database: f.database })
+    asWizard(f)
+    const nudges = () => f.database.structured.snapshot(f.spec.id)!.items.filter(item => item.data.type === 'notice' && typeof item.data.payload === 'object' && item.data.payload !== null && !Array.isArray(item.data.payload) && item.data.payload[SUCCESSION_NUDGE] === true)
+    for (let turn = 1; turn <= SUCCESSION_TURNS + 5; turn++) {
+      await f.sessions.submit(f.spec.id, 'Coworker report ' + turn, f.database.structured.snapshot(f.spec.id)!.settings)
+      expect(nudges()).toHaveLength(turn < SUCCESSION_TURNS ? 0 : 1)
+    }
+    // The prompt that crossed carried the nudge, and it told the wizard how to hand off from its first message.
+    const prompts = f.submissions.map(entry => entry.prompt)
+    expect(prompts.filter(prompt => prompt.includes('Conductor: this main conversation'))).toHaveLength(1)
+    expect(prompts[SUCCESSION_TURNS - 1]).toContain('Conductor: this main conversation has run ' + SUCCESSION_TURNS + ' turns')
+    expect(prompts[0]).toContain('agents.handoff({handoff, successor:true})')
   })
 })
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_MAX_AGE_MS, RESTART_REQUEST_MAX_AGE_MS, takeRestartInitiator, wizardTabsToResume } from './restart-initiator'
+import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_MAX_AGE_MS, RESTART_REQUEST_MAX_AGE_MS, repointRestart, takeRestartInitiator, wizardTabsToResume } from './restart-initiator'
 
 /* B1 contract (conductor-task:988100e6). Only the wizard tab that started a restart is brought back
    and told to continue. The owner's own restart (Restart to update, the owner credential, the quit
@@ -63,5 +63,22 @@ describe('requested restart', () => {
     expect(parseRestartRequest(JSON.stringify({ ...request, reason: 7 }), now)).toBeNull()
     expect(parseRestartRequest(encodeRestartRequest(null), now)).toBeNull()
     expect(launchRestartInitiator('', '', now)).toBeNull()
+  })
+})
+
+// conductor-task:main-brain-succession
+describe('re-pointing a restart to a successor', () => {
+  it('moves a pending initiator and restart request from the main brain to its successor, and nothing else', () => {
+    const initiator = encodeRestartInitiator({ agentSessionId: 'old-main', method: 'app.update.install', at: minutesAgo(1) })
+    const request = encodeRestartRequest({ agentSessionId: 'old-main', title: 'Swarm', reason: 'Install the batch', at: minutesAgo(2) })
+    const moved = repointRestart(initiator, request, 'old-main', { agentSessionId: 'successor', title: 'Swarm (continued)' })
+    expect(takeRestartInitiator(moved.initiator, now)).toEqual({ agentSessionId: 'successor', method: 'app.update.install', at: minutesAgo(1) })
+    expect(parseRestartRequest(moved.request, now)).toEqual({ agentSessionId: 'successor', title: 'Swarm (continued)', reason: 'Install the batch', at: minutesAgo(2) })
+    // The next launch brings the successor back, not the superseded tab.
+    expect(launchRestartInitiator('', moved.request, now)?.agentSessionId).toBe('successor')
+    // Another tab's claim, an empty key and junk are left alone.
+    expect(repointRestart(initiator, request, 'someone-else', { agentSessionId: 'successor', title: 'x' })).toEqual({ initiator: null, request: null })
+    expect(repointRestart('', null, 'old-main', { agentSessionId: 'successor', title: 'x' })).toEqual({ initiator: null, request: null })
+    expect(repointRestart('{not json', '[1]', 'old-main', { agentSessionId: 'successor', title: 'x' })).toEqual({ initiator: null, request: null })
   })
 })

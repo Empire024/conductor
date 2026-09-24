@@ -54,6 +54,22 @@ export function launchRestartInitiator(rawInitiator: string | null | undefined, 
   return request ? { agentSessionId: request.agentSessionId, method: 'app.restart.request', at: request.at } : null
 }
 
+/** A main brain that hands off to a successor (agents.handoff successor:true) passes on its claim
+ *  to be brought back after a restart: a pending initiator or restart request naming `from` is
+ *  re-pointed to `to`. Returns the values to store, or null for a key that needs no change.
+ *  Freshness is left to the launch that reads them. */
+export function repointRestart(rawInitiator: string | null | undefined, rawRequest: string | null | undefined, from: string, to: { agentSessionId: string; title: string }): { initiator: string | null; request: string | null } {
+  const record = (raw: string | null | undefined): Record<string, unknown> | null => {
+    if (!raw) return null
+    try { const value: unknown = JSON.parse(raw); return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null } catch { return null }
+  }
+  const initiator = record(rawInitiator), request = record(rawRequest)
+  return {
+    initiator: initiator?.agentSessionId === from ? JSON.stringify({ ...initiator, agentSessionId: to.agentSessionId }) : null,
+    request: request?.agentSessionId === from ? JSON.stringify({ ...request, agentSessionId: to.agentSessionId, title: to.title }) : null
+  }
+}
+
 export function wizardTabsToResume<T extends { resourceId?: string }>(tabs: T[], initiator: RestartInitiator | null): T[] {
   return initiator ? tabs.filter(tab => tab.resourceId === initiator.agentSessionId) : []
 }

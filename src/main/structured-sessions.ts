@@ -24,6 +24,7 @@ import { normaliseContract } from './local-models/completion.ts'
 import { composeLocalPrompt } from './local-models/briefing.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-review-gate'
+import { SUCCESSION_NUDGE, type BriefingContext } from './turn-briefing'
 
 interface LiveSession {
   spec: AgentSpec
@@ -132,6 +133,18 @@ export class StructuredSessions {
   setLocalControl(handler: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>): void {
     this.localControl = handler
   }
+  /** Whether a conversation is a main brain (a wizard, or a controller with live coworkers), so
+   *  its briefing can say when to hand off to a successor; AgentControl knows the links. */
+  private mainBrain?: (spec: AgentSpec) => boolean
+  setMainBrain(probe: (spec: AgentSpec) => boolean): void { this.mainBrain = probe }
+  /** A Conductor notice in a conversation's own timeline from outside its runtime; false when it
+   *  has no live session in this process. */
+  notice(id: string, message: string, payload?: Json): boolean {
+    const live = this.live.get(id)
+    if (!live || live.closed) return false
+    this.emit(live, { data: { type: 'notice', message, ...(payload === undefined ? {} : { payload }) } })
+    return true
+  }
   private promptDispatchAuthorityGuard?: (authority: PromptDispatchAuthority, spec: AgentSpec) => void
   setPromptDispatchAuthorityGuard(guard: (authority: PromptDispatchAuthority, spec: AgentSpec) => void): void {
     this.promptDispatchAuthorityGuard = guard
@@ -150,7 +163,7 @@ export class StructuredSessions {
     // it so the conversation can show which memories reached the turn. `runtimeId` names the
     // adapter the message will reach, or is '' when dispatching it is what creates the adapter,
     // so the caller can tell a runtime that has already been briefed from a new one.
-    private context?: (spec: AgentSpec, prompt: string, itemId: string, runtimeId: string, context?: { percent: number }) => string,
+    private context?: (spec: AgentSpec, prompt: string, itemId: string, runtimeId: string, context?: BriefingContext) => string,
     private observe?: (spec: AgentSpec, event: AgentEvent) => void,
     // Conductor-owned MCP servers for one session, serialized for the CLI's --mcp-config. Bound
     // at launch because a running conversation cannot be handed a new server later.
@@ -855,7 +868,14 @@ export class StructuredSessions {
       // How full the runtime's window is, from its own last usage report, so the briefing can
       // say once per band when the remaining work belongs in a fresh tab.
       const share = summarizeContext(state.items, live.adapter ? live.runtimeId : undefined)
-      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' || this.isApprovalReviewer(id) ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', share ? { percent: share.percent } : undefined) ?? ''
+      // A main brain is also told, once, when it has run long enough to hand off to a successor.
+      const mainBrain = this.mainBrain?.(live.spec) === true
+      const briefing: BriefingContext | undefined = mainBrain
+        ? { ...(share ? { percent: share.percent } : {}), mainBrain, turns: state.items.filter(item => item.data.type === 'text' && item.data.role === 'user').length + 1,
+          nudged: state.items.some(item => item.data.type === 'notice' && typeof item.data.payload === 'object' && item.data.payload !== null && !Array.isArray(item.data.payload) && item.data.payload[SUCCESSION_NUDGE] === true),
+          notice: message => this.emit(live, { data: { type: 'notice', message, payload: { [SUCCESSION_NUDGE]: true } } }) }
+        : share ? { percent: share.percent } : undefined
+      const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' || this.isApprovalReviewer(id) ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', briefing) ?? ''
       // A local model reads recalled background before the owner's words, fenced as reference, so
       // the owner's instruction is the last thing it reads; native providers keep it after.
       const submitted = live.spec.provider === 'local'

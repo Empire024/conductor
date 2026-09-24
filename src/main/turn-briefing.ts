@@ -39,8 +39,35 @@ export const HANDOFF_BANDS = [60, 85] as const
 
 /** The nudge itself, kept short: it names the bounded handoff format and the control method
  *  that opens the fresh tab, and nothing the policy document does not say. */
-export const handoffNudge = (percent: number): string =>
-  `Conductor: this conversation's context is at ${percent}% of its window. Finish the current step, then write a bounded handoff (Objective, Constraints, Owned files, Verified findings, Remaining work, Artifact references; at most about 1,200 tokens, with paths instead of pasted output) and call agents.handoff with it through Conductor app control to continue in a fresh tab. The owner sees both tabs; do not continue the work in parallel afterwards.`
+export const handoffNudge = (percent: number, successor = false): string =>
+  `Conductor: this conversation's context is at ${percent}% of its window. Finish the current step, then write a bounded handoff (Objective, Constraints, Owned files, Verified findings, Remaining work, Artifact references; at most about 1,200 tokens, with paths instead of pasted output) and call ${successor ? 'agents.handoff({handoff, successor:true})' : 'agents.handoff'} with it through Conductor app control to continue in a fresh tab. The owner sees both tabs; do not continue the work in parallel afterwards.`
+
+/** When a main brain (a wizard tab, or a controller with live coworkers) should pass itself on.
+ *  A main brain is woken by every coworker report and re-reads its whole transcript each time, so
+ *  length costs it far sooner than a worker; hence thresholds well below HANDOFF_BANDS. */
+export const SUCCESSION_TURNS = 25
+export const SUCCESSION_PERCENT = 40
+
+/** The per-runtime line a main brain gets with its static briefing. */
+export const SUCCESSION_HINT = `Main brain: when this conversation passes about ${SUCCESSION_TURNS} turns or ${SUCCESSION_PERCENT}% context and your coworkers are idle, finish the step you're in and call agents.handoff({handoff, successor:true}) with the six-section handoff. The successor opens as a root tab with your wizard mode, model, effort and mode, and takes over every coworker you control.`
+
+/** Set on the payload of the Conductor notice that told a main brain it crossed that threshold. */
+export const SUCCESSION_NUDGE = 'successionNudge'
+
+export const successionNudge = (turns: number, percent?: number): string =>
+  `Conductor: this main conversation has run ${turns} turns${percent === undefined ? '' : ` and uses ${Math.round(percent)}% of its context`}. Once your coworkers are idle, finish the step you're in and call agents.handoff({handoff, successor:true}) with the six-section handoff; the successor continues as this conversation, with your coworkers.`
+
+/** What a message's dispatch knows about the conversation it is sent into. `percent` is how full
+ *  the runtime's window is; the rest is set only for a main brain: `turns` counts user messages
+ *  including this one, `nudged` says its timeline already holds a succession notice, and
+ *  `notice` posts one there. */
+export interface BriefingContext {
+  percent?: number
+  mainBrain?: boolean
+  turns?: number
+  nudged?: boolean
+  notice?: (message: string) => void
+}
 
 interface Ledger {
   /** The runtime this ledger describes. Empty while the first prompt of a conversation is
@@ -53,6 +80,8 @@ interface Ledger {
   coworkerSince?: string
   /** The highest context band this runtime has already been nudged at. */
   nudgedBand: number
+  /** Whether this runtime has been told when a main brain hands off to a successor. */
+  successionHinted: boolean
 }
 
 export interface TurnBriefingDependencies {
@@ -70,7 +99,7 @@ export class TurnBriefings {
 
   /** Composes the context appended to one user message. `runtimeId` is the adapter the message
    *  will reach, or '' when dispatching it is what creates the adapter. */
-  compose(spec: AgentSpec, prompt: string, itemId: string, runtimeId: string, context?: { percent: number }): string {
+  compose(spec: AgentSpec, prompt: string, itemId: string, runtimeId: string, context?: BriefingContext): string {
     const ledger = this.ledger(spec.id, runtimeId)
     const staticDue = !ledger.staticSent
     if (staticDue) {
@@ -85,17 +114,44 @@ export class TurnBriefings {
     // recalled memory lines travel, fenced ahead of the owner's words (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+  }
+
+  /** Once per runtime, like the static briefing, but from the first message after the
+   *  conversation became a main brain: a controller only becomes one when it opens coworkers. */
+  private successionHint(ledger: Ledger, context?: BriefingContext): string {
+    if (!context?.mainBrain || ledger.successionHinted) return ''
+    ledger.successionHinted = true
+    return SUCCESSION_HINT
+  }
+
+  /** Main brains already told to pass themselves on. Their timeline is the durable record (the
+   *  notice's SUCCESSION_NUDGE, read back as context.nudged); this set covers the moment between
+   *  posting it and the next dispatch reading it. */
+  private readonly succeeded = new Set<string>()
+
+  /** Once per conversation, not per runtime: a restart or a compaction does not make a long main
+   *  brain any shorter, and the owner sees the notice in its tab. */
+  private succession(id: string, context?: BriefingContext): string {
+    if (!context?.mainBrain || context.nudged || this.succeeded.has(id)) return ''
+    const turns = context.turns ?? 0
+    const percent = context.percent !== undefined && Number.isFinite(context.percent) ? context.percent : undefined
+    if (turns < SUCCESSION_TURNS && (percent === undefined || percent < SUCCESSION_PERCENT)) return ''
+    this.succeeded.add(id)
+    const message = successionNudge(turns, percent)
+    context.notice?.(message)
+    return message
   }
 
   /** Once per band per runtime; a compaction or a new process starts the count again, since
    *  the context it measures is gone with them. */
-  private nudge(ledger: Ledger, context?: { percent: number }): string {
-    if (!context || !Number.isFinite(context.percent)) return ''
-    const band = [...HANDOFF_BANDS].reverse().find(edge => context.percent >= edge)
+  private nudge(ledger: Ledger, context?: BriefingContext): string {
+    const percent = context?.percent
+    if (percent === undefined || !Number.isFinite(percent)) return ''
+    const band = [...HANDOFF_BANDS].reverse().find(edge => percent >= edge)
     if (!band || band <= ledger.nudgedBand) return ''
     ledger.nudgedBand = band
-    return handoffNudge(Math.round(context.percent))
+    return handoffNudge(Math.round(percent), context?.mainBrain === true)
   }
 
   /** Watches a conversation for the two moments its runtime forgets. */
@@ -112,11 +168,11 @@ export class TurnBriefings {
     if (data.type === 'notice' && data.payload && typeof data.payload === 'object' && !Array.isArray(data.payload) && data.payload[CONTEXT_RESET] === true) this.reset(ledger, ledger.runtimeId)
   }
 
-  forget(agentSessionId: string): void { this.ledgers.delete(agentSessionId) }
+  forget(agentSessionId: string): void { this.ledgers.delete(agentSessionId); this.succeeded.delete(agentSessionId) }
 
   private ledger(id: string, runtimeId: string): Ledger {
     let ledger = this.ledgers.get(id)
-    if (!ledger) { ledger = { runtimeId, staticSent: false, guidanceSent: false, memoryIds: new Set(), nudgedBand: 0 }; this.ledgers.set(id, ledger) }
+    if (!ledger) { ledger = { runtimeId, staticSent: false, guidanceSent: false, memoryIds: new Set(), nudgedBand: 0, successionHinted: false }; this.ledgers.set(id, ledger) }
     else if (runtimeId && ledger.runtimeId && ledger.runtimeId !== runtimeId) this.reset(ledger, runtimeId)
     else if (runtimeId) ledger.runtimeId = runtimeId
     return ledger
@@ -129,6 +185,7 @@ export class TurnBriefings {
     ledger.memoryIds.clear()
     ledger.coworkerSince = undefined
     ledger.nudgedBand = 0
+    ledger.successionHinted = false
   }
 
   private memory(spec: AgentSpec, prompt: string, itemId: string, ledger: Ledger, heading = true): string {

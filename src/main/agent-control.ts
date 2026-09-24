@@ -1,4 +1,4 @@
-import type { RestartInitiator, RestartRequest } from './restart-initiator'
+import { repointRestart, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import type { PendingStopConfirmation } from './stop-confirmation'
 import { localModelId, LocalServerBusy, type LocalServerEntry, type LocalStopRequest } from './local-models/servers'
 import { randomUUID } from 'node:crypto'
@@ -137,7 +137,7 @@ const toolSignatures = {
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver up to 2000 characters to the conversation that opened this tab (its controller, whoever that is), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
-  'agents.handoff': `({handoff,title?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop`,
+  'agents.handoff': `({handoff,title?,successor?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back; you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
   'files.write': '({path,content,expectedContent}) — atomic compare-and-save in this project only; expectedContent:null creates a file; live views refresh. To change a sibling project, open a tab there with tabs.open({projectId}) and dispatch the work to it',
@@ -285,6 +285,8 @@ export interface AgentControlDependencies {
 /** A facade over the app's native state. Callers cannot supply or change their authority. */
 export class AgentControl {
   constructor(private readonly deps: AgentControlDependencies) {
+    // The briefing tells a main brain when to hand off to a successor; only this class knows the links.
+    deps.sessions.setMainBrain?.(spec => this.mainBrain(spec))
     deps.sessions.setApprovalReviewRouting(createApprovalRouting(deps, {
       controller: id => this.linkFor(id)?.controllerAgentSessionId,
       localAndOpen: spec => {
@@ -755,7 +757,9 @@ export class AgentControl {
     return tabMachineId(this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId))
   }
 
-  private async open(scope: AgentControlScope, args: Args, approvalReviewer = false): Promise<AgentControlTab & { projectId: string; workspaceId: string; grants?: { repository: boolean; research: boolean } }> {
+  /** `root` opens an agent tab that the caller does not control: a successor (agents.handoff
+   *  successor:true) is the caller continued, not its coworker. */
+  private async open(scope: AgentControlScope, args: Args, approvalReviewer = false, root = false): Promise<AgentControlTab & { projectId: string; workspaceId: string; grants?: { repository: boolean; research: boolean } }> {
     const kind = (args.kind ?? 'agent') as PaneKind
     const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs', 'job']
     if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
@@ -833,7 +837,7 @@ export class AgentControl {
     }
     await this.ui(target, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
     const opened = this.tab(target, tab.id)
-    if (kind === 'agent') this.relationship(scope, target, opened, 'attached')
+    if (kind === 'agent' && !root) this.relationship(scope, target, opened, 'attached')
     return { ...opened, projectId: target.projectId, workspaceId: target.sessionId, ...(grants ? { grants } : {}) }
   }
 
@@ -1617,12 +1621,14 @@ export class AgentControl {
     const { database } = this.deps
     const spec = this.authorize(scope)
     if (args.agentSessionId !== undefined) throw new Error('agents.handoff always hands off the calling conversation and takes no agentSessionId. To give work to a different tab, use agents.submit.')
+    if (args.successor !== undefined && typeof args.successor !== 'boolean') throw new Error('successor must be true or false')
     const handoff = handoffText(args)
     const settings = settingsForRuntime(database.structured.snapshot(scope.agentSessionId)!.settings)
     const source = this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)
     // The receiver is this conversation continued, so it is named after it. Kept short enough
     // that a repeated handoff cannot grow an unbounded tab title.
     const title = args.title === undefined ? (source?.title ?? spec.title).slice(0, 100).replace(/ \(continued\)$/, '') + ' (continued)' : text(args, 'title', 120)
+    if (args.successor === true) return this.succeed(scope, spec, source, { handoff, settings, title })
     // Deliberately the ordinary tabs.open path: same catalog check, same machine inheritance,
     // same permission clamping. Provider is inherited by omission; model, effort and permission
     // are named so the receiver continues on this conversation's settings rather than on the
@@ -1650,6 +1656,101 @@ export class AgentControl {
       handedOff: true, tabId: tab.id, agentSessionId, uri: tab.uri, projectId: tab.projectId, workspaceId: tab.workspaceId,
       title: tab.title ?? title, provider: spec.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
       note: 'The remaining work now belongs to that tab, which has the handoff as its first prompt. Finish only the step you are already in, report it, and stop — do not carry on with the handed-over work here in parallel. Your tab stays open and you may still steer the new one with agents.*.'
+    }
+  }
+
+  /** Every live control link this conversation holds, in any project: the coworkers it controls. */
+  private controlledBy(controllerId: string): AgentControlLink[] {
+    const links = new Map<string, AgentControlLink>()
+    for (const project of this.deps.database.listProjects()) for (const workspace of this.deps.database.listSessions(project.id)) {
+      for (const tab of this.tabs({ projectId: project.id, sessionId: workspace.id, agentSessionId: '' })) {
+        if (tab.kind !== 'agent' || !tab.resourceId || links.has(tab.resourceId)) continue
+        const link = this.linkFor(tab.resourceId)
+        if (link?.controllerAgentSessionId === controllerId) links.set(tab.resourceId, link)
+      }
+    }
+    return [...links.values()]
+  }
+
+  /** A main brain is a wizard tab or a controller with live coworkers: the conversation that is
+   *  woken by every report and is told (turn-briefing.ts) when to pass itself on. */
+  private mainBrain(spec: AgentSpec): boolean {
+    if (spec.provider === 'local' || this.deps.sessions.isApprovalReviewer(spec.id)) return false
+    try { return wizardActive(this.deps.database.structured.snapshot(spec.id)?.settings, spec.provider) || this.controlledBy(spec.id).length > 0 }
+    catch { return false /* A briefing hint never blocks a message. */ }
+  }
+
+  /**
+   * agents.handoff({successor:true}): a main brain passes itself on. The receiver is not the
+   * caller's coworker but the caller continued, so it opens as a root (or under the caller's own
+   * controller, if it has one), takes over the wizard flag and limit continuation, and every live
+   * control link the caller holds moves to it in one synchronous step, before its first prompt, so
+   * coworker reports, steering, approval review and app-update clearances all reach it. A pending
+   * restart that would bring the caller back brings the successor back instead.
+   *
+   * The caller keeps its tab and history but loses the wizard flag (one owner-authority main per
+   * workspace), is marked superseded, and its tab shows "Continued in <tab>". It is not
+   * interrupted: it finishes the step it is in, exactly as with an ordinary handoff.
+   */
+  private async succeed(scope: AgentControlScope, spec: AgentSpec, source: AgentControlTab | undefined, request: { handoff: string; settings: SessionSettings; title: string }): Promise<unknown> {
+    const { database, sessions } = this.deps
+    const wizard = scope.wizard === true
+    const coworkers = this.controlledBy(scope.agentSessionId)
+    if (!wizard && !coworkers.length) throw new Error('successor:true is for a main brain: a wizard tab, or a controller with live coworkers. This conversation is neither; call agents.handoff without successor to hand your work to a fresh tab')
+    if (source?.state?.remotePeerId || this.callerMachineId(scope) !== LOCAL_MACHINE_ID) throw new Error('A successor opens on this machine, and this conversation runs on or is driven by another one; call agents.handoff without successor')
+    const { handoff, settings, title } = request
+    const tab = await this.open(scope, {
+      kind: 'agent', title, model: settings.model ?? spec.model, permission: settings.permission, exactPermission: true,
+      ...(settings.effort ? { effort: settings.effort } : {})
+    }, false, true)
+    const agentSessionId = tab.resourceId
+    if (!agentSessionId) throw new Error(`The successor tab “${title}” opened, but this machine cannot deliver a prompt to it; nothing was handed over — keep working in this conversation`)
+    const successorTitle = tab.title ?? title
+    // The successor is the same brain: wizard mode and limit continuation come with it.
+    const opened = database.structured.snapshot(agentSessionId)!
+    if (wizard) database.structured.update(agentSessionId, { settings: { ...opened.settings, wizard: true } })
+    if (wizard || spec.continueOnLimit) sessions.setContinueOnLimit(agentSessionId, true)
+    // Transferred before the first prompt, so the successor's first agents.list already shows its
+    // coworkers; nothing awaits between these writes, so no control call sees half of them.
+    const key = (id: string) => 'agentControlParent:' + id
+    const previous = coworkers.map(link => [link.targetAgentSessionId, database.getSetting(key(link.targetAgentSessionId))] as const)
+    for (const link of coworkers) database.setSetting(key(link.targetAgentSessionId), JSON.stringify({ ...link, controllerAgentSessionId: agentSessionId, controllerTabId: tab.id }))
+    const prompt = handoff + `\n\nConductor: you are the successor of “${source?.title ?? spec.title}” (${scope.agentSessionId}), not its coworker${wizard ? ', and this tab is now the wizard' : ''}. ${coworkers.length ? `You now control ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'} (${coworkers.map(link => link.targetAgentSessionId).join(', ')}); their reports, approvals and steering come to you. ` : ''}The previous tab finishes its current step and stops.`
+    // Straight to the session rather than through agents.submit, which would take control of the
+    // tab it prompts and so make the successor the caller's coworker after all.
+    const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: source?.title || spec.title }
+    try { await sessions.submit(agentSessionId, prompt, database.structured.snapshot(agentSessionId)!.settings, [], origin) }
+    catch (error) {
+      for (const [id, raw] of previous) raw === null ? database.removeSetting(key(id)) : database.setSetting(key(id), raw)
+      if (wizard) database.structured.update(agentSessionId, { settings: { ...database.structured.snapshot(agentSessionId)!.settings, wizard: false } })
+      throw new Error(`The successor tab “${successorTitle}” opened but would not accept the handoff, so nothing was handed over and you still control your coworkers — keep working in this conversation: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    // A sub-controller's successor stays under the same controller, so its reports still go up.
+    const parent = this.linkFor(scope.agentSessionId)
+    if (parent) database.setSetting(key(agentSessionId), JSON.stringify({ ...parent, targetAgentSessionId: agentSessionId, controlledTabId: tab.id }))
+    for (const [id, grant] of this.updateGrants) if (grant.controllerAgentSessionId === scope.agentSessionId) this.updateGrants.set(id, { ...grant, controllerAgentSessionId: agentSessionId })
+    const restart = repointRestart(database.getSetting(RESTART_INITIATOR_KEY), database.getSetting(RESTART_REQUEST_KEY), scope.agentSessionId, { agentSessionId, title: successorTitle })
+    if (restart.initiator) database.setSetting(RESTART_INITIATOR_KEY, restart.initiator)
+    if (restart.request) database.setSetting(RESTART_REQUEST_KEY, restart.request)
+    // One owner-authority main per workspace: the caller stops being a wizard the moment the
+    // successor becomes one, so its remaining calls in this turn run with ordinary authority.
+    const callerState = database.structured.snapshot(scope.agentSessionId)!
+    if (callerState.settings.wizard) database.structured.update(scope.agentSessionId, { settings: { ...callerState.settings, wizard: false } })
+    // Superseded, not failed: nobody resumes it as unfinished work. It is still finishing its
+    // step, but by the handoff contract it is done once that step is, so it is recorded as such.
+    const superseded = this.recovery().supersede(scope, scope.agentSessionId, 'completed', agentSessionId, `Continued in “${successorTitle}” (agents.handoff successor)`.slice(0, 300))
+    sessions.notice(scope.agentSessionId, `Continued in “${successorTitle}”. This conversation handed itself on${wizard ? ', with wizard mode,' : ''} and ${coworkers.length ? `its ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : 'its work'}; it finishes its current step and stops.`, { succession: { agentSessionId, tabId: tab.id, title: successorTitle, uri: tab.uri } })
+    const touched = new Map<string, { projectId: string; sessionId: string }>([[scope.projectId + '\0' + scope.sessionId, scope]])
+    for (const link of coworkers) touched.set(link.projectId + '\0' + link.sessionId, { projectId: link.projectId, sessionId: link.sessionId })
+    for (const workspace of touched.values()) this.deps.linksChanged?.(workspace)
+    this.deps.collaboration.postMessage({ projectId: scope.projectId, sessionId: scope.sessionId, agentSessionId: scope.agentSessionId, toAgentSessionId: agentSessionId, kind: 'handoff', body: `Continued in “${successorTitle}”${coworkers.length ? `, which now controls ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : ''}. This conversation finishes its current step and stops.`, metadata: { handoff: 'successor', fromTabId: source?.id, toTabId: tab.id, characters: handoff.length, wizard, coworkers: coworkers.map(link => link.targetAgentSessionId) } })
+    const created = database.structured.snapshot(agentSessionId)
+    return {
+      handedOff: true, successor: true, tabId: tab.id, agentSessionId, uri: tab.uri, projectId: tab.projectId, workspaceId: tab.workspaceId,
+      title: successorTitle, provider: spec.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
+      wizard, continueOnLimit: wizard || Boolean(spec.continueOnLimit), coworkers: coworkers.map(link => link.targetAgentSessionId), controller: parent?.controllerAgentSessionId ?? null,
+      restart: { initiator: Boolean(restart.initiator), request: Boolean(restart.request) }, superseded: superseded.superseded,
+      note: `“${successorTitle}” is now this conversation${wizard ? ' and the wizard' : ''}. You no longer control any coworker and${wizard ? ' no longer hold the owner’s authority' : ' have no coworkers to steer'}: their reports, approvals and steering go to the successor. Finish only the step you are already in (you may still git.ship your own finished files), report it in one line, and stop.`
     }
   }
 

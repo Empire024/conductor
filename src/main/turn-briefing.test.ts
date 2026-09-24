@@ -6,7 +6,7 @@ import type { AgentSpec } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
-import { CONTEXT_RESET, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge } from './turn-briefing'
+import { CONTEXT_RESET, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -170,5 +170,58 @@ describe('what a native runtime is told, and how often', () => {
     expect(first).toContain('stale cart totals')
     for (const block of STATIC) expect(first).toContain(block)
     expect(first).not.toContain('COWORKERS')
+  })
+})
+
+// conductor-task:main-brain-succession
+describe('telling a main brain when to pass itself on', () => {
+  it('gives a main brain the succession line once per runtime, from the message it became one', () => {
+    const f = fixture()
+    // A conversation that is not (yet) a main brain is not told.
+    expect(f.briefings.compose(f.spec, 'Plan the batch', 'item-1', '', { turns: 1 })).not.toContain(SUCCESSION_HINT)
+    f.starting('runtime-1')
+    // It opened coworkers: from its next message on it is a controller.
+    expect(f.briefings.compose(f.spec, 'Dispatch the workers', 'item-2', 'runtime-1', { mainBrain: true, turns: 2 })).toContain(SUCCESSION_HINT)
+    expect(f.briefings.compose(f.spec, 'Next report', 'item-3', 'runtime-1', { mainBrain: true, turns: 3 })).not.toContain(SUCCESSION_HINT)
+    // A new process has forgotten it.
+    f.starting('runtime-2')
+    expect(f.briefings.compose(f.spec, 'Resumed', 'item-4', 'runtime-2', { mainBrain: true, turns: 4 })).toContain(SUCCESSION_HINT)
+    expect(SUCCESSION_HINT).toContain('agents.handoff({handoff, successor:true})')
+  })
+
+  it('nudges a main brain once, as a notice in its tab, when it passes the turn or context threshold', () => {
+    const f = fixture()
+    const notice = vi.fn()
+    const send = (turns: number, percent?: number, nudged = false) => f.briefings.compose(f.spec, 'Report from W3', 'item-' + turns, 'runtime-1', { mainBrain: true, turns, ...(percent === undefined ? {} : { percent }), nudged, notice })
+    f.starting('runtime-1')
+    expect(send(SUCCESSION_TURNS - 1, SUCCESSION_PERCENT - 1)).not.toContain('Conductor: this main conversation')
+    expect(notice).not.toHaveBeenCalled()
+    const crossed = send(SUCCESSION_TURNS)
+    expect(crossed).toContain(successionNudge(SUCCESSION_TURNS))
+    expect(notice).toHaveBeenCalledExactlyOnceWith(successionNudge(SUCCESSION_TURNS))
+    // Never again for this conversation: not later, not in a new runtime, not after a compaction.
+    expect(send(SUCCESSION_TURNS + 5, 70)).not.toContain('Conductor: this main conversation')
+    f.starting('runtime-2')
+    expect(f.briefings.compose(f.spec, 'Later', 'item-x', 'runtime-2', { mainBrain: true, turns: 40, notice })).not.toContain('Conductor: this main conversation')
+    expect(notice).toHaveBeenCalledOnce()
+  })
+
+  it('crosses on context as well as turns, and trusts the notice already in the timeline after a restart', () => {
+    const early = fixture(), notice = vi.fn()
+    expect(early.briefings.compose(early.spec, 'Report', 'item-1', '', { mainBrain: true, turns: 3, percent: SUCCESSION_PERCENT, notice })).toContain(successionNudge(3, SUCCESSION_PERCENT))
+    expect(notice).toHaveBeenCalledOnce()
+    // A fresh process (an app restart) has no memory of it, but the timeline has the notice.
+    const restarted = fixture(), again = vi.fn()
+    expect(restarted.briefings.compose(restarted.spec, 'Report', 'item-1', '', { mainBrain: true, turns: 30, percent: 50, nudged: true, notice: again })).not.toContain('Conductor: this main conversation')
+    expect(again).not.toHaveBeenCalled()
+    // A worker at the same figures gets only the ordinary context bands, never the succession nudge.
+    const worker = fixture(), quiet = vi.fn()
+    expect(worker.briefings.compose(worker.spec, 'Work', 'item-1', '', { turns: 30, percent: 50, notice: quiet })).not.toContain('Conductor: this main conversation')
+    expect(quiet).not.toHaveBeenCalled()
+  })
+
+  it('points a main brain at the successor form of the ordinary context-band nudge', () => {
+    expect(handoffNudge(60, true)).toContain('agents.handoff({handoff, successor:true})')
+    expect(handoffNudge(60)).not.toContain('successor')
   })
 })
