@@ -96,6 +96,8 @@ export class StructuredSessions {
   setApprovalReviewRouting(routing: ApprovalReviewRouting): void { this.reviewRouting = routing; this.approvalGate.routing = routing }
   markApprovalReviewer(id: string): void { this.database.setSetting('approval-reviewer:' + id, 'true') }
   isApprovalReviewer(id: string): boolean { return this.database.getSetting('approval-reviewer:' + id) === 'true' }
+  /** Whether this process holds a runtime for the conversation (connected or connecting). */
+  hasRuntime(id: string): boolean { const live = this.live.get(id); return Boolean(live?.adapter || live?.starting) }
   private localControl?: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>
   setLocalControl(handler: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>): void {
     this.localControl = handler
@@ -1344,7 +1346,7 @@ export class StructuredSessions {
   }
   killWhere(predicate: (spec: AgentSpec) => boolean): void {
     for (const [id, live] of this.live) if (predicate(live.spec)) {
-      if (live.adapter) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Backend stopped; native resume is an explicit action' } })
+      if (this.wasCutOff(live)) this.emit(live, { data: { type: 'session', phase: 'disconnected', message: 'Backend stopped; native resume is an explicit action' } })
       this.cancelNativeAcceptances(live, 'The backend closed before native steering acceptance was confirmed. The pending input was retained; inspect the conversation before retrying.')
       // The pending continuation itself stays in SQLite: only this process's timer goes.
       // Reopening the conversation re-arms it, and a wait must not be lost to a backend restart.
@@ -1352,6 +1354,14 @@ export class StructuredSessions {
       live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id)
     }
     this.flush()
+  }
+  /** Whether stopping this runtime now cuts off work: a turn in flight or background work still
+   *  reporting into it. An idle or settled conversation keeps the phase it settled in and
+   *  reconnects its same native conversation lazily on the next submit, steer or resume, so a
+   *  restart or shutdown never turns it 'disconnected'. */
+  private wasCutOff(live: LiveSession): boolean {
+    if (!live.adapter) return false
+    return active.has(this.database.structured.snapshot(live.spec.id)!.phase) || (live.backgroundTasks ?? 0) > 0
   }
   dispose(): void { this.killWhere(() => true); this.database.structured.flush() }
 }

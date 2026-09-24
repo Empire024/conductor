@@ -1,4 +1,4 @@
-import type { RestartInitiator } from './restart-initiator'
+import { RESTART_REQUEST_MAX_AGE_MS, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import { BrowserWindow } from 'electron'
 import { NsisUpdater } from 'electron-updater'
 import type { ProgressInfo, UpdateInfo } from 'builder-util-runtime'
@@ -37,12 +37,19 @@ export class UpdateManager {
   private checking = false
   private checkTimer: NodeJS.Timeout | null = null
   private pendingPrepare: PendingPrepare | null = null
+  private restartRequest: RestartRequest | null = null
 
   constructor(private readonly options: UpdateManagerOptions) {
     this.state = { phase: 'disabled', currentVersion: options.currentVersion, configured: false, message: 'Connecting to update sources.' }
     if (options.localBuildDirectory) this.localFeed = new LocalUpdateFeed(options.localBuildDirectory)
   }
-  getState(): AppUpdateState { return { ...this.state } }
+  getState(): AppUpdateState {
+    const request = this.restartRequest
+    const current = request && Date.now() - Date.parse(request.at) <= RESTART_REQUEST_MAX_AGE_MS
+    return { ...this.state, ...(current ? { restartRequest: { title: request.title, reason: request.reason, at: request.at } } : {}) }
+  }
+  /** A wizard's app.restart.request, shown on the owner's update control until the next launch. */
+  setRestartRequest(request: RestartRequest | null): void { this.restartRequest = request; this.setState(this.state) }
 
   configure(requestedUrl: string, includeLocal = this.includeLocal): string {
     if (busy(this.state.phase)) throw new Error('Finish the downloaded update before changing update sources')

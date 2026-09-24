@@ -409,6 +409,31 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(runtime.disposed).toBe(true)
   })
 
+  it('relaunches idle conversations settled after a shutdown and marks only the in-flight turn disconnected', async () => {
+    const f = fixture()
+    const idle = { ...f.spec, id: 'idle-session' }, busy = { ...f.spec, id: 'busy-session' }
+    f.manager.ensure(idle); f.manager.ensure(busy)
+    await f.manager.submit(f.spec.id, 'Settled synthetic turn', settings)
+    f.current.finish()
+    await f.manager.submit(idle.id, 'Another settled turn', settings)
+    f.current.finish()
+    await f.manager.submit(busy.id, 'Still running at shutdown', settings)
+    f.manager.flush(); f.manager.dispose(); f.database.close()
+    const reopened = new ConductorDatabase(f.databasePath); databases.push(reopened)
+    expect(reopened.structured.snapshot(f.spec.id)?.phase).toBe('completed')
+    expect(reopened.structured.snapshot(idle.id)?.phase).toBe('completed')
+    expect(reopened.structured.snapshot(busy.id)?.phase).toBe('disconnected')
+    // The settled conversation reconnects its same native conversation on the next message.
+    const nativeId = reopened.structured.snapshot(f.spec.id)?.nativeSessionId
+    const adapters: FakeProvider[] = []
+    const restored = new StructuredSessions(reopened, () => 'synthetic-executable', vi.fn(), (_provider, options) => { const adapter = new FakeProvider(options); adapters.push(adapter); return adapter }); managers.push(restored)
+    restored.ensure(f.spec)
+    await restored.submit(f.spec.id, 'After the restart', settings)
+    expect(adapters).toHaveLength(1)
+    expect(adapters[0]!.options.nativeSessionId).toBe(nativeId)
+    expect(adapters[0]!.submissions.map(submission => submission.text)).toEqual([expect.stringContaining('After the restart')])
+  })
+
   it('restores history lazily, then resumes the same native conversation only for a new message', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'Historical synthetic turn', settings)

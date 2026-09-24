@@ -39,5 +39,5 @@ export async function detectMachine(query: () => Promise<string> = queryNvidiaSm
 
 export const describeMachine = (facts: MachineFacts): string => {
   const gpu = facts.gpus.length ? facts.gpus.map(item => `${item.name} with ${item.vramGb} GB VRAM`).join(' and ') : 'no NVIDIA GPU detected'
-  return `Machine limits (this computer, shared by every project open here): ${facts.threads} CPU threads, ${facts.ramGb} GB RAM, ${gpu}. One local model server at a time, and only a model that fits that VRAM; never download model files, install software or start a second model server without the owner; run app smoke tests one at a time.`
+  return `Machine limits (this computer, shared by every project open here): ${facts.threads} CPU threads, ${facts.ramGb} GB RAM, ${gpu}. One local model server at a time, and only a model that fits that VRAM; never download model files, install software or start a second model server without the owner; app control local.servers lists the running model servers and local.stop({model|pid}) stops one this Conductor started; run app smoke tests one at a time.`
 }

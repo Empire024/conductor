@@ -1,4 +1,6 @@
-import type { RestartInitiator } from './restart-initiator'
+import type { RestartInitiator, RestartRequest } from './restart-initiator'
+import type { PendingStopConfirmation } from './stop-confirmation'
+import { localModelId, LocalServerBusy, type LocalServerEntry, type LocalStopRequest } from './local-models/servers'
 import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
@@ -143,11 +145,13 @@ const toolSignatures = {
   'orchestration.tasks.update': '({id,title?,description?,priority?,status?,assignedAgentId?})',
   'orchestration.routines.save': '({id?,name,description?,steps:[{title,instructions?,assignedAgentId?}]})',
   'workspace.rename': '({title})',
-  'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. The owner confirms each build, unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner accepts it',
+  'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. A native coworker in Auto builds without asking; below Auto, and for a local model, the owner confirms each build unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner (or a wizard tab) installs it',
   'app.update.status': '() — state, version, log tail and result of the local update build',
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
   'git.ship': '({message,paths?,publish?,waitSeconds?}) — deliver finished work in one call. Conductor runs it on the host with the owner’s own Git credentials and network: tests, build, then a local commit (only paths if given, verified in an isolated copy when other work is also in the tree); nothing is pushed and no release is built. Only publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow and checks the release’s assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
   'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
+  'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
+  'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
@@ -173,6 +177,11 @@ export interface AgentControlHost {
   openProject?(path: string, name?: string): Promise<ProjectRecord>
   updates?: { state(): AppUpdateState; check(): Promise<AppUpdateState>; download(): Promise<AppUpdateState>; install(force: boolean, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> }
   relaunch(force: boolean, initiator?: Omit<RestartInitiator, 'at'>): Promise<void>
+  /** A wizard asking the owner to restart (app.restart.request); the latest request replaces any earlier one. */
+  requestRestart?(request: Omit<RestartRequest, 'at'>): RestartRequest
+  restartRequest?(): RestartRequest | null
+  /** The open "Work is still running" dialog, which app.quit.confirm answers. */
+  stopConfirmation?: { pending(): PendingStopConfirmation | null; answer(stopWork: boolean): PendingStopConfirmation | null }
 }
 
 /** The agentSessionId an owner-credential call carries. No conversation has this id. */
@@ -182,8 +191,10 @@ const ownerSignatures: Record<string, string> = {
   'projects.open': '({path,name?}) — owner credential or wizard tab only: register an existing folder as a project (idempotent) and return it with its workspaces',
   'app.update.check': '() — owner credential or wizard tab only: check the release and local update feeds now and return the update state (phase idle, checking, available, downloading, ready, installing, error or disabled)',
   'app.update.download': '() — owner credential or wizard tab only: download the pending update; poll app.update.check until phase is ready',
-  'app.update.install': '({force?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch; force skips the running-work confirmation and keeps unsaved editor drafts for recovery. Only the wizard tab that initiated this restart is brought back and told to continue; an outside process waits for a new control-owner.json',
-  'app.restart': '({force?}) — owner credential or wizard tab only: relaunch this Conductor (a downloaded update installs on the way out); force as above'
+  'app.update.install': '({force?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch. A restart you start yourself is forced unless you pass force:false: no running-work confirmation, and unsaved editor drafts are kept for recovery. Only the wizard tab that initiated this restart is brought back and told to continue; an outside process waits for a new control-owner.json',
+  'app.restart': '({force?}) — owner credential or wizard tab only: relaunch this Conductor (a downloaded update installs on the way out); force as above',
+  'app.restart.request': '({reason}) — wizard tab only: ask the owner to restart when you cannot (or should not) restart yourself. The owner’s Restart to update control shows “Restart requested by <tab> — <reason>”, and the next launch, however the owner restarts, brings this tab back and tells it to continue, like a restart you started. Valid until the next launch or 24 h; a new request replaces the old one',
+  'app.quit.confirm': '({stopWork}) — owner credential or wizard tab only: answer the open “Work is still running” quit/restart dialog (app.state pendingQuitConfirmation shows it): stopWork:true stops the work and goes ahead, false cancels the quit or restart'
 }
 const ownerMethods = new Set(Object.keys(ownerSignatures))
 /** The owner's authority, from either source: the credential file, or a wizard conversation. */
@@ -236,7 +247,13 @@ export interface AgentControlDependencies {
   /** Scheduled tasks (src/main/schedule-control.ts); plugged in with AgentControl.setSchedules. */
   schedules?: ScheduleControlService
   /** Whether a local model could start its server now; absent where the local runtime is not wired. */
-  localModels?: { availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }> }
+  localModels?: {
+    availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }>
+    /** The llama.cpp servers running on this machine (local.servers). */
+    servers?(): LocalServerEntry[]
+    /** Stop one Conductor-started server; throws LocalServerBusy while a turn uses it unless forced. */
+    stop?(request: LocalStopRequest): Promise<unknown>
+  }
   providers(): AgentProviderInfo[]
   /** This machine plus any paired machines a tab may be placed on. */
   machines?(): MachineDescriptor[]
@@ -845,8 +862,9 @@ export class AgentControl {
       // Allowance is account-wide; which conversation reported it is named only inside this project.
       return { observedNow: new Date().toISOString(), providers: sessions.usageLimits(args.provider as StructuredProvider | undefined).map(report => ({ ...report, windows: report.windows.map(window => ({ ...window, source: window.source.projectId === scope.projectId ? { agentSessionId: window.source.agentSessionId } : { otherProject: true } })) })) }
     }
+    if (method === 'local.servers' || method === 'local.stop') return this.localServers(scope, source, method, args)
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)
-    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null } : {}) }
+    if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null, restartRequest: this.deps.host?.restartRequest?.() ?? null, pendingQuitConfirmation: this.deps.host?.stopConfirmation?.pending() ?? null } : {}) }
     if (method === 'machines.list') {
       return this.machines().map(machine => {
         const placement = machineRunsProject(machine, scope.projectId)
@@ -1283,8 +1301,17 @@ export class AgentControl {
       return { id: project.id, name: project.name, path: project.path, workspaces: this.deps.database.listSessions(project.id).map(workspace => ({ id: workspace.id, name: workspace.name })) }
     }
     if (!host) throw new Error('App updates and restarts are unavailable in this Conductor')
+    if (method === 'app.restart.request') return this.requestRestart(scope, host, args)
+    if (method === 'app.quit.confirm') {
+      if (Object.keys(args).some(key => key !== 'stopWork') || typeof args.stopWork !== 'boolean') throw new Error('app.quit.confirm needs stopWork: true (stop the work and go ahead) or false (cancel)')
+      const answered = host.stopConfirmation?.answer(args.stopWork) ?? null
+      if (!answered) throw new Error('No quit or restart confirmation is open. app.state pendingQuitConfirmation shows one while it is.')
+      return { answered: true, stopWork: args.stopWork, action: answered.action, running: answered.running }
+    }
     if (args.force !== undefined && typeof args.force !== 'boolean') throw new Error('force must be true or false')
-    const force = args.force === true
+    // A sovereign caller answers for the restart it starts itself, so no dialog is raised for it
+    // unless it asks for one with force:false.
+    const force = args.force !== false
     const later = (label: string, work: () => Promise<void>): void => { setTimeout(() => { work().catch(error => console.warn(`${label} failed`, error)) }, 150) }
     if (method === 'app.restart') {
       later('app.restart', () => scope.owner ? host.relaunch(force) : host.relaunch(force, { agentSessionId: scope.agentSessionId, method: 'app.restart' }))
@@ -1300,6 +1327,47 @@ export class AgentControl {
       return { installing: true, version: state.availableVersion ?? null, force, note: 'Conductor quits, installs and relaunches. Wait for a new control-owner.json (new pid) before calling again.' }
     }
     throw new Error('Unknown control method; use tools.list')
+  }
+
+  /** local.servers / local.stop: the one llama.cpp server this machine holds, found and stopped
+   *  in one call each instead of a hunt through the CLI and the stack's scripts. */
+  private async localServers(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const local = this.deps.localModels
+    if (!local?.servers || !local.stop) throw new Error('Local model servers are unavailable in this Conductor')
+    if (method === 'local.servers') {
+      if (Object.keys(args).length) throw new Error('local.servers takes no arguments')
+      const conversations = scope.projectId ? this.deps.database.listProcesses(scope.projectId).filter(process => process.kind === 'agent' && process.provider === 'local') : []
+      return local.servers().map(server => ({ ...server, conversations: conversations.flatMap(process => {
+        const state = this.deps.database.structured.snapshot(process.id)
+        if (localModelId(state?.settings.model || process.model || '') !== server.model) return []
+        return [{ agentSessionId: process.id, title: process.title, phase: state?.phase ?? null, inTurn: Boolean(state && ['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'].includes(state.phase)) }]
+      }) }))
+    }
+    if (Object.keys(args).some(key => !['model', 'pid', 'force'].includes(key))) throw new Error('local.stop accepts only model, pid and force')
+    if (args.model === undefined && args.pid === undefined) throw new Error('Name the server to stop: model or pid, from local.servers')
+    if (args.pid !== undefined && (!Number.isInteger(args.pid) || (args.pid as number) <= 0)) throw new Error('pid must be a positive integer')
+    if (args.force !== undefined && typeof args.force !== 'boolean') throw new Error('force must be true or false')
+    if (!sovereign(scope)) {
+      if (source.provider === 'local') throw new Error('A sandboxed local conversation cannot stop a model server; its controller, a wizard tab or the owner can')
+      if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
+    }
+    const request: LocalStopRequest = { ...(args.model === undefined ? {} : { model: text(args, 'model', 200) }), ...(args.pid === undefined ? {} : { pid: args.pid as number }) }
+    try { return await local.stop(request) }
+    catch (error) {
+      if (!(error instanceof LocalServerBusy) || args.force !== true) throw error
+      await this.ask(scope, `${source.title} wants to stop ${error.label} although ${error.reason}; that turn fails.`, 'stop a busy local model server')
+      return await local.stop({ ...request, force: true })
+    }
+  }
+
+  private requestRestart(scope: AgentControlScope, host: AgentControlHost, args: Args): unknown {
+    if (scope.owner || !scope.wizard) throw new Error('app.restart.request is for a wizard tab that wants the owner to restart Conductor; the owner credential restarts with app.restart')
+    if (!host.requestRestart) throw new Error('Restart requests are unavailable in this Conductor')
+    if (Object.keys(args).some(key => key !== 'reason')) throw new Error('app.restart.request accepts only reason')
+    const reason = text(args, 'reason', 300)
+    const state = this.deps.database.structured.snapshot(scope.agentSessionId), spec = this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)
+    const request = host.requestRestart({ agentSessionId: scope.agentSessionId, title: state?.title || spec?.title || 'Wizard tab', reason })
+    return { requested: true, ...request, note: 'The owner sees this on the Restart to update control. The next launch brings this tab back and tells it to continue; the request lapses after that launch or 24 h.' }
   }
 
   private async localUpdate(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
@@ -1327,12 +1395,16 @@ export class AgentControl {
     const grant = this.updateGrants.get(scope.agentSessionId)
     // A grant lapses with the tab that issued it: nobody is left to answer for the build.
     const granted = Boolean(grant && this.claimHolderIsOpen(grant.projectId, grant.controllerAgentSessionId))
-    if (!granted) {
+    // A build only publishes "Update pending" to the local feed; installing it stays the owner's
+    // or a wizard tab's. So a native coworker the owner runs in Auto needs no dialog for it. A
+    // local model, and any tab below Auto, still asks.
+    const autonomous = source.provider !== 'local' && this.deps.database.structured.snapshot(scope.agentSessionId)?.settings.permission === 'auto'
+    if (!granted && !autonomous) {
       this.updateGrants.delete(scope.agentSessionId)
       await this.ask(scope, `${source.title} wants to build Conductor from this working tree and publish it as a local update.`, 'build a local update')
     }
     this.authorize(scope)
-    return { ...builder.start(source.cwd), authorizedBy: granted ? grant!.controllerAgentSessionId : 'owner' }
+    return { ...builder.start(source.cwd), authorizedBy: granted ? grant!.controllerAgentSessionId : autonomous && !sovereign(scope) ? 'auto' : 'owner' }
   }
 
   private router(scope: AgentControlScope, provider: StructuredProvider, model: string) {

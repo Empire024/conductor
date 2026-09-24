@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { encodeRestartInitiator, RESTART_INITIATOR_MAX_AGE_MS, takeRestartInitiator, wizardTabsToResume } from './restart-initiator'
+import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_MAX_AGE_MS, RESTART_REQUEST_MAX_AGE_MS, takeRestartInitiator, wizardTabsToResume } from './restart-initiator'
 
 /* B1 contract (conductor-task:988100e6). Only the wizard tab that started a restart is brought back
    and told to continue. The owner's own restart (Restart to update, the owner credential, the quit
@@ -34,5 +34,34 @@ describe('restart initiator', () => {
     expect(takeRestartInitiator('not json', now)).toBeNull()
     expect(takeRestartInitiator(JSON.stringify({ agentSessionId: '', method: 'app.restart', at: minutesAgo(1) }), now)).toBeNull()
     expect(takeRestartInitiator(JSON.stringify({ agentSessionId: 'wizard-a', method: 'app.quit', at: minutesAgo(1) }), now)).toBeNull()
+  })
+})
+
+/* conductor-task:wizard-restart-request. A wizard that cannot restart itself asks the owner with
+   app.restart.request. The request lives until the next launch or 24 h; the launch after it resumes
+   that wizard exactly like a self-started one, and a restart with no request still resumes none. */
+describe('requested restart', () => {
+  const request = { agentSessionId: 'wizard-a', title: 'Overnight wizard', reason: 'Install 0.1.54 to continue the batch', at: minutesAgo(60) }
+
+  it('round-trips a request and resumes its wizard on the next launch', () => {
+    const raw = encodeRestartRequest(request)
+    expect(parseRestartRequest(raw, now)).toEqual(request)
+    const initiator = launchRestartInitiator(encodeRestartInitiator(undefined), raw, now)
+    expect(initiator).toEqual({ agentSessionId: 'wizard-a', method: 'app.restart.request', at: request.at })
+    expect(wizardTabsToResume([{ resourceId: 'wizard-a' }, { resourceId: 'wizard-b' }], initiator)).toEqual([{ resourceId: 'wizard-a' }])
+  })
+
+  it('a self-started restart wins over a pending request', () => {
+    const own = encodeRestartInitiator({ agentSessionId: 'wizard-b', method: 'app.restart', at: minutesAgo(1) })
+    expect(launchRestartInitiator(own, encodeRestartRequest(request), now)).toMatchObject({ agentSessionId: 'wizard-b', method: 'app.restart' })
+  })
+
+  it('expires after 24 hours and ignores malformed requests', () => {
+    expect(RESTART_REQUEST_MAX_AGE_MS).toBe(24 * 60 * 60_000)
+    expect(parseRestartRequest(encodeRestartRequest({ ...request, at: minutesAgo(24 * 60 + 1) }), now)).toBeNull()
+    expect(parseRestartRequest(encodeRestartRequest({ ...request, at: minutesAgo(-5) }), now)).toBeNull()
+    expect(parseRestartRequest(JSON.stringify({ ...request, reason: 7 }), now)).toBeNull()
+    expect(parseRestartRequest(encodeRestartRequest(null), now)).toBeNull()
+    expect(launchRestartInitiator('', '', now)).toBeNull()
   })
 })

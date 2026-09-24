@@ -24,6 +24,24 @@ describe('close confirmation', () => {
     expect(hasRunningWork(process, { ...emptyProjection('agent'), runtimeId: 'runtime', phase: 'completed', items: [{ ...item, data: { ...item.data, status: 'completed' as const } }] })).toBe(false)
     expect(hasRunningWork(process, { ...emptyProjection('agent'), runtimeId: 'runtime', phase: 'completed', items: [{ ...item, data: { ...item.data, detached: false } }] })).toBe(false)
   })
+  it('does not count a stopped conversation that still holds a stale queue or background count', () => {
+    const queued = { id: 'q', text: 'next', settings: { permission: 'default' as const, plan: false }, attachments: [] }
+    for (const phase of ['disconnected', 'failed', 'interrupted'] as const) {
+      expect(hasRunningWork(process, { ...emptyProjection('agent'), phase, queued })).toBe(false)
+      expect(hasRunningWork(process, { ...emptyProjection('agent'), phase, backgroundTasks: 1 })).toBe(false)
+    }
+    // A usage-limit wait is still work: Conductor continues it when the window resets.
+    expect(hasRunningWork(process, { ...emptyProjection('agent'), phase: 'failed', limitResumeAt: '2026-09-24T20:00:00Z' })).toBe(true)
+  })
+  it('counts only a scheduled continuation for a conversation whose runtime this process no longer holds', () => {
+    const item = { id: 'shell', runtimeId: 'runtime', sequence: 1, timestamp: '2026-09-11T01:49:22Z', data: { type: 'tool' as const, name: 'Bash', detached: true, status: 'running' as const } }
+    const settled = { ...emptyProjection('agent'), runtimeId: 'runtime', phase: 'completed' as const, items: [item] }
+    expect(hasRunningWork(process, settled, false)).toBe(false)
+    expect(hasRunningWork(process, { ...settled, backgroundTasks: 2 }, false)).toBe(false)
+    expect(hasRunningWork(process, { ...settled, queued: { id: 'q', text: 'next', settings: { permission: 'default', plan: false }, attachments: [] } }, false)).toBe(false)
+    expect(hasRunningWork(process, { ...settled, limitResumeAt: '2026-09-24T20:00:00Z' }, false)).toBe(true)
+    expect(hasRunningWork(process, settled, true)).toBe(true)
+  })
   it('shares one pending decision and cancellation allows a fresh request', async () => {
     const guard = new CloseConfirmation()
     let answer!: (value: boolean) => void

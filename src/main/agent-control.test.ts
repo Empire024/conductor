@@ -126,6 +126,58 @@ describe('authorized native app control', () => {
     await expect(f.control.call(localScope, 'app.update')).rejects.toThrow('read-only')
     expect(f.localUpdates.start).toHaveBeenCalledTimes(1)
   })
+  // conductor-task:local-server-stop-control
+  it('lists the running local model servers with the conversations using them and stops one in one call', async () => {
+    const f = fixture()
+    const { LocalServerBusy } = await import('./local-models/servers')
+    const server = { model: 'local/dolphin-x1-8b', label: 'Dolphin X1 8B', pid: 62380, port: 51438, startedAt: '2026-09-24T17:00:00.000Z', startedByConductor: true }
+    let busy = true
+    const stop = vi.fn(async (request: { model?: string; pid?: number; force?: boolean }) => {
+      if (busy && !request.force) throw new LocalServerBusy(server.label, '1 conversation is mid-turn on it in this Conductor')
+      return { stopped: true, model: server.model, pid: server.pid, forced: busy }
+    })
+    const control = new AgentControl({ ...f.deps, localModels: { availability: async () => ({ available: true }), servers: () => [server], stop } })
+    const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker', model: 'local/dolphin-x1-8b' }
+    f.sessions.ensure(local)
+    openAgentTab(f, local.id, 'local-tab')
+    const localState = f.database.structured.snapshot(local.id)!
+    f.database.structured.update(local.id, { settings: { ...localState.settings, model: 'local/dolphin-x1-8b' } })
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).toEqual(expect.arrayContaining(['local.servers', 'local.stop']))
+    expect(await control.call(f.scope, 'local.servers', {})).toEqual([{ ...server, conversations: [{ agentSessionId: local.id, title: 'Local worker', phase: expect.any(String), inTurn: false }] }])
+    await expect(control.call(f.scope, 'local.stop', {})).rejects.toThrow(/model or pid/)
+    await expect(control.call({ ...f.scope, agentSessionId: local.id }, 'local.stop', { model: 'dolphin-x1-8b' })).rejects.toThrow(/sandboxed local conversation/)
+    // Busy: refused without force; force asks the owner, and a refusal stops nothing.
+    await expect(control.call(f.scope, 'local.stop', { model: 'dolphin-x1-8b' })).rejects.toThrow(/busy.*force:true/)
+    expect(f.confirm).not.toHaveBeenCalled()
+    await expect(control.call(f.scope, 'local.stop', { pid: 62380, force: true })).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenCalledTimes(1)
+    f.confirm.mockResolvedValueOnce(true as never)
+    expect(await control.call(f.scope, 'local.stop', { pid: 62380, force: true })).toMatchObject({ stopped: true, forced: true })
+    expect(stop).toHaveBeenLastCalledWith({ pid: 62380, force: true })
+    // Idle: one call, no dialog.
+    busy = false
+    expect(await control.call(f.scope, 'local.stop', { model: 'local/dolphin-x1-8b' })).toMatchObject({ stopped: true, forced: false })
+    expect(f.confirm).toHaveBeenCalledTimes(2)
+  })
+
+  // conductor-task:app-update-no-dialog-in-auto
+  it('builds a local update for a native coworker in Auto without the owner dialog, and still asks below Auto and for a local model', async () => {
+    const f = fixture()
+    const setPermission = (id: string, permission: 'default' | 'accept-edits' | 'auto') => { const state = f.database.structured.snapshot(id)!; f.database.structured.update(id, { settings: { ...state.settings, permission } }) }
+    setPermission(f.spec.id, 'accept-edits')
+    await expect(f.control.call(f.scope, 'app.update')).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenCalledTimes(1)
+    setPermission(f.spec.id, 'auto')
+    expect(await f.control.call(f.scope, 'app.update')).toMatchObject({ state: 'running', authorizedBy: 'auto' })
+    expect(f.confirm).toHaveBeenCalledTimes(1)
+    const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker' }
+    f.sessions.ensure(local)
+    openAgentTab(f, local.id, 'local-tab')
+    setPermission(local.id, 'auto')
+    await expect(f.control.call({ ...f.scope, agentSessionId: local.id }, 'app.update')).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenCalledTimes(2)
+    expect(f.localUpdates.start).toHaveBeenCalledTimes(1)
+  })
   it('tells the agent whether the owner declined app.update or was never reached, and builds nothing either way', async () => {
     const f = fixture()
     f.confirm.mockResolvedValueOnce('timeout' as never)
@@ -1306,11 +1358,12 @@ describe('the owner control credential', () => {
     phase = 'ready'
     vi.useFakeTimers()
     expect(await control.call(owner, 'app.update.install', { force: true })).toMatchObject({ installing: true, version: '1.0.1', force: true })
-    expect(await control.call(owner, 'app.restart', {})).toMatchObject({ restarting: true, force: false })
+    expect(await control.call(owner, 'app.restart', {})).toMatchObject({ restarting: true, force: true })
+    expect(await control.call(owner, 'app.restart', { force: false })).toMatchObject({ restarting: true, force: false })
     expect(host.updates.install).not.toHaveBeenCalled()
     await vi.runAllTimersAsync()
     expect(host.updates.install).toHaveBeenCalledWith(true)
-    expect(host.relaunch).toHaveBeenCalledWith(false)
+    expect(host.relaunch.mock.calls).toEqual([[true], [false]])
     vi.useRealTimers()
     await expect(control.call(owner, 'app.update.install', { force: 'yes' })).rejects.toThrow(/force must be/)
     await expect(control.call(f.scope, 'app.restart', {})).rejects.toThrow(/owner's own control credential/)
@@ -1757,17 +1810,64 @@ describe('B1: orphaned live agents and the restart initiator', () => {
     asWizard(f)
     vi.useFakeTimers()
     await control.call(f.scope, 'app.restart', { force: true })
-    await control.call(f.scope, 'app.update.install', {})
+    await control.call(f.scope, 'app.update.install', { force: false })
     await vi.runAllTimersAsync()
     expect(host.relaunch).toHaveBeenCalledWith(true, { agentSessionId: f.spec.id, method: 'app.restart' })
     expect(host.updates.install).toHaveBeenCalledWith(false, { agentSessionId: f.spec.id, method: 'app.update.install' })
     host.relaunch.mockClear(); host.updates.install.mockClear()
     const owner = control.ownerScope({ projectId: f.project.id })
-    await control.call(owner, 'app.restart', {})
+    await control.call(owner, 'app.restart', { force: false })
     await control.call(owner, 'app.update.install', { force: true })
     await vi.runAllTimersAsync()
     expect(host.relaunch.mock.calls).toEqual([[false]])
     expect(host.updates.install.mock.calls).toEqual([[true]])
     vi.useRealTimers()
+  })
+
+  // conductor-task:wizard-answers-quit-dialog
+  it('a restart a wizard starts itself never raises the running-work dialog, and a wizard can answer an open one', async () => {
+    const f = fixture()
+    const ready = () => ({ phase: 'ready' as const, currentVersion: '2.0.0', availableVersion: '2.0.1', configured: true })
+    let open: { action: 'quit' | 'restart'; running: Array<{ id: string; title: string }>; openedAt: string } | null = { action: 'quit', running: [{ id: 'agent-x', title: 'Worker' }], openedAt: '2026-09-24T18:00:00.000Z' }
+    const stopConfirmation = { pending: vi.fn(() => open), answer: vi.fn((_stopWork: boolean) => { const answered = open; open = null; return answered }) }
+    const host = { version: '2.0.0', pid: 77, relaunch: vi.fn(async () => {}), stopConfirmation, updates: { state: vi.fn(ready), check: vi.fn(async () => ready()), download: vi.fn(async () => ready()), install: vi.fn(async () => {}) } }
+    const control = new AgentControl({ ...f.deps, host })
+    await expect(control.call(f.scope, 'app.quit.confirm', { stopWork: true })).rejects.toThrow(/wizard tab/)
+    asWizard(f)
+    expect(await control.call(f.scope, 'app.state', {})).toMatchObject({ pendingQuitConfirmation: { action: 'quit', running: [{ id: 'agent-x', title: 'Worker' }] } })
+    await expect(control.call(f.scope, 'app.quit.confirm', {})).rejects.toThrow(/needs stopWork/)
+    expect(await control.call(f.scope, 'app.quit.confirm', { stopWork: true })).toMatchObject({ answered: true, stopWork: true, action: 'quit' })
+    expect(stopConfirmation.answer).toHaveBeenCalledWith(true)
+    expect(await control.call(f.scope, 'app.state', {})).toMatchObject({ pendingQuitConfirmation: null })
+    await expect(control.call(f.scope, 'app.quit.confirm', { stopWork: false })).rejects.toThrow(/No quit or restart confirmation is open/)
+    vi.useFakeTimers()
+    expect(await control.call(f.scope, 'app.restart', {})).toMatchObject({ force: true })
+    expect(await control.call(f.scope, 'app.update.install', {})).toMatchObject({ force: true })
+    await vi.runAllTimersAsync()
+    vi.useRealTimers()
+    expect(host.relaunch).toHaveBeenCalledWith(true, { agentSessionId: f.spec.id, method: 'app.restart' })
+    expect(host.updates.install).toHaveBeenCalledWith(true, { agentSessionId: f.spec.id, method: 'app.update.install' })
+    expect(f.confirm).not.toHaveBeenCalled()
+  })
+
+  // conductor-task:wizard-restart-request
+  it('a wizard can ask the owner to restart; the request names it, and nobody else may file one', async () => {
+    const f = fixture()
+    let stored: { agentSessionId: string; title: string; reason: string; at: string } | null = null
+    const host = { version: '2.0.0', pid: 77, relaunch: vi.fn(async () => {}),
+      requestRestart: vi.fn((request: { agentSessionId: string; title: string; reason: string }) => (stored = { ...request, at: '2026-09-24T18:00:00.000Z' })),
+      restartRequest: vi.fn(() => stored) }
+    const control = new AgentControl({ ...f.deps, host })
+    await expect(control.call(f.scope, 'app.restart.request', { reason: 'Install the new build' })).rejects.toThrow(/wizard tab/)
+    await expect(control.call(control.ownerScope({ projectId: f.project.id }), 'app.restart.request', { reason: 'x' })).rejects.toThrow(/is for a wizard tab/)
+    asWizard(f)
+    expect(Object.keys(await control.call(f.scope, 'tools.list', {}) as object)).toEqual(expect.arrayContaining(['app.restart.request', 'app.quit.confirm']))
+    await expect(control.call(f.scope, 'app.restart.request', {})).rejects.toThrow(/Invalid reason/)
+    await expect(control.call(f.scope, 'app.restart.request', { reason: 'x', force: true })).rejects.toThrow(/accepts only reason/)
+    expect(await control.call(f.scope, 'app.restart.request', { reason: 'Install the new build' })).toMatchObject({ requested: true, agentSessionId: f.spec.id, reason: 'Install the new build' })
+    expect(host.requestRestart).toHaveBeenCalledWith({ agentSessionId: f.spec.id, title: expect.any(String), reason: 'Install the new build' })
+    expect(await control.call(f.scope, 'app.state', {})).toMatchObject({ restartRequest: { agentSessionId: f.spec.id, reason: 'Install the new build' } })
+    // Asking is not restarting.
+    expect(host.relaunch).not.toHaveBeenCalled()
   })
 })

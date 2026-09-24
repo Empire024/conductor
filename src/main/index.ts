@@ -1,4 +1,5 @@
-import { encodeRestartInitiator, RESTART_INITIATOR_KEY, takeRestartInitiator, wizardTabsToResume, type RestartInitiator } from './restart-initiator'
+import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, wizardTabsToResume, type RestartInitiator, type RestartRequest } from './restart-initiator'
+import { StopConfirmations } from './stop-confirmation'
 import { guardLayoutSave } from './layout-save-guard'
 import { WeeklyUsageSummaryService } from './weekly-usage-summary'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -67,7 +68,9 @@ import { createDurableJobsService, DurableJobStore, structuredStageRuntime, type
 import { durableJobPorts, gatedRuntime } from './durable-jobs/wiring'
 import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/server-lifecycle'
 import { registerDurableJobsIpc } from './durable-jobs-ipc'
-import { health as llamaHealth, readRunRecord } from './local-models/llama'
+import { health as llamaHealth, processAlive as llamaProcessAlive, readRunRecord, stopServer as stopLlamaServer } from './local-models/llama'
+import { runningLlamaProcesses } from './local-models/resource-guard'
+import { listLocalServers, stopLocalServer, type LocalStopRequest } from './local-models/servers'
 import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
 import type { ScheduleRunner } from './schedule-runner'
 import { createScheduledTasks, latestModelsBuiltin } from './schedule-wiring'
@@ -90,7 +93,7 @@ import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
 import { LocalUpdateBuilder } from './local-update-build'
-import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, setLocalEndpointOverride, slotsProcessing } from './providers/local'
+import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, releaseVerdict, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
 import { registerDeliveryIpc } from './delivery-ipc'
 import { gitHubCredential } from './github-credential'
@@ -188,6 +191,8 @@ let isQuitting = false
 let hostLifecycle: HostLifecycleController | null = null
 let servicesDisposed = false
 const closeConfirmation = new CloseConfirmation()
+/** The open "Work is still running" dialog, answerable by a wizard through app.quit.confirm. */
+const stopConfirmations = new StopConfirmations()
 let archiveBusy = false
 let replacingDesk = false
 let quitRequest: Promise<void> | null = null
@@ -584,8 +589,8 @@ const disposeRuntimeServices = (): void => {
   }
 }
 
-/** Only the wizard tab that initiated this restart is brought back and told to continue.
- *  Owner restarts restore windows without starting any conversations. */
+/** Only the wizard tab that initiated this restart, or asked the owner for it, is brought back and
+ *  told to continue. Other owner restarts restore windows without starting any conversations. */
 const resumeWizardTabs = async (initiator: RestartInitiator): Promise<void> => {
   for (const project of database.listDeskProjects()) for (const workspace of database.listSessions(project.id)) {
     const tabs: PaneTab[] = []
@@ -598,11 +603,58 @@ const resumeWizardTabs = async (initiator: RestartInitiator): Promise<void> => {
       if (!state || !spec || spec.provider === 'local' || !state.nativeSessionId || !wizardActive(state.settings, spec.provider)) continue
       try {
         await agents.structured.resume(tab.resourceId, state.settings)
-        await agents.structured.submit(tab.resourceId, `[Conductor] Conductor restarted itself (now ${app.getVersion()}) and brought this wizard tab back. Continue your work from where you left off; check app.state and agents.list first, since your coworkers may need resuming too.`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+        await agents.structured.submit(tab.resourceId, `[Conductor] ${initiator.method === 'app.restart.request' ? 'The owner restarted Conductor as you requested' : 'Conductor restarted itself'} (now ${app.getVersion()}) and brought this wizard tab back. Continue your work from where you left off; check app.state and agents.list first, since your coworkers may need resuming too.`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
         console.log(`Wizard tab ${tab.resourceId} resumed after the restart`)
       } catch (error) { console.warn(`Wizard tab ${tab.resourceId} could not be resumed after the restart`, error) }
     }
   }
+}
+
+/** A wizard's request that the owner restart (app.restart.request). It is kept in the settings so
+ *  the next launch, however the owner restarts, resumes that wizard; the launch consumes it. */
+const readRestartRequest = (): RestartRequest | null => parseRestartRequest(database.getSetting(RESTART_REQUEST_KEY), new Date())
+const recordRestartRequest = (request: Omit<RestartRequest, 'at'>): RestartRequest => {
+  const recorded = { ...request, at: new Date().toISOString() }
+  database.setSetting(RESTART_REQUEST_KEY, encodeRestartRequest(recorded))
+  updates?.setRestartRequest(recorded)
+  return recorded
+}
+
+/** local.servers: the llama.cpp servers on this machine, Conductor-started ones first. */
+const runningLocalServers = (): ReturnType<typeof listLocalServers> => {
+  let models: ReturnType<typeof loadLocalConfig>['models'][string][] = []
+  try { models = Object.values(loadLocalConfig().models) } catch { /* No local stack: only the process list can show a server. */ }
+  return listLocalServers({ models: () => models, record: readRunRecord, alive: llamaProcessAlive, inventory: runningLlamaProcesses })
+}
+/** local.stop: one Conductor-started server, refused while a turn uses it unless forced. */
+const stopRunningLocalServer = (request: LocalStopRequest): ReturnType<typeof stopLocalServer> => {
+  const config = loadLocalConfig(), apiKey = readLocalApiKey()
+  return stopLocalServer(runningLocalServers(), request, {
+    busy: server => releaseVerdict(server, apiKey),
+    stop: async model => {
+      const target = config.models[model]
+      if (!target) throw new Error(`${model} is not configured in the local model stack`)
+      return stopLlamaServer(target)
+    }
+  })
+}
+
+/** Restart Conductor the way app.restart does; a downloaded update installs on the way out. */
+const relaunchConductor = async (force: boolean, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> => {
+  // A downloaded update installs and relaunches by itself; relaunching as well would start
+  // Conductor twice.
+  if (updates.getState().phase === 'ready') { await updates.install({ force }, initiator); return }
+  await prepareForUpdateInstall(force, initiator)
+  app.relaunch()
+  app.quit()
+}
+
+/** Which wizard tab, if any, this launch brings back, consuming the records that name it. */
+const takeLaunchInitiator = (): RestartInitiator | null => {
+  const initiator = launchRestartInitiator(database.getSetting(RESTART_INITIATOR_KEY), database.getSetting(RESTART_REQUEST_KEY), new Date())
+  database.setSetting(RESTART_INITIATOR_KEY, '')
+  database.setSetting(RESTART_REQUEST_KEY, '')
+  return initiator
 }
 
 /** `force` is the owner's own control credential restarting the app unattended: running work is
@@ -754,18 +806,19 @@ const showDecision = async (owner: BrowserWindow | null, options: Electron.Messa
 }
 
 const runningWork = (): ReturnType<ConductorDatabase['listProcesses']> => database.listProcesses().filter(process =>
-  hasRunningWork(process, process.kind === 'agent' ? database.structured.snapshot(process.id) : null)
+  hasRunningWork(process, process.kind === 'agent' ? database.structured.snapshot(process.id) : null, process.kind === 'agent' ? agents.structured.hasRuntime(process.id) : undefined)
 )
 
 const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit' | 'restart'): Promise<boolean> => {
   const active = runningWork()
   if (!active.length && !agents.nativeCli.hasSubmittedInput()) return true
-  return closeConfirmation.request(async () => (await showDecision(liveWindow(owner), {
+  const running = active.slice(0, 8).map(process => ({ id: process.id, title: process.title }))
+  return closeConfirmation.request(() => stopConfirmations.ask({ action, running }, async signal => (await showDecision(liveWindow(owner), {
     type: 'warning', title: action === 'restart' ? 'Restart Conductor?' : 'Quit Conductor?',
     message: 'Work is still running in Conductor.',
-    detail: `${active.length ? active.slice(0, 8).map(process => process.title).join('\n') : 'A native CLI command is still running.'}\n\nStopping the application interrupts work in every project and window.`,
-    buttons: [action === 'restart' ? 'Stop work and restart' : 'Stop work and quit', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true
-  })) === 0)
+    detail: `${running.length ? running.map(process => process.title).join('\n') : 'A native CLI command is still running.'}\n\nStopping the application interrupts work in every project and window.`,
+    buttons: [action === 'restart' ? 'Stop work and restart' : 'Stop work and quit', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true, signal
+  })) === 0))
 }
 
 const broadcastSessionArchive = (result: SessionArchiveResult): void => {
@@ -1418,6 +1471,14 @@ const registerIpc = (): void => {
   ipcMain.handle('updates:check', (event) => { trustedStructured(event); return updates.check() })
   ipcMain.handle('updates:download', (event) => { trustedStructured(event); return updates.download() })
   ipcMain.handle('updates:install', (event) => { trustedStructured(event); return updates.install() })
+  // The owner answering a wizard's restart request when no update is waiting to install.
+  ipcMain.handle('updates:restart', async (event) => {
+    trustedStructured(event)
+    try { await relaunchConductor(false) } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'UPDATE_CANCELLED') return
+      throw error
+    }
+  })
   ipcMain.on('updates:prepare-ack', (event, requestId: string) => {
     updates.acknowledgePrepare(event.sender.id, requestId)
   })
@@ -2217,17 +2278,13 @@ app.whenReady().then(async () => {
       version: app.getVersion(), pid: process.pid,
       openProject: registerProjectFolder,
       updates: { state: () => updates.getState(), check: () => updates.check(), download: () => updates.download(), install: (force, initiator) => updates.install({ force }, initiator) },
-      relaunch: async (force, initiator) => {
-        // A downloaded update installs and relaunches by itself; relaunching as well would start
-        // Conductor twice.
-        if (updates.getState().phase === 'ready') { await updates.install({ force }, initiator); return }
-        await prepareForUpdateInstall(force, initiator)
-        app.relaunch()
-        app.quit()
-      }
+      relaunch: relaunchConductor,
+      requestRestart: recordRestartRequest,
+      restartRequest: readRestartRequest,
+      stopConfirmation: { pending: () => stopConfirmations.pending(), answer: stopWork => stopConfirmations.answer(stopWork) }
     },
     delivery,
-    localModels: { availability: localModelAvailability },
+    localModels: { availability: localModelAvailability, servers: runningLocalServers, stop: stopRunningLocalServer },
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
@@ -2347,6 +2404,7 @@ app.whenReady().then(async () => {
     localBuildDirectory: join(app.getPath('userData'), 'local-updates'),
     beforeInstall: prepareForUpdateInstall
   })
+  updates.setRestartRequest(readRestartRequest())
   try {
     updates.configure(getAppSettings().updateFeedUrl, getAppSettings().includeLocalUpdates)
   } catch (error) {
@@ -2364,8 +2422,7 @@ app.whenReady().then(async () => {
   disposeOrchestrationIpc = registerOrchestrationIpc(orchestration)
   scheduleRunner.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
-  const initiator = takeRestartInitiator(database.getSetting(RESTART_INITIATOR_KEY), new Date())
-  database.setSetting(RESTART_INITIATOR_KEY, '')
+  const initiator = takeLaunchInitiator()
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
     ? parseSavedWindowLayout(database.getSetting(UPDATE_WINDOW_LAYOUT_KEY))
@@ -2376,11 +2433,10 @@ app.whenReady().then(async () => {
   for (const record of detachedRecords) {
     openDetachedWindow(record.id, false, savedWindowLayout?.detached[record.id])
   }
-  if (restoreAfterUpdate) {
-    database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'false')
-    // The windows first, then the wizards: the panes must exist for the resumed turns to show in.
-    if (initiator) setTimeout(() => { void resumeWizardTabs(initiator) }, 4000)
-  }
+  if (restoreAfterUpdate) database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'false')
+  // The windows first, then the wizards: the panes must exist for the resumed turns to show in.
+  // A requested restart resumes its wizard however the owner restarted, even by quitting by hand.
+  if (initiator) setTimeout(() => { void resumeWizardTabs(initiator) }, 4000)
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow()
   })

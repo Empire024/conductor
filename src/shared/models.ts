@@ -207,6 +207,8 @@ export interface AppUpdateState {
   lastCheckedAt?: string
   source?: 'local' | 'release'
   localBuildWarning?: string
+  /** A wizard tab asked the owner to restart (app.restart.request); cleared by the next launch. */
+  restartRequest?: { title: string; reason: string; at: string }
 }
 
 export interface AppDiagnostics {

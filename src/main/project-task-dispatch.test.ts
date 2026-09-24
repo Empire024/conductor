@@ -180,7 +180,8 @@ describe('Project tasks native dispatch',()=> {
     expect(f.submissions).toHaveLength(1)
     const probe=f.database.structured.history(f.project.id).find(entry=>entry.id.startsWith('allowance-probe'))!
     expect(f.database.structured.events(probe.id).some(event=>event.data.type==='usage')).toBe(true)
-    expect(f.database.structured.snapshot(probe.id)?.phase).toBe('disconnected')
+    // The probe never ran a turn, so closing it leaves it settled, not disconnected.
+    expect(f.database.structured.snapshot(probe.id)?.phase).toBe('idle')
   })
   it('does not leave an empty workspace when allowance bootstrap produces no evidence',async()=>{
     const f=fixture({quota:false})

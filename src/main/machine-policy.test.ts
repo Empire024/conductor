@@ -14,6 +14,7 @@ describe('machine limits, stated once per runtime', () => {
     expect(line).toContain('24 CPU threads, 63 GB RAM, NVIDIA GeForce RTX 5070 with 12 GB VRAM')
     expect(line).toContain('One local model server at a time')
     expect(line).toContain('never download model files')
+    expect(line).toContain('local.servers lists the running model servers and local.stop({model|pid}) stops one')
     expect(line.split('\n')).toHaveLength(1)
     expect(describeMachine({ threads: 8, ramGb: 16, gpus: [] })).toContain('no NVIDIA GPU detected')
   })
