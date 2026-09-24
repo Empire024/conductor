@@ -68,6 +68,7 @@ import { SchedulesPane } from './components/SchedulesPane'
 import { WorkspaceFiles } from './components/WorkspaceFiles'
 import { openWorkspaceFile, changeWorkspacePath, loadWorkspaceFiles, workspaceFileIds, workspaceFileMachine } from './components/workspace-files-state'
 import { ProjectBacklogPane } from './components/ProjectBacklogPane'
+import { IdeasView } from './components/ideas/IdeasView'
 import { AppVersionButton } from './components/AppVersionButton'
 import { SystemPerformanceChip } from './components/SystemPerformanceChip'
 import { applyAppTheme, resolveThemeVariant } from './appearance'
@@ -134,6 +135,9 @@ export function App(): React.JSX.Element {
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [renameProjectId, setRenameProjectId] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [ideasOpen, setIdeasOpen] = useState(false)
+  const [ideasCapture, setIdeasCapture] = useState(0)
+  useEffect(() => window.conductor.ideas.onCapture(() => { setIdeasOpen(true); setIdeasCapture(n => n + 1) }), [])
   const [utilityPanel, setUtilityPanel] = useState<SidebarUtilityPanel | null>(() => {
     const saved = localStorage.getItem('conductor.utilityPanel')
     if (saved === 'jobs') { localStorage.removeItem('conductor.utilityPanel'); return null }
@@ -1225,6 +1229,7 @@ export function App(): React.JSX.Element {
     { id: 'open-files', label: 'Open Explorer', detail: 'Browse the active project', category: 'Workspace', icon: 'file', run: () => window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'explorer' })) },
     { id: 'open-browser', label: 'Open responsive browser', detail: 'Mobile-first Chromium preview', category: 'Workspace', icon: 'browser', run: () => window.dispatchEvent(new CustomEvent('conductor:sidebar-mode', { detail: 'browser' })) },
     { id: 'open-memory', label: 'Open project memory', detail: 'Open the workspace memory drawer', category: 'Workspace', icon: 'file', run: () => setUtilityPanel('memory') },
+    { id: 'ideas', label: 'Ideas: new note', detail: 'Jot an idea down; no project needed', category: 'Workspace', icon: 'file', shortcut: 'Ctrl+Alt+I', run: () => { setIdeasOpen(true); setIdeasCapture(n => n + 1) } },
     { id: 'open-processes', label: 'Open process dashboard', detail: 'Open the workspace process drawer', category: 'Workspace', icon: 'layout', run: () => setUtilityPanel('processes') },
     { id: 'split-right', label: 'Split tab right', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Alt →', run: () => splitFocused('right') },
     { id: 'split-below', label: 'Split tab below', category: 'Layout', icon: 'layout', shortcut: 'Ctrl Alt ↓', run: () => splitFocused('below') },
@@ -1446,6 +1451,7 @@ export function App(): React.JSX.Element {
         onNewTab={activeSession ? () => openInFocused('launcher') : undefined}
         onCloseWorkspace={activeSession ? () => void closeSession(activeSession.id) : undefined}
         onSettings={() => setSettingsOpen(true)}
+        onIdeas={() => setIdeasOpen(true)}
         updateState={updateState}
       />
       <div className="app-body">
@@ -1648,6 +1654,7 @@ export function App(): React.JSX.Element {
           ) : (
             <div className="app-loading"><i style={spinPhaseStyle(Date.now())} /><span>Restoring your workspace</span></div>
           )}
+          {ideasOpen && <IdeasView captureRequest={ideasCapture} onClose={() => setIdeasOpen(false)} />}
         </div>
       </div>
       <footer className="statusbar app-statusbar">

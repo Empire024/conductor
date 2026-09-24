@@ -5,6 +5,7 @@ import {
   FolderOpen,
   Laptop,
   LayoutPanelTop,
+  Lightbulb,
   Maximize2,
   Minimize2,
   Minus,
@@ -44,6 +45,8 @@ interface TitleBarProps {
   onNewTab?(): void
   onCloseWorkspace?(): void
   onSettings?(): void
+  /** Opens Ideas (docs/ideas.md); ideas are project-independent, so the entry lives here. */
+  onIdeas?(): void
   updateState?: AppUpdateState
 }
 
@@ -125,6 +128,7 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
       <div className="titlebar-drag">
         <span className="titlebar-project"><strong>{props.sessionName ?? 'Untitled session'}</strong>{props.projectName ? <> <span>/</span> {props.projectName}</> : null}</span>
       </div>
+      {props.onIdeas && <button className="quick-theme-toggle titlebar-ideas" aria-label="Ideas" title="Ideas (Ctrl+Alt+I)" onClick={props.onIdeas}><Lightbulb size={16} /></button>}
       <div className="quick-theme-menu-host" ref={themeMenuRef}>
       <button onContextMenu={(event) => { event.preventDefault(); setThemeMenuOpen((open) => !open) }} className="quick-theme-toggle" aria-label={`Switch to ${nextVariant} theme`} onClick={() => { setThemeMenuOpen(false); props.onThemeVariant(nextVariant) }} title={props.themeAuto ? `Theme follows local time. Click to use ${nextVariant} manually.` : `Theme: ${props.themeVariant}. Click for ${nextVariant}.`}>
         <ThemeIcon size={17} /> <span>{label}</span>

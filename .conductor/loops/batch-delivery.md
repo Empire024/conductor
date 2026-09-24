@@ -1,6 +1,6 @@
 ---
 id: batch-delivery
-version: 3
+version: 4
 title: Deliver one batch of related tasks with the least tokens at the highest quality
 trigger: [manual, after:task-triage]
 inputs: [batchId, taskIds, allowedPaths]
@@ -33,10 +33,13 @@ steps:
     alternate: codex:gpt-6-astra
     effort: high
     input: git diff limited to allowedPaths, once
+  - id: verify
+    role: verifier
+    action: loops.run(verify) # adversarial check against the owner's original request (see verify.md)
   - id: ship
     role: controller
     action: git.ship
-locked: [budget, steps.review, steps.ship]
+locked: [budget, steps.review, steps.verify, steps.ship]
 ---
 
 # Batch delivery
@@ -51,9 +54,12 @@ locked: [budget, steps.review, steps.ship]
    the summary.
 4. **Review.** The frontier model that did not write the contract (Fable ↔ Astra) reads the diff once and answers approve or a specific list of changes. At most one corrective
    round, then escalate to the owner.
-5. **Ship.** `git.ship({message, paths})` with the batch's files only; wait on `git.ship.status`. Do not publish;
+5. **Verify.** Run the `verify` loop on the batch: a brain plans adversarial, real-world scenarios from the owner's
+   original item text and images, not the implementer's tests; cheap hands run them in the real app with real models and
+   real data; the brain judges VERIFIED or REOPEN. An item is ticked `[x]` only after VERIFIED.
+6. **Ship.** `git.ship({message, paths})` with the batch's files only; wait on `git.ship.status`. Do not publish;
    publish once per set of batches.
-6. Before every dispatch, read `usage.limits`. At 70% Claude weekly or more, implementation moves to Sonnet/Haiku with a
+7. Before every dispatch, read `usage.limits`. At 70% Claude weekly or more, implementation moves to Sonnet/Haiku with a
    tighter contract. At 73%, Claude work stops; Astra plus local finish. Astra stops at 95%.
 
 Known hazard (2026-09-24): a coworker whose tab disappears loses app control and cannot `git.ship`. Its controller
@@ -77,3 +83,5 @@ ships for it from the coworker's handoff, which must list the exact paths and me
 - 2026-09-24 v3 (owner rule, applied by the controller): contract moves to Astra (Fable for the hardest designs) and review
   to the frontier model that did not write the contract. The owner approved changing the locked review step. Opus/Sonnet/Haiku
   implement; local helps.
+- 2026-09-24 v4 (owner rule): a Verifier step (loop `verify`) sits between review and ship. Passing tests or a small sample is not
+  proof; items are ticked only when adversarial real-world scenarios pass. Locked step.
