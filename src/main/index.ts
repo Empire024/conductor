@@ -1,5 +1,6 @@
 import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, wizardTabsToResume, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import { StopConfirmations } from './stop-confirmation'
+import { ConversationHistory, registerConversationHistoryIpc } from './conversation-history'
 import { guardLayoutSave } from './layout-save-guard'
 import { WeeklyUsageSummaryService } from './weekly-usage-summary'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -10,6 +11,7 @@ import { importPromptImage } from './prompt-images'
 import { importPromptAttachmentPath, projectPromptAttachment } from './prompt-context'
 import { moveExternalDropIntoProject, moveProjectDropWithinProject } from './file-drop-move'
 import { ProjectBacklogs } from './project-backlog'
+import type { ProjectTaskListQuery } from '../shared/project-backlog'
 import { ProjectTaskDispatcher } from './project-task-dispatch'
 import { SourceControl } from './source-control'
 import { pruneDiffSnapshots } from './agent-artifacts'
@@ -1275,6 +1277,7 @@ const registerIpc = (): void => {
     return agents.structured.archive(sessionId, archived)
   })
   ipcMain.handle('structured:history', (event, projectId, query) => { trustedStructured(event); if (query !== undefined && (typeof query !== 'string' || query.length > 500)) throw new Error('Invalid search'); return database.structured.history(structuredId(projectId), query) })
+  registerConversationHistoryIpc(ipcMain, new ConversationHistory(database.structured), { trusted: trustedStructured, id: structuredId })
   ipcMain.handle('structured:search-messages', (event, projectId, query, excludeId) => { trustedStructured(event); if (typeof query !== 'string' || query.length > 500) throw new Error('Invalid search'); return database.structured.searchMessages(structuredId(projectId), query, excludeId === undefined ? undefined : structuredId(excludeId)) })
   ipcMain.handle('structured:artifact', (event, id, artifactId) => { trustedStructured(event); const sessionId = structuredId(id); if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Remote change artifacts'); return database.structured.artifact(sessionId, structuredId(artifactId)) })
   ipcMain.handle('structured:output', (event, id, artifactId) => { trustedStructured(event); const sessionId = structuredId(id); if (remoteControl?.mirror.isRemote(sessionId)) return remoteControl.mirror.unsupported(sessionId, 'Remote output artifacts'); return database.structured.output(sessionId, structuredId(artifactId)) })
@@ -1289,8 +1292,8 @@ const registerIpc = (): void => {
   // host instead; reaching here with one is the mistake these guards make loud.
   ipcMain.handle('project-tasks:dispatch-options', (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'The task list'); return projectTaskDispatcher.options(projectId) })
   ipcMain.handle('project-tasks:dispatch', (event, projectId, revision, request) => { trustedStructured(event); requireLocalProject(database, projectId, 'Dispatching a task'); return projectTaskDispatcher.dispatch(projectId, revision, request) })
-  ipcMain.handle('project-tasks:get', (event, projectId: string) => { trustedStructured(event); requireLocalProject(database, projectId, 'The task list'); return projectBacklogs.get(projectId) })
-  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit) => { trustedStructured(event); const project = localProject(database, projectId, 'Editing the task list'); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }); invalidateProjectFiles(project.path); return result })
+  ipcMain.handle('project-tasks:get', (event, projectId: string, query?: ProjectTaskListQuery) => { trustedStructured(event); requireLocalProject(database, projectId, 'The task list'); return projectBacklogs.get(projectId, query) })
+  ipcMain.handle('project-tasks:edit', async (event, projectId, revision, edit, query?: ProjectTaskListQuery) => { trustedStructured(event); const project = localProject(database, projectId, 'Editing the task list'); const result = await projectBacklogs.edit(projectId, revision, edit, { actor: 'you' }, query); invalidateProjectFiles(project.path); return result })
   ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control'); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
   ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); requireLocalProject(database, projectId, 'Reviewing changes'); return projectBacklogs.changes(projectId, taskId) })
   disposeScheduleIpc = registerScheduleIpc({ store: schedules, runner: scheduleRunner,
