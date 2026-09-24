@@ -21,7 +21,7 @@ import { safeStorageCipher } from './safe-storage-vault'
 import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { installContextMenu } from './context-menu'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, screen, shell, webContents } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, screen, shell, webContents } from 'electron'
 import { SystemMetricsSampler } from './system-metrics.ts'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics.ts'
 import { CloseConfirmation, hasRunningWork } from './close-confirmation'
@@ -67,8 +67,8 @@ import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/serv
 import { registerDurableJobsIpc } from './durable-jobs-ipc'
 import { health as llamaHealth, readRunRecord } from './local-models/llama'
 import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
-import { ScheduleRunner } from './schedule-runner'
-import { LatestModelsJob } from './schedule-jobs/latest-models'
+import type { ScheduleRunner } from './schedule-runner'
+import { createScheduledTasks, latestModelsBuiltin } from './schedule-wiring'
 import { registerScheduleIpc } from './schedule-ipc'
 import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
@@ -116,6 +116,8 @@ let orchestration: OrchestrationStore
 let disposeOrchestrationIpc: (() => void) | undefined
 let schedules: ScheduleStore
 let scheduleRunner: ScheduleRunner
+/** Scheduled tasks' runner and the host services its panel and app control use (schedule-wiring.ts). */
+let scheduledTasks: ReturnType<typeof createScheduledTasks>
 /** Durable overnight local-model jobs (src/main/durable-jobs); null until the app is ready. */
 let durableJobs: DurableJobsServiceImpl | null = null
 let disposeDurableJobsIpc: (() => void) | undefined
@@ -1198,6 +1200,8 @@ const registerIpc = (): void => {
   ipcMain.handle('project-tasks:set-source-control', (event, projectId: string, enabled: boolean) => { trustedStructured(event); requireLocalProject(database, projectId, 'Source control'); sourceControl.setEnabled(projectId, enabled === true); return sourceControl.describe(projectId) })
   ipcMain.handle('project-tasks:changes', (event, projectId: string, taskId: string) => { trustedStructured(event); requireLocalProject(database, projectId, 'Reviewing changes'); return projectBacklogs.changes(projectId, taskId) })
   disposeScheduleIpc = registerScheduleIpc({ store: schedules, runner: scheduleRunner,
+    agents: projectId => scheduledTasks.agents(projectId), openConversation: (projectId, id, title) => scheduledTasks.openConversation(projectId, id, title),
+    assignScripts: (projectId, schedule) => scheduledTasks.assignScripts(projectId, schedule), changed: projectId => scheduledTasks.control.changed(projectId),
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, projectId, 'Schedules') },
     reveal: path => shell.showItemInFolder(path) })
   disposeDeliveryIpc = registerDeliveryIpc({ service: delivery,
@@ -1745,6 +1749,12 @@ const registerIpc = (): void => {
     requireLocalProject(database, spec.projectId, 'Running an agent')
     return agents.ensure(spec)
   })
+  ipcMain.handle('agent:activity-phases', (event, ids: string[]) => {
+    trustedStructured(event)
+    if (!Array.isArray(ids) || ids.length > 5000 || ids.some(id => typeof id !== 'string')) throw new Error('Invalid agent ids')
+    const wanted = new Set(ids)
+    return Object.fromEntries(database.listAgentActivity().filter(row => wanted.has(row.id)).map(row => [row.id, row.activityPhase]))
+  })
   ipcMain.handle('agent:restart', (event, spec: AgentSpec) => { trustedStructured(event); requireLocalProject(database, spec.projectId, 'Running an agent'); return agents.restart(spec) })
   ipcMain.handle('agent:submit', (event, id: string, message: string, mode?: 'manual' | 'edit' | 'plan' | 'auto') => {
     trustedStructured(event)
@@ -2038,7 +2048,9 @@ app.whenReady().then(async () => {
   const conductorProject = database.listProjects().find(project => {
     try { return (JSON.parse(readFileSync(join(project.path, 'package.json'), 'utf8')) as {name?:string}).name === 'conductor-desktop' } catch { return false }
   })
-  if (conductorProject) schedules.ensureLatestModelsSchedule(conductorProject.id)
+  if (conductorProject) schedules.ensureBuiltin(conductorProject.id, latestModelsBuiltin())
+  // A project that already had the old fixed check (added from its Schedules panel) keeps it, now with its scripts.
+  for (const schedule of schedules.all()) if (schedule.kind === 'latest-models-methods' && schedule.projectId !== conductorProject?.id) schedules.ensureBuiltin(schedule.projectId, latestModelsBuiltin())
   sourceControl = new SourceControl(database)
   projectBacklogs = new ProjectBacklogs(database, sourceControl)
   for (const project of database.listDeskProjects()) void projectBacklogs.ensure(project.id).catch(error => console.warn('Project task file unavailable', error))
@@ -2180,8 +2192,6 @@ app.whenReady().then(async () => {
     linksChanged: scope => publish('agent-control:links-changed', { projectId: scope.projectId, sessionId: scope.sessionId })
   })
   projectTaskDispatcher = new ProjectTaskDispatcher({ database, backlogs: projectBacklogs, sessions: agents.structured, control, providers: () => agents.listProviders(), ui: agentControlUi.request, workspaceCreated: session => publish('sessions:restored', session), changed: projectId => { const project = database.getProject(projectId); if (project) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId, path: 'feature-list.md' }) } })
-  const latestModelsJob = new LatestModelsJob({ store: schedules, artifactDirectory: join(app.getPath('userData'), 'schedule-evidence'), catalog: projectId => projectTaskDispatcher.options(projectId) })
-  scheduleRunner = new ScheduleRunner({ store: schedules, jobs: { 'latest-models-methods': context => latestModelsJob.run(context) }, changed: projectId => publish('schedules:changed', projectId) })
   agentControlUi.register(control)
   agents.structured.setLocalControl((spec, method, args) => control.call({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, method, args))
   // Durable overnight jobs run in this process on the same structured runtime as every tab; a
@@ -2221,6 +2231,20 @@ app.whenReady().then(async () => {
     })
   })
   control.setDurableJobs(durableJobs)
+  // Scheduled tasks (docs/schedules.md): scripts at night and in idle windows, local churn through
+  // the same generation gate as durable jobs, bounded frontier reviews only on changed evidence.
+  scheduledTasks = createScheduledTasks({
+    store: schedules, userData: app.getPath('userData'), database, sessions: agents.structured, control, ui: agentControlUi.request,
+    providers: () => agents.listProviders(), metrics: () => systemMetrics.sample(),
+    idleSeconds: () => powerMonitor.getSystemIdleTime(), screenLocked: () => powerMonitor.getSystemIdleState(1) === 'locked',
+    deliveryRunning: () => database.listDeskProjects().some(project => delivery.current(project.id)?.state === 'running'),
+    localUpdateBuilding: () => localUpdateBuilder.status().state === 'running',
+    durableJobsRunning: () => durableJobs?.list({ status: ['running', 'recovering'] }).length ?? 0,
+    generationGate, localTurnsInFlight: () => localTurnsInFlight() > 0,
+    changed: projectId => publish('schedules:changed', projectId)
+  })
+  scheduleRunner = scheduledTasks.runner
+  control.setSchedules(scheduledTasks.control)
   // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
   // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
   // one after every restart.

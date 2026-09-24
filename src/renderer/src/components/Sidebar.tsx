@@ -115,7 +115,7 @@ const railItems: Array<{
   { icon: MemoryStick, label: 'Memory', utility: 'memory', group: 'secondary' },
   { icon: Gauge, label: 'Processes', utility: 'processes', group: 'secondary' },
   { icon: GitBranch, label: 'Source control', utility: 'source-control', group: 'secondary' },
-  { icon: Clock3, label: 'Schedules', utility: 'schedules', group: 'secondary' },
+  { icon: Clock3, label: 'Scheduled tasks', utility: 'schedules', group: 'secondary' },
   { icon: Hourglass, label: 'Durable jobs', utility: 'jobs', group: 'secondary' }
 ]
 

@@ -1026,6 +1026,13 @@ export class StructuredSessions {
       this.database.setSetting(ACCOUNT_LIMITS_KEY, JSON.stringify(next))
     } catch { /* A usage record never breaks the event pipeline it observes. */ }
   }
+  /** How many conversations are mid-turn right now: the scheduler's "Conductor is busy" signal
+   *  (src/main/schedule-gate.ts). A conversation waiting on the owner is not counted. */
+  turnsInFlight(): number {
+    let count = 0
+    for (const live of this.live.values()) if (!live.closed && live.activityPhase === 'working') count++
+    return count
+  }
   /** The newest reported allowance of each cloud provider, with what is not known said outright. */
   usageLimits(provider?: StructuredProvider): AccountLimitsReport[] {
     const record = this.accountLimits(), now = Date.now()
