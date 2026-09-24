@@ -4,13 +4,34 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync, mkdirSyn
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ConductorDatabase } from './database'
-import { parseProjectTasks, ProjectBacklogs, updateProjectTaskText } from './project-backlog'
-import { PROJECT_TASK_MAX_LENGTH } from '../shared/project-backlog'
+import { pageProjectTasks, parseProjectTasks, ProjectBacklogs, updateProjectTaskText } from './project-backlog'
+import { PROJECT_TASK_ARCHIVE_AFTER_MS, PROJECT_TASK_MAX_LENGTH } from '../shared/project-backlog'
 const roots:string[]=[]
 afterEach(()=>{for(const root of roots.splice(0))rmSync(root,{recursive:true,force:true})})
 function fixture(){const root=mkdtempSync(join(tmpdir(),'conductor-task-test-'));roots.push(root);const db=new ConductorDatabase(join(root,'state.db'));const project=db.upsertProject(root,'Test');return {root,db,project,service:new ProjectBacklogs(db)}}
 
 describe('project task files',()=> {
+  it('archives old completed tasks and pages only the requested visible slice',()=>{
+    const now=Date.parse('2026-09-24T12:00:00.000Z')
+    const activity=(at:string,status:'todo'|'doing'|'done')=>[{id:at,status,actor:'file' as const,at}]
+    const tasks=[
+      {id:'active-1',title:'Active high',kind:'task' as const,status:'todo' as const,priority:'high' as const,weight:'heavy' as const,line:1,activity:activity('2026-09-23T00:00:00.000Z','todo')},
+      {id:'active-2',title:'Active normal',kind:'bug' as const,status:'doing' as const,priority:'normal' as const,weight:'medium' as const,line:2,activity:activity('2026-09-22T00:00:00.000Z','doing')},
+      {id:'recent-done',title:'Recent done',kind:'feature' as const,status:'done' as const,priority:'normal' as const,weight:'light' as const,line:3,activity:activity(new Date(now-PROJECT_TASK_ARCHIVE_AFTER_MS+1).toISOString(),'done')},
+      {id:'archived',title:'Ancient done',kind:'idea' as const,status:'done' as const,priority:'low' as const,weight:'light' as const,line:4,activity:activity(new Date(now-PROJECT_TASK_ARCHIVE_AFTER_MS-1).toISOString(),'done')}
+    ]
+    const first=pageProjectTasks(tasks,{offset:0,limit:1},now)
+    expect(first.tasks.map(task=>task.id)).toEqual(['active-2'])
+    expect(first.page).toEqual({offset:0,limit:1,total:2,hasMore:true})
+    expect(first.summary).toEqual({total:4,completed:2,archived:1})
+    expect(tasks.find(task=>task.id==='archived')).not.toHaveProperty('archived')
+    const archived=pageProjectTasks(tasks,{includeArchived:true,offset:0,limit:10},now)
+    expect(archived.tasks.map(task=>task.id)).toContain('archived')
+    expect(archived.tasks.find(task=>task.id==='archived')).toMatchObject({archived:true})
+    const completed=pageProjectTasks(tasks,{includeDone:true,offset:0,limit:10},now)
+    expect(completed.tasks.map(task=>task.id)).toContain('recent-done')
+    expect(completed.tasks.map(task=>task.id)).not.toContain('archived')
+  })
   it('round-trips large multiline bug reports and HTML logs without accepting task markers',()=>{
     const report='<!-- diagnostic -->\nrecovery:checkpoint\n'+('Error: Invalid workspace document owner\n'.repeat(500))+'<!-- diagnostic -->\n- [ ] log text\n```text\nstack trace\n```'
     const added=updateProjectTaskText('## Bugs\n',{type:'add',kind:'bug',title:report})

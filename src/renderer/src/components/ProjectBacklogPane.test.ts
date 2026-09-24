@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ProjectRecord } from '../../../shared/models'
 import type { ProjectTask, ProjectTaskActivity } from '../../../shared/project-backlog'
 import type { ContextAttachment } from '../../../shared/structured-agent'
-import { embedTaskImages, ProjectBacklogPane, sortProjectTasks, splitTaskImages, submitTaskShortcut, taskTitleRow } from './ProjectBacklogPane'
+import { embedTaskImages, isLongTaskBody, projectTaskScaleSummary, ProjectBacklogPane, sortProjectTasks, splitTaskImages, submitTaskShortcut, taskTitleRow } from './ProjectBacklogPane'
 
 // A minimal, real Storage-shaped implementation: the component reads/writes the
 // bare `localStorage` global directly (not `window.localStorage`), so a Node
@@ -119,6 +119,25 @@ describe('a done task renders the check affordance', () => {
   })
 })
 
+describe('long task bodies', () => {
+  it('collapses multi-line and long reports until their title is clicked', () => {
+    expect(isLongTaskBody('one\ntwo\nthree\nfour')).toBe(true)
+    expect(isLongTaskBody('x'.repeat(220))).toBe(true)
+    expect(isLongTaskBody('Short task')).toBe(false)
+    const collapsed = renderToStaticMarkup(taskTitleRow('todo', 'one\ntwo\nthree\nfour', () => {}, { long: true, expanded: false }))
+    expect(collapsed).toContain('is-collapsed')
+    expect(collapsed).toContain('aria-expanded="false"')
+    const expanded = renderToStaticMarkup(taskTitleRow('todo', 'one\ntwo\nthree\nfour', () => {}, { long: true, expanded: true }))
+    expect(expanded).toContain('is-expanded')
+    expect(expanded).toContain('aria-expanded="true"')
+  })
+})
+
+it('names both priority and weight on every task hover summary', () => {
+  expect(projectTaskScaleSummary({priority:'high',weight:'heavy'})).toBe('Priority: High · Weight: Heavy')
+  expect(projectTaskScaleSummary({priority:'low',weight:'light'})).toBe('Priority: Low · Weight: Light')
+})
+
 describe('Ctrl+Enter submits a filed task', () => {
   it('requests form submission on Ctrl+Enter and Cmd+Enter', () => {
     for (const overrides of [{ ctrlKey: true }, { metaKey: true }]) {
@@ -206,5 +225,13 @@ describe('ProjectBacklogPane compose form image upload', () => {
     const html = render()
     expect(html).toContain('aria-label="Task type filter"')
     expect(html).toContain('<option value="task">Tasks</option>')
+  })
+
+  it('starts with done and archived tasks excluded by explicit toggles', () => {
+    const html = render()
+    expect(html).toContain('aria-label="Show done tasks"')
+    expect(html).toContain('aria-label="Show archived tasks"')
+    expect(html).not.toContain('aria-label="Show done tasks" checked')
+    expect(html).not.toContain('aria-label="Show archived tasks" checked')
   })
 })

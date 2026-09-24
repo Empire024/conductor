@@ -13,7 +13,7 @@
  */
 
 import type { AgentActivityPhase, AgentProviderId, RuntimeProcessSummary } from './models'
-import type { ProjectTaskKind, ProjectTaskPriority, ProjectTaskWeight } from './project-backlog'
+import type { ProjectTaskKind, ProjectTaskPriority, ProjectTaskStatus, ProjectTaskWeight } from './project-backlog'
 import type { PendingInteraction, SessionPhase, StructuredProvider, TimelineItem } from './structured-agent'
 import type { SystemMetricsSnapshot } from './system-metrics'
 import type { WeeklyModelUsageReport } from './weekly-model-usage'
@@ -205,6 +205,7 @@ export interface PhoneAccessBridge {
  *   POST /api/sessions/:id/interrupt                                -> { phase }
  *   POST /api/sessions/:id/resume                                   -> { phase }
  *   POST /api/tabs/open                   PhoneOpenTabRequest       -> PhoneOpenTabResult
+ *   GET  /api/projects/:id/tasks?offset=&limit=                     -> PhoneProjectTaskPage
  *   POST /api/projects/:id/tasks          PhoneProjectTaskRequest   -> PhoneProjectTaskResult
  *   GET  /api/metrics                                               -> PhoneMetrics
  *   POST /api/push/subscribe              { subscription }          -> { ok: true }
@@ -372,6 +373,21 @@ export interface PhoneProjectTaskResult {
   kind: ProjectTaskKind
   priority: ProjectTaskPriority
   weight: ProjectTaskWeight
+}
+
+export interface PhoneProjectTask {
+  id: string
+  title: string
+  kind: ProjectTaskKind
+  status: ProjectTaskStatus
+  priority: ProjectTaskPriority
+  weight: ProjectTaskWeight
+}
+
+export interface PhoneProjectTaskPage {
+  projectId: string
+  tasks: PhoneProjectTask[]
+  page: { offset: number; limit: number; total: number; hasMore: boolean }
 }
 
 export interface PhoneRuntimeProcess extends RuntimeProcessSummary {

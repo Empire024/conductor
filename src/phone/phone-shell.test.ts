@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest'
 const bootSource = readFileSync(new URL('./boot.js', import.meta.url), 'utf8')
 const swSource = readFileSync(new URL('./sw.js', import.meta.url), 'utf8')
 const indexSource = readFileSync(new URL('./index.html', import.meta.url), 'utf8')
+const appSource = readFileSync(new URL('./app.js', import.meta.url), 'utf8')
 
 const ORIGIN = 'https://phone.test:51841'
 const IPHONE_SAFARI = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1'
@@ -268,6 +269,15 @@ describe('index.html', () => {
     expect(boot).toBeGreaterThan(0)
     expect(app).toBeGreaterThan(boot)
     expect(indexSource).not.toMatch(/<script>(?!<\/script>)/)
+  })
+})
+
+describe('phone task section', () => {
+  it('has a dedicated Tasks route and keeps project-task creation out of New', () => {
+    expect(appSource).toContain("hash.indexOf('#/tasks')")
+    expect(appSource).toContain("{ id: 'tasks', label: 'Tasks', hash: '#/tasks' }")
+    expect(appSource).toContain("api('/api/projects/' + encodeURIComponent(form.projectId) + '/tasks?offset='")
+    expect(appSource).not.toContain("{ id: 'project', label: 'Project task' }")
   })
 })
 

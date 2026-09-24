@@ -554,6 +554,7 @@
     const hash = window.location.hash || '#/'
     const session = /^#\/session\/(.+)$/.exec(hash)
     if (session) return { name: 'session', id: decodeURIComponent(session[1]), key: 'session:' + session[1] }
+    if (hash.indexOf('#/tasks') === 0) return { name: 'tasks', key: 'tasks' }
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
     if (hash.indexOf('#/system') === 0) return { name: 'system', key: 'system' }
     if (hash.indexOf('#/phone') === 0) return { name: 'phone', key: 'phone' }
@@ -606,6 +607,7 @@
   const buildScreen = route => {
     if (route.name === 'pair') return pairScreen()
     if (route.name === 'session') return conversationScreen(route.id)
+    if (route.name === 'tasks') return projectTasksScreen()
     if (route.name === 'new') return newTaskScreen()
     if (route.name === 'system') return systemScreen()
     if (route.name === 'phone') return phoneScreen()
@@ -618,6 +620,7 @@
 
   const TAB_ICONS = {
     sessions: ['M4 7h16', 'M4 12h16', 'M4 17h11'],
+    tasks: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M3.5 6h.01', 'M3.5 12h.01', 'M3.5 18h.01'],
     new: ['M12 5v14', 'M5 12h14'],
     system: ['M3 13h3.5l2.5-6 3.5 12 2.5-6H21'],
     phone: ['M8.5 2.75h7a1.75 1.75 0 0 1 1.75 1.75v15a1.75 1.75 0 0 1-1.75 1.75h-7A1.75 1.75 0 0 1 6.75 19.5v-15A1.75 1.75 0 0 1 8.5 2.75Z', 'M11 18.5h2']
@@ -628,6 +631,7 @@
     bar.setAttribute('aria-label', 'Sections')
     const tabs = [
       { id: 'sessions', label: 'Sessions', hash: '#/' },
+      { id: 'tasks', label: 'Tasks', hash: '#/tasks' },
       { id: 'new', label: 'New', hash: '#/new' },
       { id: 'system', label: 'System', hash: '#/system' },
       { id: 'phone', label: 'Phone', hash: '#/phone' }
@@ -2076,6 +2080,120 @@
     }
   }
 
+  // ------------------------------------------------------------------ project tasks screen
+
+  const projectTasksScreen = () => {
+    const root = el('div', 'screen')
+    const header = topbar()
+    const scroll = scroller()
+    root.appendChild(header)
+    root.appendChild(scroll)
+    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'Tasks')]))
+
+    let page = { tasks: [], page: { offset: 0, limit: 20, total: 0, hasMore: false } }
+    let loading = false
+    let adding = false
+    let problem = ''
+    const expanded = {}
+
+    const load = async reset => {
+      reconcileForm()
+      const form = state.form
+      if (!form || !form.projectId || loading) return
+      loading = true
+      problem = ''
+      const projectId = form.projectId
+      const offset = reset ? 0 : page.tasks.length
+      draw()
+      try {
+        const next = await api('/api/projects/' + encodeURIComponent(form.projectId) + '/tasks?offset=' + offset + '&limit=20')
+        if (projectId !== state.form.projectId) return
+        page = reset ? next : { ...next, tasks: page.tasks.concat(next.tasks || []) }
+      } catch (error) { problem = errorMessage(error) }
+      finally { loading = false; if (screen && screen.key === 'tasks') draw() }
+    }
+
+    const draw = () => {
+      reconcileForm()
+      const top = scroll.scrollTop
+      clear(scroll)
+      const phone = state.phone
+      if (!phone) { scroll.appendChild(emptyNote('Reading this computerâ€¦')); return }
+      const form = state.form
+      const body = el('div', 'form project-tasks-phone')
+      body.appendChild(field('Project', select(
+        (phone.projects || []).map(entry => ({ value: entry.id, label: entry.name })),
+        form.projectId,
+        value => { form.projectId = value; page = { tasks: [], page: { offset: 0, limit: 20, total: 0, hasMore: false } }; draw(); void load(true) }
+      )))
+
+      const quick = el('section', 'card task-quick-add')
+      quick.appendChild(el('h2', 'card-title', 'Quick add'))
+      const report = el('textarea', 'input prompt')
+      report.rows = 3
+      report.placeholder = 'Add a task, bug, feature, or idea'
+      report.setAttribute('aria-label', 'New project task')
+      report.maxLength = phone.projectTaskMaxLength || 200000
+      report.value = form.taskTitle
+      report.addEventListener('input', () => { form.taskTitle = report.value; paintAdd() })
+      quick.appendChild(report)
+      const scales = el('div', 'task-scales')
+      const taskKind = select(['task', 'bug', 'feature', 'idea'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskKind, value => { form.taskKind = value })
+      const taskPriority = select(['high', 'normal', 'low'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskPriority, value => { form.taskPriority = value })
+      const taskWeight = select(['heavy', 'medium', 'light'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskWeight, value => { form.taskWeight = value })
+      taskKind.setAttribute('aria-label', 'Task type'); taskPriority.setAttribute('aria-label', 'Task priority'); taskWeight.setAttribute('aria-label', 'Task weight')
+      scales.appendChild(taskKind); scales.appendChild(taskPriority); scales.appendChild(taskWeight)
+      quick.appendChild(scales)
+      const add = button('primary wide', 'Add task', async () => {
+        if (adding || !form.taskTitle.trim()) return
+        adding = true; paintAdd(); problem = ''
+        try {
+          const created = await api('/api/projects/' + encodeURIComponent(form.projectId) + '/tasks', { method: 'POST', body: { title: form.taskTitle, kind: form.taskKind, priority: form.taskPriority, weight: form.taskWeight } })
+          form.taskTitle = ''
+          showToast({ kind: 'done', title: 'Project task added', body: created && created.title, url: '#/tasks' })
+          page = { tasks: [], page: { offset: 0, limit: 20, total: 0, hasMore: false } }
+          adding = false
+          await load(true)
+        } catch (error) { problem = errorMessage(error); adding = false; draw() }
+      })
+      const paintAdd = () => { add.disabled = adding || !form.projectId || !form.taskTitle.trim(); add.textContent = adding ? 'Addingâ€¦' : 'Add task' }
+      paintAdd()
+      quick.appendChild(add)
+      body.appendChild(quick)
+
+      const project = projectById(form.projectId)
+      const heading = el('div', 'task-list-head')
+      heading.appendChild(el('h2', 'card-title', project ? project.name : 'Project tasks'))
+      heading.appendChild(el('span', 'muted-note', page.page.total + ' open'))
+      body.appendChild(heading)
+      const list = el('div', 'phone-task-list')
+      for (const task of page.tasks || []) {
+        const card = el('article', 'card phone-task')
+        const text = el('button', 'phone-task-title' + (expanded[task.id] ? ' expanded' : ''), task.title)
+        text.type = 'button'
+        text.setAttribute('aria-expanded', expanded[task.id] ? 'true' : 'false')
+        text.addEventListener('click', () => { expanded[task.id] = !expanded[task.id]; draw() })
+        card.appendChild(text)
+        card.appendChild(el('p', 'card-note', [task.status === 'doing' ? 'In progress' : 'To do', task.kind, task.priority + ' priority', task.weight + ' weight'].join(' · ')))
+        list.appendChild(card)
+      }
+      if (!page.tasks.length && !loading) list.appendChild(emptyNote('No open tasks in this project.'))
+      body.appendChild(list)
+      if (page.page.hasMore) body.appendChild(button('ghost wide task-more', loading ? 'Loadingâ€¦' : 'Load more', () => { if (!loading) void load(false) }))
+      if (loading && !page.tasks.length) body.appendChild(emptyNote('Loading tasksâ€¦'))
+      if (problem) body.appendChild(el('p', 'pending-error', problem))
+      scroll.appendChild(body)
+      scroll.scrollTop = top
+    }
+
+    scroll.addEventListener('scroll', () => {
+      if (!loading && page.page.hasMore && scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 180) void load(false)
+    })
+    draw()
+    if (state.form && state.form.projectId) void load(true)
+    return { key: 'tasks', root: root, update: () => { reconcileForm(); draw(); if (state.form && state.form.projectId) void load(true) } }
+  }
+
   // ------------------------------------------------------------------ new task screen
 
   const projectById = id => ((state.phone && state.phone.projects) || []).filter(project => project.id === id)[0] || null
@@ -2089,7 +2207,7 @@
   const reconcileForm = () => {
     const phone = state.phone
     if (!phone) return
-    const form = state.form || (state.form = { mode: 'agent', projectId: '', workspaceId: '', machineId: '', provider: '', model: '', effort: '', title: '', prompt: '', taskTitle: '', taskKind: 'task', taskPriority: 'normal', taskWeight: 'medium' })
+    const form = state.form || (state.form = { projectId: '', workspaceId: '', machineId: '', provider: '', model: '', effort: '', title: '', prompt: '', taskTitle: '', taskKind: 'task', taskPriority: 'normal', taskWeight: 'medium' })
     const projects = phone.projects || []
     if (!projectById(form.projectId)) form.projectId = projects.length ? projects[0].id : ''
     const project = projectById(form.projectId)
@@ -2139,51 +2257,11 @@
       const model = models.filter(entry => entry.id === form.model)[0] || null
       const body = el('div', 'form')
 
-      const modes = el('div', 'chips new-modes')
-      for (const entry of [{ id: 'agent', label: 'Conversation' }, { id: 'project', label: 'Project task' }]) {
-        const choice = button('chip' + (form.mode === entry.id ? ' selected' : ''), entry.label, () => { form.mode = entry.id; draw() })
-        choice.setAttribute('aria-pressed', form.mode === entry.id ? 'true' : 'false')
-        modes.appendChild(choice)
-      }
-      body.appendChild(modes)
-
       body.appendChild(field('Project', select(
         (phone.projects || []).map(entry => ({ value: entry.id, label: entry.name })),
         form.projectId,
         value => { form.projectId = value; form.workspaceId = ''; form.machineId = ''; draw() }
       )))
-
-      if (form.mode === 'project') {
-        const report = el('textarea', 'input prompt')
-        report.rows = 7
-        report.placeholder = 'Describe the task, bug, feature, or idea'
-        report.maxLength = phone.projectTaskMaxLength || 200000
-        report.value = form.taskTitle
-        report.addEventListener('input', () => { form.taskTitle = report.value; paintTask() })
-        body.appendChild(field('Task', report, 'Saved to this project\'s feature-list.md.'))
-        body.appendChild(field('Type', select(['task', 'bug', 'feature', 'idea'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskKind, value => { form.taskKind = value })))
-        body.appendChild(field('Priority', select(['high', 'normal', 'low'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskPriority, value => { form.taskPriority = value })))
-        body.appendChild(field('Weight', select(['heavy', 'medium', 'light'].map(value => ({ value: value, label: value.charAt(0).toUpperCase() + value.slice(1) })), form.taskWeight, value => { form.taskWeight = value })))
-        const problem = el('p', 'pending-error'); problem.hidden = true
-        const add = button('primary wide', 'Add project task', async () => {
-          if (busy || !form.taskTitle.trim()) return
-          busy = true; add.disabled = true; add.textContent = 'Addingâ€¦'; problem.hidden = true
-          try {
-            const created = await api('/api/projects/' + encodeURIComponent(form.projectId) + '/tasks', { method: 'POST', body: { title: form.taskTitle, kind: form.taskKind, priority: form.taskPriority, weight: form.taskWeight } })
-            form.taskTitle = ''; busy = false
-            showToast({ kind: 'done', title: 'Project task added', body: created && created.title, url: '#/' })
-            go('#/')
-          } catch (error) {
-            busy = false; problem.textContent = errorMessage(error); problem.hidden = false; add.textContent = 'Add project task'; paintTask()
-          }
-        })
-        const reason = el('p', 'field-hint reason')
-        const paintTask = () => {
-          const blocker = !form.projectId ? 'Add a project on the computer first.' : !form.taskTitle.trim() ? 'Write the task first.' : ''
-          add.disabled = busy || Boolean(blocker); reason.textContent = blocker; reason.hidden = !blocker
-        }
-        paintTask(); body.appendChild(add); body.appendChild(reason); body.appendChild(problem); scroll.appendChild(body); return
-      }
 
       const workspaces = project ? project.workspaces || [] : []
       body.appendChild(field('Workspace', select(

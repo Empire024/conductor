@@ -428,7 +428,11 @@ export class RemoteControlHost {
       if (!this.terminals) throw new RemoteAccessError('Terminals are not available on this machine.', 503)
       return this.terminals.call(peer, method, args)
     }
-    if (method === 'tasks.list') return backlogs.get(this.deps.peers.requireProject(peer, args.projectId).id)
+    if (method === 'tasks.list') {
+      const projectId=this.deps.peers.requireProject(peer,args.projectId).id
+      if(!['query','kind','includeDone','includeArchived','offset','limit'].some(key=>key in args))return backlogs.get(projectId)
+      return backlogs.get(projectId,{...(typeof args.query==='string'?{query:args.query}:{}),...(typeof args.kind==='string'?{kind:args.kind as ProjectTaskKind}:{}),includeDone:args.includeDone===true,includeArchived:args.includeArchived===true,...(typeof args.offset==='number'?{offset:args.offset}:{}),...(typeof args.limit==='number'?{limit:args.limit}:{})})
+    }
     if (method === 'tasks.create') {
       const project = this.deps.peers.requireProject(peer, args.projectId)
       const board = await backlogs.get(project.id)

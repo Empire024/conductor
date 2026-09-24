@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { lstatSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import type { AgentSpec } from '../shared/models'
-import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskEdit, ProjectTaskKind, ProjectTaskOwner, ProjectTaskPriority, ProjectTaskWeight } from '../shared/project-backlog'
-import { PROJECT_TASK_MAX_LENGTH } from '../shared/project-backlog'
+import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskEdit, ProjectTaskKind, ProjectTaskListQuery, ProjectTaskOwner, ProjectTaskPriority, ProjectTaskWeight } from '../shared/project-backlog'
+import { PROJECT_TASK_ARCHIVE_AFTER_MS, PROJECT_TASK_MAX_LENGTH, PROJECT_TASK_PAGE_SIZE } from '../shared/project-backlog'
 import type { SourceControlChangeSet } from '../shared/source-control'
 import type { ConductorDatabase } from './database'
 import type { SourceControl } from './source-control'
@@ -36,6 +36,47 @@ const sections:Record<ProjectTaskKind,{heading:string;pattern:RegExp}> = {
   bug: {heading:'Bugs', pattern: /^(?:#{1,6}\s*)?(?:bugs?|bug list)\s*:?\s*$/i},
   feature: {heading:'Features', pattern: /^(?:#{1,6}\s*)?(?:features?|feature list)\s*:?\s*$/i},
   idea: {heading:'Ideas', pattern: /^(?:#{1,6}\s*)?(?:ideas?|idea list)\s*:?\s*$/i}
+}
+const priorityRank:Record<ProjectTaskPriority,number>={high:0,normal:1,low:2}
+const statusRank:Record<ProjectTask['status'],number>={doing:0,todo:1,done:2}
+
+function createdAt(task:ProjectTask):number {
+  const first=task.activity.at(-1)
+  const stamp=first?Date.parse(first.at):NaN
+  return Number.isFinite(stamp)?stamp:task.line
+}
+function completedAt(task:ProjectTask):number {
+  let stamp=NaN
+  for(const activity of task.activity) {
+    if(activity.status!=='done')break
+    const candidate=Date.parse(activity.at)
+    if(Number.isFinite(candidate))stamp=candidate
+  }
+  return stamp
+}
+
+/** Apply archive, search and paging before a task list crosses IPC or the phone connection. */
+export function pageProjectTasks(tasks:ProjectTask[],query:ProjectTaskListQuery,now=Date.now()):Pick<ProjectBacklog,'tasks'|'page'|'summary'> {
+  const prepared=tasks.map(task=> {
+    const completed=completedAt(task)
+    const archived=task.status==='done' && Number.isFinite(completed) && completed<now-PROJECT_TASK_ARCHIVE_AFTER_MS
+    return archived?{...task,archived:true}:{...task,archived:undefined}
+  })
+  const needle=typeof query.query==='string'?query.query.trim().toLocaleLowerCase():''
+  const visible=prepared.filter(task=> {
+    if(task.archived && query.includeArchived!==true)return false
+    if(!task.archived && task.status==='done' && query.includeDone!==true)return false
+    if(query.kind && query.kind!=='all' && task.kind!==query.kind)return false
+    return !needle || task.title.toLocaleLowerCase().includes(needle)
+  }).sort((a,b)=>statusRank[a.status]-statusRank[b.status] || priorityRank[a.priority]-priorityRank[b.priority] || createdAt(b)-createdAt(a))
+  const offset=Number.isInteger(query.offset)&&query.offset!>=0?query.offset!:0
+  const requested=Number.isInteger(query.limit)?query.limit!:PROJECT_TASK_PAGE_SIZE
+  const limit=Math.max(1,Math.min(100,requested))
+  return {
+    tasks:visible.slice(offset,offset+limit),
+    page:{offset,limit,total:visible.length,hasMore:offset+limit<visible.length},
+    summary:{total:prepared.length,completed:prepared.filter(task=>task.status==='done').length,archived:prepared.filter(task=>task.archived).length}
+  }
 }
 
 /** Who made a task move. Agents are identified by their live conversation. */
@@ -154,17 +195,18 @@ export class ProjectBacklogs {
     if(!lstatSync(path).isFile() || statSync(path).size>maximum)throw new Error('The project task file must be a text file no larger than 1 MB')
     return path
   }
-  async get(projectId:string):Promise<ProjectBacklog> {
+  async get(projectId:string,query?:ProjectTaskListQuery):Promise<ProjectBacklog> {
     const path=await this.ensure(projectId), text=readFileSync(path,'utf8')
     if(Buffer.byteLength(text)>maximum)throw new Error('The project task file is too large')
     const owners=this.owners(projectId), tasks=parseProjectTasks(text)
     const history=await this.reconcile(projectId,tasks)
     for(const task of tasks)task.activity=history.get(task.id)??[]
     const sourceControl=await this.sourceControl?.describe(projectId)
-    return {projectId,path:PROJECT_TASK_FILE,revision:digest(text),tasks,owners,
+    const view=query?pageProjectTasks(tasks,query):{tasks}
+    return {projectId,path:PROJECT_TASK_FILE,revision:digest(text),...view,owners,
       sourceControl:sourceControl??{projectId,available:false,enabled:false,reason:'Repository links are unavailable in this window.'}}
   }
-  async edit(projectId:string,revision:string,edit:ProjectTaskEdit,actor?:ProjectTaskActor):Promise<ProjectBacklog> {
+  async edit(projectId:string,revision:string,edit:ProjectTaskEdit,actor?:ProjectTaskActor,query?:ProjectTaskListQuery):Promise<ProjectBacklog> {
     if(!edit || typeof revision!=='string')throw new Error('Invalid task edit')
     const path=await this.ensure(projectId), text=readFileSync(path,'utf8')
     if(digest(text)!==revision)throw new Error('The task list changed on disk. Your edit was not saved; refresh and try again.')
@@ -184,7 +226,7 @@ export class ProjectBacklogs {
       const agentId=edit.agentId===undefined?before.agentId:(edit.agentId??undefined)
       if(status!==before.status || agentId!==before.agentId)await this.record(projectId,before.id,status,agentId,actor)
     }
-    return this.get(projectId)
+    return this.get(projectId,query)
   }
   /** Diffs are anchored to the commits a task was opened against and last moved against. */
   async changes(projectId:string,taskId:string):Promise<SourceControlChangeSet> {

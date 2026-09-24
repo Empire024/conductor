@@ -3,6 +3,7 @@ import { makeId, type AgentProviderInfo, type AgentSpec, type PaneTab } from '..
 import type { AgentControl, } from './agent-control'
 import type { AgentControlScope, AgentControlUiRequest } from '../shared/agent-control'
 import type { ProjectTask, ProjectTaskDispatchAssignment, ProjectTaskDispatchOptions, ProjectTaskDispatchRequest, ProjectTaskDispatchResult } from '../shared/project-backlog'
+import { PROJECT_TASK_PAGE_SIZE } from '../shared/project-backlog'
 import { MAX_PROMPT_CHARS, type SessionSettings, type StructuredProvider } from '../shared/structured-agent'
 import { AUTO_FIXER_INSTRUCTIONS } from '../shared/orchestration'
 import { resolveEffortChoice } from '../shared/model-effort'
@@ -206,7 +207,7 @@ export class ProjectTaskDispatcher {
       if(assignment.status==='failed')assignment.error+=' The selected tasks were kept. Inspect the visible tab before retrying an uncertain provider result.'
     }
     this.deps.changed(projectId)
-    return {board:await backlogs.get(projectId),assignments:[assignment]}
+    return {board:await backlogs.get(projectId,{offset:0,limit:PROJECT_TASK_PAGE_SIZE,includeDone:false,includeArchived:false}),assignments:[assignment]}
   }
 
   private autoTarget(options:ProjectTaskDispatchOptions):{catalog:ProjectTaskDispatchOptions['providers'][number];model:ProjectTaskDispatchOptions['providers'][number]['models'][number]} {

@@ -119,6 +119,15 @@ const escapes: Array<[string, string]> = [
 ]
 
 describe('what a paired machine may read and write', () => {
+  it('forwards an explicit task page without changing an ordinary full tasks.list read', async () => {
+    const get=vi.fn(async()=>({revision:'rev-1',tasks:[],page:{offset:0,limit:20,total:0,hasMore:false}}))
+    fix=fixture({backlogs:{get} as unknown as ProjectBacklogs})
+    await fix.call('tasks.list',{projectId:'shared-project',offset:20,limit:20,includeDone:false,includeArchived:false})
+    expect(get).toHaveBeenLastCalledWith('shared-project',{includeDone:false,includeArchived:false,offset:20,limit:20})
+    await fix.call('tasks.list',{projectId:'shared-project'})
+    expect(get).toHaveBeenLastCalledWith('shared-project')
+  })
+
   it('creates a project task only in the exact granted project with an optimistic revision', async () => {
     const get = vi.fn(async () => ({ revision: 'rev-1', tasks: [] }))
     const edit = vi.fn(async (_projectId, revision, change) => {

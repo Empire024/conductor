@@ -12,7 +12,7 @@ import { normalizeUsageWindows, summarizeUsage, updatedSequence, usageWindowAppl
 import {
   DEFAULT_PHONE_SETTINGS, PHONE_PAIRING_TTL_MS, PHONE_STATE_LIMITS,
   type PhoneAccessSettings, type PhoneAccessState, type PhoneConversation, type PhoneDevice, type PhoneMessageMode, type PhoneMetrics,
-  type PhoneNotification, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
+  type PhoneNotification, type PhoneOpenTabRequest, type PhoneOpenTabResult, type PhonePairingOffer, type PhoneProjectTaskPage, type PhoneProjectTaskRequest, type PhoneProjectTaskResult, type PhonePushSubscription,
   type PhoneSelf, type PhoneSessionSummary, type PhoneState, type PhoneTailnetView, type PhoneTimelineItem, type PhoneUsageWindow
 } from '../shared/phone-access'
 import { rememberedPermission } from './app-settings'
@@ -101,6 +101,7 @@ export interface PhoneRemoteSessions {
 }
 
 export interface PhoneProjectTasks {
+  list(project: ProjectRecord, query: { offset: number; limit: number }): Promise<PhoneProjectTaskPage>
   create(project: ProjectRecord, input: { title: string; kind: ProjectTaskKind; priority: ProjectTaskPriority; weight: ProjectTaskWeight }): Promise<PhoneProjectTaskResult>
 }
 
@@ -918,6 +919,17 @@ export class PhoneAccessService {
     const result = await this.deps.projectTasks.create(project, { title, kind: raw.kind as ProjectTaskKind, priority: priority as ProjectTaskPriority, weight: weight as ProjectTaskWeight })
     this.refresh()
     return result
+  }
+
+  async listProjectTasks(projectId:unknown,input:{offset?:unknown;limit?:unknown}={}):Promise<PhoneProjectTaskPage> {
+    if(typeof projectId!=='string' || !projectId || projectId.length>160)throw new PhoneAccessError('Choose a project that is open in Conductor.',404)
+    const project=this.deps.database.getProject(projectId)
+    if(!project)throw new PhoneAccessError('Choose a project that is open in Conductor.',404)
+    if(!this.deps.projectTasks)throw new PhoneAccessError('Project tasks are unavailable in this Conductor.',503)
+    const offset=input.offset===undefined?0:Number(input.offset), limit=input.limit===undefined?20:Number(input.limit)
+    if(!Number.isInteger(offset)||offset<0)throw new PhoneAccessError('Choose a valid project task offset.')
+    if(!Number.isInteger(limit)||limit<1||limit>50)throw new PhoneAccessError('Choose between 1 and 50 project tasks at a time.')
+    return this.deps.projectTasks.list(project,{offset,limit})
   }
 
   dispose(): void {

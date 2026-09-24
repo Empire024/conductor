@@ -44,7 +44,7 @@ interface Fixture {
   push: ReturnType<typeof vi.fn>
   machines: MachineDescriptor[]
   changed: ReturnType<typeof vi.fn>
-  projectTasks: { create: ReturnType<typeof vi.fn> }
+  projectTasks: { list: ReturnType<typeof vi.fn>; create: ReturnType<typeof vi.fn> }
 }
 
 function fixture(options: { now?: () => number } = {}): Fixture {
@@ -104,7 +104,10 @@ function fixture(options: { now?: () => number } = {}): Fixture {
     { id: 'gemini', displayName: 'Gemini CLI', available: true, installUrl: '', models: [{ id: 'gemini-3', label: 'Gemini 3' }], efforts: [] }
   ]
   const changed = vi.fn()
-  const projectTasks = { create: vi.fn(async (project: ProjectRecord, input: { title: string; kind: 'task' | 'bug' | 'feature' | 'idea'; priority: 'high' | 'normal' | 'low'; weight: 'heavy' | 'medium' | 'light' }) => ({ id: 'task-created', projectId: project.id, ...input })) }
+  const projectTasks = {
+    list: vi.fn(async (project:ProjectRecord,query:{offset:number;limit:number})=>({projectId:project.id,tasks:[{id:'open-task',title:'Open task',kind:'task' as const,status:'todo' as const,priority:'normal' as const,weight:'medium' as const}],page:{...query,total:1,hasMore:false}})),
+    create: vi.fn(async (project: ProjectRecord, input: { title: string; kind: 'task' | 'bug' | 'feature' | 'idea'; priority: 'high' | 'normal' | 'low'; weight: 'heavy' | 'medium' | 'light' }) => ({ id: 'task-created', projectId: project.id, ...input }))
+  }
   const service = new PhoneAccessService({
     store, vault: new MemoryVault(), database, sessions, remote, providers: () => providers, machines: () => machines, machineName: () => 'MAIN', version: '0.1.3',
     ui, metrics: async () => ({ sampledAt: 'now', cpuPercent: 12, cpuCores: 16, memoryUsedBytes: 8e9, memoryTotalBytes: 32e9, gpus: [], processes: [], localServers: [], unavailable: [] }),
@@ -386,6 +389,14 @@ describe('driving a conversation', () => {
 })
 
 describe('starting work from the phone', () => {
+  it('lists only a validated bounded page of open project tasks', async () => {
+    const fix=fixture()
+    await expect(fix.service.listProjectTasks('project-a',{offset:'20',limit:'10'})).resolves.toMatchObject({projectId:'project-a',tasks:[{id:'open-task'}],page:{offset:20,limit:10}})
+    expect(fix.projectTasks.list).toHaveBeenCalledWith(fix.projects[0],{offset:20,limit:10})
+    await expect(fix.service.listProjectTasks('project-a',{offset:-1})).rejects.toThrow('valid project task offset')
+    await expect(fix.service.listProjectTasks('project-a',{limit:51})).rejects.toThrow('between 1 and 50')
+  })
+
   it('adds a validated project task to the exact selected project', async () => {
     const fix = fixture()
     await expect(fix.service.createProjectTask('project-b', { title: '  Keep remote scope\r\nwith details  ', kind: 'bug', priority: 'high', weight: 'heavy' })).resolves.toMatchObject({ id: 'task-created', projectId: 'project-b' })

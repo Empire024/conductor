@@ -2,6 +2,9 @@ import type { SourceControlChangeSet, SourceControlStatus } from './source-contr
 
 /** Large enough for a complete diagnostic report; shared by every task entry point. */
 export const PROJECT_TASK_MAX_LENGTH = 200_000
+/** Completed work remains in feature-list.md forever, but leaves the everyday task view after two weeks. */
+export const PROJECT_TASK_ARCHIVE_AFTER_MS = 14 * 24 * 60 * 60 * 1000
+export const PROJECT_TASK_PAGE_SIZE = 40
 
 export type ProjectTaskStatus = 'todo' | 'doing' | 'done'
 export type ProjectTaskKind = 'task' | 'bug' | 'feature' | 'idea'
@@ -41,13 +44,16 @@ export interface ProjectTaskActivity {
   workspace?:string
   commit?:string
 }
-export interface ProjectTask { id:string; title:string; kind:ProjectTaskKind; status:ProjectTaskStatus; agentId?:string; priority:ProjectTaskPriority; weight:ProjectTaskWeight; line:number; activity:ProjectTaskActivity[] }
+export interface ProjectTask { id:string; title:string; kind:ProjectTaskKind; status:ProjectTaskStatus; agentId?:string; priority:ProjectTaskPriority; weight:ProjectTaskWeight; line:number; activity:ProjectTaskActivity[]; archived?:boolean }
 export interface ProjectTaskOwner { id:string; sessionId:string; title:string; workspace:string; provider:string; phase:string }
-export interface ProjectBacklog { projectId:string; path:string; revision:string; tasks:ProjectTask[]; owners:ProjectTaskOwner[]; sourceControl:SourceControlStatus }
+export interface ProjectTaskListQuery { query?:string; kind?:'all'|ProjectTaskKind; includeDone?:boolean; includeArchived?:boolean; offset?:number; limit?:number }
+export interface ProjectTaskPage { offset:number; limit:number; total:number; hasMore:boolean }
+export interface ProjectTaskSummary { total:number; completed:number; archived:number }
+export interface ProjectBacklog { projectId:string; path:string; revision:string; tasks:ProjectTask[]; owners:ProjectTaskOwner[]; sourceControl:SourceControlStatus; page?:ProjectTaskPage; summary?:ProjectTaskSummary }
 export type ProjectTaskEdit = { type:'add'; title:string; kind:ProjectTaskKind; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | { type:'update'; id:string; title?:string; kind?:ProjectTaskKind; status?:ProjectTaskStatus; agentId?:string|null; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | {type:'remove';id:string}
 export interface ProjectBacklogBridge {
-  get(projectId:string):Promise<ProjectBacklog>
-  edit(projectId:string,revision:string,edit:ProjectTaskEdit):Promise<ProjectBacklog>
+  get(projectId:string,query?:ProjectTaskListQuery):Promise<ProjectBacklog>
+  edit(projectId:string,revision:string,edit:ProjectTaskEdit,query?:ProjectTaskListQuery):Promise<ProjectBacklog>
   setSourceControl(projectId:string,enabled:boolean):Promise<SourceControlStatus>
   changes(projectId:string,taskId:string):Promise<SourceControlChangeSet>
   dispatchOptions(projectId:string):Promise<ProjectTaskDispatchOptions>

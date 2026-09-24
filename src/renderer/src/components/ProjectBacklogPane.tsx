@@ -1,10 +1,10 @@
-import { PROJECT_TASK_MAX_LENGTH } from '../../../shared/project-backlog'
+import { PROJECT_TASK_MAX_LENGTH, PROJECT_TASK_PAGE_SIZE } from '../../../shared/project-backlog'
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Bug, Check, ChevronDown, ChevronRight, Circle, CircleCheck, CircleDot, ClipboardList, FileText, GitBranch, GitCompare, Github, Lightbulb, ListTodo, Pencil, RefreshCw, Search, Send, Sparkles, Trash2, X } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
 import { projectTaskKinds, projectTaskPriorities, projectTaskWeights } from '../../../shared/project-backlog'
-import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskDispatchResult, ProjectTaskDispatchTarget, ProjectTaskEdit, ProjectTaskKind, ProjectTaskPriority, ProjectTaskWeight } from '../../../shared/project-backlog'
+import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskDispatchResult, ProjectTaskDispatchTarget, ProjectTaskEdit, ProjectTaskKind, ProjectTaskListQuery, ProjectTaskPriority, ProjectTaskWeight } from '../../../shared/project-backlog'
 import type { SourceControlChangeSet } from '../../../shared/source-control'
 import type { ContextAttachment } from '../../../shared/structured-agent'
 import { AgentDialog } from '../panes/StructuredAgentRenderers'
@@ -183,8 +183,12 @@ export function taskAuthor(activity:ProjectTaskActivity):string {
 }
 
 /** A done task must read as done at a glance, not just once you notice the muted text. */
-export function taskTitleRow(status:ProjectTask['status'],content:React.ReactNode,onClick:()=>void):React.JSX.Element {
-  return <div className="project-task-title-row">{status==='done' && <Check size={13} className="project-task-done-check" aria-hidden="true"/>}<button className="project-task-title" onClick={onClick}>{content}</button></div>
+export function isLongTaskBody(text:string):boolean {return text.length>180 || text.split('\n').length>3}
+export function projectTaskScaleSummary(task:Pick<ProjectTask,'priority'|'weight'>):string {return 'Priority: '+priorityLabels[task.priority]+' · Weight: '+weightLabels[task.weight]}
+
+export function taskTitleRow(status:ProjectTask['status'],content:React.ReactNode,onClick:()=>void,options?:{long?:boolean;expanded?:boolean}):React.JSX.Element {
+  const long=options?.long===true, expanded=options?.expanded===true
+  return <div className="project-task-title-row">{status==='done' && <Check size={13} className="project-task-done-check" aria-hidden="true"/>}<button className={'project-task-title'+(long?(expanded?' is-expanded':' is-collapsed'):'')} {...(long?{'aria-expanded':expanded,title:expanded?'Collapse task':'Expand task'}:{})} onClick={onClick}>{content}</button></div>
 }
 
 function TaskChanges({project,task,onClose}:{project:ProjectRecord;task:ProjectTask;onClose():void}):React.JSX.Element {
@@ -254,11 +258,13 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
   const [images,setImages]=useState<ContextAttachment[]>(()=>readBacklogDraft(project.id).images)
   const [editing,setEditing]=useState<TaskEditingDraft|null>(()=>readBacklogDraft(project.id).editing),[diffTask,setDiffTask]=useState<ProjectTask|null>(null)
   const [selected,setSelected]=useState<Set<string>>(()=>new Set())
+  const [expanded,setExpanded]=useState<Set<string>>(()=>new Set())
   const [confirmDelete,setConfirmDelete]=useState<string|null>(null)
   const [assignment,setAssignment]=useState<{mode:ProjectTaskAssignmentMode;tasks:ProjectTask[];revision:string}|null>(null)
-  const key='conductor.tasks.done.'+project.id
-  const [doneOpen,setDoneOpen]=useState(()=>localStorage.getItem(key)==='true')
-  const revision=useRef(0),mounted=useRef(false),writing=useRef(false)
+  const doneKey='conductor.tasks.done.'+project.id,archiveKey='conductor.tasks.archived.'+project.id
+  const [showDone,setShowDone]=useState(()=>localStorage.getItem(doneKey)==='true')
+  const [showArchived,setShowArchived]=useState(()=>localStorage.getItem(archiveKey)==='true')
+  const revision=useRef(0),mounted=useRef(false),writing=useRef(false),boardRef=useRef<ProjectBacklog|null>(null)
   const draft=useRef<BacklogDraft>({title,images,editing})
   draft.current={title,images,editing}
   const keepDraft=(next:Partial<BacklogDraft>):void=> {
@@ -268,23 +274,38 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
   const draftTitle=(next:string):void=>{setTitle(next);keepDraft({title:next})}
   const draftImages=(next:ContextAttachment[]):void=>{setImages(next);keepDraft({images:next})}
   const draftEditing=(next:TaskEditingDraft|null):void=>{setEditing(next);keepDraft({editing:next})}
-  useEffect(()=>{setSelected(new Set());setAssignment(null);setConfirmDelete(null);const saved=readBacklogDraft(project.id);draft.current=saved;setTitle(saved.title);setImages(saved.images);setEditing(saved.editing)},[project.id])
+  useEffect(()=>{setSelected(new Set());setExpanded(new Set());setAssignment(null);setConfirmDelete(null);setShowDone(localStorage.getItem('conductor.tasks.done.'+project.id)==='true');setShowArchived(localStorage.getItem('conductor.tasks.archived.'+project.id)==='true');const saved=readBacklogDraft(project.id);draft.current=saved;setTitle(saved.title);setImages(saved.images);setEditing(saved.editing)},[project.id])
   useEffect(()=>{if(board)setSelected(current=>{const available=new Set(board.tasks.map(task=>task.id));const next=new Set([...current].filter(id=>available.has(id)));return next.size===current.size?current:next})},[board])
   // A task deleted elsewhere must not leave an unreachable edit draft behind.
   useEffect(()=>{if(board && editing && !board.tasks.some(task=>task.id===editing.id))draftEditing(null)},[board,editing])
   useEffect(()=>{if(board && confirmDelete && confirmDelete!=='selection' && !board.tasks.some(task=>task.id===confirmDelete))setConfirmDelete(null)},[board,confirmDelete])
-  const refresh=useCallback(async()=> {
+  const viewQuery=(offset=0,limit=PROJECT_TASK_PAGE_SIZE):ProjectTaskListQuery=>({query,kind,includeDone:showDone,includeArchived:showArchived,offset,limit})
+  const acceptBoard=(next:ProjectBacklog):void=>{boardRef.current=next;setBoard(next)}
+  const refresh=useCallback(async(force=false)=> {
     const sequence=++revision.current
-    try {const next=await window.conductor.projectTasks.get(project.id);if(mounted.current && sequence===revision.current)setBoard(next)}
+    try {const next=await window.conductor.projectTasks.get(project.id,{query,kind,includeDone:showDone,includeArchived:showArchived,offset:0,limit:PROJECT_TASK_PAGE_SIZE});if(mounted.current && sequence===revision.current){const current=boardRef.current;if(!force&&current?.revision===next.revision)acceptBoard({...next,tasks:current.tasks,page:current.page});else acceptBoard(next)}}
     catch(reason){if(mounted.current)setError(String(reason))}
-  },[project.id])
-  useEffect(()=>{mounted.current=true;void refresh();const timer=setInterval(()=>{if(!writing.current)void refresh()},1500);window.addEventListener('focus',refresh);return()=>{mounted.current=false;revision.current++;clearInterval(timer);window.removeEventListener('focus',refresh)}},[refresh])
-  useEffect(()=>window.conductor.files.onChanged(change=>{if(change.projectId===project.id && change.path.replaceAll('\\','/').toLowerCase()==='feature-list.md' && !writing.current)void refresh()}),[project.id,refresh])
+  },[project.id,query,kind,showDone,showArchived])
+  useEffect(()=>{mounted.current=true;boardRef.current=null;void refresh(true);const timer=setInterval(()=>{if(!writing.current)void refresh(false)},1500);const focus=():void=>{if(!writing.current)void refresh(true)};window.addEventListener('focus',focus);return()=>{mounted.current=false;revision.current++;clearInterval(timer);window.removeEventListener('focus',focus)}},[refresh])
+  useEffect(()=>window.conductor.files.onChanged(change=>{if(change.projectId===project.id && change.path.replaceAll('\\','/').toLowerCase()==='feature-list.md' && !writing.current)void refresh(true)}),[project.id,refresh])
+  const loadMore=async():Promise<void>=> {
+    const current=boardRef.current
+    if(!current?.page?.hasMore || writing.current)return
+    writing.current=true
+    try {
+      const next=await window.conductor.projectTasks.get(project.id,viewQuery(current.tasks.length,PROJECT_TASK_PAGE_SIZE))
+      if(!mounted.current)return
+      if(next.revision!==current.revision){acceptBoard(next);return}
+      const known=new Set(current.tasks.map(task=>task.id))
+      acceptBoard({...next,tasks:[...current.tasks,...next.tasks.filter(task=>!known.has(task.id))]})
+    }catch(reason){if(mounted.current)setError(String(reason))}
+    finally{writing.current=false}
+  }
   const edit=async(change:ProjectTaskEdit):Promise<boolean>=> {
     if(!board || board.projectId!==project.id || writing.current)return false
     writing.current=true;setBusy(true);setError('');revision.current++
-    try {const next=await window.conductor.projectTasks.edit(project.id,board.revision,change);if(mounted.current)setBoard(next);return true}
-    catch(reason){if(mounted.current)setError(String(reason));await refresh();return false}
+    try {const next=await window.conductor.projectTasks.edit(project.id,board.revision,change,viewQuery(0,Math.max(PROJECT_TASK_PAGE_SIZE,Math.min(100,board.tasks.length))));if(mounted.current)acceptBoard(next);return true}
+    catch(reason){if(mounted.current)setError(String(reason));await refresh(true);return false}
     finally{writing.current=false;if(mounted.current)setBusy(false)}
   }
   const dispatch=async(target:ProjectTaskDispatchTarget,prompt?:string):Promise<ProjectTaskDispatchResult>=> {
@@ -292,9 +313,9 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
     writing.current=true;setBusy(true);setError('');revision.current++
     try {
       const result=await window.conductor.projectTasks.dispatch(project.id,assignment.revision,{taskIds:assignment.tasks.map(task=>task.id),target,...(prompt?{prompt}:{})})
-      if(mounted.current){setBoard(result.board);const sent=new Set(result.assignments.filter(item=>item.status!=='failed').flatMap(item=>item.taskIds));setSelected(current=>new Set([...current].filter(id=>!sent.has(id))))}
+      if(mounted.current){acceptBoard(result.board);const sent=new Set(result.assignments.filter(item=>item.status!=='failed').flatMap(item=>item.taskIds));setSelected(current=>new Set([...current].filter(id=>!sent.has(id))));void refresh(true)}
       return result
-    } catch(reason){await refresh();throw reason}
+    } catch(reason){await refresh(true);throw reason}
     finally{writing.current=false;if(mounted.current)setBusy(false)}
   }
   const removeTasks=async(ids:string[]):Promise<boolean>=> {
@@ -302,18 +323,18 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
     writing.current=true;setBusy(true);setError('');revision.current++
     let current=board
     try {
-      for(const id of ids)current=await window.conductor.projectTasks.edit(project.id,current.revision,{type:'remove',id})
-      if(mounted.current)setBoard(current)
+      for(const id of ids)current=await window.conductor.projectTasks.edit(project.id,current.revision,{type:'remove',id},viewQuery(0,Math.max(PROJECT_TASK_PAGE_SIZE,Math.min(100,current.tasks.length))))
+      if(mounted.current)acceptBoard(current)
       setSelected(existing=>new Set([...existing].filter(id=>!ids.includes(id))))
       return true
-    } catch(reason){if(mounted.current)setError(String(reason));await refresh();return false}
+    } catch(reason){if(mounted.current)setError(String(reason));await refresh(true);return false}
     finally{writing.current=false;if(mounted.current)setBusy(false)}
   }
   const scm=board?.sourceControl
   const links=Boolean(scm?.enabled && scm.available)
   const toggleSourceControl=async(enabled:boolean):Promise<void>=> {
     setError('')
-    try {await window.conductor.projectTasks.setSourceControl(project.id,enabled);await refresh()}
+    try {await window.conductor.projectTasks.setSourceControl(project.id,enabled);await refresh(true)}
     catch(reason){setError(String(reason))}
   }
   const openOnGithub=async(task:ProjectTask):Promise<void>=> {
@@ -324,8 +345,8 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
       await window.conductor.system.openExternal(changes.compareUrl)
     } catch(reason){setError(String(reason))}
   }
-  const visible=sortProjectTasks((board?.tasks??[]).filter(task=>(kind==='all'||task.kind===kind) && task.title.toLowerCase().includes(query.toLowerCase())))
-  const todo=visible.filter(task=>task.status==='todo'),doing=visible.filter(task=>task.status==='doing'),done=visible.filter(task=>task.status==='done')
+  const visible=board?.tasks??[]
+  const todo=visible.filter(task=>task.status==='todo'),doing=visible.filter(task=>task.status==='doing'),done=visible.filter(task=>task.status==='done'&&!task.archived),archived=visible.filter(task=>task.archived)
   const row=(task:ProjectTask):React.JSX.Element=> {
     const owner=board?.owners.find(owner=>owner.id===task.agentId)
     const Selected=selected.has(task.id)?CircleCheck:Circle
@@ -334,10 +355,11 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
     const author=last?taskAuthor(last):''
     const opened=task.activity.length===1 && last?.status==='todo'
     const {text:taskText,images:taskImages}=splitTaskImages(task.title)
-    return <article className={'project-task status-'+task.status+(selected.has(task.id)?' is-selected':'')} key={task.id} data-task-id={task.id}>
+    const long=isLongTaskBody(taskText),isExpanded=expanded.has(task.id)
+    return <article className={'project-task status-'+task.status+(selected.has(task.id)?' is-selected':'')} key={task.id} data-task-id={task.id} title={projectTaskScaleSummary(task)}>
       <button type="button" role="checkbox" className="project-task-check" aria-label={'Select '+task.title} aria-checked={selected.has(task.id)} title={selected.has(task.id)?'Deselect task':'Select task'} disabled={busy} onClick={()=>setSelected(current=>{const next=new Set(current);if(next.has(task.id))next.delete(task.id);else next.add(task.id);return next})}><Selected size={16}/></button>
       <div className="project-task-body">
-        {editing?.id===task.id ? <form onSubmit={event=>{event.preventDefault();if(!editing.title.trim() || busy)return;void edit({type:'update',id:task.id,title:editing.title,kind:editing.kind??task.kind}).then(saved=>{if(saved)draftEditing(null)})}}><textarea autoFocus aria-label="Edit task" value={editing.title} onChange={event=>draftEditing({...editing,title:event.target.value})} onKeyDown={event=>{submitTaskShortcut(event);if(event.key==='Escape' && !event.nativeEvent.isComposing && event.nativeEvent.keyCode!==229)draftEditing(null)}} title="Ctrl+Enter to save; Enter for a new line" maxLength={PROJECT_TASK_MAX_LENGTH}/><div className="project-task-edit-actions"><select aria-label="Edit task type" value={editing.kind??task.kind} onChange={event=>draftEditing({...editing,kind:event.target.value as ProjectTaskKind})} onKeyDown={submitTaskShortcut}><option value="task">Task</option><option value="bug">Bug</option><option value="feature">Feature</option><option value="idea">Idea</option></select><span/><button disabled={busy||!editing.title.trim()} type="submit">Save</button><button type="button" onClick={()=>draftEditing(null)}>Cancel</button></div></form> : taskTitleRow(task.status,taskText || (taskImages.length?'Attached image':task.title),()=>draftEditing({id:task.id,title:task.title,kind:task.kind}))}
+        {editing?.id===task.id ? <form onSubmit={event=>{event.preventDefault();if(!editing.title.trim() || busy)return;void edit({type:'update',id:task.id,title:editing.title,kind:editing.kind??task.kind}).then(saved=>{if(saved)draftEditing(null)})}}><textarea autoFocus aria-label="Edit task" value={editing.title} onChange={event=>draftEditing({...editing,title:event.target.value})} onKeyDown={event=>{submitTaskShortcut(event);if(event.key==='Escape' && !event.nativeEvent.isComposing && event.nativeEvent.keyCode!==229)draftEditing(null)}} title="Ctrl+Enter to save; Enter for a new line" maxLength={PROJECT_TASK_MAX_LENGTH}/><div className="project-task-edit-actions"><select aria-label="Edit task type" value={editing.kind??task.kind} onChange={event=>draftEditing({...editing,kind:event.target.value as ProjectTaskKind})} onKeyDown={submitTaskShortcut}><option value="task">Task</option><option value="bug">Bug</option><option value="feature">Feature</option><option value="idea">Idea</option></select><span/><button disabled={busy||!editing.title.trim()} type="submit">Save</button><button type="button" onClick={()=>draftEditing(null)}>Cancel</button></div></form> : taskTitleRow(task.status,taskText || (taskImages.length?'Attached image':task.title),()=>{if(long)setExpanded(current=>{const next=new Set(current);if(next.has(task.id))next.delete(task.id);else next.add(task.id);return next})},{long,expanded:isExpanded})}
         {taskImages.length>0 && <div className="project-task-images">{taskImages.map(image=><PromptImageThumbnail key={image.id} projectId={project.id} attachment={{id:image.id,kind:'image' as const,name:image.name,path:image.path}}/>)}</div>}
         <div className="project-task-meta"><span className={'project-task-kind '+task.kind}><Kind size={11}/> {kindLabels[task.kind]}</span>
           <select aria-label={'Status of '+task.title} disabled={busy} value={task.status} onChange={event=>void edit({type:'update',id:task.id,status:event.target.value as ProjectTask['status']})}><option value="todo">To do</option><option value="doing">In progress</option><option value="done">Done</option></select>
@@ -361,11 +383,11 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
       </div>
     </article>
   }
-  const shown=[...doing,...todo,...(doneOpen?done:[])]
+  const shown=[...doing,...todo,...done,...archived]
   const allShownSelected=shown.length>0&&shown.every(task=>selected.has(task.id))
   const selectedTasks=(board?.tasks??[]).filter(task=>selected.has(task.id))
   const openAssignment=(mode:ProjectTaskAssignmentMode):void=>{if(board)setAssignment({mode,tasks:selectedTasks,revision:board.revision})}
-  const total=board?.tasks.length??0,completed=board?.tasks.filter(task=>task.status==='done').length??0
+  const total=board?.summary?.total??board?.tasks.length??0,completed=board?.summary?.completed??board?.tasks.filter(task=>task.status==='done').length??0
   return <section className="project-backlog" aria-label="Project tasks">
     <header><div><ListTodo size={17}/><strong>{project.name}</strong><span>{completed}/{total} done</span></div><progress max={Math.max(1,total)} value={completed} aria-label="Project task completion"/>
       <div className="project-backlog-actions"><button title="Open task file" onClick={()=>openWorkspaceFile(project.id,'feature-list.md','editor')}><FileText size={12}/> feature-list.md</button><button title="Refresh project tasks" aria-label="Refresh project tasks" onClick={()=>void refresh()}><RefreshCw size={13}/></button></div>
@@ -381,7 +403,7 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
       <textarea aria-label="New project task" placeholder="Add a task, bug, feature, or idea…" value={title} onChange={event=>draftTitle(event.target.value)} rows={2} maxLength={PROJECT_TASK_MAX_LENGTH} onKeyDown={submitTaskShortcut} title="Ctrl+Enter to add; Enter for a new line"/>
       <div><span className="project-task-add-controls"><PromptImageUpload projectId={project.id} disabled={busy} onError={setError} onAttach={added=>{if(images.length+added.length>20){setError('A task can have up to 20 attached images. Remove some and attach these again.');return}draftImages([...images,...added])}}/><select aria-label="New task type" value={newKind} onChange={event=>setNewKind(event.target.value as ProjectTaskKind)} onKeyDown={submitTaskShortcut}><option value="task">Task</option><option value="bug">Bug</option><option value="feature">Feature</option><option value="idea">Idea</option></select><TaskScaleSlider ariaLabel="New task priority" label="Priority" value={newPriority} values={prioritySliderValues} labels={priorityLabels} onChange={setNewPriority} onKeyDown={submitTaskShortcut}/><TaskScaleSlider ariaLabel="New task weight" label="Weight" value={newWeight} values={weightSliderValues} labels={weightLabels} onChange={setNewWeight} onKeyDown={submitTaskShortcut}/></span><button className="project-task-send" type="submit" title="Add task" aria-label="Add task" disabled={busy||!board||!title.trim()}><Send size={14} aria-hidden="true"/></button></div>
     </form>
-    <div className="project-task-filters"><label><Search size={13}/><input aria-label="Search project tasks" placeholder="Search tasks" value={query} onChange={event=>setQuery(event.target.value)}/>{query&&<button title="Clear search" onClick={()=>setQuery('')}><X size={11}/></button>}</label><select aria-label="Task type filter" value={kind} onChange={event=>setKind(event.target.value as typeof kind)}><option value="all">All types</option><option value="task">Tasks</option><option value="bug">Bugs</option><option value="feature">Features</option><option value="idea">Ideas</option></select></div>
+    <div className="project-task-filters"><label><Search size={13}/><input aria-label="Search project tasks" placeholder="Search tasks" value={query} onChange={event=>setQuery(event.target.value)}/>{query&&<button title="Clear search" onClick={()=>setQuery('')}><X size={11}/></button>}</label><select aria-label="Task type filter" value={kind} onChange={event=>setKind(event.target.value as typeof kind)}><option value="all">All types</option><option value="task">Tasks</option><option value="bug">Bugs</option><option value="feature">Features</option><option value="idea">Ideas</option></select><label className="project-task-toggle"><input type="checkbox" aria-label="Show done tasks" checked={showDone} onChange={event=>{localStorage.setItem(doneKey,String(event.target.checked));setShowDone(event.target.checked)}}/> Done</label><label className="project-task-toggle"><input type="checkbox" aria-label="Show archived tasks" checked={showArchived} onChange={event=>{localStorage.setItem(archiveKey,String(event.target.checked));setShowArchived(event.target.checked)}}/> Archived</label></div>
     <div className="project-task-selection">
       <div><button type="button" disabled={busy||!shown.length} onClick={()=>setSelected(current=>{const next=new Set(current);for(const task of shown){if(allShownSelected)next.delete(task.id);else next.add(task.id)}return next})}>{allShownSelected?'Deselect visible':'Select visible'}</button>
         <span role="status" aria-live="polite">{selected.size} selected</span>{selected.size>0&&<button type="button" disabled={busy} onClick={()=>setSelected(new Set())}>Clear selection</button>}</div>
@@ -393,10 +415,12 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
       </div>}
     </div>
     {error&&<p className="project-task-error" role="alert">{error}</p>}
-    <div className="project-task-list">
+    <div className="project-task-list" onScroll={event=>{const target=event.currentTarget;if(target.scrollHeight-target.scrollTop-target.clientHeight<180)void loadMore()}}>
       {doing.length>0&&<section aria-label="Tasks in progress"><h3><CircleDot size={13}/> In progress <span>{doing.length}</span></h3>{doing.map(row)}</section>}
       <section aria-label="Tasks to do"><h3><Circle size={13}/> To do <span>{todo.length}</span></h3>{todo.map(row)}{!todo.length&&<p className="project-task-empty">{board?'No pending items here.':'Loading tasks…'}</p>}</section>
-      <section aria-label="Completed tasks"><button className="project-task-done-heading" aria-expanded={doneOpen} onClick={()=>setDoneOpen(open=>{localStorage.setItem(key,String(!open));return !open})}>{doneOpen?<ChevronDown size={14}/>:<ChevronRight size={14}/>} Done <span>{done.length}</span></button>{doneOpen&&done.map(row)}</section>
+      {showDone&&<section aria-label="Completed tasks"><h3><Check size={13}/> Done <span>{done.length}</span></h3>{done.map(row)}</section>}
+      {showArchived&&<section aria-label="Archived tasks"><h3><Check size={13}/> Archived <span>{archived.length}</span></h3>{archived.map(row)}</section>}
+      {board?.page?.hasMore&&<button className="project-task-more" disabled={writing.current} onClick={()=>void loadMore()}>Load more</button>}
     </div>
     <footer>Saved in your project. Agent edits appear automatically.</footer>
     {assignment&&<ProjectTaskAssignment project={project} tasks={assignment.tasks} mode={assignment.mode} onDispatch={dispatch} onClose={()=>setAssignment(null)}/>}

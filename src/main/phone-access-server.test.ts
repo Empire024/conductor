@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { request as httpsRequest, type RequestOptions } from 'node:https'
 import type { IncomingMessage } from 'node:http'
+import type { ProjectRecord } from '../shared/models'
+import type { PhoneProjectTaskPage } from '../shared/phone-access'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID } from '../shared/remote-control'
 import { PhoneAccessService } from './phone-access'
 import { PhoneAccessServer } from './phone-access-server'
@@ -16,21 +18,22 @@ class MapStore implements SecretKeyValueStore {
 const cleanup: Array<() => Promise<void> | void> = []
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close() })
 
-function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: ReturnType<typeof vi.fn>; createTask: ReturnType<typeof vi.fn> } {
+function serviceFixture(): { service: PhoneAccessService; store: MapStore; ui: ReturnType<typeof vi.fn>; createTask: ReturnType<typeof vi.fn>; listTasks: ReturnType<typeof vi.fn> } {
   const store = new MapStore()
   const ui = vi.fn(async () => ({}))
   const project = { id: 'project-a', name: 'Conductor', path: 'C:\\work\\conductor', createdAt: 't', updatedAt: 't' }
   const createTask = vi.fn(async (_project, input) => ({ id: 'phone-task', projectId: 'project-a', ...input }))
+  const listTasks = vi.fn(async (_project:ProjectRecord, query:{offset:number;limit:number}):Promise<PhoneProjectTaskPage> => ({ projectId: 'project-a', tasks: [{ id: 'open', title: 'Open', kind: 'task', status: 'todo', priority: 'normal', weight: 'medium' }], page: { ...query, total: 1, hasMore: false } }))
   const service = new PhoneAccessService({
     store, vault: new MemoryVault(),
     database: { listProjects: () => [project], getProject: id => id === project.id ? project : null, listSessions: () => [], listDetachedWindows: () => [], listProcesses: () => [], listAgentActivity: () => [], structured: { snapshot: () => null, spec: () => null, history: () => [], update: () => undefined } },
     sessions: { ensure: () => ({ id: 'x', available: false, status: 'unavailable', transcript: '' }), connectSession: async () => undefined, submit: async () => undefined, steer: async () => undefined, queue: async () => undefined, respond: async () => undefined, interrupt: async () => undefined, resume: async () => undefined },
     providers: () => [], machines: () => [{ id: LOCAL_MACHINE_ID, name: 'MAIN', kind: 'local', status: 'online', accountLogin: null, projects: [], connection: LOCAL_CONNECTION }],
-    machineName: () => 'MAIN', version: '0.1.3', ui, projectTasks: { create: createTask },
+    machineName: () => 'MAIN', version: '0.1.3', ui, projectTasks: { list: listTasks, create: createTask },
     metrics: async () => ({ sampledAt: 'now', cpuPercent: 1, cpuCores: 4, memoryUsedBytes: 1, memoryTotalBytes: 2, gpus: [], processes: [], localServers: [], unavailable: [] }),
     push: vi.fn(async () => ({ status: 201, gone: false, retryAfter: null, body: '' })), log: () => undefined
   })
-  return { service, store, ui, createTask }
+  return { service, store, ui, createTask, listTasks }
 }
 
 interface Reply { status: number; headers: IncomingMessage['headers']; body: string; raw: Buffer }
@@ -130,6 +133,9 @@ describe('the phone listener', () => {
     const task = await call(port, '/api/projects/project-a/tasks', { ca, method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ title: 'From phone', kind: 'feature', priority: 'high', weight: 'heavy' }) })
     expect(task.status).toBe(200)
     expect(JSON.parse(task.body)).toMatchObject({ id: 'phone-task', projectId: 'project-a', title: 'From phone', kind: 'feature' })
+    const tasks = await call(port, '/api/projects/project-a/tasks?offset=10&limit=5', { ca, headers: { authorization: `Bearer ${token}` } })
+    expect(tasks.status).toBe(200)
+    expect(JSON.parse(tasks.body)).toMatchObject({ projectId: 'project-a', tasks: [{ id: 'open', status: 'todo' }], page: { offset: 10, limit: 5, total: 1, hasMore: false } })
     expect((await call(port, '/api/whatever', { ca, headers: { authorization: `Bearer ${token}` } })).status).toBe(404)
     const metrics = await call(port, '/api/metrics', { ca, headers: { authorization: `Bearer ${token}` } })
     expect(JSON.parse(metrics.body)).toMatchObject({ system: { cpuCores: 4 }, runtimes: [] })

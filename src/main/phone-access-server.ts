@@ -372,7 +372,7 @@ export class PhoneAccessServer {
       const device = this.deps.service.authenticate(token)
       if (!device) { reply(401, { error: 'This phone is not paired, or its access was revoked.' }); request.resume(); return }
       if (url.pathname === '/api/stream') { if (method !== 'GET') throw new PhoneAccessError('Method not allowed', 405); this.stream(device, request, response); return }
-      reply(200, await this.route(method, url.pathname, body, device))
+      reply(200, await this.route(method, url.pathname, body, device, url.searchParams))
     } catch (error) {
       request.resume()
       const status = error instanceof PhoneAccessError ? error.status : 400
@@ -396,7 +396,7 @@ export class PhoneAccessServer {
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
   }
 
-  private async route(method: string, path: string, body: Record<string, unknown>, device: PhoneDevice): Promise<unknown> {
+  private async route(method: string, path: string, body: Record<string, unknown>, device: PhoneDevice, query:URLSearchParams): Promise<unknown> {
     const { service } = this.deps
     const get = method === 'GET', post = method === 'POST'
     if (path === '/api/me' && get) return service.self(device.id)
@@ -406,6 +406,7 @@ export class PhoneAccessServer {
     if (path === '/api/metrics' && get) return service.metrics()
     if (path === '/api/tabs/open' && post) return service.openTab(body as never)
     const projectTasks = path.match(/^\/api\/projects\/([^/]+)\/tasks$/)
+    if (projectTasks && get) return service.listProjectTasks(decodeURIComponent(projectTasks[1]!), { offset: query.get('offset') ?? undefined, limit: query.get('limit') ?? undefined })
     if (projectTasks && post) return service.createProjectTask(decodeURIComponent(projectTasks[1]!), body as never)
     if (path === '/api/push/subscribe' && post) { service.setSubscription(device.id, body.subscription); return { ok: true } }
     if (path === '/api/push/unsubscribe' && post) { service.setSubscription(device.id, null); return { ok: true } }
