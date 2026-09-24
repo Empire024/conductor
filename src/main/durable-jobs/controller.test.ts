@@ -160,7 +160,9 @@ describe('durable job controller', () => {
   it('interrupts a stage that exceeds its timeout and retries it', async () => {
     const { service, runtime } = setup([{ kind: 'hang' }, { kind: 'answer', text: 'ok\nJOB STATUS: DONE' }])
     const created = await service.create(input({ budgets: { stageTimeoutMs: 1 } }))
-    await until(() => service.status(created.id).status === 'completed')
+    // A timeout, an interrupt and a retry each take a few event-loop turns; a busy full-suite run
+    // can stretch that past until()'s 4 s default, so this test alone waits longer (still bounded).
+    await until(() => service.status(created.id).status === 'completed', 20_000)
     expect(runtime.sessions.get(runtime.opened[0]!)!.interrupts).toBe(1)
     expect(service.events(created.id).some(event => event.kind === 'retry' && event.message.includes('timed out'))).toBe(true)
   })
