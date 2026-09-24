@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { comparableFailure } from './progress.ts'
 
 export interface ExecutionState {
   version: 1
@@ -10,7 +11,9 @@ export interface ExecutionState {
   inputs: Array<{ path: string; fingerprint: string }>
   artifacts: Array<{ path: string; fingerprint: string }>
   hypotheses: Array<{ text: string; status: 'unverified' | 'invalidated'; reason?: string }>
-  failures: Array<{ method: string; error: string; count: number }>
+  /** `across` counts equivalent failures on the same source from any tool (an ENOENT through
+   *  read_file and through apply_edits alike). */
+  failures: Array<{ method: string; error: string; count: number; across?: number }>
   budgets: { startedAt: number; rounds: number; requests: number; recoveries: number; tokens: number; checkpoints: number }
   progress: number
   segmentProgress: number
@@ -35,6 +38,10 @@ export function observeExecution(state: ExecutionState, call: { id: string; name
     const previous = state.failures.find(f => f.method === method && f.error === error)
     if (previous) previous.count++
     else state.failures.push({ method, error, count: 1 })
+    const same = comparableFailure(error)
+    const equivalent = state.failures.filter(f => f.method.slice(f.method.indexOf(':') + 1) === source && comparableFailure(f.error) === same)
+    const across = equivalent.reduce((sum, f) => sum + f.count, 0)
+    for (const f of equivalent) f.across = across
     state.failures = state.failures.slice(-16)
     state.nextAction = recoveryHint(call.name, output)
     return
@@ -54,6 +61,7 @@ export function recoveryHint(name: string, error: string): string {
   if (/ENOTDIR|not a directory/i.test(error)) return 'Search accepts a file or directory; inspect the specified path and use the returned type and workspace-relative path.'
   if (/bytes|too large|truncat/i.test(error)) return 'Inspect the file, then request a bounded line or byte range. Use local code to process the full input.'
   if (/denied|unavailable|permission/i.test(error)) return 'This capability is unavailable under the current permissions/runtime. Report the concrete blocker; do not repeat or bypass it.'
+  if (/ENOENT|no such file|does not exist|not found/i.test(error)) return 'The path does not exist. Do not try it with another tool: if the owner asked for it, report that it is missing and stop; if you chose it yourself, go back to what the owner asked.'
   return `Change the failed ${name} approach using the current source evidence; check a small example before rerunning the full task.`
 }
 

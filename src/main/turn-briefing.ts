@@ -24,10 +24,6 @@ import { projectTaskBriefing } from './project-backlog'
 /** An adapter sets this on a notice payload the moment the runtime has compacted its context. */
 export const CONTEXT_RESET = 'contextReset'
 
-/** The one instruction a sandboxed local model gets besides its system prompt. Its tool bridge
- *  is scoped in code; this only names it. */
-export const LOCAL_BRIEFING = 'Use the conductor tool for durable project memory and tasks.list. Work only on your assigned task.'
-
 export const MEMORY_HEADING = 'Conductor project memory (current project evidence takes precedence):'
 
 /** Context bands at which a conversation is told, once each per runtime, to hand its remaining
@@ -76,10 +72,13 @@ export class TurnBriefings {
       ledger.staticSent = true
       try { this.deps.database.forgetStaleMemories(spec.projectId) } catch { /* Pruning is opportunistic; recall works without it. */ }
     }
-    const memory = this.memory(spec, prompt, itemId, ledger)
+    const local = spec.provider === 'local'
+    const memory = this.memory(spec, prompt, itemId, ledger, !local)
     // Local models use the scoped in-process tool bridge. Never put a bearer credential for the
-    // unrestricted app-control HTTP surface into their prompt or sandbox.
-    if (spec.provider === 'local') return [memory, staticDue ? LOCAL_BRIEFING : ''].filter(Boolean).join('\n\n')
+    // unrestricted app-control HTTP surface into their prompt or sandbox. They get no per-turn
+    // nudge either: a small model takes the last imperative it reads as its orders, so only the
+    // recalled memory lines travel, fenced ahead of the owner's words (local-models/briefing.ts).
+    if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
     return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? this.deps.machine?.() ?? '' : '', staticDue ? this.deps.control?.(spec) ?? '' : '', this.nudge(ledger, context)].filter(Boolean).join('\n\n')
   }
@@ -127,7 +126,7 @@ export class TurnBriefings {
     ledger.nudgedBand = 0
   }
 
-  private memory(spec: AgentSpec, prompt: string, itemId: string, ledger: Ledger): string {
+  private memory(spec: AgentSpec, prompt: string, itemId: string, ledger: Ledger, heading = true): string {
     // A bare "continue" names nothing; whatever steered the previous turn is still in context.
     if (!memoryTokens(prompt).length) return ''
     const fresh = this.deps.database.recall(spec.projectId, prompt, spec.provider, 8).filter(memory => !ledger.memoryIds.has(memory.id))
@@ -139,7 +138,7 @@ export class TurnBriefings {
     // invisible edit to the prompt.
     try { this.deps.database.recordMemoryRecall({ projectId: spec.projectId, agentSessionId: spec.id, itemId, prompt, memoryIds: sent.map(memory => memory.id) }) }
     catch { /* The ledger explains a turn; it is never a precondition for sending one. */ }
-    return `${MEMORY_HEADING}\n${formatRecalledMemories(sent)}`
+    return heading ? `${MEMORY_HEADING}\n${formatRecalledMemories(sent)}` : formatRecalledMemories(sent)
   }
 
   private coworkers(spec: AgentSpec, ledger: Ledger): string {

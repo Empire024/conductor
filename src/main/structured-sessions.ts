@@ -20,6 +20,7 @@ import { sanitizeDiagnostic } from './structured-store'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
 import { normaliseContract } from './local-models/completion.ts'
+import { composeLocalPrompt } from './local-models/briefing.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-review-gate'
 
@@ -798,7 +799,11 @@ export class StructuredSessions {
       // say once per band when the remaining work belongs in a fresh tab.
       const share = summarizeContext(state.items, live.adapter ? live.runtimeId : undefined)
       const recalled = process.env.CONDUCTOR_LIVE_TESTS === '1' || this.isApprovalReviewer(id) ? '' : this.context?.(live.spec, text, userItemId, live.adapter ? live.runtimeId : '', share ? { percent: share.percent } : undefined) ?? ''
-      const submitted = `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
+      // A local model reads recalled background before the owner's words, fenced as reference, so
+      // the owner's instruction is the last thing it reads; native providers keep it after.
+      const submitted = live.spec.provider === 'local'
+        ? composeLocalPrompt(`${text.trim()}${context}`, recalled)
+        : `${text.trim()}${context}${recalled ? `\n\n${recalled}` : ''}`
       this.assertPromptWithinLimit(submitted.length)
       // A queued message may have captured settings before the owner revoked browser access.
       // Never let that per-message snapshot overwrite the explicit, newer session authority.

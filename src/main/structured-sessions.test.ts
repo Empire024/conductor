@@ -12,6 +12,7 @@ import type { AdapterEvent, ContextAttachment, InteractionResponse, PromptOrigin
 import { MAX_PROMPT_CHARS } from '../shared/structured-agent'
 import { LocalSetupError } from './providers/local'
 import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../shared/local-models'
+import { composeLocalPrompt, LOCAL_BACKGROUND_OPEN, splitLocalPrompt } from './local-models/briefing'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
 const remoteOrigin = (projectId: string): PromptOrigin => ({
@@ -520,6 +521,26 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     managers.push(withRecall); withRecall.ensure(f.spec)
     await expect(withRecall.submit(f.spec.id, 'short draft', settings)).rejects.toThrow('Prompt must contain')
     expect(f.adapters.reduce((count, adapter) => count + adapter.submissions.length, 0)).toBe(0)
+  })
+
+  it('puts recalled background before the owner\'s words for a local model and after them for a native one', async () => {
+    const f = fixture()
+    f.manager.dispose()
+    const recalled = '- [semantic] The checkout tax total is computed from stale cart totals'
+    const withRecall = new StructuredSessions(f.database, () => 'synthetic-executable', f.broadcast, f.factory, () => recalled)
+    managers.push(withRecall)
+    withRecall.ensure(f.spec)
+    await withRecall.submit(f.spec.id, 'Fix the checkout tax', settings)
+    expect(f.current.submissions[0]!.text).toBe(`Fix the checkout tax\n\n${recalled}`)
+
+    const local: AgentSpec = { ...f.spec, id: 'local-recall', provider: 'local', title: 'Local' }
+    withRecall.ensure(local)
+    await withRecall.submit(local.id, 'paste back the prompt you received', settings)
+    const submitted = f.current.submissions[0]!.text
+    expect(submitted).toBe(composeLocalPrompt('paste back the prompt you received', recalled))
+    expect(submitted.startsWith(LOCAL_BACKGROUND_OPEN)).toBe(true)
+    expect(submitted.endsWith('\n\npaste back the prompt you received')).toBe(true)
+    expect(splitLocalPrompt(submitted)).toEqual({ instruction: 'paste back the prompt you received', background: recalled })
   })
 
   it('forks native context and copies immutable historical artifacts without an inference submission', async () => {

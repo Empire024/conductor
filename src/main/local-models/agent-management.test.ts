@@ -172,6 +172,48 @@ describe('round policy and stagnation detection', () => {
     expect(callFingerprint('read_file', { path: 'a', offset: 1 })).toBe(callFingerprint('read_file', { offset: 1, path: 'a' }))
   })
 
+  it('counts the same missing-path failure across tools, warns once and stops at the policy limit', () => {
+    const detector = new StagnationDetector(policy.stagnation)
+    const path = '/workspace/file.txt'
+    const write = `error: ENOENT: no such file or directory, open 'C:\\Users\\x\\ws\\file.txt'`
+    const read = `error: ENOENT: no such file or directory, realpath 'C:\\Users\\x\\ws\\file.txt'`
+    const calls = [
+      { name: 'apply_edits', arguments: { path, edits: [{ old_text: 'a', new_text: 'b' }] }, output: write, failed: true },
+      { name: 'apply_edits', arguments: { path, edits: [{ old_text: 'a', new_text: 'b' }] }, output: write, failed: true },
+      { name: 'apply_edits', arguments: { path, edits: [{ old_text: 'a', new_text: 'c' }] }, output: write, failed: true },
+      { name: 'edit_file', arguments: { path, old_text: 'a', new_text: 'b' }, output: write, failed: true },
+      { name: 'edit_file', arguments: { path, old_text: 'a', new_text: 'b' }, output: write, failed: true },
+      { name: 'read_file', arguments: { path }, output: read, failed: true },
+    ]
+    const verdicts = calls.map(call => detector.observe(call))
+    expect(verdicts.map(verdict => verdict.action)).toEqual(['none', 'none', 'warn', 'none', 'none', 'stop'])
+    expect(detector.warnings).toBe(1)
+    expect(verdicts[5]!.message).toContain(`Equivalent failures on ${path} 6 times across apply_edits, edit_file, read_file`)
+
+    // A second tool reaching the warn threshold on the same path is named as a cross-tool pattern.
+    const mixed = new StagnationDetector(policy.stagnation)
+    mixed.observe({ name: 'apply_edits', arguments: { path }, output: write, failed: true })
+    mixed.observe({ name: 'edit_file', arguments: { path }, output: write, failed: true })
+    const warned = mixed.observe({ name: 'read_file', arguments: { path }, output: read, failed: true })
+    expect(warned.action).toBe('warn')
+    expect(warned.message).toContain(`The same failure has now happened 3 times on ${path} across apply_edits, edit_file, read_file`)
+    expect(warned.message).toContain('ENOENT: no such file or directory')
+    expect(warned.message).toContain('Trying another tool on the same target fails the same way. If the owner asked for this target, report the failure and stop')
+  })
+
+  it('does not pool the same error on different paths', () => {
+    const detector = new StagnationDetector(policy.stagnation)
+    const actions = ['a.txt', 'b.txt', 'c.txt', 'd.txt', 'e.txt'].map((file, n) => detector.observe({ name: n % 2 ? 'read_file' : 'apply_edits', arguments: { path: `/workspace/${file}` }, output: `error: ENOENT: no such file or directory, open 'C:\\ws\\${file}'`, failed: true }))
+    // Five unproductive rounds stay below the idle warning; nothing counts as a repeat.
+    expect(actions.map(verdict => verdict.action)).toEqual(['none', 'none', 'none', 'none', 'none'])
+    expect(Math.max(...actions.map(verdict => verdict.repeats))).toBe(1)
+
+    const explore = new StagnationDetector(policy.stagnation)
+    expect(explore.observe({ name: 'read_file', arguments: { path: 'missing.txt' }, output: `error: ENOENT: no such file or directory, realpath 'C:\\ws\\missing.txt'`, failed: true }).action).toBe('none')
+    expect(explore.observe({ name: 'list_files', arguments: { path: '.' }, output: 'notes.txt\nsrc/', failed: false }).action).toBe('none')
+    expect(explore.observe({ name: 'read_file', arguments: { path: 'other.txt' }, output: `error: ENOENT: no such file or directory, realpath 'C:\\ws\\other.txt'`, failed: true }).action).toBe('none')
+  })
+
   it('cuts off a reply that keeps restarting its own reasoning', () => {
     const settled = { content: 'The function returns the diff. '.repeat(200), reasoning: '' }
     expect(ruminationVerdict(settled, policy.generation)).toBeUndefined()

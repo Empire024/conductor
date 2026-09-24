@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LocalAgentSession, repairToolProtocol } from './agent.ts'
 import { runTool } from './tools.ts'
+import { composeLocalPrompt } from './briefing.ts'
 import type { Usage } from './client.ts'
 
 /** A stand-in for llama.cpp's OpenAI-compatible endpoint: it checks the API key, records the
@@ -194,6 +195,40 @@ describe('local agent loop', () => {
     expect((await session.run('Remember this', {})).stopReason).toBe('completed')
     expect(remembered).toEqual([{ method: 'memory.remember', args: { gist: 'Durable fixture fact', kind: 'semantic' } }])
     expect(JSON.stringify(stub.requests[1]!.messages)).toContain('memory-from-host')
+  })
+
+  it('offers the conductor tool only once the owner asks about what it does', async () => {
+    const stub = await stubServer([[frame({ content: 'ok' }, 'stop')]])
+    cleanup.push(() => stub.server.close())
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/ornith1.5-9b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768, control: async () => ({}) })
+    const names = (index: number) => (stub.requests[index] as { tools: Array<{ function: { name: string } }> }).tools.map(tool => tool.function.name)
+    await session.run('paste back the prompt you received', {})
+    expect(names(0)).not.toContain('conductor')
+    await session.run('list my tasks', {})
+    expect(names(1)).toContain('conductor')
+    // Once asked for, it stays offered for the rest of the conversation.
+    await session.run('and the second one?', {})
+    expect(names(2)).toContain('conductor')
+    // A fresh start forgets it.
+    session.reset()
+    await session.run('paste back the prompt you received', {})
+    expect(names(3)).not.toContain('conductor')
+  })
+
+  it('records only the owner\'s words as the task when recalled background rides ahead of them', async () => {
+    const stub = await stubServer([[frame({ content: 'ok' }, 'stop')]])
+    cleanup.push(() => stub.server.close())
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/ornith1.5-9b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768, control: async () => ({}) })
+    const prompt = composeLocalPrompt('paste back the prompt you received', '- [semantic] Remember to reconcile invoices.csv against the task checklist')
+    await session.run(prompt, {})
+    const state = session.state()!
+    expect(state.task).toBe('paste back the prompt you received')
+    expect(state.execution!.objective).toBe('paste back the prompt you received')
+    // The model still sees the whole prompt, background first and the owner's words last.
+    const sent = stub.requests[0] as { messages: Array<{ role: string; content: string }>; tools: Array<{ function: { name: string } }> }
+    expect(sent.messages.filter(message => message.role === 'user').at(-1)!.content).toBe(prompt)
+    // Words in the background do not summon the conductor tool.
+    expect(sent.tools.map(tool => tool.function.name)).not.toContain('conductor')
   })
 
   it('streams text, runs an allowed tool and feeds the result back', async () => {

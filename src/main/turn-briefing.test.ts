@@ -6,7 +6,7 @@ import type { AgentSpec } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
-import { CONTEXT_RESET, LOCAL_BRIEFING, MEMORY_HEADING, TurnBriefings, handoffNudge } from './turn-briefing'
+import { CONTEXT_RESET, MEMORY_HEADING, TurnBriefings, handoffNudge } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -134,13 +134,17 @@ describe('what a native runtime is told, and how often', () => {
     expect(local.briefings.compose(local.spec, 'Keep going', 'item-2', 'runtime-1', { percent: 95 })).toBe('')
   })
 
-  it('gives a local model its memory and one instruction, never a control credential', () => {
+  it('gives a local model only its memory lines: no heading, no nudge, never a control credential', () => {
     const f = fixture('local')
+    // Nothing recalled on a fresh runtime means nothing at all, not a standing instruction.
+    expect(f.briefings.compose(f.spec, 'paste back the prompt you received', 'item-0', '')).toBe('')
     f.remember('The checkout tax total is computed from stale cart totals', ['checkout', 'tax'])
     const first = f.briefings.compose(f.spec, 'Investigate the checkout tax bug', 'item-1', '')
-    expect(first).toBe(`${MEMORY_HEADING}\n- [semantic] The checkout tax total is computed from stale cart totals\n\n${LOCAL_BRIEFING}`)
+    expect(first).toBe('- [semantic] The checkout tax total is computed from stale cart totals')
+    expect(first).not.toContain(MEMORY_HEADING)
     f.starting('runtime-1')
     expect(f.briefings.compose(f.spec, 'Fix the checkout tax total', 'item-2', 'runtime-1')).toBe('')
+    expect(f.database.listMemoryRecalls(f.spec.id).map(recall => recall.itemId)).toEqual(['item-1'])
     expect(f.control).not.toHaveBeenCalled()
     expect(f.coworkers).not.toHaveBeenCalled()
   })

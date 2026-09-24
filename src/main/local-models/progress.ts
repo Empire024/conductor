@@ -49,6 +49,28 @@ export function callFingerprint(name: string, args: Record<string, unknown>): st
   return `${name}:${digest(stable(normalised))}`
 }
 
+/** The argument a failure is about, independent of which tool reported it: the path, or else the
+ *  command/query/pattern text. Undefined when the call has none, so unrelated argument-less
+ *  failures are never pooled across tools. */
+function failureSubject(args: Record<string, unknown>): string | undefined {
+  for (const key of ['path', 'command', 'query', 'pattern']) {
+    const value = args[key]
+    if (typeof value !== 'string' || !value.trim()) continue
+    return key === 'path' ? `path:${value.trim().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '')}` : `${key}:${value.replace(/\s+/g, ' ').trim()}`
+  }
+  return undefined
+}
+
+/** Error text with the tool-specific parts removed: a leading `error: ` and the syscall suffix
+ *  (`, open '…'` vs `, realpath '…'`), so ENOENTs from a write tool and a read tool compare equal. */
+export function comparableFailure(output: string): string {
+  return comparableOutput(output).trim()
+    .replace(/^error:\s*/i, '')
+    .replace(/,\s*(?:open|realpath|stat|lstat|scandir|access|opendir|readlink|mkdir|rmdir|unlink|rename|copyfile)\s+'[^'\n]*'(?:\s*->\s*'[^'\n]*')?/gi, '')
+    .replace(/[a-f0-9]{32,64}/g, '#').replace(/\bline \d+|:\d+:\d+/g, 'line #')
+    .slice(0, 400)
+}
+
 /** Notices repetition without semantics: the same call again, the same failing result again,
  *  an edit that changed nothing, or a run of rounds that produced no new file change or command
  *  result. Warned once per pattern; stopped only when the pattern goes on past the policy. */
@@ -62,6 +84,8 @@ export class StagnationDetector {
   private warned = new Set<string>()
   private seenEvidence = new Set<string>()
   private failedApproaches = new Map<string, number>()
+  /** Failures on the same subject with the same error, whichever tool produced them. */
+  private crossToolFailures = new Map<string, { count: number; tools: Set<string> }>()
   /** How many warnings this run has fired, for the stop report. */
   warnings = 0
 
@@ -78,6 +102,12 @@ export class StagnationDetector {
     const failedMethod = `${call.name}:${String(call.arguments.path ?? '')}:${comparable.replace(/[a-f0-9]{32,64}/g, '#').replace(/\bline \d+|:\d+:\d+/g,'line #').slice(0, 400)}`
     const failures = call.failed ? (this.failedApproaches.get(failedMethod) ?? 0) + 1 : 0
     if (call.failed) this.failedApproaches.set(failedMethod, failures)
+    const subject = call.failed ? failureSubject(call.arguments) : undefined
+    const failure = subject === undefined ? '' : comparableFailure(call.output)
+    const crossKey = subject === undefined ? '' : `cross:${subject}|${digest(failure)}`
+    const cross = crossKey ? this.crossToolFailures.get(crossKey) ?? { count: 0, tools: new Set<string>() } : undefined
+    if (cross) { cross.count++; cross.tools.add(call.name); this.crossToolFailures.set(crossKey, cross) }
+    const crossToolFailures = cross?.count ?? 0
 
     // New evidence: a write that changed something, or a command whose result we have not seen.
     const noop = call.name === 'edit_file' && /\(0 replacements?\)|was not found/.test(call.output)
@@ -85,15 +115,27 @@ export class StagnationDetector {
     if (evidence && !this.seenEvidence.has(evidence)) { this.seenEvidence.add(evidence); this.idleRounds = 0 }
     else this.idleRounds++
 
-    const repeated = Math.max(this.repeats, this.outcomeRepeats, failures)
+    const repeated = Math.max(this.repeats, this.outcomeRepeats, failures, crossToolFailures)
     const idle = this.idleRounds >= this.policy.idleRoundsWarnAt
+    // The same failure on the same subject reached through more than one tool is one pattern:
+    // it is named as such, and warned once rather than once per tool.
+    const crossTriggered = crossToolFailures >= this.policy.repeatWarnAt
+    const acrossTools = !!cross && cross.tools.size > 1 && crossToolFailures === repeated
+    const where = subject?.replace(/^[a-z]+:/, '') ?? ''
+    const tools = cross ? [...cross.tools].join(', ') : call.name
+    const excerpt = failure.split('\n').find(line => line.trim())?.trim().slice(0, 160) ?? ''
     if (call.analysis && this.idleRounds >= this.policy.idleRoundsWarnAt * 2) return { repeats: repeated, idle, action:'stop',message:'Repeated script changes and calls produced no new source evidence or execution result. Processing remains unvalidated.' }
     if (repeated >= this.policy.repeatStopAt) {
-      return { repeats: repeated, idle, action: 'stop', message: `The ${call.name} approach has produced equivalent results ${repeated} times without progress, including intervening attempts.` }
+      return { repeats: repeated, idle, action: 'stop', message: acrossTools
+        ? `Equivalent failures on ${where} ${repeated} times across ${tools}; the run was ended.`
+        : `The ${call.name} approach has produced equivalent results ${repeated} times without progress, including intervening attempts.` }
     }
-    if (repeated >= this.policy.repeatWarnAt && !this.warned.has(fingerprint)) {
+    if (repeated >= this.policy.repeatWarnAt && !this.warned.has(fingerprint) && !(crossTriggered && this.warned.has(crossKey))) {
       this.warned.add(fingerprint); this.warnings++
-      return { repeats: repeated, idle, action: 'warn', message: `[Conductor] You appear to be repeating an unsuccessful action (${call.name}, ${repeated} times with the same result) without meaningful progress. Stop repeating it, reassess the evidence you already have, and choose a different approach: change the code, or read the specific lines the failure names.` }
+      if (crossTriggered) this.warned.add(crossKey)
+      return { repeats: repeated, idle, action: 'warn', message: acrossTools
+        ? `[Conductor] The same failure has now happened ${repeated} times on ${where} across ${tools} (${excerpt}). Trying another tool on the same target fails the same way. If the owner asked for this target, report the failure and stop; otherwise continue with what the owner actually asked.`
+        : `[Conductor] You appear to be repeating an unsuccessful action (${call.name}, ${repeated} times with the same result) without meaningful progress. Stop repeating it, reassess the evidence you already have, and choose a different approach: change the code, or read the specific lines the failure names.` }
     }
     if (idle && !this.warned.has('idle')) {
       this.warned.add('idle'); this.warnings++
