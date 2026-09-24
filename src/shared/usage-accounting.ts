@@ -472,3 +472,114 @@ export function evaluateUsageCap(cap: UsageCap, report: UsageScopeReport): Usage
 }
 
 const round = (value: number): number => Math.round(value * 10) / 10
+
+/* ------------------------------------------------------------------------- *
+ * Latest reported allowance (app control `usage.limits`)
+ *
+ * A small record of the newest account allowance each provider reported, kept
+ * per bucket as usage events arrive so reading it never touches the journal.
+ * A Claude bucket is one keyed window; a Codex bucket is one limit id with its
+ * primary/secondary windows and credits. Values are stored as reported.
+ * ------------------------------------------------------------------------- */
+
+export interface AccountLimitSource { agentSessionId: string; projectId: string }
+export interface AccountLimitObservation extends AccountLimitSource { observedAt: string; limits: Record<string, Json> }
+export type AccountLimitRecord = Partial<Record<StructuredProvider, Record<string, AccountLimitObservation>>>
+const ACCOUNT_LIMIT_BUCKETS = 32
+
+/** True when a usage payload carries account allowance at all, so token-only reports cost nothing. */
+export function carriesAccountLimits(limits: Json | undefined): boolean {
+  const root = object(limits)
+  return Object.keys(object(root.rateLimits)).length > 0 || Object.keys(object(root.rateLimitsByLimitId)).length > 0
+}
+
+/** Folds one reported payload into the record; null when it reported no allowance. */
+export function recordAccountLimits(record: AccountLimitRecord, provider: StructuredProvider, limits: Json | undefined, observation: AccountLimitSource & { observedAt: string }): AccountLimitRecord | null {
+  const root = object(limits), byLimitId = object(root.rateLimitsByLimitId), rateLimits = object(root.rateLimits)
+  const buckets: Record<string, AccountLimitObservation> = { ...record[provider] }
+  let changed = false
+  const snapshot = (key: string, value: Json): void => {
+    const next = object(value)
+    if (!Object.keys(next).length) return
+    const bucket = 'limit:' + key
+    const previous = object(object(buckets[bucket]?.limits.rateLimitsByLimitId)[key])
+    // A sparse update names only what changed; a null field keeps the value last reported.
+    buckets[bucket] = { ...observation, limits: { rateLimitsByLimitId: { [key]: { ...previous, ...Object.fromEntries(Object.entries(next).filter(([, field]) => field !== null)) } } } }
+    changed = true
+  }
+  for (const [key, value] of Object.entries(byLimitId)) snapshot(key, value)
+  if ('primary' in rateLimits || 'secondary' in rateLimits) {
+    const key = string(rateLimits.limitId) ?? 'default'
+    if (!(key in byLimitId)) snapshot(key, rateLimits)
+  } else {
+    for (const [key, value] of Object.entries(rateLimits)) {
+      if (number(object(value).usedPercent) === undefined) continue
+      buckets['window:' + key] = { ...observation, limits: { rateLimits: { [key]: value } } }
+      changed = true
+    }
+  }
+  if (!changed) return null
+  const kept = Object.entries(buckets).sort(([, a], [, b]) => b.observedAt.localeCompare(a.observedAt)).slice(0, ACCOUNT_LIMIT_BUCKETS)
+  return { ...record, [provider]: Object.fromEntries(kept) }
+}
+
+export interface AccountLimitWindow {
+  bucket: string
+  key: string
+  label: string
+  kind: UsageWindowKind
+  scope: UsageWindow['scope']
+  models?: string[]
+  usedPercent: number
+  windowMinutes: number | null
+  resetsAt: string | null
+  /** `reset`: the window rolled over after it was observed, so its current use is unknown. */
+  state: 'current' | 'reset'
+  observedAt: string
+  ageSeconds: number
+  source: AccountLimitSource
+}
+export interface AccountLimitCredits { bucket: string; hasCredits?: boolean; unlimited?: boolean; balance?: string | null; planType?: string; observedAt: string }
+export interface AccountLimitsReport { provider: StructuredProvider; status: 'reported' | 'unknown'; windows: AccountLimitWindow[]; credits?: AccountLimitCredits[]; unknown: string[] }
+
+const PROVIDER_NAMES: Partial<Record<StructuredProvider, string>> = { claude: 'Claude', codex: 'Codex', grok: 'Grok' }
+/** The windows each provider's runtime is known to report; one missing from the record is named. */
+const EXPECTED_WINDOWS: Partial<Record<StructuredProvider, string[]>> = { claude: ['five_hour', 'seven_day'] }
+
+export function describeAccountLimits(record: AccountLimitRecord, provider: StructuredProvider, now = Date.now()): AccountLimitsReport {
+  const name = PROVIDER_NAMES[provider] ?? provider
+  const observations = Object.entries(record[provider] ?? {})
+  const windows: AccountLimitWindow[] = [], credits: AccountLimitCredits[] = [], unknown: string[] = []
+  for (const [bucket, observation] of observations) {
+    const age = Math.max(0, Math.round((now - Date.parse(observation.observedAt)) / 1000))
+    const source = { agentSessionId: observation.agentSessionId, projectId: observation.projectId }
+    const label = bucket.replace(/^(limit|window):/, '')
+    for (const window of normalizeUsageWindows(observation.limits)) {
+      const reset = window.resetsAt !== undefined && Date.parse(window.resetsAt) <= now
+      windows.push({
+        bucket: label, key: window.key, label: window.label, kind: window.kind, scope: window.scope,
+        ...(window.modelSelectors?.length ? { models: window.modelSelectors } : {}),
+        usedPercent: window.usedPercent, windowMinutes: window.windowMinutes ?? null, resetsAt: window.resetsAt ?? null,
+        state: reset ? 'reset' : 'current', observedAt: observation.observedAt, ageSeconds: age, source
+      })
+      if (reset) unknown.push(`${name} ${window.label.toLowerCase()} (${window.key}) reset at ${window.resetsAt} after it was observed; its current use is unknown until ${name} reports again.`)
+      if (window.resetsAt === undefined) unknown.push(`${name} did not report when ${window.key} resets.`)
+    }
+    const snapshot = object(object(observation.limits.rateLimitsByLimitId)[label])
+    const reported = object(snapshot.credits)
+    if (Object.keys(reported).length || string(snapshot.planType)) credits.push({
+      bucket: label,
+      ...(typeof reported.hasCredits === 'boolean' ? { hasCredits: reported.hasCredits } : {}),
+      ...(typeof reported.unlimited === 'boolean' ? { unlimited: reported.unlimited } : {}),
+      ...('balance' in reported ? { balance: typeof reported.balance === 'string' ? reported.balance : null } : {}),
+      ...(string(snapshot.planType) ? { planType: string(snapshot.planType)! } : {}),
+      observedAt: observation.observedAt
+    })
+  }
+  for (const key of EXPECTED_WINDOWS[provider] ?? []) if (observations.length && !windows.some(window => window.key === key)) unknown.push(`${name} has not reported its ${key} window yet.`)
+  if (!windows.length) unknown.push(provider === 'grok'
+    ? 'Grok does not report an account allowance through its runtime (only token spend and context use), so its weekly allowance is unknown here; the Grok dashboard shows it.'
+    : `${name} has not reported its account allowance since Conductor began recording it; any ${name} conversation reports it as it runs.`)
+  windows.sort((a, b) => a.bucket.localeCompare(b.bucket) || (b.windowMinutes ?? -1) - (a.windowMinutes ?? -1))
+  return { provider, status: windows.length ? 'reported' : 'unknown', windows, ...(credits.length ? { credits } : {}), unknown }
+}

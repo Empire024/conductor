@@ -14,7 +14,7 @@ import { InteractionResponseRejectedError, SteeringUnavailableError, type Adapte
 import { createProviderAdapter } from './providers/factory'
 import { validateLiveTurn } from './live-test-policy'
 import { activeUsageCap, parseUsageLimitReset, usageCapKey } from './usage-limit'
-import { describeUsageCap, evaluateUsageCap, summarizeContext, summarizeUsageRun, type UsageCapStatus } from '../shared/usage-accounting'
+import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluateUsageCap, recordAccountLimits, summarizeContext, summarizeUsageRun, type AccountLimitRecord, type AccountLimitsReport, type UsageCapStatus } from '../shared/usage-accounting'
 import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
@@ -65,6 +65,8 @@ interface LiveSession {
 }
 type Factory = (provider: StructuredProvider, options: AdapterOptions) => ProviderAdapter
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
+/** Settings row holding the newest reported allowance per provider and bucket (`usageLimits`). */
+const ACCOUNT_LIMITS_KEY = 'usageLimits.latest'
 /** Activity states a conversation can be cut off in; anything else has already settled. A
  *  conversation waiting on background work is one of them: that work belongs to the runtime
  *  process, so losing the connection ends it rather than leaving it running somewhere. */
@@ -512,6 +514,19 @@ export class StructuredSessions {
   }
   async steer(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<void> {
     return this.followup(id, text, settings, attachments, true, undefined, origin)
+  }
+  /** What the composer does with a message, for a caller that cannot see the conversation: steer
+   *  it into (or queue it behind) a turn that is under way, and otherwise start a turn with it
+   *  exactly as `submit` does. A turn that is still stopping is refused rather than raced. */
+  async steerOrStart(id: string, text: string, settings: SessionSettings, attachments: ContextAttachment[] = [], origin?: PromptOrigin): Promise<'started' | 'queued'> {
+    const live = this.get(id), phase = this.database.structured.snapshot(id)!.phase
+    if (phase === 'interrupting') throw new Error('The conversation is still stopping its last turn; send the message again once it has stopped')
+    if (live.submitting || live.steering || live.queueing || active.has(phase)) {
+      await this.steer(id, text, settings, attachments, origin)
+      return 'queued'
+    }
+    await this.submit(id, text, settings, attachments, origin)
+    return 'started'
   }
   /** Project-task ownership is transferred only after the native runtime acknowledges custody.
    * Unlike an ordinary composer steer, this never degrades into an unbounded host-side queue. */
@@ -984,6 +999,34 @@ export class StructuredSessions {
     }, 2000)
   }
 
+  /* --- Latest reported allowance ---------------------------------------- *
+   * The newest account allowance each provider reported, per bucket, kept in
+   * one settings row as usage events arrive, so `usage.limits` answers from it
+   * without a turn and without reading the journal.
+   * ---------------------------------------------------------------------- */
+
+  private accountLimitRecord?: AccountLimitRecord
+  private accountLimits(): AccountLimitRecord {
+    if (!this.accountLimitRecord) {
+      try { this.accountLimitRecord = JSON.parse(this.database.getSetting(ACCOUNT_LIMITS_KEY) ?? '{}') as AccountLimitRecord }
+      catch { this.accountLimitRecord = {} }
+    }
+    return this.accountLimitRecord
+  }
+  private noteAccountLimits(live: LiveSession, limits: import('../shared/structured-agent').Json | undefined, observedAt: string): void {
+    try {
+      const next = recordAccountLimits(this.accountLimits(), live.spec.provider as StructuredProvider, limits, { observedAt, agentSessionId: live.spec.id, projectId: live.spec.projectId })
+      if (!next) return
+      this.accountLimitRecord = next
+      this.database.setSetting(ACCOUNT_LIMITS_KEY, JSON.stringify(next))
+    } catch { /* A usage record never breaks the event pipeline it observes. */ }
+  }
+  /** The newest reported allowance of each cloud provider, with what is not known said outright. */
+  usageLimits(provider?: StructuredProvider): AccountLimitsReport[] {
+    const record = this.accountLimits(), now = Date.now()
+    return (['claude', 'codex', 'grok'] as const).filter(id => !provider || id === provider).map(id => describeAccountLimits(record, id, now))
+  }
+
   /* --- Provider usage limits -------------------------------------------- *
    * A provider window that has closed is not a failure to recover from, it is
    * a wait with a known end. The reset time is persisted so the wait survives
@@ -1198,6 +1241,7 @@ export class StructuredSessions {
     const event = store.append({ ...source, data, schemaVersion: 1, id: randomUUID(), sequence: state.sequence + 1, sessionId: live.spec.id, runtimeId: live.runtimeId, provider: live.spec.provider as StructuredProvider, projectId: live.spec.projectId, workspaceId: live.spec.sessionId, cwd: live.spec.cwd, timestamp: new Date().toISOString(), nativeSessionId: source.nativeSessionId ?? state.nativeSessionId })
     this.pending.push(event)
     this.observe?.(live.spec, event)
+    if (data.type === 'usage' && data.source === 'provider' && carriesAccountLimits(data.limits)) this.noteAccountLimits(live, data.limits, event.timestamp)
     // Claude reports usage per stream delta, so evaluating a cap on every event would
     // rescan the whole timeline many times a second. A cap acting a moment late is
     // indistinguishable to the owner; rescanning per delta is not.

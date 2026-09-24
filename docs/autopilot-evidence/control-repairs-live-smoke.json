@@ -1,0 +1,345 @@
+{
+  "root": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-control-repairs-vT5hgW",
+  "projectPath": "C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-control-repairs-vT5hgW\\inventory-project",
+  "llamaServersBefore": 0,
+  "checks": [
+    "catalog: git.ship local by default, jobs.pause interrupts at once, agents.steer contract, usage.limits listed",
+    "G1: usage.limits reported Claude five_hour 24%, seven_day 95%, Fable weekly 99% from agent_mufeqg1l_dq22hrc; Codex and Grok unknown",
+    "G7: agents.steer idle → started, running → queued (steered into the turn), interrupted → started; each prompt sent once",
+    "G3: local local/qwen3.5-9b dispatched read-only (no sandbox mode), phase completed, 21 tool calls, project unchanged",
+    "G1: usageLimits.latest persisted across a hard stop; after relaunch usage.limits reports Claude five_hour 24% observed 2026-09-24T10:47:04.494Z (restart at 2026-09-24T10:48:01.777Z)"
+  ],
+  "catalog": {
+    "gitShip": "({message,paths?,publish?,waitSeconds?}) — deliver finished work in one call. Conductor runs it on the host with the owner’s own Git credentials and network: tests, build, then a local commit (only paths if given, verified in an isolated copy when other work is also in the tree); nothing is pushed and no release is built. Only publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow and checks the release’s assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status",
+    "jobsPause": "({jobId,reason?}) — the owner, a wizard tab, or the conversation that created the job; interrupts the running stage at once (there is no safe point to wait for), records a tool call it cut off as an unknown side effect that is never replayed, and starts nothing new; the interrupted attempt is not charged, and resume starts the stage again in a fresh conversation",
+    "agentsSteer": "({agentSessionId,prompt}) — what the user composer does with a message: while a turn is running (or waiting on an approval or a question) it steers the message into that turn where the provider can, else queues it behind the turn; while the conversation is idle, finished, failed, disconnected or interrupted it starts a turn with it exactly as agents.submit does (one turn, same settings, same control link); while a turn is still stopping it is refused, so send it again once it has stopped. The result says which: delivery \"started\" for a new turn, \"queued\" for a message steered into or queued behind the running one",
+    "usageLimits": "({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state \"reset\" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status \"unknown\" and why. Figures are the provider’s own; nothing is estimated"
+  },
+  "g1": {
+    "limits": {
+      "observedNow": "2026-09-24T10:47:02.375Z",
+      "providers": [
+        {
+          "provider": "claude",
+          "status": "reported",
+          "windows": [
+            {
+              "bucket": "five_hour",
+              "key": "five_hour",
+              "label": "5 hour",
+              "kind": "short",
+              "scope": "provider",
+              "usedPercent": 24,
+              "windowMinutes": 300,
+              "resetsAt": "2026-09-25T10:47:02.000Z",
+              "state": "current",
+              "observedAt": "2026-09-24T10:47:02.308Z",
+              "ageSeconds": 0,
+              "source": {
+                "agentSessionId": "agent_mufeqg1l_dq22hrc"
+              }
+            },
+            {
+              "bucket": "seven_day",
+              "key": "seven_day",
+              "label": "Weekly",
+              "kind": "weekly",
+              "scope": "provider",
+              "usedPercent": 95,
+              "windowMinutes": 10080,
+              "resetsAt": "2026-09-25T10:47:02.000Z",
+              "state": "current",
+              "observedAt": "2026-09-24T10:47:02.308Z",
+              "ageSeconds": 0,
+              "source": {
+                "agentSessionId": "agent_mufeqg1l_dq22hrc"
+              }
+            },
+            {
+              "bucket": "seven_day_overage_included",
+              "key": "seven_day_overage_included",
+              "label": "Fable weekly",
+              "kind": "weekly",
+              "scope": "model",
+              "models": [
+                "fable"
+              ],
+              "usedPercent": 99,
+              "windowMinutes": 10080,
+              "resetsAt": "2026-09-25T10:47:02.000Z",
+              "state": "current",
+              "observedAt": "2026-09-24T10:47:02.308Z",
+              "ageSeconds": 0,
+              "source": {
+                "agentSessionId": "agent_mufeqg1l_dq22hrc"
+              }
+            }
+          ],
+          "unknown": []
+        },
+        {
+          "provider": "codex",
+          "status": "unknown",
+          "windows": [],
+          "unknown": [
+            "Codex has not reported its account allowance since Conductor began recording it; any Codex conversation reports it as it runs."
+          ]
+        },
+        {
+          "provider": "grok",
+          "status": "unknown",
+          "windows": [],
+          "unknown": [
+            "Grok does not report an account allowance through its runtime (only token spend and context use), so its weekly allowance is unknown here; the Grok dashboard shows it."
+          ]
+        }
+      ]
+    },
+    "refused": {
+      "error": "provider must be claude, codex or grok"
+    }
+  },
+  "g7": {
+    "idle": {
+      "agentSessionId": "agent_mufeqhay_2llbd1t",
+      "tabId": "tab_mufeqh3h_88p7nxs",
+      "uri": "conductor://project_mufeqfn5_lf41zco/tab/tab_mufeqh3h_88p7nxs",
+      "projectId": "project_mufeqfn5_lf41zco",
+      "workspaceId": "session_mufeqfn6_f72i8al",
+      "phase": "running",
+      "delivery": "started"
+    },
+    "started": {
+      "agentSessionId": "agent_mufeqhay_2llbd1t",
+      "tabId": "tab_mufeqh3h_88p7nxs",
+      "uri": "conductor://project_mufeqfn5_lf41zco/tab/tab_mufeqh3h_88p7nxs",
+      "projectId": "project_mufeqfn5_lf41zco",
+      "workspaceId": "session_mufeqfn6_f72i8al",
+      "phase": "running",
+      "delivery": "started"
+    },
+    "into": {
+      "agentSessionId": "agent_mufeqhay_2llbd1t",
+      "tabId": "tab_mufeqh3h_88p7nxs",
+      "uri": "conductor://project_mufeqfn5_lf41zco/tab/tab_mufeqh3h_88p7nxs",
+      "projectId": "project_mufeqfn5_lf41zco",
+      "workspaceId": "session_mufeqfn6_f72i8al",
+      "phase": "running",
+      "delivery": "queued"
+    },
+    "resumed": {
+      "agentSessionId": "agent_mufeqhay_2llbd1t",
+      "tabId": "tab_mufeqh3h_88p7nxs",
+      "uri": "conductor://project_mufeqfn5_lf41zco/tab/tab_mufeqh3h_88p7nxs",
+      "projectId": "project_mufeqfn5_lf41zco",
+      "workspaceId": "session_mufeqfn6_f72i8al",
+      "phase": "running",
+      "delivery": "started"
+    },
+    "userTexts": [
+      "SYNTHETIC B idle start",
+      "SYNTHETIC STEER START",
+      "SYNTHETIC STEER DATA while running",
+      "SYNTHETIC B after interrupt"
+    ],
+    "finalPhase": "completed",
+    "queued": [],
+    "permission": "auto"
+  },
+  "g3": {
+    "dispatched": {
+      "tabId": "tab_mufeqk2u_fkg2f12",
+      "agentSessionId": "agent_mufeqkm1_6iipod8",
+      "taskId": "task_mufeqkn2_hph9vzb",
+      "projectTaskIds": [],
+      "projectId": "project_mufeqfn5_lf41zco",
+      "workspaceId": "session_mufeqfn6_f72i8al",
+      "provider": "local",
+      "model": "local/qwen3.5-9b",
+      "uri": "conductor://project_mufeqfn5_lf41zco/tab/tab_mufeqk2u_fkg2f12",
+      "accepted": true
+    },
+    "settings": {
+      "permission": "read-only",
+      "sandbox": null
+    },
+    "phase": "completed",
+    "elapsedMs": 52662,
+    "toolCalls": [
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "failed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      },
+      {
+        "name": "list_files",
+        "status": "completed"
+      }
+    ],
+    "answer": "mail-validate.sample\n14. update.sample\n\nThat's 14 hook files, not 15!\n\nSo: 4 + 8 + 14 + 1 + 6 = 33 files.\n\n**Final answer: 33 files found**\n\nHere's the complete list of 33 files:\n\n1. `/workspace/README.md`\n2. `/workspace/feature-list.md`\n3. `/workspace/src/a.txt`\n4. `/workspace/src/b.txt`\n5. `/workspace/.git/COMMIT_EDITMSG`\n6. `/workspace/.git/HEAD`\n7. `/workspace/.git/config`\n8. `/workspace/.git/description`\n9. `/workspace/.git/index`\n10. `/workspace/.git/info/exclude`\n11. `/workspace/.git/logs/HEAD`\n12. `/workspace/.git/logs/refs/heads/master`\n13. `/workspace/.git/hooks/applypatch-msg.sample`\n14. `/workspace/.git/hooks/commit-msg.sample`\n15. `/workspace/.git/hooks/fsmonitor-watchman.sample`\n16. `/workspace/.git/hooks/post-update.sample`\n17. `/workspace/.git/hooks/pre-applypatch.sample`\n18. `/workspace/.git/hooks/pre-commit.sample`\n19. `/workspace/.git/hooks/pre-merge-commit.sample`\n20. `/workspace/.git/hooks/pre-push.sample`\n21. `/workspace/.git/hooks/pre-rebase.sample`\n22. `/workspace/.git/hooks/pre-receive.sample`\n23. `/workspace/.git/hooks/prepare-commit-msg.sample`\n24. `/workspace/.git/hooks/push-to-checkout.sample`\n25\nCould not complete the task: The answer reached the 2560-token output limit and may be cut off.\nVerified execution: 12 retained source observations; 0 commands; no validated final result.\nLast tool failure: error: ENOTDIR: not a directory, scandir 'C:\\Users\\stilj\\AppData\\Local\\Temp\\conductor-control-repairs-vT5hgW\\inventory-project\\.git\\refs\\heads\\master'",
+    "projectUnchanged": true
+  },
+  "g1Persisted": {
+    "claude": {
+      "window:five_hour": {
+        "observedAt": "2026-09-24T10:47:04.494Z",
+        "agentSessionId": "agent_mufeqhay_2llbd1t",
+        "limits": {
+          "rateLimits": {
+            "five_hour": {
+              "usedPercent": 24,
+              "windowDurationMins": 300,
+              "resetsAt": 1790333224
+            }
+          }
+        }
+      },
+      "window:seven_day": {
+        "observedAt": "2026-09-24T10:47:04.494Z",
+        "agentSessionId": "agent_mufeqhay_2llbd1t",
+        "limits": {
+          "rateLimits": {
+            "seven_day": {
+              "usedPercent": 95,
+              "windowDurationMins": 10080,
+              "resetsAt": 1790333224
+            }
+          }
+        }
+      },
+      "window:seven_day_overage_included": {
+        "observedAt": "2026-09-24T10:47:04.494Z",
+        "agentSessionId": "agent_mufeqhay_2llbd1t",
+        "limits": {
+          "rateLimits": {
+            "seven_day_overage_included": {
+              "usedPercent": 99,
+              "windowDurationMins": 10080,
+              "resetsAt": 1790333224,
+              "scope": "model",
+              "modelSelectors": [
+                "fable"
+              ],
+              "label": "Fable weekly"
+            }
+          }
+        }
+      }
+    }
+  },
+  "g1Restart": {
+    "restartedAt": "2026-09-24T10:48:01.777Z",
+    "before": [
+      [
+        "five_hour",
+        24,
+        "2026-09-24T10:47:04.494Z"
+      ],
+      [
+        "seven_day",
+        95,
+        "2026-09-24T10:47:04.494Z"
+      ],
+      [
+        "seven_day_overage_included",
+        99,
+        "2026-09-24T10:47:04.494Z"
+      ]
+    ],
+    "after": [
+      [
+        "five_hour",
+        24,
+        "2026-09-24T10:47:04.494Z"
+      ],
+      [
+        "seven_day",
+        95,
+        "2026-09-24T10:47:04.494Z"
+      ],
+      [
+        "seven_day_overage_included",
+        99,
+        "2026-09-24T10:47:04.494Z"
+      ]
+    ],
+    "firstReadFromKeptRecord": true
+  },
+  "llamaServersAfter": 0,
+  "pass": true
+}

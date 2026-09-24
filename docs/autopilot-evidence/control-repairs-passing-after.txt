@@ -1,0 +1,158 @@
+ ✓ src/main/local-models/harness.test.ts (9 tests) 77ms
+ ✓ src/main/local-models/bounded-tools.test.ts (19 tests) 316ms
+ ✓ src/main/phone-access.test.ts (25 tests) 116ms
+ ✓ src/main/local-models/output-budget.test.ts (8 tests) 202ms
+ ✓ src/main/durable-jobs/handoff.test.ts (17 tests) 225ms
+ ✓ src/main/remote-control-host.test.ts (61 tests) 233ms
+ ✓ src/main/local-models/recovery.test.ts (10 tests) 457ms
+ ✓ src/main/local-models/resource-guard.test.ts (7 tests) 799ms
+   ✓ machine-wide startup serialization > serializes two simultaneous process starts so only one can publish residency  434ms
+   ✓ machine-wide startup serialization > excludes a second OS process, then releases the lock even on failure  358ms
+ ✓ src/main/local-models/agent-management.test.ts (18 tests) 93ms
+ ✓ src/main/usage-limit.test.ts (13 tests) 32ms
+ ✓ src/main/local-models/agent-loop.test.ts (19 tests) 655ms
+ ✓ src/main/local-models/web.test.ts (4 tests) 20ms
+ ✓ src/main/local-models/sandbox-dependency-guard.test.ts (4 tests) 22ms
+ ✓ src/main/providers/local-context.test.ts (4 tests) 11ms
+ ✓ src/main/local-models/local-boundary-adversarial.test.ts (1 test) 13ms
+ ✓ src/main/local-models/context-management.test.ts (8 tests) 919ms
+ ✓ src/main/local-models/session-checkpoint.test.ts (3 tests) 6ms
+ ✓ src/main/local-models/sandbox-startup.test.ts (3 tests) 5ms
+ ✓ src/main/local-models/context-budget.test.ts (4 tests) 7ms
+ ✓ src/main/structured-sessions-local-checkpoint.test.ts (1 test) 420ms
+   ✓ wires registered conversation identity through database reopening and expires old runtime closures without submitting  419ms
+ ✓ src/main/phone-access-server.test.ts (7 tests) 778ms
+   ✓ the phone listener > streams the state to a paired phone and pushes a fresh one when something changes  508ms
+ ✓ src/main/local-models/control-integration.test.ts (1 test) 506ms
+   ✓ binds LocalAdapter control to durable project memory, live permissions and runtime lifetime  505ms
+ ✓ src/renderer/src/panes/usage-summary.test.ts (28 tests) 45ms
+ ✓ src/main/local-models/paths.test.ts (7 tests) 2133ms
+   ✓ local data root > keeps caches, temp and workspaces on the root  592ms
+   ✓ model relocation > moves across volumes and preserves the bytes  644ms
+   ✓ model relocation > migrates a model file off the old location and verifies it in place  510ms
+   ✓ model relocation > refuses to migrate a file whose size does not match the pinned model  382ms
+ ✓ src/main/local-models/local-models.test.ts (50 tests) 1970ms
+   ✓ sandbox arguments > mirrors the host line-ending translation into a granted container  367ms
+   ✓ masking under a repository-writes grant > leaves git nothing to record for a masked path the owner tracks  911ms
+   ✓ llama.cpp server lifecycle > stops an idle server this Conductor started to make room for the requested model  348ms
+ ✓ src/main/local-models/file-processing.test.ts (98 tests) 3044ms
+   ✓ bounded selected-schema helper > parses multiline BOM/CRLF bank records and matches the independent fixture oracle  2639ms
+ ✓ src/main/local-models/processing-workflow.test.ts (22 tests) 3045ms
+   ✓ observed-schema workflow and independent source checks > profiles observed headers for principal without injecting expected results  524ms
+   ✓ observed-schema workflow and independent source checks > profiles observed headers for heldout without injecting expected results  640ms
+   ✓ observed-schema workflow and independent source checks > validates principal with source-backed positive, ambiguity, absence and outgoing result  368ms
+   ✓ observed-schema workflow and independent source checks > validates heldout with source-backed positive, ambiguity, absence and outgoing result  394ms
+   ✓ observed-schema workflow and independent source checks > rejects remapped references and signs, hidden data rows, wrong sources and date equality  391ms
+   ✓ observed-schema workflow and independent source checks > uses explicit path roles without asking the model to transcribe a nested profile  443ms
+ ✓ src/main/local-models/git-push.test.ts (6 tests) 3491ms
+   ✓ granted git push > pushes the checked-out branch on the host and reports the result  1245ms
+   ✓ granted git push > refuses a branch that is not checked out and a remote that does not exist  481ms
+   ✓ granted git push > reports a rejected push instead of retrying it with force  1258ms
+   ✓ granted git push > is refused by run_command until the owner grants repository writes  500ms
+ ✓ src/main/structured-sessions-usage-cap.test.ts (3 tests) 4647ms
+   ✓ usage caps stop a conversation cleanly (synthetic, zero inference) > stops on the consumed share, says why, and refuses further turns until the cap changes  1481ms
+   ✓ usage caps stop a conversation cleanly (synthetic, zero inference) > caps an absolute account level and a token total, and honors a tab opt-out  2409ms
+   ✓ usage caps stop a conversation cleanly (synthetic, zero inference) > never stops on a figure the provider has not reported  755ms
+ ✓ src/main/providers/local.test.ts (20 tests) 5504ms
+   ✓ local provider adapter > says whether a local model can start now: an idle server of ours gives way, a mid-turn one is named  752ms
+   ✓ local provider adapter > reports an interrupted turn as interrupted rather than failed  3177ms
+ ✓ src/main/project-task-dispatch.test.ts (29 tests) 11432ms
+   ✓ Project tasks native dispatch > sends selected tasks once to an existing tab while preserving its permissions and unrelated tasks  319ms
+   ✓ Project tasks native dispatch > steers an active tab and claims tasks only after its native acceptance receipt  382ms
+   ✓ Project tasks native dispatch > keeps tasks unclaimed when active-turn delivery is uncertain  369ms
+   ✓ Project tasks native dispatch > opens a visible new provider tab and validates its selected concrete effort before submitting  396ms
+   ✓ Project tasks native dispatch > launches one visible main Fixer with actual-model selection and native coworker instructions  501ms
+   ✓ Project tasks native dispatch > uses fresh runtime model buckets to avoid an almost exhausted Astra default when Sol has allowance  367ms
+   ✓ Project tasks native dispatch > ranks coordinator capability before free quota and requests high reasoning when supported  428ms
+   ✓ Project tasks native dispatch > bootstraps Codex allowance without a tab, then creates exactly one Automation workspace after evidence succeeds  420ms
+   ✓ Project tasks native dispatch > does not leave an empty workspace when allowance bootstrap produces no evidence  325ms
+   ✓ Project tasks native dispatch > uses an invisible disposable bootstrap when the project has no open or closed workspace  706ms
+   ✓ Project tasks native dispatch > uses the durable timestamp of a repeated quota item so a current read supersedes old refusal evidence  377ms
+   ✓ Project tasks native dispatch > reads the uncapped durable usage journal when current allowance is outside the UI history page  1305ms
+   ✓ Project tasks native dispatch > keeps an owner-selected provider/model explicit even when its reported allowance is low  416ms
+   ✓ Project tasks native dispatch > uses fresh account evidence with a configured catalog when another runtime provider is low  456ms
+   ✓ Project tasks native dispatch > refuses automatic submission for Codex low plus Claude 1%, all exhausted, or no quota evidence  977ms
+   ✓ Project tasks native dispatch > applies an explicitly chosen permission mode to a new tab and threads it into the submitted settings  330ms
+   ✓ Project tasks native dispatch > opens a new tab on the owner's remembered permission for that provider when the request leaves it unset  342ms
+   ✓ Project tasks native dispatch > still lets an explicit dispatch permission win over the owner's remembered mode  342ms
+   ✓ Project tasks native dispatch > opens the auto Fixer tab on the owner's remembered permission too  397ms
+   ✓ Project tasks native dispatch > appends an optional owner instruction to the dispatched prompt, and omits it entirely when blank  363ms
+   ✓ Project tasks native dispatch > dispatches a single report above the former 50k ceiling and rejects only an over-combined native prompt  562ms
+   ✓ Project tasks native dispatch > keeps tasks unchanged on native failure, retains the visible tab, and never retries the prompt  342ms
+ ✓ src/main/agent-control.test.ts (87 tests) 27350ms
+   ✓ authorized native app control > builds a local app update only for the owner’s confirmation or a non-sandboxed coworker’s standing grant  393ms
+   ✓ authorized native app control > ships a cloud coworker’s work on the host in one call, asks the owner for a local model, and refuses read-only turns  367ms
+   ✓ authorized native app control > advertises configured local models and dispatches native local coworkers within inherited read-only permissions  443ms
+   ✓ authorized native app control > refuses foreign projects/workspaces, hidden sessions and closed callers  347ms
+   ✓ authorized native app control > observes coworker identity and fresh native execution results, including detached and older updated tools  695ms
+   ✓ authorized native app control > runs the router through persisted definitions, visible tabs and native turn events  1471ms
+   ✓ authorized native app control > focuses durable coordinated-message origins in either direction, after release, and from retained history  377ms
+   ✓ authorized native app control > requires owner confirmation before closing an active tab and never closes the caller  352ms
+   ✓ authorized native app control > closes a settled agent tab without a prompt and retains its conversation  349ms
+   ✓ authorized native app control > compares file versions, announces live changes and rejects escapes and competing leases (aliased root: false)  340ms
+   ✓ authorized native app control > compares file versions, announces live changes and rejects escapes and competing leases (aliased root: true)  321ms
+   ✓ authorized native app control > propagates restrictive runtime settings and prevents filesystem or delegation bypass: {"permission":"default","sandbox":"read-only","plan":false}  371ms
+   ✓ authorized native app control > propagates restrictive runtime settings and prevents filesystem or delegation bypass: {"permission":"default","plan":true}  357ms
+   ✓ authorized native app control > opens controlled tabs with the controller autonomy rather than leaving every one of them on ask  442ms
+   ✓ authorized native app control > opens a native coworker on Auto, the highest mode its provider offers, whatever the owner remembered or the caller asked  517ms
+   ✓ authorized native app control > keeps a lower mode only for an agent the caller marks as not to be trusted, from its explicit ask or the owner's remembered mode  380ms
+   ✓ authorized native app control > rejects an explicit tabs.open permission that is not a real mode, or one this provider does not offer  317ms
+   ✓ authorized native app control > never lets a Claude-only remembered mode leak into a new Codex tab  323ms
+   ✓ authorized native app control > still clamps a remembered mode to the controller's own autonomy  307ms
+   ✓ authorized native app control > preserves human memories and checklist ownership during agent writes  325ms
+   ✓ authorized native app control > releases a claim whose owning conversation is no longer open anywhere in the project  307ms
+   ✓ authorized native app control > lets an agent set task priority, and refuses a value the backlog would silently discard  316ms
+   ✓ authorized native app control > moves resumed hidden history to its visible workspace without losing native identity, settings or protocol authority  375ms
+   ✓ controlled coworker model configuration > repairs stale tab metadata, preserves authority settings, persists, and drives the next native request  402ms
+   ✓ controlled coworker model configuration > rejects invalid or arbitrary settings and refuses active, queued, or pending work  342ms
+   ✓ controlled coworker model configuration > requires an existing direct control claim and refuses self, ancestors, released tabs, and foreign projects  360ms
+   ✓ Project task handoff through native router dispatch > transfers only accepted exact task claims to a visible worker with the selected effort  410ms
+   ✓ projects open side by side in one window > hands work to a tab opened in the sibling project and keeps steering only that tab  351ms
+   ✓ steering an uncontrolled tab in a co-opened project > reads but never steers a tab a paired machine drives, and keeps a paired caller inside its project  454ms
+   ✓ steering an uncontrolled tab in a co-opened project > configures, resumes and releases a controlled sibling-project coworker  356ms
+   ✓ context handoff to a fresh tab > hands off only the calling conversation, never another tab  380ms
+   ✓ context handoff to a fresh tab > lets a read-only or planning conversation hand off, because the receiver inherits the same mode  550ms
+   ✓ local-model grants through app control > accepts the grants when the tab is created, through tabs.open and router.dispatch, under the same rules  330ms
+   ✓ durable jobs over app control > lists jobs.* only once the job controller is plugged in, through the setDurableJobs hook  362ms
+   ✓ control catalog and dispatch repairs > agents.steer starts one turn on an idle conversation, exactly as agents.submit does  319ms
+   ✓ control catalog and dispatch repairs > agents.steer steers into a running turn, or queues behind it, and starts nothing new  493ms
+   ✓ control catalog and dispatch repairs > agents.steer starts one new turn after an interrupt, with no duplicate and no authority change  340ms
+   ✓ control catalog and dispatch repairs > reports the latest provider allowance per bucket from usage events, zero-turn, with explicit unknowns, and keeps it over a restart  373ms
+   ✓ control catalog and dispatch repairs > dispatches a local model read-only without a sandbox mode it does not have, and keeps its writes refused  303ms
+   ✓ control catalog and dispatch repairs > closes the tab and drops the task of a dispatch whose prompt was refused before any turn  343ms
+ ✓ src/main/structured-sessions.test.ts (113 tests) 29613ms
+   ✓ internal local adapter availability > enforces stronger review before owner IPC can answer and never retries uncertain delivery  507ms
+   ✓ internal local adapter availability > lets the owner answer a request the stronger review is still considering, and drops the late reviewer result  380ms
+   ✓ internal local adapter availability > reaches actionable local setup when no external executable or local config exists  325ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > configures the project browser for claude unless the owner switched it off  588ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > configures the project browser for codex unless the owner switched it off  647ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > reconnects the same idle native claude conversation when browser tools change  363ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > reconnects the same idle native codex conversation when browser tools change  382ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > revokes browser access during an active claude turn and refreshes before the next turn  360ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > revokes browser access during an active codex turn and refreshes before the next turn  335ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > keeps a newer browser revocation when an older queued claude message drains  388ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > keeps a newer browser revocation when an older queued codex message drains  365ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > opens every new claude conversation with browser tools on until the owner switches them off, whoever opens it  359ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > opens every new codex conversation with browser tools on until the owner switches them off, whoever opens it  369ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > opens a new conversation on Auto until the owner chooses another mode for that provider  398ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > claims an approval once across views and rejects a wrong runtime or unsupported scope  365ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > resumes the same native conversation for a new message, sends it once, and ignores stale callbacks  328ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > restores history lazily, then resumes the same native conversation only for a new message  351ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > denying preserves bytes, approving edits once, Keep does not reapply, and undo preserves later work  339ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > keeps simultaneous sessions independent and rejects workspace rebinding and unsafe file context  347ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > forks native context and copies immutable historical artifacts without an inference submission  326ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > preserves native history and immutable review after an authorized project folder relocation  333ms
+   ✓ backend session ownership and lifecycle — fake provider boundary > applies each queued effort to the same native Claude conversation  415ms
+   ✓ queued messages and native CLI handoff > owns a queued message across views and dispatches it exactly once after completion  305ms
+   ✓ queued messages and native CLI handoff > retries a queued message into a failed phase only once  311ms
+   ✓ mid-turn steering and input retention > rejects invalid input and queue overflow so the composer keeps the original draft  462ms
+   ✓ steering receipts and Escape delivery > does not replay a cancellation without proof, or replay from a budget stop  392ms
+   ✓ steering receipts and Escape delivery > promotes a message queued during native startup into the active turn once steering becomes available  307ms
+   ✓ transfers a promoted queue entry to native pending ownership even when delivery becomes uncertain  350ms
+   ✓ retains transferred input when a definite native refusal races with Stop  338ms
+   ✓ activity reported while subagent work outlives its turn > never lets a child revive a turn that stopped, failed or lost its runtime  582ms
+   ✓ activity reported while background work outlives its turn > never masks a turn that was interrupted, failed, or lost its runtime  360ms
+   ✓ provider usage limits and automatic continuation > stops waiting when the owner continues the conversation first  316ms
+ Test Files  33 passed (33)
+      Tests  709 passed (709)
+   Duration  31.37s (transform 5.07s, setup 0ms, collect 20.02s, tests 98.19s, environment 6ms, prepare 5.42s)

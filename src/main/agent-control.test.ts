@@ -17,10 +17,11 @@ import type { AgentEventData, ProviderCapabilities, SessionProjection, Structure
 import type { AdapterOptions, ProviderAdapter } from './providers/adapter'
 import { FakeDurableJobsService } from '../shared/durable-jobs-fake'
 import type { DurableJobEvent, DurableJobSummary } from '../shared/durable-jobs'
+import { assertLocalControlAllowed, assertToolAllowed, toolSpecs } from './local-models/tools'
 
 const dispose: Array<() => void> = []
 afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); vi.useRealTimers() })
-function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['permissions']>>) {
+function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['permissions']>>, sandboxByProvider?: Partial<Record<StructuredProvider, ProviderCapabilities['sandboxModes']>>) {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0'); vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
   const root = mkdtempSync(join(tmpdir(), 'conductor-control-')), canonicalProjectPath = join(root, 'project')
   mkdirSync(canonicalProjectPath)
@@ -35,7 +36,7 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   const submissions: Array<{ provider: StructuredProvider; prompt: string; settings: import('../shared/structured-agent').SessionSettings; options: AdapterOptions }> = []
   const broadcast = vi.fn()
   const sessions = new StructuredSessions(database, () => 'synthetic-provider', broadcast, (provider, options): ProviderAdapter => {
-    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: ['inherit', 'read-only', 'workspace-write'], effort: ['low', 'high'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }, { id: provider + '-advanced', label: provider + ' Advanced', effort: ['high'], defaultEffort: 'high' }], limitations: ['Zero inference fixture'] }
+    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: sandboxByProvider && provider in sandboxByProvider ? sandboxByProvider[provider] : ['inherit', 'read-only', 'workspace-write'], effort: ['low', 'high'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }, { id: provider + '-advanced', label: provider + ' Advanced', effort: ['high'], defaultEffort: 'high' }], limitations: ['Zero inference fixture'] }
     return { provider, capabilities, start: async () => { options.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: 'native-' + options.runtimeId } }) },
       submit: async (prompt, settings) => { submissions.push({ provider, prompt, settings: structuredClone(settings), options }); options.emit({ itemId: 'result', data: { type: 'text', role: 'assistant', text: 'Native fixture result', mode: 'snapshot' } }); options.emit({ data: { type: 'session', phase: 'completed' } }) }, respond: async () => {}, interrupt: async () => {}, dispose: () => {} }
   })
@@ -1513,5 +1514,203 @@ describe('durable jobs over app control', () => {
     expect(reopened.resourceId).toBe(job.id)
     expect(f.service.list()).toHaveLength(1)
     await expect(f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: 'job_missing' })).rejects.toThrow(/No durable job/)
+  })
+})
+describe('control catalog and dispatch repairs', () => {
+  const phase = (f: ReturnType<typeof fixture>, id: string, value: SessionProjection['phase']): void => {
+    const state = f.database.structured.snapshot(id)!, spec = f.database.structured.spec<AgentSpec>(id)!
+    f.database.structured.append({ schemaVersion: 1, id: 'phase-' + id + '-' + (state.sequence + 1), sequence: state.sequence + 1, sessionId: id, runtimeId: state.runtimeId || 'phase-runtime', provider: spec.provider as StructuredProvider, projectId: spec.projectId, workspaceId: spec.sessionId, cwd: spec.cwd, timestamp: new Date().toISOString(), data: { type: 'session', phase: value } })
+  }
+  const settle = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 20))
+
+  it('lists Grok beside Codex and Claude, opens it in planning under a planning controller and configures it', async () => {
+    const f = fixture(false, { grok: ['default', 'accept-edits', 'auto'] })
+    f.deps.providers().push({ id: 'grok', displayName: 'Grok', available: true, installUrl: '', models: [{ id: 'grok-synthetic', label: 'Grok Synthetic' }], efforts: [{ id: 'low', label: 'Low' }] })
+    const catalog = await f.control.call(f.scope, 'models.list') as Array<{ provider: string; models: Array<{ id: string }> }>
+    expect(catalog.map(entry => entry.provider)).toEqual(['codex', 'claude', 'grok'])
+    expect(catalog.find(entry => entry.provider === 'grok')?.models[0]?.id).toBe('grok-synthetic')
+    expect((await f.control.call(f.scope, 'tools.list') as Record<string, string>)['tabs.open']).toContain('a Claude, Codex or Grok coworker opens on Auto')
+    const auto = await f.control.call(f.scope, 'tabs.open', { provider: 'grok', model: 'grok-synthetic' }) as AgentControlTab
+    expect(f.database.structured.snapshot(auto.resourceId!)?.settings).toMatchObject({ permission: 'auto', plan: false })
+    expect(await f.control.call(f.scope, 'agents.configure', { agentSessionId: auto.resourceId, model: 'grok-advanced', effort: 'high' })).toMatchObject({ provider: 'grok', model: 'grok-advanced', effort: 'high' })
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, plan: true } })
+    const planning = await f.control.call(f.scope, 'tabs.open', { provider: 'grok', model: 'grok-synthetic' }) as AgentControlTab
+    expect(f.database.structured.snapshot(planning.resourceId!)?.settings.plan).toBe(true)
+  })
+
+  it('describes git.ship as a local commit unless publish is asked for, and passes publish through', async () => {
+    const f = fixture()
+    const catalog = await f.control.call(f.scope, 'tools.list') as Record<string, string>
+    expect(catalog['git.ship']).toContain('a local commit')
+    expect(catalog['git.ship']).toContain('publish: true')
+    expect(catalog['git.ship']).not.toContain('then it waits for the release the push triggers')
+    await f.control.call(f.scope, 'git.ship', { message: 'Local' })
+    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Local' }, expect.anything())
+    await f.control.call(f.scope, 'git.ship', { message: 'Release', publish: true })
+    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Release', publish: true }, expect.anything())
+    await f.control.call(f.scope, 'git.ship', { message: 'Still local', publish: false })
+    expect(f.delivery.ship).toHaveBeenLastCalledWith(f.project.id, f.project.path, { message: 'Still local' }, expect.anything())
+    const local: AgentSpec = { ...f.spec, id: 'local-worker', provider: 'local', title: 'Local worker' }
+    f.sessions.ensure(local)
+    openAgentTab(f, local.id, 'local-tab')
+    await expect(f.control.call({ ...f.scope, agentSessionId: local.id }, 'git.ship', { message: 'Local' })).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenLastCalledWith(expect.anything(), 'Local worker wants to test, build and commit this project on this machine (no push, no release).')
+    await expect(f.control.call({ ...f.scope, agentSessionId: local.id }, 'git.ship', { message: 'Release', publish: true })).rejects.toThrow('declined')
+    expect(f.confirm).toHaveBeenLastCalledWith(expect.anything(), 'Local worker wants to test, build and commit this project, push it and publish its release.')
+    expect(f.delivery.ship).toHaveBeenCalledTimes(3)
+  })
+
+  it('says jobs.pause interrupts the running stage at once', async () => {
+    const f = fixture()
+    f.control.setDurableJobs(new FakeDurableJobsService())
+    const pause = (await f.control.call(f.scope, 'tools.list') as Record<string, string>)['jobs.pause']
+    expect(pause).toContain('interrupts the running stage at once (there is no safe point to wait for)')
+    expect(pause).toContain('records a tool call it cut off as an unknown side effect that is never replayed')
+    expect(pause).not.toContain('finishes at a safe point')
+  })
+
+  it('agents.steer starts one turn on an idle conversation, exactly as agents.submit does', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', effort: 'low' }) as AgentControlTab
+    const settings = structuredClone(f.database.structured.snapshot(child.resourceId!)!.settings)
+    expect(f.database.structured.snapshot(child.resourceId!)?.phase).toBe('idle')
+    const result = await f.control.call(f.scope, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'Start from idle' }) as Record<string, unknown>
+    await settle()
+    expect(result).toMatchObject({ agentSessionId: child.resourceId, delivery: 'started' })
+    expect(f.submissions).toHaveLength(1)
+    expect(f.submissions[0]!.prompt).toContain('Start from idle')
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toEqual(settings)
+    expect(f.control.listLinks(f.project.id, f.workspace.id).filter(link => link.targetAgentSessionId === child.resourceId)).toHaveLength(1)
+    expect((await f.control.call(f.scope, 'tools.list') as Record<string, string>)['agents.steer']).toMatch(/running.*queues it behind the turn.*idle.*starts a turn/s)
+  })
+
+  it('agents.steer steers into a running turn, or queues behind it, and starts nothing new', async () => {
+    const f = fixture()
+    const live = (id: string) => (f.sessions as unknown as { live: Map<string, { adapter: ProviderAdapter }> }).live.get(id)!.adapter
+    const running = async (): Promise<AgentControlTab> => {
+      const child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', effort: 'low' }) as AgentControlTab
+      await f.control.call(f.scope, 'agents.submit', { agentSessionId: child.resourceId, prompt: 'First turn' })
+      await settle()
+      phase(f, child.resourceId!, 'running')
+      return child
+    }
+    // A provider that steers takes the message into the running turn.
+    const steering = await running()
+    const steered: string[] = []
+    live(steering.resourceId!).steer = async text => { steered.push(text) }
+    expect(await f.control.call(f.scope, 'agents.steer', { agentSessionId: steering.resourceId, prompt: 'Into the running turn' })).toMatchObject({ delivery: 'queued' })
+    await settle()
+    expect(steered).toEqual(['Into the running turn'])
+    // One that cannot steer holds it behind the turn.
+    const queueing = await running()
+    live(queueing.resourceId!).capabilities.steering = false
+    expect(await f.control.call(f.scope, 'agents.steer', { agentSessionId: queueing.resourceId, prompt: 'Behind the running turn' })).toMatchObject({ delivery: 'queued' })
+    await settle()
+    expect(f.database.structured.snapshot(queueing.resourceId!)?.queuedPrompts?.map(prompt => prompt.text)).toEqual(['Behind the running turn'])
+    expect(f.submissions).toHaveLength(2)
+    // A turn that is still stopping is refused, not raced.
+    phase(f, queueing.resourceId!, 'interrupting')
+    await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: queueing.resourceId, prompt: 'Too soon' })).rejects.toThrow(/still stopping/)
+    expect(f.submissions).toHaveLength(2)
+  })
+
+  it('agents.steer starts one new turn after an interrupt, with no duplicate and no authority change', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', effort: 'low' }) as AgentControlTab
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: child.resourceId, prompt: 'First turn' })
+    await settle()
+    phase(f, child.resourceId!, 'interrupted')
+    const settings = structuredClone(f.database.structured.snapshot(child.resourceId!)!.settings)
+    const links = f.control.listLinks(f.project.id, f.workspace.id)
+    const result = await f.control.call(f.scope, 'agents.steer', { agentSessionId: child.resourceId, prompt: 'Resume the bounded work' }) as Record<string, unknown>
+    await settle()
+    expect(result).toMatchObject({ delivery: 'started' })
+    expect(f.submissions.map(submission => submission.prompt.includes('Resume the bounded work'))).toEqual([false, true])
+    expect(f.database.structured.snapshot(child.resourceId!)?.queuedPrompts ?? []).toEqual([])
+    expect(f.database.structured.snapshot(child.resourceId!)?.settings).toEqual(settings)
+    expect(f.control.listLinks(f.project.id, f.workspace.id)).toEqual(links)
+  })
+
+  it('reports the latest provider allowance per bucket from usage events, zero-turn, with explicit unknowns, and keeps it over a restart', async () => {
+    const f = fixture()
+    const now = Date.now(), inFiveHours = Math.floor(now / 1000) + 5 * 3600, inAWeek = Math.floor(now / 1000) + 6 * 86400, anHourAgo = Math.floor(now / 1000) - 3600
+    const empty = await f.control.call(f.scope, 'usage.limits') as { providers: Array<{ provider: string; status: string; windows: unknown[]; unknown: string[] }> }
+    expect(empty.providers.map(entry => [entry.provider, entry.status])).toEqual([['claude', 'unknown'], ['codex', 'unknown'], ['grok', 'unknown']])
+    const claude = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic', effort: 'low' }) as AgentControlTab
+    const codex = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', effort: 'low' }) as AgentControlTab
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: claude.resourceId, prompt: 'One turn' })
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: codex.resourceId, prompt: 'One turn' })
+    const emit = (provider: StructuredProvider) => f.submissions.find(submission => submission.provider === provider)!.options.emit
+    emit('claude')({ itemId: 'usage:account-rate-limits', data: { type: 'usage', source: 'provider', limits: { rateLimits: { five_hour: { usedPercent: 42, windowDurationMins: 300, resetsAt: inFiveHours }, seven_day: { usedPercent: 61.5, windowDurationMins: 10080, resetsAt: inAWeek }, seven_day_overage_included: { usedPercent: 12, windowDurationMins: 10080, resetsAt: anHourAgo } } } } })
+    emit('codex')({ itemId: 'account-rate-limits', data: { type: 'usage', source: 'provider', limits: { rateLimits: { limitId: 'codex', primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: inFiveHours } }, rateLimitsByLimitId: { codex: { limitId: 'codex', limitName: null, primary: { usedPercent: 10, windowDurationMins: 300, resetsAt: inFiveHours }, secondary: { usedPercent: 96, windowDurationMins: 10080, resetsAt: inAWeek }, credits: { hasCredits: true, unlimited: false, balance: '12.50' }, planType: 'pro' } } } } })
+    // A sparse update changes one window of the bucket and leaves the other as last reported.
+    emit('codex')({ itemId: 'account-rate-limits', data: { type: 'usage', source: 'provider', limits: { rateLimits: { limitId: 'codex', primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: inFiveHours }, secondary: null, credits: null } } } })
+    // Token spend is not an allowance and is never mistaken for one.
+    emit('claude')({ itemId: 'usage:turn', data: { type: 'usage', scope: 'turn', source: 'provider', inputTokens: 10, outputTokens: 5, limits: { contextUsedTokens: 15 } } })
+    const submitted = f.submissions.length
+    const report = await f.control.call(f.scope, 'usage.limits') as { observedNow: string; providers: Array<{ provider: string; status: string; windows: Array<Record<string, unknown>>; credits?: Array<Record<string, unknown>>; unknown: string[] }> }
+    expect(f.submissions).toHaveLength(submitted)
+    const byProvider = Object.fromEntries(report.providers.map(entry => [entry.provider, entry]))
+    expect(byProvider.claude!.status).toBe('reported')
+    expect(byProvider.claude!.windows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: 'five_hour', usedPercent: 42, windowMinutes: 300, resetsAt: new Date(inFiveHours * 1000).toISOString(), state: 'current', scope: 'provider', source: { agentSessionId: claude.resourceId } }),
+      expect.objectContaining({ key: 'seven_day', usedPercent: 61.5, kind: 'weekly', state: 'current' }),
+      expect.objectContaining({ key: 'seven_day_overage_included', scope: 'model', models: ['fable'], state: 'reset' })
+    ]))
+    expect(byProvider.claude!.windows.every(window => typeof window.observedAt === 'string' && typeof window.ageSeconds === 'number')).toBe(true)
+    expect(byProvider.codex!.windows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ bucket: 'codex', key: 'codex:primary', usedPercent: 12, state: 'current' }),
+      expect.objectContaining({ bucket: 'codex', key: 'codex:secondary', usedPercent: 96, kind: 'weekly' })
+    ]))
+    expect(byProvider.codex!.credits).toEqual([expect.objectContaining({ bucket: 'codex', hasCredits: true, unlimited: false, balance: '12.50', planType: 'pro' })])
+    expect(byProvider.grok).toMatchObject({ status: 'unknown', windows: [] })
+    expect(byProvider.grok!.unknown.join(' ')).toMatch(/Grok.*does not report/)
+    expect(await f.control.call(f.scope, 'usage.limits', { provider: 'codex' })).toMatchObject({ providers: [expect.objectContaining({ provider: 'codex' })] })
+    await expect(f.control.call(f.scope, 'usage.limits', { provider: 'openai' })).rejects.toThrow(/provider/)
+    await expect(f.control.call(f.scope, 'usage.limits', { window: 'all' })).rejects.toThrow(/accepts only provider/)
+    expect(JSON.stringify(await f.control.call(f.scope, 'tools.list'))).toContain('usage.limits')
+    // A local model may read it in any mode; it writes nothing.
+    expect(() => assertLocalControlAllowed('usage.limits', { provider: 'claude' }, true)).not.toThrow()
+    expect(() => assertLocalControlAllowed('usage.limits', { projectId: 'x' }, true)).toThrow()
+    // The record survives a restart: a fresh session manager over the same database reads it.
+    const restarted = new StructuredSessions(f.database, () => 'synthetic-provider', vi.fn(), () => { throw new Error('No runtime is started to read limits') })
+    dispose.push(() => restarted.dispose())
+    const codexAfter = restarted.usageLimits().find(entry => entry.provider === 'codex')!
+    expect(codexAfter.windows.map(window => [window.key, window.usedPercent, window.observedAt])).toEqual(byProvider.codex!.windows.map(window => [window.key, window.usedPercent, window.observedAt]))
+  })
+
+  it('dispatches a local model read-only without a sandbox mode it does not have, and keeps its writes refused', async () => {
+    const f = fixture(false, { local: ['accept-edits', 'read-only'] }, { local: undefined })
+    f.deps.providers().push({ id: 'local', displayName: 'Local', available: true, installUrl: '', models: [{ id: 'local-synthetic', label: 'Local synthetic' }], efforts: [] })
+    const result = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Read-only inventory', prompt: 'List the fixture files.', provider: 'local', model: 'local-synthetic', permission: 'read-only', exactPermission: true }] }) as Array<{ agentSessionId: string; accepted: boolean; error?: string }>
+    expect(result[0]).toMatchObject({ accepted: true })
+    expect(result[0]!.error).toBeUndefined()
+    const settings = f.database.structured.snapshot(result[0]!.agentSessionId)!.settings
+    expect(settings.permission).toBe('read-only')
+    expect(settings.sandbox).toBeUndefined()
+    expect(f.submissions.at(-1)).toMatchObject({ provider: 'local', settings: expect.objectContaining({ permission: 'read-only' }) })
+    // The local runtime's read-only mode is its permission: no write tool and no command runner.
+    for (const tool of ['write_file', 'edit_file', 'apply_edits', 'run_command']) expect(() => assertToolAllowed(tool, true)).toThrow(/read-only/)
+    expect(toolSpecs(true).map(spec => spec.function.name)).not.toEqual(expect.arrayContaining(['write_file']))
+    // A provider that does have a read-only sandbox still gets it.
+    const codex = await f.control.call(f.scope, 'tabs.open', { provider: 'codex', model: 'codex-synthetic', permission: 'read-only', exactPermission: true }) as AgentControlTab
+    expect(f.database.structured.snapshot(codex.resourceId!)?.settings).toMatchObject({ permission: 'read-only', sandbox: 'read-only' })
+  })
+
+  it('closes the tab and drops the task of a dispatch whose prompt was refused before any turn', async () => {
+    const f = fixture()
+    vi.spyOn(f.sessions, 'submit').mockRejectedValueOnce(new Error('Synthetic refusal before any turn'))
+    const result = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Refused worker', prompt: 'Never runs', provider: 'codex', model: 'codex-synthetic' }] }) as Array<Record<string, unknown>>
+    expect(result[0]).toMatchObject({ accepted: false, error: 'Synthetic refusal before any turn', tabClosed: true })
+    expect(result[0]!.taskId).toBeUndefined()
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.close', params: { tabId: result[0]!.tabId } })
+    expect(f.orchestration.listTasks(f.project.id).filter(task => task.title === 'Refused worker')).toEqual([])
+    expect(f.control.listLinks(f.project.id, f.workspace.id).filter(link => link.targetAgentSessionId === result[0]!.agentSessionId)).toEqual([])
+    expect(f.submissions).toHaveLength(0)
+    // A worker that did get its prompt keeps its tab and task.
+    const kept = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Accepted worker', prompt: 'Runs', provider: 'codex', model: 'codex-synthetic' }] }) as Array<Record<string, unknown>>
+    expect(kept[0]).toMatchObject({ accepted: true })
+    expect(f.orchestration.listTasks(f.project.id).filter(task => task.title === 'Accepted worker')).toHaveLength(1)
   })
 })

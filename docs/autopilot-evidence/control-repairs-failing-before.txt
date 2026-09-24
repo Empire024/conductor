@@ -1,0 +1,274 @@
+
+ RUN  v3.2.7 C:/Users/stilj/AppData/Local/Temp/control-repairs-head
+
+ ❯ src/main/agent-control.test.ts (87 tests | 9 failed | 78 skipped) 1470ms
+   ↓ authorized native app control > builds a local app update only for the owner’s confirmation or a non-sandboxed coworker’s standing grant
+   ↓ authorized native app control > tells the agent whether the owner declined app.update or was never reached, and builds nothing either way
+   ↓ authorized native app control > ships a cloud coworker’s work on the host in one call, asks the owner for a local model, and refuses read-only turns
+   ↓ authorized native app control > advertises configured local models and dispatches native local coworkers within inherited read-only permissions
+   ↓ authorized native app control > refuses foreign projects/workspaces, hidden sessions and closed callers
+   ↓ authorized native app control > observes coworker identity and fresh native execution results, including detached and older updated tools
+   ↓ authorized native app control > runs the router through persisted definitions, visible tabs and native turn events
+   ↓ authorized native app control > focuses durable coordinated-message origins in either direction, after release, and from retained history
+   ↓ authorized native app control > requires owner confirmation before closing an active tab and never closes the caller
+   ↓ authorized native app control > closes a settled agent tab without a prompt and retains its conversation
+   ↓ authorized native app control > compares file versions, announces live changes and rejects escapes and competing leases (aliased root: false)
+   ↓ authorized native app control > compares file versions, announces live changes and rejects escapes and competing leases (aliased root: true)
+   ↓ authorized native app control > propagates restrictive runtime settings and prevents filesystem or delegation bypass: {"permission":"default","sandbox":"read-only","plan":false}
+   ↓ authorized native app control > propagates restrictive runtime settings and prevents filesystem or delegation bypass: {"permission":"default","plan":true}
+   ↓ authorized native app control > opens controlled tabs with the controller autonomy rather than leaving every one of them on ask
+   ↓ authorized native app control > opens a native coworker on Auto, the highest mode its provider offers, whatever the owner remembered or the caller asked
+   ↓ authorized native app control > keeps a lower mode only for an agent the caller marks as not to be trusted, from its explicit ask or the owner's remembered mode
+   ↓ authorized native app control > rejects an explicit tabs.open permission that is not a real mode, or one this provider does not offer
+   ↓ authorized native app control > never lets a Claude-only remembered mode leak into a new Codex tab
+   ↓ authorized native app control > still clamps a remembered mode to the controller's own autonomy
+   ↓ authorized native app control > preserves human memories and checklist ownership during agent writes
+   ↓ authorized native app control > releases a claim whose owning conversation is no longer open anywhere in the project
+   ↓ authorized native app control > lets an agent set task priority, and refuses a value the backlog would silently discard
+   ↓ authorized native app control > moves resumed hidden history to its visible workspace without losing native identity, settings or protocol authority
+   ↓ authorized native app control > resolves exact tab/file/workspace URIs and rejects foreign filesystem paths
+   ↓ controlled coworker model configuration > repairs stale tab metadata, preserves authority settings, persists, and drives the next native request
+   ↓ controlled coworker model configuration > rejects invalid or arbitrary settings and refuses active, queued, or pending work
+   ↓ controlled coworker model configuration > requires an existing direct control claim and refuses self, ancestors, released tabs, and foreign projects
+   ↓ local protocol boundary > authenticates the native briefing and rejects browser origins, malformed bodies and stale authority
+   ↓ local protocol boundary > makes no first-party MCP exception and supplies no protocol authority during isolated live tests
+   ↓ Project task handoff through native router dispatch > transfers only accepted exact task claims to a visible worker with the selected effort
+   ↓ Project task handoff through native router dispatch > rejects missing, finished, competing active, and duplicate task IDs before any new tab or prompt
+   ↓ Project task handoff through native router dispatch > retains the original task claim and visible worker after a native dispatch refusal without retrying
+   ↓ which machine a controlled tab runs on > records this machine on a tab a local controller opens
+   ↓ which machine a controlled tab runs on > keeps a child tab on the same machine as the controller that opened it
+   ↓ which machine a controlled tab runs on > moves a child tab only when the caller names a machine explicitly
+   ↓ which machine a controlled tab runs on > refuses an unknown or revoked machine instead of quietly running the work here
+   ↓ which machine a controlled tab runs on > falls back to this machine when the controller machine is no longer paired
+   ↓ which machine a controlled tab runs on > refuses to place a tab on a machine this project was never paired with
+   ↓ which machine a controlled tab runs on > refuses when the paired machine is now sharing a different project under that mapping
+   ↓ which machine a controlled tab runs on > tells the caller which machine it is on and which others can run this project
+   ↓ which machine a controlled tab runs on > reports plainly when this window cannot place tabs on other machines
+   ↓ projects open side by side in one window > names every open project and reads a sibling without being able to write to it
+   ↓ projects open side by side in one window > hands work to a tab opened in the sibling project and keeps steering only that tab
+   ↓ projects open side by side in one window > dispatches a coworker into the sibling project but never hands it this project’s task claims
+   ↓ steering an uncontrolled tab in a co-opened project > lists the owner’s uncontrolled tab to an agent of a sibling project and lets it read and steer it
+   ↓ steering an uncontrolled tab in a co-opened project > hides a sibling-project tab another agent controls and refuses to read or steer it
+   ↓ steering an uncontrolled tab in a co-opened project > reads but never steers a tab a paired machine drives, and keeps a paired caller inside its project
+   ↓ steering an uncontrolled tab in a co-opened project > lets a sandboxed local caller read the tab but not steer it
+   ↓ steering an uncontrolled tab in a co-opened project > renames, focuses and splits a coworker it controls in a sibling project, in the workspace that holds it
+   ↓ steering an uncontrolled tab in a co-opened project > stops a running or approval-waiting coworker in a sibling project, and interrupting alone takes no control
+   ↓ steering an uncontrolled tab in a co-opened project > closes a controlled sibling-project coworker, asking the owner first while it has work, and releases the link on both sides
+   ↓ steering an uncontrolled tab in a co-opened project > closes a settled sibling-project coworker without asking
+   ↓ steering an uncontrolled tab in a co-opened project > configures, resumes and releases a controlled sibling-project coworker
+   ↓ steering an uncontrolled tab in a co-opened project > keeps every boundary around a controlled sibling-project coworker
+   ↓ a conversation a paired machine is driving > stays inside the project that machine was granted, even with another project open here
+   ↓ context handoff to a fresh tab > refuses a handoff that is not the bounded six-section format, naming what is wrong
+   ↓ context handoff to a fresh tab > accepts the headings however the model marked them up, as long as each stands on its own line
+   ↓ context handoff to a fresh tab > opens a fresh tab on the caller’s own provider, model, effort and mode and gives it the handoff as its first prompt
+   ↓ context handoff to a fresh tab > hands off only the calling conversation, never another tab
+   ↓ context handoff to a fresh tab > lets a read-only or planning conversation hand off, because the receiver inherits the same mode
+   ↓ context handoff to a fresh tab > advertises itself in tools.list with the six sections a caller has to write
+   ↓ local-model grants through app control > lets a non-local controller grant and revoke repository writes and research on a local tab it opened, durably and visibly
+   ↓ local-model grants through app control > refuses a non-local target, a local caller, itself, a tab the caller does not control, and a conversation a paired machine drives
+   ↓ local-model grants through app control > accepts the grants when the tab is created, through tabs.open and router.dispatch, under the same rules
+   ↓ bounded local tasks and compact supervision through app control > stores a task contract on a local tab it opens, refuses one elsewhere, and exposes a compact status
+   ↓ the owner control credential > resolves an owner scope to a named or default project and workspace, and never to a conversation
+   ↓ the owner control credential > bootstraps a profile with no project: discovery and projects.open answer, everything else names the gap
+   ↓ the owner control credential > opens coworkers on Auto without a tab of its own, drives them, and needs no confirmation dialog
+   ↓ the owner control credential > answers the owner-only app methods through the host hooks, and refuses them to conversations
+   ↓ the owner control credential > serves the owner credential over the loopback server from a file it writes at start and removes at close
+   ↓ wizard tabs > a wizard tab holds the owner’s authority in its own conversation, on a frontier model only
+   ↓ wizard tabs > reads the full text of a tool output the history only carries a tail of
+   ↓ durable jobs over app control > lists jobs.* only once the job controller is plugged in, through the setDurableJobs hook
+   ↓ durable jobs over app control > lets the owner, a wizard tab or a writable non-local conversation create a job on a local model only
+   ↓ durable jobs over app control > lets the creator, the owner and a wizard tab pause, resume and cancel; others and local models only read
+   ↓ durable jobs over app control > treats another project’s job as missing and bounds the event page
+   ↓ durable jobs over app control > opens a job tab whose identity is the job id, focuses it when asked again and reopens it after a close
+   × control catalog and dispatch repairs > lists Grok beside Codex and Claude, opens it in planning under a planning controller and configures it 150ms
+     → expected [ 'codex', 'claude' ] to deeply equal [ 'codex', 'claude', 'grok' ]
+   × control catalog and dispatch repairs > describes git.ship as a local commit unless publish is asked for, and passes publish through 134ms
+     → expected '({message,paths?,publish?,waitSeconds…' to contain 'a local commit'
+   × control catalog and dispatch repairs > says jobs.pause interrupts the running stage at once 129ms
+     → expected '({jobId,reason?}) — the owner, a wiza…' to contain 'interrupts the running stage at once …'
+   × control catalog and dispatch repairs > agents.steer starts one turn on an idle conversation, exactly as agents.submit does 154ms
+     → There is no active turn to queue behind
+   × control catalog and dispatch repairs > agents.steer steers into a running turn, or queues behind it, and starts nothing new 207ms
+     → expected { …(6) } to match object { delivery: 'queued' }
+(6 matching properties omitted from actual)
+   × control catalog and dispatch repairs > agents.steer starts one new turn after an interrupt, with no duplicate and no authority change 219ms
+     → There is no active turn to queue behind
+   × control catalog and dispatch repairs > reports the latest provider allowance per bucket from usage events, zero-turn, with explicit unknowns, and keeps it over a restart 132ms
+     → Unknown control method; use tools.list
+   × control catalog and dispatch repairs > dispatches a local model read-only without a sandbox mode it does not have, and keeps its writes refused 175ms
+     → expected { tabId: 'tab_mufeic4p_bkgwxwb', …(7) } to match object { accepted: true }
+(7 matching properties omitted from actual)
+   × control catalog and dispatch repairs > closes the tab and drops the task of a dispatch whose prompt was refused before any turn 168ms
+     → expected { tabId: 'tab_mufeic9g_4icyqm0', …(7) } to match object { accepted: false, …(2) }
+(6 matching properties omitted from actual)
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 9 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > lists Grok beside Codex and Claude, opens it in planning under a planning controller and configures it
+AssertionError: expected [ 'codex', 'claude' ] to deeply equal [ 'codex', 'claude', 'grok' ]
+
+- Expected
++ Received
+
+  [
+    "codex",
+    "claude",
+-   "grok",
+  ]
+
+ ❯ src/main/agent-control.test.ts:1530:50
+    1528|     f.deps.providers().push({ id: 'grok', displayName: 'Grok', availab…
+    1529|     const catalog = await f.control.call(f.scope, 'models.list') as Ar…
+    1530|     expect(catalog.map(entry => entry.provider)).toEqual(['codex', 'cl…
+       |                                                  ^
+    1531|     expect(catalog.find(entry => entry.provider === 'grok')?.models[0]…
+    1532|     expect((await f.control.call(f.scope, 'tools.list') as Record<stri…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > describes git.ship as a local commit unless publish is asked for, and passes publish through
+AssertionError: expected '({message,paths?,publish?,waitSeconds…' to contain 'a local commit'
+
+Expected: "a local commit"
+Received: "({message,paths?,publish?,waitSeconds?}) — deliver finished work in one call. Conductor runs it on the host with the owner’s own Git credentials and network: tests, build, commit (only paths if given, verified in an isolated copy when other work is also in the tree), push, then it waits for the release the push triggers and checks its assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status"
+
+ ❯ src/main/agent-control.test.ts:1545:33
+    1543|     const f = fixture()
+    1544|     const catalog = await f.control.call(f.scope, 'tools.list') as Rec…
+    1545|     expect(catalog['git.ship']).toContain('a local commit')
+       |                                 ^
+    1546|     expect(catalog['git.ship']).toContain('publish: true')
+    1547|     expect(catalog['git.ship']).not.toContain('then it waits for the r…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > says jobs.pause interrupts the running stage at once
+AssertionError: expected '({jobId,reason?}) — the owner, a wiza…' to contain 'interrupts the running stage at once …'
+
+Expected: "interrupts the running stage at once (there is no safe point to wait for)"
+Received: "({jobId,reason?}) — the owner, a wizard tab, or the conversation that created the job; the current step finishes at a safe point and nothing new starts"
+
+ ❯ src/main/agent-control.test.ts:1568:19
+    1566|     f.control.setDurableJobs(new FakeDurableJobsService())
+    1567|     const pause = (await f.control.call(f.scope, 'tools.list') as Reco…
+    1568|     expect(pause).toContain('interrupts the running stage at once (the…
+       |                   ^
+    1569|     expect(pause).toContain('records a tool call it cut off as an unkn…
+    1570|     expect(pause).not.toContain('finishes at a safe point')
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > agents.steer starts one turn on an idle conversation, exactly as agents.submit does
+Error: There is no active turn to queue behind
+ ❯ src/main/structured-sessions.ts:531:140
+    529|       const state = this.database.structured.snapshot(id)!
+    530|       if (live.handoff || this.cliOwned(id)) throw new Error('Switch t…
+    531|       if (!live.adapter || !['starting', 'running', 'waiting_input', '…
+       |                                                                                                                                            ^
+    532|       if (typeof text !== 'string' || !text.trim() || text.length > 60…
+    533|       settings = this.messageSettings(state, settings)
+ ❯ StructuredSessions.followup src/main/structured-sessions.ts:600:5
+ ❯ StructuredSessions.steer src/main/structured-sessions.ts:514:17
+ ❯ AgentControl.call src/main/agent-control.ts:949:31
+ ❯ src/main/agent-control.test.ts:1578:36
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > agents.steer steers into a running turn, or queues behind it, and starts nothing new
+AssertionError: expected { …(6) } to match object { delivery: 'queued' }
+(6 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+-   "delivery": "queued",
++   "agentSessionId": "agent_mufeibp0_sq8fsk6",
++   "phase": "running",
++   "projectId": "project_mufeibnt_1xabl1k",
++   "tabId": "tab_mufeibp0_kl80ovn",
++   "uri": "conductor://project_mufeibnt_1xabl1k/tab/tab_mufeibp0_kl80ovn",
++   "workspaceId": "session_mufeibnu_os14rir",
+  }
+
+ ❯ src/main/agent-control.test.ts:1602:133
+    1600|     const steered: string[] = []
+    1601|     live(steering.resourceId!).steer = async text => { steered.push(te…
+    1602|     expect(await f.control.call(f.scope, 'agents.steer', { agentSessio…
+       |                                                                                                                                     ^
+    1603|     await settle()
+    1604|     expect(steered).toEqual(['Into the running turn'])
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > agents.steer starts one new turn after an interrupt, with no duplicate and no authority change
+Error: There is no active turn to queue behind
+ ❯ src/main/structured-sessions.ts:531:140
+    529|       const state = this.database.structured.snapshot(id)!
+    530|       if (live.handoff || this.cliOwned(id)) throw new Error('Switch t…
+    531|       if (!live.adapter || !['starting', 'running', 'waiting_input', '…
+       |                                                                                                                                            ^
+    532|       if (typeof text !== 'string' || !text.trim() || text.length > 60…
+    533|       settings = this.messageSettings(state, settings)
+ ❯ StructuredSessions.followup src/main/structured-sessions.ts:600:5
+ ❯ StructuredSessions.steer src/main/structured-sessions.ts:514:17
+ ❯ AgentControl.call src/main/agent-control.ts:949:31
+ ❯ src/main/agent-control.test.ts:1626:36
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > reports the latest provider allowance per bucket from usage events, zero-turn, with explicit unknowns, and keeps it over a restart
+Error: Unknown control method; use tools.list
+ ❯ AgentControl.call src/main/agent-control.ts:1031:11
+    1029|     if (method === 'router.dispatch') return this.dispatchRouter(scope…
+    1030|     if (jobMethods.has(method)) return this.jobs(scope, source, method…
+    1031|     throw new Error('Unknown control method; use tools.list')
+       |           ^
+    1032|   }
+    1033| 
+ ❯ src/main/agent-control.test.ts:1638:35
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > dispatches a local model read-only without a sandbox mode it does not have, and keeps its writes refused
+AssertionError: expected { tabId: 'tab_mufeic4p_bkgwxwb', …(7) } to match object { accepted: true }
+(7 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+-   "accepted": true,
++   "accepted": false,
+  }
+
+ ❯ src/main/agent-control.test.ts:1687:23
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/9]⎯
+
+ FAIL  src/main/agent-control.test.ts > control catalog and dispatch repairs > closes the tab and drops the task of a dispatch whose prompt was refused before any turn
+AssertionError: expected { tabId: 'tab_mufeic9g_4icyqm0', …(7) } to match object { accepted: false, …(2) }
+(6 matching properties omitted from actual)
+
+- Expected
++ Received
+
+  {
+    "accepted": false,
+    "error": "Synthetic refusal before any turn",
+-   "tabClosed": true,
+  }
+
+ ❯ src/main/agent-control.test.ts:1705:23
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/9]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  9 failed | 78 skipped (87)
+   Start at  12:40:40
+   Duration  2.71s (transform 618ms, setup 0ms, collect 916ms, tests 1.47s, environment 0ms, prepare 117ms)
+
+G3-HEAD [{"tabId":"tab_mufeiva2_6x6ix82","agentSessionId":"agent_mufeiva3_cduptch","taskId":"task_mufeival_oluydn2","projectTaskIds":[],"projectId":"project_mufeiv8n_67sy54h","workspaceId":"session_mufeiv8p_bapf8bp","accepted":false,"error":"Execution sandbox unsupported by this provider"}]
