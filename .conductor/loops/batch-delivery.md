@@ -1,6 +1,6 @@
 ---
 id: batch-delivery
-version: 1
+version: 2
 title: Deliver one batch of related tasks with the least tokens at the highest quality
 trigger: [manual, after:task-triage]
 inputs: [batchId, taskIds, allowedPaths]
@@ -17,7 +17,7 @@ steps:
     output: failing tests + acceptance (commands, allowedPaths)
   - id: implement
     role: implementer
-    model: codex:gpt-6-astra
+    model: claude:opus[1m]   # owner rule 2026-09-24: Astra and Fable think (contract, architecture, review), Opus and lower implement
     effort: high
     fallback: claude:sonnet   # for role=ui batches with an exact spec
   - id: churn
@@ -41,8 +41,10 @@ locked: [budget, steps.review, steps.ship]
 
 1. **Contract.** Opus writes the failing tests and an acceptance list: the commands that must pass and the
    allowed paths. Keep it short; point to code by file:line; no broad exploration.
-2. **Implement.** One fresh Astra tab per batch, dispatched with `projectTaskIds`. It makes the tests pass within
-   `allowedPaths` and does not choose scope. Check `agents.snapshot` → `effectiveSettings.permissionMode` is `auto`.
+2. **Implement.** One fresh Opus tab per batch (Sonnet for exact-spec UI batches), dispatched with `projectTaskIds`. It makes
+   the tests pass within `allowedPaths` and does not choose scope. Check `agents.snapshot` → `settings.permission` is `auto`
+   (Codex has no `effectiveSettings.permissionMode`). The contract's allowedPaths must include every store, IPC-type and
+   session file the fix path crosses, not only the files the bug shows in; a missing path costs a full stop-and-ask round.
 3. **Churn.** A local durable job runs the suites and benchmarks and summarizes failures. Frontier models read only
    the summary.
 4. **Review.** Opus reads the diff once and answers approve or a specific list of changes. At most one corrective
@@ -59,3 +61,14 @@ ships for it from the coworker's handoff, which must list the exact paths and me
 
 - 2026-09-24 (pre-loop, by hand): two Opus xhigh coworkers (Schedules ea74d128, typing performance 141e0a02).
   Both lost their tabs to the CLI toggle bug and handed off message and paths; the controller shipped for them.
+- 2026-09-24 B1 renderer state bugs (+ restart initiator added mid-contract), commit 3b2ea0f. Contract: Opus high,
+  17:31-17:38 (7 min; 6 failing test files). Implement: Astra high, 17:38-17:50 round 1 (stopped to ask for 3 paths
+  outside allowedPaths: structured-store, shared/ipc, structured-sessions), 17:52-17:59 round 2 (READY, 3,264 tests),
+  17:59-18:04 corrective round. Churn: skipped (no local server running). Review: Opus, pre-read while Astra ran,
+  one list of 5: [major] the idle recovery checkpoint persisted layouts around the new save guard; the guard could
+  duplicate a tab moved to another workspace/window; phone working words had "?" for "…"; AgentDialog X/Esc
+  closed natively past a busy caller; plus (fixed by Opus at ship) the guard read every layout on every checkpoint.
+  Ship: 18:06-18:08, git.ship clean first try. Rounds: 1 scope stop + 1 corrective. Slow/useless: the allowedPaths gap
+  (one whole round); reading a Codex report via agents.history paged ~120 × 100 events (needs a tail/last-message
+  read); the effectiveSettings.permissionMode check does not exist for Codex. Owner rule from this run: the
+  implementer role moves from Astra to Opus from B2 on (applied as v2).
