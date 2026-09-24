@@ -50,17 +50,27 @@ try {
   await expect(page.locator('.pane-tab.closing')).toHaveCount(0)
   await expect.poll(() => page.locator('.pane-tab').evaluateAll(tabs => tabs.every(tab => tab.getBoundingClientRect().width >= 50))).toBe(true)
   pass('Workspace sidebar lists real tabs and restores closed tabs')
+  // Record what the renderer asks the main process for when it floats a tab. A window launched with
+  // CONDUCTOR_TEST_USER_DATA is parked and never takes the desktop (030907e), so the real
+  // always-on-top flag is deliberately withheld here; the floating request itself must still arrive.
+  await app.evaluate(({ ipcMain }) => {
+    const original = ipcMain._invokeHandlers.get('window:detach')
+    globalThis.__detachRequests = []
+    ipcMain.removeHandler('window:detach')
+    ipcMain.handle('window:detach', (event, ...args) => { globalThis.__detachRequests.push(args[4] ?? null); return original(event, ...args) })
+  })
   await page.locator('.workspace-tab-row').first().click({ button: 'right' })
   await page.getByRole('menuitem', { name: 'Show tab', exact: true }).click()
   await expect.poll(() => app.windows().length).toBe(2)
   const detached = app.windows().find(window => window !== page)
   await detached.waitForSelector('.pane-tab')
-  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().filter(window => window.isAlwaysOnTop()).length), 1)
+  assert.deepEqual(await app.evaluate(() => globalThis.__detachRequests), [{ alwaysOnTop: true }], 'Show tab must request a floating (always-on-top) window')
+  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().filter(window => window.isAlwaysOnTop()).length), 0, 'A parked test window must never be made always-on-top')
   await expect(page.locator('.pane-tab')).toHaveCount(1)
   await detached.getByRole('button', { name: 'Close', exact: true }).click()
   await expect.poll(() => app.windows().length).toBe(1)
   await expect(page.locator('.pane-tab')).toHaveCount(2)
-  pass('Show tab opens a floating window above content and closing it restores the original tab')
+  pass('Show tab requests a floating window (withheld while parked) and closing it restores the original tab')
   const hoverTab = page.locator('.pane-tab.active')
   await page.locator('.titlebar-brand').hover()
   const beforeHover = await hoverTab.evaluate(element => getComputedStyle(element).backgroundColor)
@@ -81,10 +91,12 @@ try {
   await page.getByRole('menuitemradio', { name: 'Night', exact: true }).click()
   await page.locator('.quick-theme-toggle').click()
   await expect(page.locator('html')).toHaveAttribute('data-theme-variant', 'day')
-  const themeControl = await page.locator('.quick-theme-toggle').evaluate(element => ({ height: element.getBoundingClientRect().height, icon: element.querySelector('svg').getBoundingClientRect().width, transition: document.documentElement.classList.contains('theme-changing') }))
+  // Since 030907e the swap is one view-transition crossfade (appearance.ts applyAppTheme): the root
+  // carries the transient 'conductor-theme' snapshot name for ~260 ms instead of a theme-changing class.
+  const themeControl = await page.locator('.quick-theme-toggle').evaluate(element => ({ height: element.getBoundingClientRect().height, icon: element.querySelector('svg').getBoundingClientRect().width, transition: document.documentElement.style.viewTransitionName }))
   assert.ok(themeControl.height >= 32 && themeControl.icon > 0)
-  assert.equal(themeControl.transition, true)
-  await expect(page.locator('html')).not.toHaveClass(/theme-changing/)
+  assert.equal(themeControl.transition, 'conductor-theme', 'The theme swap must run as a view-transition crossfade')
+  await expect.poll(() => page.evaluate(() => document.documentElement.style.viewTransitionName)).toBe('')
   await shot('day-explorer')
   pass('Day/night control has visible icons, a full-height click target, and smooth color transitions')
   await page.locator('.activity-rail').getByRole('button', { name: 'Workspace', exact: true }).click()

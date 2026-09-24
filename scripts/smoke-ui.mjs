@@ -223,91 +223,78 @@ if (initial.result.value === 1) {
   await delay(1200)
 }
 
-const dragTab = async (sourceTitle, targetTitle, zoneClass) => {
+// Chrome-style tab drag (030907e replaced the per-pane dock-zone overlays): the drop target is
+// resolved from the pointer alone. Over a pane's tab strip the tab joins that strip at the
+// pointer's insertion index; anywhere in a pane's body it peels off to the nearest edge of that
+// pane (tab-drag.ts dropTargetAt). `destination` is 'bar' (after the target tab) or an edge.
+const dragTab = async (sourceTitle, targetTitle, destination) => {
   await evaluate(`(() => {
     const tabs = [...document.querySelectorAll('.pane-tab')]
     const source = tabs.find((tab) => tab.textContent.trim().startsWith(${JSON.stringify(sourceTitle)}))
     const target = tabs.find((tab) => tab.textContent.trim().startsWith(${JSON.stringify(targetTitle)}))
-    const targetGroup = target?.closest('.pane-group')
-    if (!source || !target || !targetGroup) throw new Error('Drag target was not found')
+    if (!source || !target?.closest('.pane-group')) throw new Error('Drag source or target tab was not found')
     const transfer = new DataTransfer()
     const sourceRect = source.getBoundingClientRect()
     source.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: transfer, clientX: sourceRect.left + 12, clientY: sourceRect.top + 12 }))
-    window.__conductorSmokeDrag = {
-      source,
-      transfer,
-      sourceTitle: ${JSON.stringify(sourceTitle)},
-      targetTitle: ${JSON.stringify(targetTitle)}
-    }
+    window.__conductorSmokeDrag = { transfer, sourceTitle: ${JSON.stringify(sourceTitle)}, targetTitle: ${JSON.stringify(targetTitle)} }
     return true
   })()`)
   await delay(80)
+  // Measured after dragstart: the lifted source tab collapses out of its strip.
   await evaluate(`(() => {
     const drag = window.__conductorSmokeDrag
-    const target = [...document.querySelectorAll('.pane-tab')]
-      .find((tab) => tab.textContent.trim().startsWith(drag?.targetTitle ?? ''))
-    const targetGroup = target?.closest('.pane-group')
-    const zone = targetGroup?.querySelector(${JSON.stringify(zoneClass)})
-    if (!drag || !zone) throw new Error('Requested docking option was not available after drag start')
-    const zoneRect = zone.getBoundingClientRect()
-    zone.dispatchEvent(new DragEvent('dragenter', { bubbles: true, dataTransfer: drag.transfer, clientX: zoneRect.left + zoneRect.width / 2, clientY: zoneRect.top + zoneRect.height / 2 }))
-    zone.dispatchEvent(new DragEvent('dragover', { bubbles: true, dataTransfer: drag.transfer, clientX: zoneRect.left + zoneRect.width / 2, clientY: zoneRect.top + zoneRect.height / 2 }))
-    drag.zone = zone
+    const target = [...document.querySelectorAll('.pane-tab')].find((tab) => !tab.classList.contains('drag-lifted') && tab.textContent.trim().startsWith(drag?.targetTitle ?? ''))
+    const group = target?.closest('.pane-group')
+    const header = group?.querySelector('.pane-header')
+    if (!drag || !target || !group || !header) throw new Error('Drop target pane was not available after drag start')
+    const destination = ${JSON.stringify(destination)}
+    const groupRect = group.getBoundingClientRect(), headerBottom = header.getBoundingClientRect().bottom, tabRect = target.getBoundingClientRect()
+    const bodyMiddle = (headerBottom + groupRect.bottom) / 2
+    const point = destination === 'bar' ? { x: tabRect.right - 3, y: (tabRect.top + tabRect.bottom) / 2 }
+      : destination === 'right' ? { x: groupRect.right - 8, y: bodyMiddle }
+      : destination === 'left' ? { x: groupRect.left + 8, y: bodyMiddle }
+      : destination === 'above' ? { x: (groupRect.left + groupRect.right) / 2, y: headerBottom + 8 }
+      : { x: (groupRect.left + groupRect.right) / 2, y: groupRect.bottom - 8 }
+    const over = document.elementFromPoint(point.x, point.y)
+    if (!over || over.closest('.pane-group') !== group) throw new Error('Drop point is not over the target pane: ' + JSON.stringify(point))
+    over.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: drag.transfer, clientX: point.x, clientY: point.y }))
+    over.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: drag.transfer, clientX: point.x, clientY: point.y }))
+    drag.point = point
+    drag.groupId = group.dataset.groupId
     return true
   })()`)
   await delay(180)
   const visual = await evaluate(`(() => {
     const drag = window.__conductorSmokeDrag
-    const tabs = [...document.querySelectorAll('.pane-tab')]
-    const source = tabs.find((tab) => tab.textContent.trim().startsWith(drag?.sourceTitle ?? ''))
-    const target = tabs.find((tab) => tab.textContent.trim().startsWith(drag?.targetTitle ?? ''))
-    const targetGroup = target?.closest('.pane-group')
-    const preview = document.querySelector('.dock-snap-preview')
+    const group = document.querySelector('.pane-group[data-group-id="' + CSS.escape(drag?.groupId ?? '') + '"]')
     const ghost = document.querySelector('.pane-drag-ghost')
-    const sourceGroup = source?.closest('.pane-group')
-    const sameGroup = sourceGroup === targetGroup
-    const hover = Boolean(targetGroup?.matches('.dock-hover'))
-    const liveContent = targetGroup?.querySelector(':scope > .pane-content')
-    const hoverTransform = liveContent ? getComputedStyle(liveContent).transform : 'none'
-    const sourceZoneCount = sourceGroup?.querySelectorAll('.dock-zone').length ?? -1
-    const targetZoneCount = targetGroup?.querySelectorAll('.dock-zone').length ?? -1
-    if (!drag || !preview || !ghost) return {
-      hasDrag: Boolean(drag),
-      hasPreview: Boolean(preview),
-      hasGhost: Boolean(ghost),
-      hover,
-      hoverTransform,
-      sourceZoneCount,
-      targetZoneCount
-    }
-    const previewRect = preview.getBoundingClientRect()
+    const preview = group?.querySelector('.dock-preview')
+    const liveContent = group?.querySelector(':scope > .pane-content')
+    const gapTab = [...(group?.querySelectorAll('.pane-tab, .pane-add-tab') ?? [])].find((tab) => parseFloat(tab.style.marginLeft) > 0)
     return {
-      ghostTitle: ghost.textContent,
-      previewWidth: previewRect.width,
-      targetWidth: targetGroup?.offsetWidth ?? 0,
-      hover,
-      hoverTransform,
-      sourceZoneCount,
-      targetZoneCount,
-      sameGroup,
-      targetHasCenter: Boolean(targetGroup?.querySelector('.dock-center'))
+      hasDrag: Boolean(drag),
+      ghostTitle: ghost?.textContent ?? null,
+      hover: Boolean(group?.matches('.dock-hover')),
+      hoverEdge: [...(group?.classList ?? [])].find((name) => name.startsWith('dock-hover-')) ?? null,
+      hoverTransform: liveContent ? getComputedStyle(liveContent).transform : 'none',
+      previewWidth: preview ? preview.getBoundingClientRect().width : 0,
+      targetWidth: group?.offsetWidth ?? 0,
+      insertionGap: Boolean(gapTab),
+      sourceLifted: Boolean(document.querySelector('.pane-tab.drag-lifted'))
     }
   })()`)
-  if (!visual.result.value?.ghostTitle?.includes(sourceTitle)) {
-    throw new Error(`Tab drag did not render a visible ghost and snap preview: ${JSON.stringify(visual.result.value)}`)
+  const seen = visual.result.value
+  if (!seen?.ghostTitle?.includes(sourceTitle) || !seen.sourceLifted) {
+    throw new Error(`Tab drag did not render a visible ghost and lift the source tab: ${JSON.stringify(seen)}`)
   }
-  if (zoneClass !== '.dock-center' && visual.result.value.previewWidth > visual.result.value.targetWidth * 0.7) {
-    throw new Error('Edge docking preview did not show the pane snap size')
+  if (destination === 'bar') {
+    if (!seen.insertionGap || seen.hover) throw new Error(`Hovering a tab strip did not open an insertion gap (or showed an edge preview): ${JSON.stringify(seen)}`)
+  } else {
+    if (seen.hoverEdge !== 'dock-hover-' + destination || !seen.previewWidth) throw new Error(`Edge docking preview did not show for ${destination}: ${JSON.stringify(seen)}`)
+    if (seen.previewWidth > seen.targetWidth * 0.7) throw new Error('Edge docking preview did not show the pane snap size')
+    if (seen.hoverTransform === 'none') throw new Error('Dock hover did not live-reflow the destination tab area')
   }
-  if (!visual.result.value.hover || visual.result.value.hoverTransform === 'none') {
-    throw new Error('Dock hover did not live-reflow the destination tab area')
-  }
-  if (visual.result.value.targetZoneCount === 0 ||
-      (!visual.result.value.sameGroup && visual.result.value.sourceZoneCount !== 0) ||
-      (visual.result.value.sameGroup && visual.result.value.targetHasCenter)) {
-    throw new Error(`Docking exposed invalid drop zones: ${JSON.stringify(visual.result.value)}`)
-  }
-  if (!capturedDragPreview && zoneClass !== '.dock-center') {
+  if (!capturedDragPreview && destination !== 'bar') {
     const previewShot = await call('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
     const previewOutput = resolve(dirname(output), 'drag-preview.png')
     await mkdir(dirname(previewOutput), { recursive: true })
@@ -316,29 +303,28 @@ const dragTab = async (sourceTitle, targetTitle, zoneClass) => {
   }
   await evaluate(`(() => {
     const drag = window.__conductorSmokeDrag
-    const tabs = [...document.querySelectorAll('.pane-tab')]
-    const source = tabs.find((tab) => tab.textContent.trim().startsWith(drag.sourceTitle))
-    const target = tabs.find((tab) => tab.textContent.trim().startsWith(drag.targetTitle))
-    const zone = target?.closest('.pane-group')?.querySelector(${JSON.stringify(zoneClass)})
-    if (!source || !zone) throw new Error('Docking nodes disappeared before drop')
-    zone.dispatchEvent(new DragEvent('drop', { bubbles: true, dataTransfer: drag.transfer }))
+    const source = document.querySelector('.pane-tab.drag-lifted')
+    const over = document.elementFromPoint(drag.point.x, drag.point.y)
+    if (!source || !over) throw new Error('Drag nodes disappeared before drop')
+    over.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: drag.transfer, clientX: drag.point.x, clientY: drag.point.y }))
     source.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: drag.transfer }))
     delete window.__conductorSmokeDrag
   })()`)
   await delay(45)
   const animatedSnap = await evaluate(`(() => ({
     arrival: Boolean(document.querySelector('.pane-group.snap-arrival')),
-    animations: document.getAnimations().length
+    animations: document.getAnimations().length,
+    ghost: Boolean(document.querySelector('.pane-drag-ghost'))
   }))()`)
-  // Existing groups keep the short snap-arrival class; newly-created split
-  // groups can be represented entirely by the browser's view transition.
-  if (!animatedSnap.result.value.arrival && animatedSnap.result.value.animations === 0) {
+  if (animatedSnap.result.value.ghost) throw new Error('The drag ghost outlived the drop')
+  // An edge drop marks the destination pane with the short snap-arrival animation.
+  if (destination !== 'bar' && !animatedSnap.result.value.arrival && animatedSnap.result.value.animations === 0) {
     throw new Error(`Docked pane did not animate into its snapped layout: ${JSON.stringify(animatedSnap.result.value)}`)
   }
   await delay(305)
 }
 
-await dragTab('Claude', 'Codex', '.dock-center')
+await dragTab('Claude', 'Codex', 'bar')
 const grouped = await evaluate(`(() => ({
   groups: document.querySelectorAll('.pane-group').length,
   maxTabs: Math.max(...[...document.querySelectorAll('.pane-tabs')].map((group) => group.querySelectorAll('.pane-tab').length))
@@ -347,7 +333,7 @@ if (grouped.result.value.groups !== 3 || grouped.result.value.maxTabs !== 2) {
   throw new Error(`Center docking failed: ${JSON.stringify(grouped.result.value)}`)
 }
 
-await dragTab('Claude', 'Codex', '.dock-right')
+await dragTab('Claude', 'Codex', 'right')
 const splitBackOut = await evaluate(`document.querySelectorAll('.pane-group').length`)
 if (splitBackOut.result.value !== 4) throw new Error('Splitting a grouped tab back out failed')
 
@@ -384,17 +370,28 @@ const restored = await evaluate(`(() => ({
 if (restored.result.value.groups !== 4 || restored.result.value.maximizedBadge || !restored.result.value.ghost) {
   throw new Error(`Starting a drag did not restore the maximized layout: ${JSON.stringify(restored.result.value)}`)
 }
+const tabsBeforeRelease = await evaluate(`document.querySelectorAll('.pane-tab').length`)
+// Release the drag inside the window, over the tab's own slot. A bare dragend with no drop is a
+// drag that left every Conductor window, and since the parked test window sits off every display
+// the real cursor is always outside it, so PaneWorkspace would (correctly) tear the tab off into a
+// detached window and the rest of this smoke would lose its PowerShell tab.
 await evaluate(`(() => {
   const drag = window.__conductorMaximizedDrag
-  drag.tab.dispatchEvent(new DragEvent('dragend', {
-    bubbles: true,
-    dataTransfer: drag.transfer,
-    screenX: window.screenX + 100,
-    screenY: window.screenY + 100
-  }))
+  const slot = document.querySelector('.pane-tab.drag-lifted') ?? drag.tab
+  const header = slot.closest('.pane-group')?.querySelector('.pane-header')
+  const rect = (header ?? slot).getBoundingClientRect()
+  const x = rect.left + 20, y = rect.top + rect.height / 2
+  const over = document.elementFromPoint(x, y) ?? document.body
+  over.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: drag.transfer, clientX: x, clientY: y }))
+  over.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: drag.transfer, clientX: x, clientY: y }))
+  drag.tab.dispatchEvent(new DragEvent('dragend', { bubbles: true, dataTransfer: drag.transfer }))
   delete window.__conductorMaximizedDrag
 })()`)
 await delay(700)
+const afterRelease = await evaluate(`({ tabs: document.querySelectorAll('.pane-tab').length, groups: document.querySelectorAll('.pane-group').length, ghost: Boolean(document.querySelector('.pane-drag-ghost')) })`)
+if (afterRelease.result.value.tabs !== tabsBeforeRelease.result.value || afterRelease.result.value.groups < 4 || afterRelease.result.value.ghost) {
+  throw new Error(`Releasing a drag inside the window changed the layout: ${JSON.stringify({ before: tabsBeforeRelease.result.value, after: afterRelease.result.value })}`)
+}
 
 const claudeBeforeCtrlC = await evaluate(`window.conductor.agents.listProcesses()`)
 await evaluate(`(() => {
@@ -446,12 +443,21 @@ const middleTabPoint = await evaluate(`(() => {
     .find((item) => item.textContent.includes('PowerShell'))
   if (!tab) throw new Error('PowerShell tab was not found')
   const rect = tab.getBoundingClientRect()
-  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+  const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2
+  const hit = document.elementFromPoint(x, y)
+  return { x, y, hit: hit ? hit.tagName + '.' + [...hit.classList].join('.') : null, onTab: Boolean(hit?.closest('.pane-tab') === tab) }
 })()`)
 await middleClick(middleTabPoint.result.value)
-await delay(350)
-const closedPowerShellCount = await evaluate(`[...document.querySelectorAll('.pane-tab')].filter((item) => item.textContent.includes('PowerShell')).length`)
-if (closedPowerShellCount.result.value !== 1) throw new Error('Middle-click did not close the runtime tab')
+let closedPowerShellCount
+for (let attempt = 0; attempt < 10; attempt += 1) {
+  await delay(150)
+  closedPowerShellCount = await evaluate(`[...document.querySelectorAll('.pane-tab')].filter((item) => item.textContent.includes('PowerShell')).length`)
+  if (closedPowerShellCount.result.value === 1) break
+}
+if (closedPowerShellCount.result.value !== 1) {
+  const tabsNow = await evaluate(`[...document.querySelectorAll('.pane-tab')].map((item) => item.textContent.trim() + (item.classList.contains('closing') ? ' (closing)' : ''))`)
+  throw new Error(`Middle-click did not close the runtime tab: ${JSON.stringify({ point: middleTabPoint.result.value, tabs: tabsNow.result.value })}`)
+}
 
 await evaluate(`(() => {
   document.querySelector('.pane-group .pane-header')
@@ -507,6 +513,13 @@ await delay(200)
 
 await evaluate(`document.querySelector('.activity-rail button[aria-label="Settings"]')?.click()`)
 await delay(100)
+// Settings is split into sections; the theme controls live on the Appearance page.
+await evaluate(`(() => {
+  const section = [...document.querySelectorAll('.settings-nav button')].find((item) => item.textContent.trim() === 'Appearance')
+  if (!section) throw new Error('Appearance settings section was unavailable')
+  section.click()
+})()`)
+await delay(100)
 await evaluate(`(() => {
   const select = document.querySelector('.theme-family-select select')
   if (!select) throw new Error('Theme settings were unavailable')
@@ -515,7 +528,7 @@ await evaluate(`(() => {
   select.dispatchEvent(new Event('change', { bubbles: true }))
 })()`)
 await delay(100)
-await evaluate(`(() => { const auto = document.querySelector('.theme-auto-setting input'); if (auto?.checked) auto.click() })()`)
+await evaluate(`(() => { const auto = document.querySelector('.theme-controls .theme-auto-setting input'); if (auto?.checked) auto.click() })()`)
 await delay(100)
 await evaluate(`[...document.querySelectorAll('.theme-variant-setting button')].find((item) => item.textContent.includes('Day'))?.click()`)
 await delay(250)
@@ -583,16 +596,21 @@ if (idleProcessSpinner.result.value.count === 0 && idleProcessSpinner.result.val
 await evaluate(`document.querySelector('.workspace-utility-drawer .utility-header-actions button:last-child')?.click()`)
 await delay(120)
 
-const workspaceSidebarInitiallyOpen = await evaluate(`Boolean(document.querySelector('aside.sidebar'))`)
+// The sidebar stays mounted when hidden (so it can slide); hidden means the shell is rail-only
+// and the aside is aria-hidden.
+const sidebarOpenExpression = `Boolean(document.querySelector('.left-shell:not(.rail-only) > aside.sidebar:not([aria-hidden="true"])'))`
+// Explorer (opened earlier for package.json) shares that aside, so "open" is not enough: the
+// Workspace rail control itself has to be the active one before clicking it again hides it.
+const workspaceSidebarInitiallyOpen = await evaluate(`${sidebarOpenExpression} && Boolean(document.querySelector('.activity-rail button.active[aria-label="Workspace"]'))`)
 if (!workspaceSidebarInitiallyOpen.result.value) await evaluate(`document.querySelector('.activity-rail button[aria-label="Workspace"]')?.click()`)
 await delay(100)
 await evaluate(`document.querySelector('.activity-rail button[aria-label="Workspace"]')?.click()`)
 await delay(120)
-const workspaceHidden = await evaluate(`!document.querySelector('aside.sidebar') && Boolean(document.querySelector('.activity-rail'))`)
+const workspaceHidden = await evaluate(`Boolean(document.querySelector('.left-shell.rail-only > aside.sidebar[aria-hidden="true"]')) && Boolean(document.querySelector('.activity-rail'))`)
 if (!workspaceHidden.result.value) throw new Error('Clicking the active Workspace control did not hide its sidebar')
 await evaluate(`document.querySelector('.activity-rail button[aria-label="Workspace"]')?.click()`)
 await delay(140)
-const workspaceReopened = await evaluate(`Boolean(document.querySelector('aside.sidebar'))`)
+const workspaceReopened = await evaluate(sidebarOpenExpression)
 if (!workspaceReopened.result.value) throw new Error('Workspace control did not reopen its sidebar')
 
 await evaluate(`document.querySelector('.activity-rail button[aria-label="Explorer"]')?.click()`)
@@ -615,9 +633,15 @@ const previewReady = await evaluate(`Boolean(document.querySelector('.file-previ
 if (!previewReady.result.value) throw new Error('Markdown did not open in the in-app previewer')
 
 await evaluate(`document.querySelector('.statusbar-link')?.click()`)
-await delay(400)
-const chromiumReady = await evaluate(`Boolean(document.querySelector('.browser-sidebar webview.chromium-webview'))`)
-if (!chromiumReady.result.value) throw new Error('Browser sidebar did not mount a Chromium webview')
+// The browser is no longer a <webview>: the main process hosts a Chromium guest view and the
+// sidebar's pane carries that guest's webContents id once it exists.
+let chromiumReady
+for (let attempt = 0; attempt < 20; attempt += 1) {
+  await delay(200)
+  chromiumReady = await evaluate(`Number(document.querySelector('.browser-sidebar:not([hidden]) .browser-pane.chromium-shell')?.dataset.browserWebContentsId) > 0`)
+  if (chromiumReady.result.value) break
+}
+if (!chromiumReady.result.value) throw new Error('Browser sidebar did not attach a Chromium guest view')
 await evaluate(`document.querySelector('.activity-rail button[aria-label="Workspace"]')?.click()`)
 await delay(150)
 
@@ -768,8 +792,21 @@ for (let attempt = 0; attempt < 50; attempt += 1) {
 }
 const emptyWorkspace = await evaluate(`Boolean(document.querySelector('.empty-pane-workspace'))`)
 if (!emptyWorkspace.result.value) throw new Error('Ctrl+W did not allow all panes to close')
+// Since 64c7a02 Ctrl+W only ever closes tabs: on an empty workspace it is a no-op rather than
+// closing the workspace itself.
 await pressCtrlW()
-await delay(500)
+await delay(300)
+const afterEmptyCtrlW = await evaluate(`({ workspaces: document.querySelectorAll('.session-tab').length, empty: Boolean(document.querySelector('.empty-pane-workspace')) })`)
+if (afterEmptyCtrlW.result.value.workspaces !== 1 || !afterEmptyCtrlW.result.value.empty) {
+  throw new Error(`Ctrl+W on an empty workspace must leave the workspace open: ${JSON.stringify(afterEmptyCtrlW.result.value)}`)
+}
+// Close the final workspace with its own close control.
+await evaluate(`(() => {
+  const close = document.querySelector('.session-tab.active .session-tab-close')
+  if (!close) throw new Error('Workspace close control was unavailable')
+  close.click()
+})()`)
+await delay(700)
 const zeroWorkspace = await evaluate(`(() => ({
   workspaces: document.querySelectorAll('.session-tab').length,
   activeWorkspace: Boolean(document.querySelector('.session-tab.active')),

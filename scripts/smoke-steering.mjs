@@ -73,7 +73,12 @@ try {
   await expect(input()).toHaveValue('Another unsent draft')
   assert.equal((await users('Another unsent draft')).length, 0)
   results.checks.push('Escape with no submitted pending input remains a plain stop and never submits the composer draft')
-  await pane.getByRole('button', { name: 'Resume conversation', exact: true }).click()
+  // An interrupted conversation offers resume in two deliberate places: the runtime banner's action
+  // (runtime-banner.ts, 030907e) and the composer's send button in its resume state. Both must be
+  // there; the banner's is the one clicked.
+  await expect(pane.locator('.sa-send')).toHaveAttribute('data-state', 'resume')
+  await expect(pane.locator('.sa-send')).toHaveAccessibleName('Resume conversation')
+  await pane.locator('.sa-runtime-banner').getByRole('button', { name: 'Resume conversation', exact: true }).click()
   await expect.poll(async () => (await snapshot()).phase).toBe('idle')
   await send('SYNTHETIC STEERING WAIT')
   await expect.poll(async () => (await snapshot()).phase).toBe('running')

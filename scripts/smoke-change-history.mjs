@@ -43,9 +43,15 @@ try {
 
   const composer = page.getByRole('textbox', { name: /message|prompt/i }).last()
   await composer.fill('SYNTHETIC A: remove the two unused declarations, then run node --test panel.test.mjs once.')
+  // A new Codex conversation opens on Auto (98b0b6e), which answers the fixture's in-workspace
+  // edit approval itself: no "Allow once" card, a recorded "Auto allowed" notice instead.
+  await expect(page.getByRole('button', { name: 'Conversation mode', exact: true })).toHaveText('Auto')
   await page.getByRole('button', { name: 'Send message', exact: true }).click()
-  await page.getByRole('button', { name: 'Allow once', exact: true }).click()
   await expect.poll(async () => (await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId))?.phase, { timeout: 20_000 }).toBe('completed')
+  const answered = await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)
+  assert.ok(answered.items.some(item => item.data.type === 'notice' && /^Auto allowed /.test(item.data.message)), 'Auto must record that it answered the edit approval')
+  await expect(page.getByRole('button', { name: 'Allow once', exact: true })).toHaveCount(0)
+  results.checks.push('Auto answers the in-workspace edit approval itself and records that it did')
   const edited = await readFile(target, 'utf8')
   assert.notEqual(edited, baseline)
 

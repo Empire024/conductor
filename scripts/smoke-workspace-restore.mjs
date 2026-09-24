@@ -22,7 +22,8 @@ try {
   const project = await page.evaluate(() => window.conductor.projects.create('Workspace restore fixture'))
   await page.reload()
   await page.getByText('Workspace restore fixture', { exact: true }).first().click()
-  const sidebarName = () => page.locator('.sidebar-session-row > button:first-child').first()
+  // The row now starts with the tab-list toggle (WorkspaceTabToggle); the name is the open button.
+  const sidebarName = () => page.locator('.sidebar-session-row > .sidebar-session-open').first()
   await sidebarName().dblclick()
   const rename = page.locator('.sidebar-session-rename')
   await expect(rename).toBeFocused()

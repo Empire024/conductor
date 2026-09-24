@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rename, rm } from 'node:fs/promise
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 
 // Real Electron main/preload/renderers and HTTP broker; only provider processes are synthetic.
 const root = await mkdtemp(join(tmpdir(), 'conductor-control-smoke-'))
@@ -14,6 +15,11 @@ const sourceLabel = sourceProvider === 'claude' ? 'Claude' : 'Codex'
 const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_EMPTY_HISTORY: '1', CONDUCTOR_TEST_CONTROL_CAPTURE: capture, CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS
 const app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 30000 })
+// Whole-run watchdog: every step below is bounded, and this catches anything that still is not.
+// Kills the whole Electron tree: on Windows a plain kill of the main pid leaves it running.
+const killElectron = () => { try { const pid = app.process().pid; if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); else app.process().kill('SIGKILL') } catch { /* already gone */ } }
+const watchdog = setTimeout(() => { console.error('FAIL smoke-agent-control exceeded 180 s; killing Electron'); killElectron(); process.exit(1) }, 180_000)
+watchdog.unref()
 const page = await app.firstWindow()
 page.setDefaultTimeout(15000)
 const errors = [], checks = []
@@ -27,7 +33,8 @@ const credentials = async () => {
   return { endpoint, token }
 }
 const call = async (auth, method, args = {}) => {
-  const response = await fetch(auth.endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + auth.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ method, args }) })
+  // Bounded: a control call that never answers must fail this smoke, not hang it.
+  const response = await fetch(auth.endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + auth.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ method, args }), signal: AbortSignal.timeout(30_000) })
   const result = await response.json()
   assert.equal(response.status, 200, method + ': ' + JSON.stringify(result))
   return result.result
@@ -61,7 +68,18 @@ try {
   const workerState = await page.evaluate(id => window.conductor.structured.snapshot(id), worker.agentSessionId)
   assert.ok(workerState.items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text.includes('bounded native fixture')))
   assert.ok(workerState.items.some(item => item.data.type === 'text' && item.data.role === 'assistant' && item.data.text.includes('Synthetic fixture continuation')))
-  await expect(page.locator('.agent-control-links')).toContainText('Visible worker')
+  // The old always-on .agent-control-links strip is now one labelled marker per tab header
+  // (AgentControlLinks.tsx: MAIN / COWORKER) whose popover lists the relationship.
+  const workerMarker = page.getByRole('button', { name: 'Visible worker is a coworker controlled by Conductor router; show relationship details', exact: true })
+  await expect(workerMarker).toHaveText('COWORKER')
+  await workerMarker.click()
+  const relationships = page.getByRole('dialog', { name: 'Agent tab relationships for Visible worker', exact: true })
+  await expect(relationships).toContainText('Conductor router')
+  await expect(relationships.getByRole('button', { name: 'Disconnect control of Visible worker', exact: true })).toBeVisible()
+  await relationships.getByRole('button', { name: 'Close agent tab relationships', exact: true }).click()
+  // The owner's source tab is marked MAIN over the router it started; the sidebar row names the chain too.
+  await expect(page.getByRole('button', { name: sourceLabel + ' is the main coordinating tab and controls 1 coworker: Conductor router; show relationship details', exact: true })).toHaveText('MAIN')
+  await expect(page.getByRole('button', { name: 'Visible worker is coworker controlled by Conductor router; show the main tab', exact: true })).toBeVisible()
   const board = await page.evaluate(projectId => window.conductor.orchestration.snapshot(projectId), project.id)
   assert.ok(board.agents.some(agent => agent.role === 'conductor-router'))
   assert.ok(board.tasks.some(task => task.id === worker.taskId))
@@ -70,7 +88,7 @@ try {
   await call(router, 'tabs.detach', { tabId: worker.tabId })
   await expect.poll(() => app.windows().length).toBe(2)
   const detached = app.windows().find(candidate => candidate !== page)
-  await expect(detached.locator('.agent-control-links')).toContainText('Conductor router')
+  await expect(detached.getByRole('button', { name: 'Visible worker is a coworker controlled by Conductor router; show relationship details', exact: true })).toBeVisible()
   await page.evaluate(uri => window.conductor.agentControl.openUri(uri), worker.uri)
   await expect(detached.locator('[data-structured-session="' + worker.agentSessionId + '"]')).toBeVisible()
   assert.equal(await app.evaluate(({ BrowserWindow }) => new URL(BrowserWindow.getFocusedWindow()?.webContents.getURL() ?? 'file:///').searchParams.has('detached')), true)
@@ -105,8 +123,24 @@ try {
   await page.screenshot({ path: join(output, 'control-and-live-editor.png') })
   assert.deepEqual(errors, [])
   await writeFile(join(output, 'report.json'), JSON.stringify({ checks, errors, sourceProvider, inference: 'none', providerBoundary: 'synthetic raw process' }, null, 2))
+} catch (error) {
+  process.exitCode = 1
+  console.error('FAIL after: ' + (checks.at(-1) ?? 'nothing') + '\n' + (error?.stack ?? String(error)))
+  console.error('Last provider input (tail): ' + (await readFile(capture, 'utf8').catch(() => '<none>')).slice(-1500))
+  await page.screenshot({ path: join(output, 'failure.png') }).catch(() => {})
+  throw error
 } finally {
-  await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1, checkboxChecked: false }) }).catch(() => {})
-  await app.close()
+  clearTimeout(watchdog)
+  // Answer the close prompts by label, not index: "Don't Save" for the owner's dirty draft and
+  // "Stop work and quit" for the still-running fixture turns (index 1 there is Cancel).
+  await Promise.race([app.evaluate(({ dialog }) => {
+    const answer = async (...args) => { const buttons = (args.at(-1)?.buttons ?? []); const index = buttons.findIndex(label => label === "Don't Save" || label === 'Stop work and quit'); return { response: index >= 0 ? index : 0, checkboxChecked: false } }
+    dialog.showMessageBox = answer
+  }), new Promise(done => setTimeout(done, 5000))]).catch(() => {})
+  // A close that never settles (a pending native turn, a quit prompt) must not hang the run.
+  const closed = await Promise.race([app.close().then(() => true, () => true), new Promise(done => setTimeout(() => done(false), 20_000))])
+  if (!closed) { console.error('FAIL app.close did not settle within 20 s; killing Electron'); killElectron(); process.exitCode = 1 }
   await rm(capture, { force: true })
 }
+// Playwright's connection can keep the loop alive after a forced kill; the verdict is already set.
+process.exit(process.exitCode ?? 0)

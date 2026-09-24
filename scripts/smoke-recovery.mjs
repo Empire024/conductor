@@ -1,4 +1,9 @@
+import { readFile, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
 const port = Number(process.argv[2] || 9341)
+const preparedFile = join(tmpdir(), `conductor-smoke-recovery-${port}.json`)
 const mode = process.argv[3] || 'verify'
 const marker = '// conductor crash recovery draft'
 const delay = (milliseconds) => new Promise((done) => setTimeout(done, milliseconds))
@@ -59,14 +64,15 @@ if (mode === 'prepare') {
   await call('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
   await call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 })
   await delay(250)
+  // Project files open in the workspace document beside the panes, not as pane tabs.
   await evaluate(`(() => {
-    const tab = [...document.querySelectorAll('.pane-tab')].find((item) => item.textContent.includes('package.json'))
-    if (!tab) throw new Error('package.json editor tab is missing')
+    const tab = [...document.querySelectorAll('.workspace-document .file-tab [role="tab"]')].find((item) => item.textContent.includes('package.json'))
+    if (!tab) throw new Error('package.json file tab is missing')
     tab.click()
   })()`)
   await delay(500)
   await evaluate(`(() => {
-    const input = document.querySelector('.monaco-editor textarea.inputarea')
+    const input = document.querySelector('.workspace-document .file-tab-content:not([hidden]) .monaco-editor textarea.inputarea')
     if (!input) throw new Error('Monaco input was not available')
     input.focus()
   })()`)
@@ -78,13 +84,17 @@ if (mode === 'prepare') {
     project: document.querySelector('.project-row.active .ellipsis')?.textContent,
     workspace: document.querySelector('.session-tab.active')?.textContent,
     groups: document.querySelectorAll('.pane-group').length,
-    recovered: Boolean(document.querySelector('.code-toolbar button.dirty'))
+    recovered: Boolean(document.querySelector('.workspace-document .file-tab-content:not([hidden]) .code-toolbar button.dirty'))
   })`)
   if (!prepared.recovered) throw new Error('Editor did not become dirty before crash')
+  if (!prepared.project) throw new Error('No active project before crash')
+  // verify runs in a fresh process after the hard kill; it compares against what was prepared here.
+  await writeFile(preparedFile, JSON.stringify(prepared))
   console.log(JSON.stringify({ mode, ...prepared }, null, 2))
 } else {
+  const prepared = JSON.parse(await readFile(preparedFile, 'utf8'))
   const restored = await evaluate(`(() => {
-    const packageTab = [...document.querySelectorAll('.pane-tab')].find((item) => item.textContent.includes('package.json'))
+    const packageTab = [...document.querySelectorAll('.workspace-document .file-tab [role="tab"]')].find((item) => item.textContent.includes('package.json'))
     packageTab?.click()
     return {
       project: document.querySelector('.project-row.active .ellipsis')?.textContent,
@@ -95,10 +105,13 @@ if (mode === 'prepare') {
     }
   })()`)
   await delay(750)
-  restored.draftBadge = await evaluate(`Boolean(document.querySelector('.code-recovered'))`)
-  restored.editorText = await evaluate(`document.querySelector('.monaco-editor .view-lines')?.textContent ?? ''`)
-  restored.markerVisible = restored.editorText.includes(marker)
-  if (restored.project !== 'Smoke Managed') throw new Error(`Wrong restored project: ${restored.project}`)
+  restored.draftBadge = await evaluate(`Boolean(document.querySelector('.workspace-document .file-tab-content:not([hidden]) .code-recovered'))`)
+  restored.editorText = await evaluate(`document.querySelector('.workspace-document .file-tab-content:not([hidden]) .monaco-editor .view-lines')?.textContent ?? ''`)
+  // Monaco renders spaces as non-breaking spaces in .view-lines.
+  restored.markerVisible = restored.editorText.replace(/ /g, ' ').includes(marker)
+  // The seed (smoke-ui --preserve) names the project 'Smoke Managed' only under a managed projects
+  // root; under the harness's own root it is 'Workspace smoke'. Either way it must be the one prepared.
+  if (restored.project !== prepared.project) throw new Error(`Wrong restored project: ${restored.project}, prepared ${prepared.project}`)
   if (!restored.workspace?.includes('Renamed workspace')) throw new Error(`Wrong restored workspace: ${restored.workspace}`)
   if (restored.groups < 2) throw new Error(`Only ${restored.groups} pane group(s) were restored`)
   if (!restored.tabs.some((tab) => tab.includes('Codex')) || !restored.tabs.some((tab) => tab.includes('PowerShell'))) {
@@ -106,5 +119,6 @@ if (mode === 'prepare') {
   }
   console.log(JSON.stringify({ mode, ...restored }, null, 2))
   if (!restored.draftBadge) throw new Error('Unsaved editor draft was not restored')
+  if (!restored.markerVisible) throw new Error('The restored draft does not contain the text typed before the crash')
 }
 socket.close()

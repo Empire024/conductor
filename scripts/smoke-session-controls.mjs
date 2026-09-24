@@ -34,9 +34,12 @@ try {
   const errors=[]; page.on('pageerror', error=>errors.push(error.message))
   await page.goto(server.resolvedUrls.local[0]+'__session-controls')
   const slider=page.getByRole('slider',{name:'Reasoning effort'})
-  await expect(slider).toHaveValue('3')
+  // The slider carries exactly the model's reported ladder (low, high, xhigh); 'Account default'
+  // is no longer a slider position (supportedEffortChoices drops 'auto'), so xhigh is index 2 of 0..2.
+  await expect(slider).toHaveAttribute('max','2')
+  await expect(slider).toHaveValue('2')
   await expect(slider).toHaveAttribute('aria-valuetext','Xhigh')
-  await slider.press('ArrowLeft'); await expect(slider).toHaveValue('2'); await expect(slider).toHaveAttribute('aria-valuetext','High')
+  await slider.press('ArrowLeft'); await expect(slider).toHaveValue('1'); await expect(slider).toHaveAttribute('aria-valuetext','High')
   const mode=page.getByRole('button',{name:'Conversation mode',exact:true})
   await mode.click()
   await expect(page.getByRole('menuitemradio',{name:/Ask/})).toBeFocused()

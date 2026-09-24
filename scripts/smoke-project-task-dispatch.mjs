@@ -205,7 +205,10 @@ try {
   const fixerId = (await board()).tasks.find(task => task.id === fourth.id).agentId
   const fixer = await snapshot(fixerId)
   assert.ok(fixer.items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text.includes('Project tasks Fixer') && item.data.text.includes('models.list') && item.data.text.includes('router.dispatch') && item.data.text.includes(fourth.id)))
-  assert.notEqual(fixer.settings.permission, 'auto', 'Auto Fixer must not switch the provider permission mode')
+  // A brand-new native conversation opens on the owner's remembered mode for the provider, Auto
+  // until they choose otherwise (structured-sessions.ts ensure; AGENTS.md "Dispatched Claude and
+  // Codex coworkers run in Auto"). This fresh profile has no remembered mode, so the Fixer is on Auto.
+  assert.equal(fixer.settings.permission, 'auto', 'Auto Fixer opens on the highest (Auto) mode in a fresh profile')
   const briefing = await readFile(capture, 'utf8')
   const endpoint = briefing.match(/POST (http:\/\/127\.0\.0\.1:\d+\/control)/)?.[1]
   const token = briefing.match(/Bearer ([a-f0-9]{64})/)?.[1]
@@ -225,6 +228,7 @@ try {
   const worker = workers[0]
   await expect.poll(async () => (await board()).tasks.find(task => task.id === fourth.id).agentId).toBe(worker.agentSessionId)
   assert.equal((await snapshot(worker.agentSessionId)).settings.effort, 'low')
+  assert.equal((await snapshot(worker.agentSessionId)).settings.permission, 'auto', 'router.dispatch opens the coworker on Auto without exactPermission')
   await closeResult('Auto Fixer')
   await page.evaluate(uri => window.conductor.agentControl.openUri(uri), worker.uri)
   await expect(page.locator('[data-structured-session="' + worker.agentSessionId + '"]')).toBeVisible()

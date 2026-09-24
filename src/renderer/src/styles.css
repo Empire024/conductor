@@ -1759,6 +1759,10 @@ body.autoscrolling * { cursor: all-scroll !important; }
 .tab-group .pane-tab:last-child { border-right: 0; }
 .tab-group .pane-tab.active { background: color-mix(in srgb, var(--accent) 15%, var(--surface-0)); }
 .tab-group .pane-tab.active::before { border-radius: 6px 6px 0 0; }
+/* The active fill above outranks the generic tab hover, so the active tab needs its own hover
+ * step or pointing at it gives no feedback at all. */
+.pane-tab.active:hover, .tab-group .pane-tab.active:hover { background: color-mix(in srgb, var(--accent) 22%, var(--surface-0)); }
+:root[data-theme="light"] .pane-tab.active:hover { background: color-mix(in srgb, var(--accent) 20%, #fff); }
 
 .tab-group-chip {
   flex: 0 0 auto;

@@ -238,17 +238,18 @@ try {
   const claude = await sweepProvider('claude')
   if (!live) {
     // R7/R4: nothing has chosen an effort, so the runtime was launched without --effort (the CLI
-    // applies its own configured level) and the composer says "Account default" instead of a
-    // guessed "Medium"; the model stand-in before discovery is the 1M Opus the account defaults to.
+    // applies its own configured level) and the model picker says "Account default"; the model stand-in before discovery is the 1M Opus the account defaults to.
     expect(claude.report.beforeDiscovery.label).toBe('Account default')
-    expect(claude.report.beforeDiscovery.effortControl?.value).toBe('Account default')
+    // Since 9fb9450 the effort control names the documented ladder default behind Account default
+    // (display only; the saved effort stays undefined and no --effort is sent, checked below).
+    expect(claude.report.beforeDiscovery.effortControl?.value).toBe('Medium (account default)')
     expect((await snapshot(claude.id)).settings.effort).toBeUndefined()
     const discovered = await page.evaluate(id => window.conductor.structured.discover(id), claude.id)
     const launchArgs = discovered?.initialize?.swarm_launch_args ?? []
     expect(launchArgs).not.toContain('--effort')
     expect(launchArgs[launchArgs.indexOf('--model') + 1]).toBe('opus[1m]')
     claude.report.launchArgs = launchArgs
-    check(`claude: before discovery the composer read "Account default" for model and effort, no effort was saved, and the runtime was launched with "${launchArgs.filter((arg, i) => /^--(model|effort)$/.test(launchArgs[i - 1]) || /^--(model|effort)$/.test(arg)).join(' ')}" (no --effort)`)
+    check(`claude: before discovery the composer read "Account default" for the model and "Medium (account default)" for effort, no effort was saved, and the runtime was launched with "${launchArgs.filter((arg, i) => /^--(model|effort)$/.test(launchArgs[i - 1]) || /^--(model|effort)$/.test(arg)).join(' ')}" (no --effort)`)
     // Context window learned from the first result, the ring against usable capacity, then a
     // compaction boundary that clears the old figure. Sonnet: 1M window in the fixture. The model
     // is chosen through the picker the way the owner does it, so the composer state is what the

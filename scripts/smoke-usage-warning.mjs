@@ -55,6 +55,27 @@ try {
   await expect(page.locator('.sa-usage-warning')).toHaveCount(0)
   results.checks.push('Still silent at 1,100 of 1,800 tokens (61%, below the 70% approaching floor)')
 
+  // The Processes summary in the sidebar footer reads the same real IPC channels
+  // (structured.snapshot + usageCaps.read) on its own poll, independent of the open tab. Its flame
+  // is for a process that is burning right now (9139839: a settled or idle process keeps its spend
+  // but clears the flame), so it is exercised while the fixture turn is still running: tighten the
+  // cap to 1,150 so 1,100 is 96% of it, then restore it.
+  await page.evaluate((id) => window.conductor.usageCaps.write('tab', id, { metric: 'tokens', limit: 1150, basis: 'conversation' }), sessionId)
+  const processesWarning = page.locator('.process-status-summary-warning')
+  await expect(processesWarning).toBeVisible({ timeout: 10000 })
+  await expect(processesWarning).toHaveClass(/level-high/)
+  const expensiveRow = page.locator('.process-status-summary-row.level-high')
+  await expect(expensiveRow).toBeVisible()
+  await expect(expensiveRow).toHaveAttribute('title', /getting expensive/i)
+  assert.equal((await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)).phase, 'running')
+  results.checks.push('Processes summary in the sidebar flags the running project as expensive (1,100 of 1,150 tokens), at a glance and across projects')
+  await page.screenshot({ path: join(output, 'usage-warning-processes-high.png'), fullPage: true })
+  results.screenshots.push('artifacts/backlog-followup/usage-warning-processes-high.png')
+  await page.evaluate((id) => window.conductor.usageCaps.write('tab', id, { metric: 'tokens', limit: 1800, basis: 'conversation' }), sessionId)
+  await expect(processesWarning).toHaveCount(0, { timeout: 10000 })
+  await expect(page.locator('.sa-usage-warning')).toHaveCount(0, { timeout: 10000 })
+  results.checks.push('Restoring the 1,800 cap clears the Processes flame and the tab pill without a reload')
+
   await writeFile(join(project.path, '.synthetic-telemetry-finish'), 'Release final synthetic telemetry report.\n')
   await expect.poll(async () => (await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)).phase, { timeout: 15000 }).toBe('completed')
   const warning = page.locator('.sa-usage-warning')
@@ -66,24 +87,19 @@ try {
   await page.screenshot({ path: join(output, 'usage-warning-tab-high.png'), fullPage: true })
   results.screenshots.push('artifacts/backlog-followup/usage-warning-tab-high.png')
 
-  // The Processes summary in the sidebar footer reads the same real IPC channels
-  // (structured.snapshot + usageCaps.read) on its own poll, independent of the open tab.
-  const processesWarning = page.locator('.process-status-summary-warning')
-  await expect(processesWarning).toBeVisible({ timeout: 10000 })
-  await expect(processesWarning).toHaveClass(/level-high/)
-  const expensiveRow = page.locator('.process-status-summary-row.level-high')
-  await expect(expensiveRow).toBeVisible()
-  await expect(expensiveRow).toHaveAttribute('title', /getting expensive/i)
-  results.checks.push('Processes summary in the sidebar shows the same project as expensive, at a glance and across projects')
-  await page.screenshot({ path: join(output, 'usage-warning-processes-high.png'), fullPage: true })
-  results.screenshots.push('artifacts/backlog-followup/usage-warning-processes-high.png')
+  // The settled conversation keeps its composer pill (it describes this conversation's spend) but
+  // no longer burns, so the Processes flame stays clear. Wait past one 4 s summary poll first.
+  await page.waitForTimeout(5000)
+  await expect(page.locator('.process-status-summary-warning')).toHaveCount(0)
+  await expect(page.locator('.process-status-summary-row.level-high')).toHaveCount(0)
+  results.checks.push('A completed conversation keeps the composer warning but clears the Processes flame (not burning any more)')
 
   // Clearing the cap removes the only figure this conversation has to warn on (the synthetic
-  // Codex fixture never reports cost), so both warnings must fully clear, not just downgrade.
+  // Codex fixture never reports cost), so the composer warning must fully clear, not just downgrade.
   await page.evaluate((id) => window.conductor.usageCaps.write('tab', id, null), sessionId)
   await expect(page.locator('.sa-usage-warning')).toHaveCount(0, { timeout: 10000 })
   await expect(page.locator('.process-status-summary-warning')).toHaveCount(0, { timeout: 10000 })
-  results.checks.push('Clearing the cap clears both warnings -- the tab pill and the Processes badge -- without a reload')
+  results.checks.push('Clearing the cap clears the tab pill without a reload')
 
   assert.deepEqual(errors, [])
 } catch (error) {

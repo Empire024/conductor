@@ -49,9 +49,17 @@ try {
     await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('Home')
     await page.getByRole('slider', { name: 'Reasoning effort', exact: true }).press('End')
     await expect(page.getByRole('slider', { name: 'Reasoning effort', exact: true })).toHaveAttribute('aria-valuetext', 'Low')
+    // The composer mode is the one place Codex permissions are chosen (98b0b6e removed the
+    // dialog's sandbox/approval selectors). A new conversation opens on Auto, which answers the
+    // fixture's edit approval itself; Edit maps to workspace-write + on-request and keeps the card.
+    const modeButton = page.getByRole('button', { name: 'Conversation mode', exact: true })
+    await expect(modeButton).toHaveText('Auto')
+    await modeButton.click()
+    await page.getByRole('menuitemradio', { name: /Edit/ }).click()
+    await expect(modeButton).toHaveText('Edit')
     await page.getByRole('button', { name: 'Session settings', exact: true }).click()
-    await page.getByLabel('Execution sandbox', { exact: true }).selectOption('workspace-write')
-    await page.getByLabel('Approval policy', { exact: true }).selectOption('untrusted')
+    await expect(page.getByLabel('Execution sandbox', { exact: true })).toHaveCount(0)
+    await expect(page.getByLabel('Approval policy', { exact: true })).toHaveCount(0)
     const connected = await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId)
     await page.getByRole('button', { name: 'Resume connection', exact: true }).click()
     await expect.poll(async () => { const state = await page.evaluate(id => window.conductor.structured.snapshot(id), sessionId); return state.phase === 'idle' && state.runtimeId !== connected.runtimeId }).toBe(true)
@@ -59,10 +67,9 @@ try {
     assert.equal(configured.items.filter(item => item.data.type === 'text' && item.data.role === 'user').length, 0)
     assert.equal(configured.settings.model, 'synthetic-model')
     assert.equal(configured.settings.effort ?? configured.capabilities.effectiveSettings?.effort, 'low')
-    assert.equal(configured.settings.sandbox, 'workspace-write')
-    assert.equal(configured.settings.approvalPolicy, 'untrusted')
+    assert.equal(configured.settings.permission, 'accept-edits')
     await page.getByRole('button', { name: 'Close Conversation settings', exact: true }).click()
-    results.checks.push('Searchable model picker with keyboard focus restoration and effort slider update backend settings; sandbox/approvals remain separate; metadata discovery and resume submit no prompt')
+    results.checks.push('Searchable model picker with keyboard focus restoration and effort slider update backend settings; permissions come only from the composer mode (Auto -> Edit), not the settings dialog; metadata discovery and resume submit no prompt')
   }
   const composer = page.getByRole('textbox', { name: /message|prompt/i }).last()
   await composer.fill('SYNTHETIC A: remove the two unused declarations, then run node --test panel.test.mjs once.')

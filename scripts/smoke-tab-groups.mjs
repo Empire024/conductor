@@ -20,7 +20,9 @@ window.conductor = {
   agentControl: { links: async () => [], onLinksChanged: () => () => {} },
   window: { isCursorOutside: async () => false },
   structured: { bindWorkspace: async () => {} },
-  sessions: { save: async () => {} }
+  sessions: { save: async () => {} },
+  // LauncherPane lists paired machines and their running terminals; this fixture has none.
+  remote: { machines: async () => [], refreshMachines: async () => [], onState: () => () => {}, terminals: { list: async () => [] }, files: {} }
 };
 const TITLES = ['Fix tab drag regression','Review layout operations','Workspace files sidebar','Effort picker polish','Project backlog pane','Session controls','Remote control server','VS Code bridge','Separator drag','Launcher grid','Codex protocol','Usage limit banner'];
 const tabs = TITLES.map((title, index) => ({ id: 'pane-' + index, kind: 'launcher', title, resourceId: 'agent-' + index }));
@@ -70,7 +72,9 @@ try {
   const errors = []
   page.on('pageerror', error => errors.push(error.message))
   await page.goto(server.resolvedUrls.local[0] + '__tab-groups')
-  await page.waitForSelector('.pane-tab')
+  // A fixture that throws while mounting leaves an empty page; name the renderer error instead of
+  // timing out on a selector.
+  await page.waitForSelector('.pane-tab').catch(error => { throw new Error('Tab strip never rendered; page errors: ' + JSON.stringify(errors), { cause: error }) })
   await expect(page.locator('.pane-tab')).toHaveCount(12)
 
   // 1. The active tab has to be obvious against its neighbours, in both themes.
