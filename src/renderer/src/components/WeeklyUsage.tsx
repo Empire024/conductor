@@ -34,6 +34,7 @@ export function WeeklyUsage({ compact = false }: { compact?: boolean }): React.J
       {models.map((model, index) => <span key={`${model.provider}:${model.model}`} title={`${model.model ?? model.provider}: ${model.totalTokens!.toLocaleString()} recorded tokens${model.estimated ? ' (estimated)' : ''}`} style={{ width: `${100 * model.totalTokens! / total}%`, background: colors[index % colors.length] }} />)}
     </div>
     {!compact && <div className="weekly-usage-models">{models.map((model, index) => <span key={`${model.provider}:${model.model}`}><i style={{ background: colors[index % colors.length] }} /><b>{model.model ?? `${model.provider} · model unavailable`}</b><span>{model.estimated ? '~' : ''}{label(model.totalTokens!)}</span></span>)}</div>}
+    {report?.localSavings && (!compact || report.localSavings.tokensSaved > 0) && <div className="weekly-usage-local" title={`${report.localSavings.calls} local assist calls (${report.localSavings.modelCalls} answered by the local model), which read ${label(report.localSavings.localInputTokens)} tokens locally. Saved ≈ raw characters ÷ 4 − returned characters ÷ 4.`}>Local models saved ≈ {label(report.localSavings.tokensSaved)} tokens this week</div>}
     {!compact && <small className="weekly-usage-note">Recorded on this computer across projects. {partial ? 'Incomplete counters are excluded. ' : ''}Provider allowance is shown separately.</small>}
   </section>
 }

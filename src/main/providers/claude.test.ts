@@ -72,6 +72,20 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     await expect(fixture({ approvalReviewer: true, nativeSessionId: 'old-native' }).adapter.start()).rejects.toThrow('fresh isolated')
   })
 
+  it('passes the browser and conductor-local configs in one --mcp-config, and neither to a reviewer', async () => {
+    const both = fixture({ mcpConfig: 'browser.json', localAssistMcpConfig: 'local.json' })
+    await both.adapter.start()
+    const args = both.transport.options.args
+    expect(args.filter(arg => arg === '--mcp-config')).toHaveLength(1)
+    expect(args.slice(args.indexOf('--mcp-config') + 1, args.indexOf('--mcp-config') + 3)).toEqual(['browser.json', 'local.json'])
+    const local = fixture({ localAssistMcpConfig: 'local.json' })
+    await local.adapter.start()
+    expect(local.transport.options.args[local.transport.options.args.indexOf('--mcp-config') + 1]).toBe('local.json')
+    const reviewer = fixture({ approvalReviewer: true, localAssistMcpConfig: 'local.json' })
+    await reviewer.adapter.start()
+    expect(reviewer.transport.options.args).not.toContain('local.json')
+  })
+
   it('keeps a managed Auto worker on native auto even when its controller reviews coworkers', async () => {
     const f = fixture({ reviewApprovals: true, settings: { permission: 'auto', plan: false } })
     await f.adapter.start()

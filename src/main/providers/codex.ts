@@ -29,6 +29,7 @@ import type { ThreadForkResponse } from './generated/codex/v2/ThreadForkResponse
 import type { ThreadGoalGetResponse } from './generated/codex/v2/ThreadGoalGetResponse'
 import type { SkillsListResponse } from './generated/codex/v2/SkillsListResponse'
 import { BROWSER_MCP_SERVER_NAME } from '../../shared/browser-mcp'
+import { codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
 import { canonicalAction } from '../approval-review'
 
 export const CODEX_PROTOCOL_BASELINE = '0.155.1'
@@ -386,7 +387,7 @@ export class CodexAdapter implements ProviderAdapter {
       if (!record(initialized) || typeof initialized.userAgent !== 'string') throw new Error('Malformed Codex initialize response')
       this.transport.send({ method: 'initialized' })
       const liveEnvironment = this.options.environment ?? process.env
-      let threadConfig = codexBrowserMcpThreadConfig(this.options.mcpConfig)
+      let threadConfig = mergeCodexMcpConfigs(codexBrowserMcpThreadConfig(this.options.mcpConfig), codexLocalAssistThreadConfig(this.options.localAssistMcpConfig))
       if (liveEnvironment.CONDUCTOR_LIVE_TESTS === '1') {
         if (threadConfig) throw new Error('Codex live isolation cannot enable the Conductor browser MCP')
         const requirements = await this.request<ConfigRequirementsReadResponse>('configRequirements/read')

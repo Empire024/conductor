@@ -6,7 +6,7 @@ import type { AgentSpec } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
-import { CONTEXT_RESET, MEMORY_HEADING, TurnBriefings, handoffNudge } from './turn-briefing'
+import { CONTEXT_RESET, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -132,6 +132,18 @@ describe('what a native runtime is told, and how often', () => {
     const local = fixture('local')
     local.briefings.compose(local.spec, 'Start', 'item-1', 'runtime-1', { percent: 90 })
     expect(local.briefings.compose(local.spec, 'Keep going', 'item-2', 'runtime-1', { percent: 95 })).toBe('')
+  })
+
+  it('tells Claude and Codex once per runtime to hand long output to the local model', () => {
+    const f = fixture('codex')
+    const first = f.briefings.compose(f.spec, 'Run the tests', 'item-1', '')
+    expect(first).toContain(`MACHINE limits: one local model server at a time ${LOCAL_ASSIST_HINT}`)
+    expect(LOCAL_ASSIST_HINT).toContain('run_and_summarize')
+    expect(LOCAL_ASSIST_HINT.length).toBeLessThan(200)
+    f.starting('runtime-1')
+    expect(f.briefings.compose(f.spec, 'Again', 'item-2', 'runtime-1')).not.toContain(LOCAL_ASSIST_HINT)
+    const grok = fixture('grok')
+    expect(grok.briefings.compose(grok.spec, 'Run the tests', 'item-1', '')).not.toContain(LOCAL_ASSIST_HINT)
   })
 
   it('gives a local model only its memory lines: no heading, no nudge, never a control credential', () => {

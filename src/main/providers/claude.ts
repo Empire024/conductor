@@ -180,7 +180,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     // tools are simply present: there is no way to hand a running conversation a new server, and
     // the owner should never have to restart one to get them. --mcp-config is additive, so the
     // owner's own MCP configuration is untouched; --strict-mcp-config is deliberately not sent.
-    if (!this.options.approvalReviewer && this.options.mcpConfig) args.push('--mcp-config', this.options.mcpConfig)
+    // One variadic flag carries both servers; a repeated flag is not something the CLI promises to merge.
+    const mcpConfigs = this.options.approvalReviewer ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig].filter((config): config is string => Boolean(config))
+    if (mcpConfigs.length) args.push('--mcp-config', ...mcpConfigs)
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // No --bare, --system-prompt, --setting-sources, or environment auth mutation:
     // CLI defaults retain the coding-agent prompt, user/project/local configuration and policy.

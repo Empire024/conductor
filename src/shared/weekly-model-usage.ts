@@ -58,6 +58,8 @@ export interface WeeklyModelUsageReport {
     countersWithoutBaseline: number
     nestedReportsExcluded: number
   }
+  /** Local assist calls over the same window (src/main/local-assist); absent where it is not running. */
+  localSavings?: { tokensSaved: number; calls: number; modelCalls: number; localInputTokens: number; localOutputTokens: number }
 }
 
 interface Sample {

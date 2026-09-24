@@ -124,6 +124,10 @@ export class StructuredSessions {
   isApprovalReviewer(id: string): boolean { return this.database.getSetting('approval-reviewer:' + id) === 'true' }
   /** Whether this process holds a runtime for the conversation (connected or connecting). */
   hasRuntime(id: string): boolean { const live = this.live.get(id); return Boolean(live?.adapter || live?.starting) }
+  /** The conductor-local MCP server (src/main/local-assist): every Claude and Codex conversation
+   *  gets it, unlike the browser tools, which the owner switches on per conversation. */
+  private localAssist?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
+  setLocalAssist(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void { this.localAssist = server }
   private localControl?: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>
   setLocalControl(handler: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>): void {
     this.localControl = handler
@@ -246,6 +250,7 @@ export class StructuredSessions {
       executable: live.executable, cwd: live.spec.cwd, runtimeId, nativeSessionId: state.nativeSessionId,
       settings: settingsForRuntime(state.settings, runtimeId),
       mcpConfig: this.isApprovalReviewer(id) || live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
+      localAssistMcpConfig: this.isApprovalReviewer(id) ? '' : this.localAssist?.configure(live.spec) ?? '',
       approvalReviewer: this.isApprovalReviewer(id),
       reviewApprovals: Boolean(this.reviewRouting?.enabled(live.spec)),
       authorizeTool: (name, input) => this.approvalGate.guardTool(live.spec, name, input),
@@ -1437,7 +1442,7 @@ export class StructuredSessions {
       // The pending continuation itself stays in SQLite: only this process's timer goes.
       // Reopening the conversation re-arms it, and a wait must not be lost to a backend restart.
       this.cancelContinuation(id)
-      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id)
+      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id); this.localAssist?.release(id)
     }
     this.flush()
   }
@@ -1470,7 +1475,7 @@ export class StructuredSessions {
       this.cancelContinuation(id)
       live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer)
       live.adapter = undefined
-      this.live.delete(id); this.mcp?.release(id)
+      this.live.delete(id); this.mcp?.release(id); this.localAssist?.release(id)
       kept.push(id)
     }
     this.flush()

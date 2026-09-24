@@ -166,6 +166,19 @@ describe('backend session ownership and lifecycle — fake provider boundary', (
     expect(mcp.configure).not.toHaveBeenCalled()
   })
 
+  it.each(['claude', 'codex'] as const)('hands every %s launch the conductor-local tools, browser or not, and releases them on close', async provider => {
+    const localAssist = { configure: vi.fn(() => 'local-assist-config.json'), release: vi.fn() }
+    const f = fixture(provider, true)
+    f.manager.setLocalAssist(localAssist)
+    f.manager.saveSettings(f.spec.id, settings)
+    await f.manager.submit(f.spec.id, 'Run the tests', settings)
+    expect(f.current.options.localAssistMcpConfig).toBe('local-assist-config.json')
+    expect(f.current.options.mcpConfig).toBe('')
+    expect(localAssist.configure).toHaveBeenCalledWith(f.spec)
+    f.manager.killWhere(() => true)
+    expect(localAssist.release).toHaveBeenCalledWith(f.spec.id)
+  })
+
   it.each(['claude', 'codex'] as const)('reconnects the same idle native %s conversation when browser tools change', async provider => {
     const mcp = { configure: vi.fn(() => 'private-browser-config.json'), release: vi.fn() }
     const f = fixture(provider, true, mcp)

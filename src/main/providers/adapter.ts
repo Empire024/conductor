@@ -24,6 +24,8 @@ export interface AdapterOptions {
   environment?: NodeJS.ProcessEnv
   /** Backend-created provider-native MCP configuration file (or bounded inline fallback). */
   mcpConfig?: string
+  /** The conductor-local MCP server (src/main/local-assist), in the same form as mcpConfig. */
+  localAssistMcpConfig?: string
   /** Host-only reviewer isolation; never accepted from worker settings or app-control input. */
   approvalReviewer?: boolean
   /** Delegated native approval events must pass the host reviewer gate, including Auto mode. */

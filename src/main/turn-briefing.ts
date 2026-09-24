@@ -26,6 +26,11 @@ export const CONTEXT_RESET = 'contextReset'
 
 export const MEMORY_HEADING = 'Conductor project memory (current project evidence takes precedence):'
 
+/** Rides with the machine line, once per runtime, for the runtimes the conductor-local MCP
+ *  server is attached to (src/main/local-assist). One sentence: it is paid on every new runtime. */
+export const LOCAL_ASSIST_HINT = 'Save tokens: for tests, builds and long logs call run_and_summarize; for reading large files call local_ask (conductor-local tools, answered by the local model).'
+const LOCAL_ASSIST_PROVIDERS = new Set(['claude', 'codex'])
+
 /** Context bands at which a conversation is told, once each per runtime, to hand its remaining
  *  work to a fresh tab. Two bands, not one threshold: docs/token-thrift-policy.md shows the
  *  payback varies by model and cache ratio, so the first is a prompt to plan and the second a
@@ -80,7 +85,7 @@ export class TurnBriefings {
     // recalled memory lines travel, fenced ahead of the owner's words (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? this.deps.machine?.() ?? '' : '', staticDue ? this.deps.control?.(spec) ?? '' : '', this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', this.nudge(ledger, context)].filter(Boolean).join('\n\n')
   }
 
   /** Once per band per runtime; a compaction or a new process starts the count again, since

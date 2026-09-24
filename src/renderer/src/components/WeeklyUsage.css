@@ -11,3 +11,4 @@
 .weekly-usage-note { display: block; margin-top: 6px; color: var(--text-3); }
 .weekly-usage.compact { padding: 5px 0 0; font-size: 9px; }
 @media (prefers-reduced-motion: reduce) { .weekly-usage-bar > span { transition: none; } }
+.weekly-usage-local { margin-top: 6px; color: var(--text-2); }
