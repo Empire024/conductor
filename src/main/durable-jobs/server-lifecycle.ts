@@ -27,7 +27,9 @@ import { redactData, redactSensitive } from './watchdog.ts'
  *     | { ok: false; blocked: { resumable: true; reason; nextAction; diagnostics } }
  *   class ServerSupervisor(modelId, ports, options?)
  *     check(): Promise<{ state: ServerState; restarted: boolean; observation }>   one probe, events on change
- *     ensureReady(signal?: AbortSignal): Promise<ServerReadiness>               probe, restart with backoff, or block
+ *     ensureReady(signal?: AbortSignal): Promise<ServerReadiness>               probe, restart with backoff, or block;
+ *                                      an aborted signal ends any wait at once and is checked right
+ *                                      before every start attempt, so a superseded job never switches the model
  *   function createLlamaServerPorts(modelId, deps?): Promise<ServerLifecyclePorts>  real wiring, lazy imports
  *
  * Different-model policy (docs/machine-profile.md: one server, 12 GB VRAM; interactive use first):
@@ -155,6 +157,13 @@ export class ServerSupervisor {
     let failures = 0
     let quietSince: number | null = null
     const cancelled = (): ServerReadiness => ({ ok: false, blocked: { resumable: true, reason: 'Server recovery was cancelled.', nextAction: 'Resume the job to retry the server.', diagnostics: { model: this.modelId } } })
+    // The owner's pause or cancel must not wait out a poll (30 s) or a backoff (up to 2 min).
+    const wait = (ms: number): Promise<void> => !signal ? this.ports.sleep(ms) : new Promise(resolve => {
+      if (signal.aborted) return resolve()
+      const done = (): void => { signal.removeEventListener('abort', done); resolve() }
+      signal.addEventListener('abort', done)
+      void this.ports.sleep(ms).then(done, done)
+    })
     const block = (reason: string, nextAction: string, diagnostics: Record<string, unknown> = {}): ServerReadiness => {
       const secrets = this.ports.secrets ?? []
       this.emit(`Blocked: ${reason}`, { nextAction, ...diagnostics })
@@ -164,7 +173,9 @@ export class ServerSupervisor {
       if (signal?.aborted) return cancelled()
       const { state, restarted, observation } = await this.check()
       if (state === 'healthy') return { ok: true, port: observation.port, restarted, message: `${this.modelId} healthy on 127.0.0.1:${observation.port}` }
-      if (state === 'loading' && this.ports.now() - started < this.options.loadingGraceMs) { await this.ports.sleep(Math.min(this.options.pollMs, this.options.backoff.initialDelayMs)); continue }
+      if (state === 'loading' && this.ports.now() - started < this.options.loadingGraceMs) { await wait(Math.min(this.options.pollMs, this.options.backoff.initialDelayMs)); continue }
+      // Superseded while probing: starting (or switching) a server now would be for nobody.
+      if (signal?.aborted) return cancelled()
 
       const allowSwitch = this.options.differentModel === 'switch-when-idle' && quietSince !== null && this.ports.now() - quietSince >= this.options.interactiveQuietMs
       const result = await this.ports.ensure({ allowSwitch })
@@ -191,7 +202,7 @@ export class ServerSupervisor {
           return block(`${this.modelId} is waiting for the machine: ${running.model} holds the one local model server.`, nextAction, { running: running.model, ours: running.ours, busy: running.busy, waitedMs: waited })
         }
         this.emit(`Waiting: ${running.model} holds the local model server (${running.busy ?? (running.ours ? 'idle' : 'not started by Conductor')}); the job does not interrupt it.`, { running: running.model, ours: running.ours, busy: running.busy, quietForMs: quietSince === null ? 0 : this.ports.now() - quietSince })
-        await this.ports.sleep(this.options.pollMs)
+        await wait(this.options.pollMs)
         continue
       } else failure = { reason: result.reason, message: result.message }
       failures++
@@ -202,7 +213,7 @@ export class ServerSupervisor {
       }
       const delay = delays[failures - 1]!
       this.emit(`Server start attempt ${failures} failed (${failure.reason}); retrying in ${Math.round(delay / 1000)}s.`, { attempt: failures, delayMs: delay, reason: failure.reason, detail: failure.message })
-      await this.ports.sleep(delay)
+      await wait(delay)
     }
   }
 }

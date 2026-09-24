@@ -3,8 +3,8 @@ import { mkdir } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { makeId } from '../../shared/models'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_STAGE_KINDS, TERMINAL_JOB_STATUSES, type CreateDurableJobInput, type DurableJobCheckpoint, type DurableJob, type DurableJobBudgets, type DurableJobEvent, type DurableJobReport, type DurableJobsService, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../shared/durable-jobs'
-import { DurableJobController } from './controller'
-import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type HandoffPort, type LoopGuardPort, type ReportPort, type ServerLifecyclePort, type StageRuntime, type WatchdogPort } from './ports'
+import { DurableJobController, operationKindForTool } from './controller'
+import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type HandoffPort, type LoopGuardPort, type LocalExecutionView, type ReportPort, type ServerLifecyclePort, type StageRuntime, type WatchdogPort } from './ports'
 import { reconcileJobs, type ReconcileOutcome } from './reconcile'
 import { collectDurableJobEvents } from './report'
 import { DurableJobStore, type StoredJob } from './store'
@@ -77,9 +77,13 @@ export class DurableJobsServiceImpl implements DurableJobsService {
   private readonly worktrees: WorktreeOps
   private readonly clock: () => Date
   private readonly disposeStore: () => void
+  /** Jobs a previous process left running, until start() has reconciled them. An owner command
+   *  before that would settle their in-flight work blindly and skip the reconciliation. */
+  private readonly unreconciled: Set<string>
 
   constructor(private readonly options: DurableJobsServiceOptions) {
     this.ownerId = options.ownerId ?? `${process.pid}:${randomUUID()}`
+    this.unreconciled = new Set(options.store.list({ status: ['running', 'recovering'] }).filter(job => job.lease?.ownerId !== this.ownerId).map(job => job.id))
     this.handoff = options.handoff ?? defaultHandoffPort
     this.report_ = options.report ?? jsonReportPort
     this.worktrees = options.worktrees ?? gitWorktrees
@@ -104,7 +108,9 @@ export class DurableJobsServiceImpl implements DurableJobsService {
 
   /** App start: reconcile what the previous process left running, then resume and dequeue. */
   async start(): Promise<ReconcileOutcome[]> {
-    const outcomes = await reconcileJobs({ store: this.store, runtime: this.options.runtime, worktrees: this.worktrees, ownerId: this.ownerId, leaseTtlMs: this.options.leaseTtlMs ?? 60_000 })
+    let outcomes: ReconcileOutcome[]
+    try { outcomes = await reconcileJobs({ store: this.store, runtime: this.options.runtime, worktrees: this.worktrees, ownerId: this.ownerId, leaseTtlMs: this.options.leaseTtlMs ?? 60_000 }) }
+    finally { this.unreconciled.clear() }
     for (const outcome of outcomes) this.controller.markLost(outcome.lostSessions)
     for (const outcome of outcomes) if (outcome.decision === 'resume') {
       try { this.controller.start(outcome.jobId, 'Recovered after Conductor restarted') }
@@ -197,20 +203,61 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     return this.store.checkpoints(jobId)
   }
 
+  /** Refuses an owner command on a job the previous process left running until start() has
+   *  reconciled it (reconciliation runs a few seconds after launch, once the windows are up). */
+  private refuseUnreconciled(jobId: string): void {
+    if (this.unreconciled.has(jobId)) throw new Error('Conductor is still reconciling this job after the restart (it first settles what the previous run left in flight); try again in a few seconds.')
+  }
+
+  /**
+   * Settles what the owner's pause or cancel cuts off. A tool call the stage conversation has in
+   * flight may be half done: it is recorded as its own unknown side effect (never replayed), and
+   * the model call that made it settles unknown too instead of reading as a clean failure.
+   */
+  private settleCutOff(jobId: string, stage: DurableJobStage | undefined, failed: string): Pending | undefined {
+    const pending = stage?.agentSessionId ? this.options.runtime.observe(stage.agentSessionId).execution?.pending : undefined
+    for (const op of this.store.operations(jobId, 'intended')) {
+      const cut = pending && op.kind === 'model-call' && op.stageId === stage!.id
+      this.store.settle(jobId, { owner: true }, op.id, cut ? 'unknown' : 'failed', cut ? `Stopped by the owner inside ${pending.name} (${pending.id}); its side effect is unknown and it is not replayed.` : failed)
+    }
+    if (pending) this.recordCutOffTool(jobId, stage!, pending)
+    return pending
+  }
+
+  private recordCutOffTool(jobId: string, stage: DurableJobStage, pending: Pending): void {
+    const record = this.store.intend(jobId, { owner: true }, { stageId: stage.id, kind: operationKindForTool(pending.name), description: `${pending.name} ${pending.arguments.slice(0, 600)}` })
+    this.store.settle(jobId, { owner: true }, record.id, 'unknown', 'The owner stopped the stage while this tool call ran; it may have partly run and is not replayed.')
+  }
+
+  /** Interrupts the stage conversation, then records a tool call it started meanwhile. */
+  private async interruptStage(jobId: string, stage: DurableJobStage | undefined, recorded: Pending | undefined): Promise<void> {
+    if (!stage?.agentSessionId) return
+    await this.options.runtime.interrupt(stage.agentSessionId).catch(error => console.warn(`Durable job ${jobId}: interrupt failed`, error))
+    const late = this.options.runtime.observe(stage.agentSessionId).execution?.pending
+    if (late && late.id !== recorded?.id) this.recordCutOffTool(jobId, stage, late)
+  }
+
   pause(jobId: string, reason = 'Paused by the owner'): DurableJobSummary {
     const job = this.store.get(jobId)
     if (job.status !== 'running' && job.status !== 'queued') throw new Error(`Only a running or queued job can be paused; this one is ${job.status}`)
+    this.refuseUnreconciled(jobId)
     const running = this.store.stages(jobId).find(stage => stage.status === 'running')
-    // The owner's command supersedes the running loop first, so it cannot write after this.
+    // The owner's command supersedes the running loop first, so it cannot write after this. The
+    // conversation is interrupted at once, whatever it is doing: there is no safe point to wait for.
+    let pending: Pending | undefined
     this.store.batch(jobId, () => {
       this.store.supersede(jobId, reason)
-      for (const op of this.store.operations(jobId, 'intended')) this.store.settle(jobId, { owner: true }, op.id, 'failed', 'Interrupted by the owner\'s pause; not replayed. Resume starts the stage in a fresh conversation.')
+      pending = this.settleCutOff(jobId, running, 'Interrupted by the owner\'s pause; not replayed. Resume starts the stage in a fresh conversation.')
       // A paused attempt is not charged against the stage's attempts.
-      if (running) this.store.saveStage(jobId, { owner: true }, { ...running, status: 'pending', attempt: Math.max(0, running.attempt - 1), error: 'Paused by the owner' }, { kind: 'stage', message: `Stage ${running.index + 1} paused; its conversation is interrupted` })
-      this.store.transition(jobId, 'paused', reason, { owner: true })
+      if (running) this.store.saveStage(jobId, { owner: true }, { ...running, status: 'pending', attempt: Math.max(0, running.attempt - 1), error: pending ? `Paused by the owner during ${pending.name}` : 'Paused by the owner' }, { kind: 'stage', message: `Stage ${running.index + 1} paused; its conversation is interrupted` })
+      if (!pending) this.store.transition(jobId, 'paused', reason, { owner: true })
+      else {
+        const nextAction = `Inspect what ${pending.name} ${pending.arguments.slice(0, 200)} did in ${job.cwd} before resuming; it was cut off mid-run and will not be replayed.`
+        this.store.transition(jobId, 'paused', `${reason}; ${pending.name} was cut off mid-run and its effect is unknown`, { owner: true }, { handoff: { ...job.handoff, nextAction, updatedAt: this.clock().toISOString() } }, { nextAction })
+      }
     })
     void this.controller.detach(jobId, true)
-    if (running?.agentSessionId) void this.options.runtime.interrupt(running.agentSessionId).catch(() => undefined)
+    void this.interruptStage(jobId, running, pending)
     return this.status(jobId)
   }
 
@@ -223,7 +270,7 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     // The owner's resume is the authority to try again: an exhausted stage gets new attempts.
     if (current && current.attempt >= job.budgets.maxStageAttempts + this.store.attemptBase(current.id)) this.store.grantAttempts(jobId, { owner: true }, current.id)
     const unknown = this.store.operations(jobId, 'unknown')
-    if (unknown.length && job.status === 'blocked') this.store.event(jobId, { owner: true }, 'note', `Resumed by the owner with ${unknown.length} unverified side effect(s) left as they are; nothing is replayed.`)
+    if (unknown.length) this.store.event(jobId, { owner: true }, 'note', `Resumed by the owner with ${unknown.length} unverified side effect(s) left as they are; nothing is replayed.`)
     if (job.budgets.maxElapsedMs > 0) this.store.event(jobId, { owner: true }, 'note', 'The elapsed-time budget restarts from the owner\'s resume.', { elapsedBudget: 'restarted' })
     this.controller.start(jobId, 'Resumed by the owner')
     return this.status(jobId)
@@ -232,12 +279,14 @@ export class DurableJobsServiceImpl implements DurableJobsService {
   async cancel(jobId: string, reason = 'Cancelled by the owner'): Promise<DurableJobSummary> {
     const job = this.store.get(jobId)
     if (TERMINAL_JOB_STATUSES.includes(job.status)) throw new Error(`This job is already ${job.status}`)
+    this.refuseUnreconciled(jobId)
     const stages = this.store.stages(jobId)
     const running = stages.find(stage => stage.status === 'running')
     // Authoritative: supersede, record, then stop the conversation. Nothing continues afterwards.
+    let pending: Pending | undefined
     this.store.batch(jobId, () => {
       this.store.supersede(jobId, reason)
-      for (const op of this.store.operations(jobId, 'intended')) this.store.settle(jobId, { owner: true }, op.id, 'failed', 'Cancelled by the owner; not replayed.')
+      pending = this.settleCutOff(jobId, running, 'Cancelled by the owner; not replayed.')
       for (const stage of stages) {
         if (stage.status === 'running') this.store.saveStage(jobId, { owner: true }, { ...stage, status: 'failed', error: reason, completedAt: this.clock().toISOString() })
         else if (stage.status === 'pending') this.store.saveStage(jobId, { owner: true }, { ...stage, status: 'skipped' })
@@ -245,7 +294,7 @@ export class DurableJobsServiceImpl implements DurableJobsService {
       this.store.transition(jobId, 'cancelled', reason, { owner: true })
     })
     await this.controller.detach(jobId, true)
-    if (running?.agentSessionId) await this.options.runtime.interrupt(running.agentSessionId).catch(error => console.warn(`Durable job ${jobId}: interrupt on cancel failed`, error))
+    await this.interruptStage(jobId, running, pending)
     void this.report(jobId).catch(error => console.warn(`Durable job ${jobId}: report failed`, error))
     return this.status(jobId)
   }
@@ -286,6 +335,8 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     }
   }
 }
+
+type Pending = NonNullable<LocalExecutionView['pending']>
 
 export function createDurableJobsService(options: DurableJobsServiceOptions): DurableJobsServiceImpl {
   return new DurableJobsServiceImpl(options)

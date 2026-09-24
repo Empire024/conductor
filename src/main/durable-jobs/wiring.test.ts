@@ -7,7 +7,7 @@ import type { LocalStopReport } from '../../shared/local-stop'
 import type { Json, SessionProjection, TimelineItem } from '../../shared/structured-agent'
 import { DurableJobsServiceImpl } from './index'
 import type { StageObservation } from './ports'
-import { LocalGenerationGate } from './server-lifecycle'
+import { LocalGenerationGate, type ServerLifecyclePorts, type ServerObservation } from './server-lifecycle'
 import { DurableJobStore } from './store'
 import { FakeRuntime, FakeWorktrees, tick, until, type ScriptedOutcome } from './test-fakes'
 import type { HealthProbe } from './watchdog'
@@ -280,6 +280,58 @@ describe('server port and generation gate', () => {
     expect(gate.holder()).toBeNull()
     runtime.dispose()
     expect(turnStarted).toBeUndefined()
+  })
+})
+
+describe('server wait under an owner command', () => {
+  /** Another model holds the one server and is busy: the supervisor waits (30 s polls, up to 2 h). */
+  function occupied() {
+    const state = { ensureCalls: [] as Array<{ allowSwitch: boolean }>, free: false, modelId: '' }
+    const other: ServerObservation = { recordPresent: true, pid: 7, pidAlive: true, port: 8081, listening: true, health: { ok: true, status: 200, models: ['local/other'] } }
+    const ports: ServerLifecyclePorts = {
+      now: Date.now,
+      sleep: ms => new Promise(resolve => { setTimeout(resolve, ms).unref?.() }),
+      probe: async () => state.free ? { ...other, health: { ok: true, status: 200, models: [state.modelId] } } : other,
+      ensure: async opts => { state.ensureCalls.push(opts); return { ok: false, reason: 'other-model', running: { model: 'local/other', ours: true, busy: 'an interactive chat' }, message: 'busy' } },
+      emit: () => undefined
+    }
+    return { state, serverPorts: async (id: string) => { state.modelId = id; return ports } }
+  }
+  const settlesWithin = (promise: Promise<unknown>, ms: number) => Promise.race([promise.then(() => 'settled'), new Promise(resolve => setTimeout(() => resolve('still waiting'), ms))])
+
+  function service(serverPorts: ReturnType<typeof occupied>['serverPorts']) {
+    const dir = mkdtempSync(join(tmpdir(), 'wiring-server-wait-')); dirs.push(dir)
+    const store = new DurableJobStore(':memory:')
+    const runtime = new FakeRuntime([], { kind: 'answer', text: 'ok\nJOB STATUS: DONE' })
+    const jobs = new DurableJobsServiceImpl({ store, runtime, worktrees: new FakeWorktrees(), logRoot: dir, projectPath: () => dir, sleep: tick, pollMs: 0, server: serverPort({ store, serverPorts, endpointOverride: () => null }) })
+    services.push(jobs)
+    return { jobs, runtime }
+  }
+
+  it('stops waiting for the server as soon as the owner pauses, and resumes cleanly', async () => {
+    const { state, serverPorts } = occupied()
+    const { jobs, runtime } = service(serverPorts)
+    const created = await jobs.create({ projectId: 'p', title: 'Waits', objective: 'Work', model: 'local/qwen3.6-35b-a3b' })
+    await until(() => state.ensureCalls.length === 1)
+    jobs.pause(created.id)
+    expect(await settlesWithin(jobs.controller.idle(created.id), 1_000)).toBe('settled')
+    expect(runtime.opened).toHaveLength(0)
+    state.free = true
+    await jobs.resume(created.id)
+    await until(() => jobs.status(created.id).status === 'completed')
+    expect(runtime.opened).toHaveLength(1)
+  })
+
+  it('stops waiting as soon as the owner cancels and never starts or switches a model afterwards', async () => {
+    const { state, serverPorts } = occupied()
+    const { jobs, runtime } = service(serverPorts)
+    const created = await jobs.create({ projectId: 'p', title: 'Waits', objective: 'Work', model: 'local/qwen3.6-35b-a3b' })
+    await until(() => state.ensureCalls.length === 1)
+    await jobs.cancel(created.id)
+    expect(await settlesWithin(jobs.controller.idle(created.id), 1_000)).toBe('settled')
+    for (let i = 0; i < 20; i++) await tick()
+    expect(state.ensureCalls).toEqual([{ allowSwitch: false }])
+    expect(runtime.opened).toHaveLength(0)
   })
 })
 

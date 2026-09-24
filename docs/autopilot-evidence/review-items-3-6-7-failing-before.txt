@@ -1,0 +1,13 @@
+﻿   × server lifecycle > stops waiting for another model the moment the job is superseded, not after the poll 533ms
+   × server lifecycle > never asks to start or switch a model once the job is superseded 2ms
+   × durable job controller > never counts an answer that is only reasoning as a completed stage 47ms
+   × owner commands while a tool runs > records a tool the pause cut off as an unknown side effect, not a clean failure, and resumes fresh 47ms
+   × owner commands while a tool runs > records a tool the cancel cut off, including one that started while the interrupt went out 47ms
+   × reconciliation after a restart > retries a stage blocked on an approval in a fresh conversation after restarts, instead of re-blocking on the dead one 63ms
+   × reconciliation after a restart > does not count the time Conductor was down as active time 46ms
+   × reconciliation after a restart > refuses the owner's pause or cancel until reconciliation has settled a job left running 48ms
+   ✓ reconciliation after a restart > stops a superseded controller from writing 47ms
+   × server wait under an owner command > stops waiting for the server as soon as the owner pauses, and resumes cleanly 1069ms
+   × server wait under an owner command > stops waiting as soon as the owner cancels and never starts or switches a model afterwards 1074ms
+ Test Files  4 failed (4)
+      Tests  10 failed | 53 passed (63)

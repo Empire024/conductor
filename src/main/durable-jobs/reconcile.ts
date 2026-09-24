@@ -23,7 +23,9 @@ import type { WorktreeOps } from './worktree'
  *      handoff, or moves it to `blocked` with a practical next action when any side effect is
  *      unknown. Shell commands, file writes, git and tests are never replayed blindly; the local
  *      session checkpoint already refuses to replay its own pending tool call (agent.ts).
- * Jobs that were queued, paused or blocked need nothing: they hold no conversation.
+ * Jobs that were queued or paused need nothing: they hold no conversation. A blocked job holds no
+ * loop, but its stage may still be `running` (blocked on an approval or a question in its
+ * conversation, or blocked by an earlier pass on an unknown side effect); see reconcileBlocked.
  */
 
 export interface ReconcileOptions {
@@ -81,16 +83,64 @@ async function decide(options: ReconcileOptions, job: StoredJob, guard: WriteGua
   return { status: 'unknown', reason: `A ${op.kind} operation was in flight and its outcome cannot be verified; it is not replayed.` }
 }
 
+/** A stage conversation that had not finished before the restart died with the process. */
+const cutOff = (options: ReconcileOptions, agentSessionId: string): boolean => {
+  const observation = options.runtime.observe(agentSessionId)
+  return !(observation.phase === 'completed' && observation.stopSequence > 0)
+}
+
+/**
+ * A blocked job whose stage is still `running`. Its conversation was opened by the process that
+ * died, so it is reported lost: the owner's resume then retries the stage in a fresh conversation
+ * instead of re-attaching to the dead one and blocking on the same approval after every restart.
+ * A model call it left in flight is settled here; an unknown effect updates the next action. The
+ * job stays blocked for the owner, and a later launch with nothing left to settle writes nothing.
+ */
+async function reconcileBlocked(options: ReconcileOptions, listed: StoredJob): Promise<ReconcileOutcome | undefined> {
+  const running = options.store.stages(listed.id).filter(stage => stage.status === 'running' && stage.agentSessionId)
+  if (!running.length) return undefined
+  const lost: string[] = []
+  const settled: ReconcileOutcome['operations'] = []
+  const intended = options.store.operations(listed.id, 'intended')
+  if (intended.length) {
+    const lease = options.store.acquire(listed.id, options.ownerId, options.leaseTtlMs, { takeover: true, reason: 'reconciliation of a blocked job after Conductor restarted' })
+    const guard: WriteGuard = { epoch: lease.epoch }
+    const job = options.store.get(listed.id)
+    for (const op of intended) {
+      const verdict = await decide(options, job, guard, op, lost)
+      const record = options.store.settle(job.id, guard, op.id, verdict.status, verdict.reason)
+      options.store.event(job.id, guard, 'recovery', `${op.kind} "${op.description}": ${verdict.status}. ${verdict.reason}`, { operationId: op.id, status: verdict.status })
+      settled.push({ id: record.id, kind: record.kind, status: record.status, reconciliation: record.reconciliation })
+    }
+    if (settled.some(op => op.status === 'unknown')) {
+      const described = options.store.operations(job.id, 'unknown').slice(-3).map(op => op.description).join('; ')
+      const nextAction = `Inspect the workspace (${job.cwd}) for the effect of: ${described}. Nothing was replayed. Resume the job once the files are in the state you want, or cancel it.`
+      options.store.update(job.id, guard, { handoff: { ...job.handoff, nextAction, updatedAt: new Date().toISOString() } })
+    }
+    options.store.release(job.id, guard)
+  }
+  for (const stage of running) if (!lost.includes(stage.agentSessionId!) && cutOff(options, stage.agentSessionId!)) lost.push(stage.agentSessionId!)
+  return { jobId: listed.id, decision: 'blocked', lostSessions: lost, operations: settled }
+}
+
 export async function reconcileJobs(options: ReconcileOptions): Promise<ReconcileOutcome[]> {
   const outcomes: ReconcileOutcome[] = []
-  for (const listed of options.store.list({ status: ['running', 'recovering'] })) {
+  for (const listed of options.store.list({ status: ['running', 'recovering', 'blocked'] })) {
+    if (listed.status === 'blocked') {
+      const outcome = await reconcileBlocked(options, listed)
+      if (outcome) outcomes.push(outcome)
+      continue
+    }
     const previous = listed.lease
     // A job this very process already started (created in the seconds before this pass ran) is
     // live, not left over: taking it over would supersede its own loop and strand it.
     if (previous?.ownerId === options.ownerId) continue
+    // Active time ends where the dead process was last seen (its last event or lease renewal),
+    // not at this launch: the downtime was not work.
+    const lastSeen = Math.max(Date.parse(options.store.lastEvent(listed.id)?.at ?? '') || 0, previous ? Date.parse(previous.expiresAt) - options.leaseTtlMs || 0 : 0)
     const lease = options.store.acquire(listed.id, options.ownerId, options.leaseTtlMs, { takeover: true, reason: 'reconciliation after Conductor restarted' })
     const guard: WriteGuard = { epoch: lease.epoch }
-    if (listed.status === 'running') options.store.transition(listed.id, 'recovering', 'Conductor restarted while this job was running', guard)
+    if (listed.status === 'running') options.store.transition(listed.id, 'recovering', 'Conductor restarted while this job was running', guard, {}, undefined, lastSeen || undefined)
     options.store.count(listed.id, guard, { recoveries: 1 })
     options.store.event(listed.id, guard, 'recovery', `Reconciling after restart; previous owner ${previous?.ownerId ?? 'unknown'} (epoch ${previous?.epoch ?? 0})`, { previousOwner: previous?.ownerId ?? null, epoch: lease.epoch })
     const job = options.store.get(listed.id)
@@ -103,10 +153,7 @@ export async function reconcileJobs(options: ReconcileOptions): Promise<Reconcil
       settled.push({ id: record.id, kind: record.kind, status: record.status, reconciliation: record.reconciliation })
     }
     // A running stage whose conversation is not accounted for above (no op in flight) is lost too.
-    for (const stage of options.store.stages(job.id)) if (stage.status === 'running' && stage.agentSessionId && !lost.includes(stage.agentSessionId)) {
-      const observation = options.runtime.observe(stage.agentSessionId)
-      if (!(observation.phase === 'completed' && observation.stopSequence > 0)) lost.push(stage.agentSessionId)
-    }
+    for (const stage of options.store.stages(job.id)) if (stage.status === 'running' && stage.agentSessionId && !lost.includes(stage.agentSessionId) && cutOff(options, stage.agentSessionId)) lost.push(stage.agentSessionId)
     if (settled.some(op => op.status === 'unknown')) {
       const described = options.store.operations(job.id, 'unknown').slice(-3).map(op => op.description).join('; ')
       const nextAction = `Inspect the workspace (${job.cwd}) for the effect of: ${described}. Nothing was replayed. Resume the job once the files are in the state you want, or cancel it.`

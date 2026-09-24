@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import { makeId } from '../../shared/models'
 import type { DurableJob, DurableJobOperation, DurableJobStage } from '../../shared/durable-jobs'
+import { visibleContent } from './handoff'
 import type { HandoffPort, LoopGuardPort, ServerLifecyclePort, StageObservation, StageRuntime, WatchdogPort } from './ports'
 import { StaleEpochError, type DurableJobStore, type StoredJob, type WriteGuard } from './store'
 import type { WorktreeOps } from './worktree'
@@ -69,11 +70,12 @@ const ACTIVE = new Set<string>(['starting', 'running', 'waiting_approval', 'wait
 const NEEDS_OWNER = new Set<string>(['waiting_approval', 'waiting_input'])
 
 /** The controller's success test: the model's own final answer, no truncation, no pending or
- *  failed task state. An empty or cut-off answer is never a completed stage. */
+ *  failed task state. An empty or cut-off answer is never a completed stage, and neither is one
+ *  that is only reasoning (a closed or unclosed `<think>` block with nothing after it). */
 export function stageSucceeded(observation: StageObservation): boolean {
   if (observation.phase !== 'completed') return false
   if (observation.stop?.reason !== 'completed') return false
-  if (!observation.lastAnswer.trim()) return false
+  if (!visibleContent(observation.lastAnswer).text) return false
   if (observation.stop.acceptance && !observation.stop.acceptance.passed) return false
   if (observation.execution?.pending) return false
   return !observation.execution || observation.execution.lifecycle === 'completed'
@@ -86,7 +88,7 @@ export function describeFailure(observation: StageObservation, interruptedFor?: 
   if (observation.lastError) return observation.lastError
   if (observation.stop?.acceptance && !observation.stop.acceptance.passed) return `Acceptance command failed: ${observation.stop.acceptance.command} (exit ${observation.stop.acceptance.exitCode})`
   if (observation.execution && observation.execution.lifecycle !== 'completed') return `Local task ended ${observation.execution.lifecycle}: ${observation.execution.nextAction}`
-  if (!observation.lastAnswer.trim()) return 'The stage produced no final answer.'
+  if (!visibleContent(observation.lastAnswer).text) return 'The stage produced no final answer.'
   return `The stage conversation ended ${observation.phase}.`
 }
 

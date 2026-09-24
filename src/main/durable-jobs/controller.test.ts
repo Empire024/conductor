@@ -85,6 +85,13 @@ describe('durable job controller', () => {
     expect(stageSucceeded({ phase: 'completed', stopSequence: 1, stop: { reason: 'completed', detail: '', filesChanged: [] }, lastAnswer: 'ok', filesChanged: [] })).toBe(true)
   })
 
+  it('never counts an answer that is only reasoning as a completed stage', () => {
+    const answer = (lastAnswer: string) => ({ phase: 'completed' as const, stopSequence: 1, stop: { reason: 'completed' as const, detail: '', filesChanged: [] }, lastAnswer, filesChanged: [] })
+    expect(stageSucceeded(answer('<think>I should edit the parser.</think>'))).toBe(false)
+    expect(stageSucceeded(answer('<think>still thinking about the parser'))).toBe(false)
+    expect(stageSucceeded(answer('<think>checked</think>\nParser refactored.\nJOB STATUS: DONE'))).toBe(true)
+  })
+
   it('plans further stages for an open-ended job until the model reports done', async () => {
     const { service, runtime } = setup([{ kind: 'answer', text: 'Parsed module A.\nJOB STATUS: CONTINUE: refactor module B' }, { kind: 'answer', text: 'B done.\nJOB STATUS: DONE' }])
     const created = await service.create(input())
@@ -255,5 +262,46 @@ describe('durable job controller', () => {
     expect(service.get(created.id).stages[0]!.attempt).toBe(3)
     expect(service.status(created.id).counters.loopsDetected).toBe(1)
     expect(runtime.opened).toHaveLength(3)
+  })
+})
+
+describe('owner commands while a tool runs', () => {
+  const tool = { id: 'call_9', name: 'run_command', arguments: '{"command":"npm run migrate"}' }
+
+  it('records a tool the pause cut off as an unknown side effect, not a clean failure, and resumes fresh', async () => {
+    const { service, runtime, store } = setup([{ kind: 'hang' }, { kind: 'answer', text: 'ok\nJOB STATUS: DONE' }])
+    const created = await service.create(input())
+    await until(() => runtime.opened.length === 1 && runtime.observe(runtime.opened[0]!).phase === 'running')
+    const id = runtime.opened[0]!
+    runtime.set(id, { ...runtime.observe(id), execution: { lifecycle: 'running', nextAction: '', pending: tool } })
+    const paused = service.pause(created.id)
+    expect(paused.status).toBe('paused')
+    expect(paused.statusReason).toContain('run_command was cut off mid-run')
+    const ops = store.operations(created.id)
+    expect(ops.filter(op => op.kind === 'model-call').map(op => op.status)).toEqual(['unknown'])
+    expect(ops.filter(op => op.kind === 'shell')).toMatchObject([{ status: 'unknown', description: expect.stringContaining('npm run migrate') }])
+    expect(store.operations(created.id, 'failed')).toHaveLength(0)
+    expect(service.get(created.id).handoff.nextAction).toContain('npm run migrate')
+    expect(service.get(created.id).stages[0]).toMatchObject({ status: 'pending', attempt: 0 })
+    await until(() => runtime.sessions.get(id)!.interrupts > 0)
+    await service.resume(created.id)
+    await until(() => service.status(created.id).status === 'completed')
+    expect(runtime.opened).toHaveLength(2)
+    expect(service.events(created.id).some(event => event.message.includes('unverified side effect'))).toBe(true)
+    // Recorded once: the check after the interrupt sees the same call.
+    expect(store.operations(created.id).filter(op => op.kind === 'shell')).toHaveLength(1)
+  })
+
+  it('records a tool the cancel cut off, including one that started while the interrupt went out', async () => {
+    const { service, runtime, store } = setup([{ kind: 'hang' }])
+    const created = await service.create(input())
+    await until(() => runtime.opened.length === 1 && runtime.observe(runtime.opened[0]!).phase === 'running')
+    const id = runtime.opened[0]!
+    const interrupt = runtime.interrupt.bind(runtime)
+    runtime.interrupt = async agentSessionId => { await interrupt(agentSessionId); runtime.set(agentSessionId, { ...runtime.observe(agentSessionId), execution: { lifecycle: 'blocked', nextAction: '', pending: { ...tool, id: 'call_10', name: 'write_file', arguments: '{"path":"db.sqlite"}' } } }) }
+    const cancelled = await service.cancel(created.id)
+    expect(cancelled.status).toBe('cancelled')
+    expect(runtime.sessions.get(id)!.interrupts).toBeGreaterThan(0)
+    expect(store.operations(created.id).filter(op => op.kind === 'file-write')).toMatchObject([{ status: 'unknown', description: expect.stringContaining('db.sqlite') }])
   })
 })

@@ -109,6 +109,67 @@ describe('reconciliation after a restart', () => {
     expect(outcomes[0]!.decision).toBe('blocked')
   })
 
+  it('retries a stage blocked on an approval in a fresh conversation after restarts, instead of re-blocking on the dead one', async () => {
+    const dir = temp('durable-reconcile-blocked-')
+    const store = new DurableJobStore(':memory:')
+    const runtime = new FakeRuntime([{ kind: 'approval' }, { kind: 'answer', text: 'ok\nJOB STATUS: DONE' }])
+    const first = launch(store, runtime, 'pid:1:launch-a', dir)
+    const created = await first.create({ projectId: 'p', title: 'Night', objective: 'Work', model: 'local/qwen' })
+    await until(() => store.get(created.id).status === 'blocked')
+    const [waiting] = runtime.opened
+    expect(store.stages(created.id)[0]).toMatchObject({ status: 'running', agentSessionId: waiting })
+    first.dispose()
+    // That conversation died with the first process; its persisted projection still reads waiting_approval.
+    const second = launch(store, runtime, 'pid:2:launch-b', dir)
+    expect(await second.start()).toMatchObject([{ jobId: created.id, decision: 'blocked', lostSessions: [waiting], operations: [{ kind: 'model-call', status: 'failed' }] }])
+    expect(store.operations(created.id, 'intended')).toHaveLength(0)
+    second.dispose()
+    // A further restart before the owner resumes settles nothing new and writes nothing.
+    const events = store.events(created.id).length
+    const third = launch(store, runtime, 'pid:3:launch-c', dir)
+    expect(await third.start()).toMatchObject([{ jobId: created.id, decision: 'blocked', lostSessions: [waiting], operations: [] }])
+    expect(store.events(created.id)).toHaveLength(events)
+    expect(store.get(created.id).status).toBe('blocked')
+    for (let i = 0; i < 20; i++) await tick()
+    expect(runtime.opened).toHaveLength(1)
+    await third.resume(created.id)
+    await until(() => store.get(created.id).status !== 'running' && !third.controller.isRunning(created.id))
+    expect(store.get(created.id).status).toBe('completed')
+    expect(runtime.opened).toHaveLength(2)
+    expect(third.events(created.id).filter(event => event.kind === 'approval')).toHaveLength(1)
+    expect(third.get(created.id).stages[0]).toMatchObject({ status: 'completed', attempt: 2, agentSessionId: runtime.opened[1] })
+  })
+
+  it('does not count the time Conductor was down as active time', async () => {
+    let now = Date.parse('2026-09-24T00:00:00.000Z')
+    const clock = () => new Date(now)
+    const dir = temp('durable-reconcile-active-')
+    const store = new DurableJobStore(':memory:', clock)
+    const runtime = new FakeRuntime([{ kind: 'hang' }, { kind: 'answer', text: 'ok\nJOB STATUS: DONE' }])
+    const make = (ownerId: string) => { const service = new DurableJobsServiceImpl({ store, runtime, worktrees: new FakeWorktrees(), logRoot: dir, projectPath: () => dir, ownerId, sleep: tick, pollMs: 0, interruptGraceMs: 200, clock }); services.push(service); return service }
+    const first = make('pid:1')
+    const created = await first.create({ projectId: 'p', title: 'Night', objective: 'Work', model: 'local/qwen' })
+    await until(() => runtime.opened.length === 1 && runtime.observe(runtime.opened[0]!).phase === 'running')
+    now += 5_000
+    store.event(created.id, { owner: true }, 'note', 'last sign of life')
+    first.dispose()
+    now += 3_600_000
+    await make('pid:2').start()
+    expect(store.get(created.id).activeMs).toBe(5_000)
+  })
+
+  it('refuses the owner\'s pause or cancel until reconciliation has settled a job left running', async () => {
+    const { dir, store, runtime, jobId, agentSessionId } = await crashMidStage([{ kind: 'hang' }, { kind: 'answer', text: 'ok\nJOB STATUS: DONE' }])
+    runtime.set(agentSessionId, { phase: 'running', stopSequence: 0, lastAnswer: '', filesChanged: [], execution: { lifecycle: 'running', nextAction: '', pending: { id: 'call_7', name: 'run_command', arguments: '{"command":"npm run migrate"}' } } })
+    const second = launch(store, runtime, 'pid:2', dir)
+    expect(() => second.pause(jobId)).toThrow(/reconciling/)
+    await expect(second.cancel(jobId)).rejects.toThrow(/reconciling/)
+    expect(store.operations(jobId, 'intended')).toHaveLength(1)
+    expect((await second.start())[0]!.decision).toBe('blocked')
+    expect(store.operations(jobId, 'unknown').map(op => op.kind).sort()).toEqual(['model-call', 'shell'])
+    expect((await second.cancel(jobId)).status).toBe('cancelled')
+  })
+
   it('stops a superseded controller from writing', async () => {
     const dir = temp('durable-stale-')
     const store = new DurableJobStore(':memory:')

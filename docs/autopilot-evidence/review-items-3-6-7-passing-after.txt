@@ -1,0 +1,33 @@
+﻿
+ RUN  v3.2.7 C:/Users/stilj/AppData/Local/Temp/dj-head
+
+ ✓ src/main/durable-jobs/watchdog.test.ts (10 tests) 7ms
+ ✓ src/main/durable-jobs/loop-guard.test.ts (10 tests) 18ms
+ ✓ src/main/durable-jobs/server-lifecycle.test.ts (15 tests) 245ms
+ ✓ src/main/durable-jobs/structured-runtime.test.ts (3 tests) 4ms
+ ✓ src/main/durable-jobs/handoff.test.ts (16 tests) 117ms
+ ✓ src/main/durable-jobs/report.test.ts (8 tests) 487ms
+node.exe : warning: in the working copy of 'a.txt', LF will be replaced by CRLF the next time Git touches it
+At line:1 char:1
++ & "C:\Program Files\nodejs/node.exe" "C:\Program Files\nodejs/node_mo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (warning: in the... Git touches it:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+ ✓ src/main/durable-jobs-ipc.test.ts (2 tests) 840ms
+   ✓ durable job detail IPC > shows the exact newest 200 events of a job longer than 20,000, oldest first, without paging the history  838ms
+ ✓ src/main/durable-jobs/controller.test.ts (20 tests) 1019ms
+ ✓ src/main/durable-jobs/reconcile.test.ts (11 tests) 1404ms
+   ✓ git worktree checkpoints > works in its own worktree from HEAD, never touches the owner's dirty tree and finds its checkpoint commit  922ms
+ ✓ src/main/durable-jobs/store.test.ts (12 tests) 1890ms
+   ✓ DurableJobStore > returns the exact newest events beyond 20,000, oldest first, from one indexed bounded query  774ms
+   ✓ DurableJobStore > reads the newest tail again after the database file is reopened  750ms
+ ✓ src/main/durable-jobs/wiring.test.ts (17 tests) 2379ms
+   ✓ supervision ports > gives a quiet running tool the tool budget, past the model timeout, then watches the model again  587ms
+   ✓ supervision ports > stops a tool that runs past the tool budget, and not before  560ms
+
+ Test Files  11 passed (11)
+      Tests  124 passed (124)
+   Start at  11:55:33
+   Duration  3.25s (transform 1.03s, setup 0ms, collect 3.47s, tests 8.41s, environment 2ms, prepare 1.61s)
+

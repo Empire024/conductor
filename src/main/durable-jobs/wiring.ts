@@ -7,7 +7,7 @@ import { buildDurableJobReport, parseTestResult, writeDurableJobReport } from '.
 import { ServerSupervisor, type LocalGenerationGate, type ServerLifecyclePorts } from './server-lifecycle'
 import type { DurableJobStore } from './store'
 import { localModelId } from './structured-runtime'
-import { Watchdog, type DurableJobEventDraft, type HealthProbe, type WatchdogOptions } from './watchdog'
+import { ContextRolloverWatch, latestContextTokens, Watchdog, type DurableJobEventDraft, type HealthProbe, type WatchdogOptions } from './watchdog'
 
 /**
  * Plugs the handoff (handoff.ts), server lifecycle, watchdog and loop guard (server-lifecycle.ts,
@@ -146,6 +146,9 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
       // instead, where silence is not a stall (a test suite or a build may print nothing).
       let call: string | null = dog.begin('model-call', `stage ${stage.index + 1} round 1`, `${stage.id}:call`)
       let rounds = 1, lastSequence = options.snapshot(agentSessionId)?.sequence ?? 0, stopped = false
+      // contextRolloverFraction inside the stage: past it, the attempt stops between tool calls and
+      // the next attempt continues in a fresh context from the handoff (once per attempt).
+      const rollover = new ContextRolloverWatch(windowFor(options, job.model.model).contextTokens, job.budgets.contextRolloverFraction)
       const seen = new Set<string>()
       const tools = new Map<string, string>()
       const toolStarted = (itemId: string, name: string): void => {
@@ -193,6 +196,8 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
           if (verdict.action === 'replan') { emit(verdict.event); stop(`loop guard replan: ${verdict.instruction}`); return true }
           if (verdict.action === 'block') { emit(verdict.event); giveUp(verdict.reason, 'loop'); return true }
         }
+        const crossed = rollover.observe(latestContextTokens(state?.items ?? []), tools.size > 0)
+        if (crossed) { stop(`context rollover: the stage context reached ${crossed.promptTokens} tokens, past ${Math.round(crossed.fraction * 100)}% of the ${crossed.contextTokens}-token window (${crossed.thresholdTokens}); continue in a fresh context from the handoff`); return true }
         return false
       }
 
@@ -239,6 +244,21 @@ export function supervisionPorts(options: DurableJobsWiringOptions): { watchdog:
 
 // --- Server lifecycle ------------------------------------------------------------------------
 
+/** Aborts once the job's lease epoch moves on: the owner paused or cancelled it, or a restart took
+ *  it over. A superseded job then stops waiting for the server at once (the wait for another model
+ *  can last waitForModelMs, two hours) and never starts or switches a model for nobody. */
+function supersededSignal(store: DurableJobStore, context: ServerContext | undefined): { signal: AbortSignal; dispose(): void } {
+  const abort = new AbortController()
+  if (!context) return { signal: abort.signal, dispose: () => undefined }
+  const check = (): void => {
+    try { if (store.get(context.jobId).lease?.epoch !== context.epoch) abort.abort() }
+    catch { abort.abort() }
+  }
+  const unsubscribe = store.onChange(jobId => { if (jobId === context.jobId && !abort.signal.aborted) check() })
+  check()
+  return { signal: abort.signal, dispose: unsubscribe }
+}
+
 /** One ServerSupervisor per model; its events go to whichever job asked last. */
 export function serverPort(options: Pick<DurableJobsWiringOptions, 'store' | 'serverPorts' | 'endpointOverride'>): ServerLifecyclePort {
   const supervisors = new Map<string, { supervisor: Promise<ServerSupervisor>; context?: ServerContext }>()
@@ -257,13 +277,17 @@ export function serverPort(options: Pick<DurableJobsWiringOptions, 'store' | 'se
   return {
     async ensureReady(model, context) {
       if (options.endpointOverride()) return { ready: true }
-      const readiness = await (await supervisorFor(model, context)).ensureReady()
+      const superseded = supersededSignal(options.store, context)
+      let readiness: Awaited<ReturnType<ServerSupervisor['ensureReady']>>
+      try { readiness = await (await supervisorFor(model, context)).ensureReady(superseded.signal) } finally { superseded.dispose() }
       // The supervisor already waited and backed off; its block is final for this attempt.
       return readiness.ok ? { ready: true } : { ready: false, reason: `${readiness.blocked.reason} Next: ${readiness.blocked.nextAction}`, retryable: false }
     },
     async recover(model, _reason, context) {
       if (options.endpointOverride()) return false
-      const readiness = await (await supervisorFor(model, context)).ensureReady()
+      const superseded = supersededSignal(options.store, context)
+      let readiness: Awaited<ReturnType<ServerSupervisor['ensureReady']>>
+      try { readiness = await (await supervisorFor(model, context)).ensureReady(superseded.signal) } finally { superseded.dispose() }
       return readiness.ok && readiness.restarted
     }
   }

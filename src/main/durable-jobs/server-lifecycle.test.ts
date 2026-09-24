@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { DurableJobEventDraft } from './watchdog.ts'
+import { until } from './test-fakes'
 import { LocalGenerationGate, ServerSupervisor, backoffSchedule, classifyServer, createLlamaServerPorts, type EnsureResult, type ServerLifecyclePorts, type ServerObservation } from './server-lifecycle.ts'
 
 const MODEL = 'local/qwen3.6-35b-a3b'
@@ -22,6 +23,27 @@ function fakePorts(probes: Array<ServerObservation | (() => ServerObservation)>,
 }
 
 describe('server lifecycle', () => {
+  it('stops waiting for another model the moment the job is superseded, not after the poll', async () => {
+    const ports = fakePorts([healthy(1, 't0', ['local/other'])], [{ ok: false, reason: 'other-model', running: { model: 'local/other', ours: true, busy: 'an interactive chat' }, message: 'busy' }])
+    ports.sleep = () => new Promise(() => undefined)
+    const abort = new AbortController()
+    const waiting = new ServerSupervisor(MODEL, ports).ensureReady(abort.signal)
+    await until(() => ports.ensureCalls.length === 1)
+    abort.abort()
+    const outcome = await Promise.race([waiting, new Promise(resolve => setTimeout(() => resolve('still waiting'), 500))])
+    expect(outcome).toMatchObject({ ok: false, blocked: { reason: 'Server recovery was cancelled.' } })
+    expect(ports.ensureCalls).toHaveLength(1)
+  })
+
+  it('never asks to start or switch a model once the job is superseded', async () => {
+    const abort = new AbortController()
+    let probes = 0
+    const ports = fakePorts([() => { if (++probes === 2) abort.abort(); return healthy(1, 't0', ['local/other']) }], [{ ok: false, reason: 'other-model', running: { model: 'local/other', ours: true, busy: null }, message: 'idle' }])
+    const result = await new ServerSupervisor(MODEL, ports, { interactiveQuietMs: 0 }).ensureReady(abort.signal)
+    expect(ports.ensureCalls).toEqual([{ allowSwitch: false }])
+    expect(result.ok).toBe(false)
+  })
+
   it('classifies dead, loading, unresponsive, wrong-model and healthy servers', () => {
     expect(classifyServer(dead, MODEL)).toBe('dead')
     expect(classifyServer({ ...dead, pidAlive: true }, MODEL)).toBe('loading')

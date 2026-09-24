@@ -1,0 +1,135 @@
+﻿Command (cwd = git-archive export of HEAD 85b9b0d + only this change, built with npx electron-vite build):
+  node scripts/smoke-durable-jobs.mjs --blocked-restart   (DURABLE_SMOKE_TIMEOUT_MS=900000)
+Exit code: 0
+Isolated profile: CONDUCTOR_TEST_USER_DATA under %TEMP%\conductor-durable-jobs-* (removed after PASS); window parked off-screen.
+
+Timeline (stderr):
+exit=0
+node : [2026-09-24T09:57:40.946Z] app launched (parked) {"pid":62176}
+[2026-09-24T09:57:42.488Z] control protocol ready 
+{"projectId":"project_mufcyztt_1djx9l0","model":"local/qwen3.6-35b-a3b","stubEndpoint":"http://127.0.0.1:55728"}
+[2026-09-24T09:57:43.060Z] cloud model refused {"error":"Durable jobs run on a local model only; opus is not a local 
+entry of models.list"}
+[2026-09-24T09:57:57.107Z] app killed while the stage ran run_command {"pid":62176}
+[2026-09-24T09:57:57.807Z] app relaunched (1st restart) {"pid":44316}
+[2026-09-24T09:57:57.814Z] owner pause right after relaunch refused {"error":"Conductor is still reconciling this job 
+after the restart (it first settles what the previous run left in flight); try again in a few seconds."}
+[2026-09-24T09:58:00.902Z] job reconciled to blocked on the unknown side effect 
+{"jobId":"job_mufcz1w8_xvix5uo","status":"blocked","stage":"Slow step","attempt":1,"elapsedMs":17045,"activeMs":103}
+[2026-09-24T09:58:00.904Z] unknown side effect recorded {"statusReason":"A side effect was in flight when Conductor 
+stopped and its outcome is unknown","recoveries":1}
+[2026-09-24T09:58:01.616Z] app killed with the job blocked and its stage still running {"pid":44316}
+[2026-09-24T09:58:02.212Z] app relaunched (2nd restart) {"pid":50076}
+[2026-09-24T09:58:10.234Z] still blocked after the 2nd restart, nothing rewritten {"events":11}
+[2026-09-24T09:58:16.929Z] blocked job resumed after two restarts 
+{"jobId":"job_mufcz1w8_xvix5uo","status":"completed","elapsedMs":32898,"activeMs":6608}
+[2026-09-24T09:58:16.931Z] after resume {"status":"completed","statusReason":"Every stage 
+completed","attemptsStarted":["Stage 1 \"Slow step\" attempt 2 started on local/qwen3.6-35b-a3b"],"reblocks":[],"active
+Ms":6608,"elapsedMs":32898,"counters":{"stagesCompleted":1,"retries":1,"recoveries":1,"contextRollovers":0,"loopsDetect
+ed":0,"cloudEscalations":0}}
+[2026-09-24T09:58:16.931Z] blocked restart scenario done; main job skipped
+
+JSON summary (stdout):
+{
+  "mode": "stub",
+  "model": "local/qwen3.6-35b-a3b",
+  "root": "(removed)",
+  "stubRequests": 2,
+  "observations": [
+    {
+      "at": "2026-09-24T09:57:40.946Z",
+      "label": "app launched (parked)",
+      "pid": 62176
+    },
+    {
+      "at": "2026-09-24T09:57:42.488Z",
+      "label": "control protocol ready",
+      "projectId": "project_mufcyztt_1djx9l0",
+      "model": "local/qwen3.6-35b-a3b",
+      "stubEndpoint": "http://127.0.0.1:55728"
+    },
+    {
+      "at": "2026-09-24T09:57:43.060Z",
+      "label": "cloud model refused",
+      "error": "Durable jobs run on a local model only; opus is not a local entry of models.list"
+    },
+    {
+      "at": "2026-09-24T09:57:57.107Z",
+      "label": "app killed while the stage ran run_command",
+      "pid": 62176
+    },
+    {
+      "at": "2026-09-24T09:57:57.807Z",
+      "label": "app relaunched (1st restart)",
+      "pid": 44316
+    },
+    {
+      "at": "2026-09-24T09:57:57.814Z",
+      "label": "owner pause right after relaunch refused",
+      "error": "Conductor is still reconciling this job after the restart (it first settles what the previous run left in flight); try again in a few seconds."
+    },
+    {
+      "at": "2026-09-24T09:58:00.902Z",
+      "label": "job reconciled to blocked on the unknown side effect",
+      "jobId": "job_mufcz1w8_xvix5uo",
+      "status": "blocked",
+      "stage": "Slow step",
+      "attempt": 1,
+      "elapsedMs": 17045,
+      "activeMs": 103
+    },
+    {
+      "at": "2026-09-24T09:58:00.904Z",
+      "label": "unknown side effect recorded",
+      "statusReason": "A side effect was in flight when Conductor stopped and its outcome is unknown",
+      "recoveries": 1
+    },
+    {
+      "at": "2026-09-24T09:58:01.616Z",
+      "label": "app killed with the job blocked and its stage still running",
+      "pid": 44316
+    },
+    {
+      "at": "2026-09-24T09:58:02.212Z",
+      "label": "app relaunched (2nd restart)",
+      "pid": 50076
+    },
+    {
+      "at": "2026-09-24T09:58:10.234Z",
+      "label": "still blocked after the 2nd restart, nothing rewritten",
+      "events": 11
+    },
+    {
+      "at": "2026-09-24T09:58:16.929Z",
+      "label": "blocked job resumed after two restarts",
+      "jobId": "job_mufcz1w8_xvix5uo",
+      "status": "completed",
+      "elapsedMs": 32898,
+      "activeMs": 6608
+    },
+    {
+      "at": "2026-09-24T09:58:16.931Z",
+      "label": "after resume",
+      "status": "completed",
+      "statusReason": "Every stage completed",
+      "attemptsStarted": [
+        "Stage 1 \"Slow step\" attempt 2 started on local/qwen3.6-35b-a3b"
+      ],
+      "reblocks": [],
+      "activeMs": 6608,
+      "elapsedMs": 32898,
+      "counters": {
+        "stagesCompleted": 1,
+        "retries": 1,
+        "recoveries": 1,
+        "contextRollovers": 0,
+        "loopsDetected": 0,
+        "cloudEscalations": 0
+      }
+    },
+    {
+      "at": "2026-09-24T09:58:16.931Z",
+      "label": "blocked restart scenario done; main job skipped"
+    }
+  ]
+}

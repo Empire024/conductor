@@ -29,6 +29,11 @@ import assert from 'node:assert/strict'
 //                   capacity — a second job runs to completion meanwhile — and after an app restart
 //                   the first is still blocked with the same approval, resumes once the owner has
 //                   done the step, and completes without a second approval.
+//   --blocked-restart (stub) only this: a hard kill while a stage's run_command is running (Docker
+//                   sleep) leaves the job for reconciliation, which blocks it on the unknown side
+//                   effect with its stage still running; an owner pause in the seconds before that
+//                   pass is refused. After a second restart the job is still blocked, nothing is
+//                   rewritten, and one resume continues it once in a fresh conversation to completion.
 // Every observation is printed with its timestamp; the JSON summary is the evidence.
 const argv = process.argv.slice(2)
 const flag = name => argv.some(arg => arg === `--${name}` || arg.startsWith(`--${name}=`))
@@ -72,17 +77,25 @@ if (fixture === 'crossref') {
 const git = (...args) => execFileSync('git', args, { cwd: projectPath, stdio: 'pipe' }).toString().trim()
 git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'add', '.'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'commit', '-q', '-m', 'Initial')
 
+/** Electron processes (main, GPU, renderer, utility) still running on this run's profile. */
+const profileProcesses = () => {
+  const list = execFileSync('powershell', ['-NoProfile', '-Command', `Get-CimInstance Win32_Process -Filter "name='electron.exe'" | ForEach-Object { "$($_.ProcessId)\`t$($_.CommandLine)" }`], { encoding: 'utf8' })
+  return list.split(/\r?\n/).filter(line => line.toLowerCase().includes(root.toLowerCase())).map(line => Number(line.split('\t')[0]))
+}
+
 // --- Stub model: slow enough that a stage is observably running, scripted by prompt markers -----
 const stubRequests = []
 // --approval-gate: set once the "owner" has done the refused step; the approval case then finishes.
 let approvalGranted = false
+// --blocked-restart: set once the job has been reconciled and restarted; the fresh attempt then finishes.
+let toolReleased = false
 const stub = realModel ? null : createServer((request, response) => {
   const chunks = []
   request.on('data', chunk => chunks.push(chunk))
   request.on('end', () => {
     const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') : {}
     const prompt = JSON.stringify(body.messages ?? '')
-    stubRequests.push({ at: new Date().toISOString(), path: request.url, approvalCase: prompt.includes('APPROVAL-CASE') })
+    stubRequests.push({ at: new Date().toISOString(), path: request.url, approvalCase: prompt.includes('APPROVAL-CASE'), blockedRestartCase: prompt.includes('BLOCKED-RESTART-CASE') })
     const send = payload => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(payload)) }
     if (request.url?.startsWith('/health')) return send({ status: 'ok' })
     if (request.url?.startsWith('/v1/models')) return send({ object: 'list', data: [{ id: model, object: 'model' }] })
@@ -98,7 +111,8 @@ const stub = realModel ? null : createServer((request, response) => {
     const appending = stageObjective.includes('Append the line')
     // STALL-CASE never answers; LOOP-CASE repeats one identical read forever.
     if (prompt.includes('STALL-CASE')) return
-    const reply = prompt.includes('APPROVAL-CASE') && approvalGranted ? { content: 'left-pad is installed; the owner ran the install.\nJOB STATUS: DONE' }
+    const reply = prompt.includes('BLOCKED-RESTART-CASE') ? (toolReleased || afterTool ? { content: 'The slow step is settled; nothing is left to do.\nJOB STATUS: DONE' } : call('run_command', { command: 'sleep 120' }))
+      : prompt.includes('APPROVAL-CASE') && approvalGranted ? { content: 'left-pad is installed; the owner ran the install.\nJOB STATUS: DONE' }
       : prompt.includes('APPROVAL-CASE') ? call('run_command', { command: 'npm install left-pad --save' })
       : prompt.includes('LOOP-CASE') ? call('read_file', { path: 'README.md' })
       : afterTool ? { content: appending ? 'Appended "durable smoke" to notes.txt.\nJOB STATUS: CONTINUE: verify the line' : 'notes.txt ends with the line durable smoke.\nJOB STATUS: DONE' }
@@ -223,6 +237,62 @@ try {
     assert.ok(stubRequests.slice(requestsBefore).some(entry => entry.approvalCase), 'the resumed job never generated')
     observe('approval gate verified', { secondJob: second.id, firstJob: gated.id, attempts: resumed.currentStage?.attempt ?? null, counters: resumed.counters, approvals: approvalsAfter.length, requestsAfterResume: stubRequests.length - requestsBefore })
     throw Object.assign(new Error('approval gate only'), { skipped: true })
+  }
+
+  // --- Blocked restart: a job blocked with its stage still running continues once after restarts --
+  if (flag('blocked-restart')) {
+    if (!stub) throw new Error('--blocked-restart scripts the stub model; run it without --real-model')
+    const events = async jobId => { const all = []; for (let after; ;) { const page = await call('jobs.events', { jobId, limit: 200, ...(after ? { afterId: after } : {}) }); all.push(...page); if (page.length < 200) return all; after = page.at(-1).id } }
+    // A hard stop of the whole tree: the crash reconcile.ts exists for (a graceful quit with a job
+    // running waits on a dialog). The next launch waits until nothing holds the profile.
+    const kill = async label => {
+      const pid = app.process().pid
+      try { execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'pipe' }) } catch { /* already gone */ }
+      await expect.poll(() => profileProcesses().length, { timeout: 30_000 }).toBe(0)
+      observe(label, { pid })
+    }
+    const job = await call('jobs.create', { title: 'Smoke: blocked restart', model, objective: 'BLOCKED-RESTART-CASE: run the slow step.', stages: [{ title: 'Slow step', objective: 'BLOCKED-RESTART-CASE: run sleep 120 in the workspace', completionCriteria: ['The slow step ran'] }] })
+    await expect.poll(() => stubRequests.filter(entry => entry.blockedRestartCase).length, { timeout: 60_000 }).toBeGreaterThan(0)
+    // The stub answers after its delay with run_command; Docker then runs sleep 120 with the call pending.
+    await new Promise(done => setTimeout(done, Number(process.env.DURABLE_SMOKE_STUB_DELAY_MS ?? 4000) + 8_000))
+    const before = await status(job.id)
+    assert.equal(before.status, 'running', `the job was not running inside its tool call: ${before.status} ${before.statusReason ?? ''}`)
+    await kill('app killed while the stage ran run_command')
+
+    await launch('app relaunched (1st restart)')
+    owner = await credential()
+    // Reconciliation runs a few seconds after launch; an owner command in that window must not bypass it.
+    const early = await call('jobs.pause', { jobId: job.id, reason: 'Smoke early pause' }, { expectError: true })
+    observe('owner pause right after relaunch refused', { error: String(early).slice(0, 200) })
+    const blocked = await waitFor(job.id, s => s.status === 'blocked', 'job reconciled to blocked on the unknown side effect', 60_000)
+    assert.match(blocked.statusReason ?? '', /side effect/i, `blocked for an unexpected reason: ${blocked.statusReason}`)
+    const reconciled = await events(job.id)
+    assert.ok(reconciled.some(event => event.kind === 'recovery' && /run_command/.test(event.message) && /unknown/.test(event.message)), 'reconciliation did not record the cut-off run_command as unknown')
+    assert.ok(!reconciled.some(event => event.kind === 'transition' && event.data?.to === 'paused'), 'the early pause went through and bypassed reconciliation')
+    observe('unknown side effect recorded', { statusReason: blocked.statusReason, recoveries: blocked.counters.recoveries })
+
+    await kill('app killed with the job blocked and its stage still running')
+    await launch('app relaunched (2nd restart)')
+    owner = await credential()
+    await new Promise(done => setTimeout(done, 8_000))
+    const still = await status(job.id)
+    assert.equal(still.status, 'blocked', 'the blocked job moved across the second restart')
+    assert.equal(still.statusReason, blocked.statusReason, 'the block reason changed across the second restart')
+    const afterSecond = await events(job.id)
+    assert.deepEqual(afterSecond.map(event => event.id), reconciled.map(event => event.id), 'the second restart rewrote the blocked job')
+    observe('still blocked after the 2nd restart, nothing rewritten', { events: afterSecond.length })
+
+    toolReleased = true
+    await call('jobs.resume', { jobId: job.id })
+    const done = await waitFor(job.id, s => ['completed', 'blocked', 'failed'].includes(s.status), 'blocked job resumed after two restarts', STAGE_TIMEOUT)
+    const after = (await events(job.id)).slice(afterSecond.length)
+    const attempts = after.filter(event => event.kind === 'stage' && /attempt \d+ started/.test(event.message))
+    const reblocks = after.filter(event => event.kind === 'transition' && event.data?.to === 'blocked')
+    observe('after resume', { status: done.status, statusReason: done.statusReason, attemptsStarted: attempts.map(event => event.message), reblocks: reblocks.map(event => event.message), activeMs: done.activeMs, elapsedMs: done.elapsedMs, counters: done.counters })
+    assert.equal(done.status, 'completed', `the resumed job ended ${done.status}: ${done.statusReason ?? ''}`)
+    assert.equal(reblocks.length, 0, 'the resumed job blocked again')
+    assert.equal(attempts.length, 1, 'the resumed job did not continue exactly once')
+    throw Object.assign(new Error('blocked restart only'), { skipped: true })
   }
 
   // --- 1. Create and watch it run -------------------------------------------------------------
@@ -353,7 +423,7 @@ try {
   await page.screenshot({ path: join(output, 'jobs-panel.png') })
   observe('done', { jobs: (await call('jobs.list')).map(entry => ({ id: entry.id, status: entry.status })) })
 } catch (error) {
-  if (error?.skipped) observe(flag('approval-gate') ? 'approval gate scenario done; main job skipped' : 'extras skipped (--extras=none)')
+  if (error?.skipped) observe(flag('approval-gate') ? 'approval gate scenario done; main job skipped' : flag('blocked-restart') ? 'blocked restart scenario done; main job skipped' : 'extras skipped (--extras=none)')
   else {
     failed = error
     observe('FAILED', { message: String(error?.message ?? error).slice(0, 800) })
