@@ -1,0 +1,83 @@
+import { existsSync, realpathSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { isAbsolute, join, relative, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { DatabaseSync } from 'node:sqlite'
+
+/** Older than a day-scale elapsed budget. Only `startedAt` inside the job document changes. */
+const EXPIRED_ELAPSED_MS = 14 * 24 * 60 * 60 * 1000
+const FILLERS = 1100
+
+const norm = value => resolve(value).replace(/[\\/]+$/g, '').toLowerCase()
+const inside = (parent, child) => {
+  const root = norm(parent)
+  const path = norm(child)
+  return path === root || path.startsWith(root + '\\') || path.startsWith(root + '/')
+}
+
+/** Isolated temp profile only. Never the owner APPDATA\\Conductor database, including via a junction. */
+export function assertIsolatedProfile(profile) {
+  if (typeof profile !== 'string' || !profile.trim()) throw new Error('profile path required')
+  const resolved = resolve(profile)
+  const real = existsSync(resolved) ? realpathSync(resolved) : resolved
+  const temp = realpathSync(tmpdir())
+  const fromTemp = relative(temp, real)
+  if (!fromTemp || fromTemp.startsWith('..') || isAbsolute(fromTemp)) throw new Error('profile must be an isolated directory inside the temp dir')
+  const owner = process.env.APPDATA ? resolve(process.env.APPDATA, 'Conductor') : null
+  if (owner && inside(owner, real)) throw new Error('profile must not be under APPDATA/Conductor')
+  const dbPath = join(real, 'conductor.db')
+  if (!existsSync(dbPath)) throw new Error('isolated profile has no conductor.db')
+  const realDb = realpathSync(dbPath)
+  if (!inside(temp, realDb) || (owner && inside(owner, realDb))) throw new Error('refusing database outside the isolated temp profile')
+  return realDb
+}
+
+function event(jobId, index, kind, message, data) {
+  const at = new Date(Date.now() + index * 1000).toISOString()
+  return { id: `jobevt_f1_${jobId}_${index}`, jobId, at, kind, message, ...(data ? { data } : {}) }
+}
+
+/** Early recovery, 1100 fillers, a middle note with data.test, then late recovery and escalation. */
+export function historyEvents(jobId) {
+  const half = FILLERS / 2
+  const events = [event(jobId, 0, 'recovery', 'early recovery', { phase: 'early' })]
+  for (let i = 0; i < half; i++) events.push(event(jobId, events.length, 'note', `filler ${i}`))
+  events.push(event(jobId, events.length, 'note', 'middle note', { test: true }))
+  for (let i = half; i < FILLERS; i++) events.push(event(jobId, events.length, 'note', `filler ${i}`))
+  events.push(event(jobId, events.length, 'recovery', 'late recovery', { phase: 'late' }))
+  events.push(event(jobId, events.length, 'escalation', 'late escalation', { phase: 'late' }))
+  return events
+}
+
+/**
+ * Insert real-shaped rows into an existing job. The job document is parsed and written back
+ * with only startedAt moved into the past. Rolls back and closes on failure.
+ */
+export function seedHistory(profile, jobId) {
+  if (typeof jobId !== 'string' || !jobId.trim()) throw new Error('jobId required')
+  const db = new DatabaseSync(assertIsolatedProfile(profile))
+  let committed = false
+  try {
+    db.exec('BEGIN IMMEDIATE')
+    const row = db.prepare('SELECT data FROM durable_jobs WHERE id = ?').get(jobId)
+    if (!row?.data) throw new Error(`Durable job not found: ${jobId}`)
+    const job = JSON.parse(String(row.data))
+    const startedAt = new Date(Date.now() - EXPIRED_ELAPSED_MS).toISOString()
+    db.prepare('UPDATE durable_jobs SET data = ? WHERE id = ?').run(JSON.stringify({ ...job, startedAt }), jobId)
+    const insert = db.prepare('INSERT INTO durable_job_events (id, job_id, at, kind, data) VALUES (?, ?, ?, ?, ?)')
+    const events = historyEvents(jobId)
+    for (const item of events) insert.run(item.id, jobId, item.at, item.kind, JSON.stringify(item))
+    db.exec('COMMIT')
+    committed = true
+    return { jobId, startedAt, events: events.length, fillers: FILLERS }
+  } catch (error) {
+    if (!committed) db.exec('ROLLBACK')
+    throw error
+  } finally {
+    db.close()
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  throw new Error('StageA scaffold only')
+}
