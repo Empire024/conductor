@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { ContextAttachment } from './structured-agent'
-import { FOLD_MIN_CHARS, MESSAGE_MAX_CHARS, PASTED_TEXT_MAX_CHARS, PASTED_TEXT_PREFIX, foldInsertedText, foldOversizedMessage, insertedRange, isPastedText, lineCount, removePastedText, shouldFoldText, unfoldPastedText } from './pasted-text'
+import { FOLD_MIN_CHARS, MESSAGE_MAX_CHARS, PASTED_TEXT_MAX_CHARS, PASTED_TEXT_PREFIX, foldInsertedText, foldOversizedMessage, insertedRange, isPastedText, lineCount, mayFoldInput, removePastedText, shouldFoldText, unfoldPastedText } from './pasted-text'
 
 const lines = (count: number): string => Array.from({ length: count }, (_, index) => 'line ' + (index + 1)).join('\n')
 
@@ -67,5 +67,30 @@ describe('pasted text folding', () => {
     expect(foldOversizedMessage('x'.repeat(MESSAGE_MAX_CHARS), [])).toBeUndefined()
     const folded = foldOversizedMessage('x'.repeat(MESSAGE_MAX_CHARS + 1), [], 'big')
     expect(folded).toEqual({ message: '[Pasted text #1: 1 line]', attachment: { id: PASTED_TEXT_PREFIX + 'big', kind: 'selection', name: 'Pasted text #1: 1 line', content: 'x'.repeat(MESSAGE_MAX_CHARS + 1) } })
+  })
+
+  it('decides in constant time whether an edit could fold, so typing never diffs the draft', () => {
+    const draft = 'x'.repeat(40_000)
+    expect(mayFoldInput('insertText', 'a', draft.length, draft.length + 1)).toBe(false)
+    expect(mayFoldInput('insertCompositionText', 'ka', draft.length, draft.length + 2)).toBe(false)
+    expect(mayFoldInput('deleteContentBackward', null, draft.length, draft.length - 1)).toBe(false)
+    expect(mayFoldInput('insertLineBreak', null, draft.length, draft.length + 1)).toBe(false)
+    expect(mayFoldInput('insertFromPaste', null, draft.length, draft.length + 5)).toBe(true)
+    expect(mayFoldInput('insertFromDrop', null, draft.length, draft.length)).toBe(true)
+    expect(mayFoldInput('historyUndo', null, draft.length, draft.length)).toBe(true)
+    expect(mayFoldInput(undefined, undefined, draft.length, draft.length + 1)).toBe(true)
+    // Text inserted in one event (an IME commit, dictation, a text expander) still folds, even
+    // when it replaces a selection and the draft barely grows.
+    expect(mayFoldInput('insertText', lines(31), draft.length, draft.length + 1)).toBe(true)
+    // Programmatic insertion arrives as one small input event per line; the composer sees the
+    // whole run as one change against the draft it last rendered.
+    expect(mayFoldInput('insertText', 'line 31', draft.length, draft.length + lines(31).length)).toBe(true)
+    expect(mayFoldInput('insertLineBreak', null, draft.length, draft.length + lines(31).length)).toBe(true)
+    // Nothing shorter than the smallest foldable run can fold, whatever it contains.
+    const shortest = '\n'.repeat(30)
+    expect(shouldFoldText(shortest)).toBe(true)
+    expect(shouldFoldText(shortest.slice(1))).toBe(false)
+    expect(mayFoldInput('insertText', shortest.slice(1), 0, 29)).toBe(false)
+    expect(mayFoldInput('insertText', shortest, 0, 30)).toBe(true)
   })
 })

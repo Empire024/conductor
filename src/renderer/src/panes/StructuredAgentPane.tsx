@@ -31,8 +31,8 @@ import { composerStarterChoices, prepareComposerDraft } from './composer-starter
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag, isComposerFileDrag } from '../components/composer-file-drop'
 import { concreteModel } from '../../../shared/agent-model-selection'
 import { localModelLabel } from '../../../shared/local-models'
-import { useComposerDraft } from './use-composer-draft'
-import { foldInsertedText, foldOversizedMessage, isPastedText, removePastedText, unfoldPastedText } from '../../../shared/pasted-text'
+import { attachToDraft, useComposerDraft } from './use-composer-draft'
+import { foldInsertedText, foldOversizedMessage, isPastedText, mayFoldInput, removePastedText, unfoldPastedText } from '../../../shared/pasted-text'
 import { initialPermission, rememberPermission } from './permission-memory'
 import { bannerAbsorbsError, runtimeBanner } from './runtime-banner'
 import { cleanIpcError } from '../ipc-errors'
@@ -40,14 +40,25 @@ import { copyText } from '../clipboard'
 import { onAgentControlGrants, onAgentControlSettings } from '../agent-control-settings'
 import './StructuredAgentPane.css'
 
-let focusedAgent: { sessionId: string; projectId: string } | null = null
+let focusedAgent: { sessionId: string; projectId: string; historical: boolean } | null = null
 export function dispatchAgentContext(projectId: string, attachment: ContextAttachment): boolean {
   if (!focusedAgent || focusedAgent.projectId !== projectId) {
     window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Focus a Claude, Codex or Grok conversation in this project, then attach context.' }))
     return false
   }
-  window.dispatchEvent(new CustomEvent('conductor:agent-context', { detail: { projectId, sessionId: focusedAgent.sessionId, attachment } }))
+  // Into the conversation's draft directly: its tab may since have been suspended, and a mounted
+  // pane shows the new chip through its draft subscription. A saved conversation being previewed
+  // takes no new context.
+  if (!focusedAgent.historical) attachToDraft(projectId, focusedAgent.sessionId, attachment)
   return true
+}
+/** How a conversation's view looked when its tab was suspended, by the tab's conversation id. */
+interface SuspendedView { activeId: string; historical: boolean; scrollTop: number; nearBottom: boolean; visibleCount: number; presented: string[] }
+const suspendedViews = new Map<string, SuspendedView>()
+function rememberSuspendedView(resourceId: string, view: SuspendedView): void {
+  suspendedViews.delete(resourceId)
+  suspendedViews.set(resourceId, view)
+  if (suspendedViews.size > 200) suspendedViews.delete(suspendedViews.keys().next().value!)
 }
 function storedExpansion(id: string): Record<string, boolean> {
   try { return JSON.parse(localStorage.getItem('conductor.structured.expansion.' + id) ?? '{}') as Record<string, boolean> } catch { return {} }
@@ -70,16 +81,17 @@ const historyTime = (timestamp?: string): string => {
 type PinnedPrompt = { id: string; text: string; sequence: number; origin?: PromptOrigin }
 
 export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Element {
-  const [activeId, setActiveId] = useState(props.conversationId ?? props.resourceId)
+  const restoredView = useRef(suspendedViews.get(props.resourceId) ?? null)
+  const [activeId, setActiveId] = useState(() => restoredView.current?.activeId ?? props.conversationId ?? props.resourceId)
   // Until main reports the durable execution owner, fail closed as remote. This prevents an early
   // render from probing a same-named controller file for a mirrored conversation.
   const [fileMachineId, setFileMachineId] = useState('unresolved-remote-owner')
   const [fileCwd, setFileCwd] = useState(props.project.path)
-  const [historical, setHistorical] = useState(false)
+  const [historical, setHistorical] = useState(() => restoredView.current?.historical ?? false)
   const [projection, setProjection] = useState<SessionProjection>(() => emptyProjection(props.resourceId))
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
-  const { draft, setMessage, setAttachments, setDraft, clearSubmitted } = useComposerDraft(props.project.id, activeId)
+  const { draft, setMessage, setAttachments, setDraft, clearSubmitted, flush: flushDraft } = useComposerDraft(props.project.id, activeId)
   const { message, attachments } = draft
   const draftRef = useRef(draft); draftRef.current = draft
   const composer = useRef<HTMLTextAreaElement>(null)
@@ -172,6 +184,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const nearBottom = useRef(true)
   const userScrollUntil = useRef(0)
   const presentedRequests = useRef(new Set<string>())
+  const pendingScrollRestore = useRef<number | null>(null)
   const priorSequence = useRef(0)
   const submitLock = useRef(false)
   const connection = useRef<{ sessionId: string; promise: Promise<void> } | null>(null)
@@ -199,7 +212,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     setError('')
     setProjection(emptyProjection(activeId))
     setExpansion(storedExpansion(activeId))
-    setVisibleCount(250)
+    const view = restoredView.current?.activeId === activeId ? restoredView.current : null
+    setVisibleCount(view?.visibleCount ?? 250)
     setReadingWindow(null)
     setPendingPromptScroll(null)
     setDockedQuestions(new Set())
@@ -207,9 +221,10 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     lastVisibleItems.current = []
     priorSequence.current = 0
     lastConversationItems.current = []
-    nearBottom.current = true
+    nearBottom.current = view?.nearBottom ?? true
+    pendingScrollRestore.current = view && !view.nearBottom ? view.scrollTop : null
     userScrollUntil.current = 0
-    presentedRequests.current.clear()
+    presentedRequests.current = new Set(view?.presented)
     commandLoad.current = null
     setCommandDiscovery(undefined)
     setCommandDismissed(false)
@@ -269,6 +284,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   }, [activeId, historical, props.continueOnLimit, props.resourceId, provider, ready])
 
   useEffect(() => {
+    if (!ready) return
     const settled: AgentActivityPhase = projection.phase === 'waiting_approval' || projection.phase === 'waiting_input' ? 'waiting_input' : projection.phase === 'running' || projection.phase === 'starting' || projection.phase === 'interrupting' ? 'working' : projection.phase === 'failed' ? 'failed' : projection.phase === 'disconnected' ? 'disconnected' : projection.phase === 'interrupted' ? 'stopped' : projection.phase === 'completed' ? 'complete' : 'idle'
     // A turn that ended because the provider's window closed is waiting on a known time, not
     // broken. Main records that as 'limited'; report the same thing rather than overwriting it.
@@ -278,7 +294,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     // of the same phase, so without the same correction it would paint the checkmark back on.
     const phase: AgentActivityPhase = (projection.backgroundTasks ?? 0) > 0 && ['complete', 'idle'].includes(limited) ? 'waiting_background' : limited
     window.dispatchEvent(new CustomEvent('conductor:agent-activity', { detail: { id: activeId, phase } }))
-  }, [activeId, projection.phase, projection.limitResumeAt, projection.backgroundTasks])
+  }, [activeId, ready, projection.phase, projection.limitResumeAt, projection.backgroundTasks])
 
   useLayoutEffect(() => {
     const next = projection.items.filter(isConversationActivity)
@@ -294,16 +310,6 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     } else if (projection.sequence > priorSequence.current) setNewOutput(true)
     priorSequence.current = projection.sequence
   }, [projection.sequence])
-
-  useEffect(() => {
-    const receive = (event: Event): void => {
-      const detail = (event as CustomEvent<{ projectId: string; sessionId: string; attachment: ContextAttachment }>).detail
-      if (detail.projectId !== props.project.id || detail.sessionId !== activeId || historical) return
-      setAttachments((current) => [...current.filter((item) => item.id !== detail.attachment.id), detail.attachment].slice(-20))
-    }
-    window.addEventListener('conductor:agent-context', receive)
-    return () => window.removeEventListener('conductor:agent-context', receive)
-  }, [activeId, props.project.id, historical])
 
   useEffect(() => {
     const pinSelection = (): void => {
@@ -594,6 +600,25 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     return readingWindow.map((item) => latest.get(item.id) ?? item)
   }, [projection.items, conversationItems, visibleCount, readingWindow])
   useLayoutEffect(() => { lastVisibleItems.current = visibleItems }, [visibleItems])
+  useLayoutEffect(() => {
+    if (!ready) return
+    restoredView.current = null
+    if (pendingScrollRestore.current === null || !timeline.current) return
+    timeline.current.scrollTop = pendingScrollRestore.current
+    pendingScrollRestore.current = null
+  }, [ready])
+  const readyRef = useRef(ready); readyRef.current = ready
+  const historicalRef = useRef(historical); historicalRef.current = historical
+  const visibleCountRef = useRef(visibleCount); visibleCountRef.current = visibleCount
+  // A layout cleanup runs before React detaches the timeline, so its scroll position is still live.
+  // A pane that never finished opening leaves the view it was restoring from untouched.
+  useLayoutEffect(() => () => {
+    if (!readyRef.current) return
+    rememberSuspendedView(propsRef.current.resourceId, {
+      activeId: activeIdRef.current, historical: historicalRef.current, scrollTop: timeline.current?.scrollTop ?? 0,
+      nearBottom: nearBottom.current, visibleCount: visibleCountRef.current, presented: [...presentedRequests.current]
+    })
+  }, [])
   // The scroll-to-pinned-prompt jump goes through the same reading-window pin as a deliberate
   // scroll up, rather than a raw scrollTop write, so it does not fight autoscroll afterwards.
   const scrollToPinnedPrompt = (): void => {
@@ -755,6 +780,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     if (historical) return
     void window.conductor.structured.saveSettings(activeId, next).catch((reason: unknown) => setError(reason instanceof Error ? reason.message : String(reason)))
   }
+  const updateSettingsRef = useRef(updateSettings); updateSettingsRef.current = updateSettings
+  // Stable, so the re-render each keystroke causes leaves every memoized timeline card alone.
+  const switchPermission = useCallback((permission: SessionSettings['permission']): void => updateSettingsRef.current({ plan: false, permission }), [])
   const chooseCommand = (command: ComposerCommand): void => {
     setCommandDismissed(true); setCommandIndex(0)
     setMessage(command.insert ?? '')
@@ -771,7 +799,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     else if (command.name === 'fork' && !activePhases.has(projection.phase)) void fork()
   }
 
-  return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id } }}>
+  return <AgentFileMachineContext.Provider value={fileMachineId}><section ref={pane} className="structured-agent-pane" data-provider={provider} data-structured-session={activeId} data-file-machine={fileMachineId} onFocusCapture={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }} onPointerDown={() => { focusedAgent = { sessionId: activeId, projectId: props.project.id, historical } }}>
     <header className="sa-session-bar">
       <ProviderIcon provider={provider} size={15} />
       {props.onRequestCli && <div className="agent-view-switch"><button className="active" aria-pressed title="Chat"><MessagesSquare size={13} /> Chat</button><button title="Continue the same conversation in the native CLI" disabled={!ready || historical || activePhases.has(projection.phase) || Boolean(projection.queued)} onClick={() => props.onRequestCli?.(activeId)}><TerminalSquare size={13} /> CLI</button></div>}
@@ -816,7 +844,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {earlierCount > 0 && <button className="sa-load-earlier" onClick={showEarlier}>Show earlier activities ({earlierCount})</button>}
       {projection.truncated && <button className="sa-load-earlier" onClick={() => setHistoryOpen(true)}>Open conversation history</button>}
       {ready && activityGroups.map(group => {
-        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} onSwitchPermission={historical || provider !== 'claude' ? undefined : (permission) => updateSettings({ plan: false, permission })} />)
+        const activities = group.map(item => <StructuredActivity key={item.id} item={item} sessionId={activeId} projectId={props.project.id} onInspectAttachment={setInspectAttachment} cwd={fileCwd} expanded={expansion[item.id] ?? false} interactive={!historical && item.runtimeId === projection.runtimeId} dockedQuestion={dockedQuestions.has(item.id)} parentLabel={item.parentId && labelAnchors.has(item.id) ? parentLabels.get(item.runtimeId + ':' + item.parentId) : undefined} onExpand={onExpand} onOpenFile={onOpenFile} onDiff={setDiff} onRespond={onRespond} onFocusOrigin={focusOrigin} onDockQuestion={setQuestionDocked} onSwitchPermission={historical || provider !== 'claude' ? undefined : switchPermission} />)
         // A recall belongs to the message it was injected with, so it renders directly under it.
         const recall = group.length === 1 && group[0]!.nativeItemId ? recallByItem.get(group[0]!.nativeItemId) : undefined
         if (recall) return <div className="sa-turn" key={group[0]!.id}>{activities[0]}<MemoryRecallStrip recall={recall} onChanged={loadTurnRecalls} /></div>
@@ -846,9 +874,11 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       {promptChars > MAX_PROMPT_CHARS * 0.9 && <p className={'sa-prompt-limit' + (sendBlocked === 'oversized' ? ' sa-prompt-limit-over' : '')} role="status">{sendBlocked === 'oversized' ? `Too large to send: ${promptChars.toLocaleString()} of ${MAX_PROMPT_CHARS.toLocaleString()} characters including attachments. Remove or shorten an attachment, or trim the message.` : `${promptChars.toLocaleString()} / ${MAX_PROMPT_CHARS.toLocaleString()} characters`}</p>}
       {permissionParity(settings, capabilities) && <p className="sa-request-summary" role="status">{permissionParity(settings, capabilities)}</p>}
       {commandsOpen && <CommandAutocomplete id={commandListId} commands={commands} selected={Math.min(commandIndex, commands.length - 1)} loading={commandLoading} onSelect={setCommandIndex} onChoose={chooseCommand} />}
-      <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => setCommandDismissed(true)} onChange={event => {
+      <textarea ref={composer} aria-autocomplete="list" aria-controls={commandsOpen ? commandListId : undefined} aria-expanded={commandsOpen} aria-activedescendant={commandsOpen ? commandListId + '-' + Math.min(commandIndex, commands.length - 1) : undefined} aria-label={'Message ' + name} placeholder={historical ? 'Resume this conversation to send a message' : projection.archived ? 'Unarchive this conversation to send a message' : steering ? (pendingSteering.some(input => input.status === 'sending' || input.status === 'accepted') ? 'Add another message' : 'Message after the next tool use') : activePhases.has(projection.phase) ? 'Queue a message after this turn' : 'Message ' + name} value={message} disabled={!ready || historical || resuming || projection.archived} rows={2} onFocus={() => { if (ready && !historical && !projection.nativeSessionId && !activePhases.has(projection.phase)) void connect().catch(reason => setError(reason instanceof Error ? reason.message : String(reason))) }} onBlur={() => { setCommandDismissed(true); flushDraft() }} onChange={event => {
         // A long paste or drop folds into a "[Pasted text #N: L lines]" chip, as the Claude CLI does.
-        const fold = foldInsertedText(draftRef.current.message, event.target.value, draftRef.current.attachments)
+        // Only an event that could have inserted a long run pays for diffing the whole draft.
+        const input = event.nativeEvent as Partial<InputEvent>
+        const fold = mayFoldInput(input.inputType, input.data, draftRef.current.message.length, event.target.value.length) ? foldInsertedText(draftRef.current.message, event.target.value, draftRef.current.attachments) : { folded: false as const }
         if (fold.folded) {
           setDraft(fold.message, [...draftRef.current.attachments, fold.attachment])
           const caret = fold.caret

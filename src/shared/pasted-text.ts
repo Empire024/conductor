@@ -30,6 +30,22 @@ export function pastedTextAttachment(text: string, existing: Pick<ContextAttachm
   return { id: PASTED_TEXT_PREFIX + id, kind: 'selection', name: `Pasted text #${number}: ${lines.toLocaleString('en-US')} line${lines === 1 ? '' : 's'}`, content: text }
 }
 
+/** The shortest run that can fold: more than FOLD_MIN_LINES lines take FOLD_MIN_LINES line breaks. */
+const FOLDABLE_MIN_CHARS = Math.min(FOLD_MIN_CHARS + 1, FOLD_MIN_LINES)
+
+const TYPING_INPUTS = new Set(['insertText', 'insertCompositionText', 'insertLineBreak', 'insertParagraph'])
+
+/** Whether a composer edit could have inserted a foldable run, decided in constant time so an
+ *  ordinary keystroke never diffs the whole draft. Pastes, drops, undo/redo and anything
+ *  unrecognised take the full check. Typing, IME, line breaks and deletions take it only when the
+ *  event itself carries a foldable run or the draft grew by one since it was last rendered: text
+ *  inserted programmatically (dictation, a text expander, an automation's insertText) arrives as
+ *  one small input event per line, which the composer sees as a single change. */
+export function mayFoldInput(inputType: string | undefined, data: string | null | undefined, previousLength: number, nextLength: number): boolean {
+  if (!inputType || !(TYPING_INPUTS.has(inputType) || inputType.startsWith('delete'))) return true
+  return nextLength - previousLength >= FOLDABLE_MIN_CHARS || typeof data === 'string' && data.length >= FOLDABLE_MIN_CHARS
+}
+
 /** Where `next` differs from `previous` as one inserted run: [start, end) in `next`. */
 export function insertedRange(previous: string, next: string): { start: number; end: number } {
   let start = 0

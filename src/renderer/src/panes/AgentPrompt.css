@@ -45,7 +45,9 @@
 .agent-effort-ticks i.active { background: color-mix(in srgb, var(--effort-charge) 84%, white); box-shadow: 0 0 0 1px var(--surface-1), 0 0 6px color-mix(in srgb, var(--effort-charge) 60%, transparent); transform: scale(1.18); }
 @container style(--effort-progress: 100%) {
   .agent-effort-ticks::before { background: linear-gradient(90deg, color-mix(in srgb, var(--effort-charge) 26%, transparent), color-mix(in srgb, var(--effort-charge) 13%, transparent)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--effort-charge) 32%, transparent), 0 0 16px color-mix(in srgb, var(--effort-charge) 24%, transparent); }
-  .agent-effort-ticks i.active { animation: agent-effort-charged 2.6s ease-in-out infinite; }
+  /* A few pulses, not forever: an endless box-shadow animation repaints every frame and keeps the
+     renderer busy the whole time a maxed-out composer is on screen, typing included. */
+  .agent-effort-ticks i.active { animation: agent-effort-charged 2.6s ease-in-out 3; }
 }
 @keyframes agent-effort-charged { 50% { box-shadow: 0 0 0 1px var(--surface-1), 0 0 9px color-mix(in srgb, var(--effort-charge) 85%, transparent); } }
 @media (prefers-reduced-motion: reduce) {

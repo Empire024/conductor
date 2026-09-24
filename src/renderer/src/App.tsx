@@ -91,29 +91,23 @@ import { UpdatePrompt } from './components/UpdatePrompt'
 import { AgentConfirmDialog } from './components/AgentConfirmDialog'
 import { useAgentConfirm } from './use-agent-confirm'
 import { summarizeSubagents } from './panes/usage-summary'
+import { afterQuietIdle, checkpointChanged, workspaceDocumentsReader } from './recovery-autosave'
 import { spinPhaseStyle } from './spin-sync'
 import { CONDUCTOR_FILE_DRAG, decodeConductorFileDrag } from './components/composer-file-drop'
 import type { MachineDescriptor } from '../../shared/remote-control'
 import { LOCAL_MACHINE_ID } from '../../shared/remote-control'
 
-const workspaceDocumentsSnapshot = (): WorkspaceDocumentState[] => {
-  const documents: WorkspaceDocumentState[] = []
-  for (let index = 0; index < localStorage.length; index++) {
-    const key = localStorage.key(index)
-    if (!key?.startsWith('conductor.workspaceFiles.')) continue
-    // Load through the same migration the file tabs use, so a record left by an older
-    // build reaches the checkpoint in the shape it accepts. One malformed record used to
-    // make the main process reject the whole checkpoint, losing every workspace's autosave.
-    const workspaceId = key.slice('conductor.workspaceFiles.'.length)
-    const { files, activeId } = loadWorkspaceFiles(workspaceId)
-    documents.push({
-      workspaceId,
-      files: files.map(file => ({ ...file, machineId: workspaceFileMachine(file) })),
-      activeId: typeof activeId === 'string' && files.some(file => file.id === activeId) ? activeId : null
-    })
+const workspaceDocumentsSnapshot = workspaceDocumentsReader(() => localStorage, (workspaceId): WorkspaceDocumentState => {
+  // Load through the same migration the file tabs use, so a record left by an older
+  // build reaches the checkpoint in the shape it accepts. One malformed record used to
+  // make the main process reject the whole checkpoint, losing every workspace's autosave.
+  const { files, activeId } = loadWorkspaceFiles(workspaceId)
+  return {
+    workspaceId,
+    files: files.map(file => ({ ...file, machineId: workspaceFileMachine(file) })),
+    activeId: typeof activeId === 'string' && files.some(file => file.id === activeId) ? activeId : null
   }
-  return documents
-}
+})
 
 const restoreWorkspaceDocuments = (documents: WorkspaceDocumentState[] | undefined): void => {
   for (const state of documents ?? []) localStorage.setItem('conductor.workspaceFiles.' + state.workspaceId, JSON.stringify({ files: state.files, activeId: state.activeId }))
@@ -258,7 +252,9 @@ export function App(): React.JSX.Element {
   const focusedGroupIdsRef = useRef<Record<string, string>>({})
   const sessionIdsByProjectRef = useRef<Record<string, string>>({})
   const recoveryReadyRef = useRef(false)
-  const checkpointTimerRef = useRef<number | null>(null)
+  const checkpointTimerRef = useRef<(() => void) | null>(null)
+  /** What main last accepted, so an autosave that would write the same thing is skipped. */
+  const lastCheckpointRef = useRef<WorkspaceRecoveryCheckpoint | null>(null)
   const saveRevisionRef = useRef(0)
   const soundProfileRef = useRef(appSettings.agentSoundProfile)
   sessionsRef.current = sessions
@@ -288,7 +284,7 @@ export function App(): React.JSX.Element {
     : utilityPanel === 'processes'
       ? { label: 'Processes', aria: 'Process dashboard', icon: Gauge }
       : utilityPanel === 'schedules'
-        ? { label: 'Schedules', aria: 'Smart schedules and run history', icon: Clock3 }
+        ? { label: 'Scheduled tasks', aria: 'Scheduled tasks, their scripts and run history', icon: Clock3 }
       : utilityPanel === 'source-control'
         ? { label: 'Source control', aria: 'Repository status and delivery', icon: GitBranch }
       : utilityPanel === 'jobs'
@@ -606,14 +602,20 @@ export function App(): React.JSX.Element {
 
   useEffect(() => {
     if (loading || !recoveryReadyRef.current) return
-    if (checkpointTimerRef.current !== null) window.clearTimeout(checkpointTimerRef.current)
+    checkpointTimerRef.current?.()
     const revision = ++saveRevisionRef.current
     setSaveStatus('unsaved')
-    checkpointTimerRef.current = window.setTimeout(async () => {
+    checkpointTimerRef.current = afterQuietIdle(() => void (async () => {
       checkpointTimerRef.current = null
+      const snapshot = recoveryCheckpoint()
+      if (!checkpointChanged(lastCheckpointRef.current, snapshot)) {
+        if (saveRevisionRef.current === revision) setSaveStatus('saved')
+        return
+      }
       setSaveStatus('saving')
       try {
-        await window.conductor.recovery.checkpoint(recoveryCheckpoint())
+        await window.conductor.recovery.checkpoint(snapshot)
+        lastCheckpointRef.current = snapshot
         if (saveRevisionRef.current === revision) {
           setLastSavedAt(Date.now())
           setSaveStatus('saved')
@@ -622,17 +624,17 @@ export function App(): React.JSX.Element {
         if (saveRevisionRef.current === revision) setSaveStatus('error')
         debugLog('workspace', 'Autosave failed', reason, 'error')
       }
-    }, 100)
+    })())
   }, [activeProjectId, activeSessionId, loading, recoveryCheckpoint, sessions])
 
   useEffect(() => {
     const flushRecovery = (): void => {
       if (!recoveryReadyRef.current) return
-      if (checkpointTimerRef.current !== null) {
-        window.clearTimeout(checkpointTimerRef.current)
-        checkpointTimerRef.current = null
-      }
-      if (window.conductor.recovery.flush(recoveryCheckpoint())) {
+      checkpointTimerRef.current?.()
+      checkpointTimerRef.current = null
+      const snapshot = recoveryCheckpoint()
+      if (window.conductor.recovery.flush(snapshot)) {
+        lastCheckpointRef.current = snapshot
         saveRevisionRef.current += 1
         setLastSavedAt(Date.now())
         setSaveStatus('saved')
@@ -661,14 +663,14 @@ export function App(): React.JSX.Element {
 
   const saveWorkspaceNow = useCallback(async (): Promise<void> => {
     if (!recoveryReadyRef.current) return
-    if (checkpointTimerRef.current !== null) {
-      window.clearTimeout(checkpointTimerRef.current)
-      checkpointTimerRef.current = null
-    }
+    checkpointTimerRef.current?.()
+    checkpointTimerRef.current = null
     const revision = ++saveRevisionRef.current
     setSaveStatus('saving')
     try {
-      await window.conductor.recovery.checkpoint(recoveryCheckpoint())
+      const snapshot = recoveryCheckpoint()
+      await window.conductor.recovery.checkpoint(snapshot)
+      lastCheckpointRef.current = snapshot
       if (saveRevisionRef.current === revision) {
         setLastSavedAt(Date.now())
         setSaveStatus('saved')

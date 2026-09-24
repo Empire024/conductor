@@ -292,6 +292,7 @@ const bridge: ConductorBridge = {
     onData: (callback) => subscribe('agent:data', callback),
     onStatus: (callback: (payload: RuntimeStatusEvent) => void) => subscribe('agent:status', callback),
     onEvent: (callback: (payload: NormalizedAgentEvent) => void) => subscribe('agent:event', callback),
+    activityPhases: (ids) => ipcRenderer.invoke('agent:activity-phases', ids),
     listProviders: () => ipcRenderer.invoke('agent:list-providers'),
     listProcesses: (projectId) => ipcRenderer.invoke('runtime:list-processes', projectId)
   },

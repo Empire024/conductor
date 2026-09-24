@@ -8,6 +8,8 @@ import { ProviderIcon } from '../components/ProviderIcon'
 import { PaneTabMenu, TabGroupMenu } from '../components/PaneTabMenu'
 import { TabActivityIndicator } from '../components/TabActivityIndicator'
 import { applyTabGroupAction, applyWorkspaceTabAction } from './workspace-tab-actions'
+import { mountedTabIds, touchRecentTabs } from './tab-keep-alive'
+import { useSuspendedConversations } from './use-suspended-conversations'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal, flushSync } from 'react-dom'
 import {
@@ -169,7 +171,8 @@ const PaneBody = ({
   onAttachTerminal(machineId: string, remoteTerminalId: string, title: string): void
   onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
   onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
-  onUpdateTab(tabId: string, state: Record<string, unknown>): void
+  /** Merges `patch` into the tab's latest state. */
+  onUpdateTab(tabId: string, patch: Record<string, unknown>): void
   onConversationChange(tabId: string, conversation: ConversationIdentity): Promise<void>
 }): React.JSX.Element => {
   // A project that lives on another machine has no files, git history or processes on this
@@ -190,7 +193,7 @@ const PaneBody = ({
         onOpenFile={onOpenFile}
         archiveDormant={tab.state?.archiveDormant === true}
         machineId={(tab.state?.machineId as string) ?? 'local'}
-        onArchiveActivated={() => onUpdateTab(tab.id, { ...tab.state, archiveDormant: false })}
+        onArchiveActivated={() => onUpdateTab(tab.id, { archiveDormant: false })}
       />
     )
   }
@@ -210,12 +213,12 @@ const PaneBody = ({
         session={session}
         onOpenFile={onOpenFile}
         onConversationChange={conversation => onConversationChange(tab.id, conversation)}
-        onModelChange={(model) => onUpdateTab(tab.id, { ...tab.state, model })}
-        onEffortChange={(effort) => onUpdateTab(tab.id, { ...tab.state, effort })}
-        onViewModeChange={(viewMode) => onUpdateTab(tab.id, { ...tab.state, viewMode })}
+        onModelChange={(model) => onUpdateTab(tab.id, { model })}
+        onEffortChange={(effort) => onUpdateTab(tab.id, { effort })}
+        onViewModeChange={(viewMode) => onUpdateTab(tab.id, { viewMode })}
         archiveDormant={tab.state?.archiveDormant === true}
         machineId={(tab.state?.machineId as string) ?? 'local'}
-        onArchiveActivated={() => onUpdateTab(tab.id, { ...tab.state, archiveDormant: false })}
+        onArchiveActivated={() => onUpdateTab(tab.id, { archiveDormant: false })}
       />
     )
   }
@@ -235,8 +238,8 @@ const PaneBody = ({
     ? <div className="coming-pane"><span>Remote file</span><strong>Preview is unavailable. Open this host file in the guarded editor.</strong></div>
     : <FilePreviewPane project={project} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} onOpenEditor={(path, allowBinary) => onOpenFile(path, undefined, 'editor', allowBinary)} />
   if (tab.kind === 'browser') return tab.state?.archiveDormant === true
-    ? <SessionArchiveDormantPane kind="browser" title={tab.title} onActivate={() => onUpdateTab(tab.id, { ...tab.state, archiveDormant: false })} />
-    : <BrowserPane project={project} projectId={project.id} machineId={(tab.state?.machineId as string | undefined) ?? (placement === LOCAL_MACHINE_ID ? undefined : placement)} performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { ...tab.state, url })} />
+    ? <SessionArchiveDormantPane kind="browser" title={tab.title} onActivate={() => onUpdateTab(tab.id, { archiveDormant: false })} />
+    : <BrowserPane project={project} projectId={project.id} machineId={(tab.state?.machineId as string | undefined) ?? (placement === LOCAL_MACHINE_ID ? undefined : placement)} performanceTabId={tab.id} initialUrl={(tab.state?.url as string) ?? undefined} onUrlChange={(url) => onUpdateTab(tab.id, { url })} />
   return (
     <div className="coming-pane">
       <span>{tab.kind}</span>
@@ -284,6 +287,12 @@ function PaneGroup({
   const workspaceRef = useRef(workspace)
   workspaceRef.current = workspace
   const activeTab = group.tabs.find((tab) => tab.id === group.activeTabId) ?? group.tabs[0]!
+  // Only the selected tab, views that cannot remount losslessly and a few recent cheap ones keep
+  // their React view; an inactive conversation is suspended and rebuilds from its snapshot.
+  const recentTabsRef = useRef<readonly string[]>([])
+  recentTabsRef.current = touchRecentTabs(recentTabsRef.current, activeTab.id, new Set(group.tabs.map((tab) => tab.id)))
+  const mountedIds = mountedTabIds(group.tabs, activeTab.id, recentTabsRef.current)
+  useSuspendedConversations(group.tabs, mountedIds, workspace.project, workspace.session)
   const menuTab = group.tabs.find(tab => tab.id === menuPosition?.tabId) ?? activeTab
   const menuGroup = tabGroupsOf(group).find(item => item.id === groupMenu?.tabGroupId)
   const focused = workspace.focusedGroupId === group.id
@@ -456,8 +465,18 @@ function PaneGroup({
     }).catch((reason: unknown) => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Cannot open file: ' + (reason instanceof Error ? reason.message : String(reason)) })))
   }
 
-  const setTabState = (tabId: string, state: Record<string, unknown>): void => {
-    workspace.onLayout(updateTab(workspace.layout, group.id, tabId, (tab) => ({ ...tab, state })))
+  // A pane's callbacks outlive the render that created them (a conversation view reports its
+  // saved view mode once its snapshot arrives, after it mounts), so a patch is applied to the
+  // latest layout. Writing back that render's layout would undo every change made since: a tab
+  // opened or closed in the meantime, another tab selected. An unchanged patch writes nothing.
+  const setTabState = (tabId: string, patch: Record<string, unknown>): void => {
+    const current = workspaceRef.current
+    const tab = findGroup(current.layout.root, group.id)?.tabs.find((item) => item.id === tabId)
+    if (!tab || Object.entries(patch).every(([key, value]) => tab.state?.[key] === value)) return
+    const layout = updateTab(current.layout, group.id, tabId, (item) => ({ ...item, state: { ...item.state, ...patch } }))
+    // Until the next render, a second patch builds on this one rather than on the older layout.
+    workspaceRef.current = { ...current, layout }
+    current.onLayout(layout)
   }
 
 
@@ -663,7 +682,7 @@ function PaneGroup({
         </div>
       </header>
       <div className="pane-content">
-        {group.tabs.map((tab) => (
+        {group.tabs.filter((tab) => mountedIds.has(tab.id)).map((tab) => (
           <div key={tab.id} className="pane-tab-content" data-performance-tab-id={tab.id} style={{ display: tab.id === activeTab.id ? 'flex' : 'none' }}>
             <PaneBody tab={tab} groupId={group.id} project={workspace.project} session={workspace.session} onOpen={open} onOpenFile={(path, line, mode, allowBinary) => openFile(path, line, mode, allowBinary, tab.state?.machineId as string | undefined)} onUpdateTab={setTabState} onConversationChange={changeConversation}
               placement={placement} placementError={placementError} onSelectMachine={choose} onAttachTerminal={attachTerminal} />

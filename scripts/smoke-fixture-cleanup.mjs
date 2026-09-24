@@ -22,11 +22,17 @@ export async function cleanupFixtureApp(app, report, label = 'fixture cleanup') 
     if (page.isClosed()) continue
     try {
       const result = await page.evaluate(async () => {
-        const ids = [...document.querySelectorAll('[data-structured-session]')].map(element => element.getAttribute('data-structured-session')).filter(Boolean)
+        // Mounted conversation panes plus the tabs whose views are suspended (tab-keep-alive.ts);
+        // a tab id that is not a structured conversation has no snapshot and is skipped.
+        const ids = [
+          ...[...document.querySelectorAll('[data-structured-session]')].map(element => element.getAttribute('data-structured-session')),
+          ...[...document.querySelectorAll('.pane-tab[data-control-agent-id]')].map(element => element.getAttribute('data-control-agent-id'))
+        ].filter(Boolean)
         const rows = []
         for (const id of new Set(ids)) {
           try {
             let state = await window.conductor.structured.snapshot(id)
+            if (!state) continue
             for (const queued of state.queuedPrompts ?? []) await window.conductor.structured.cancelQueued(id, queued.id)
             if (['starting', 'running', 'waiting_input', 'waiting_approval', 'interrupting'].includes(state.phase)) await window.conductor.structured.interrupt(id, false)
             const until = Date.now() + 5000

@@ -1,21 +1,39 @@
-import { useCallback, useSyncExternalStore, type SetStateAction } from 'react'
+import { useCallback, useEffect, useSyncExternalStore, type SetStateAction } from 'react'
 import type { ContextAttachment } from '../../../shared/structured-agent'
 import { ComposerDraftStore, composerDraftKey } from './composer-draft-store'
 
 const drafts = new ComposerDraftStore(() => localStorage, () => {
   window.dispatchEvent(new CustomEvent('conductor:toast', { detail: 'Could not save this message draft to disk. Keep this window open until you can save or send it.' }))
 })
+// Typing is saved after a short pause; anything still unsaved is written the moment the page
+// can go away (reload, close, restart to update) or the window stops being visible.
+const flushAll = (): void => drafts.flush()
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushAll)
+  window.addEventListener('beforeunload', flushAll)
+  window.addEventListener('conductor:flush-session', flushAll)
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll() })
+}
+
+/** Adds context to a conversation's draft whether or not a pane is showing it. */
+export function attachToDraft(projectId: string, sessionId: string, attachment: ContextAttachment): void {
+  drafts.update(composerDraftKey(projectId, sessionId), draft => ({
+    ...draft, attachments: [...draft.attachments.filter(item => item.id !== attachment.id), attachment].slice(-20)
+  }))
+}
 
 export function useComposerDraft(projectId: string, sessionId: string) {
   const key = composerDraftKey(projectId, sessionId)
   const subscribe = useCallback((listener: () => void) => {
-    const unsubscribe = drafts.subscribe(listener)
+    const unsubscribe = drafts.subscribe(key, listener)
     const storageChanged = (event: StorageEvent): void => {
       if (event.key === key || event.key === null) listener()
     }
     window.addEventListener('storage', storageChanged)
     return () => { unsubscribe(); window.removeEventListener('storage', storageChanged) }
   }, [key])
+  // Leaving a conversation (switching it, closing or suspending its tab) saves what it held.
+  useEffect(() => () => drafts.flush(key), [key])
   const snapshot = useCallback(() => drafts.get(key), [key])
   const draft = useSyncExternalStore(subscribe, snapshot)
   const setMessage = useCallback((message: string) => drafts.update(key, current => ({ ...current, message })), [key])
@@ -25,5 +43,6 @@ export function useComposerDraft(projectId: string, sessionId: string) {
   /** One revision for an edit that changes both, such as folding a paste into an attachment. */
   const setDraft = useCallback((message: string, attachments: ContextAttachment[]) => drafts.update(key, () => ({ message, attachments })), [key])
   const clearSubmitted = useCallback((revision: string) => drafts.clearSubmitted(key, revision), [key])
-  return { draft, setMessage, setAttachments, setDraft, clearSubmitted }
+  const flush = useCallback(() => drafts.flush(key), [key])
+  return { draft, setMessage, setAttachments, setDraft, clearSubmitted, flush }
 }

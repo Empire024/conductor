@@ -121,9 +121,10 @@ try {
   assert.ok(state.machines.some(machine => machine.id === phoneProject.machineId && machine.projectIds.includes(project.id)))
   const opened = await api(origin, '/api/tabs/open', { ca, token, body: { projectId: project.id, workspaceId: phoneProject.workspaces[0].id, machineId: phoneProject.machineId, provider: 'claude', model: claude.models[0].id, title: 'Phone task', prompt: 'SYNTHETIC QUESTION from the phone' } })
   assert.ok(opened.sessionId && opened.tabId)
-  // The tab is added without stealing the desktop's focus, so it is in the strip but need not be the active pane.
+  // The tab is added without stealing the desktop's focus, so it is in the strip but need not be the
+  // active pane; an inactive conversation's view is suspended, so the tab itself is what must exist.
   await expect(page.getByText('Phone task', { exact: true }).first()).toBeVisible()
-  await expect(page.locator(`[data-structured-session="${opened.sessionId}"]`)).toBeAttached()
+  await expect(page.locator(`.pane-tab[data-control-agent-id="${opened.sessionId}"]`)).toBeAttached()
   const asking = await until(() => api(origin, '/api/sessions/' + opened.sessionId, { ca, token }), conversation => conversation.pending.length === 1, 'the fixture question')
   assert.equal(asking.summary.state, 'attention')
   assert.equal(asking.summary.needs, 'question')

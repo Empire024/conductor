@@ -2,6 +2,7 @@ import type { UsageCapScope, UsageCapSetting, UsageCapSnapshot } from './usage-a
 import type { WeeklyModelUsageReport } from './weekly-model-usage'
 import type {
   AppSettings,
+  AgentActivityPhase,
   AgentSoundProfile,
   AppUpdateState,
   AppDiagnostics,
@@ -191,6 +192,8 @@ export interface ConductorBridge {
     onData(callback: (payload: { id: string; data: string }) => void): () => void
     onStatus(callback: (payload: RuntimeStatusEvent) => void): () => void
     onEvent(callback: (payload: NormalizedAgentEvent) => void): () => void
+    /** Each agent's last recorded phase (main is its one writer), for tabs whose pane is not mounted. */
+    activityPhases(ids: string[]): Promise<Record<string, AgentActivityPhase>>
     listProviders(): Promise<AgentProviderInfo[]>
     listProcesses(projectId?: string): Promise<RuntimeProcessSummary[]>
   }
