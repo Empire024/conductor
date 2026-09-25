@@ -111,3 +111,27 @@
 /* The title bar's lightbulb (TitleBar.tsx): the theme toggle's look, icon-only width. */
 .quick-theme-toggle.titlebar-ideas { min-width: 38px; padding: 0 11px; }
 .quick-theme-toggle.titlebar-ideas:hover { color: var(--accent); }
+
+/* Autopilot (IdeaRunPanel.tsx, docs/idea-autopilot.md): the run, its plan, stages and checkpoints. */
+.idea-run-panel { display: grid; gap: 7px; }
+.idea-run-title { margin: 0; display: flex; align-items: center; gap: 6px; color: var(--text); font-size: 11px; font-weight: 600; }
+.idea-run-title .ideas-status { margin-left: auto; }
+.idea-run-status.status-waiting-owner, .idea-run-status.status-awaiting-approval { border-color: var(--accent-muted); color: var(--accent); }
+.idea-run-status.status-paused, .idea-run-status.status-failed { color: var(--warning, #d9a441); }
+.idea-run-dry { display: inline-flex; align-items: center; gap: 4px; color: var(--text-2); }
+.idea-run-error { margin: 0; color: var(--danger, #e06c75); }
+.idea-run-detail { display: grid; gap: 7px; }
+.idea-run-reason, .idea-run-summary { margin: 0; line-height: 1.5; }
+.idea-run-reason { color: var(--text); }
+.idea-run-warnings { margin: 0; padding-left: 16px; color: var(--warning, #d9a441); line-height: 1.45; }
+.idea-run-stages { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+.idea-run-stages li { line-height: 1.45; }
+.idea-run-stages li p { margin: 2px 0; color: var(--text-2); }
+.idea-run-stages small { display: block; color: var(--text-3); }
+.idea-run-stages li.stage-done strong { color: var(--text-3); }
+.idea-run-stages li.stage-running strong, .idea-run-stages li.stage-waiting-owner strong { color: var(--accent); }
+.idea-run-checkpoint { display: grid; gap: 5px; padding: 8px; border: 1px solid var(--accent-muted); border-radius: 7px; background: var(--accent-bg); }
+.idea-run-checkpoint p { margin: 0; line-height: 1.45; }
+.idea-run-checkpoint-head { display: flex; align-items: center; gap: 6px; color: var(--text); }
+.idea-run-action-detail { margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; padding: 6px; border-radius: 5px; background: var(--surface-0); color: var(--text); font-size: 11px; }
+.idea-run-answered { margin: 0; padding-left: 16px; color: var(--text-3); }

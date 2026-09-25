@@ -15,6 +15,7 @@ import { deliveryBridge } from './delivery'
 import { durableJobsBridge } from './durable-jobs'
 import { logicLoopsBridge } from './logic-loops'
 import { ideasBridge } from './ideas'
+import { ideaRunsBridge } from './idea-runs'
 
 const subscribe = <T>(channel: string, callback: (payload: T) => void): (() => void) => {
   const listener = (_event: Electron.IpcRendererEvent, payload: T): void => callback(payload)
@@ -180,6 +181,7 @@ const bridge: ConductorBridge = {
   delivery: deliveryBridge,
   durableJobs: durableJobsBridge,
   ideas: ideasBridge,
+  ideaRuns: ideaRunsBridge,
   logicLoops: logicLoopsBridge,
   projects: {
     reorder: (ids) => ipcRenderer.invoke('projects:reorder', ids),

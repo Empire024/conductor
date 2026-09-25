@@ -7,6 +7,7 @@ import {
   actorLabel, briefView, defaultProjectId, exploredLine, formatDateTime, groupIdeaLinks, isExploring, linkProvenance,
   sectionAuthorLine, showOriginalText, timelineEvents, workedOnLine
 } from './ideas-model'
+import { IdeaRunPanel } from './IdeaRunPanel'
 
 export type IdeaWorkProvider = 'claude' | 'codex'
 export type IdeaAction = 'status' | 'work' | 'explore' | 'task' | 'archive' | 'link'
@@ -85,6 +86,8 @@ export function IdeaDetailPanel(props: IdeaDetailPanelProps): React.JSX.Element 
           )}
         </div>
       </section>
+
+      <IdeaRunPanel ideaId={idea.id} projectId={projectId} />
 
       {idea.latestBrief && (
         <details className="ideas-panel-section" open>

@@ -57,6 +57,7 @@ export interface ConductorBridge {
   delivery: import('./delivery').DeliveryBridge
   durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
   ideas: import('./ideas').IdeasBridge
+  ideaRuns: import('./idea-runs').IdeaRunsBridge
   logicLoops: import('./logic-loops').LogicLoopsBridge
   nativeCli: {
     ensure(id: string): Promise<RuntimeEnsureResult & { sequence: number }>
