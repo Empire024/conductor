@@ -26,6 +26,7 @@ import { composeLocalPrompt } from './local-models/briefing.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
 import { ApprovalReviewGate, type ApprovalReviewRouting } from './approval-review-gate'
 import { SUCCESSION_NUDGE, type BriefingContext } from './turn-briefing'
+import type { PermissionGrants } from './permission-grants/service'
 
 interface LiveSession {
   spec: AgentSpec
@@ -140,6 +141,18 @@ export class StructuredSessions {
    *  gets it, unlike the browser tools, which the owner switches on per conversation. */
   private localAssist?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
   setLocalAssist(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void { this.localAssist = server }
+  /** The `conductor` MCP server and the owner's permission grants (src/main/permission-grants):
+   *  Claude conversations get both, never an approval reviewer. */
+  private conductorMcp?: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }
+  setConductorMcp(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void { this.conductorMcp = server }
+  private permissionGrants?: PermissionGrants
+  setPermissionGrants(grants: PermissionGrants): void { this.permissionGrants = grants }
+  /** Hands a live Claude runtime its current grants; 'offline' when there is none to hand them to. */
+  async applyPermissionRules(id: string): Promise<'applied' | 'unsupported' | 'offline'> {
+    const adapter = this.live.get(id)?.adapter
+    if (!adapter || this.live.get(id)?.closed) return 'offline'
+    return adapter.applyPermissionRules ? adapter.applyPermissionRules() : 'unsupported'
+  }
   private localControl?: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>
   setLocalControl(handler: (spec: AgentSpec, method: string, args: Record<string, unknown>) => Promise<unknown>): void {
     this.localControl = handler
@@ -310,6 +323,10 @@ export class StructuredSessions {
       settings: settingsForRuntime(state.settings, runtimeId),
       mcpConfig: this.isApprovalReviewer(id) || live.spec.provider === 'local' || !state.settings.browserMcp ? '' : this.mcp?.configure(live.spec) ?? '',
       localAssistMcpConfig: this.isApprovalReviewer(id) ? '' : this.localAssist?.configure(live.spec) ?? '',
+      ...(live.spec.provider === 'claude' && !this.isApprovalReviewer(id) ? {
+        conductorMcpConfig: this.conductorMcp?.configure(live.spec) ?? '',
+        ...(this.permissionGrants ? { permissionGrants: this.permissionGrants.adapterPort(id) } : {})
+      } : {}),
       approvalReviewer: this.isApprovalReviewer(id),
       reviewApprovals: Boolean(this.reviewRouting?.enabled(live.spec)),
       authorizeTool: (name, input) => this.approvalGate.guardTool(live.spec, name, input),
@@ -1535,7 +1552,7 @@ export class StructuredSessions {
       // The pending continuation itself stays in SQLite: only this process's timer goes.
       // Reopening the conversation re-arms it, and a wait must not be lost to a backend restart.
       this.cancelContinuation(id)
-      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id); this.localAssist?.release(id)
+      live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer); live.adapter?.dispose(); this.live.delete(id); this.mcp?.release(id); this.localAssist?.release(id); this.conductorMcp?.release(id); this.permissionGrants?.closed(id)
     }
     this.flush()
   }

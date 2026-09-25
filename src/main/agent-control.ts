@@ -50,6 +50,8 @@ import type { CloudRuns } from './cloud/runs'
 import type { RemoteJobService } from './remote-jobs/service'
 import type { LocalMachineReadiness } from '../shared/always-on'
 import { ControlActivityRecorder, type PreparedCall } from './control-activity'
+import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERMISSION_OWNER_SIGNATURES } from './permission-grants/control'
+import type { PermissionGrants } from './permission-grants/service'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 
 type Args = Record<string, unknown>
@@ -167,7 +169,7 @@ const toolSignatures = {
   'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. A native coworker in Auto builds without asking; below Auto, and for a local model, the owner confirms each build unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner (or a wizard tab) installs it',
   'app.update.status': '() — state, version, log tail and result of the local update build',
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
-  'git.ship': '({message,paths?,publish?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow and checks its assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
+  'git.ship': '({message,paths?,publish?,mac?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow (with the Mac build unless mac: false) and checks its Windows and Mac assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status',
   'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
   'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
   'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
@@ -193,7 +195,7 @@ const crossProjectMethods: string[] = ['tabs.list', 'tabs.open', 'tabs.focus', '
 export interface DeliveryControl {
   status(projectId: string, cwd: string): Promise<RepositoryStatus>
   current(projectId: string): DeliveryRun | null
-  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean }, requestedBy: DeliveryRequester): DeliveryRun
+  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean; mac?: boolean }, requestedBy: DeliveryRequester): DeliveryRun
   wait(projectId: string, runId: string, timeoutMs: number): Promise<DeliveryRun>
 }
 
@@ -288,6 +290,8 @@ export interface AgentControlDependencies {
   /** conductor-local MCP tools (src/main/local-assist/wiring.ts); plugged in with
    *  AgentControl.setLocalAssist, so construction order does not matter. */
   localAssist?: { savings(days?: number): SavingsSummary }
+  /** Owner permission grants (src/main/permission-grants); plugged in with setPermissionGrants. */
+  permissionGrants?: PermissionGrants
   /** Finished coworkers closing themselves (src/main/coworker-autoclose.ts); plugged in with
    *  AgentControl.setCoworkerAutoClose. Without it agents.finish is unavailable. */
   coworkerAutoClose?: CoworkerAutoClose
@@ -933,7 +937,11 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }
+    if (PERMISSION_METHODS.includes(method)) {
+      if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
+      return callPermissions(this.deps.permissionGrants, { agentSessionId: scope.agentSessionId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
+    }
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -1264,6 +1272,7 @@ export class AgentControl {
 
   /** Plugs in the conductor-local savings ledger once it is constructed (src/main/index.ts). */
   setLocalAssist(service: AgentControlDependencies['localAssist']): void { this.deps.localAssist = service }
+  setPermissionGrants(grants: PermissionGrants): void { this.deps.permissionGrants = grants }
 
   /** Plugs in the finished-coworker closer once it is constructed (src/main/index.ts). */
   setCoworkerAutoClose(service: CoworkerAutoClose | undefined): void { this.deps.coworkerAutoClose = service }
@@ -1500,8 +1509,9 @@ export class AgentControl {
       return await settle(run) ?? { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
     }
     if (method !== 'git.ship') throw new Error('Unknown control method; use tools.list')
-    if (Object.keys(args).some(key => !['message', 'paths', 'publish', 'waitSeconds'].includes(key))) throw new Error('git.ship accepts only message, paths, publish and waitSeconds')
+    if (Object.keys(args).some(key => !['message', 'paths', 'publish', 'mac', 'waitSeconds'].includes(key))) throw new Error('git.ship accepts only message, paths, publish, mac and waitSeconds')
     if (args.publish !== undefined && typeof args.publish !== 'boolean') throw new Error('publish must be true or false')
+    if (args.mac !== undefined && typeof args.mac !== 'boolean') throw new Error('mac must be true or false')
     if (restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
     const message = text(args, 'message', 5000)
     let paths: string[] | undefined
@@ -1514,7 +1524,7 @@ export class AgentControl {
     const publish = args.publish === true
     if (source.provider === 'local') await this.ask(scope, publish ? `${source.title} wants to test, build and commit this project, push it and publish its release.` : `${source.title} wants to test, build and commit this project on this machine (no push, no release).`, 'deliver this project')
     this.authorize(scope)
-    const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}), ...(publish ? { publish } : {}) }, scope.owner ? { kind: 'owner' } : { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title })
+    const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}), ...(publish ? { publish } : {}), ...(publish && args.mac === false ? { mac: false } : {}) }, scope.owner ? { kind: 'owner' } : { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title })
     return settle(run)
   }
 

@@ -31,6 +31,7 @@ import { AgentControlServer } from './agent-control-server'
 import { AgentControlUi } from './agent-control-ui'
 import { BrowserMcpServer } from './browser-mcp'
 import { startLocalAssist, type LocalAssist } from './local-assist/wiring'
+import { registerPermissionGrantsIpc, startPermissionGrants } from './permission-grants/wiring'
 import { BrowserViews } from './browser-views'
 import { RemoteControlService } from './remote-control-ipc'
 import { safeStorageCipher } from './safe-storage-vault'
@@ -185,6 +186,7 @@ let disposePhoneBroadcast: (() => void) | undefined
 let agentControlUi: AgentControlUi | undefined
 let browserMcp: BrowserMcpServer | undefined
 let localAssist: LocalAssist | undefined
+let permissionGrants: Awaited<ReturnType<typeof startPermissionGrants>> | undefined
 let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
 /** The catalog a local update build records for its compatibility report: the configured model
@@ -696,7 +698,7 @@ const disposeRuntimeServices = (): void => {
     ['cloud runs', () => cloud?.dispose()],
     ['idea-runs', () => { disposeIdeaRunsIpc?.(); ideaRunsRegistration?.dispose() }],
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
-    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
+    ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); permissionGrants?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['coworker auto-close', () => coworkerAutoClose?.dispose()],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
@@ -2510,6 +2512,7 @@ const registerIpc = (): void => {
   }
   if (ideasRegistration) disposeIdeasIpc = ideasRegistration.registerIpc(event => trustedStructured(event))
   if (ideaRunsRegistration) disposeIdeaRunsIpc = ideaRunsRegistration.registerIpc(event => trustedStructured(event))
+  registerPermissionGrantsIpc(() => permissionGrants?.grants, event => trustedStructured(event))
   cloud?.registerIpc({
     authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, structuredId(projectId), 'Cloud sessions') },
     projectPath: projectId => { const project = database.getProject(projectId); return project && !project.remote ? project.path : null }
@@ -2810,6 +2813,11 @@ app.whenReady().then(async () => {
   localAssist = await startLocalAssist({ structured: database.structured, userData: app.getPath('userData'), sessions: agents.structured })
     .catch(error => { console.warn('Local assist is unavailable', error); return undefined })
   control.setLocalAssist(localAssist)
+  // One narrow owner approval for a classifier-refused call, and the `conductor` MCP tools for
+  // tab messaging (src/main/permission-grants, docs/permissions-classifier.md).
+  permissionGrants = await startPermissionGrants({ sessions: agents.structured, store: database.structured, control: (scope, method, args) => control.call(scope, method, args), publish, announce: notification => phoneAccess?.announce(notification), workspaces: database })
+    .catch(error => { console.warn('Permission grants are unavailable', error); return undefined })
+  if (permissionGrants) control.setPermissionGrants(permissionGrants.grants)
   remoteControl.registerIpc()
   await remoteControl.start()
   // Phones reach this Conductor through their own listener, built on the same stores and the

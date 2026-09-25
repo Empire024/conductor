@@ -22,7 +22,8 @@ export const MUTATION_FAMILIES = {
     'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save',
     'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
     'ideas.run', 'ideas.run.approve', 'ideas.run.decide', 'ideas.run.pause', 'ideas.run.resume', 'ideas.run.stop'
-  ]
+  ],
+  permissions: ['permissions.request', 'permissions.decide', 'permissions.revoke']
 } as const satisfies Record<string, readonly string[]>
 export type MutationFamily = keyof typeof MUTATION_FAMILIES
 const FAMILY_OF = new Map<string, MutationFamily>(Object.entries(MUTATION_FAMILIES).flatMap(([family, methods]) => methods.map(method => [method, family as MutationFamily] as const)))
@@ -40,7 +41,7 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'app.update.status', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
     'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get', 'ideas.runs',
-    'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'cloud.list', 'cloud.status', 'cloud.transcript'
+    'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'cloud.list', 'cloud.status', 'cloud.transcript', 'permissions.list'
   ].map(method => `read:${method}` as const),
   ...[...FAMILY_OF.keys()].map(method => `mutation:${method}` as const)
 ])
