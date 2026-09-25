@@ -439,3 +439,32 @@ describe('project task weight',()=> {
     } finally {f.db.close()}
   })
 })
+
+describe('description text under a task (FX17 task-list-description-bullets)',()=> {
+  const checkbox=/^(?:[-*+]\s+|\d+[.)]\s+)?\[( |x|~|implemented|in progress|working|done)\]/i
+  it('counts only lines with their own checkbox, never indented bullets or paragraphs',()=>{
+    const source=['## Features','- [x] Token accounting <!-- conductor-task:token-accounting -->','  - keep the fields separate','  1. numbered detail','','- [x] Long tasks while typing','  - Long tasks while typing went down','  * Verifie','  Paragraph under an unmarked item.','- [ ] Open item','Plain paragraph after the list.','- plain bullet that is not a task','3. Legacy numbered item','  4. indented numbered detail',''].join('\n')
+    const tasks=parseProjectTasks(source)
+    expect(tasks.map(task=>[task.title.split('\n')[0],task.status])).toEqual([['Token accounting','done'],['Long tasks while typing','done'],['Open item','todo'],['Legacy numbered item','todo']])
+    expect(tasks[0]!.title).toContain('keep the fields separate')
+  })
+  it('matches the checkbox count of a copy of the real feature-list.md',async()=>{
+    const real=readFileSync(join(__dirname,'..','..','feature-list.md'),'utf8')
+    let fenced=false
+    const boxes:string[]=[]
+    for(const line of real.split(/\r?\n/)) {
+      if(/^\s*(```|~~~)/.test(line)) {fenced=!fenced;continue}
+      const match=!fenced?checkbox.exec(line):null
+      if(match)boxes.push(match[1]!.toLowerCase())
+    }
+    const f=fixture()
+    writeFileSync(join(f.root,'feature-list.md'),real)
+    try {
+      const board=await f.service.get(f.project.id), lines=real.split(/\r?\n/)
+      expect(board.tasks).toHaveLength(boxes.length)
+      expect(board.tasks.filter(task=>task.status==='todo')).toHaveLength(boxes.filter(box=>box===' ').length)
+      expect(board.tasks.filter(task=>task.status==='doing')).toHaveLength(boxes.filter(box=>box==='~'||box==='in progress'||box==='working').length)
+      expect(board.tasks.filter(task=>!checkbox.test(lines[task.line-1]!)).map(task=>lines[task.line-1])).toEqual([])
+    } finally {f.db.close()}
+  })
+})

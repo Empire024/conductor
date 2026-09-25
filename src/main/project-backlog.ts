@@ -96,15 +96,17 @@ export function parseProjectTasks(text:string):ProjectTask[] {
     if(/^(bugs?|bug list)\s*:?$/i.test(heading)) {kind='bug';continue}
     if(/^(features?|feature list)\s*:?$/i.test(heading)) {kind='feature';continue}
     if(/^(ideas?|idea list)\s*:?$/i.test(heading)) {kind='idea';continue}
-    const item=/^\s*(?:(?:[-*+] |\d+[.)]\s+))?(?:\[( |x|~|implemented|in progress|working|done)\]\s*)?(.+?)\s*$/i.exec(source)
-    if(!item || !/^\s*(?:[-*+]\s+|\d+[.)]\s+|\[(?: |x|~|implemented|in progress|working|done)\])/i.test(source))continue
+    // Only a line with its own checkbox is a task, plus unindented legacy numbered items.
+    // Indented bullets, numbers and paragraphs are description text of the item above.
+    const item=/^(\s*)([-*+]\s+|\d+[.)]\s+)?(?:\[( |x|~|implemented|in progress|working|done)\]\s*)?(.+?)\s*$/i.exec(source)
+    if(!item || item[3]===undefined && (item[1] || !/^\d/.test(item[2]??'')))continue
     const metadata=[...source.matchAll(marker)][0]
     const end=taskEnd(lines,line)
-    const title=[item[2]!.replace(marker,'').trim(),...lines.slice(line+1,end).map(value=>value.slice(2))].join('\n')
+    const title=[item[4]!.replace(marker,'').trim(),...lines.slice(line+1,end).map(value=>value.slice(2))].join('\n')
     if(!title || title.startsWith('<!--') && !metadata)continue
     const hash=digest(kind+'\n'+title).slice(0,20), count=duplicates.get(hash)??0
     duplicates.set(hash,count+1)
-    const status=/^(x|implemented|done)$/i.test(item[1]??'')?'done':/^(~|in progress|working)$/i.test(item[1]??'')?'doing':'todo'
+    const status=/^(x|implemented|done)$/i.test(item[3]??'')?'done':/^(~|in progress|working)$/i.test(item[3]??'')?'doing':'todo'
     tasks.push({id:metadata?.[1] ?? hash+'-'+count,title,kind,status,agentId:attr(metadata?.[2],'agent'),priority:parsePriority(attr(metadata?.[2],'priority')),weight:parseWeight(attr(metadata?.[2],'weight')),line:line+1,activity:[]})
     line=end-1
   }
