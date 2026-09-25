@@ -34,6 +34,11 @@ import assert from 'node:assert/strict'
 //                   effect with its stage still running; an owner pause in the seconds before that
 //                   pass is refused. After a second restart the job is still blocked, nothing is
 //                   rewritten, and one resume continues it once in a fresh conversation to completion.
+//   --soak          (with --real-model --fixture=crossref) only this: the crossref job runs back
+//                   to back, unattended, for DURABLE_SMOKE_TIMEOUT_MS (default 6h, minus a 15-minute
+//                   buffer for the last iteration), with a lower contextRolloverFraction so every
+//                   iteration rolls over its context at least once; asserts at least one rollover
+//                   and at least two completed iterations.
 // Every observation is printed with its timestamp; the JSON summary is the evidence.
 const argv = process.argv.slice(2)
 const flag = name => argv.some(arg => arg === `--${name}` || arg.startsWith(`--${name}=`))
@@ -297,13 +302,43 @@ try {
 
   // --- 1. Create and watch it run -------------------------------------------------------------
   const pair = (a, b) => ({ title: `Write notes for ${a} and ${b}`, objective: `Read modules/${a}.js and modules/${b}.js in line ranges (never whole) and write notes/${a}.md and notes/${b}.md: for each module, the exported function name families, how many functions it defines, and every import from another module with the functions it uses.`, completionCriteria: [`notes/${a}.md and notes/${b}.md exist and list the imports of each module`] })
-  const job = await call('jobs.create', fixture === 'crossref' ? {
-    title: 'Smoke: cross-reference six modules', model,
+  const crossrefJob = (title = 'Smoke: cross-reference six modules') => ({
+    title, model,
     objective: 'Summarise the six modules in modules/ into notes/<module>.md, then write CROSSREF.md: a table of which module imports which functions from which other module, built from the notes.',
     constraints: ['Only write files under notes/ and CROSSREF.md', 'Read source files in ranges of at most 300 lines'],
+    // A long soak wants several context rollovers, not just a job that happens to finish; the
+    // fixture's own peaks (~15k-22k of 32,768) rarely cross the default 0.7 threshold on their
+    // own, so a soak run forces a lower one to make every stage roll over reliably.
+    ...(flag('soak') ? { budgets: { contextRolloverFraction: 0.4 } } : {}),
     stages: [pair('alpha', 'beta'), pair('gamma', 'delta'), pair('epsilon', 'zeta'),
       { title: 'Write the cross-reference', objective: 'Using notes/*.md (not the sources), write CROSSREF.md with one row per import: importing module, imported module, function names.', completionCriteria: ['CROSSREF.md has a row for every import listed in notes/'] }]
-  } : {
+  })
+
+  // --- Soak: the crossref job, back to back, for hours, unattended --------------------------
+  if (flag('soak')) {
+    if (!realModel || fixture !== 'crossref') throw new Error('--soak is meant for --real-model --fixture=crossref')
+    // Leaves 15 minutes of the overall watchdog (DURABLE_SMOKE_TIMEOUT_MS, capped at 6h by the
+    // caller) so the last iteration can settle and the report/summary still gets written.
+    const deadline = Date.now() + Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? 6 * 3_600_000) - 15 * 60_000
+    let iteration = 0, totalRollovers = 0, totalStages = 0, totalRetries = 0, totalRecoveries = 0
+    while (Date.now() < deadline) {
+      iteration++
+      const soakJob = await call('jobs.create', crossrefJob(`Smoke: soak iteration ${iteration}`))
+      const settled = await waitFor(soakJob.id, s => ['completed', 'blocked', 'failed'].includes(s.status), `soak iteration ${iteration} settled`, STAGE_TIMEOUT)
+      totalRollovers += settled.counters.contextRollovers
+      totalStages += settled.counters.stagesCompleted
+      totalRetries += settled.counters.retries
+      totalRecoveries += settled.counters.recoveries
+      observe('soak iteration done', { iteration, status: settled.status, statusReason: settled.statusReason, counters: settled.counters, elapsedMs: settled.elapsedMs, activeMs: settled.activeMs })
+      if (settled.status !== 'completed') await call('jobs.cancel', { jobId: soakJob.id, reason: 'Smoke soak: iteration did not complete cleanly' })
+    }
+    observe('soak finished', { iterations: iteration, totalRollovers, totalStages, totalRetries, totalRecoveries })
+    assert.ok(totalRollovers > 0, `the soak never triggered a context rollover across ${iteration} iteration(s)`)
+    assert.ok(iteration >= 2, `the soak only completed ${iteration} iteration(s); not enough for an unattended-hours check`)
+    throw Object.assign(new Error('soak only'), { skipped: true })
+  }
+
+  const job = await call('jobs.create', fixture === 'crossref' ? crossrefJob() : {
     title: 'Smoke: append a line', objective: 'Append the line "durable smoke" to notes.txt and commit it.',
     model, constraints: ['Only edit notes.txt'],
     stages: [{ title: 'Append', objective: 'Append the line "durable smoke" to notes.txt', completionCriteria: ['notes.txt ends with durable smoke'] },
