@@ -5,10 +5,10 @@ title: Deliver one batch of related tasks with the least tokens at the highest q
 trigger: [manual, after:task-triage]
 inputs: [batchId, taskIds, allowedPaths]
 budget:
-  claudeWeeklyMax: 80
+  claudeWeeklyMax: 85
   codexWeeklyMax: 95
-  opusOnlyReviewAbove: 78
-  claudeStopAt: 80
+  opusOnlyReviewAbove: 83
+  claudeStopAt: 85
 steps:
   - id: contract
     role: architect
@@ -60,10 +60,17 @@ locked: [budget, steps.review, steps.verify, steps.ship]
    REOPEN (guarded by a control run) or UNVERIFIED. An item is ticked `[x]` only after VERIFIED.
 6. **Ship.** `git.ship({message, paths})` with the batch's files only; wait on `git.ship.status`. Do not publish;
    publish once per set of batches.
-7. Before every dispatch, read `usage.limits`. Opus implements up to 78% Claude weekly (owner 2026-09-25: no downgrade to Sonnet for budget, it lowers quality); from 78% finish in-flight work only; at 80% Claude work stops; Astra plus local finish. Astra stops at 95%.
+7. Before every dispatch, read `usage.limits`. Opus implements up to 83% Claude weekly (owner 2026-09-25: no downgrade to Sonnet for budget, it lowers quality); from 83% finish in-flight work only; at 85% Claude work stops; Astra plus local finish. Astra stops at 95%.
 
 Known hazard (2026-09-24): a coworker whose tab disappears loses app control and cannot `git.ship`. Its controller
 ships for it from the coworker's handoff, which must list the exact paths and message.
+
+## Brief contract (Opus 5.5 guide, 2026-09-25)
+
+- Every worker brief states its completion criteria ("done means: …") in the one dispatch message, with the owner's words and exclusive owned files; no "think carefully" lines (the model thinks before every reply).
+- Workers answer "Needs from you" first, then a results table (item | status | commit | evidence), marking unconfirmed findings.
+- The controller checks a worker's evidence before accepting it (reads the commit and the evidence path, re-runs the failing scenario when it is cheap), and folds corrections in with mid-run steers instead of restarts.
+- The checklist that must survive context summarization is feature-list.md plus docs/swarm-<date>.md, updated as each step lands.
 
 ## Run log
 
