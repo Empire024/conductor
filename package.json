@@ -15,9 +15,10 @@
     "build": "npm run typecheck && electron-vite build",
     "dist:win": "npm run build && electron-builder --win nsis --x64 --publish never && node scripts/generate-update-manifest.mjs",
     "preview": "electron-vite preview",
+    "postinstall": "node scripts/node-pty-spawn-helper.cjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run && npm run test:scripts",
-    "test:scripts": "node --test scripts/live-acceptance-guard.test.mjs scripts/local-update-package.test.mjs scripts/repair-codex-workspace-owner.test.mjs scripts/claude-permission-acceptance-guard.test.mjs scripts/run-smoke-background.test.mjs scripts/tailscale-policy.test.mjs scripts/overseer.test.mjs scripts/smoke-lock.test.mjs scripts/verify-kit.test.mjs",
+    "test:scripts": "node --test scripts/live-acceptance-guard.test.mjs scripts/local-update-package.test.mjs scripts/repair-codex-workspace-owner.test.mjs scripts/claude-permission-acceptance-guard.test.mjs scripts/run-smoke-background.test.mjs scripts/tailscale-policy.test.mjs scripts/overseer.test.mjs scripts/smoke-lock.test.mjs scripts/verify-kit.test.mjs scripts/node-pty-spawn-helper.test.mjs",
     "overseer": "node scripts/overseer.mjs",
     "update:local": "node scripts/build-local-update.mjs",
     "test:local-update-package": "node --test scripts/local-update-package.test.mjs",
@@ -105,6 +106,7 @@
     ],
     "asar": true,
     "npmRebuild": false,
+    "afterPack": "./scripts/node-pty-spawn-helper.cjs",
     "directories": {
       "output": "release",
       "buildResources": "build"

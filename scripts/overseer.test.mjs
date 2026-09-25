@@ -3,10 +3,11 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { mkdtemp, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { devLayout, installedUserData, readCredential, userDataFor, validateCredential } from './overseer/credentials.mjs'
 import { ControlError, createControlClient } from './overseer/control-client.mjs'
-import { loadGoal, normalizeGoal, prepareProjectFolder, validateGoal } from './overseer/goal.mjs'
+import { CHECKOUT_PLACEHOLDER, expandCheckout, goalPortability, loadGoal, normalizeGoal, prepareProjectFolder, validateGoal } from './overseer/goal.mjs'
+import { CHECKOUT } from './overseer/util.mjs'
 import { evaluateRun, findValidatedArtifact, projectItems, resolveArtifactOutputs, runOracle } from './overseer/evaluate.mjs'
 import { buildFixerPrompt, chooseClaudeModel, dispatchFixer, findMarker, parseMarker } from './overseer/fixer.mjs'
 import { waitSettled, LOCAL_SETTLED } from './overseer/agent-wait.mjs'
@@ -147,13 +148,53 @@ test('goal validation names every problem', () => {
   assert.deepEqual(validateGoal(good), [])
 })
 
-test('shipped goal files are valid', async () => {
+test('shipped goal files are valid on every platform', async () => {
   for (const name of ['local-qwen-faktury.json', 'local-dolphin-tools.json']) {
     const goal = await loadGoal(resolve('scripts/overseer/goals', name))
     assert.equal(goal.worker.provider, 'local')
     assert.ok(goal.fixer.notes.length > 40)
+    // The fixer always works in the checkout the overseer runs from, on any machine.
+    assert.equal(goal.fixer.project, CHECKOUT)
   }
   await assert.rejects(loadGoal(resolve('scripts/overseer/goals/missing.json')), /file not found/)
+})
+
+test('shipped goals run here, or say which machine holds their folder', async t => {
+  for (const name of ['local-qwen-faktury.json', 'local-dolphin-tools.json']) {
+    const goal = await loadGoal(resolve('scripts/overseer/goals', name))
+    const reason = goalPortability(goal)
+    // A goal about the owner's own Windows folder is skipped on POSIX with that reason, not failed.
+    await t.test(name, { skip: reason ?? false }, () => {
+      assert.equal(reason, null)
+      assert.ok(isAbsolute(goal.project.path), `${name}: project.path ${goal.project.path} is not absolute here`)
+    })
+  }
+  // The app's own goal names no machine at all.
+  const dolphin = await loadGoal(resolve('scripts/overseer/goals/local-dolphin-tools.json'))
+  assert.equal(dolphin.project.path, CHECKOUT)
+  assert.equal(goalPortability(dolphin), null)
+})
+
+test('${checkout} stands for this checkout and Windows paths are valid but only run on Windows', () => {
+  assert.equal(expandCheckout(CHECKOUT_PLACEHOLDER), CHECKOUT)
+  assert.equal(expandCheckout('${checkout}/scripts'), join(CHECKOUT, 'scripts'))
+  assert.equal(expandCheckout('${checkout}\\scripts'), join(CHECKOUT, 'scripts'))
+  assert.equal(expandCheckout('${checkouts}/x'), '${checkouts}/x')
+  assert.equal(expandCheckout('/plain/path'), '/plain/path')
+  const windowsGoal = { ...baseGoal(), project: { name: 'faktury', path: 'C:/Users/owner/faktury', inputs: [] }, fixer: { project: '\\\\server\\share\\conductor' } }
+  assert.deepEqual(validateGoal(windowsGoal), [])
+  const posixGoal = { ...baseGoal(), project: { name: 'faktury', path: '/Users/owner/faktury', inputs: [] }, fixer: { project: '${checkout}' } }
+  assert.deepEqual(validateGoal(posixGoal), [])
+  assert.match(validateGoal({ ...baseGoal(), project: { name: 'x', path: 'relative/path', inputs: [] } }).join('\n'), /project.path must be an absolute path or start with \$\{checkout\}/)
+  assert.match(validateGoal({ ...baseGoal(), fixer: { project: 'checkout' } }).join('\n'), /fixer.project must be an absolute path/)
+  const normalized = normalizeGoal(windowsGoal, 'windows.json')
+  assert.equal(goalPortability(normalized, { platform: 'win32' }), null)
+  const reason = goalPortability(normalized, { platform: 'darwin' })
+  assert.match(reason, /project.path C:\/Users\/owner\/faktury and fixer.project \\\\server\\share\\conductor are Windows paths; this is darwin/)
+  assert.match(reason, /\$\{checkout\}/)
+  assert.equal(goalPortability(normalizeGoal(posixGoal, 'posix.json'), { platform: 'darwin' }), null)
+  assert.equal(goalPortability(normalizeGoal(posixGoal, 'posix.json'), { platform: 'linux' }), null)
+  assert.equal(goalPortability({ ...normalized, project: { ...normalized.project, path: '/srv/faktury' } }, { platform: 'linux' }).includes('fixer.project'), true)
 })
 
 test('dev project folders are recreated from inputs only, installed uses the real folder', async () => {
