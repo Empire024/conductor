@@ -1,0 +1,11 @@
+/* Local model energy: the per-turn line in the timeline and the Usage & limits section. */
+.sa-local-energy strong { color: var(--text); font-weight: 600; }
+.sa-local-energy-totals { margin: 14px 0; }
+.sa-local-energy-totals > h4 { margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-2); }
+.sa-local-energy-totals dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px; margin: 0; font-size: 12px; }
+.sa-local-energy-totals dt { color: var(--text-2); }
+.sa-local-energy-totals dd { margin: 0; }
+.sa-energy-price { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; font-size: 11px; color: var(--text-2); }
+.sa-energy-price label { display: inline-flex; align-items: center; gap: 4px; }
+.sa-energy-price input { width: 64px; font-size: 11px; }
+.sa-energy-price input[aria-label="Currency"] { width: 32px; }

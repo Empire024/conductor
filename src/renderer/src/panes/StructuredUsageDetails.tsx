@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { StructuredProvider, TimelineItem } from '../../../shared/structured-agent'
 import type { UsageCap, UsageCapMetric, UsageCapScope, UsageCapSetting, UsageCapSnapshot, UsageScopeReport, UsageWindowMovement } from '../../../shared/usage-accounting'
 import { describeUsageCap, evaluateUsageCap, shortWindow, summarizeContext, summarizeUsage, summarizeUsageRun, weeklyWindow } from './usage-summary'
+import { summarizeLocalEnergy } from '../../../shared/local-energy'
+import { LocalEnergyUsage } from './LocalEnergyCard'
 import './StructuredUsageDetails.css'
 
 const providerNames: Record<StructuredProvider, string> = { codex: 'Codex', claude: 'Claude', grok: 'Grok', local: 'Local model' }
@@ -158,6 +160,7 @@ export function StructuredUsageContent({ items, truncated = false, modelLabel, a
   // model-scoped allowance buckets belong in this view.
   const report = useMemo(() => summarizeUsageRun(items, undefined, modelLabel), [items, modelLabel])
   const context = summarizeContext(items)
+  const energy = useMemo(() => summarizeLocalEnergy(items), [items])
   const providerName = report.provider ? providerNames[report.provider] : undefined
   const name = [providerName, modelLabel ?? report.model, report.effort && report.effort !== 'auto' ? `(${report.effort})` : '']
     .filter(Boolean).join(' ') || 'This conversation'
@@ -172,6 +175,7 @@ export function StructuredUsageContent({ items, truncated = false, modelLabel, a
     <ScopeFigures report={report.conversation} label="This conversation" />
     {report.run && !sameRun && <ScopeFigures report={report.run} label="Current provider run" />}
     {usage.contextWindow !== undefined && <dl><dt>Model context window</dt><dd>{usage.contextWindow.toLocaleString()} tokens</dd></dl>}
+    <LocalEnergyUsage totals={energy} />
     {usage.costUsd !== undefined && <dl><dt>{usage.costEstimated ? 'Estimated cost' : 'Reported cost'}{usage.costScope === 'latest' ? ' (latest report)' : ''}</dt><dd>${usage.costUsd.toFixed(4)}</dd></dl>}
     {!report.currentWindows.length && <p className="sa-detail-hint">Account limits have not been reported.</p>}
     {usage.costUsd !== undefined && <p className="sa-detail-hint">Reported cost is not a subscription charge.</p>}

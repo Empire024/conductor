@@ -6,6 +6,8 @@ import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_
 import { LocalAgentSession, LocalTurnSuspension, type LocalAgentEvents } from '../local-models/agent.ts'
 import { normaliseContract } from '../local-models/completion.ts'
 import { localStopPayload, localStopSummary, type LocalStopReport } from '../../shared/local-stop.ts'
+import { localEnergyNotice } from '../../shared/local-energy.ts'
+import { startLocalEnergyMeter } from '../local-energy.ts'
 import { endpointFor, loadConfig, modelFilePath, readApiKey } from '../local-models/config.ts'
 import type { LocalModelConfig, LocalStackConfig } from '../local-models/config.ts'
 import { inspectAdmission, startServer } from '../local-models/llama.ts'
@@ -378,6 +380,9 @@ export class LocalAdapter implements ProviderAdapter {
     const textItem = (): string => `${turn.items}:text:${turn.round}`
     const reasoningItem = (): string => `${turn.items}:reasoning:${turn.round}`
     let releaseTurn = (): void => {}
+    // GPU energy of this turn (local-energy.ts), reported beside its stop notice.
+    const energy = startLocalEnergyMeter()
+    const reportEnergy = (): void => this.emit({ turnId, itemId: `${turn.items}:energy`, data: localEnergyNotice(energy.stop()) })
     try {
       // Claimed before the server is even checked, so a switch decided in another conversation
       // between this check and the first request cannot take the server out from under it.
@@ -416,16 +421,19 @@ export class LocalAdapter implements ProviderAdapter {
       // Paused for a restart: the next process continues it, so nothing here ends the turn.
       if (outcome.suspended) { turn.suspended = outcome.suspended; return }
       if (outcome.stopReason === 'provider_error' || outcome.stopReason === 'context_limit') this.emit({ turnId, data: { type: 'error', message: outcome.report.detail } })
+      reportEnergy()
       this.emit({ turnId, itemId: `${turnId}:stop`, data: { type: 'notice', message: localStopSummary(outcome.report), payload: localStopPayload(outcome.report) } })
       this.emit({ turnId, data: { type: 'session', phase: phaseFor(outcome) } })
     } catch (error) {
       // Paused before the model was reached: the next process starts this turn from its prompt.
       if (controller.signal.reason instanceof LocalTurnSuspension) return
+      if (turn.started) reportEnergy()
       if (controller.signal.aborted) { this.emit({ turnId, data: { type: 'session', phase: 'interrupted' } }); return }
       const detail = error instanceof Error ? error.message : 'Local model request failed'
       this.emit({ turnId, data: { type: 'error', message: pausePoint ? `The turn paused for the restart could not continue: ${detail} Its progress up to the pause is saved; send a message to continue from it.` : detail } })
       this.emit({ turnId, data: { type: 'session', phase: 'failed' } })
     } finally {
+      energy.stop()
       releaseTurn()
       if (this.controller === controller) this.controller = undefined
     }
