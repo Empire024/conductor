@@ -109,6 +109,9 @@ export interface CompletionRequest {
    *  template says "parameters" arrives as a one-character call); under the full grammar the
    *  same model produces a complete, valid call. Left unset for an ordinary request. */
   toolChoice?: 'auto' | 'required'
+  /** Sent as llama.cpp `chat_template_kwargs` (see templates.ts). Dropped with the other optional
+   *  parameters when the agent loop retries a refused request. */
+  templateKwargs?: Record<string, unknown>
   /** Consulted after every streamed delta with what has accumulated so far. A returned string
    *  ends generation early with that word as the finish reason: the agent loop uses it to cut
    *  off a reply that is talking itself in circles rather than acting. */
@@ -173,7 +176,7 @@ export async function runtimePromptTokens(request: CompletionRequest): Promise<n
   try {
     const signal = request.signal ? AbortSignal.any([request.signal,AbortSignal.timeout(3000)]) : AbortSignal.timeout(3000)
     const headers = {'Content-Type':'application/json',Authorization:`Bearer ${request.apiKey}`}
-    const template=await fetch(`${request.endpoint}/apply-template`,{method:'POST',headers,signal,body:JSON.stringify({messages:request.messages,tools:request.tools??[],add_generation_prompt:true,...(request.reasoningEffort?{reasoning_effort:request.reasoningEffort}:{})})})
+    const template=await fetch(`${request.endpoint}/apply-template`,{method:'POST',headers,signal,body:JSON.stringify({messages:request.messages,tools:request.tools??[],add_generation_prompt:true,...(request.reasoningEffort?{reasoning_effort:request.reasoningEffort}:{}),...(request.templateKwargs?{chat_template_kwargs:request.templateKwargs}:{})})})
     if(!template.ok) { unsupportedTokenizer.add(request.endpoint); return undefined }
     const rendered=await template.json() as {prompt?:unknown}
     if(typeof rendered.prompt!=='string'||rendered.prompt.length>2_000_000) return undefined
@@ -214,6 +217,7 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
       temperature: request.temperature ?? 0.3,
       max_tokens: request.maxTokens ?? 4096,
       ...(request.reasoningEffort ? { reasoning_effort: request.reasoningEffort } : {}),
+      ...(request.templateKwargs ? { chat_template_kwargs: request.templateKwargs } : {}),
       ...(request.tools?.length ? { tools: request.tools, tool_choice: request.toolChoice ?? 'auto' } : {})
     })
   })

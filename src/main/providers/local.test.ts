@@ -286,7 +286,7 @@ describe('local provider adapter', () => {
     expect(ready.large.prompts).toEqual([])
   })
 
-  it('offers web search and states the git grant only when the conversation was granted them', async () => {
+  it('offers web search to every conversation, deep research and the git grant only when granted', async () => {
     let ready: Awaited<ReturnType<typeof stack>>
     try { ready = await stack([frame({ content: 'ok' }), frame({}, 'stop')]) } catch (reason) { return guard(reason) }
     const plainEvents: AdapterEvent[] = []
@@ -295,9 +295,10 @@ describe('local provider adapter', () => {
     await plain.submit('research this', settings())
     expect(await settled(plainEvents)).toBe('completed')
     const ungranted = ready.small.requests.at(-1)!
-    expect(ungranted.tools?.map(tool => tool.function.name)).not.toContain('web_search')
+    expect(ungranted.tools?.map(tool => tool.function.name)).toContain('web_search')
     expect(ungranted.messages[0]!.content).toContain('.git directory is mounted read-only')
-    expect(ungranted.messages[0]!.content).toContain('no web search tool')
+    expect(ungranted.messages[0]!.content).toContain('web calls')
+    expect(ungranted.messages[0]!.content).not.toContain('deep research')
 
     const grantedEvents: AdapterEvent[] = []
     const granted = adapter(ready.workspace, grantedEvents, { localGit: true, localResearch: true })

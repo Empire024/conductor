@@ -726,18 +726,21 @@ describe('tool policy', () => {
   const context = (root: string, readOnly = false) => ({ workspace: root, readOnly, sandbox: null, timeoutSec: 30 })
 
   it('offers only the sandbox-bound tools', () => {
-    expect(toolSpecs(false).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
-    expect(toolSpecs(true).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read'])
+    expect(toolSpecs(false).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
+    expect(toolSpecs(true).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read'])
   })
 
-  it('withholds web search until the owner grants research, and refuses it even if the model asks', async () => {
+  it('offers web search with or without deep research, which only lifts the budget and asks for a wider search', async () => {
     const research = { git: false, research: true }
     expect(toolSpecs(false, false, research).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
     expect(toolSpecs(true, false, research).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read'])
     const root = workspace()
     try {
-      // The schema is only an offer; the grant is enforced where the call is dispatched.
-      expect((await runTool('web_search', JSON.stringify({ query: 'anything' }), context(root))).output).toMatch(/^denied: Tool denied by policy.*deep research/)
+      const searchSpec = (grants: { git: boolean; research: boolean }): string => toolSpecs(false, false, grants).find(spec => spec.function.name === 'web_search')!.function.description
+      expect(searchSpec(research)).toContain('different wordings')
+      expect(searchSpec({ git: false, research: false })).not.toContain('different wordings')
+      // A bounded coding task is still refused it where the call is dispatched.
+      expect((await runTool('web_search', JSON.stringify({ query: 'anything' }), { ...context(root), scope: 'coding' as const })).output).toMatch(/^denied: Tool denied by policy.*not part of this bounded coding task/)
       const described = (grants: { git: boolean; research: boolean }): string => toolSpecs(false, false, grants).find(spec => spec.function.name === 'run_command')!.function.description
       expect(described({ git: false, research: false })).toContain('.git directory is read-only')
       expect(described({ git: true, research: false })).toContain('commit and branch locally')

@@ -1,10 +1,11 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { createConnection, createServer } from 'node:net'
 import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import type { LocalModelConfig } from './config.ts'
 import { configPath, loadConfig, logsDir, modelFilePath, runDir, runFile } from './config.ts'
 import { childEnvironment } from './paths.ts'
+import { writeChatTemplate } from './templates.ts'
 import { AdmissionRefusal, admissionRefusal, assertResourceHeadroom, runningLlamaProcesses, withAdmissionLock, type BlockingServer, type ServerProcess } from './resource-guard.ts'
 
 /** What the installed llama-server accepts, read from its own --help once per executable. A
@@ -51,7 +52,7 @@ export function validateExtraArgs(args: string[]): string[] {
 /** The exact server argv. Bound to 127.0.0.1 only, web UI off, API key required, one slot, and
  *  --jinja so the model's own chat template drives OpenAI-style tool calls. No tool runtime, no
  *  MCP, no agent mode, no RPC backend. */
-export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPath = modelFilePath(model), features?: LlamaServerFeatures): string[] {
+export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPath = modelFilePath(model), features?: LlamaServerFeatures, chatTemplateFile?: string): string[] {
   if (!/^[a-f0-9]{32,}$/i.test(apiKey)) throw new Error('Local model API key is malformed')
   const quantizedKv = Boolean(model.kvCacheType && model.kvCacheType !== 'f16' && model.kvCacheType !== 'bf16')
   const cacheArgs = model.kvCacheType && features?.cacheTypeK && features.cacheTypeV ? ['--cache-type-k', model.kvCacheType, '--cache-type-v', model.kvCacheType] : []
@@ -70,6 +71,8 @@ export function llamaServerArgs(model: LocalModelConfig, apiKey: string, modelPa
     '--n-gpu-layers', String(model.gpuLayers),
     '--parallel', '1',
     '--jinja',
+    // Conductor's own template (templates.ts); the owner's extraArgs may still not name one.
+    ...(chatTemplateFile ? ['--chat-template-file', chatTemplateFile] : []),
     ...cacheArgs,
     ...flashArgs,
     ...validateExtraArgs(model.extraArgs ?? [])
@@ -485,7 +488,8 @@ async function startAdmittedServer(executable: string, model: LocalModelConfig, 
   const log = openSync(logFile(model), 'a')
   // TEMP, caches and any model-cache variable point at the local root, so the server can never
   // stage large files on the system drive.
-  const child = spawn(executable, llamaServerArgs({ ...model, port }, apiKey, path, features), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
+  const template = writeChatTemplate(model.id, join(dirname(configPath()), 'templates'))
+  const child = spawn(executable, llamaServerArgs({ ...model, port }, apiKey, path, features, template), { shell: false, windowsHide: true, detached: true, stdio: ['ignore', log, log], env: childEnvironment() })
   closeSync(log)
   let spawnError = ''
   child.on('error', error => { spawnError = error.message })

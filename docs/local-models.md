@@ -82,11 +82,14 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   owner grants repository writes for that one conversation (see *Per-conversation grants*).
 - **No network in the runtime.** The container runs with `--network none`; it cannot browse,
   upload source, reach cloud metadata or talk to other machines on the LAN.
-- **Credential-free GET research.** `web_read`, and `web_search` when granted, retrieve public HTTPS text on port 443,
+- **Credential-free GET research.** `web_read` and `web_search` (every full-scope conversation
+  since 2026-09-25, eight web calls per owner message without deep research; see
+  docs/local-model-dolphin-x1-8b.md) retrieve public HTTPS text on port 443,
   without inherited cookies, authorization headers or request bodies. IPv4 DNS answers must
   all be public and the chosen address is pinned for the socket; every redirect is checked
   again. IPv6-only destinations are refused. Requests have a 20-second budget, at most three
-  redirects, a 256 KiB response cap and a 24,000-character tool result. Results are explicitly
+  redirects, a 4 MiB page cut (a result page over 1.5 MiB is refused) and a 12,000-character
+  page text. Results are explicitly
   marked untrusted. Public URL paths/query strings can transmit information: this is not a
   general source-exfiltration prevention mechanism. Do not use it for confidential research
   queries. Credential filename policy likewise cannot identify secrets embedded in arbitrary
@@ -127,11 +130,12 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
   read, or a withheld path is tracked as a symlink or submodule (which no replica can reproduce),
   the command is refused rather than run. What remains possible is a deliberate, targeted
   `git rm --cached` — no different from the model deleting any other file it is allowed to touch,
-  local-only, and recoverable from the reflog. *Deep research* (`localResearch`) adds the `web_search` tool and
-  raises the tool-round budget from 16 to 48. Both are refused on any provider other than
-  `local`, are held on the conversation rather than on a message — a queued prompt cannot carry
-  a grant that has since been withdrawn — and `web_search` is refused at dispatch, not merely
-  withheld from the schema.
+  local-only, and recoverable from the reflog. *Deep research* (`localResearch`) lifts the per-message web budget,
+  asks the model to search widely, and raises the tool-round budget from 16 to 48; `web_search`
+  itself is offered without it. Both grants are refused on any provider other than
+  `local` and are held on the conversation rather than on a message — a queued prompt cannot carry
+  a grant that has since been withdrawn — and the web budget is enforced at dispatch, not merely
+  stated in the prompt.
 - **Cancellation reaches commands.** Stop removes only this conversation's Docker container
   and waits for removal, so a Linux command cannot continue writing after its Docker client
   disappears. Output overflow and command timeout also remove the container before returning.

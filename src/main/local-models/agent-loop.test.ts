@@ -250,7 +250,7 @@ describe('local agent loop', () => {
     const second = stub.requests[1] as { messages: Array<{ role: string; content: string }>; tools: Array<{ function: { name: string } }> }
     expect(second.messages.at(-1)).toMatchObject({ role: 'tool' })
     expect(second.messages.at(-1)!.content).toContain('export const answer = 42')
-    expect(second.tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
+    expect(second.tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
   })
 
   it('re-asks once under the tool grammar when the server hands back a stub call, then runs the repaired call', async () => {
@@ -312,7 +312,7 @@ describe('local agent loop', () => {
     cleanup.push(() => stub.server.close())
     const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: workspace(), sandbox: null, readOnly: true, timeoutSec: 30, contextTokens: 32768 })
     await session.run('Summarize', {})
-    expect((stub.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_read'])
+    expect((stub.requests[0] as { tools: Array<{ function: { name: string } }> }).tools.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read'])
   })
 
   it('repairs and retries once when the server refuses the request, then reports what it cannot fix', async () => {

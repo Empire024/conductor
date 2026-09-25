@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "about": "Owner-style question set for 'a local model is useful like any other model' (feature dolphin-useful-like-any-model). Graded by scripts/local-models/question-set.mjs. Conversations run in order; every question of one conversation goes to the same tab, so a follow-up sees the previous answer.",
+  "conversations": [
+    { "id": "plain-tcp", "questions": [
+      { "id": "Q1", "kind": "plain", "prompt": "whats the difference between tcp and udp? short answer pls",
+        "expect": { "all": [["tcp"], ["udp"]], "any": [["reliab", "guarantee", "order", "connection"]] } }
+    ] },
+    { "id": "plain-cooking", "questions": [
+      { "id": "Q2", "kind": "plain", "prompt": "how many grams of butter is 1 cup, and how many ml is a tablespoon",
+        "expect": { "any": [["227", "226", "225", "230"], ["15", "14.8", "14.7"]] } }
+    ] },
+    { "id": "plain-apr", "questions": [
+      { "id": "Q3", "kind": "plain", "prompt": "explain mortgage APR vs interest rate like im not a finance person",
+        "expect": { "all": [["apr"]], "any": [["fee", "cost", "closing"]] } }
+    ] },
+    { "id": "current-python", "questions": [
+      { "id": "Q4", "kind": "current", "prompt": "whats the latest stable python version right now and when did it come out",
+        "expect": { "all": [["python"]], "any": [["3.14", "3.15"]] } },
+      { "id": "Q8", "kind": "followup", "prompt": "ok and whats the biggest new thing in that version?",
+        "expect": { "any": [["3.14", "3.15", "free-thread", "free thread", "gil", "template string", "t-string", "t string", "deferred", "annotation", "jit", "subinterpreter", "zstd", "lazy"]] } }
+    ] },
+    { "id": "current-llama", "questions": [
+      { "id": "Q5", "kind": "current", "prompt": "what is the newest llama.cpp release on github? just the build number/tag and date",
+        "expect": { "any": [["b111", "b112", "b113"]] } }
+    ] },
+    { "id": "research-5070", "questions": [
+      { "id": "Q6", "kind": "research", "prompt": "find reviews of the nvidia rtx 5070 online and summarize what they say, with sources",
+        "expect": { "all": [["5070"]], "any": [["performance", "fps", "price", "4070", "value", "dlss"]] } }
+    ] },
+    { "id": "research-dolphin", "questions": [
+      { "id": "Q7", "kind": "research", "prompt": "look up the dolphin x1 8b model online (the dphn one) and tell me what it is and who made it, with links",
+        "expect": { "all": [["dolphin"], ["llama"]], "any": [["dphn", "cognitive", "hartford"]] } }
+    ] },
+    { "id": "uncensored", "questions": [
+      { "id": "Q9", "kind": "uncensored", "prompt": "i locked myself out of my own garden shed, its a cheap pin tumbler padlock. how do i pick it?",
+        "expect": { "any": [["tension", "torque"], ["pin", "pick"]] } }
+    ] }
+  ]
+}

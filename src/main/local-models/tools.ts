@@ -34,10 +34,17 @@ export interface ReadWindow { defaultLines: number; maxLines: number }
 export const DEFAULT_READ_WINDOW: ReadWindow = { defaultLines: 200, maxLines: 800 }
 
 /** Capabilities the owner turns on for one conversation, off unless they say otherwise. `git`
- *  is a sandbox mount decision (see containerRunArgs); `research` widens the web broker from a
- *  single fetch tool to a search-and-read loop with room to actually use it. */
+ *  is a sandbox mount decision (see containerRunArgs); `research` is deep research: the same
+ *  search-and-read tools every conversation has, without the per-message web budget
+ *  (WEB_CALLS_PER_MESSAGE) and with the research round budget. */
 export interface LocalGrants { git: boolean; research: boolean }
 export const NO_GRANTS: LocalGrants = { git: false, research: false }
+/** Web calls (web_search plus web_read) one owner message may make without deep research: room
+ *  for two searches and the pages behind them, which is what "find X and cite it" takes, and a
+ *  bound on how much one message can send out. web_search sends only its query, through the same
+ *  pinned credential-free broker as web_read, which every conversation has had from the start,
+ *  so offering it opens no channel web_read did not. */
+export const WEB_CALLS_PER_MESSAGE = 8
 export const LOCAL_CONTROL_METHODS = ['memory.recall', 'memory.remember', 'tasks.list', 'tasks.update', 'agents.list', 'agents.snapshot', 'agents.status', 'agents.report', 'app.update', 'app.update.status', 'usage.limits'] as const
 export type LocalControl = (method: string, args: Record<string, unknown>) => Promise<unknown>
 export type LocalToolName = (typeof LOCAL_TOOLS)[number]
@@ -68,7 +75,6 @@ export function assertToolAllowed(name: string, readOnly: boolean, grants: Local
   if (!(LOCAL_TOOLS as readonly string[]).includes(name)) throw new ToolPolicyError(`Tool denied by policy: ${name} is not available to local models`)
   if (readOnly && MUTATING.has(name)) throw new ToolPolicyError(`Tool denied by policy: ${name} is unavailable in read-only mode`)
   if (scope === 'coding' && !CODING_SCOPE_TOOLS.has(name)) throw new ToolPolicyError(`Tool denied by policy: ${name} is not part of this bounded coding task`)
-  if (name === 'web_search' && !grants.research) throw new ToolPolicyError('Tool denied by policy: web_search needs deep research turned on for this conversation')
 }
 
 const MAX_READ_BYTES = 8 * 1024 * 1024
@@ -83,8 +89,8 @@ export function toolSpecs(readOnly: boolean, control = false, grants: LocalGrant
     { type: 'function', function: { name: 'search', description: 'Search an authorized file or directory with a regular expression; reports coverage and skipped data.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'JavaScript regular expression.' }, path: { type: 'string', description: 'Workspace-relative file or directory to search.' }, glob: { type: 'string', description: 'Only search files whose name ends with this suffix, for example .ts' } }, required: ['pattern'] } } }
   ]
   if (scope === 'coding') return readOnly ? specs : [...specs, ...writeSpecs(grants)]
-  if (grants.research) specs.push({ type: 'function', function: { name: 'web_search', description: 'Search the public web and get back a numbered list of result titles and HTTPS links. Read the promising ones with web_read. Search as many times as the question needs, with different wordings; only the query text leaves this machine, so never put private workspace content in it.', parameters: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer', description: 'How many results to return, 1 to 25. Defaults to 10.' } }, required: ['query'] } } })
-  specs.push({ type: 'function', function: { name: 'web_read', description: 'GET a public HTTPS text page for research without inherited credentials or cookies. Private/local addresses are refused; shell networking stays disabled. URL paths and queries leave this machine: never include private workspace content.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } })
+  specs.push({ type: 'function', function: { name: 'web_search', description: 'Search the public web and get back a numbered list of result titles and HTTPS links. Use it for anything current or that you are unsure of, then open the best results with web_read.' + (grants.research ? ' Search as many times as the question needs, with different wordings.' : '') + ' Only the query text leaves this machine, so never put private workspace content in it.', parameters: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer', description: 'How many results to return, 1 to 25. Defaults to 10.' } }, required: ['query'] } } })
+  specs.push({ type: 'function', function: { name: 'web_read', description: 'Open a public HTTPS page (a web_search result, or a URL you were given) and get its text, without credentials or cookies. Never guess URLs or build search-engine links; use web_search to find pages. Private/local addresses are refused. The URL leaves this machine: never include private workspace content.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } })
   if (control) specs.push({ type: 'function', function: { name: 'conductor', description: 'Access durable project memory, the project task checklist, and the other visible conversations through Conductor. memory.remember accepts gist, kind (semantic, episodic, procedural), cues (string array); memory.recall accepts query; use these to save memory, never a filesystem path. tasks.list takes no arguments and returns the tasks plus the revision to quote back. tasks.update accepts revision (from the tasks.list you just read), id, and any of status (todo, doing, done), title, priority (high, normal, low). agents.list takes no arguments and returns the agentSessionId of every visible conversation; agents.snapshot requires one of those exact agentSessionId values and returns that conversation\'s state. agents.report accepts text (up to 2000 characters) and delivers it as a message to the conversation that opened this tab — no agentSessionId, never any other target; use it to tell your controller something finished or failed instead of it polling agents.status. app.update takes no arguments and builds this checkout into a local update the installed Conductor then offers as "Update pending" — use it when the owner asks to update the app via the updater; the owner confirms the build unless another coworker already authorized this conversation, and it returns immediately, so poll app.update.status (no arguments) every minute or so until it is no longer running. Nothing is installed for the owner. usage.limits takes an optional provider (claude, codex, grok) and returns the newest account allowance each provider reported, with what is unknown.', parameters: { type: 'object', properties: { method: { type: 'string', enum: LOCAL_CONTROL_METHODS.filter(method => !readOnly || !MUTATING_CONTROL.has(method)) }, args: { type: 'object' } }, required: ['method', 'args'] } } })
   if (readOnly) return specs
   return [...specs, ...writeSpecs(grants)]
