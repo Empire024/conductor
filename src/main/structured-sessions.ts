@@ -112,9 +112,10 @@ const activityPhaseOf = (phase: SessionPhase): AgentActivityPhase =>
           : phase === 'disconnected' ? 'disconnected'
             : phase === 'interrupted' ? 'stopped' : 'idle'
 
+/** Queued messages go out as written, separated by a wide blank break; no per-message header tokens. */
 const queuedText = (prompts: QueuedPrompt[]): string => prompts.length === 1 ? prompts[0]!.text.trim() : prompts
-  .map((prompt, index) => `--- Queued message ${index + 1} of ${prompts.length}${prompt.origin ? ` (${prompt.origin.label})` : ''} ---\n\n${prompt.text.trim()}`)
-  .join('\n\n')
+  .map(prompt => `${prompt.origin ? `(${prompt.origin.label}) ` : ''}${prompt.text.trim()}`)
+  .join('\n\n\n')
 
 const fallbackAfterRefusal = (provider: StructuredProvider, model: string): { model: string; notice: string } | null => {
   if (provider === 'claude' && /fable/i.test(model)) return { model: 'opus[1m]', notice: 'Fable refused this turn; continuing on Opus 5.5' }

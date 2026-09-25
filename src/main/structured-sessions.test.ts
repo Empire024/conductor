@@ -841,12 +841,7 @@ describe('queued messages and native CLI handoff', () => {
     await f.manager.queue(f.spec.id, 'fifth', settings)
     f.current.finish()
     await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
-    expect(f.current.submissions[1]?.text).toBe([
-      '--- Queued message 1 of 4 ---', 'second',
-      '--- Queued message 2 of 4 ---', 'third',
-      '--- Queued message 3 of 4 ---', 'fourth',
-      '--- Queued message 4 of 4 ---', 'fifth'
-    ].join('\n\n'))
+    expect(f.current.submissions[1]?.text).toBe(['second', 'third', 'fourth', 'fifth'].join('\n\n\n'))
     const userMessages = f.database.structured.snapshot(f.spec.id)?.items.filter(item => item.data.type === 'text' && item.data.role === 'user') ?? []
     expect(userMessages).toHaveLength(2)
     expect(userMessages.at(-1)?.data).toMatchObject({ type: 'text', text: f.current.submissions[1]?.text })
@@ -1418,11 +1413,7 @@ it('Escape flushes every queued message in original order after interruption', a
   f.current.capabilities.steering = true
   await f.manager.interrupt(f.spec.id, true)
   await vi.waitFor(() => expect(f.current.submissions).toHaveLength(2))
-  expect(f.current.submissions[1]?.text).toBe([
-    '--- Queued message 1 of 3 ---', 'Queued first',
-    '--- Queued message 2 of 3 ---', 'Queued second',
-    '--- Queued message 3 of 3 ---', 'Queued third'
-  ].join('\n\n'))
+  expect(f.current.submissions[1]?.text).toBe(['Queued first', 'Queued second', 'Queued third'].join('\n\n\n'))
   expect(f.current.steers).toEqual([])
   expect(f.database.structured.snapshot(f.spec.id)?.queuedPrompts).toEqual([])
 })
