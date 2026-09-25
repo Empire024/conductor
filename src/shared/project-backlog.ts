@@ -47,7 +47,9 @@ export interface ProjectTaskActivity {
 export interface ProjectTask { id:string; title:string; kind:ProjectTaskKind; status:ProjectTaskStatus; agentId?:string; priority:ProjectTaskPriority; weight:ProjectTaskWeight; line:number; activity:ProjectTaskActivity[]; archived?:boolean }
 export interface ProjectTaskOwner { id:string; sessionId:string; title:string; workspace:string; provider:string; phase:string }
 export interface ProjectTaskListQuery { query?:string; kind?:'all'|ProjectTaskKind; includeDone?:boolean; includeArchived?:boolean; offset?:number; limit?:number }
-export interface ProjectTaskPage { offset:number; limit:number; total:number; hasMore:boolean }
+/** How many filtered tasks each pane section holds across the whole list, not only the loaded page. */
+export interface ProjectTaskSectionCounts { doing:number; todo:number; done:number; archived:number }
+export interface ProjectTaskPage { offset:number; limit:number; total:number; hasMore:boolean; sections?:ProjectTaskSectionCounts }
 export interface ProjectTaskSummary { total:number; completed:number; archived:number }
 export interface ProjectBacklog { projectId:string; path:string; revision:string; tasks:ProjectTask[]; owners:ProjectTaskOwner[]; sourceControl:SourceControlStatus; page?:ProjectTaskPage; summary?:ProjectTaskSummary }
 export type ProjectTaskEdit = { type:'add'; title:string; kind:ProjectTaskKind; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | { type:'update'; id:string; title?:string; kind?:ProjectTaskKind; status?:ProjectTaskStatus; agentId?:string|null; priority?:ProjectTaskPriority; weight?:ProjectTaskWeight } | {type:'remove';id:string}

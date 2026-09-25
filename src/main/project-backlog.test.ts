@@ -22,7 +22,7 @@ describe('project task files',()=> {
     ]
     const first=pageProjectTasks(tasks,{offset:0,limit:1},now)
     expect(first.tasks.map(task=>task.id)).toEqual(['active-2'])
-    expect(first.page).toEqual({offset:0,limit:1,total:2,hasMore:true})
+    expect(first.page).toEqual({offset:0,limit:1,total:2,hasMore:true,sections:{doing:1,todo:1,done:0,archived:0}})
     expect(first.summary).toEqual({total:4,completed:2,archived:1})
     expect(tasks.find(task=>task.id==='archived')).not.toHaveProperty('archived')
     const archived=pageProjectTasks(tasks,{includeArchived:true,offset:0,limit:10},now)
@@ -31,6 +31,23 @@ describe('project task files',()=> {
     const completed=pageProjectTasks(tasks,{includeDone:true,offset:0,limit:10},now)
     expect(completed.tasks.map(task=>task.id)).toContain('recent-done')
     expect(completed.tasks.map(task=>task.id)).not.toContain('archived')
+  })
+  it('counts every section across the whole filtered list, not only the loaded page (V4 R1)',()=>{
+    const now=Date.parse('2026-09-24T12:00:00.000Z'),day=24*60*60*1000
+    const task=(index:number,status:'todo'|'doing'|'done',at:number)=>({id:'t'+index,title:'Task '+index,kind:'task' as const,status,priority:'normal' as const,weight:'medium' as const,line:index,activity:[{id:'a'+index,status,actor:'file' as const,at:new Date(at).toISOString()}]})
+    const tasks=[
+      ...Array.from({length:180},(_,index)=>task(index,'todo',now-day)),
+      ...Array.from({length:4},(_,index)=>task(200+index,'doing',now-day)),
+      ...Array.from({length:70},(_,index)=>task(300+index,'done',now-(1+index%10)*day)),
+      ...Array.from({length:250},(_,index)=>task(400+index,'done',now-(15+index%45)*day))
+    ]
+    const first=pageProjectTasks(tasks,{includeDone:true,includeArchived:true,offset:0,limit:40},now)
+    expect(first.tasks).toHaveLength(40)
+    expect(first.tasks.some(task=>task.status==='done')).toBe(false)
+    expect(first.summary).toEqual({total:504,completed:320,archived:250})
+    expect(first.page?.sections).toEqual({doing:4,todo:180,done:70,archived:250})
+    const bugsOnly=pageProjectTasks(tasks,{kind:'bug',includeDone:true,includeArchived:true,offset:0,limit:40},now)
+    expect(bugsOnly.page?.sections).toEqual({doing:0,todo:0,done:0,archived:0})
   })
   it('round-trips large multiline bug reports and HTML logs without accepting task markers',()=>{
     const report='<!-- diagnostic -->\nrecovery:checkpoint\n'+('Error: Invalid workspace document owner\n'.repeat(500))+'<!-- diagnostic -->\n- [ ] log text\n```text\nstack trace\n```'

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ProjectRecord } from '../../../shared/models'
 import type { ProjectTask, ProjectTaskActivity } from '../../../shared/project-backlog'
 import type { ContextAttachment } from '../../../shared/structured-agent'
-import { embedTaskImages, isLongTaskBody, projectTaskScaleSummary, ProjectBacklogPane, sortProjectTasks, splitTaskImages, submitTaskShortcut, taskTitleRow } from './ProjectBacklogPane'
+import { embedTaskImages, isLongTaskBody, projectTaskScaleSummary, ProjectBacklogPane, projectTaskSectionCounts, sortProjectTasks, splitTaskImages, submitTaskShortcut, taskTitleRow } from './ProjectBacklogPane'
 
 // A minimal, real Storage-shaped implementation: the component reads/writes the
 // bare `localStorage` global directly (not `window.localStorage`), so a Node
@@ -104,6 +104,19 @@ describe('sorting project tasks for display (priority first, then newest added)'
     const input = [a, b]
     sortProjectTasks(input)
     expect(input).toEqual([a, b])
+  })
+})
+
+describe('section heading counts (V4 R1)', () => {
+  const loaded = { doing: [], todo: [], done: [], archived: [] }
+  it('takes each count from the whole filtered list, so an unloaded Archived section still reads 250', () => {
+    const board = { page: { offset: 0, limit: 40, total: 504, hasMore: true, sections: { doing: 4, todo: 180, done: 70, archived: 250 } } }
+    expect(projectTaskSectionCounts(board, loaded)).toEqual({ doing: 4, todo: 180, done: 70, archived: 250 })
+  })
+  it('falls back to the loaded rows when the source sent no section counts (older phone hosts)', () => {
+    const done = [{ id: 'd', title: 'Done', kind: 'task', status: 'done', priority: 'normal', weight: 'medium', line: 1, activity: [] }] as ProjectTask[]
+    expect(projectTaskSectionCounts({ page: { offset: 0, limit: 40, total: 1, hasMore: false } }, { ...loaded, done })).toEqual({ doing: 0, todo: 0, done: 1, archived: 0 })
+    expect(projectTaskSectionCounts(null, loaded)).toEqual({ doing: 0, todo: 0, done: 0, archived: 0 })
   })
 })
 

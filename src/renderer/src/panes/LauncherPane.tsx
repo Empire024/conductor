@@ -212,7 +212,7 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
           const blocked = Boolean(current?.reason) || (elsewhere && kind === 'agent' && !mirrorable)
           const tileBody = (
             <>
-              <span className={`launch-icon ${tone}`}>{provider ? <ProviderIcon provider={provider} size={21} /> : <Icon size={19} />}</span>
+              <span className={`launch-icon ${tone}`}>{provider ? <ProviderIcon provider={provider} model={model} size={21} /> : <Icon size={19} />}</span>
               <span><strong>{title}</strong>{detail && <small>{detail}{elsewhere && mirrorable ? ` · runs on ${hostName}` : provider === 'local' ? ' · runs on this machine' : ''}</small>}</span>
               {key && <kbd>{key}</kbd>}
               <ChevronRight className="launch-arrow" size={15} />

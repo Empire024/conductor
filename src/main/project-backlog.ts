@@ -74,7 +74,7 @@ export function pageProjectTasks(tasks:ProjectTask[],query:ProjectTaskListQuery,
   const limit=Math.max(1,Math.min(100,requested))
   return {
     tasks:visible.slice(offset,offset+limit),
-    page:{offset,limit,total:visible.length,hasMore:offset+limit<visible.length},
+    page:{offset,limit,total:visible.length,hasMore:offset+limit<visible.length,sections:{doing:visible.filter(task=>task.status==='doing').length,todo:visible.filter(task=>task.status==='todo').length,done:visible.filter(task=>task.status==='done'&&!task.archived).length,archived:visible.filter(task=>task.archived).length}},
     summary:{total:prepared.length,completed:prepared.filter(task=>task.status==='done').length,archived:prepared.filter(task=>task.archived).length}
   }
 }

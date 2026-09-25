@@ -4,7 +4,7 @@ import { createPortal } from 'react-dom'
 import { Bug, Check, ChevronDown, ChevronRight, Circle, CircleCheck, CircleDot, ClipboardList, FileText, GitBranch, GitCompare, Github, Lightbulb, ListTodo, Pencil, RefreshCw, Search, Send, Sparkles, Trash2, X } from 'lucide-react'
 import type { ProjectRecord } from '../../../shared/models'
 import { projectTaskKinds, projectTaskPriorities, projectTaskWeights } from '../../../shared/project-backlog'
-import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskDispatchResult, ProjectTaskDispatchTarget, ProjectTaskEdit, ProjectTaskKind, ProjectTaskListQuery, ProjectTaskPriority, ProjectTaskWeight } from '../../../shared/project-backlog'
+import type { ProjectBacklog, ProjectTask, ProjectTaskActivity, ProjectTaskDispatchResult, ProjectTaskDispatchTarget, ProjectTaskEdit, ProjectTaskKind, ProjectTaskListQuery, ProjectTaskPriority, ProjectTaskSectionCounts, ProjectTaskWeight } from '../../../shared/project-backlog'
 import type { SourceControlChangeSet } from '../../../shared/source-control'
 import type { ContextAttachment } from '../../../shared/structured-agent'
 import { AgentDialog } from '../panes/StructuredAgentRenderers'
@@ -233,6 +233,11 @@ function TaskChanges({project,task,onClose}:{project:ProjectRecord;task:ProjectT
 interface TaskEditingDraft {id:string;title:string;kind?:ProjectTaskKind}
 interface BacklogDraft {title:string;images:ContextAttachment[];editing:TaskEditingDraft|null}
 const emptyBacklogDraft:BacklogDraft={title:'',images:[],editing:null}
+/** Section headings count the whole filtered list; the loaded page only holds its first rows. */
+export function projectTaskSectionCounts(board:Pick<ProjectBacklog,'page'>|null|undefined,loaded:Record<keyof ProjectTaskSectionCounts,ProjectTask[]>):ProjectTaskSectionCounts {
+  const counts=board?.page?.sections
+  return {doing:counts?.doing??loaded.doing.length,todo:counts?.todo??loaded.todo.length,done:counts?.done??loaded.done.length,archived:counts?.archived??loaded.archived.length}
+}
 const backlogDraftKey=(projectId:string):string=>'conductor.tasks.draft.'+projectId
 const isDraftImage=(value:unknown):value is ContextAttachment=>Boolean(value) && typeof value==='object' && (value as ContextAttachment).kind==='image' && typeof (value as ContextAttachment).id==='string' && typeof (value as ContextAttachment).path==='string' && typeof (value as ContextAttachment).name==='string'
 const readBacklogDraft=(projectId:string):BacklogDraft=> {
@@ -348,6 +353,7 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
   }
   const visible=board?.tasks??[]
   const todo=visible.filter(task=>task.status==='todo'),doing=visible.filter(task=>task.status==='doing'),done=visible.filter(task=>task.status==='done'&&!task.archived),archived=visible.filter(task=>task.archived)
+  const sections=projectTaskSectionCounts(board,{doing,todo,done,archived})
   const row=(task:ProjectTask):React.JSX.Element=> {
     const owner=board?.owners.find(owner=>owner.id===task.agentId)
     const Selected=selected.has(task.id)?CircleCheck:Circle
@@ -417,10 +423,10 @@ export function ProjectBacklogPane({project}:{project:ProjectRecord}):React.JSX.
     </div>
     {error&&<p className="project-task-error" role="alert">{error}</p>}
     <div className="project-task-list" onScroll={event=>{const target=event.currentTarget;if(target.scrollHeight-target.scrollTop-target.clientHeight<180)void loadMore()}}>
-      {doing.length>0&&<section aria-label="Tasks in progress"><h3><CircleDot size={13}/> In progress <span>{doing.length}</span></h3>{doing.map(row)}</section>}
-      <section aria-label="Tasks to do"><h3><Circle size={13}/> To do <span>{todo.length}</span></h3>{todo.map(row)}{!todo.length&&<p className="project-task-empty">{board?'No pending items here.':'Loading tasks…'}</p>}</section>
-      {showDone&&<section aria-label="Completed tasks"><h3><Check size={13}/> Done <span>{done.length}</span></h3>{done.map(row)}</section>}
-      {showArchived&&<section aria-label="Archived tasks"><h3><Check size={13}/> Archived <span>{archived.length}</span></h3>{archived.map(row)}</section>}
+      {sections.doing>0&&<section aria-label="Tasks in progress"><h3><CircleDot size={13}/> In progress <span>{sections.doing}</span></h3>{doing.map(row)}</section>}
+      <section aria-label="Tasks to do"><h3><Circle size={13}/> To do <span>{sections.todo}</span></h3>{todo.map(row)}{!todo.length&&<p className="project-task-empty">{board?'No pending items here.':'Loading tasks…'}</p>}</section>
+      {showDone&&<section aria-label="Completed tasks"><h3><Check size={13}/> Done <span>{sections.done}</span></h3>{done.map(row)}{sections.done>done.length&&<p className="project-task-empty">{sections.done-done.length} more load as you scroll.</p>}</section>}
+      {showArchived&&<section aria-label="Archived tasks"><h3><Check size={13}/> Archived <span>{sections.archived}</span></h3>{archived.map(row)}{sections.archived>archived.length&&<p className="project-task-empty">{sections.archived-archived.length} more load as you scroll.</p>}</section>}
       {board?.page?.hasMore&&<button className="project-task-more" disabled={writing.current} onClick={()=>void loadMore()}>Load more</button>}
     </div>
     <LogicLoopsSection projectId={project.id}/>
