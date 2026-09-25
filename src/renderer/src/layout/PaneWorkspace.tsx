@@ -16,6 +16,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal, flushSync } from 'react-dom'
 import {
   Bot,
+  Cloud,
   FileText,
   FolderTree,
   Globe2,
@@ -78,6 +79,7 @@ import { RemoteFilesPane } from '../panes/RemoteFilesPane'
 import { FilePreviewPane } from '../panes/FilePreviewPane'
 import { TerminalPane } from '../panes/TerminalPane'
 import { LauncherPane } from '../panes/LauncherPane'
+import { CloudPane } from '../panes/CloudPane'
 import { FileTreePane } from '../panes/FileTreePane'
 import { CodePane } from '../panes/CodePane'
 import { BrowserPane } from '../panes/BrowserPane'
@@ -143,6 +145,7 @@ const iconFor = (tab: PaneTab): typeof Bot => {
   if (tab.kind === 'code' || tab.kind === 'preview') return fileTypeIcon((tab.state?.path as string) ?? tab.resourceId ?? '')
   if (tab.kind === 'browser') return Globe2
   if (tab.kind === 'job') return Hourglass
+  if (tab.kind === 'cloud') return Cloud
   return FileText
 }
 
@@ -252,6 +255,8 @@ const PaneBody = ({
   if (tab.kind === 'tasks') return <ProjectBacklogPane project={project} />
   // The job id is the tab's identity: whatever happens to the layout, this tab shows that job.
   if (tab.kind === 'job') return tab.resourceId ? <DurableJobPanel projectId={project.id} jobId={tab.resourceId} /> : <DurableJobsPane projectId={project.id} workspaceId={session.id} />
+  // The run id is the tab's identity, like a job tab's: the session runs whether or not a tab shows it.
+  if (tab.kind === 'cloud' && tab.resourceId) return <CloudPane projectId={project.id} runId={tab.resourceId} />
   // Every read and write for a remote project's file goes through the host, which is what carries
   // the revision check that turns a concurrent edit into a conflict message instead of an overwrite.
   if (tab.kind === 'code') return <CodePane project={project} tabId={tab.id} path={(tab.state?.path as string) ?? tab.resourceId ?? ''} line={tab.state?.line as number | undefined} machineId={host ?? fileMachineId(tab.state?.machineId as string | undefined)} />

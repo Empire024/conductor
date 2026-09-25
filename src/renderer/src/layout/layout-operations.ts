@@ -209,8 +209,9 @@ export const closeTab = (
  * launcher and durable job views. Files, editors, browsers, memory, and automation
  * live in workspace chrome so their lifecycles cannot be confused with PTY sessions.
  * A job tab stays because it is a durable identity (its resourceId is the job id):
- * a reload must bring back the same job, not drop the view of it. */
-export const RUNTIME_TAB_KINDS: readonly string[] = ['launcher', 'agent', 'terminal', 'job']
+ * a reload must bring back the same job, not drop the view of it. A cloud tab stays for the
+ * same reason: its resourceId is the cloud run id (src/shared/cloud.ts). */
+export const RUNTIME_TAB_KINDS: readonly string[] = ['launcher', 'agent', 'terminal', 'job', 'cloud']
 export const stripWorkspaceUtilityTabs = (layout: WorkspaceLayout): WorkspaceLayout => {
   let next = layout
   const utilityTabs = listGroups(layout.root).flatMap((group) =>

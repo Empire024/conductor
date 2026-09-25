@@ -4,6 +4,7 @@ import {
   Bot,
   ChevronRight,
   Clock,
+  Cloud,
   MonitorSmartphone,
   Plug,
   RefreshCw,
@@ -18,6 +19,7 @@ import type { RemoteTerminalSummary } from '../../../shared/remote-terminals'
 import { checkRemoteProjectPlacement } from '../../../shared/project-identity'
 import { checkProjectPlacement, requiredMachineId } from '../layout/machine-placement'
 import { DurableJobForm } from '../components/DurableJobsPane'
+import { CloudLaunchForm } from './CloudLaunchForm'
 
 interface LauncherPaneProps {
   projectId: string
@@ -103,6 +105,8 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
   const [durableFor, setDurableFor] = useState<string | null>(null)
   const [creatingJob, setCreatingJob] = useState(false)
   const [jobError, setJobError] = useState('')
+  /** The cloud session form below the grid; a cloud session always runs from this machine. */
+  const [cloudForm, setCloudForm] = useState(false)
   const host = requiredMachineId(project)
   const selected = host ?? machineId ?? LOCAL_MACHINE_ID
 
@@ -259,7 +263,15 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
             </div>
           )
         })}
+        {selected === LOCAL_MACHINE_ID && workspaceId && !current?.reason && (
+          <button type="button" aria-pressed={cloudForm} onClick={() => setCloudForm(open => !open)} title="A Claude Code session in the cloud, on this project's GitHub repository">
+            <span className="launch-icon amber"><Cloud size={19} /></span>
+            <span><strong>Claude Cloud</strong><small>Claude Code in the cloud · spends cloud credit</small></span>
+            <ChevronRight className="launch-arrow" size={15} />
+          </button>
+        )}
       </div>
+      {selected === LOCAL_MACHINE_ID && workspaceId && cloudForm && <CloudLaunchForm projectId={projectId} workspaceId={workspaceId} onDone={() => setCloudForm(false)} />}
       {selected === LOCAL_MACHINE_ID && onOpenJob && durableFor && (() => {
         const model = LOCAL_MODELS.find(entry => entry.id === durableFor)
         if (!model) return null

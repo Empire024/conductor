@@ -15,6 +15,8 @@ export type PaneKind =
   | 'logs'
   /** A view of one durable local-model job; resourceId is the job id (src/shared/durable-jobs.ts). */
   | 'job'
+  /** A Claude Code cloud session run as a coworker; resourceId is the run id (src/shared/cloud.ts). */
+  | 'cloud'
 
 export type AgentProviderId = 'codex' | 'claude' | 'grok' | 'gemini' | 'qwen' | 'kimi' | 'local'
 export type AgentEffort = 'auto' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'

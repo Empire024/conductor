@@ -17,6 +17,7 @@ export const MUTATION_FAMILIES = {
     'loops.run', 'loops.record', 'loops.propose', 'loops.apply', 'loops.reject'
   ],
   nodes: ['nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove'],
+  cloud: ['cloud.start', 'cloud.send', 'cloud.interrupt', 'cloud.stop', 'cloud.attach', 'cloud.fetch'],
   other: [
     'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save',
     'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
@@ -39,7 +40,7 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'app.update.status', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
     'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get', 'ideas.runs',
-    'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log'
+    'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'cloud.list', 'cloud.status', 'cloud.transcript'
   ].map(method => `read:${method}` as const),
   ...[...FAMILY_OF.keys()].map(method => `mutation:${method}` as const)
 ])

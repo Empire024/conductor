@@ -152,7 +152,8 @@ describe('control method classes', () => {
       'projects.open', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm',
       'ideas.list', 'ideas.get', 'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
       'ideas.run', 'ideas.runs', 'ideas.run.approve', 'ideas.run.decide', 'ideas.run.pause', 'ideas.run.resume', 'ideas.run.stop',
-      'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove'
+      'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove',
+      'cloud.start', 'cloud.list', 'cloud.status', 'cloud.transcript', 'cloud.send', 'cloud.interrupt', 'cloud.stop', 'cloud.attach', 'cloud.fetch'
     ]
     const f = await fixture(async method => method === 'tools.list'
       ? Object.fromEntries(advertised.map(name => [name, 'signature']))

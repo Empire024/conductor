@@ -1,0 +1,39 @@
+.cloud-pane { min-width: 0; min-height: 0; flex: 1; overflow: hidden; display: flex; flex-direction: column; width: 100%; height: 100%; }
+.cloud-pane > header { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 6px 8px; align-items: center; border-bottom: 1px solid var(--border-soft); color: var(--text-3); font-size: 11px; }
+.cloud-pane > header strong { color: var(--text); font-size: 12px; max-width: 40ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cloud-pane > header code { color: var(--text-2); font-size: 10px; }
+.cloud-pane > header a { color: var(--blue); }
+.cloud-pane .cloud-spacer { flex: 1; }
+.cloud-pane button { display: inline-flex; align-items: center; gap: 5px; min-height: 22px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-2); background: var(--surface-2); font: inherit; font-size: 11px; cursor: pointer; }
+.cloud-pane button:hover:not(:disabled) { border-color: var(--accent-muted); color: var(--text); }
+.cloud-pane button:disabled { opacity: .55; cursor: default; }
+.cloud-status { text-transform: capitalize; font-size: 10px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--text-2); white-space: nowrap; }
+.cloud-status.status-working, .cloud-status.status-starting { color: var(--accent); border-color: var(--accent-muted); }
+.cloud-status.status-failed { color: var(--danger); border-color: var(--danger); }
+.cloud-result code { overflow-wrap: anywhere; }
+.cloud-result { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--border-soft); font-size: 11px; color: var(--text-2); }
+.cloud-result pre { flex-basis: 100%; margin: 0; max-height: 120px; overflow: auto; font-size: 10px; color: var(--text-3); }
+.cloud-error { padding: 6px 8px; color: var(--danger); font-size: 11px; white-space: pre-wrap; border-bottom: 1px solid var(--border-soft); }
+.cloud-terminal { flex: 1; min-height: 0; padding: 4px 0 0 6px; }
+.launcher-cloud-form { display: grid; gap: 8px; border: 1px solid var(--border); background: var(--surface-1); border-radius: 8px; padding: 12px; margin-top: 10px; }
+.launcher-cloud-form label { display: grid; gap: 4px; font-size: 10px; color: var(--text-3); text-transform: uppercase; }
+.launcher-cloud-form textarea, .launcher-cloud-form select { border: 1px solid var(--border); border-radius: 4px; background: var(--surface-0); color: var(--text); padding: 6px; font: inherit; font-size: 12px; text-transform: none; resize: vertical; }
+.launcher-cloud-form small { color: var(--text-3); font-size: 10px; line-height: 1.45; }
+.launcher-cloud-form .launcher-cloud-actions { display: flex; gap: 6px; }
+.launcher-cloud-form button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-2); color: var(--text); padding: 6px 9px; cursor: pointer; font-size: 11px; }
+.launcher-cloud-form button:disabled { opacity: .55; cursor: default; }
+.launcher-cloud-form .cloud-error { border: 0; padding: 0; }
+.cloud-usage { color: var(--text-3); font-size: 10px; white-space: nowrap; }
+.cloud-result small { flex-basis: 100%; color: var(--text-3); font-size: 10px; }
+.cloud-transcript { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 6px 8px; list-style: none; display: grid; align-content: start; gap: 4px; }
+.cloud-entry { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 8px; font-size: 11px; line-height: 1.45; border-top: 1px solid var(--border-soft); padding-top: 4px; }
+.cloud-entry span { color: var(--text-3); font-size: 9px; text-transform: uppercase; padding-top: 2px; }
+.cloud-entry p { margin: 0; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; }
+.cloud-entry.role-assistant p { color: var(--text); }
+.cloud-entry.role-tool p, .cloud-entry.role-result p { font-family: ui-monospace, monospace; font-size: 10px; color: var(--text-3); max-height: 8em; overflow: hidden; }
+.cloud-terminal.compact { flex: 0 0 140px; border-top: 1px solid var(--border-soft); }
+.cloud-status.status-pushed { color: var(--blue); }
+.cloud-status.status-running { color: var(--accent); border-color: var(--accent-muted); }
+.launcher-cloud-form input { border: 1px solid var(--border); border-radius: 4px; background: var(--surface-0); color: var(--text); padding: 6px; font: inherit; font-size: 12px; text-transform: none; }
+.cloud-pane > * { min-width: 0; max-width: 100%; }
+.cloud-pane > header > * { min-width: 0; }

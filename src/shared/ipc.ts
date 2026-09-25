@@ -59,6 +59,7 @@ export interface ConductorBridge {
   projectTasks: import('./project-backlog').ProjectBacklogBridge
   delivery: import('./delivery').DeliveryBridge
   durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
+  cloud: import('./cloud').CloudBridge
   ideas: import('./ideas').IdeasBridge
   ideaRuns: import('./idea-runs').IdeaRunsBridge
   logicLoops: import('./logic-loops').LogicLoopsBridge
