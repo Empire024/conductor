@@ -9,6 +9,7 @@ import { ClaudeAdapter, CLAUDE_COMPATIBILITY } from './providers/claude'
 import { JsonLineTransport } from './providers/transport'
 import { createApprovalRouting } from './approval-review-routing'
 import { ApprovalReviews } from './approval-review'
+import { sessionRules } from './approval-review-rules'
 import type { AgentControlDependencies } from './agent-control'
 import type { AgentSpec } from '../shared/models'
 import type { SessionSettings, TimelineItem } from '../shared/structured-agent'
@@ -28,6 +29,7 @@ afterEach(async () => {
   for (const database of databases.splice(0)) database.close()
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 })
   vi.unstubAllEnvs()
+  sessionRules.clear()
 })
 
 function harness(decision: 'allow' | 'deny' | 'escalate' | 'perhaps') {
@@ -79,9 +81,9 @@ describe('stronger-model review through real adapters (offline fixture, zero inf
     await vi.waitFor(() => expect(f.snapshot().phase).toBe('completed'), { timeout: 15000 })
     expect(readFileSync(join(f.workspace, 'panel.mjs'), 'utf8')).toBe(edited)
     expect(f.snapshot().items.find(item => item.data.type === 'tool' && item.data.name === 'Bash')?.data).toMatchObject({ status: 'completed', exitCode: 0 })
-    // One reviewer turn, closed after its decision; it never used a tool.
+    // One reviewer turn; the reviewer stays for the worker's next request (closed once idle), and it never used a tool.
     expect(f.opened).toHaveLength(1)
-    await vi.waitFor(() => expect(f.closed).toEqual(f.opened))
+    expect(f.closed).toEqual([])
     expect(f.snapshot(f.opened[0]).items.some(item => ['tool', 'interaction'].includes(item.data.type))).toBe(false)
     // The owner never answered: the journal names the reviewer model and turn, no owner answer,
     // and the observed execution result of the one exact action.

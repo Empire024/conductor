@@ -64,6 +64,28 @@ export const StructuredAgentTelemetry = memo(function StructuredAgentTelemetry({
   </div>
 })
 
+/** What stronger-model approval reviews have cost this worker, as the review gate last reported it
+ *  (approval-review-gate.ts publishes it as a payload notice, which is not a timeline row). */
+export interface ApprovalReviewUsageView { reviews: number; covered: number; rules: number; tokens: number | null; elapsedMs: number | null; budget: { used: number; cap: number } | null }
+export function approvalReviewUsageOf(items: TimelineItem[]): ApprovalReviewUsageView | undefined {
+  for (let index = items.length - 1; index >= 0; index--) {
+    const data = items[index]!.data
+    if (data.type !== 'notice' || !data.payload || typeof data.payload !== 'object' || Array.isArray(data.payload)) continue
+    const usage = (data.payload as Record<string, unknown>).approvalReviews
+    if (usage && typeof usage === 'object' && typeof (usage as ApprovalReviewUsageView).reviews === 'number') return usage as ApprovalReviewUsageView
+  }
+  return undefined
+}
+const compactTokens = (value: number): string => value >= 1_000_000 ? (value / 1_000_000).toFixed(1) + 'M' : value >= 1000 ? Math.round(value / 1000) + 'k' : String(value)
+export function approvalReviewLabel(usage: ApprovalReviewUsageView): { label: string; title: string; spent: boolean } {
+  const spent = Boolean(usage.budget && usage.budget.used >= usage.budget.cap)
+  const label = `Reviews ${usage.reviews}${usage.tokens !== null ? ' · ' + compactTokens(usage.tokens) + ' tok' : ''}${usage.budget ? ` · ${usage.budget.used}/${usage.budget.cap}` : ''}`
+  const title = [`Stronger-model approval reviews for this conversation: ${usage.reviews}${usage.tokens !== null ? `, ${usage.tokens.toLocaleString()} tokens` : ''}${usage.elapsedMs !== null ? `, ${Math.round(usage.elapsedMs / 1000)} s` : ''}.`,
+    `${usage.covered} more answered by ${usage.rules} session rule${usage.rules === 1 ? '' : 's'} without a review.`,
+    usage.budget ? `Task review budget: ${usage.budget.used} of ${usage.budget.cap} used${spent ? '; further approvals wait for you or a wizard.' : '.'}` : ''].filter(Boolean).join(' ')
+  return { label, title, spent }
+}
+
 /** Usage % and the view-usage entry point live on the composer control line, beside effort/model/mode. */
 export const StructuredUsageSummary = memo(function StructuredUsageSummary({ items: latest, runtimeId, truncated = false, modelLabel, agentSessionId, workspaceId }: { items: TimelineItem[]; runtimeId: string; truncated?: boolean; modelLabel?: string; agentSessionId?: string; workspaceId?: string }): React.JSX.Element {
   const items = useSettledItems(latest)
@@ -86,11 +108,13 @@ export const StructuredUsageSummary = memo(function StructuredUsageSummary({ ite
     return () => { active = false; window.clearInterval(timer) }
   }, [agentSessionId, workspaceId])
   const warning = useMemo(() => evaluateUsageWarning(summarizeUsageRun(items).conversation, cap), [items, cap])
+  const reviews = useMemo(() => { const usage = approvalReviewUsageOf(items); return usage && (usage.reviews || usage.covered) ? approvalReviewLabel(usage) : undefined }, [items])
   return <div className="sa-usage-summary">
     {context && context.percent >= 40 && <button type="button" className={'sa-context-circle level-' + context.level} aria-label={`Context ${Math.floor(context.percent)}% used`} title={`${Math.floor(context.percent)}% context used (${context.used.toLocaleString()} / ${context.capacity.toLocaleString()} tokens). ${context.percent >= 90 ? 'Context nearly full. Use /compact to make room.' : 'View context details.'}`} aria-expanded={open} onClick={() => setOpen(current => !current)}>
       <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><circle className="sa-context-track" cx="12" cy="12" r="9" /><circle className="sa-context-fill" cx="12" cy="12" r="9" pathLength="100" strokeDasharray={`${context.percent} 100`} transform="rotate(-90 12 12)" /></svg><span>{Math.floor(context.percent)}%</span>
     </button>}
     {warning && <span className={'sa-usage-warning level-' + warning.level} role="status" title={warning.detail}><Flame size={11} aria-hidden="true" /><span>{warning.level === 'high' ? 'Expensive' : 'Rising cost'}</span></span>}
+    {reviews && <span className={'sa-review-usage' + (reviews.spent ? ' spent' : '')} role="status" title={reviews.title}>{reviews.label}</span>}
     <button type="button" className="sa-usage-link" aria-expanded={open} onClick={() => setOpen(current => !current)}>View usage</button>
     {open && <AgentDialog title="Usage" onClose={() => setOpen(false)}><StructuredUsageContent items={items} truncated={truncated} modelLabel={modelLabel} agentSessionId={agentSessionId} workspaceId={workspaceId} /></AgentDialog>}
   </div>

@@ -6,9 +6,10 @@ import type { AgentSpec } from '../shared/models'
 import type { AdapterEvent, InteractionResponse, Json, SessionSettings } from '../shared/structured-agent'
 import { ApprovalReviewGate } from './approval-review-gate'
 import type { ReviewAction, ReviewResult } from './approval-review'
+import { sessionRules } from './approval-review-rules'
 
 const roots: string[] = []
-afterEach(() => { roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); vi.restoreAllMocks() })
+afterEach(() => { roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); vi.restoreAllMocks(); sessionRules.clear() })
 const tick = () => new Promise(resolve => setImmediate(resolve))
 function fixture() {
   const cwd = mkdtempSync(join(tmpdir(), 'approval-gate-')); roots.push(cwd)
@@ -35,6 +36,34 @@ function fixture() {
 }
 
 describe('host approval response gate (synthetic reviewers, no inference)', () => {
+  it('reviews each class of action once per worker and answers repeats from the session rule', async () => {
+    const f = fixture()
+    const sequence: Array<[string, Json, string]> = [
+      ['a', { command: 'npm test' }, 'Bash'], ['b', { command: 'npm test -- --run x' }, 'Bash'], ['c', { command: 'npx tsc --noEmit' }, 'Bash'],
+      ['d', { file_path: 'panel.txt', content: 'one' }, 'Write'], ['e', { file_path: 'other.txt', content: 'two' }, 'Write'], ['f', { command: 'npx tsc --noEmit -p x' }, 'Bash'], ['g', { command: 'npm test' }, 'Bash']
+    ]
+    for (const [id, args, tool] of sequence) {
+      f.gate.intercept(f.spec, 'runtime', f.request(id, args, tool))
+      await vi.waitFor(() => expect(f.responses.map(response => response.requestId)).toContain(id))
+      // The native tool ran: a later identical command is new work, not a replay.
+      f.gate.intercept(f.spec, 'runtime', { itemId: 'tool-' + id, data: { type: 'tool', name: tool, status: 'completed' } } as AdapterEvent)
+    }
+    expect(f.responses.every(response => response.decision === 'allow')).toBe(true)
+    expect(f.run).toHaveBeenCalledTimes(3)
+    expect(f.run.mock.calls.map(call => call[1].tool)).toEqual(['Bash', 'Bash', 'Write'])
+    const usage = f.publications.map(event => event.data).filter(data => data.type === 'notice').at(-1)
+    expect(usage).toMatchObject({ payload: { approvalReviews: { reviews: 3, covered: 4, rules: 3 } } })
+    expect(sessionRules.list({ workerId: 'worker', runtimeId: 'runtime' }).map(rule => rule.key).sort()).toEqual(['Bash:npm test', 'Bash:npx tsc', 'edit:workspace'])
+  })
+
+  it('never answers from a session rule what reaches an owner-only boundary', async () => {
+    const f = fixture()
+    sessionRules.add({ workerId: 'worker', runtimeId: 'runtime' }, { key: 'Bash:Remove-Item -Recurse', source: 'wizard', by: 'test', at: 'now', example: 'Bash' })
+    f.gate.intercept(f.spec, 'runtime', f.request('danger', { command: 'Remove-Item -Recurse -Force C:\\Users\\owner\\Documents\\old' }, 'Bash'))
+    await f.waitPhase('blocked')
+    expect(f.responses).toHaveLength(0)
+  })
+
   it('reviews and answers a production native write without any executor contract, so the owner is not asked', async () => {
     const f = fixture()
     delete f.gate.routing!.supportsExactExecution

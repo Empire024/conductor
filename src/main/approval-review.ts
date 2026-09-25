@@ -17,6 +17,10 @@ export interface ReviewRecord {
   reviewerElapsedMs?: number; reviewerUsage?: Json
   ownerAnswer?: 'allow' | 'deny'; grantScope: 'exact-action'; createdAt: string; updatedAt: string
   denied?: boolean
+  /** The worker's session rule (approval-review-rules.ts) that answered this action without a reviewer turn. */
+  coveredBy?: string
+  /** Who answered instead of the reviewer or the owner's card: a wizard tab or the owner's control credential. */
+  answeredBy?: string
   history: Array<{ at: string; phase: ReviewPhase; rationale: string }>
 }
 export interface ReviewResult { decision: 'allow' | 'deny' | 'escalate'; rationale: string; digest: string; reviewerId: string; model: string; turnId: string; elapsedMs?: number; usage?: Json }
@@ -37,6 +41,9 @@ const requestKey = (action: ReviewAction) => hash([action.workerId, action.runti
 const operationKey = (action: ReviewAction) => hash([action.projectId, action.machineId, action.tool, action.arguments, action.paths])
 // A denial conservatively fences the target, including changed contents and another worker/tool.
 const targetKeys = (action: ReviewAction) => (action.paths.length ? action.paths : ['*']).map(path => hash([action.projectId, action.machineId, path]))
+/** A response intent whose native tool result was observed: a later identical request is new work, not a replay. */
+const concluded = (record: ReviewRecord) => record.history.some(entry => entry.phase === 'executed' || entry.phase === 'execution-failed')
+const intended = (record: ReviewRecord) => record.history.some(entry => entry.phase === 'responding')
 const safe = (text: string) => text.replace(/Bearer\s+\S+|(?:sk-|ghp_|github_pat_)[A-Za-z0-9_-]+/gi, '[credential redacted]').replace(/((?:password|token|secret|api[_-]?key)\s*[=:]\s*)[^\s,;]+/gi, '$1[redacted]').slice(0, 1600)
 
 /** Host-only journal. Persist response intent before transport; never replay an uncertain allow.
@@ -54,6 +61,11 @@ export class ApprovalReviews {
   }
   get(projectId: string, id: string): ReviewRecord | undefined { return this.records(projectId).find(record => record.id === id) }
   lookup(action: ReviewAction): ReviewRecord | undefined { return this.records(action.projectId).find(record => record.requestKey === requestKey(action)) }
+  /** The record of one native request, found by its identity alone. */
+  forRequest(projectId: string, workerId: string, runtimeId: string, requestId: string): ReviewRecord | undefined {
+    const key = hash([workerId, runtimeId, requestId])
+    return this.records(projectId).find(record => record.requestKey === key)
+  }
   /** The reviews raised for one worker's requests, for its usage attribution. */
   forWorker(projectId: string, workerId: string): ReviewRecord[] { return this.records(projectId).filter(record => record.workerId === workerId) }
   hasDenials(projectId: string): boolean { return this.records(projectId).some(record => record.denied) }
@@ -80,7 +92,9 @@ export class ApprovalReviews {
     const at = new Date().toISOString(), message = safe(rationale)
     return this.save({ ...record, ...extra, ...(phase === 'denied' ? { denied: true } : {}), phase, rationale: message, updatedAt: at, history: [...record.history, { at, phase, rationale: message }] })
   }
-  async review(action: ReviewAction, run: (digest: string) => Promise<ReviewResult>, changed: (record: ReviewRecord) => void): Promise<ReviewRecord> {
+  /** Reviews one action, or with `rule` answers it from the worker's session rule: the same fences
+   *  (durable denial, replay, uncertain target, unsupported boundary) apply first either way. */
+  async review(action: ReviewAction, run: (digest: string) => Promise<ReviewResult>, changed: (record: ReviewRecord) => void, rule?: { key: string; rationale: string }): Promise<ReviewRecord> {
     const key = requestKey(action), digest = actionDigest(action)
     const existing = this.lookup(action)
     if (existing && existing.digest !== digest) return this.transition(existing, 'blocked', 'Native request identity was reused with changed arguments or authority; no response will be replayed')
@@ -93,17 +107,18 @@ export class ApprovalReviews {
     }
     const at = new Date().toISOString()
     const operation = operationKey(action)
-    const replay = this.records(action.projectId).find(record => record.operationKey === operation && record.history.some(entry => entry.phase === 'responding'))
+    const replay = this.records(action.projectId).find(record => record.operationKey === operation && intended(record) && !concluded(record))
     // Only a concrete path carries an execution uncertainty forward; a pathless request (the
     // wildcard target) would otherwise fence every later command of the project behind the first
     // one whose completion was never observed.
     const concrete = action.paths.length ? targetKeys(action) : []
-    const uncertain = this.records(action.projectId).some(record => record.history.some(entry => entry.phase === 'responding') && !record.history.some(entry => ['executed', 'execution-failed'].includes(entry.phase)) && record.targetKeys.some(key => concrete.includes(key)))
+    const uncertain = this.records(action.projectId).some(record => intended(record) && !concluded(record) && record.targetKeys.some(key => concrete.includes(key)))
     let record = this.save({ id: randomUUID(), digest, requestKey: key, operationKey: operation, targetKeys: targetKeys(action), projectId: action.projectId, machineId: action.machineId, workerId: action.workerId, runtimeId: action.runtimeId, requestId: action.requestId, phase: 'reviewing', rationale: 'Waiting for a stronger reviewing turn', grantScope: 'exact-action', createdAt: at, updatedAt: at, history: [] })
     if (this.denied(action)) return this.transition(record, 'denied', 'A durable denial covers this target. Another worker, argument or tool route cannot retry it')
     if (replay) return this.transition(record, 'blocked', 'This logical operation already has a native response intent. Reconnect or replacement requests cannot execute it again')
     if (uncertain) return this.transition(record, 'blocked', 'A prior action on this target has no conclusive execution result; another route cannot retry it')
     if (action.boundary === 'unsupported') return this.transition(record, 'blocked', action.reason)
+    if (rule) return action.boundary === 'workspace-write' ? this.transition(record, 'approved', rule.rationale, { coveredBy: rule.key }) : this.transition(record, 'blocked', 'A session rule never answers a native owner boundary')
     changed(record)
     const promise = (async () => {
       try {
@@ -125,19 +140,28 @@ export class ApprovalReviews {
     try { return await promise } finally { this.inFlight.delete(key) }
   }
   /** One narrow response grant. Host revalidates live payload and restrictions immediately first. */
-  reserve(action: ReviewAction, ownerAnswer?: 'allow' | 'deny'): ReviewRecord {
+  reserve(action: ReviewAction, ownerAnswer?: 'allow' | 'deny', answeredBy?: string): ReviewRecord {
     const record = this.lookup(action)
     if (!record || record.digest !== actionDigest(action)) throw new Error('Approval does not match the current action')
     if (ownerAnswer) {
       if (record.phase !== 'owner') throw new Error('Owner approval is available only after explicit reviewer escalation')
-      if (ownerAnswer === 'deny') return this.transition(record, 'denied', 'Owner denied this action and target', { ownerAnswer })
+      if (ownerAnswer === 'deny') return this.transition(record, 'denied', answeredBy ? `${answeredBy} denied this action and target` : 'Owner denied this action and target', { ownerAnswer, ...(answeredBy ? { answeredBy } : {}) })
     } else if (!['approved', 'denied'].includes(record.phase)) throw new Error('There is no unconsumed review decision')
     if ((ownerAnswer === 'allow' || record.phase === 'approved') && this.denied(action)) throw new Error('A durable denial covers this action target')
     if (ownerAnswer === 'allow' || record.phase === 'approved') {
       const peers = this.records(action.projectId).filter(peer => peer.id !== record.id)
       const keys = action.paths.length ? targetKeys(action) : []
-      if (peers.some(peer => peer.history.some(entry => entry.phase === 'responding') && (peer.operationKey === record.operationKey || !peer.history.some(entry => ['executed', 'execution-failed'].includes(entry.phase)) && peer.targetKeys.some(key => keys.includes(key))))) throw new Error('A competing operation already reserved this mutation or target; duplicate execution refused')
+      if (peers.some(peer => intended(peer) && !concluded(peer) && (peer.operationKey === record.operationKey || peer.targetKeys.some(key => keys.includes(key))))) throw new Error('A competing operation already reserved this mutation or target; duplicate execution refused')
     }
-    return this.transition(record, 'responding', 'Response intent persisted before native transport; it must not be replayed', ownerAnswer ? { ownerAnswer } : {})
+    return this.transition(record, 'responding', (answeredBy ? answeredBy + ' answered. ' : '') + 'Response intent persisted before native transport; it must not be replayed', { ...(ownerAnswer ? { ownerAnswer } : {}), ...(answeredBy ? { answeredBy } : {}) })
+  }
+  /** A wizard's (or the owner credential's) answer to a request no review was bound to: journaled
+   *  for the audit, without a response-intent fence, because nothing here tracks its execution. */
+  answered(request: Pick<ReviewAction, 'projectId' | 'machineId' | 'workerId' | 'runtimeId' | 'requestId' | 'tool' | 'arguments' | 'paths'>, answeredBy: string, decision: string, reason: string): ReviewRecord {
+    const at = new Date().toISOString(), key = hash([request.workerId, request.runtimeId, request.requestId]), rationale = safe(`${answeredBy} answered ${decision}: ${reason}`)
+    const existing = this.records(request.projectId).find(record => record.requestKey === key)
+    if (existing) return this.save({ ...existing, answeredBy, phase: 'responded', rationale, updatedAt: at, history: [...existing.history, { at, phase: 'responded', rationale }] })
+    return this.save({ id: randomUUID(), digest: hash(request), requestKey: key, operationKey: hash([request.projectId, request.machineId, request.tool, request.arguments, request.paths]), targetKeys: [], projectId: request.projectId, machineId: request.machineId,
+      workerId: request.workerId, runtimeId: request.runtimeId, requestId: request.requestId, phase: 'responded', rationale, answeredBy, grantScope: 'exact-action', createdAt: at, updatedAt: at, history: [{ at, phase: 'responded', rationale }] })
   }
 }

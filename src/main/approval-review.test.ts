@@ -161,4 +161,36 @@ describe('ApprovalReviews', () => {
     expect(reruns).toBe(0)
     expect(approved.id).toBe(recovered.id)
   })
+
+  it('treats an identical request after an observed execution as new work, not a replay', async () => {
+    const journal = new ApprovalReviews(new MemoryPersistence()), command = { tool: 'Bash', arguments: { command: 'npm test' }, paths: [] }
+    const first = action({ ...command, requestId: 'run-1' })
+    await journal.review(first, async digest => result(digest), unchanged)
+    const reserved = journal.reserve(first)
+    journal.transition(journal.transition(reserved, 'responded', 'delivered'), 'executed', 'Native tool reported completed')
+    const again = action({ ...command, requestId: 'run-2' })
+    expect((await journal.review(again, async digest => result(digest), unchanged)).phase).toBe('approved')
+    expect(journal.reserve(again).phase).toBe('responding')
+  })
+
+  it('answers from a session rule without a reviewer turn, behind the same fences', async () => {
+    const journal = new ApprovalReviews(new MemoryPersistence())
+    let runs = 0
+    const covered = await journal.review(action({ requestId: 'ruled' }), async digest => { runs++; return result(digest) }, unchanged, { key: 'edit:workspace', rationale: 'Covered by rule' })
+    expect(covered).toMatchObject({ phase: 'approved', coveredBy: 'edit:workspace' })
+    expect(covered.reviewerId).toBeUndefined()
+    const owner = await journal.review(action({ requestId: 'owner-boundary', boundary: 'native-owner' }), async digest => { runs++; return result(digest) }, unchanged, { key: 'edit:workspace', rationale: 'Covered by rule' })
+    expect(owner.phase).toBe('blocked')
+    expect(runs).toBe(0)
+  })
+
+  it('journals a wizard answer to a request no review was bound to, attributed and without a replay fence', async () => {
+    const journal = new ApprovalReviews(new MemoryPersistence())
+    const record = journal.answered({ projectId: 'project-1', machineId: 'local', workerId: 'worker-1', runtimeId: 'runtime-1', requestId: 'asked', tool: 'Bash', arguments: { command: 'npm test' }, paths: [] }, 'Wizard agent-w', 'allow (once)', 'the task runs its tests')
+    expect(record).toMatchObject({ phase: 'responded', answeredBy: 'Wizard agent-w' })
+    expect(record.rationale).toContain('the task runs its tests')
+    expect(journal.forRequest('project-1', 'worker-1', 'runtime-1', 'asked')?.id).toBe(record.id)
+    const later = action({ tool: 'Bash', arguments: { command: 'npm test' }, paths: [], requestId: 'later' })
+    expect((await journal.review(later, async digest => result(digest), unchanged)).phase).toBe('approved')
+  })
 })

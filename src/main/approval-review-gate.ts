@@ -5,6 +5,7 @@ import type { AgentSpec } from '../shared/models'
 import type { AdapterEvent, InteractionResponse, Json, PendingInteraction, SessionSettings } from '../shared/structured-agent'
 import { workspacePath } from './agent-artifacts'
 import { ApprovalReviews, actionDigest, canonicalAction, type ReviewAction, type ReviewPersistence, type ReviewRecord, type ReviewResult } from './approval-review'
+import { commandClass, sessionRules } from './approval-review-rules'
 import { ownerOnlyEscalation } from './providers/codex'
 import { sanitizeDiagnostic } from './structured-store'
 
@@ -18,14 +19,36 @@ function boundedArguments(value: Json): Json {
   return { truncatedForReview: true, totalChars: canonical.length, preview: canonical.slice(0, REVIEWER_ARGUMENT_CHARS) }
 }
 /** The text a command-like request acts through, for the owner-only boundary check. */
-function reachOf(input: Record<string, Json>): string {
+export function reachOf(input: Record<string, Json>): string {
   const parts: string[] = []
   for (const key of ['command', 'cmd', 'commands', 'permissions', 'grantRoot', 'changes', 'file_path', 'notebook_path', 'path', 'url'] as const) if (input[key] !== undefined) parts.push(canonicalAction(input[key]))
   return parts.join('\n')
 }
 
+/** Who answers the next owner-path response to one request instead of the owner's card: set by
+ *  agents.approve (wizard-approvals.ts) just before it responds, consumed by reserve(). */
+const attributions = new Map<string, string>()
+const attributionKey = (response: Pick<InteractionResponse, 'sessionId' | 'runtimeId' | 'requestId'>) => canonicalAction([response.sessionId, response.runtimeId, response.requestId])
+/** Returns a check to run after the response: true when a bound review journaled the answer. */
+export function attributeAnswer(response: Pick<InteractionResponse, 'sessionId' | 'runtimeId' | 'requestId'>, answeredBy: string): () => boolean {
+  const key = attributionKey(response)
+  attributions.set(key, answeredBy)
+  return () => !attributions.delete(key)
+}
+/** The review cost line a worker's usage summary shows (a payload notice, so not a timeline row). */
+export interface ApprovalReviewUsage { reviews: number; covered: number; rules: number; tokens: number | null; elapsedMs: number | null; budget: { used: number; cap: number } | null }
+export const APPROVAL_REVIEW_USAGE_ITEM = 'approval-review-usage'
+const tokenTotal = (usage: Json | undefined): number | undefined => {
+  const report = object(usage), tokens = object(object(report.run).tokens ?? object(report.conversation).tokens)
+  const value = (key: string) => typeof tokens[key] === 'number' ? tokens[key] as number : 0
+  const total = typeof tokens.totalTokens === 'number' ? tokens.totalTokens : value('inputTokens') + value('outputTokens') + value('cacheCreationTokens') + value('cachedTokens')
+  return total > 0 ? total : undefined
+}
+
 export interface ApprovalReviewRouting {
   enabled(spec: AgentSpec): boolean
+  /** Reviews spent and allowed for the owner task this action belongs to. */
+  budget?(action: ReviewAction): { used: number; cap: number }
   authorization(spec: AgentSpec): { text: string; id: string; ownerTaskId?: string }
   run(spec: AgentSpec, action: ReviewAction, digest: string): Promise<ReviewResult>
   /** @deprecated Never consulted since 18312fd: the owner accepted review without execution-time
@@ -140,7 +163,17 @@ export class ApprovalReviewGate {
   }
   private async prepare(binding: Binding): Promise<void> {
     binding.action = await this.action(binding)
-    const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => { if (!binding.settled) this.update(binding, record) })
+    // A class this worker was already allowed in this session is answered from that rule: the
+    // journal still records it and every fence still applies, but no reviewer turn is paid for.
+    const scope = { workerId: binding.spec.id, runtimeId: binding.runtimeId }
+    const rule = sessionRules.covering(scope, { ...binding.action, cwd: binding.spec.cwd })
+    const covered = rule && { key: rule.key, rationale: `Covered by this conversation's session rule "${rule.key}" (${rule.source === 'wizard' ? 'allowed for the session by ' + rule.by : 'first allowed by the ' + rule.by + ' review'}); no new review` }
+    const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => { if (!binding.settled) this.update(binding, record) }, covered)
+    if (record.phase === 'approved' && record.reviewerId && !record.coveredBy) {
+      const key = commandClass({ ...binding.action, cwd: binding.spec.cwd })
+      if (key) sessionRules.add(scope, { key, source: 'review', recordId: record.id, by: record.reviewerModel ?? 'stronger', at: record.updatedAt, example: binding.action.tool })
+    }
+    this.report(binding)
     // An owner who answered meanwhile has already settled the record; the reviewer's late word is not used.
     if (binding.settled) return
     this.update(binding, record)
@@ -150,6 +183,26 @@ export class ApprovalReviewGate {
       if (!binding.interaction.choices.some(choice => choice.id === decision && !choice.disabled)) { this.update(binding, this.journal.transition(record, 'blocked', 'Native provider did not offer the exact one-action response')); return }
       await this.respond({ sessionId: binding.spec.id, runtimeId: binding.runtimeId, requestId: binding.interaction.id, decision })
     }
+  }
+  /** What the worker's reviews cost so far, for its usage line (StructuredUsageSummary). */
+  usage(spec: AgentSpec, action?: ReviewAction): ApprovalReviewUsage {
+    const records = this.journal.forWorker(spec.projectId, spec.id)
+    const reviewed = records.filter(record => record.reviewerId && !record.coveredBy)
+    let tokens = 0, counted = false, elapsed = 0, timed = false
+    for (const record of reviewed) {
+      const total = tokenTotal(record.reviewerUsage)
+      if (total !== undefined) { tokens += total; counted = true }
+      if (typeof record.reviewerElapsedMs === 'number') { elapsed += record.reviewerElapsedMs; timed = true }
+    }
+    return { reviews: reviewed.length, covered: records.filter(record => record.coveredBy).length, rules: action ? sessionRules.list({ workerId: spec.id, runtimeId: action.runtimeId }).length : 0, tokens: counted ? tokens : null, elapsedMs: timed ? elapsed : null, budget: action && this.routing?.budget ? this.routing.budget(action) : null }
+  }
+  private report(binding: Binding): void {
+    try {
+      const usage = this.usage(binding.spec, binding.action)
+      const cost = [usage.tokens !== null ? `${usage.tokens.toLocaleString('en-US')} tokens` : '', usage.elapsedMs !== null ? `${Math.round(usage.elapsedMs / 1000)} s` : ''].filter(Boolean).join(', ')
+      const message = `Approval reviews: ${usage.reviews}${cost ? ` (${cost})` : ''}; ${usage.covered} answered by ${usage.rules} session rule${usage.rules === 1 ? '' : 's'}${usage.budget ? `; task budget ${usage.budget.used}/${usage.budget.cap}` : ''}`
+      this.publish(binding.spec.id, binding.runtimeId, { itemId: APPROVAL_REVIEW_USAGE_ITEM, data: { type: 'notice', message, payload: { approvalReviews: usage as unknown as Json } } })
+    } catch { /* The cost line is informational; it never holds up an answer. */ }
   }
   /** The automatic path is strict: an exact, unchanged action and a matching reviewer decision, or
    *  nothing is sent. The owner's path always passes. A review that never reached a record, one
@@ -172,14 +225,16 @@ export class ApprovalReviewGate {
       return binding.record
     }
     binding.settled = 'owner'
+    const answeredBy = attributions.get(attributionKey(response))
+    attributions.delete(attributionKey(response))
     if (record?.phase === 'owner' && binding.action && (decision === 'allow' || decision === 'deny')) {
       try {
         const current = await this.action(binding)
-        if (actionDigest(current) === actionDigest(binding.action)) { binding.record = this.journal.reserve(current, decision); return binding.record }
+        if (actionDigest(current) === actionDigest(binding.action)) { binding.record = this.journal.reserve(current, decision, answeredBy); return binding.record }
       } catch { /* The exact-action grant cannot be journaled; the owner's answer still goes through below. */ }
     }
     if (record && !SETTLED_PHASES.includes(record.phase)) {
-      binding.record = this.journal.transition(record, 'responding', `Owner answered while the review was ${record.phase}; the reviewer's result is not used`, decision === 'allow' || decision === 'deny' ? { ownerAnswer: decision } : {})
+      binding.record = this.journal.transition(record, 'responding', `${answeredBy ?? 'Owner'} answered while the review was ${record.phase}; the reviewer's result is not used`, { ...(decision === 'allow' || decision === 'deny' ? { ownerAnswer: decision } : {}), ...(answeredBy ? { answeredBy } : {}) })
       return binding.record
     }
     return undefined
