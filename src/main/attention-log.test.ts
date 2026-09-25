@@ -57,7 +57,22 @@ describe('attention verdicts', () => {
     expect(attentionVerdict(refused, { open: true, state: 'working', items: [denialItem] })).toEqual({ verdict: 'undecided' })
     expect(attentionVerdict(refused, { open: true, state: 'working', items: [denialItem, tool] })).toEqual({ verdict: 'settled', outcome: 'routed-around', next: 'The agent went another way: 1 tool call since.' })
     expect(attentionVerdict(refused, { open: true, state: 'attention', pendingId: 'q-1', items: [denialItem] })).toMatchObject({ verdict: 'settled', outcome: 'routed-around' })
-    expect(attentionVerdict(refused, { open: true, state: 'done', items: [denialItem, item(3, { type: 'text', role: 'assistant', text: 'I could not push.', mode: 'snapshot' })] })).toMatchObject({ verdict: 'blocked' })
+  })
+
+  it('reads a refusal followed by a stopped turn as blocked only when the turn ends asking the owner', () => {
+    const ended = (...texts: string[]): AttentionView => ({ open: true, state: 'done', items: [denialItem, ...texts.map((text, index) => item(3 + index, { type: 'text', role: 'assistant', text, mode: 'snapshot' }))] })
+    // VR2 N1d: a turn that ends with a statement went another way; only a turn that asks the owner waits on them.
+    expect(attentionVerdict(refused, ended('Pushing is blocked in this mode, so the commit stays local; the controller publishes the batch. Done.'))).toEqual({ verdict: 'settled', outcome: 'routed-around', next: 'The turn ended after the refusal without asking the owner.' })
+    expect(attentionVerdict(refused, ended('I could not push.'))).toMatchObject({ verdict: 'settled', outcome: 'routed-around' })
+    expect(attentionVerdict(refused, { open: true, state: 'done', items: [denialItem] })).toEqual({ verdict: 'settled', outcome: 'routed-around', next: 'The turn ended after the refusal and said nothing more.' })
+    // VR2 N1e: the turn asks the owner.
+    expect(attentionVerdict(refused, ended('The push was refused. Can you allow it or push for me?'))).toEqual({ verdict: 'blocked', next: 'The turn stopped after the refusal and asked the owner.' })
+    expect(attentionVerdict(refused, ended('The push was refused.', 'Please approve the push, then I will continue.'))).toMatchObject({ verdict: 'blocked' })
+    expect(attentionVerdict(refused, ended('## Needs from you\n- Push main from your terminal; auto mode refuses it.\n\n## Results\nCommitted locally.'))).toMatchObject({ verdict: 'blocked' })
+    expect(attentionVerdict(refused, ended('## Needs from you\nNone.\n\n## Results\nCommitted locally; the controller publishes.'))).toMatchObject({ verdict: 'settled', outcome: 'routed-around' })
+    // A rhetorical question mid-report, or a question mark inside code, is not a question to the owner.
+    expect(attentionVerdict(refused, ended('Why was it refused? Pushing to main is blocked in auto mode.\n\nSo I committed locally and stopped there.'))).toMatchObject({ verdict: 'settled' })
+    expect(attentionVerdict(refused, ended('Committed locally; `git push origin main?` is the controller\'s step.'))).toMatchObject({ verdict: 'settled' })
   })
 })
 

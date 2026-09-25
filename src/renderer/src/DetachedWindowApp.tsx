@@ -190,6 +190,18 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     setClosedTabs(existing => existing.filter(tab => !tabIds.includes(tab.id)))
   }, [setLayout])
 
+  // The window's own close (title-bar x): the same working-tab question as the tab x. The main
+  // window offers the undo, since this one is gone by then.
+  useEffect(() => window.conductor.window.onCloseRequested(id => {
+    window.conductor.window.answerClose(id, 'asking')
+    const current = layoutRef.current
+    const tabs = current ? listGroups(current.root).flatMap(group => group.tabs) : []
+    void guardTabClose(tabs).then(
+      working => window.conductor.window.answerClose(id, working ? working.map(item => item.tab.resourceId!) : null),
+      () => window.conductor.window.answerClose(id, null)
+    )
+  }), [])
+
   useEffect(() => {
     const closeRequested = (): void => {
       const current = layoutRef.current

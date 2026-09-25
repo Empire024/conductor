@@ -518,7 +518,7 @@ describe('notifications', () => {
     expect(fix.service.streamCount()).toBe(0)
   })
 
-  it('holds a claude auto-mode classifier denial and pushes it only once the turn stops on it, never twice', async () => {
+  it('holds a claude auto-mode classifier denial and pushes it only once the turn stops on it asking the owner, never twice', async () => {
     const fix = fixture()
     const phone = pairPhone(fix.service)
     fix.service.setSubscription(phone.id, { endpoint: 'https://push.example/sub', keys: { p256dh: 'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } })
@@ -537,9 +537,10 @@ describe('notifications', () => {
     // Still thinking after the grace period, with no other route taken yet: undecided, nothing sent.
     await vi.advanceTimersByTimeAsync(ATTENTION_GRACE_MS)
     expect(fix.push).not.toHaveBeenCalled()
-    // The result frame confirms the same item and the turn stops on the refusal: the finish is
-    // announced, and so is the refusal it stopped on, once.
-    fix.projections.set('agent-1', projection('agent-1', { phase: 'completed', items: [{ ...denied, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload(denial, true) } }] }))
+    // The result frame confirms the same item and the turn stops on the refusal asking the owner:
+    // the finish is announced, and so is the refusal it stopped on, once.
+    const asks = item(3, { type: 'text', role: 'assistant', text: 'The edit was refused. Can you allow it?', mode: 'snapshot' })
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'completed', items: [{ ...denied, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload(denial, true) } }, asks] }))
     fix.activity.set('agent-1', 'complete')
     fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 3, data: { type: 'notice' } }])
     await vi.advanceTimersByTimeAsync(500)

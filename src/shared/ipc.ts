@@ -273,7 +273,11 @@ export interface ConductorBridge {
     getDetached(id: string): Promise<{ record: DetachedWindowRecord; project: ProjectRecord; session: SessionRecord } | null>
     saveDetached(id: string, layout: WorkspaceLayout, maximizedGroupId: string | null): Promise<void>
     flushDetached(id: string, layout: WorkspaceLayout, maximizedGroupId: string | null): void
-    onDetachedClosed(callback: (payload: { sessionId: string }) => void): () => void
+    /** `working`: agent sessions whose working tabs the owner agreed to close with the window. */
+    onDetachedClosed(callback: (payload: { sessionId: string; working?: string[] }) => void): () => void
+    /** The window's own close asks first: answer 'asking' at once, then the agreed working sessions, or null to keep the window. */
+    onCloseRequested(callback: (id: number) => void): () => void
+    answerClose(id: number, working: string[] | null | 'asking'): void
   }
   platform: NodeJS.Platform
 }

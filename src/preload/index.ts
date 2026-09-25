@@ -374,7 +374,9 @@ const bridge: ConductorBridge = {
     flushDetached: (id, layout, maximizedGroupId) => {
       ipcRenderer.sendSync('window:flush-detached', id, layout, maximizedGroupId)
     },
-    onDetachedClosed: (callback) => subscribe('detached:closed', callback)
+    onDetachedClosed: (callback) => subscribe('detached:closed', callback),
+    onCloseRequested: (callback) => subscribe('window:close-requested', callback),
+    answerClose: (id, working) => ipcRenderer.send('window:close-answer', id, working)
   },
   platform: process.platform
 }

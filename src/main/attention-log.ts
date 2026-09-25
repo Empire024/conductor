@@ -51,6 +51,27 @@ function interactionOf(items: readonly TimelineItem[], id: string | undefined): 
   return undefined
 }
 
+const NOTHING_NEEDED = /^(none|nothing|n\/a|no action|no owner)/i
+const OWNER_REQUEST = /\b(can|could|would|will) you\b|\bplease (allow|approve|confirm|grant|run|push|decide|choose|pick|check|answer|reply|let me)\b|\b(need|needs|want) (you|your)\b|\blet me know\b|\b(waiting|wait) (for|on) (you|your)\b|\byour (call|decision|approval|go-ahead|answer)\b|\bshould I\b|\bdo you want\b/i
+
+/** Whether a stopped turn's last words ask the owner for something: a question to the owner, a
+ *  request for the owner's action or decision, or a "Needs from you" section that is not "none".
+ *  Code is ignored, and only the closing paragraph counts for questions and requests, so a
+ *  rhetorical question mid-report or a finished statement is not read as waiting on the owner. */
+export function asksOwner(text: string): boolean {
+  const prose = text.replace(/```[\s\S]*?(```|$)/g, ' ').replace(/`[^`\n]*`/g, ' ').trim()
+  if (!prose) return false
+  const needs = /needs? from you\b/i.exec(prose)
+  if (needs) {
+    // What follows the heading, markdown stripped: "none" means the report asks nothing.
+    const after = prose.slice(needs.index + needs[0].length, needs.index + needs[0].length + 200).replace(/[#*_|>:\-–—\s]+/g, ' ').trim()
+    if (after && !NOTHING_NEEDED.test(after)) return true
+  }
+  const last = prose.split(/\n\s*\n/).map(paragraph => paragraph.trim()).filter(Boolean).at(-1) ?? ''
+  const closing = last.split(/(?<=[.!?])\s+/).slice(-2)
+  return closing.some(sentence => /\?[\s*_)"']*$/.test(sentence)) || OWNER_REQUEST.test(closing.join(' '))
+}
+
 /** Whether the moment still holds the turn on the owner. Pure, so each rule is testable alone. */
 export function attentionVerdict(candidate: AttentionCandidate, view: AttentionView | undefined): AttentionVerdict {
   if (!view?.open) return { verdict: 'settled', outcome: 'closed', next: 'The tab was closed.' }
@@ -61,7 +82,10 @@ export function attentionVerdict(candidate: AttentionCandidate, view: AttentionV
     if (tools) return { verdict: 'settled', outcome: 'routed-around', next: `The agent went another way: ${tools} tool call${tools === 1 ? '' : 's'} since.` }
     if (view.state === 'attention') return { verdict: 'settled', outcome: 'routed-around', next: 'The agent asked the owner instead; that request is judged on its own.' }
     if (view.state === 'working' || view.state === 'limited') return { verdict: 'undecided' }
-    return { verdict: 'blocked', next: 'The turn stopped after the refusal and is waiting for the owner.' }
+    // The turn stopped: it waits on the owner only if its last words ask the owner for something.
+    const said = since.reduce((text, item) => item.data.type === 'text' && item.data.role === 'assistant' ? text + (item.data.mode === 'delta' ? '' : '\n\n') + item.data.text : text, '')
+    if (asksOwner(said)) return { verdict: 'blocked', next: 'The turn stopped after the refusal and asked the owner.' }
+    return { verdict: 'settled', outcome: 'routed-around', next: said.trim() ? 'The turn ended after the refusal without asking the owner.' : 'The turn ended after the refusal and said nothing more.' }
   }
   const interaction = interactionOf(view.items, candidate.pendingId)
   if (view.state === 'attention' && view.pendingId === candidate.pendingId) {

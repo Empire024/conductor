@@ -1255,10 +1255,17 @@ export function App(): React.JSX.Element {
 
   const agentConfirm = useAgentConfirm()
 
-  useEffect(() => window.conductor.window.onDetachedClosed(({ sessionId }) => {
-    if (!activeProjectId || !sessions.some((session) => session.id === sessionId)) return
-    void window.conductor.sessions.list(activeProjectId).then(setSessions)
-  }), [activeProjectId, sessions])
+  useEffect(() => window.conductor.window.onDetachedClosed(({ sessionId, working = [] }) => {
+    const stop = (ids: string[]): void => { for (const id of ids) void window.conductor.structured.interrupt(id).catch(() => undefined) }
+    if (!activeProjectId || !sessions.some((session) => session.id === sessionId)) { stop(working); return }
+    void window.conductor.sessions.list(activeProjectId).then((listed) => {
+      setSessions(listed)
+      // Working tabs the owner closed with their window: undo for a few seconds, then stop.
+      const closed = listed.find((session) => session.id === sessionId)?.closedTabs.filter((tab) => tab.resourceId && working.includes(tab.resourceId)) ?? []
+      stop(working.filter((id) => !closed.some((tab) => tab.resourceId === id)))
+      if (closed.length) offerUndo(closed.map((tab) => ({ tab, work: 'still working' })), sessionId, '', closed.map((tab) => tab.id))
+    })
+  }), [activeProjectId, sessions, offerUndo])
 
   const commands = useMemo<PaletteCommand[]>(() => [
     { id: 'open-claude', label: 'Open Claude Code', detail: 'Open in the focused tab group', category: 'Agents', icon: 'agent', shortcut: 'Ctrl T then C', run: () => openInFocused('agent', 'claude') },

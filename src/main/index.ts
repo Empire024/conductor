@@ -390,6 +390,9 @@ const createWindow = (
   })
   let closeApproved = false
   let decidingClose = false
+  /** Agent sessions whose working tabs the owner agreed to close with this window; the main
+   *  window offers their undo and stops them when it lapses (feature confirm-close-working-tab). */
+  let closingWork: string[] = []
   window.on('close', (event) => {
     if (closeApproved || isQuitting) return
     event.preventDefault()
@@ -400,7 +403,14 @@ const createWindow = (
     const tabs: string[] = []
     const collect = (node: import('../shared/models').LayoutNode): void => { if (node.type === 'split') node.children.forEach(collect); else tabs.push(...node.tabs.filter(tab => tab.kind === 'code').map(tab => tab.id)) }
     if (record) collect(record.layout.root)
-    void resolveUnsavedEditors(window, tabs).then((approved) => { decidingClose = false; if (approved && !window.isDestroyed()) { closeApproved = true; window.close() } })
+    // A floating window hands its tabs back to the workspace, so only a plain one asks about work.
+    const working = floatingDetachedIds().includes(detachedId) ? Promise.resolve<string[] | null>([]) : confirmWindowWork(window)
+    void working.then(async (agreed) => {
+      if (!agreed) return false
+      const approved = await resolveUnsavedEditors(window, tabs)
+      if (approved) closingWork = agreed
+      return approved
+    }).then((approved) => { decidingClose = false; if (approved && !window.isDestroyed()) { closeApproved = true; window.close() } }, () => { decidingClose = false })
   })
 
   window.once('ready-to-show', () => {
@@ -433,9 +443,11 @@ const createWindow = (
       const closed = database.closeDetachedWindow(detachedId, floatingIds.includes(detachedId))
       if (floatingIds.includes(detachedId)) database.setSetting('floatingDetachedWindows', JSON.stringify(floatingIds.filter(id => id !== detachedId)))
       if (!closed) return
+      // Nobody left to offer the undo: the owner agreed to stop these turns, so stop them now.
+      if (!mainWindow) for (const id of closingWork) void Promise.resolve(remoteControl?.mirror.isRemote(id) ? remoteControl.mirror.interrupt(id, false) : agents.structured.interrupt(id, false)).catch(() => undefined)
       for (const recipient of BrowserWindow.getAllWindows()) {
         if (!recipient.isDestroyed()) {
-          recipient.webContents.send('detached:closed', { sessionId: closed.sessionId })
+          recipient.webContents.send('detached:closed', { sessionId: closed.sessionId, working: closingWork })
         }
       }
     } catch (error) {
@@ -867,6 +879,25 @@ const readDraftFile = async (draft: EditorDraft, target?: string): Promise<strin
   if (machineId === LOCAL_MACHINE_ID) return readEditorFile(target ?? await resolveEditorPath(draft.projectId, draft.path))
   if (!remoteControl) throw new Error('Remote files are not available.')
   return (await remoteControl.files.read({ machineId, projectId: draft.projectId, path: draft.path })).content
+}
+/** A detached window's own close (title-bar x, window:close) asks its renderer the same question as
+ *  the tab x: working tabs get "close and stop it?" with "Don't close" as the default. Resolves the
+ *  agent sessions the owner agreed to close (possibly none), or null to keep the window. A renderer
+ *  that cannot answer (crashed, loading, or silent for a few seconds) does not hold the window open. */
+const windowCloseAnswers = new Map<number, { window: BrowserWindow; answer(working: string[] | null | 'asking'): void }>()
+let nextWindowCloseRequest = 1
+const confirmWindowWork = (window: BrowserWindow): Promise<string[] | null> => {
+  const contents = window.webContents
+  if (window.isDestroyed() || contents.isDestroyed() || contents.isCrashed() || contents.isLoading()) return Promise.resolve([])
+  return new Promise((resolve) => {
+    const id = nextWindowCloseRequest++
+    const finish = (working: string[] | null): void => { clearTimeout(silent); windowCloseAnswers.delete(id); window.removeListener('closed', gone); resolve(working) }
+    const gone = (): void => finish([])
+    const silent = setTimeout(() => finish([]), 5000)
+    window.once('closed', gone)
+    windowCloseAnswers.set(id, { window, answer: (working) => { if (working === 'asking') clearTimeout(silent); else finish(working) } })
+    contents.send('window:close-requested', id)
+  })
 }
 const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): Promise<boolean> => {
   // Serialize decisions across windows. A caller with another scope checks again afterwards.
@@ -2267,6 +2298,12 @@ const registerIpc = (): void => {
     window.isMaximized() ? window.unmaximize() : window.maximize()
   })
   ipcMain.on('window:close', (event) => BrowserWindow.fromWebContents(event.sender)?.close())
+  ipcMain.on('window:close-answer', (event, id: unknown, working: unknown) => {
+    const pending = typeof id === 'number' ? windowCloseAnswers.get(id) : undefined
+    if (!pending || pending.window.isDestroyed() || pending.window.webContents !== event.sender) return
+    if (working === 'asking' || working === null) pending.answer(working)
+    else pending.answer(Array.isArray(working) ? working.filter((item): item is string => typeof item === 'string') : [])
+  })
   ipcMain.handle('window:is-maximized', (event) =>
     Boolean((() => {
       const window = BrowserWindow.fromWebContents(event.sender)
