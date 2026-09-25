@@ -84,6 +84,11 @@ describe('recovery note and agent', () => {
     expect(recoveryNote(report({ outcome: 'agent-recovered', attempts: [report().attempts[0]!, report().attempts[0]!] }))).toContain("recovery mode's relaunch failed 2 times and the recovery agent brought it back")
   })
 
+  it('names a crash as a crash', () => {
+    expect(recoveryNote(report({ kind: 'running', error: 'Conductor pid 100 ended without quitting (crash or kill) and no Conductor answered app control within 4 s' })))
+      .toBe(' The previous Conductor crashed or was killed (Conductor pid 100 ended without quitting (crash or kill) and no Conductor answered app control within 4 s); recovery mode relaunched it (attempt 1). Recovery report: C:\\u\\recovery\\recovery-1.md.')
+  })
+
   it('never reaches the real CLI from a test profile unless told to, and denies commits, pushes and deletes', () => {
     const resolveClaude = (): string => 'C:\\Users\\o\\.local\\bin\\claude.exe'
     expect(recoveryAgentCommand({ env: {}, testProfile: false, resolveClaude })).toEqual(['C:\\Users\\o\\.local\\bin\\claude.exe'])

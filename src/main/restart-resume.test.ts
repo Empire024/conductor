@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import type { RecoveryReport } from './recovery/protocol'
 import { coworkerResumeMessage, encodeRestartIntent, restartLine, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_MAX_AGE_MS, resumePlan, restartReason, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type RestartKind } from './restart-resume'
 
 /* resume-after-any-restart: every restart kind brings back the wizards that were working or waiting
@@ -55,7 +56,7 @@ describe('resume plan for each restart kind', () => {
   const reasons: Array<[RestartKind, RegExp]> = [
     ['update-on-quit', /update installed on quit/],
     ['update-install', /^update installed$/],
-    ['running', /crash relaunch/],
+    ['running', /^crash, the previous Conductor ended without quitting$/],
     ['quit', /owner quit and reopened/],
     ['restart', /^restart$/]
   ]
@@ -63,7 +64,7 @@ describe('resume plan for each restart kind', () => {
     const plan = resumePlan(intent(kind, { toVersion: '0.1.53' }), null)
     expect(plan).toMatchObject({ wizards: ['wizard'], coworkers: ['worker-a'], fromVersion: '0.1.52' })
     expect(plan!.reason).toMatch(reason)
-    expect(wizardResumeMessage(plan!, '0.1.53', 1)).toMatch(/^\[Conductor\] Conductor restarted \(.+, 0\.1\.52 -> 0\.1\.53\); continue\. This wizard tab was brought back and 1 coworker whose turn was cut was resumed too\./)
+    expect(wizardResumeMessage(plan!, '0.1.53', 1)).toMatch(/^\[Conductor\] Conductor restarted \(.+, 0\.1\.52 -> 0\.1\.53\); continue\..* This wizard tab was brought back and 1 coworker whose turn was cut was resumed too\./)
     expect(coworkerResumeMessage(plan!, '0.1.53')).toMatch(/^\[Conductor\] Conductor restarted \(.+, 0\.1\.52 -> 0\.1\.53\); continue\./)
   })
   it('"Stop work" in the quit dialog resumes nobody', () => {
@@ -90,6 +91,45 @@ describe('resume plan for each restart kind', () => {
     const plan = resumePlan(intent('quit', { coworkers: [] }), null)!
     expect(wizardResumeMessage(plan, '0.1.52', 0)).toBe('[Conductor] Conductor restarted (the owner quit and reopened Conductor, 0.1.52 -> 0.1.52); continue. This wizard tab was brought back. Check app.state and agents.list first, then carry on from where you left off.')
     expect(wizardResumeMessage(plan, '0.1.52', 2)).toContain('2 coworkers whose turns were cut were resumed too')
+  })
+})
+
+describe('a crash (FX27)', () => {
+  const recovery = (extra: Partial<RecoveryReport> = {}): RecoveryReport => ({
+    id: 'recovery-1', at: minutesAgo(0), appPid: 100, kind: 'running', fromVersion: '0.1.52', outcome: 'relaunched',
+    error: 'Conductor pid 100 ended without quitting (crash or kill) and no Conductor answered app control within 4 s',
+    attempts: [{ exe: 'C:\\x\\Conductor.exe', args: [], startedAt: minutesAgo(0), ready: true }], reportPath: 'C:\\u\\recovery\\recovery-1.md', ...extra
+  })
+  it('recovered by recovery mode: the wizard hears the crash, the report and continue, in that order', () => {
+    const plan = resumePlan(intent('running'), null, recovery())!
+    expect(plan).toMatchObject({ reason: 'crash, recovered by recovery mode', crash: true, wizards: ['wizard'], coworkers: ['worker-a'] })
+    expect(wizardResumeMessage(plan, '0.1.52', 1)).toBe('[Conductor] Conductor restarted (crash, recovered by recovery mode, 0.1.52 -> 0.1.52); The previous Conductor crashed or was killed (Conductor pid 100 ended without quitting (crash or kill) and no Conductor answered app control within 4 s); recovery mode relaunched it (attempt 1). Recovery report: C:\\u\\recovery\\recovery-1.md; continue. The crash cut whatever this conversation was running; its native conversation was resumed. This wizard tab was brought back and 1 coworker whose turn was cut was resumed too. Check app.state and agents.list first, then carry on from where you left off.')
+    expect(coworkerResumeMessage(plan, '0.1.52')).toBe('[Conductor] Conductor restarted (crash, recovered by recovery mode, 0.1.52 -> 0.1.52); The previous Conductor crashed or was killed (Conductor pid 100 ended without quitting (crash or kill) and no Conductor answered app control within 4 s); recovery mode relaunched it (attempt 1). Recovery report: C:\\u\\recovery\\recovery-1.md; continue. The restart cut your turn: pick up your task from where you left off.')
+  })
+  it('the owner started it again after a crash: still resumed, without a recovery report', () => {
+    const plan = resumePlan(intent('running'), null)!
+    expect(plan).toMatchObject({ reason: 'crash, the previous Conductor ended without quitting', crash: true })
+    expect(plan).not.toHaveProperty('recovery')
+    expect(wizardResumeMessage(plan, '0.1.52', 0)).toMatch(/^\[Conductor\] Conductor restarted \(crash, the previous Conductor ended without quitting, 0\.1\.52 -> 0\.1\.52\); continue\. The crash cut/)
+  })
+  it('recovery mode could not bring it back: not called recovered, and says so', () => {
+    const plan = resumePlan(intent('running'), null, recovery({ outcome: 'down' }))!
+    expect(plan.reason).toBe('crash, the previous Conductor ended without quitting')
+    expect(plan.recovery).toMatch(/recovery mode could not bring it back; it was started by hand/)
+  })
+  it('a crash while nothing was working resumes nobody, even with a recovery report', () => {
+    expect(resumePlan(intent('running', { wizards: [], coworkers: [] }), null, recovery())).toBeNull()
+  })
+  it('a clean quit with nothing working resumes nobody, and a clean quit is never a crash', () => {
+    expect(resumePlan(intent('quit', { wizards: [], coworkers: [] }), null)).toBeNull()
+    const plan = resumePlan(intent('quit'), null)!
+    expect(plan).not.toHaveProperty('crash')
+    expect(wizardResumeMessage(plan, '0.1.52', 1)).not.toMatch(/crash/)
+  })
+  it('an update install recovery mode had to finish keeps its reason and puts the report before continue', () => {
+    const plan = resumePlan(intent('update-install', { toVersion: '0.1.53' }), null, recovery({ kind: 'update-install', error: 'after the update install of 0.1.53 no new Conductor answered app control within 180 s of pid 100 exiting' }))!
+    expect(plan.reason).toBe('update installed')
+    expect(coworkerResumeMessage(plan, '0.1.53')).toMatch(/^\[Conductor\] Conductor restarted \(update installed, 0\.1\.52 -> 0\.1\.53\); Conductor did not come back by itself after this stop \(.+\); recovery mode relaunched it \(attempt 1\)\. Recovery report: C:\\u\\recovery\\recovery-1\.md; continue\. The restart cut your turn/)
   })
 })
 

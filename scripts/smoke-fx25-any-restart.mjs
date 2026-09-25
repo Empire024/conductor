@@ -192,7 +192,7 @@ try {
   await new Promise(r => setTimeout(r, 1500))
   const second = await launch()
   observe('relaunched after the crash', { pid: second.pid })
-  await expectResumed('crash', 'crash relaunch')
+  await expectResumed('crash', 'crash')
 
   // 2. The owner credential's forced restart (not the wizard's): the cut coworker is resumed too.
   await hang()

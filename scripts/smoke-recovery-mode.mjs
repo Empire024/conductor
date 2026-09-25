@@ -205,7 +205,7 @@ try {
   const message1 = await continueMessage(before)
   observe('wizard continue message (agent recovery)', { message: message1 })
   assert.match(message1, /Conductor restarted \(app\.restart by this wizard/)
-  assert.match(message1, /Conductor did not come back by itself after this stop \(after app\.restart no new Conductor answered app control within \d+ s of pid \d+ exiting\); recovery mode's relaunch failed 2 times and the recovery agent brought it back\. Recovery report: .*recovery-.*\.md\./)
+  assert.match(message1, /Conductor did not come back by itself after this stop \(after app\.restart no new Conductor answered app control within \d+ s of pid \d+ exiting\); recovery mode's relaunch failed 2 times and the recovery agent brought it back\. Recovery report: .*recovery-.*\.md; continue\./)
   await pendingReportGone()
   const [report1Name] = await reportsOnDisk()
   const report1 = await readJson(join(recoveryDir, report1Name))

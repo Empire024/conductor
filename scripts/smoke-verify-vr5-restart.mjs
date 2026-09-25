@@ -159,7 +159,7 @@ try {
     before = prompts().length
     spawnSync('taskkill', ['/PID', String(inst.credential.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
     await relaunchParked(inst, { env: { CONDUCTOR_TEST_DIALOGS: 'hold' } })
-    await judgeResume('R2b', before, /Conductor restarted \(crash relaunch/, 'taskkill /T /F of this smoke\'s own app pid')
+    await judgeResume('R2b', before, /Conductor restarted \(crash,/, 'taskkill /T /F of this smoke\'s own app pid')
 
     step('R2c a ready update and running work: the quit asks; Stop work resumes nobody')
     await hang()

@@ -85,6 +85,31 @@ A restart nobody was watching still comes back without taking the screen.
   Recovery report: …\recovery\recovery-….md.`
 - **Log.** `recovery/watchdog.log` (rotated at 1 MiB); `recovery/watchdog.json` names the live watchdog.
 
+## After a crash, the wizards continue (FX27)
+
+A crash records no stop, so the next launch finds FX25's live `running` restart record
+(`restart-resume.ts`) and treats it as a crash. The record is rewritten on every agent phase change
+(coalesced, 250 ms) as well as every 5 s, so a turn that started a second before the crash is in it.
+The launch brings back every wizard that was working or waiting on its coworkers and every coworker
+whose turn was cut (native resume), after the runtime host has stopped the runtimes the crashed
+process left there, and tells each one:
+
+`[Conductor] Conductor restarted (crash, recovered by recovery mode, <old> -> <new>); The previous
+Conductor crashed or was killed (<watchdog's reason>); recovery mode relaunched it (attempt 1).
+Recovery report: <path>.md; continue. …`
+
+A crash the owner recovered by hand says `crash, the previous Conductor ended without quitting` and
+has no report. A clean quit is never a crash: it resumes only work it recorded as running, and
+nothing when its turns had finished.
+
+With the runtime host on, the host outlives the crash but stops the cut runtime itself
+(`host.log`: "client left without detaching …; closing it"); `startRuntimeHost` closes any it did
+not (log "Closed host runtime … that a crashed Conductor left behind"), and the resume waits for
+that. Nothing is reattached: the crashed process never saved the adapter state and frame position a
+reattach continues from (only `detachForRestart` on a clean restart does), so the conversation
+resumes from its native transcript in a new host runtime. Smoke:
+`node scripts/smoke-lock.mjs -- node scripts/smoke-verify-vr6-recovery.mjs --group crash [--host]`.
+
 ## The recovery agent
 
 `claude -p` (Claude Code, found on PATH or `%USERPROFILE%\.local\bin\claude.exe`), in the Conductor

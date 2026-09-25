@@ -125,5 +125,6 @@ export function recoveryNote(report: RecoveryReport | null): string {
     : report.outcome === 'agent-recovered'
       ? `recovery mode's relaunch failed ${tried} time${tried === 1 ? '' : 's'} and the recovery agent brought it back`
       : 'recovery mode could not bring it back; it was started by hand'
-  return ` Conductor did not come back by itself after this stop (${report.error}); ${how}. Recovery report: ${report.reportPath}.`
+  const why = report.kind === 'running' ? `The previous Conductor crashed or was killed (${report.error})` : `Conductor did not come back by itself after this stop (${report.error})`
+  return ` ${why}; ${how}. Recovery report: ${report.reportPath}.`
 }

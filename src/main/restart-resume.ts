@@ -1,4 +1,5 @@
 import type { RestartInitiator } from './restart-initiator'
+import { recoveryNote, type RecoveryReport } from './recovery/protocol'
 
 /* Any Conductor restart brings back the wizard tabs that were working or waiting on their
  * coworkers, and the coworkers whose turns the restart cut (feature-list.md:
@@ -73,12 +74,13 @@ export function mayInstallOnQuit(state: { updateReady: boolean; unkeptWork: bool
   return !state.updateReady || !state.unkeptWork || state.ownerAnswered
 }
 
-/** How the restart is named to the conversations it brings back. */
-export function restartReason(intent: RestartIntent | null, initiator: RestartInitiator | null): string {
+/** How the restart is named to the conversations it brings back. `recovered`: recovery mode's
+ *  watchdog brought the app back (docs/recovery-mode.md). */
+export function restartReason(intent: RestartIntent | null, initiator: RestartInitiator | null, recovered = false): string {
   if (initiator?.method === 'app.restart.request') return 'the restart this wizard asked the owner for'
   if (initiator) return initiator.method === 'app.update.install' ? 'update installed by this wizard' : 'app.restart by this wizard'
   switch (intent?.kind) {
-    case 'running': return 'crash relaunch: the previous Conductor ended without quitting'
+    case 'running': return recovered ? 'crash, recovered by recovery mode' : 'crash, the previous Conductor ended without quitting'
     case 'quit': return 'the owner quit and reopened Conductor'
     case 'update-on-quit': return 'update installed on quit'
     case 'update-install': return 'update installed'
@@ -89,17 +91,25 @@ export function restartReason(intent: RestartIntent | null, initiator: RestartIn
 
 /** `fromVersion` is absent when the previous process left no record of what it ran, such as a
  *  version from before these records existed. */
-export interface ResumePlan { reason: string; fromVersion?: string; wizards: string[]; coworkers: string[] }
+export interface ResumePlan {
+  reason: string; fromVersion?: string; wizards: string[]; coworkers: string[]
+  /** The previous process crashed: whatever its conversations were running was cut. */
+  crash?: boolean
+  /** Recovery mode's sentence and report path, when the watchdog had to bring the app back. */
+  recovery?: string
+}
 
 /** Who this launch brings back: the wizard that started or asked for the restart, and, unless the
  *  owner said "Stop work", every wizard that was working or waiting on its coworkers and the
  *  coworkers whose turns were cut. Null when nobody is. */
-export function resumePlan(intent: RestartIntent | null, initiator: RestartInitiator | null): ResumePlan | null {
+export function resumePlan(intent: RestartIntent | null, initiator: RestartInitiator | null, recovery: RecoveryReport | null = null): ResumePlan | null {
   const resume = intent?.resume === true
   const wizards = [...new Set([...(initiator ? [initiator.agentSessionId] : []), ...(resume ? intent!.wizards : [])])]
   const coworkers = resume ? intent!.coworkers.filter(id => !wizards.includes(id)) : []
   if (!wizards.length && !coworkers.length) return null
-  return { reason: restartReason(intent, initiator), ...(intent ? { fromVersion: intent.fromVersion } : {}), wizards, coworkers }
+  const crash = !initiator && intent?.kind === 'running'
+  const note = recoveryNote(recovery).trim().replace(/\.$/, '')
+  return { reason: restartReason(intent, initiator, crash && recovery !== null && recovery.outcome !== 'down'), ...(intent ? { fromVersion: intent.fromVersion } : {}), wizards, coworkers, ...(crash ? { crash } : {}), ...(note ? { recovery: note } : {}) }
 }
 
 /** The one line every brought-back conversation starts from. The old version is only ever the
@@ -108,10 +118,14 @@ export function resumePlan(intent: RestartIntent | null, initiator: RestartIniti
 export const restartLine = (reason: string, fromVersion: string | undefined, toVersion: string): string =>
   fromVersion ? `Conductor restarted (${reason}, ${fromVersion} -> ${toVersion})` : `Conductor restarted (${reason}, now ${toVersion})`
 
+/** `[Conductor] Conductor restarted (<reason>, <old> -> <new>); <recovery report>; continue.` */
+const resumeLead = (plan: ResumePlan, toVersion: string): string =>
+  `[Conductor] ${restartLine(plan.reason, plan.fromVersion, toVersion)}${plan.recovery ? `; ${plan.recovery}` : ''}; continue.`
+
 export function wizardResumeMessage(plan: ResumePlan, toVersion: string, coworkersResumed: number): string {
-  return `[Conductor] ${restartLine(plan.reason, plan.fromVersion, toVersion)}; continue. This wizard tab was brought back${coworkersResumed ? ` and ${coworkersResumed === 1 ? '1 coworker whose turn was cut was' : `${coworkersResumed} coworkers whose turns were cut were`} resumed too` : ''}. Check app.state and agents.list first, then carry on from where you left off.`
+  return `${resumeLead(plan, toVersion)}${plan.crash ? ' The crash cut whatever this conversation was running; its native conversation was resumed.' : ''} This wizard tab was brought back${coworkersResumed ? ` and ${coworkersResumed === 1 ? '1 coworker whose turn was cut was' : `${coworkersResumed} coworkers whose turns were cut were`} resumed too` : ''}. Check app.state and agents.list first, then carry on from where you left off.`
 }
 
 export function coworkerResumeMessage(plan: ResumePlan, toVersion: string): string {
-  return `[Conductor] ${restartLine(plan.reason, plan.fromVersion, toVersion)}; continue. The restart cut your turn: pick up your task from where you left off.`
+  return `${resumeLead(plan, toVersion)} The restart cut your turn: pick up your task from where you left off.`
 }
