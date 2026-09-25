@@ -31,4 +31,14 @@ describe('local update builds', () => {
     expect(() => builder.start(empty)).toThrow()
     expect(builder.status().state).toBe('idle')
   })
+  it("publishes a test instance’s build into the test profile’s feed, never the installed app’s", async () => {
+    if (process.platform !== 'win32') return
+    const root = checkout('local-update-feed-', { name: 'conductor-desktop' })
+    writeFileSync(join(root, 'scripts', 'build-local-update.mjs'), "const at = process.argv.indexOf('--feed-dir'); console.log('Local update ready: 0.1.1-local.1'); console.log('Feed: ' + (at > 0 ? process.argv[at + 1] : 'owner feed'))\n", 'utf8')
+    const feed = join(root, 'profile', 'local-updates')
+    const builder = new LocalUpdateBuilder({ feedDirectory: () => feed })
+    builder.start(root)
+    await vi.waitFor(() => expect(builder.status().state).toBe('succeeded'), { timeout: 20_000 })
+    expect(builder.status().feedDirectory).toBe(feed)
+  })
 })

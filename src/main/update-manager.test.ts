@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 const f = vi.hoisted(() => ({
@@ -28,13 +28,14 @@ vi.mock('electron-updater', async () => {
     })
     downloadUpdate = vi.fn(async () => {
       await f.downloadGate
-      this.emit('update-downloaded', { version: this.version })
+      this.emit('update-downloaded', { version: this.version, sha512: 'sha-' + this.version, downloadedFile: `C:\\cache\\Conductor-Setup-${this.version}.exe` })
     })
     quitAndInstall = vi.fn()
   } }
 })
 import { UpdateManager } from './update-manager'
 import { RestorePointStore } from './restore-points'
+import { createUpdateInstallSeam } from './update-install-seam'
 const managers: UpdateManager[] = []
 const roots: string[] = []
 const updateDir = (): string => { const root = mkdtempSync(join(tmpdir(), 'conductor-update-manager-')); roots.push(root); return root }
@@ -136,4 +137,46 @@ it('keeps a downloaded update ready when the owner cancels closing dirty editors
   await m.check(); await m.download(); await m.install()
   expect(m.getState().phase).toBe('ready')
   expect(f.instances.every((instance) => instance.quitAndInstall.mock.calls.length === 0)).toBe(true)
+})
+
+describe('test-mode installs go through the installer stub', () => {
+  const rollbackFixture = (directory: string, version: string): void => {
+    new RestorePointStore(directory).record({ version, commit: 'a'.repeat(40), createdAt: '2026-09-23T12:00:00Z', dirty: false,
+      cliVersions: { claude: '2.1.278', codex: '0.155.1', grok: '1.0.41' }, models: [{ provider: 'claude', models: [{ id: 'opus' }] }],
+      installer: `Conductor-Setup-${version}.exe`, blockmap: `Conductor-Setup-${version}.exe.blockmap` })
+    writeFileSync(join(directory, `restore-point-${version}.json`), JSON.stringify({ schemaVersion: 1, version }))
+  }
+  it('a test-mode rollback writes installer-stub.json and relaunches instead of running the installer', async () => {
+    const userData = updateDir(), directory = join(userData, 'local-updates'), version = '0.1.3-local.1'
+    mkdirSync(directory, { recursive: true }); rollbackFixture(directory, version)
+    f.localVersion = version
+    const relaunch = vi.fn()
+    const installSeam = createUpdateInstallSeam({ isPackaged: false, env: { CONDUCTOR_TEST_USER_DATA: userData }, relaunch, now: () => new Date('2026-09-25T10:00:00Z') })
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: false, allowDevelopmentUpdates: true, localBuildDirectory: directory, beforeInstall: vi.fn(), installSeam })
+    managers.push(m); m.configure('')
+    expect(f.instances.every(instance => instance.autoInstallOnAppQuit === false)).toBe(true)
+    await m.rollback(version)
+    const rollbackUpdater = f.instances.at(-1)
+    expect(rollbackUpdater.autoInstallOnAppQuit).toBe(false)
+    expect(() => rollbackUpdater.quitAndInstall(true, true)).toThrow(/Test mode never runs an installer/)
+    expect(relaunch).toHaveBeenCalledOnce()
+    expect(JSON.parse(readFileSync(join(userData, 'installer-stub.json'), 'utf8'))).toEqual({
+      version, installerPath: `C:\\cache\\Conductor-Setup-${version}.exe`, sha512: 'sha-' + version, reason: 'rollback', requestedAt: '2026-09-25T10:00:00.000Z'
+    })
+    // The relaunched app reports the version the stub "installed".
+    const next = new UpdateManager({ currentVersion: '0.1.4', isPackaged: false, localBuildDirectory: directory, beforeInstall: vi.fn(),
+      installSeam: createUpdateInstallSeam({ isPackaged: false, env: { CONDUCTOR_TEST_USER_DATA: userData }, relaunch: vi.fn() }) })
+    managers.push(next)
+    expect(next.getState().currentVersion).toBe(version)
+    expect(next.versions().find(point => point.version === version)?.firstLaunchedAt).toBeTruthy()
+  })
+  it('a normal test-mode update install records reason "update"', async () => {
+    const userData = updateDir(), relaunch = vi.fn()
+    const installSeam = createUpdateInstallSeam({ isPackaged: false, env: { CONDUCTOR_TEST_USER_DATA: userData }, relaunch })
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: false, allowDevelopmentUpdates: true, localBuildDirectory: join(userData, 'local-updates'), beforeInstall: vi.fn(), installSeam })
+    managers.push(m); m.configure('')
+    await m.check(); await m.download(); await m.install()
+    expect(relaunch).toHaveBeenCalledOnce()
+    expect(JSON.parse(readFileSync(join(userData, 'installer-stub.json'), 'utf8'))).toMatchObject({ version: f.localVersion, reason: 'update' })
+  })
 })

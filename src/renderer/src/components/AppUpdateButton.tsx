@@ -15,14 +15,16 @@ export const restartRequestLabel = (state: AppUpdateState): string | undefined =
 
 const shortCli = (label: string, value: string | null): string => `${label} ${value ?? 'unknown'}`
 
-export function VersionsMenu({ currentVersion, versions, busy, onRollback, onPin }: {
+export function VersionsMenu({ currentVersion, versions, busy, onRollback, onPin, onOpen }: {
   currentVersion: string
   versions: RestorePoint[]
   busy: boolean
   onRollback(version: string): void
   onPin(version: string, pinned: boolean): void
+  /** Builds made while the app runs add restore points, so the list is re-read on every open. */
+  onOpen?(): void
 }): React.JSX.Element {
-  return <details className="update-versions-menu">
+  return <details className="update-versions-menu" onToggle={event => { if (event.currentTarget.open) onOpen?.() }}>
     <summary>Versions</summary>
     <div className="update-versions-popover">
       <strong>Restore points</strong>
@@ -49,7 +51,7 @@ export function AppUpdateButton({ state, onAction }: { state: AppUpdateState; on
   useEffect(refreshVersions, [])
   const confirm = pendingQuitConfirm && <UpdateQuitConfirm running={pendingQuitConfirm} onConfirm={() => void confirmQuitAndInstall()} onCancel={cancelQuitConfirm} />
   const requested = restartRequestLabel(state)
-  const menu = <VersionsMenu currentVersion={state.currentVersion} versions={versions} busy={versionBusy} onPin={(version, pinned) => {
+  const menu = <VersionsMenu currentVersion={state.currentVersion} versions={versions} busy={versionBusy} onOpen={refreshVersions} onPin={(version, pinned) => {
     setVersionBusy(true); setVersionError('')
     void window.conductor.updates.pinVersion(version, pinned).then(refreshVersions).catch(reason => setVersionError(reason instanceof Error ? reason.message : String(reason))).finally(() => setVersionBusy(false))
   }} onRollback={version => {

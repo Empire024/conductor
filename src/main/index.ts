@@ -101,6 +101,7 @@ import { registerAgentCollaborationIpc } from './agent-collaboration-ipc'
 import { ProjectPreviewServer } from './project-preview'
 import { invalidateProjectFiles, searchProjectFiles, type FileSearchResult } from './project-file-search'
 import { UpdateManager } from './update-manager'
+import { testInstallProfile } from './update-install-seam'
 import { LocalUpdateBuilder } from './local-update-build'
 import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, releaseVerdict, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
@@ -171,7 +172,8 @@ const configuredModelCatalog = (): unknown => agents?.listProviders().filter(pro
   provider: provider.id, available: provider.available, source: 'configured',
   models: provider.models.filter(model => !['default', 'auto'].includes(model.id)).map(model => ({ ...model, effort: provider.efforts.map(effort => effort.id).filter(id => id !== 'auto') }))
 })) ?? []
-const localUpdateBuilder = new LocalUpdateBuilder({ modelsList: configuredModelCatalog })
+// A test instance's app.update publishes into its own profile's feed, never the installed app's.
+const localUpdateBuilder = new LocalUpdateBuilder({ modelsList: configuredModelCatalog, feedDirectory: () => testInstallProfile({ isPackaged: app.isPackaged }) ? join(app.getPath('userData'), 'local-updates') : null })
 const delivery = new DeliveryService({ githubToken: () => gitHubCredential(homedir()) })
 let updates: UpdateManager
 let mainWindow: BrowserWindow | null = null
@@ -965,7 +967,9 @@ const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit
   // with the choice that actually lets the app go down ("stop"), not the button a live owner would
   // default to (background keeps it alive) or the cancel button smoke-lock's generic fallback would
   // otherwise pick (feature-list.md: smoke-instances-never-leak).
-  const stopChoiceIndex = background ? 1 : 0
+  // CONDUCTOR_TEST_STOP_DECISION=background lets a smoke take the keep-running answer instead, to
+  // check a turn surviving a restart through the runtime host.
+  const stopChoiceIndex = background ? (process.env.CONDUCTOR_TEST_STOP_DECISION === 'background' ? 0 : 1) : 0
   return closeConfirmation.decide(() => stopConfirmations.ask({ action, running, choices }, async signal => choices[await showDecision(liveWindow(owner), {
     type: 'warning', title: action === 'restart' ? 'Restart Conductor?' : 'Quit Conductor?',
     message: 'Work is still running in Conductor.',

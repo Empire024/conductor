@@ -1,13 +1,15 @@
 import { RESTART_REQUEST_MAX_AGE_MS, type RestartInitiator, type RestartRequest } from './restart-initiator'
-import { BrowserWindow } from 'electron'
+import { app, BrowserWindow } from 'electron'
 import { NsisUpdater } from 'electron-updater'
 import type { ProgressInfo, UpdateInfo } from 'builder-util-runtime'
+import type { UpdateDownloadedEvent } from 'electron-updater'
 import { gt, valid } from 'semver'
 import type { AppUpdateState } from '../shared/models'
 import { DEFAULT_GITHUB_UPDATE_URL, normalizeUpdateFeedUrl, resolveUpdateProvider, type ConductorUpdateProvider } from './update-config'
 import { LocalUpdateFeed } from './local-update-feed'
 import { RestorePointStore } from './restore-points'
 import type { RestorePoint } from '../shared/models'
+import { createUpdateInstallSeam, type InstallRequest, type UpdateInstallSeam } from './update-install-seam'
 
 interface UpdateManagerOptions {
   currentVersion: string
@@ -16,6 +18,8 @@ interface UpdateManagerOptions {
   localBuildDirectory?: string
   /** `force` is the owner's own credential asking: no running-work dialog, drafts kept for recovery. */
   beforeInstall(force: boolean, initiator?: Omit<RestartInitiator, 'at'>): void | Promise<void>
+  /** Defaults to the real one: quitAndInstall, or the installer stub in a test profile. */
+  installSeam?: UpdateInstallSeam
 }
 interface PendingPrepare {
   requestId: string
@@ -41,13 +45,20 @@ export class UpdateManager {
   private checkTimer: NodeJS.Timeout | null = null
   private pendingPrepare: PendingPrepare | null = null
   private restartRequest: RestartRequest | null = null
+  private readonly seam: UpdateInstallSeam
+  /** The running version; in a test profile, the one the installer stub last "installed". */
+  private readonly currentVersion: string
+  private downloaded: Omit<InstallRequest, 'reason'> | null = null
+  private installReason: InstallRequest['reason'] = 'update'
 
   constructor(private readonly options: UpdateManagerOptions) {
-    this.state = { phase: 'disabled', currentVersion: options.currentVersion, configured: false, message: 'Connecting to update sources.' }
+    this.seam = options.installSeam ?? createUpdateInstallSeam({ isPackaged: options.isPackaged, relaunch: () => { app.relaunch(); app.quit() } })
+    this.currentVersion = this.seam.reportedVersion(options.currentVersion)
+    this.state = { phase: 'disabled', currentVersion: this.currentVersion, configured: false, message: 'Connecting to update sources.' }
     if (options.localBuildDirectory) {
       this.localFeed = new LocalUpdateFeed(options.localBuildDirectory)
       this.restorePoints = new RestorePointStore(options.localBuildDirectory)
-      this.restorePoints.beginRun(options.currentVersion)
+      this.restorePoints.beginRun(this.currentVersion)
     }
   }
   getState(): AppUpdateState {
@@ -62,7 +73,7 @@ export class UpdateManager {
     if (!this.restorePoints) throw new Error('Local restore points are unavailable')
     return this.restorePoints.pin(version, pinned)
   }
-  recordFailedShip(): void { this.restorePoints?.recordFailedShip(this.options.currentVersion) }
+  recordFailedShip(): void { this.restorePoints?.recordFailedShip(this.currentVersion) }
 
   configure(requestedUrl: string, includeLocal = this.includeLocal): string {
     if (busy(this.state.phase)) throw new Error('Finish the downloaded update before changing update sources')
@@ -77,11 +88,11 @@ export class UpdateManager {
     this.localUrl = undefined
     this.includeLocal = includeLocal
     if (!this.options.isPackaged && !this.options.allowDevelopmentUpdates) {
-      this.setState({ phase: 'disabled', currentVersion: this.options.currentVersion, configured: true, message: 'Installed builds update from GitHub and enabled local test builds.' })
+      this.setState({ phase: 'disabled', currentVersion: this.currentVersion, configured: true, message: 'Installed builds update from GitHub and enabled local test builds.' })
       return feedUrl
     }
     this.remoteUpdater = this.createUpdater(resolveUpdateProvider(feedUrl))
-    this.setState({ phase: 'idle', currentVersion: this.options.currentVersion, configured: true, message: 'Checking ' + (feedUrl || DEFAULT_GITHUB_UPDATE_URL) + (includeLocal ? ' and local test builds' : '') + ' automatically.' })
+    this.setState({ phase: 'idle', currentVersion: this.currentVersion, configured: true, message: 'Checking ' + (feedUrl || DEFAULT_GITHUB_UPDATE_URL) + (includeLocal ? ' and local test builds' : '') + ' automatically.' })
     this.scheduleChecks()
     return feedUrl
   }
@@ -97,10 +108,12 @@ export class UpdateManager {
     updater.allowPrerelease = false // Local generic feeds still accept their explicitly versioned build.
     updater.forceDevUpdateConfig = Boolean(this.options.allowDevelopmentUpdates)
     updater.logger = console
+    this.seam.prepare(updater)
     updater.on('download-progress', (info: ProgressInfo) => {
       if (current()) this.setState({ ...this.state, phase: 'downloading', progress: Math.max(0, Math.min(100, info.percent)), message: 'Downloading Conductor ' + this.state.availableVersion + '…' })
     })
-    updater.on('update-downloaded', (info: UpdateInfo) => {
+    updater.on('update-downloaded', (info: UpdateDownloadedEvent) => {
+      if (current()) this.downloaded = { version: info.version, installerPath: info.downloadedFile ?? null, sha512: info.sha512 ?? info.files?.[0]?.sha512 ?? null }
       if (current()) this.setState({ ...this.state, phase: 'ready', availableVersion: info.version, progress: 100, message: 'Update downloaded. Restart Conductor to install it.' })
       else updater.autoInstallOnAppQuit = false
     })
@@ -118,11 +131,11 @@ export class UpdateManager {
     const problems: string[] = []
     let selected = false
     const consider = (updater: NsisUpdater, info: UpdateInfo | undefined, source: 'local' | 'release'): void => {
-      if (epoch !== this.epoch || busy(this.state.phase) || !info || !valid(info.version) || !gt(info.version, this.options.currentVersion)) return
+      if (epoch !== this.epoch || busy(this.state.phase) || !info || !valid(info.version) || !gt(info.version, this.currentVersion)) return
       if (selected && this.state.availableVersion && !gt(info.version, this.state.availableVersion)) return
       selected = true
       this.updater = updater
-      this.setState({ phase: 'available', currentVersion: this.options.currentVersion, availableVersion: info.version, source, configured: true, message: 'Update pending: Conductor ' + info.version + (source === 'local' ? ' (local test build).' : '.'), lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
+      this.setState({ phase: 'available', currentVersion: this.currentVersion, availableVersion: info.version, source, configured: true, message: 'Update pending: Conductor ' + info.version + (source === 'local' ? ' (local test build).' : '.'), lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
     }
     // Start remote I/O concurrently, but offer a valid local build without waiting
     // for the network. A selected download cannot be replaced by a late response.
@@ -132,7 +145,7 @@ export class UpdateManager {
         try {
           const local = await this.localFeed.refresh()
           if (epoch !== this.epoch) return this.getState()
-          if (local && gt(local.version, this.options.currentVersion)) {
+          if (local && gt(local.version, this.currentVersion)) {
             if (!this.localUpdater || local.url !== this.localUrl) {
               this.localUpdater?.removeAllListeners()
               this.localUpdater = this.createUpdater({ provider: 'generic', url: local.url, useMultipleRangeRequest: false })
@@ -151,7 +164,7 @@ export class UpdateManager {
       else if (remoteResponse.result?.isUpdateAvailable) consider(remote, remoteResponse.result.updateInfo, 'release')
       if (!selected && !busy(this.state.phase)) {
         this.updater = null
-        this.setState({ phase: problems.length ? 'error' : 'idle', currentVersion: this.options.currentVersion, configured: true, message: problems[0] ?? 'Conductor is up to date.', lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
+        this.setState({ phase: problems.length ? 'error' : 'idle', currentVersion: this.currentVersion, configured: true, message: problems[0] ?? 'Conductor is up to date.', lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
       }
     } finally { if (epoch === this.epoch) this.checking = false }
     return this.getState()
@@ -178,10 +191,11 @@ export class UpdateManager {
     this.updater = updater
     const result = await updater.checkForUpdates()
     if (!result?.isUpdateAvailable) throw new Error(`Restore point ${version} is not installable`)
-    this.setState({ phase: 'available', currentVersion: this.options.currentVersion, availableVersion: version, source: 'local', configured: true, message: `Rolling back to Conductor ${version}.` })
+    this.setState({ phase: 'available', currentVersion: this.currentVersion, availableVersion: version, source: 'local', configured: true, message: `Rolling back to Conductor ${version}.` })
     await this.download()
     if (this.state.phase !== 'ready') throw new Error(this.state.message ?? `Could not download restore point ${version}`)
-    await this.install()
+    this.installReason = 'rollback'
+    try { await this.install() } finally { this.installReason = 'update' }
   }
   async install(options: { force?: boolean } = {}, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> {
     if (!this.updater || this.state.phase !== 'ready') return
@@ -189,7 +203,9 @@ export class UpdateManager {
     try {
       await this.prepareRenderers()
       await (initiator ? this.options.beforeInstall(options.force === true, initiator) : this.options.beforeInstall(options.force === true))
-      this.updater.quitAndInstall(true, true)
+      const version = this.state.availableVersion ?? this.downloaded?.version ?? ''
+      const downloaded = this.downloaded?.version === version ? this.downloaded : null
+      this.seam.install(this.updater, { version, installerPath: downloaded?.installerPath ?? null, sha512: downloaded?.sha512 ?? null, reason: this.installReason })
     } catch (reason) {
       if (reason && typeof reason === 'object' && 'code' in reason && reason.code === 'UPDATE_CANCELLED') { this.setState({ ...this.state, phase: 'ready', message: 'Update ready. Restart whenever you are ready.' }); return }
       this.setState({ ...this.state, phase: 'error', message: 'Could not prepare the update: ' + errorMessage(reason) })
@@ -212,7 +228,7 @@ export class UpdateManager {
     this.localUpdater?.on('error', () => {})
     this.updater = this.remoteUpdater = this.localUpdater = null
     this.localFeed?.dispose()
-    this.restorePoints?.endRun(this.options.currentVersion)
+    this.restorePoints?.endRun(this.currentVersion)
     this.pendingPrepare?.finish()
   }
 

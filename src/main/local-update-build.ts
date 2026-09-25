@@ -70,7 +70,9 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
   private current: LocalUpdateBuildStatus = idle()
   private child: ChildProcess | null = null
 
-  constructor(private readonly options: { modelsList?: () => unknown } = {}) {}
+  /** `feedDirectory` overrides where the build publishes; a test instance passes its own profile's
+   *  feed so its builds never reach the installed app's (see update-install-seam.ts). */
+  constructor(private readonly options: { modelsList?: () => unknown; feedDirectory?: () => string | null } = {}) {}
 
   unsupported(workspace: string): string | null {
     if (process.platform !== 'win32') return 'Local installed-app updates currently require Windows x64.'
@@ -96,7 +98,8 @@ export class LocalUpdateBuilder implements LocalUpdateBuildService {
     if (!npm) throw new Error('Could not find npm on this machine; the build needs the host’s Node.js installation.')
     const started = new Date().toISOString()
     this.current = { state: 'running', workspace: root, startedAt: started, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'Building a local Conductor update; this takes several minutes.', log: [] }
-    const child = spawn(node.executable, [join(root, 'scripts', 'build-local-update.mjs')], {
+    const feedDirectory = this.options.feedDirectory?.()
+    const child = spawn(node.executable, [join(root, 'scripts', 'build-local-update.mjs'), ...(feedDirectory ? ['--feed-dir', feedDirectory] : [])], {
       cwd: root, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'],
       env: {
         ...process.env, npm_execpath: npm,
