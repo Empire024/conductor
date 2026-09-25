@@ -1,43 +1,187 @@
 // Runs one command under a machine-wide lock so concurrent agents never run two Electron smokes
 // (or a build and a smoke) at once: docs/machine-profile.md asks for smokes one at a time because
-// parallel ones push each other past their timeouts. Usage:
-//   node scripts/smoke-lock.mjs -- <command> [args...]
-// The lock is a directory under the OS temp folder (mkdir is atomic). A holder older than
-// LOCK_STALE_MS is treated as abandoned and replaced. Exit code is the command's.
-import { spawn } from 'node:child_process'
-import { mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+// parallel ones push each other past their timeouts.
+//
+// Usage: node scripts/smoke-lock.mjs [--timeout-min N] -- <command> [args...]
+//
+// The lock is a directory under the OS temp folder (mkdir is atomic); holder.txt inside it records
+// who holds it, when, and for how long. A holder whose pid is dead, or whose age exceeds 2x its
+// recorded timeout, is stale and is broken with a logged reason.
+//
+// The run is killed - the whole process tree, not just the spawned pid, since Electron and its
+// fixture CLIs leave grandchildren behind - on the run's own hard timeout, on normal exit, on
+// SIGINT/SIGTERM, and when this process's own parent (whatever invoked it) is gone. That is what
+// keeps a smoke from outliving the run that asked for it (feature-list.md: smoke-instances-never-leak).
+import { spawn, spawnSync } from 'node:child_process'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
-const LOCK_DIR = join(tmpdir(), 'conductor-smoke.lock')
-const LOCK_STALE_MS = 20 * 60 * 1000
+export const LOCK_DIR = join(tmpdir(), 'conductor-smoke.lock')
+export const DEFAULT_TIMEOUT_MIN = 20
+export const WAITER_GIVE_UP_MIN = 60
 const POLL_MS = 5000
+const PARENT_POLL_MS = 5000
 
-const separator = process.argv.indexOf('--')
-const command = separator >= 0 ? process.argv.slice(separator + 1) : process.argv.slice(2)
-if (!command.length) { console.error('usage: node scripts/smoke-lock.mjs -- <command> [args...]'); process.exit(2) }
+/** `--timeout-min` (or `=N`) is smoke-lock's own flag and must come before `--`; everything after
+ *  `--` is the wrapped command, untouched. With no `--` at all the whole argv is the command, for
+ *  the old two-arg call shape. */
+export function parseArgs(argv) {
+  const separator = argv.indexOf('--')
+  const own = separator >= 0 ? argv.slice(0, separator) : []
+  const command = separator >= 0 ? argv.slice(separator + 1) : argv.slice(0)
+  let timeoutMin = DEFAULT_TIMEOUT_MIN
+  for (let i = 0; i < own.length; i++) {
+    const arg = own[i]
+    if (arg === '--timeout-min') { timeoutMin = Number(own[++i]); continue }
+    if (arg.startsWith('--timeout-min=')) timeoutMin = Number(arg.slice('--timeout-min='.length))
+  }
+  if (!Number.isFinite(timeoutMin) || timeoutMin <= 0) timeoutMin = DEFAULT_TIMEOUT_MIN
+  return { command, timeoutMin }
+}
+
+export function isProcessAlive(pid) {
+  try { process.kill(pid, 0); return true }
+  catch (error) { return error.code === 'EPERM' }
+}
+
+/** Whether a recorded lock holder should be treated as abandoned, and why - null when it is still
+ *  good. Pure given `now`/`alive` so it is testable without real processes or the real clock. */
+export function staleReason(holder, now, alive = isProcessAlive) {
+  if (!holder || typeof holder.pid !== 'number') return 'holder.txt is unreadable'
+  if (!alive(holder.pid)) return `holder process ${holder.pid} is gone`
+  const timeoutMin = holder.timeoutMin ?? DEFAULT_TIMEOUT_MIN
+  const age = now - Date.parse(holder.startedAt ?? '')
+  if (Number.isFinite(age) && age > timeoutMin * 60_000 * 2) {
+    return `holder ${holder.pid} has run ${Math.round(age / 60000)} min, more than 2x its ${timeoutMin} min timeout`
+  }
+  return null
+}
+
+const LEGACY_HOLDER = /^(\d+)\s+(\S+)\s+([\s\S]*)$/
+
+/** holder.txt was plain text (`pid iso command`) before this file learned to record a timeout, so
+ *  a run of the previous smoke-lock.mjs mid-flight during a rollout still writes that shape. Parsed
+ *  as a fallback so it reads as a normal live holder instead of "unreadable" - which would otherwise
+ *  break its lock out from under it (this really happened once, live, while this file was in flight). */
+export function parseHolderText(text) {
+  try { return JSON.parse(text) } catch { /* fall through to the legacy format */ }
+  const match = LEGACY_HOLDER.exec(text.trim())
+  return match ? { pid: Number(match[1]), startedAt: match[2], command: match[3] } : null
+}
+
+const readHolder = () => {
+  let text
+  try { text = readFileSync(join(LOCK_DIR, 'holder.txt'), 'utf8') } catch { return null }
+  return parseHolderText(text)
+}
+
+/** Whether `pid` may remove the lock: only the run that currently holds it, per holder.txt - never
+ *  "whatever process happens to be exiting". A missing/corrupt holder.txt has nothing to protect,
+ *  so it counts as ownable. Without this, a run whose lock was broken as stale (or a waiter that
+ *  never held it) still deletes the *next* holder's live lock on its own way out - this happened for
+ *  real: waiters from one evening were still alive the next morning, having each stolen and then
+ *  torn down each other's locks in turn. */
+export function ownsLock(holder, pid) {
+  return !holder || holder.pid === pid
+}
+
+/** Whether a waiter has been in the acquire loop long enough to give up rather than wait forever -
+ *  a genuinely stuck lock (its stale check keeps failing for some reason not yet understood) must
+ *  still let the waiter exit non-zero instead of hanging alongside it. */
+export function waiterExpired(startedMs, now, limitMin = WAITER_GIVE_UP_MIN) {
+  return now - startedMs > limitMin * 60_000
+}
+
+/** Kills a process and everything it spawned. Windows has no process-group signal, so `/T` walks
+ *  the tree by recorded parent pid, which Windows keeps even after the parent itself has exited. */
+export function killTree(pid, log = () => {}) {
+  if (process.platform === 'win32') {
+    const result = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' })
+    // 128: no such process - already gone, not a failure worth logging.
+    if (result.status !== 0 && result.status !== 128) log(`[smoke-lock] taskkill for ${pid} exited ${result.status}`)
+    return
+  }
+  try { process.kill(-pid, 'SIGKILL') } catch (error) { log(`[smoke-lock] group kill for ${pid} failed: ${error.message}`) }
+}
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-async function acquire() {
+async function acquire(timeoutMin, command) {
   const started = Date.now()
   for (;;) {
-    try { mkdirSync(LOCK_DIR); writeFileSync(join(LOCK_DIR, 'holder.txt'), `${process.pid} ${new Date().toISOString()} ${command.join(' ')}\n`); return }
-    catch (error) { if (error.code !== 'EEXIST') throw error }
-    let age = 0
-    try { age = Date.now() - statSync(LOCK_DIR).mtimeMs } catch { continue }
-    if (age > LOCK_STALE_MS) { try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch { /* another waiter got it */ } continue }
+    try {
+      mkdirSync(LOCK_DIR)
+      writeFileSync(join(LOCK_DIR, 'holder.txt'), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), timeoutMin, command: command.join(' ') }))
+      return
+    } catch (error) { if (error.code !== 'EEXIST') throw error }
+    const reason = staleReason(readHolder(), Date.now())
+    if (reason) {
+      console.error(`[smoke-lock] breaking stale lock: ${reason}`)
+      try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch { /* another waiter got it first */ }
+      continue
+    }
+    if (waiterExpired(started, Date.now())) throw new Error(`gave up waiting for ${LOCK_DIR} after ${WAITER_GIVE_UP_MIN} min`)
     if ((Date.now() - started) % 60000 < POLL_MS) console.error(`[smoke-lock] waiting for ${LOCK_DIR} (${Math.round((Date.now() - started) / 1000)} s)`)
     await sleep(POLL_MS)
   }
 }
 
-const release = () => { try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch { /* already gone */ } }
+/** Only removes a lock this process still holds - see ownsLock(). A run whose lock was broken as
+ *  stale while it ran, or a waiter that never acquired one, must not delete whoever holds it now. */
+const release = () => {
+  if (!ownsLock(readHolder(), process.pid)) return
+  try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch { /* already gone */ }
+}
 
-await acquire()
-// Direct spawn keeps arguments intact; only a .cmd/.bat launcher (npm.cmd) needs the shell.
-const child = spawn(command[0], command.slice(1), { stdio: 'inherit', shell: /\.(?:cmd|bat)$/i.test(command[0]) })
-const finish = code => { release(); process.exit(code ?? 1) }
-child.on('exit', finish)
-child.on('error', error => { console.error(`[smoke-lock] ${error.message}`); finish(1) })
-for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { child.kill(); finish(130) })
+async function main() {
+  const { command, timeoutMin } = parseArgs(process.argv.slice(2))
+  if (!command.length) { console.error('usage: node scripts/smoke-lock.mjs [--timeout-min N] -- <command> [args...]'); process.exit(2) }
+  try { await acquire(timeoutMin, command) }
+  catch (error) { console.error(`[smoke-lock] ${error.message}`); process.exit(1) }
+
+  // Direct spawn keeps arguments intact; only a .cmd/.bat launcher (npm.cmd) needs the shell. The
+  // child gets its own process group off Windows so a POSIX kill(-pid) can reach its descendants.
+  // CONDUCTOR_TEST_PARENT_PID names *this* process - not the smoke script's own, closer parent -
+  // as the one every Electron instance the smoke launches should watch, so an abrupt kill of this
+  // process (taskkill /F, no /T - the smoke script itself is left running) still tears the app down.
+  const child = spawn(command[0], command.slice(1), {
+    stdio: 'inherit',
+    shell: /\.(?:cmd|bat)$/i.test(command[0]),
+    detached: process.platform !== 'win32',
+    env: { ...process.env, CONDUCTOR_TEST_PARENT_PID: String(process.pid) }
+  })
+
+  let finished = false
+  const finish = code => {
+    if (finished) return
+    finished = true
+    clearTimeout(timeoutTimer)
+    clearInterval(parentTimer)
+    killTree(child.pid, console.error)
+    release()
+    process.exit(code ?? 1)
+  }
+
+  const timeoutTimer = setTimeout(() => {
+    console.error(`[smoke-lock] run exceeded ${timeoutMin} min, killing the process tree`)
+    finish(124)
+  }, timeoutMin * 60_000)
+
+  // Captured once: after the real parent exits, ppid is unreliable (reparented on POSIX, stale on
+  // Windows), so only the pid seen at startup is meaningful to keep polling.
+  const initialParentPid = process.ppid
+  const parentTimer = setInterval(() => {
+    if (!isProcessAlive(initialParentPid)) {
+      console.error(`[smoke-lock] parent ${initialParentPid} is gone, killing the process tree`)
+      finish(1)
+    }
+  }, PARENT_POLL_MS)
+
+  child.on('exit', code => finish(code))
+  child.on('error', error => { console.error(`[smoke-lock] ${error.message}`); finish(1) })
+  for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => finish(130))
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) await main()

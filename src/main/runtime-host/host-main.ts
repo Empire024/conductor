@@ -34,6 +34,20 @@ const host = new RuntimeHost({ pipe: lock.pipe, secret: lock.secret, idleMs, log
 process.on('uncaughtException', error => log(`uncaught: ${error.stack ?? error.message}`))
 process.on('unhandledRejection', error => log(`unhandled: ${error instanceof Error ? error.stack ?? error.message : String(error)}`))
 
+// Test mode only (launcher.ts sets this iff CONDUCTOR_TEST_USER_DATA): this host dies with the app
+// that started it instead of outliving it, the way a real launch's host is meant to.
+const watchPid = Number(process.env.CONDUCTOR_RUNTIME_HOST_WATCH_PID)
+if (Number.isInteger(watchPid) && watchPid > 0) {
+  const watchdog = setInterval(() => {
+    if (alive(watchPid)) return
+    clearInterval(watchdog)
+    log(`watched process ${watchPid} is gone; exiting`)
+    release()
+    process.exit(1)
+  }, 5000)
+  watchdog.unref()
+}
+
 host.listen().then(() => {
   const temporary = lockPath + '.' + process.pid
   writeFileSync(temporary, JSON.stringify(lock), { encoding: 'utf8', mode: 0o600 })

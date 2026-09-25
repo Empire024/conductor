@@ -7,7 +7,7 @@ import { ConversationHistory, registerConversationHistoryIpc } from './conversat
 import { guardLayoutSave } from './layout-save-guard'
 import { WeeklyUsageSummaryService } from './weekly-usage-summary'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { promises as fs, readFileSync } from 'node:fs'
+import { promises as fs, readFileSync, appendFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
 import { importPromptImage } from './prompt-images'
@@ -30,7 +30,9 @@ import { safeStorageCipher } from './safe-storage-vault'
 import { ProjectFileChanges } from './project-file-changes'
 import { isStructuredRendererUrl } from './structured-ipc-policy'
 import { installContextMenu } from './context-menu'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, powerMonitor, screen, shell, webContents } from 'electron'
+import { app, BrowserWindow, clipboard, ipcMain, Menu, powerMonitor, screen, shell, webContents } from 'electron'
+import * as testDialogs from './test-mode-dialogs'
+import { startTestModeWatchdog } from './test-mode-watchdog'
 import { SystemMetricsSampler } from './system-metrics.ts'
 import type { SystemMetricsSnapshot } from '../shared/system-metrics.ts'
 import { CloseConfirmation, hasRunningWork, hasSessionWork } from './close-confirmation'
@@ -228,6 +230,24 @@ app.setName('Conductor')
 // Isolated automation profile is chosen before the single-instance lock.
 if (!app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA) app.setPath('userData', resolve(process.env.CONDUCTOR_TEST_USER_DATA))
 if (app.isPackaged) delete process.env.CONDUCTOR_OFFLINE_TESTS
+/** An automation profile (CONDUCTOR_TEST_USER_DATA). Gates the watchdog below, the dialog guard in
+ *  ./test-mode-dialogs, and routing main-process errors to a log instead of a native error box -
+ *  none of which a real, owner-driven launch should ever behave differently for. */
+const testMode = !app.isPackaged && !!process.env.CONDUCTOR_TEST_USER_DATA
+if (testMode) {
+  // A leaked overnight verifier left Electron and its fixture CLIs running for hours after the
+  // smoke script that launched it was gone (feature-list.md: smoke-instances-never-leak). This
+  // instance dies, tree and all, within one poll interval of that launcher disappearing.
+  startTestModeWatchdog()
+  const mainErrorsLog = join(resolve(process.env.CONDUCTOR_TEST_USER_DATA!), 'main-errors.log')
+  const logMainError = (kind: string, detail: string): void => {
+    try { appendFileSync(mainErrorsLog, `${new Date().toISOString()} [${kind}] ${detail}\n`) } catch { /* logging never blocks anything */ }
+  }
+  // Electron's default handling for these is a modal "A JavaScript error occurred" dialog, which
+  // is exactly the kind of native window a parked test instance must never put on a real screen.
+  process.on('uncaughtException', error => logMainError('uncaughtException', error.stack ?? error.message))
+  process.on('unhandledRejection', reason => logMainError('unhandledRejection', reason instanceof Error ? reason.stack ?? reason.message : String(reason)))
+}
 /** Smoke runs and probes drive a real window, but they must never take the desktop from whoever
  *  is working: an automation profile (CONDUCTOR_TEST_USER_DATA) parks its windows off-screen,
  *  out of the taskbar, and never activates or raises them. Set CONDUCTOR_BACKGROUND_WINDOWS=0 to
@@ -851,7 +871,7 @@ const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): 
       detail: dirty.map(({ draft }) => (database.getProject(draft.projectId)?.name ?? '') + ' / ' + draft.path).join('\n'),
       buttons: ['Save', "Don't Save", 'Cancel'], defaultId: 0, cancelId: 2, noLink: true
     }
-    const { response } = owner && !owner.isDestroyed() ? await dialog.showMessageBox(owner, options) : await dialog.showMessageBox(options)
+    const { response } = await testDialogs.showMessageBox(owner, options)
     if (response === 2) return false
     // Resolve again after the dialog: a file may have moved, changed or been
     // deleted while the owner was deciding. Validate all drafts before writing.
@@ -899,8 +919,7 @@ const resolveUnsavedEditors = (owner: BrowserWindow | null, tabIds?: string[]): 
     return !database.listEditorDrafts().some((draft) => !draft.recoveredAt && (!tabIds || tabIds.includes(draft.tabId)))
   })().catch(async (reason: unknown) => {
     const options: Electron.MessageBoxOptions = { type: 'error', title: 'Could not close editor', message: reason instanceof Error ? reason.message : String(reason) }
-    if (owner && !owner.isDestroyed()) await dialog.showMessageBox(owner, options)
-    else await dialog.showMessageBox(options)
+    await testDialogs.showMessageBox(owner, options)
     return false
   })
   resolvingEditors = task
@@ -912,8 +931,8 @@ const liveWindow = (owner?: BrowserWindow | null): BrowserWindow | null => owner
   ? owner
   : mainWindow && !mainWindow.isDestroyed() ? mainWindow : [...detachedWindows.values()].find(window => !window.isDestroyed()) ?? null
 
-const showDecision = async (owner: BrowserWindow | null, options: Electron.MessageBoxOptions): Promise<number> => {
-  const result = owner && !owner.isDestroyed() ? await dialog.showMessageBox(owner, options) : await dialog.showMessageBox(options)
+const showDecision = async (owner: BrowserWindow | null, options: Electron.MessageBoxOptions, testResponse?: number): Promise<number> => {
+  const result = await testDialogs.showMessageBox(owner, options, testResponse)
   return result.response
 }
 
@@ -936,6 +955,11 @@ const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit
   const background = Boolean(runtimeHostClient?.connected) && active.some(process => process.kind === 'agent')
   const choices: StopDecision[] = background ? ['background', 'stop', 'cancel'] : ['stop', 'cancel']
   const verb = action === 'restart' ? 'restart' : 'quit'
+  // A parked test instance must never sit on this dialog: a guarded run answers it itself, headless,
+  // with the choice that actually lets the app go down ("stop"), not the button a live owner would
+  // default to (background keeps it alive) or the cancel button smoke-lock's generic fallback would
+  // otherwise pick (feature-list.md: smoke-instances-never-leak).
+  const stopChoiceIndex = background ? 1 : 0
   return closeConfirmation.decide(() => stopConfirmations.ask({ action, running, choices }, async signal => choices[await showDecision(liveWindow(owner), {
     type: 'warning', title: action === 'restart' ? 'Restart Conductor?' : 'Quit Conductor?',
     message: 'Work is still running in Conductor.',
@@ -944,7 +968,7 @@ const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit
       : 'Stopping the application interrupts work in every project and window.'}`,
     buttons: background ? [`Keep running in background and ${verb}`, `Stop all and ${verb}`, 'Cancel'] : [`Stop work and ${verb}`, 'Cancel'],
     defaultId: background ? 0 : 1, cancelId: choices.length - 1, noLink: true, signal
-  })] ?? 'cancel', { running: stopQuestion }))
+  }, stopChoiceIndex)] ?? 'cancel', { running: stopQuestion }))
 }
 
 const broadcastSessionArchive = (result: SessionArchiveResult): void => {
@@ -973,8 +997,7 @@ const saveSessionArchive = async (owner?: BrowserWindow | null): Promise<Session
       defaultPath: current === 'Untitled session' ? 'Conductor session.conductor-session' : current + '.conductor-session',
       filters: [{ name: 'Conductor session', extensions: ['conductor-session'] }]
     }
-    const selectedOwner = liveWindow(owner)
-    const result = selectedOwner ? await dialog.showSaveDialog(selectedOwner, options) : await dialog.showSaveDialog(options)
+    const result = await testDialogs.showSaveDialog(liveWindow(owner), options)
     if (result.canceled || !result.filePath) return null
     const name = basename(result.filePath, extname(result.filePath)).trim().slice(0, 200) || 'Conductor session'
     const archive = database.sessionArchive(name)
@@ -1005,9 +1028,8 @@ const openSessionArchive = async (owner?: BrowserWindow | null): Promise<Session
   if (archiveBusy) throw new Error('Another session archive operation is already running.')
   archiveBusy = true
   try {
-    const selectedOwner = liveWindow(owner)
     const options: Electron.OpenDialogOptions = { title: 'Open Conductor session', buttonLabel: 'Open session', properties: ['openFile'], filters: [{ name: 'Conductor session', extensions: ['conductor-session'] }] }
-    const selected = selectedOwner ? await dialog.showOpenDialog(selectedOwner, options) : await dialog.showOpenDialog(options)
+    const selected = await testDialogs.showOpenDialog(liveWindow(owner), options)
     if (selected.canceled || !selected.filePaths[0]) return null
     const importedArchive = await readSessionArchive(selected.filePaths[0])
     await validateArchiveProjectPaths(importedArchive)
@@ -1017,7 +1039,7 @@ const openSessionArchive = async (owner?: BrowserWindow | null): Promise<Session
     const active = runningWork()
     const nativeActive = agents.nativeCli.hasSubmittedInput()
     if (dirty.length || active.length || nativeActive) {
-      const confirmed = await closeConfirmation.request(async () => (await showDecision(selectedOwner, {
+      const confirmed = await closeConfirmation.request(async () => (await showDecision(liveWindow(owner), {
         type: 'warning', title: 'Open saved session?', message: `Replace this desk with “${importedArchive.name}”?`,
         detail: `${dirty.length ? `${dirty.length} unsaved editor draft${dirty.length === 1 ? '' : 's'} will be kept in the recovery snapshot.\n` : ''}${active.length || nativeActive ? 'Running work in every project and window will be interrupted after the current desk is safely archived.\n' : ''}\nCancel keeps the current desk and all work unchanged.`,
         buttons: ['Open session', 'Cancel'], defaultId: 1, cancelId: 1, noLink: true
@@ -1434,7 +1456,7 @@ const registerIpc = (): void => {
     changed: projectId => { for (const window of BrowserWindow.getAllWindows()) if (!window.isDestroyed()) window.webContents.send('logic-loops:changed', projectId) } })
   ipcMain.handle('projects:list', () => database.listDeskProjects())
   ipcMain.handle('projects:open-folder', async () => {
-    const result = await dialog.showOpenDialog({
+    const result = await testDialogs.showOpenDialog(null, {
       title: 'Open a project folder',
       properties: ['openDirectory', 'createDirectory']
     })
@@ -1463,9 +1485,7 @@ const registerIpc = (): void => {
       buttonLabel: 'Move here',
       properties: ['openDirectory', 'createDirectory']
     }
-    const result = owner
-      ? await dialog.showOpenDialog(owner, options)
-      : await dialog.showOpenDialog(options)
+    const result = await testDialogs.showOpenDialog(owner, options)
     if (result.canceled || !result.filePaths[0]) return null
 
     const destinationParent = resolve(result.filePaths[0])
@@ -1523,9 +1543,7 @@ const registerIpc = (): void => {
       buttonLabel: 'Use this folder',
       properties: ['openDirectory', 'createDirectory']
     }
-    const result = owner
-      ? await dialog.showOpenDialog(owner, options)
-      : await dialog.showOpenDialog(options)
+    const result = await testDialogs.showOpenDialog(owner, options)
     if (!result.canceled && result.filePaths[0]) {
       database.setSetting('projectsRoot', resolve(result.filePaths[0]))
     }
@@ -2376,8 +2394,7 @@ app.whenReady().then(async () => {
         buttonLabel: 'Save',
         defaultPath: basename(description.file.path)
       }
-      const owner = liveWindow()
-      const result = owner ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options)
+      const result = await testDialogs.showSaveDialog(liveWindow(), options)
       return result.canceled || !result.filePath ? null : result.filePath
     },
     publish: (channel, payload) => publish(channel, payload)
@@ -2553,7 +2570,7 @@ app.whenReady().then(async () => {
       return requestTailscaleCertificate(executable, dnsName, join(app.getPath('userData'), 'phone-access'))
     }
   })
-  disposePhoneIpc = registerPhoneAccessIpc({ ipcMain, service: phoneAccess, server: phoneServer, window: () => liveWindow(mainWindow), showSaveDialog: (owner, options) => owner ? dialog.showSaveDialog(owner, options) : dialog.showSaveDialog(options) })
+  disposePhoneIpc = registerPhoneAccessIpc({ ipcMain, service: phoneAccess, server: phoneServer, window: () => liveWindow(mainWindow), showSaveDialog: (owner, options) => testDialogs.showSaveDialog(owner, options) })
   void phoneServer.apply().catch(error => console.warn('Phone access did not start', error))
   updates = new UpdateManager({
     currentVersion: app.getVersion(),
