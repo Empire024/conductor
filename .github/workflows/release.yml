@@ -6,6 +6,11 @@ name: Release Conductor
 # for a release nobody installed.
 on:
   workflow_dispatch:
+    inputs:
+      mac:
+        description: Also build the unsigned (ad-hoc) Apple silicon dmg and zip and add them to the release
+        type: boolean
+        default: false
 
 concurrency:
   group: conductor-installed-update
@@ -17,6 +22,8 @@ permissions:
 jobs:
   windows-release:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -102,3 +109,36 @@ jobs:
             --generate-notes `
             --latest `
             --title "Conductor $version"
+
+  # Only when asked (the mac input). A delivery's publish never sets it, so the Windows release is
+  # built, published and verified exactly as before, and this job adds the Mac files to that same
+  # release afterwards. The build is ad-hoc signed (no Apple Developer ID); an installed Mac app
+  # updates from latest-mac.yml and the zip through Conductor's own updater (mac-zip-updater.ts),
+  # never Squirrel.Mac. The tests ran in the Windows job; this job only packages.
+  macos-release:
+    needs: windows-release
+    if: ${{ inputs.mac }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build macOS release
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: |
+          npm version '${{ needs.windows-release.outputs.version }}' --no-git-tag-version
+          npm run dist:mac
+      - name: Add the Mac files to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version='${{ needs.windows-release.outputs.version }}'
+          gh release upload "v$version" \
+            "release/Conductor-$version-arm64.dmg" \
+            "release/Conductor-$version-arm64-mac.zip" \
+            "release/Conductor-$version-arm64-mac.zip.blockmap" \
+            "release/latest-mac.yml"

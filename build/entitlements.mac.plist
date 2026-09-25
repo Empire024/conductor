@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The macOS build is ad-hoc signed (no Apple Developer ID) with the hardened runtime off, so
+     these are not enforced today. They are what Electron needs if the hardened runtime is ever
+     turned on: V8's JIT, and loading the bundle's own frameworks and node-pty, whose ad-hoc
+     signatures do not share a team. -->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

@@ -14,6 +14,7 @@
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "dist:win": "npm run build && electron-builder --win nsis --x64 --publish never && node scripts/generate-update-manifest.mjs",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip --arm64 --publish never",
     "preview": "electron-vite preview",
     "postinstall": "node scripts/node-pty-spawn-helper.cjs",
     "typecheck": "tsc --noEmit",
@@ -140,6 +141,34 @@
       "runAfterFinish": true,
       "deleteAppDataOnUninstall": false,
       "artifactName": "Conductor-Setup-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "identity": "-",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "notarize": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "artifactName": "Conductor-${version}-${arch}-mac.${ext}"
+    },
+    "dmg": {
+      "artifactName": "Conductor-${version}-${arch}.${ext}"
     },
     "extraResources": [
       {

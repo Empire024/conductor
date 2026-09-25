@@ -1,6 +1,6 @@
 import { RESTART_REQUEST_MAX_AGE_MS, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import { app, BrowserWindow } from 'electron'
-import { NsisUpdater } from 'electron-updater'
+import { NsisUpdater, type BaseUpdater } from 'electron-updater'
 import type { ProgressInfo, UpdateInfo } from 'builder-util-runtime'
 import type { UpdateDownloadedEvent } from 'electron-updater'
 import { gt, valid } from 'semver'
@@ -13,6 +13,7 @@ import { CliVersionStore, PINNABLE_CLIS, plainCliVersion, restorePlan, setActive
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { createUpdateInstallSeam, type InstallRequest, type UpdateInstallSeam } from './update-install-seam'
+import { MacZipUpdater } from './mac-zip-updater'
 
 interface UpdateManagerOptions {
   currentVersion: string
@@ -29,6 +30,8 @@ interface UpdateManagerOptions {
   cliVersions?: CliVersionStore
   /** When the installed CLIs are first saved after launch; null never (unit tests). */
   cliSnapshotDelayMs?: number | null
+  /** Picks the updater (NSIS or the Mac zip swap); defaults to process.platform. */
+  platform?: NodeJS.Platform
 }
 interface PendingPrepare {
   requestId: string
@@ -40,14 +43,17 @@ const CLI_SNAPSHOT_INTERVAL_MS = 6 * 60 * 60_000
 const PREPARE_TIMEOUT_MS = 2_000
 /** A test profile (CONDUCTOR_TEST_USER_DATA) looks for older CLI versions under a fake home, never the owner's. */
 const testCliHome = (): string | undefined => process.env.CONDUCTOR_TEST_USER_DATA ? process.env.CONDUCTOR_TEST_CLI_HOME?.trim() || join(process.env.CONDUCTOR_TEST_USER_DATA, 'cli-home') : undefined
+/** Windows installs the NSIS installer; a Mac swaps in the release zip itself (mac-zip-updater.ts), never through Squirrel.Mac. */
+export const createPlatformUpdater = (provider: ConductorUpdateProvider, platform: NodeJS.Platform = process.platform): BaseUpdater =>
+  platform === 'darwin' ? new MacZipUpdater(provider) : new NsisUpdater(provider)
 const busy = (phase: AppUpdateState['phase']): boolean => ['downloading', 'ready', 'installing'].includes(phase)
 const errorMessage = (reason: unknown): string => (reason instanceof Error ? reason.message : String(reason)).replace(/^Error:\s*/i, '').slice(0, 280)
 
 export class UpdateManager {
   private state: AppUpdateState
-  private updater: NsisUpdater | null = null
-  private remoteUpdater: NsisUpdater | null = null
-  private localUpdater: NsisUpdater | null = null
+  private updater: BaseUpdater | null = null
+  private remoteUpdater: BaseUpdater | null = null
+  private localUpdater: BaseUpdater | null = null
   private localFeed?: LocalUpdateFeed
   private restorePoints?: RestorePointStore
   private cliVersions?: CliVersionStore
@@ -89,6 +95,7 @@ export class UpdateManager {
       }
     }
   }
+  private get platform(): NodeJS.Platform { return this.options.platform ?? process.platform }
   getState(): AppUpdateState {
     const request = this.restartRequest
     const current = request && Date.now() - Date.parse(request.at) <= RESTART_REQUEST_MAX_AGE_MS
@@ -154,8 +161,8 @@ export class UpdateManager {
     this.scheduleChecks()
     return feedUrl
   }
-  private createUpdater(provider: ConductorUpdateProvider, allowDowngrade = false): NsisUpdater {
-    const updater = new NsisUpdater(provider)
+  private createUpdater(provider: ConductorUpdateProvider, allowDowngrade = false): BaseUpdater {
+    const updater = createPlatformUpdater(provider, this.platform)
     const epoch = this.epoch
     const current = (): boolean => epoch === this.epoch && this.updater === updater
     updater.autoDownload = false
@@ -188,7 +195,7 @@ export class UpdateManager {
     this.setState({ ...this.state, phase: 'checking', message: 'Checking released and local builds…', localBuildWarning: undefined })
     const problems: string[] = []
     let selected = false
-    const consider = (updater: NsisUpdater, info: UpdateInfo | undefined, source: 'local' | 'release'): void => {
+    const consider = (updater: BaseUpdater, info: UpdateInfo | undefined, source: 'local' | 'release'): void => {
       if (epoch !== this.epoch || busy(this.state.phase) || !info || !valid(info.version) || !gt(info.version, this.currentVersion)) return
       if (selected && this.state.availableVersion && !gt(info.version, this.state.availableVersion)) return
       selected = true
@@ -218,11 +225,17 @@ export class UpdateManager {
       }
       const remoteResponse = await remoteResult
       if (epoch !== this.epoch) return this.getState()
-      if ('error' in remoteResponse) problems.push(errorMessage(remoteResponse.error))
-      else if (remoteResponse.result?.isUpdateAvailable) consider(remote, remoteResponse.result.updateInfo, 'release')
+      // A release is published with its Mac files only when asked (release.yml's mac input), so
+      // on a Mac a release without latest-mac.yml is not an error, just nothing to install yet.
+      let noMacBuild = false
+      if ('error' in remoteResponse) {
+        const message = errorMessage(remoteResponse.error)
+        if (this.platform === 'darwin' && /latest-mac\.yml/.test(message)) noMacBuild = true
+        else problems.push(message)
+      } else if (remoteResponse.result?.isUpdateAvailable) consider(remote, remoteResponse.result.updateInfo, 'release')
       if (!selected && !busy(this.state.phase)) {
         this.updater = null
-        this.setState({ phase: problems.length ? 'error' : 'idle', currentVersion: this.currentVersion, configured: true, message: problems[0] ?? 'Conductor is up to date.', lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
+        this.setState({ phase: problems.length ? 'error' : 'idle', currentVersion: this.currentVersion, configured: true, message: problems[0] ?? (noMacBuild ? 'The latest release has no Mac build yet.' : 'Conductor is up to date.'), lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
       }
     } finally { if (epoch === this.epoch) this.checking = false }
     return this.getState()

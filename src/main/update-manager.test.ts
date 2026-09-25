@@ -5,7 +5,7 @@ import { join } from 'node:path'
 const f = vi.hoisted(() => ({
   instances: [] as Array<any>, local: vi.fn(), remoteVersion: '0.1.4', localVersion: '0.1.5-local.1',
   remoteGate: undefined as Promise<void> | undefined, downloadGate: undefined as Promise<void> | undefined,
-  remoteError: false
+  remoteError: false as boolean | string
 }))
 vi.mock('electron', () => ({ BrowserWindow: { getAllWindows: () => [] } }))
 vi.mock('./local-update-feed', () => ({ LocalUpdateFeed: class {
@@ -14,14 +14,15 @@ vi.mock('./local-update-feed', () => ({ LocalUpdateFeed: class {
 } }))
 vi.mock('electron-updater', async () => {
   const { EventEmitter } = await import('node:events')
-  return { NsisUpdater: class extends EventEmitter {
+  // BaseUpdater too: the macOS updater (mac-zip-updater.ts) extends it.
+  class Updater extends EventEmitter {
     autoInstallOnAppQuit = true
     version = ''
     constructor(readonly provider: { provider: string }) { super(); f.instances.push(this) }
     checkForUpdates = vi.fn(async () => {
       if (this.provider.provider === 'github') {
         await f.remoteGate
-        if (f.remoteError) throw new Error('Offline')
+        if (f.remoteError) throw new Error(typeof f.remoteError === 'string' ? f.remoteError : 'Offline')
       }
       this.version = this.provider.provider === 'github' ? f.remoteVersion : f.localVersion
       return { isUpdateAvailable: true, updateInfo: { version: this.version } }
@@ -31,7 +32,8 @@ vi.mock('electron-updater', async () => {
       this.emit('update-downloaded', { version: this.version, sha512: 'sha-' + this.version, downloadedFile: `C:\\cache\\Conductor-Setup-${this.version}.exe` })
     })
     quitAndInstall = vi.fn()
-  } }
+  }
+  return { BaseUpdater: Updater, NsisUpdater: class extends Updater {} }
 })
 // Hermetic CLI rollback: no real CLI is resolved, run or looked for in the owner's home.
 vi.mock('./cli-versions', async importOriginal => {
@@ -40,7 +42,8 @@ vi.mock('./cli-versions', async importOriginal => {
     constructor(options: import('./cli-versions').CliVersionStoreOptions) { super({ home: options.directory, resolveInstalled: () => null, readVersion: async () => null, ...options }) }
   } }
 })
-import { UpdateManager } from './update-manager'
+import { UpdateManager, createPlatformUpdater } from './update-manager'
+import { MacZipUpdater } from './mac-zip-updater'
 import { CliVersionStore, pinnedCliExecutable } from './cli-versions'
 import { RestorePointStore } from './restore-points'
 import { createUpdateInstallSeam } from './update-install-seam'
@@ -221,5 +224,27 @@ describe('test-mode installs go through the installer stub', () => {
     await m.check(); await m.download(); await m.install()
     expect(relaunch).toHaveBeenCalledOnce()
     expect(JSON.parse(readFileSync(join(userData, 'installer-stub.json'), 'utf8'))).toMatchObject({ version: f.localVersion, reason: 'update' })
+  })
+})
+
+describe('the updater per platform', () => {
+  it('a Mac swaps in the release zip itself; Windows keeps the NSIS updater', () => {
+    const feed = { provider: 'github', owner: 'Empire024', repo: 'conductor', releaseType: 'release' } as const
+    expect(createPlatformUpdater(feed, 'darwin')).toBeInstanceOf(MacZipUpdater)
+    const windows = createPlatformUpdater(feed, 'win32')
+    expect(windows).not.toBeInstanceOf(MacZipUpdater)
+    expect(windows.constructor.name).not.toBe('MacZipUpdater')
+  })
+  it('on a Mac, a release published without its Mac files is nothing to install, not an error', async () => {
+    const missing = 'Cannot find latest-mac.yml in the latest release artifacts (https://github.com/Empire024/conductor/releases/download/v0.1.9/latest-mac.yml): HttpError: 404'
+    f.remoteError = missing
+    f.local.mockResolvedValue(null)
+    const mac = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall: vi.fn(), platform: 'darwin' })
+    managers.push(mac); mac.configure('')
+    expect(await mac.check()).toMatchObject({ phase: 'idle', message: 'The latest release has no Mac build yet.' })
+    expect(f.instances.at(-1)).toBeInstanceOf(MacZipUpdater)
+    // Windows still reports it: there it would be a broken release.
+    const windows = manager()
+    expect(await windows.check()).toMatchObject({ phase: 'error', message: missing })
   })
 })
