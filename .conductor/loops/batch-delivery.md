@@ -55,8 +55,9 @@ locked: [budget, steps.review, steps.verify, steps.ship]
 4. **Review.** The frontier model that did not write the contract (Fable ↔ Astra) reads the diff once and answers approve or a specific list of changes. At most one corrective
    round, then escalate to the owner.
 5. **Verify.** Run the `verify` loop on the batch: a brain plans adversarial, real-world scenarios from the owner's
-   original item text and images, not the implementer's tests; cheap hands run them in the real app with real models and
-   real data; the brain judges VERIFIED or REOPEN. An item is ticked `[x]` only after VERIFIED.
+   original item text and images, not the implementer's tests; one Opus tab (verify v3) runs them in the real app on the shared
+   scripts/verify-kit.mjs, day lane only (long, real-model and perf runs go to the overnight lane), and judges VERIFIED,
+   REOPEN (guarded by a control run) or UNVERIFIED. An item is ticked `[x]` only after VERIFIED.
 6. **Ship.** `git.ship({message, paths})` with the batch's files only; wait on `git.ship.status`. Do not publish;
    publish once per set of batches.
 7. Before every dispatch, read `usage.limits`. Opus implements up to 78% Claude weekly (owner 2026-09-25: no downgrade to Sonnet for budget, it lowers quality); from 78% finish in-flight work only; at 80% Claude work stops; Astra plus local finish. Astra stops at 95%.
