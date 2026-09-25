@@ -64,7 +64,10 @@ describe('Claude CLI bridge — synthetic raw protocol, zero inference', () => {
     const f = fixture({ approvalReviewer: true, mcpConfig: '{"mcpServers":{"unwanted":{}}}' })
     await f.adapter.start()
     const args = f.transport.options.args
-    expect(args).toContain('--bare')
+    // --bare would drop the owner's OAuth login ("Not logged in"), so isolation is spelled out.
+    expect(args).not.toContain('--bare')
+    expect(args[args.indexOf('--setting-sources') + 1]).toBe('')
+    expect(args).toContain('--disable-slash-commands')
     expect(args).toContain('--strict-mcp-config')
     expect(args[args.indexOf('--tools') + 1]).toBe('')
     expect(args[args.indexOf('--mcp-config') + 1]).toBe('{"mcpServers":{}}')

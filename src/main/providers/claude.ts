@@ -202,10 +202,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.settings.model) args.push('--model', this.settings.model)
     if (this.settings.effort) args.push('--effort', this.settings.effort)
     if (this.options.approvalReviewer) {
-      // Host-only role: no tools, plugins/hooks/project instructions or MCP, before any model
-      // turn starts. OAuth remains the normal native authentication path; no bypass flags.
+      // Host-only role: no tools, settings hooks, skills or MCP, before any model turn starts.
+      // Not --bare: since 2.1.28x it reads only ANTHROPIC_API_KEY, never the owner's OAuth login,
+      // so every review answered "Not logged in" and fell back to the owner. No bypass flags.
       if (this.nativeSessionId) throw new Error('Approval reviewers must start a fresh isolated native session')
-      args.push('--bare', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}')
+      args.push('--setting-sources', '', '--disable-slash-commands', '--tools', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}')
     }
     // Conductor's own MCP servers (currently the browser view) are attached at launch so the
     // tools are simply present: there is no way to hand a running conversation a new server, and
