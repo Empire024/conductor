@@ -1436,8 +1436,12 @@ describe('composer settings persistence', () => {
 })
 
 describe('activity reported for a lost connection', () => {
-  const activityPhase = (f: ReturnType<typeof fixture>) =>
-    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  // recordActivityPhase now coalesces the durable status write and its broadcast to `flush`,
+  // so a synchronous check of the persisted row must flush first.
+  const activityPhase = (f: ReturnType<typeof fixture>) => {
+    f.manager.flush()
+    return f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  }
 
   it('reports disconnected when the connection is lost while the turn is still in flight', async () => {
     const f = fixture()
@@ -1458,8 +1462,12 @@ describe('activity reported for a lost connection', () => {
 })
 
 describe('activity reported while subagent work outlives its turn', () => {
-  const activityPhase = (f: ReturnType<typeof fixture>) =>
-    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  // recordActivityPhase now coalesces the durable status write and its broadcast to `flush`,
+  // so a synchronous check of the persisted row must flush first.
+  const activityPhase = (f: ReturnType<typeof fixture>) => {
+    f.manager.flush()
+    return f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  }
   const subagent = (name: string, status: 'running' | 'completed' | 'failed', detached = true) =>
     ({ itemId: name, data: { type: 'subagent' as const, name, status, detached } })
 
@@ -1512,8 +1520,12 @@ describe('activity reported while subagent work outlives its turn', () => {
 })
 
 describe('activity reported while background work outlives its turn', () => {
-  const activityPhase = (f: ReturnType<typeof fixture>) =>
-    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  // recordActivityPhase now coalesces the durable status write and its broadcast to `flush`,
+  // so a synchronous check of the persisted row must flush first.
+  const activityPhase = (f: ReturnType<typeof fixture>) => {
+    f.manager.flush()
+    return f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  }
   const tick = (f: ReturnType<typeof fixture>) => f.current.emit({ data: { type: 'notice', message: 'Claude task lifecycle' } })
 
   it('keeps a conversation waiting while work it backgrounded runs past the end of its turn', async () => {
@@ -1585,8 +1597,12 @@ describe('activity reported while background work outlives its turn', () => {
 
 describe('provider usage limits and automatic continuation', () => {
   const limited = "You've hit your session limit · resets in 2 hours"
-  const activityPhase = (f: ReturnType<typeof fixture>) =>
-    f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  // recordActivityPhase now coalesces the durable status write and its broadcast to `flush`,
+  // so a synchronous check of the persisted row must flush first.
+  const activityPhase = (f: ReturnType<typeof fixture>) => {
+    f.manager.flush()
+    return f.database.listProcesses().find(process => process.id === f.spec.id)?.activityPhase
+  }
   /** How a provider reports an exhausted quota: an ordinary failed turn whose text names a time. */
   const hitLimit = (f: ReturnType<typeof fixture>): void => {
     f.current.emit({ data: { type: 'error', message: limited } })
@@ -1665,5 +1681,38 @@ describe('provider usage limits and automatic continuation', () => {
     reopened.ensure({ ...f.spec, continueOnLimit: true })
     await vi.advanceTimersByTimeAsync(2 * 60 * 60_000)
     expect(f.current.submissions.at(-1)?.text).toBe('continue')
+  })
+})
+
+describe('a burst of synchronous events batches its durable write, its status write, and its broadcast', () => {
+  it('stages every event of the burst in memory and writes the whole batch in one flush, split into bounded broadcasts', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Burst turn', settings)
+    const from = f.database.structured.snapshot(f.spec.id)!.sequence
+    const before = f.broadcast.mock.calls.filter(call => call[0] === 'structured:events').length
+    const burstSize = 1_200
+    // All staged synchronously, in one JS turn, the way a fast provider's stdout chunk arrives.
+    for (let index = 0; index < burstSize; index++) f.current.emit({ itemId: `burst-${index}`, data: { type: 'notice', message: `burst ${index}` } })
+    // Nothing durable yet: `emit` only stages events in memory until a flush runs.
+    expect(f.database.structured.events(f.spec.id, from)).toHaveLength(0)
+    f.manager.flush()
+    expect(f.database.structured.events(f.spec.id, from)).toHaveLength(burstSize)
+    // The broadcast itself is spread across more than one IPC message, each bounded, rather than
+    // one message holding the whole burst.
+    await vi.waitFor(() => expect(f.broadcast.mock.calls.filter(call => call[0] === 'structured:events').length - before).toBeGreaterThan(1))
+    const batches = f.broadcast.mock.calls.filter(call => call[0] === 'structured:events').slice(before).map(call => call[1] as unknown[])
+    for (const batch of batches) expect(batch.length).toBeLessThanOrEqual(500)
+    expect(batches.reduce((sum, batch) => sum + batch.length, 0)).toBe(burstSize)
+  })
+  it('coalesces many phase reports within one burst into a single status write and a single broadcast', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Coalesce turn', settings)
+    f.manager.flush()
+    const before = f.broadcast.mock.calls.filter(call => call[0] === 'agent:status').length
+    for (let index = 0; index < 50; index++) f.current.emit({ data: { type: 'session', phase: index % 2 ? 'running' : 'waiting_input' } })
+    f.manager.flush()
+    const statusBroadcasts = f.broadcast.mock.calls.filter(call => call[0] === 'agent:status').slice(before)
+    expect(statusBroadcasts).toHaveLength(1)
+    expect(statusBroadcasts[0]![1]).toMatchObject({ id: f.spec.id })
   })
 })

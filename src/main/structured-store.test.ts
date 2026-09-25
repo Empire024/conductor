@@ -262,3 +262,41 @@ it('retains pending native input after a backend restart as uncertain, without r
   expect(restored.snapshot('one')?.items).toEqual([])
   expect(restored.events('one')).toHaveLength(2)
 })
+
+describe('staged batches: persist is transactional, ordered, and crash-safe', () => {
+  it('keeps a staged event off disk until persist runs, then writes a whole batch in one transaction, in order', () => {
+    const { store } = fixture()
+    const staged = [1, 2, 3].map(sequence => store.stage(event(sequence, { type: 'notice', message: `staged ${sequence}` })))
+    // The in-memory projection is already current - a burst's later events can correlate against
+    // it - even though nothing has reached disk yet.
+    expect(store.snapshot('one')?.sequence).toBe(3)
+    expect(store.events('one')).toHaveLength(0)
+    store.persist(staged)
+    expect(store.events('one').map(entry => entry.sequence)).toEqual([1, 2, 3])
+    expect(store.events('one').map(entry => (entry.data as { message: string }).message)).toEqual(['staged 1', 'staged 2', 'staged 3'])
+  })
+  it('rolls back the whole batch when one of its rows cannot be written, never a partial commit', () => {
+    const { store, db } = fixture()
+    store.append(event(1, { type: 'notice', message: 'already durable' }))
+    const staged = [store.stage(event(2, { type: 'notice', message: 'two' })), store.stage(event(3, { type: 'notice', message: 'three' }))]
+    // Seed a row that collides with the batch's own second event, so persist's single transaction
+    // has to fail partway through and roll back what it had already written in this same call.
+    db.prepare('INSERT INTO structured_events(session_id,sequence,event_json) VALUES(?,?,?)').run('one', 3, JSON.stringify({ sequence: 3 }))
+    expect(() => store.persist(staged)).toThrow()
+    // Sequence 2 was valid on its own but never lands: the transaction that would have written it
+    // aborted before COMMIT. Sequence 1 (committed earlier) and the seeded 3 are untouched.
+    expect(store.events('one').map(entry => entry.sequence)).toEqual([1, 3])
+  })
+  it('a crash before the next persist loses only the still-pending batch, not what was already committed', () => {
+    const f = fixture()
+    f.store.append(event(1, { type: 'notice', message: 'committed before the crash' }))
+    f.store.checkpoint('one')
+    // Staged but never persisted or checkpointed - the in-flight batch a crash here would lose.
+    f.store.stage(event(2, { type: 'notice', message: 'lost' }))
+    f.db.close()
+    const reopened = new DatabaseSync(f.path); databases.push(reopened)
+    const restored = new StructuredAgentStore(reopened, f.root)
+    expect(restored.snapshot('one')).toMatchObject({ sequence: 1 })
+    expect(restored.events('one').map(entry => entry.sequence)).toEqual([1])
+  })
+})

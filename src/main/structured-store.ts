@@ -217,6 +217,16 @@ export class StructuredAgentStore {
     }
   }
   append(event: AgentEvent): AgentEvent {
+    const safe = this.project(event)
+    this.writeEvent(safe)
+    return safe
+  }
+  /** The in-memory half of `append`: validates, sanitizes and folds one event into the resident
+   *  projection and (if warm) the archive tail, without touching disk. A caller staging many
+   *  synchronous events from one burst of provider output projects each through here and writes
+   *  them together through `persist`, so the burst pays one commit and one broadcast instead of
+   *  one of each per event. */
+  private project(event: AgentEvent): AgentEvent {
     const state = this.snapshot(event.sessionId)
     if (!state || event.sequence !== state.sequence + 1) throw new Error('Non-contiguous provider event sequence')
     const safe = sanitizeDiagnostic(event) as AgentEvent
@@ -226,16 +236,37 @@ export class StructuredAgentStore {
     // the journal - never replays it a second time when it is folded in explicitly just after.
     const needsArchiveTail = next.sequence > JOURNAL_WINDOW || this.archiveTails.has(event.sessionId)
     const tailBefore = needsArchiveTail ? this.archiveTail(event.sessionId) : null
-    this.db.prepare('INSERT INTO structured_events(session_id,sequence,event_json) VALUES(?,?,?)').run(event.sessionId, event.sequence, JSON.stringify(safe))
-    // Sequence is assigned monotonically, so the first row wins and remains the runtime's start
-    // even after `checkpoint` compacts the events it was read from.
-    if (safe.runtimeId && safe.timestamp) this.db.prepare('INSERT OR IGNORE INTO structured_runtimes(session_id,runtime_id,started_at,first_sequence) VALUES(?,?,?,?)').run(safe.sessionId, safe.runtimeId, safe.timestamp, safe.sequence)
     this.projections.set(event.sessionId, next)
     // Past the journal window, every event also grows the durable archive's live tail in memory,
     // exactly like the resident projection above, so a checkpoint never depends on the journal
     // still holding an event by the time it gets around to flushing it.
     if (tailBefore) this.archiveTails.set(event.sessionId, growArchiveTail(tailBefore, safe))
     return safe
+  }
+  private writeEvent(safe: AgentEvent): void {
+    this.db.prepare('INSERT INTO structured_events(session_id,sequence,event_json) VALUES(?,?,?)').run(safe.sessionId, safe.sequence, JSON.stringify(safe))
+    // Sequence is assigned monotonically, so the first row wins and remains the runtime's start
+    // even after `checkpoint` compacts the events it was read from.
+    if (safe.runtimeId && safe.timestamp) this.db.prepare('INSERT OR IGNORE INTO structured_runtimes(session_id,runtime_id,started_at,first_sequence) VALUES(?,?,?,?)').run(safe.sessionId, safe.runtimeId, safe.timestamp, safe.sequence)
+  }
+  /** Projects one event into memory only - the durable write is deferred to a later `persist`
+   *  call. Never durable on its own: a caller that stages an event must persist it (directly or
+   *  through the pending batch a flush drains) before treating it as delivered. */
+  stage(event: AgentEvent): AgentEvent {
+    return this.project(event)
+  }
+  /** Durably writes already-staged events in one transaction, so a burst that staged thousands of
+   *  events synchronously pays one commit instead of one per event - the dominant cost a 12k
+   *  events/s burst was paying, at roughly one fsync-equivalent commit per row. Never called from
+   *  inside another caller-managed transaction: `append`'s own callers that wrap it in their own
+   *  `BEGIN`/`COMMIT` (to batch fixture writes) never call `persist`. */
+  persist(events: AgentEvent[]): void {
+    if (!events.length) return
+    this.db.exec('BEGIN')
+    try {
+      for (const event of events) this.writeEvent(event)
+      this.db.exec('COMMIT')
+    } catch (reason) { this.db.exec('ROLLBACK'); throw reason }
   }
   /** The archive tail in memory, cold-loading it from the last flush plus whatever the journal
    *  still holds since then (the invariant `checkpoint` maintains: the journal floor never falls

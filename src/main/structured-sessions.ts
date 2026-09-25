@@ -85,6 +85,12 @@ export interface DetachedRuntimeRecord {
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 /** Settings row holding the newest reported allowance per provider and bucket (`usageLimits`). */
 const ACCOUNT_LIMITS_KEY = 'usageLimits.latest'
+/** The most events one `structured:events` IPC message carries. A burst can stage tens of
+ *  thousands of events in one synchronous pass; broadcasting them in one message serializes and
+ *  posts the whole array at once, blocking the process for its full size. Bounded batches sent a
+ *  tick apart (`setImmediate`) keep any one message small and let other work - including the
+ *  owner's next keystroke - run between them. */
+const BROADCAST_BATCH = 500
 /** Activity states a conversation can be cut off in; anything else has already settled. A
  *  conversation waiting on background work is one of them: that work belongs to the runtime
  *  process, so losing the connection ends it rather than leaving it running somewhere. */
@@ -152,7 +158,22 @@ export class StructuredSessions {
   }
   private live = new Map<string, LiveSession>()
   private pending: AgentEvent[] = []
-  private flushTimer?: NodeJS.Timeout
+  /** The latest status per session since the last flush - `recordActivityPhase` can fire many
+   *  times per session within one synchronous burst of events; only the final one is worth a
+   *  write and a broadcast. */
+  private pendingStatus = new Map<string, { id: string; status: string; phase: string }>()
+  private flushScheduled = false
+  /** Coalesces every synchronous `emit`/`recordActivityPhase` call in the current burst into one
+   *  `flush`, via a microtask rather than a timer: a microtask drains before this class's own
+   *  callers resume from an `await` on the same call stack (adapter `start()`, `submit()`...), so
+   *  code that reads `structured_events`/`structured_runtimes` straight from SQL - bypassing the
+   *  always-current in-memory projection - never observes a staged-but-unwritten event. A macrotask
+   *  timer could not promise that: it can only run after such an `await` has already resumed. */
+  private scheduleFlush(): void {
+    if (this.flushScheduled) return
+    this.flushScheduled = true
+    queueMicrotask(() => this.flush())
+  }
   private artifacts: AgentArtifacts
   private continuationTimers = new Map<string, NodeJS.Timeout>()
   constructor(
@@ -1327,14 +1348,18 @@ export class StructuredSessions {
     if ((reported === 'complete' || reported === 'idle') && this.ownsBackgroundWork(live)) return 'waiting_background'
     return reported
   }
-  /** The one writer of the phase every project rolls up and every tab indicator follows. */
+  /** The one writer of the phase every project rolls up and every tab indicator follows. The
+   *  in-memory phase other logic in this class reads (`live.activityPhase`) updates immediately;
+   *  the durable write and the broadcast are queued and coalesced by `flush`, so a session that
+   *  reports many phases within one synchronous burst pays for one write and one broadcast, not
+   *  one per event. */
   private recordActivityPhase(live: LiveSession, phase: AgentActivityPhase): void {
     live.activityPhase = phase
     // AgentRecord.status is a coarser union than the phase, so the unhappy phases collapse
     // back onto its own vocabulary here rather than leaking new values into stored rows.
     const status = phase === 'working' || phase === 'idle' || phase === 'waiting_background' ? 'running' : phase === 'failed' || phase === 'disconnected' ? 'error' : phase === 'stopped' ? 'exited' : phase
-    this.database.setAgentStatus(live.spec.id, status, phase)
-    this.broadcast('agent:status', { id: live.spec.id, status, phase })
+    this.pendingStatus.set(live.spec.id, { id: live.spec.id, status, phase })
+    this.scheduleFlush()
   }
   private emit(live: LiveSession, source: AdapterEvent, reviewProjection = false): void {
     const store = this.database.structured, state = store.snapshot(live.spec.id)
@@ -1363,7 +1388,7 @@ export class StructuredSessions {
       try { data = { ...data, outputArtifactId: store.putOutput(live.spec.id, output), output: output.slice(-32_000) } }
       catch { data = { ...data, output: '[Output artifact unavailable: storage allowance reached. Bounded tail follows.]\n' + output.slice(-32_000) } }
     }
-    const event = store.append({ ...source, data, schemaVersion: 1, id: randomUUID(), sequence: state.sequence + 1, sessionId: live.spec.id, runtimeId: live.runtimeId, provider: live.spec.provider as StructuredProvider, projectId: live.spec.projectId, workspaceId: live.spec.sessionId, cwd: live.spec.cwd, timestamp: new Date().toISOString(), nativeSessionId: source.nativeSessionId ?? state.nativeSessionId })
+    const event = store.stage({ ...source, data, schemaVersion: 1, id: randomUUID(), sequence: state.sequence + 1, sessionId: live.spec.id, runtimeId: live.runtimeId, provider: live.spec.provider as StructuredProvider, projectId: live.spec.projectId, workspaceId: live.spec.sessionId, cwd: live.spec.cwd, timestamp: new Date().toISOString(), nativeSessionId: source.nativeSessionId ?? state.nativeSessionId })
     this.pending.push(event)
     this.observe?.(live.spec, event)
     if (data.type === 'usage' && data.source === 'provider' && carriesAccountLimits(data.limits)) this.noteAccountLimits(live, data.limits, event.timestamp)
@@ -1375,7 +1400,7 @@ export class StructuredSessions {
       if (live.closed) return
       try { this.enforceUsageCap(live) } catch { /* A cap never breaks the event pipeline it observes. */ }
     }, 250)
-    if (!this.flushTimer) this.flushTimer = setTimeout(() => this.flush(), 32)
+    this.scheduleFlush()
     // The provider announces a closed usage window as an ordinary turn failure. Read it here,
     // between appending the error and recording the phase it produces, so the phase below can
     // report the wait rather than a dead end. `noteUsageLimit` re-enters `emit` for its own
@@ -1449,12 +1474,29 @@ export class StructuredSessions {
     for (const entry of outcome.reverted) for (const artifactId of entry.artifactIds) this.emit(live, { data: { type: 'review', artifactId, outcome: 'reverted' } })
     return outcome
   }
+  /** Drains everything a burst of `emit`/`recordActivityPhase` calls staged in memory: one
+   *  transaction durably writes every pending event (instead of one commit per event), one
+   *  checkpoint per touched session persists its projection, and one status write per session
+   *  replaces however many phases it reported. Only the owner-facing broadcast is spread across
+   *  more than one tick, in bounded batches, once everything above is already on disk - so an
+   *  event the renderer receives is always durable, and a crash before this call loses at most
+   *  the batch that was still pending. */
   flush(): void {
-    if (this.flushTimer) clearTimeout(this.flushTimer)
-    this.flushTimer = undefined
+    this.flushScheduled = false
     const events = this.pending.splice(0)
+    if (events.length) this.database.structured.persist(events)
     for (const id of new Set(events.map(event => event.sessionId))) this.database.structured.checkpoint(id)
-    if (events.length) this.broadcast('structured:events', events)
+    const statuses = [...this.pendingStatus.values()]
+    this.pendingStatus.clear()
+    for (const entry of statuses) { this.database.setAgentStatus(entry.id, entry.status, entry.phase); this.broadcast('agent:status', entry) }
+    if (events.length) this.broadcastEvents(events)
+  }
+  private broadcastEvents(events: AgentEvent[], offset = 0): void {
+    const batch = events.slice(offset, offset + BROADCAST_BATCH)
+    if (!batch.length) return
+    this.broadcast('structured:events', batch)
+    const next = offset + batch.length
+    if (next < events.length) setImmediate(() => this.broadcastEvents(events, next))
   }
   killWhere(predicate: (spec: AgentSpec) => boolean): void {
     for (const [id, live] of this.live) if (predicate(live.spec)) {
