@@ -398,6 +398,26 @@ export async function relaunched(inst = state.current, oldPid = inst.credential?
   return (Date.now() - started) / 1000
 }
 
+/** Starts a spawn-mode instance again on its own profile after the scenario quit or killed it (an
+ *  app.restart relaunches by itself: use relaunched() for that). `env` changes this launch and the
+ *  ones after it; undefined deletes a variable. Returns the new main pid. */
+export async function relaunchParked(inst = state.current, { env: extraEnv = {}, args = [], launchTimeoutMs = 60_000 } = {}) {
+  if (inst.mode !== 'spawn') throw new Error('relaunchParked is for spawn-mode instances')
+  const oldPid = inst.credential?.pid
+  if (oldPid != null) await poll(() => !isAlive(oldPid), { timeoutMs: 30_000, intervalMs: 250, label: `pid ${oldPid} to exit before the relaunch` })
+  for (const [key, value] of Object.entries(extraEnv)) { if (value === undefined) delete inst.env[key]; else inst.env[key] = String(value) }
+  if (inst.browser) { await withDeadline(inst.browser.close(), 5000); inst.browser = null; inst.page = null }
+  inst.cdpPort = await freePort()
+  step(`relaunch spawn (${inst.root})`)
+  const log = openSync(join(inst.root, 'app.log'), 'a')
+  inst.child = spawn(electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, BUILD, ...args], { env: inst.env, stdio: ['ignore', log, log], windowsHide: true })
+  closeSync(log)
+  inst.pids.add(inst.child.pid)
+  inst.closed = false
+  await owner(inst, { pid: inst.child.pid, timeoutMs: launchTimeoutMs })
+  return inst.child.pid
+}
+
 /** The raw control answer {status, body}. Prefer call(); this is for scenarios that expect a refusal. */
 export async function callRaw(method, args = {}, { inst = state.current, projectId = inst?.projectId, workspaceId, timeoutMs = 60_000 } = {}) {
   const credential = inst.credential && isAlive(inst.credential.pid) ? inst.credential : await owner(inst)
