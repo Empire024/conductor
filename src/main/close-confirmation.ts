@@ -2,13 +2,15 @@ import type { RuntimeProcessSummary } from '../shared/models'
 import type { SessionProjection } from '../shared/structured-agent'
 import type { StopDecision } from './stop-confirmation'
 
-/** Process existence is not turn evidence: idle adapters and shells remain open. `live` says
- *  whether this process still holds the conversation's runtime; when it does not, a queue or a
- *  background count left in the projection is history, not work (see hasSessionWork). */
+/** What the quit/restart dialog asks about. Process existence is not turn evidence: idle
+ *  adapters and shells remain open. `live` says whether this process still holds the
+ *  conversation's runtime; when it does not, a queue or a background count left in the projection
+ *  is history, not work (see hasSessionWork). A turn already being stopped is not work either:
+ *  quitting only finishes what the stop asked for, and its queue waits for the owner. */
 export function hasRunningWork(process: RuntimeProcessSummary, state?: SessionProjection | null, live?: boolean): boolean {
   if (process.kind !== 'agent') return false
   if (state) {
-    return hasSessionWork(state, live)
+    return state.phase !== 'interrupting' && hasSessionWork(state, live)
   }
   return ['working', 'waiting_input', 'waiting_background'].includes(process.activityPhase ?? '') || Boolean(process.resumeAt)
 }

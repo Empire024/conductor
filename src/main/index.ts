@@ -921,6 +921,12 @@ const runningWork = (): ReturnType<ConductorDatabase['listProcesses']> => databa
   hasRunningWork(process, process.kind === 'agent' ? database.structured.snapshot(process.id) : null, process.kind === 'agent' ? agents.structured.hasRuntime(process.id) : undefined)
 )
 
+/** The work a quit or restart would ask the owner about now, or null when it would go ahead. */
+const stopQuestion = (): Array<{ id: string; title: string }> | null => {
+  const active = runningWork()
+  return active.length || agents.nativeCli.hasSubmittedInput() ? active.slice(0, 8).map(process => ({ id: process.id, title: process.title })) : null
+}
+
 const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit' | 'restart'): Promise<StopDecision> => {
   const active = runningWork()
   if (!active.length && !agents.nativeCli.hasSubmittedInput()) return 'stop'
@@ -938,7 +944,7 @@ const confirmApplicationStop = async (owner: BrowserWindow | null, action: 'quit
       : 'Stopping the application interrupts work in every project and window.'}`,
     buttons: background ? [`Keep running in background and ${verb}`, `Stop all and ${verb}`, 'Cancel'] : [`Stop work and ${verb}`, 'Cancel'],
     defaultId: background ? 0 : 1, cancelId: choices.length - 1, noLink: true, signal
-  })] ?? 'cancel'))
+  })] ?? 'cancel', { running: stopQuestion }))
 }
 
 const broadcastSessionArchive = (result: SessionArchiveResult): void => {
@@ -2418,7 +2424,7 @@ app.whenReady().then(async () => {
       relaunch: relaunchConductor,
       requestRestart: recordRestartRequest,
       restartRequest: readRestartRequest,
-      stopConfirmation: { pending: () => stopConfirmations.pending(), answer: stopWork => stopConfirmations.answer(stopWork) }
+      stopConfirmation: { pending: () => stopConfirmations.pending(), answer: stopWork => stopConfirmations.answer(stopWork), wouldAsk: stopQuestion }
     },
     delivery,
     localModels: { availability: localModelAvailability, servers: runningLocalServers, stop: stopRunningLocalServer },

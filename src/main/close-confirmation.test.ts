@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { CloseConfirmation, hasRunningWork } from './close-confirmation'
+import { CloseConfirmation, hasRunningWork, hasSessionWork } from './close-confirmation'
 import { emptyProjection } from '../shared/structured-agent-reducer'
 import type { RuntimeProcessSummary } from '../shared/models'
 
@@ -11,8 +11,19 @@ describe('close confirmation', () => {
     expect(hasRunningWork(process, { ...emptyProjection('agent'), phase: 'starting', items: [{ id: 'old', runtimeId: 'old', sequence: 1, timestamp: '2026-09-01T00:00:00Z', data: { type: 'text', role: 'user', text: 'historical prompt', mode: 'snapshot' } }] })).toBe(false)
     expect(hasRunningWork({ ...process, kind: 'terminal' })).toBe(false)
   })
-  it.each(['running', 'waiting_approval', 'waiting_input', 'interrupting'] as const)('protects %s in any project/workspace', phase => {
+  it.each(['running', 'waiting_approval', 'waiting_input'] as const)('protects %s in any project/workspace', phase => {
     expect(hasRunningWork(process, { ...emptyProjection('agent'), phase })).toBe(true)
+  })
+  /* 19c298e4 (V3 S12): a tab the owner stopped mid-turn is not work to ask about, even while its
+     provider is still winding the turn down and it holds a queued or steered prompt. */
+  it('does not count a turn that was already stopped, whatever it still holds', () => {
+    const queued = { id: 'q', text: 'queued while stopping', settings: { permission: 'default' as const, plan: false }, attachments: [] }
+    const steer = { ...queued, id: 's', runtimeId: 'runtime', status: 'sending' as const }
+    const stopping = { ...emptyProjection('agent'), runtimeId: 'runtime', phase: 'interrupting' as const, queued, queuedPrompts: [queued], pendingSteering: [steer] }
+    expect(hasRunningWork(process, stopping, true)).toBe(false)
+    expect(hasRunningWork(process, { ...stopping, phase: 'interrupted' }, true)).toBe(false)
+    // Closing such a tab is still guarded while its provider winds down.
+    expect(hasSessionWork(stopping, true)).toBe(true)
   })
   it('protects queued prompts and scheduled continuation without treating stale task labels as execution', () => {
     expect(hasRunningWork(process, { ...emptyProjection('agent'), queued: { id: 'q', text: 'next', settings: { permission: 'default', plan: false }, attachments: [] } })).toBe(true)

@@ -1564,6 +1564,13 @@ describe('the owner control credential', () => {
     await vi.runAllTimersAsync()
     expect(host.updates.install).toHaveBeenCalledWith(true)
     expect(host.relaunch.mock.calls).toEqual([[true], [false]])
+    // 19c298e4 (V3 S12): a restart that has to ask the owner first says so instead of restarting:true.
+    const asking = new AgentControl({ ...f.deps, host: { ...host, stopConfirmation: { pending: () => null, answer: () => null, wouldAsk: () => [{ id: 'agent-a', title: 'Worker' }] } } })
+    const askingOwner = asking.ownerScope({ projectId: f.project.id })
+    expect(await asking.call(askingOwner, 'app.restart', { force: false })).toMatchObject({ restarting: false, confirmationPending: true, running: [{ id: 'agent-a', title: 'Worker' }] })
+    expect(await asking.call(askingOwner, 'app.restart', { force: true })).toMatchObject({ restarting: true, force: true })
+    await vi.runAllTimersAsync()
+    expect(host.relaunch.mock.calls).toEqual([[true], [false], [false], [true]])
     vi.useRealTimers()
     await expect(control.call(owner, 'app.update.install', { force: 'yes' })).rejects.toThrow(/force must be/)
     await expect(control.call(f.scope, 'app.restart', {})).rejects.toThrow(/owner's own control credential/)

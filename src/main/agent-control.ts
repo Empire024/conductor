@@ -197,8 +197,9 @@ export interface AgentControlHost {
   /** A wizard asking the owner to restart (app.restart.request); the latest request replaces any earlier one. */
   requestRestart?(request: Omit<RestartRequest, 'at'>): RestartRequest
   restartRequest?(): RestartRequest | null
-  /** The open "Work is still running" dialog, which app.quit.confirm answers. */
-  stopConfirmation?: { pending(): PendingStopConfirmation | null; answer(stopWork: boolean): PendingStopConfirmation | null }
+  /** The open "Work is still running" dialog, which app.quit.confirm answers. `wouldAsk` names
+   *  the work a quit or restart would ask the owner about now, or null when it would go ahead. */
+  stopConfirmation?: { pending(): PendingStopConfirmation | null; answer(stopWork: boolean): PendingStopConfirmation | null; wouldAsk?(): PendingStopConfirmation['running'] | null }
 }
 
 /** The agentSessionId an owner-credential call carries. No conversation has this id. */
@@ -1431,7 +1432,11 @@ export class AgentControl {
     const force = args.force !== false
     const later = (label: string, work: () => Promise<void>): void => { setTimeout(() => { work().catch(error => console.warn(`${label} failed`, error)) }, 150) }
     if (method === 'app.restart') {
+      // An unforced restart with work running asks the owner first; the caller is told so rather
+      // than promised a restart that then waits on the dialog.
+      const asking = force ? null : host.stopConfirmation?.wouldAsk?.() ?? null
       later('app.restart', () => scope.owner ? host.relaunch(force) : host.relaunch(force, { agentSessionId: scope.agentSessionId, method: 'app.restart' }))
+      if (asking) return { restarting: false, confirmationPending: true, force, running: asking, note: 'Work is still running, so the owner is asked first ("Work is still running"; app.state pendingQuitConfirmation). Conductor restarts once that is answered (app.quit.confirm from the owner credential or a wizard tab) or once the work it names has settled; cancelling leaves it running.' }
       return { restarting: true, force, note: 'Conductor relaunches; a downloaded update installs on the way out. Wait for a new control-owner.json (new pid) before calling again.' }
     }
     if (!host.updates) throw new Error('The updater is unavailable in this Conductor')

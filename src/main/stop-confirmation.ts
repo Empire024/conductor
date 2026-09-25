@@ -14,16 +14,29 @@ export class StopConfirmations {
   pending(): PendingStopConfirmation | null { return this.open ? structuredClone(this.open.info) : null }
 
   /** Shows the dialog through `show`, which must close it when the signal aborts. Resolves with
-   *  the owner's click, or the answer an agent gave first. */
-  async ask(info: Omit<PendingStopConfirmation, 'openedAt' | 'choices'> & { choices?: StopDecision[] }, show: (signal: AbortSignal) => Promise<StopDecision>): Promise<StopDecision> {
+   *  the owner's click, or the answer an agent gave first. `watch.running` is polled while the
+   *  dialog is open: it keeps the named work current, and once it returns null (nothing the dialog
+   *  asks about is left) the dialog closes itself and the quit or restart goes ahead, so a request
+   *  never waits on a question that no longer applies. */
+  async ask(info: Omit<PendingStopConfirmation, 'openedAt' | 'choices'> & { choices?: StopDecision[] }, show: (signal: AbortSignal) => Promise<StopDecision>, watch?: { running(): PendingStopConfirmation['running'] | null; intervalMs?: number }): Promise<StopDecision> {
     const abort = new AbortController()
     let answered: StopDecision | undefined
-    const entry = { info: { ...info, choices: info.choices ?? ['stop', 'cancel'], openedAt: new Date().toISOString() }, answer: (decision: StopDecision) => { answered = decision; abort.abort() } }
+    const entry = { info: { ...info, choices: info.choices ?? ['stop', 'cancel'], openedAt: new Date().toISOString() }, answer: (decision: StopDecision) => { answered ??= decision; abort.abort() } }
     this.open = entry
+    const timer = watch && setInterval(() => {
+      if (this.open !== entry) return
+      const running = watch.running()
+      if (running) { entry.info.running = running; return }
+      this.open = null
+      entry.answer('stop')
+    }, watch.intervalMs ?? 1000)
     try {
       const clicked = await show(abort.signal)
       return answered ?? clicked
-    } finally { if (this.open === entry) this.open = null }
+    } finally {
+      if (timer) clearInterval(timer)
+      if (this.open === entry) this.open = null
+    }
   }
 
   /** Answers the open dialog; returns what it asked, or null when none is open. `true` stops the

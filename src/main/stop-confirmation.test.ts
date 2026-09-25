@@ -43,6 +43,20 @@ describe('stop confirmations', () => {
     expect(confirmations.answer(false)).toBeNull()
   })
 
+  /* 19c298e4 (V3 S12): a dialog never outlives the work it asks about. */
+  it('closes itself and goes ahead once the work it names has settled', async () => {
+    const confirmations = new StopConfirmations(), box = dialog()
+    let running: Array<{ id: string; title: string }> | null = [{ id: 'agent-a', title: 'Worker' }, { id: 'agent-b', title: 'Other' }]
+    const decision = confirmations.ask(info, box.show, { running: () => running, intervalMs: 5 })
+    running = [{ id: 'agent-b', title: 'Other' }]
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(confirmations.pending()?.running).toEqual([{ id: 'agent-b', title: 'Other' }])
+    running = null
+    expect(await decision).toBe('stop')
+    expect(box.closed).toBe(true)
+    expect(confirmations.pending()).toBeNull()
+  })
+
   /* e1610f01: quitting with running work can keep it running in the background. */
   it('offers keeping work in the background only when the dialog does', async () => {
     const confirmations = new StopConfirmations()
