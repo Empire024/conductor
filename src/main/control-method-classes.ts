@@ -12,7 +12,7 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'files.list', 'files.read', 'tasks.list', 'memory.recall', 'orchestration.snapshot',
     'app.update.status', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
-    'loops.list', 'loops.get', 'loops.history', 'loops.proposals'
+    'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get'
   ].map(method => `read:${method}` as const),
   ...[
     'tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close',
@@ -27,7 +27,8 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',
     'projects.open', 'app.update.check', 'app.update.download', 'app.update.install',
     'app.restart', 'app.restart.request', 'app.quit.confirm', 'loops.run', 'loops.record',
-    'loops.propose', 'loops.apply', 'loops.reject'
+    'loops.propose', 'loops.apply', 'loops.reject',
+    'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work'
   ].map(method => `mutation:${method}` as const)
 ])
 

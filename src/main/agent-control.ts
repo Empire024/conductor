@@ -40,6 +40,7 @@ import { normaliseContract } from './local-models/completion.ts'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, type CreateDurableJobInput, type DurableJobsService, type DurableJobStatus, type DurableJobSummary } from '../shared/durable-jobs'
 import { scheduleCall, scheduleMethods, scheduleSignatures, type ScheduleControlService } from './schedule-control'
 import { LogicLoops, type LoopRecordInput } from './logic-loops'
+import { ideaMethods, ideaSignatures, type IdeasControlCaller } from './ideas/control'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -262,6 +263,8 @@ export interface AgentControlDependencies {
   durableJobs?: DurableJobsService
   /** Scheduled tasks (src/main/schedule-control.ts); plugged in with AgentControl.setSchedules. */
   schedules?: ScheduleControlService
+  /** Ideas (src/main/ideas/register.ts); plugged in with AgentControl.setIdeas. */
+  ideas?: { call(caller: IdeasControlCaller, method: string, args: unknown): Promise<unknown> }
   /** Whether a local model could start its server now; absent where the local runtime is not wired. */
   localModels?: {
     availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }>
@@ -880,7 +883,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -1182,11 +1185,30 @@ export class AgentControl {
     if (method === 'router.dispatch') return this.dispatchRouter(scope, args)
     if (jobMethods.has(method)) return this.jobs(scope, source, method, args)
     if (scheduleMethods.has(method)) return this.scheduledTasks(scope, source, method, args)
+    if (ideaMethods.has(method)) return this.ideasMethod(scope, source, method, args)
     throw new Error('Unknown control method; use tools.list')
   }
 
   /** Plugs in scheduled tasks once the scheduler is constructed (src/main/index.ts). */
   setSchedules(service: ScheduleControlService | undefined): void { this.deps.schedules = service }
+
+  /** Plugs in Ideas once it is constructed (src/main/index.ts). */
+  setIdeas(service: AgentControlDependencies['ideas']): void { this.deps.ideas = service }
+
+  /** ideas.* (src/main/ideas/control.ts): a local model or a read-only/planning conversation may
+   *  only read, exactly like durable jobs and scheduled tasks; the owner and a wizard tab may
+   *  always change them. */
+  private ideasMethod(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const service = this.deps.ideas
+    if (!service) throw new Error('Ideas are unavailable in this Conductor')
+    const settings = scope.owner ? undefined : this.deps.database.structured.snapshot(scope.agentSessionId)?.settings
+    const caller: IdeasControlCaller = {
+      projectId: scope.projectId, agentSessionId: scope.agentSessionId, title: source.title,
+      sovereign: sovereign(scope), readOnly: source.provider === 'local' || restricted(settings),
+      ...(settings?.model ?? source.model ? { model: settings?.model ?? source.model } : {})
+    }
+    return service.call(caller, method, args)
+  }
 
   /** schedules.* (src/main/schedule-control.ts): the caller's authority is decided here, from its
    *  authorized scope and durable settings, never from anything it sends. */

@@ -97,12 +97,14 @@ describe('durable job view', () => {
     expect(formatDuration(8 * 3_600_000 + 7 * 60_000)).toBe('8 h 07 min')
   })
 
-  it('offers durable execution beside local model selection and keeps its model fixed', () => {
+  it('offers durable execution collapsed behind a toggle, not a bare disclosure', () => {
     const html = renderToStaticMarkup(createElement(DurableJobLauncherOption, {
       model: { id: 'local/qwen3.6-35b-a3b', label: 'Qwen 35B' }, busy: false, onCreate: noop
     }))
-    expect(html).toContain('Run as durable job (staged, resumable, overnight)')
-    expect(html).toContain('value="local/qwen3.6-35b-a3b"')
-    expect(html).toContain('Job objective')
+    expect(html).toContain('Run as durable job')
+    expect(html).toContain('staged, resumable, overnight')
+    expect(html).not.toContain('<details')
+    // Collapsed by default: the form (and its fixed model) is not in the markup until opened.
+    expect(html).not.toContain('Job objective')
   })
 })

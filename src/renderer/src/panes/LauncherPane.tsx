@@ -223,9 +223,20 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
         })}
       </div>
       {selected === LOCAL_MACHINE_ID && onOpenJob && <div className="launcher-durable-option">
-        <label>Local model for durable work<select aria-label="Durable job local model" value={durableModel.id} onChange={event => setDurableModel(LOCAL_MODELS.find(model => model.id === event.target.value) ?? LOCAL_MODELS[0]!)}>
-          {LOCAL_MODELS.map(model => <option key={model.id} value={model.id}>{model.label}</option>)}
-        </select></label>
+        <span className="launcher-durable-label">Local model for durable work</span>
+        <div className="launcher-durable-models" role="group" aria-label="Local model for durable work">
+          {LOCAL_MODELS.map(model => (
+            <button
+              key={model.id}
+              type="button"
+              className={model.id === durableModel.id ? 'active' : ''}
+              aria-pressed={model.id === durableModel.id}
+              onClick={() => setDurableModel(model)}
+            >
+              {model.label}
+            </button>
+          ))}
+        </div>
         <DurableJobLauncherOption model={durableModel} busy={creatingJob} error={jobError} onCreate={input => {
           setCreatingJob(true); setJobError('')
           void window.conductor.durableJobs.create({ projectId, ...(workspaceId ? { workspaceId } : {}), ...input })

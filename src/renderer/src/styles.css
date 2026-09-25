@@ -615,6 +615,12 @@ kbd {
 .launch-arrow { display: none; color: #8e986a; }
 .launcher-grid button:hover kbd { display: none; }
 .launcher-grid button:hover .launch-arrow { display: block; }
+.launcher-durable-option { width: min(100%, 610px); margin-top: 10px; padding: 10px 12px; border: 1px solid #242a31; border-radius: 7px; background: #11151a; display: grid; gap: 8px; }
+.launcher-durable-label { font-size: 9.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #6d757e; }
+.launcher-durable-models { display: flex; flex-wrap: wrap; gap: 6px; }
+.launcher-durable-models button { height: 24px; padding: 0 10px; border: 1px solid #242a31; border-radius: 999px; background: #171c22; color: #8b939c; font-size: 10.5px; cursor: pointer; }
+.launcher-durable-models button:hover { color: #cfd3d8; background: #1c2229; }
+.launcher-durable-models button.active { color: var(--accent); border-color: var(--accent-muted); background: #16211a; }
 .launcher-tip { width: min(100%, 610px); display: flex; align-items: center; gap: 6px; margin-top: 12px; color: #4f5760; font-size: 9px; }
 .launcher-tip svg { color: #788452; }
 
@@ -965,6 +971,9 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 :root[data-theme="light"] .launcher-heading h2,
 :root[data-theme="light"] .memory-heading strong,
 :root[data-theme="light"] .process-dashboard strong { color: var(--text); }
+:root[data-theme="light"] .launcher-durable-option { background: #fffffff2; border-color: var(--border); }
+:root[data-theme="light"] .launcher-durable-models button { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
+:root[data-theme="light"] .launcher-durable-models button:hover { color: var(--text); }
 :root[data-theme="light"] kbd { box-shadow: none; }
 :root[data-theme="light"] ::-webkit-scrollbar-thumb { background: #c4ccd8; border: 2px solid transparent; background-clip: padding-box; }
 

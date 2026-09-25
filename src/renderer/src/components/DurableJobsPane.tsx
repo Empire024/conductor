@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ExternalLink, FileText, FolderOpen, Pause, Play, Plus, Square } from 'lucide-react'
+import { ChevronDown, ChevronRight, ExternalLink, FileText, FolderOpen, Pause, Play, Plus, Square } from 'lucide-react'
 import { canTransition, TERMINAL_JOB_STATUSES, type DurableJobEvent, type DurableJobReport, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../../shared/durable-jobs'
 import type { DurableJobDetail } from '../../../shared/durable-jobs-bridge'
 import { LOCAL_QWEN_35B } from '../../../shared/local-models'
@@ -166,18 +166,20 @@ export function DurableJobLauncherOption({ model, busy, error = '', onCreate }: 
   error?: string
   onCreate(input: { title: string; objective: string; model: string; constraints: string[] }): void
 }): React.JSX.Element {
+  const [open, setOpen] = useState(false)
   const [objective, setObjective] = useState(''), [title, setTitle] = useState('')
-  return <details className="durable-job-launcher">
-    <summary>Run as durable job (staged, resumable, overnight)</summary>
-    <form onSubmit={event => { event.preventDefault(); if (objective.trim()) onCreate({ title: title.trim(), objective: objective.trim(), model: model.id, constraints: [] }) }}>
-      <input type="hidden" name="model" value={model.id} />
+  return <div className="durable-job-launcher">
+    <button type="button" className="durable-job-launcher-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
+      {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />} Run as durable job <span>staged, resumable, overnight</span>
+    </button>
+    {open && <form className="durable-job-launcher-form" onSubmit={event => { event.preventDefault(); if (objective.trim()) onCreate({ title: title.trim(), objective: objective.trim(), model: model.id, constraints: [] }) }}>
       <strong>{model.label}</strong>
       <label>Job objective<textarea aria-label="Job objective" rows={3} value={objective} onChange={event => setObjective(event.target.value)} placeholder="What should this local model finish?" /></label>
       <label>Title<input aria-label="Job title" value={title} onChange={event => setTitle(event.target.value)} placeholder="Optional" /></label>
       {error && <p className="durable-job-error" role="alert">{error}</p>}
-      <button type="submit" disabled={busy || !objective.trim()}><Plus size={13} />{busy ? 'Startingâ€¦' : 'Start durable job'}</button>
-    </form>
-  </details>
+      <button type="submit" disabled={busy || !objective.trim()}><Plus size={13} />{busy ? 'Starting…' : 'Start durable job'}</button>
+    </form>}
+  </div>
 }
 
 /** Loads one job and follows it: the detail refreshes on every change the service publishes. */

@@ -81,6 +81,7 @@ import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './
 import type { ScheduleRunner } from './schedule-runner'
 import { createScheduledTasks, latestModelsBuiltin } from './schedule-wiring'
 import { registerScheduleIpc } from './schedule-ipc'
+import { registerIdeas, type IdeasRegistration } from './ideas/register'
 import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
 import { isRemoteProject, localProject, requireLocalProject } from './project-scope'
@@ -136,6 +137,9 @@ let disposeDurableJobsIpc: (() => void) | undefined
 let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
+/** The owner's Ideas inbox (src/main/ideas/register.ts); undefined until the app is ready. */
+let ideasRegistration: IdeasRegistration | undefined
+let disposeIdeasIpc: (() => void) | undefined
 let disposeLogicLoopsIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
@@ -584,6 +588,7 @@ const disposeRuntimeServices = (): void => {
     // app quit is never recorded as a failed stage. The jobs stay running and are reconciled on
     // the next launch.
     ['durable jobs', () => { durableJobs?.dispose(); disposeDurableJobsGate?.(); disposeDurableJobsIpc?.() }],
+    ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
@@ -2251,6 +2256,7 @@ const registerIpc = (): void => {
       reveal: path => shell.showItemInFolder(path)
     })
   }
+  if (ideasRegistration) disposeIdeasIpc = ideasRegistration.registerIpc(event => trustedStructured(event))
 }
 
 app.whenReady().then(async () => {
@@ -2477,6 +2483,18 @@ app.whenReady().then(async () => {
   })
   scheduleRunner = scheduledTasks.runner
   control.setSchedules(scheduledTasks.control)
+  // The owner's Ideas inbox (docs/ideas.md): capture shortcut, phone route, Idea Incubator
+  // schedule and the local-model explorer, plus ideas.* app control.
+  ideasRegistration = registerIdeas({
+    databasePath, database, control, ui: agentControlUi.request,
+    jobs: () => durableJobs ?? undefined,
+    backlogs: projectBacklogs, schedules,
+    publish: (channel, payload) => publish(channel, payload),
+    window: () => liveWindow(mainWindow),
+    background: backgroundWindows,
+    machine: () => remoteControl!.machineName()
+  })
+  control.setIdeas(ideasRegistration.control)
   // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
   // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
   // one after every restart.

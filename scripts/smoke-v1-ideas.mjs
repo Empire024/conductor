@@ -36,11 +36,10 @@ const call = async (method, args = {}) => {
   const r = await fetch(owner.endpoint, { method: 'POST', headers: { Authorization: 'Bearer ' + owner.token, 'Content-Type': 'application/json' }, body: JSON.stringify({ method, args, ...(projectId ? { scope: { projectId } } : {}) }) })
   const body = await r.json(); assert.equal(r.status, 200, `${method}: ${JSON.stringify(body)}`); return body.result
 }
-// ideas.* is implemented (src/main/ideas/control.ts) but never wired into AgentControl's dispatch
-// (no ideasCall/ideaMethods reference anywhere in src/main/agent-control.ts or index.ts) -- an
-// app-control caller gets "Unknown control method". Confirmed as a real finding (see S22-wiring
-// below). window.conductor.ideas.* (src/preload/ideas.ts) IS wired for the trusted renderer, so
-// that is what drives S20/S22/S23/S24 here.
+// ideas.* is wired into AgentControl's dispatch (agent-control.ts: ideaMethods/ideasMethod) as well
+// as the trusted renderer's window.conductor.ideas.* (src/preload/ideas.ts); S22-wiring below
+// checks the app-control surface for real. The rest of this script drives the renderer bridge,
+// same as the Ideas view itself does.
 const ideas = (method, ...args) => page.evaluate(({ method, args }) => window.conductor.ideas[method](...args), { method, args })
 
 const watchdog = setTimeout(() => { observe('watchdog: giving up'); console.log(JSON.stringify({ root, observations }, null, 2)); process.exit(1) }, 40 * 60_000)
@@ -65,7 +64,8 @@ try {
   await page.locator('.ideas-view').first().waitFor({ timeout: 15_000 })
   await page.screenshot({ path: join(output, 's20-ideas-view.png') })
   const list1 = await ideas('list', {})
-  record('S22-wiring', 'FAIL (real)', 'ideas.* app-control methods are not reachable: agent-control.ts never imports/calls ideasCall or references ideaMethods from src/main/ideas/control.ts, so a caller using the documented app-control surface gets {"error":"Unknown control method; use tools.list"}. Confirmed by first trying ideas.list through app-control before falling back to window.conductor.ideas.* (the renderer-only IPC bridge) for the rest of this script.')
+  const wiringList = await call('ideas.list', {})
+  record('S22-wiring', Array.isArray(wiringList) ? 'PASS' : 'FAIL (real)', `ideas.list reachable through app-control (agent-control.ts ideaMethods/ideasMethod): returned ${Array.isArray(wiringList) ? wiringList.length + ' ideas' : JSON.stringify(wiringList)}`)
   const captured = list1.find(i => i.title?.includes('First capture line') || i.note?.includes('First capture line'))
   record('S20-capture', captured && captured.status === 'inbox' ? 'PASS' : 'FAIL', `found=${Boolean(captured)}, title=${captured?.title}, status=${captured?.status}`)
   await page.keyboard.press('Escape')
@@ -138,7 +138,7 @@ try {
 
   // ---- S24: "Work on this idea" with a fixture Claude provider ----
   const workIdea = captured5[2] // "Clothing company..." — already explored in S22
-  const worked = await ideas('work', { ideaId: workIdea.id, provider: 'claude' })
+  const worked = await ideas('work', { ideaId: workIdea.id, projectId, provider: 'claude' })
   observe('ideas.work dispatched', worked)
   await expect.poll(() => existsSync(captureFile), { timeout: 30_000 }).toBe(true)
   const firstPrompt = await readFile(captureFile, 'utf8')
