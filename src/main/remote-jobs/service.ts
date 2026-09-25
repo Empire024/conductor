@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { basename } from 'node:path'
-import { nodeCapabilities, normalizeCapability, parseProbe, PROBE_SCRIPT, selectNode } from './capabilities.ts'
+import { nodeCapabilities, nodeReadiness, normalizeCapability, parseProbe, PROBE_SCRIPT, selectNode } from './capabilities.ts'
 import { buildJobCommand, buildScriptCommand, buildStopCommand, MarkerScanner, shQuote } from './shell.ts'
 import type { LogStream, RemoteJobStore } from './store.ts'
 import type { ExecHandle, ExecResult, TransportFactory } from './transport.ts'
@@ -144,7 +144,7 @@ export class RemoteJobService {
   }
 
   private summary(node: ExecutionNode): NodeSummary {
-    return { ...node, capabilities: nodeCapabilities(node), currentJobs: this.jobsOn(node.id).map(job => job.id) }
+    return { ...node, capabilities: nodeCapabilities(node), currentJobs: this.jobsOn(node.id).map(job => job.id), readiness: nodeReadiness(node.facts) }
   }
 
   private jobsOn(nodeId: string): RemoteJob[] {

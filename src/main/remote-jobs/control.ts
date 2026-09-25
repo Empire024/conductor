@@ -9,7 +9,7 @@ import type { NodeSummary, RemoteJob, RemoteJobStatus } from './types.ts'
  * nodes and jobs is decided here, so the control surface stays one line there.
  */
 export const nodeSignatures = {
-  'nodes.list': '() — execution nodes: other computers of the owner that run bounded commands over SSH inside the tailnet (docs/mac-node.md), each with platform, arch, hardware, capabilities (macos, arm64, apple-silicon, node@24, xcode-clt…), status, last seen and current jobs',
+  'nodes.list': '() — execution nodes: other computers of the owner that run bounded commands over SSH inside the tailnet (docs/mac-node.md), each with platform, arch, hardware, capabilities (macos, arm64, apple-silicon, node@24, xcode-clt…), status, last seen, current jobs, and readiness (a Mac: never sleeps on AC, restarts after power loss, gets past boot unattended, Tailscale and Conductor start by themselves; missing lists the steps still needed)',
   'nodes.probe': '({nodeId?}) — ask one node (or every node) what it is now; marks it online or offline and refreshes its facts and capabilities',
   'nodes.run': '({command,nodeId?|requires?:string[],cwd?,timeoutSec?,checkout?:boolean|{commit?},title?}) — run one bash command on a node: nodeId names it, or requires picks an online node with all those capabilities (["macos"] never runs anywhere else). Bounded: timeoutSec (default 1800) is enforced on the node, the whole process group is stopped on timeout, cancel or a lost connection, stdout/stderr are kept here. checkout brings the node\'s own checkout of this project to a commit first (HEAD by default; the commit is pushed to the node, nothing needs publishing) and cwd is then inside it. Returns the job; follow with nodes.job({jobId,waitSeconds})',
   'nodes.jobs': '({nodeId?,status?:string[],limit?}) — remote jobs of this project, newest first, without their output',
@@ -163,7 +163,8 @@ export function withNodes<T extends { id: string }>(machines: T[], nodes: NodeSu
   const facet = (node: NodeSummary): Record<string, unknown> => ({
     nodeId: node.id, status: node.status, platform: node.facts?.platform ?? null, arch: node.facts?.arch ?? null,
     osVersion: node.facts?.osVersion ?? null, model: node.facts?.model ?? null, capabilities: node.capabilities,
-    lastSeenAt: node.lastSeenAt, currentJobs: node.currentJobs, workspaceRoot: `~/${node.root}`
+    lastSeenAt: node.lastSeenAt, currentJobs: node.currentJobs, workspaceRoot: `~/${node.root}`,
+    readiness: node.readiness ? { ready: node.readiness.ready, missing: node.readiness.missing } : null
   })
   const linked = new Map(nodes.filter(node => node.peerMachineId).map(node => [node.peerMachineId!, node]))
   return [

@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { nodeCapabilities, parseProbe, PROBE_SCRIPT, selectNode } from './capabilities.ts'
+import { nodeCapabilities, nodeReadiness, parseProbe, PROBE_SCRIPT, selectNode } from './capabilities.ts'
 import { RemoteJobService, syncScript } from './service.ts'
 import { buildJobCommand, JOB_WRAPPER, MarkerScanner, shQuote } from './shell.ts'
 import { RemoteJobStore } from './store.ts'
@@ -104,6 +104,18 @@ describe('node records', () => {
     const facts = parseProbe(MAC_PROBE)
     expect(facts).toMatchObject({ platform: 'darwin', arch: 'arm64', osVersion: '15.6.1', model: 'Macmini9,1', cores: 8, performanceCores: 4, ramGb: 16, diskFreeGb: 175, rosetta: false, sleepMinutes: '0', developerDir: '/Library/Developer/CommandLineTools' })
     expect(nodeCapabilities({ facts, labels: ['electron-build'] })).toEqual(['apple-silicon', 'arm64', 'brew', 'electron-build', 'git', 'macos', 'node', 'node@24', 'npm', 'xcode-clt'])
+  })
+
+  it('says what still keeps a Mac from being on when it is needed', () => {
+    const before = parseProbe(`${MAC_PROBE}\nsleep=1\nautorestart=0\nwomp=1\nfileVault=FileVault is On. \ntailscaleMode=login-item\nconductor=not-installed`)
+    const readiness = nodeReadiness(before)!
+    expect(readiness.ready).toBe(false)
+    expect(Object.fromEntries(readiness.checks.map(check => [check.id, check.ok]))).toEqual({ sleep: false, 'auto-restart': false, 'boot-unlock': false, tailscale: false, conductor: false })
+    expect(readiness.missing.join('\n')).toMatch(/sudo pmset -c sleep 0[\s\S]*autorestart 1[\s\S]*fdesetup disable/)
+    const after = parseProbe(`${MAC_PROBE.replace('sleep=0', 'sleep=0')}\nautorestart=1\nfileVault=FileVault is Off. \nautoLogin=juraj\ntailscaleMode=login-item\nconductor=at-login`)
+    expect(nodeReadiness(after)).toMatchObject({ ready: true, missing: [] })
+    expect(parseProbe('os=Darwin\nfileVault=FileVault is On. Decryption in progress: Percent completed = 40 ').fileVault).toBe('changing')
+    expect(nodeReadiness(parseProbe(LINUX_PROBE))).toBeNull()
   })
 
   it('reports Command Line Tools shims instead of pretending git is there', () => {

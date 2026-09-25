@@ -55,6 +55,30 @@ export interface NodeFacts {
   tools: Record<string, NodeTool>
   /** Tools present only as Command Line Tools shims that would open an installer dialog. */
   shims: string[]
+  /** What decides whether the machine comes back on its own; null off macOS or when not reported. */
+  autoRestart?: boolean | null
+  wakeOnNetwork?: boolean | null
+  fileVault?: 'on' | 'off' | 'changing' | null
+  autoLoginUser?: string | null
+  /** How Tailscale starts: a system daemon (before login), a login item, only running now, or absent. */
+  tailscaleMode?: 'daemon' | 'login-item' | 'running' | 'absent' | null
+  conductor?: 'at-login' | 'installed' | 'not-installed' | null
+}
+
+export interface ReadinessCheck {
+  id: 'sleep' | 'auto-restart' | 'boot-unlock' | 'tailscale' | 'conductor'
+  label: string
+  /** null: the node did not say. */
+  ok: boolean | null
+  detail: string
+}
+
+/** Whether the machine is on when it is needed, with no one at it (feature always-on-machines). */
+export interface NodeReadiness {
+  ready: boolean
+  checks: ReadinessCheck[]
+  /** The physical or owner steps still needed, in words. */
+  missing: string[]
 }
 
 export type NodeStatus = 'unknown' | 'online' | 'offline'
@@ -83,6 +107,7 @@ export interface ExecutionNode {
 export interface NodeSummary extends ExecutionNode {
   capabilities: string[]
   currentJobs: string[]
+  readiness: NodeReadiness | null
 }
 
 export type RemoteJobStatus = 'queued' | 'preparing' | 'running' | 'succeeded' | 'failed' | 'timed-out' | 'cancelled' | 'lost'

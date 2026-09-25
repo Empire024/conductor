@@ -1,4 +1,4 @@
-import type { ExecutionNode, NodeFacts, NodePlatform } from './types.ts'
+import type { ExecutionNode, NodeFacts, NodePlatform, NodeReadiness, ReadinessCheck } from './types.ts'
 
 /**
  * One probe, one round trip: `key=value` lines about the OS, hardware and the tools on the PATH a
@@ -33,6 +33,18 @@ if [ "$(uname -s)" = Darwin ]; then
   kv developerDir "$(xcode-select -p 2>/dev/null)"
   if /usr/bin/pgrep -q oahd 2>/dev/null; then kv rosetta yes; else kv rosetta no; fi
   kv sleep "$(pmset -g 2>/dev/null | awk '$1 == "sleep" { print $2; exit }')"
+  kv autorestart "$(pmset -g 2>/dev/null | awk '$1 == "autorestart" { print $2; exit }')"
+  kv womp "$(pmset -g 2>/dev/null | awk '$1 == "womp" { print $2; exit }')"
+  kv fileVault "$(fdesetup status 2>/dev/null | tr '\n' ' ')"
+  kv autoLogin "$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)"
+  gui="$(launchctl print "gui/$(id -u)" 2>/dev/null)"
+  if launchctl print system/com.tailscale.tailscaled >/dev/null 2>&1; then kv tailscaleMode daemon
+  elif printf '%s' "$gui" | grep -q 'io.tailscale.ipn.*login-item'; then kv tailscaleMode login-item
+  elif pgrep -q -x Tailscale; then kv tailscaleMode running
+  else kv tailscaleMode absent; fi
+  if [ ! -d /Applications/Conductor.app ] && [ ! -d "$HOME/Applications/Conductor.app" ]; then kv conductor not-installed
+  elif printf '%s' "$gui" | grep -qi 'conductor.*login'; then kv conductor at-login
+  else kv conductor installed; fi
 else
   kv cores "$(getconf _NPROCESSORS_ONLN 2>/dev/null)"
   kv memBytes "$(awk '/^MemTotal:/ { printf "%d", $2 * 1024 }' /proc/meminfo 2>/dev/null)"
@@ -83,8 +95,46 @@ export function parseProbe(stdout: string): NodeFacts {
     developerDir: get('developerDir') || null,
     rosetta: platform === 'darwin' ? get('rosetta') === 'yes' : null,
     sleepMinutes: platform === 'darwin' ? get('sleep') || null : null,
-    tools, shims
+    tools, shims,
+    ...(platform === 'darwin' ? {
+      autoRestart: flag(get('autorestart')), wakeOnNetwork: flag(get('womp')),
+      // "FileVault is On." / "FileVault is Off." / "... Encryption|Decryption in progress ..."
+      fileVault: /in progress/i.test(get('fileVault')) ? 'changing' : /FileVault is On/i.test(get('fileVault')) ? 'on' : /FileVault is Off/i.test(get('fileVault')) ? 'off' : null,
+      autoLoginUser: get('autoLogin') || null,
+      tailscaleMode: (['daemon', 'login-item', 'running', 'absent'] as const).find(mode => mode === get('tailscaleMode')) ?? null,
+      conductor: (['at-login', 'installed', 'not-installed'] as const).find(state => state === get('conductor')) ?? null
+    } : {})
   }
+}
+
+const flag = (value: string): boolean | null => value === '1' ? true : value === '0' ? false : null
+
+/**
+ * Whether a Mac is on when it is needed with no one at it: it does not sleep on AC power, it
+ * restarts after a power cut, it gets past boot without someone typing a password (FileVault off
+ * and automatic login, or FileVault on and a person present), Tailscale starts by itself, and
+ * Conductor opens at login. Only macOS is assessed; other platforms return null.
+ */
+export function nodeReadiness(facts: NodeFacts | null): NodeReadiness | null {
+  if (!facts || facts.platform !== 'darwin') return null
+  const checks: ReadinessCheck[] = []
+  const add = (id: ReadinessCheck['id'], label: string, ok: boolean | null, detail: string): void => { checks.push({ id, label, ok, detail }) }
+  add('sleep', 'Never sleeps on AC power', facts.sleepMinutes === null ? null : facts.sleepMinutes === '0',
+    facts.sleepMinutes === null ? 'pmset did not say' : facts.sleepMinutes === '0' ? 'pmset sleep 0' : `pmset sleep ${facts.sleepMinutes}: sudo pmset -c sleep 0`)
+  add('auto-restart', 'Starts again after a power cut', facts.autoRestart ?? null,
+    facts.autoRestart ? 'pmset autorestart 1' : facts.autoRestart === false ? 'sudo pmset -c autorestart 1' : 'pmset did not say')
+  const unlock = facts.fileVault === 'off' && Boolean(facts.autoLoginUser)
+  add('boot-unlock', 'Reaches a logged-in session after a reboot with no one there', facts.fileVault === undefined || facts.fileVault === null ? null : unlock,
+    facts.fileVault === 'on' ? 'FileVault is on: after a reboot the Mac waits for a password at its own screen (sudo fdesetup disable, then automatic login)'
+      : facts.fileVault === 'changing' ? 'FileVault is being turned on or off' : facts.autoLoginUser ? `FileVault off, automatic login as ${facts.autoLoginUser}` : 'FileVault off but no automatic login: sudo sysadminctl -autologin set -userName <user> -password -')
+  add('tailscale', 'Tailscale starts on its own', facts.tailscaleMode === undefined || facts.tailscaleMode === null ? null : facts.tailscaleMode === 'daemon' || (facts.tailscaleMode === 'login-item' && unlock),
+    facts.tailscaleMode === 'daemon' ? 'tailscaled system daemon (up before login)'
+      : facts.tailscaleMode === 'login-item' ? (unlock ? 'Tailscale.app opens at the automatic login' : 'Tailscale.app opens at login, which needs someone to log in')
+        : facts.tailscaleMode === 'running' ? 'running now but not set to open at login' : 'not installed')
+  add('conductor', 'Conductor opens at login', facts.conductor === undefined || facts.conductor === null ? null : facts.conductor === 'at-login',
+    facts.conductor === 'at-login' ? 'Conductor opens at login' : facts.conductor === 'installed' ? 'installed, not set to open at login' : 'Conductor is not installed on this machine (needs a macOS build)')
+  const missing = checks.filter(check => check.ok !== true).map(check => `${check.label}: ${check.detail}`)
+  return { ready: checks.every(check => check.ok === true), checks, missing }
 }
 
 /** Spellings a caller might use for the same capability. */

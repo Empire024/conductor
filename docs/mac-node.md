@@ -143,7 +143,7 @@ the caller's project.
 
 ## 4. Windows-only assumptions that affect a macOS build (from reading the code)
 
-To be confirmed on the Mac in Phase 4. Size: T trivial, S small, M medium, L large.
+Read from the code before the Mac was reachable; section 5 lists what the Mac actually showed (Phase 4). Size: T trivial, S small, M medium, L large.
 
 **Build, typecheck, tests**
 - `tsc`, `electron-vite build`, vitest config: platform-neutral. The database is `node:sqlite`
@@ -190,5 +190,190 @@ To be confirmed on the Mac in Phase 4. Size: T trivial, S small, M medium, L lar
 Discovered 2026-09-25: Tailscale `jurajs-mac-mini` (100.93.223.7), online, direct path, port 22
 open, key `%USERPROFILE%\.ssh\conductor_mac_ed25519`.
 
-_Phases 2–4, 8 and the live job tests follow once the key is authorized and the user name is known;
-the Phase 10 report is appended here._
+### Capability report (Phase 2, 2026-09-25, over SSH as `jurajdubovec`)
+
+| | |
+|---|---|
+| Hostname | `Mac-mini` (Tailscale `jurajs-mac-mini`) |
+| macOS | 27.0 (26A428), kernel Darwin 27.0.0 |
+| Hardware | Mac mini M1 (`Macmini9,1`), Apple M1, 8 cores (4 performance), 16 GB RAM |
+| Disk | 460 GB, 421 GB free |
+| Shell | `/bin/zsh`; non-interactive SSH PATH `/usr/bin:/bin:/usr/sbin:/sbin` |
+| Architecture | arm64 native, Rosetta not installed (not needed) |
+| Security | SIP enabled, Gatekeeper enabled, FileVault on, application firewall off, sudo needs a password |
+| Tailscale | 1.102.4, standalone app, network extension enabled; Remote Login on |
+| Power (AC) | `sleep 1` (only awake while the display is on), `displaysleep 10`, `womp 1`, `autorestart 0`, `powernap 1` |
+| Dev tools | none: no Command Line Tools (git/python3/xcodebuild are installer shims), no Homebrew, no Node |
+
+The record lives in `<userData>/remote-jobs/nodes.json` as node `mac-mini` and shows in
+`machines.list` as `node:mac-mini`. It was registered with `scripts/mac-node.mjs register`
+because `nodes.register` is owner/wizard-only and the owner's brief asked for this registration.
+
+### Node environment
+
+`~/.conductor-node/env.sh` (loaded by every job and probe, and from `~/.zshenv` so plain
+`ssh mac-mini '<cmd>'` sees the same PATH):
+
+```sh
+if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; fi
+if [ -d /opt/homebrew/opt/node@22/bin ]; then PATH="/opt/homebrew/opt/node@22/bin:$PATH"; fi
+export PATH
+```
+
+### Live remote jobs (Phase 6)
+
+Run through the app's `nodes.run` and through `scripts/mac-node.mjs`, 2026-09-25:
+
+| Job | Result |
+|---|---|
+| `uname -mrs; sw_vers …; echo … >&2`, requires `macos, apple-silicon` | succeeded, routed to mac-mini, both streams captured, 1.7 s |
+| `exit 7` | failed, exit 7 |
+| `sleep 601`, timeoutSec 5 | timed-out after 6.0 s, stopped by the node |
+| two background sleeps + `wait`, cancelled after 4 s | cancelled, whole process group stopped |
+| `nohup sleep 604 &` then exit 0 | succeeded; the left-behind child was killed |
+| `sleep … ; wait`, local `ssh.exe` killed mid-run | lost; the Mac saw stdin EOF and stopped the group |
+| requires `macos, xcode` | refused: "No online node with macos, xcode. mac-mini lacks xcode." |
+
+After each run, `pgrep` found no leftover processes on the Mac and `~/.conductor-node/jobs` was empty.
+The first live run showed bash's `Terminated: 15` notices in job stderr; fixed in e976f9f.
+
+### Bootstrap (Phase 3)
+
+Inspected first; installed only what the repo needs, all native arm64:
+
+- **Command Line Tools 27.0** (Apple Git 2.54) and **Homebrew 7.0.6** at `/opt/homebrew`: installed by
+  the owner with the Homebrew installer (it needs the Mac password; sudo is not passwordless, and the
+  password was never stored). Homebrew is also on the login-shell PATH through `~/.zprofile`.
+- **Node 22.23.3 / npm 10.9.9** (`brew install node@22`, run as a remote job): Node 22 is what
+  `release.yml` builds with.
+- Not installed: Rosetta, Xcode, `gh` (the node gets commits by push, so it needs no GitHub
+  access), any GUI app or background daemon.
+- Owner power settings: `sudo pmset -c sleep 0 autorestart 1` (confirmed `sleep 0`, `autorestart 1`).
+
+### Conductor on the Mac (Phase 4)
+
+All run as checkout jobs through `nodes.run`, at e976f9f pushed from MAIN into the Mac's own
+checkout `~/conductor-node/work/conductor`:
+
+| Step | Result |
+|---|---|
+| `npm ci` | PASS, 506 packages in 18 s; node-pty resolves its `darwin-arm64` prebuild |
+| `tsc --noEmit` | PASS |
+| `electron-vite build` | PASS (12.8 s) |
+| `vitest run` | 3701 / 3737 pass, 36 fail in 13 files (whole suite in about 40 s) |
+| `npm run test:scripts` | 91 pass, 1 fail, 11 skipped (Windows-only) |
+| `electron-builder --mac dir --arm64` (unsigned) | PASS: 411 MB `Conductor.app`, Mach-O arm64, ad-hoc signed; the binary runs (Electron 37.10.3, darwin arm64) |
+
+What failed on macOS, grouped by cause (recorded as tasks below; none was changed here, because each
+belongs to another area's files):
+
+1. **Paths compared without resolving symlinks** (about 23 tests): macOS's temp folder is
+   `/var/folders/…` and `/var` is a link to `/private/var`. The file-drop move guard reports
+   "Symbolic-link file drops are not moved", the local update feed reports "folder is redirected",
+   and path-relative listings come back empty. Files: `file-drop-move`, `file-drop-cross-volume`,
+   `prompt-context`, `local-update-feed`, `durable-jobs/handoff`, `local-models/context-management`,
+   `output-budget`, `bounded-tools`. With `TMPDIR=/private/tmp` all 8 files pass. The product has
+   the same fault for any project under a linked folder, so both sides should be resolved with
+   `realpath` before comparing.
+2. **Windows path forms asserted on POSIX** (12 tests, `remote-control-host.test.ts`): `C:x`,
+   `\\server\share` and `..\..` are ordinary file names inside the workspace on POSIX, so the
+   host correctly allows them there. These cases should run only on win32, with a POSIX case for `../`.
+3. **Local models are Windows-only** (`local-models/paths`, `local-models`, `sandbox-startup`): drive
+   letters, `Docker Desktop.exe`, `.ps1` setup.
+4. **`scripts/overseer/goals/local-qwen-faktury.json`** holds Windows absolute paths, so
+   "shipped goal files are valid" fails on POSIX.
+5. **`providers/grok.test.ts`** "Edit allows in-workspace edits itself…" times out on every run on
+   the Mac (4 s synthetic-protocol wait). Not diagnosed yet.
+6. **Packaging: node-pty's `spawn-helper` has no execute bit** (`-rw-r--r--` after `npm ci` and in the
+   package). With it, every terminal fails with `posix_spawnp failed`; after `chmod +x` a pty spawns
+   (`pty says: pty-ok`). Fix: `chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper` in a
+   postinstall and an electron-builder afterPack hook.
+
+Not attempted, needs a decision: a signed/notarized DMG (Developer ID), a `mac` block and icon in
+the build config, `MacUpdater`, a macOS job in `release.yml`, and launching the GUI on the Mac (it
+would open over whatever is on the Mac's screen; a parked smoke run is the way).
+
+### Tasks from Phase 4 (for the controller to file)
+
+| Id | Task | Size |
+|---|---|---|
+| mac-realpath | Resolve symlinks (`realpath`) on both sides of project/drop/feed root comparisons; realpath temp fixture roots in tests | S |
+| mac-host-path-tests | `remote-control-host.test.ts`: Windows path-form cases win32-only, add POSIX `../` cases | T |
+| mac-overseer-goal | Make `local-qwen-faktury.json` portable or skip non-portable goals on POSIX | T |
+| mac-grok-test | Diagnose the Grok ACP fixture timeout on macOS | S |
+| mac-spawn-helper | `chmod +x` node-pty `spawn-helper` (postinstall + afterPack) | T |
+| mac-packaging | `mac` build block (dmg+zip, arm64), `.icns`, entitlements, signing and notarization with the owner's Developer ID, `MacUpdater`, macOS release job | M–L |
+| mac-runtime | Section 4's runtime list: runtime-host launcher on darwin, PATH import from the login shell, traffic lights, default terminal and PowerShell schedules | S each |
+
+### Unattended operation (Phase 8)
+
+| Check | State |
+|---|---|
+| Sleep on AC | `sleep 0` (owner) |
+| Restart after power loss | `autorestart 1` (owner); `womp 1` |
+| SSH | Remote Login is a launchd system service, so it is up whenever the Mac has booted |
+| Dev environment over non-interactive SSH | `~/.zshenv` → `~/.conductor-node/env.sh`: plain `ssh mac 'node -v'` finds Node 22, npm, brew, git |
+| No zombies | jobs run in their own process group; timeout, cancel, lost connection and normal exit all kill the group; verified with `pgrep` |
+| Security | SIP and Gatekeeper left on; nothing disabled |
+| Tailscale after reboot | Tailscale.app (standalone 1.102.4) opens at login through its registered login-item helper, which needs a logged-in session |
+| Boot without a person | **not yet**: FileVault is on, so after any reboot the Mac waits at its own password screen, and no SSH or Tailscale comes up until someone types the password |
+
+`nodes.list` reports all of this as `readiness` (checks, `ready`, and `missing` in words) from every
+probe, which is the Mac half of feature `always-on-machines`.
+
+#### Owner step: FileVault off and automatic login (owner decision 2026-09-25)
+
+The owner decided the Mac must be on whenever it is needed. That means FileVault off plus
+automatic login, so after a power cut the Mac boots straight into the owner's session, and
+Tailscale.app (a login item) connects. The trade-off, stated once: anyone with physical access to
+the Mac gets a logged-in session and an unencrypted disk. In Windows Terminal on MAIN:
+
+```
+ssh -t -i %USERPROFILE%\.ssh\conductor_mac_ed25519 jurajdubovec@jurajs-mac-mini
+sudo fdesetup disable
+fdesetup status
+sudo sysadminctl -autologin set -userName jurajdubovec -password -
+sudo shutdown -r now
+```
+
+- `fdesetup disable` asks for the Mac password. On Apple silicon it finishes within minutes. Run
+  `fdesetup status` until it says `FileVault is Off.` before the next line: macOS refuses automatic
+  login while FileVault is on or still changing.
+- `sysadminctl -autologin … -password -` asks for the Mac password once more. macOS keeps it for
+  automatic login (`/etc/kcpassword`); Conductor never sees or stores it.
+- The restart is the test: once the Mac comes back, `nodes.probe` should show it online with
+  `boot-unlock` and `tailscale` ok, without anyone touching the Mac.
+- Tailscale: the standalone app cannot run before login, but with automatic login it does not need
+  to. The open-source `tailscaled` system daemon (`brew install tailscale`, run as root) would come up
+  before login, but it replaces the app (both cannot run) and needs its own sign-in. Only worth it
+  if automatic login is ever turned off again.
+
+## 6. Phase 10 report (2026-09-25)
+
+**MAC NODE**
+- Name: Mac mini (M1), node `mac-mini` (`node:mac-mini` in `machines.list`); hostname `Mac-mini`
+- Tailscale hostname: `jurajs-mac-mini` (100.93.223.7, direct path)
+- macOS 27.0 (26A428); architecture arm64 (native, no Rosetta)
+- Hardware: Macmini9,1, Apple M1, 8 cores (4 performance), 16 GB RAM, 460 GB SSD (420 GB free)
+
+**CONNECTIVITY**
+- Tailscale: PASS
+- SSH (key only, `jurajdubovec`, host key pinned in Conductor's known_hosts): PASS
+- Remote command execution (bounded jobs, timeout, cancel, lost connection, no leftovers): PASS
+
+**DEVELOPMENT**
+- Git (Apple Git 2.54, Command Line Tools 27.0): PASS
+- Node (22.23.3, Homebrew `node@22`, arm64): PASS
+- Conductor dependencies (`npm ci`): PASS
+- Build (`tsc`, `electron-vite build`, unsigned arm64 `Conductor.app`): PASS
+- Tests: FAIL. 3701 of 3737 vitest tests and 91 of 92 script tests pass; the 37 failures have 6 known causes, filed as tasks in section 5 (mostly the `/var` symlink and Windows-only tests). Packaged terminals need the `spawn-helper` execute-bit fix.
+
+**CONDUCTOR INTEGRATION**
+- Machine registered (node record with facts, capabilities, readiness, last seen, current jobs; shown in `machines.list`): PASS
+- Remote jobs (`nodes.run` through the app; records and logs in `<userData>/remote-jobs`): PASS
+- Result/log collection (exit code, stdout/stderr tails, full logs, `nodes.log`): PASS
+- macOS-targeted dispatch (`requires: ["macos"]` → mac-mini; unmet requirements refused by name; commit pushed to the node's own checkout): PASS
+
+**BLOCKERS**
+- FileVault off + automatic login (owner decision, needs the Mac password): the command block in section 5. Until then an unplanned reboot leaves the Mac at its password screen, unreachable.
+- Signed macOS builds need the owner's Apple Developer ID (not requested yet).
