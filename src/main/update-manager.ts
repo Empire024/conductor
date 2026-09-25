@@ -8,7 +8,10 @@ import type { AppUpdateState } from '../shared/models'
 import { DEFAULT_GITHUB_UPDATE_URL, normalizeUpdateFeedUrl, resolveUpdateProvider, type ConductorUpdateProvider } from './update-config'
 import { LocalUpdateFeed } from './local-update-feed'
 import { RestorePointStore } from './restore-points'
-import type { RestorePoint } from '../shared/models'
+import type { CliPinState, RestorePlan, RestorePoint, RestoreScope } from '../shared/models'
+import { CliVersionStore, PINNABLE_CLIS, plainCliVersion, restorePlan, setActiveCliVersions } from './cli-versions'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import { createUpdateInstallSeam, type InstallRequest, type UpdateInstallSeam } from './update-install-seam'
 
 interface UpdateManagerOptions {
@@ -20,6 +23,12 @@ interface UpdateManagerOptions {
   beforeInstall(force: boolean, initiator?: Omit<RestartInitiator, 'at'>): void | Promise<void>
   /** Defaults to the real one: quitAndInstall, or the installer stub in a test profile. */
   installSeam?: UpdateInstallSeam
+  /** The model catalogs Conductor offers now, compared with a restore point's in its plan. */
+  currentModels?(): RestorePoint['models']
+  /** Saved CLI copies and pins (src/main/cli-versions.ts); defaults to one beside the restore points. */
+  cliVersions?: CliVersionStore
+  /** When the installed CLIs are first saved after launch; null never (unit tests). */
+  cliSnapshotDelayMs?: number | null
 }
 interface PendingPrepare {
   requestId: string
@@ -27,7 +36,10 @@ interface PendingPrepare {
   finish(): void
 }
 const CHECK_INTERVAL_MS = 2 * 60 * 1000
+const CLI_SNAPSHOT_INTERVAL_MS = 6 * 60 * 60_000
 const PREPARE_TIMEOUT_MS = 2_000
+/** A test profile (CONDUCTOR_TEST_USER_DATA) looks for older CLI versions under a fake home, never the owner's. */
+const testCliHome = (): string | undefined => process.env.CONDUCTOR_TEST_USER_DATA ? process.env.CONDUCTOR_TEST_CLI_HOME?.trim() || join(process.env.CONDUCTOR_TEST_USER_DATA, 'cli-home') : undefined
 const busy = (phase: AppUpdateState['phase']): boolean => ['downloading', 'ready', 'installing'].includes(phase)
 const errorMessage = (reason: unknown): string => (reason instanceof Error ? reason.message : String(reason)).replace(/^Error:\s*/i, '').slice(0, 280)
 
@@ -38,6 +50,8 @@ export class UpdateManager {
   private localUpdater: NsisUpdater | null = null
   private localFeed?: LocalUpdateFeed
   private restorePoints?: RestorePointStore
+  private cliVersions?: CliVersionStore
+  private cliSnapshotTimer: NodeJS.Timeout | null = null
   private localUrl?: string
   private includeLocal = true
   private epoch = 0
@@ -59,6 +73,20 @@ export class UpdateManager {
       this.localFeed = new LocalUpdateFeed(options.localBuildDirectory)
       this.restorePoints = new RestorePointStore(options.localBuildDirectory)
       this.restorePoints.beginRun(this.currentVersion)
+      this.cliVersions = options.cliVersions ?? new CliVersionStore({ directory: join(options.localBuildDirectory, 'cli-cache'), ...(testCliHome() ? { home: testCliHome() } : {}) })
+      setActiveCliVersions(this.cliVersions)
+      // A test profile saves CLIs only when a smoke asks (CONDUCTOR_TEST_CLI_SNAPSHOT_MS), so no
+      // other smoke copies the owner's real CLIs into its profile.
+      const testDelay = process.env.CONDUCTOR_TEST_USER_DATA ? (process.env.CONDUCTOR_TEST_CLI_SNAPSHOT_MS ? Number(process.env.CONDUCTOR_TEST_CLI_SNAPSHOT_MS) : null) : 20_000
+      const delay = options.cliSnapshotDelayMs === undefined ? testDelay : options.cliSnapshotDelayMs
+      if (delay !== null) {
+        this.cliSnapshotTimer = setTimeout(() => {
+          void this.saveClis()
+          this.cliSnapshotTimer = setInterval(() => void this.saveClis(), CLI_SNAPSHOT_INTERVAL_MS)
+          this.cliSnapshotTimer.unref()
+        }, delay)
+        this.cliSnapshotTimer.unref()
+      }
     }
   }
   getState(): AppUpdateState {
@@ -72,6 +100,36 @@ export class UpdateManager {
   pinVersion(version: string, pinned: boolean): RestorePoint {
     if (!this.restorePoints) throw new Error('Local restore points are unavailable')
     return this.restorePoints.pin(version, pinned)
+  }
+  /** What rolling back to a restore point changes: the app (scope all) and the CLIs. */
+  async restorePlan(version: string, scope: RestoreScope = 'all'): Promise<RestorePlan> {
+    if (!this.restorePoints || !this.cliVersions) throw new Error('Local restore points are unavailable')
+    const store = this.cliVersions
+    const point = this.restorePoints.list().find(entry => entry.version === version)
+    if (!point) throw new Error(`No restore point ${version}`)
+    const pins = store.pins()
+    const clis = Object.fromEntries(await Promise.all(PINNABLE_CLIS.map(async provider => {
+      const installed = (await store.installed(provider).catch(() => null))?.version ?? null
+      const recorded = plainCliVersion(point.cliVersions[provider])
+      return [provider, { installed, pinned: pins[provider]?.version ?? null, availability: recorded ? store.availability(provider, recorded, installed) : 'missing' }] as const
+    }))) as Parameters<typeof restorePlan>[0]['clis']
+    return restorePlan({ point, scope, currentAppVersion: this.currentVersion, clis, currentModels: this.options.currentModels?.() ?? [],
+      appRestorable: existsSync(join(this.restorePoints.directory, `restore-point-${version}.json`)) })
+  }
+  cliPins(): Promise<CliPinState[]> { return this.cliVersions?.pinStates() ?? Promise.resolve([]) }
+  /** Every tab launches the installed Claude Code and Codex again. */
+  useInstalledClis(): Promise<CliPinState[]> {
+    this.cliVersions?.clearPins()
+    return this.cliPins()
+  }
+  /** Keeps the installed CLIs and the versions the restore points name, so rolling back needs no network. */
+  async saveClis(): Promise<void> {
+    if (!this.cliVersions || !this.restorePoints) return
+    try {
+      const recorded = Object.fromEntries(PINNABLE_CLIS.map(provider => [provider, this.restorePoints!.list().map(point => plainCliVersion(point.cliVersions?.[provider])).filter((value): value is string => Boolean(value))]))
+      await this.cliVersions.snapshot(recorded)
+      await this.cliVersions.prune(recorded)
+    } catch (error) { console.warn('Could not save the installed CLI versions', error) }
   }
   recordFailedShip(): void { this.restorePoints?.recordFailedShip(this.currentVersion) }
 
@@ -179,9 +237,14 @@ export class UpdateManager {
   }
   /** Selects an immutable historical build in the same loopback feed, downloads it through the
    * normal updater, then takes the existing guarded restart path. */
-  async rollback(version: string): Promise<void> {
-    if (!this.restorePoints || !this.localFeed) throw new Error('Local restore points are unavailable')
-    if (busy(this.state.phase)) throw new Error('Finish the current update before rolling back')
+  async rollback(version: string, scope: RestoreScope = 'all'): Promise<RestorePlan> {
+    if (!this.restorePoints || !this.localFeed || !this.cliVersions) throw new Error('Local restore points are unavailable')
+    if (scope === 'all' && busy(this.state.phase)) throw new Error('Finish the current update before rolling back')
+    const plan = await this.restorePlan(version, scope)
+    if (plan.blocked) throw new Error(plan.blocked)
+    // The CLIs first: they take effect at once, and the app install below ends this process.
+    await this.cliVersions.restore(plan)
+    if (scope === 'clis') return plan
     const point = this.restorePoints.activate(version)
     const local = await this.localFeed.refresh()
     if (!local || local.version !== point.version) throw new Error(`Restore point ${version} could not be opened by the local update feed`)
@@ -196,6 +259,7 @@ export class UpdateManager {
     if (this.state.phase !== 'ready') throw new Error(this.state.message ?? `Could not download restore point ${version}`)
     this.installReason = 'rollback'
     try { await this.install() } finally { this.installReason = 'update' }
+    return plan
   }
   async install(options: { force?: boolean } = {}, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> {
     if (!this.updater || this.state.phase !== 'ready') return
@@ -221,6 +285,8 @@ export class UpdateManager {
 
   dispose(): void {
     this.clearTimer()
+    if (this.cliSnapshotTimer) clearTimeout(this.cliSnapshotTimer)
+    this.cliSnapshotTimer = null
     this.epoch++
     this.remoteUpdater?.removeAllListeners()
     this.localUpdater?.removeAllListeners()

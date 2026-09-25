@@ -176,9 +176,14 @@ const rollbackFromUi = async version => {
   // text is kept in localStorage so it can be read back after the relaunch.
   await page.evaluate(() => { localStorage.removeItem('fx12Confirm'); window.confirm = message => { localStorage.setItem('fx12Confirm', String(message)); return true } })
   const menu = await openVersions()
-  const row = menu.locator('li').filter({ hasText: version })
+  const row = menu.locator('li').filter({ hasText: version }).filter({ has: page.getByRole('button', { name: 'Roll back to this version' }) })
   await expect(row).toHaveCount(1)
-  await clickDetached(row.getByRole('button', { name: 'Roll back to this version' }))
+  // FX20: the Versions menu shows the rollback plan in place and waits for "Confirm rollback".
+  await row.getByRole('button', { name: 'Roll back to this version' }).click()
+  const plan = menu.locator('.update-restore-plan')
+  await expect(plan).toContainText(`Roll back to Conductor ${version}`)
+  await page.evaluate(text => localStorage.setItem('fx12Confirm', text), await plan.innerText())
+  await clickDetached(plan.getByRole('button', { name: 'Confirm rollback' }))
 }
 const confirmText = () => page.evaluate(() => localStorage.getItem('fx12Confirm'))
 

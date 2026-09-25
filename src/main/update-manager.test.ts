@@ -33,7 +33,15 @@ vi.mock('electron-updater', async () => {
     quitAndInstall = vi.fn()
   } }
 })
+// Hermetic CLI rollback: no real CLI is resolved, run or looked for in the owner's home.
+vi.mock('./cli-versions', async importOriginal => {
+  const actual = await importOriginal<typeof import('./cli-versions')>()
+  return { ...actual, CliVersionStore: class extends actual.CliVersionStore {
+    constructor(options: import('./cli-versions').CliVersionStoreOptions) { super({ home: options.directory, resolveInstalled: () => null, readVersion: async () => null, ...options }) }
+  } }
+})
 import { UpdateManager } from './update-manager'
+import { CliVersionStore, pinnedCliExecutable } from './cli-versions'
 import { RestorePointStore } from './restore-points'
 import { createUpdateInstallSeam } from './update-install-seam'
 const managers: UpdateManager[] = []
@@ -128,6 +136,31 @@ describe('installed updater source ownership — mocked transport, no installati
     expect(rollbackUpdater.allowDowngrade).toBe(true)
     expect(rollbackUpdater.downloadUpdate).toHaveBeenCalledOnce()
     expect(rollbackUpdater.quitAndInstall).toHaveBeenCalledExactlyOnceWith(true, true)
+  })
+
+  it('rolls back the CLIs only: pins the recorded versions, installs nothing, and shows the plan first', async () => {
+    const directory = updateDir(), version = '0.1.3-local.1', home = join(directory, 'home')
+    new RestorePointStore(directory).record({ version, commit: 'a'.repeat(40), createdAt: '2026-09-23T12:00:00Z', dirty: false,
+      cliVersions: { claude: '2.1.278 (Claude Code)', codex: 'codex-cli 0.155.1', grok: null }, models: [],
+      installer: `Conductor-Setup-${version}.exe`, blockmap: `Conductor-Setup-${version}.exe.blockmap` })
+    mkdirSync(join(home, '.local', 'share', 'claude', 'versions'), { recursive: true })
+    writeFileSync(join(home, '.local', 'share', 'claude', 'versions', '2.1.278'), '2.1.278')
+    const installed = join(directory, 'claude.exe'); writeFileSync(installed, '2.1.290')
+    const cliVersions = new CliVersionStore({ directory: join(directory, 'cli-cache'), home, resolveInstalled: provider => provider === 'claude' ? installed : null,
+      readVersion: async file => { try { return readFileSync(file, 'utf8') } catch { return null } } })
+    const m = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: directory, beforeInstall: vi.fn(), cliVersions, cliSnapshotDelayMs: null })
+    managers.push(m); m.configure('')
+    const plan = await m.restorePlan(version, 'clis')
+    expect(plan.app).toBeNull()
+    expect(plan.clis.map(change => [change.provider, change.from, change.to, change.action])).toEqual([['claude', '2.1.290', '2.1.278', 'pin'], ['codex', null, '0.155.1', 'unavailable']])
+    // No saved build descriptor: the app cannot come back, the CLIs still can.
+    expect((await m.restorePlan(version, 'all')).blocked).toMatch(/no saved build/)
+    await m.rollback(version, 'clis')
+    expect(pinnedCliExecutable('claude')).toBe(join(directory, 'cli-cache', 'claude', '2.1.278', process.platform === 'win32' ? 'claude.exe' : 'claude'))
+    expect(f.instances.every(instance => instance.quitAndInstall.mock.calls.length === 0 && instance.downloadUpdate.mock.calls.length === 0)).toBe(true)
+    expect(await m.cliPins()).toMatchObject([{ provider: 'claude', version: '2.1.278', installed: '2.1.290', restorePoint: version }])
+    expect(await m.useInstalledClis()).toEqual([])
+    expect(pinnedCliExecutable('claude')).toBeNull()
   })
 })
 

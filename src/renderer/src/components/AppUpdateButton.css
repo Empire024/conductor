@@ -11,3 +11,10 @@
 .update-version-actions { display: flex; gap: 6px; margin-top: 4px; }
 .update-version-actions button { font-size: 9px; padding: 3px 6px; }
 .update-version-error { color: var(--danger); font-size: 9px; }
+.update-restore-plan { display: grid; gap: 5px; margin-bottom: 9px; padding: 8px; border: 1px solid var(--accent); border-radius: 6px; }
+.update-restore-plan ul { gap: 3px; padding-left: 2px; }
+.update-restore-plan li { padding: 0; border: 0; }
+.update-restore-plan li[data-action="unavailable"], .update-restore-plan p { color: var(--text-2); }
+.update-restore-plan p { margin: 0; font-size: 9px; }
+.update-cli-pins { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; padding: 6px 8px; border-radius: 6px; background: var(--surface-2); }
+.update-cli-pins button { font-size: 9px; padding: 3px 6px; white-space: nowrap; }

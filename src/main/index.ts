@@ -53,7 +53,7 @@ import type {
   WorkspaceLayout
 } from '../shared/models'
 import { AGENT_SOUND_PROFILES, isMemoryKind, THEME_IDS, THEME_VARIANTS } from '../shared/models'
-import type { LayoutNode } from '../shared/models'
+import type { LayoutNode, RestorePoint, RestoreScope } from '../shared/models'
 import { wizardActive } from '../shared/structured-agent'
 import type { AgentConfirmResponse } from '../shared/agent-confirm'
 import { AgentConfirmBroker } from './agent-confirm-broker'
@@ -1664,7 +1664,10 @@ const registerIpc = (): void => {
   ipcMain.handle('updates:check', (event) => { trustedStructured(event); return updates.check() })
   ipcMain.handle('updates:versions', (event) => { trustedStructured(event); return updates.versions() })
   ipcMain.handle('updates:pin-version', (event, version: string, pinned: boolean) => { trustedStructured(event); return updates.pinVersion(version, pinned) })
-  ipcMain.handle('updates:rollback', (event, version: string) => { trustedStructured(event); return updates.rollback(version) })
+  ipcMain.handle('updates:restore-plan', (event, version: string, scope: RestoreScope) => { trustedStructured(event); return updates.restorePlan(version, scope === 'clis' ? 'clis' : 'all') })
+  ipcMain.handle('updates:rollback', (event, version: string, scope?: RestoreScope) => { trustedStructured(event); return updates.rollback(version, scope === 'clis' ? 'clis' : 'all') })
+  ipcMain.handle('updates:cli-pins', (event) => { trustedStructured(event); return updates.cliPins() })
+  ipcMain.handle('updates:use-installed-clis', (event) => { trustedStructured(event); return updates.useInstalledClis() })
   ipcMain.handle('updates:download', (event) => { trustedStructured(event); return updates.download() })
   ipcMain.handle('updates:install', (event) => { trustedStructured(event); return updates.install() })
   // The owner answering a wizard's restart request when no update is waiting to install.
@@ -2663,6 +2666,7 @@ app.whenReady().then(async () => {
     isPackaged: app.isPackaged,
     allowDevelopmentUpdates: process.env.CONDUCTOR_UPDATE_DEV === '1',
     localBuildDirectory: join(app.getPath('userData'), 'local-updates'),
+    currentModels: () => (configuredModelCatalog() ?? []) as RestorePoint['models'],
     beforeInstall: prepareForUpdateInstall
   })
   updates.setRestartRequest(readRestartRequest())

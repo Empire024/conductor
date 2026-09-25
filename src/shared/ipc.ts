@@ -9,6 +9,9 @@ import type {
   AppDiagnostics,
   AppPerformanceSnapshot,
   RestorePoint,
+  RestorePlan,
+  RestoreScope,
+  CliPinState,
   DebugConsoleSnapshot,
   DebugScreenshot,
   AgentMemory,
@@ -122,7 +125,12 @@ export interface ConductorBridge {
     install(): Promise<void>
     versions(): Promise<RestorePoint[]>
     pinVersion(version: string, pinned: boolean): Promise<RestorePoint>
-    rollback(version: string): Promise<void>
+    /** What rolling back changes (app and CLIs, or the CLIs only), shown before the owner confirms. */
+    restorePlan(version: string, scope: RestoreScope): Promise<RestorePlan>
+    rollback(version: string, scope?: RestoreScope): Promise<RestorePlan>
+    /** Claude Code / Codex versions a rollback pinned instead of the installed CLIs. */
+    cliPins(): Promise<CliPinState[]>
+    useInstalledClis(): Promise<CliPinState[]>
     /** Restart for a wizard's restart request when no update is waiting to install. */
     restart(): Promise<void>
     acknowledgePrepare(requestId: string): void

@@ -90,6 +90,8 @@ const captureRestorePoint = async descriptor => {
     version, commit, createdAt: descriptor.createdAt, dirty,
     cliVersions: { claude: cliVersion('claude'), codex: cliVersion('codex'), grok: cliVersion('grok') },
     models: parseModels(), installer: descriptor.installer, blockmap: descriptor.blockmap,
+    // This build honours CLI pins (src/main/cli-versions.ts), so rolling back to it keeps restored CLIs.
+    cliPinning: true,
     pinned: existing?.pinned === true, knownGood: existing?.knownGood === true,
     crashCount: existing?.crashCount || 0, failedShipCount: existing?.failedShipCount || 0,
     ...(existing?.firstLaunchedAt ? { firstLaunchedAt: existing.firstLaunchedAt } : {})

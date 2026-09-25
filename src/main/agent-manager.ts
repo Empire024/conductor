@@ -21,6 +21,7 @@ import type { AgentCollaborationRuntime } from './agent-collaboration-runtime'
 import { captureMemories, capturedMemoryKey } from './memory'
 import { LOCAL_MODELS, localModelLabel } from '../shared/local-models'
 import { NativeCliManager } from './native-cli-manager'
+import { pinnedCliExecutable } from './cli-versions'
 import { loadConfig } from './local-models/config.ts'
 import { StructuredSessions } from './structured-sessions'
 import { TurnBriefings } from './turn-briefing'
@@ -121,7 +122,8 @@ const providers: Record<AgentProviderId, AgentProvider> = {
   codex: {
     id: 'codex',
     displayName: 'Codex',
-    resolveExecutable: () => findOnPath('codex', process.env.CONDUCTOR_CODEX_PATH),
+    // A CLI rolled back from the Versions menu (cli-versions.ts) wins over PATH and the env override.
+    resolveExecutable: () => pinnedCliExecutable('codex') ?? findOnPath('codex', process.env.CONDUCTOR_CODEX_PATH),
     installUrl: 'https://developers.openai.com/codex/cli/',
     models: CODEX_MODELS,
     efforts: CODEX_EFFORTS,
@@ -141,7 +143,7 @@ const providers: Record<AgentProviderId, AgentProvider> = {
   claude: {
     id: 'claude',
     displayName: 'Claude Code',
-    resolveExecutable: () => findOnPath('claude', process.env.CONDUCTOR_CLAUDE_PATH),
+    resolveExecutable: () => pinnedCliExecutable('claude') ?? findOnPath('claude', process.env.CONDUCTOR_CLAUDE_PATH),
     installUrl: 'https://docs.anthropic.com/en/docs/claude-code/setup',
     // Mirrors the ids the installed Claude Code 2.1.278 advertised on 2026-09-21 (`initialize.models`):
     // the account default resolves to Opus with the 1M window, and the only Opus entry is `opus[1m]`.

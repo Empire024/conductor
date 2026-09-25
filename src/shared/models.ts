@@ -226,7 +226,35 @@ export interface RestorePoint {
   crashCount: number
   failedShipCount: number
   firstLaunchedAt?: string
+  /** Built with CLI rollback (FX20): after rolling back to it, it still honours the CLI pins. */
+  cliPinning?: boolean
 }
+
+/** `all` installs the saved build and puts back its CLIs; `clis` only puts back the CLIs. */
+export type RestoreScope = 'all' | 'clis'
+export type PinnableCli = 'claude' | 'codex'
+/** What rolling back does to one CLI: `pin` launches a saved or still-installed older copy,
+ *  `unpin` goes back to the installed CLI because that is the recorded version. */
+export interface RestorePlanCli {
+  provider: PinnableCli
+  label: string
+  from: string | null
+  to: string | null
+  action: 'keep' | 'pin' | 'unpin' | 'unavailable' | 'unrecorded'
+  source?: 'saved copy' | 'CLI install folder'
+}
+export interface RestorePlan {
+  version: string
+  scope: RestoreScope
+  app: { from: string; to: string } | null
+  clis: RestorePlanCli[]
+  /** Model ids the point recorded compared with the catalogs Conductor offers now. */
+  models: Array<{ provider: string; added: string[]; removed: string[] }>
+  warnings: string[]
+  blocked?: string
+}
+/** A CLI Conductor launches from its version cache instead of the installed one. */
+export interface CliPinState { provider: PinnableCli; label: string; version: string; installed: string | null; pinnedAt: string; restorePoint?: string }
 
 export interface AppDiagnostics {
   appVersion: string
