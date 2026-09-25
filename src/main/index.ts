@@ -80,6 +80,7 @@ import { sshTransport } from './remote-jobs/transport'
 import { durableJobPorts, gatedRuntime } from './durable-jobs/wiring'
 import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/server-lifecycle'
 import { registerDurableJobsIpc } from './durable-jobs-ipc'
+import { createCloud, type CloudRegistration } from './cloud/register'
 import { health as llamaHealth, processAlive as llamaProcessAlive, readRunRecord, stopServer as stopLlamaServer } from './local-models/llama'
 import { runningLlamaProcesses } from './local-models/resource-guard'
 import { listLocalServers, stopLocalServer, type LocalStopRequest } from './local-models/servers'
@@ -147,6 +148,8 @@ let scheduledTasks: ReturnType<typeof createScheduledTasks>
 let durableJobs: DurableJobsServiceImpl | null = null
 /** Bounded commands on the owner's other computers (docs/mac-node.md). */
 let remoteJobs: RemoteJobService | null = null
+/** Claude Code cloud sessions run as coworkers (docs/cloud-coworker.md); null until the app is ready. */
+let cloud: CloudRegistration | null = null
 let disposeDurableJobsIpc: (() => void) | undefined
 let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
@@ -646,6 +649,7 @@ const disposeRuntimeServices = (): void => {
     // app quit is never recorded as a failed stage. The jobs stay running and are reconciled on
     // the next launch.
     ['durable jobs', () => { durableJobs?.dispose(); disposeDurableJobsGate?.(); disposeDurableJobsIpc?.() }],
+    ['cloud runs', () => cloud?.dispose()],
     ['idea-runs', () => { disposeIdeaRunsIpc?.(); ideaRunsRegistration?.dispose() }],
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
@@ -2445,6 +2449,10 @@ const registerIpc = (): void => {
   }
   if (ideasRegistration) disposeIdeasIpc = ideasRegistration.registerIpc(event => trustedStructured(event))
   if (ideaRunsRegistration) disposeIdeaRunsIpc = ideaRunsRegistration.registerIpc(event => trustedStructured(event))
+  cloud?.registerIpc({
+    authorize: (event, projectId) => { trustedStructured(event); requireLocalProject(database, structuredId(projectId), 'Cloud sessions') },
+    projectPath: projectId => { const project = database.getProject(projectId); return project && !project.remote ? project.path : null }
+  })
 }
 
 app.whenReady().then(async () => {
@@ -2670,6 +2678,12 @@ app.whenReady().then(async () => {
     control.setRemoteJobs(remoteJobs)
   } catch (error) {
     console.warn('Execution nodes are unavailable', error)
+  }
+  try {
+    cloud = createCloud({ userData: app.getPath('userData'), claudeExecutable: () => agents.listProviders().find(provider => provider.id === 'claude')?.executable ?? null, ui: agentControlUi.request })
+    control.setCloud(cloud.runs)
+  } catch (error) {
+    console.warn('Cloud sessions are unavailable', error)
   }
   // Finished coworkers close themselves, and a settled CLI is released after the owner's idle
   // timeout (src/main/coworker-autoclose.ts). A test launch may shorten the timeout to seconds.

@@ -45,6 +45,8 @@ import { LogicLoops, type LoopRecordInput } from './logic-loops'
 import { ideaMethods, ideaSignatures, type IdeasControlCaller } from './ideas/control'
 import { ideaRunMethods, ideaRunSignatures, type IdeaRunsControlCaller } from './idea-runs/control'
 import { callNodeMethod, nodeMethods, nodeSignatures, withNodes } from './remote-jobs/control'
+import { callCloudMethod, cloudCatalogEntry, cloudMethods, cloudSignatures } from './cloud/control'
+import type { CloudRuns } from './cloud/runs'
 import type { RemoteJobService } from './remote-jobs/service'
 import type { LocalMachineReadiness } from '../shared/always-on'
 import { ControlActivityRecorder, type PreparedCall } from './control-activity'
@@ -218,7 +220,7 @@ const ownerSignatures: Record<string, string> = {
   'projects.open': '({path,name?}) — owner credential or wizard tab only: register an existing folder as a project (idempotent) and return it with its workspaces',
   'app.update.check': '() — owner credential or wizard tab only: check the release and local update feeds now and return the update state (phase idle, checking, available, downloading, ready, installing, error or disabled)',
   'app.update.download': '() — owner credential or wizard tab only: download the pending update; poll app.update.check until phase is ready',
-  'app.update.install': '({force?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch. A restart you start yourself is forced unless you pass force:false: no running-work confirmation, and unsaved editor drafts are kept for recovery. Only the wizard tab that initiated this restart is brought back and told to continue; an outside process waits for a new control-owner.json',
+  'app.update.install': '({force?}) — owner credential or wizard tab only: quit, install the downloaded update and relaunch. A restart you start yourself is forced unless you pass force:false: no running-work confirmation, and unsaved editor drafts are kept for recovery. This wizard tab, every wizard tab working or waiting on its coworkers, and the coworkers whose turns the restart cut are brought back and told to continue (as after any restart); an outside process waits for a new control-owner.json',
   'app.restart': '({force?}) — owner credential or wizard tab only: relaunch this Conductor (a downloaded update installs on the way out); force as above',
   'app.restart.request': '({reason}) — wizard tab only: ask the owner to restart when you cannot (or should not) restart yourself. The owner’s Restart to update control shows “Restart requested by <tab> — <reason>”, and the next launch, however the owner restarts, brings this tab back and tells it to continue, like a restart you started. Valid until the next launch or 24 h; a new request replaces the old one',
   'app.quit.confirm': '({stopWork}) — owner credential or wizard tab only: answer the open “Work is still running” quit/restart dialog (app.state pendingQuitConfirmation shows it): stopWork:true stops the work and goes ahead, false cancels the quit or restart'
@@ -273,6 +275,8 @@ export interface AgentControlDependencies {
   durableJobs?: DurableJobsService
   /** Execution nodes and remote jobs (src/main/remote-jobs); plugged in with AgentControl.setRemoteJobs. */
   remoteJobs?: RemoteJobService
+  /** Claude Code cloud sessions (src/main/cloud); plugged in with AgentControl.setCloud. */
+  cloud?: CloudRuns
   /** This machine's always-on readiness (src/main/machine-readiness.ts); plugged in with AgentControl.setLocalReadiness. */
   localReadiness?: () => Promise<LocalMachineReadiness>
   /** Scheduled tasks (src/main/schedule-control.ts); plugged in with AgentControl.setSchedules. */
@@ -307,6 +311,11 @@ export interface AgentControlDependencies {
   linksChanged?(scope: { projectId: string; sessionId: string }): void
 }
 
+/** tabs.open({provider:"cloud"}) and router.dispatch tasks name the cloud run with their own words: branch is the base ref. */
+function cloudStart(args: Args): Args {
+  if (args.repository !== undefined && args.repository !== true) throw new Error('A cloud session works on this project\'s own GitHub repository; repository only takes true')
+  return Object.fromEntries(Object.entries({ prompt: args.prompt, model: args.model, effort: args.effort, ref: args.branch ?? args.ref, title: args.title, focus: args.focus }).filter(([, value]) => value !== undefined))
+}
 /** A facade over the app's native state. Callers cannot supply or change their authority. */
 export class AgentControl {
   constructor(private readonly deps: AgentControlDependencies) {
@@ -789,6 +798,7 @@ export class AgentControl {
     const allowed: PaneKind[] = ['agent', 'terminal', 'file-tree', 'browser', 'tasks', 'memory', 'routine', 'logs', 'job']
     if (!allowed.includes(kind)) throw new Error('Unsupported tab kind; use files.open for editors')
     if (kind === 'job') return this.openJobTab(scope, args)
+    if (kind === 'agent' && args.provider === 'cloud') return this.cloud(scope, this.authorize(scope), 'cloud.start', cloudStart(args)) as never
     // Where the tab is going. Only the caller's own scope is ever authorized; the target only
     // says which open workspace receives the tab.
     const target = this.sibling(scope, args)
@@ -923,7 +933,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -951,7 +961,7 @@ export class AgentControl {
         return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: !placement.ok ? placement.message : machine.kind === 'local' ? 'Runs every project open in this Conductor; projects.list names them.' : null, ...(machine.kind === 'local' && readiness ? { readiness } : {}) }
       }), this.deps.remoteJobs?.listNodes() ?? [])
     }
-    if (method === 'models.list') return this.catalog(scope)
+    if (method === 'models.list') return this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope)
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
     if (method === 'tabs.open') return this.open(scope, args)
     if (['tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close'].includes(method)) {
@@ -1242,6 +1252,7 @@ export class AgentControl {
     if (method === 'router.dispatch') return this.dispatchRouter(scope, args)
     if (jobMethods.has(method)) return this.jobs(scope, source, method, args)
     if (nodeMethods.has(method)) return this.nodes(scope, source, method, args)
+    if (cloudMethods.has(method)) return this.cloud(scope, source, method, args)
     if (scheduleMethods.has(method)) return this.scheduledTasks(scope, source, method, args)
     if (ideaMethods.has(method)) return this.ideasMethod(scope, source, method, args)
     if (ideaRunMethods.has(method)) return this.ideaRunsMethod(scope, source, method, args)
@@ -1331,6 +1342,29 @@ export class AgentControl {
   setDurableJobs(service: DurableJobsService | undefined): void { this.deps.durableJobs = service }
 
   setRemoteJobs(service: RemoteJobService | undefined): void { this.deps.remoteJobs = service }
+
+  setCloud(runs: CloudRuns | undefined): void { this.deps.cloud = runs }
+
+  /** cloud.*: Claude Code cloud sessions spend the owner's cloud credit, so who may start and
+   *  steer them follows nodes.run; the rest lives in cloud/control.ts. A run's tab opens like any
+   *  tab this caller opens: in the background with a "new" mark unless focus is asked for. */
+  private cloud(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const runs = this.deps.cloud
+    if (!runs) throw new Error('Cloud sessions are unavailable in this Conductor')
+    const project = this.deps.database.getProject(scope.projectId)
+    const refusal = sovereign(scope) ? null
+      : source.provider === 'local' ? 'A sandboxed local conversation cannot start or steer cloud sessions; the owner, a wizard tab or a non-local coworker can'
+        : restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings) ? 'This conversation is read-only or planning' : null
+    return callCloudMethod(runs, {
+      projectId: scope.projectId, workspaceId: scope.sessionId, projectPath: project && !project.remote ? project.path : null,
+      startedBy: scope.owner ? 'owner' : scope.agentSessionId, refusal,
+      openTab: async (run, focus) => {
+        const tab: PaneTab = { id: makeId('tab'), kind: 'cloud', title: run.title.slice(0, 120), resourceId: run.id, state: { model: run.model } }
+        await this.showOpened(scope, scope, tab, focus === undefined ? {} : { focus })
+        return this.tab(scope, tab.id)
+      }
+    }, method, args)
+  }
 
   setLocalReadiness(read: (() => Promise<LocalMachineReadiness>) | undefined): void { this.deps.localReadiness = read }
 
@@ -1666,6 +1700,11 @@ export class AgentControl {
     const dispatcherAgentId = this.deps.orchestration.snapshot(scope.projectId).agents
       .find(agent => agent.role === 'conductor-router' || agent.role === 'auto-fixer')?.id ?? null
     for (const request of requests) {
+      if (request.provider === 'cloud') {
+        if (request.projectTaskIds.length || request.projectId !== undefined) throw new Error('A cloud worker takes neither project task claims nor another project')
+        results.push(await this.cloud(scope, this.authorize(scope), 'cloud.start', cloudStart(request)))
+        continue
+      }
       const tab = await this.open(scope, { ...request, kind: 'agent', ...(request.projectTaskIds.length ? { focus: false } : {}) })
       // A dispatched coworker is a run of this work, not a new identity. Minting an agent per
       // dispatch turned the roster into a task log; the task row below already records the run,
