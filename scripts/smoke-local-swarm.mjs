@@ -43,14 +43,20 @@ delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS; delete env.CON
 const sleep = ms => new Promise(done => setTimeout(done, ms))
 const poll = async (read, timeoutMs, intervalMs = 1000) => { const started = Date.now(); for (;;) { const value = await read(); if (value) return value; if (Date.now() - started > timeoutMs) throw new Error('timed out'); await sleep(intervalMs) } }
 
-const coworkerPrompt = (file, functions, extra) => `In this workspace, math.js exports ${functions.join(' and ')}. Write the file ${file} using node:test and node:assert/strict (import { test } from 'node:test'; import assert from 'node:assert/strict'; import { ${functions.join(', ')} } from '../math.js') with at least two tests for each of ${functions.join(' and ')}${extra}. Run it with run_command: node --test ${file}. If it fails, fix ${file} (never change math.js) and run it again. Then call the conductor tool with method "agents.report" and args {"text": "${file}: <how many tests, pass or fail>"}. That report is how your controller learns the result.`
+// Short and flat: an 8B model follows a few plain steps far better than nested instructions.
+const coworkerPrompt = (file, functions) => `Use the write_file tool (do not paste code in your reply) to create ${file} as an ES module: import { test } from 'node:test'; import assert from 'node:assert/strict'; import { ${functions.join(', ')} } from '../math.js'; then two test() cases for each of ${functions.join(' and ')} using assert.equal${functions.includes('divide') ? ', and one using assert.throws(() => divide(1, 0))' : ''}. Then report the result with agents.report.`
+// Each coworker is a bounded task (a contract narrower than the controller, which has none): it
+// may write only its own test file, and Conductor runs the acceptance command itself.
+const dispatches = ['test/add.test.js', 'test/multiply.test.js'].map((file, index) => ({
+  title: index ? 'multiply tests' : 'add tests',
+  prompt: coworkerPrompt(file, index ? ['multiply', 'divide'] : ['add', 'subtract']),
+  contract: { allowedPaths: [file], acceptance: { command: `node --test ${file}`, timeoutSec: 60 } }
+}))
 const controllerPrompt = [
-  'You are the controller of a small local swarm of coworkers. Use the conductor tool for these steps, in order:',
-  `1. Call conductor with method "tabs.open" and args {"title": "add and subtract tests", "prompt": ${JSON.stringify(coworkerPrompt('test/add.test.js', ['add', 'subtract'], ''))}}.`,
-  `2. Call conductor with method "tabs.open" and args {"title": "multiply and divide tests", "prompt": ${JSON.stringify(coworkerPrompt('test/multiply.test.js', ['multiply', 'divide'], ', including that divide throws for division by zero'))}}.`,
-  '3. Reply "Dispatched two coworkers." and end your turn. Do not write any tests yourself.',
-  'Each coworker reports back later as a new message to you. When a report arrives and you have not yet received both, reply "Waiting for the other coworker." When you have both reports, run node --test with run_command and reply with a short merged summary: each test file, its number of tests, and whether the whole suite passes.'
+  `Open a coworker: call the conductor tool with method "tabs.open" and args ${JSON.stringify(dispatches[0])}. After that, open a second coworker the same way with args ${JSON.stringify(dispatches[1])}. Then reply "Dispatched." and stop; do not write tests yourself.`,
+  'Your coworkers report back later as new messages. Once both have reported, run node --test with run_command and reply with a short summary of both test files.'
 ].join('\n')
+const nudge = `You have not opened your coworkers yet. Call the conductor tool now with method tabs.open and args ${JSON.stringify(dispatches[0])}, then again with args ${JSON.stringify(dispatches[1])}. Then reply "Dispatched."`
 
 let app
 const killElectron = () => { try { const pid = app.process().pid; if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' }); else app.process().kill('SIGKILL') } catch { /* already gone */ } }
@@ -87,6 +93,22 @@ try {
   const coworkersOf = async () => (await call('agents.list', {}, project.id)).filter(entry => entry.provider === 'local' && entry.agentSessionId !== controller)
   const deadline = budgetMinutes * 60_000
   // The coworkers appear, opened by the controller itself.
+  // One follow-up if the first turn settles without dispatching: a small model sometimes answers
+  // instead of acting. It is recorded, and it is still the controller that opens the coworkers.
+  const settledPhase = phase => ['completed', 'failed', 'interrupted', 'idle'].includes(phase)
+  const firstTurn = await poll(async () => {
+    if ((await coworkersOf()).length >= 2) return 'dispatched'
+    const status = await call('agents.status', { agentSessionId: controller })
+    return settledPhase(status.phase) && Date.now() - started > 5000 ? 'settled' : null
+  }, 12 * 60_000, 5000)
+  if (firstTurn === 'settled' && (await coworkersOf()).length < 2) {
+    report.nudged = true
+    const state = await snapshot(controller)
+    report.firstTurnAnswer = texts(state.items, 'assistant').join('\n').slice(0, 1000)
+    report.firstTurnTools = (state.items ?? []).filter(item => item.data?.type === 'tool').map(item => `${item.data.name}:${item.data.status}`)
+    console.log('NOTE the controller settled without opening both coworkers; one follow-up message sent. It had answered: ' + report.firstTurnAnswer.slice(0, 300))
+    await call('agents.steer', { agentSessionId: controller, prompt: nudge })
+  }
   const coworkers = await poll(async () => { const found = await coworkersOf(); return found.length >= 2 ? found : null }, 12 * 60_000, 5000).catch(async error => {
     const state = await snapshot(controller)
     report.controllerAnswer = texts(state.items, 'assistant').join('\n').slice(0, 2000)
@@ -124,7 +146,7 @@ try {
     return null
   }, deadline, 10_000)
   report.wallSeconds = Math.round((Date.now() - started) / 1000)
-  report.reports = final.reports.map(item => ({ from: item.data.origin?.label, text: item.data.text.slice(0, 500) }))
+  report.reports = final.reports.map(item => ({ from: item.data.origin?.label, automatic: item.data.text.startsWith('[Automatic report'), text: item.data.text.slice(0, 500) }))
   report.controllerAnswers = texts(final.state.items, 'assistant').map(text => text.slice(0, 1500))
   for (const entry of coworkers) {
     const state = await snapshot(entry.agentSessionId)
@@ -142,7 +164,7 @@ try {
   const files = existsSync(join(projectPath, 'test')) ? (await readdir(join(projectPath, 'test'))).filter(name => name.endsWith('.js')) : []
   report.testFiles = files
   const run = spawnSync(process.execPath, ['--test', ...files.map(name => join('test', name))], { cwd: projectPath, encoding: 'utf8', timeout: 60_000 })
-  const summary = (run.stdout + run.stderr).split(/\r?\n/).filter(line => /^# (tests|pass|fail)/.test(line))
+  const summary = (run.stdout + run.stderr).split(/\r?\n/).filter(line => /^(?:#|ℹ) (?:tests|pass|fail) /.test(line))
   report.hostTestRun = { exitCode: run.status, summary }
   console.log('host node --test:', JSON.stringify(report.hostTestRun))
   if (files.length === 2 && run.status === 0) check(`The merged result holds: ${files.join(' and ')} pass on the host (${summary.join(', ')})`)

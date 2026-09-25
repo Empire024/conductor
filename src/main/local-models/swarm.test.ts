@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import { LOCAL_SWARM_LIMITS, planLocalCoworker, type LocalOpener } from './swarm'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { LOCAL_SWARM_LIMITS, planLocalCoworker, watchLocalCoworker, type LocalOpener } from './swarm'
 import { agentTabIds, anonymousConversations, persistableClosedTabs, persistableLayout } from './anonymous'
 import { MemoryResultStore } from './result-artifacts'
 import type { PaneTab, WorkspaceLayout } from '../../shared/models'
@@ -47,6 +47,9 @@ describe('local swarm plan', () => {
     expect(planLocalCoworker(bounded, {}).open.contract).toEqual({ allowedPaths: ['src/', 'README.md'] })
     expect(planLocalCoworker(bounded, { contract: { allowedPaths: ['src/a.test.ts'] } }).open.contract).toEqual({ allowedPaths: ['src/a.test.ts'] })
     expect(() => planLocalCoworker(bounded, { contract: { allowedPaths: ['package.json'] } })).toThrow(/only paths this conversation may write/)
+    // A JSON-string contract, as a small model sends it, is held to the same rules.
+    expect(planLocalCoworker(opener(), { contract: JSON.stringify({ allowedPaths: ['test/a.test.js'], acceptance: { command: 'node --test test/a.test.js' } }) }).open.contract).toEqual({ allowedPaths: ['test/a.test.js'], acceptance: { command: 'node --test test/a.test.js' } })
+    expect(() => planLocalCoworker(bounded, { contract: JSON.stringify({ allowedPaths: ['package.json'] }) })).toThrow(/only paths this conversation may write/)
   })
 })
 
@@ -86,5 +89,33 @@ describe('anonymous registry and layouts', () => {
     const id = store.save('owner', 'hello world')
     expect(store.read('owner', id, 6, 5)).toContain('\nworld')
     expect(() => store.read('someone else', id)).toThrow(/Unknown/)
+  })
+})
+
+describe('automatic coworker report', () => {
+  const state = (phase: string, sequence: number, items: Array<Record<string, unknown>>) => ({ phase, sequence, items: items as never, queuedPrompts: [] }) as never
+  const text = (sequence: number, value: string) => ({ id: 't' + sequence, sequence, data: { type: 'text', role: 'assistant', text: value, mode: 'snapshot' } })
+  const report = (sequence: number) => ({ id: 'r' + sequence, sequence, data: { type: 'tool', name: 'conductor', status: 'completed', input: { method: 'agents.report', args: { text: 'done' } } } })
+
+  it('reports a settled turn that did not report itself, once, and leaves a reported turn alone', async () => {
+    vi.useFakeTimers()
+    try {
+      let current = state('running', 2, [])
+      const delivered: string[] = []
+      const stop = watchLocalCoworker('agent_w', 'add tests', { snapshot: () => current, deliver: async value => { delivered.push(value) }, intervalMs: 10 })
+      current = state('running', 5, [text(5, 'working')])
+      await vi.advanceTimersByTimeAsync(30)
+      expect(delivered).toEqual([])
+      current = state('completed', 6, [text(6, 'All 4 tests pass.')])
+      await vi.advanceTimersByTimeAsync(30)
+      expect(delivered).toHaveLength(1)
+      expect(delivered[0]).toMatch(/^\[Automatic report: add tests ended its turn \(completed\) without agents\.report\] All 4 tests pass\./)
+      await vi.advanceTimersByTimeAsync(30)
+      expect(delivered).toHaveLength(1)
+      current = state('completed', 9, [text(6, 'old'), report(8), text(9, 'Reported.')])
+      await vi.advanceTimersByTimeAsync(30)
+      expect(delivered).toHaveLength(1)
+      stop()
+    } finally { vi.useRealTimers() }
   })
 })

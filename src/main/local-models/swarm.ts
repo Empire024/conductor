@@ -1,4 +1,4 @@
-import type { SessionSettings } from '../../shared/structured-agent'
+import type { SessionProjection, SessionSettings, TimelineItem } from '../../shared/structured-agent'
 import { normaliseContract, pathAllowed, type TaskContract } from './completion.ts'
 
 /**
@@ -77,7 +77,10 @@ export function planLocalCoworker(opener: LocalOpener, args: Record<string, unkn
   if (repository && !opener.settings.localGit) throw new Error('A sandboxed local conversation without the repository-write grant cannot give it to a coworker; only the same grants or fewer')
   if (research && !opener.settings.localResearch) throw new Error('A sandboxed local conversation without the deep-research grant cannot give it to a coworker; only the same grants or fewer')
   const own = opener.settings.localContract ? normaliseContract(opener.settings.localContract) : undefined
-  let contract = args.contract === undefined ? undefined : normaliseContract(args.contract)
+  // A small model often sends a nested object as a JSON string; it is parsed, then held to the same rules.
+  let requestedContract = args.contract
+  if (typeof requestedContract === 'string') { try { requestedContract = JSON.parse(requestedContract) } catch { throw new Error('contract must be an object with allowedPaths and/or acceptance (not a string)') } }
+  let contract = requestedContract === undefined ? undefined : normaliseContract(requestedContract)
   if (own?.allowedPaths) {
     // A bounded task's coworker stays inside the same bounds: named paths must be among the
     // opener's, and a coworker given none inherits the opener's list rather than none at all.
@@ -95,4 +98,43 @@ export function planLocalCoworker(opener: LocalOpener, args: Record<string, unkn
     grants: { localGit: repository ?? Boolean(opener.settings.localGit), localResearch: research ?? Boolean(opener.settings.localResearch) },
     ...(prompt !== undefined ? { prompt } : {})
   }
+}
+
+export interface CoworkerWatchDeps {
+  snapshot(id: string): SessionProjection | null
+  /** Delivers the automatic report to the controller, as agents.report would. */
+  deliver(text: string): Promise<unknown>
+  intervalMs?: number
+}
+
+const SETTLED: ReadonlySet<string> = new Set(['completed', 'failed', 'interrupted', 'idle'])
+const reported = (item: TimelineItem): boolean => item.data.type === 'tool' && item.data.name === 'conductor' && JSON.stringify(item.data.input ?? null).includes('agents.report')
+
+/**
+ * A small model forgets to call agents.report, and then its controller waits for a message that
+ * never comes. Each time a local coworker's turn settles without one, its controller is sent the
+ * end of that turn's answer instead, labelled as automatic. A turn that did report is left alone.
+ * Returns the stop function; the watch also ends by itself once the coworker is gone.
+ */
+export function watchLocalCoworker(id: string, title: string, deps: CoworkerWatchDeps): () => void {
+  let handled = deps.snapshot(id)?.sequence ?? 0
+  let delivering = false
+  const tick = (): void => {
+    const state = deps.snapshot(id)
+    if (!state) { stop(); return }
+    if (delivering || !SETTLED.has(state.phase) || state.sequence <= handled || state.queuedPrompts?.length) return
+    const turn = state.items.filter(item => (item.updatedSequence ?? item.sequence) > handled)
+    handled = state.sequence
+    if (!turn.length || turn.some(reported)) return
+    const answer = turn.filter(item => item.data.type === 'text' && item.data.role === 'assistant').map(item => item.data.type === 'text' ? item.data.text : '').join('\n').trim()
+    const tools = turn.filter(item => item.data.type === 'tool').length
+    if (!answer && !tools) return
+    const text = `[Automatic report: ${title} ended its turn (${state.phase}) without agents.report] ${answer ? answer.slice(-1600) : `No answer text; it made ${tools} tool call${tools === 1 ? '' : 's'}.`}`
+    delivering = true
+    void deps.deliver(text.slice(0, 2000)).catch(() => undefined).finally(() => { delivering = false })
+  }
+  const timer = setInterval(tick, deps.intervalMs ?? 3000)
+  timer.unref?.()
+  const stop = (): void => clearInterval(timer)
+  return stop
 }
