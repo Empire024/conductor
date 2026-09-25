@@ -89,6 +89,10 @@ describe('ideas.* control', () => {
     const idea = store.capture({ text: 'Agent-started work' }, { kind: 'owner' })
     await ideasCall(service, agent, 'ideas.work', { ideaId: idea.id, provider: 'codex' })
     expect(openAgent.mock.calls[0]![0]).toMatchObject({ projectId: 'project_1', provider: 'codex' })
+    // An agent's ideas.work opens the conversation without taking the owner's focus (FX21).
+    expect(openAgent.mock.calls[0]![0]).toMatchObject({ background: true })
+    await service.work({ ideaId: idea.id, projectId: 'project_1', provider: 'codex' })
+    expect(openAgent.mock.calls[1]![0]).not.toHaveProperty('background')
   })
 })
 

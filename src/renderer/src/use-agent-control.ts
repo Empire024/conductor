@@ -7,6 +7,7 @@ import { activateTab, addTab, findGroup, listGroups, splitGroup, updateTab } fro
 import { applyWorkspaceTabAction } from './layout/workspace-tab-actions'
 import { announceAgentControlGrants, announceAgentControlSettings } from './agent-control-settings'
 import { hasComposerDraft } from './panes/use-composer-draft'
+import { markNewTab } from './layout/new-tab-marks'
 
 export interface AgentControlHost {
   detachedId?: string
@@ -16,18 +17,44 @@ export interface AgentControlHost {
   openFile(projectId: string, path: string): void
 }
 
+/** How long the owner's keyboard has to be still in this window before a focus an agent asked
+ *  for is applied (FX21), and how long it may wait for that before giving up. */
+export const KEYBOARD_PAUSE_MS = 1500
+const KEYBOARD_WAIT_LIMIT_MS = 25_000
+
+/** Resolves true once no key has been pressed for KEYBOARD_PAUSE_MS, false after the limit. */
+export async function waitForKeyboardPause(lastKeyAt: () => number, now: () => number = Date.now, sleep: (ms: number) => Promise<void> = ms => new Promise(resolve => setTimeout(resolve, ms))): Promise<boolean> {
+  const deadline = now() + KEYBOARD_WAIT_LIMIT_MS
+  while (now() - lastKeyAt() < KEYBOARD_PAUSE_MS) {
+    if (now() >= deadline) return false
+    await sleep(150)
+  }
+  return true
+}
+
 /** Serializes commands so subsequent requests always see the preceding saved layout. */
 export function useAgentControl(host: AgentControlHost): void {
   const latest = useRef(host)
   latest.current = host
   useEffect(() => {
     let queue = Promise.resolve()
-    return window.conductor.agentControl.onRequest(request => {
-      queue = queue.then(async () => {
-        try { window.conductor.agentControl.respond({ id: request.id, result: await handleAgentControlRequest(request, latest.current) }) }
-        catch (reason) { window.conductor.agentControl.respond({ id: request.id, error: reason instanceof Error ? reason.message : String(reason) }) }
-      })
+    let lastKeyAt = 0
+    const onKey = (): void => { lastKeyAt = Date.now() }
+    window.addEventListener('keydown', onKey, true)
+    const respond = (id: string, outcome: { result?: unknown; error?: string }): void => window.conductor.agentControl.respond({ id, ...outcome })
+    const stop = window.conductor.agentControl.onRequest(request => {
+      const enqueue = (): void => {
+        queue = queue.then(async () => {
+          try { respond(request.id, { result: await handleAgentControlRequest(request, latest.current) }) }
+          catch (reason) { respond(request.id, { error: reason instanceof Error ? reason.message : String(reason) }) }
+        })
+      }
+      // A focus an agent asked for waits until the owner stops typing here, and only then joins
+      // the queue, so other requests are not held up behind it and it reads a fresh layout.
+      if (request.params.whenIdle !== true) { enqueue(); return }
+      void waitForKeyboardPause(() => lastKeyAt).then(paused => { if (paused) enqueue(); else respond(request.id, { error: 'The owner kept typing, so the tab was not brought into view' }) })
     })
+    return () => { window.removeEventListener('keydown', onKey, true); stop() }
   }, [])
 }
 
@@ -110,6 +137,8 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
       // Owner task assignment keeps its dialog alive until native submission
       // returns, including when Project tasks is itself the active pane tab.
       next = { ...session, layout: focus ? added : activateTab(added, group.id, group.activeTabId), maximizedGroupId: focus ? null : session.maximizedGroupId }
+      // Opened behind the owner's back (FX21): the strip marks it until the owner looks at it.
+      if (!focus) markNewTab(created.id)
     }
     // A tab an agent opens lands active in its own group, so it's already there the moment the
     // owner looks - but only an explicit focus:true asks to move the owner's actual attention

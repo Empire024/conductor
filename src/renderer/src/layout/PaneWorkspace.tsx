@@ -10,6 +10,7 @@ import { PaneTabMenu, TabGroupMenu } from '../components/PaneTabMenu'
 import { TabActivityIndicator } from '../components/TabActivityIndicator'
 import { applyTabGroupAction, applyWorkspaceTabAction } from './workspace-tab-actions'
 import { mountedTabIds, touchRecentTabs } from './tab-keep-alive'
+import { clearNewTab, useNewTabMarks } from './new-tab-marks'
 import { useSuspendedConversations } from './use-suspended-conversations'
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal, flushSync } from 'react-dom'
@@ -307,6 +308,8 @@ function PaneGroup({
   const workspaceRef = useRef(workspace)
   workspaceRef.current = workspace
   const activeTab = group.tabs.find((tab) => tab.id === group.activeTabId) ?? group.tabs[0]!
+  const newTabs = useNewTabMarks()
+  useEffect(() => clearNewTab(activeTab.id), [activeTab.id, newTabs])
   // Only the selected tab, views that cannot remount losslessly and a few recent cheap ones keep
   // their React view; an inactive conversation is suspended and rebuilds from its snapshot.
   const recentTabsRef = useRef<readonly string[]>([])
@@ -627,7 +630,7 @@ function PaneGroup({
         data-control-tab-id={tab.id}
         data-control-agent-id={tab.resourceId}
         {...(dropSlot ? { 'data-drop-slot-id': tab.id } : {})}
-        className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
+        className={`pane-tab ${tab.id === activeTab.id ? 'active' : ''} ${tabPhase === 'waiting_input' ? 'needs-attention' : ''} ${openingTabIds.has(tab.id) ? 'opening' : ''} ${spotlight?.tabId === tab.id ? 'spotlight' : ''} ${closingTabIds.has(tab.id) ? 'closing' : ''} ${newTabs.has(tab.id) && tab.id !== activeTab.id ? 'is-new' : ''} ${isSourceGroup && dragging!.tab.id === tab.id ? 'drag-lifted' : ''}`}
         style={{ marginLeft: gapHere ? dragging!.width : undefined }}
         onClick={() => workspace.onLayout(layout => activateTab(layout, group.id, tab.id))}
         onContextMenu={event => showContextMenu(event, tab)}
@@ -644,6 +647,7 @@ function PaneGroup({
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
         <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
+        {newTabs.has(tab.id) && tab.id !== activeTab.id && <span className="pane-tab-new-mark" title="Opened by an agent; not viewed yet" aria-label="new" />}
         {controller && <ControlledByBadge compact controllerTitle={controller.controllerTitle ?? group.tabs.find(candidate => candidate.id === controller.controllerTabId)?.title ?? 'another tab'} />}
         {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (
           <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
@@ -721,6 +725,7 @@ function PaneGroup({
                   })}
                 >
                   <span>{coworkerGroup.coworkers.length}</span>
+                  {!expanded && coworkerGroup.coworkers.some(tab => newTabs.has(tab.id) && tab.id !== activeTab.id) && <span className="pane-tab-new-mark" title="An agent opened a coworker here that you have not viewed yet" aria-label="new" />}
                   {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
                 </button>
                 {visibleCoworkers.map(tab => renderTab(tab, false, expanded))}

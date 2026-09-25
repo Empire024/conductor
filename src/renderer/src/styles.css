@@ -1056,6 +1056,9 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 .tab-activity.complete .tab-ring circle { fill: #22c57a; stroke: #22c57a; stroke-dasharray: 40; opacity: 1; animation: activity-pop .38s cubic-bezier(.16,1.4,.25,1); }
 .tab-activity.complete .tab-ring path { stroke-dashoffset: 0; }
 .tab-activity.waiting_input .tab-ring circle { stroke: #ecc48d; opacity: .8; }
+/* A tab an agent opened in the background (FX21): a small accent dot until the owner looks. */
+.pane-tab > .pane-tab-new-mark, .coworker-tab-toggle > .pane-tab-new-mark { width: 6px; height: 6px; flex: 0 0 6px; align-self: center; border-radius: 50%; background: var(--accent); opacity: .85; }
+.coworker-tab-toggle > .pane-tab-new-mark { width: 5px; height: 5px; flex-basis: 5px; margin-left: 2px; }
 .pane-tab.needs-attention { color: var(--text); background: color-mix(in srgb, #ecc48d 5%, transparent); box-shadow: inset 0 -1px color-mix(in srgb, #ecc48d 65%, transparent); }
 .tab-activity.waiting_input { color: #ecc48d; }
 .tab-activity .tab-attention-bell { width: 11px; height: 11px; overflow: visible; stroke-width: 1.7; opacity: .78; }

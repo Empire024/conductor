@@ -14,7 +14,8 @@ export interface IdeasServiceDeps {
   memories(): AgentMemory[]
   projectTitle(projectId: string): string | null
   /** Opens a visible agent tab in the project and submits the prompt. */
-  openAgent(request: { projectId: string; provider: NonNullable<WorkOnIdeaInput['provider']>; model?: string; title: string; prompt: string }): Promise<{ agentSessionId: string; tabId: string }>
+  /** background: an agent asked, so the tab opens without taking the owner's focus (FX21). */
+  openAgent(request: { projectId: string; provider: NonNullable<WorkOnIdeaInput['provider']>; model?: string; title: string; prompt: string; background?: boolean }): Promise<{ agentSessionId: string; tabId: string }>
   /** Adds a Project task and returns its id. */
   addTask(projectId: string, title: string): Promise<{ taskId: string; title: string }>
   /** Shows a linked conversation, job or file. */
@@ -52,7 +53,7 @@ export class IdeasService {
     if (!projectTitle) throw new Error('Choose a project to work in')
     const provider = input.provider ?? 'claude'
     if (!['claude', 'codex', 'grok', 'local'].includes(provider)) throw new Error('provider must be claude, codex, grok or local')
-    const opened = await this.deps.openAgent({ projectId, provider, ...(input.model ? { model: String(input.model) } : {}), title: `Idea: ${idea.title}`.slice(0, 120), prompt: workOnIdeaBrief(idea, this.relatedMemories(idea.text)) })
+    const opened = await this.deps.openAgent({ projectId, provider, ...(input.model ? { model: String(input.model) } : {}), ...(actor.kind === 'owner' ? {} : { background: true }), title: `Idea: ${idea.title}`.slice(0, 120), prompt: workOnIdeaBrief(idea, this.relatedMemories(idea.text)) })
     const { store } = this.deps
     store.link(idea.id, { kind: 'project', targetId: projectId, label: projectTitle, projectId }, actor)
     store.link(idea.id, { kind: 'agent-session', targetId: opened.agentSessionId, label: `${provider} conversation "Idea: ${idea.title}"`.slice(0, 300), projectId, createdFromIdeaId: idea.id, createdByAgentSessionId: opened.agentSessionId }, actor, { workedOn: true, message: `Work started in a ${provider} conversation in ${projectTitle}` })

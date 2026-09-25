@@ -130,7 +130,7 @@ export function registerIdeas(deps: IdeasRegistrationDeps): IdeasRegistration {
     projectTitle: projectId => { const project = database.getProject(projectId); return project ? project.name : null },
     async openAgent(request) {
       const owner = control.ownerScope({ projectId: request.projectId })
-      const opened = await control.call(owner, 'tabs.open', { provider: request.provider, ...(request.model ? { model: request.model } : {}), title: request.title }) as { id: string; resourceId?: string }
+      const opened = await control.call(owner, 'tabs.open', { provider: request.provider, ...(request.model ? { model: request.model } : {}), ...(request.background ? { focus: false } : {}), title: request.title }) as { id: string; resourceId?: string }
       if (!opened.resourceId) throw new Error('The agent tab did not open')
       await control.call(owner, 'agents.submit', { agentSessionId: opened.resourceId, prompt: request.prompt })
       return { agentSessionId: opened.resourceId, tabId: opened.id }

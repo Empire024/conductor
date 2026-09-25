@@ -3,8 +3,9 @@ import type { AgentControlUiRequest } from '../../shared/agent-control'
 import type { SessionRecord } from '../../shared/models'
 import { createDefaultLayout } from '../../shared/models'
 import { listGroups } from './layout/layout-operations'
-import { handleAgentControlRequest, type AgentControlHost } from './use-agent-control'
+import { handleAgentControlRequest, KEYBOARD_PAUSE_MS, waitForKeyboardPause, type AgentControlHost } from './use-agent-control'
 import { composerDraftKey } from './panes/composer-draft-store'
+import { clearNewTab, newTabMarks } from './layout/new-tab-marks'
 
 function fixture() {
   let session: SessionRecord = { id: 'session', projectId: 'project', name: 'Workspace', layout: createDefaultLayout(), maximizedGroupId: null, closedTabs: [], continueOnLimit: false, createdAt: '', updatedAt: '' }
@@ -154,5 +155,27 @@ describe('visible agent control', () => {
     await handleAgentControlRequest(request('tabs.focus', { tabId: tab.id }), host)
     expect(listGroups(current().layout.root)[0]!.activeTabId).toBe(tab.id)
     expect(host.commit).toHaveBeenLastCalledWith(current(), initial.id, true)
+  })
+  it('marks a tab an agent opened in the background as new, keeping the owner on the active tab (FX21)', async () => {
+    const { host, request, current } = fixture()
+    const initial = listGroups(current().layout.root)[0]!
+    await handleAgentControlRequest(request('tabs.open', { tab: { id: 'bg-one', kind: 'agent', title: 'One', resourceId: 'one' }, focus: false }), host)
+    await handleAgentControlRequest(request('tabs.open', { tab: { id: 'bg-two', kind: 'agent', title: 'Two', resourceId: 'two' }, focus: false }), host)
+    expect(listGroups(current().layout.root)[0]!.activeTabId).toBe(initial.activeTabId)
+    expect(host.commit).toHaveBeenLastCalledWith(current(), initial.id, false)
+    expect([...newTabMarks()]).toEqual(expect.arrayContaining(['bg-one', 'bg-two']))
+    // A tab opened in front is not new; the owner is already looking at it.
+    await handleAgentControlRequest(request('tabs.open', { tab: { id: 'fg', kind: 'agent', title: 'Front', resourceId: 'front' }, focus: true }), host)
+    expect(newTabMarks().has('fg')).toBe(false)
+    clearNewTab('bg-one'); clearNewTab('bg-two')
+    expect(newTabMarks().has('bg-one') || newTabMarks().has('bg-two')).toBe(false)
+  })
+  it('holds an agent-asked focus until the keyboard has been still for the pause, and gives up on endless typing (FX21)', async () => {
+    let clock = 0
+    const sleep = async (ms: number): Promise<void> => { clock += ms }
+    await expect(waitForKeyboardPause(() => Math.min(clock, 3000), () => clock, sleep)).resolves.toBe(true)
+    expect(clock).toBeGreaterThanOrEqual(3000 + KEYBOARD_PAUSE_MS)
+    clock = 0
+    await expect(waitForKeyboardPause(() => clock, () => clock, sleep)).resolves.toBe(false)
   })
 })

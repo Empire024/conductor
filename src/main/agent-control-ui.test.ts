@@ -4,7 +4,10 @@ import type { AgentControlUiRequest } from '../shared/agent-control'
 
 vi.mock('electron', () => ({
   ipcMain: { on: vi.fn(), removeListener: vi.fn(), handle: vi.fn(), removeHandler: vi.fn() },
-  BrowserWindow: {}
+  BrowserWindow: {},
+  app: { on: vi.fn() },
+  webContents: { getAllWebContents: () => [] },
+  powerMonitor: { getSystemIdleTime: () => 60 }
 }))
 
 vi.mock('./structured-ipc-policy', () => ({ isStructuredRendererUrl: () => true }))
@@ -47,6 +50,31 @@ describe('AgentControlUi window focus', () => {
     void ui.request(request('tabs.focus', { tabId: 'tab' }))
     expect(window.show).toHaveBeenCalled()
     expect(window.focus).toHaveBeenCalled()
+  })
+  it('does not raise the window when an agent closes, renames or reconfigures a tab', () => {
+    const window = fakeWindow()
+    const ui = new AgentControlUi('renderer/index.html', () => window as never)
+    for (const action of ['tabs.close', 'tabs.rename', 'agents.configure', 'agents.configure-confirmed', 'agents.grant-confirmed', 'workspace.rename'] as const) void ui.request(request(action, { tabId: 'tab' }))
+    expect(window.show).not.toHaveBeenCalled()
+    expect(window.focus).not.toHaveBeenCalled()
+    expect(window.webContents.send).toHaveBeenCalledTimes(6)
+  })
+  it('holds an agent-asked focus until the owner pauses typing, then raises the window', async () => {
+    vi.useFakeTimers()
+    try {
+      const window = fakeWindow()
+      let lastKeyAt = Date.now()
+      const ui = new AgentControlUi('renderer/index.html', () => window as never, { lastKeyAt: () => lastKeyAt, systemIdleSeconds: () => undefined })
+      void ui.request(request('tabs.focus', { tabId: 'tab', whenIdle: true }))
+      await vi.advanceTimersByTimeAsync(1000)
+      lastKeyAt = Date.now()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(window.focus).not.toHaveBeenCalled()
+      expect(window.webContents.send).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(window.focus).toHaveBeenCalled()
+      expect(window.webContents.send).toHaveBeenCalledWith('agent-control:request', expect.objectContaining({ action: 'tabs.focus' }))
+    } finally { vi.useRealTimers() }
   })
   it('raises the window to restore and focus a retained source tab', () => {
     const window = fakeWindow()
