@@ -173,7 +173,8 @@ Read from the code before the Mac was reachable; section 5 lists what the Mac ac
 - Tree kills are win32-gated with POSIX fallbacks; `transport.ts:199`, `runtime-host/host.ts:252`
   signal only the child, not its group (S).
 
-**Packaging, signing, update**
+**Packaging, signing, update** (all resolved in FX30 without a Developer ID; see "Packaging and
+updates, unsigned" in section 5)
 - No `mac` block in the electron-builder config, no `dist:mac`, icon is `build/icon.svg` only (needs
   `.icns` or a 1024 px PNG) (S).
 - No hardened runtime, entitlements or notarization; arm64 needs at least ad-hoc signing to launch;
@@ -302,7 +303,7 @@ would open over whatever is on the Mac's screen; a parked smoke run is the way).
 | mac-overseer-goal | Make `local-qwen-faktury.json` portable or skip non-portable goals on POSIX | T |
 | mac-grok-test | Diagnose the Grok ACP fixture timeout on macOS | S |
 | mac-spawn-helper | `chmod +x` node-pty `spawn-helper` (postinstall + afterPack) | T |
-| mac-packaging | `mac` build block (dmg+zip, arm64), `.icns`, entitlements, signing and notarization with the owner's Developer ID, `MacUpdater`, macOS release job | M–L |
+| mac-packaging | `mac` build block (dmg+zip, arm64), `.icns`, entitlements, signing and notarization with the owner's Developer ID, `MacUpdater`, macOS release job (done unsigned in FX30: ad-hoc signing, Conductor's own zip updater) | M–L |
 | mac-runtime | Section 4's runtime list: runtime-host launcher on darwin, PATH import from the login shell, traffic lights, default terminal and PowerShell schedules | S each |
 
 ### Runtime and realpath on the Mac (MACRT, 2026-09-25)
@@ -357,13 +358,95 @@ Proof, all through `nodes.run` on mac-mini:
 Launching the GUI from an SSH job works while the owner's console session is logged in
 (`launchctl print gui/<uid>` succeeds). A smoke-profile window is parked off every display.
 
-**Left for mac-packaging** (waits on the owner's Apple Developer ID): a `mac` block in the
-electron-builder config (dmg + zip, arm64), a 1024 px icon or `.icns`, hardened runtime and
-entitlements, signing and notarization, `MacUpdater` in `update-manager.ts` (Squirrel.Mac refuses
-unsigned apps), mac assets in `delivery.ts`/`local-update-feed.ts`/`generate-update-manifest.mjs`,
-and a `macos-14` job in `release.yml`. Also still open: menu shortcuts and hints say Ctrl where a
-Mac expects ⌘ (for example "Jump to… Ctrl K"), and `test:remote-relay` and friends need a POSIX
-runner instead of `run-smoke-background.ps1`.
+mac-packaging was left for later and is done below, without a Developer ID. Still open: menu
+shortcuts and hints say Ctrl where a Mac expects ⌘ (for example "Jump to… Ctrl K"), and
+`test:remote-relay` and friends need a POSIX runner instead of `run-smoke-background.ps1`.
+
+### Packaging and updates, unsigned (FX30, 2026-09-25)
+
+Owner decision 2026-09-25: no paid Apple Developer ID. The Mac build is **ad-hoc signed** and
+updates through **Conductor's own updater**, never Squirrel.Mac. Windows is unchanged.
+
+**Build** (`npm run dist:mac` = `npm run build` + `electron-builder --mac dmg zip --arm64 --publish never`;
+package.json `build.mac`):
+- Targets: `Conductor-<version>-arm64.dmg` (drag to Applications) and `Conductor-<version>-arm64-mac.zip`
+  (what updates download), with their blockmaps and `latest-mac.yml`.
+- `identity: "-"` signs ad-hoc (`codesign -s -`). Apple silicon will not run an unsigned binary, and
+  ad-hoc is enough for that. `hardenedRuntime: false`, `notarize: false`, `gatekeeperAssess: false`.
+- `build/entitlements.mac.plist`: JIT, unsigned executable memory and library validation off. Not
+  enforced without the hardened runtime; they are what Electron needs if it is ever turned on.
+- `build/icon.icns` comes from `build/icon.svg`: `npx electron scripts/make-mac-icon.cjs` renders it in
+  an offscreen window (nothing on screen), insets it to Apple's 824 px grid, and packs 16–1024 px PNGs.
+  Rerun it when the SVG changes and commit the result.
+- The afterPack hook (`scripts/node-pty-spawn-helper.cjs`) still makes `spawn-helper` executable.
+- Windows: `electron-builder --win dir` from the same `out/` with HEAD's config and with this one gives
+  254 files, 0 different. electron-builder strips `build` and `scripts` from the packaged package.json.
+
+**Why not Squirrel.Mac.** electron-updater's `MacUpdater` hands the zip to Squirrel.Mac. Squirrel.Mac
+installs only a build whose signature satisfies the running app's designated requirement. For an
+ad-hoc signature that requirement is the exact code hash, so every new build would be refused.
+
+**The Mac updater** (`src/main/mac-zip-updater.ts`; `update-manager.ts` `createPlatformUpdater`
+picks it on darwin and `NsisUpdater` everywhere else):
+1. Check and download work as on Windows: the configured feed, or the GitHub release by default, gives
+   `latest-mac.yml`. The zip for this architecture is downloaded and electron-updater checks its sha512.
+   The Update pending / Restart to update flow and `app.update.install` are unchanged.
+2. Install (`doInstall`) refuses a copy that cannot replace itself, and says how to fix it: a
+   translocated (quarantined) app, one running from the disk image, or a read-only folder. Otherwise
+   it starts a detached `/bin/sh` and Conductor quits. The script:
+   - waits for the old pid to exit (120 s cap);
+   - `ditto -x -k` the zip into `.Conductor.app.update.XXXXXX` next to the app, clears quarantine,
+     and requires `codesign --verify --deep --strict`;
+   - swaps the bundles by two renames (if the second fails, the old app is put back);
+   - relaunches `Contents/MacOS/Conductor` with the same arguments and environment, as `app.relaunch`
+     would.
+   Every step is logged to `~/Library/Caches/conductor-desktop-updater/install.log`.
+3. A release published without Mac files has no `latest-mac.yml`. On a Mac that reads "The latest
+   release has no Mac build yet." and is not reported as an error. On Windows a missing manifest is
+   still an error.
+
+**Release** (`.github/workflows/release.yml`). The workflow gained a `mac` input (boolean, default
+false). The `macos-release` job runs only when that input is true: after the Windows job, on
+`macos-14`, it adds the dmg, zip, zip blockmap and `latest-mac.yml` to the release the Windows job
+created. A delivery's publish never sets the input, so the Windows publish runs exactly as before.
+To include the Mac build, run the workflow from the Actions page with `mac` ticked.
+
+**First install on the owner's Mac** (once):
+1. Download `Conductor-<version>-arm64.dmg` from the release, open it, and drag Conductor to Applications.
+2. In Terminal: `xattr -dr com.apple.quarantine /Applications/Conductor.app`. Without this step,
+   macOS says the downloaded ad-hoc app "is damaged and can't be opened". `spctl` rejects an ad-hoc
+   build, but Gatekeeper only checks apps that carry the quarantine flag.
+3. Open Conductor from Applications.
+
+**Later updates** arrive in the app itself: Update pending, then Restart to update (or
+`app.update.install`). They come from the GitHub release, when it was published with `mac`, or from
+any feed URL set in Settings that serves `latest-mac.yml` and the zip. Nothing needs re-approving,
+because the updater's own download carries no quarantine flag and the script clears one anyway.
+`app.update` / `update:local` (a local build fed to the installed app) is still Windows-only: it
+builds an NSIS installer. A Mac-side local build would need `build-local-update.mjs` and
+`local-update-feed.ts` to learn the zip.
+
+**Proof on mac-mini** (at cf4dd22):
+
+| Job | What | Result |
+|---|---|---|
+| rj_muhdkrak_3469d5 | `npm ci`, `npm run build`, `electron-builder --mac dmg zip --arm64` twice (0.1.90, 0.1.91) | PASS: 137 MB dmg and zip each, `latest-mac.yml`; `codesign -dv`: `Signature=adhoc`, `flags=0x2(adhoc)`, `TeamIdentifier=not set`; icon.icns 1024 px; spawn-helper `-rwxr-xr-x` |
+| rj_muhdnmu1_fbd9c1, rj_muhdrf79_71bdfe (final script) | `scripts/smoke-mac-packaging.mjs`: install from the dmg, parked packaged launch, update 0.1.90 → 0.1.91 through the app's own update control | **ALL 19 PASS**: `codesign --verify --deep --strict` satisfied, `spctl` rejected (expected), window at x −6000 and never focused, Update pending 0.1.91 from a loopback feed, downloaded, installed (install.log: swap in about 1 s), relaunched as 0.1.91 with the same arguments, parked again, swapped bundle verifies, no staging folder left |
+| rj_muhdok3n_1efbc0 | `tsc`, `vitest`, `test:scripts` | tsc PASS; the darwin-only swap-script tests (real ditto, codesign, rename, relaunch; a tampered bundle is refused) PASS; vitest 3970 pass, 1 fail (this item's own Windows-half test used the host platform, now pinned to win32); scripts 103 pass, 0 fail |
+
+The smoke launches a packaged build parked, even though a packaged app ignores
+`CONDUCTOR_TEST_USER_DATA`. It starts the app with `--inspect-brk` and its own `--user-data-dir`. Before
+any app code runs, the smoke's inspector hook moves every window 6000 px left of the displays and hides
+the Dock icon. The relaunch keeps those arguments, so the new build is parked the same way.
+
+Not run: the `macos-release` job on GitHub, because this item does not publish. It runs the first
+time the owner or controller dispatches the workflow with `mac` ticked.
+
+Unconfirmed: the smoke replaced a bundle under `~/fx30/work/Applications` and was started from an
+SSH job. Replacing `/Applications/Conductor.app` from the owner's own session may raise macOS's App
+Management prompt ("Conductor would like to modify apps"). If it appears, allow it once under
+Privacy & Security → App Management. If it is refused, the swap fails with the old app intact, and
+the reason is in install.log.
 
 ### Unattended operation (Phase 8)
 

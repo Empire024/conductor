@@ -244,7 +244,8 @@ describe('the updater per platform', () => {
     expect(await mac.check()).toMatchObject({ phase: 'idle', message: 'The latest release has no Mac build yet.' })
     expect(f.instances.at(-1)).toBeInstanceOf(MacZipUpdater)
     // Windows still reports it: there it would be a broken release.
-    const windows = manager()
+    const windows = new UpdateManager({ currentVersion: '0.1.4', isPackaged: true, localBuildDirectory: updateDir(), beforeInstall: vi.fn(), platform: 'win32' })
+    managers.push(windows); windows.configure('')
     expect(await windows.check()).toMatchObject({ phase: 'error', message: missing })
   })
 })
