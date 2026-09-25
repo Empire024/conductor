@@ -44,6 +44,8 @@ const RELEASE_TIMEOUT_MS = 45 * 60 * 1000
 const RELEASE_APPEAR_MS = 5 * 60 * 1000
 const RATE_LIMIT_CAP_MS = 10 * 60 * 1000
 const DEFAULT_ASSETS = ['.exe', '.exe.blockmap', 'latest.yml']
+/** What an installed Mac app updates from (mac-zip-updater.ts reads latest-mac.yml and the zip). */
+const MAC_ASSETS = ['.dmg', '-mac.zip', '-mac.zip.blockmap', 'latest-mac.yml']
 const EMIT_INTERVAL_MS = 250
 
 // ---------------------------------------------------------------------------------------------
@@ -299,7 +301,8 @@ interface Plan {
   build: string[] | null
   defaultBuild: boolean
   buildSkip: string
-  release: { workflow: string; assets: string[]; dispatch: boolean } | null
+  /** macInput: the workflow declares a `mac` dispatch input; mac: this publish asks for it. */
+  release: { workflow: string; assets: string[]; dispatch: boolean; macInput: boolean; mac: boolean } | null
   releaseSkip: string
   publish: boolean
 }
@@ -326,6 +329,23 @@ export function workflowRunsOnPush(text: string): boolean {
     const line = lines[index]!
     if (/^\S/.test(line)) break
     if (/^\s+(-\s*)?push\s*:?\s*(#.*)?$/.test(line)) return true
+  }
+  return false
+}
+
+/** Whether a workflow_dispatch workflow declares a `mac` input (release.yml's optional Mac job).
+ *  Read as text between `on:` and `jobs:`, so a job that happens to be called mac is not it. */
+export function workflowHasMacInput(text: string): boolean {
+  const lines = text.replace(/\r\n/g, '\n').split('\n')
+  let inputs = -1
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!
+    if (/^jobs:/.test(line)) return false
+    if (/^\s+inputs:\s*(#.*)?$/.test(line)) { inputs = line.search(/\S/); continue }
+    if (inputs < 0) continue
+    const indent = line.search(/\S/)
+    if (indent >= 0 && indent <= inputs) inputs = -1
+    else if (/^\s+mac:\s*(#.*)?$/.test(line)) return true
   }
   return false
 }
@@ -414,7 +434,7 @@ export class DeliveryService {
     }
   }
 
-  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean }, requestedBy: DeliveryRequester): DeliveryRun {
+  ship(projectId: string, cwd: string, request: { message: string; paths?: string[]; publish?: boolean; mac?: boolean }, requestedBy: DeliveryRequester): DeliveryRun {
     const root = resolve(cwd)
     const key = process.platform === 'win32' ? root.toLowerCase() : root
     for (const [id, active] of this.active) {
@@ -431,6 +451,8 @@ export class DeliveryService {
       message: typeof request?.message === 'string' ? request.message : '',
       paths: Array.isArray(request?.paths) ? [...request.paths] : null,
       publish: request?.publish === true,
+      // A publish carries the Mac build unless it was asked to leave it out.
+      ...(request?.publish === true ? { mac: request?.mac !== false } : {}),
       startedAt: now, finishedAt: null, commit: null, releaseTag: null, releaseUrl: null, workflowRunUrl: null,
       stages: DELIVERY_STAGES.map(({ id, label }) => ({ id, label, state: 'pending', startedAt: null, finishedAt: null, detail: '', log: [] })),
       error: null
@@ -629,7 +651,9 @@ export class DeliveryService {
     else {
       let text = ''
       try { text = readFileSync(join(root, '.github', 'workflows', workflow), 'utf8') } catch { /* unreadable: treated as push-triggered, the older shape */ }
-      release = { workflow, assets: config.release?.assets ?? DEFAULT_ASSETS, dispatch: text ? !workflowRunsOnPush(text) : false }
+      const dispatch = text ? !workflowRunsOnPush(text) : false
+      const macInput = dispatch && workflowHasMacInput(text)
+      release = { workflow, assets: config.release?.assets ?? DEFAULT_ASSETS, dispatch, macInput, mac: macInput && active.run.mac !== false }
     }
 
     const parts = [
@@ -810,10 +834,11 @@ export class DeliveryService {
       const dispatched = await this.deps.fetch(`https://api.github.com/repos/${owner}/${repo}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`, {
         method: 'POST', signal,
         headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Conductor', 'X-GitHub-Api-Version': '2022-11-28', Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ref: plan.config.branch })
+        // Dispatch inputs are strings; `mac` is only sent to a workflow that declares it.
+        body: JSON.stringify({ ref: plan.config.branch, ...(plan.release!.macInput ? { inputs: { mac: String(plan.release!.mac) } } : {}) })
       })
       if (dispatched.status !== 204) throw new StageFailure(`The push succeeded, but GitHub answered ${dispatched.status} when asked to start ${workflow}. Start it from the repository's Actions page.`)
-      this.log(active, stage, [`Started ${workflow} on ${plan.config.branch}`])
+      this.log(active, stage, [`Started ${workflow} on ${plan.config.branch}${plan.release!.macInput ? plan.release!.mac ? ' with the Mac build' : ' without the Mac build' : ''}`])
     }
     this.log(active, stage, [`Waiting for ${workflow} on ${short(sha)}`])
     let workflowRun: any = null
@@ -841,10 +866,14 @@ export class DeliveryService {
     }
 
     const conclusion = String(workflowRun.conclusion ?? '')
+    // The Mac job runs after the Windows job has published the release; when only it failed, the
+    // Windows release is real and still gets verified, and the Mac failure is reported as such.
+    let macFailure: string[] | null = null
     if (conclusion === 'cancelled') {
       throw new StageFailure(`The ${workflow} run for ${short(sha)} was cancelled — superseded by a newer push. The commit is on ${plan.config.remote}/${plan.config.branch}; the newer run's release will include it.`, 'cancelled')
     }
-    if (conclusion !== 'success') {
+    if (conclusion !== 'success' && plan.release!.mac) macFailure = await this.macOnlyFailure(api, workflowRun.id)
+    if (conclusion !== 'success' && !macFailure) {
       const reasons = await this.failureAnnotations(api, workflowRun.id)
       if (reasons.length) this.log(active, stage, reasons.flatMap(reason => reason.split('\n')))
       throw new StageFailure(`The ${workflow} run for ${short(sha)} ended ${conclusion || 'unsuccessfully'}: ${active.run.workflowRunUrl ?? ''}${reasons.length ? `\n${reasons.join('\n')}` : ''}`)
@@ -866,10 +895,31 @@ export class DeliveryService {
     active.run.releaseTag = release.tag_name ?? null
     active.run.releaseUrl = release.html_url ?? null
     const names: string[] = Array.isArray(release.assets) ? release.assets.map((asset: any) => String(asset?.name ?? '')) : []
-    const missing = assets.filter(pattern => !names.some(name => name.endsWith(pattern)))
+    const missingOf = (patterns: string[]): string[] => patterns.filter(pattern => !names.some(name => name.endsWith(pattern)))
+    const missing = missingOf(assets)
     this.log(active, stage, [`Release ${release.tag_name}: ${names.join(', ') || 'no assets'}`])
     if (missing.length) throw new StageFailure(`Release ${release.tag_name} is missing assets matching ${missing.join(', ')} (it has ${names.join(', ') || 'none'}). The installed app cannot update from it: ${release.html_url ?? ''}`)
-    return `Release ${release.tag_name} published with ${assets.join(', ')}.`
+    if (!plan.release!.mac) return `Release ${release.tag_name} published with ${assets.join(', ')}.`
+    const stands = `The Windows release ${release.tag_name} stands with ${assets.join(', ')}; an installed Mac app gets no update from it.`
+    if (macFailure) {
+      this.log(active, stage, macFailure)
+      throw new StageFailure(`The Mac build failed: ${active.run.workflowRunUrl ?? ''}\n${macFailure.join('\n')}\n${stands}`)
+    }
+    const macMissing = missingOf(MAC_ASSETS)
+    if (macMissing.length) throw new StageFailure(`The Mac build ran but release ${release.tag_name} is missing ${macMissing.join(', ')}. ${stands} ${release.html_url ?? ''}`)
+    return `Release ${release.tag_name} published with ${[...assets, ...MAC_ASSETS].join(', ')}.`
+  }
+
+  /** The failure lines when every failed job of the run is a Mac job and another job succeeded
+   *  (the Windows release was published); null when anything else failed. */
+  private async macOnlyFailure(api: (path: string) => Promise<GithubResponse>, runId: number): Promise<string[] | null> {
+    const jobs = await api(`/actions/runs/${runId}/jobs?per_page=50`)
+    if (!jobs.ok) return null
+    const all: any[] = (Array.isArray(jobs.data?.jobs) ? jobs.data.jobs : []).filter(Boolean)
+    const isMac = (job: any): boolean => /mac/i.test(String(job.name ?? ''))
+    const failed = all.filter(job => job.conclusion && job.conclusion !== 'success' && job.conclusion !== 'skipped')
+    if (!failed.length || !failed.every(isMac) || !all.some(job => !isMac(job) && job.conclusion === 'success')) return null
+    return this.failureAnnotations(api, runId)
   }
 
   /** Workflow logs need admin rights to download; the release workflow re-emits test failures as

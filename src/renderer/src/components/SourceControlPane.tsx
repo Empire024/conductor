@@ -149,6 +149,9 @@ export interface SourceControlViewProps {
   /** Push and publish a GitHub release after the commit; off by default. */
   publish: boolean
   onPublish(publish: boolean): void
+  /** With publish: also build the Mac dmg/zip for installed Mac apps; on by default. */
+  mac?: boolean
+  onMac?(mac: boolean): void
   onShip(): void
   onCancel(): void
   onRefresh(): void
@@ -281,6 +284,9 @@ export function SourceControlView(props: SourceControlViewProps): React.JSX.Elem
         <label className="scp-publish" title="Off: the commit stays on this machine and the installed app updates through app.update. On: push main and build a GitHub release for other devices; it costs a hosted build, so use it for bigger, tested states rather than every delivery.">
           <input type="checkbox" checked={props.publish} disabled={running} onChange={event => props.onPublish(event.target.checked)} />Publish release
         </label>
+        {props.publish && props.onMac && <label className="scp-publish" title="On: the release also carries the Apple silicon dmg and zip, so an installed Mac app updates from it (a separate hosted Mac build). Off: Windows only.">
+          <input type="checkbox" checked={props.mac !== false} disabled={running} onChange={event => props.onMac?.(event.target.checked)} />Mac build
+        </label>}
         <small className="scp-ship-reason">{blocker ?? (props.publish ? 'Test → build → commit → push → start & verify release' : 'Test → build → commit (local)')}</small>
       </div>
     </form>}
@@ -297,6 +303,7 @@ export function SourceControlPane({ project }: { project: ProjectRecord }): Reac
   const [excluded, setExcluded] = useState<ReadonlySet<string>>(() => new Set())
   const [shipping, setShipping] = useState(false)
   const [publish, setPublish] = useState(false)
+  const [mac, setMac] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
   const [now, setNow] = useState(Date.now())
@@ -356,7 +363,7 @@ export function SourceControlPane({ project }: { project: ProjectRecord }): Reac
     setShipping(true); setError('')
     try {
       const paths = shipPaths(status.files, selected)
-      const started = await deliveryBridge().ship({ projectId: project.id, message: message.trim(), ...(paths ? { paths } : {}), publish })
+      const started = await deliveryBridge().ship({ projectId: project.id, message: message.trim(), ...(paths ? { paths } : {}), publish, ...(publish && !mac ? { mac: false } : {}) })
       setExpanded({})
       setRun(started)
     } catch (reason) {
@@ -393,6 +400,8 @@ export function SourceControlPane({ project }: { project: ProjectRecord }): Reac
     onSelectAll={(all) => setExcluded(all ? new Set() : new Set((status?.files ?? []).map(file => file.path)))}
     publish={publish}
     onPublish={setPublish}
+    mac={mac}
+    onMac={setMac}
     onShip={() => void ship()}
     onCancel={() => void cancel()}
     onRefresh={() => void refresh()}

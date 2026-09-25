@@ -110,9 +110,10 @@ jobs:
             --latest `
             --title "Conductor $version"
 
-  # Only when asked (the mac input). A delivery's publish never sets it, so the Windows release is
-  # built, published and verified exactly as before, and this job adds the Mac files to that same
-  # release afterwards. The build is ad-hoc signed (no Apple Developer ID); an installed Mac app
+  # When the mac input is set, which a delivery's publish does unless asked not to (git.ship
+  # mac: false, or the Source control panel's Mac build switch). The Windows release is built,
+  # published and verified first; this job adds the Mac files to that same release afterwards,
+  # and a failure here leaves the Windows release standing. The build is ad-hoc signed (no Apple Developer ID); an installed Mac app
   # updates from latest-mac.yml and the zip through Conductor's own updater (mac-zip-updater.ts),
   # never Squirrel.Mac. The tests ran in the Windows job; this job only packages.
   macos-release:

@@ -118,6 +118,10 @@ describe('source control view', () => {
     expect(html).not.toContain('Release workflow will be')
     expect(render({ publish: true })).toContain('Release workflow will be started and verified')
     expect(render({ publish: true })).toContain('Ship &amp; publish')
+    // Publishing carries the Mac build by default; the switch only appears with Publish on.
+    expect(html).not.toContain('Mac build')
+    expect(render({ publish: true, onMac: () => {} })).toMatch(/checked=""[^>]*\/?>Mac build/)
+    expect(render({ publish: true, mac: false, onMac: () => {} })).not.toMatch(/checked=""[^>]*\/?>Mac build/)
     expect(html).toContain('4 of 4 changes selected')
     expect(html.match(/type="checkbox" checked=""/g)).toHaveLength(4)
     expect(html).toContain('badge-untracked')

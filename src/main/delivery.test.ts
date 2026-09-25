@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DeliveryService, normalizeDeliveryPath, parseDeliveryConfig, parseGithubRemote, parsePorcelain, workflowRunsOnPush, type DeliveryRunOptions } from './delivery'
+import { DeliveryService, normalizeDeliveryPath, parseDeliveryConfig, parseGithubRemote, parsePorcelain, workflowHasMacInput, workflowRunsOnPush, type DeliveryRunOptions } from './delivery'
 import type { DeliveryRun } from '../shared/delivery'
 
 const SHA = 'a'.repeat(40)
@@ -67,10 +67,10 @@ function harness(setup: { replies?: Record<string, Handler>; files?: Record<stri
     '/releases?per_page=10': [{ tag_name: 'v1.2.3', html_url: 'https://github.com/owner/app/releases/tag/v1.2.3', target_commitish: SHA, published_at: '2026-09-22T10:10:00Z', assets: [{ name: 'Conductor-Setup-1.2.3.exe' }, { name: 'Conductor-Setup-1.2.3.exe.blockmap' }, { name: 'latest.yml' }] }],
     ...setup.github
   }
-  const requests: { url: string; headers: Record<string, string> }[] = []
+  const requests: { url: string; headers: Record<string, string>; body?: string }[] = []
   const fetchFake = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input)
-    requests.push({ url, headers: (init?.headers ?? {}) as Record<string, string> })
+    requests.push({ url, headers: (init?.headers ?? {}) as Record<string, string>, ...(typeof init?.body === 'string' ? { body: init.body } : {}) })
     const key = Object.keys(github).filter(fragment => url.includes(fragment)).sort((a, b) => b.length - a.length)[0]
     if (!key) return new Response('not found', { status: 404 })
     let body = github[key]
@@ -85,7 +85,7 @@ function harness(setup: { replies?: Record<string, Handler>; files?: Record<stri
     now: () => new Date(clock), sleep: async ms => { sleeps.push(ms); clock += ms }, tempDir: () => temp
   })
   const ran = (prefix: string): boolean => calls.some(call => [call.command, ...call.args].join(' ').startsWith(prefix))
-  const ship = async (request: { message: string; paths?: string[]; publish?: boolean } = { message: 'Ship it' }): Promise<DeliveryRun> => {
+  const ship = async (request: { message: string; paths?: string[]; publish?: boolean; mac?: boolean } = { message: 'Ship it' }): Promise<DeliveryRun> => {
     const started = service.ship('p1', root, { publish: true, ...request }, { kind: 'agent', agentSessionId: 's1', title: 'Agent' })
     return service.wait('p1', started.id, 5000)
   }
@@ -148,6 +148,92 @@ describe('local delivery by default', () => {
     expect(workflowRunsOnPush('on: push\n')).toBe(true)
     expect(workflowRunsOnPush('# runs on push? no\non:\n  workflow_dispatch:\njobs:\n  push:\n    runs-on: x\n')).toBe(false)
     expect(workflowRunsOnPush('on:\n  workflow_dispatch:\n')).toBe(false)
+  })
+})
+
+describe('publishing carries the Mac build', () => {
+  const macWorkflow = { '.github/workflows/release.yml': 'on:\n  workflow_dispatch:\n    inputs:\n      mac:\n        description: Also build the Mac files\n        type: boolean\n        default: false\njobs:\n  windows-release:\n    runs-on: windows-latest\n  macos-release:\n    runs-on: macos-14\n' }
+  const windowsAssets = [{ name: 'Conductor-Setup-1.2.3.exe' }, { name: 'Conductor-Setup-1.2.3.exe.blockmap' }, { name: 'latest.yml' }]
+  const macAssets = [{ name: 'Conductor-1.2.3-arm64.dmg' }, { name: 'Conductor-1.2.3-arm64-mac.zip' }, { name: 'Conductor-1.2.3-arm64-mac.zip.blockmap' }, { name: 'latest-mac.yml' }]
+  const releaseWith = (assets: { name: string }[]) => [{ tag_name: 'v1.2.3', html_url: 'https://github.com/owner/app/releases/tag/v1.2.3', target_commitish: SHA, published_at: '2026-09-22T10:10:00Z', assets }]
+  const dispatched = () => ({ '/actions/workflows/release.yml/dispatches': new Response(null, { status: 204 }) })
+  const dispatchBody = (h: { requests: { url: string; body?: string }[] }): unknown => JSON.parse(h.requests.find(request => request.url.endsWith('/dispatches'))?.body ?? 'null')
+
+  it('dispatches with mac true by default and verifies the Mac files beside the Windows ones', async () => {
+    const h = harness({ files: macWorkflow, github: { ...dispatched(), '/releases?per_page=10': releaseWith([...windowsAssets, ...macAssets]) } })
+    const run = await h.ship()
+    expect(run.error).toBeNull()
+    expect(run.state).toBe('delivered')
+    expect(run.mac).toBe(true)
+    expect(dispatchBody(h)).toEqual({ ref: 'main', inputs: { mac: 'true' } })
+    expect(run.stages[5]!.detail).toMatch(/latest-mac\.yml/)
+    expect(run.stages[5]!.detail).toMatch(/\.dmg/)
+  })
+
+  it('leaves the Mac build out only when asked, and then does not look for it', async () => {
+    const h = harness({ files: macWorkflow, github: dispatched() })
+    const run = await h.ship({ message: 'Ship it', mac: false })
+    expect(run.state).toBe('delivered')
+    expect(run.mac).toBe(false)
+    expect(dispatchBody(h)).toEqual({ ref: 'main', inputs: { mac: 'false' } })
+  })
+
+  it('sends no mac input to a workflow that does not declare one', async () => {
+    const h = harness({ files: { '.github/workflows/release.yml': 'on:\n  workflow_dispatch:\njobs: {}\n' }, github: dispatched() })
+    const run = await h.ship()
+    expect(run.state).toBe('delivered')
+    expect(dispatchBody(h)).toEqual({ ref: 'main' })
+    expect(run.stages[5]!.detail).not.toMatch(/mac/i)
+  })
+
+  it('fails naming each missing Mac file while saying the Windows release stands', async () => {
+    const h = harness({ files: macWorkflow, github: { ...dispatched(), '/releases?per_page=10': releaseWith([...windowsAssets, macAssets[0]!]) } })
+    const run = await h.ship()
+    expect(run.state).toBe('failed')
+    expect(run.releaseTag).toBe('v1.2.3')
+    expect(run.error).toMatch(/Windows release v1\.2\.3 stands/)
+    expect(run.error).toMatch(/-mac\.zip, -mac\.zip\.blockmap, latest-mac\.yml/)
+  })
+
+  it('reports a failed Mac job as exactly that, after checking the Windows release', async () => {
+    const h = harness({
+      files: macWorkflow,
+      github: {
+        ...dispatched(),
+        '/actions/runs?head_sha=': { workflow_runs: [{ id: 7, path: '.github/workflows/release.yml', status: 'completed', conclusion: 'failure', html_url: 'https://github.com/owner/app/actions/runs/7', run_started_at: '2026-09-22T10:00:10Z' }] },
+        '/actions/runs/7/jobs': { jobs: [{ id: 98, name: 'windows-release', conclusion: 'success', steps: [] }, { id: 99, name: 'macos-release', conclusion: 'failure', steps: [{ name: 'Build macOS release', conclusion: 'failure' }] }] },
+        '/check-runs/99/annotations': [{ title: 'dmg', message: 'hdiutil: create failed' }],
+        '/releases?per_page=10': releaseWith(windowsAssets)
+      }
+    })
+    const run = await h.ship()
+    expect(run.state).toBe('failed')
+    expect(run.releaseTag).toBe('v1.2.3')
+    expect(run.error).toMatch(/^The Mac build failed/)
+    expect(run.error).toMatch(/Windows release v1\.2\.3 stands with \.exe, \.exe\.blockmap, latest\.yml/)
+    expect(run.error).toContain('at step "Build macOS release"')
+    expect(run.error).toContain('hdiutil: create failed')
+  })
+
+  it('still fails the whole release when the Windows job fails', async () => {
+    const h = harness({
+      files: macWorkflow,
+      github: {
+        ...dispatched(),
+        '/actions/runs?head_sha=': { workflow_runs: [{ id: 7, path: '.github/workflows/release.yml', status: 'completed', conclusion: 'failure', html_url: 'u' }] },
+        '/actions/runs/7/jobs': { jobs: [{ id: 98, name: 'windows-release', conclusion: 'failure', steps: [{ name: 'Test', conclusion: 'failure' }] }, { id: 99, name: 'macos-release', conclusion: 'skipped', steps: [] }] }
+      }
+    })
+    const run = await h.ship()
+    expect(run.state).toBe('failed')
+    expect(run.error).toMatch(/ended failure/)
+    expect(run.error).not.toMatch(/stands/)
+  })
+
+  it('reads whether a workflow declares the mac input', () => {
+    expect(workflowHasMacInput(macWorkflow['.github/workflows/release.yml'])).toBe(true)
+    expect(workflowHasMacInput('on:\n  workflow_dispatch:\njobs:\n  mac:\n    runs-on: macos-14\n')).toBe(false)
+    expect(workflowHasMacInput(readFileSync(join(__dirname, '..', '..', '.github', 'workflows', 'release.yml'), 'utf8'))).toBe(true)
   })
 })
 

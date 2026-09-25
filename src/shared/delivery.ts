@@ -35,6 +35,9 @@ export interface DeliveryRun {
   /** False: the commit stays local (push and release are skipped). True: push and verify the
    *  GitHub release. Absent on runs recorded before the distinction existed, which published. */
   publish?: boolean
+  /** On a publish: whether the release workflow was asked for the Mac build too (true unless the
+   *  request said mac: false) and its dmg, zip, blockmap and latest-mac.yml are verified. */
+  mac?: boolean
   startedAt: string
   finishedAt: string | null
   commit: string | null
@@ -79,6 +82,9 @@ export interface DeliveryRequest {
   /** Push and publish a GitHub release after the commit. Off by default: a release costs a
    *  hosted build and is only needed when another device must update. */
   publish?: boolean
+  /** With publish: false leaves the Mac build out of the release. Default true, so an installed
+   *  Mac app updates from every published release. */
+  mac?: boolean
 }
 
 export interface DeliveryBridge {
