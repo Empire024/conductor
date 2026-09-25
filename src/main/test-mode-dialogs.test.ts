@@ -80,6 +80,26 @@ describe('showMessageBox', () => {
     expect(result.response).toBe(9)
     expect(showMessageBoxMock).toHaveBeenCalled()
   })
+
+  it('holds a self-closing dialog open with CONDUCTOR_TEST_DIALOGS=hold, never showing the real one', async () => {
+    process.env.CONDUCTOR_TEST_USER_DATA = 'C:\\profile'
+    process.env.CONDUCTOR_TEST_DIALOGS = 'hold'
+    const abort = new AbortController()
+    let settled = false
+    const pending = showMessageBox(null, { message: 'Work is still running', buttons: ['Stop', 'Cancel'], cancelId: 1, signal: abort.signal }, 0).then(result => { settled = true; return result })
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(settled).toBe(false)
+    abort.abort()
+    expect((await pending).response).toBe(1)
+    expect(showMessageBoxMock).not.toHaveBeenCalled()
+  })
+
+  it('still answers a dialog without an abort signal at once under hold', async () => {
+    process.env.CONDUCTOR_TEST_USER_DATA = 'C:\\profile'
+    process.env.CONDUCTOR_TEST_DIALOGS = 'hold'
+    expect((await showMessageBox(null, { message: 'hi', cancelId: 2 })).response).toBe(2)
+    expect(showMessageBoxMock).not.toHaveBeenCalled()
+  })
 })
 
 describe('showSaveDialog / showOpenDialog', () => {

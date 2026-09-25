@@ -7,7 +7,10 @@ import { app, dialog, type BrowserWindow, type MessageBoxOptions, type MessageBo
  *  a real display (feature-list.md: smoke-instances-never-leak). Every dialog.show* call site in
  *  the main process goes through here so test mode answers headlessly with a safe default instead
  *  of blocking on a modal nobody can see. CONDUCTOR_TEST_DIALOGS=1 opts a smoke back into the real
- *  dialog, to exercise the dialog itself through its own stub. */
+ *  dialog, to exercise the dialog itself through its own stub. CONDUCTOR_TEST_DIALOGS=hold keeps the
+ *  guard but plays an owner who has not clicked yet: a dialog that can close itself (it has an
+ *  abort signal, like the running-work confirmation) stays open until it does, so a smoke can see
+ *  it pending and watch it close once the work stops. */
 export const guardingDialogs = (): boolean =>
   !app.isPackaged && !!process.env.CONDUCTOR_TEST_USER_DATA && process.env.CONDUCTOR_TEST_DIALOGS !== '1'
 
@@ -23,6 +26,12 @@ const ownerWindow = (owner: BrowserWindow | null | undefined): BrowserWindow | u
  *  defaultId is used, which declines rather than takes an unreviewed action. */
 export async function showMessageBox(owner: BrowserWindow | null | undefined, options: MessageBoxOptions, testResponse?: number): Promise<MessageBoxReturnValue> {
   if (guardingDialogs()) {
+    const signal = options.signal
+    if (process.env.CONDUCTOR_TEST_DIALOGS === 'hold' && signal) {
+      logGuarded(`"${options.message}" -> held until it closes itself`)
+      if (!signal.aborted) await new Promise<void>(done => signal.addEventListener('abort', () => done(), { once: true }))
+      return { response: options.cancelId ?? options.defaultId ?? 0, checkboxChecked: false }
+    }
     const response = testResponse ?? options.cancelId ?? options.defaultId ?? 0
     logGuarded(`"${options.message}" -> response ${response}`)
     return { response, checkboxChecked: false }

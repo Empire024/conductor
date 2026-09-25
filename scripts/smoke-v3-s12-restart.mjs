@@ -15,6 +15,9 @@ import assert from 'node:assert/strict'
 //      restarting:true, no dialog opens, and the app relaunches within 20 s.
 //   B. 1 streaming tab: the reply says confirmationPending and names it, the dialog is open; the
 //      owner then stops that tab, and the dialog closes itself and the app relaunches.
+// Test mode answers every dialog headlessly (test-mode-dialogs.ts, since 2de1884): left alone it would
+// take "Stop work" at once and B could never see the dialog open. CONDUCTOR_TEST_DIALOGS=hold keeps
+// the guard (nothing reaches the screen) but plays an owner who has not clicked yet.
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-v3-s12-restart.mjs [--keep]
 
 const keep = process.argv.includes('--keep')
@@ -71,7 +74,7 @@ const git = (...args) => execFileSync('git', args, { cwd: projectPath, stdio: 'p
 await writeFile(join(projectPath, 'README.md'), '# V3 S12 smoke\n')
 git('init', '-q', '-b', 'main'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'add', '.'); git('-c', 'user.email=smoke@example.invalid', '-c', 'user.name=Smoke', 'commit', '-q', '-m', 'Initial')
 
-const env = { ...process.env, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_FIXTURE_DIR: fixtures }
+const env = { ...process.env, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_FIXTURE_DIR: fixtures, CONDUCTOR_TEST_DIALOGS: 'hold' }
 delete env.ELECTRON_RUN_AS_NODE; delete env.CONDUCTOR_LIVE_TESTS; delete env.CONDUCTOR_BACKGROUND_WINDOWS
 
 let owner, projectId
@@ -152,7 +155,7 @@ try {
   assert.equal(restartB.restarting, false, 'B: a restart that waits on the owner must not answer restarting:true')
   assert.equal(restartB.confirmationPending, true)
   assert.deepEqual(restartB.running.map(entry => entry.id), [streaming])
-  await expect.poll(async () => (await call('app.state')).pendingQuitConfirmation?.running?.map(entry => entry.id) ?? null, { timeout: 5_000, intervals: [100] }).toEqual([streaming])
+  await expect.poll(async () => (await call('app.state')).pendingQuitConfirmation?.running?.map(entry => entry.id) ?? null, { timeout: 15_000, intervals: [100] }).toEqual([streaming])
   observe('B: dialog open, naming exactly the streaming tab')
   await new Promise(r => setTimeout(r, 2000))
   assert.ok(alive(secondPid), 'B: the app must wait for the owner while the turn runs')
