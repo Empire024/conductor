@@ -5,7 +5,8 @@
 // Usage: node scripts/smoke-lock.mjs [--timeout-min N] -- <command> [args...]
 //
 // The lock is a directory under the OS temp folder (mkdir is atomic); holder.txt inside it records
-// who holds it, when, and for how long. A holder whose pid is dead, or whose age exceeds 2x its
+// who holds it, when, and for how long. Waiters take it in arrival order through ticket files in
+// conductor-smoke.queue next to it, and print their place in line. A holder whose pid is dead, or whose age exceeds 2x its
 // recorded timeout, is stale and is broken with a logged reason.
 //
 // The run is killed - the whole process tree, not just the spawned pid, since Electron and its
@@ -13,7 +14,7 @@
 // SIGINT/SIGTERM, and when this process's own parent (whatever invoked it) is gone. That is what
 // keeps a smoke from outliving the run that asked for it (feature-list.md: smoke-instances-never-leak).
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -71,12 +72,6 @@ export function parseHolderText(text) {
   return match ? { pid: Number(match[1]), startedAt: match[2], command: match[3] } : null
 }
 
-const readHolder = () => {
-  let text
-  try { text = readFileSync(join(LOCK_DIR, 'holder.txt'), 'utf8') } catch { return null }
-  return parseHolderText(text)
-}
-
 /** Whether `pid` may remove the lock: only the run that currently holds it, per holder.txt - never
  *  "whatever process happens to be exiting". A missing/corrupt holder.txt has nothing to protect,
  *  so it counts as ownable. Without this, a run whose lock was broken as stale (or a waiter that
@@ -108,38 +103,118 @@ export function killTree(pid, log = () => {}) {
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-async function acquire(timeoutMin, command) {
-  const started = Date.now()
-  for (;;) {
-    try {
-      mkdirSync(LOCK_DIR)
-      writeFileSync(join(LOCK_DIR, 'holder.txt'), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), timeoutMin, command: command.join(' ') }))
-      return
-    } catch (error) { if (error.code !== 'EEXIST') throw error }
-    const reason = staleReason(readHolder(), Date.now())
-    if (reason) {
-      console.error(`[smoke-lock] breaking stale lock: ${reason}`)
-      try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch { /* another waiter got it first */ }
-      continue
+// --------------------------------------------------------------------- the waiting line
+//
+// Waiters queue in arrival order. Polling alone had no fairness: a verifier chaining smokes back to
+// back re-took the lock the moment it let go, and another waiter starved (VR2 waited 11+ min behind
+// three VR3 runs). Each waiter writes a ticket file into QUEUE_DIR - next to the lock, not inside it,
+// since the lock directory only exists while someone holds it - named by arrival time, and only the
+// oldest ticket whose waiter is still alive may take the lock. A dead waiter's ticket is removed as
+// soon as anyone sees it. A waiter from a smoke-lock.mjs that predates the queue has no ticket and
+// can still win a free lock by racing mkdir; that only lasts until every caller runs this file.
+
+export const QUEUE_DIR = join(tmpdir(), 'conductor-smoke.queue')
+
+/** Ticket names sort in arrival order: zero-padded milliseconds, then the pid as a tie-break. */
+export function ticketName(pid, now) {
+  return `${String(now).padStart(15, '0')}-${String(pid).padStart(10, '0')}.json`
+}
+
+export function takeTicket(queueDir, pid, now, command = '') {
+  mkdirSync(queueDir, { recursive: true })
+  const name = ticketName(pid, now)
+  writeFileSync(join(queueDir, name), JSON.stringify({ pid, queuedAt: new Date(now).toISOString(), command }))
+  return name
+}
+
+export function dropTicket(queueDir, name) {
+  try { rmSync(join(queueDir, name), { force: true }) } catch { /* already gone */ }
+}
+
+const ticketPid = name => Number(/^\d+-(\d+)\.json$/.exec(name)?.[1] ?? NaN)
+
+/** The live line in order, with dead waiters' tickets removed on the way (a waiter killed without
+ *  its exit handler running must never hold up everyone behind it). */
+export function liveQueue(queueDir, alive = isProcessAlive, log = () => {}) {
+  let names = []
+  try { names = readdirSync(queueDir).filter(name => name.endsWith('.json')).sort() } catch { return [] }
+  return names.filter(name => {
+    const pid = ticketPid(name)
+    if (Number.isInteger(pid) && alive(pid)) return true
+    log(`[smoke-lock] skipping a dead waiter's ticket (${Number.isInteger(pid) ? `pid ${pid}` : name})`)
+    dropTicket(queueDir, name)
+    return false
+  })
+}
+
+/** 1 = next in line. 0 when the ticket is gone (it is then taken again, at the back). */
+export function queuePosition(line, name) {
+  return line.indexOf(name) + 1
+}
+
+/** Waits for the lock in arrival order. Everything it touches is injectable, so two waiters can be
+ *  simulated in one process (smoke-lock.test.mjs). Breaking a stale holder, the waiter give-up and
+ *  the holder record are unchanged from the unqueued version. */
+export async function acquire(timeoutMin, command, options = {}) {
+  const { lockDir = LOCK_DIR, queueDir = QUEUE_DIR, pid = process.pid, alive = isProcessAlive, now = Date.now, wait = sleep, log = console.error, pollMs = POLL_MS, giveUpMin = WAITER_GIVE_UP_MIN, onTicket = () => {}, signal } = options
+  const started = now()
+  let ticket = takeTicket(queueDir, pid, now(), command.join(' '))
+  onTicket(ticket)
+  let shown = -1, lastNote = started
+  const holderOf = () => { try { return parseHolderText(readFileSync(join(lockDir, 'holder.txt'), 'utf8')) } catch { return null } }
+  try {
+    for (;;) {
+      signal?.throwIfAborted()
+      const line = liveQueue(queueDir, alive, log)
+      let position = queuePosition(line, ticket)
+      if (!position) { ticket = takeTicket(queueDir, pid, now(), command.join(' ')); onTicket(ticket); continue }
+      if (position === 1) {
+        try {
+          mkdirSync(lockDir)
+          writeFileSync(join(lockDir, 'holder.txt'), JSON.stringify({ pid, startedAt: new Date(now()).toISOString(), timeoutMin, command: command.join(' ') }))
+          return
+        } catch (error) { if (error.code !== 'EEXIST') throw error }
+        const reason = staleReason(holderOf(), now(), alive)
+        if (reason) {
+          log(`[smoke-lock] breaking stale lock: ${reason}`)
+          try { rmSync(lockDir, { recursive: true, force: true }) } catch { /* someone else broke it first */ }
+          continue
+        }
+      }
+      if (waiterExpired(started, now(), giveUpMin)) throw new Error(`gave up waiting for ${lockDir} after ${giveUpMin} min`)
+      if (position !== shown || now() - lastNote >= 60_000) {
+        const holder = holderOf()
+        log(`[smoke-lock] waiting for ${lockDir}: position ${position} of ${line.length} in line${holder?.pid ? `, held by ${holder.pid} (${holder.command ?? 'unknown command'})` : ''}, ${Math.round((now() - started) / 1000)} s so far`)
+        shown = position; lastNote = now()
+      }
+      await wait(position === 1 ? Math.min(pollMs, 1000) : pollMs)
     }
-    if (waiterExpired(started, Date.now())) throw new Error(`gave up waiting for ${LOCK_DIR} after ${WAITER_GIVE_UP_MIN} min`)
-    if ((Date.now() - started) % 60000 < POLL_MS) console.error(`[smoke-lock] waiting for ${LOCK_DIR} (${Math.round((Date.now() - started) / 1000)} s)`)
-    await sleep(POLL_MS)
-  }
+  } finally { dropTicket(queueDir, ticket) }
 }
 
 /** Only removes a lock this process still holds - see ownsLock(). A run whose lock was broken as
  *  stale while it ran, or a waiter that never acquired one, must not delete whoever holds it now. */
-const release = () => {
-  if (!ownsLock(readHolder(), process.pid)) return
-  try { rmSync(LOCK_DIR, { recursive: true, force: true }) } catch { /* already gone */ }
+export const release = (lockDir = LOCK_DIR, pid = process.pid) => {
+  let holder = null
+  try { holder = parseHolderText(readFileSync(join(lockDir, 'holder.txt'), 'utf8')) } catch { /* no holder */ }
+  if (!ownsLock(holder, pid)) return
+  try { rmSync(lockDir, { recursive: true, force: true }) } catch { /* already gone */ }
 }
 
 async function main() {
   const { command, timeoutMin } = parseArgs(process.argv.slice(2))
   if (!command.length) { console.error('usage: node scripts/smoke-lock.mjs [--timeout-min N] -- <command> [args...]'); process.exit(2) }
-  try { await acquire(timeoutMin, command) }
+  // A waiter stopped by Ctrl+C or a plain kill leaves the line at once; one that dies without
+  // running this is skipped by the next waiter that sees its ticket (liveQueue).
+  let ticket = null
+  const leaveLine = () => { if (ticket) dropTicket(QUEUE_DIR, ticket) }
+  process.on('exit', leaveLine)
+  const stopWaiting = () => { leaveLine(); process.exit(130) }
+  process.on('SIGINT', stopWaiting); process.on('SIGTERM', stopWaiting)
+  try { await acquire(timeoutMin, command, { onTicket: name => { ticket = name } }) }
   catch (error) { console.error(`[smoke-lock] ${error.message}`); process.exit(1) }
+  ticket = null
+  process.off('SIGINT', stopWaiting); process.off('SIGTERM', stopWaiting)
 
   // Direct spawn keeps arguments intact; only a .cmd/.bat launcher (npm.cmd) needs the shell. The
   // child gets its own process group off Windows so a POSIX kill(-pid) can reach its descendants.
