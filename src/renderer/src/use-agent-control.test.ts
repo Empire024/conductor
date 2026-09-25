@@ -4,6 +4,7 @@ import type { SessionRecord } from '../../shared/models'
 import { createDefaultLayout } from '../../shared/models'
 import { listGroups } from './layout/layout-operations'
 import { handleAgentControlRequest, type AgentControlHost } from './use-agent-control'
+import { composerDraftKey } from './panes/composer-draft-store'
 
 function fixture() {
   let session: SessionRecord = { id: 'session', projectId: 'project', name: 'Workspace', layout: createDefaultLayout(), maximizedGroupId: null, closedTabs: [], continueOnLimit: false, createdAt: '', updatedAt: '' }
@@ -25,6 +26,20 @@ describe('visible agent control', () => {
     await handleAgentControlRequest(request('tabs.close', { tabId: tab.id }), host)
     expect(current().closedTabs.at(-1)?.id).toBe(tab.id)
     expect(host.commit).toHaveBeenCalledTimes(4)
+  })
+  it('keeps a tab with an unsent draft when a finished coworker is closed for it', async () => {
+    const stored = new Map<string, string>([[composerDraftKey('project', 'drafted'), JSON.stringify({ version: 1, revision: 'r1', message: 'not sent yet', attachments: [] })]])
+    vi.stubGlobal('localStorage', { getItem: (key: string) => stored.get(key) ?? null, setItem: (key: string, value: string) => { stored.set(key, value) }, removeItem: (key: string) => { stored.delete(key) } })
+    try {
+      const { host, request, current } = fixture()
+      for (const resourceId of ['drafted', 'clean']) await handleAgentControlRequest(request('tabs.open', { tab: { id: resourceId + '-tab', kind: 'agent', title: resourceId, resourceId } }), host)
+      await expect(handleAgentControlRequest(request('tabs.close', { tabId: 'drafted-tab', unlessDraft: true }), host)).rejects.toThrow('unsent draft')
+      await handleAgentControlRequest(request('tabs.close', { tabId: 'clean-tab', unlessDraft: true }), host)
+      expect(current().closedTabs.map(tab => tab.id)).toEqual(['clean-tab'])
+      // An ordinary close still closes it; only Conductor's own finish keeps the draft.
+      await handleAgentControlRequest(request('tabs.close', { tabId: 'drafted-tab' }), host)
+      expect(current().closedTabs.map(tab => tab.id)).toEqual(['clean-tab', 'drafted-tab'])
+    } finally { vi.unstubAllGlobals() }
   })
   it('rejects another workspace and stale tab IDs without modifying state', async () => {
     const { host, request } = fixture()

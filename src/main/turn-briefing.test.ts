@@ -6,7 +6,8 @@ import type { AgentSpec } from '../shared/models'
 import { ConductorDatabase } from './database'
 import { MEMORY_PROTOCOL } from './memory'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
-import { CONTEXT_RESET, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge } from './turn-briefing'
+import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
+import { CONTEXT_RESET, FINISH_HINT, MEMORY_HEADING, LOCAL_ASSIST_HINT, TurnBriefings, handoffNudge, SUCCESSION_HINT, SUCCESSION_PERCENT, SUCCESSION_TURNS, successionNudge } from './turn-briefing'
 
 const roots: string[] = [], databases: ConductorDatabase[] = []
 afterEach(() => {
@@ -144,6 +145,17 @@ describe('what a native runtime is told, and how often', () => {
     expect(f.briefings.compose(f.spec, 'Again', 'item-2', 'runtime-1')).not.toContain(LOCAL_ASSIST_HINT)
     const grok = fixture('grok')
     expect(grok.briefings.compose(grok.spec, 'Run the tests', 'item-1', '')).not.toContain(LOCAL_ASSIST_HINT)
+  })
+
+  it('tells a coworker a controller opened, once per runtime, to finish itself when done', () => {
+    const owner = fixture()
+    expect(owner.briefings.compose(owner.spec, 'Build it', 'item-1', '')).not.toContain(FINISH_HINT)
+    const f = fixture()
+    f.database.setSetting(COWORKER_OPENED_PREFIX + f.spec.id, 'controller')
+    expect(f.briefings.compose(f.spec, 'Build it', 'item-1', '')).toContain(FINISH_HINT)
+    expect(FINISH_HINT).toBe('When your work is delivered and reported, end with agents.finish({}) so your tab and CLI are released.')
+    f.starting('runtime-1')
+    expect(f.briefings.compose(f.spec, 'Again', 'item-2', 'runtime-1')).not.toContain(FINISH_HINT)
   })
 
   it('gives a local model only its memory lines: no heading, no nudge, never a control credential', () => {

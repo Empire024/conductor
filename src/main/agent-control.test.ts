@@ -19,6 +19,7 @@ import { FakeDurableJobsService } from '../shared/durable-jobs-fake'
 import type { DurableJobEvent, DurableJobSummary } from '../shared/durable-jobs'
 import { assertLocalControlAllowed, assertToolAllowed, toolSpecs } from './local-models/tools'
 import { SUCCESSION_NUDGE, SUCCESSION_TURNS, TurnBriefings } from './turn-briefing'
+import { COWORKER_OPENED_PREFIX, CoworkerAutoClose } from './coworker-autoclose'
 import { encodeRestartInitiator, encodeRestartRequest, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, takeRestartInitiator } from './restart-initiator'
 
 const dispose: Array<() => void> = []
@@ -2136,5 +2137,81 @@ describe('viewing through app control', () => {
     f.submissions.at(-1)!.options.emit({ data: { type: 'session', phase: 'completed', backgroundTasks: 0 } })
     await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.backgroundTasks ?? 0).toBe(0))
     expect(await f.control.call(f.scope, 'agents.status', { agentSessionId: id })).toMatchObject({ phase: 'completed', backgroundTasks: 0 })
+  })
+})
+
+describe('agents.finish', () => {
+  const settle = (f: ReturnType<typeof fixture>, id: string, phase: SessionProjection['phase'], extra: Record<string, unknown> = {}) =>
+    f.database.structured.append({ schemaVersion: 1, id: 'finish-' + phase + '-' + Math.random(), sequence: f.database.structured.snapshot(id)!.sequence + 1, sessionId: id, runtimeId: 'finish-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase, ...extra } as AgentEventData })
+  const closer = (f: ReturnType<typeof fixture>) => {
+    const released: string[] = []
+    f.control.setCoworkerAutoClose(new CoworkerAutoClose({
+      settings: f.database, snapshot: id => f.database.structured.snapshot(id),
+      targets: () => f.control.finishTargets(), close: target => f.control.closeFinished(target),
+      release: select => f.sessions.killWhere(spec => { const chosen = select(spec); if (chosen) released.push(spec.id); return chosen })
+    }))
+    return released
+  }
+  const closes = (f: ReturnType<typeof fixture>) => f.requests.filter(request => request.action === 'tabs.close')
+
+  it('marks the tabs a controller opens as coworkers, and not the owner’s', async () => {
+    const f = fixture()
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    expect(f.database.getSetting(COWORKER_OPENED_PREFIX + child.resourceId)).toBe('controller')
+    const owned = await f.control.call(f.control.ownerScope({ projectId: f.project.id, workspaceId: f.workspace.id }), 'tabs.open', { provider: 'codex' }) as AgentControlTab
+    expect(owned.resourceId).toBeTruthy()
+    expect(f.database.getSetting(COWORKER_OPENED_PREFIX + owned.resourceId)).toBeNull()
+  })
+
+  it('is refused while the coworker runs or has background tasks, naming why, with no dialog', async () => {
+    const f = fixture(); closer(f)
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    settle(f, child.resourceId!, 'running')
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: child.resourceId })).rejects.toThrow(/its turn is still running/)
+    settle(f, child.resourceId!, 'completed', { backgroundTasks: 1 })
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: child.resourceId })).rejects.toThrow(/1 background task still running/)
+    expect(closes(f)).toHaveLength(0)
+    expect(f.confirm).not.toHaveBeenCalled()
+  })
+
+  it('lets the controller close a settled coworker at once, keeping history and releasing its runtime', async () => {
+    const f = fixture(), released = closer(f)
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    settle(f, child.resourceId!, 'completed')
+    const result = await f.control.call(f.scope, 'agents.finish', { agentSessionId: child.resourceId }) as { finished: boolean; note: string }
+    expect(result).toMatchObject({ finished: true, agentSessionId: child.resourceId, tabId: child.id })
+    expect(closes(f).at(-1)).toMatchObject({ params: { tabId: child.id, unlessDraft: true } })
+    expect(f.confirm).not.toHaveBeenCalled()
+    expect(released).toEqual([child.resourceId])
+    expect(f.database.getSetting('agentControlParent:' + child.resourceId)).toBeNull()
+    expect(f.database.getSetting(COWORKER_OPENED_PREFIX + child.resourceId)).toBeNull()
+    expect(f.database.structured.snapshot(child.resourceId!)).toBeTruthy()
+  })
+
+  it('refuses a tab the caller does not control and takes only agentSessionId', async () => {
+    const f = fixture(); closer(f)
+    f.sessions.ensure({ ...f.spec, id: 'owners-own', title: 'Owner tab' })
+    openAgentTab(f, 'owners-own', 'owners-own-tab')
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: 'owners-own' })).rejects.toThrow(/Finish only a coworker this agent controls/)
+    await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: 'owners-own', force: true })).rejects.toThrow(/accepts only agentSessionId/)
+    expect(closes(f)).toHaveLength(0)
+  })
+
+  it('lets a coworker finish itself once its own turn settles', async () => {
+    const f = fixture(), released = closer(f)
+    const child = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    const self = { ...f.scope, agentSessionId: child.resourceId! }
+    settle(f, child.resourceId!, 'running')
+    expect(await f.control.call(self, 'agents.finish', {})).toMatchObject({ finished: false })
+    await new Promise(resolve => setTimeout(resolve, 2_300))
+    expect(closes(f)).toHaveLength(0)
+    settle(f, child.resourceId!, 'completed')
+    await vi.waitFor(() => expect(closes(f)).toHaveLength(1), { timeout: 5_000 })
+    expect(released).toEqual([child.resourceId])
+  })
+
+  it('refuses a self-finish from the owner’s own tab', async () => {
+    const f = fixture(); closer(f)
+    await expect(f.control.call(f.scope, 'agents.finish', {})).rejects.toThrow(/owner’s own tab/)
   })
 })

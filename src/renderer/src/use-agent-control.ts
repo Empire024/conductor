@@ -6,6 +6,7 @@ import { makeLauncherTab } from '../../shared/models'
 import { activateTab, addTab, findGroup, listGroups, splitGroup, updateTab } from './layout/layout-operations'
 import { applyWorkspaceTabAction } from './layout/workspace-tab-actions'
 import { announceAgentControlGrants, announceAgentControlSettings } from './agent-control-settings'
+import { hasComposerDraft } from './panes/use-composer-draft'
 
 export interface AgentControlHost {
   detachedId?: string
@@ -132,6 +133,8 @@ export async function handleAgentControlRequest(request: AgentControlUiRequest, 
     } else {
       const action = request.action === 'tabs.focus' ? 'focus' : request.action === 'tabs.close' ? 'close' : request.action === 'tabs.detach' ? 'detach' : null
       if (!action) throw new Error('Unsupported workspace action.')
+      // A finished coworker closing itself (agents.finish, the auto-close sweep) never takes words the owner has not sent yet.
+      if (action === 'close' && request.params.unlessDraft === true && tab.kind === 'agent' && tab.resourceId && hasComposerDraft(session.projectId, tab.resourceId)) throw new Error('it has an unsent draft')
       if (action === 'close' && tab.kind === 'code') {
         window.dispatchEvent(new Event('conductor:flush-editors'))
         if (!await window.conductor.files.confirmClose([tab.id])) throw new Error('Closing the file was cancelled.')

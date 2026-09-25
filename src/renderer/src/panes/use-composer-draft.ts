@@ -22,6 +22,12 @@ export function attachToDraft(projectId: string, sessionId: string, attachment: 
   }))
 }
 
+/** Whether a conversation holds words or context not sent yet: a tab Conductor must not close on its own. */
+export function hasComposerDraft(projectId: string, sessionId: string): boolean {
+  const draft = drafts.get(composerDraftKey(projectId, sessionId))
+  return Boolean(draft.message.trim() || draft.attachments.length)
+}
+
 export function useComposerDraft(projectId: string, sessionId: string) {
   const key = composerDraftKey(projectId, sessionId)
   const subscribe = useCallback((listener: () => void) => {

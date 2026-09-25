@@ -8,7 +8,7 @@ export type ControlMethodClass = 'read' | 'mutation'
 export const MUTATION_FAMILIES = {
   delivery: ['git.ship'],
   tabs: ['tabs.open', 'tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close', 'router.start', 'router.dispatch', 'workspace.rename'],
-  agents: ['agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer', 'agents.interrupt', 'agents.resume', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.supersede', 'agents.report'],
+  agents: ['agents.compact', 'agents.configure', 'agents.grant', 'agents.submit', 'agents.steer', 'agents.interrupt', 'agents.resume', 'agents.fork', 'agents.release', 'agents.handoff', 'agents.supersede', 'agents.report', 'agents.finish'],
   app: ['projects.open', 'app.update', 'app.update.authorize', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm', 'local.stop'],
   files: ['files.write', 'files.open', 'tasks.update', 'memory.remember', 'memory.forget'],
   schedules: [

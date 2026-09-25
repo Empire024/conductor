@@ -20,6 +20,7 @@ import type { ConductorDatabase } from './database'
 import type { CoworkerBriefingOptions } from './agent-collaboration-store'
 import { fitRecalledMemories, formatRecalledMemories, MEMORY_PROTOCOL, memoryTokens } from './memory'
 import { projectTaskBriefing } from './project-backlog'
+import { COWORKER_OPENED_PREFIX } from './coworker-autoclose'
 
 /** An adapter sets this on a notice payload the moment the runtime has compacted its context. */
 export const CONTEXT_RESET = 'contextReset'
@@ -30,6 +31,10 @@ export const MEMORY_HEADING = 'Conductor project memory (current project evidenc
  *  server is attached to (src/main/local-assist). One sentence: it is paid on every new runtime. */
 export const LOCAL_ASSIST_HINT = 'Save tokens: for tests, builds and long logs call run_and_summarize; for reading large files call local_ask (conductor-local tools, answered by the local model).'
 const LOCAL_ASSIST_PROVIDERS = new Set(['claude', 'codex'])
+
+/** Once per runtime, for a coworker a controller opened (coworker-autoclose.ts): a finished
+ *  coworker left open keeps its CLI process alive for nothing. */
+export const FINISH_HINT = 'When your work is delivered and reported, end with agents.finish({}) so your tab and CLI are released.'
 
 /** Context bands at which a conversation is told, once each per runtime, to hand its remaining
  *  work to a fresh tab. Two bands, not one threshold: docs/token-thrift-policy.md shows the
@@ -85,7 +90,7 @@ interface Ledger {
 }
 
 export interface TurnBriefingDependencies {
-  database: Pick<ConductorDatabase, 'recall' | 'recordMemoryRecall' | 'forgetStaleMemories'>
+  database: Pick<ConductorDatabase, 'recall' | 'recordMemoryRecall' | 'forgetStaleMemories'> & Partial<Pick<ConductorDatabase, 'getSetting'>>
   coworkers?: (agentSessionId: string, options: CoworkerBriefingOptions) => string
   control?: (spec: AgentSpec) => string
   /** One line on what this computer can carry, so no project's agent overloads it. */
@@ -114,7 +119,11 @@ export class TurnBriefings {
     // recalled memory lines travel, fenced ahead of the owner's words (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', staticDue && this.coworker(spec) ? FINISH_HINT : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+  }
+
+  private coworker(spec: AgentSpec): boolean {
+    try { return this.deps.database.getSetting?.(COWORKER_OPENED_PREFIX + spec.id) != null } catch { return false /* A hint never stops a message. */ }
   }
 
   /** Once per runtime, like the static briefing, but from the first message after the

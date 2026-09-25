@@ -8,6 +8,7 @@ import { relative } from 'node:path'
 import type { AgentControlLink, AgentControlScope, AgentControlTab, AgentControlUiRequest, AgentFileChange } from '../shared/agent-control'
 import { conductorUri } from '../shared/agent-control'
 import { hasSessionWork } from './close-confirmation'
+import { COWORKER_OPENED_PREFIX, type CoworkerAutoClose, type FinishTarget } from './coworker-autoclose'
 import { agentConfirmFailure } from './agent-confirm-broker'
 import type { AgentConfirmOutcome } from '../shared/agent-confirm'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type AppUpdateState, type LayoutNode, type PaneKind, type PaneTab, type ProjectRecord } from '../shared/models'
@@ -139,6 +140,7 @@ const toolSignatures = {
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver up to 2000 characters to the conversation that opened this tab (its controller, whoever that is), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
+  'agents.finish': '({agentSessionId?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; refused, naming the reason, while it is running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn',
   'agents.handoff': `({handoff,title?,successor?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back; you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
@@ -270,6 +272,9 @@ export interface AgentControlDependencies {
   /** conductor-local MCP tools (src/main/local-assist/wiring.ts); plugged in with
    *  AgentControl.setLocalAssist, so construction order does not matter. */
   localAssist?: { savings(days?: number): SavingsSummary }
+  /** Finished coworkers closing themselves (src/main/coworker-autoclose.ts); plugged in with
+   *  AgentControl.setCoworkerAutoClose. Without it agents.finish is unavailable. */
+  coworkerAutoClose?: CoworkerAutoClose
   /** Whether a local model could start its server now; absent where the local runtime is not wired. */
   localModels?: {
     availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }>
@@ -846,6 +851,9 @@ export class AgentControl {
     await this.ui(target, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
     const opened = this.tab(target, tab.id)
     if (kind === 'agent' && !root) this.relationship(scope, target, opened, 'attached')
+    // The mark of a coworker a controller opened, which agents.finish and the auto-close sweep may
+    // close; the owner's own tabs, and tabs a controller only took over, never carry it.
+    if (kind === 'agent' && !root && !approvalReviewer && !scope.owner && opened.resourceId) this.deps.database.setSetting(COWORKER_OPENED_PREFIX + opened.resourceId, scope.agentSessionId)
     return { ...opened, projectId: target.projectId, workspaceId: target.sessionId, ...(grants ? { grants } : {}) }
   }
 
@@ -955,6 +963,7 @@ export class AgentControl {
       // `controlled: false` marks a sibling-project tab nobody controls yet.
       return [...own, ...orphaned, ...this.reachableElsewhere(scope).map(({ tab, scope: target, yours }) => ({ ...this.observation(target, tab, database.structured.snapshot(tab.resourceId!), observedAt), crossProject: true, controlled: yours }))]
     }
+    if (method === 'agents.finish') return this.finish(scope, args)
     if (method === 'agents.report') {
       if (Object.keys(args).some(key => key !== 'text')) throw new Error('agents.report accepts only text')
       if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error('This conversation is read-only or planning')
@@ -1203,6 +1212,9 @@ export class AgentControl {
 
   /** Plugs in the conductor-local savings ledger once it is constructed (src/main/index.ts). */
   setLocalAssist(service: AgentControlDependencies['localAssist']): void { this.deps.localAssist = service }
+
+  /** Plugs in the finished-coworker closer once it is constructed (src/main/index.ts). */
+  setCoworkerAutoClose(service: CoworkerAutoClose | undefined): void { this.deps.coworkerAutoClose = service }
 
   /** Plugs in Ideas once it is constructed (src/main/index.ts). */
   setIdeas(service: AgentControlDependencies['ideas']): void { this.deps.ideas = service }
@@ -1695,6 +1707,65 @@ export class AgentControl {
       title: tab.title ?? title, provider: spec.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
       note: 'The remaining work now belongs to that tab, which has the handoff as its first prompt. Finish only the step you are already in, report it, and stop — do not carry on with the handed-over work here in parallel. Your tab stays open and you may still steer the new one with agents.*.'
     }
+  }
+
+  /**
+   * agents.finish: a controller closes a settled coworker it controls, or a coworker ({}) asks to
+   * be closed once its own turn settles. The rules (never a wizard, a controller with open
+   * coworkers, a running turn or background tasks) live in coworker-autoclose.ts; this checks who
+   * may name whom, exactly as for any other agents.* mutation.
+   */
+  private async finish(scope: AgentControlScope, args: Args): Promise<unknown> {
+    const service = this.deps.coworkerAutoClose
+    if (!service) throw new Error('agents.finish is unavailable in this window')
+    if (Object.keys(args).some(key => key !== 'agentSessionId')) throw new Error('agents.finish accepts only agentSessionId')
+    if (args.agentSessionId === undefined) {
+      if (scope.owner) throw new Error('The owner credential has no tab of its own to finish; name the coworker with agentSessionId')
+      const self = this.finishTargets().find(target => target.agentSessionId === scope.agentSessionId)
+      if (!self) throw new Error('The caller no longer has an open tab')
+      return service.requestSelfFinish(self)
+    }
+    const id = text(args, 'agentSessionId', 160)
+    this.target(scope, id, true)
+    const target = this.finishTargets().find(candidate => candidate.agentSessionId === id)
+    if (!target) throw new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name')
+    if (target.controller !== scope.agentSessionId && !sovereign(scope)) throw new Error('Finish only a coworker this agent controls; agents.list shows them as its coworkers')
+    return service.finish(target)
+  }
+
+  /** Every agent tab in the workspaces open in this window, as the finish rules see it. */
+  finishTargets(): FinishTarget[] {
+    const tabs: Array<{ tab: AgentControlTab; projectId: string; sessionId: string; controller: string | null }> = []
+    for (const project of this.deps.database.listProjects()) for (const workspace of this.deps.database.listSessions(project.id)) {
+      let open: AgentControlTab[]
+      try { open = this.tabs({ projectId: project.id, sessionId: workspace.id, agentSessionId: '' }) } catch { continue }
+      for (const tab of open) if (tab.kind === 'agent' && tab.resourceId) tabs.push({ tab, projectId: project.id, sessionId: workspace.id, controller: this.linkFor(tab.resourceId)?.controllerAgentSessionId ?? null })
+    }
+    const controllers = new Set(tabs.flatMap(entry => entry.controller ? [entry.controller] : []))
+    return tabs.map(({ tab, projectId, sessionId, controller }) => {
+      const id = tab.resourceId!, state = this.deps.database.structured.snapshot(id)
+      const provider = typeof tab.state?.provider === 'string' ? tab.state.provider : undefined
+      return {
+        agentSessionId: id, projectId, sessionId, tabId: tab.id, title: tab.title, provider, controller,
+        opened: this.deps.database.getSetting(COWORKER_OPENED_PREFIX + id) !== null,
+        wizard: wizardActive(state?.settings, provider), controlsLiveCoworkers: controllers.has(id),
+        remote: Boolean(tab.state?.remotePeerId) || tabMachineId(tab) !== LOCAL_MACHINE_ID
+      }
+    })
+  }
+
+  /** Closes a finished coworker's tab through the renderer's tabs.close, which keeps it in the
+   *  workspace's closed tabs and refuses one with an unsent draft, then drops its control link. */
+  async closeFinished(target: FinishTarget): Promise<void> {
+    const scope = { projectId: target.projectId, sessionId: target.sessionId, agentSessionId: '' }
+    await this.ui(scope, 'tabs.close', { tabId: target.tabId, unlessDraft: true })
+    const key = 'agentControlParent:' + target.agentSessionId, stored = this.deps.database.getSetting(key)
+    this.deps.database.removeSetting(key)
+    this.deps.linksChanged?.(scope)
+    if (!stored) return
+    const link = JSON.parse(stored) as AgentControlLink
+    if (link.controllerProjectId && (link.controllerProjectId !== target.projectId || link.controllerSessionId !== target.sessionId)) { this.deps.linksChanged?.({ projectId: link.controllerProjectId, sessionId: link.controllerSessionId ?? link.sessionId }); return }
+    this.deps.collaboration.postMessage({ projectId: target.projectId, sessionId: target.sessionId, agentSessionId: link.controllerAgentSessionId, toAgentSessionId: target.agentSessionId, kind: 'handoff', body: `Finished ${target.title}: its tab is closed with history kept and its CLI released.`, metadata: { control: 'detached', finished: true, controllerTabId: link.controllerTabId, controlledTabId: link.controlledTabId } })
   }
 
   /** Every live control link this conversation holds, in any project: the coworkers it controls. */

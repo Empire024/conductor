@@ -4,6 +4,7 @@ import type { AgentProviderInfo, AgentSoundCue, AgentSoundProfile, AppSettings, 
 import { THEME_OPTIONS } from '../../../shared/models'
 import { playAgentSound } from '../agent-sounds'
 import { UsageCapDefaultSetting } from './UsageCapDefaultSetting'
+import { CoworkerAutoCloseSetting } from './CoworkerAutoCloseSetting'
 import { RemoteControlSettings } from './RemoteControlSettings'
 import { PhoneAccessSettings } from './PhoneAccessSettings'
 import { matchingSettingsSections, resolveSettingsSection, SETTINGS_SECTIONS, type SettingsSectionId } from './settings-navigation'
@@ -227,6 +228,7 @@ export function SettingsPanel({
             </>}
             {activeSection === 'usage' && <>
               <UsageCapDefaultSetting />
+              <CoworkerAutoCloseSetting />
             </>}
             {activeSection === 'machines' && <>
               <RemoteControlSettings />

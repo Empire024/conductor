@@ -199,7 +199,9 @@ const bridge: ConductorBridge = {
     setAgentSoundProfile: (profile) => ipcRenderer.invoke('settings:set-agent-sound-profile', profile),
     setDefaultNewFileExtension: (extension) => ipcRenderer.invoke('settings:set-default-file-extension', extension),
     setUpdateFeedUrl: (url) => ipcRenderer.invoke('settings:set-update-feed-url', url),
-    setLocalUpdates: (enabled) => ipcRenderer.invoke('settings:set-local-updates', enabled)
+    setLocalUpdates: (enabled) => ipcRenderer.invoke('settings:set-local-updates', enabled),
+    coworkerAutoClose: () => ipcRenderer.invoke('settings:coworker-autoclose'),
+    setCoworkerAutoClose: (minutes) => ipcRenderer.invoke('settings:set-coworker-autoclose', minutes)
   },
   updates: {
     openLocalFolder: () => ipcRenderer.invoke('updates:open-local-folder'),

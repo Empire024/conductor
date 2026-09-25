@@ -104,6 +104,7 @@ import { UpdateManager } from './update-manager'
 import { LocalUpdateBuilder } from './local-update-build'
 import { localEndpointOverride, localModelAvailability, localTurnsInFlight, onLocalTurnStart, releaseVerdict, setLocalEndpointOverride, slotsProcessing } from './providers/local'
 import { DeliveryService } from './delivery'
+import { COWORKER_AUTOCLOSE_SETTING, CoworkerAutoClose, coworkerAutoCloseMinutes, normalizeCoworkerAutoCloseMinutes } from './coworker-autoclose'
 import { registerDeliveryIpc } from './delivery-ipc'
 import { registerLogicLoopsIpc } from './logic-loops/ipc'
 import { gitHubCredential } from './github-credential'
@@ -139,6 +140,7 @@ let disposeDurableJobsIpc: (() => void) | undefined
 let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
 let disposeDeliveryIpc: (() => void) | undefined
+let coworkerAutoClose: CoworkerAutoClose | undefined
 /** The owner's Ideas inbox (src/main/ideas/register.ts); undefined until the app is ready. */
 let ideasRegistration: IdeasRegistration | undefined
 let disposeIdeasIpc: (() => void) | undefined
@@ -613,6 +615,7 @@ const disposeRuntimeServices = (): void => {
     ['durable jobs', () => { durableJobs?.dispose(); disposeDurableJobsGate?.(); disposeDurableJobsIpc?.() }],
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
+    ['coworker auto-close', () => coworkerAutoClose?.dispose()],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
     ['schedule runner', () => scheduleRunner?.stop()],
@@ -1604,6 +1607,12 @@ const registerIpc = (): void => {
     return getAppSettings()
   })
 
+  ipcMain.handle('settings:coworker-autoclose', (event) => { trustedStructured(event); return coworkerAutoCloseMinutes(key => database.getSetting(key)) })
+  ipcMain.handle('settings:set-coworker-autoclose', (event, minutes: unknown) => {
+    trustedStructured(event)
+    database.setSetting(COWORKER_AUTOCLOSE_SETTING, String(normalizeCoworkerAutoCloseMinutes(minutes)))
+    return coworkerAutoCloseMinutes(key => database.getSetting(key))
+  })
   ipcMain.handle('settings:set-local-updates', (event, enabled: unknown) => {
     trustedStructured(event)
     if (typeof enabled !== 'boolean') throw new Error('Invalid local update setting')
@@ -2495,6 +2504,19 @@ app.whenReady().then(async () => {
     })
   })
   control.setDurableJobs(durableJobs)
+  // Finished coworkers close themselves, and a settled CLI is released after the owner's idle
+  // timeout (src/main/coworker-autoclose.ts). A test launch may shorten the timeout to seconds.
+  const autoCloseOverride = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_COWORKER_AUTOCLOSE_MS) || undefined : undefined
+  coworkerAutoClose = new CoworkerAutoClose({
+    settings: database, snapshot: id => database.structured.snapshot(id),
+    targets: () => control.finishTargets(), close: target => control.closeFinished(target),
+    release: select => agents.structured.killWhere(select),
+    notice: (id, message) => { agents.structured.notice(id, message) },
+    ...(autoCloseOverride ? { timeoutOverrideMs: autoCloseOverride } : {})
+  })
+  control.setCoworkerAutoClose(coworkerAutoClose)
+  delivery.onChanged(run => coworkerAutoClose?.noteDelivery(run))
+  coworkerAutoClose.start()
   // Scheduled tasks (docs/schedules.md): scripts at night and in idle windows, local churn through
   // the same generation gate as durable jobs, bounded frontier reviews only on changed evidence.
   scheduledTasks = createScheduledTasks({

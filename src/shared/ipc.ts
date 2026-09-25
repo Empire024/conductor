@@ -105,6 +105,9 @@ export interface ConductorBridge {
     setDefaultNewFileExtension(extension: string): Promise<AppSettings>
     setUpdateFeedUrl(url: string): Promise<AppSettings>
     setLocalUpdates(enabled: boolean): Promise<AppSettings>
+    /** Minutes a finished coworker stays open, and a settled CLI stays alive, before Conductor closes or releases it; 0 is Off. */
+    coworkerAutoClose(): Promise<number>
+    setCoworkerAutoClose(minutes: number): Promise<number>
   }
   updates: {
     openLocalFolder(): Promise<void>
