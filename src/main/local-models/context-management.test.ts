@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LocalAgentSession, type LocalTelemetryEntry } from './agent.ts'
@@ -50,12 +50,16 @@ describe('context management in the local agent loop', () => {
   const cleanup: Array<() => void> = []
   afterEach(() => { for (const dispose of cleanup.splice(0)) dispose() })
 
+  // The workspace is handed over through a link (a junction on Windows) while the tools report
+  // real paths, the way a macOS /var temp root or a Windows 8.3 RUNNER~1 temp root is spelled.
   const workspace = (): string => {
-    const root = mkdtempSync(join(tmpdir(), 'conductor-ctx-'))
+    const real = mkdtempSync(join(tmpdir(), 'conductor-ctx-'))
+    const root = `${real}-link`
+    symlinkSync(real, root, 'junction')
+    cleanup.push(() => { rmSync(root, { force: true }); rmSync(real, { recursive: true, force: true }) })
     mkdirSync(join(root, 'src'), { recursive: true })
     writeFileSync(join(root, 'src', 'a.ts'), 'export const value = 1\n', 'utf8')
     for (let n = 0; n < 12; n++) writeFileSync(join(root, `big-${n}.txt`), Array.from({ length: 200 }, (_v, i) => `FILE${n} line ${i + 1} ${'payload '.repeat(18)}`).join('\n') + '\n', 'utf8')
-    cleanup.push(() => rmSync(root, { recursive: true, force: true }))
     return root
   }
 

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import { createServer, type Server } from 'node:http'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LocalAgentSession } from './agent.ts'
@@ -69,9 +69,13 @@ describe('output-budget helpers', () => {
 describe('local agent output-budget loop', () => {
   const cleanup: Array<() => void> = []
   afterEach(() => { for (const dispose of cleanup.splice(0)) dispose() })
+  // Reached through a link (a junction on Windows) while the tools report real paths, as a macOS
+  // /var or Windows 8.3 temp root is.
   const workspace = (): string => {
-    const root = mkdtempSync(join(tmpdir(), 'conductor-output-budget-'))
-    cleanup.push(() => rmSync(root, { recursive: true, force: true }))
+    const real = mkdtempSync(join(tmpdir(), 'conductor-output-budget-'))
+    const root = `${real}-link`
+    symlinkSync(real, root, 'junction')
+    cleanup.push(() => { rmSync(root, { force: true }); rmSync(real, { recursive: true, force: true }) })
     return root
   }
   const session = (endpoint: string, root: string): LocalAgentSession => new LocalAgentSession({ endpoint, apiKey: 'k'.repeat(64), model: 'local/qwen3.5-9b', workspace: root, sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })

@@ -9,7 +9,8 @@ import { detectsTestRun, shapeTestOutput, shapeToolOutput } from './tool-output.
 import { roundStage, roundStageMessage, StagnationDetector, type RoundStage, type StagnationSnapshot } from './progress.ts'
 import { completionEstablished, contractConstraints, emptyEvidence, finalizeNow, recordCommand, recordWrite, unverifiedClaim, type AcceptanceResult, type RunEvidence, type TaskContract } from './completion.ts'
 import type { LocalRoundEntry, LocalStopReason, LocalStopReport } from '../../shared/local-stop.ts'
-import { join, relative } from 'node:path'
+import { join } from 'node:path'
+import { canonicalRelative } from '../canonical-path.ts'
 import { randomUUID } from 'node:crypto'
 import { stat } from 'node:fs/promises'
 import { outputBudgetLoopStop, truncatedCallResult, type OutputBudgetLoop } from './output-budget.ts'
@@ -977,7 +978,7 @@ export class LocalAgentSession {
         }
         if (outcome.evidence?.source.sha256 && outcome.evidence.source.stable) {
           const source = outcome.evidence.source
-          const path = toPosix(relative(this.options.workspace,source.path))
+          const path = canonicalRelative(this.options.workspace,source.path)
           const prior = execution.inputs.find(i=>i.path===path)
           if(prior && prior.fingerprint!==source.sha256) {
             execution.hypotheses.push({text:`Derived results for ${path}`,status:'invalidated',reason:`Observed content fingerprint changed from ${prior.fingerprint} to ${source.sha256}`})
@@ -993,9 +994,10 @@ export class LocalAgentSession {
           wroteThisRound = true
           for (const path of outcome.paths) {
             await recordWrite(ledger.evidence, this.options.workspace, path, call.name)
-            const version=ledger.evidence.writes.find(w=>w.path===toPosix(relative(this.options.workspace,path)))
+            const changed = canonicalRelative(this.options.workspace, path)
+            const version=ledger.evidence.writes.find(w=>w.path===changed)
             if(version)execution.artifacts=[...execution.artifacts.filter(a=>a.path!==version.path),{path:version.path,fingerprint:version.sha256}].slice(-32)
-            noteFileChanged(state, toPosix(relative(this.options.workspace, path)))
+            noteFileChanged(state, changed)
             if (!this.processing) execution.progress++
           }
         }
