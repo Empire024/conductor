@@ -8,11 +8,12 @@ import { CoworkerAutoCloseSetting } from './CoworkerAutoCloseSetting'
 import { RemoteControlSettings } from './RemoteControlSettings'
 import { AlwaysOnSettings } from './AlwaysOnSettings'
 import { PhoneAccessSettings } from './PhoneAccessSettings'
+import { AttentionLogSettings } from './AttentionLogSettings'
 import { matchingSettingsSections, resolveSettingsSection, SETTINGS_SECTIONS, type SettingsSectionId } from './settings-navigation'
 import './SettingsPanel.css'
 
 let rememberedSection: SettingsSectionId = 'general'
-const sectionIcons = { general: Settings2, appearance: Palette, sounds: Volume2, usage: Gauge, machines: Monitor, phone: Smartphone, updates: RefreshCw, runtimes: Bot, debug: Bug }
+const sectionIcons = { general: Settings2, appearance: Palette, sounds: Volume2, usage: Gauge, machines: Monitor, phone: Smartphone, notifications: BellRing, updates: RefreshCw, runtimes: Bot, debug: Bug }
 
 export function SettingsPanel({
   settings,
@@ -237,6 +238,9 @@ export function SettingsPanel({
             </>}
             {activeSection === 'phone' && <>
               <PhoneAccessSettings />
+            </>}
+            {activeSection === 'notifications' && <>
+              <AttentionLogSettings />
             </>}
             {activeSection === 'updates' && <>
               <section>

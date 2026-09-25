@@ -28,7 +28,7 @@ function fixture() {
   const scope = { projectId: 'p', sessionId: 's', agentSessionId: 'controller' }
   const rows = () => notices.filter(notice => notice.id === 'controller' && notice.itemId)
   const lastRow = () => controlActivityOf({ type: 'notice', message: '', payload: rows().at(-1)!.payload })!
-  return { recorder, notices, settings, items, timers, scope, rows, lastRow, tick: (ms: number) => { clock += ms } }
+  return { recorder, notices, settings, items, timers, scope, rows, lastRow, titles, tick: (ms: number) => { clock += ms } }
 }
 
 describe('control activity recorder', () => {
@@ -89,6 +89,38 @@ describe('control activity recorder', () => {
     f.recorder.record({ scope: f.scope, method: 'agents.finish', args: { agentSessionId: 'fx7' }, error: 'Finish only a coworker this agent controls' })
     expect(f.lastRow().actions[0]).toMatchObject({ label: 'Finished FX7', failed: true, error: 'Finish only a coworker this agent controls' })
     expect(f.notices.some(notice => notice.id === 'fx7')).toBe(false)
+  })
+
+  it('names a closed tab and tells it who closed it, resolved before the close ran (VR1 C1)', () => {
+    const f = fixture()
+    const call = { scope: f.scope, method: 'tabs.close', args: { tabId: 'tab-9' } }
+    const prepared = f.recorder.prepare(call)
+    // The close is announced while the coworker is still open: a closed conversation takes no notice.
+    const told = f.notices.filter(notice => notice.id === 'fx9')
+    expect(told.map(notice => [notice.message, controlledByOf({ type: 'notice', message: notice.message, payload: notice.payload })?.verb])).toEqual([['Closed by Swarm (tabs.close)', 'Closed']])
+    delete f.titles.fx9
+    f.recorder.record({ ...call, result: { closed: true }, prepared })
+    expect(f.lastRow().actions[0]).toMatchObject({ method: 'tabs.close', label: 'Closed FX9', target: { tabId: 'tab-9', agentSessionId: 'fx9', title: 'FX9' } })
+    expect(f.notices.filter(notice => notice.id === 'fx9')).toHaveLength(1)
+  })
+
+  it('corrects an announced close that failed, and prepares nothing for reads or untargeted calls', () => {
+    const f = fixture()
+    const call = { scope: f.scope, method: 'agents.release', args: { agentSessionId: 'fx7' } }
+    const prepared = f.recorder.prepare(call)
+    f.recorder.record({ ...call, error: 'Release only a coworker this agent controls', prepared })
+    expect(f.notices.filter(notice => notice.id === 'fx7').map(notice => notice.message)).toEqual([
+      'Released by Swarm (agents.release)', 'Released by Swarm did not happen (agents.release): Release only a coworker this agent controls'
+    ])
+    expect(f.lastRow().actions[0]).toMatchObject({ label: 'Released FX7', failed: true })
+    expect(f.recorder.prepare({ scope: f.scope, method: 'tabs.list', args: {} })).toBeUndefined()
+    expect(f.recorder.prepare({ scope: f.scope, method: 'agents.finish', args: {} })).toBeUndefined()
+    // A rename is told after it happened, as before.
+    const rename = { scope: f.scope, method: 'tabs.rename', args: { tabId: 'tab-7', title: 'FX7b' } }
+    const renamed = f.recorder.prepare(rename)
+    expect(f.notices.filter(notice => notice.id === 'fx7')).toHaveLength(2)
+    f.recorder.record({ ...rename, result: {}, prepared: renamed })
+    expect(f.notices.filter(notice => notice.id === 'fx7').at(-1)!.message).toBe('Renamed by Swarm (tabs.rename)')
   })
 
   it('keeps a bounded history of app-wide actions, including the owner credential\'s', () => {

@@ -3,7 +3,7 @@ import { matchingSettingsSections, resolveSettingsSection, SETTINGS_SECTIONS } f
 
 describe('settings navigation', () => {
   it('keeps the owner-facing page order stable', () => {
-    expect(SETTINGS_SECTIONS.map(section => section.id)).toEqual(['general', 'appearance', 'sounds', 'usage', 'machines', 'phone', 'updates', 'runtimes', 'debug'])
+    expect(SETTINGS_SECTIONS.map(section => section.id)).toEqual(['general', 'appearance', 'sounds', 'usage', 'machines', 'phone', 'notifications', 'updates', 'runtimes', 'debug'])
   })
   it('matches titles, descriptions and controls, ignoring case and extra space', () => {
     expect(matchingSettingsSections(' PHONE ')).toEqual(['phone'])
@@ -11,8 +11,9 @@ describe('settings navigation', () => {
     expect(matchingSettingsSections('  HIDDEN   files ')).toEqual(['general'])
     expect(matchingSettingsSections('tokens')).toEqual(['usage'])
     expect(matchingSettingsSections('tailscale')).toEqual(['machines', 'phone'])
+    expect(matchingSettingsSections('grace period')).toEqual(['notifications'])
     expect(matchingSettingsSections('not-a-setting')).toEqual([])
-    expect(matchingSettingsSections('  ')).toHaveLength(9)
+    expect(matchingSettingsSections('  ')).toHaveLength(10)
   })
   it('opens General first, remembers the last page, and lets a deep link override it', () => {
     expect(resolveSettingsSection()).toBe('general')

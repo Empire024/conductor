@@ -24,7 +24,11 @@ export interface ControlActivityDeps {
   setTimer?(callback: () => void, ms: number): unknown
   clearTimer?(handle: unknown): void
 }
-export interface ControlCall { scope: AgentControlScope; method: string; args: unknown; result?: unknown; error?: string }
+export interface ControlCall { scope: AgentControlScope; method: string; args: unknown; result?: unknown; error?: string; prepared?: PreparedCall }
+/** What `prepare` settled before the call ran: the target it acts on, resolved while it is still
+ *  open, and whether that target was already told (a close is announced before it happens,
+ *  because a closed conversation takes no more notices). */
+export interface PreparedCall { method: string; target?: ControlTarget; noticed?: { verb: string; byTitle: string } }
 
 export const READ_FLUSH_MS = 5000
 const MAX_TRACKED_CALLERS = 200
@@ -88,6 +92,12 @@ export class ControlActivityRecorder {
 
   private now(): number { return this.deps.now?.() ?? Date.now() }
 
+  /** Runs before a mutation: resolves the tab or conversation it names while that is still open,
+   *  and announces a close on the target now. Never throws. */
+  prepare(call: Omit<ControlCall, 'result' | 'error' | 'prepared'>): PreparedCall | undefined {
+    try { return this.prepareUnsafe(call) } catch (error) { console.warn('Control activity was not prepared', error); return undefined }
+  }
+
   /** Never throws: recording is decoration and must not fail the call it describes. */
   record(call: ControlCall): void {
     try { this.recordUnsafe(call) } catch (error) { console.warn('Control activity was not recorded', error) }
@@ -98,6 +108,35 @@ export class ControlActivityRecorder {
       const parsed = JSON.parse(this.deps.getSetting(APP_CONTROL_HISTORY_KEY) ?? '[]') as unknown
       return Array.isArray(parsed) ? parsed.filter((entry): entry is AppControlEntry => Boolean(entry && typeof entry === 'object' && typeof (entry as AppControlEntry).label === 'string')) : []
     } catch { return [] }
+  }
+
+  private prepareUnsafe(call: Omit<ControlCall, 'result' | 'error' | 'prepared'>): PreparedCall | undefined {
+    if (controlMethodClass(call.method) === 'read') return undefined
+    const args = object(call.args)
+    const tabVerb = TAB_VERBS[call.method], agentVerb = AGENT_VERBS[call.method]
+    const verb = tabVerb ?? (agentVerb && str(args.agentSessionId) ? agentVerb : undefined)
+    if (!verb) return undefined
+    const target = tabVerb ? this.named(undefined, str(args.tabId)) : this.named(str(args.agentSessionId))
+    const caller = call.scope.owner ? undefined : call.scope.agentSessionId || undefined
+    if (verb.kind !== 'close' || !verb.notify || !target.agentSessionId || target.agentSessionId === caller) return { method: call.method, target }
+    const { by, byTitle } = this.caller(call.scope)
+    this.notifyDriven(target.agentSessionId, { agentSessionId: caller ?? null, ...(by?.tabId ? { tabId: by.tabId } : {}), title: byTitle, method: call.method, verb: verb.verb, at: new Date(this.now()).toISOString() })
+    return { method: call.method, target, noticed: { verb: verb.verb, byTitle } }
+  }
+
+  private caller(scope: AgentControlScope): { by?: ControlTarget; byTitle: string } {
+    const caller = scope.owner ? undefined : scope.agentSessionId || undefined
+    const by = caller ? this.deps.describe({ agentSessionId: caller }) : undefined
+    return { ...(by ? { by } : {}), byTitle: scope.owner ? 'the owner' : by?.title ?? 'another conversation' }
+  }
+
+  private notifyDriven(agentSessionId: string, payload: ControlledBy): void {
+    this.deps.notice(agentSessionId, `${payload.verb} by ${payload.title} (${payload.method})`, { [CONTROLLED_BY_KEY]: payload as unknown as Json })
+  }
+
+  private named(agentSessionId?: string, tabId?: string): ControlTarget {
+    const found = agentSessionId || tabId ? this.deps.describe({ ...(agentSessionId ? { agentSessionId } : {}), ...(tabId ? { tabId } : {}) }) : undefined
+    return { ...(agentSessionId ? { agentSessionId } : {}), ...(tabId ? { tabId } : {}), ...found }
   }
 
   private recordUnsafe(call: ControlCall): void {
@@ -116,8 +155,7 @@ export class ControlActivityRecorder {
       return
     }
     const described = this.describeCall(call, at)
-    const by = caller ? this.deps.describe({ agentSessionId: caller }) : undefined
-    const byTitle = call.scope.owner ? 'the owner' : by?.title ?? 'another conversation'
+    const { by, byTitle } = this.caller(call.scope)
     if (caller && described.actions.length) {
       const row = this.row(caller)
       for (const action of described.actions) row.activity.actions.push(action)
@@ -126,10 +164,15 @@ export class ControlActivityRecorder {
       row.dirty = true
       this.flush(caller)
     }
-    if (!call.error) for (const { target, verb } of described.driven) {
+    const noticed = call.prepared?.method === call.method ? call.prepared.noticed : undefined
+    if (noticed && call.error) {
+      // The close was announced before it ran; say so when it did not happen after all.
+      const target = described.driven[0]?.target
+      if (target?.agentSessionId) this.deps.notice(target.agentSessionId, `${noticed.verb} by ${noticed.byTitle} did not happen (${call.method}): ${call.error.slice(0, 160)}`, {})
+    }
+    if (!call.error && !noticed) for (const { target, verb } of described.driven) {
       if (!target.agentSessionId || target.agentSessionId === caller) continue
-      const payload: ControlledBy = { agentSessionId: caller ?? null, ...(by?.tabId ? { tabId: by.tabId } : {}), title: byTitle, method: call.method, verb, at }
-      this.deps.notice(target.agentSessionId, `${verb} by ${byTitle} (${call.method})`, { [CONTROLLED_BY_KEY]: payload as unknown as Json })
+      this.notifyDriven(target.agentSessionId, { agentSessionId: caller ?? null, ...(by?.tabId ? { tabId: by.tabId } : {}), title: byTitle, method: call.method, verb, at })
     }
     const appWide = described.actions.filter(action => action.appWide)
     if (appWide.length) {
@@ -143,10 +186,9 @@ export class ControlActivityRecorder {
   private describeCall(call: ControlCall, at: string): Described {
     const args = object(call.args), result = call.result, failure = call.error ? { failed: true, error: call.error.slice(0, 160) } : {}
     const { method } = call
-    const named = (agentSessionId?: string, tabId?: string): ControlTarget => {
-      const found = agentSessionId || tabId ? this.deps.describe({ ...(agentSessionId ? { agentSessionId } : {}), ...(tabId ? { tabId } : {}) }) : undefined
-      return { ...(agentSessionId ? { agentSessionId } : {}), ...(tabId ? { tabId } : {}), ...found }
-    }
+    // A target resolved before the call still names a tab the call has since closed.
+    const prepared = call.prepared?.method === method ? call.prepared.target : undefined
+    const named = (agentSessionId?: string, tabId?: string): ControlTarget => prepared ?? this.named(agentSessionId, tabId)
     const titled = (target: ControlTarget, fallback: string): string => target.title || fallback
     if (method === 'tabs.open') {
       const tab = object(result), target = { ...named(str(tab.resourceId), str(tab.id)), ...(str(tab.title) ? { title: str(tab.title) } : {}) }
