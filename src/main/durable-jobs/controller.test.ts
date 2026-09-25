@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -254,6 +254,20 @@ describe('durable job controller', () => {
     expect(worktrees.commits.map(commit => commit.message)).toEqual(['Durable job checkpoint: Before stage 1 attempt 1', 'Durable job checkpoint: After stage 1 "Stage 1"'])
     expect(job.stages[0]!.checkpointId).toBeDefined()
     expect(service.status(created.id).lastCheckpoint?.commit).toBeDefined()
+  })
+
+  it('runs in the same project folder of the worktree when git names the root by its real path', async () => {
+    // git reports the canonical root; the project is opened through a link (macOS /var, a Windows 8.3 alias).
+    const real = mkdtempSync(join(tmpdir(), 'durable-linked-')); const link = `${real}-link`
+    mkdirSync(join(real, 'repo', 'app'), { recursive: true }); symlinkSync(real, link, 'junction')
+    dirs.push(link, real)
+    const store = new DurableJobStore(':memory:')
+    const service = new DurableJobsServiceImpl({ store, runtime: new FakeRuntime([{ kind: 'answer', text: 'ok\nJOB STATUS: DONE' }]), worktrees: new FakeWorktrees(realpathSync.native(join(real, 'repo'))), logRoot: real, projectPath: () => join(link, 'repo', 'app'), ownerId: 'pid:test', sleep: tick, pollMs: 0, interruptGraceMs: 200 })
+    services.push(service)
+    const created = await service.create(input())
+    const job = service.get(created.id)
+    expect(job.cwd).toBe(join(job.worktree!.path, 'app'))
+    await until(() => service.status(created.id).status === 'completed')
   })
 
   it('snapshots changed files under logDir for a folder without git', async () => {

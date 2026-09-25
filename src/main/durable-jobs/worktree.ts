@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { cp, lstat, mkdir, readdir, readFile, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { DurableJobArtifactRef } from '../../shared/durable-jobs'
+import { canonicalRelative } from '../canonical-path'
 
 /**
  * Where a durable job works and how its checkpoints are kept.
@@ -165,7 +166,7 @@ async function storeObject(directory: string, hash: string, data: Buffer): Promi
 
 /** Package folders (repository-relative) at the root and the job's project folder. */
 function packageDirsOf(root: string, projectPath: string, worktreePath: string): string[] {
-  const project = relative(root, resolve(projectPath))
+  const project = canonicalRelative(root, projectPath)
   const candidates = ['', project && !project.startsWith('..') && !isAbsolute(project) ? project : '']
   return [...new Set(candidates)].filter(dir => existsSync(join(worktreePath, dir, 'package.json')))
 }

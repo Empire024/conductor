@@ -1,7 +1,7 @@
 import { splitExecutionEnvelope } from './bounded-execution.ts'
 import { boundedSearch } from './bounded-search.ts'
 import { afterEach, expect, it, vi } from 'vitest'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -56,6 +56,15 @@ it('searches a file and reports oversized or excluded directory coverage honestl
   await mkdir(join(c.workspace, 'node_modules')); await writeFile(join(c.workspace, 'too-big'), Buffer.alloc(9 * 1024 * 1024, 65))
   const result = await call(c, 'search', { pattern: 'missing' })
   expect(result.output).toContain('coverage=partial'); expect(result.output).toContain('exceeds 8 MiB'); expect(result.output).toContain('no matches in searched coverage')
+})
+it('searches a workspace handed over through a link (macOS /var, a Windows 8.3 temp root)', async () => {
+  const real = await fixture(), links = await mkdtemp(join(tmpdir(), 'bounded-tools-links-')), workspace = join(links, 'nested', 'workspace')
+  roots.unshift(links); await mkdir(join(links, 'nested'))
+  await symlink(real.workspace, workspace, 'junction')
+  await mkdir(join(real.workspace, 'src')); await writeFile(join(real.workspace, 'src', 'a.ts'), 'const needle = 1\n')
+  const found = await call({ ...real, workspace }, 'search', { pattern: 'needle' })
+  expect(found.failed).toBe(false)
+  expect(found.output).toContain('src/a.ts:1:7: const needle = 1'); expect(found.output).not.toContain('..')
 })
 it('rejects escaped and secret paths in each read mode', async () => {
   const c = await fixture()
