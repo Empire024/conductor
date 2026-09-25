@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
-import { relative } from 'node:path'
+import { canonicalRelative } from '../canonical-path.ts'
 
 /** When a local run is finished, and whether its final message can be believed. Small models
  *  say "all edits applied, tests pass" with no tool call behind it (a real run did exactly that),
@@ -72,7 +72,7 @@ export const emptyEvidence = (): RunEvidence => ({ writes: [], commands: [] })
 export async function recordWrite(evidence: RunEvidence, workspace: string, absolutePath: string, tool: string): Promise<void> {
   let sha256 = ''
   try { sha256 = createHash('sha256').update(await readFile(absolutePath)).digest('hex') } catch { sha256 = 'unreadable' }
-  const path = toPosix(relative(workspace, absolutePath))
+  const path = toPosix(canonicalRelative(workspace, absolutePath))
   const existing = evidence.writes.findIndex(entry => entry.path === path)
   if (existing >= 0) evidence.writes[existing] = { path, tool, sha256 }
   else evidence.writes.push({ path, tool, sha256 })

@@ -12,6 +12,7 @@ import { SandboxPolicyError, SandboxUnavailableError, assertNoPackageInstall } f
 import { readPublicWeb, searchPublicWeb } from './web.ts'
 import { isSecretPath, resolveInWorkspace, resolveWritablePath, SecretPathError, WorkspaceBoundaryError } from './workspace.ts'
 import { pathAllowed, type TaskContract } from './completion.ts'
+import { canonicalRelative } from '../canonical-path.ts'
 
 /** The complete capability set a local model is given. It is an allowlist in code, not an
  *  instruction in a prompt: a name that is not in this list cannot be dispatched at all, which
@@ -224,15 +225,17 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
           context.signal?.throwIfAborted()
           if (Date.now() - searchStarted > 1500) { skipped.push('search time budget reached; narrow path/pattern'); return false }
           if (scanned >= 2000) { skipped.push('file count limit reached'); return false }
-          file = (await resolveInWorkspace(context.workspace, relative(context.workspace, file))).path
-          if (suffix && !file.endsWith(suffix)) { skipped.push(`${relative(context.workspace, file)}: suffix filter`); return true }
+          // The walk yields canonical paths; the workspace may be spelled through a link or an 8.3 alias.
+          const resolvedFile = await resolveInWorkspace(context.workspace, canonicalRelative(context.workspace, file))
+          file = resolvedFile.path
+          const rel = resolvedFile.relative
+          if (suffix && !file.endsWith(suffix)) { skipped.push(`${rel}: suffix filter`); return true }
           const info = await stat(file)
-          if (info.size > MAX_READ_BYTES) { skipped.push(`${relative(context.workspace, file)}: exceeds 8 MiB; use read_file inspect/bytes`); return true }
+          if (info.size > MAX_READ_BYTES) { skipped.push(`${rel}: exceeds 8 MiB; use read_file inspect/bytes`); return true }
           let content: string
-          try { content = await readFile(file, 'utf8') } catch { skipped.push(`${relative(context.workspace, file)}: unreadable`); return true }
+          try { content = await readFile(file, 'utf8') } catch { skipped.push(`${rel}: unreadable`); return true }
           scanned++
-          if (content.includes('\0') || content.includes('\uFFFD')) { skipped.push(`${relative(context.workspace, file)}: binary or invalid UTF-8; use read_file inspect/bytes`); return true }
-          const rel = relative(context.workspace, file).replace(/\\/g, '/')
+          if (content.includes('\0') || content.includes('\uFFFD')) { skipped.push(`${rel}: binary or invalid UTF-8; use read_file inspect/bytes`); return true }
           const found = boundedSearch(content, pattern, MAX_SEARCH_HITS - hits.length)
           for (const hit of found.hits) hits.push(`${rel}:${hit.line}:${hit.column}: ${hit.excerpt}`)
           if (found.skippedCount) skipped.push(`${rel}: ${found.skippedCount} lines exceed 16 KiB regex limit (first lines: ${found.skippedLines.join(', ')}); use read_file bytes or a saved streaming script`)

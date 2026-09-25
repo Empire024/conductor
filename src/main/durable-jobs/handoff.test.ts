@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { createServer } from 'node:http'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DEFAULT_DURABLE_JOB_BUDGETS, type DurableJobHandoff, type DurableJobStage } from '../../shared/durable-jobs.ts'
@@ -15,6 +15,8 @@ import { buildStagePrompt, classifyResponse, classifyStageOutcome, estimateReque
 const cleanup: Array<() => void> = []
 afterEach(() => { cleanup.splice(0).forEach(fn => fn()) })
 const tempDir = (prefix: string): string => { const dir = mkdtempSync(join(tmpdir(), prefix)); cleanup.push(() => rmSync(dir, { recursive: true, force: true })); return dir }
+/** A temp root spelled through a link (a junction on Windows), as a macOS /var or Windows 8.3 temp root is. */
+const linkedTempDir = (prefix: string): string => { const real = tempDir(prefix); const link = `${real}-link`; symlinkSync(real, link, 'junction'); cleanup.unshift(() => rmSync(link, { force: true })); return link }
 
 const QWEN = { id: 'local/qwen3.6-35b-a3b', contextTokens: 32768 }
 const job = { id: 'job-1', title: 'Port the parser', objective: 'Port the invoice parser to the new format and keep every test green.', logDir: 'C:/jobs/job-1/logs', budgets: DEFAULT_DURABLE_JOB_BUDGETS }
@@ -150,7 +152,7 @@ const sessionOptions = (url: string, root: string, taskId: string) => ({ endpoin
 
 describe('extractHandoff', () => {
   it('lets a second worker continue from the handoff alone, without the prior transcript', async () => {
-    const root = tempDir('durable-handoff-')
+    const root = linkedTempDir('durable-handoff-')
     const stage1 = stage(0, 'Record the constant', 'Write the parser constant to notes.txt.')
     const stage2 = stage(1, 'Report the constant', 'Read the file stage 1 wrote and state the constant.')
     // Worker 1: writes a file, then finishes with narration only it should remember.

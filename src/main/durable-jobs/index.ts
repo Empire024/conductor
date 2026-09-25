@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir } from 'node:fs/promises'
-import { join, relative } from 'node:path'
+import { join } from 'node:path'
+import { canonicalRelative } from '../canonical-path'
 import { makeId } from '../../shared/models'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_STAGE_KINDS, TERMINAL_JOB_STATUSES, type CreateDurableJobInput, type DurableJobCheckpoint, type DurableJob, type DurableJobBudgets, type DurableJobEvent, type DurableJobReport, type DurableJobsService, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../shared/durable-jobs'
 import { DurableJobController, operationKindForTool } from './controller'
@@ -148,7 +149,7 @@ export class DurableJobsServiceImpl implements DurableJobsService {
       const root = await this.worktrees.gitRoot(projectPath)
       if (root) {
         worktree = await this.worktrees.create(projectPath, id, join(logDir, 'worktree'))
-        cwd = join(worktree.path, relative(root, projectPath))
+        cwd = join(worktree.path, canonicalRelative(root, projectPath))
       }
     }
     const now = this.clock().toISOString()
