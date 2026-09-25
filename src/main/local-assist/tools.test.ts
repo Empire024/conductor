@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LocalModelOutcome, LocalModelRequest, SavingsRecord } from './contract'
 import { capLines, failureLines, modelExcerpt, splitLines, stripAnsi } from './digest'
-import { LocalAssistTools, hostCommandRunner, type CommandRunner, type LocalAssistSession } from './tools'
+import { LocalAssistTools, hostCommandRunner, promptTerms, type CommandRunner, type LocalAssistSession } from './tools'
 
 let root: string
 beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'local-assist-')) })
@@ -23,7 +23,7 @@ function harness(options: { outcome?: LocalModelOutcome; output?: string; exitCo
   })
   const tools = new LocalAssistTools({
     session: id => id === 'a1' ? session(options.session) : undefined,
-    runner: { ask: async request => { asked.push(request); return options.outcome ?? { ok: true, answer: { text: 'FAIL src/a.test.ts > adds\nsrc/a.ts:3 expected 2', model: 'local/qwen', inputTokens: 900, outputTokens: 30, durationMs: 50 } } } },
+    runner: { contextTokens: async () => 32_768, promptTokens: async request => Math.ceil((request.system.length + request.user.length) / 4), ask: async request => { asked.push(request); return options.outcome ?? { ok: true, answer: { text: 'FAIL src/a.test.ts > adds\nsrc/a.ts:3 expected 2', model: 'local/qwen', inputTokens: 900, outputTokens: 30, durationMs: 50 } } } },
     ledger: { record: entry => records.push({ at: 'now', ...entry }), summary: () => { throw new Error('unused') } },
     run,
     now: () => new Date('2026-09-24T12:00:00Z'),
@@ -113,6 +113,30 @@ describe('run_and_summarize', () => {
     const result = await h.tools.runAndSummarize('a1', { command: 'echo ok', timeoutSec: 5 })
     expect(result.structured).not.toMatchObject({ stillRunning: true })
   })
+
+  it('sizes the excerpt from the server and retries a context refusal once at half the size', async () => {
+    const output = Array.from({ length: 30_000 }, (_, index) => `FAIL src/case-${index}.test.ts > step ${index} (shard ${index % 32}): AssertionError: expected ${index} to equal ${index + 1} at src/case-${index}.test.ts:${index % 400}:7`).join('\n')
+    const asked: LocalModelRequest[] = []
+    const tools = new LocalAssistTools({
+      session: () => session(),
+      runner: {
+        contextTokens: async () => 32_768,
+        ask: async request => {
+          asked.push(request)
+          return asked.length === 1 ? { ok: false, reason: 'the request was longer than the local model\'s context', contextExceeded: true } : { ok: true, answer: { text: 'All steps passed.', model: 'local/qwen', inputTokens: 900, outputTokens: 5, durationMs: 5 } }
+        }
+      },
+      ledger: { record: () => undefined, summary: () => { throw new Error('unused') } },
+      run: async request => { writeFileSync(request.logFile, output); return { exitCode: 0, durationMs: 5, timedOut: false, outputChars: output.length } }
+    })
+    const result = await tools.runAndSummarize('a1', { command: 'npm test', timeoutSec: 60 })
+    expect(asked).toHaveLength(2)
+    // Unmeasured, at 1.5 characters a token: the first excerpt fits a 32k context, not 60,000 chars.
+    expect(asked[0]!.user.length).toBeLessThan(32_768 * 1.5)
+    expect(asked[1]!.user.length).toBeLessThan(asked[0]!.user.length * 0.6)
+    expect(result.text).toContain('All steps passed.')
+    expect(result.structured).toMatchObject({ summarized: true })
+  })
 })
 
 describe('local_ask and summarize_file', () => {
@@ -183,6 +207,105 @@ describe('local_ask and summarize_file', () => {
     const result = await h.tools.summarizeFile('a1', { path: 'a.md' })
     expect(result.text).toContain('Local model unavailable: no local model is configured.')
     expect(h.records[0]).toMatchObject({ tool: 'summarize_file', usedModel: false, rawChars: 0 })
+  })
+
+  /** The VR3 A4 fixture: ~1 MB of dense service-log lines with needles near 100 KB and 900 KB. */
+  const denseLog = (): string => {
+    const services = ['auth', 'billing', 'search', 'render', 'queue', 'mailer', 'gateway', 'indexer']
+    const verbs = ['accepted', 'retried', 'throttled', 'completed', 'deferred', 'rejected', 'merged', 'flushed']
+    let out = '', i = 0, alpha = false, omega = false
+    while (out.length < 1_050_000) {
+      if (!alpha && out.length > 100_000) { out += 'NEEDLE-ALPHA configuration value: 48213-KESTREL\n'; alpha = true }
+      if (!omega && out.length > 900_000) { out += 'NEEDLE-OMEGA rollback token: 90517-HALCYON\n'; omega = true }
+      out += `2026-09-2${i % 5} 1${i % 10}:${String(i % 60).padStart(2, '0')} [${services[(i * 7) % 8]}] request ${100000 + i} ${verbs[(i * 5 + 3) % 8]} after ${(i * 37) % 900} ms (shard ${(i * 11) % 32})\n`
+      i++
+    }
+    return out
+  }
+  /** A 32k server whose tokenizer makes 1.7 characters a token and that refuses, as llama.cpp does,
+   *  any prompt that does not leave the answer room. */
+  const strictServer = (options: { measure?: boolean; charsPerToken?: number; onAsk?: () => void } = {}) => {
+    const asked: LocalModelRequest[] = []
+    let refused = 0
+    const tokens = (text: string): number => Math.ceil(text.length / (options.charsPerToken ?? 1.7))
+    const runner = {
+      contextTokens: async () => 32_768,
+      ...(options.measure === false ? {} : { promptTokens: async (request: { system: string; user: string }) => tokens(request.system + request.user) + 12 }),
+      ask: async (request: LocalModelRequest): Promise<LocalModelOutcome> => {
+        asked.push(request)
+        options.onAsk?.()
+        if (tokens(request.system + request.user) + 12 + request.maxTokens > 32_768) { refused++; return { ok: false, reason: 'the request was longer than the local model\'s context (Local model request failed with HTTP 400 (exceed_context_size))', contextExceeded: true } }
+        // Answered the way the real Qwen 3.6 answered the two-needle question on one section:
+        // the needle it holds, and NOT FOUND for the other (VR3 A4 re-run, 15:2xZ).
+        const needle = /^\d+: (NEEDLE-\w+ .*)$/m.exec(request.user)
+        const other = needle?.[1]!.startsWith('NEEDLE-ALPHA') ? 'NEEDLE-OMEGA' : 'NEEDLE-ALPHA'
+        return { ok: true, answer: { text: needle ? `${needle[0]}\n${other}: NOT FOUND IN THIS EXCERPT` : 'NOT FOUND IN THIS EXCERPT', model: 'local/qwen3.6-35b-a3b', inputTokens: 1000, outputTokens: 10, durationMs: 20 } }
+      }
+    }
+    return { runner, asked, refused: () => refused }
+  }
+
+  it('sizes windows from the server\'s real context so a dense 1 MB log is read end to end (VR3 A4)', async () => {
+    writeFileSync(join(root, 's7-1mb.log'), denseLog())
+    const server = strictServer()
+    const tools = new LocalAssistTools({ session: () => session(), runner: server.runner, ledger: { record: () => undefined, summary: () => { throw new Error('unused') } } })
+    const result = await tools.ask('a1', { prompt: 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', files: ['s7-1mb.log'] })
+    expect(server.refused()).toBe(0)
+    expect(result.structured).toMatchObject({ answered: true, examined: result.structured.chunks })
+    expect(result.text).toMatch(/s7-1mb\.log \(part \d+\/\d+, lines \d+–\d+\): \d+: NEEDLE-ALPHA configuration value: 48213-KESTREL/)
+    expect(result.text).toMatch(/s7-1mb\.log \(part \d+\/\d+, lines \d+–\d+\): \d+: NEEDLE-OMEGA rollback token: 90517-HALCYON/)
+    expect(result.text).not.toContain('not examined')
+    // The sections naming the question's terms are read before the rest.
+    expect(server.asked[0]!.user).toContain('NEEDLE-ALPHA configuration')
+    expect(server.asked[1]!.user).toContain('NEEDLE-OMEGA rollback')
+    expect(result.text.indexOf('NEEDLE-ALPHA configuration')).toBeLessThan(result.text.indexOf('NEEDLE-OMEGA rollback'))
+  })
+
+  it('retries a window the server refuses as too long once, as two halves, when it cannot measure first', async () => {
+    writeFileSync(join(root, 'dense.log'), denseLog().slice(0, 200_000))
+    const server = strictServer({ measure: false, charsPerToken: 1.2 })
+    const tools = new LocalAssistTools({ session: () => session(), runner: server.runner, ledger: { record: () => undefined, summary: () => { throw new Error('unused') } } })
+    const result = await tools.ask('a1', { prompt: 'Quote the NEEDLE-ALPHA line.', files: ['dense.log'] })
+    expect(server.refused()).toBeGreaterThan(0)
+    expect(result.text).toContain('NEEDLE-ALPHA configuration value: 48213-KESTREL')
+    expect(result.text).not.toContain('not examined')
+    expect(result.structured).toMatchObject({ answered: true, examined: result.structured.chunks })
+  })
+
+  it('stops after one smaller retry and names exactly which lines were not read', async () => {
+    writeFileSync(join(root, 'dense.log'), denseLog().slice(0, 200_000))
+    const tools = new LocalAssistTools({
+      session: () => session(),
+      runner: { ask: async () => ({ ok: false, reason: 'the request was longer than the local model\'s context (Local model request failed with HTTP 400 (exceed_context_size))', contextExceeded: true }) },
+      ledger: { record: () => undefined, summary: () => { throw new Error('unused') } }
+    })
+    const result = await tools.ask('a1', { prompt: 'Quote the NEEDLE-ALPHA line.', files: ['dense.log'] })
+    expect(result.structured).toMatchObject({ answered: false, examined: 0 })
+    expect(result.text).toMatch(/^Not found in the 0 of \d+ section\(s\)/)
+    expect(result.text).toMatch(/were not examined \(local model failed: .*exceed_context_size.*\): dense\.log lines 1–\d+\./)
+  })
+
+  it('answers within the 300 s an HTTP MCP client waits: term sections first, the rest reported unread (VR3 A4)', async () => {
+    writeFileSync(join(root, 's7-1mb.log'), denseLog())
+    let clock = Date.parse('2026-09-25T12:00:00Z')
+    const server = strictServer({ onAsk: () => { clock += 75_000 } })
+    const tools = new LocalAssistTools({ session: () => session(), runner: server.runner, ledger: { record: () => undefined, summary: () => { throw new Error('unused') } }, now: () => new Date(clock) })
+    const result = await tools.ask('a1', { prompt: 'values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines', files: ['s7-1mb.log'] })
+    // 75 s a section: sections end at 75, 150 and 225 s; a fourth would end at 300 s, past 240.
+    expect(server.asked).toHaveLength(3)
+    expect(server.asked[2]!.timeoutMs).toBe(135_000) // cut off 285 s into the call, under the client's 300 s
+    expect(result.text).toContain('NEEDLE-ALPHA configuration value: 48213-KESTREL')
+    expect(result.text).toContain('NEEDLE-OMEGA rollback token: 90517-HALCYON')
+    const total = result.structured.chunks as number
+    expect(result.text).toContain(`read 3 of ${total} sections. ${total - 3} of ${total} sections of s7-1mb.log (`)
+    expect(result.text).toMatch(/bytes\) were not examined \(one call answers within 4 min, and a section takes about 75 s on this model\): s7-1mb\.log lines \d+–\d+/)
+    expect(result.text).toContain('Sections naming "needle-alpha", "needle-omega" were read first.')
+  })
+
+  it('picks only distinctive literals from the question', () => {
+    expect(promptTerms('values on the NEEDLE-ALPHA and NEEDLE-OMEGA lines')).toEqual(['needle-alpha', 'needle-omega'])
+    expect(promptTerms('where is line1500 defined? Is there a line saying ALL_DONE or "exit code 3"?')).toEqual(['exit code 3', 'line1500', 'all_done'])
+    expect(promptTerms('Summarise this file: its purpose and anything unusual.')).toEqual([])
   })
 })
 

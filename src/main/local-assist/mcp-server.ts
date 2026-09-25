@@ -154,7 +154,10 @@ export class LocalAssistMcpServer {
         try {
           const result = await tool.call(this.tools, credential.agentSessionId, args, signal)
           if (this.credentials.get(credential.agentSessionId) !== credential) throw new Error('Local assist access was revoked while the tool was running')
-          return { ...envelope, result: { content: [{ type: 'text', text: result.text }], structuredContent: result.structured } }
+          // The answer rides in structuredContent too: Claude Code (and Codex) hand the model only
+          // the structuredContent JSON when a result has one and drop the text blocks, so without
+          // it every successful call reached the caller as `{"answered":true,…}` and nothing else.
+          return { ...envelope, result: { content: [{ type: 'text', text: result.text }], structuredContent: { text: result.text, ...result.structured } } }
         } catch (error) { return { ...envelope, result: { isError: true, content: [{ type: 'text', text: errorMessage(error) }] } } }
       }
       return { ...envelope, error: { code: -32601, message: `Method not found: ${message.method ?? '(none)'}` } }

@@ -206,4 +206,29 @@ describe('local model runner', () => {
     await createLocalModelRunner(h.ports).ask(request)
     expect(h.log.completes[1]!.model).toBe('local')
   })
+
+  it('flags a context refusal so the caller can retry smaller, and gives a generation the time it asks for (VR3 A4)', async () => {
+    const refusal = Object.assign(new Error('Local model request failed with HTTP 400 (exceed_context_size)'), { status: 400, contextExceeded: true })
+    const h = harness({ servers: () => [entry(QWEN_9B, 6001)], complete: async () => { throw refusal } })
+    const outcome = await createLocalModelRunner(h.ports).ask(request)
+    expect(outcome).toMatchObject({ ok: false, contextExceeded: true })
+    expect(!outcome.ok && outcome.reason).toMatch(/longer than the local model's context .*exceed_context_size/)
+    const other = await createLocalModelRunner(harness({ servers: () => [entry(QWEN_9B, 6001)], complete: async () => { throw new Error('socket hang up') } }).ports).ask(request)
+    expect(other).toEqual({ ok: false, reason: 'the local model failed: socket hang up' })
+  })
+
+  it("reads the running server's context and measures a prompt on its tokenizer without generating", async () => {
+    const measured: CompletionRequest[] = []
+    const h = harness({
+      servers: () => [entry(QWEN_9B, 6001)],
+      context: async (endpoint, id) => endpoint === 'http://127.0.0.1:6001' && id === QWEN_9B ? 32768 : null,
+      measure: async req => { measured.push(req); return 1234 }
+    })
+    const runner = createLocalModelRunner(h.ports)
+    expect(await runner.contextTokens!()).toBe(32768)
+    expect(await runner.promptTokens!({ system: 'S', user: 'U' })).toBe(1234)
+    expect(measured[0]).toMatchObject({ endpoint: 'http://127.0.0.1:6001', model: QWEN_9B, measureTokens: true, messages: [{ role: 'system', content: 'S' }, { role: 'user', content: 'U' }] })
+    expect(h.log.completes).toHaveLength(0)
+    expect(await createLocalModelRunner(harness({ servers: () => [entry(QWEN_9B, 6001)] }).ports).contextTokens!()).toBeNull()
+  })
 })

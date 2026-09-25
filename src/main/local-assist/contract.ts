@@ -28,7 +28,7 @@ export interface LocalModelAnswer {
 }
 
 /** `ok: false` names why the local model was not used; the tool then returns raw lines and says so. */
-export type LocalModelOutcome = { ok: true; answer: LocalModelAnswer } | { ok: false; reason: string }
+export type LocalModelOutcome = { ok: true; answer: LocalModelAnswer } | { ok: false; reason: string; contextExceeded?: boolean }
 
 export interface LocalModelRequest {
   system: string
@@ -36,6 +36,8 @@ export interface LocalModelRequest {
   maxTokens: number
   /** Overrides MODEL_WAIT_BUDGET_MS (tests). */
   waitBudgetMs?: number
+  /** Overrides GENERATION_TIMEOUT_MS for a request whose prompt alone takes longer to read. */
+  timeoutMs?: number
   signal?: AbortSignal
 }
 
@@ -43,6 +45,12 @@ export interface LocalModelRunner {
   /** One bounded, non-streaming answer. Never throws. Waits at most the wait budget for a server
    *  and a free slot, and at most GENERATION_TIMEOUT_MS for the answer. */
   ask(request: LocalModelRequest): Promise<LocalModelOutcome>
+  /** The running server's per-slot context in tokens (llama.cpp /props n_ctx), or null when no
+   *  server answers or it does not say. Starts no generation. */
+  contextTokens?(signal?: AbortSignal): Promise<number | null>
+  /** Tokens this system + user pair renders to on the running server (its chat template and
+   *  tokenizer), or null when it cannot be measured. Starts no generation. */
+  promptTokens?(request: Pick<LocalModelRequest, 'system' | 'user'>, signal?: AbortSignal): Promise<number | null>
 }
 
 /** What the runner needs from the app; index.ts wires the real ones (model-runner.ts has a
@@ -67,6 +75,10 @@ export interface LocalModelRunnerPorts {
   /** startServer under the machine-wide admission lock; resolves once it answers. */
   start(model: LocalModelConfig): Promise<{ port: number }>
   complete(request: CompletionRequest): Promise<CompletionResult>
+  /** The server's per-slot context (n_ctx), or null. */
+  context?(endpoint: string, model: string): Promise<number | null>
+  /** The rendered prompt's token count on the server (apply-template + tokenize), or null. */
+  measure?(request: CompletionRequest): Promise<number | null>
 }
 
 export type LocalAssistTool = 'run_and_summarize' | 'local_ask' | 'summarize_file'

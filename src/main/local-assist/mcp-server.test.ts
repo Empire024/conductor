@@ -47,6 +47,21 @@ describe('LocalAssistMcpServer', () => {
     expect(runAndSummarize).toHaveBeenCalledWith('mine', { command: 'npm test' }, expect.any(AbortSignal))
   })
 
+  it('puts the answer where Claude Code and Codex read it: inside structuredContent (VR3 A5)', async () => {
+    const answer = 'NEEDLE-ALPHA is 48213-KESTREL (s7.log:1365)\n— local'
+    const ask = vi.fn(async () => ({ text: answer, structured: { answered: true, files: [{ path: 's7.log', bytes: 10, truncated: false }] } }))
+    const server = await started({ ask } as never)
+    const { url, token } = claudeCredential(server.configure(spec('claude')))
+    const called = await (await rpc(url, token, { jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'local_ask', arguments: { prompt: 'x', files: ['s7.log'] } } })).json()
+    // What Claude Code hands the model: the structuredContent JSON when there is one, text blocks
+    // dropped (Codex does the same); the content text only when there is none.
+    const surfaced = (result: { content: Array<{ type: string; text?: string }>; structuredContent?: unknown }): string =>
+      result.structuredContent !== undefined ? JSON.stringify(result.structuredContent) : result.content.filter(part => part.type === 'text').map(part => part.text).join('\n')
+    expect(JSON.parse(surfaced(called.result)).text).toBe(answer)
+    expect(called.result.structuredContent).toMatchObject({ answered: true, files: [{ path: 's7.log' }] })
+    expect(called.result.content).toEqual([{ type: 'text', text: answer }])
+  })
+
   it('reports a tool failure as a result the agent can read', async () => {
     const server = await started({ runAndSummarize: async () => { throw new Error('only available to a conversation in Auto') } } as never)
     const { url, token } = claudeCredential(server.configure(spec('claude')))

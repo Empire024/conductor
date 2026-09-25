@@ -23,7 +23,9 @@ export interface LocalModelRunnerOptions {
   generationTimeoutMs?: number
 }
 
-class Fallback { constructor(readonly reason: string) {} }
+class Fallback { constructor(readonly reason: string, readonly contextExceeded = false) {} }
+/** How long a measured context or a located server is trusted before it is read again. */
+const LOCATE_MEMORY_MS = 30_000
 
 const seconds = (ms: number): number => Math.max(1, Math.round(ms / 1000))
 /** Short, single-line, and never carrying the key. Server bodies never reach an error message
@@ -36,6 +38,8 @@ const safeDetail = (error: unknown, secrets: string[]): string => {
 }
 const stripThinking = (text: string): string => text.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/<think>[\s\S]*$/i, '').trim()
 const estimate = (chars: number): number => Math.ceil(chars / 4)
+/** llama.cpp's refusal of a prompt longer than the slot (LocalRequestError.contextExceeded). */
+const contextExceeded = (error: unknown): boolean => Boolean(error && typeof error === 'object' && (error as { contextExceeded?: unknown }).contextExceeded === true)
 
 export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: LocalModelRunnerOptions = {}): LocalModelRunner {
   const preferred = options.preferred ?? DEFAULT_PREFERRED_MODELS
@@ -121,7 +125,8 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
   const generate = async (request: LocalModelRequest, endpoint: string, model: string, apiKey: string, started: number): Promise<LocalModelOutcome> => {
     const controller = new AbortController()
     let timedOut = false
-    const timer = setTimeout(() => { timedOut = true; controller.abort() }, generationTimeoutMs)
+    const timeoutMs = request.timeoutMs ?? generationTimeoutMs
+    const timer = setTimeout(() => { timedOut = true; controller.abort() }, timeoutMs)
     const onAbort = (): void => controller.abort()
     request.signal?.addEventListener('abort', onAbort)
     try {
@@ -131,7 +136,7 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
         messages: [{ role: 'system', content: request.system }, { role: 'user', content: request.user }],
         maxTokens: request.maxTokens, temperature: 0.2, reasoningEffort: 'none', signal: controller.signal
       })
-      if (timedOut) throw new Fallback(`the local model did not answer within ${seconds(generationTimeoutMs)} s`)
+      if (timedOut) throw new Fallback(`the local model did not answer within ${seconds(timeoutMs)} s`)
       cancelled(request.signal)
       const text = stripThinking(result.content ?? '')
       if (!text) throw new Fallback('the local model returned an empty answer')
@@ -146,8 +151,9 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
       }
     } catch (error) {
       if (error instanceof Fallback) throw error
-      if (timedOut) throw new Fallback(`the local model did not answer within ${seconds(generationTimeoutMs)} s`)
+      if (timedOut) throw new Fallback(`the local model did not answer within ${seconds(timeoutMs)} s`)
       if (request.signal?.aborted) throw new Fallback('the call was cancelled')
+      if (contextExceeded(error)) throw new Fallback(`the request was longer than the local model's context (${safeDetail(error, [apiKey])})`, true)
       throw new Fallback(`the local model failed: ${safeDetail(error, [apiKey])}`)
     } finally {
       clearTimeout(timer)
@@ -155,7 +161,42 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
     }
   }
 
+  /** The endpoint a measurement goes to: the override, or the server ask() would use. No lock:
+   *  reading /props or tokenizing never takes the generation slot. */
+  let located: { at: number; endpoint: string; model: string; context?: number | null } | null = null
+  const locate = async (signal?: AbortSignal): Promise<{ endpoint: string; model: string; context?: number | null } | null> => {
+    if (located && ports.now() - located.at < LOCATE_MEMORY_MS) return located
+    try {
+      let override: string | null = null
+      try { override = ports.endpointOverride() } catch { /* none */ }
+      const started = ports.now()
+      const found = override ? { endpoint: override, model: pick(configured())?.id ?? 'local' } : await ensureServer(started, started + MODEL_WAIT_BUDGET_MS, signal).then(({ port, model }) => ({ endpoint: `http://127.0.0.1:${port}`, model }))
+      located = { at: ports.now(), ...found }
+      return located
+    } catch { return null }
+  }
+
   return {
+    async contextTokens(signal) {
+      const server = await locate(signal)
+      if (!server || !ports.context) return null
+      if (server.context === undefined) {
+        const context = await ports.context(server.endpoint, server.model).catch(() => null)
+        server.context = typeof context === 'number' && Number.isSafeInteger(context) && context > 0 ? context : null
+      }
+      return server.context
+    },
+    async promptTokens(request, signal) {
+      const server = await locate(signal)
+      if (!server || !ports.measure) return null
+      let apiKey = ''
+      try { apiKey = ports.apiKey() } catch { return null }
+      const tokens = await ports.measure({
+        endpoint: server.endpoint, apiKey, model: server.model, measureTokens: true, reasoningEffort: 'none', signal,
+        messages: [{ role: 'system', content: request.system }, { role: 'user', content: request.user }]
+      }).catch(() => null)
+      return typeof tokens === 'number' && Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null
+    },
     async ask(request) {
       const started = ports.now()
       const deadline = started + (request.waitBudgetMs ?? MODEL_WAIT_BUDGET_MS)
@@ -183,7 +224,8 @@ export function createLocalModelRunner(ports: LocalModelRunnerPorts, options: Lo
         if (busy) throw new Fallback(`the local model was busy for ${seconds(Math.min(ports.now(), deadline) - started)} s`)
         return await generate(request, `http://127.0.0.1:${port}`, model, apiKey, started)
       } catch (error) {
-        return { ok: false, reason: error instanceof Fallback ? error.reason : `the local model failed: ${safeDetail(error, [safeKey(ports)])}` }
+        if (error instanceof Fallback) return { ok: false, reason: error.reason, ...(error.contextExceeded ? { contextExceeded: true } : {}) }
+        return { ok: false, reason: `the local model failed: ${safeDetail(error, [safeKey(ports)])}` }
       } finally {
         if (locked) release()
       }
@@ -222,6 +264,8 @@ export async function realRunnerPorts(): Promise<LocalModelRunnerPorts> {
       const outcome = await llama.startServer(config.loadConfig().llamaServer, model, key)
       return { port: outcome.port }
     },
-    complete: request => client.chatCompletion(request)
+    complete: request => client.chatCompletion(request),
+    context: async (endpoint, model) => (await local.probeLocalContext(endpoint, apiKey(), model, Number.MAX_SAFE_INTEGER)).serverTokens ?? null,
+    measure: async request => (await client.runtimePromptTokens(request)) ?? null
   }
 }

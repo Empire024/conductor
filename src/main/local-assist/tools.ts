@@ -4,7 +4,7 @@ import { createWriteStream, mkdirSync } from 'node:fs'
 import { open, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isSecretPath } from '../local-models/workspace.ts'
-import type { LocalAssistTool, LocalModelOutcome, LocalModelRunner, SavingsLedger } from './contract.ts'
+import { GENERATION_TIMEOUT_MS, type LocalAssistTool, type LocalModelOutcome, type LocalModelRunner, type SavingsLedger } from './contract.ts'
 import { capLines, chunkLines, clip, failureLines, modelExcerpt, splitLines, stripAnsi, tailLines } from './digest.ts'
 
 /** The conversation a call belongs to, read live on every call: a permission the owner lowers
@@ -38,9 +38,31 @@ export interface LocalAssistResult { text: string; structured: Record<string, un
 
 /** Raw lines returned verbatim with every summary, so nothing critical depends only on the model. */
 const RAW_TAIL = 15
-/** Characters of log or file the local model reads in one call: its 32k-token context has to
- *  hold this, the instructions and the answer. */
-const MODEL_INPUT_CHARS = 60_000
+/** Prompt tokens one request asks for at most, whatever the server's context: at the ~400
+ *  tokens/s this machine's Qwen 3.6 reads a prompt, a window this size is already over a minute.
+ *  Below it, a request is sized from the running server (inputBudget), never fixed: a fixed 60,000
+ *  characters overflowed the owner's 32k-context Qwen 3.6 on every window of a dense log (VR3 A4),
+ *  because digits, ids and timestamps run at about 1.7 characters per token on its tokenizer. */
+const MAX_WINDOW_TOKENS = 32_000
+/** Context assumed when the running server does not report its own (the configured default). */
+const FALLBACK_CONTEXT_TOKENS = 32_768
+/** Characters per token assumed when the server's tokenizer cannot be asked: below a dense log's. */
+const FALLBACK_CHARS_PER_TOKEN = 1.5
+/** Kept free for the chat template and the framing around the material. */
+const FRAMING_TOKENS = 256
+/** Characters of each sample the tokenizer measures the material's density on. */
+const SAMPLE_CHARS = 12_000
+/** One local_ask answers within this. An MCP client calling over HTTP with a plain fetch gives up
+ *  on a response after 300 s (undici's headers timeout: VR3's a4-raw.mjs was cut off at exactly
+ *  300 s), and everything a call read before its caller gave up is lost. A 1 MB log is about 27
+ *  minutes of prompt reading on this machine, so no section is started that would end past this
+ *  at the pace of the slowest one so far, sections naming the question's own terms are read
+ *  first, and the answer names the lines left unread. */
+const CALL_BUDGET_MS = 240_000
+/** A generation still running this long into the call is abandoned, under the 300 s client limit. */
+const CALL_HARD_LIMIT_MS = 285_000
+/** Slowest prompt reading a request is given time for before it counts as stuck. */
+const MIN_PROMPT_TOKENS_PER_SEC = 200
 /** Raised from 512 KB: at the old cap a needle past it was never read at all (never mind
  *  answered), which is worse than the truncation note this cap still leaves for anything beyond
  *  it. 1.5 MB comfortably covers a single large source or log file while keeping the chunked
@@ -155,6 +177,52 @@ const NOT_FOUND = 'NOT FOUND IN THIS EXCERPT'
  *  never guess about the rest of the file — it can only say this excerpt did or did not have it. */
 const CHUNK_ASK_SYSTEM = `You answer a question using ONLY the excerpt of a file shown below; you are not shown the rest of the file. Be exact and terse; cite file:line for every claim. If this excerpt does not contain the answer, reply with exactly "${NOT_FOUND}" and nothing else. No preamble.`
 
+interface InputBudget {
+  /** Most prompt tokens one request may render to on the server, answer room already held back. */
+  limit: number
+  /** Of that, what the material itself may take. */
+  tokens: number
+  charsPerToken: number
+}
+interface AskWindow { file: string; bytes: number; truncated: boolean; part: number; parts: number; lines: string[]; retried: boolean }
+
+/** Up to three samples (head, middle, tail) of the material, for measuring its density. */
+const samples = (text: string): string[] => {
+  if (text.length <= SAMPLE_CHARS * 3) return [text]
+  const middle = Math.floor(text.length / 2 - SAMPLE_CHARS / 2)
+  return [text.slice(0, SAMPLE_CHARS), text.slice(middle, middle + SAMPLE_CHARS), text.slice(-SAMPLE_CHARS)]
+}
+/** A generation that has to read this many prompt tokens first gets the time to read them. */
+const readingTimeout = (promptTokens: number): number => GENERATION_TIMEOUT_MS + Math.ceil(promptTokens / MIN_PROMPT_TOKENS_PER_SEC) * 1000
+const lineNumber = (line: string | undefined): number => Number(/^(\d+): /.exec(line ?? '')?.[1] ?? 0)
+const firstLine = (window: AskWindow): number => lineNumber(window.lines[0])
+const lastLine = (window: AskWindow): number => lineNumber(window.lines[window.lines.length - 1])
+const label = (window: AskWindow): string => window.parts > 1 ? `${window.file} (part ${window.part}/${window.parts}, lines ${firstLine(window)}–${lastLine(window)})` : window.file
+const original = (planned: AskWindow[], window: AskWindow): AskWindow => planned.find(candidate => candidate.file === window.file && candidate.part === window.part) ?? window
+/** The unread lines per file as merged ranges, so the caller knows exactly what nobody read. */
+const unreadRanges = (windows: AskWindow[]): string => {
+  const byFile = new Map<string, Array<[number, number]>>()
+  for (const window of windows) byFile.set(window.file, [...(byFile.get(window.file) ?? []), [firstLine(window), lastLine(window)]])
+  return [...byFile].map(([file, ranges]) => {
+    const merged: Array<[number, number]> = []
+    for (const [from, to] of ranges.sort((a, b) => a[0] - b[0])) {
+      const last = merged[merged.length - 1]
+      if (last && from <= last[1] + 1) last[1] = Math.max(last[1], to)
+      else merged.push([from, to])
+    }
+    const shown = merged.slice(0, 8).map(([from, to]) => from === to ? `${from}` : `${from}–${to}`).join(', ')
+    return `${file} lines ${shown}${merged.length > 8 ? ` and ${merged.length - 8} more ranges` : ''}`
+  }).join('; ')
+}
+const STOP_WORDS = new Set(['the', 'and', 'that', 'this', 'with', 'from', 'what', 'where', 'which', 'when', 'line', 'lines', 'file', 'files', 'value', 'values', 'quote', 'find', 'there', 'about', 'does', 'into', 'every', 'list', 'show', 'give'])
+/** The question's distinctive literals (identifiers with digits, capitals, _ - . or quotes): a
+ *  section that contains one is read first. Plain English words never qualify. */
+export function promptTerms(prompt: string): string[] {
+  const quoted = [...prompt.matchAll(/["'`]([^"'`\n]{3,80})["'`]/g)].map(match => match[1]!)
+  const words = prompt.split(/[^A-Za-z0-9_.\-]+/).map(word => word.replace(/^[.\-]+|[.\-]+$/g, '')).filter(word => word.length >= 4 && !STOP_WORDS.has(word.toLowerCase()) && (/\d/.test(word) || /[_.\-]/.test(word) || /[A-Z]/.test(word.slice(1))))
+  return [...new Set([...quoted, ...words].map(term => term.toLowerCase()))].slice(0, 12)
+}
+
 export class LocalAssistTools {
   private readonly run: CommandRunner
   private readonly readText: (file: string, maxBytes: number) => Promise<string>
@@ -231,12 +299,16 @@ export class LocalAssistTools {
     if (!lines.length) summary = '(the command printed nothing)'
     else if (lines.length <= RAW_TAIL) summary = ''
     else {
-      outcome = await this.deps.runner.ask({
-        system: SUMMARY_SYSTEM,
-        user: `Command: ${command}\nResult: ${status}\n${question ? `Question: ${question}\n` : ''}\nIn at most ${maxLines} lines: ${question ? 'answer the question, then ' : ''}say whether it passed; for each failure give the test or check name, file:line and the first error line, quoting them exactly. Skip passing items.\n\nOutput:\n${modelExcerpt(lines, MODEL_INPUT_CHARS)}`,
-        maxTokens: Math.min(2048, maxLines * 40),
-        signal
-      })
+      const maxTokens = Math.min(2048, maxLines * 40)
+      const build = (chars: number): string => `Command: ${command}\nResult: ${status}\n${question ? `Question: ${question}\n` : ''}\nIn at most ${maxLines} lines: ${question ? 'answer the question, then ' : ''}say whether it passed; for each failure give the test or check name, file:line and the first error line, quoting them exactly. Skip passing items.\n\nOutput:\n${modelExcerpt(lines, chars)}`
+      const budget = await this.inputBudget(SUMMARY_SYSTEM.length + build(0).length, maxTokens, samples(lines.map(line => clip(line)).join('\n')), signal)
+      let chars = Math.floor(budget.tokens * budget.charsPerToken)
+      const measured = await this.deps.runner.promptTokens?.({ system: SUMMARY_SYSTEM, user: build(chars) }, signal).catch(() => null)
+      if (measured && measured > budget.limit) chars = Math.floor(chars * budget.limit / measured * 0.95)
+      const send = (size: number): Promise<LocalModelOutcome> => this.deps.runner.ask({ system: SUMMARY_SYSTEM, user: build(size), maxTokens, timeoutMs: readingTimeout(size / budget.charsPerToken), signal })
+      outcome = await send(chars)
+      // Refused as longer than the context after all: once more at half the excerpt.
+      if (!outcome.ok && outcome.contextExceeded) outcome = await send(Math.floor(chars / 2))
       summary = outcome.ok
         ? `Summary (${outcome.answer.model}, local):\n${capLines(outcome.answer.text, maxLines)}`
         : [`Local summary unavailable: ${outcome.reason}.`, ...(() => { const found = failureLines(lines, maxLines); return found.length ? ['Failure-looking lines (pattern match, not the model):', ...found] : [] })()].join('\n')
@@ -269,63 +341,118 @@ export class LocalAssistTools {
       files.push({ relative: file.relative, ...read })
     }
     const rawChars = files.reduce((sum, file) => sum + file.text.length, 0)
-    // Share the model's input budget across the files; a file whose own content needs more than
-    // its share is split into windows below instead of losing its unmatched middle.
-    const share = files.length ? Math.floor(MODEL_INPUT_CHARS / files.length) : MODEL_INPUT_CHARS
-    const fileChunks = files.map(file => {
-      const numbered = splitLines(file.text).map((line, index) => `${index + 1}: ${line}`)
-      return { file, ...chunkLines(numbered, share, Number.MAX_SAFE_INTEGER) }
-    })
-    const allWindows = fileChunks.flatMap(({ file, chunks }) => chunks.map((body, index) => ({ file, index, total: chunks.length, body })))
     const listing = files.map(file => `${file.relative} (${file.bytes} bytes)`).join(', ')
+    const numbered = files.map(file => splitLines(file.text).map((line, index) => `${index + 1}: ${line}`))
+    const singleTokens = Math.min(2048, maxLines * 40), windowTokens = Math.min(1024, maxLines * 20)
+    const framing = CHUNK_ASK_SYSTEM.length + prompt.length + 400
+    const budget = await this.inputBudget(framing, Math.max(singleTokens, windowTokens), files.length ? samples(numbered.map(lines => lines.join('\n')).join('\n')) : [], signal)
+    let windowChars = Math.floor(budget.tokens * budget.charsPerToken)
+    const record = { files: files.map(file => ({ path: file.relative, bytes: file.bytes, truncated: file.truncated })) }
 
-    // The common case (no files, or files small enough for one window) is answered in one call
-    // exactly as before: full material in one prompt, one system message tuned for that.
-    if (allWindows.length <= 1) {
-      const material = fileChunks.map(({ file, chunks }) => `=== ${file.relative} (${file.bytes} bytes${file.truncated ? `, first ${MAX_FILE_BYTES} read` : ''}) ===\n${chunks[0] ?? ''}`).join('\n\n')
-      const outcome = await this.deps.runner.ask({
-        system: ASK_SYSTEM,
-        user: `${prompt}\n\nAnswer in at most ${maxLines} lines.${material ? `\n\nFiles (line numbers prefixed):\n${material}` : ''}`,
-        maxTokens: Math.min(2048, maxLines * 40),
-        signal
-      })
-      const body = outcome.ok
-        ? `${capLines(outcome.answer.text, maxLines)}\n— ${outcome.answer.model}, local${listing ? `, over ${listing}` : ''}`
-        : `Local model unavailable: ${outcome.reason}. Nothing was summarised; read ${listing || 'the files'} yourself or call again shortly.`
-      this.record(session, tool, outcome.ok ? rawChars : 0, body.length, outcome)
-      return { text: body, structured: { answered: outcome.ok, files: files.map(file => ({ path: file.relative, bytes: file.bytes, truncated: file.truncated })) } }
+    // The common case (no files, or files small enough for one window) is answered in one call:
+    // full material in one prompt, one system message tuned for that. Each file gets its share of
+    // the window; one that needs more than its share is split into windows below instead of
+    // losing its unmatched middle.
+    const share = files.length ? Math.floor(windowChars / files.length) : windowChars
+    const whole = numbered.map(lines => chunkLines(lines, share, 2))
+    if (whole.every(({ chunks }) => chunks.length <= 1)) {
+      const material = files.map((file, index) => `=== ${file.relative} (${file.bytes} bytes${file.truncated ? `, first ${MAX_FILE_BYTES} read` : ''}) ===\n${whole[index]!.chunks[0] ?? ''}`).join('\n\n')
+      const user = `${prompt}\n\nAnswer in at most ${maxLines} lines.${material ? `\n\nFiles (line numbers prefixed):\n${material}` : ''}`
+      const measured = files.length ? await this.deps.runner.promptTokens?.({ system: ASK_SYSTEM, user }, signal).catch(() => null) : null
+      let outcome: LocalModelOutcome | undefined
+      if (measured && measured > budget.limit) windowChars = Math.floor(windowChars * budget.limit / measured * 0.95)
+      else {
+        outcome = await this.deps.runner.ask({ system: ASK_SYSTEM, user, maxTokens: singleTokens, timeoutMs: readingTimeout(user.length / budget.charsPerToken), signal })
+        if (!outcome.ok && outcome.contextExceeded && files.length) { windowChars = Math.floor(windowChars / 2); outcome = undefined }
+      }
+      if (outcome) {
+        const body = outcome.ok
+          ? `${capLines(outcome.answer.text, maxLines)}\n— ${outcome.answer.model}, local${listing ? `, over ${listing}` : ''}`
+          : `Local model unavailable: ${outcome.reason}. Nothing was summarised; read ${listing || 'the files'} yourself or call again shortly.`
+        this.record(session, tool, outcome.ok ? rawChars : 0, body.length, outcome)
+        return { text: body, structured: { answered: outcome.ok, ...record } }
+      }
+      // It did not fit after all (the server counted more than the estimate, or refused it):
+      // fall through to windows at the size the server allows.
     }
 
     // Too big for one window: map the question over each window in turn (never guessing about a
-    // window it was not shown), then reduce the hits into one answer. Bounded so one huge file
-    // cannot turn a call into an unbounded number of local model round trips.
-    const windows = allWindows.slice(0, MAX_ASK_CHUNKS)
-    const found: string[] = []
-    let inputTokens = 0, outputTokens = 0, usedModel = false, lastModel: string | undefined, failureReason: string | undefined, examined = 0
-    for (const window of windows) {
-      const label = window.total > 1 ? `${window.file.relative} (part ${window.index + 1}/${window.total})` : window.file.relative
-      const outcome = await this.deps.runner.ask({
-        system: CHUNK_ASK_SYSTEM,
-        user: `${prompt}\n\nExcerpt of ${label}, ${window.file.bytes} bytes total${window.file.truncated ? `, only the first ${MAX_FILE_BYTES} bytes of the file were read` : ''}. Lines are numbered from the start of the file, not this excerpt:\n${window.body}`,
-        maxTokens: Math.min(1024, maxLines * 20),
-        signal
-      })
-      if (!outcome.ok) { failureReason = outcome.reason; break }
+    // window it was not shown), then reduce the hits into one answer. Every window is checked
+    // against the server's own count before it is sent and split if it would not fit; a window the
+    // server still refuses as too long is retried once as two halves. Sections that contain the
+    // question's own terms are read first, and the whole call is bounded by the call limit and the
+    // time budget, so the answer always says exactly which lines were not read.
+    const planned: AskWindow[] = []
+    files.forEach((file, index) => {
+      const { chunks } = chunkLines(numbered[index]!, windowChars, Number.MAX_SAFE_INTEGER)
+      chunks.forEach((chunk, part) => planned.push({ file: file.relative, bytes: file.bytes, truncated: file.truncated, part: part + 1, parts: chunks.length, lines: chunk.split('\n'), retried: false }))
+    })
+    const terms = promptTerms(prompt)
+    const naming = (window: AskWindow): boolean => { const body = window.lines.join('\n').toLowerCase(); return terms.some(term => body.includes(term)) }
+    const first = terms.length ? planned.filter(naming) : []
+    const queue = first.length && first.length < planned.length ? [...first, ...planned.filter(window => !first.includes(window))] : [...planned]
+    const found: Array<{ window: AskWindow; text: string }> = []
+    const unread: AskWindow[] = []
+    let inputTokens = 0, outputTokens = 0, usedModel = false, lastModel: string | undefined, stopped: string | undefined, examined = 0, calls = 0, sections = planned.length
+    const started = this.now().getTime()
+    let slowest = 0
+    const request = (window: AskWindow): string => `${prompt}\n\nExcerpt of ${label(window)}, ${window.bytes} bytes total${window.truncated ? `, only the first ${MAX_FILE_BYTES} bytes of the file were read` : ''}. Lines are numbered from the start of the file, not this excerpt:\n${window.lines.join('\n')}`
+    const halve = (window: AskWindow): AskWindow[] => { const middle = Math.ceil(window.lines.length / 2); sections++; return [{ ...window, lines: window.lines.slice(0, middle), retried: true }, { ...window, lines: window.lines.slice(middle), retried: true }] }
+    while (queue.length) {
+      const window = queue.shift()!
+      if (calls >= MAX_ASK_CHUNKS) { stopped = `one call reads at most ${MAX_ASK_CHUNKS} sections`; unread.push(window, ...queue.splice(0)); break }
+      if (calls && this.now().getTime() - started + slowest > CALL_BUDGET_MS) { stopped = `one call answers within ${CALL_BUDGET_MS / 60_000} min, and a section takes about ${Math.round(slowest / 1000)} s on this model`; unread.push(window, ...queue.splice(0)); break }
+      const user = request(window)
+      const measured = await this.deps.runner.promptTokens?.({ system: CHUNK_ASK_SYSTEM, user }, signal).catch(() => null)
+      if (measured && measured > budget.limit && window.lines.length > 1) { queue.unshift(...halve(window)); continue }
+      const sent = this.now().getTime()
+      const outcome = await this.deps.runner.ask({ system: CHUNK_ASK_SYSTEM, user, maxTokens: windowTokens, timeoutMs: Math.max(30_000, Math.min(readingTimeout(measured ?? user.length / budget.charsPerToken), started + CALL_HARD_LIMIT_MS - sent)), signal })
+      slowest = Math.max(slowest, this.now().getTime() - sent)
+      calls++
+      if (!outcome.ok) {
+        if (outcome.contextExceeded && !window.retried && window.lines.length > 1) { queue.unshift(...halve(window)); continue }
+        stopped = `local model failed: ${outcome.reason}`
+        unread.push(window, ...queue.splice(0))
+        break
+      }
       examined++
       usedModel = true
       inputTokens += outcome.answer.inputTokens
       outputTokens += outcome.answer.outputTokens
       lastModel = outcome.answer.model
-      const answer = outcome.answer.text.trim()
-      if (answer && !answer.toUpperCase().includes(NOT_FOUND)) found.push(`${label}: ${answer}`)
+      // Per line: a question with two parts gets "A: value" and "B: NOT FOUND IN THIS EXCERPT" from
+      // a section holding only A, and dropping the whole answer lost A (VR3 A4 fixture, both needles).
+      const answer = outcome.answer.text.split('\n').filter(line => line.trim() && !line.toUpperCase().includes(NOT_FOUND)).join('\n').trim()
+      if (answer) found.push({ window, text: answer })
     }
-    const unexamined = allWindows.length - examined
-    const remainder = unexamined > 0 ? ` ${unexamined} of ${allWindows.length} sections of ${listing || 'the file(s)'} were not examined${failureReason ? ` (local model failed: ${failureReason})` : ' — this is larger than one call can fully cover; ask again about a narrower part or file if needed'}.` : ''
+    // Hits in file order, whatever order they were read in.
+    found.sort((a, b) => planned.indexOf(original(planned, a.window)) - planned.indexOf(original(planned, b.window)) || firstLine(a.window) - firstLine(b.window))
+    const order = examined && first.length && first.length < planned.length ? ` Sections naming ${terms.map(term => JSON.stringify(term)).join(', ')} were read first.` : ''
+    const remainder = unread.length
+      ? ` ${unread.length} of ${sections} sections of ${listing || 'the file(s)'} were not examined (${stopped}): ${unreadRanges(unread)}.${order} Read those lines yourself, or ask about a smaller file.`
+      : ''
     const body = found.length
-      ? `${capLines(found.join('\n'), maxLines)}\n— local, over ${listing}.${remainder}`
-      : `Not found in the ${examined} section(s) of ${listing || 'the file(s)'} read.${remainder}`
+      ? `${capLines(found.map(hit => `${label(hit.window)}: ${hit.text}`).join('\n'), maxLines)}\n— local, over ${listing}; read ${examined} of ${sections} sections.${remainder}`
+      : `Not found in the ${examined} of ${sections} section(s) of ${listing || 'the file(s)'} read.${remainder}`
     this.recordUsage(session, tool, usedModel ? rawChars : 0, body.length, { inputTokens, outputTokens, usedModel, model: lastModel })
-    return { text: body, structured: { answered: usedModel && found.length > 0, chunks: allWindows.length, examined, files: files.map(file => ({ path: file.relative, bytes: file.bytes, truncated: file.truncated })) } }
+    return { text: body, structured: { answered: usedModel && found.length > 0, chunks: sections, examined, ...record } }
+  }
+
+  /** How much material one request may carry: the running server's own context less the answer,
+   *  the instructions and the template, in tokens, and how many characters of this material one
+   *  token covers, measured on the server's tokenizer over samples of it when the server allows. */
+  private async inputBudget(instructionChars: number, answerTokens: number, material: string[], signal?: AbortSignal): Promise<InputBudget> {
+    const runner = this.deps.runner
+    const context = (await runner.contextTokens?.(signal).catch(() => null)) ?? FALLBACK_CONTEXT_TOKENS
+    const limit = Math.min(context - answerTokens, MAX_WINDOW_TOKENS) - FRAMING_TOKENS
+    const tokens = Math.max(1024, limit - Math.ceil(instructionChars / 2))
+    let ratio: number | null = null
+    for (const sample of material) {
+      const counted = sample ? await runner.promptTokens?.({ system: '', user: sample }, signal).catch(() => null) : null
+      if (!counted) break
+      ratio = Math.min(ratio ?? Infinity, sample.length / counted)
+    }
+    return { limit: Math.max(1024, limit), tokens, charsPerToken: ratio === null ? FALLBACK_CHARS_PER_TOKEN : ratio * 0.95 }
   }
 
   summarizeFile(agentSessionId: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<LocalAssistResult> {
