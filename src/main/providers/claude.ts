@@ -154,6 +154,23 @@ export class ClaudeAdapter implements ProviderAdapter {
     return outstanding
   }
 
+  /** Stops every backgrounded task through the CLI's own stop_task control (what the SDK's
+   *  stopTask sends). The CLI reports each one stopped with a task notification, which retires
+   *  it here as usual. A task the CLI refuses to stop is one it no longer runs, so it is retired
+   *  here instead: nothing else would ever report it gone. */
+  async stopBackgroundWork(): Promise<number> {
+    const ids = [...this.backgroundTasks].filter(([, task]) => task.backgrounded).map(([id]) => id)
+    if (!ids.length || this.disposed || !this.transport?.connected) return 0
+    await Promise.all(ids.map(async id => {
+      try { await this.control({ subtype: 'stop_task', task_id: id }) }
+      catch (error) {
+        if (!this.backgroundTasks.delete(id)) return
+        this.emit({ data: { type: 'notice', message: `Background task ${id} could not be stopped and is no longer counted: ${error instanceof Error ? error.message : String(error)}` } })
+      }
+    }))
+    return ids.length
+  }
+
   /** A turn the runtime starts by itself - a background task reporting, a watcher firing - has
    *  no input of ours to mark its start, so the session would keep saying 'idle' while the model
    *  is demonstrably streaming text and calling tools. The first main-conversation frame of such

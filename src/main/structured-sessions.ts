@@ -62,6 +62,10 @@ interface LiveSession {
   /** The background-task count this conversation last reported, so a change in the provider's
    *  inventory between turns can be noticed and restated. */
   backgroundTasks?: number
+  /** Handed on to a successor (agents.handoff): the background work it owns is stopped once its
+   *  turn settles, and `stoppingBackground` is set while that stop is in flight. */
+  retiring?: boolean
+  stoppingBackground?: boolean
   /** The cap decision that stopped this conversation; cleared when the owner changes the cap. */
   capStop?: { reason: string; capKey: string }
   capTimer?: NodeJS.Timeout
@@ -152,6 +156,23 @@ export class StructuredSessions {
     if (!live || live.closed) return false
     this.emit(live, { ...(itemId ? { itemId } : {}), data: { type: 'notice', message, ...(payload === undefined ? {} : { payload }) } })
     return true
+  }
+  /** A conversation that handed itself on (agents.handoff successor) owns no work any more: the
+   *  background tasks it started - watch loops, backgrounded shells - are stopped as soon as its
+   *  last turn settles, so its read-only tab settles too instead of spinning on work nobody reads. */
+  retireBackgroundWork(id: string): boolean {
+    const live = this.live.get(id)
+    if (!live || live.closed) return false
+    live.retiring = true
+    this.stopRetiredWork(live, this.database.structured.snapshot(id)?.phase ?? 'idle')
+    return true
+  }
+  private stopRetiredWork(live: LiveSession, phase: SessionPhase): void {
+    if (!live.retiring || live.stoppingBackground || live.closed || active.has(phase) || !live.adapter?.stopBackgroundWork || !this.ownsBackgroundWork(live)) return
+    live.stoppingBackground = true
+    void live.adapter.stopBackgroundWork()
+      .catch(error => console.warn('The background work of a handed-off conversation could not be stopped', error))
+      .finally(() => { live.stoppingBackground = false })
   }
   private promptDispatchAuthorityGuard?: (authority: PromptDispatchAuthority, spec: AgentSpec) => void
   setPromptDispatchAuthorityGuard(guard: (authority: PromptDispatchAuthority, spec: AgentSpec) => void): void {
@@ -1454,6 +1475,7 @@ export class StructuredSessions {
       const outstanding = live.adapter.backgroundWork?.() ?? 0
       if (outstanding !== (live.backgroundTasks ?? 0)) this.emit(live, { data: { type: 'session', phase: state.phase, backgroundTasks: outstanding } })
     }
+    if (live.retiring) this.stopRetiredWork(live, data.type === 'session' ? data.phase : state.phase)
   }
   async review(id: string, artifactId: string, action: 'keep' | 'undo'): Promise<{ outcome: 'kept' | 'reverted' | 'conflict'; message?: string }> {
     const live = this.get(id), store = this.database.structured, artifact = store.artifact(id, artifactId)

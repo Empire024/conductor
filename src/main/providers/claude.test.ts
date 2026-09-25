@@ -740,6 +740,28 @@ describe('Claude task reporting (payloads captured from a real session)', () => 
     expect(f.projection().items.some(item => item.data.type === 'subagent')).toBe(false)
   })
 
+  it('stops every backgrounded task through the stop_task control and retires what the CLI no longer runs', async () => {
+    const f = fixture()
+    await f.adapter.start(); await f.adapter.submit('Start watch loops', settings)
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'watch-1', tool_use_id: 'toolu_w1', description: 'Watch ship status', is_backgrounded: true, task_type: 'local_bash' })
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'watch-2', tool_use_id: 'toolu_w2', description: 'Watch coworkers', is_backgrounded: true, task_type: 'local_bash' })
+    f.transport.receive({ type: 'system', subtype: 'task_started', task_id: 'foreground', tool_use_id: 'toolu_f', description: 'Typecheck', is_backgrounded: false, task_type: 'local_bash' })
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, session_id: 'native', usage: {} })
+    expect(f.adapter.backgroundWork()).toBe(2)
+    f.transport.autoControlResponses = false
+    const stopping = f.adapter.stopBackgroundWork()
+    const stops = f.transport.sent.filter(item => JSON.stringify(item).includes('stop_task')) as Array<{ request_id: string; request: { task_id: string } }>
+    expect(stops.map(item => item.request)).toEqual([{ subtype: 'stop_task', task_id: 'watch-1' }, { subtype: 'stop_task', task_id: 'watch-2' }])
+    // The CLI stops the first and reports it; the second it no longer knows.
+    f.transport.receive({ type: 'control_response', response: { subtype: 'success', request_id: stops[0]!.request_id, response: {} } })
+    f.transport.receive({ type: 'system', subtype: 'task_notification', task_id: 'watch-1', tool_use_id: 'toolu_w1', status: 'stopped', summary: 'Watch ship status was stopped' })
+    f.transport.receive({ type: 'control_response', response: { subtype: 'error', request_id: stops[1]!.request_id, error: 'No task found with ID: watch-2' } })
+    await expect(stopping).resolves.toBe(2)
+    expect(f.adapter.backgroundWork()).toBe(0)
+    expect(f.projection().items.find(item => item.nativeItemId === 'toolu_w1')?.data).toMatchObject({ type: 'tool', status: 'interrupted' })
+    expect(f.events.some(event => event.data.type === 'notice' && event.data.message.includes('watch-2 could not be stopped'))).toBe(true)
+  })
+
   it('keeps an associated detached Task tool truthful while its background agent outlives the parent', async () => {
     const f = fixture()
     await f.adapter.start(); await f.adapter.submit('Start background agent', settings)

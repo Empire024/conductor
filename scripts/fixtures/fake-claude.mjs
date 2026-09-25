@@ -54,6 +54,8 @@ let permissionMode = process.argv[process.argv.indexOf('--permission-mode') + 1]
 const sessionRules = new Set()
 const steeringHeld = new Map()
 const steeringTimers = new Set()
+// SYNTHETIC WATCH LOOPS: backgrounded shells that never finish on their own; only stop_task ends one.
+const watchLoops = new Map()
 
 // One turn that writes where a real agent writes: a memory file under the owner's profile, a
 // sibling project, a brand-new nested directory, and one ordinary in-workspace edit. Only the
@@ -111,6 +113,16 @@ for await (const line of input) {
       if (permissionScenario === 'REJECT' && message.request.mode === 'auto') send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Synthetic managed policy disables auto-mode' } })
       else { permissionMode = message.request.mode; success(message.request_id) }
     } else if (kind === 'set_model' || kind === 'apply_flag_settings') success(message.request_id)
+    else if (kind === 'stop_task') {
+      // The CLI's own stop: the task is killed, reported stopped, and dropped from the inventory.
+      const task = watchLoops.get(message.request.task_id)
+      if (process.env.CONDUCTOR_TEST_STOP_TASK_LOG) writeFileSync(process.env.CONDUCTOR_TEST_STOP_TASK_LOG, JSON.stringify({ taskId: message.request.task_id, known: Boolean(task) }) + '\n', { flag: 'a' })
+      if (!task) { send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: `No task found with ID: ${message.request.task_id}` } }); continue }
+      watchLoops.delete(message.request.task_id)
+      success(message.request_id)
+      emit({ type: 'system', subtype: 'task_notification', task_id: message.request.task_id, tool_use_id: task.toolId, status: 'stopped', summary: `${task.description} was stopped` })
+      emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [...watchLoops].map(([id, loop]) => ({ task_id: id, tool_use_id: loop.toolId, task_type: 'local_bash', description: loop.description })) })
+    }
     else send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Unsupported synthetic control' } })
   } else if (message.type === 'user') {
     if (!initialized) throw new Error('User message before initialization')
@@ -210,6 +222,24 @@ for await (const line of input) {
       text('**Synthetic Claude activity:** writing a memory file, a sibling project file and one file in this workspace.')
       outsideIndex = 0
       stepOutside()
+      continue
+    }
+    if (prompt.startsWith('SYNTHETIC WATCH LOOPS')) {
+      // A main brain arms three watch loops in the background and keeps its turn open for a step
+      // (long enough to call agents.handoff from inside it), then reports. The loops run on.
+      emit({ type: 'system', subtype: 'init', model: fableQuotaFixture ? 'claude-fable-5-1' : 'synthetic-claude', claude_code_version: '2.1.263' })
+      const armed = ++turn
+      for (const index of [1, 2, 3]) {
+        const taskId = `watch-${armed}-${index}`, toolId = `watch-tool-${armed}-${index}`, description = `Synthetic watch loop ${index}`
+        declare(toolId, 'Bash', { command: `while true; do sleep 30; done # ${index}`, description, run_in_background: true })
+        watchLoops.set(taskId, { toolId, description })
+        emit({ type: 'system', subtype: 'task_started', task_id: taskId, tool_use_id: toolId, description, is_backgrounded: true, task_type: 'local_bash', status: 'running' })
+        result(toolId, `Command running in the background with ID: ${taskId}`)
+      }
+      emit({ type: 'system', subtype: 'background_tasks_changed', tasks: [...watchLoops].map(([id, loop]) => ({ task_id: id, tool_use_id: loop.toolId, task_type: 'local_bash', description: loop.description })) })
+      text('Three watch loops are armed; finishing this step.')
+      const timer = setTimeout(() => { steeringTimers.delete(timer); text('Step finished.'); finish() }, Number(process.env.CONDUCTOR_SMOKE_STEP_MS ?? 4000))
+      steeringTimers.add(timer)
       continue
     }
     if (prompt.startsWith('SYNTHETIC BASH WAIT')) {

@@ -54,6 +54,15 @@ class FakeProvider implements ProviderAdapter {
    *  can answer, exactly as the real adapters report it. */
   background = 0
   backgroundWork(): number { return this.background }
+  /** Stops asked for; like the real runtime, each stop reports back as a task lifecycle frame. */
+  stopsRequested = 0
+  async stopBackgroundWork(): Promise<number> {
+    this.stopsRequested++
+    const stopped = this.background
+    this.background = 0
+    this.emit({ data: { type: 'notice', message: 'Claude task lifecycle' } })
+    return stopped
+  }
   async fork(): Promise<string> { return `forked-${this.options.nativeSessionId ?? this.options.runtimeId}` }
   async rename(): Promise<void> { await this.renameGate }
   dispose(): void { this.disposed = true }
@@ -1553,6 +1562,39 @@ describe('activity reported while background work outlives its turn', () => {
     tick(f)
     expect(activityPhase(f)).toBe('complete')
     expect(f.database.structured.snapshot(f.spec.id)?.backgroundTasks).toBe(0)
+  })
+
+  it('stops the background work of a handed-off conversation once its step settles, never mid-turn', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Hand off to a successor', settings)
+    f.current.background = 3
+    tick(f)
+    // agents.handoff({successor:true}) is called from inside the turn: it finishes its step first.
+    expect(f.manager.retireBackgroundWork(f.spec.id)).toBe(true)
+    expect(f.current.stopsRequested).toBe(0)
+    expect(activityPhase(f)).toBe('working')
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.stopsRequested).toBe(1))
+    expect(activityPhase(f)).toBe('complete')
+    expect(f.database.structured.snapshot(f.spec.id)?.backgroundTasks).toBe(0)
+  })
+
+  it('stops the background work of a settled handed-off conversation at once, and any it starts later', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Start watch loops', settings)
+    f.current.background = 2
+    f.current.finish()
+    expect(activityPhase(f)).toBe('waiting_background')
+    f.manager.retireBackgroundWork(f.spec.id)
+    await vi.waitFor(() => expect(activityPhase(f)).toBe('complete'))
+    expect(f.current.stopsRequested).toBe(1)
+    await new Promise(resolve => setImmediate(resolve))
+    // A later provider turn that backgrounds more work is stopped when it settles too.
+    f.current.emit({ data: { type: 'session', phase: 'running' } })
+    f.current.background = 1
+    f.current.finish()
+    await vi.waitFor(() => expect(f.current.stopsRequested).toBe(2))
+    expect(activityPhase(f)).toBe('complete')
   })
 
   it('starts waiting as soon as the runtime reports work it backgrounded mid-turn', async () => {

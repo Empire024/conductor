@@ -57,6 +57,10 @@ export interface ProviderAdapter {
    *  about it: the tool call returned the moment the work was handed to the background. Only
    *  the runtime that reported the work can answer, so this is the live process' own count. */
   backgroundWork?(): number
+  /** Stop every piece of that outstanding work through the runtime's own control, for a
+   *  conversation that no longer owns it (agents.handoff successor). Returns how many it asked
+   *  to stop; each retires from backgroundWork() as the runtime reports it stopped. */
+  stopBackgroundWork?(): Promise<number>
   /** Fold the runtime's own transcript into its durable task state, keeping the same logical
    *  conversation (the local runtime; native CLIs compact themselves). Null when there is
    *  nothing to fold. */
