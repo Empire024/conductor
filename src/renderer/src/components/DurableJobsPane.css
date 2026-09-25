@@ -49,24 +49,25 @@
 .durable-job-report { display: grid; gap: 6px; }
 .durable-job-path { margin: 0; font-family: ui-monospace, monospace; font-size: 10px; color: var(--text-3); overflow-wrap: anywhere; }
 
-/* Compact launcher-local creation UI (DurableJobLauncherOption), styled to match the rest of the
+/* Compact launcher-local creation form (DurableJobForm), styled to match the rest of the
    launcher's dark tile theme (src/renderer/src/panes/LauncherPane.tsx, styles.css .launcher-*)
-   rather than the DurableJobsPane's own theme-variable palette above. */
-.durable-job-launcher { border-top: 1px solid #242a31; padding-top: 8px; }
-.durable-job-launcher-toggle { display: flex; align-items: center; gap: 5px; width: 100%; border: 0; background: none; padding: 0; color: #8b939c; font-size: 11px; cursor: pointer; }
-.durable-job-launcher-toggle:hover { color: #cfd3d8; }
-.durable-job-launcher-toggle span { color: #5b636d; font-weight: 400; }
-.durable-job-launcher-form { margin-top: 8px; display: grid; gap: 6px; }
-.durable-job-launcher-form strong { font-size: 10.5px; color: #cfd3d8; }
+   rather than the DurableJobsPane's own theme-variable palette above. The toggle that reveals
+   this form lives on the model's own launcher tile (.launcher-tile-durable-toggle); this form
+   never picks its own model. */
+.durable-job-launcher-form { display: grid; gap: 6px; }
+.durable-job-launcher-form strong { font-size: 10.5px; color: #cfd3d8; display: flex; align-items: baseline; gap: 6px; }
+.durable-job-launcher-form strong span { color: #5b636d; font-weight: 400; font-size: 9.5px; }
 .durable-job-launcher-form label { display: grid; gap: 3px; font-size: 9.5px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: #6d757e; }
 .durable-job-launcher-form textarea, .durable-job-launcher-form input { border: 1px solid #242a31; border-radius: 5px; background: #171c22; color: #cfd3d8; font-size: 11px; padding: 6px 8px; font-family: inherit; resize: vertical; }
 .durable-job-launcher-form textarea:focus-visible, .durable-job-launcher-form input:focus-visible { outline: none; border-color: #2f6f7a; }
+.durable-job-launcher-form-actions { display: flex; gap: 8px; }
 .durable-job-launcher-form button[type="submit"] { justify-self: start; display: flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px; border: 1px solid #242a31; border-radius: 5px; background: #171c22; color: #cfd3d8; font-size: 10.5px; cursor: pointer; }
 .durable-job-launcher-form button[type="submit"]:hover:not(:disabled) { background: #1c2229; }
 .durable-job-launcher-form button[type="submit"]:disabled { opacity: .5; cursor: default; }
-:root[data-theme="light"] .durable-job-launcher { border-color: var(--border); }
-:root[data-theme="light"] .durable-job-launcher-toggle,
+.durable-job-launcher-form-cancel { height: 26px; padding: 0 10px; border: 1px solid #242a31; border-radius: 5px; background: none; color: #8b939c; font-size: 10.5px; cursor: pointer; }
+.durable-job-launcher-form-cancel:hover { color: #cfd3d8; background: #1c2229; }
 :root[data-theme="light"] .durable-job-launcher-form strong { color: var(--text); }
 :root[data-theme="light"] .durable-job-launcher-form textarea,
 :root[data-theme="light"] .durable-job-launcher-form input,
-:root[data-theme="light"] .durable-job-launcher-form button[type="submit"] { background: var(--surface-2); color: var(--text); border-color: var(--border); }
+:root[data-theme="light"] .durable-job-launcher-form button[type="submit"],
+:root[data-theme="light"] .durable-job-launcher-form-cancel { background: var(--surface-2); color: var(--text); border-color: var(--border); }

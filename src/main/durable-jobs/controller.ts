@@ -1,8 +1,9 @@
 import { join } from 'node:path'
 import { makeId } from '../../shared/models'
 import type { DurableJob, DurableJobOperation, DurableJobStage } from '../../shared/durable-jobs'
+import { unmetCriteria, mechanicalCompletionCheck } from './completion-check'
 import { visibleContent } from './handoff'
-import type { HandoffPort, LoopGuardPort, ServerLifecyclePort, StageObservation, StageRuntime, WatchdogPort } from './ports'
+import type { CompletionCheckPort, HandoffPort, LoopGuardPort, ServerLifecyclePort, StageObservation, StageRuntime, WatchdogPort } from './ports'
 import { StaleEpochError, type DurableJobStore, type StoredJob, type WriteGuard } from './store'
 import type { WorktreeOps } from './worktree'
 
@@ -34,6 +35,9 @@ export interface ControllerOptions {
   server: ServerLifecyclePort
   loopGuard: LoopGuardPort
   worktrees: WorktreeOps
+  /** Verifies the stage's completionCriteria against its cwd before trusting a "done" self-report.
+   *  Defaults to the mechanical file/line checker (completion-check.ts). */
+  completion?: CompletionCheckPort
   /** This app process: `${pid}:${launchId}`. */
   ownerId: string
   clock?: () => Date
@@ -111,12 +115,14 @@ export class DurableJobController {
   private readonly sleep: (ms: number) => Promise<void>
   private readonly pollMs: number
   private readonly leaseTtlMs: number
+  private readonly completion: CompletionCheckPort
 
   constructor(private readonly options: ControllerOptions) {
     this.clock = options.clock ?? (() => new Date())
     this.sleep = options.sleep ?? (ms => new Promise(resolve => { const timer = setTimeout(resolve, ms); timer.unref?.() }))
     this.pollMs = options.pollMs ?? 2_000
     this.leaseTtlMs = options.leaseTtlMs ?? 60_000
+    this.completion = options.completion ?? mechanicalCompletionCheck
   }
 
   private get store(): DurableJobStore { return this.options.store }
@@ -363,8 +369,16 @@ export class DurableJobController {
     }
     run.agentSessionId = undefined
     const observation = wait.observation
-    const succeeded = !wait.interruptedFor && stageSucceeded(observation)
-    if (inFlight && inFlight.status === 'intended') this.store.settle(job.id, guard, inFlight.id, succeeded ? 'done' : 'failed', succeeded ? 'The conversation finished with a completed stop report' : describeFailure(observation, wait.interruptedFor))
+    let succeeded = !wait.interruptedFor && stageSucceeded(observation)
+    // The model's own "done" is never proof by itself: a completion criterion phrased as a
+    // checkable fact about a file (exists, line count) is verified against the job's cwd before
+    // the stage is trusted. A criterion this cannot parse is left unchecked, never blocking on it.
+    let criteriaFailure: string | undefined
+    if (succeeded && stage.completionCriteria.length) {
+      const unmet = unmetCriteria(await this.completion.check(job.cwd, stage.completionCriteria).catch(() => []))
+      if (unmet.length) { succeeded = false; criteriaFailure = `Completion criteria not met: ${unmet.map(check => check.detail).join('; ')}` }
+    }
+    if (inFlight && inFlight.status === 'intended') this.store.settle(job.id, guard, inFlight.id, succeeded ? 'done' : 'failed', succeeded ? 'The conversation finished with a completed stop report' : (criteriaFailure ?? describeFailure(observation, wait.interruptedFor)))
     const latest = this.store.get(job.id)
     const allStages = this.store.stages(job.id)
     const decision = this.options.handoff.afterStage({ job: latest, stage, stages: allStages, observation, succeeded })
@@ -412,7 +426,7 @@ export class DurableJobController {
       return 'stop'
     }
     // Failed attempt.
-    const error = describeFailure(observation, wait.interruptedFor)
+    const error = criteriaFailure ?? describeFailure(observation, wait.interruptedFor)
     const rolledOver = decision.contextRollover || observation.stop?.reason === 'context_limit'
     // A rollover that made file progress in its own fresh context (new files written, or an
     // existing one added to) continues from the handoff for free: only a rollover with nothing to

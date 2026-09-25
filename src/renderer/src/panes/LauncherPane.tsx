@@ -3,6 +3,7 @@ import { ProviderIcon } from '../components/ProviderIcon'
 import {
   Bot,
   ChevronRight,
+  Clock,
   MonitorSmartphone,
   Plug,
   RefreshCw,
@@ -16,7 +17,7 @@ import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
 import type { RemoteTerminalSummary } from '../../../shared/remote-terminals'
 import { checkRemoteProjectPlacement } from '../../../shared/project-identity'
 import { checkProjectPlacement, requiredMachineId } from '../layout/machine-placement'
-import { DurableJobLauncherOption } from '../components/DurableJobsPane'
+import { DurableJobForm } from '../components/DurableJobsPane'
 
 interface LauncherPaneProps {
   projectId: string
@@ -97,7 +98,9 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
   const [checking, setChecking] = useState(false)
   const [running, setRunning] = useState<RemoteTerminalSummary[] | null>(null)
   const [runningError, setRunningError] = useState('')
-  const [durableModel, setDurableModel] = useState(LOCAL_MODELS[0]!)
+  /** Which local model's launcher tile has its durable toggle on; the durable form below the
+   *  grid, when shown, is always for exactly this model, never a separately chosen one. */
+  const [durableFor, setDurableFor] = useState<string | null>(null)
   const [creatingJob, setCreatingJob] = useState(false)
   const [jobError, setJobError] = useState('')
   const host = requiredMachineId(project)
@@ -207,44 +210,77 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
           const elsewhere = selected !== LOCAL_MACHINE_ID
           const mirrorable = provider === 'claude' || provider === 'codex' || provider === 'grok' || provider === 'local'
           const blocked = Boolean(current?.reason) || (elsewhere && kind === 'agent' && !mirrorable)
-          return (
-            <button
-              key={`${kind}-${provider ?? ''}-${model ?? ''}`}
-              disabled={blocked}
-              title={blocked ? (current?.reason || `${title} cannot run on another machine yet.`) : undefined}
-              onClick={() => onOpen(kind, provider, model)}
-            >
+          const tileBody = (
+            <>
               <span className={`launch-icon ${tone}`}>{provider ? <ProviderIcon provider={provider} size={21} /> : <Icon size={19} />}</span>
               <span><strong>{title}</strong>{detail && <small>{detail}{elsewhere && mirrorable ? ` · runs on ${hostName}` : provider === 'local' ? ' · runs on this machine' : ''}</small>}</span>
               {key && <kbd>{key}</kbd>}
               <ChevronRight className="launch-arrow" size={15} />
-            </button>
+            </>
+          )
+          // Only a local model can be run as a durable job, and only on this machine, and only
+          // where the caller can open the resulting job tab. Its durable toggle lives on this
+          // exact tile: there is no separate model picker for durable work.
+          const durable = provider === 'local' && selected === LOCAL_MACHINE_ID && Boolean(onOpenJob)
+          if (!durable) {
+            return (
+              <button
+                key={`${kind}-${provider ?? ''}-${model ?? ''}`}
+                disabled={blocked}
+                title={blocked ? (current?.reason || `${title} cannot run on another machine yet.`) : undefined}
+                onClick={() => onOpen(kind, provider, model)}
+              >
+                {tileBody}
+              </button>
+            )
+          }
+          const active = durableFor === model
+          return (
+            <div key={`${kind}-${provider ?? ''}-${model ?? ''}`} className="launcher-tile">
+              <button
+                type="button"
+                className="launcher-tile-open"
+                disabled={blocked}
+                title={blocked ? (current?.reason || `${title} cannot run on another machine yet.`) : undefined}
+                onClick={() => onOpen(kind, provider, model)}
+              >
+                {tileBody}
+              </button>
+              <button
+                type="button"
+                className={`launcher-tile-durable-toggle${active ? ' active' : ''}`}
+                aria-pressed={active}
+                aria-label={`Run ${title} as a durable job`}
+                title="Run as a durable job: staged, resumable, overnight"
+                onClick={() => setDurableFor(active ? null : model!)}
+              >
+                <Clock size={12} />
+              </button>
+            </div>
           )
         })}
       </div>
-      {selected === LOCAL_MACHINE_ID && onOpenJob && <div className="launcher-durable-option">
-        <span className="launcher-durable-label">Local model for durable work</span>
-        <div className="launcher-durable-models" role="group" aria-label="Local model for durable work">
-          {LOCAL_MODELS.map(model => (
-            <button
-              key={model.id}
-              type="button"
-              className={model.id === durableModel.id ? 'active' : ''}
-              aria-pressed={model.id === durableModel.id}
-              onClick={() => setDurableModel(model)}
-            >
-              {model.label}
-            </button>
-          ))}
-        </div>
-        <DurableJobLauncherOption model={durableModel} busy={creatingJob} error={jobError} onCreate={input => {
-          setCreatingJob(true); setJobError('')
-          void window.conductor.durableJobs.create({ projectId, ...(workspaceId ? { workspaceId } : {}), ...input })
-            .then(summary => onOpenJob({ id: summary.id, title: summary.title }))
-            .catch(reason => setJobError(reason instanceof Error ? reason.message : String(reason)))
-            .finally(() => setCreatingJob(false))
-        }} />
-      </div>}
+      {selected === LOCAL_MACHINE_ID && onOpenJob && durableFor && (() => {
+        const model = LOCAL_MODELS.find(entry => entry.id === durableFor)
+        if (!model) return null
+        return (
+          <div className="launcher-durable-option">
+            <DurableJobForm
+              model={model}
+              busy={creatingJob}
+              error={jobError}
+              onCancel={() => { setDurableFor(null); setJobError('') }}
+              onCreate={input => {
+                setCreatingJob(true); setJobError('')
+                void window.conductor.durableJobs.create({ projectId, ...(workspaceId ? { workspaceId } : {}), ...input })
+                  .then(summary => { setDurableFor(null); onOpenJob({ id: summary.id, title: summary.title }) })
+                  .catch(reason => setJobError(reason instanceof Error ? reason.message : String(reason)))
+                  .finally(() => setCreatingJob(false))
+              }}
+            />
+          </div>
+        )
+      })()}
       {/*
         A shell on the host outlives the tab that was watching it - closing a view is not stopping a
         process - so after a reconnect, a restart or a closed tab there may well be one still

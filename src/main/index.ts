@@ -2530,6 +2530,7 @@ app.whenReady().then(async () => {
   // conductor-local MCP tools (src/main/local-assist): every Claude and Codex launch from here on.
   localAssist = await startLocalAssist({ structured: database.structured, userData: app.getPath('userData'), sessions: agents.structured })
     .catch(error => { console.warn('Local assist is unavailable', error); return undefined })
+  control.setLocalAssist(localAssist)
   remoteControl.registerIpc()
   await remoteControl.start()
   // Phones reach this Conductor through their own listener, built on the same stores and the

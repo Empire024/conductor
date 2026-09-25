@@ -102,6 +102,19 @@ export interface WatchdogPort {
   watch(context: WatchContext, onStuck: (reason: string) => void): { dispose(): void }
 }
 
+export interface CompletionCheck {
+  criterion: string
+  /** false when the criterion's wording could not be mechanically parsed (never blocks on it). */
+  checked: boolean
+  met: boolean
+  detail: string
+}
+/** Verifies the stage's own completionCriteria against the job's cwd, for the ones phrased as a
+ *  checkable fact about a file (exists, line count) — never the model's self-report alone. */
+export interface CompletionCheckPort {
+  check(cwd: string, criteria: readonly string[]): Promise<CompletionCheck[]>
+}
+
 export type ServerReadiness = { ready: true } | { ready: false; reason: string; retryable: boolean }
 /** Which job asks, so server events land in its log under its lease. */
 export interface ServerContext { jobId: string; epoch: number }

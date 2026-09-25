@@ -4,7 +4,7 @@ import { join, relative } from 'node:path'
 import { makeId } from '../../shared/models'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_STAGE_KINDS, TERMINAL_JOB_STATUSES, type CreateDurableJobInput, type DurableJobCheckpoint, type DurableJob, type DurableJobBudgets, type DurableJobEvent, type DurableJobReport, type DurableJobsService, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../shared/durable-jobs'
 import { DurableJobController, operationKindForTool } from './controller'
-import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type HandoffPort, type LoopGuardPort, type LocalExecutionView, type ReportPort, type ServerLifecyclePort, type StageRuntime, type WatchdogPort } from './ports'
+import { alwaysReadyServer, defaultHandoffPort, jsonReportPort, noopWatchdog, repeatedErrorLoopGuard, type CompletionCheckPort, type HandoffPort, type LoopGuardPort, type LocalExecutionView, type ReportPort, type ServerLifecyclePort, type StageRuntime, type WatchdogPort } from './ports'
 import { reconcileJobs, type ReconcileOutcome } from './reconcile'
 import { collectDurableJobEvents } from './report'
 import { DurableJobStore, type StoredJob } from './store'
@@ -27,6 +27,7 @@ export interface DurableJobsServiceOptions {
   loopGuard?: LoopGuardPort
   report?: ReportPort
   worktrees?: WorktreeOps
+  completion?: CompletionCheckPort
   /** Throws when the model is not an available local model (models.list id). */
   validateModel?: (model: string) => void | Promise<void>
   ownerId?: string
@@ -91,7 +92,7 @@ export class DurableJobsServiceImpl implements DurableJobsService {
     this.controller = new DurableJobController({
       store: options.store, runtime: options.runtime, handoff: this.handoff,
       watchdog: options.watchdog ?? noopWatchdog, server: options.server ?? alwaysReadyServer,
-      loopGuard: options.loopGuard ?? repeatedErrorLoopGuard, worktrees: this.worktrees,
+      loopGuard: options.loopGuard ?? repeatedErrorLoopGuard, worktrees: this.worktrees, completion: options.completion,
       ownerId: this.ownerId, clock: this.clock, sleep: options.sleep, pollMs: options.pollMs,
       leaseTtlMs: options.leaseTtlMs, maxConcurrent: options.maxConcurrent, maxImplicitStages: options.maxImplicitStages,
       interruptGraceMs: options.interruptGraceMs,

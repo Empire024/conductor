@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { FakeDurableJobsService } from '../../../shared/durable-jobs-fake'
 import { checkpointsFromEvents, type DurableJobDetail } from '../../../shared/durable-jobs-bridge'
-import { DurableJobCreateForm, DurableJobLauncherOption, DurableJobList, DurableJobView, elapsedMs, formatDuration, jobControls, problems, type DurableJobViewProps } from './DurableJobsPane'
+import { DurableJobCreateForm, DurableJobForm, DurableJobList, DurableJobView, elapsedMs, formatDuration, jobControls, problems, type DurableJobViewProps } from './DurableJobsPane'
 
 const T0 = Date.parse('2026-09-24T21:00:00.000Z')
 const noop = (): void => {}
@@ -97,14 +97,14 @@ describe('durable job view', () => {
     expect(formatDuration(8 * 3_600_000 + 7 * 60_000)).toBe('8 h 07 min')
   })
 
-  it('offers durable execution collapsed behind a toggle, not a bare disclosure', () => {
-    const html = renderToStaticMarkup(createElement(DurableJobLauncherOption, {
-      model: { id: 'local/qwen3.6-35b-a3b', label: 'Qwen 35B' }, busy: false, onCreate: noop
+  it('is a form for exactly the model handed to it, with no model picker of its own', () => {
+    const html = renderToStaticMarkup(createElement(DurableJobForm, {
+      model: { id: 'local/qwen3.6-35b-a3b', label: 'Qwen 35B' }, busy: false, onCreate: noop, onCancel: noop
     }))
-    expect(html).toContain('Run as durable job')
+    expect(html).toContain('Qwen 35B')
     expect(html).toContain('staged, resumable, overnight')
+    expect(html).toContain('Job objective')
+    expect(html).not.toContain('<select')
     expect(html).not.toContain('<details')
-    // Collapsed by default: the form (and its fixed model) is not in the markup until opened.
-    expect(html).not.toContain('Job objective')
   })
 })

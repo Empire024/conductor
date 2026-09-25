@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { ChevronDown, ChevronRight, ExternalLink, FileText, FolderOpen, Pause, Play, Plus, Square } from 'lucide-react'
+import { ExternalLink, FileText, FolderOpen, Pause, Play, Plus, Square } from 'lucide-react'
 import { canTransition, TERMINAL_JOB_STATUSES, type DurableJobEvent, type DurableJobReport, type DurableJobStage, type DurableJobStatus, type DurableJobSummary } from '../../../shared/durable-jobs'
 import type { DurableJobDetail } from '../../../shared/durable-jobs-bridge'
 import { LOCAL_QWEN_35B } from '../../../shared/local-models'
@@ -158,28 +158,27 @@ export function DurableJobCreateForm({ models, busy, onCreate }: { models: Array
   </form>
 }
 
-/** Compact launcher-local creation UI. The selected tile supplies the exact local model, while
- * the resulting job immediately replaces the launcher with its durable conversation tab. */
-export function DurableJobLauncherOption({ model, busy, error = '', onCreate }: {
+/** Compact launcher-local creation form for one fixed local model. The toggle that shows it lives
+ * on that model's own launcher tile (LauncherPane.tsx), not here: this is the form alone, so
+ * "durable" is never a second model picker independent of what the owner actually clicked. */
+export function DurableJobForm({ model, busy, error = '', onCreate, onCancel }: {
   model: { id: string; label: string }
   busy: boolean
   error?: string
   onCreate(input: { title: string; objective: string; model: string; constraints: string[] }): void
+  onCancel(): void
 }): React.JSX.Element {
-  const [open, setOpen] = useState(false)
   const [objective, setObjective] = useState(''), [title, setTitle] = useState('')
-  return <div className="durable-job-launcher">
-    <button type="button" className="durable-job-launcher-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
-      {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />} Run as durable job <span>staged, resumable, overnight</span>
-    </button>
-    {open && <form className="durable-job-launcher-form" onSubmit={event => { event.preventDefault(); if (objective.trim()) onCreate({ title: title.trim(), objective: objective.trim(), model: model.id, constraints: [] }) }}>
-      <strong>{model.label}</strong>
-      <label>Job objective<textarea aria-label="Job objective" rows={3} value={objective} onChange={event => setObjective(event.target.value)} placeholder="What should this local model finish?" /></label>
-      <label>Title<input aria-label="Job title" value={title} onChange={event => setTitle(event.target.value)} placeholder="Optional" /></label>
-      {error && <p className="durable-job-error" role="alert">{error}</p>}
+  return <form className="durable-job-launcher-form" onSubmit={event => { event.preventDefault(); if (objective.trim()) onCreate({ title: title.trim(), objective: objective.trim(), model: model.id, constraints: [] }) }}>
+    <strong>{model.label} <span>staged, resumable, overnight</span></strong>
+    <label>Job objective<textarea aria-label="Job objective" rows={3} value={objective} onChange={event => setObjective(event.target.value)} placeholder="What should this local model finish?" autoFocus /></label>
+    <label>Title<input aria-label="Job title" value={title} onChange={event => setTitle(event.target.value)} placeholder="Optional" /></label>
+    {error && <p className="durable-job-error" role="alert">{error}</p>}
+    <div className="durable-job-launcher-form-actions">
       <button type="submit" disabled={busy || !objective.trim()}><Plus size={13} />{busy ? 'Starting…' : 'Start durable job'}</button>
-    </form>}
-  </div>
+      <button type="button" className="durable-job-launcher-form-cancel" onClick={onCancel}>Cancel</button>
+    </div>
+  </form>
 }
 
 /** Loads one job and follows it: the detail refreshes on every change the service publishes. */

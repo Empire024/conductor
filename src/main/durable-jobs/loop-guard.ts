@@ -113,6 +113,16 @@ export function failureSignature(output: string): string {
 
 const PROGRESS_KINDS: ReadonlySet<ProgressSignal['kind']> = new Set(['file-diff', 'test-ran', 'decision', 'stage-output'])
 
+/** Read-only inspection tools (never a write or a command): failing on "not there yet" is a
+ *  normal check before creating something, not evidence of a stuck approach. */
+const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(['read_file', 'list_files', 'search'])
+const NOT_FOUND_RE = /\b(ENOENT|no such file|does not exist|not found)\b/i
+/** A failed read whose own target was missing (RV1 D1: `read_file INDEX.md` tried 3 times before
+ *  the stage had created it blocked the job on the loop guard's failedApproachLimit). Never
+ *  counted as a failed approach; a genuinely stuck stage still trips near-identical-calls or
+ *  no-progress-rounds instead. */
+const benignNotFound = (call: ObservedCall): boolean => call.failed && READ_ONLY_TOOLS.has(call.name) && NOT_FOUND_RE.test(call.output)
+
 export class LoopGuard {
   private readonly stageId: string
   private readonly now: () => number
@@ -171,18 +181,21 @@ export class LoopGuard {
     const sample = boundedExcerpt(`${call.name} ${target || JSON.stringify(call.arguments)} -> ${call.failed ? 'failed: ' : ''}${call.output}`, 300)
     this.lastCall = { name: call.name, target, sample }
     const stagnation = this.detector.observe(call)
+    const benign = benignNotFound(call)
 
     // Near-identical only counts when the call taught nothing new: it failed, or its output
-    // (normalised) has been seen before. Reading the next window of a file is not a loop.
+    // (normalised) has been seen before. Reading the next window of a file is not a loop. A
+    // benign not-found read never counts here either, so a few checks before creating a file
+    // never escalate toward near-identical-calls.
     const outputKey = digest(`${call.name}|${target}|${failureSignature(call.output)}|${call.failed ? '' : digest(call.output.replace(/\b\d+(?:\.\d+)?\s*m?s\b|duration_ms=\d+|[a-f0-9]{8}-[a-f0-9-]{27,}/gi, '#'))}`)
     const repeatedOutput = this.seenOutputs.has(outputKey)
     this.seenOutputs.add(outputKey)
     const near = nearCallKey(call.name, call.arguments)
-    const nearCount = call.failed || repeatedOutput ? (this.nearCounts.get(near) ?? 0) + 1 : 1
+    const nearCount = !benign && (call.failed || repeatedOutput) ? (this.nearCounts.get(near) ?? 0) + 1 : 1
     this.nearCounts.set(near, nearCount)
 
     let failed = 0
-    if (call.failed) {
+    if (call.failed && !benign) {
       const approach = `${call.name}|${target}|${failureSignature(call.output)}`
       const entry = this.failedApproaches.get(approach) ?? { count: 0, tool: call.name, target, sample }
       entry.count++
@@ -199,7 +212,9 @@ export class LoopGuard {
     else if (repeatedOutput || call.failed) this.idleRounds++
 
     if (failed >= this.options.failedApproachLimit) return this.detected({ pattern: 'failed-approach', tool: call.name, target, count: failed, sample: [sample], ...this.base() })
-    if (stagnation.action === 'stop') return this.detected({ pattern: 'identical-calls', tool: call.name, target, count: stagnation.repeats, sample: [sample, redactSensitive(stagnation.message ?? '')], ...this.base() })
+    // A benign not-found read still feeds the generic identical-call detector above (so its idle
+    // bookkeeping stays in sync), but never blocks or replans on that pattern alone.
+    if (stagnation.action === 'stop' && !benign) return this.detected({ pattern: 'identical-calls', tool: call.name, target, count: stagnation.repeats, sample: [sample, redactSensitive(stagnation.message ?? '')], ...this.base() })
     if (nearCount >= this.options.nearIdenticalLimit) return this.detected({ pattern: 'near-identical-calls', tool: call.name, target, count: nearCount, sample: [sample], ...this.base() })
     const idle = this.idleVerdict()
     if (idle.action !== 'continue') return idle

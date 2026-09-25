@@ -81,8 +81,7 @@ Windows native binaries (Rollup, esbuild), so `tsc`/`vitest` could not run insid
 
 ## Not yet wired
 
-- `local.savings` (or a field on `usage.limits`) in app control: `LocalAssist.savings(days)`
-  (`local-assist/wiring.ts`) already computes the figure the usage view uses; it needs one
-  routing line in `src/main/agent-control.ts` and `src/main/index.ts`'s control-dependency wiring
-  (see the FX2 handoff notes) plus, if the owner wants it, a `local.prepareDeps` owner-only
-  method that calls `prepareLinuxDependencies` directly.
+- `usage.limits`'s `localSavings` field carries the same figure the usage view shows
+  (`AgentControl.setLocalAssist`, wired from `LocalAssist.savings()` in `src/main/index.ts`;
+  `null` where local assist did not start). `local.prepareDeps`, an owner-only method that calls
+  `prepareLinuxDependencies` directly, is still not wired.

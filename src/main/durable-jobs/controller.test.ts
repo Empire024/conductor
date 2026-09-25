@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -107,6 +107,24 @@ describe('durable job controller', () => {
     const job = service.get(created.id)
     expect(job.stages[0]).toMatchObject({ status: 'completed', attempt: 2 })
     expect(store.attemptBase(job.stages[0]!.id)).toBe(0)
+  })
+
+  it('never settles a stage completed when its completion criterion is unmet, even though the model claims done (RV1 D5)', async () => {
+    const { service } = setup([{ kind: 'answer', text: 'Wrote the log.\nJOB STATUS: DONE' }])
+    const created = await service.create(input({ budgets: { maxStageAttempts: 1 }, stages: [{ title: 'Write the log', objective: 'Write LOG.md with at least 3 lines', completionCriteria: ['LOG.md has 3 lines'] }] }))
+    await until(() => service.status(created.id).status === 'blocked')
+    const job = service.get(created.id)
+    expect(job.stages[0]).toMatchObject({ status: 'pending' })
+    expect(job.stages[0]!.error).toContain('Completion criteria not met: LOG.md does not exist')
+    expect(job.counters.stagesCompleted).toBe(0)
+  })
+
+  it('completes a stage once its completion criterion is actually met on disk', async () => {
+    const { service, dir } = setup([{ kind: 'answer', text: 'Wrote the log.\nJOB STATUS: DONE', filesChanged: ['LOG.md'] }])
+    writeFileSync(join(dir, 'LOG.md'), 'a\nb\nc\n')
+    const created = await service.create(input({ stages: [{ title: 'Write the log', objective: 'Write LOG.md with at least 3 lines', completionCriteria: ['LOG.md has 3 lines'] }] }))
+    await until(() => service.status(created.id).status === 'completed')
+    expect(service.get(created.id).stages[0]).toMatchObject({ status: 'completed' })
   })
 
   it('treats an output-limit stop as unfinished even when text exists', () => {

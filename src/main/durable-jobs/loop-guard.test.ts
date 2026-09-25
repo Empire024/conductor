@@ -51,6 +51,23 @@ describe('loop guard', () => {
     expect(fail(77)).toMatchObject({ action: 'replan', evidence: { pattern: 'failed-approach', count: 3 } })
   })
 
+  it('does not block or replan on read_file failing because the file does not exist yet (RV1 D1)', () => {
+    const { guard: g } = guard()
+    const fail = () => g.observeToolCall({ name: 'read_file', arguments: { path: 'INDEX.md' }, output: "failed: ENOENT: no such file or directory, open 'INDEX.md'", failed: true })
+    // failedApproachLimit is 3 by default: three of these used to block the job (RV1 D1) even
+    // though checking a file exists before creating it is normal. A generic identical-call
+    // "warn" may still fire (it only nudges the worker; it never stops the stage).
+    const actions = Array.from({ length: 6 }, () => fail().action)
+    expect(actions).not.toContain('replan')
+    expect(actions).not.toContain('block')
+    // A genuinely failing read (not "not found") still trips the guard normally.
+    const g2 = guard().guard
+    const realFail = () => g2.observeToolCall({ name: 'read_file', arguments: { path: 'INDEX.md' }, output: 'failed: EACCES: permission denied', failed: true })
+    expect(realFail().action).toBe('continue')
+    expect(realFail().action).toBe('continue')
+    expect(realFail()).toMatchObject({ action: 'replan', evidence: { pattern: 'failed-approach' } })
+  })
+
   it('counts repeated chat as no progress and a real progress signal as progress', () => {
     const { guard: g } = guard({ idleRoundsLimit: 5 })
     for (let i = 0; i < 4; i++) expect(g.observeChatRound().action).toBe('continue')

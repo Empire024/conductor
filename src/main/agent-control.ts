@@ -27,6 +27,7 @@ import { readTextFile } from './text-files'
 import { invalidateProjectFiles, searchProjectFiles } from './project-file-search'
 import { inheritMachineId, machineRunsProject, tabMachineId } from './machines'
 import type { LocalUpdateBuildService } from './local-update-build'
+import type { SavingsSummary } from './local-assist/contract'
 import type { DeliveryRequester, DeliveryRun, RepositoryStatus } from '../shared/delivery'
 import { LOCAL_CONNECTION, LOCAL_MACHINE_ID, type MachineDescriptor } from '../shared/remote-control'
 import { createApprovalRouting } from './approval-review-routing'
@@ -160,7 +161,7 @@ const toolSignatures = {
   'git.ship.status': '({runId?,waitSeconds?}) — the running or latest delivery of this project: each stage with its log tail, commit, release tag and error; waitSeconds (max 100) long-polls until the run settles',
   'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
   'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
-  'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated',
+  'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated. Also carries localSavings: the conductor-local MCP tools\' (run_and_summarize, local_ask, summarize_file) measured frontier-token savings over the last 7 days — calls, modelCalls, localInputTokens/localOutputTokens and tokensSaved — or null where local assist is not wired',
   'loops.list': '() — validated .conductor/loops/*.md definitions in this project, with version, triggers, inputs, budget and step count',
   'loops.get': '({id}) — one validated logic loop including its instructions and exact model/effort/action steps',
   'loops.history': '({id}) — the loop file’s git history: commit, timestamp and subject',
@@ -266,6 +267,9 @@ export interface AgentControlDependencies {
   schedules?: ScheduleControlService
   /** Ideas (src/main/ideas/register.ts); plugged in with AgentControl.setIdeas. */
   ideas?: { call(caller: IdeasControlCaller, method: string, args: unknown): Promise<unknown> }
+  /** conductor-local MCP tools (src/main/local-assist/wiring.ts); plugged in with
+   *  AgentControl.setLocalAssist, so construction order does not matter. */
+  localAssist?: { savings(days?: number): SavingsSummary }
   /** Whether a local model could start its server now; absent where the local runtime is not wired. */
   localModels?: {
     availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }>
@@ -895,7 +899,11 @@ export class AgentControl {
       const providers: StructuredProvider[] = ['claude', 'codex', 'grok']
       if (args.provider !== undefined && !providers.includes(args.provider as StructuredProvider)) throw new Error('provider must be claude, codex or grok')
       // Allowance is account-wide; which conversation reported it is named only inside this project.
-      return { observedNow: new Date().toISOString(), providers: sessions.usageLimits(args.provider as StructuredProvider | undefined).map(report => ({ ...report, windows: report.windows.map(window => ({ ...window, source: window.source.projectId === scope.projectId ? { agentSessionId: window.source.agentSessionId } : { otherProject: true } })) })) }
+      return {
+        observedNow: new Date().toISOString(),
+        providers: sessions.usageLimits(args.provider as StructuredProvider | undefined).map(report => ({ ...report, windows: report.windows.map(window => ({ ...window, source: window.source.projectId === scope.projectId ? { agentSessionId: window.source.agentSessionId } : { otherProject: true } })) })),
+        localSavings: this.deps.localAssist?.savings() ?? null
+      }
     }
     if (method === 'local.servers' || method === 'local.stop') return this.localServers(scope, source, method, args)
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)
@@ -1192,6 +1200,9 @@ export class AgentControl {
 
   /** Plugs in scheduled tasks once the scheduler is constructed (src/main/index.ts). */
   setSchedules(service: ScheduleControlService | undefined): void { this.deps.schedules = service }
+
+  /** Plugs in the conductor-local savings ledger once it is constructed (src/main/index.ts). */
+  setLocalAssist(service: AgentControlDependencies['localAssist']): void { this.deps.localAssist = service }
 
   /** Plugs in Ideas once it is constructed (src/main/index.ts). */
   setIdeas(service: AgentControlDependencies['ideas']): void { this.deps.ideas = service }
