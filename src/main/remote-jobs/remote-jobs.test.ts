@@ -80,6 +80,8 @@ describe('shell pieces', () => {
     expect(JOB_WRAPPER).toContain('kill -TERM -"$pid"')
     expect(JOB_WRAPPER).toContain('kill -KILL -"$pid"')
     expect(JOB_WRAPPER).toContain('cat <&3')
+    // bash's own job notices ("Terminated: 15 cat ...") must not land in the job's stderr.
+    expect(JOB_WRAPPER).toContain('exec 4>&2 2>/dev/null')
   })
 
   it('ssh is keys-only, bounded and pins the host key in Conductor\'s own file', () => {

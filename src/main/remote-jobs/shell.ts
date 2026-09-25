@@ -24,7 +24,8 @@ export function shQuote(value: string): string {
 export const MARKER_PREFIX = '@@conductor-job:'
 
 export const JOB_WRAPPER = String.raw`id=$1; cwd=$2; limit=$3; cmd=$4; tag="@@conductor-job:$5"
-mark() { printf '%s %s\n' "$tag" "$1" >&2; }
+markfd=2
+mark() { printf '%s %s\n' "$tag" "$1" >&$markfd; }
 state="$HOME/.conductor-node/jobs/$id"
 mkdir -p "$state" || { mark error=state-dir; mark exit=125; exit 125; }
 if [ -f "$HOME/.conductor-node/env.sh" ]; then . "$HOME/.conductor-node/env.sh" >/dev/null 2>&1; fi
@@ -36,10 +37,14 @@ set -m
 /bin/bash -c "$cmd" </dev/null 3<&- &
 pid=$!
 set +m
+# From here the wrapper's own stderr (bash job notices such as "Terminated: 15") goes nowhere;
+# the job keeps the real one, and marks go to a copy of it.
+exec 4>&2 2>/dev/null
+markfd=4
 trap '' PIPE HUP
 echo "$pid" >"$state/pid"
 mark "started pid=$pid"
-cat <&3 >/dev/null 2>&1 &
+cat <&3 >/dev/null 2>&1 4>&- &
 line=$!
 exec 3<&-
 deadline=$(( $(date +%s) + limit ))
