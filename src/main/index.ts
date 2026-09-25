@@ -7,6 +7,7 @@ import { startWatchdogProcess, watchdogRuntime } from './recovery/detached'
 import { recoveryNote } from './recovery/protocol'
 import { importLoginShellPath } from './login-shell-path'
 import { workspaceWindowChrome } from './window-chrome'
+import { startParkedPriority } from './background-priority'
 import type { RuntimeHostClient } from './runtime-host/client'
 import { setRuntimeHost } from './providers/transport'
 import { ConversationHistory, registerConversationHistoryIpc } from './conversation-history'
@@ -285,6 +286,9 @@ if (testMode) {
  *  out of the taskbar, and never activates or raises them. Set CONDUCTOR_BACKGROUND_WINDOWS=0 to
  *  watch a run, or =1 to park a normal launch. */
 export const backgroundWindows = !app.isPackaged && (process.env.CONDUCTOR_BACKGROUND_WINDOWS ?? (process.env.CONDUCTOR_TEST_USER_DATA ? '1' : '0')) === '1'
+// A parked instance is background work: below normal priority, GPU and renderers included, so the
+// owner's own Conductor never waits on it (typing-lag-under-test-load).
+startParkedPriority(app, backgroundWindows, process.env, message => console.log(message))
 /** Far enough left of every display that no part of a parked window is ever composited over the
  *  owner's screen, while the renderer keeps painting so CDP screenshots stay real. */
 const parkedPosition = (): { x: number; y: number } => {
