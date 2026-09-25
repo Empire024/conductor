@@ -238,6 +238,9 @@ if (testMode) {
   // A leaked overnight verifier left Electron and its fixture CLIs running for hours after the
   // smoke script that launched it was gone (feature-list.md: smoke-instances-never-leak). This
   // instance dies, tree and all, within one poll interval of that launcher disappearing.
+  // Pin the launcher once: a relaunched instance (app.restart) inherits this env, so it and its
+  // runtime host keep watching the smoke that started the run, not the previous app process.
+  if (!process.env.CONDUCTOR_TEST_PARENT_PID) process.env.CONDUCTOR_TEST_PARENT_PID = String(process.ppid)
   startTestModeWatchdog()
   const mainErrorsLog = join(resolve(process.env.CONDUCTOR_TEST_USER_DATA!), 'main-errors.log')
   const logMainError = (kind: string, detail: string): void => {

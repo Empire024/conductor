@@ -36,9 +36,10 @@ export async function connectRuntimeHost(launch: RuntimeHostLaunch): Promise<Run
   delete environment.NODE_OPTIONS
   // A test-profile host must not outlive the app that started it: a restart smoke left detached
   // host processes running 35 min after their app was gone (feature-list.md:
-  // smoke-instances-never-leak). Off test mode the host is meant to survive an app restart, so this
+  // smoke-instances-never-leak). It watches the smoke launcher, so the host still survives a test
+  // restart. Off test mode the host is meant to survive an app restart, so this
   // is never set for a real launch.
-  if (process.env.CONDUCTOR_TEST_USER_DATA) environment.CONDUCTOR_RUNTIME_HOST_WATCH_PID = String(process.pid)
+  if (process.env.CONDUCTOR_TEST_USER_DATA) environment.CONDUCTOR_RUNTIME_HOST_WATCH_PID = process.env.CONDUCTOR_TEST_PARENT_PID || String(process.pid)
   const child = spawn(runtime, [script, '--user-data', launch.userData], { detached: true, stdio: 'ignore', windowsHide: true, env: environment, cwd: hostDirectory(launch.userData) })
   child.on('error', error => launch.log?.(`runtime host could not start: ${error.message}`))
   child.unref()
