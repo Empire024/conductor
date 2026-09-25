@@ -8,7 +8,8 @@ import { captureAdapterState, restoreAdapterState, settled } from './adapter-sta
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { privateConfigFile, relayMcpConfigs, relaysMcp, removeConfigFiles } from '../runtime-host/relay-config'
 import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
-import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, parseAutoModeDenialReason } from '../../shared/auto-mode-denial'
+import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, hookDenialReason, parseAutoModeDenialReason, type DenialGrantRequest } from '../../shared/auto-mode-denial'
+import { callMatchesRule, describeGrantRequest } from '../../shared/permission-grants'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
 /** The local CLI bridge is checked against the official CLI/extension 2.1.278: the 2026-09-21
@@ -106,7 +107,9 @@ export class ClaudeAdapter implements ProviderAdapter {
   private controls = new Map<string, { resolve(value: ObjectValue): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>()
   private tools = new Map<string, Tool>()
   /** Tool calls the CLI's own auto-mode classifier refused, by tool_use_id (../../shared/auto-mode-denial.ts). */
-  private autoModeDenials = new Map<string, { tool: string; reason: string; parentId?: string; confirmed?: boolean }>()
+  private autoModeDenials = new Map<string, { tool: string; reason: string; parentId?: string; confirmed?: boolean; request?: DenialGrantRequest }>()
+  /** The --settings file carrying owner-granted rules at launch (src/main/permission-grants). */
+  private grantSettingsFile?: string
   private streams = new Map<string, { messageId: string; blocks: Map<number, Block>; textBlocks: number }>()
   /** Task starts carry identity/type/background state; later progress/completion frames may omit them. */
   private backgroundTasks = new Map<string, { description: string; taskType?: string; toolUseId?: string; backgrounded: boolean }>()
@@ -213,9 +216,18 @@ export class ClaudeAdapter implements ProviderAdapter {
     // the owner should never have to restart one to get them. --mcp-config is additive, so the
     // owner's own MCP configuration is untouched; --strict-mcp-config is deliberately not sent.
     // One variadic flag carries both servers; a repeated flag is not something the CLI promises to merge.
-    const mcpConfigs = await this.relayMcp(this.options.approvalReviewer ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig].filter((config): config is string => Boolean(config)))
+    const mcpConfigs = await this.relayMcp(this.options.approvalReviewer ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig, this.options.conductorMcpConfig].filter((config): config is string => Boolean(config)))
     if (mcpConfigs.length) args.push('--mcp-config', ...mcpConfigs)
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
+    // Rules the owner granted this conversation (src/main/permission-grants) ride in the flag
+    // settings layer, the same layer apply_flag_settings changes while it runs. Nothing else is
+    // ever put there, so a launch without grants passes no --settings at all.
+    const grantRules = this.options.approvalReviewer ? [] : this.options.permissionGrants?.rules() ?? []
+    if (grantRules.length) {
+      this.grantSettingsFile = privateConfigFile(JSON.stringify({ permissions: { allow: grantRules.map(entry => entry.rule) } }), `claude-grants-${this.options.runtimeId}`)
+      this.relayFiles.push(this.grantSettingsFile)
+      args.push('--settings', this.grantSettingsFile)
+    }
     // No --bare, --system-prompt, --setting-sources, or environment auth mutation:
     // CLI defaults retain the coding-agent prompt, user/project/local configuration and policy.
     this.transport = this.createTransport(args)
@@ -226,7 +238,9 @@ export class ClaudeAdapter implements ProviderAdapter {
       const initialized = await this.control({ subtype: 'initialize', hooks: {
         PreToolUse: [{ hookCallbackIds: ['conductor_before'], timeout }],
         PostToolUse: [{ hookCallbackIds: ['conductor_after'], timeout }],
-        PostToolUseFailure: [{ hookCallbackIds: ['conductor_failed'], timeout }]
+        PostToolUseFailure: [{ hookCallbackIds: ['conductor_failed'], timeout }],
+        // The classifier's own record of a refusal, with the exact tool input (claude 2.1.282).
+        PermissionDenied: [{ hookCallbackIds: ['conductor_denied'], timeout }]
       }, forwardSubagentText: true, promptSuggestions: false, agentProgressSummaries: false })
       this.capabilities.models = array(initialized.models).flatMap((entry) => {
         const model = object(entry)
@@ -298,7 +312,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     restoreAdapterState(this, detachment.state)
     this.disposed = false
     // The CLI still calls the relay it was started with; its routes now lead to this app's servers.
-    if (this.mcpRelayed) await relayMcpConfigs(currentRuntimeHost(), this.relayKey, [this.options.mcpConfig, this.options.localAssistMcpConfig], error => this.relayNotice(error))
+    if (this.mcpRelayed) await relayMcpConfigs(currentRuntimeHost(), this.relayKey, [this.options.mcpConfig, this.options.localAssistMcpConfig, this.options.conductorMcpConfig], error => this.relayNotice(error))
     this.transport = this.createTransport([], detachment.transport)
     this.transport.start()
     // The store closed this conversation's open work when it loaded (an app that stopped is
@@ -306,6 +320,9 @@ export class ClaudeAdapter implements ProviderAdapter {
     for (const [id, tool] of this.tools) if (tool.status === 'preparing' || tool.status === 'running' || tool.status === 'awaiting_approval') this.updateTool(id, {})
     for (const [id, request] of this.requests) this.emit({ requestId: id, itemId: request.toolId, data: { type: 'interaction', interaction: request.interaction } })
     this.emit({ data: { type: 'session', phase: this.phase, nativeSessionId: this.nativeSessionId } })
+    // Grants live only as long as this app's grant service remembers them: a CLI that outlived an
+    // app restart is handed the current set (normally none), so no forgotten rule stays in force.
+    if (this.options.permissionGrants) void this.applyPermissionRules().catch(error => console.warn('Could not restate permission grants on a reattached Claude runtime', error))
   }
 
   async submit(text: string, settings: SessionSettings, attachments: ContextAttachment[] = []): Promise<void> {
@@ -470,6 +487,21 @@ export class ClaudeAdapter implements ProviderAdapter {
     const receipt = await this.control({ subtype: 'interrupt', cancel_queued: true })
     // Only the exact native cancellation receipt authorizes replay after Escape.
     for (const id of array(receipt.cancelled)) if (typeof id === 'string') this.inputDelivery(id, 'cancelled', { method: 'interrupt', payload: receipt })
+  }
+
+  /** Hands the running CLI the owner's current grants (permissionGrants.rules()) in its flag
+   *  settings layer, replacing the previous set, so a revoked or used rule is gone at once.
+   *  'unsupported' when this CLI does not take apply_flag_settings here: the rules then reach it
+   *  through --settings when the conversation next starts. */
+  async applyPermissionRules(): Promise<'applied' | 'unsupported'> {
+    if (this.options.approvalReviewer || !this.ready || this.disposed || !this.transport?.connected) return 'unsupported'
+    const rules = this.options.permissionGrants?.rules() ?? []
+    try { await this.control({ subtype: 'apply_flag_settings', settings: { permissions: { allow: rules.map(entry => entry.rule) } } }) }
+    catch (error) {
+      if (/not supported|not implemented|unknown|unsupported/i.test(error instanceof Error ? error.message : '')) return 'unsupported'
+      throw error
+    }
+    return 'applied'
   }
 
   async stop(): Promise<void> { this.dispose(); await this.transport?.closeAndWait?.() }
@@ -945,10 +977,29 @@ export class ClaudeAdapter implements ProviderAdapter {
     const reason = parseAutoModeDenialReason(output)
     if (!reason || this.autoModeDenials.has(toolUseId)) return
     const tool = this.tools.get(toolUseId)
-    const denial = { tool: tool?.name ?? 'a tool', reason, ...(tool?.parentId ? { parentId: tool.parentId } : {}) }
+    const granted = tool ? (this.options.permissionGrants?.rules() ?? []).find(entry => callMatchesRule(entry.rule, tool.name, tool.input, this.options.cwd)) : undefined
+    if (granted) this.options.permissionGrants?.refused?.(granted.rule)
+    this.recordAutoModeDenial(toolUseId, reason, undefined, { method: 'tool_result/auto_mode_denial', payload: { tool_use_id: toolUseId, reason } })
+  }
+  /** The PermissionDenied hook is the structured record: exact tool, exact input, the classifier's
+   *  reason. It normally arrives before the tool_result wording, which is then only a fallback for
+   *  a CLI that does not run the hook. A denial of a call the owner already granted is reported as
+   *  such, because that is the evidence that a grant did not take effect. */
+  private hookedAutoModeDenial(toolUseId: string, name: string, input: ObjectValue, rawReason: string): void {
+    const reason = hookDenialReason(rawReason)
+    const granted = (this.options.permissionGrants?.rules() ?? []).find(entry => callMatchesRule(entry.rule, name, input, this.options.cwd))
+    if (granted) this.options.permissionGrants?.refused?.(granted.rule)
+    if (this.autoModeDenials.get(toolUseId)?.request) return
+    this.recordAutoModeDenial(toolUseId, reason, { name, input }, { method: 'hook/permission_denied', payload: { tool_use_id: toolUseId, tool_name: name, reason: rawReason.slice(0, 400) } })
+  }
+  private recordAutoModeDenial(toolUseId: string, reason: string, call: { name: string; input: ObjectValue } | undefined, native: { method: string; payload: Json }): void {
+    const tool = this.tools.get(toolUseId), name = call?.name ?? tool?.name
+    const input = call?.input ?? (tool ? object(tool.input) : undefined)
+    const request = name && input ? describeGrantRequest({ tool: name, input, cwd: this.options.cwd, category: reason, toolUseId }) : undefined
+    const denial = { tool: name ?? 'a tool', reason, ...(tool?.parentId ? { parentId: tool.parentId } : {}), ...(request ? { request } : {}) }
     if (this.autoModeDenials.size >= 256) this.autoModeDenials.delete(this.autoModeDenials.keys().next().value!)
     this.autoModeDenials.set(toolUseId, denial)
-    this.emit({ itemId: autoModeDenialItemId(toolUseId), parentId: denial.parentId, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload({ ...denial, toolUseId }) }, native: { method: 'tool_result/auto_mode_denial', payload: { tool_use_id: toolUseId, reason } } })
+    this.emit({ itemId: autoModeDenialItemId(toolUseId), parentId: denial.parentId, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload({ ...denial, toolUseId }) }, native })
   }
   /** The result frame's permission_denials (claude 2.1.280: [{ tool_name, tool_input, tool_use_id }])
    *  is the runtime's record of every denial in the turn, the owner's own included, so it confirms a
@@ -1038,6 +1089,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     const input = object(request.input), callback = string(request.callback_id)
     const id = string(request.tool_use_id) ?? string(input.tool_use_id)
     const name = string(input.tool_name) ?? 'Unknown tool', args = object(input.tool_input)
+    if (id && callback === 'conductor_denied') { this.hookedAutoModeDenial(id, name, args, string(input.reason) ?? ''); return }
     if (!id || !['conductor_before', 'conductor_after', 'conductor_failed'].includes(callback ?? '')) throw new Error('Unknown Claude lifecycle hook callback')
     if (!this.tools.has(id)) this.declareTool(id, name, args)
     const paths = ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'].includes(name) ? [string(args.file_path) ?? string(args.notebook_path)].filter((path): path is string => Boolean(path)) : []
@@ -1057,6 +1109,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     }
     const response = object(input.tool_response), success = callback === 'conductor_after' && response.interrupted !== true && (number(response.exitCode) ?? 0) === 0
     if (paths.length) await this.options.afterTool?.(id, paths, success)
+    // The call ran, so the permission check is behind it: an approve-once grant for exactly this
+    // call is spent now, and the service takes it back out of the live settings.
+    const spent = (this.options.permissionGrants?.rules() ?? []).find(entry => entry.once && callMatchesRule(entry.rule, name, args, this.options.cwd))
+    if (spent) this.options.permissionGrants?.used(spent.rule)
     const stdout = string(response.stdout), stderr = string(response.stderr)
     const priorStatus = this.tools.get(id)?.status
     this.updateTool(id, { status: priorStatus === 'rejected' || priorStatus === 'interrupted' ? priorStatus : success ? 'completed' : input.is_interrupt === true || response.interrupted === true ? 'interrupted' : 'failed' }, {

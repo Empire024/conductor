@@ -58,6 +58,7 @@ export interface ConductorBridge {
   phone: import('./phone-access').PhoneAccessBridge
   projectTasks: import('./project-backlog').ProjectBacklogBridge
   delivery: import('./delivery').DeliveryBridge
+  permissionGrants: import('./permission-grants').PermissionGrantsBridge
   durableJobs: import('./durable-jobs-bridge').DurableJobsBridge
   cloud: import('./cloud').CloudBridge
   ideas: import('./ideas').IdeasBridge

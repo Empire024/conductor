@@ -30,3 +30,13 @@ describe('a tool call answered through a question interaction', () => {
     expect(performance.now() - started).toBeLessThan(500)
   })
 })
+
+describe('permission grant notices', () => {
+  const notice = (payload: unknown): TimelineItem => ({ id: 'n', runtimeId: 'runtime', nativeItemId: 'auto-denial:use-1', sequence: 1, updatedSequence: 1, timestamp: '', data: { type: 'notice', message: 'Auto mode refused Write', payload } } as unknown as TimelineItem)
+  it('keeps a classifier denial, an agent request and a grant delivery notice in the conversation', () => {
+    expect(isConversationActivity(notice({ autoModeDenial: { tool: 'Write', reason: 'Modify Shared Resources', toolUseId: 'use-1' } }))).toBe(true)
+    expect(isConversationActivity(notice({ permissionGrant: { id: 'grant:1' } }))).toBe(true)
+    expect(isConversationActivity(notice({ permissionGrantDelivery: { rule: 'Edit(//c/x)' } }))).toBe(true)
+    expect(isConversationActivity(notice({ somethingElse: true }))).toBe(false)
+  })
+})

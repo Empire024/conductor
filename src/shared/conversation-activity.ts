@@ -2,6 +2,7 @@ import type { TimelineItem } from './structured-agent'
 import { localStopOf } from './local-stop'
 import { localEnergyOf } from './local-energy'
 import { isControlActivityNotice } from './control-activity'
+import { isPermissionGrantNotice } from './permission-grants'
 
 /** Claude's CLI keeps a long-running tool visible by re-emitting it under a synthetic
  *  `<toolUseId>-heartbeat-N` item that carries no input and repeats its parent's name. Those
@@ -53,5 +54,7 @@ export function isConversationActivity(item: TimelineItem, _index?: number, item
   if (localEnergyOf(data)) return true
   // What a conversation did through app control, and who drove this one (control-activity.ts).
   if (isControlActivityNotice(data)) return true
+  // A classifier denial and a permission request are cards the owner answers (permission-grants.ts).
+  if (isPermissionGrantNotice(data)) return true
   return data.payload === undefined
 }

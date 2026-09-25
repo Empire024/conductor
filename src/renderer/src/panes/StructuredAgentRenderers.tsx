@@ -22,6 +22,8 @@ import { LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL } from '../../../sh
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { autoModeDenialOf } from '../../../shared/auto-mode-denial'
 import { AutoModeDenialCard } from './AutoModeDenialCard'
+import { LivePermissionGrantCard } from '../components/permission-grants/PermissionGrantCard'
+import { grantStatusOf, permissionGrantOf } from '../../../shared/permission-grants'
 import { localStopOf } from '../../../shared/local-stop'
 import { localEnergyOf } from '../../../shared/local-energy'
 import { LocalEnergyNotice } from './LocalEnergyCard'
@@ -584,7 +586,10 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
     case 'subagent': body = <section className="sa-subagent"><strong>{data.name}</strong><small>{data.status.replaceAll('_', ' ')}</small></section>; break
     case 'error': body = <p className="sa-error" role="alert">{data.message}{data.code && data.code !== LOCAL_MODEL_SETUP_ERROR_CODE && <small> ({data.code})</small>}{data.code === LOCAL_MODEL_SETUP_ERROR_CODE && <button type="button" onClick={() => void window.conductor.system.openExternal(LOCAL_MODEL_SETUP_URL)}>Download / set up local model</button>}</p>; break
     case 'notice': {
-      const denial = autoModeDenialOf(data); if (denial) { body = <AutoModeDenialCard denial={denial} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
+      const denial = autoModeDenialOf(data)
+      if (denial?.request) { body = <LivePermissionGrantCard agentSessionId={props.sessionId} requestId={props.item.nativeItemId ?? props.item.id} request={{ ...denial.request, status: grantStatusOf(data) }} interactive={props.interactive} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
+      const asked = permissionGrantOf(data); if (asked) { body = <LivePermissionGrantCard agentSessionId={props.sessionId} requestId={asked.id} request={asked} interactive={props.interactive} />; break }
+      if (denial) { body = <AutoModeDenialCard denial={denial} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
       const stop = localStopOf(data); if (stop) { body = <LocalStopCard report={stop} />; break }
       const energy = localEnergyOf(data); if (energy) { body = <LocalEnergyNotice reading={energy} />; break }
       const control = controlActivityOf(data); if (control) { body = <ControlActivityRow activity={control} onFocusAgent={props.onFocusOrigin} />; break }

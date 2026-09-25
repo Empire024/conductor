@@ -32,6 +32,10 @@ export const MEMORY_HEADING = 'Conductor project memory (current project evidenc
 export const LOCAL_ASSIST_HINT = 'Save tokens: for tests, builds and long logs call run_and_summarize; for reading large files call local_ask (conductor-local tools, answered by the local model).'
 const LOCAL_ASSIST_PROVIDERS = new Set(['claude', 'codex'])
 
+/** Once per runtime, for Claude conversations, which get the `conductor` MCP tools and owner
+ *  permission grants (src/main/permission-grants, docs/permissions-classifier.md). */
+export const PERMISSION_GRANT_HINT = 'If Auto mode refuses a call you need, or will refuse one (production, shared or external), do not hand it to the owner to run: call request_permission (conductor tools; app control permissions.request) with {command|path|url, reason, rollback}. Split preparing (write the script) from running it, ask for exactly one call, keep working meanwhile, and after "[Conductor] approved: <rule>; retry it now" run exactly that call and verify it. Message other tabs with send_message, report and handoff, not from a shell.'
+
 /** Once per runtime, for a coworker a controller opened (coworker-autoclose.ts): a finished
  *  coworker left open keeps its CLI process alive for nothing. */
 export const FINISH_HINT = 'When your work is delivered and reported, end with agents.finish({}) so your tab and CLI are released.'
@@ -119,7 +123,7 @@ export class TurnBriefings {
     // recalled memory lines travel, fenced ahead of the owner's words (local-models/briefing.ts).
     if (local) return memory
     const coworkers = this.coworkers(spec, ledger)
-    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', staticDue && this.coworker(spec) ? FINISH_HINT : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
+    return [memory, staticDue ? MEMORY_PROTOCOL : '', coworkers, staticDue ? projectTaskBriefing(spec) : '', staticDue ? [this.deps.machine?.() ?? '', LOCAL_ASSIST_PROVIDERS.has(spec.provider) ? LOCAL_ASSIST_HINT : '', spec.provider === 'claude' ? PERMISSION_GRANT_HINT : ''].filter(Boolean).join(' ') : '', staticDue ? this.deps.control?.(spec) ?? '' : '', staticDue && this.coworker(spec) ? FINISH_HINT : '', this.successionHint(ledger, context), this.succession(spec.id, context) || this.nudge(ledger, context)].filter(Boolean).join('\n\n')
   }
 
   private coworker(spec: AgentSpec): boolean {

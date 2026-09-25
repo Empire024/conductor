@@ -6,7 +6,7 @@ import { ClaudeAdapter, CLAUDE_COMPATIBILITY, claudeCompatibility } from './clau
 import { JsonLineDecoder, JsonLineTransport, type TransportOptions } from './transport'
 import { SteeringUnavailableError, type AdapterOptions } from './adapter'
 import { resolve, join } from 'node:path'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const settings: SessionSettings = { permission: 'default', plan: false }
@@ -1220,7 +1220,9 @@ describe('claude auto-mode classifier denials', () => {
     expect(notices).toHaveLength(1)
     expect(notices[0]!.nativeItemId).toBe('auto-denial:toolu_denied')
     expect(notices[0]!.data).toMatchObject({ type: 'notice', payload: { autoModeDenial: { tool: 'Edit', reason: 'Security Weaken', toolUseId: 'toolu_denied' } } })
-    expect(notices[0]!.data.type === 'notice' ? notices[0]!.data.message : '').toBe("Auto mode refused Edit (Security Weaken). The claude CLI's own classifier decided this, so Conductor could not show you a card. Switch this conversation to Edit to get an Allow card for such actions, or add a permission rule.")
+    // The notice names the exact call and the one rule approving it would hand this conversation.
+    expect(notices[0]!.data.type === 'notice' ? notices[0]!.data.message : '').toBe("Auto mode refused Edit (Security Weaken): Edit a file (shared): C:/Windows/System32/drivers/etc/hosts. The claude CLI's own classifier decided this. Approve it once or for this session, or deny it: Conductor then hands this conversation exactly Edit(//c/Windows/System32/drivers/etc/hosts) and tells it to retry.")
+    expect(autoModeDenialOf(notices[0]!.data)?.request).toMatchObject({ tool: 'Edit', class: 'shared', rule: 'Edit(//c/Windows/System32/drivers/etc/hosts)', category: 'Security Weaken' })
     expect(f.events.some(event => event.native?.method === 'tool_result/auto_mode_denial')).toBe(true)
     // Nothing was asked of the owner through the approval channel, because the CLI never asked Conductor.
     expect(items.some(item => item.data.type === 'interaction')).toBe(false)
@@ -1243,5 +1245,73 @@ describe('claude auto-mode classifier denials', () => {
     const items = f.projection().items
     expect(items.find(item => item.data.type === 'tool' && item.nativeItemId === 'shell')?.data).toMatchObject({ status: 'rejected' })
     expect(items.some(item => item.data.type === 'notice' && autoModeDenialOf(item.data))).toBe(false)
+  })
+})
+
+describe('owner permission grants (src/main/permission-grants)', () => {
+  const deniedHook = (requestId: string, toolId: string, name: string, input: Json, reason: string): Json =>
+    ({ type: 'control_request', request_id: requestId, request: { subtype: 'hook_callback', callback_id: 'conductor_denied', tool_use_id: toolId, input: { hook_event_name: 'PermissionDenied', tool_use_id: toolId, tool_name: name, tool_input: input, reason } } })
+
+  it('registers the PermissionDenied hook and turns its record into one structured request, which the text fallback does not duplicate', async () => {
+    const f = fixture(); await f.adapter.start()
+    const initialize = f.transport.sent.find(message => (message as { request?: { subtype?: string } }).request?.subtype === 'initialize') as { request: { hooks: Record<string, Json> } }
+    expect(initialize.request.hooks.PermissionDenied).toEqual([{ hookCallbackIds: ['conductor_denied'], timeout: expect.any(Number) }])
+    await f.adapter.submit('Synthetic', settings)
+    // The haftheme case (2026-09-25), with a stand-in path: a new local script, refused for what it describes.
+    const input = { file_path: 'C:\\Users\\owner\\site\\app\\prod\\fix-pool.sh', content: '#!/usr/bin/env bash\n' }
+    f.transport.receive(toolUse('toolu_w', 'Write', input))
+    f.transport.receive(deniedHook('deny-hook', 'toolu_w', 'Write', input, 'Modify Shared Resources'))
+    await flush()
+    expect(f.transport.sent.some(message => { const reply = message as { type?: string; response?: { request_id?: string; subtype?: string } }; return reply.type === 'control_response' && reply.response?.request_id === 'deny-hook' && reply.response.subtype === 'success' })).toBe(true)
+    f.transport.receive({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_w', is_error: true, content: 'Permission for this action was denied by the Claude Code auto mode classifier. Reason: [Modify Shared Resources]. If you have other tasks that don\'t depend on this action, continue working on those.' }] } })
+    await flush()
+    const notices = f.projection().items.filter(item => autoModeDenialOf(item.data))
+    expect(notices).toHaveLength(1)
+    expect(autoModeDenialOf(notices[0]!.data)).toMatchObject({ tool: 'Write', reason: 'Modify Shared Resources', request: { action: 'Write a file', resource: 'C:\\Users\\owner\\site\\app\\prod\\fix-pool.sh', class: 'local', rule: 'Edit(//c/Users/owner/site/app/prod/fix-pool.sh)', category: 'Modify Shared Resources' } })
+    expect(f.events.some(event => event.native?.method === 'hook/permission_denied')).toBe(true)
+  })
+
+  it('launches with the granted rules in --settings, hands a running CLI the current set through apply_flag_settings, and passes no --settings without grants', async () => {
+    let rules = [{ rule: 'Bash(ssh -i key root@192.0.2.10 bash -s < app/prod/fix-pool.sh)', once: true }]
+    const f = fixture({ permissionGrants: { rules: () => rules, used: vi.fn() } })
+    await f.adapter.start()
+    const args = f.transport.options.args
+    expect(JSON.parse(readFileSync(args[args.indexOf('--settings') + 1]!, 'utf8'))).toEqual({ permissions: { allow: [rules[0]!.rule] } })
+    rules = []
+    await expect(f.adapter.applyPermissionRules()).resolves.toBe('applied')
+    expect(f.transport.sent.at(-1)).toMatchObject({ type: 'control_request', request: { subtype: 'apply_flag_settings', settings: { permissions: { allow: [] } } } })
+    const none = fixture(); await none.adapter.start()
+    expect(none.transport.options.args).not.toContain('--settings')
+    const reviewer = fixture({ approvalReviewer: true, permissionGrants: { rules: () => [{ rule: 'Bash(git status)', once: false }], used: vi.fn() } }); await reviewer.adapter.start()
+    expect(reviewer.transport.options.args).not.toContain('--settings')
+  })
+
+  it('reports a CLI that cannot take flag settings while it runs as unsupported', async () => {
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn() } }); await f.adapter.start()
+    f.transport.autoControlResponses = false
+    const applying = f.adapter.applyPermissionRules(); await flush()
+    const request = f.transport.sent.at(-1) as { request_id: string }
+    f.transport.receive({ type: 'control_response', response: { subtype: 'error', request_id: request.request_id, error: 'apply_flag_settings is not supported in this context (onApplyFlagSettings callback not registered)' } })
+    await expect(applying).resolves.toBe('unsupported')
+  })
+
+  it('spends an approve-once grant only after its exact call ran, and reports a granted call the classifier still refused', async () => {
+    const command = 'ssh -i key root@192.0.2.10 bash -s < app/prod/fix-pool.sh'
+    const used = vi.fn(), refused = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [{ rule: `Bash(${command})`, once: true }], used, refused } })
+    await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    f.transport.receive(toolUse('other', 'Bash', { command: 'git status' }))
+    f.transport.receive(hook('after-other', 'conductor_after', 'other', 'Bash', { command: 'git status' }, { stdout: '', exitCode: 0 }))
+    f.transport.receive(toolUse('granted', 'Bash', { command }))
+    f.transport.receive(hook('before-granted', 'conductor_before', 'granted', 'Bash', { command }))
+    await flush()
+    expect(used).not.toHaveBeenCalled()
+    f.transport.receive(hook('after-granted', 'conductor_after', 'granted', 'Bash', { command }, { stdout: 'ok', exitCode: 0 }))
+    await flush()
+    expect(used).toHaveBeenCalledExactlyOnceWith(`Bash(${command})`)
+    f.transport.receive(toolUse('again', 'Bash', { command }))
+    f.transport.receive(deniedHook('denied-again', 'again', 'Bash', { command }, '[External System Write]'))
+    await flush()
+    expect(refused).toHaveBeenCalledWith(`Bash(${command})`)
   })
 })

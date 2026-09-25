@@ -57,6 +57,45 @@ const steeringTimers = new Set()
 // SYNTHETIC WATCH LOOPS: backgrounded shells that never finish on their own; only stop_task ends one.
 const watchLoops = new Map()
 
+// SYNTHETIC CLASSIFIER (scripts/smoke-permission-grant.mjs): replays the auto-mode classifier
+// denial recorded in the haftheme session on 2026-09-25 (haftheme-denial-2026-09-25.json) for
+// stand-in calls, and lets a sensitive call through only when the flag settings layer (--settings at
+// launch, apply_flag_settings while running) holds its exact rule. Whether the real CLI lets such a
+// rule decide before its classifier is UNCONFIRMED (docs/permissions-classifier.md): this fixture
+// exercises Conductor's side of the path only. No command is ever executed.
+const recordedDenial = JSON.parse(readFileSync(new URL('./haftheme-denial-2026-09-25.json', import.meta.url), 'utf8'))
+const settingsArgument = process.argv.indexOf('--settings')
+let flagAllow = new Set(settingsArgument >= 0 ? JSON.parse(readFileSync(process.argv[settingsArgument + 1], 'utf8')).permissions?.allow ?? [] : [])
+const flagLog = entry => { if (process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG) writeFileSync(process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG, JSON.stringify({ at: Date.now(), ...entry }) + '\n', { flag: 'a' }) }
+flagLog({ launch: [...flagAllow] })
+let deniedHookRegistered = false
+const classifierCalls = {
+  WRITE: () => ({ tool: 'Write', input: { file_path: resolve(recordedDenial.standInPath), content: '#!/usr/bin/env bash\n# Stand-in for the pool fix script: prints one line and touches nothing.\necho "pool fix stand-in"\n' } }),
+  OTHER: () => ({ tool: 'Bash', input: { command: "ssh -o BatchMode=yes -o ConnectTimeout=3 root@192.0.2.10 'lswsctrl restart'" } }),
+  LOCAL: () => ({ tool: 'Write', input: { file_path: resolve('notes/todo.md'), content: '- tidy the README\n' }, local: true })
+}
+const escapeRule = content => content.replaceAll('\\', '\\\\').replaceAll('(', '\\(').replaceAll(')', '\\)')
+const posixPath = path => { const drive = /^([A-Za-z]):[/\\]/.exec(path); return drive ? '/' + drive[1].toLowerCase() + path.slice(2).replaceAll('\\', '/') : path.replaceAll('\\', '/') }
+const ruleFor = call => call.tool === 'Write' ? `Edit(${escapeRule('/' + posixPath(call.input.file_path))})` : `${call.tool}(${escapeRule(call.input.command)})`
+let classifierCount = 0, classified, lastRefused
+const classify = call => {
+  const id = `classified-${++classifierCount}`
+  classified = { id, call }
+  declare(id, call.tool, call.input)
+  if (call.local || flagAllow.has(ruleFor(call))) { pending = `${id}-pre`; hook(pending, 'conductor_before', id, call.tool, call.input); return }
+  lastRefused = call
+  const refuse = () => {
+    result(id, recordedDenial.toolResult, true)
+    text(`SYNTHETIC classifier refused ${call.tool} (${recordedDenial.reason}); nothing ran.`)
+    emit({ type: 'result', subtype: 'success', is_error: false, usage: {}, permission_denials: [{ tool_name: call.tool, tool_input: call.input, tool_use_id: id }] })
+    pending = undefined; classified = undefined
+  }
+  if (!deniedHookRegistered) { refuse(); return }
+  pending = `${id}-denied`
+  classified.refuse = refuse
+  send({ type: 'control_request', request_id: pending, request: { subtype: 'hook_callback', callback_id: 'conductor_denied', tool_use_id: id, input: { hook_event_name: 'PermissionDenied', tool_use_id: id, tool_name: call.tool, tool_input: call.input, reason: recordedDenial.reason } } })
+}
+
 // One turn that writes where a real agent writes: a memory file under the owner's profile, a
 // sibling project, a brand-new nested directory, and one ordinary in-workspace edit. Only the
 // last two are the workspace's business; the snapshot layer has nothing to capture for the rest
@@ -90,6 +129,7 @@ for await (const line of input) {
       // Delayed metadata response exercises pressing Send during initialization.
       await new Promise(resolve => setTimeout(resolve, 800))
       initialized = true
+      deniedHookRegistered = Boolean(message.request.hooks?.PermissionDenied?.length)
       const models = fableQuotaFixture
         ? [{ value: 'claude-fable-5-1', displayName: 'Claude Fable 5.1', supportsEffort: true, supportedEffortLevels: ['high'], defaultEffort: 'high' }]
         : [{ value: 'synthetic-claude', displayName: 'Synthetic Claude fixture', supportsEffort: true, supportedEffortLevels: ['low', 'high'], defaultEffort: 'high' }]
@@ -112,7 +152,12 @@ for await (const line of input) {
     } else if (kind === 'set_permission_mode') {
       if (permissionScenario === 'REJECT' && message.request.mode === 'auto') send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Synthetic managed policy disables auto-mode' } })
       else { permissionMode = message.request.mode; success(message.request_id) }
-    } else if (kind === 'set_model' || kind === 'apply_flag_settings') success(message.request_id)
+    } else if (kind === 'apply_flag_settings') {
+      // A shallow merge into the flag layer, as the CLI describes it: permissions replaces permissions.
+      if (message.request.settings?.permissions) flagAllow = new Set(message.request.settings.permissions.allow ?? [])
+      flagLog({ applied: [...flagAllow] })
+      success(message.request_id)
+    } else if (kind === 'set_model') success(message.request_id)
     else if (kind === 'stop_task') {
       // The CLI's own stop: the task is killed, reported stopped, and dropped from the inventory.
       const task = watchLoops.get(message.request.task_id)
@@ -145,7 +190,25 @@ for await (const line of input) {
       emit({ type: 'result', subtype: 'success', is_error: false, usage: { input_tokens: 1800, output_tokens: 40 } })
       continue
     }
+    // Conductor's own answer to a permission grant (src/main/permission-grants): retry exactly the
+    // refused call, or stand down.
+    if (typeof prompt === 'string' && prompt.startsWith('[Conductor] approved:')) {
+      if (!lastRefused) throw new Error('Synthetic fixture has no refused call to retry')
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      classify(lastRefused); continue
+    }
+    if (typeof prompt === 'string' && prompt.startsWith('[Conductor] the owner denied:')) {
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      text('SYNTHETIC: understood; not retrying it.'); finish(); continue
+    }
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
+    if (prompt.startsWith('SYNTHETIC CLASSIFIER ')) {
+      const scenario = /^SYNTHETIC CLASSIFIER (WRITE|OTHER|LOCAL|RETRY)\b/.exec(prompt)?.[1]
+      if (!scenario) throw new Error('Unknown synthetic classifier scenario')
+      if (scenario === 'RETRY' && !lastRefused) throw new Error('Synthetic fixture has no refused call to retry')
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      classify(scenario === 'RETRY' ? lastRefused : classifierCalls[scenario]()); continue
+    }
     // An idea run's prompts (src/main/idea-runs/briefs.ts), answered from the scenario file a smoke
     // names: keys are the prompt's first line ("PLAN", "STAGE research", "OCCURRENCE post 1"),
     // matched exactly, then by its first two words, then by its first word.
@@ -379,6 +442,21 @@ for await (const line of input) {
   } else if (message.type === 'control_response') {
     const { request_id: id, response } = message.response
     if (id !== pending) throw new Error('Response does not match the outstanding synthetic request')
+    if (classified && id === `${classified.id}-denied`) { classified.refuse(); continue }
+    if (classified && id === `${classified.id}-pre`) {
+      const { call } = classified
+      if (response?.hookSpecificOutput?.permissionDecision === 'deny') { result(classified.id, 'Denied by the host hook', true); pending = undefined; classified = undefined; finish(); continue }
+      if (call.tool === 'Write') { mkdirSync(dirname(call.input.file_path), { recursive: true }); writeFileSync(call.input.file_path, call.input.content) }
+      classified.output = call.tool === 'Write' ? `File created successfully at: ${call.input.file_path}` : 'SYNTHETIC: the command was allowed; the fixture never executes it.'
+      pending = `${classified.id}-post`
+      hook(pending, 'conductor_after', classified.id, call.tool, call.input, call.tool === 'Write' ? { filePath: call.input.file_path } : { stdout: classified.output, exitCode: 0 })
+      continue
+    }
+    if (classified && id === `${classified.id}-post`) {
+      result(classified.id, classified.output)
+      text(`SYNTHETIC classified call ran: ${ruleFor(classified.call)}`)
+      pending = undefined; classified = undefined; finish(); continue
+    }
     if (id === `permission-${turn}`) {
       for (const update of response.updatedPermissions ?? []) {
         if (update.type === 'setMode' && update.mode === 'acceptEdits' && update.destination === 'session' && ['SESSION_EDIT', 'REPEAT_EDIT'].includes(permissionScenario)) { permissionMode = 'acceptEdits'; continue }

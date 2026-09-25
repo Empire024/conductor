@@ -26,6 +26,13 @@ export interface AdapterOptions {
   mcpConfig?: string
   /** The conductor-local MCP server (src/main/local-assist), in the same form as mcpConfig. */
   localAssistMcpConfig?: string
+  /** The `conductor` MCP server (src/main/permission-grants/control-mcp.ts): tab messaging and
+   *  permission requests as first-party tools, in the same form as mcpConfig. */
+  conductorMcpConfig?: string
+  /** Native allow rules the owner granted this one conversation (src/main/permission-grants):
+   *  read at launch and whenever applyPermissionRules runs; used() when an approve-once rule's
+   *  call has run, refused() when the classifier refused a call a rule was granted for. */
+  permissionGrants?: { rules(): Array<{ rule: string; once: boolean }>; used(rule: string): void; refused?(rule: string): void }
   /** Host-only reviewer isolation; never accepted from worker settings or app-control input. */
   approvalReviewer?: boolean
   /** Delegated native approval events must pass the host reviewer gate, including Auto mode. */
@@ -61,6 +68,9 @@ export interface ProviderAdapter {
    *  conversation that no longer owns it (agents.handoff successor). Returns how many it asked
    *  to stop; each retires from backgroundWork() as the runtime reports it stopped. */
   stopBackgroundWork?(): Promise<number>
+  /** Hand the running provider its current owner-granted rules (options.permissionGrants).
+   *  'unsupported' when it cannot take them live; they then apply from its next start. */
+  applyPermissionRules?(): Promise<'applied' | 'unsupported'>
   /** Fold the runtime's own transcript into its durable task state, keeping the same logical
    *  conversation (the local runtime; native CLIs compact themselves). Null when there is
    *  nothing to fold. */
