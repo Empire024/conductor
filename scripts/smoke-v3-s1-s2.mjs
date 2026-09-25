@@ -20,12 +20,13 @@ import assert from 'node:assert/strict'
 const WORDS = 120
 const DELAY_MS = 250
 const queuedSubmit = process.argv.includes('--queued-submit')
-const queuedMode = process.argv.includes('--queued') || queuedSubmit
+const noRestart = process.argv.includes('--queued-no-restart')
+const queuedMode = process.argv.includes('--queued') || queuedSubmit || noRestart
 const keep = process.argv.includes('--keep')
-const scenario = queuedMode ? 'S2' : 'S1'
+const scenario = noRestart ? 'S2-control' : queuedMode ? 'S2' : 'S1'
 const HARD_TIMEOUT_MS = 13 * 60_000
 const root = await mkdtemp(join(tmpdir(), 'conductor-v3-s1s2-'))
-const output = resolve(`artifacts/v3-verify/${scenario}`)
+const output = resolve(`artifacts/v3-verify/${noRestart ? 'S2' : scenario}`)
 await mkdir(output, { recursive: true })
 const profile = join(root, 'profile'), fixtures = join(root, 'fixtures'), projectPath = join(root, 'project')
 await mkdir(fixtures, { recursive: true }); await mkdir(projectPath, { recursive: true })
@@ -166,17 +167,21 @@ try {
     observe(`5 prompts queued into Claude A via ${method} just before the restart`)
   }
 
-  await call('app.restart', { force: true })
-  observe('app.restart requested')
-  await expect.poll(() => alive(firstPid), { timeout: 30_000 }).toBe(false)
-  await expect.poll(async () => { try { const next = JSON.parse(await readFile(join(profile, 'control-owner.json'), 'utf8')); return next.pid !== firstPid && alive(next.pid) ? next.pid : null } catch { return null } }, { timeout: 60_000, intervals: [500] }).not.toBe(null)
-  owner = await credential()
-  relaunchedPid = owner.pid
-  observe('app relaunched', { pid: relaunchedPid })
+  if (!noRestart) {
+    await call('app.restart', { force: true })
+    observe('app.restart requested')
+    await expect.poll(() => alive(firstPid), { timeout: 30_000 }).toBe(false)
+    await expect.poll(async () => { try { const next = JSON.parse(await readFile(join(profile, 'control-owner.json'), 'utf8')); return next.pid !== firstPid && alive(next.pid) ? next.pid : null } catch { return null } }, { timeout: 60_000, intervals: [500] }).not.toBe(null)
+    owner = await credential()
+    relaunchedPid = owner.pid
+    observe('app relaunched', { pid: relaunchedPid })
 
-  const after = await hostRequest(hostLock(), { op: 'list' }).catch(() => [])
-  observe('runtime host snapshot after relaunch', { count: after.length, sameHostPid: hostLock()?.pid === lock.pid })
-  assert.equal(hostLock()?.pid, lock.pid, 'the relaunched app should attach to the same runtime host process')
+    const after = await hostRequest(hostLock(), { op: 'list' }).catch(() => [])
+    observe('runtime host snapshot after relaunch', { count: after.length, sameHostPid: hostLock()?.pid === lock.pid })
+    assert.equal(hostLock()?.pid, lock.pid, 'the relaunched app should attach to the same runtime host process')
+  } else {
+    observe('S2-control: skipping app.restart entirely, per the controller\'s request')
+  }
 
   for (const [name, id] of Object.entries(ids)) {
     try {
