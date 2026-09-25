@@ -65,6 +65,11 @@ const bridge: ConductorBridge = {
     rename: (deviceId, name) => ipcRenderer.invoke('phone:rename', deviceId, name),
     saveCertificate: () => ipcRenderer.invoke('phone:save-certificate'),
     testNotification: (deviceId) => ipcRenderer.invoke('phone:test-notification', deviceId),
+    setLockCode: (code) => ipcRenderer.invoke('phone:lock-set', code),
+    removeLockCode: () => ipcRenderer.invoke('phone:lock-remove'),
+    resetLock: () => ipcRenderer.invoke('phone:lock-reset'),
+    setLockIdle: (minutes) => ipcRenderer.invoke('phone:lock-idle', minutes),
+    lockPhones: () => ipcRenderer.invoke('phone:lock-all'),
     onChanged: (callback) => subscribe('phone:changed', callback)
   },
   remote: {

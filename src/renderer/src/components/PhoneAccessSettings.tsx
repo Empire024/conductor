@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { BellRing, Check, Copy, Download, ExternalLink, Pencil, RefreshCw, ShieldAlert, Smartphone, Wifi, X } from 'lucide-react'
+import { BellRing, Check, Copy, Download, ExternalLink, Lock, Pencil, RefreshCw, ShieldAlert, Smartphone, Wifi, X } from 'lucide-react'
 import type { PhoneAccessState, PhoneDevice, PhoneExposure } from '../../../shared/phone-access'
-import { DEFAULT_PHONE_PORT, TAILSCALE_APP_LINKS, TAILSCALE_DNS_ADMIN_URL, trustPageUrl } from '../../../shared/phone-access'
+import { DEFAULT_PHONE_PORT, PHONE_LOCK_IDLE_MINUTES, TAILSCALE_APP_LINKS, TAILSCALE_DNS_ADMIN_URL, trustPageUrl } from '../../../shared/phone-access'
 import { qrSvg } from '../../../shared/qr-code'
 import {
   accessStatus,
@@ -78,6 +78,10 @@ export function PhoneAccessSettings(): React.JSX.Element {
    * that is not in here; one paired earlier may be holding an address that no longer answers.
    */
   const known = useRef<Set<string> | null>(null)
+  /** The phone lock code being typed; it crosses to the main process once, to be hashed there. */
+  const [lockCode, setLockCode] = useState('')
+  const [lockConfirm, setLockConfirm] = useState('')
+  const [lockProblem, setLockProblem] = useState('')
 
   const receive = (fresh: PhoneAccessState): void => {
     if (!known.current) known.current = new Set(fresh.devices.map(device => device.id))
@@ -157,6 +161,18 @@ export function PhoneAccessSettings(): React.JSX.Element {
   const testNotification = (device: PhoneDevice): void => {
     void attempt(`test-${device.id}`, () => window.conductor.phone.testNotification(device.id),
       result => setTested(current => ({ ...current, [device.id]: testResultText(result) })))
+  }
+
+  const saveLockCode = (): void => {
+    if (!/^[0-9]{6}$/.test(lockCode)) { setLockProblem('The code is exactly six digits.'); return }
+    if (lockCode !== lockConfirm) { setLockProblem('The two codes differ.'); return }
+    setLockProblem('')
+    void attempt('lock-set', () => window.conductor.phone.setLockCode(lockCode), fresh => { receive(fresh); setLockCode(''); setLockConfirm('') })
+  }
+
+  const removeLockCode = (): void => {
+    if (!window.confirm('Remove the phone code? Paired phones then open Conductor without one, and the phone terminal closes.')) return
+    apply('lock-remove', () => window.conductor.phone.removeLockCode())
   }
 
   const copyButton = (key: string, value: string, title: string): React.JSX.Element => (
@@ -508,6 +524,53 @@ export function PhoneAccessSettings(): React.JSX.Element {
             {tested[device.id] && <small className="phone-hint">{tested[device.id]}</small>}
           </div>
         ))}
+      </div>
+
+      <div className="phone-card phone-lock">
+        <strong className="phone-card-title"><Lock size={13} /> Phone lock</strong>
+        <p className="phone-hint">
+          {state.lock.configured
+            ? `Every phone asks for the 6-digit code before it shows anything, and again before it opens a terminal.${state.lock.unlockedDevices.length ? ` ${state.lock.unlockedDevices.length} unlocked right now.` : ''}`
+            : 'Off. A paired phone opens Conductor without a code, and the phone terminal stays closed.'}
+        </p>
+        {state.lock.lockedOut && (
+          <p className="phone-error"><ShieldAlert size={12} /> Locked out after {state.lock.failures} wrong codes. No phone can unlock until you reset it.</p>
+        )}
+        {!state.lock.lockedOut && state.lock.failures > 0 && (
+          <p className="phone-warning">{state.lock.failures} wrong {state.lock.failures === 1 ? 'code' : 'codes'} in a row; five lock every phone out.</p>
+        )}
+        <div className="phone-lock-form">
+          <input type="password" inputMode="numeric" autoComplete="new-password" maxLength={6} placeholder={state.lock.configured ? 'New code' : '6-digit code'}
+            aria-label="Phone code" value={lockCode} disabled={working}
+            onChange={event => { setLockCode(event.target.value.replace(/\D/g, '')); setLockProblem('') }} />
+          <input type="password" inputMode="numeric" autoComplete="new-password" maxLength={6} placeholder="Again"
+            aria-label="Phone code again" value={lockConfirm} disabled={working}
+            onChange={event => { setLockConfirm(event.target.value.replace(/\D/g, '')); setLockProblem('') }}
+            onKeyDown={event => { if (event.key === 'Enter') saveLockCode() }} />
+          <button type="button" disabled={working || !lockCode} onClick={saveLockCode}>{state.lock.configured ? 'Change code' : 'Set code'}</button>
+        </div>
+        {lockProblem && <p className="phone-error"><ShieldAlert size={12} /> {lockProblem}</p>}
+        {state.lock.configured && (
+          <>
+            <label className="phone-row">
+              <span>
+                <strong>Lock after</strong>
+                <small>An unlocked phone locks after this long untouched, and when the app has been in the background for a minute.</small>
+              </span>
+              <select value={state.lock.idleMinutes} disabled={working}
+                onChange={event => apply('lock-idle', () => window.conductor.phone.setLockIdle(Number(event.target.value)))}>
+                {PHONE_LOCK_IDLE_MINUTES.map(minutes => <option key={minutes} value={minutes}>{minutes} {minutes === 1 ? 'minute' : 'minutes'}</option>)}
+              </select>
+            </label>
+            <div className="phone-actions">
+              {(state.lock.lockedOut || state.lock.failures > 0) && (
+                <button type="button" disabled={working} onClick={() => apply('lock-reset', () => window.conductor.phone.resetLock())}><RefreshCw size={12} /> Reset attempts</button>
+              )}
+              <button type="button" disabled={working || !state.lock.unlockedDevices.length} onClick={() => apply('lock-all', () => window.conductor.phone.lockPhones())}><Lock size={12} /> Lock every phone now</button>
+              <button type="button" disabled={working} onClick={removeLockCode}><X size={12} /> Remove code</button>
+            </div>
+          </>
+        )}
       </div>
 
       <details className="phone-card phone-advanced phone-advanced-card">

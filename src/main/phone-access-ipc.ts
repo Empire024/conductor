@@ -12,7 +12,7 @@ export interface PhoneAccessIpcDependencies {
   showSaveDialog(window: BrowserWindow | null, options: SaveDialogOptions): Promise<{ canceled: boolean; filePath?: string }>
 }
 
-const CHANNELS = ['phone:state', 'phone:set-settings', 'phone:pair', 'phone:cancel-pairing', 'phone:check', 'phone:revoke', 'phone:rename', 'phone:save-certificate', 'phone:test-notification'] as const
+const CHANNELS = ['phone:state', 'phone:set-settings', 'phone:pair', 'phone:cancel-pairing', 'phone:check', 'phone:revoke', 'phone:rename', 'phone:save-certificate', 'phone:test-notification', 'phone:lock-set', 'phone:lock-remove', 'phone:lock-reset', 'phone:lock-idle', 'phone:lock-all'] as const
 
 /** The desktop panel's side of phone access: every handler answers with the whole panel state. */
 export function registerPhoneAccessIpc(deps: PhoneAccessIpcDependencies): () => void {
@@ -40,5 +40,11 @@ export function registerPhoneAccessIpc(deps: PhoneAccessIpcDependencies): () => 
     return result.filePath
   })
   handle('phone:test-notification', (deviceId?: string) => service.testNotification(typeof deviceId === 'string' && deviceId ? deviceId : undefined))
+  // The phone lock: the code crosses IPC once, to be hashed here; nothing sends it back.
+  handle('phone:lock-set', async (code: string) => { await service.lock.setCode(code); return state() })
+  handle('phone:lock-remove', () => { service.lock.removeCode(); return state() })
+  handle('phone:lock-reset', () => { service.lock.resetAttempts(); return state() })
+  handle('phone:lock-idle', (minutes: number) => { service.lock.setIdleMinutes(minutes); return state() })
+  handle('phone:lock-all', () => { service.lock.lockAll(); return state() })
   return () => { for (const channel of CHANNELS) ipcMain.removeHandler(channel) }
 }

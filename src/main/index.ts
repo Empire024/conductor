@@ -96,6 +96,7 @@ import { PhoneAccessService } from './phone-access'
 import { PhoneProjectTasks } from './phone-project-tasks'
 import { PhoneAccessServer, requestTailscaleCertificate } from './phone-access-server'
 import { registerPhoneAccessIpc } from './phone-access-ipc'
+import { phoneAuditWriter } from './phone-lock'
 import { StoredSecretVault } from './secret-store'
 import type { RemoteTerminalBindings } from './remote-terminals'
 import { AgentCollaborationStore } from './agent-collaboration-store'
@@ -2602,10 +2603,12 @@ app.whenReady().then(async () => {
       remote: remoteControl.client,
       changed: project => { if (!project.remote) invalidateProjectFiles(project.path); projectFileChanges?.changed({ projectId: project.id, path: 'feature-list.md' }) }
     }),
-    changed: () => { publish('phone:changed', phoneAccess!.desktopState()); hostLifecycle?.refresh() }
+    changed: () => { publish('phone:changed', phoneAccess!.desktopState()); hostLifecycle?.refresh() },
+    audit: phoneAuditWriter(join(app.getPath('userData'), 'logs', 'phone-audit.log'))
   })
   phoneServer = new PhoneAccessServer({
     service: phoneAccess,
+    terminals,
     tailscale: remoteControl.tailscale,
     tailscaleCert: dnsName => {
       const executable = remoteControl!.tailscale.locate()

@@ -267,3 +267,7 @@
 .phone-advanced-card { gap: 0; }
 .phone-advanced-card > summary { font-size: 11px; font-weight: 600; color: var(--text-2); }
 .phone-advanced-body { display: flex; flex-direction: column; gap: 9px; padding-top: 8px; }
+
+/* The phone lock: two code boxes and a button on one line. */
+.phone-lock-form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.phone-lock-form input { width: 110px; letter-spacing: 4px; font-variant-numeric: tabular-nums; }

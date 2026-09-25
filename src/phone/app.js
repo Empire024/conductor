@@ -26,6 +26,9 @@
   /* iOS suspends a backgrounded fetch stream without ending it; a silent minute means dead. */
   const STREAM_STALE_MS = 75000
   const MAX_COMPOSER_LINES = 6
+  /* The unlock token rides on every call once the phone is unlocked (src/main/phone-lock.ts). */
+  const UNLOCK_HEADER = 'X-Conductor-Unlock'
+  const LOCK_TOUCH_MS = 20000
 
   const STATE_WORDS = {
     attention: 'Needs you',
@@ -119,7 +122,14 @@
     streamProblem: '',
     /* Android's deferred install prompt, offered once after pairing in a browser tab. */
     installPrompt: null,
-    offerInstall: false
+    offerInstall: false,
+    /* PhoneLockState from /api/lock/state; null until read, or when the computer has no lock. */
+    lock: null,
+    /* True while the computer wants the code; the lock pad is then the only screen. */
+    locked: false,
+    /* Memory only, never stored: a reload or a crash locks the phone. */
+    unlockToken: null,
+    terminalProject: null
   }
 
   let appRoot = null
@@ -325,10 +335,11 @@
 
   // ------------------------------------------------------------------ api
 
-  function ApiError (message, status) {
+  function ApiError (message, status, detail) {
     const error = new Error(message)
     error.name = 'ApiError'
     error.status = status
+    error.detail = detail || null
     return error
   }
 
@@ -336,6 +347,7 @@
     const settings = options || {}
     const headers = {}
     if (state.token) headers.Authorization = 'Bearer ' + state.token
+    if (state.unlockToken) headers[UNLOCK_HEADER] = state.unlockToken
     let body
     if (settings.body !== undefined) {
       headers['Content-Type'] = 'application/json'
@@ -361,7 +373,9 @@
     }
     if (!response.ok) {
       const message = data && typeof data.error === 'string' ? data.error : 'Request failed (' + response.status + ')'
-      throw ApiError(message, response.status)
+      /* The computer says this phone is locked: nothing else is worth showing until it unlocks. */
+      if (response.status === 423 && data && data.locked) markLocked()
+      throw ApiError(message, response.status, data)
     }
     return data
   }
@@ -371,6 +385,9 @@
   const handleUnauthorized = () => {
     if (!state.token) return
     setToken(null)
+    state.unlockToken = null
+    state.locked = false
+    state.lock = null
     state.phone = null
     state.me = null
     state.conversation = null
@@ -414,7 +431,7 @@
   }
 
   const scheduleReconnect = () => {
-    if (!state.token || streamTimer || streamController) return
+    if (!state.token || streamTimer || streamController || state.locked) return
     const delay = BACKOFF_MS[Math.min(streamAttempt, BACKOFF_MS.length - 1)]
     streamAttempt += 1
     streamTimer = setTimeout(() => { streamTimer = null; connectStream() }, delay)
@@ -423,7 +440,7 @@
   /* SSE without EventSource: EventSource cannot carry an Authorization header, so the frames are
      read off a fetch body and parsed here. Lines are cut on \n with a trailing \r stripped, which
      keeps a \r\n that straddles two chunks from looking like a blank line - a false frame end. */
-  const readStream = async body => {
+  const readStream = async (body, handler) => {
     const reader = body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
@@ -440,13 +457,14 @@
       if (payload) {
         try { data = JSON.parse(payload) } catch (error) { return }
       }
+      if (handler) { handler(name, data); return }
       lastEventAt = Date.now()
       onStreamEvent(name, data)
     }
 
     const handleLine = line => {
       if (line === '') { dispatch(); return }
-      if (line.charAt(0) === ':') { lastEventAt = Date.now(); return }
+      if (line.charAt(0) === ':') { if (!handler) lastEventAt = Date.now(); return }
       const colon = line.indexOf(':')
       const name = colon < 0 ? line : line.slice(0, colon)
       let value = colon < 0 ? '' : line.slice(colon + 1)
@@ -473,17 +491,20 @@
   }
 
   const connectStream = () => {
-    if (!state.token || streamController) return
+    if (!state.token || streamController || state.locked) return
     if (streamTimer) { clearTimeout(streamTimer); streamTimer = null }
     const controller = new AbortController()
     streamController = controller
     lastEventAt = Date.now()
+    const headers = { Authorization: 'Bearer ' + state.token, Accept: 'text/event-stream' }
+    if (state.unlockToken) headers[UNLOCK_HEADER] = state.unlockToken
     fetch('/api/stream', {
-      headers: { Authorization: 'Bearer ' + state.token, Accept: 'text/event-stream' },
+      headers: headers,
       cache: 'no-store',
       signal: controller.signal
     }).then(async response => {
       if (response.status === 401) { handleUnauthorized(); return }
+      if (response.status === 423) { void checkLock(); return }
       if (!response.ok || !response.body) {
         state.streamProblem = 'The computer refused it (' + response.status + ').'
         return
@@ -528,6 +549,9 @@
       if (data) showToast(data)
       return
     }
+    /* The computer ended this unlocked session (idle, code changed, lockout): it closes the
+       stream right after saying so. */
+    if (name === 'locked') { markLocked(); void checkLock(); return }
     /* 'ping' only proves the pipe is alive, which lastEventAt already recorded. */
   }
 
@@ -579,6 +603,7 @@
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
     if (hash.indexOf('#/system') === 0) return { name: 'system', key: 'system' }
     if (hash.indexOf('#/phone') === 0) return { name: 'phone', key: 'phone' }
+    if (hash.indexOf('#/terminal') === 0) return { name: 'terminal', key: 'terminal' }
     if (hash.indexOf('#diagnose') === 0) return { name: 'diagnose', key: 'diagnose' }
     if (hash.indexOf('#trust') === 0) return { name: 'trust', key: 'trust' }
     return { name: 'sessions', key: 'sessions' }
@@ -616,7 +641,8 @@
 
   const render = () => {
     const wanted = currentRoute()
-    const route = state.token || OPEN_ROUTES.indexOf(wanted.name) >= 0 ? wanted : { name: 'pair', key: 'pair' }
+    const open = OPEN_ROUTES.indexOf(wanted.name) >= 0
+    const route = !state.token && !open ? { name: 'pair', key: 'pair' } : state.token && state.locked && !open ? { name: 'lock', key: 'lock' } : wanted
     if (screen && screen.key === route.key) {
       if (screen.update) screen.update(route)
       updateTabBar(route)
@@ -629,13 +655,15 @@
     appRoot.appendChild(screen.root)
     appRoot.appendChild(tabBar)
     updateTabBar(route)
-    if (overlayPill) overlayPill.hidden = state.connected || !state.token
+    if (overlayPill) overlayPill.hidden = state.connected || !state.token || state.locked
     /* A field can only take focus once it is in the page. */
     if (screen.onShown) screen.onShown()
   }
 
   const buildScreen = route => {
     if (route.name === 'pair') return pairScreen()
+    if (route.name === 'lock') return lockScreen()
+    if (route.name === 'terminal') return terminalScreen()
     if (route.name === 'session') return conversationScreen(route.id)
     if (route.name === 'tasks') return projectTasksScreen()
     if (route.name === 'idea') return ideaEditorScreen(route.id)
@@ -685,7 +713,7 @@
   }
 
   const updateTabBar = route => {
-    const hidden = route.name === 'pair' || route.name === 'session' || route.name === 'idea' || OPEN_ROUTES.indexOf(route.name) >= 0
+    const hidden = route.name === 'pair' || route.name === 'lock' || route.name === 'terminal' || route.name === 'session' || route.name === 'idea' || OPEN_ROUTES.indexOf(route.name) >= 0
     tabBar.hidden = hidden
     const attention = state.phone && state.phone.counts ? state.phone.counts.attention : 0
     for (const node of tabBar.querySelectorAll('.tab')) {
@@ -2475,7 +2503,9 @@
     const scroll = scroller()
     root.appendChild(header)
     root.appendChild(scroll)
-    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'System')]))
+    const terminalLink = button('ghost terminal-open', 'Terminal', () => visit('#/terminal'))
+    terminalLink.setAttribute('aria-label', 'Open a terminal on this computer')
+    clear(header).appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'System'), terminalLink]))
 
     let timer = null
 
@@ -3436,6 +3466,544 @@
     }
   }
 
+  // ------------------------------------------------------------------ lock
+
+  /* The 6-digit lock (docs/phone-lock-and-terminal.md). The computer enforces it: while locked it
+     answers nothing but /api/lock/*, so this screen is the only thing a locked phone can show. The
+     unlock token lives in memory only, so a reload, a crash or iOS dropping the app all lock. */
+
+  /* Reads whether this phone has to unlock. A failure to ask is not "unlocked": the app simply
+     carries on, and the first real call answers 423 if the lock is on. */
+  const checkLock = async () => {
+    if (!state.token) return
+    try {
+      const status = await api('/api/lock/state')
+      applyLockStatus(status)
+    } catch (error) {
+      /* Offline, most likely: the stream retries on its own, and a locked phone's stream is
+         answered 423, which asks again. */
+      if (!state.locked) connectStream()
+    }
+  }
+
+  const applyLockStatus = status => {
+    state.lock = status && typeof status === 'object' ? status : null
+    const mustUnlock = Boolean(state.lock && state.lock.configured && !state.lock.unlocked)
+    if (mustUnlock) { markLocked(); return }
+    if (state.locked) { state.locked = false; render() }
+    if (!streamController && !streamTimer) connectStream()
+  }
+
+  /* Everything read while unlocked goes, and every live connection closes with it. */
+  const markLocked = () => {
+    const wasLocked = state.locked
+    state.locked = true
+    state.unlockToken = null
+    state.phone = null
+    state.conversation = null
+    state.metrics = null
+    stopStream()
+    if (!wasLocked || !screen || screen.key !== 'lock') render()
+  }
+
+  /* The owner is using the phone: the computer's idle clock starts over, at most every 20 s. */
+  let lastTouchSent = 0
+  let lastActivityAt = Date.now()
+  let hiddenAt = 0
+  const noteActivity = () => {
+    lastActivityAt = Date.now()
+    if (!state.unlockToken || state.locked) return
+    if (Date.now() - lastTouchSent < LOCK_TOUCH_MS) return
+    lastTouchSent = Date.now()
+    api('/api/lock/touch', { method: 'POST', body: {} }).catch(() => { /* a 423 already locked the app */ })
+  }
+
+  /* Locks now, telling the computer so the session ends there too. */
+  const lockNow = () => {
+    if (!state.unlockToken) { if (state.lock && state.lock.configured) markLocked(); return }
+    const headers = { Authorization: 'Bearer ' + state.token, 'Content-Type': 'application/json' }
+    headers[UNLOCK_HEADER] = state.unlockToken
+    fetch('/api/lock/lock', { method: 'POST', headers: headers, body: '{}', cache: 'no-store', keepalive: true }).catch(() => undefined)
+    markLocked()
+  }
+
+  const lockTick = () => {
+    if (!state.unlockToken || state.locked) return
+    const idle = state.lock && state.lock.idleMs ? state.lock.idleMs : 300000
+    if (Date.now() - lastActivityAt > idle) lockNow()
+  }
+
+  const lockVisibility = visible => {
+    if (!state.lock || !state.lock.configured) return
+    if (!visible) { hiddenAt = Date.now(); return }
+    const away = hiddenAt ? Date.now() - hiddenAt : 0
+    hiddenAt = 0
+    const limit = state.lock.backgroundMs || 60000
+    if (state.unlockToken && away > limit) lockNow()
+  }
+
+  const lockScreen = () => {
+    const root = el('div', 'screen lock-screen')
+    const body = el('div', 'lock-body')
+    root.appendChild(body)
+    const title = el('h1', 'lock-title', 'Conductor is locked')
+    const hint = el('p', 'lock-hint', 'Enter your 6-digit code.')
+    const dots = el('div', 'lock-dots')
+    dots.setAttribute('aria-hidden', 'true')
+    const message = el('p', 'lock-message')
+    message.setAttribute('role', 'status')
+    const pad = el('div', 'lock-pad')
+    let digits = ''
+    let busy = false
+    let waitUntil = 0
+
+    const drawDots = () => {
+      clear(dots)
+      for (let index = 0; index < 6; index += 1) dots.appendChild(el('span', 'lock-dot' + (index < digits.length ? ' filled' : '')))
+    }
+
+    const say = (text, tone) => {
+      message.textContent = text || ''
+      message.className = 'lock-message' + (tone ? ' ' + tone : '')
+    }
+
+    const describe = status => {
+      if (!status) return
+      if (status.lockedOut) { say('Too many wrong codes. Reset the lock in Conductor on the computer (Settings > Phone).', 'danger'); return }
+      const retry = parseTime(status.retryAt)
+      if (retry && retry > Date.now()) { waitUntil = retry; return }
+      if (status.configured === false) say('No code is set on the computer any more.', '')
+    }
+
+    const submit = async () => {
+      if (busy || digits.length !== 6) return
+      if (waitUntil > Date.now()) return
+      busy = true
+      say('Checking…', '')
+      const code = digits
+      try {
+        const opened = await api('/api/lock/unlock', { method: 'POST', body: { code: code } })
+        state.unlockToken = opened.unlockToken
+        state.lock = Object.assign({}, state.lock || {}, { configured: true, unlocked: true, idleMs: opened.idleMs, backgroundMs: opened.backgroundMs, lockedOut: false, failures: 0, retryAt: null })
+        state.locked = false
+        lastActivityAt = Date.now()
+        lastTouchSent = Date.now()
+        digits = ''
+        busy = false
+        restartStream()
+        render()
+        return
+      } catch (error) {
+        digits = ''
+        drawDots()
+        busy = false
+        const text = errorMessage(error)
+        if (error && error.detail) {
+          if (error.detail.lockedOut) { say(text, 'danger'); return }
+          const retry = parseTime(error.detail.retryAt)
+          if (retry && retry > Date.now()) waitUntil = retry
+          if (typeof error.detail.remaining === 'number') { say(text + ' ' + error.detail.remaining + (error.detail.remaining === 1 ? ' try' : ' tries') + ' left before the lock needs the computer.', 'danger'); return }
+        }
+        say(text, 'danger')
+      }
+    }
+
+    const press = key => {
+      if (busy) return
+      if (key === 'back') digits = digits.slice(0, -1)
+      else if (digits.length < 6) digits += key
+      drawDots()
+      if (digits.length === 6) void submit()
+    }
+
+    for (const key of ['1', '2', '3', '4', '5', '6', '7', '8', '9', '', '0', 'back']) {
+      if (!key) { pad.appendChild(el('span', 'lock-key-gap')); continue }
+      const node = button('lock-key', key === 'back' ? null : key, () => press(key))
+      if (key === 'back') {
+        node.setAttribute('aria-label', 'Delete')
+        node.appendChild(icon(['M9 6h11v12H9l-5-6 5-6Z', 'M13 10l4 4', 'M17 10l-4 4'], 22))
+      }
+      pad.appendChild(node)
+    }
+
+    fill(body, [title, hint, dots, message, pad, button('ghost lock-help', 'Connection check', () => visit('#diagnose'))])
+    drawDots()
+    describe(state.lock)
+    const onKey = event => {
+      if (/^[0-9]$/.test(event.key || '')) press(event.key)
+      else if (event.key === 'Backspace') press('back')
+    }
+    document.addEventListener('keydown', onKey)
+    return {
+      key: 'lock',
+      root: root,
+      onSecond: () => {
+        if (waitUntil > Date.now()) say('Wait ' + Math.ceil((waitUntil - Date.now()) / 1000) + ' s before trying again.', '')
+        else if (waitUntil) { waitUntil = 0; say('', '') }
+      },
+      destroy: () => document.removeEventListener('keydown', onKey)
+    }
+  }
+
+  // ------------------------------------------------------------------ terminal
+
+  /* A shell on the computer, over this phone's authenticated connection. xterm.js is loaded only
+     when this screen opens; output arrives as server-sent events and keystrokes go up in small
+     batched POSTs. The shell dies when the phone locks, after 10 minutes without typing, or on
+     Close, and the computer writes one audit line for it. */
+
+  const loadScript = src => new Promise((resolve, reject) => {
+    if (document.querySelector && document.querySelector('script[src="' + src + '"]')) { resolve(); return }
+    const node = document.createElement('script')
+    node.src = src
+    node.onload = () => resolve()
+    node.onerror = () => reject(new Error('Could not load ' + src))
+    document.body.appendChild(node)
+  })
+
+  const loadStyle = href => {
+    if (document.querySelector && document.querySelector('link[href="' + href + '"]')) return
+    const node = document.createElement('link')
+    node.rel = 'stylesheet'
+    node.href = href
+    document.head.appendChild(node)
+  }
+
+  const loadXterm = async () => {
+    loadStyle('/xterm.css')
+    if (!window.Terminal) await loadScript('/xterm.js')
+    if (!window.FitAddon) await loadScript('/xterm-fit.js')
+  }
+
+  const bytesToBase64 = bytes => {
+    let text = ''
+    for (let index = 0; index < bytes.length; index += 1) text += String.fromCharCode(bytes[index])
+    return window.btoa(text)
+  }
+
+  const TERMINAL_KEYS = [
+    { id: 'ctrl', label: 'Ctrl' },
+    { id: 'esc', label: 'Esc', send: '\x1b' },
+    { id: 'tab', label: 'Tab', send: '\t' },
+    { id: 'left', label: '←', send: '\x1b[D' },
+    { id: 'up', label: '↑', send: '\x1b[A' },
+    { id: 'down', label: '↓', send: '\x1b[B' },
+    { id: 'right', label: '→', send: '\x1b[C' },
+    { id: 'paste', label: 'Paste' },
+    { id: 'copy', label: 'Copy' }
+  ]
+
+  const terminalScreen = () => {
+    const root = el('div', 'screen terminal-screen')
+    const header = pageHeader('Terminal')
+    const title = header.querySelector ? header.querySelector('.topbar-title') : null
+    const closeButton = button('ghost terminal-close', 'Close', () => { void closeShell() })
+    closeButton.hidden = true
+    header.firstChild.appendChild(closeButton)
+    const body = el('div', 'terminal-body')
+    root.appendChild(header)
+    root.appendChild(body)
+
+    let term = null
+    let fit = null
+    let terminalId = null
+    let offset = null
+    let controller = null
+    let pending = []
+    let flushTimer = null
+    let sending = false
+    let ctrlArmed = false
+    let resizeTimer = null
+    let observer = null
+    let ended = false
+    let destroyed = false
+
+    const machine = () => (state.phone && state.phone.machineName) || 'this computer'
+    if (title) title.textContent = 'Terminal · ' + machine()
+
+    const localProjects = () => ((state.phone && state.phone.projects) || []).filter(project => project.machineId === 'local' && project.workspaces && project.workspaces.length)
+
+    /* ---- setup: pick a folder, type the code again */
+    const drawSetup = (problem, existing) => {
+      closeButton.hidden = true
+      clear(body)
+      const scroll = scroller()
+      body.appendChild(scroll)
+      const card = el('section', 'card terminal-setup')
+      card.appendChild(el('h2', 'card-title', 'Open a shell on ' + machine()))
+      card.appendChild(el('p', 'card-note', 'It runs as you on the computer. It closes when this phone locks, after 10 minutes without typing, or when you close it. The computer logs when it opened and closed, never what you typed.'))
+      const projects = localProjects()
+      if (!projects.length) {
+        card.appendChild(el('p', 'card-note', 'No project on this computer to start in yet.'))
+        scroll.appendChild(card)
+        return
+      }
+      let projectId = state.terminalProject && projects.some(project => project.id === state.terminalProject) ? state.terminalProject : projects[0].id
+      const workspacesOf = id => (projects.find(project => project.id === id) || projects[0]).workspaces
+      let workspaceId = workspacesOf(projectId)[0].id
+      const workspaceSelect = select(workspacesOf(projectId).map(workspace => ({ value: workspace.id, label: workspace.name })), workspaceId, value => { workspaceId = value })
+      const projectSelect = select(projects.map(project => ({ value: project.id, label: project.name })), projectId, value => {
+        projectId = value
+        state.terminalProject = value
+        const next = workspacesOf(projectId)
+        workspaceId = next[0].id
+        clear(workspaceSelect)
+        for (const workspace of next) { const option = el('option', null, workspace.name); option.value = workspace.id; workspaceSelect.appendChild(option) }
+        workspaceSelect.value = workspaceId
+      })
+      const code = el('input', 'input terminal-code')
+      code.type = 'password'
+      code.setAttribute('inputmode', 'numeric')
+      code.setAttribute('autocomplete', 'off')
+      code.setAttribute('maxlength', '6')
+      code.setAttribute('aria-label', 'Your 6-digit code')
+      const open = button('primary wide', 'Open terminal', () => { void start() })
+      const start = async () => {
+        const typed = String(code.value || '').replace(/\D/g, '')
+        if (typed.length !== 6) { drawSetup('Type your 6-digit code again to open a shell.'); return }
+        open.disabled = true
+        try {
+          const size = estimateSize()
+          const opened = await api('/api/terminal/open', { method: 'POST', body: { code: typed, machineId: 'local', projectId: projectId, workspaceId: workspaceId, cols: size.cols, rows: size.rows } })
+          await attachShell(opened.terminalId, null)
+        } catch (error) {
+          open.disabled = false
+          const text = errorMessage(error)
+          const left = error && error.detail && typeof error.detail.remaining === 'number' ? ' ' + error.detail.remaining + ' tries left.' : ''
+          if (text) drawSetup(text + left)
+        }
+      }
+      fill(card, [
+        problem ? errorLine(problem, () => drawSetup('')) : null,
+        field('Project', projectSelect),
+        field('Workspace', workspaceSelect, 'The shell starts in the project folder.'),
+        field('Code', code, 'Your 6-digit code, again, for every new shell.'),
+        open
+      ])
+      scroll.appendChild(card)
+      for (const shell of existing || []) {
+        const row = el('section', 'card')
+        row.appendChild(el('h2', 'card-title', shell.title))
+        row.appendChild(el('p', 'card-note', shell.cwd + ' · since ' + clockTime(shell.startedAt)))
+        row.appendChild(button('ghost wide', 'Back to this shell', () => { void attachShell(shell.terminalId, null) }))
+        scroll.appendChild(row)
+      }
+    }
+
+    const estimateSize = () => {
+      const width = (body.clientWidth || window.innerWidth || 360) - 8
+      const height = (body.clientHeight || window.innerHeight || 640) - 110
+      return { cols: Math.max(20, Math.min(200, Math.floor(width / 7.3))), rows: Math.max(8, Math.min(100, Math.floor(height / 17))) }
+    }
+
+    /* ---- input: coalesced so a paste or a fast thumb is one request, in order */
+    const send = text => {
+      if (!terminalId || ended || !text) return
+      noteActivity()
+      pending.push(text)
+      if (!flushTimer) flushTimer = setTimeout(flush, 12)
+    }
+
+    const flush = async () => {
+      flushTimer = null
+      if (sending || !pending.length || !terminalId) return
+      sending = true
+      const text = pending.join('')
+      pending = []
+      try {
+        const bytes = new TextEncoder().encode(text)
+        for (let start = 0; start < bytes.length; start += 48 * 1024) {
+          await api('/api/terminal/' + encodeURIComponent(terminalId) + '/input', { method: 'POST', body: { data: bytesToBase64(bytes.subarray(start, start + 48 * 1024)) } })
+        }
+      } catch (error) {
+        const message = errorMessage(error)
+        if (message && term) term.write('\r\n\x1b[31m' + message + '\x1b[0m\r\n')
+      }
+      sending = false
+      if (pending.length) flush()
+    }
+
+    const withCtrl = data => {
+      if (!ctrlArmed || data.length !== 1) return data
+      ctrlArmed = false
+      drawKeys()
+      const code = data.toUpperCase().charCodeAt(0)
+      if (code >= 64 && code <= 95) return String.fromCharCode(code - 64)
+      if (data === ' ') return '\x00'
+      return data
+    }
+
+    /* ---- key row */
+    const keys = el('div', 'terminal-keys')
+    const drawKeys = () => {
+      for (const node of keys.childNodes) node.classList.toggle('armed', node.dataset.key === 'ctrl' && ctrlArmed)
+    }
+    for (const key of TERMINAL_KEYS) {
+      const node = button('terminal-key', key.label, () => {
+        if (key.id === 'ctrl') { ctrlArmed = !ctrlArmed; drawKeys() }
+        else if (key.id === 'paste') void paste()
+        else if (key.id === 'copy') void copy()
+        else send(key.send)
+        if (term && key.id !== 'copy') term.focus()
+      })
+      node.dataset.key = key.id
+      /* Keeps the on-screen keyboard up: a button that takes focus would drop it. */
+      node.addEventListener('mousedown', event => { if (event.preventDefault) event.preventDefault() })
+      keys.appendChild(node)
+    }
+
+    const paste = async () => {
+      let text = ''
+      try { text = navigator.clipboard && navigator.clipboard.readText ? await navigator.clipboard.readText() : '' } catch (error) { text = '' }
+      if (!text && window.prompt) text = window.prompt('Paste here') || ''
+      if (text) send(text.replace(/\r?\n/g, '\r'))
+    }
+
+    const copy = async () => {
+      if (!term) return
+      let text = term.getSelection()
+      if (!text) {
+        const buffer = term.buffer.active
+        const lines = []
+        for (let row = Math.max(0, buffer.baseY + buffer.cursorY - term.rows + 1); row <= buffer.baseY + buffer.cursorY; row += 1) {
+          const line = buffer.getLine(row)
+          if (line) lines.push(line.translateToString(true))
+        }
+        text = lines.join('\n').replace(/\s+$/, '')
+      }
+      try {
+        await navigator.clipboard.writeText(text)
+        showToast({ kind: 'done', title: 'Copied', body: text.length + ' characters' })
+      } catch (error) {
+        showToast({ kind: 'failed', title: 'Could not copy', body: 'Select the text with a long press instead.' })
+      }
+    }
+
+    /* ---- output */
+    const connect = () => {
+      if (!terminalId || ended || destroyed) return
+      const id = terminalId
+      const local = new AbortController()
+      controller = local
+      const headers = { Authorization: 'Bearer ' + state.token, Accept: 'text/event-stream' }
+      if (state.unlockToken) headers[UNLOCK_HEADER] = state.unlockToken
+      const query = offset === null ? '' : '?from=' + offset
+      fetch('/api/terminal/' + encodeURIComponent(id) + '/stream' + query, { headers: headers, cache: 'no-store', signal: local.signal })
+        .then(async response => {
+          if (response.status === 423) { markLocked(); return }
+          if (response.status === 404) { finish('The shell is gone.'); return }
+          if (!response.ok || !response.body) throw new Error('The computer refused the terminal (' + response.status + ').')
+          await readStream(response.body, onTerminalEvent)
+        })
+        .catch(error => { if (!error || error.name !== 'AbortError') { /* retried below */ } })
+        .then(() => {
+          if (controller !== local) return
+          controller = null
+          if (!ended && !destroyed && state.unlockToken) setTimeout(connect, 1500)
+        })
+    }
+
+    const onTerminalEvent = (name, data) => {
+      if (!term || !data) return
+      if (name === 'data') {
+        const bytes = base64ToBytes(data.data || '')
+        term.write(bytes)
+        offset = (data.offset || 0) + bytes.length
+      } else if (name === 'gap') {
+        term.write('\r\n\x1b[33m[' + data.lostBytes + ' bytes of output were dropped]\x1b[0m\r\n')
+      } else if (name === 'exit') {
+        finish('The shell exited' + (data.exitCode === null || data.exitCode === undefined ? '.' : ' with ' + data.exitCode + '.'))
+      } else if (name === 'closed') {
+        finish('The shell closed: ' + (data.reason || 'closed') + '.')
+      } else if (name === 'locked') {
+        markLocked()
+      }
+    }
+
+    const finish = reason => {
+      if (ended) return
+      ended = true
+      if (controller) { const current = controller; controller = null; current.abort() }
+      if (term) term.write('\r\n\x1b[90m' + reason + '\x1b[0m\r\n')
+      closeButton.textContent = 'New'
+      closeButton.hidden = false
+    }
+
+    const sendSize = () => {
+      if (!fit || !term || !terminalId || ended) return
+      try { fit.fit() } catch (error) { return }
+      if (resizeTimer) clearTimeout(resizeTimer)
+      resizeTimer = setTimeout(() => {
+        resizeTimer = null
+        api('/api/terminal/' + encodeURIComponent(terminalId) + '/resize', { method: 'POST', body: { cols: term.cols, rows: term.rows } }).catch(() => undefined)
+      }, 150)
+    }
+
+    const attachShell = async (id, from) => {
+      try { await loadXterm() } catch (error) { drawSetup('The terminal could not load: ' + errorMessage(error)); return }
+      if (destroyed) return
+      teardown()
+      terminalId = id
+      offset = from
+      ended = false
+      clear(body)
+      const host = el('div', 'terminal-host')
+      body.appendChild(host)
+      body.appendChild(keys)
+      closeButton.textContent = 'Close'
+      closeButton.hidden = false
+      term = new window.Terminal({ fontSize: 13, scrollback: 5000, cursorBlink: true, convertEol: false, fontFamily: 'ui-monospace, Menlo, Consolas, monospace', theme: { background: '#090b0e', foreground: '#e7e9ec', cursor: '#d6ff73' } })
+      fit = new window.FitAddon.FitAddon()
+      term.loadAddon(fit)
+      term.open(host)
+      term.onData(data => send(withCtrl(data)))
+      sendSize()
+      if (window.ResizeObserver) { observer = new window.ResizeObserver(() => sendSize()); observer.observe(host) }
+      connect()
+      term.focus()
+    }
+
+    const teardown = () => {
+      if (controller) { const current = controller; controller = null; current.abort() }
+      if (observer) { observer.disconnect(); observer = null }
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null }
+      if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null }
+      pending = []
+      if (term) { try { term.dispose() } catch (error) { /* already gone */ } }
+      term = null
+      fit = null
+    }
+
+    const closeShell = async () => {
+      const id = terminalId
+      if (id && !ended) {
+        try { await api('/api/terminal/' + encodeURIComponent(id) + '/close', { method: 'POST', body: {} }) } catch (error) { /* ended anyway */ }
+      }
+      teardown()
+      terminalId = null
+      ended = false
+      void loadExisting()
+    }
+
+    const loadExisting = async () => {
+      let existing = []
+      try { existing = await api('/api/terminal') } catch (error) {
+        const message = errorMessage(error)
+        drawSetup(message)
+        return
+      }
+      if (!destroyed && !terminalId) drawSetup('', existing)
+    }
+
+    void loadExisting()
+    return {
+      key: 'terminal',
+      root: root,
+      onVisibility: visible => { if (visible && terminalId && !ended && !controller) connect() },
+      destroy: () => { destroyed = true; teardown() }
+    }
+  }
+
   // ------------------------------------------------------------------ boot
 
   const registerServiceWorker = () => {
@@ -3511,8 +4079,11 @@
       window.visualViewport.addEventListener('resize', applyViewport)
       window.visualViewport.addEventListener('scroll', applyViewport)
     }
+    /* Any touch, key or scroll is the owner using the phone, which keeps an unlocked session open. */
+    for (const type of ['pointerdown', 'keydown', 'input', 'touchstart']) document.addEventListener(type, noteActivity, { passive: true })
     document.addEventListener('visibilitychange', () => {
       const visible = document.visibilityState === 'visible'
+      lockVisibility(visible)
       if (screen && screen.onVisibility) screen.onVisibility(visible)
       if (visible) visibleSince = Date.now()
       if (!visible || !state.token) return
@@ -3525,13 +4096,15 @@
         try { fn() } catch (error) { /* a dead node is not worth a crash */ }
       }
       if (screen && screen.onSecond) screen.onSecond()
+      lockTick()
       /* A stream that has gone quiet is a stream the phone slept through. */
       if (state.connected && document.visibilityState === 'visible' && Date.now() - lastEventAt > STREAM_STALE_MS) restartStream()
     }, 1000)
 
     registerServiceWorker()
     render()
-    if (state.token) connectStream()
+    /* The stream waits for the lock answer: a locked phone must not even ask for the state. */
+    if (state.token) void checkLock()
     /* The boot guard's watchdog waits for this; its placeholder is already gone with the first render. */
     window.__conductorBooted = true
     shell.booted()

@@ -156,7 +156,29 @@ export interface PhoneAccessState {
   recommendedEndpoint: string | null
   /** Whether push keys exist, so the panel can say why a test notification cannot go out. */
   pushConfigured: boolean
+  /** The 6-digit phone lock (src/main/phone-lock.ts). */
+  lock: PhoneLockView
 }
+
+/** The phone lock as the desktop's Settings > Phone shows it; never the code or its hash. */
+export interface PhoneLockView {
+  /** A code is set, so every phone must unlock before any API call is answered. */
+  configured: boolean
+  setAt: string | null
+  /** An unlocked phone locks after this long without the owner touching it. */
+  idleMinutes: number
+  /** An app backgrounded this long locks itself when it comes back. */
+  backgroundMs: number
+  /** Consecutive wrong codes, counted across every phone. */
+  failures: number
+  /** Five wrong codes in a row: only a reset here lets any phone unlock again. */
+  lockedOut: boolean
+  retryAt: string | null
+  /** Ids of the phones unlocked right now. */
+  unlockedDevices: string[]
+}
+
+export const PHONE_LOCK_IDLE_MINUTES = [1, 5, 10, 30] as const
 
 /** What the renderer may ask the main process, exposed as window.conductor.phone. */
 export interface PhoneAccessBridge {
@@ -181,6 +203,15 @@ export interface PhoneAccessBridge {
   saveCertificate(): Promise<string | null>
   /** Sends a test push to one phone or to every phone with notifications on. */
   testNotification(deviceId?: string): Promise<{ sent: number; message: string | null }>
+  /** Sets or changes the 6-digit code; every phone locks. */
+  setLockCode(code: string): Promise<PhoneAccessState>
+  /** Removes the code; phones need only their pairing again. */
+  removeLockCode(): Promise<PhoneAccessState>
+  /** Clears a lockout and the failure count; the code stays. */
+  resetLock(): Promise<PhoneAccessState>
+  setLockIdle(minutes: number): Promise<PhoneAccessState>
+  /** Ends every unlocked phone session now (and every phone terminal with it). */
+  lockPhones(): Promise<PhoneAccessState>
   onChanged(callback: (state: PhoneAccessState) => void): () => void
 }
 
@@ -215,6 +246,25 @@ export interface PhoneAccessBridge {
  *   GET  /api/health                      no auth                   -> PhoneHealth
  *   GET  /ca.crt                          the CA certificate, PEM, no auth
  *
+ * The 6-digit lock (docs/phone-lock-and-terminal.md). Once a code is set on the desktop, every
+ * route above except /api/pair and /api/health also needs `X-Conductor-Unlock: <unlockToken>`;
+ * without a live one the answer is 423 { error, locked: true }. Only these answer while locked:
+ *   GET  /api/lock/state                                            -> PhoneLockState
+ *   POST /api/lock/unlock                 { code }                  -> { unlockToken, idleMs, backgroundMs }
+ *                                         403 { remaining, retryAt } wrong code; 429 { retryAt } wait;
+ *                                         423 { lockedOut: true } until the desktop resets it
+ *   POST /api/lock/touch                  the owner is using the phone: restarts the idle clock
+ *   POST /api/lock/lock                   ends this unlocked session (the app went to the background)
+ *
+ * Terminal on this machine (unlocked only; opening needs the code again):
+ *   GET  /api/terminal                                              -> PhoneTerminalSummary[]
+ *   POST /api/terminal/open               { code, projectId, workspaceId, cols, rows } -> PhoneTerminalSummary
+ *   GET  /api/terminal/:id/stream?from=   text/event-stream: `data` { offset, data(base64) },
+ *                                         `gap` { offset, lostBytes }, `exit` { exitCode }, `closed` { reason }
+ *   POST /api/terminal/:id/input          { data (base64) }         -> { written }
+ *   POST /api/terminal/:id/resize         { cols, rows }            -> { cols, rows }
+ *   POST /api/terminal/:id/close                                    -> { closed: true }
+ *
  * Shell assets, all GET and unauthenticated: /, /index.html, /boot.js, /app.js, /app.css, /sw.js,
  * /manifest.webmanifest, /icon.svg, /icon-180.png, /icon-192.png, /icon-512.png.
  *
@@ -231,6 +281,18 @@ export interface PhoneAccessBridge {
  * the connection check calls it before anything else, and a failure here means TLS, address or
  * network, never pairing.
  */
+/** What a paired phone may read about the lock before it is unlocked. */
+export interface PhoneLockState {
+  configured: boolean
+  unlocked: boolean
+  lockedOut: boolean
+  failures: number
+  remaining: number
+  retryAt: string | null
+  idleMs: number
+  backgroundMs: number
+}
+
 export interface PhoneHealth {
   ok: true
   /** Conductor's package version. */

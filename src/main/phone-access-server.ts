@@ -14,11 +14,17 @@ import appCss from '../phone/app.css?raw'
 import swJs from '../phone/sw.js?raw'
 import manifestJson from '../phone/manifest.webmanifest?raw'
 import iconSvg from '../phone/icon.svg?raw'
-import { isPhoneOs, type PhoneDevice, type PhoneHealth } from '../shared/phone-access'
+// The phone terminal's emulator, the same xterm.js the desktop panes use, loaded only on #/terminal.
+import xtermJs from '../../node_modules/@xterm/xterm/lib/xterm.js?raw'
+import xtermCss from '../../node_modules/@xterm/xterm/css/xterm.css?raw'
+import xtermFitJs from '../../node_modules/@xterm/addon-fit/lib/addon-fit.js?raw'
+import { isPhoneOs, type PhoneDevice, type PhoneHealth, type PhoneLockState } from '../shared/phone-access'
 import type { TailscaleState } from '../shared/remote-control'
 import { localAddresses } from './network-addresses'
 import { PhoneAccessError, type PhoneAccessService, type PhoneListenerStatus, type PhoneTailnetDetail } from './phone-access'
 import { PHONE_ICON_SIZES, renderPhoneIcon } from './phone-icon'
+import { PHONE_LOCK_MAX_FAILURES, PhoneLockError } from './phone-lock'
+import { PhoneTerminalError, PhoneTerminals, type PhoneTerminalEvent, type PhoneTerminalRuntime } from './phone-terminal'
 import { resolveBindHost } from './remote-control-server'
 import { INSTALL_TAILSCALE_MESSAGE, isTailscaleAddress, isTailscaleIpv4, type TailscaleReader } from './tailscale'
 
@@ -26,6 +32,7 @@ const MAX_BODY = 1024 * 1024
 const MAX_SOCKETS = 64
 const MAX_STREAMS = 16
 const MAX_STREAMS_PER_DEVICE = 4
+const MAX_TERMINAL_STREAMS = 8
 const STREAM_PING_MS = 25_000
 /** Renew a Tailscale certificate this long before it lapses; Let's Encrypt issues 90-day ones. */
 const TAILSCALE_RENEW_BEFORE_MS = 14 * 86400000
@@ -42,15 +49,51 @@ export function registerPhoneApiRoute(prefix: string, route: PhoneApiRoute): () 
   return () => { if (phoneApiRoutes.get(prefix) === route) phoneApiRoutes.delete(prefix) }
 }
 
+/** The calls a phone gets answered while it is locked: the lock pad's own, nothing else. */
+export const PHONE_LOCK_ROUTES: ReadonlyArray<{ method: 'GET' | 'POST'; path: string }> = [
+  { method: 'GET', path: '/api/lock/state' },
+  { method: 'POST', path: '/api/lock/unlock' },
+  { method: 'POST', path: '/api/lock/touch' },
+  { method: 'POST', path: '/api/lock/lock' }
+]
+
+/** A route's answer when it wrote the response itself (a stream). */
+const STREAMED = Symbol('streamed')
+
+interface PhoneRequestContext {
+  method: string
+  path: string
+  body: Record<string, unknown>
+  query: URLSearchParams
+  device: PhoneDevice
+  /** The phone's live unlocked session; null only when no code is set. */
+  unlock: { id: string } | null
+  params: string[]
+  request: IncomingMessage
+  response: ServerResponse
+}
+
+interface PhoneRoute {
+  method: 'GET' | 'POST'
+  path: string | RegExp
+  /** A concrete path this route answers, for the test that proves the lock covers it. */
+  sample: string
+  run(ctx: PhoneRequestContext): unknown
+}
+
+interface OpenStream { deviceId: string; unlockId: string | null; close(reason: string): void }
+
 export interface PhoneAccessServerDependencies {
   service: PhoneAccessService
+  /** This machine's PTYs (TerminalManager), for the phone terminal; absent means no terminal. */
+  terminals?: PhoneTerminalRuntime
   tailscale?: TailscaleReader
   /** Where `tailscale cert` may write its files; unset means the certificate cannot be requested. */
   tailscaleCert?(dnsName: string): Promise<TailscaleCertificate>
   localAddresses?(): string[]
   hostname?(): string
   /** Test seam: the files served at /, /app.js and so on. */
-  assets?: Partial<Record<'index.html' | 'boot.js' | 'app.js' | 'app.css' | 'sw.js' | 'manifest.webmanifest' | 'icon.svg', string>>
+  assets?: Partial<Record<'index.html' | 'boot.js' | 'app.js' | 'app.css' | 'sw.js' | 'manifest.webmanifest' | 'icon.svg' | 'xterm.js' | 'xterm.css' | 'xterm-fit.js', string>>
   log?(message: string, error?: unknown): void
 }
 
@@ -119,9 +162,28 @@ export class PhoneAccessServer {
   private tailscaleDnsName = ''
   private renewTimer: ReturnType<typeof setInterval> | null = null
   private status: PhoneListenerStatus = { listening: false, endpoints: [], message: null, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null }
+  private readonly terminals: PhoneTerminals | null
+  private readonly routes: PhoneRoute[]
+  private readonly openStreams = new Set<OpenStream>()
+  private readonly offLocked: () => void
 
   constructor(private readonly deps: PhoneAccessServerDependencies) {
-    const files = { 'index.html': indexHtml, 'boot.js': bootJs, 'app.js': appJs, 'app.css': appCss, 'sw.js': swJs, 'manifest.webmanifest': manifestJson, 'icon.svg': iconSvg, ...deps.assets }
+    const { service } = deps
+    this.terminals = deps.terminals ? new PhoneTerminals({
+      terminals: deps.terminals,
+      workspace: (projectId, workspaceId) => service.terminalWorkspace(projectId, workspaceId),
+      machineName: () => service.machineName(),
+      audit: line => service.audit(line)
+    }) : null
+    this.routes = this.buildRoutes()
+    // A phone that locks loses its streams and its shells in the same moment.
+    this.offLocked = service.onLocked((deviceId, unlockId) => {
+      if (deviceId === null) { this.terminals?.dispose('phone code changed'); this.closeStreams(null, null); return }
+      if (unlockId === null) this.terminals?.deviceRemoved(deviceId)
+      else this.terminals?.locked(deviceId, unlockId)
+      this.closeStreams(deviceId, unlockId)
+    })
+    const files = { 'index.html': indexHtml, 'boot.js': bootJs, 'app.js': appJs, 'app.css': appCss, 'sw.js': swJs, 'manifest.webmanifest': manifestJson, 'icon.svg': iconSvg, 'xterm.js': xtermJs, 'xterm.css': xtermCss, 'xterm-fit.js': xtermFitJs, ...deps.assets }
     this.assets.set('/', asset(files['index.html'], 'text/html; charset=utf-8', { 'Content-Security-Policy': CSP, 'Cache-Control': 'no-cache' }))
     this.assets.set('/index.html', this.assets.get('/')!)
     // The boot guard is what shows an error when app.js cannot; it is small and cached like it.
@@ -131,6 +193,11 @@ export class PhoneAccessServer {
     this.assets.set('/sw.js', asset(files['sw.js'], 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache', 'Service-Worker-Allowed': '/' }))
     this.assets.set('/manifest.webmanifest', asset(files['manifest.webmanifest'], 'application/manifest+json; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     this.assets.set('/icon.svg', asset(files['icon.svg'], 'image/svg+xml; charset=utf-8', { 'Cache-Control': 'public, max-age=86400' }))
+    // The source map comment would only make the phone ask for a file that is not served.
+    const noMap = (text: string): string => text.replace(/\/\/# sourceMappingURL=\S+\s*$/, '')
+    this.assets.set('/xterm.js', asset(noMap(files['xterm.js']), 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' }))
+    this.assets.set('/xterm-fit.js', asset(noMap(files['xterm-fit.js']), 'text/javascript; charset=utf-8', { 'Cache-Control': 'no-cache' }))
+    this.assets.set('/xterm.css', asset(files['xterm.css'], 'text/css; charset=utf-8', { 'Cache-Control': 'no-cache' }))
     for (const size of PHONE_ICON_SIZES) this.assets.set(`/icon-${size}.png`, asset(renderPhoneIcon(size), 'image/png', { 'Cache-Control': 'public, max-age=86400' }))
   }
 
@@ -155,7 +222,7 @@ export class PhoneAccessServer {
     // taken below for one that is, and the setup steps' "Check again" takes its own.
     let detail = tailnetDetail(this.deps.tailscale?.last())
     const stopped = (message: string | null, extra: Partial<PhoneListenerStatus> = {}): PhoneListenerStatus => ({ listening: false, endpoints: [], message, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null, tailnet: detail, ...extra })
-    if (!settings.enabled) { this.publish(stopped(null)); return this.getStatus() }
+    if (!settings.enabled) { this.terminals?.dispose('phone access switched off'); this.publish(stopped(null)); return this.getStatus() }
     if (!(await this.vaultAvailable())) { this.publish(stopped('The OS credential store is unavailable, so the certificate key cannot be protected.')); return this.getStatus() }
     // The tailnet is read for both exposures: a phone on the tailnet reaches a 'network' listener
     // by the Tailscale address too, so the certificate should name it whenever it exists.
@@ -312,18 +379,96 @@ export class PhoneAccessServer {
 
   async stop(): Promise<void> {
     ++this.intent
+    this.terminals?.dispose('phone access switched off')
     await this.stopSocket()
     this.publish({ listening: false, endpoints: [], message: null, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null })
   }
 
   async dispose(): Promise<void> {
     if (this.renewTimer) { clearInterval(this.renewTimer); this.renewTimer = null }
+    this.offLocked()
+    this.terminals?.dispose()
     await this.stop()
   }
 
   /* ----------------------------------------------------------------------- *
    * Requests
    * ----------------------------------------------------------------------- */
+
+  /**
+   * Every authenticated route, declared once. The lock gate in handle() sits in front of all of
+   * them and of every registered extension, so a route added here (or through
+   * registerPhoneApiRoute) is locked without anyone remembering to lock it; the listener test
+   * walks this table with a locked phone and expects 423 from each `sample`.
+   */
+  private buildRoutes(): PhoneRoute[] {
+    const { service } = this.deps
+    const terminals = (): PhoneTerminals => {
+      if (!this.terminals) throw new PhoneAccessError('This Conductor has no terminals to offer.', 503)
+      return this.terminals
+    }
+    const owner = (ctx: PhoneRequestContext): { deviceId: string; deviceName: string; unlockSessionId: string | null } => {
+      // A shell is only ever handed to a phone behind the code: without one set there is nothing
+      // to re-enter and nothing that locks it again, so the terminal stays closed.
+      if (!service.lock.configured() || !ctx.unlock) throw new PhoneAccessError('Set a phone code in Conductor on the computer (Settings > Phone) to use the terminal.', 403)
+      return { deviceId: ctx.device.id, deviceName: ctx.device.name, unlockSessionId: ctx.unlock.id }
+    }
+    const session = /^\/api\/sessions\/([^/]+)$/
+    const sessionAction = /^\/api\/sessions\/([^/]+)\/(message|respond|interrupt|resume)$/
+    const projectTasks = /^\/api\/projects\/([^/]+)\/tasks$/
+    const terminal = (action: string): RegExp => new RegExp(`^/api/terminal/([^/]+)/${action}$`)
+    return [
+      { method: 'GET', path: '/api/me', sample: '/api/me', run: ctx => service.self(ctx.device.id) },
+      { method: 'POST', path: '/api/me', sample: '/api/me', run: ctx => service.rename(ctx.device.id, ctx.body.name) },
+      { method: 'POST', path: '/api/unpair', sample: '/api/unpair', run: ctx => { service.revoke(ctx.device.id); return { ok: true } } },
+      { method: 'GET', path: '/api/state', sample: '/api/state', run: () => service.phoneState() },
+      { method: 'GET', path: '/api/stream', sample: '/api/stream', run: ctx => { this.stream(ctx); return STREAMED } },
+      { method: 'GET', path: '/api/metrics', sample: '/api/metrics', run: () => service.metrics() },
+      { method: 'POST', path: '/api/tabs/open', sample: '/api/tabs/open', run: ctx => service.openTab(ctx.body as never) },
+      { method: 'GET', path: projectTasks, sample: '/api/projects/project-a/tasks', run: ctx => service.listProjectTasks(ctx.params[0]!, { offset: ctx.query.get('offset') ?? undefined, limit: ctx.query.get('limit') ?? undefined }) },
+      { method: 'POST', path: projectTasks, sample: '/api/projects/project-a/tasks', run: ctx => service.createProjectTask(ctx.params[0]!, ctx.body as never) },
+      { method: 'POST', path: '/api/push/subscribe', sample: '/api/push/subscribe', run: ctx => { service.setSubscription(ctx.device.id, ctx.body.subscription); return { ok: true } } },
+      { method: 'POST', path: '/api/push/unsubscribe', sample: '/api/push/unsubscribe', run: ctx => { service.setSubscription(ctx.device.id, null); return { ok: true } } },
+      { method: 'POST', path: '/api/push/test', sample: '/api/push/test', run: async ctx => ({ ok: true, ...await service.testNotification(ctx.device.id) }) },
+      { method: 'POST', path: '/api/notifications', sample: '/api/notifications', run: ctx => service.setNotificationPrefs(ctx.device.id, ctx.body.prefs) },
+      { method: 'GET', path: session, sample: '/api/sessions/session-a', run: ctx => service.conversation(ctx.params[0]!) },
+      {
+        method: 'POST', path: sessionAction, sample: '/api/sessions/session-a/message', run: ctx => {
+          const [id, action] = [ctx.params[0]!, ctx.params[1]!]
+          if (action === 'message') return service.sendMessage(id, { text: ctx.body.text, mode: ctx.body.mode })
+          if (action === 'respond') return service.respond(id, { requestId: ctx.body.requestId, decision: ctx.body.decision, answers: ctx.body.answers })
+          if (action === 'interrupt') return service.interrupt(id)
+          return service.resume(id)
+        }
+      },
+      { method: 'GET', path: '/api/terminal', sample: '/api/terminal', run: ctx => terminals().list(owner(ctx)) },
+      {
+        method: 'POST', path: '/api/terminal/open', sample: '/api/terminal/open', run: async ctx => {
+          const who = owner(ctx)
+          const shells = terminals()
+          // A fresh code for every shell: an unlocked phone left on a table is not a shell.
+          await service.lock.verify(ctx.body.code, ctx.device)
+          service.lock.touch(ctx.unlock!.id)
+          return shells.open(who, { machineId: ctx.body.machineId, projectId: ctx.body.projectId, workspaceId: ctx.body.workspaceId, cols: ctx.body.cols, rows: ctx.body.rows })
+        }
+      },
+      { method: 'GET', path: terminal('stream'), sample: '/api/terminal/terminal-a/stream', run: ctx => { this.terminalStream(ctx, terminals(), owner(ctx)); return STREAMED } },
+      {
+        method: 'POST', path: terminal('input'), sample: '/api/terminal/terminal-a/input', run: ctx => {
+          const written = terminals().write(owner(ctx), ctx.params[0], ctx.body.data)
+          service.lock.touch(ctx.unlock!.id)
+          return written
+        }
+      },
+      { method: 'POST', path: terminal('resize'), sample: '/api/terminal/terminal-a/resize', run: ctx => terminals().resize(owner(ctx), ctx.params[0], ctx.body.cols, ctx.body.rows) },
+      { method: 'POST', path: terminal('close'), sample: '/api/terminal/terminal-a/close', run: ctx => terminals().close(owner(ctx), ctx.params[0]) }
+    ]
+  }
+
+  /** The routes a test walks: method, pattern and one concrete path for each. */
+  routeTable(): ReadonlyArray<{ method: string; path: string; sample: string }> {
+    return this.routes.map(route => ({ method: route.method, path: String(route.path), sample: route.sample }))
+  }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const reply = (status: number, body: unknown, headers: Record<string, string> = {}): void => {
@@ -380,13 +525,63 @@ export class PhoneAccessServer {
       const token = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
       const device = this.deps.service.authenticate(token)
       if (!device) { reply(401, { error: 'This phone is not paired, or its access was revoked.' }); request.resume(); return }
-      if (url.pathname === '/api/stream') { if (method !== 'GET') throw new PhoneAccessError('Method not allowed', 405); this.stream(device, request, response); return }
-      reply(200, await this.route(method, url.pathname, body, device, url.searchParams))
+      const lock = this.deps.service.lock
+      const unlockHeader = request.headers['x-conductor-unlock']
+      const unlock = lock.configured() ? lock.session(device.id, typeof unlockHeader === 'string' ? unlockHeader.trim() : undefined) : null
+      if (url.pathname.startsWith('/api/lock/')) { reply(200, await this.lockRoute(method, url.pathname, body, device, unlock)); return }
+      // The gate. Everything below this line - the table and every registered extension - is
+      // answered only to a phone that is unlocked, whenever a code is set.
+      if (lock.configured() && !unlock) { reply(423, { error: 'Unlock Conductor on this phone first.', locked: true }); request.resume(); return }
+      const ctx: PhoneRequestContext = { method, path: url.pathname, body, query: url.searchParams, device, unlock, params: [], request, response }
+      for (const route of this.routes) {
+        if (route.method !== method) continue
+        if (typeof route.path === 'string' ? route.path !== url.pathname : !route.path.test(url.pathname)) continue
+        ctx.params = typeof route.path === 'string' ? [] : (route.path.exec(url.pathname) ?? []).slice(1).map(part => decodeURIComponent(part))
+        const result = await route.run(ctx)
+        if (result !== STREAMED) reply(200, result)
+        return
+      }
+      for (const [prefix, extension] of phoneApiRoutes) {
+        if (url.pathname === prefix || url.pathname.startsWith(prefix + '/')) { reply(200, await extension(method, url.pathname, body, url.searchParams, device)); return }
+      }
+      const known = this.routes.some(route => typeof route.path === 'string' ? route.path === url.pathname : route.path.test(url.pathname))
+      throw new PhoneAccessError(known ? 'Method not allowed' : 'Unknown route.', known ? 405 : 404)
     } catch (error) {
       request.resume()
-      const status = error instanceof PhoneAccessError ? error.status : 400
-      reply(status, { error: error instanceof Error ? error.message : 'Request failed' })
+      const status = error instanceof PhoneAccessError || error instanceof PhoneLockError || error instanceof PhoneTerminalError ? error.status : 400
+      const detail = error instanceof PhoneLockError ? error.detail : {}
+      reply(status, { error: error instanceof Error ? error.message : 'Request failed', ...detail })
     }
+  }
+
+  /** The only calls a locked phone gets answered: what the lock pad needs and nothing else. */
+  private async lockRoute(method: string, path: string, body: Record<string, unknown>, device: PhoneDevice, unlock: { id: string } | null): Promise<unknown> {
+    const lock = this.deps.service.lock
+    if (path === '/api/lock/state' && method === 'GET') {
+      const status = lock.status()
+      const state: PhoneLockState = {
+        configured: status.configured, unlocked: Boolean(unlock), lockedOut: status.lockedOut, failures: status.failures,
+        remaining: Math.max(0, PHONE_LOCK_MAX_FAILURES - status.failures), retryAt: status.retryAt,
+        idleMs: lock.idleMs(), backgroundMs: status.backgroundMs
+      }
+      return state
+    }
+    if (path === '/api/lock/unlock' && method === 'POST') {
+      const opened = await lock.unlock(body.code, device)
+      this.deps.service.changedLock()
+      return opened
+    }
+    if (path === '/api/lock/touch' && method === 'POST') {
+      if (lock.configured() && !unlock) throw new PhoneLockError('Unlock Conductor on this phone first.', 423, { locked: true })
+      if (unlock) lock.touch(unlock.id)
+      return { ok: true }
+    }
+    if (path === '/api/lock/lock' && method === 'POST') {
+      if (unlock) lock.lock(unlock.id)
+      return { ok: true }
+    }
+    const known = PHONE_LOCK_ROUTES.some(route => route.path === path)
+    throw new PhoneAccessError(known ? 'Method not allowed' : 'Unknown route.', known ? 405 : 404)
   }
 
   private async body(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -405,42 +600,13 @@ export class PhoneAccessServer {
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
   }
 
-  private async route(method: string, path: string, body: Record<string, unknown>, device: PhoneDevice, query:URLSearchParams): Promise<unknown> {
-    const { service } = this.deps
-    const get = method === 'GET', post = method === 'POST'
-    if (path === '/api/me' && get) return service.self(device.id)
-    if (path === '/api/me' && post) return service.rename(device.id, body.name)
-    if (path === '/api/unpair' && post) { service.revoke(device.id); return { ok: true } }
-    if (path === '/api/state' && get) return service.phoneState()
-    if (path === '/api/metrics' && get) return service.metrics()
-    if (path === '/api/tabs/open' && post) return service.openTab(body as never)
-    const projectTasks = path.match(/^\/api\/projects\/([^/]+)\/tasks$/)
-    if (projectTasks && get) return service.listProjectTasks(decodeURIComponent(projectTasks[1]!), { offset: query.get('offset') ?? undefined, limit: query.get('limit') ?? undefined })
-    if (projectTasks && post) return service.createProjectTask(decodeURIComponent(projectTasks[1]!), body as never)
-    if (path === '/api/push/subscribe' && post) { service.setSubscription(device.id, body.subscription); return { ok: true } }
-    if (path === '/api/push/unsubscribe' && post) { service.setSubscription(device.id, null); return { ok: true } }
-    if (path === '/api/push/test' && post) return { ok: true, ...await service.testNotification(device.id) }
-    if (path === '/api/notifications' && post) return service.setNotificationPrefs(device.id, body.prefs)
-    const session = path.match(/^\/api\/sessions\/([^/]+)(?:\/(message|respond|interrupt|resume))?$/)
-    if (session) {
-      const id = decodeURIComponent(session[1]!), action = session[2]
-      if (!action && get) return service.conversation(id)
-      if (action && post) {
-        if (action === 'message') return service.sendMessage(id, { text: body.text, mode: body.mode })
-        if (action === 'respond') return service.respond(id, { requestId: body.requestId, decision: body.decision, answers: body.answers })
-        if (action === 'interrupt') return service.interrupt(id)
-        return service.resume(id)
-      }
-    }
-    for (const [prefix, extension] of phoneApiRoutes) if (path === prefix || path.startsWith(prefix + '/')) return extension(method, path, body, query, device)
-    throw new PhoneAccessError('Unknown route.', 404)
-  }
-
-  /** One long-lived response per open app; the service writes events into it until it closes. */
-  private stream(device: PhoneDevice, request: IncomingMessage, response: ServerResponse): void {
-    const { service } = this.deps
-    if (service.streamCount() >= MAX_STREAMS) { response.writeHead(503, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ error: 'Too many open phone streams.' })); return }
-    if (service.streamCount(device.id) >= MAX_STREAMS_PER_DEVICE) { response.writeHead(429, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ error: 'This phone has too many open streams; close other tabs.' })); return }
+  /**
+   * Opens a server-sent event response tied to the phone's unlocked session: when that session
+   * ends (idle, backgrounded, code changed, lockout, unpaired) the stream is told `locked` and
+   * closed, so an open app cannot keep reading past its lock.
+   */
+  private eventStream(ctx: PhoneRequestContext, onClose: () => void): (event: string, data: unknown) => void {
+    const { request, response } = ctx
     response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no', 'X-Content-Type-Options': 'nosniff' })
     response.write('retry: 3000\n\n')
     request.socket.setNoDelay(true)
@@ -449,16 +615,62 @@ export class PhoneAccessServer {
       if (response.destroyed || response.writableEnded) throw new Error('stream closed')
       response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     }
-    let unsubscribe: (() => void) | null = null
+    const entry: OpenStream = { deviceId: ctx.device.id, unlockId: ctx.unlock?.id ?? null, close: () => undefined }
     const ping = setInterval(() => { try { write('ping', { at: new Date().toISOString() }) } catch { cleanup() } }, STREAM_PING_MS)
+    let closed = false
     const cleanup = (): void => {
+      if (closed) return
+      closed = true
       clearInterval(ping)
-      unsubscribe?.(); unsubscribe = null
+      this.openStreams.delete(entry)
+      try { onClose() } catch { /* already detached */ }
       if (!response.writableEnded) try { response.end() } catch { /* already gone */ }
     }
+    entry.close = (reason: string) => { try { write('locked', { reason }) } catch { /* closing anyway */ } cleanup() }
+    this.openStreams.add(entry)
     request.on('close', cleanup)
     response.on('close', cleanup)
     response.on('error', cleanup)
-    try { unsubscribe = service.subscribe(device.id, write) } catch (error) { this.log('Phone stream refused', error); cleanup() }
+    return write
+  }
+
+  /**
+   * Ends the streams a phone's unlocked session held open: with a null session every stream of
+   * that phone (unpaired), with a null device every phone stream (a code was set or changed).
+   */
+  private closeStreams(deviceId: string | null, unlockId: string | null): void {
+    for (const stream of [...this.openStreams]) {
+      if (deviceId !== null && stream.deviceId !== deviceId) continue
+      if (unlockId !== null && stream.unlockId !== unlockId) continue
+      stream.close(deviceId !== null && unlockId === null ? 'unpaired' : 'locked')
+    }
+  }
+
+  /** One long-lived response per open app; the service writes events into it until it closes. */
+  private stream(ctx: PhoneRequestContext): void {
+    const { service } = this.deps
+    const { device, response } = ctx
+    if (service.streamCount() >= MAX_STREAMS) { response.writeHead(503, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ error: 'Too many open phone streams.' })); return }
+    if (service.streamCount(device.id) >= MAX_STREAMS_PER_DEVICE) { response.writeHead(429, { 'Content-Type': 'application/json' }); response.end(JSON.stringify({ error: 'This phone has too many open streams; close other tabs.' })); return }
+    let unsubscribe: (() => void) | null = null
+    const write = this.eventStream(ctx, () => { unsubscribe?.(); unsubscribe = null })
+    try { unsubscribe = service.subscribe(device.id, write) } catch (error) { this.log('Phone stream refused', error); ctx.response.end() }
+  }
+
+  /** A phone terminal's output: scrollback from `from`, then live, until the shell or the lock ends it. */
+  private terminalStream(ctx: PhoneRequestContext, terminals: PhoneTerminals, owner: { deviceId: string; deviceName: string; unlockSessionId: string | null }): void {
+    if ([...this.openStreams].length >= MAX_STREAMS + MAX_TERMINAL_STREAMS) throw new PhoneAccessError('Too many open phone streams.', 503)
+    const from = ctx.query.get('from')
+    const fromOffset = from !== null && /^\d{1,15}$/.test(from) ? Number(from) : undefined
+    let detach: (() => void) | null = null
+    // Checked before the response starts, so a terminal that is not this phone's is a plain 404.
+    if (!terminals.list(owner).some(entry => entry.terminalId === ctx.params[0])) throw new PhoneAccessError('That terminal is not open.', 404)
+    const write = this.eventStream(ctx, () => { detach?.(); detach = null })
+    const send = (event: PhoneTerminalEvent): void => {
+      const { type, ...data } = event
+      write(type, data)
+      if (type === 'closed' || type === 'exit') setImmediate(() => { if (!ctx.response.writableEnded) ctx.response.end() })
+    }
+    try { detach = terminals.attach(owner, ctx.params[0], fromOffset, send) } catch (error) { this.log('Phone terminal stream refused', error); ctx.response.end() }
   }
 }

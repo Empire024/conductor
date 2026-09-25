@@ -352,7 +352,8 @@ describe('phone notification preferences', () => {
    function from each request to its JSON answer; throwing from it is a network failure. */
 interface AppCall { path: string; method: string; body: any; keepalive: boolean }
 
-const bootApp = (hash: string, respond: (call: AppCall) => unknown) => {
+/* A test that is not about the lock never sees its boot-time read: the computer has no code set. */
+const bootApp = (hash: string, respond: (call: AppCall) => unknown, options: { lock?: boolean } = {}) => {
   focusedNode = null
   const timers: Array<{ at: number; fn: () => void; id: number }> = []
   let now = 0
@@ -360,6 +361,8 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown) => {
   const windowListeners: Record<string, Listener[]> = {}
   const documentListeners: Record<string, Listener[]> = {}
   const calls: AppCall[] = []
+  const streams: Array<{ headers: Record<string, string> }> = []
+  const headersSent: Array<{ path: string; headers: Record<string, string> }> = []
   const app = new FakeNode('div')
   const pill = new FakeNode('div')
   const toasts = new FakeNode('div')
@@ -393,10 +396,14 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown) => {
     removeEventListener: () => undefined
   }
   const fetch = async (path: string, init: any = {}) => {
-    if (path === '/api/stream') return new Promise(() => undefined)
+    if (path === '/api/stream') { streams.push({ headers: { ...(init.headers || {}) } }); return new Promise(() => undefined) }
+    if (path === '/api/lock/state' && !options.lock) return { status: 200, ok: true, text: async () => JSON.stringify({ configured: false, unlocked: false }) }
     const call: AppCall = { path, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : undefined, keepalive: Boolean(init.keepalive) }
     calls.push(call)
-    const answer = await respond(call)
+    headersSent.push({ path, headers: { ...(init.headers || {}) } })
+    const answer = await respond(call) as any
+    /* An answer shaped { __status, body } is an HTTP failure; anything else is a 200. */
+    if (answer && typeof answer.__status === 'number') return { status: answer.__status, ok: answer.__status < 400, text: async () => JSON.stringify(answer.body ?? null) }
     return { status: 200, ok: true, text: async () => JSON.stringify(answer ?? null) }
   }
   const window: Record<string, any> = {
@@ -435,7 +442,7 @@ const bootApp = (hash: string, respond: (call: AppCall) => unknown) => {
   }
   const editor = () => app.find(node => node.tagName === 'TEXTAREA')
   const posts = () => calls.filter(call => call.method === 'POST')
-  return { window, document, app, calls, posts, advance, setVisibility, editor, fireWindow: (type: string) => fire(windowListeners, type) }
+  return { window, document, app, calls, posts, streams, headersSent, advance, setVisibility, editor, fireWindow: (type: string) => fire(windowListeners, type), fireDocument: (type: string, event: any = {}) => fire(documentListeners, type, event) }
 }
 
 const ideaDetail = (id: string, text: string) => ({
@@ -662,5 +669,66 @@ describe('phone viewing state', () => {
     expect(extract('viewingDescription')(1)).toBe('Turn ended; 1 background task still running; the agent continues when they finish')
     expect(appSource).toContain("viewing ? 'Viewing' : STATE_WORDS[session.state]")
     expect(appSource).toContain("session.state === 'working' && !viewing && session.turnStartedAt")
+  })
+})
+
+describe('phone lock pad', () => {
+  const lockedState = { configured: true, unlocked: false, lockedOut: false, failures: 0, remaining: 5, retryAt: null, idleMs: 300000, backgroundMs: 60000 }
+  const key = (page: ReturnType<typeof bootApp>, label: string) => page.app.find(node => node.tagName === 'BUTTON' && node.className.includes('lock-key') && node.textContent === label)!
+  const typeCode = (page: ReturnType<typeof bootApp>, code: string) => { for (const digit of code) key(page, digit).click() }
+
+  it('shows only the code pad while locked, opens no stream, and unlocks with the code', async () => {
+    const page = bootApp('#/', call => {
+      if (call.path === '/api/lock/state') return lockedState
+      if (call.path === '/api/lock/unlock') return { unlockToken: 'unlock-1', idleMs: 300000, backgroundMs: 60000 }
+      return {}
+    }, { lock: true })
+    await settleAll()
+    expect(page.app.textContent).toContain('Conductor is locked')
+    expect(page.app.querySelector('.tabbar')!.hidden).toBe(true)
+    expect(page.streams).toHaveLength(0)
+    typeCode(page, '482915')
+    await settleAll()
+    expect(page.posts()).toEqual([{ path: '/api/lock/unlock', method: 'POST', body: { code: '482915' }, keepalive: false }])
+    expect(page.app.textContent).not.toContain('Conductor is locked')
+    // The stream, and every call after it, carries the unlock token.
+    expect(page.streams.at(-1)!.headers['X-Conductor-Unlock']).toBe('unlock-1')
+  })
+
+  it('says how many tries are left after a wrong code and clears the dots', async () => {
+    const page = bootApp('#/', call => {
+      if (call.path === '/api/lock/state') return lockedState
+      if (call.path === '/api/lock/unlock') return { __status: 403, body: { error: 'That code is wrong.', remaining: 4, retryAt: null } }
+      return {}
+    }, { lock: true })
+    await settleAll()
+    typeCode(page, '000000')
+    await settleAll()
+    expect(page.app.textContent).toContain('That code is wrong. 4 tries left')
+    expect(page.app.querySelectorAll('filled')).toHaveLength(0)
+    expect(page.app.textContent).toContain('Conductor is locked')
+  })
+
+  it('goes back to the pad when the computer answers any call with 423', async () => {
+    let locked = false
+    const page = bootApp('#/system', call => {
+      if (call.path === '/api/metrics' && locked) return { __status: 423, body: { error: 'Unlock Conductor on this phone first.', locked: true } }
+      return {}
+    })
+    await settleAll()
+    expect(page.app.textContent).not.toContain('Conductor is locked')
+    locked = true
+    page.fireWindow('hashchange')
+    page.window.location.hash = '#/phone'
+    page.advance(1)
+    page.window.location.hash = '#/system'
+    page.advance(1)
+    await settleAll()
+    expect(page.app.textContent).toContain('Conductor is locked')
+  })
+
+  it('offers the terminal from the System screen', () => {
+    expect(appSource).toContain("button('ghost terminal-open', 'Terminal', () => visit('#/terminal'))")
+    expect(appSource).toContain("if (hash.indexOf('#/terminal') === 0) return { name: 'terminal', key: 'terminal' }")
   })
 })

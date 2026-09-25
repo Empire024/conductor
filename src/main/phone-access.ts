@@ -22,6 +22,7 @@ import { autoModeDenials, describeDenials, describeTransition, lastMessage, pend
 import { createCertificateAuthority, issueServerCertificate, tlsIdentityUsable, type CertificateAuthority } from './remote-tls'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
+import { PhoneLock } from './phone-lock'
 import type { WeeklyModelUsageReport } from '../shared/weekly-model-usage'
 
 const SETTINGS_KEY = 'phone-access.settings'
@@ -166,7 +167,15 @@ export interface PhoneAccessDependencies {
   /** The desktop panel's state changed (a phone paired, a code expired, a push failed). */
   changed?(): void
   log?(message: string, error?: unknown): void
+  /** The app log's audit trail: lock lockouts, resets and code changes. Never a code. */
+  audit?(line: string): void
 }
+
+/**
+ * A phone's unlocked session ended. A null session means every session that phone had (it was
+ * unpaired); a null device means every phone (a code was set or changed).
+ */
+export type PhoneLockedListener = (deviceId: string | null, unlockSessionId: string | null) => void
 
 export interface PhoneStreamWriter { (event: string, data: unknown): void }
 
@@ -230,10 +239,33 @@ export class PhoneAccessService {
   private touched = new Set<string>()
   private usageCache = new Map<string, { sequence: number; windows: UsageWindow[]; reportedAt: string; summary: PhoneSessionSummary['usage'] }>()
   private disposed = false
+  private lockedListeners = new Set<PhoneLockedListener>()
+  /** The 6-digit code in front of every phone API call (src/main/phone-lock.ts). */
+  readonly lock: PhoneLock
 
   constructor(private readonly deps: PhoneAccessDependencies) {
     this.settings = normalizePhoneSettings(parseJson(deps.store.getSetting(SETTINGS_KEY), {}))
     this.devices = parseJson<StoredDevice[]>(deps.store.getSetting(DEVICES_KEY), []).filter(device => device && typeof device.id === 'string' && typeof device.tokenHash === 'string')
+    this.lock = new PhoneLock({
+      store: deps.store, vault: deps.vault, now: () => this.now(),
+      audit: line => this.audit(line),
+      locked: (deviceId, sessionId) => { this.emitLocked(deviceId, sessionId); this.deps.changed?.() },
+      everyPhone: () => { this.emitLocked(null, null); this.deps.changed?.() }
+    })
+  }
+
+  audit(line: string): void { (this.deps.audit ?? ((text: string) => console.info(text)))(line) }
+
+  /** Streams and terminals close through this when a phone locks or is unpaired. */
+  onLocked(listener: PhoneLockedListener): () => void {
+    this.lockedListeners.add(listener)
+    return () => { this.lockedListeners.delete(listener) }
+  }
+
+  private emitLocked(deviceId: string | null, sessionId: string | null): void {
+    for (const listener of [...this.lockedListeners]) {
+      try { listener(deviceId, sessionId) } catch (error) { this.log('Phone lock listener failed', error) }
+    }
   }
 
   private now(): number { return this.deps.now?.() ?? Date.now() }
@@ -282,9 +314,15 @@ export class PhoneAccessService {
         phones: [...(this.listener.tailnet?.phones ?? [])]
       },
       recommendedEndpoint: recommendEndpoint(this.listener),
-      pushConfigured: Boolean(this.deps.store.getSetting(VAPID_PUBLIC_KEY))
+      pushConfigured: Boolean(this.deps.store.getSetting(VAPID_PUBLIC_KEY)),
+      lock: this.lock.status()
     }
   }
+
+  machineName(): string { return this.deps.machineName() }
+
+  /** A phone unlocked: the desktop panel lists which phones are open. */
+  changedLock(): void { this.deps.changed?.() }
 
   /** Conductor's own version, for the unauthenticated health answer. */
   version(): string { return this.deps.version }
@@ -408,6 +446,8 @@ export class PhoneAccessService {
     this.devices = this.devices.filter(device => device.id !== deviceId)
     if (this.devices.length === before) throw new PhoneAccessError('That phone is not paired.', 404)
     for (const stream of [...this.streams]) if (stream.deviceId === deviceId) this.streams.delete(stream)
+    this.lock.lockDevice(deviceId)
+    this.emitLocked(deviceId, null)
     this.saveDevices()
   }
 
@@ -501,13 +541,15 @@ export class PhoneAccessService {
       (notification.kind === 'test' || wantsNotification(device.notificationPrefs, notification)))
     if (!targets.length) return { sent: 0, message: deviceIds ? 'That phone has not turned notifications on.' : 'No phone has notifications on.' }
     const payload = JSON.stringify(notification)
+    const lockConfigured = this.lock.configured()
+    const redacted = JSON.stringify(redactNotification(notification))
     const send = this.deps.push ?? sendWebPush
     let sent = 0
     const problems: string[] = []
     let changed = false
     for (const device of targets) {
       try {
-        const result = await send(device.subscription!, payload, { keys, subject: 'https://github.com/Empire024/conductor', ttl: 24 * 3600, urgency: notification.kind === 'attention' ? 'high' : 'normal', topic: notification.sessionId ? topicFor(notification.sessionId) : undefined })
+        const result = await send(device.subscription!, lockConfigured && !this.lock.unlocked(device.id) ? redacted : payload, { keys, subject: 'https://github.com/Empire024/conductor', ttl: 24 * 3600, urgency: notification.kind === 'attention' ? 'high' : 'normal', topic: notification.sessionId ? topicFor(notification.sessionId) : undefined })
         if (result.gone) { device.subscription = null; device.pushFailures = 0; changed = true; problems.push(`${device.name}: the phone dropped its subscription; turn notifications on again there.`) }
         else if (result.status >= 200 && result.status < 300) { sent += 1; if (device.pushFailures) { device.pushFailures = 0; changed = true } }
         else { device.pushFailures += 1; changed = true; problems.push(`${device.name}: push service answered ${result.status}.`) }
@@ -957,11 +999,29 @@ export class PhoneAccessService {
     return this.deps.projectTasks.list(project,{offset,limit})
   }
 
+  /**
+   * Where a phone terminal starts: a workspace of a project that lives on this machine. A project
+   * mirrored from a paired machine is not one; its shells belong to that machine.
+   */
+  terminalWorkspace(projectId: string, workspaceId: string): { cwd: string; projectName: string; workspaceName: string } | null {
+    const project = this.deps.database.getProject(projectId)
+    if (!project || project.remote || !project.path) return null
+    const workspace = this.deps.database.listSessions(projectId).find(session => session.id === workspaceId)
+    if (!workspace) return null
+    return { cwd: project.path, projectName: project.name, workspaceName: workspace.name }
+  }
+
   dispose(): void {
     this.disposed = true
     if (this.refreshTimer) { clearTimeout(this.refreshTimer); this.refreshTimer = null }
     this.streams.clear()
+    this.lock.dispose()
   }
+}
+
+/** What a locked phone's lock screen may show: that Conductor has news, and nothing of it. */
+export function redactNotification(notification: PhoneNotification): PhoneNotification {
+  return { id: notification.id, kind: notification.kind, sessionId: null, title: 'Conductor', body: 'Unlock Conductor to see what changed.', at: notification.at, url: '/#/' }
 }
 
 /* --------------------------------------------------------------------------- */
