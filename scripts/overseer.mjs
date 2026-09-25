@@ -8,7 +8,7 @@ import { connect, connectInstalled, DevInstance, runBuild } from './overseer/app
 import { devLayout, installedUserData } from './overseer/credentials.mjs'
 import { deliver, projectScope } from './overseer/deliver.mjs'
 import { dispatchFixer } from './overseer/fixer.mjs'
-import { loadGoal } from './overseer/goal.mjs'
+import { goalPortability, loadGoal } from './overseer/goal.mjs'
 import { EXIT, runLoop } from './overseer/loop.mjs'
 import { runGoalOnce } from './overseer/runner.mjs'
 import { CHECKOUT, createLogger, samePath, stamp, writeJsonAtomic } from './overseer/util.mjs'
@@ -83,7 +83,12 @@ function appRegistry({ instance, log }) {
 async function commandRun(args, log, { testOnly = false } = {}) {
   if (!args.goals.length) throw new Error('at least one --goal is required')
   const goals = []
-  for (const path of args.goals) goals.push(await loadGoal(path))
+  for (const path of args.goals) {
+    const goal = await loadGoal(path)
+    const reason = goalPortability(goal)
+    if (reason) throw new Error(`goal ${path} cannot run here: ${reason}`)
+    goals.push(goal)
+  }
   const runDir = resolve(args.runDir ?? join(devLayout().base, 'runs', `${stamp()}-${goals.map(goal => goal.id).join('+')}`.slice(0, 120)))
   const runFile = join(runDir, 'run.json')
   let lastState = { goals: goals.map(goal => goal.id), target: args.target, iterations: [], outcome: 'starting' }

@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { RemotePeerRecord, RemoteProjectSummary } from '../shared/remote-control'
 import type { ConductorDatabase } from './database'
 import type { ProjectBacklogs } from './project-backlog'
@@ -104,19 +104,35 @@ function fixture(extra: Partial<RemoteControlHostDependencies> = {}) {
 let fix: ReturnType<typeof fixture>
 beforeEach(() => { fix = fixture() })
 
-/** Every shape of "somewhere else on this disk" a remote caller could name. */
-const escapes: Array<[string, string]> = [
+const windows = process.platform === 'win32'
+/** Every shape of "somewhere else on this disk" a remote caller could name, on any platform. */
+const portableEscapes: Array<[string, string]> = [
   ['a parent-relative path', '../private/secrets.env'],
-  ['a Windows parent-relative path', '..\\private\\secrets.env'],
   ['a path that climbs through a real file', 'notes.md/../../private/secrets.env'],
   ['a doubled-separator path', './/..//private//secrets.env'],
   ['an absolute path', join(private_, 'secrets.env')],
   ['a POSIX-rooted path', '/etc/passwd'],
-  ['a drive-relative path', 'C:secrets.env'],
-  ['a UNC path', '\\\\127.0.0.1\\C$\\Windows\\win.ini'],
-  ['a drive-root path', '\\Windows\\win.ini'],
   ...(junction ? [['a junction out of the project', 'escape/secrets.env'] as [string, string]] : [])
 ]
+/** Windows path forms. On POSIX `\\`, `C:` and `\\\\server` are ordinary characters of a file name
+ *  inside the workspace, so the host rightly allows them there; these run on win32 only. */
+const windowsEscapes: Array<[string, string]> = [
+  ['a Windows parent-relative path', '..\\private\\secrets.env'],
+  ['a drive-relative path', 'C:secrets.env'],
+  ['a UNC path', '\\\\127.0.0.1\\C$\\Windows\\win.ini'],
+  ['a drive-root path', '\\Windows\\win.ini']
+]
+/** The same climbs a POSIX caller can spell: only `/` separates, and `..` alone is the parent. */
+const posixEscapes: Array<[string, string]> = [
+  ['the bare parent', '..'],
+  ['a parent with a trailing slash', '../'],
+  ['a climb hidden behind a dot segment', './../private/secrets.env'],
+  ['a climb through a folder that does not exist', 'missing/../../private/secrets.env'],
+  ['a climb to the root of the temp tree', `../../${basename(root)}/private/secrets.env`],
+  ['a doubled climb past the temp tree', `../../../${basename(dirname(root))}/${basename(root)}/private/secrets.env`],
+  ['a rooted path to the private folder', `${private_}/secrets.env`]
+]
+const escapes: Array<[string, string]> = [...portableEscapes, ...(windows ? windowsEscapes : posixEscapes)]
 
 describe('what a paired machine may read and write', () => {
   it('forwards an explicit task page without changing an ordinary full tasks.list read', async () => {
@@ -221,6 +237,25 @@ describe('what a paired machine may read and write', () => {
   it.each(escapes)('refuses to open %s in the owner editor', async (_label, path) => {
     expect(await fix.refusal('files.open', { projectId: 'shared-project', sessionId: 'workspace-1', path })).not.toBe('ALLOWED')
     expect(fix.opened).toHaveLength(0)
+  })
+
+  // The Windows forms above are not escapes on POSIX: a backslash, a drive letter and a doubled
+  // backslash are plain characters of a file name inside the workspace there, and the private
+  // file is never reached. What is refused is the climb, not the spelling.
+  it.skipIf(windows).each(windowsEscapes)('on POSIX treats %s as a plain file name inside the workspace', async (_label, path) => {
+    await expect(fix.call('files.write', { projectId: 'shared-project', path, content: 'plain', expectedContent: null })).resolves.toBeDefined()
+    expect(readFileSync(join(shared, path), 'utf8')).toBe('plain')
+    // The host reports the path with slashes for display; the bytes are what matter here.
+    await expect(fix.call('files.read', { projectId: 'shared-project', path })).resolves.toMatchObject({ content: 'plain' })
+    expect(readFileSync(join(private_, 'secrets.env'), 'utf8')).toBe('GITHUB_TOKEN=ghp_realsecret')
+    expect(readFileSync(join(private_, 'secrets.env'), 'utf8')).not.toBe('plain')
+    rmSync(join(shared, path), { force: true })
+  })
+
+  it.runIf(windows).each(posixEscapes)('on Windows still refuses %s', async (_label, path) => {
+    expect(await fix.refusal('files.read', { projectId: 'shared-project', path })).not.toBe('ALLOWED')
+    expect(await fix.refusal('files.write', { projectId: 'shared-project', path, content: 'owned', expectedContent: null })).not.toBe('ALLOWED')
+    expect(readFileSync(join(private_, 'secrets.env'), 'utf8')).toBe('GITHUB_TOKEN=ghp_realsecret')
   })
 
   it('refuses every file method for a project that was never shared', async () => {
