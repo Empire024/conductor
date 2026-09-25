@@ -7,6 +7,16 @@ export interface CatalogEntry {
 
 export interface ModelChoice { model?: string; effort?: string; note?: string }
 
+/**
+ * The tabs.open arguments for a run's planner or stage agent. The run opens them on the owner's
+ * scope, where tabs.open would otherwise bring the tab to the front, so they ask for the background
+ * open every agent-opened tab gets: a "new" mark, and the owner's active tab, caret and window stay
+ * put. The owner still brings one into view by clicking it or its link on the idea.
+ */
+export function agentTabArgs(request: { provider: string; title: string }, choice: ModelChoice): Record<string, unknown> {
+  return { provider: request.provider, ...(choice.model ? { model: choice.model } : {}), ...(choice.effort ? { effort: choice.effort } : {}), title: request.title, focus: false }
+}
+
 const simple = (value: string): string => value.toLowerCase().replace(/\[1m\]/g, '').replace(/^(claude|codex|openai)[-:/]/, '').replace(/[^a-z0-9]+/g, '')
 
 /**

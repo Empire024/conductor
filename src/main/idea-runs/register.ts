@@ -13,7 +13,7 @@ import type { ScheduleStore } from '../schedule-store'
 import { registerScheduleKindExecutor } from '../schedule-wiring'
 import { ideaRunMethods, ideaRunSignatures, ideaRunsCall, type IdeaRunsControlCaller } from './control'
 import { IdeaRunController, type AgentTurnView, type IdeaRunNotification } from './controller'
-import { chooseModel, type CatalogEntry } from './models'
+import { agentTabArgs, chooseModel, type CatalogEntry } from './models'
 import { ideaRunsPhoneRoute } from './phone'
 import { IdeaRunStore } from './store'
 
@@ -102,9 +102,7 @@ export function registerIdeaRuns(deps: IdeaRunsRegistrationDeps): IdeaRunsRegist
       async open(request) {
         const owner = control.ownerScope({ projectId: request.projectId })
         const choice = chooseModel(await control.call(owner, 'models.list', {}) as CatalogEntry[], request)
-        const opened = await control.call(owner, 'tabs.open', {
-          provider: request.provider, ...(choice.model ? { model: choice.model } : {}), ...(choice.effort ? { effort: choice.effort } : {}), title: request.title
-        }) as { id: string; resourceId?: string }
+        const opened = await control.call(owner, 'tabs.open', agentTabArgs(request, choice)) as { id: string; resourceId?: string }
         if (!opened.resourceId) throw new Error('The agent tab did not open')
         return { agentSessionId: opened.resourceId, ...(choice.model ? { model: choice.model } : {}), ...(choice.note ? { note: choice.note } : {}) }
       },

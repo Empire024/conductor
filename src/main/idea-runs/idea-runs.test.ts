@@ -11,7 +11,7 @@ import { stageOverBudget, weeklyCapCheck } from './budget'
 import { IdeaRunController, type AgentTurnView, type IdeaRunNotification } from './controller'
 import { ideaRunsCall } from './control'
 import { adjustLoopFile, loopFileFor, loopIdFor } from './loop-file'
-import { chooseModel } from './models'
+import { agentTabArgs, chooseModel } from './models'
 import { normalizePlan } from './plan'
 import { asksToStripProvenance, screenAction } from './policy'
 import { parseStageReport } from './report'
@@ -320,5 +320,9 @@ describe('stage models', () => {
     expect(chooseModel(catalog, { provider: 'claude', model: 'claude-opus' })).toEqual({ model: 'opus[1m]', note: 'claude-opus opened as opus[1m]' })
     expect(chooseModel(catalog, { provider: 'claude', model: 'fable-5', effort: 'max' })).toEqual({ model: 'sonnet', note: expect.stringMatching(/fable-5 is not in models.list; using sonnet; effort max is not offered/) })
     expect(() => chooseModel(catalog, { provider: 'codex', model: 'gpt-6-astra' })).toThrow(/codex is unavailable/)
+  })
+  it('opens the planner and every stage tab in the background, never over the owner\'s active tab', () => {
+    expect(agentTabArgs({ provider: 'claude', title: 'Idea plan: Club' }, { model: 'opus[1m]', effort: 'high', note: 'x' })).toEqual({ provider: 'claude', model: 'opus[1m]', effort: 'high', title: 'Idea plan: Club', focus: false })
+    expect(agentTabArgs({ provider: 'codex', title: '· Research' }, {})).toEqual({ provider: 'codex', title: '· Research', focus: false })
   })
 })
