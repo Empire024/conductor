@@ -12,6 +12,8 @@ export const RESTART_INTENT_MAX_AGE_MS = 24 * 60 * 60_000
 export type RestartKind = 'running' | 'quit' | 'update-on-quit' | 'update-install' | 'restart'
 export interface RestartIntent {
   kind: RestartKind
+  /** The version that was running, recorded by that process before it quit: after an update the
+   *  launch reading this is already the new version and cannot know the old one any other way. */
   fromVersion: string
   /** The version an update installs on the way out. */
   toVersion?: string
@@ -85,21 +87,26 @@ export function restartReason(intent: RestartIntent | null, initiator: RestartIn
   }
 }
 
-export interface ResumePlan { reason: string; fromVersion: string; wizards: string[]; coworkers: string[] }
+/** `fromVersion` is absent when the previous process left no record of what it ran, such as a
+ *  version from before these records existed. */
+export interface ResumePlan { reason: string; fromVersion?: string; wizards: string[]; coworkers: string[] }
 
 /** Who this launch brings back: the wizard that started or asked for the restart, and, unless the
  *  owner said "Stop work", every wizard that was working or waiting on its coworkers and the
  *  coworkers whose turns were cut. Null when nobody is. */
-export function resumePlan(intent: RestartIntent | null, initiator: RestartInitiator | null, currentVersion: string): ResumePlan | null {
+export function resumePlan(intent: RestartIntent | null, initiator: RestartInitiator | null): ResumePlan | null {
   const resume = intent?.resume === true
   const wizards = [...new Set([...(initiator ? [initiator.agentSessionId] : []), ...(resume ? intent!.wizards : [])])]
   const coworkers = resume ? intent!.coworkers.filter(id => !wizards.includes(id)) : []
   if (!wizards.length && !coworkers.length) return null
-  return { reason: restartReason(intent, initiator), fromVersion: intent?.fromVersion ?? currentVersion, wizards, coworkers }
+  return { reason: restartReason(intent, initiator), ...(intent ? { fromVersion: intent.fromVersion } : {}), wizards, coworkers }
 }
 
-/** The one line every brought-back conversation starts from. */
-export const restartLine = (reason: string, fromVersion: string, toVersion: string): string => `Conductor restarted (${reason}, ${fromVersion} -> ${toVersion})`
+/** The one line every brought-back conversation starts from. The old version is only ever the
+ *  one the previous process recorded; without it the line names the running version alone rather
+ *  than claiming `new -> new` across an update. */
+export const restartLine = (reason: string, fromVersion: string | undefined, toVersion: string): string =>
+  fromVersion ? `Conductor restarted (${reason}, ${fromVersion} -> ${toVersion})` : `Conductor restarted (${reason}, now ${toVersion})`
 
 export function wizardResumeMessage(plan: ResumePlan, toVersion: string, coworkersResumed: number): string {
   return `[Conductor] ${restartLine(plan.reason, plan.fromVersion, toVersion)}; continue. This wizard tab was brought back${coworkersResumed ? ` and ${coworkersResumed === 1 ? '1 coworker whose turn was cut was' : `${coworkersResumed} coworkers whose turns were cut were`} resumed too` : ''}. Check app.state and agents.list first, then carry on from where you left off.`

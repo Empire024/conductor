@@ -1995,6 +1995,8 @@ export class AgentControl {
     // Superseded, not failed: nobody resumes it as unfinished work. It is still finishing its
     // step, but by the handoff contract it is done once that step is, so it is recorded as such.
     const superseded = this.recovery().supersede(scope, scope.agentSessionId, 'completed', agentSessionId, `Continued in “${successorTitle}” (agents.handoff successor)`.slice(0, 300))
+    // It owns no work any more: its watch loops and backgrounded shells stop once its step settles.
+    sessions.retireBackgroundWork(scope.agentSessionId)
     sessions.notice(scope.agentSessionId, `Continued in “${successorTitle}”. This conversation handed itself on${wizard ? ', with wizard mode,' : ''} and ${coworkers.length ? `its ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : 'its work'}; it finishes its current step and stops.`, { succession: { agentSessionId, tabId: tab.id, title: successorTitle, uri: tab.uri } })
     const touched = new Map<string, { projectId: string; sessionId: string }>([[scope.projectId + '\0' + scope.sessionId, scope]])
     for (const link of coworkers) touched.set(link.projectId + '\0' + link.sessionId, { projectId: link.projectId, sessionId: link.sessionId })

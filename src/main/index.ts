@@ -2819,10 +2819,10 @@ app.whenReady().then(async () => {
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
   // How the previous process stopped, read once before anything is told about the restart.
   const initiator = takeLaunchInitiator(), previousStop = takeRestartIntent()
-  const restartPlan = resumePlan(previousStop, initiator, updates.getState().currentVersion)
+  const restartPlan = resumePlan(previousStop, initiator)
   // Turns the previous process kept running are rebound before any window asks for their tabs.
   try { await reattachKeptRuntimes() } catch (error) { console.error('Kept runtimes could not be reattached', error) }
-  briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion ?? updates.getState().currentVersion, updates.getState().currentVersion))
+  briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion, updates.getState().currentVersion))
   void startRuntimeHost()
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
