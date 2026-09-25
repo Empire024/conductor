@@ -1,6 +1,6 @@
 ---
 id: batch-delivery
-version: 4
+version: 5
 title: Deliver one batch of related tasks with the least tokens at the highest quality
 trigger: [manual, after:task-triage]
 inputs: [batchId, taskIds, allowedPaths]
@@ -13,7 +13,7 @@ steps:
   - id: contract
     role: architect
     model: codex:gpt-6-astra   # owner rule 2026-09-24: Astra and Fable are the brains
-    alternate: claude:claude-fable-5-1   # for the hardest designs; Fable has its own weekly window
+    alternate: claude:opus[1m]   # owner 2026-09-24: Fable is too expensive; Opus when Codex has no allowance
     effort: high
     output: failing tests + acceptance (commands, allowedPaths)
   - id: implement
@@ -29,7 +29,7 @@ steps:
     output: last line `OK` or `FAILED <stage>` + ≤20 lines
   - id: review
     role: reviewer
-    model: claude:claude-fable-5-1   # the frontier model that did not write the contract; Astra if Fable is limited
+    model: claude:opus[1m]   # owner 2026-09-24: Fable too expensive; the reviewer is a fresh Opus tab, not the implementer
     alternate: codex:gpt-6-astra
     effort: high
     input: git diff limited to allowedPaths, once
@@ -85,3 +85,4 @@ ships for it from the coworker's handoff, which must list the exact paths and me
   implement; local helps.
 - 2026-09-24 v4 (owner rule): a Verifier step (loop `verify`) sits between review and ship. Passing tests or a small sample is not
   proof; items are ticked only when adversarial real-world scenarios pass. Locked step.
+- 2026-09-24 v5 (owner): no Fable in the loop, because it is too expensive. The contract is Astra, or Opus when Codex has no allowance; the review is a fresh Opus tab.

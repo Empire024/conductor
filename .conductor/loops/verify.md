@@ -1,13 +1,13 @@
 ---
 id: verify
-version: 1
+version: 2
 title: Verify a delivered item against what the owner actually asked for, adversarially
 trigger: [after:batch-delivery, manual]
 inputs: [taskIds, commits]
 steps:
   - id: plan
     role: verifier-architect
-    model: claude:claude-fable-5-1   # brain: invents the scenarios; Astra when Codex has allowance
+    model: claude:opus[1m]           # brain: invents the scenarios (owner 2026-09-24: Fable is too expensive; Opus)
     alternate: codex:gpt-6-astra
     effort: high
     output: verification plan (≤40 scenarios) with expected outcomes, derived from the owner's item text and images, not from the implementer's tests
@@ -18,7 +18,7 @@ steps:
     output: per-scenario PASS/FAIL with evidence (screenshot path, log path, measured numbers)
   - id: judge
     role: verifier-architect
-    model: claude:claude-fable-5-1
+    model: claude:opus[1m]
     effort: high
     output: verdict per item — VERIFIED, or REOPEN with the failing scenario and evidence
 locked: [steps.plan, steps.judge]
@@ -52,3 +52,4 @@ Budget: plan and judge are short brain turns; execution is Sonnet plus the local
 `batch-delivery`.
 
 ## Run log
+- 2026-09-24 v2 (owner): plan and judge move from Fable to Opus 5.5, because Fable is too expensive. V2/V3 were switched mid-run.
