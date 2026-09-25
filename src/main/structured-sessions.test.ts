@@ -1704,6 +1704,21 @@ describe('a burst of synchronous events batches its durable write, its status wr
     for (const batch of batches) expect(batch.length).toBeLessThanOrEqual(500)
     expect(batches.reduce((sum, batch) => sum + batch.length, 0)).toBe(burstSize)
   })
+  it('keeps broadcast order when a second burst is flushed while the first still has batches queued', async () => {
+    const f = fixture()
+    await f.manager.submit(f.spec.id, 'Ordered bursts', settings)
+    f.manager.flush()
+    const before = f.broadcast.mock.calls.filter(call => call[0] === 'structured:events').length
+    for (let index = 0; index < 1_200; index++) f.current.emit({ itemId: `first-${index}`, data: { type: 'notice', message: `first ${index}` } })
+    f.manager.flush()
+    // The next stdout chunk arrives before the first burst's remaining batches have gone out.
+    for (let index = 0; index < 10; index++) f.current.emit({ itemId: `second-${index}`, data: { type: 'notice', message: `second ${index}` } })
+    f.manager.flush()
+    const sent = () => f.broadcast.mock.calls.filter(call => call[0] === 'structured:events').slice(before).flatMap(call => call[1] as Array<{ sequence: number }>)
+    await vi.waitFor(() => expect(sent()).toHaveLength(1_210))
+    const sequences = sent().map(event => event.sequence)
+    expect(sequences).toEqual([...sequences].sort((a, b) => a - b))
+  })
   it('coalesces many phase reports within one burst into a single status write and a single broadcast', async () => {
     const f = fixture()
     await f.manager.submit(f.spec.id, 'Coalesce turn', settings)

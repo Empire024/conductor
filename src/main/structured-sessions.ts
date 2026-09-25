@@ -163,6 +163,8 @@ export class StructuredSessions {
    *  write and a broadcast. */
   private pendingStatus = new Map<string, { id: string; status: string; phase: string }>()
   private flushScheduled = false
+  private eventOutbox: AgentEvent[] = []
+  private drainingOutbox = false
   /** Coalesces every synchronous `emit`/`recordActivityPhase` call in the current burst into one
    *  `flush`, via a microtask rather than a timer: a microtask drains before this class's own
    *  callers resume from an `await` on the same call stack (adapter `start()`, `submit()`...), so
@@ -1491,12 +1493,17 @@ export class StructuredSessions {
     for (const entry of statuses) { this.database.setAgentStatus(entry.id, entry.status, entry.phase); this.broadcast('agent:status', entry) }
     if (events.length) this.broadcastEvents(events)
   }
-  private broadcastEvents(events: AgentEvent[], offset = 0): void {
-    const batch = events.slice(offset, offset + BROADCAST_BATCH)
-    if (!batch.length) return
-    this.broadcast('structured:events', batch)
-    const next = offset + batch.length
-    if (next < events.length) setImmediate(() => this.broadcastEvents(events, next))
+  /** Every flush appends to one outbox drained in order, so a later flush (the next stdout chunk)
+   *  never overtakes the batches an earlier burst still has queued for a later tick. */
+  private broadcastEvents(events: AgentEvent[]): void {
+    this.eventOutbox.push(...events)
+    if (!this.drainingOutbox) this.drainOutbox()
+  }
+  private drainOutbox(): void {
+    const batch = this.eventOutbox.splice(0, BROADCAST_BATCH)
+    if (batch.length) this.broadcast('structured:events', batch)
+    this.drainingOutbox = this.eventOutbox.length > 0
+    if (this.drainingOutbox) setImmediate(() => this.drainOutbox())
   }
   killWhere(predicate: (spec: AgentSpec) => boolean): void {
     for (const [id, live] of this.live) if (predicate(live.spec)) {
