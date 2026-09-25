@@ -101,7 +101,7 @@ export function unverifiedClaim(finalText: string, evidence: RunEvidence): strin
   return undefined
 }
 
-export interface AcceptanceResult { command: string; passed: boolean; exitCode: number; report: string; at: string }
+export interface AcceptanceResult { command: string; passed: boolean; exitCode: number; report: string; at: string; where?: 'sandbox' | 'host-copy' }
 
 /** The three conditions under which the loop asks for the final answer instead of another
  *  round: acceptance passed, only allowed paths changed, and nothing the runtime knows of is

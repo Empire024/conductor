@@ -12,21 +12,22 @@ afterEach(() => rmSync(root, { recursive: true, force: true }))
 
 const session = (overrides: Partial<LocalAssistSession> = {}): LocalAssistSession => ({ projectId: 'p1', sessionId: 's1', agentSessionId: 'a1', provider: 'claude', cwd: root, permission: 'auto', plan: false, ...overrides })
 
-function harness(options: { outcome?: LocalModelOutcome; output?: string; exitCode?: number; session?: Partial<LocalAssistSession> } = {}) {
+function harness(options: { outcome?: LocalModelOutcome; output?: string; exitCode?: number; session?: Partial<LocalAssistSession>; run?: CommandRunner; sleep?: (ms: number) => Promise<void> } = {}) {
   const asked: LocalModelRequest[] = []
   const records: SavingsRecord[] = []
   const runs: Parameters<CommandRunner>[0][] = []
-  const run: CommandRunner = async request => {
+  const run: CommandRunner = options.run ?? (async request => {
     runs.push(request)
     writeFileSync(request.logFile, options.output ?? '')
     return { exitCode: options.exitCode ?? 0, durationMs: 1234, timedOut: false, outputChars: (options.output ?? '').length }
-  }
+  })
   const tools = new LocalAssistTools({
     session: id => id === 'a1' ? session(options.session) : undefined,
     runner: { ask: async request => { asked.push(request); return options.outcome ?? { ok: true, answer: { text: 'FAIL src/a.test.ts > adds\nsrc/a.ts:3 expected 2', model: 'local/qwen', inputTokens: 900, outputTokens: 30, durationMs: 50 } } } },
     ledger: { record: entry => records.push({ at: 'now', ...entry }), summary: () => { throw new Error('unused') } },
     run,
-    now: () => new Date('2026-09-24T12:00:00Z')
+    now: () => new Date('2026-09-24T12:00:00Z'),
+    ...(options.sleep ? { sleep: options.sleep } : {})
   })
   return { tools, asked, records, runs }
 }
@@ -95,6 +96,23 @@ describe('run_and_summarize', () => {
     await expect(h.tools.runAndSummarize('a1', { command: 'dir', cwd: '..' })).rejects.toThrow(/outside/)
     await expect(h.tools.runAndSummarize('gone', { command: 'dir' })).rejects.toThrow(/no longer open/)
   })
+
+  it('does not hold the caller past the default return bound when no timeoutSec was given', async () => {
+    const h = harness({
+      run: () => new Promise(() => { /* never settles within the test: simulates a long-running command */ }),
+      sleep: () => Promise.resolve() // fast-forwards the ~120 s return bound instantly
+    })
+    const result = await h.tools.runAndSummarize('a1', { command: 'sleep 99999' })
+    expect(result.structured).toMatchObject({ stillRunning: true })
+    expect(result.text).toMatch(/still running/i)
+    expect(result.text).toContain('.conductor-scratch/local-assist/')
+  })
+
+  it('honours an explicit timeoutSec in full instead of returning early', async () => {
+    const h = harness({ output: 'ok\n', sleep: () => { throw new Error('the return-bound race must not be used when timeoutSec is explicit') } })
+    const result = await h.tools.runAndSummarize('a1', { command: 'echo ok', timeoutSec: 5 })
+    expect(result.structured).not.toMatchObject({ stillRunning: true })
+  })
 })
 
 describe('local_ask and summarize_file', () => {
@@ -117,6 +135,46 @@ describe('local_ask and summarize_file', () => {
     await expect(h.tools.ask('a1', { prompt: 'x', files: ['.env'] })).rejects.toThrow(/credential/)
     await expect(h.tools.ask('a1', { prompt: 'x', files: ['inner'] })).rejects.toThrow(/not a file/)
     expect(h.asked).toHaveLength(0)
+  })
+
+  it('finds a needle deep past the old 512 KB head-only read instead of confidently saying it is absent (S7)', async () => {
+    const FILLER = 'const filler = 0;'
+    let content = ''
+    while (content.length < 100_000) content += FILLER + '\n'
+    content += 'const NEEDLE_100K = "here";\n'
+    while (content.length < 900_000) content += FILLER + '\n'
+    content += 'const NEEDLE_900K = "here";\n'
+    while (content.length < 1_000_000) content += FILLER + '\n'
+    writeFileSync(join(root, 'big.txt'), content)
+    const asked: LocalModelRequest[] = []
+    const tools = new LocalAssistTools({
+      session: id => id === 'a1' ? session() : undefined,
+      runner: {
+        ask: async request => {
+          asked.push(request)
+          const found = request.user.includes('NEEDLE_900K')
+          return { ok: true, answer: { text: found ? 'Found: const NEEDLE_900K = "here";' : 'NOT FOUND IN THIS EXCERPT', model: 'local/qwen', inputTokens: 500, outputTokens: 10, durationMs: 20 } }
+        }
+      },
+      ledger: { record: () => undefined, summary: () => { throw new Error('unused') } }
+    })
+    const result = await tools.ask('a1', { prompt: 'Quote the line containing NEEDLE_900K.', files: ['big.txt'] })
+    expect(asked.length).toBeGreaterThan(1) // more than one window: the fix is the chunking, not a bigger single read
+    expect(result.text).toContain('NEEDLE_900K')
+    expect(result.text.toLowerCase()).not.toMatch(/^not found/)
+  })
+
+  it('says a large file was only partly examined rather than implying the rest was checked', async () => {
+    const lines = Array.from({ length: 20000 }, (_, index) => `const filler${index} = ${index};`)
+    writeFileSync(join(root, 'big.txt'), lines.join('\n'))
+    const tools = new LocalAssistTools({
+      session: id => id === 'a1' ? session() : undefined,
+      runner: { ask: async () => ({ ok: true, answer: { text: 'NOT FOUND IN THIS EXCERPT', model: 'local/qwen', inputTokens: 500, outputTokens: 10, durationMs: 20 } }) },
+      ledger: { record: () => undefined, summary: () => { throw new Error('unused') } }
+    })
+    const result = await tools.ask('a1', { prompt: 'Is there a line saying ALL_DONE?', files: ['big.txt'] })
+    expect(result.text.toLowerCase()).toContain('not found')
+    expect(result.structured).toMatchObject({ answered: false })
   })
 
   it('summarize_file is local_ask over one file and records no saving when the model is unavailable', async () => {

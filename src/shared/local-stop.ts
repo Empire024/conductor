@@ -52,7 +52,7 @@ export interface LocalStopReport {
   filesChanged: string[]
   commandsRun: number
   excludedOutputChars: number
-  acceptance?: { command: string; passed: boolean; exitCode: number }
+  acceptance?: { command: string; passed: boolean; exitCode: number; where?: 'sandbox' | 'host-copy' }
   /** Set for unverified_claim: what was claimed without evidence. */
   unverified?: string
   timeline: LocalRoundEntry[]

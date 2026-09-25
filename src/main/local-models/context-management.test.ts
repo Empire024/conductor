@@ -170,7 +170,8 @@ describe('context management in the local agent loop', () => {
   it('runs the acceptance command itself under a contract and asks the model to finalize once it passes inside the allowed paths', async () => {
     const root = workspace()
     const runs: string[] = []
-    const sandbox = { exec: async (command: string): Promise<SandboxResult> => { runs.push(command); const ok = readFileSync(join(root, 'src', 'a.ts'), 'utf8').includes('value = 2'); return { exitCode: ok ? 0 : 1, stdout: ok ? 'ok 1 - value\n# pass 1' : 'not ok 1 - value\n  expected 2, got 1\n# fail 1', stderr: '', truncated: false, timedOut: false, durationMs: 5 } } } as unknown as DockerSandbox
+    const runAcceptance = async (command: string): Promise<SandboxResult & { where: 'sandbox' | 'host-copy' }> => { runs.push(command); const ok = readFileSync(join(root, 'src', 'a.ts'), 'utf8').includes('value = 2'); return { exitCode: ok ? 0 : 1, stdout: ok ? 'ok 1 - value\n# pass 1' : 'not ok 1 - value\n  expected 2, got 1\n# fail 1', stderr: '', truncated: false, timedOut: false, durationMs: 5, where: 'sandbox' } }
+    const sandbox = { exec: runAcceptance, runAcceptance } as unknown as DockerSandbox
     const server = await stub((sent, index) => {
       if (index === 0) return { frames: [call('e0', 'edit_file', { path: 'src/a.ts', old_text: 'value = 1', new_text: 'value = 3' })] }
       if (index === 1) return { frames: [call('e1', 'edit_file', { path: 'src/a.ts', old_text: 'value = 3', new_text: 'value = 2' })] }
@@ -189,12 +190,30 @@ describe('context management in the local agent loop', () => {
     expect(lastUser(server.sent[2]!)).toContain('The task is complete: acceptance passed')
     expect(outcome.stopReason).toBe('completed')
     expect(outcome.report.detail).toContain('Finished: acceptance passed')
-    expect(outcome.report.acceptance).toEqual({ command: 'node --test tests/a.test.mjs', passed: true, exitCode: 0 })
+    expect(outcome.report.acceptance).toEqual({ command: 'node --test tests/a.test.mjs', passed: true, exitCode: 0, where: 'sandbox' })
     expect(outcome.report.filesChanged).toEqual(['src/a.ts'])
     // The bounded task got the coding tool set only.
     expect(server.sent[0]!.tools!.map(tool => tool.function.name)).toEqual(['read_file', 'list_files', 'search', 'write_file', 'edit_file', 'apply_edits', 'run_command'])
     expect(server.sent[0]!.messages[0]!.content).toContain('bounded coding task')
     expect(session.state()?.constraints.join(' ')).toContain('Only these paths may be changed: src/a.ts')
+  })
+
+  it('runs acceptance through the sandbox host-copy fallback, not exec, so a Windows node_modules native-module failure never masks a real pass', async () => {
+    // exec() stands in for what a bound Windows node_modules does to vitest/tsc in the sandbox
+    // (S25): it fails before a single test runs. runAcceptance() is where DockerSandbox falls
+    // back to an isolated host copy instead. If agent.ts called exec() directly, this would fail.
+    const root = workspace()
+    const exec = async (): Promise<SandboxResult> => ({ exitCode: 1, stdout: '', stderr: "Cannot find module '@rollup/rollup-linux-x64-gnu'", truncated: false, timedOut: false, durationMs: 5 })
+    const runAcceptance = async (command: string): Promise<SandboxResult & { where: 'sandbox' | 'host-copy' }> => ({ exitCode: 0, stdout: `ran ${command} in a host copy\nok 1 - value\n# pass 1`, stderr: '', truncated: false, timedOut: false, durationMs: 5, where: 'host-copy' })
+    const sandbox = { exec, runAcceptance } as unknown as DockerSandbox
+    const server = await stub((_sent, index) => index === 0
+      ? { frames: [call('e0', 'edit_file', { path: 'src/a.ts', old_text: 'value = 1', new_text: 'value = 2' })] }
+      : { frames: [answer('Changed src/a.ts so the value is 2; the acceptance passed.')] })
+    cleanup.push(() => server.server.close())
+    const contract = normaliseContract({ allowedPaths: ['src/a.ts'], acceptance: { command: 'npx vitest run tests/a.test.mjs' } })
+    const session = new LocalAgentSession({ endpoint: server.endpoint, apiKey: KEY, model: 'local/ornith1.5-9b', workspace: root, sandbox, readOnly: false, timeoutSec: 30, contextTokens: 32768, contract, control: async () => ({}) })
+    const outcome = await session.run('Make tests/a.test.mjs pass by changing src/a.ts only.', {})
+    expect(outcome.report.acceptance).toMatchObject({ passed: true, exitCode: 0, where: 'host-copy' })
   })
 
   it('refuses a final message that claims edits and passing tests without a single tool call', async () => {

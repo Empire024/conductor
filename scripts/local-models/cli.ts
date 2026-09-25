@@ -7,6 +7,7 @@ import { existsSync, readdirSync, rmSync, rmdirSync, statSync } from 'node:fs'
 import { execFile, spawn } from 'node:child_process'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { createInterface } from 'node:readline/promises'
 import {
   DEFAULT_CONTEXT_TOKENS, DEFAULT_SANDBOX, DOLPHIN_X1_8B, ORNITH_9B, QWEN_35B, QWEN_9B, configPath, defaultModelConfig, endpointFor,
   ensureApiKey, loadConfig, logsDir, modelDir, modelFilePath, readApiKey, recordedPort, saveConfig, tempDir
@@ -45,6 +46,26 @@ const modelsOf = (config: LocalStackConfig, only?: string): LocalModelConfig[] =
 /** Fail closed before anything else runs: no command silently recreates state on C:. */
 const requireRoot = (): ReturnType<typeof assertLocalRootUsable> => {
   try { return assertLocalRootUsable() } catch (error) { return fail(error instanceof Error ? error.message : 'Local root unavailable') }
+}
+
+/** prepare-deps is the one sandbox step that reaches the network (docs/local-assist.md): it
+ *  downloads the lockfile's packages and runs its install scripts. A command an Auto agent's
+ *  shell tool (run_and_summarize, run_command) can type is not an owner action just because the
+ *  owner could have typed the same words — those tools spawn without a TTY no matter what the
+ *  command text claims, so requiring a real interactive terminal is a gate an agent cannot pass
+ *  around, unlike an env var or flag it could simply add to the command line it already controls.
+ *  A non-interactive, owner-triggered path (an app control method) does not go through this CLI
+ *  at all: it calls prepareLinuxDependencies directly, authenticated the way every other
+ *  owner-only control method is. */
+async function confirmOwnerPresent(workspace: string): Promise<void> {
+  if (process.stdin.isTTY !== true || process.stdout.isTTY !== true) {
+    return fail(`prepare-deps downloads ${workspace}'s dependencies from the network and runs its install scripts, so it only runs at a real interactive terminal, never through an agent's shell tool. Run it yourself: node scripts/local-models/cli.ts prepare-deps --cwd "${workspace}"`)
+  }
+  const rl = createInterface({ input: process.stdin, output: process.stdout })
+  try {
+    const answer = await rl.question(`Type "yes" to download and install ${workspace}'s dependencies into the local sandbox: `)
+    if (answer.trim().toLowerCase() !== 'yes') return fail('prepare-deps cancelled: confirmation was not "yes"')
+  } finally { rl.close() }
 }
 
 /** Places an earlier setup may have left a GGUF, checked before anything is downloaded again. */
@@ -320,6 +341,7 @@ async function main(): Promise<void> {
       // The one step that gives a sandbox container the network (docs/local-assist.md): it
       // downloads the lockfile's packages, so it runs only when the owner types this command.
       const workspace = flag('cwd') ?? process.cwd()
+      await confirmOwnerPresent(workspace)
       const config = loadConfig()
       const current = await linuxDepsStatus(workspace, config.sandbox)
       if (current.state === 'no-lockfile') return void fail(`${workspace} has no package-lock.json; nothing to prepare`)

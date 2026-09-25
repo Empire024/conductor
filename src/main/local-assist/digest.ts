@@ -36,7 +36,31 @@ export function failureLines(lines: string[], limit: number, context = 1): strin
   return out
 }
 
-const clip = (line: string, max = 400): string => line.length > max ? `${line.slice(0, max)}…` : line
+export const clip = (line: string, max = 400): string => line.length > max ? `${line.slice(0, max)}…` : line
+
+/** Splits already-numbered lines into consecutive windows of at most maxChars each, covering the
+ *  whole input in order — nothing in the middle is dropped the way `modelExcerpt`'s failure-regex
+ *  filter would drop it. A local model with a small context otherwise gets only the head and tail
+ *  of a large file and answers confidently from what it saw, which for a plain read (not a test
+ *  log) is worse than truncating in the caller's face: it has to say what it examined instead.
+ *  Stops after maxChunks windows so one huge file cannot turn a call into an unbounded number of
+ *  model round trips; `consumedLines` says how much of the input made it into a window. */
+export function chunkLines(lines: string[], maxChars: number, maxChunks: number): { chunks: string[]; consumedLines: number } {
+  const chunks: string[] = []
+  let current: string[] = [], currentChars = 0, consumed = 0
+  for (const line of lines) {
+    const clipped = clip(line, 2000)
+    const size = clipped.length + 1
+    if (currentChars + size > maxChars && current.length) {
+      if (chunks.length >= maxChunks) break
+      chunks.push(current.join('\n'))
+      current = []; currentChars = 0
+    }
+    current.push(clipped); currentChars += size; consumed++
+  }
+  if (current.length && chunks.length < maxChunks) chunks.push(current.join('\n'))
+  return { chunks, consumedLines: consumed }
+}
 
 /** What the local model reads: the head, every failure region and the tail, within maxChars.
  *  A 30k-token context has to hold this plus the answer, so the long middle of a passing run is

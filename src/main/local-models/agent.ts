@@ -561,7 +561,7 @@ export class LocalAgentSession {
       filesChanged: ledger.evidence.writes.map(write => write.path),
       commandsRun: ledger.evidence.commands.length,
       excludedOutputChars: ledger.excludedOutputChars,
-      ...(acceptance ? { acceptance: { command: acceptance.command, passed: acceptance.passed, exitCode: acceptance.exitCode } } : {}),
+      ...(acceptance ? { acceptance: { command: acceptance.command, passed: acceptance.passed, exitCode: acceptance.exitCode, where: acceptance.where } } : {}),
       ...(unverified ? { unverified } : {}),
       timeline: ledger.timeline.slice(-64)
       ,task: { lifecycle: this.taskState!.execution!.lifecycle, requests: this.taskState!.execution!.budgets.requests, recoveries: this.taskState!.execution!.budgets.recoveries, elapsedMs: Date.now() - this.taskState!.execution!.budgets.startedAt, tokens: this.taskState!.execution!.budgets.tokens, segmentLimit: this.policy.rounds.hardLimit, maxRounds: this.policy.task.maxRounds }
@@ -600,12 +600,15 @@ export class LocalAgentSession {
     ledger.acceptanceStale = false
     let result: AcceptanceResult
     try {
-      const run = await this.options.sandbox.exec(acceptance.command, Math.min(acceptance.timeoutSec ?? this.options.timeoutSec, this.options.timeoutSec * 2), signal)
+      // runAcceptance (not exec): until a Linux dependency tree is prepared for this workspace,
+      // it runs the command in an isolated host copy instead of the sandbox's bound Windows
+      // node_modules, which fails native binaries (Rollup, esbuild) before a test can run at all.
+      const run = await this.options.sandbox.runAcceptance(acceptance.command, Math.min(acceptance.timeoutSec ?? this.options.timeoutSec, this.options.timeoutSec * 2), signal)
       const raw = [run.stdout, run.stderr, run.timedOut ? 'command exceeded its time limit' : '', `exit code: ${run.exitCode}`].filter(Boolean).join('\n')
       events.toolEnd?.({ id: `acceptance:${ledger.round}`, name: 'acceptance', output: raw, failed: run.exitCode !== 0, durationMs: run.durationMs })
       const shaped = shapeTestOutput(raw, this.policy.toolOutput.testReportChars)
       ledger.excludedOutputChars += shaped.excluded
-      result = { command: acceptance.command, passed: run.exitCode === 0, exitCode: run.exitCode, report: shaped.text, at: new Date().toISOString() }
+      result = { command: acceptance.command, passed: run.exitCode === 0, exitCode: run.exitCode, report: shaped.text, at: new Date().toISOString(), where: run.where }
     } catch (error) {
       result = { command: acceptance.command, passed: false, exitCode: -1, report: `acceptance could not run: ${error instanceof Error ? error.message : 'unknown error'}`, at: new Date().toISOString() }
     }

@@ -5,7 +5,7 @@ import { open, realpath, stat } from 'node:fs/promises'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { isSecretPath } from '../local-models/workspace.ts'
 import type { LocalAssistTool, LocalModelOutcome, LocalModelRunner, SavingsLedger } from './contract.ts'
-import { capLines, failureLines, modelExcerpt, splitLines, stripAnsi, tailLines } from './digest.ts'
+import { capLines, chunkLines, clip, failureLines, modelExcerpt, splitLines, stripAnsi, tailLines } from './digest.ts'
 
 /** The conversation a call belongs to, read live on every call: a permission the owner lowers
  *  mid-conversation applies to the next call. */
@@ -30,6 +30,8 @@ export interface LocalAssistDeps {
   /** Reads a log back; injectable for tests. */
   readText?: (file: string, maxBytes: number) => Promise<string>
   now?: () => Date
+  /** Injectable for tests: real setTimeout-based by default. */
+  sleep?: (ms: number) => Promise<void>
 }
 
 export interface LocalAssistResult { text: string; structured: Record<string, unknown> }
@@ -39,11 +41,25 @@ const RAW_TAIL = 15
 /** Characters of log or file the local model reads in one call: its 32k-token context has to
  *  hold this, the instructions and the answer. */
 const MODEL_INPUT_CHARS = 60_000
-const MAX_FILE_BYTES = 512 * 1024
+/** Raised from 512 KB: at the old cap a needle past it was never read at all (never mind
+ *  answered), which is worse than the truncation note this cap still leaves for anything beyond
+ *  it. 1.5 MB comfortably covers a single large source or log file while keeping the chunked
+ *  map-reduce below (chunkLines / MAX_ASK_CHUNKS) to a bounded number of local model calls. */
+const MAX_FILE_BYTES = 1536 * 1024
 const MAX_FILES = 12
+/** Local model round trips one `local_ask`/`summarize_file` call will make over one file's
+ *  content before it stops and says how much it actually examined. */
+const MAX_ASK_CHUNKS = 24
 const MAX_LOG_READ = 16 * 1024 * 1024
-const DEFAULT_TIMEOUT_SEC = 600
+/** The command's own kill bound when the caller does not name one: generous, so a real test suite
+ *  is not truncated. */
+const DEFAULT_KILL_SEC = 600
 const MAX_TIMEOUT_SEC = 1800
+/** Longest a caller is held for a command it did not put an explicit timeoutSec on. Past this the
+ *  call returns a "still running" note instead of blocking; the command keeps running in the
+ *  background up to its own kill bound. An explicit timeoutSec is the caller asking to wait that
+ *  long, so it is honoured in full instead. */
+const DEFAULT_RETURN_SEC = 120
 
 const text = (args: Record<string, unknown>, key: string, limit: number, optional = false): string | undefined => {
   const value = args[key]
@@ -134,15 +150,31 @@ export const hostCommandRunner: CommandRunner = ({ command, cwd, logFile, timeou
 
 const SUMMARY_SYSTEM = 'You summarise command output for a busy engineer who will not read the log. Be exact and terse. Report only what the output shows; never guess. No preamble.'
 const ASK_SYSTEM = 'You answer questions about the files provided, for an engineer who will not read them. Be exact and terse; cite file:line where you can. If the files do not contain the answer, say so. No preamble.'
+const NOT_FOUND = 'NOT FOUND IN THIS EXCERPT'
+/** Used once a file needed more than one window: each call only ever sees one window, so it must
+ *  never guess about the rest of the file — it can only say this excerpt did or did not have it. */
+const CHUNK_ASK_SYSTEM = `You answer a question using ONLY the excerpt of a file shown below; you are not shown the rest of the file. Be exact and terse; cite file:line for every claim. If this excerpt does not contain the answer, reply with exactly "${NOT_FOUND}" and nothing else. No preamble.`
 
 export class LocalAssistTools {
   private readonly run: CommandRunner
   private readonly readText: (file: string, maxBytes: number) => Promise<string>
   private readonly now: () => Date
+  private readonly sleep: (ms: number) => Promise<void>
   constructor(private readonly deps: LocalAssistDeps) {
     this.run = deps.run ?? hostCommandRunner
     this.readText = deps.readText ?? readLog
     this.now = deps.now ?? (() => new Date())
+    this.sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)))
+  }
+
+  /** Races a command against a return bound. Resolves with the finished run when it lands first;
+   *  otherwise resolves `done: false` and leaves the command running in the background (it still
+   *  stops at its own kill bound; `run` never rejects). */
+  private async boundedRun(run: Promise<CommandRun>, ms: number): Promise<{ done: true; run: CommandRun } | { done: false }> {
+    return Promise.race([
+      run.then(result => ({ done: true as const, run: result })),
+      this.sleep(ms).then(() => ({ done: false as const }))
+    ])
   }
 
   private session(agentSessionId: string): LocalAssistSession {
@@ -153,7 +185,13 @@ export class LocalAssistTools {
 
   private record(session: LocalAssistSession, tool: LocalAssistTool, rawChars: number, returnedChars: number, outcome: LocalModelOutcome | undefined): void {
     const answer = outcome?.ok ? outcome.answer : undefined
-    this.deps.ledger.record({ tool, projectId: session.projectId, agentSessionId: session.agentSessionId, provider: session.provider, rawChars, returnedChars, localInputTokens: answer?.inputTokens ?? 0, localOutputTokens: answer?.outputTokens ?? 0, usedModel: Boolean(answer), ...(answer ? { model: answer.model } : {}) })
+    this.recordUsage(session, tool, rawChars, returnedChars, { inputTokens: answer?.inputTokens ?? 0, outputTokens: answer?.outputTokens ?? 0, usedModel: Boolean(answer), model: answer?.model })
+  }
+
+  /** Same ledger line as `record`, for a call answered over several local model round trips
+   *  (chunked `local_ask`) whose usage is summed across them rather than coming from one outcome. */
+  private recordUsage(session: LocalAssistSession, tool: LocalAssistTool, rawChars: number, returnedChars: number, usage: { inputTokens: number; outputTokens: number; usedModel: boolean; model?: string }): void {
+    this.deps.ledger.record({ tool, projectId: session.projectId, agentSessionId: session.agentSessionId, provider: session.provider, rawChars, returnedChars, localInputTokens: usage.inputTokens, localOutputTokens: usage.outputTokens, usedModel: usage.usedModel, ...(usage.model ? { model: usage.model } : {}) })
   }
 
   /** run_and_summarize. Only for a conversation already allowed to run shell commands on its
@@ -165,16 +203,26 @@ export class LocalAssistTools {
     if (command.includes('\0')) throw new Error('command contains a NUL byte')
     const question = text(args, 'question', 2000, true)
     const maxLines = count(args, 'maxLines', 30, 3, 200)
-    const timeoutSec = count(args, 'timeoutSec', DEFAULT_TIMEOUT_SEC, 5, MAX_TIMEOUT_SEC)
+    const explicitTimeout = args.timeoutSec !== undefined
+    const timeoutSec = count(args, 'timeoutSec', DEFAULT_KILL_SEC, 5, MAX_TIMEOUT_SEC)
     const cwd = args.cwd === undefined ? session.cwd : (await this.directory(session.cwd, text(args, 'cwd', 1000)!))
     const scratch = join(session.cwd, '.conductor-scratch', 'local-assist')
     mkdirSync(scratch, { recursive: true })
     const stamp = this.now().toISOString().replace(/[:.]/g, '-')
     const logFile = join(scratch, `${stamp}-${randomBytes(3).toString('hex')}.log`)
-    const run = await this.run({ command, cwd, logFile, timeoutMs: timeoutSec * 1000, signal })
+    const logPath = relative(session.cwd, logFile).split(sep).join('/')
+    const started = this.now().getTime()
+    const runPromise = this.run({ command, cwd, logFile, timeoutMs: timeoutSec * 1000, signal })
+    const returnAfterMs = Math.min(DEFAULT_RETURN_SEC * 1000, timeoutSec * 1000)
+    const race = explicitTimeout ? { done: true as const, run: await runPromise } : await this.boundedRun(runPromise, returnAfterMs)
+    if (!race.done) {
+      const waitedSec = Math.round((this.now().getTime() - started) / 1000) || Math.round(returnAfterMs / 1000)
+      const body = `Still running after ${waitedSec} s (not finished yet). It keeps running in the background and is killed after ${timeoutSec} s total if it has not finished by then. Log: ${logPath} — read it directly, or call run_and_summarize again shortly to check.`
+      return { text: body, structured: { stillRunning: true, logPath, waitedMs: waitedSec * 1000 } }
+    }
+    const run = race.run
     const raw = stripAnsi(await this.readText(logFile, MAX_LOG_READ).catch(() => ''))
     const lines = splitLines(raw)
-    const logPath = relative(session.cwd, logFile).split(sep).join('/')
     const status = run.timedOut ? `timed out after ${timeoutSec} s (process tree killed)` : `exit ${run.exitCode ?? 'none'}`
     const header = `${status} · ${(run.durationMs / 1000).toFixed(1)} s · ${lines.length} lines, ${run.outputChars} bytes · full log: ${logPath}`
     const tail = tailLines(lines, RAW_TAIL)
@@ -221,25 +269,63 @@ export class LocalAssistTools {
       files.push({ relative: file.relative, ...read })
     }
     const rawChars = files.reduce((sum, file) => sum + file.text.length, 0)
-    // Share the model's input budget across the files; a file over its share keeps its head and tail.
-    const share = files.length ? Math.floor(MODEL_INPUT_CHARS / files.length) : 0
-    const material = files.map(file => {
+    // Share the model's input budget across the files; a file whose own content needs more than
+    // its share is split into windows below instead of losing its unmatched middle.
+    const share = files.length ? Math.floor(MODEL_INPUT_CHARS / files.length) : MODEL_INPUT_CHARS
+    const fileChunks = files.map(file => {
       const numbered = splitLines(file.text).map((line, index) => `${index + 1}: ${line}`)
-      const body = modelExcerpt(numbered, share)
-      return `=== ${file.relative} (${file.bytes} bytes${file.truncated ? `, first ${MAX_FILE_BYTES} read` : ''}) ===\n${body}`
-    }).join('\n\n')
-    const outcome = await this.deps.runner.ask({
-      system: ASK_SYSTEM,
-      user: `${prompt}\n\nAnswer in at most ${maxLines} lines.${material ? `\n\nFiles (line numbers prefixed):\n${material}` : ''}`,
-      maxTokens: Math.min(2048, maxLines * 40),
-      signal
+      return { file, ...chunkLines(numbered, share, Number.MAX_SAFE_INTEGER) }
     })
+    const allWindows = fileChunks.flatMap(({ file, chunks }) => chunks.map((body, index) => ({ file, index, total: chunks.length, body })))
     const listing = files.map(file => `${file.relative} (${file.bytes} bytes)`).join(', ')
-    const body = outcome.ok
-      ? `${capLines(outcome.answer.text, maxLines)}\n— ${outcome.answer.model}, local${listing ? `, over ${listing}` : ''}`
-      : `Local model unavailable: ${outcome.reason}. Nothing was summarised; read ${listing || 'the files'} yourself or call again shortly.`
-    this.record(session, tool, outcome.ok ? rawChars : 0, body.length, outcome)
-    return { text: body, structured: { answered: outcome.ok, files: files.map(file => ({ path: file.relative, bytes: file.bytes, truncated: file.truncated })) } }
+
+    // The common case (no files, or files small enough for one window) is answered in one call
+    // exactly as before: full material in one prompt, one system message tuned for that.
+    if (allWindows.length <= 1) {
+      const material = fileChunks.map(({ file, chunks }) => `=== ${file.relative} (${file.bytes} bytes${file.truncated ? `, first ${MAX_FILE_BYTES} read` : ''}) ===\n${chunks[0] ?? ''}`).join('\n\n')
+      const outcome = await this.deps.runner.ask({
+        system: ASK_SYSTEM,
+        user: `${prompt}\n\nAnswer in at most ${maxLines} lines.${material ? `\n\nFiles (line numbers prefixed):\n${material}` : ''}`,
+        maxTokens: Math.min(2048, maxLines * 40),
+        signal
+      })
+      const body = outcome.ok
+        ? `${capLines(outcome.answer.text, maxLines)}\n— ${outcome.answer.model}, local${listing ? `, over ${listing}` : ''}`
+        : `Local model unavailable: ${outcome.reason}. Nothing was summarised; read ${listing || 'the files'} yourself or call again shortly.`
+      this.record(session, tool, outcome.ok ? rawChars : 0, body.length, outcome)
+      return { text: body, structured: { answered: outcome.ok, files: files.map(file => ({ path: file.relative, bytes: file.bytes, truncated: file.truncated })) } }
+    }
+
+    // Too big for one window: map the question over each window in turn (never guessing about a
+    // window it was not shown), then reduce the hits into one answer. Bounded so one huge file
+    // cannot turn a call into an unbounded number of local model round trips.
+    const windows = allWindows.slice(0, MAX_ASK_CHUNKS)
+    const found: string[] = []
+    let inputTokens = 0, outputTokens = 0, usedModel = false, lastModel: string | undefined, failureReason: string | undefined, examined = 0
+    for (const window of windows) {
+      const label = window.total > 1 ? `${window.file.relative} (part ${window.index + 1}/${window.total})` : window.file.relative
+      const outcome = await this.deps.runner.ask({
+        system: CHUNK_ASK_SYSTEM,
+        user: `${prompt}\n\nExcerpt of ${label}, ${window.file.bytes} bytes total${window.file.truncated ? `, only the first ${MAX_FILE_BYTES} bytes of the file were read` : ''}. Lines are numbered from the start of the file, not this excerpt:\n${window.body}`,
+        maxTokens: Math.min(1024, maxLines * 20),
+        signal
+      })
+      if (!outcome.ok) { failureReason = outcome.reason; break }
+      examined++
+      usedModel = true
+      inputTokens += outcome.answer.inputTokens
+      outputTokens += outcome.answer.outputTokens
+      lastModel = outcome.answer.model
+      const answer = outcome.answer.text.trim()
+      if (answer && !answer.toUpperCase().includes(NOT_FOUND)) found.push(`${label}: ${answer}`)
+    }
+    const unexamined = allWindows.length - examined
+    const remainder = unexamined > 0 ? ` ${unexamined} of ${allWindows.length} sections of ${listing || 'the file(s)'} were not examined${failureReason ? ` (local model failed: ${failureReason})` : ' — this is larger than one call can fully cover; ask again about a narrower part or file if needed'}.` : ''
+    const body = found.length
+      ? `${capLines(found.join('\n'), maxLines)}\n— local, over ${listing}.${remainder}`
+      : `Not found in the ${examined} section(s) of ${listing || 'the file(s)'} read.${remainder}`
+    this.recordUsage(session, tool, usedModel ? rawChars : 0, body.length, { inputTokens, outputTokens, usedModel, model: lastModel })
+    return { text: body, structured: { answered: usedModel && found.length > 0, chunks: allWindows.length, examined, files: files.map(file => ({ path: file.relative, bytes: file.bytes, truncated: file.truncated })) } }
   }
 
   summarizeFile(agentSessionId: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<LocalAssistResult> {
@@ -269,7 +355,7 @@ export const LOCAL_ASSIST_TOOLS: LocalAssistToolSpec[] = [
       cwd: { type: 'string', description: 'Optional directory inside the project to run in.' },
       question: { type: 'string', description: 'Optional: what you want to know from the output.' },
       maxLines: { type: 'number', description: 'Most summary lines to return (default 30).' },
-      timeoutSec: { type: 'number', description: 'Kill the command after this many seconds (default 600, max 1800).' }
+      timeoutSec: { type: 'number', description: `Kill the command after this many seconds (max ${MAX_TIMEOUT_SEC}). Without it, the call returns within about ${DEFAULT_RETURN_SEC} s even if the command is still running (it keeps going in the background, killed after ${DEFAULT_KILL_SEC} s, and logged at the returned path) — pass this when you want to wait out a specific, longer command.` }
     }, ['command']),
     call: (tools, id, args, signal) => tools.runAndSummarize(id, args, signal)
   },
