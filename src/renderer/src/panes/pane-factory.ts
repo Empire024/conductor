@@ -2,6 +2,7 @@ import type { AgentProviderId, PaneKind, PaneTab } from '../../../shared/models'
 import { makeId } from '../../../shared/models'
 import { localModelLabel } from '../../../shared/local-models'
 import { LOCAL_MACHINE_ID } from '../../../shared/remote-control'
+import { defaultTerminal, rendererPlatform } from '../../../shared/terminal-shell'
 
 export const createPaneTab = (
   kind: PaneKind,
@@ -37,12 +38,13 @@ export const createPaneTab = (
       const remote = options?.machineId && options.machineId !== LOCAL_MACHINE_ID
         ? { machineId: options.machineId, ...(options.remoteTerminalId ? { remoteTerminalId: options.remoteTerminalId } : {}) }
         : {}
+      const terminal = defaultTerminal(rendererPlatform())
       return {
         id: makeId('pane'),
         kind,
-        title: options?.title ?? 'PowerShell',
+        title: options?.title ?? terminal.title,
         resourceId: options?.resourceId ?? makeId('terminal'),
-        state: { shell: 'powershell', ...remote }
+        state: { shell: terminal.shell, ...remote }
       }
     }
     case 'file-tree':

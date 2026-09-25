@@ -34,13 +34,14 @@ describe('local data root', () => {
     for (const dispose of cleanup.splice(0)) dispose()
   })
 
-  it('names every directory under one root', () => {
+  // Local models are Windows-only: these cases assert drive-letter roots.
+  it.runIf(process.platform === 'win32')('names every directory under one root', () => {
     const paths = layoutFor('D:\\ConductorLocal')
     expect(paths.models).toBe('D:\\ConductorLocal\\models')
     expect(Object.values(paths).every(value => value.startsWith('D:\\ConductorLocal'))).toBe(true)
   })
 
-  it('refuses a root on the system drive instead of falling back to it', () => {
+  it.runIf(process.platform === 'win32')('refuses a root on the system drive instead of falling back to it', () => {
     process.env.CONDUCTOR_LOCAL_ROOT = join(systemDrive() + '\\', 'ConductorLocal')
     expect(() => localRoot()).toThrow(LocalRootError)
     expect(onSystemDrive(join(systemDrive() + '\\', 'anything'))).toBe(true)

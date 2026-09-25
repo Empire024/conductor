@@ -66,6 +66,7 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
   const nextVariant: ThemeVariant = props.themeVariant === 'night' ? 'day' : 'night'
   const label = props.themeAuto ? 'auto' : props.themeVariant
   const maximized = useWindowMaximized()
+  const mac = window.conductor.platform === 'darwin'
 
   useEffect(() => {
     if (!fileMenuOpen) return
@@ -87,7 +88,8 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
   }
 
   return (
-    <header className="titlebar">
+    // macOS draws its own traffic lights at the left of the title bar (src/main/window-chrome.ts).
+    <header className={mac ? 'titlebar mac' : 'titlebar'}>
       <div className="titlebar-file" ref={menuRef}>
         <button className={fileMenuOpen ? 'titlebar-brand active' : 'titlebar-brand'} onClick={() => setFileMenuOpen((open) => !open)} aria-haspopup="menu" aria-expanded={fileMenuOpen}>
           <span className="brand-mark" aria-hidden="true"><i /><i /><i /></span>
@@ -141,13 +143,13 @@ export function TitleBar(props: TitleBarProps): React.JSX.Element {
         <button role="menuitemcheckbox" aria-checked={props.themeAuto} onClick={() => { props.onThemeAuto?.(!props.themeAuto); setThemeMenuOpen(false) }}><Laptop size={14} /> Follow local time{props.themeAuto && <span className="theme-selected">✓</span>}</button>
       </div>}
       </div>
-      <div className="window-controls">
+      {!mac && <div className="window-controls">
         <button onClick={() => window.conductor.window.minimize()} aria-label="Minimize"><Minus size={14} /></button>
         <button onClick={() => window.conductor.window.toggleMaximize()} aria-label={maximized ? 'Restore window' : 'Maximize window'} title={maximized ? 'Restore window' : 'Maximize window'}>
           {maximized ? <Minimize2 size={14} /> : <Maximize2 size={13} />}
         </button>
         <button className="window-close" onClick={() => window.conductor.window.close()} aria-label="Close"><X size={15} /></button>
-      </div>
+      </div>}
     </header>
   )
 }

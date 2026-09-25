@@ -1,4 +1,4 @@
-import { SCHEDULE_AGENT_PROVIDERS, SCHEDULE_TIMINGS, type CreateScheduleInput, type ScheduleAgent, type ScheduleCreator, type ScheduleDefinition, type UpdateScheduleInput } from '../shared/schedules'
+import { SCHEDULE_AGENT_PROVIDERS, SCHEDULE_TIMINGS, scheduleScriptLanguages, type CreateScheduleInput, type ScheduleAgent, type ScheduleCreator, type ScheduleDefinition, type UpdateScheduleInput } from '../shared/schedules'
 import type { ScheduleRunner } from './schedule-runner'
 import type { ScheduleStore } from './schedule-store'
 import { validAgent } from './schedule-store'
@@ -16,7 +16,9 @@ import { validAgent } from './schedule-store'
  * unattended, which is exactly what a local model is otherwise kept away from.
  */
 
-const SCRIPT_CONTRACT = 'Each script runs with the project folder as cwd, node scripts as ES modules (.mjs, built-in modules only) and powershell as .ps1. Its stdout is the evidence Conductor digests, so print a compact, deterministic summary (no timestamps or durations, sorted), at most 256 KB; stderr is for diagnostics. Exit 0 means valid. Env: CONDUCTOR_SCHEDULE_STATE_DIR persists between runs (caches, ETags), CONDUCTOR_SCHEDULE_RUN_DIR holds earlier scripts\' stdout of this run as <name>.out, CONDUCTOR_SCHEDULE_CHANGED is 1 once an earlier script changed or failed'
+// PowerShell scripts exist only on Windows (scheduleScriptLanguages).
+const SCRIPT_LANGUAGES = scheduleScriptLanguages(process.platform).map(language => `"${language}"`).join('|')
+const SCRIPT_CONTRACT = `Each script runs with the project folder as cwd, node scripts as ES modules (.mjs, built-in modules only)${process.platform === 'win32' ? ' and powershell as .ps1' : ''}. Its stdout is the evidence Conductor digests, so print a compact, deterministic summary (no timestamps or durations, sorted), at most 256 KB; stderr is for diagnostics. Exit 0 means valid. Env: CONDUCTOR_SCHEDULE_STATE_DIR persists between runs (caches, ETags), CONDUCTOR_SCHEDULE_RUN_DIR holds earlier scripts\' stdout of this run as <name>.out, CONDUCTOR_SCHEDULE_CHANGED is 1 once an earlier script changed or failed`
 
 export const scheduleSignatures: Record<string, string> = {
   'schedules.list': '() — scheduled tasks of this project: goal, assigned agent, cadence, timing (night/idle), urgent, next run, why a due run is waiting, last result and script names',
@@ -27,7 +29,7 @@ export const scheduleSignatures: Record<string, string> = {
   'schedules.resume': '({taskId}) — resume a paused task; its next window starts now',
   'schedules.runNow': '({taskId}) — run it now, skipping the night/idle wait (never alongside another scheduled run); returns the run, then read schedules.get',
   'schedules.delete': '({taskId}) — asks the owner unless the owner or a wizard tab asks; built-in tasks can only be paused',
-  'schedules.scripts.save': `({taskId,name,content,language?:"node"|"powershell",description?,format?:"text"|"json",runWhen?:"always"|"changed",timeoutSec?,order?}) — add or replace one of the task's deterministic scripts (the task's maintainer, the owner or a wizard tab). name is 1-48 lower-case letters, digits and hyphens; content up to 64 KB; at most 12 scripts, run in order; runWhen "changed" (for expensive checks such as tests) runs only after an earlier script changed or failed; timeoutSec 1-1200 (default 120). ${SCRIPT_CONTRACT}. Test a script by running it yourself before saving it`,
+  'schedules.scripts.save': `({taskId,name,content,language?:${SCRIPT_LANGUAGES},description?,format?:"text"|"json",runWhen?:"always"|"changed",timeoutSec?,order?}) — add or replace one of the task's deterministic scripts (the task's maintainer, the owner or a wizard tab). name is 1-48 lower-case letters, digits and hyphens; content up to 64 KB; at most 12 scripts, run in order; runWhen "changed" (for expensive checks such as tests) runs only after an earlier script changed or failed; timeoutSec 1-1200 (default 120). ${SCRIPT_CONTRACT}. Test a script by running it yourself before saving it`,
   'schedules.scripts.delete': '({taskId,name}) — remove one of the task\'s scripts (maintainer, owner or wizard tab); scripts Conductor ships with a built-in task stay'
 }
 export const scheduleMethods = new Set(Object.keys(scheduleSignatures))

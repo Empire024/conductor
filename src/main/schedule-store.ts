@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { makeId } from '../shared/models'
 import {
   nextDue, SCHEDULE_AGENT_PROVIDERS, SCHEDULE_DEFAULT_TIMEOUT_MS, SCHEDULE_KINDS, SCHEDULE_MAX_MINUTES, SCHEDULE_MIN_MINUTES,
-  SCHEDULE_NAME_MAX, SCHEDULE_PROMPT_MAX, SCHEDULE_SCRIPT_DEFAULT_TIMEOUT_SEC, SCHEDULE_SCRIPT_LANGUAGES, SCHEDULE_SCRIPT_MAX_BYTES,
+  SCHEDULE_NAME_MAX, SCHEDULE_PROMPT_MAX, SCHEDULE_SCRIPT_DEFAULT_TIMEOUT_SEC, SCHEDULE_SCRIPT_LANGUAGES, SCHEDULE_SCRIPT_MAX_BYTES, scheduleScriptLanguages,
   SCHEDULE_SCRIPT_MAX_PER_TASK, SCHEDULE_SCRIPT_MAX_TIMEOUT_SEC, SCHEDULE_SCRIPT_NAME, SCHEDULE_TIMINGS,
   type CreateScheduleInput, type SaveScheduleScriptInput, type ScheduleAgent, type ScheduleCreator, type ScheduleDefinition,
   type ScheduleKind, type ScheduleModelStep, type ScheduleOutcome, type ScheduleRun, type ScheduleScript, type ScheduleScriptResult,
@@ -436,6 +436,7 @@ export class ScheduleStore {
   private writeScript(scheduleId: string, input: Required<Omit<SaveScheduleScriptInput, 'language'>> & { language: ScheduleScript['language'] }, origin: ScheduleScript['origin'], author: ScheduleCreator, now: Date): ScheduleScript {
     if (typeof input.content !== 'string' || !input.content.trim() || input.content.includes('\0') || Buffer.byteLength(input.content) > SCHEDULE_SCRIPT_MAX_BYTES) throw new Error(`Script content must be non-empty text of at most ${SCHEDULE_SCRIPT_MAX_BYTES / 1024} KB`)
     if (!SCHEDULE_SCRIPT_LANGUAGES.includes(input.language)) throw new Error(`language must be ${SCHEDULE_SCRIPT_LANGUAGES.join(' or ')}`)
+    if (!scheduleScriptLanguages(process.platform).includes(input.language)) throw new Error('PowerShell scripts run only on Windows; write this check as a node script')
     if (!['text', 'json'].includes(input.format)) throw new Error('format must be text or json')
     if (!['always', 'changed'].includes(input.runWhen)) throw new Error('runWhen must be always or changed')
     if (!Number.isInteger(input.timeoutSec) || input.timeoutSec < 1 || input.timeoutSec > SCHEDULE_SCRIPT_MAX_TIMEOUT_SEC) throw new Error(`timeoutSec must be a whole number from 1 to ${SCHEDULE_SCRIPT_MAX_TIMEOUT_SEC}`)

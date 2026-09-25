@@ -24,8 +24,11 @@ const sameSourceVersion = (left: Stats, right: Stats): boolean => sameIdentity(l
 // so comparing a lexical path against its realpath() would misreport every alias-shortened ancestor
 // (e.g. a Windows temp directory) as a symlink. Walking each component's own identity by lstat sidesteps
 // alias renaming entirely and still catches a real symlink or junction anywhere along the path.
-async function assertNoLexicalSymlink(target: string, message: string): Promise<void> {
-  for (let current = target, parent = dirname(current); parent !== current; current = parent, parent = dirname(current)) {
+// A path under `root` is walked only below it: the project root itself may sit behind a link
+// (macOS /var -> /private/var, a linked projects folder), and roots are compared canonically.
+async function assertNoLexicalSymlink(target: string, message: string, root?: string): Promise<void> {
+  const stop = root !== undefined && inside(root, target) ? root : undefined
+  for (let current = target, parent = dirname(current); parent !== current && !(stop !== undefined && samePath(current, stop)); current = parent, parent = dirname(current)) {
     if ((await lstat(current)).isSymbolicLink()) throw new Error(message)
   }
 }
@@ -187,7 +190,7 @@ async function linkThenUnlink(source: string, target: string, sourceBefore: Awai
 export async function moveExternalDropIntoProject(projectRoot: string, sourcePath: string, requestedDirectory: string): Promise<{ path: string; name: string }> {
   if (!isAbsolute(sourcePath) || !sourcePath.trim()) throw new Error('External drops require one absolute source path')
   const lexicalSource = resolve(sourcePath)
-  await assertNoLexicalSymlink(lexicalSource, 'Symbolic-link file drops are not moved')
+  await assertNoLexicalSymlink(lexicalSource, 'Symbolic-link file drops are not moved', resolve(projectRoot))
   const [realRoot, realSource] = await Promise.all([realpath(projectRoot), realpath(lexicalSource)])
   if (inside(realRoot, realSource)) throw new Error('Use the project file drag action for files already inside this project')
   const sourceBefore = await lstat(realSource)

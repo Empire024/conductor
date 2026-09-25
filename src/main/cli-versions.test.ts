@@ -100,7 +100,7 @@ describe('CLI version store', () => {
     expect(store.cachedVersions('claude').sort()).toEqual(['2.1.278', '2.1.290'])
     expect(store.cachedVersions('codex').sort()).toEqual(['0.155.1', '0.156.0'])
     // A version folder is linked, not copied: same file, no extra disk.
-    expect(statSync(join(cache, 'claude', '2.1.278', 'claude.exe')).nlink).toBeGreaterThan(1)
+    expect(statSync(join(cache, 'claude', '2.1.278', process.platform === 'win32' ? 'claude.exe' : 'claude')).nlink).toBeGreaterThan(1)
     expect(existsSync(join(cache, 'codex', '0.155.1', 'codex-resources', 'codex-command-runner.exe'))).toBe(true)
     // The CLI cleaning up its old version does not take the saved copy with it.
     rmSync(join(claudeVersions, '2.1.278'))

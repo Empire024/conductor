@@ -64,6 +64,8 @@ button:focus-visible, input:focus-visible { outline: 1px solid var(--accent-mute
   z-index: 100;
 }
 
+/* Room for the native macOS traffic lights (src/main/window-chrome.ts TRAFFIC_LIGHTS). */
+.titlebar.mac { padding-left: 78px; }
 .titlebar-file { position: relative; width: 280px; flex: 0 0 280px; -webkit-app-region: no-drag; }
 .titlebar-brand {
   width: 280px;

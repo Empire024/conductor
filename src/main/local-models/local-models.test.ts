@@ -97,7 +97,8 @@ describe('sandbox arguments', () => {
     expect(args.join(' ')).not.toMatch(/docker\.sock|npipe|--privileged|--pid host|--ipc host/)
   })
 
-  it('masks detected secrets and binds nothing but the workspace', () => {
+  // Local models are Windows-only: the bind source is a Windows workspace path.
+  it.runIf(process.platform === 'win32')('masks detected secrets and binds nothing but the workspace', () => {
     const joined = args.join(' ')
     expect(joined).toContain('type=bind,source=C:/projects/demo,target=/workspace')
     expect(joined).toContain('target=/workspace/.env,readonly')
@@ -296,7 +297,7 @@ describe('adopting a running container', () => {
     `true\t${label}\t${JSON.stringify([{ Type: 'bind', Source: source, Destination: '/workspace' }])}`
   const digest = mountDigest(JSON.stringify({ masks: [], git: false }))
 
-  it('rebuilds unless the running container was built from these exact mounts', () => {
+  it.runIf(process.platform === 'win32')('rebuilds unless the running container was built from these exact mounts', () => {
     expect(adoptableContainer(inspected(digest, 'C:\\projects\\demo'), digest, 'C:/projects/demo')).toBe(true)
     expect(adoptableContainer(inspected(digest, '/host_mnt/c/projects/demo'), digest, 'C:/projects/demo')).toBe(true)
     // A container built while .git was writable, or before a secret appeared, carries a different

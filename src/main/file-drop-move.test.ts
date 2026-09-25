@@ -5,7 +5,8 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { moveExternalDropIntoProject, moveProjectDropWithinProject } from './file-drop-move'
 
 const roots: string[] = []
-const root = (): string => { const path = mkdtempSync(join(tmpdir(), 'conductor-drop-move-')); roots.push(path); return path }
+// Canonical, so a fixture outside the project is not itself behind a link (macOS tmpdir() is under /var -> /private/var).
+const root = (): string => { const path = realpathSync.native(mkdtempSync(join(tmpdir(), 'conductor-drop-move-'))); roots.push(path); return path }
 afterEach(() => { for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true }) })
 
 // A Windows temp directory can be reached through a short (8.3) alias while the code under test
@@ -46,6 +47,23 @@ describe('external explorer file drop move', () => {
     symlinkSync(escape, join(project, 'linked-folder'), 'junction')
     await expect(moveExternalDropIntoProject(project, realSource, 'linked-folder')).rejects.toThrow('existing project folder')
     expect(readFileSync(realSource, 'utf8')).toBe('safe')
+  })
+
+  it('accepts a project reached through a linked folder and compares its canonical root', async () => {
+    const base = root(), realProject = join(base, 'real-project'), linkedProject = join(base, 'linked-project'), outside = join(base, 'outside')
+    mkdirSync(join(realProject, 'media'), { recursive: true }); mkdirSync(outside)
+    symlinkSync(realProject, linkedProject, 'junction')
+    const source = join(outside, 'clip.mp4'); writeFileSync(source, 'clip')
+    const moved = await moveExternalDropIntoProject(linkedProject, source, 'media')
+    expect(canonicalPath(moved.path)).toBe(canonicalPath(join(realProject, 'media', 'clip.mp4')))
+    // A file already in the project, dropped by its linked path, is the project drag intent, not a symlink.
+    writeFileSync(join(realProject, 'inside.txt'), 'inside')
+    await expect(moveExternalDropIntoProject(linkedProject, join(linkedProject, 'inside.txt'), '')).rejects.toThrow('project file drag action')
+    // A link below the project root still redirects, so it is still refused.
+    symlinkSync(outside, join(realProject, 'linked-outside'), 'junction')
+    writeFileSync(join(outside, 'other.txt'), 'other')
+    await expect(moveExternalDropIntoProject(linkedProject, join(linkedProject, 'linked-outside', 'other.txt'), '')).rejects.toThrow('Symbolic-link')
+    expect(readFileSync(join(outside, 'other.txt'), 'utf8')).toBe('other')
   })
 
   it('refuses an in-project or non-file source as the wrong drop intent', async () => {

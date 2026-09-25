@@ -71,6 +71,8 @@ export interface ScheduleDefinition {
 
 export const SCHEDULE_SCRIPT_LANGUAGES = ['node', 'powershell'] as const
 export type ScheduleScriptLanguage = (typeof SCHEDULE_SCRIPT_LANGUAGES)[number]
+/** PowerShell ships only with Windows, so a PowerShell script is offered and run only there. */
+export const scheduleScriptLanguages = (platform: string): readonly ScheduleScriptLanguage[] => platform === 'win32' ? SCHEDULE_SCRIPT_LANGUAGES : ['node']
 export type ScheduleScriptFormat = 'text' | 'json'
 /** 'changed' scripts (expensive checks such as tests) run only when an earlier script of the
  *  same run changed or failed. */

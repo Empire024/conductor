@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { assertPromptImportSize, importPromptAttachment, importPromptAttachmentPath, projectPromptAttachment, promptContextLimits } from './prompt-context'
 
 const roots: string[] = []
-const workspace = (): string => { const root = mkdtempSync(join(tmpdir(), 'conductor-prompt-context-')); roots.push(root); return root }
+// Canonical, so an external drop is not itself behind a link (macOS tmpdir() is under /var -> /private/var).
+const workspace = (): string => { const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'conductor-prompt-context-'))); roots.push(root); return root }
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true, maxRetries: 5 }) })
 
 describe('prompt file context', () => {
@@ -58,5 +59,17 @@ describe('prompt file context', () => {
     const external = await importPromptAttachmentPath(root, join(outside, 'outside.md'), 'renamed.md', 'text/markdown')
     expect(external).toMatchObject({ kind: 'file', name: 'renamed.md', content: 'outside\n' })
     expect(external).not.toHaveProperty('path')
+  })
+
+  it('treats a drop under a project reached through a linked folder as a project file', async () => {
+    const base = workspace(), realProject = join(base, 'real-project'), linkedProject = join(base, 'linked-project'), outside = join(base, 'outside')
+    mkdirSync(realProject); mkdirSync(outside)
+    symlinkSync(realProject, linkedProject, process.platform === 'win32' ? 'junction' : 'dir')
+    writeFileSync(join(realProject, 'inside.md'), 'inside\n')
+    await expect(importPromptAttachmentPath(linkedProject, join(linkedProject, 'inside.md'))).resolves.toMatchObject({ kind: 'file', path: 'inside.md', content: 'inside\n' })
+    // A link below the project root still redirects the drop, so it is still refused.
+    writeFileSync(join(outside, 'secret.md'), 'secret\n')
+    symlinkSync(outside, join(realProject, 'escape'), process.platform === 'win32' ? 'junction' : 'dir')
+    await expect(importPromptAttachmentPath(linkedProject, join(linkedProject, 'escape', 'secret.md'))).rejects.toThrow(/Symbolic-link/)
   })
 })

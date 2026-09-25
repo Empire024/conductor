@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtemp, writeFile, rm, symlink, readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, writeFile, rm, symlink, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
@@ -74,6 +74,11 @@ describe('private local build feed — synthetic, no installer execution', () =>
     const redirected = new LocalUpdateFeed(join(f.root, 'redirected-feed'))
     feeds.push(redirected)
     await expect(redirected.refresh()).rejects.toThrow('redirected')
+    // A real feed folder whose parent is linked (macOS /var -> /private/var) is served.
+    await symlink(external.root, join(f.root, 'linked-parent'), 'junction')
+    await mkdir(join(external.root, 'feed'))
+    const nested = await fixture('0.1.7-local.20260907160000000', join(f.root, 'linked-parent', 'feed'))
+    await expect(nested.feed.refresh()).resolves.toMatchObject({ version: '0.1.7-local.20260907160000000' })
     await rm(join(f.root, f.info.installer))
     await expect(f.feed.refresh()).rejects.toThrow()
   })

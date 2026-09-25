@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -35,7 +35,8 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 import { moveExternalDropIntoProject } from './file-drop-move'
 
 const roots: string[] = []
-const root = (): string => { const path = mkdtempSync(join(tmpdir(), 'conductor-cross-volume-')); roots.push(path); return path }
+// Canonical, so the dropped source is not itself behind a link (macOS tmpdir() is under /var -> /private/var).
+const root = (): string => { const path = realpathSync.native(mkdtempSync(join(tmpdir(), 'conductor-cross-volume-'))); roots.push(path); return path }
 afterEach(() => {
   faults.forceCrossVolume = false
   faults.failStageWrite = false

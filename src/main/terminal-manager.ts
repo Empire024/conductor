@@ -380,7 +380,8 @@ export class TerminalManager {
   }
 
   private defaultShell(): string {
-    if (process.platform !== 'win32') return process.env.SHELL || '/bin/bash'
+    // zsh is the macOS default shell; an app started from Finder may have no SHELL.
+    if (process.platform !== 'win32') return process.env.SHELL || (process.platform === 'darwin' ? '/bin/zsh' : '/bin/bash')
     const systemRoot = process.env.SystemRoot || 'C:\\Windows'
     const powershell = join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
     return existsSync(powershell) ? powershell : 'powershell.exe'

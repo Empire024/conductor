@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync, openSync, readSync, closeSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -566,9 +566,13 @@ export class CloudRuns {
   }
 
   /** The newest conversation the CLI saved for `dir` since `since` (its projects folder names
-   *  the folder with every character other than a letter, digit or dash turned into a dash). */
+   *  the folder with every character other than a letter, digit or dash turned into a dash). The
+   *  CLI names it after its own working directory, which POSIX reports canonical (macOS /var is
+   *  /private/var), so the folder is named from the resolved path there. */
   private newestConversation(dir: string, since: number, accept: (file: string) => boolean = () => true): string | null {
-    const folder = join(this.projectsDir(), dir.replace(/[^A-Za-z0-9-]/g, '-'))
+    let cwd = dir
+    if (process.platform !== 'win32') { try { cwd = realpathSync(dir) } catch { /* named as given */ } }
+    const folder = join(this.projectsDir(), cwd.replace(/[^A-Za-z0-9-]/g, '-'))
     try {
       const files = readdirSync(folder).filter(name => name.endsWith('.jsonl')).map(name => ({ path: join(folder, name), at: statSync(join(folder, name)).mtimeMs })).filter(file => file.at >= since - 1000)
       return files.sort((x, y) => y.at - x.at).find(file => accept(file.path))?.path ?? null

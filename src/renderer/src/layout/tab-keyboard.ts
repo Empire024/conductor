@@ -1,4 +1,5 @@
 import { DEFAULT_LOCAL_MODEL, localModelLabel } from '../../../shared/local-models'
+import { defaultTerminal, rendererPlatform } from '../../../shared/terminal-shell'
 import type { AgentProviderId, LayoutNode, PaneGroupNode, PaneKind, SplitNode, WorkspaceLayout } from '../../../shared/models'
 import { dockTab, findGroup, listGroups, resizeSplit, type DockEdge } from './layout-operations'
 
@@ -22,7 +23,7 @@ export const TAB_CHORD: Record<string, ChordTarget> = {
   k: { kind: 'agent', provider: 'kimi', label: 'Kimi Code' },
   g: { kind: 'agent', provider: 'gemini', label: 'Gemini CLI' },
   l: { kind: 'agent', provider: 'local', model: DEFAULT_LOCAL_MODEL, label: localModelLabel(DEFAULT_LOCAL_MODEL) },
-  t: { kind: 'terminal', label: 'PowerShell' },
+  t: { kind: 'terminal', label: defaultTerminal(rendererPlatform()).title },
   n: { kind: 'launcher', label: 'New tab' }
 }
 

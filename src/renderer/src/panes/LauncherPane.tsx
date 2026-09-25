@@ -20,6 +20,7 @@ import { checkRemoteProjectPlacement } from '../../../shared/project-identity'
 import { checkProjectPlacement, requiredMachineId } from '../layout/machine-placement'
 import { DurableJobForm } from '../components/DurableJobsPane'
 import { CloudLaunchForm } from './CloudLaunchForm'
+import { defaultTerminal, rendererPlatform } from '../../../shared/terminal-shell'
 
 interface LauncherPaneProps {
   projectId: string
@@ -59,7 +60,7 @@ const choices: Array<{
   { kind: 'agent', provider: 'qwen', icon: Bot, title: 'Qwen Code', tone: 'cyan', key: 'Q' },
   { kind: 'agent', provider: 'kimi', icon: Sparkles, title: 'Kimi Code', tone: 'violet', key: 'K' },
   { kind: 'agent', provider: 'gemini', icon: Sparkles, title: 'Gemini CLI', tone: 'blue', key: 'G' },
-  { kind: 'terminal', icon: TerminalSquare, title: 'PowerShell', tone: 'blue', key: 'T' }
+  { kind: 'terminal', icon: TerminalSquare, title: defaultTerminal(rendererPlatform()).title, tone: 'blue', key: 'T' }
 ]
 
 /**

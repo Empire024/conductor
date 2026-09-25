@@ -81,7 +81,8 @@ export function normalizeGoal(goal, source) {
  */
 export function goalPortability(goal, { platform = process.platform } = {}) {
   if (platform === 'win32') return null
-  const foreign = [['project.path', goal.project?.path], ['fixer.project', goal.fixer?.project]].filter(([, value]) => typeof value === 'string' && windowsOnly(value) && !isInside(CHECKOUT, value))
+  // Only a Windows checkout can hold a Windows path; on POSIX `resolve` would read C:/x as relative to it.
+  const foreign = [['project.path', goal.project?.path], ['fixer.project', goal.fixer?.project]].filter(([, value]) => typeof value === 'string' && windowsOnly(value) && !(windowsOnly(CHECKOUT) && isInside(CHECKOUT, value)))
   if (!foreign.length) return null
   return `${foreign.map(([key, value]) => `${key} ${value}`).join(' and ')} ${foreign.length === 1 ? 'is a Windows path' : 'are Windows paths'}; this is ${platform}. Use ${CHECKOUT_PLACEHOLDER} for the checkout, or run the goal on the machine that holds the folder.`
 }

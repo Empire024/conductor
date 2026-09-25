@@ -518,7 +518,8 @@ export class LogicLoops {
   private maybeAutoRevert(loopId: string): void {
     const latest = [...this.listProposalsRaw()].reverse().find(entry => entry.loopId === loopId && entry.status === 'applied')
     if (!latest || latest.metric === undefined || latest.baselineMetric === undefined || !latest.decidedAt || !latest.previousContent || latest.previousVersion === undefined) return
-    const since = this.runIndex(loopId).filter(entry => entry.createdAt > latest.decidedAt!)
+    // A run recorded in the same millisecond as the apply came after it (record follows apply).
+    const since = this.runIndex(loopId).filter(entry => entry.createdAt >= latest.decidedAt!)
     if (since.length < 2) return
     const metrics: RecordedRunMetric[] = since.slice(0, 2).map(entry => ({ runId: entry.runId, value: runMetricValue(latest.metric!, this.database.listLoopStepRuns(entry.runId)) }))
     const verdict = evaluateAutoRevert(latest.baselineMetric, metrics)

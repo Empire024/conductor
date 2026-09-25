@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, promises as fs, readFileSync, statSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, posix } from 'node:path'
 import { RuntimeHostClient } from './client'
 import { RUNTIME_HOST_FEATURES, RUNTIME_HOST_PROTOCOL, type HostLock } from './protocol'
 
@@ -41,7 +41,8 @@ export async function connectRuntimeHost(launch: RuntimeHostLaunch): Promise<Run
   }
   if (!launch.start) return null
   await fs.mkdir(hostDirectory(launch.userData), { recursive: true })
-  const runtime = launch.packaged ? await copiedRuntime(launch.userData) : process.execPath
+  const placed = hostRuntimeFor(process.platform, process.execPath, existsSync)
+  const runtime = launch.packaged && placed.copy ? await copiedRuntime(launch.userData) : launch.packaged ? placed.executable : process.execPath
   const script = launch.packaged ? await copiedScript(launch.userData, launch.hostScript) : launch.hostScript
   const environment: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: '1' }
   delete environment.NODE_OPTIONS
@@ -60,6 +61,20 @@ export async function connectRuntimeHost(launch: RuntimeHostLaunch): Promise<Run
     try { return await RuntimeHostClient.connect(started.pipe, started.secret) } catch { /* not listening yet */ }
   }
   throw new Error('The runtime host did not start within 15 s')
+}
+
+/**
+ * What runs a packaged host. Windows copies the runtime out of the install folder, which the NSIS
+ * installer clears of every process on update. A macOS binary cannot run outside its bundle (it
+ * loads Electron Framework.framework relative to itself), and replacing the .app leaves a running
+ * host's open files intact, so it runs in place: from the bundle's helper, which has no Dock icon,
+ * else the app binary itself.
+ */
+export function hostRuntimeFor(platform: NodeJS.Platform, execPath: string, exists: (path: string) => boolean): { executable: string; copy: boolean } {
+  if (platform !== 'darwin') return { executable: execPath, copy: true }
+  const name = posix.basename(execPath)
+  const helper = posix.join(posix.dirname(posix.dirname(execPath)), 'Frameworks', `${name} Helper.app`, 'Contents', 'MacOS', `${name} Helper`)
+  return { executable: exists(helper) ? helper : execPath, copy: false }
 }
 
 const processAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM' } }

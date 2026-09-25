@@ -2,7 +2,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { ScheduleScript, ScheduleScriptResult } from '../shared/schedules'
+import { scheduleScriptLanguages, type ScheduleScript, type ScheduleScriptResult } from '../shared/schedules'
 
 /**
  * Runs a scheduled task's scripts: the deterministic half of a scheduled task. A script is text
@@ -94,6 +94,8 @@ export class ScheduleScriptRunner {
 
   run(request: ScriptProcessRequest): Promise<ScriptProcessOutput> {
     const { script } = request
+    // A PowerShell script saved on Windows never gets as far as a missing powershell.exe elsewhere.
+    if (!scheduleScriptLanguages(process.platform).includes(script.language)) return Promise.resolve({ exitCode: null, stdout: '', stderr: '', timedOut: false, durationMs: 0, truncated: false, error: 'PowerShell scripts run only on Windows; rewrite this check as a node script' })
     const launch = script.language === 'powershell' ? { ...this.launchers.powershell(), env: undefined } : this.launchers.node()
     const started = Date.now()
     return new Promise(resolve => {

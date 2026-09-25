@@ -4,7 +4,8 @@ import { dockerDesktopCandidates, ensureDockerAvailable, resetDockerDesktopStart
 afterEach(() => resetDockerDesktopStartupForTests())
 
 describe('lazy Docker Desktop startup', () => {
-  it('finds installed desktop paths without launching anything', () => {
+  // Docker Desktop.exe paths: local models are Windows-only.
+  it.runIf(process.platform === 'win32')('finds installed desktop paths without launching anything', () => {
     expect(dockerDesktopCandidates({ ProgramFiles: 'C:\\Programs', LOCALAPPDATA: 'C:\\User' })).toEqual([
       'C:\\Programs\\Docker\\Docker\\Docker Desktop.exe',
       'C:\\User\\Docker\\Docker Desktop.exe'

@@ -93,8 +93,12 @@ const within = (root: string, target: string): boolean => {
 // so comparing a lexical path against its realpath() would misreport every alias-shortened ancestor
 // (e.g. a Windows temp directory) as a symlink. Walking each component's own identity by lstat sidesteps
 // alias renaming entirely and still catches a real symlink or junction anywhere along the path.
-async function assertNoLexicalSymlink(target: string): Promise<void> {
-  for (let current = target, parent = dirname(current); parent !== current; current = parent, parent = dirname(current)) {
+// A drop under the project is walked only below its root: the root itself may sit behind a link
+// (macOS /var -> /private/var, a linked projects folder), and roots are compared canonically.
+async function assertNoLexicalSymlink(target: string, root: string): Promise<void> {
+  const stop = within(root, target) ? root : undefined
+  const same = (left: string, right: string): boolean => process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right
+  for (let current = target, parent = dirname(current); parent !== current && !(stop !== undefined && same(current, stop)); current = parent, parent = dirname(current)) {
     if ((await lstat(current)).isSymbolicLink()) throw new Error('Symbolic-link file drops are not attached')
   }
 }
@@ -105,7 +109,7 @@ async function assertNoLexicalSymlink(target: string): Promise<void> {
 export async function importPromptAttachmentPath(cwd: string, sourcePath: string, nameValue?: unknown, mimeType?: unknown): Promise<ContextAttachment> {
   if (typeof sourcePath !== 'string' || !isAbsolute(sourcePath) || sourcePath.length > 32_768 || sourcePath.includes('\0')) throw new Error('The dropped file path is invalid')
   const lexical = resolve(sourcePath)
-  await assertNoLexicalSymlink(lexical)
+  await assertNoLexicalSymlink(lexical, resolve(cwd))
   const [root, source] = await Promise.all([workspacePath(cwd, '.'), realpath(lexical)])
   if (within(root, source)) return projectPromptAttachment(cwd, relative(root, source))
   const descriptor = await open(source, 'r')

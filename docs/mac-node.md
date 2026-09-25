@@ -305,6 +305,66 @@ would open over whatever is on the Mac's screen; a parked smoke run is the way).
 | mac-packaging | `mac` build block (dmg+zip, arm64), `.icns`, entitlements, signing and notarization with the owner's Developer ID, `MacUpdater`, macOS release job | M–L |
 | mac-runtime | Section 4's runtime list: runtime-host launcher on darwin, PATH import from the login shell, traffic lights, default terminal and PowerShell schedules | S each |
 
+### Runtime and realpath on the Mac (MACRT, 2026-09-25)
+
+mac-host-path-tests, mac-overseer-goal, mac-grok-test and mac-spawn-helper landed in d2ca3f5 (PR #2).
+MACRT did mac-realpath and mac-runtime. Decision (controller): a symlinked root is allowed; paths
+are compared canonically.
+
+**mac-realpath.** A root may sit behind a link (macOS `/var` -> `/private/var`, a linked projects
+folder); a link *below* a root still redirects and is still refused.
+- `file-drop-move.ts`, `prompt-context.ts`: a drop under the project is walked for links only
+  below the project root. An external source is still walked whole.
+- `local-update-feed.ts`: the feed folder itself must not be a link, but its parents may be.
+  Everything inside it is compared against its realpath.
+- `cloud/runs.ts`: the Claude CLI names its projects folder after its own cwd, which POSIX reports
+  canonical, so a teleport's conversation is looked up under the resolved path off Windows.
+- Tests realpath their `mkdtemp` roots. New cases cover a project or feed reached through a link.
+- Found on the Mac too, and fixed: `logic-loops` auto-revert missed a run recorded in the same
+  millisecond as the apply (the M1 is fast enough); `scripts/overseer/goal.mjs` read `C:/…` as
+  relative to a POSIX checkout; `cli-versions.test.ts` expected `claude.exe`; the local-model
+  tests that assert drive letters and `Docker Desktop.exe` run on win32 only.
+
+**mac-runtime.** On Windows nothing changes: each change is a darwin branch, and
+`scripts/smoke-mac-runtime.mjs` checks both platforms.
+- Runtime host (`runtime-host/launcher.ts` `hostRuntimeFor`): a packaged Mac app runs the host in
+  place from `Contents/Frameworks/Conductor Helper.app` (no Dock icon), or from the app binary if
+  the helper is missing. A copied Mac binary cannot find `Electron Framework.framework`, and
+  replacing the `.app` leaves a running host's open files intact. Windows still copies the runtime.
+- PATH (`login-shell-path.ts`, awaited first in `whenReady`): on darwin the login shell
+  (`$SHELL -ilc`, 5 s cap, output between markers) is asked for its PATH, and its entries go
+  first. If that fails, `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `/usr/local/bin` and
+  `~/.local/bin` are added. Other platforms keep the PATH they started with.
+- Window (`window-chrome.ts`): on darwin the workspace window uses `titleBarStyle: 'hidden'` with
+  the traffic lights at {14, 13}. `TitleBar.tsx` then draws no minimize/maximize/close buttons and
+  `.titlebar.mac` leaves 78 px for the lights. A parked Mac window is not background-throttled.
+  Windows and Linux stay `frame: false`.
+- Terminal: a new terminal tab is labelled `zsh` on a Mac (`shared/terminal-shell.ts`). The shell
+  is `$SHELL`, else `/bin/zsh` on darwin.
+- Schedules: `scheduleScriptLanguages` offers PowerShell only on win32. Off Windows, the store
+  refuses to save a PowerShell script, the runner refuses to run one without starting anything, and
+  `schedules.scripts.save` does not mention it.
+
+Proof, all through `nodes.run` on mac-mini:
+
+| Job | What | Result |
+|---|---|---|
+| rj_muhabajl_a392ef | baseline at e907364: `npm ci`, `tsc`, `vitest`, `test:scripts` | vitest 3908 pass / 21 fail; scripts 101 pass / 3 fail |
+| rj_muhav5nh_83e67d | the same at e907364 + MACRT | tsc PASS; vitest **3937 pass, 0 fail**, 14 skipped (3951); scripts **103 pass, 0 fail**, 12 skipped |
+| rj_muhazk4i_726533 | parked launch (`scripts/smoke-mac-runtime.mjs`, Finder PATH, no SHELL) | PASS: parked at x -6000, not focused, traffic lights {14,13}, no own buttons, 78 px padding, `/opt/homebrew/bin` first on main's PATH; screenshot `artifacts/mac-runtime/parked-window-darwin.png` |
+| rj_muhb1f3s_8a358e | `electron-builder --mac dir --arm64` (unsigned), then the host from the bundle helper | PASS: helper runs as Node (Electron 37.10.3, darwin arm64), `runtime-host.js` writes its lock and socket, the process is `Conductor Helper`, no Dock entry |
+
+Launching the GUI from an SSH job works while the owner's console session is logged in
+(`launchctl print gui/<uid>` succeeds). A smoke-profile window is parked off every display.
+
+**Left for mac-packaging** (waits on the owner's Apple Developer ID): a `mac` block in the
+electron-builder config (dmg + zip, arm64), a 1024 px icon or `.icns`, hardened runtime and
+entitlements, signing and notarization, `MacUpdater` in `update-manager.ts` (Squirrel.Mac refuses
+unsigned apps), mac assets in `delivery.ts`/`local-update-feed.ts`/`generate-update-manifest.mjs`,
+and a `macos-14` job in `release.yml`. Also still open: menu shortcuts and hints say Ctrl where a
+Mac expects ⌘ (for example "Jump to… Ctrl K"), and `test:remote-relay` and friends need a POSIX
+runner instead of `run-smoke-background.ps1`.
+
 ### Unattended operation (Phase 8)
 
 | Check | State |
