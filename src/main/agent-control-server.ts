@@ -5,7 +5,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AgentControlScope } from '../shared/agent-control'
 import type { AgentSpec } from '../shared/models'
 import type { AgentControl } from './agent-control'
-import { controlMethodClass } from './control-method-classes'
+import { controlMethodClass, controlMethodFamily } from './control-method-classes'
 
 /** Where the owner's own credential is written, and what a process that reads it may claim. */
 export interface OwnerCredentialOptions { path: string; appVersion: string; packaged: boolean }
@@ -90,7 +90,8 @@ export class AgentControlServer {
     const credential = [...this.credentials.values()].find(credential => authorization === 'Bearer ' + credential.token)
     const owner = Boolean(this.ownerToken) && authorization === 'Bearer ' + this.ownerToken
     if (!credential && !owner) { reply(401, { error: 'Unauthorized control session' }); request.resume(); return }
-    // Reads and waits may overlap a caller's mutation. Mutations keep their per-session order,
+    // Reads and waits may overlap a caller's mutation. Mutations keep their order per session and
+    // method family (control-method-classes.ts), so a long git.ship never holds up tabs.open,
     // while the bounded request count prevents one credential from monopolising the server.
     const key = owner ? OWNER_KEY : credential!.scope.agentSessionId
     const inFlight = this.inFlight.get(key) ?? 0
@@ -115,7 +116,7 @@ export class AgentControlServer {
       }
       const result = controlMethodClass(input.method) === 'read'
         ? await call()
-        : await this.withMutationLock(key, call)
+        : await this.withMutationLock(`${key}\0${controlMethodFamily(input.method) ?? 'other'}`, call)
       if (input.method === 'tools.list' && result && typeof result === 'object' && !Array.isArray(result)) {
         const unclassified = Object.keys(result).filter(method => !controlMethodClass(method))
         if (unclassified.length) throw new Error(`Unclassified control methods: ${unclassified.join(', ')}`)

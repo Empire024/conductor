@@ -207,7 +207,14 @@ try {
       summary.s20_renameRace = { renameA: renameA.status, renameB: renameB.status, finalTitle }
       observe('S20 two simultaneous tabs.rename', summary.s20_renameRace)
     }
-    await shipPromise2.catch(() => {})
+    const shipped2 = await shipPromise2.catch(error => ({ error: String(error) }))
+    summary.s20_ship = { status: shipped2.status, latencyMs: shipped2.latencyMs, state: shipped2.body?.result?.status ?? shipped2.body?.error ?? shipped2.error }
+    observe('S20 git.ship settled', summary.s20_ship)
+    // control-concurrent-requests: the lock is per (session, method family), so a ship still
+    // verifying never holds up tabs.open from the same credential.
+    assert.ok(summary.s20_ship.latencyMs > tabsOpenLatencyMs + 2000, 'S20: the ship should still have been running while tabs.open answered')
+    assert.equal(tabsOpenResult.status, 200, 'S20: tabs.open failed')
+    assert.ok(tabsOpenLatencyMs < 5000, `S20: tabs.open waited ${tabsOpenLatencyMs} ms behind git.ship`)
   }
 
   observe('PASS')

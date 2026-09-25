@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AgentSpec } from '../shared/models'
 import { AgentControlServer } from './agent-control-server'
-import { CONTROL_METHOD_CLASSES, controlMethodClass } from './control-method-classes'
+import { CONTROL_METHOD_CLASSES, MUTATION_FAMILIES, controlMethodClass, controlMethodFamily } from './control-method-classes'
 
 const servers: AgentControlServer[] = []
 afterEach(() => { servers.splice(0).forEach(server => server.close()) })
@@ -75,6 +75,48 @@ describe('agent-control request concurrency', () => {
     expect(calls).toEqual(['tabs.open', 'tabs.close'])
   })
 
+  /* control-concurrent-requests (V3 S20): the lock is per (session, method family). */
+  it('never makes tabs.open wait behind a long git.ship from the same session', async () => {
+    const ship = deferred()
+    const shipping = deferred()
+    const f = await fixture(async method => {
+      if (method === 'git.ship') { shipping.resolve(); await ship.promise }
+      return method
+    })
+
+    const delivering = f.request('git.ship')
+    await shipping.promise
+    const started = Date.now()
+    const opened = await f.request('tabs.open')
+    expect(opened.status).toBe(200)
+    expect(await opened.json()).toEqual({ result: 'tabs.open' })
+    expect(Date.now() - started).toBeLessThan(1000)
+    ship.resolve()
+    expect((await delivering).status).toBe(200)
+  })
+
+  it('keeps two calls of one family in arrival order', async () => {
+    const first = deferred()
+    const firstStarted = deferred()
+    const calls: string[] = []
+    const f = await fixture(async method => {
+      calls.push(method)
+      if (calls.length === 1) { firstStarted.resolve(); await first.promise }
+      return method
+    })
+
+    const renaming = f.request('tabs.rename')
+    await firstStarted.promise
+    const renamingAgain = f.request('tabs.rename')
+    const steering = f.request('agents.steer')
+    expect((await steering).status).toBe(200)
+    expect(calls).toEqual(['tabs.rename', 'agents.steer'])
+    first.resolve()
+    expect((await renaming).status).toBe(200)
+    expect((await renamingAgain).status).toBe(200)
+    expect(calls).toEqual(['tabs.rename', 'agents.steer', 'tabs.rename'])
+  })
+
   it('caps one session at eight concurrent requests', async () => {
     const release = deferred()
     const allStarted = deferred()
@@ -121,5 +163,17 @@ describe('control method classes', () => {
     expect(controlMethodClass('jobs.pause')).toBe('mutation')
     expect(controlMethodClass('agents.history')).toBe('read')
     expect(controlMethodClass('git.ship.status')).toBe('read')
+    // Every mutation belongs to exactly one family, and reads to none.
+    const families = Object.values(MUTATION_FAMILIES).flat()
+    expect(new Set(families).size).toBe(families.length)
+    expect([...CONTROL_METHOD_CLASSES].filter(entry => entry.startsWith('mutation:')).map(entry => entry.slice('mutation:'.length)).sort()).toEqual([...families].sort())
+    expect(controlMethodFamily('git.ship')).toBe('delivery')
+    expect(controlMethodFamily('tabs.open')).toBe('tabs')
+    expect(controlMethodFamily('router.dispatch')).toBe('tabs')
+    expect(controlMethodFamily('agents.steer')).toBe('agents')
+    expect(controlMethodFamily('app.restart')).toBe('app')
+    expect(controlMethodFamily('files.write')).toBe('files')
+    expect(controlMethodFamily('schedules.create')).toBe('schedules')
+    expect(controlMethodFamily('agents.status')).toBeUndefined()
   })
 })
