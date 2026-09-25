@@ -18,6 +18,7 @@ import { newExecutionState, observeExecution, fingerprint, type ExecutionState }
 import { isFileProcessingTask, processingRequest, processingTool, PROCESSING_GUIDE, observedPlanHint, type ProcessingRun } from './processing-workflow.ts'
 import { mentionsConductorControl, splitLocalPrompt } from './briefing.ts'
 import { MemoryResultStore, type LocalResultStore } from './result-artifacts.ts'
+import { CONDUCTOR_NOTE, cappedStatus, conductorNoteGuard, stripConductorNotes } from './visible-text.ts'
 import { promptDate, templateKwargs } from './templates.ts'
 
 /** The whole agent loop for a local model. Conductor stays the orchestrator: llama.cpp only
@@ -315,6 +316,8 @@ interface RunLedger {
   finalizing: boolean
   ruminations: number
   nudged: boolean
+  /** Empty replies retried under the tool grammar this turn (a call the server could not parse at all). */
+  droppedRepairs?: number
   detector: StagnationDetector
   /** Argument characters of every call the output limit cut off this turn, by tool. */
   truncatedCalls: Map<string, number[]>
@@ -534,8 +537,13 @@ export class LocalAgentSession {
       if (!this.messages.some(message => message.role === 'user')) {
         this.messages.push({ role: 'user', content: 'Continue the current task.' })
       }
+      // What reaches the timeline (visible-text.ts): a quiet round (the forced search, an answer
+      // owed a page read) shows nothing, since its text never becomes the answer; status text is
+      // capped; visible text stops where the model starts imitating a Conductor note.
+      const status = cappedStatus(delta => events.reasoning?.(delta))
+      const visible = conductorNoteGuard(delta => events.text?.(delta))
       try {
-        return await chatCompletion({
+        const result = await chatCompletion({
           ...(this.options.anonymous ? { anonymous: true } : {}),
           endpoint: this.options.endpoint,
           apiKey: this.options.apiKey,
@@ -550,10 +558,16 @@ export class LocalAgentSession {
           // parameter itself, since an unknown one is refused by some builds with the same 400.
           ...(attempt ? {} : { reasoningEffort: 'none' as const, templateKwargs: templateKwargs() }),
           signal,
-          stopWhen: accumulated => ruminationVerdict(accumulated, this.policy.generation),
-          onText: delta => this.processing || quiet ? events.reasoning?.(delta) : events.text?.(delta),
-          onReasoning: delta => events.reasoning?.(delta)
+          stopWhen: accumulated => accumulated.content.includes(CONDUCTOR_NOTE) ? 'conductor_note'
+            // Held to `required`, prose means the call is not coming (llama.cpp does not always hold
+            // Dolphin to it): stop paying for a draft nobody will read.
+            : toolChoice === 'required' && accumulated.content.length > 400 ? 'no_tool_call'
+              : ruminationVerdict(accumulated, this.policy.generation),
+          onText: delta => quiet ? undefined : this.processing ? status(delta) : visible.push(delta),
+          onReasoning: status
         })
+        visible.flush()
+        return { ...result, content: stripConductorNotes(result.content) }
       } catch (error) {
         if (attempt || signal?.aborted || !(error instanceof LocalRequestError) || !error.recoverable) throw this.describe(error)
         events.notice?.(`The local server refused the request (HTTP ${error.status}); retrying once with a repaired, shorter conversation.`)
@@ -848,8 +862,15 @@ export class LocalAgentSession {
       // a tool, so the same request goes out once more with the full grammar enforced, which
       // makes that model produce the complete call; a second failure falls through to the
       // ordinary malformed-call result and the stagnation detector below.
-      if (!truncated && calls.length && calls.some(call => !argumentsAreObject(call.arguments)) && ledger.requests < requestCeiling) {
-        const names = [...new Set(calls.filter(call => !argumentsAreObject(call.arguments)).map(call => call.name))].join(', ')
+      // The same model also writes a whole call in the OpenAI wire shape ({"type":"function",
+      // "function":{"name","arguments":"<string>"}}), which llama.cpp's parser rejects outright:
+      // the stream then ends with no text, no reasoning and no call at all. Answered with "give
+      // your final answer", the model reports work it never did, so that empty reply gets the same
+      // grammar-enforced retry (at most twice a turn).
+      const dropped = !truncated && !ruminated && !calls.length && !completion.content.trim() && !completion.reasoning.trim() && tools.length > 0 && !ledger.finalizing && (ledger.droppedRepairs ?? 0) < 2
+      if (!truncated && (dropped || calls.length && calls.some(call => !argumentsAreObject(call.arguments))) && ledger.requests < requestCeiling) {
+        if (dropped) ledger.droppedRepairs = (ledger.droppedRepairs ?? 0) + 1
+        const names = dropped ? 'tool' : [...new Set(calls.filter(call => !argumentsAreObject(call.arguments)).map(call => call.name))].join(', ')
         events.notice?.(`The local server could not parse the model's ${names} call; asking again with the tool grammar enforced.`)
         let repaired: CompletionResult | undefined
         try {

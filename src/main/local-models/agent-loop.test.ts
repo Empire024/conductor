@@ -280,6 +280,30 @@ describe('local agent loop', () => {
     expect(third!.messages.some(message => /were not a JSON object/.test(message.content))).toBe(false)
   })
 
+  it('re-asks under the tool grammar when the server drops a call it could not parse at all, instead of asking for an answer', async () => {
+    // Dolphin writing a call in the OpenAI wire shape: llama.cpp rejects the whole reply and the
+    // stream ends with no text, no reasoning and no call. "Give your final answer" there made the
+    // model report work it never did (the local swarm smoke, 2026-09-26).
+    const stub = await stubServer([
+      [frame({}, 'stop')],
+      [frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'read_file', arguments: '{"path":"src/index.ts"}' } }] }, 'tool_calls')],
+      [frame({ content: 'The answer is 42.' }, 'stop')]
+    ])
+    cleanup.push(() => stub.server.close())
+    const notices: string[] = [], tools: string[] = []
+    const session = new LocalAgentSession({ endpoint: stub.endpoint, apiKey: 'k'.repeat(64), model: 'local/dolphin-x1-8b', workspace: workspace(), sandbox: null, readOnly: false, timeoutSec: 30, contextTokens: 32768 })
+    const outcome = await session.run('What is the answer?', { notice: message => notices.push(message), toolEnd: call => tools.push(`${call.name}:${call.failed ? 'failed' : 'ok'}`) })
+    expect(outcome.stopReason).toBe('completed')
+    expect(outcome.text).toBe('The answer is 42.')
+    expect(tools).toEqual(['read_file:ok'])
+    expect(notices.some(message => /could not parse the model's tool call/.test(message))).toBe(true)
+    expect(notices.some(message => /reasoning only/.test(message))).toBe(false)
+    const [first, second] = stub.requests as Array<{ tool_choice?: string; messages: unknown[] }>
+    expect(first!.tool_choice).toBe('auto')
+    expect(second!.tool_choice).toBe('required')
+    expect(second!.messages.length).toBe(first!.messages.length)
+  })
+
   it('ends a run whose calls stay unreadable even under the grammar, instead of spending every round on them', async () => {
     const stub = await stubServer([[frame({ tool_calls: [{ index: 0, id: 'call_1', function: { name: 'conductor', arguments: '{' } }] }, 'tool_calls')]])
     cleanup.push(() => stub.server.close())

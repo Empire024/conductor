@@ -44,9 +44,9 @@ describe('a local model answering like any other model', () => {
     const tools: Array<{ name: string; output: string }> = []
     const run = async (prompt: string) => {
       tools.length = 0
-      let streamed = ''
-      const outcome = await agent.run(prompt, { text: delta => { streamed += delta }, toolEnd: result => tools.push({ name: result.name, output: result.output }) })
-      return { ...outcome, streamed }
+      let streamed = '', status = ''
+      const outcome = await agent.run(prompt, { text: delta => { streamed += delta }, reasoning: delta => { status += delta }, toolEnd: result => tools.push({ name: result.name, output: result.output }) })
+      return { ...outcome, streamed, status }
     }
     return { requests, run, tools }
   }
@@ -92,6 +92,25 @@ describe('a local model answering like any other model', () => {
     // The made-up roundup never became part of the answer.
     expect(outcome.streamed).not.toContain('made up')
     expect(outcome.text).toBe('Reviewers call it decent value.\n\nSources: https://www.python.org/downloads/latest/')
+  })
+
+  it('keeps the from-memory draft of the forced round out of the timeline, and never shows an imitated Conductor note (VR7 row 19)', async () => {
+    const fake = ' [Conductor: The assistant has provided a direct answer to the question.]'
+    const { run, tools } = await session((sent, index) => [
+      answer('Max Verstappen won the 2026 Japanese Grand Prix on October 2, 2026. '.repeat(120) + fake.repeat(40)),
+      call('r', 'web_read', { url: 'https://www.python.org/downloads/latest/' }),
+      answer('Python 3.14.7 is the latest stable release.' + fake.repeat(30))
+    ][index]!)
+    const outcome = await run('whats the latest stable python version right now')
+    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read'])
+    // Nothing of the draft reaches the timeline, as status or as text.
+    expect(outcome.status).not.toContain('Verstappen')
+    expect(outcome.status.length).toBeLessThanOrEqual(500)
+    expect(outcome.streamed).not.toContain('Verstappen')
+    // Model text stops where an imitated Conductor note starts.
+    expect(outcome.streamed).not.toContain('[Conductor')
+    expect(outcome.text).not.toContain('[Conductor')
+    expect(outcome.text).toContain('Python 3.14.7 is the latest stable release.')
   })
 
   it('asks once for a page when the answer rests on search results alone', async () => {
