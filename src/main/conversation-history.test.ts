@@ -95,7 +95,67 @@ describe('conversation history beyond the resident projection', () => {
     expect(page).toMatchObject({ hasMore: false, unavailable: true })
     const transcript = await history.transcript('chat')
     expect(transcript.olderUnavailable).toBe(true)
-    expect(transcript.markdown).toContain('_Earlier activity in this conversation is no longer stored._')
+    expect(transcript.markdown).toContain('200 earlier events are no longer stored')
+  })
+
+  /** One conversation's events appended and checkpointed the way production actually drives
+   *  `StructuredAgentStore`: `checkpoint` after each batch, so the durable transcript archive
+   *  (`structured_transcript_archive*`) grows the way `trimJournal` grows it, not by deleting
+   *  the journal directly the way the fixture above does. */
+  function seedWithCheckpoints(total: number, chunk: number) {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-history-archive-')); roots.push(root)
+    const db = new DatabaseSync(join(root, 'events.sqlite')); databases.push(db)
+    db.exec('CREATE TABLE agent_sessions(id TEXT PRIMARY KEY)')
+    db.prepare('INSERT INTO agent_sessions(id) VALUES(?)').run('chat')
+    const store = new StructuredAgentStore(db, root)
+    store.register('chat', 'project', 'claude', { provider: 'claude' })
+    const event = (index: number): AgentEvent => ({ schemaVersion: 1, id: 'event-' + index, sequence: index, sessionId: 'chat', runtimeId: 'runtime', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: 'fixture', timestamp: '2026-09-24T00:00:00.000Z', itemId: 'item-' + index, data: { type: 'text', role: index % 2 ? 'assistant' : 'user', text: `Message ${index}`, mode: 'snapshot' } })
+    for (let start = 1; start <= total; start += chunk) {
+      db.exec('BEGIN')
+      for (let index = start; index < start + chunk && index <= total; index++) store.append(event(index))
+      db.exec('COMMIT')
+      store.checkpoint('chat')
+    }
+    return { db, store, event }
+  }
+
+  it('archives what falls out of the journal, so Copy transcript still starts at the first prompt beyond sequence 20,000', async () => {
+    const total = 24_000
+    const { store } = seedWithCheckpoints(total, 2_000)
+    const history = new ConversationHistory(store, async () => {})
+    const transcript = await history.transcript('chat')
+    expect(transcript.olderUnavailable).toBe(false)
+    expect(transcript.messages).toBe(total)
+    // No gap and no duplicate: every message from 1 to `total`, in order, exactly once. The title
+    // line (`# Message 2`) echoes an early message and is excluded, or it would double-count it.
+    const found = [...transcript.markdown.slice(transcript.markdown.indexOf('\n')).matchAll(/Message (\d+)/g)].map(match => Number(match[1]))
+    expect(found).toEqual(Array.from({ length: total }, (_, index) => index + 1))
+    expect(transcript.markdown).toMatch(/^# Message \d+\n\n## Claude Code\n\nMessage 1\n\n## You\n\nMessage 2/)
+    expect(transcript.markdown.trimEnd().endsWith(`Message ${total}`)).toBe(true)
+  })
+
+  it('keeps archiving correctly across a restart, and only reports a real gap for history that predates the archive', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-history-archive-restart-')); roots.push(root)
+    const dbPath = join(root, 'events.sqlite')
+    let db = new DatabaseSync(dbPath); databases.push(db)
+    db.exec('CREATE TABLE agent_sessions(id TEXT PRIMARY KEY)')
+    db.prepare('INSERT INTO agent_sessions(id) VALUES(?)').run('chat')
+    let store = new StructuredAgentStore(db, root)
+    store.register('chat', 'project', 'claude', { provider: 'claude' })
+    const event = (index: number): AgentEvent => ({ schemaVersion: 1, id: 'event-' + index, sequence: index, sessionId: 'chat', runtimeId: 'runtime', provider: 'claude', projectId: 'project', workspaceId: 'workspace', cwd: 'fixture', timestamp: '2026-09-24T00:00:00.000Z', itemId: 'item-' + index, data: { type: 'text', role: index % 2 ? 'assistant' : 'user', text: `Message ${index}`, mode: 'snapshot' } })
+    const append = (from: number, to: number): void => { db.exec('BEGIN'); for (let index = from; index <= to; index++) store.append(event(index)); db.exec('COMMIT') }
+    append(1, 21_000)
+    store.checkpoint('chat') // first trim: archives 1..1000, journal keeps 1001..21000
+    db.close()
+    db = new DatabaseSync(dbPath); databases.push(db)
+    store = new StructuredAgentStore(db, root) // cold rebuild of the archive tail from archived_through=1000
+    append(21_001, 24_000)
+    store.checkpoint('chat') // second trim: archives up to 4000
+    const history = new ConversationHistory(store, async () => {})
+    const transcript = await history.transcript('chat')
+    expect(transcript.olderUnavailable).toBe(false)
+    const found = [...transcript.markdown.slice(transcript.markdown.indexOf('\n')).matchAll(/Message (\d+)/g)].map(match => Number(match[1]))
+    expect(found).toEqual(Array.from({ length: 24_000 }, (_, index) => index + 1))
   })
 
   it('copies the whole stored conversation, journal and resident parts, as Markdown', async () => {

@@ -35,9 +35,10 @@ export interface TranscriptOptions {
   title: string
   /** How the assistant is named in the headings: "Claude Code", "Codex", a local model's name. */
   assistant: string
-  /** Older activity existed but is no longer stored; the transcript says so instead of pretending
-   *  it starts at the beginning. */
-  olderUnavailable?: boolean
+  /** Count of events permanently missing before the transcript's first item - gone before this
+   *  conversation's durable archive began covering it. Zero or omitted means nothing is missing;
+   *  the transcript says so instead of pretending it starts at the beginning. */
+  olderUnavailable?: number
 }
 /** A whole conversation as clean Markdown: one heading per turn change, message text verbatim,
  *  every tool call summarized on one line, approvals and questions with their outcome. Only the
@@ -45,7 +46,7 @@ export interface TranscriptOptions {
  *  usage and heartbeats never do. Pure, so the store can build it without the DOM. */
 export function conversationMarkdown(items: TimelineItem[], options: TranscriptOptions): { markdown: string; messages: number } {
   const blocks: string[] = ['# ' + oneLine(options.title || 'Conversation', 200)]
-  if (options.olderUnavailable) blocks.push('_Earlier activity in this conversation is no longer stored._')
+  if (options.olderUnavailable) blocks.push(`_… ${options.olderUnavailable.toLocaleString()} earlier ${options.olderUnavailable === 1 ? 'event is' : 'events are'} no longer stored._`)
   let speaker = ''
   let messages = 0
   let list: string[] = []

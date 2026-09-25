@@ -4,11 +4,11 @@ import { isConversationActivity } from '../shared/conversation-activity'
 import type { ConversationHistoryHit, ConversationHistoryPage, ConversationTranscript } from '../shared/conversation-history'
 import { conversationMarkdown } from '../shared/conversation-transcript'
 import { localModelLabel } from '../shared/local-models'
-import type { SessionProjection, TimelineItem } from '../shared/structured-agent'
+import type { AgentEvent, SessionProjection, TimelineItem } from '../shared/structured-agent'
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
 import type { StructuredAgentStore } from './structured-store'
 
-type HistoryStore = Pick<StructuredAgentStore, 'snapshot' | 'spec' | 'journalFloor' | 'journalRange'>
+type HistoryStore = Pick<StructuredAgentStore, 'snapshot' | 'spec' | 'journalFloor' | 'journalRange' | 'archive'>
 
 /** Journal rows read per step. Each step is one primary-key range scan, and the loop yields to the
  *  event loop between steps, so rebuilding a long history never blocks the main process for long. */
@@ -44,12 +44,60 @@ function historical(item: TimelineItem): TimelineItem {
 const assistantName = (provider: string | undefined, model: string | undefined): string =>
   provider === 'claude' ? 'Claude Code' : provider === 'grok' ? 'Grok' : provider === 'local' ? localModelLabel(model) : 'Codex'
 
+/** The durable transcript archive's live tail: reducer state for events not yet flushed to
+ *  storage, plus items the reducer's own item cap would otherwise have dropped before a flush
+ *  caught them - settled the same way {@link Region} settles a rebuild, just grown one event at a
+ *  time from `StructuredAgentStore.append` instead of rebuilt from a journal range. */
+export interface ArchiveTail { state: SessionProjection; settled: TimelineItem[]; settledIds: Set<string>; claude: boolean }
+export const emptyArchiveTail = (id: string): ArchiveTail => ({ state: emptyProjection(id), settled: [], settledIds: new Set(), claude: false })
+
+/** One more event into the archive tail, in memory. The store calls this on every append once a
+ *  conversation has grown past the journal's retention window, so the archive never depends on
+ *  the journal still holding an event by the time a checkpoint gets around to flushing it. */
+export function growArchiveTail(tail: ArchiveTail, event: AgentEvent): ArchiveTail {
+  const state = projectAgentEvent(tail.state, event)
+  const claude = tail.claude || event.provider === 'claude'
+  if (state.items.length <= SETTLE_AT) return { state, settled: tail.settled, settledIds: tail.settledIds, claude }
+  const settled = tail.settled.slice(), settledIds = new Set(tail.settledIds)
+  for (const item of state.items.slice(0, -KEEP_LIVE)) if (!settledIds.has(item.id)) { settled.push(item); settledIds.add(item.id) }
+  return { state: { ...state, items: state.items.slice(-KEEP_LIVE) }, settled, settledIds, claude }
+}
+
+/** Everything in the tail below `deleteBelow`, ready to persist as the events they came from
+ *  leave the journal for good, and the tail that is left once they are gone. Items already
+ *  settled but not yet below the cut, and live items still below the reducer's own item cap, both
+ *  carry forward into the remainder rather than being dropped: a flush only removes what it
+ *  actually persists. */
+export function settleArchiveTail(tail: ArchiveTail, deleteBelow: number): { items: TimelineItem[]; remainder: ArchiveTail } {
+  const flush: TimelineItem[] = []
+  const settled: TimelineItem[] = [], settledIds = new Set<string>()
+  for (const item of tail.settled) (item.sequence < deleteBelow ? flush : settled).push(item)
+  for (const item of settled) settledIds.add(item.id)
+  // A settled item that a later event touched again was re-created in the running state from that
+  // event alone; the settled copy above is the complete one, so its stale recreation here is
+  // never re-emitted (mirrors the same rule `ConversationHistory.build` applies to a journal
+  // rebuild).
+  const liveItems = tail.state.items.filter(item => {
+    if (tail.settledIds.has(item.id)) return false
+    if (item.sequence < deleteBelow) { flush.push(item); return false }
+    return true
+  })
+  const recovered = tail.claude ? recoverClaudeMessageDuplicates(flush) : flush
+  const items = recovered.map(historical).filter(isConversationActivity)
+  const remainder: ArchiveTail = { state: { ...tail.state, items: liveItems }, settled, settledIds, claude: tail.claude }
+  return { items, remainder }
+}
+
 /**
  * Conversation history beyond the renderer's reach. The main process keeps each conversation's
  * latest 2000 items resident and the renderer holds exactly that projection; older activity
- * survives only in the event journal (the last 20,000 events of each conversation). Paging,
- * find and the transcript read that part here, through primary-key range scans only: the
- * journal is multi-gigabyte, and no read may scan it by content.
+ * survives in the event journal only for the last 20,000 events of each conversation. Paging and
+ * find read that journal-only part here, through primary-key range scans only: the journal is
+ * multi-gigabyte, and no read may scan it by content. Once a conversation has grown past that
+ * window, its transcript also draws on the durable transcript archive (`StructuredAgentStore`'s
+ * `structured_transcript_archive*` tables): the compact, already-rendered items a checkpoint
+ * persisted before deleting their events, so Copy transcript still starts at the very first
+ * prompt no matter how long the conversation has grown.
  */
 export class ConversationHistory {
   private regions = new Map<string, Region>()
@@ -86,11 +134,17 @@ export class ConversationHistory {
     const resident = this.store.snapshot(id)
     if (!resident) throw new Error('This conversation is no longer stored.')
     const region = await this.region(id)
-    const items = [...(region?.items ?? []), ...resident.items.filter(isConversationActivity)]
+    const archive = this.store.archive(id)
+    const items = [...(archive?.items ?? []), ...(region?.items ?? []), ...resident.items.filter(isConversationActivity)]
     const spec = this.store.spec<{ provider?: string }>(id)
     const provider = resident.capabilities?.provider ?? spec?.provider
-    const olderUnavailable = resident.truncated && (!region || region.floor > 1)
-    const { markdown, messages } = conversationMarkdown(items, { title: resident.title, assistant: assistantName(provider, resident.settings.model), olderUnavailable })
+    // The archive's own coverage, when it exists, is the authoritative earliest sequence: it may
+    // reach back to the very first event even though the journal alone (`region.floor`) no longer
+    // does. Without an archive at all, the journal floor is all there is to go on.
+    const earliest = archive ? archive.from : (region ? region.floor : 1)
+    const missingEvents = Math.max(0, earliest - 1)
+    const olderUnavailable = resident.truncated && missingEvents > 0
+    const { markdown, messages } = conversationMarkdown(items, { title: resident.title, assistant: assistantName(provider, resident.settings.model), olderUnavailable: missingEvents })
     return { markdown, messages, olderUnavailable }
   }
 

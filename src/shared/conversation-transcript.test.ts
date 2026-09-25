@@ -30,8 +30,8 @@ describe('conversation transcript', () => {
   it('names dispatched prompts by their origin and keeps approvals, errors and attachments', () => {
     const prompt = item({ type: 'text', role: 'user', text: 'Review W3', mode: 'snapshot', origin: { agentSessionId: 'agent', label: 'Controller' }, attachments: [{ id: 'a', kind: 'file', name: 'notes.md' }] })
     const approval = item({ type: 'interaction', interaction: { id: 'r', kind: 'approval', title: 'Run `rm -rf out`', input: {}, choices: [], status: 'resolved', outcome: 'accept' } })
-    const { markdown } = conversationMarkdown([prompt, approval, item({ type: 'error', message: 'Usage limit reached' })], { title: '', assistant: 'Codex', olderUnavailable: true })
-    expect(markdown).toContain('_Earlier activity in this conversation is no longer stored._')
+    const { markdown } = conversationMarkdown([prompt, approval, item({ type: 'error', message: 'Usage limit reached' })], { title: '', assistant: 'Codex', olderUnavailable: 5000 })
+    expect(markdown).toContain('_… 5,000 earlier events are no longer stored._')
     expect(markdown).toContain('## Controller\n\nReview W3\n\n_Attached: notes.md_')
     expect(markdown).toContain('## Codex\n\n- Approval: Run `rm -rf out` → accept')
     expect(markdown).toContain('> **Error:** Usage limit reached')

@@ -6,7 +6,12 @@ import type { DatabaseSync } from 'node:sqlite'
 import type { AgentEvent, AgentEventData, ConversationHistoryEntry, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
 import type { WeeklyUsageConversation, WeeklyUsageEvent } from '../shared/weekly-model-usage'
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
+import { emptyArchiveTail, growArchiveTail, settleArchiveTail, type ArchiveTail } from './conversation-history'
 import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
+
+/** Events beyond this many for a conversation live only in the durable transcript archive, never
+ *  in the bounded journal `checkpoint` trims below it. */
+const JOURNAL_WINDOW = 20_000
 
 export function sanitizeDiagnostic(value: unknown): unknown {
   if (typeof value === 'string') return value
@@ -62,6 +67,7 @@ function usageEvent(row: Record<string, unknown>, data: AgentEventData): WeeklyU
 export class StructuredAgentStore {
   private artifactBytes = 0
   private projections = new Map<string, SessionProjection>()
+  private archiveTails = new Map<string, ArchiveTail>()
   readonly artifactDirectory: string
   constructor(private db: DatabaseSync, dataDirectory: string) {
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
@@ -87,6 +93,14 @@ export class StructuredAgentStore {
       CREATE TABLE IF NOT EXISTS structured_artifacts (
         id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
         kind TEXT NOT NULL, filename TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS structured_transcript_archive (
+        session_id TEXT NOT NULL REFERENCES structured_sessions(id) ON DELETE CASCADE,
+        sequence INTEGER NOT NULL, item_json TEXT NOT NULL, PRIMARY KEY(session_id, sequence)
+      );
+      CREATE TABLE IF NOT EXISTS structured_transcript_archive_state (
+        session_id TEXT PRIMARY KEY REFERENCES structured_sessions(id) ON DELETE CASCADE,
+        archived_through INTEGER NOT NULL, archived_from INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS live_suite_budget (
         suite_id TEXT NOT NULL, provider TEXT NOT NULL, submissions INTEGER NOT NULL DEFAULT 0,
@@ -206,19 +220,74 @@ export class StructuredAgentStore {
     const state = this.snapshot(event.sessionId)
     if (!state || event.sequence !== state.sequence + 1) throw new Error('Non-contiguous provider event sequence')
     const safe = sanitizeDiagnostic(event) as AgentEvent
+    const next = projectAgentEvent(state, safe)
+    // Read (and lazily cold-load) the archive tail before this event is inserted below, so a
+    // cold load's own journal read - which would otherwise see this same event already sitting in
+    // the journal - never replays it a second time when it is folded in explicitly just after.
+    const needsArchiveTail = next.sequence > JOURNAL_WINDOW || this.archiveTails.has(event.sessionId)
+    const tailBefore = needsArchiveTail ? this.archiveTail(event.sessionId) : null
     this.db.prepare('INSERT INTO structured_events(session_id,sequence,event_json) VALUES(?,?,?)').run(event.sessionId, event.sequence, JSON.stringify(safe))
     // Sequence is assigned monotonically, so the first row wins and remains the runtime's start
     // even after `checkpoint` compacts the events it was read from.
     if (safe.runtimeId && safe.timestamp) this.db.prepare('INSERT OR IGNORE INTO structured_runtimes(session_id,runtime_id,started_at,first_sequence) VALUES(?,?,?,?)').run(safe.sessionId, safe.runtimeId, safe.timestamp, safe.sequence)
-    this.projections.set(event.sessionId, projectAgentEvent(state, safe))
+    this.projections.set(event.sessionId, next)
+    // Past the journal window, every event also grows the durable archive's live tail in memory,
+    // exactly like the resident projection above, so a checkpoint never depends on the journal
+    // still holding an event by the time it gets around to flushing it.
+    if (tailBefore) this.archiveTails.set(event.sessionId, growArchiveTail(tailBefore, safe))
     return safe
+  }
+  /** The archive tail in memory, cold-loading it from the last flush plus whatever the journal
+   *  still holds since then (the invariant `checkpoint` maintains: the journal floor never falls
+   *  below `archived_through + 1`), the same way the constructor rebuilds `projections` on restart.
+   *  Reflects the journal exactly as it stands when called - a caller about to insert a new event
+   *  must call this first, so the cold-load path never reads that event before folding it in itself. */
+  private archiveTail(id: string): ArchiveTail {
+    const cached = this.archiveTails.get(id)
+    if (cached) return cached
+    const row = this.db.prepare('SELECT archived_through FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_through: number } | undefined
+    const tail = this.events(id, row?.archived_through ?? 0).reduce(growArchiveTail, emptyArchiveTail(id))
+    this.archiveTails.set(id, tail)
+    return tail
   }
   checkpoint(id: string): void {
     const state = this.snapshot(id)
     if (!state) return
     this.db.prepare('UPDATE structured_sessions SET projection_json=?, title=?, archived=? WHERE id=?').run(JSON.stringify(state), state.title, state.archived ? 1 : 0, id)
     // Snapshot anchors older history before compacting the bounded event journal.
-    if (state.sequence > 20_000) this.db.prepare('DELETE FROM structured_events WHERE session_id=? AND sequence<?').run(id, state.sequence - 20_000)
+    if (state.sequence > JOURNAL_WINDOW) this.trimJournal(id, state.sequence - JOURNAL_WINDOW)
+  }
+  /** Flushes the archive tail's settled items below `deleteBelow` into the durable archive and
+   *  deletes those same events from the journal in one transaction, so a crash between the two can
+   *  never lose an event without also losing its archived copy, or the reverse. */
+  private trimJournal(id: string, deleteBelow: number): void {
+    const existing = this.db.prepare('SELECT archived_through, archived_from FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_through: number; archived_from: number } | undefined
+    const alreadyCovered = existing !== undefined && existing.archived_through >= deleteBelow - 1
+    const settled = alreadyCovered ? null : settleArchiveTail(this.archiveTail(id), deleteBelow)
+    const archivedFrom = existing?.archived_from ?? this.journalFloor(id) ?? 1
+    this.db.exec('BEGIN')
+    try {
+      if (settled) {
+        const insert = this.db.prepare('INSERT OR REPLACE INTO structured_transcript_archive(session_id,sequence,item_json) VALUES(?,?,?)')
+        for (const item of settled.items) insert.run(id, item.sequence, JSON.stringify(item))
+        this.db.prepare(`INSERT INTO structured_transcript_archive_state(session_id,archived_through,archived_from) VALUES(?,?,?)
+          ON CONFLICT(session_id) DO UPDATE SET archived_through=excluded.archived_through`).run(id, deleteBelow - 1, archivedFrom)
+      }
+      this.db.prepare('DELETE FROM structured_events WHERE session_id=? AND sequence<?').run(id, deleteBelow)
+      this.db.exec('COMMIT')
+    } catch (reason) { this.db.exec('ROLLBACK'); throw reason }
+    if (settled) this.archiveTails.set(id, settled.remainder)
+  }
+  /** The durable transcript archive: timeline items already rendered out of events that have left
+   *  the journal, persisted once by `trimJournal` and never rewritten. `from` is the earliest
+   *  sequence the archive - and transitively the whole stored conversation - actually covers;
+   *  anything before it was already gone from the journal before this conversation's archive
+   *  started covering it. */
+  archive(id: string): { items: TimelineItem[]; from: number } | null {
+    const state = this.db.prepare('SELECT archived_from FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_from: number } | undefined
+    if (!state) return null
+    const rows = this.db.prepare('SELECT item_json FROM structured_transcript_archive WHERE session_id=? ORDER BY sequence').all(id) as Array<{ item_json: string }>
+    return { items: rows.map(row => JSON.parse(row.item_json) as TimelineItem), from: state.archived_from }
   }
   update(id: string, values: Partial<Pick<SessionProjection, 'title' | 'archived' | 'settings'>>): void {
     const state = this.snapshot(id)
