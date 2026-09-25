@@ -6,13 +6,14 @@ import { randomUUID } from 'node:crypto'
 import { realpathSync } from 'node:fs'
 import type { AgentActivityPhase, AgentSpec, LayoutNode, RuntimeEnsureResult } from '../shared/models'
 import { isFrontierModel, MAX_PROMPT_CHARS, PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
-import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
+import type { ActivityStatus, AdapterEvent, AgentEvent, ContextAttachment, InteractionResponse, Json, PendingSteering, PromptDispatchAuthority, PromptOrigin, QueuedPrompt, SessionPhase, SessionSettings, StructuredProvider } from '../shared/structured-agent'
 import type { AgentChangeHistory, RevertOutcome, RevertScope } from '../shared/agent-change-history'
 import type { ConductorDatabase } from './database'
 import { AgentArtifacts, workspacePath } from './agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter } from './providers/adapter'
 import { createProviderAdapter } from './providers/factory'
 import type { RuntimeDetachment } from './providers/adapter'
+import { settled } from './providers/adapter-state'
 import { validateLiveTurn } from './live-test-policy'
 import { activeUsageCap, parseUsageLimitReset, usageCapKey } from './usage-limit'
 import { carriesAccountLimits, describeAccountLimits, describeUsageCap, evaluateUsageCap, recordAccountLimits, summarizeContext, summarizeUsageRun, type AccountLimitRecord, type AccountLimitsReport, type UsageCapStatus } from '../shared/usage-accounting'
@@ -78,7 +79,7 @@ export interface DetachedRuntimeRecord {
   runtimeId: string
   provider: string
   adapter: RuntimeDetachment
-  live: { turnId?: string; activityPhase?: AgentActivityPhase; backgroundTasks?: number; currentTurn?: LiveSession['currentTurn'] }
+  live: { turnId?: string; activityPhase?: AgentActivityPhase; backgroundTasks?: number; currentTurn?: LiveSession['currentTurn']; steering?: Record<string, 'sending' | 'accepted'> }
   at: string
 }
 const active = new Set<SessionPhase>(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
@@ -1485,12 +1486,20 @@ export class StructuredSessions {
   async detachForRestart(): Promise<string[]> {
     const kept: string[] = []
     for (const [id, live] of [...this.live]) {
+      // A message being handed to the turn right now (a steer, a queued message, a submit)
+      // finishes in moments. Waiting for it keeps the turn running instead of stopping it with
+      // that message half handed over.
+      const handing = () => Boolean(live.submitting || live.starting || live.queueing || live.steering || live.dispatchingQueue || live.nativeAcceptance?.size)
+      if (handing()) await settled(() => !handing() || live.closed)
       const adapter = live.adapter
-      if (!adapter?.detach || live.closed || live.submitting || live.handoff || live.starting || live.queueing || live.steering || live.interrupting || live.dispatchingQueue || live.nativeAcceptance?.size || !this.wasCutOff(live)) continue
+      if (!adapter?.detach || live.closed || handing() || live.handoff || live.interrupting || !this.wasCutOff(live)) continue
       let detachment: RuntimeDetachment | null = null
       try { detachment = await adapter.detach() } catch (error) { console.warn(`Conversation ${id} could not keep its runtime running`, error) }
       if (!detachment || this.live.get(id) !== live) continue
-      const record: DetachedRuntimeRecord = { version: 1, runtimeId: live.runtimeId, provider: live.spec.provider, adapter: detachment, live: { turnId: live.turnId, activityPhase: live.activityPhase, backgroundTasks: live.backgroundTasks, currentTurn: live.currentTurn }, at: new Date().toISOString() }
+      // The kept provider process holds every steer it was sent, answered or not; the next app
+      // process restores them as still owned by it, never as input to resend.
+      const steering = Object.fromEntries((this.database.structured.snapshot(id)?.pendingSteering ?? []).filter(input => input.runtimeId === live.runtimeId && (input.status === 'sending' || input.status === 'accepted')).map(input => [input.id, input.status as 'sending' | 'accepted']))
+      const record: DetachedRuntimeRecord = { version: 1, runtimeId: live.runtimeId, provider: live.spec.provider, adapter: detachment, live: { turnId: live.turnId, activityPhase: live.activityPhase, backgroundTasks: live.backgroundTasks, currentTurn: live.currentTurn, steering }, at: new Date().toISOString() }
       this.writeDetached({ ...this.readDetached(), [id]: record })
       this.cancelContinuation(id)
       live.closed = true; live.budget?.dispose(); if (live.shutdownTimer) clearTimeout(live.shutdownTimer); if (live.capTimer) clearTimeout(live.capTimer)
@@ -1531,6 +1540,13 @@ export class StructuredSessions {
     live.runtimeId = record.runtimeId; live.closed = false; live.responses.clear()
     live.turnId = record.live.turnId; live.backgroundTasks = record.live.backgroundTasks; live.currentTurn = record.live.currentTurn
     if (record.live.activityPhase) this.recordActivityPhase(live, record.live.activityPhase)
+    // Loading the store marked this runtime's steers uncertain, as for any process that stopped.
+    // This one did not stop: the steers it was sent are still its own, and its receipts (buffered
+    // or still to come) settle each one exactly once.
+    const held = record.live.steering ?? {}
+    const prompts = this.database.structured.snapshot(id)?.pendingSteering ?? []
+    const restored = (input: PendingSteering) => input.runtimeId === record.runtimeId && input.status === 'uncertain' && held[input.id] !== undefined
+    if (prompts.some(restored)) this.setSteering(live, prompts.map(input => restored(input) ? { ...input, status: held[input.id]! } : input))
     live.adapter = this.factory(live.spec.provider as StructuredProvider, { ...this.options(live, live.runtimeId), attach: record.adapter })
     live.starting = live.adapter.start().catch(error => {
       this.emit(live, { data: { type: 'error', message: error instanceof Error ? error.message : 'The kept runtime could not be reattached' } })

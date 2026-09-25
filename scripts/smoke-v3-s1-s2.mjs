@@ -38,7 +38,9 @@ const observe = (label, data = {}) => {
 }
 
 // fake-claude: streams w001..w120 on the first turn; any prompt arriving while busy is queued and
-// answered (a short distinct ack) in arrival order once the current turn finishes.
+// answered (a short distinct ack) in arrival order once the current turn finishes. Like the
+// installed CLI, a steer (priority 'next') is acknowledged with command_lifecycle 'queued' and
+// runs as its own native turn after the preceding result ('started', then 'completed').
 await writeFile(join(fixtures, 'fake-claude.mjs'), `
 import readline from 'node:readline'
 import { randomUUID } from 'node:crypto'
@@ -58,14 +60,16 @@ const stream = async (text, ackId) => {
   const full = Array.isArray(text) ? text.join('') : text
   emit({ type: 'assistant', message: { id, content: [{ type: 'text', text: full }] } })
 }
-const turn = async first => {
+const turn = async (first, command) => {
   busy = true
+  if (command) emit({ type: 'command_lifecycle', command_uuid: command.uuid, state: 'started' })
   emit({ type: 'system', subtype: 'init', model: 'synthetic-claude' })
   if (first) await stream(words)
-  else await stream(['ack:' + first])
+  else await stream(['ack:' + command.tag])
   emit({ type: 'result', subtype: 'success', is_error: false, usage: {} })
+  if (command) emit({ type: 'command_lifecycle', command_uuid: command.uuid, state: 'completed' })
   busy = false
-  if (queued.length) { const next = queued.shift(); void turn(next) }
+  if (queued.length) { const next = queued.shift(); void turn(false, next) }
 }
 let turnCount = 0
 readline.createInterface({ input: process.stdin }).on('line', line => {
@@ -77,9 +81,11 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   if (message.type !== 'user') return
   const blocks = message.message.content
   const prompt = Array.isArray(blocks) ? blocks.filter(b => b.type === 'text').map(b => b.text).join('') : blocks
-  if (busy) { queued.push(prompt); return }
+  // Conductor appends its briefing to the prompt; the ack names only the test's own tag.
+  const command = { uuid: message.uuid, tag: /queued-[0-9]+/.exec(prompt)?.[0] ?? 'prompt' }
+  if (busy) { queued.push(command); if (message.priority === 'next') emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'queued' }); return }
   turnCount++
-  void turn(turnCount === 1 ? true : prompt)
+  void turn(turnCount === 1, command)
 })
 `)
 
@@ -216,6 +222,10 @@ try {
   observe('all 3 tabs completed with exact numbered sequence, sequences verified', perTab)
 
   if (queuedMode) {
+    // The steers run as their own native turns after the first one, so the tab passes through
+    // 'completed' before they are answered; wait until it has settled with nothing left waiting.
+    const settledStatus = async () => { const status = await call('agents.status', { agentSessionId: ids.claude1 }); const acks = (projection(ids.claude1).items ?? []).filter(item => item.data?.type === 'text' && item.data.role === 'assistant' && item.data.text?.startsWith('ack:queued-')).length; return status.phase === 'completed' && status.waitingPrompts === 0 && acks >= 5 }
+    await expect.poll(settledStatus, { timeout: 60_000, intervals: [500] }).toBe(true).catch(() => observe('Claude A did not settle with 5 acks and nothing waiting within 60 s'))
     const proj = projection(ids.claude1)
     const assistantTexts = (proj.items ?? []).filter(item => item.data?.type === 'text' && item.data.role === 'assistant').map(item => item.data.text)
     const acks = assistantTexts.filter(t => t.startsWith('ack:queued-'))
@@ -223,6 +233,12 @@ try {
     observe('queued prompts answered', { acks })
     assert.equal(acks.length, 5, `expected 5 queued acks, got ${acks.length}`)
     assert.deepEqual(acks, Array.from({ length: 5 }, (_, i) => `ack:queued-${i}`), 'queued prompts were not answered exactly once, in order')
+    const steered = (proj.items ?? []).filter(item => item.data?.type === 'text' && item.data.role === 'user' && /^queued-\d$/.test(item.data.text)).map(item => item.data.text)
+    summary.steeredUserMessages = steered
+    assert.deepEqual(steered, Array.from({ length: 5 }, (_, i) => `queued-${i}`), 'each steered prompt should appear once, in order')
+    const status = await call('agents.status', { agentSessionId: ids.claude1 })
+    summary.claude1Final = { phase: status.phase, waitingPrompts: status.waitingPrompts, pendingSteering: proj.pendingSteering ?? [], queuedPrompts: proj.queuedPrompts ?? [] }
+    assert.equal(status.waitingPrompts, 0, 'no steered prompt may be left waiting after the turn completes')
   }
 
   await page.screenshot({ path: join(output, `${scenario}-tabs-completed.png`) }).catch(() => {})

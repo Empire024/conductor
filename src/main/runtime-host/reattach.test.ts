@@ -50,6 +50,54 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
   emit({ type: 'result', subtype: 'success', is_error: false, usage: {} })
 })`
 
+/** A Claude CLI stand-in that steers the way the installed runtime does: input sent with
+ *  priority 'next' while a turn runs is acknowledged ('queued', here after a short delay so an
+ *  app restart can land before it) and answered in arrival order, each as its own native turn
+ *  ('started' after the preceding result, then 'completed'). */
+const STEERING_CLAUDE = `
+const readline = require('node:readline')
+const { randomUUID } = require('node:crypto')
+const send = message => process.stdout.write(JSON.stringify(message) + '\\n')
+const emit = message => send({ uuid: randomUUID(), session_id: 'steer-native-1', parent_tool_use_id: null, ...message })
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+const stream = async (words, delay) => {
+  const id = randomUUID()
+  emit({ type: 'stream_event', event: { type: 'message_start', message: { id } } })
+  emit({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } })
+  for (const word of words) { emit({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: word } } }); await wait(delay) }
+  emit({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
+  emit({ type: 'stream_event', event: { type: 'message_stop' } })
+  emit({ type: 'assistant', message: { id, content: [{ type: 'text', text: words.join('') }] } })
+}
+let busy = false
+const waiting = []
+const turn = async (words, command) => {
+  busy = true
+  if (command) emit({ type: 'command_lifecycle', command_uuid: command, state: 'started' })
+  emit({ type: 'system', subtype: 'init', model: 'synthetic-claude' })
+  await stream(words, 40)
+  emit({ type: 'result', subtype: 'success', is_error: false, usage: {} })
+  if (command) emit({ type: 'command_lifecycle', command_uuid: command, state: 'completed' })
+  busy = false
+  const next = waiting.shift()
+  if (next) void turn(['ack:' + next.text], next.uuid)
+}
+readline.createInterface({ input: process.stdin }).on('line', line => {
+  const message = JSON.parse(line)
+  if (message.type === 'control_request') {
+    const response = message.request.subtype === 'initialize' ? { models: [{ value: 'synthetic-claude', displayName: 'Synthetic' }] } : {}
+    return send({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id, response } })
+  }
+  if (message.type !== 'user') return
+  const text = /steer-\\d+/.exec(JSON.stringify(message.message.content))?.[0] ?? 'prompt'
+  if (busy) {
+    waiting.push({ uuid: message.uuid, text })
+    setTimeout(() => emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'queued' }), 300)
+    return
+  }
+  void turn(Array.from({ length: 30 }, (_, i) => 'w' + i + ' '))
+})`
+
 /** A Codex App Server stand-in: one turn streams twenty deltas, runs a command and completes. */
 const FAKE_CODEX = `
 const readline = require('node:readline')
@@ -178,6 +226,44 @@ describe('reattaching a turn across an app restart', () => {
     expect(sequences).toEqual(sequences.map((_, index) => sequences[0]! + index))
     expect(state.items.some(item => item.data.type === 'notice' && /kept running/.test((item.data as { message: string }).message))).toBe(true)
     expect(second.sessions.detachedRuntimes()).toEqual([])
+  })
+
+  it('hands steers sent just before a restart over exactly once and completes the turn (V3 S2)', async () => {
+    writeFileSync(fake, STEERING_CLAUDE)
+    const workspace = join(root, 'workspace-steer'); mkdirSync(workspace)
+    const databasePath = join(root, 'steer.db')
+    const first = await app(databasePath)
+    const project = first.database.upsertProject(workspace, 'Steer project')
+    const spec: AgentSpec = { id: 'steer-agent', projectId: project.id, sessionId: first.database.listSessions(project.id)[0]!.id, provider: 'claude', title: 'Steered', cwd: workspace }
+    first.sessions.ensure(spec)
+    await first.sessions.submit(spec.id, 'Start the long turn', settings)
+    await until(() => assistantText(first.database, spec.id).some(text => text.includes('w3 ')), 'the turn to be under way')
+    for (let index = 0; index < 4; index++) await first.sessions.steer(spec.id, `steer-${index}`, settings)
+    // Some receipts arrive before the restart, the rest while no app is listening, and the last
+    // steer is still being handed over when the restart begins.
+    await until(() => (first.database.structured.snapshot(spec.id)!.pendingSteering ?? []).some(input => input.status === 'accepted'), 'the first native receipt')
+    const lastSteer = first.sessions.steer(spec.id, 'steer-4', settings)
+    expect(await first.sessions.detachForRestart()).toEqual([spec.id])
+    await lastSteer
+    expect(first.database.structured.snapshot(spec.id)!.pendingSteering).toHaveLength(5)
+    first.sessions.dispose(); first.client.dispose(); first.database.close()
+    await new Promise(resolve => setTimeout(resolve, 400))
+
+    const second = await app(databasePath)
+    // The kept process still holds every steer: none may come back as a message to resend.
+    expect(second.database.structured.snapshot(spec.id)!.pendingSteering?.map(input => input.status)).toEqual(Array(5).fill('uncertain'))
+    await second.sessions.reattach(spec.id)
+    expect((second.database.structured.snapshot(spec.id)!.pendingSteering ?? []).filter(input => !['sending', 'accepted'].includes(input.status))).toEqual([])
+    await until(() => {
+      const state = second.database.structured.snapshot(spec.id)!
+      return state.phase === 'completed' && !(state.pendingSteering?.length) && assistantText(second.database, spec.id).includes('ack:steer-4')
+    }, 'every steer to be answered and the turn to complete', 20_000)
+    second.sessions.flush()
+    const state = second.database.structured.snapshot(spec.id)!
+    expect(assistantText(second.database, spec.id).filter(text => text.startsWith('ack:'))).toEqual([0, 1, 2, 3, 4].map(index => `ack:steer-${index}`))
+    const userTexts = state.items.filter(item => item.data.type === 'text' && item.data.role === 'user').map(item => (item.data as { text: string }).text)
+    expect(userTexts.filter(text => text.startsWith('steer-'))).toEqual([0, 1, 2, 3, 4].map(index => `steer-${index}`))
+    expect(state.queuedPrompts ?? []).toEqual([])
   })
 
   it('continues a Codex turn the same way', async () => {
