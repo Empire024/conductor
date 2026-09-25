@@ -1,5 +1,6 @@
 import type { UsageCapScope, UsageCapSetting, UsageCapSnapshot } from './usage-accounting'
 import type { WeeklyModelUsageReport } from './weekly-model-usage'
+import type { AlwaysOnState, LoginItemState } from './always-on'
 import type {
   AppSettings,
   AgentActivityPhase,
@@ -108,6 +109,9 @@ export interface ConductorBridge {
     /** Minutes a finished coworker stays open, and a settled CLI stays alive, before Conductor closes or releases it; 0 is Off. */
     coworkerAutoClose(): Promise<number>
     setCoworkerAutoClose(minutes: number): Promise<number>
+    /** "Start Conductor when I log in" and whether this machine comes back unattended (docs/always-on.md). */
+    alwaysOn(refresh?: boolean): Promise<AlwaysOnState>
+    setStartAtLogin(enabled: boolean): Promise<LoginItemState>
   }
   updates: {
     openLocalFolder(): Promise<void>

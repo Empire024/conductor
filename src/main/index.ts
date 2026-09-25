@@ -91,6 +91,8 @@ import { normalizeNewFileExtension, normalizeThemeSettings } from './app-setting
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
 import { isRemoteProject, localProject, requireLocalProject } from './project-scope'
 import { electronTray, installHostLifecycle, type HostLifecycleController } from './host-lifecycle'
+import { LoginItem } from './login-item'
+import { localReadiness } from './machine-readiness'
 import { ensureTrayIconFile } from './tray-icon'
 import { PhoneAccessService } from './phone-access'
 import { PhoneProjectTasks } from './phone-project-tasks'
@@ -223,6 +225,10 @@ let isQuitting = false
 let runtimeHostClient: RuntimeHostClient | null = null
 /** Keeps a hosting machine alive with no window, and asks before a quit would cut its peers off. */
 let hostLifecycle: HostLifecycleController | null = null
+/** "Start Conductor when I log in" and this machine's always-on readiness (docs/always-on.md). */
+let loginItem: LoginItem | null = null
+let localMachineReadiness: ReturnType<typeof localReadiness> | null = null
+let loginStartHandled = false
 let servicesDisposed = false
 const closeConfirmation = new CloseConfirmation()
 /** The open "Work is still running" dialog, answerable by a wizard through app.quit.confirm. */
@@ -394,6 +400,8 @@ const createWindow = (
   })
 
   window.once('ready-to-show', () => {
+    // Opened by the login item: the first window starts minimized and takes no focus.
+    if (!detachedId && loginItem?.startedAtLogin && !loginStartHandled && !backgroundWindows) { loginStartHandled = true; window.minimize(); return }
     if (visibleSavedPlacement?.maximized && !backgroundWindows) window.maximize()
     revealWindow(window, false)
   })
@@ -1631,6 +1639,15 @@ const registerIpc = (): void => {
     void updates.check()
     return getAppSettings()
   })
+  ipcMain.handle('always-on:state', async (event, refresh: unknown) => {
+    trustedStructured(event)
+    return { loginItem: loginItem!.state(), readiness: await localMachineReadiness?.({ refresh: refresh === true }) ?? null }
+  })
+  ipcMain.handle('always-on:set-start-at-login', (event, enabled: unknown) => {
+    trustedStructured(event)
+    if (typeof enabled !== 'boolean') throw new Error('Invalid start-at-login setting')
+    return loginItem!.set(enabled)
+  })
   ipcMain.handle('updates:open-local-folder', async (event) => {
     trustedStructured(event)
     const path = join(app.getPath('userData'), 'local-updates')
@@ -2310,6 +2327,12 @@ app.whenReady().then(async () => {
   app.setAppUserModelId('io.conductor.desktop')
   const databasePath = join(app.getPath('userData'), 'conductor.db')
   database = new ConductorDatabase(databasePath)
+  // A development or test build never writes the OS login items (src/main/login-item.ts).
+  loginItem = new LoginItem({ app, platform: process.platform, execPath: process.execPath, argv: process.argv, system: app.isPackaged && !process.env.CONDUCTOR_TEST_USER_DATA, store: database })
+  localMachineReadiness = localReadiness({
+    conductorAtLogin: () => loginItem?.enabled() ?? null,
+    failsafe: () => phoneAccess ? { phoneEnabled: phoneAccess.getSettings().enabled, lockConfigured: phoneAccess.lock.configured() } : null
+  })
   weeklyUsage = new WeeklyUsageSummaryService(database)
   database.reconcileInterruptedRuntimes()
   // v1 could mistake Codex's "usage limit resets available" credit notice for
@@ -2514,6 +2537,7 @@ app.whenReady().then(async () => {
     })
   })
   control.setDurableJobs(durableJobs)
+  if (localMachineReadiness) control.setLocalReadiness(localMachineReadiness)
   try {
     const remoteJobStore = new RemoteJobStore(join(app.getPath('userData'), 'remote-jobs'))
     remoteJobs = new RemoteJobService({ store: remoteJobStore, transport: sshTransport({ knownHostsFile: remoteJobStore.knownHostsFile }) })

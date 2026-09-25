@@ -207,7 +207,9 @@ const bridge: ConductorBridge = {
     setUpdateFeedUrl: (url) => ipcRenderer.invoke('settings:set-update-feed-url', url),
     setLocalUpdates: (enabled) => ipcRenderer.invoke('settings:set-local-updates', enabled),
     coworkerAutoClose: () => ipcRenderer.invoke('settings:coworker-autoclose'),
-    setCoworkerAutoClose: (minutes) => ipcRenderer.invoke('settings:set-coworker-autoclose', minutes)
+    setCoworkerAutoClose: (minutes) => ipcRenderer.invoke('settings:set-coworker-autoclose', minutes),
+    alwaysOn: (refresh) => ipcRenderer.invoke('always-on:state', refresh === true),
+    setStartAtLogin: (enabled) => ipcRenderer.invoke('always-on:set-start-at-login', enabled)
   },
   updates: {
     openLocalFolder: () => ipcRenderer.invoke('updates:open-local-folder'),

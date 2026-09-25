@@ -6,6 +6,7 @@ import { playAgentSound } from '../agent-sounds'
 import { UsageCapDefaultSetting } from './UsageCapDefaultSetting'
 import { CoworkerAutoCloseSetting } from './CoworkerAutoCloseSetting'
 import { RemoteControlSettings } from './RemoteControlSettings'
+import { AlwaysOnSettings } from './AlwaysOnSettings'
 import { PhoneAccessSettings } from './PhoneAccessSettings'
 import { matchingSettingsSections, resolveSettingsSection, SETTINGS_SECTIONS, type SettingsSectionId } from './settings-navigation'
 import './SettingsPanel.css'
@@ -231,6 +232,7 @@ export function SettingsPanel({
               <CoworkerAutoCloseSetting />
             </>}
             {activeSection === 'machines' && <>
+              <AlwaysOnSettings />
               <RemoteControlSettings />
             </>}
             {activeSection === 'phone' && <>

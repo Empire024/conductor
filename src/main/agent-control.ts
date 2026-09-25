@@ -45,6 +45,7 @@ import { LogicLoops, type LoopRecordInput } from './logic-loops'
 import { ideaMethods, ideaSignatures, type IdeasControlCaller } from './ideas/control'
 import { callNodeMethod, nodeMethods, nodeSignatures, withNodes } from './remote-jobs/control'
 import type { RemoteJobService } from './remote-jobs/service'
+import type { LocalMachineReadiness } from '../shared/always-on'
 import { ControlActivityRecorder } from './control-activity'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 
@@ -119,7 +120,7 @@ const toolSignatures = {
   'tools.list': '() — discover these methods and arguments',
   'app.state': '() — current project, workspace, tabs, relationships, the machine each tab runs on, and the other projects open in this Conductor',
   'projects.list': '() — every project open in this Conductor with its workspaces; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks, and on tabs.focus/rename/split/detach/close for an agent tab this caller controls there',
-  'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run',
+  'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run; the local machine carries readiness (whether it comes back unattended after a reboot, with the missing steps in words)',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
   'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?}) — visible tab; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again focuses the open one',
@@ -271,6 +272,8 @@ export interface AgentControlDependencies {
   durableJobs?: DurableJobsService
   /** Execution nodes and remote jobs (src/main/remote-jobs); plugged in with AgentControl.setRemoteJobs. */
   remoteJobs?: RemoteJobService
+  /** This machine's always-on readiness (src/main/machine-readiness.ts); plugged in with AgentControl.setLocalReadiness. */
+  localReadiness?: () => Promise<LocalMachineReadiness>
   /** Scheduled tasks (src/main/schedule-control.ts); plugged in with AgentControl.setSchedules. */
   schedules?: ScheduleControlService
   /** Ideas (src/main/ideas/register.ts); plugged in with AgentControl.setIdeas. */
@@ -923,9 +926,11 @@ export class AgentControl {
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)
     if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null, restartRequest: this.deps.host?.restartRequest?.() ?? null, pendingQuitConfirmation: this.deps.host?.stopConfirmation?.pending() ?? null } : {}) }
     if (method === 'machines.list') {
+      // Whether this computer comes back by itself after a reboot (feature always-on-machines).
+      const readiness = await this.deps.localReadiness?.().catch(() => null) ?? null
       return withNodes(this.machines().map(machine => {
         const placement = machineRunsProject(machine, scope.projectId)
-        return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: !placement.ok ? placement.message : machine.kind === 'local' ? 'Runs every project open in this Conductor; projects.list names them.' : null }
+        return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: !placement.ok ? placement.message : machine.kind === 'local' ? 'Runs every project open in this Conductor; projects.list names them.' : null, ...(machine.kind === 'local' && readiness ? { readiness } : {}) }
       }), this.deps.remoteJobs?.listNodes() ?? [])
     }
     if (method === 'models.list') return this.catalog(scope)
@@ -1284,6 +1289,8 @@ export class AgentControl {
   setDurableJobs(service: DurableJobsService | undefined): void { this.deps.durableJobs = service }
 
   setRemoteJobs(service: RemoteJobService | undefined): void { this.deps.remoteJobs = service }
+
+  setLocalReadiness(read: (() => Promise<LocalMachineReadiness>) | undefined): void { this.deps.localReadiness = read }
 
   /** nodes.*: who may start and stop jobs follows jobs.create; the rest lives in remote-jobs/control.ts. */
   private nodes(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
