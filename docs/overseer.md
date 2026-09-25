@@ -74,10 +74,11 @@ Goals live in `scripts/overseer/goals/`. Example (`local-qwen-faktury.json`):
     "maxLoopWarnings": 2,
     "oracle": "scripts/overseer/oracles/faktury.mjs"
   },
-  "fixer": { "provider": "claude", "model": "opus", "project": "C:/Claude/conductor", "focus": ["src/main/local-models/"], "notes": "..." }
+  "fixer": { "provider": "claude", "model": "opus", "project": "${checkout}", "focus": ["src/main/local-models/"], "notes": "..." }
 }
 ```
 
+- `project.path` and `fixer.project` are absolute paths. `${checkout}` (alone or as a prefix, `${checkout}/scripts`) stands for the checkout the overseer runs from, so a goal about the app itself names no machine. A Windows drive or UNC path is valid everywhere but runs only on Windows: on macOS or Linux `run`/`test` refuse it up front with the reason, and `scripts/overseer.test.mjs` skips it with the same words.
 - `project.inputs` are the only files copied into the dev project folder (`<projects root>/<project.name>`, recreated each iteration). The installed target uses `project.path` itself and changes nothing in it.
 - `worker`: a `local` worker needs `permission: "accept-edits"`.
 - `success` (every listed check must hold):

@@ -1,9 +1,19 @@
 import { copyFile, mkdir, readFile, rm } from 'node:fs/promises'
-import { basename, isAbsolute, join, resolve } from 'node:path'
+import { basename, isAbsolute, join, posix, resolve, win32 } from 'node:path'
 import { CHECKOUT, isInside } from './util.mjs'
 
 const isString = value => typeof value === 'string' && value.trim().length > 0
 const stringArray = value => Array.isArray(value) && value.every(item => typeof item === 'string')
+
+/** Stands for the checkout the overseer runs from, so a goal about the app itself carries no machine's folder. */
+export const CHECKOUT_PLACEHOLDER = '${checkout}'
+const CHECKOUT_PREFIX = /^\$\{checkout\}(?=$|[\\/])/
+/** Absolute on some platform: the placeholder, a POSIX root, a Windows drive or UNC root. */
+const isAbsoluteAnywhere = value => CHECKOUT_PREFIX.test(value) || posix.isAbsolute(value) || win32.isAbsolute(value)
+/** A Windows drive or UNC path, which only that platform can open; a POSIX-rooted path is rooted on both. */
+const windowsOnly = value => win32.isAbsolute(value) && !posix.isAbsolute(value)
+/** `${checkout}` and `${checkout}/x` become this checkout's folder; any other path is returned as written. */
+export const expandCheckout = value => typeof value === 'string' && CHECKOUT_PREFIX.test(value) ? resolve(CHECKOUT, value.slice(CHECKOUT_PLACEHOLDER.length).replace(/^[\\/]+/, '')) : value
 
 /** Every problem in a goal spec, as human-readable strings. Empty means valid. */
 export function validateGoal(goal) {
@@ -16,7 +26,7 @@ export function validateGoal(goal) {
   if (!project || typeof project !== 'object') errors.push('project is required')
   else {
     if (!isString(project.name) || /[\\/:*?"<>|]/.test(project.name)) errors.push('project.name must be a plain folder name')
-    if (!isString(project.path) || !isAbsolute(project.path)) errors.push('project.path must be an absolute path')
+    if (!isString(project.path) || !isAbsoluteAnywhere(project.path)) errors.push('project.path must be an absolute path or start with ${checkout}')
     if (project.inputs !== undefined && !stringArray(project.inputs)) errors.push('project.inputs must be an array of file names')
     else for (const input of project.inputs ?? []) if (isAbsolute(input) || input.split(/[\\/]/).includes('..')) errors.push(`project.inputs entry ${JSON.stringify(input)} must be relative to project.path`)
   }
@@ -42,7 +52,7 @@ export function validateGoal(goal) {
     if (!fixer || typeof fixer !== 'object') errors.push('fixer must be an object')
     else {
       if (fixer.provider !== undefined && fixer.provider !== 'claude') errors.push('fixer.provider must be "claude"')
-      if (fixer.project !== undefined && (!isString(fixer.project) || !isAbsolute(fixer.project))) errors.push('fixer.project must be an absolute path')
+      if (fixer.project !== undefined && (!isString(fixer.project) || !isAbsoluteAnywhere(fixer.project))) errors.push('fixer.project must be an absolute path or start with ${checkout}')
       if (fixer.focus !== undefined && !stringArray(fixer.focus)) errors.push('fixer.focus must be an array of strings')
       if (fixer.timeoutMinutes !== undefined && !(typeof fixer.timeoutMinutes === 'number' && fixer.timeoutMinutes > 0)) errors.push('fixer.timeoutMinutes must be a positive number')
     }
@@ -52,14 +62,27 @@ export function validateGoal(goal) {
 
 /** Defaults applied after validation, so the rest of the overseer never re-checks presence. */
 export function normalizeGoal(goal, source) {
+  const fixer = { provider: 'claude', model: 'opus', project: CHECKOUT, focus: [], notes: '', timeoutMinutes: 60, ...goal.fixer }
   return {
     ...goal,
     source,
     timeoutMinutes: goal.timeoutMinutes ?? 25,
-    project: { ...goal.project, inputs: goal.project.inputs ?? [] },
+    project: { ...goal.project, path: expandCheckout(goal.project.path), inputs: goal.project.inputs ?? [] },
     success: { phases: ['completed'], ...goal.success },
-    fixer: { provider: 'claude', model: 'opus', project: CHECKOUT, focus: [], notes: '', timeoutMinutes: 60, ...goal.fixer }
+    fixer: { ...fixer, project: expandCheckout(fixer.project) }
   }
+}
+
+/**
+ * Why a (normalized) goal cannot run on this platform, or null when it can. A goal that names the
+ * owner's Windows folder is valid everywhere but only runnable there; the overseer says so up
+ * front instead of failing on the first input copy, and the tests skip it with the same words.
+ */
+export function goalPortability(goal, { platform = process.platform } = {}) {
+  if (platform === 'win32') return null
+  const foreign = [['project.path', goal.project?.path], ['fixer.project', goal.fixer?.project]].filter(([, value]) => typeof value === 'string' && windowsOnly(value))
+  if (!foreign.length) return null
+  return `${foreign.map(([key, value]) => `${key} ${value}`).join(' and ')} ${foreign.length === 1 ? 'is a Windows path' : 'are Windows paths'}; this is ${platform}. Use ${CHECKOUT_PLACEHOLDER} for the checkout, or run the goal on the machine that holds the folder.`
 }
 
 export async function loadGoal(path) {

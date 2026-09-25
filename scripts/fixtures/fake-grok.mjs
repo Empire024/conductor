@@ -10,6 +10,7 @@
 // FAKE_GROK_UNAUTHENTICATED=1 makes session/new fail the way a signed-out CLI does.
 import { randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
+import { join } from 'node:path'
 
 const efforts = (values, preferred = 'high') => values.map(value => ({ id: value, value, label: value, default: value === preferred }))
 const catalog = (current = 'grok-4.7') => ({
@@ -42,10 +43,15 @@ async function prompt(session, text) {
     await new Promise(resolve => { session.cancel = resolve })
     return 'cancelled'
   }
+  // The live CLI names the file with the platform's own separator (`C:\\work\\notes.txt` in the
+  // Windows captures, `/work/notes.txt` on macOS). A hard-coded backslash on POSIX is not a
+  // separator at all: `<cwd>\notes.txt` is then a sibling of the workspace, so Edit mode holds
+  // a card for it and the "in-workspace edit" scenario never completes.
+  const notes = join(session.cwd, 'notes.txt')
   const tool = text.includes('synthetic:edit') ? {
-    toolCallId: `call-${randomUUID()}-0`, name: 'search_replace', label: 'Edit', kind: 'edit', title: `Edit \`${session.cwd}\\notes.txt\``,
-    rawInput: { variant: 'SearchReplace', file_path: `${session.cwd}\\notes.txt`, old_string: 'one', new_string: 'one\ntwo' },
-    content: [{ type: 'diff', path: `${session.cwd}\\notes.txt`, oldText: 'one', newText: 'one\ntwo' }], locations: [{ path: `${session.cwd}\\notes.txt` }]
+    toolCallId: `call-${randomUUID()}-0`, name: 'search_replace', label: 'Edit', kind: 'edit', title: `Edit \`${notes}\``,
+    rawInput: { variant: 'SearchReplace', file_path: notes, old_string: 'one', new_string: 'one\ntwo' },
+    content: [{ type: 'diff', path: notes, oldText: 'one', newText: 'one\ntwo' }], locations: [{ path: notes }]
   } : /synthetic:command (.+)/.test(text) ? (() => {
     const command = /synthetic:command (.+)/.exec(text)[1].trim()
     return { toolCallId: `call-${randomUUID()}-0`, name: 'run_terminal_command', label: 'Run Command', kind: 'execute', title: `Execute \`${command}\``, rawInput: { variant: 'Bash', command }, content: [], locations: [] }
