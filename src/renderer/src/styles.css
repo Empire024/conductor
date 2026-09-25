@@ -1982,3 +1982,11 @@ body.autoscrolling * { cursor: all-scroll !important; }
 .scp-ship-reason { min-width: 0; color: var(--text-3); font-size: 9px; line-height: 1.35; }
 .scp-publish { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text-2); white-space: nowrap; cursor: pointer; }
 .scp-publish input { margin: 0; }
+
+/* Work a click started in main is still running (src/preload/busy-work.ts): the progress cursor over
+   the whole app, and the control that was used dims and pulses until it is done. Shown only after
+   100 ms, so fast actions never flicker. */
+html.ipc-busy, html.ipc-busy * { cursor: progress !important; }
+[data-ipc-busy] { cursor: progress !important; animation: ipc-busy-pulse 0.9s ease-in-out infinite alternate; }
+@keyframes ipc-busy-pulse { from { opacity: 1; } to { opacity: 0.55; } }
+@media (prefers-reduced-motion: reduce) { [data-ipc-busy] { animation: none; opacity: 0.65; } }

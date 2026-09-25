@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
+import { installBusyWork } from './busy-work'
 import type { ConductorBridge } from '../shared/ipc'
 import type {
   AgentSpec,
@@ -383,5 +384,6 @@ const bridge: ConductorBridge = {
   platform: process.platform
 }
 
-contextBridge.exposeInMainWorld('conductor', bridge)
+// Every call a click starts shows the progress cursor and a busy control while it runs (busy-work.ts).
+contextBridge.exposeInMainWorld('conductor', installBusyWork(bridge))
 ipcRenderer.on('window:close-tab', () => window.dispatchEvent(new Event('conductor:close-tab')))
