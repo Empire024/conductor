@@ -282,6 +282,23 @@ describe('remote jobs', () => {
     expect(fake.calls.at(-1)!.command).toContain(`.conductor-node/jobs/${job.id}`)
   })
 
+  it('a job another live process runs is neither recovered nor cancelled from here, and its progress is seen', async () => {
+    let started!: () => void
+    const running = new Promise<void>(resolve => { started = resolve })
+    behave((_spec, run) => { run.mark('started pid=5'); run.stdout('step 1\n'); started() })
+    const job = await service.submit({ command: 'long', nodeId: 'mac-mini' })
+    await running
+    // The record now names another runner, as if a script had submitted it.
+    store.saveJob({ ...store.getJob(job.id)!, runnerPid: 999_999 })
+    const other = new RemoteJobService({ store: new RemoteJobStore(root), transport: fake.factory(), isAlive: pid => pid === 999_999 })
+    expect(await other.recover()).toEqual([])
+    await expect(other.cancel(job.id)).rejects.toThrow(/run by another process/)
+    expect(other.getJob(job.id)).toMatchObject({ status: 'running' })
+    // A node registered by the other process is visible here without a restart.
+    other.registerNode({ id: 'spare', ssh: { host: 'spare', user: 'u', identityFile: 'k' } })
+    expect(service.listNodes().map(node => node.id)).toContain('spare')
+  })
+
   it('validates what a job asks for', async () => {
     await expect(service.submit({ command: ' ', nodeId: 'mac-mini' })).rejects.toThrow(/command/)
     await expect(service.submit({ command: 'x', nodeId: 'mac-mini', timeoutSec: 0 })).rejects.toThrow(/timeoutSec/)

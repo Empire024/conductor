@@ -73,6 +73,9 @@ import { OrchestrationStore } from './orchestration-store'
 import { registerOrchestrationIpc } from './orchestration-ipc'
 import { ScheduleStore } from './schedule-store'
 import { createDurableJobsService, DurableJobStore, structuredStageRuntime, type DurableJobsServiceImpl } from './durable-jobs'
+import { RemoteJobService } from './remote-jobs/service'
+import { RemoteJobStore } from './remote-jobs/store'
+import { sshTransport } from './remote-jobs/transport'
 import { durableJobPorts, gatedRuntime } from './durable-jobs/wiring'
 import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/server-lifecycle'
 import { registerDurableJobsIpc } from './durable-jobs-ipc'
@@ -137,6 +140,8 @@ let scheduleRunner: ScheduleRunner
 let scheduledTasks: ReturnType<typeof createScheduledTasks>
 /** Durable overnight local-model jobs (src/main/durable-jobs); null until the app is ready. */
 let durableJobs: DurableJobsServiceImpl | null = null
+/** Bounded commands on the owner's other computers (docs/mac-node.md). */
+let remoteJobs: RemoteJobService | null = null
 let disposeDurableJobsIpc: (() => void) | undefined
 let disposeDurableJobsGate: (() => void) | undefined
 let disposeScheduleIpc: (() => void) | undefined
@@ -2508,6 +2513,14 @@ app.whenReady().then(async () => {
     })
   })
   control.setDurableJobs(durableJobs)
+  try {
+    const remoteJobStore = new RemoteJobStore(join(app.getPath('userData'), 'remote-jobs'))
+    remoteJobs = new RemoteJobService({ store: remoteJobStore, transport: sshTransport({ knownHostsFile: remoteJobStore.knownHostsFile }) })
+    void remoteJobs.recover().catch(error => console.warn('Remote jobs left by the last run could not be recovered', error))
+    control.setRemoteJobs(remoteJobs)
+  } catch (error) {
+    console.warn('Execution nodes are unavailable', error)
+  }
   // Finished coworkers close themselves, and a settled CLI is released after the owner's idle
   // timeout (src/main/coworker-autoclose.ts). A test launch may shorten the timeout to seconds.
   const autoCloseOverride = !app.isPackaged && process.env.CONDUCTOR_TEST_USER_DATA ? Number(process.env.CONDUCTOR_TEST_COWORKER_AUTOCLOSE_MS) || undefined : undefined
@@ -2674,6 +2687,8 @@ app.on('before-quit', (event) => {
 
 app.on('will-quit', () => {
   hostLifecycle?.dispose()
+  // Closing each job's held stdin is what tells its node to stop it.
+  void remoteJobs?.shutdown(0)
   void remoteControl?.dispose().catch(error => console.warn('Remote control did not shut down cleanly', error))
   disposePhoneIpc?.()
   disposePhoneBroadcast?.()

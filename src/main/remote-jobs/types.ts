@@ -126,6 +126,8 @@ export interface RemoteJob {
   projectId: string | null
   createdBy: string | null
   cancelReason: string | null
+  /** The process that runs it (the app or a script); only that process follows or ends it. */
+  runnerPid: number | null
 }
 
 export interface SubmitRemoteJob {

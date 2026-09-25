@@ -16,6 +16,7 @@ export const MUTATION_FAMILIES = {
     'schedules.create', 'schedules.update', 'schedules.pause', 'schedules.resume', 'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',
     'loops.run', 'loops.record', 'loops.propose', 'loops.apply', 'loops.reject'
   ],
+  nodes: ['nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove'],
   other: [
     'orchestration.tasks.create', 'orchestration.tasks.update', 'orchestration.routines.save',
     'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work'
@@ -36,7 +37,8 @@ export const CONTROL_METHOD_CLASSES = new Set<`${ControlMethodClass}:${string}`>
     'files.list', 'files.read', 'tasks.list', 'memory.recall', 'orchestration.snapshot',
     'app.update.status', 'git.status', 'git.ship.status', 'local.servers', 'usage.limits',
     'jobs.list', 'jobs.status', 'jobs.events', 'schedules.list', 'schedules.get',
-    'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get'
+    'loops.list', 'loops.get', 'loops.history', 'loops.proposals', 'ideas.list', 'ideas.get',
+    'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log'
   ].map(method => `read:${method}` as const),
   ...[...FAMILY_OF.keys()].map(method => `mutation:${method}` as const)
 ])

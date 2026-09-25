@@ -150,7 +150,8 @@ describe('control method classes', () => {
       'router.start', 'router.dispatch', 'jobs.create', 'jobs.list', 'jobs.status', 'jobs.events', 'jobs.pause', 'jobs.resume', 'jobs.cancel', 'jobs.report',
       'schedules.list', 'schedules.get', 'schedules.create', 'schedules.update', 'schedules.pause', 'schedules.resume', 'schedules.runNow', 'schedules.delete', 'schedules.scripts.save', 'schedules.scripts.delete',
       'projects.open', 'app.update.check', 'app.update.download', 'app.update.install', 'app.restart', 'app.restart.request', 'app.quit.confirm',
-      'ideas.list', 'ideas.get', 'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work'
+      'ideas.list', 'ideas.get', 'ideas.capture', 'ideas.link', 'ideas.note', 'ideas.explore', 'ideas.work',
+      'nodes.list', 'nodes.jobs', 'nodes.job', 'nodes.log', 'nodes.probe', 'nodes.run', 'nodes.cancel', 'nodes.register', 'nodes.remove'
     ]
     const f = await fixture(async method => method === 'tools.list'
       ? Object.fromEntries(advertised.map(name => [name, 'signature']))

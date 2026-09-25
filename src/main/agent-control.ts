@@ -43,6 +43,8 @@ import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, type CreateDurableJo
 import { scheduleCall, scheduleMethods, scheduleSignatures, type ScheduleControlService } from './schedule-control'
 import { LogicLoops, type LoopRecordInput } from './logic-loops'
 import { ideaMethods, ideaSignatures, type IdeasControlCaller } from './ideas/control'
+import { callNodeMethod, nodeMethods, nodeSignatures, withNodes } from './remote-jobs/control'
+import type { RemoteJobService } from './remote-jobs/service'
 import { ControlActivityRecorder } from './control-activity'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 
@@ -117,7 +119,7 @@ const toolSignatures = {
   'tools.list': '() — discover these methods and arguments',
   'app.state': '() — current project, workspace, tabs, relationships, the machine each tab runs on, and the other projects open in this Conductor',
   'projects.list': '() — every project open in this Conductor with its workspaces; a sibling project accepts projectId on tabs.list/tabs.open, files.list/read/open, tasks.list and router.dispatch tasks, and on tabs.focus/rename/split/detach/close for an agent tab this caller controls there',
-  'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts',
+  'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
   'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?}) — visible tab; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again focuses the open one',
@@ -267,6 +269,8 @@ export interface AgentControlDependencies {
   /** Durable overnight local-model jobs; absent until the job controller is constructed. The
    *  app plugs it in with AgentControl.setDurableJobs, so construction order does not matter. */
   durableJobs?: DurableJobsService
+  /** Execution nodes and remote jobs (src/main/remote-jobs); plugged in with AgentControl.setRemoteJobs. */
+  remoteJobs?: RemoteJobService
   /** Scheduled tasks (src/main/schedule-control.ts); plugged in with AgentControl.setSchedules. */
   schedules?: ScheduleControlService
   /** Ideas (src/main/ideas/register.ts); plugged in with AgentControl.setIdeas. */
@@ -898,7 +902,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -919,10 +923,10 @@ export class AgentControl {
     if (scope.owner && !scope.projectId) throw new Error(`${method} needs a project: none is open in this Conductor yet. Register one with projects.open({path}) and pass its id as scope.projectId`)
     if (method === 'app.state') return { observedAt: new Date().toISOString(), projectId: scope.projectId, workspaceId: scope.sessionId, project: database.getProject(scope.projectId), workspace: database.getSession(scope.sessionId), tabs: this.tabs(scope), relationships: this.listLinks(scope.projectId, scope.sessionId).map(link => ({ agentSessionId: link.targetAgentSessionId, controllerAgentSessionId: link.controllerAgentSessionId })), machineId: this.callerMachineId(scope), machines: this.machines(), projects: this.projects(scope), ...(sovereign(scope) ? { owner: scope.owner === true, wizard: scope.wizard === true, appVersion: this.deps.host?.version ?? null, pid: this.deps.host?.pid ?? null, updates: this.deps.host?.updates?.state() ?? null, restartRequest: this.deps.host?.restartRequest?.() ?? null, pendingQuitConfirmation: this.deps.host?.stopConfirmation?.pending() ?? null } : {}) }
     if (method === 'machines.list') {
-      return this.machines().map(machine => {
+      return withNodes(this.machines().map(machine => {
         const placement = machineRunsProject(machine, scope.projectId)
         return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: !placement.ok ? placement.message : machine.kind === 'local' ? 'Runs every project open in this Conductor; projects.list names them.' : null }
-      })
+      }), this.deps.remoteJobs?.listNodes() ?? [])
     }
     if (method === 'models.list') return this.catalog(scope)
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
@@ -1206,6 +1210,7 @@ export class AgentControl {
     if (method === 'router.start') return this.startRouter(scope, args)
     if (method === 'router.dispatch') return this.dispatchRouter(scope, args)
     if (jobMethods.has(method)) return this.jobs(scope, source, method, args)
+    if (nodeMethods.has(method)) return this.nodes(scope, source, method, args)
     if (scheduleMethods.has(method)) return this.scheduledTasks(scope, source, method, args)
     if (ideaMethods.has(method)) return this.ideasMethod(scope, source, method, args)
     throw new Error('Unknown control method; use tools.list')
@@ -1277,6 +1282,19 @@ export class AgentControl {
   /** Plugs in the durable job controller once it is constructed (src/main/index.ts); undefined
    *  unplugs it. jobs.* methods and job tabs answer only while one is set. */
   setDurableJobs(service: DurableJobsService | undefined): void { this.deps.durableJobs = service }
+
+  setRemoteJobs(service: RemoteJobService | undefined): void { this.deps.remoteJobs = service }
+
+  /** nodes.*: who may start and stop jobs follows jobs.create; the rest lives in remote-jobs/control.ts. */
+  private nodes(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const service = this.deps.remoteJobs
+    if (!service) throw new Error('Execution nodes are unavailable in this Conductor')
+    const project = this.deps.database.getProject(scope.projectId)
+    const refusal = sovereign(scope) ? null
+      : source.provider === 'local' ? 'A sandboxed local conversation cannot run commands on another machine; the owner, a wizard tab or a non-local coworker can'
+        : restricted(this.deps.database.structured.snapshot(scope.agentSessionId)?.settings) ? 'This conversation is read-only or planning' : null
+    return callNodeMethod(service, { projectId: scope.projectId, projectPath: project && !project.remote ? project.path : null, agentSessionId: scope.agentSessionId, owner: sovereign(scope), refusal }, method, args)
+  }
 
   /** The job a jobs.* call names, only when it belongs to the caller's project. Another project's
    *  job reads as missing, so its id discloses nothing. */

@@ -25,6 +25,8 @@ export interface RemoteJobServiceOptions {
   cancelGraceMs?: number
   tailChars?: number
   onChange?: (job: RemoteJob) => void
+  /** Whether a runner process is still alive; a job whose runner lives is not an orphan. */
+  isAlive?: (pid: number) => boolean
 }
 
 export const DEFAULT_JOB_TIMEOUT_SEC = 30 * 60
@@ -37,6 +39,10 @@ const gitRevParse = (repoPath: string, ref: string): Promise<string> => new Prom
     else resolve(stdout.trim())
   })
 })
+
+const processAlive = (pid: number): boolean => {
+  try { process.kill(pid, 0); return true } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM' }
+}
 
 const tail = (value: string, chars: number): string => value.length > chars ? value.slice(value.length - chars) : value
 const lastLines = (value: string): string => tail(value.trim(), 400)
@@ -64,6 +70,7 @@ export class RemoteJobService {
   private readonly cancelGraceMs: number
   private readonly tailChars: number
   private readonly onChange?: (job: RemoteJob) => void
+  private readonly isAlive: (pid: number) => boolean
   private readonly active = new Map<string, Active>()
   private readonly waiters = new Map<string, Array<(job: RemoteJob) => void>>()
   private readonly running = new Set<Promise<void>>()
@@ -81,6 +88,7 @@ export class RemoteJobService {
     this.cancelGraceMs = options.cancelGraceMs ?? 20_000
     this.tailChars = options.tailChars ?? 16_384
     this.onChange = options.onChange
+    this.isAlive = options.isAlive ?? processAlive
   }
 
   private now(): string { return this.clock().toISOString() }
@@ -213,7 +221,7 @@ export class RemoteJobService {
       checkout, timeoutSec, status: 'queued', detail: null, exitCode: null, remotePid: null,
       createdAt: this.now(), startedAt: null, endedAt: null,
       stdoutBytes: 0, stderrBytes: 0, stdoutTail: '', stderrTail: '',
-      projectId: input.projectId ?? null, createdBy: input.createdBy ?? null, cancelReason: null
+      projectId: input.projectId ?? null, createdBy: input.createdBy ?? null, cancelReason: null, runnerPid: process.pid
     }
     this.save(job)
     this.store.prune()
@@ -237,6 +245,9 @@ export class RemoteJobService {
     const job = this.getJob(id)
     if (TERMINAL_REMOTE_JOB_STATUSES.includes(job.status)) return job
     const active = this.active.get(id)
+    if (!active && job.runnerPid !== null && job.runnerPid !== process.pid && this.isAlive(job.runnerPid)) {
+      throw new Error(`${id} is run by another process (pid ${job.runnerPid}); cancel it there`)
+    }
     if (!active) {
       this.finish({ ...job, cancelReason: reason ?? null }, 'cancelled', 'Cancelled before it started.')
       return this.getJob(id)
@@ -273,7 +284,8 @@ export class RemoteJobService {
    * session ended with the old process, and the wrapper stops a job when that happens).
    */
   async recover(): Promise<RemoteJob[]> {
-    const orphans = this.store.listJobs().filter(job => ACTIVE.includes(job.status) && !this.active.has(job.id))
+    const orphans = this.store.listJobs().filter(job => ACTIVE.includes(job.status) && !this.active.has(job.id)
+      && (job.runnerPid === null || job.runnerPid === process.pid || !this.isAlive(job.runnerPid)))
     for (const job of orphans) {
       this.finish(job, job.status === 'queued' ? 'cancelled' : 'lost', job.status === 'queued' ? 'Conductor restarted before it started.' : 'Conductor restarted while it ran; the node was asked to stop what was left of it.')
     }
@@ -310,7 +322,7 @@ export class RemoteJobService {
 
   /** Starts every queued job whose node has room and whose checkout is free. */
   private pump(): void {
-    const queued = this.store.listJobs().filter(job => job.status === 'queued' && !this.active.has(job.id)).reverse()
+    const queued = this.store.listJobs().filter(job => job.status === 'queued' && !this.active.has(job.id) && (job.runnerPid === null || job.runnerPid === process.pid)).reverse()
     for (const job of queued) {
       const node = this.store.getNode(job.nodeId)
       if (!node) { this.finish(job, 'failed', 'Its node was removed.'); continue }

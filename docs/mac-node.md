@@ -121,7 +121,25 @@ fetches it into its checkout, `checkout --detach --force`, `git clean -fd` (keep
 
 `<userData>/remote-jobs/`: `nodes.json`, `known_hosts`, `jobs/<id>/{job.json,stdout.log,stderr.log}`,
 the newest 300 finished jobs kept. Plain files beside (not inside) the multi-gigabyte journal.
-Every JSON write is temp-file + rename.
+Every JSON write is temp-file + rename. The app and `scripts/mac-node.mjs` can use the folder at
+the same time: each job records its `runnerPid`, only that process follows, cancels or recovers
+it, and the other re-reads records and `nodes.json` from disk.
+
+### App control
+
+`src/main/remote-jobs/control.ts`, wired into `agent-control.ts` with one dispatch line and
+plugged in from `index.ts` (`control.setRemoteJobs`):
+
+- reads: `nodes.list`, `nodes.jobs`, `nodes.job({jobId, waitSeconds})`, `nodes.log`;
+- `nodes.probe`, `nodes.run`, `nodes.cancel`: the owner, a wizard tab, or a non-local, writable
+  conversation (the jobs.create rule); a job can be cancelled by the conversation that started it;
+- `nodes.register`, `nodes.remove`: owner or wizard only (they name a host to trust and a key file);
+- `machines.list` includes each node: as the `node` facet of its paired peer when
+  `peerMachineId` links them, otherwise as `{id: "node:<id>", kind: "node", runsThisProject: false}`
+  so tab placement never picks it.
+
+`nodes.run({command, requires: ["macos"], checkout: true})` is "Run on: mac-mini" for a commit of
+the caller's project.
 
 ## 4. Windows-only assumptions that affect a macOS build (from reading the code)
 

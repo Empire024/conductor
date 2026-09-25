@@ -10,6 +10,10 @@ import { TERMINAL_REMOTE_JOB_STATUSES } from './types.ts'
  *
  * Every JSON write goes to a temporary file first and is renamed over the old one, so a crash
  * leaves either the old record or the new one, never half of one.
+ *
+ * The app and scripts/mac-node.mjs may use one folder at the same time. Each process owns the jobs
+ * it runs; records another process writes are re-read from disk until they are finished, and
+ * nodes.json is re-read whenever it changed on disk.
  */
 export const REMOTE_JOB_RETENTION = 300
 
@@ -19,44 +23,76 @@ const writeJson = (path: string, value: unknown): void => {
   renameSync(temporary, path)
 }
 
+const stampOf = (file: string): string => { const stat = statSync(file); return `${stat.mtimeMs}:${stat.size}:${stat.ino}` }
+
 export type LogStream = 'stdout' | 'stderr'
 
 export class RemoteJobStore {
   readonly root: string
   private nodes: ExecutionNode[] = []
+  private nodesStamp = ''
   private readonly jobs = new Map<string, RemoteJob>()
+  /** Jobs whose latest record this process wrote; the rest are re-read until finished. */
+  private readonly written = new Set<string>()
 
   constructor(root: string) {
     this.root = root
     mkdirSync(join(root, 'jobs'), { recursive: true })
-    const nodesFile = join(root, 'nodes.json')
-    if (existsSync(nodesFile)) {
-      const stored = JSON.parse(readFileSync(nodesFile, 'utf8')) as { nodes?: ExecutionNode[] }
-      this.nodes = Array.isArray(stored.nodes) ? stored.nodes : []
-    }
-    for (const id of readdirSync(join(root, 'jobs'))) {
-      try { this.jobs.set(id, JSON.parse(readFileSync(join(root, 'jobs', id, 'job.json'), 'utf8')) as RemoteJob) } catch { /* a directory without a readable record is not a job */ }
-    }
+    this.refreshNodes()
+    this.refreshJobs()
+  }
+
+  private refreshNodes(): void {
+    const file = join(this.root, 'nodes.json')
+    const stamp = existsSync(file) ? stampOf(file) : ''
+    if (stamp === this.nodesStamp) return
+    this.nodesStamp = stamp
+    if (!stamp) { this.nodes = []; return }
+    const stored = JSON.parse(readFileSync(file, 'utf8')) as { nodes?: ExecutionNode[] }
+    this.nodes = Array.isArray(stored.nodes) ? stored.nodes : []
+  }
+
+  private refreshJob(id: string): void {
+    const known = this.jobs.get(id)
+    if (known && (this.written.has(id) || TERMINAL_REMOTE_JOB_STATUSES.includes(known.status))) return
+    try { this.jobs.set(id, JSON.parse(readFileSync(join(this.root, 'jobs', id, 'job.json'), 'utf8')) as RemoteJob) } catch { /* a directory without a readable record is not a job */ }
+  }
+
+  private refreshJobs(): void {
+    const present = new Set(readdirSync(join(this.root, 'jobs')))
+    for (const id of present) this.refreshJob(id)
+    for (const id of this.jobs.keys()) if (!present.has(id)) this.jobs.delete(id)
   }
 
   get knownHostsFile(): string { return join(this.root, 'known_hosts') }
 
-  listNodes(): ExecutionNode[] { return this.nodes.map(node => ({ ...node })) }
+  listNodes(): ExecutionNode[] { this.refreshNodes(); return this.nodes.map(node => ({ ...node })) }
   getNode(id: string): ExecutionNode | undefined {
+    this.refreshNodes()
     const node = this.nodes.find(entry => entry.id === id)
     return node ? { ...node } : undefined
   }
   saveNode(node: ExecutionNode): void {
+    this.refreshNodes()
     this.nodes = [...this.nodes.filter(entry => entry.id !== node.id), node].sort((a, b) => a.id.localeCompare(b.id))
-    writeJson(join(this.root, 'nodes.json'), { version: 1, nodes: this.nodes })
+    this.writeNodes()
   }
   removeNode(id: string): void {
+    this.refreshNodes()
     this.nodes = this.nodes.filter(entry => entry.id !== id)
-    writeJson(join(this.root, 'nodes.json'), { version: 1, nodes: this.nodes })
+    this.writeNodes()
+  }
+  private writeNodes(): void {
+    const file = join(this.root, 'nodes.json')
+    writeJson(file, { version: 1, nodes: this.nodes })
+    this.nodesStamp = stampOf(file)
   }
 
-  listJobs(): RemoteJob[] { return [...this.jobs.values()].map(job => ({ ...job })).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)) }
+  listJobs(): RemoteJob[] {
+    this.refreshJobs()
+    return [...this.jobs.values()].map(job => ({ ...job })).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)) }
   getJob(id: string): RemoteJob | undefined {
+    if (/^[\w-]+$/.test(id) && existsSync(join(this.root, 'jobs', id))) this.refreshJob(id)
     const job = this.jobs.get(id)
     return job ? { ...job } : undefined
   }
@@ -66,6 +102,7 @@ export class RemoteJobStore {
   saveJob(job: RemoteJob): void {
     mkdirSync(this.jobDir(job.id), { recursive: true })
     this.jobs.set(job.id, { ...job })
+    this.written.add(job.id)
     writeJson(join(this.jobDir(job.id), 'job.json'), job)
   }
 
@@ -88,6 +125,7 @@ export class RemoteJobStore {
     const removed = finished.slice(keep).map(job => job.id)
     for (const id of removed) {
       this.jobs.delete(id)
+      this.written.delete(id)
       rmSync(this.jobDir(id), { recursive: true, force: true })
     }
     return removed
