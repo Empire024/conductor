@@ -3,18 +3,20 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
+import { BACKGROUND_PRIORITY, NORMAL_PRIORITY, lowerPriority, restoreNormalPriority, wrappedCommand } from './lib/background-priority.mjs'
 import { DEFAULT_TIMEOUT_MIN, WAITER_GIVE_UP_MIN, acquire, ownsLock, parseArgs, parseHolderText, queuePosition, release, staleReason, ticketName, waiterExpired } from './smoke-lock.mjs'
 
 test('parseArgs: default timeout with no flag', () => {
-  assert.deepEqual(parseArgs(['--', 'node', 'scripts/smoke-foo.mjs']), { command: ['node', 'scripts/smoke-foo.mjs'], timeoutMin: DEFAULT_TIMEOUT_MIN })
+  assert.deepEqual(parseArgs(['--', 'node', 'scripts/smoke-foo.mjs']), { command: ['node', 'scripts/smoke-foo.mjs'], timeoutMin: DEFAULT_TIMEOUT_MIN, priority: 'background' })
 })
 
 test('parseArgs: --timeout-min N before the separator', () => {
-  assert.deepEqual(parseArgs(['--timeout-min', '45', '--', 'node', 'scripts/smoke-foo.mjs']), { command: ['node', 'scripts/smoke-foo.mjs'], timeoutMin: 45 })
+  assert.deepEqual(parseArgs(['--timeout-min', '45', '--', 'node', 'scripts/smoke-foo.mjs']), { command: ['node', 'scripts/smoke-foo.mjs'], timeoutMin: 45, priority: 'background' })
 })
 
 test('parseArgs: --timeout-min=N form', () => {
-  assert.deepEqual(parseArgs(['--timeout-min=1', '--', 'node', 'x.mjs']), { command: ['node', 'x.mjs'], timeoutMin: 1 })
+  assert.deepEqual(parseArgs(['--timeout-min=1', '--', 'node', 'x.mjs']), { command: ['node', 'x.mjs'], timeoutMin: 1, priority: 'background' })
 })
 
 test('parseArgs: a non-numeric or non-positive timeout falls back to the default', () => {
@@ -24,11 +26,11 @@ test('parseArgs: a non-numeric or non-positive timeout falls back to the default
 })
 
 test('parseArgs: no separator treats the whole argv as the command (old call shape)', () => {
-  assert.deepEqual(parseArgs(['node', 'scripts/smoke-foo.mjs']), { command: ['node', 'scripts/smoke-foo.mjs'], timeoutMin: DEFAULT_TIMEOUT_MIN })
+  assert.deepEqual(parseArgs(['node', 'scripts/smoke-foo.mjs']), { command: ['node', 'scripts/smoke-foo.mjs'], timeoutMin: DEFAULT_TIMEOUT_MIN, priority: 'background' })
 })
 
 test('parseArgs: an empty argv is an empty command', () => {
-  assert.deepEqual(parseArgs([]), { command: [], timeoutMin: DEFAULT_TIMEOUT_MIN })
+  assert.deepEqual(parseArgs([]), { command: [], timeoutMin: DEFAULT_TIMEOUT_MIN, priority: 'background' })
 })
 
 // --------------------------------------------------------------------- staleReason
@@ -218,4 +220,34 @@ test('FIFO: ticket names sort by arrival, then pid', () => {
   assert.ok(ticketName(1, 1000) < ticketName(2, 1000))
   assert.equal(queuePosition(['a', 'b'], 'b'), 2)
   assert.equal(queuePosition(['a'], 'gone'), 0)
+})
+
+test('parseArgs: --priority normal keeps a measurement run at normal priority; anything else is background', () => {
+  assert.equal(parseArgs(['--priority', 'normal', '--', 'node', 'x.mjs']).priority, 'normal')
+  assert.equal(parseArgs(['--priority=normal', '--timeout-min', '60', '--', 'node', 'x.mjs']).priority, 'normal')
+  assert.equal(parseArgs(['--priority=high', '--', 'node', 'x.mjs']).priority, 'background')
+  // After the separator it belongs to the wrapped command.
+  assert.deepEqual(parseArgs(['--', 'node', 'x.mjs', '--priority', 'normal']), { command: ['node', 'x.mjs', '--priority', 'normal'], timeoutMin: DEFAULT_TIMEOUT_MIN, priority: 'background' })
+})
+
+test('lowerPriority: below normal once, never raises an idle process, honours the opt-out, never throws', () => {
+  const calls = []
+  const set = (pid, value) => calls.push([pid, value])
+  assert.equal(lowerPriority(0, { env: {}, get: () => NORMAL_PRIORITY, set }), 'lowered')
+  assert.deepEqual(calls, [[0, BACKGROUND_PRIORITY]])
+  assert.equal(lowerPriority(0, { env: {}, get: () => BACKGROUND_PRIORITY, set }), 'already')
+  assert.equal(lowerPriority(0, { env: {}, get: () => 19, set }), 'already')
+  assert.equal(lowerPriority(0, { env: { CONDUCTOR_BACKGROUND_PRIORITY: '0' }, get: () => NORMAL_PRIORITY, set }), 'skipped')
+  assert.equal(calls.length, 1)
+  assert.equal(lowerPriority(0, { env: {}, get: () => NORMAL_PRIORITY, set: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }) } }), 'failed: EACCES')
+  assert.equal(restoreNormalPriority(0, { get: () => BACKGROUND_PRIORITY, set }), 'restored')
+  assert.equal(restoreNormalPriority(0, { get: () => NORMAL_PRIORITY, set }), 'already')
+  assert.deepEqual(wrappedCommand(['--', 'npx', 'vitest']), ['npx', 'vitest'])
+})
+
+test('a child started by a lowered process inherits below-normal priority', () => {
+  const script = "import { getPriority } from 'node:os'; process.stdout.write(String(getPriority()))"
+  const run = spawnSync(process.execPath, [join(import.meta.dirname, 'lib', 'background-priority.mjs'), '--', process.execPath, '--input-type=module', '-e', script], { encoding: 'utf8', env: { ...process.env, CONDUCTOR_BACKGROUND_PRIORITY: '' } })
+  assert.equal(run.status, 0, run.stderr)
+  assert.ok(Number(run.stdout) >= BACKGROUND_PRIORITY, `child priority ${run.stdout}`)
 })

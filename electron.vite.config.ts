@@ -1,8 +1,16 @@
 import { resolve } from 'node:path'
+import { constants, getPriority, setPriority } from 'node:os'
 import { build } from 'esbuild'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import type { Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
+
+// A build is background work next to the owner's own Conductor (typing-lag-under-test-load,
+// docs/perf/typing-under-load.md): it starts below normal priority, and so does everything it
+// forks, so the owner's typing never waits on it. CONDUCTOR_BACKGROUND_PRIORITY=0 keeps normal.
+if (process.env.CONDUCTOR_BACKGROUND_PRIORITY !== '0') {
+  try { if (getPriority() < constants.priority.PRIORITY_BELOW_NORMAL) setPriority(constants.priority.PRIORITY_BELOW_NORMAL) } catch { /* keep normal priority */ }
+}
 
 /** The runtime host runs outside the app, from a copy under userData (docs/runtime-host.md), so
  *  it is bundled on its own into one self-contained CommonJS file with only node: imports. */

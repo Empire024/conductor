@@ -2,7 +2,13 @@
 // (or a build and a smoke) at once: docs/machine-profile.md asks for smokes one at a time because
 // parallel ones push each other past their timeouts.
 //
-// Usage: node scripts/smoke-lock.mjs [--timeout-min N] -- <command> [args...]
+// Usage: node scripts/smoke-lock.mjs [--timeout-min N] [--priority normal] -- <command> [args...]
+//
+// The run starts below normal priority, and so does everything it launches (Electron with its GPU
+// and renderer processes, builds, test workers): the owner types into their own Conductor on this
+// machine, and a smoke must never make that lag (scripts/lib/background-priority.mjs,
+// docs/perf/typing-under-load.md). --priority normal keeps it at normal priority, for a
+// measurement whose stand-in plays the owner's app.
 //
 // The lock is a directory under the OS temp folder (mkdir is atomic); holder.txt inside it records
 // who holds it, when, and for how long. Waiters take it in arrival order through ticket files in
@@ -18,6 +24,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { lowerPriority } from './lib/background-priority.mjs'
 
 export const LOCK_DIR = join(tmpdir(), 'conductor-smoke.lock')
 export const DEFAULT_TIMEOUT_MIN = 20
@@ -33,13 +40,16 @@ export function parseArgs(argv) {
   const own = separator >= 0 ? argv.slice(0, separator) : []
   const command = separator >= 0 ? argv.slice(separator + 1) : argv.slice(0)
   let timeoutMin = DEFAULT_TIMEOUT_MIN
+  let priority = 'background'
   for (let i = 0; i < own.length; i++) {
     const arg = own[i]
     if (arg === '--timeout-min') { timeoutMin = Number(own[++i]); continue }
     if (arg.startsWith('--timeout-min=')) timeoutMin = Number(arg.slice('--timeout-min='.length))
+    if (arg === '--priority') { priority = own[++i] === 'normal' ? 'normal' : 'background'; continue }
+    if (arg.startsWith('--priority=')) priority = arg.slice('--priority='.length) === 'normal' ? 'normal' : 'background'
   }
   if (!Number.isFinite(timeoutMin) || timeoutMin <= 0) timeoutMin = DEFAULT_TIMEOUT_MIN
-  return { command, timeoutMin }
+  return { command, timeoutMin, priority }
 }
 
 export function isProcessAlive(pid) {
@@ -202,8 +212,8 @@ export const release = (lockDir = LOCK_DIR, pid = process.pid) => {
 }
 
 async function main() {
-  const { command, timeoutMin } = parseArgs(process.argv.slice(2))
-  if (!command.length) { console.error('usage: node scripts/smoke-lock.mjs [--timeout-min N] -- <command> [args...]'); process.exit(2) }
+  const { command, timeoutMin, priority } = parseArgs(process.argv.slice(2))
+  if (!command.length) { console.error('usage: node scripts/smoke-lock.mjs [--timeout-min N] [--priority normal] -- <command> [args...]'); process.exit(2) }
   // A waiter stopped by Ctrl+C or a plain kill leaves the line at once; one that dies without
   // running this is skipped by the next waiter that sees its ticket (liveQueue).
   let ticket = null
@@ -215,6 +225,11 @@ async function main() {
   catch (error) { console.error(`[smoke-lock] ${error.message}`); process.exit(1) }
   ticket = null
   process.off('SIGINT', stopWaiting); process.off('SIGTERM', stopWaiting)
+  // Lowered here, before the spawn, so the whole run inherits it (a waiter in line costs nothing).
+  if (priority !== 'normal') {
+    const lowered = lowerPriority()
+    if (lowered.startsWith('failed')) console.error(`[smoke-lock] could not lower the run's priority (${lowered})`)
+  }
 
   // Direct spawn keeps arguments intact; only a .cmd/.bat launcher (npm.cmd) needs the shell. The
   // child gets its own process group off Windows so a POSIX kill(-pid) can reach its descendants.

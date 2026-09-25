@@ -26,7 +26,10 @@ Write `.conductor-scratch/{round}/plan.md`, with three lanes:
 - **Overnight (a queue, not run by you):** real local-model runs over 5 min, soaks, perf and typing numbers, real
   provider turns, anything over 20 min under the lock. Write the commands into
   `.conductor-scratch/verify-overnight/{round}.md`. *Retro: the soak was cut at 20 min, D1 wasted 2 h, perf ran
-  under llama load.*
+  under llama load.* When the round touches launch paths, smoke-lock, verify-kit or parked-window code, queue
+  the typing-under-load guard there too: `node scripts/smoke-lock.mjs --priority normal --timeout-min 60 -- node
+  scripts/perf-input.mjs --label=guard --load=swarm --repeat=3 --throttle=4 --assert` (exit 1 = typing lags
+  while test work runs; bound in `docs/perf/typing-under-load.md`).
 - **Owner-gated:** list them, and they are NOT RUN (owner) unless decided above.
 
 Leave out generic hostile input (paths with spaces, binary files, emoji) unless the item handles that input. *Retro:

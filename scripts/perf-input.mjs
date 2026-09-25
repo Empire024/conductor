@@ -1,7 +1,12 @@
 import { _electron as electron, expect } from '@playwright/test'
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { spawn, spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { cp, mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { cpus, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { priorityName, restoreNormalPriority } from './lib/background-priority.mjs'
+import { killTree } from './smoke-lock.mjs'
 
 // Typing benchmark for the composer. Each scenario is a fresh, parked launch (CONDUCTOR_TEST_USER_DATA:
 // the window sits off every display and never takes focus) of a project whose workspace holds one
@@ -44,6 +49,23 @@ import { join, resolve } from 'node:path'
 // long-conversation rows are held to.
 // --assert exits non-zero when a row misses its target: while streaming p95 < 32 ms and no key over
 // 250 ms, during a burst no key over 1,000 ms, and at rest p95 within 5 ms of the floor (--floor).
+//
+// --load=launch,vitest types into one parked "owner" instance while test work runs next to it
+// (docs/perf/typing-under-load.md). Each round is a quiet typing window (the same-run floor) and
+// then one window per load, typed from the moment the load starts until it has finished:
+//   launch: what a smoke or verifier does, `electron-vite build` into out/ and a parked Conductor
+//           launched from it, left up for --load-idle seconds (default 8) and killed;
+//   vitest: `vitest run` over the whole suite for --load-seconds (default 60), then killed;
+//   swarm:  launch, vitest and `tsc --noEmit` at once, four coworkers' worth: the machine saturates.
+// --repeat=N rounds (default 3). The owner stand-in runs at normal priority from a copy of out/
+// (the launch load rebuilds out/ under it); --load-priority=normal starts the load the way it was
+// started before typing-lag-under-test-load (normal priority, the parked instance does not lower
+// itself: the "before" numbers), the default starts it the way smoke-lock does now.
+// With --assert, a load fails when the median over the rounds of its p95 or p99 exceeds the quiet
+// median by more than --bound-ms (default 25): the regression guard. Before the fix a swarm load
+// missed it by 4x (p99 +108 ms), after it passes with room (+12 ms); docs/perf/typing-under-load.md.
+//   node scripts/smoke-lock.mjs --priority normal --timeout-min 60 -- node scripts/perf-input.mjs
+//     --label=under-load --load=launch,vitest --repeat=3 --throttle=1 --assert
 const args = Object.fromEntries(process.argv.slice(2).filter(arg => arg.startsWith('--')).map(arg => {
   const [key, value = 'true'] = arg.slice(2).split('=')
   return [key, value]
@@ -68,8 +90,30 @@ const provider = args.provider === 'claude' || streamRate || burst ? 'claude' : 
 const events = Number(args.events ?? 3000)
 const livePrompt = streamRate ? `SYNTHETIC STREAM ${streamRate} ${streamSeconds}` : burst ? `SYNTHETIC LONG ${burst}` : ''
 const providerTitle = provider === 'claude' ? 'Claude' : 'Codex'
+const LOADS = { launch: startLaunchLoad, vitest: startVitestLoad, swarm: startSwarmLoad }
+const loads = args.load ? args.load.split(',').filter(Boolean) : []
+for (const kind of loads) if (!(kind in LOADS)) throw new Error(`--load=${kind}: expected one of ${Object.keys(LOADS).join(', ')}`)
+const repeat = Math.max(1, Number(args.repeat ?? 3))
+const loadPriority = args['load-priority'] === 'normal' ? 'normal' : 'background'
+const loadSeconds = Number(args['load-seconds'] ?? 60)
+const loadIdleSeconds = Number(args['load-idle'] ?? 8)
+const boundMs = Number(args['bound-ms'] ?? 25)
 const output = resolve('artifacts/perf-input')
 await mkdir(output, { recursive: true })
+// The measuring process and the stand-in it launches play the owner's app: normal priority, even
+// when smoke-lock started this run lowered (Windows lets a process raise itself back to normal).
+const standInPriority = restoreNormalPriority()
+if (standInPriority.startsWith('failed')) console.warn(`[perf-input] could not restore normal priority (${standInPriority}): run under smoke-lock --priority normal`)
+// The launch load rebuilds out/, so the stand-in runs from a copy inside the checkout (node_modules
+// still resolves by walking up). --app points it at any other build.
+let appMain = resolve(args.app ?? 'out/main/index.js')
+let standInCopy
+if (!args.app && loads.includes('launch')) {
+  standInCopy = resolve('.conductor-scratch/perf-input/stand-in-' + process.pid)
+  await rm(standInCopy, { recursive: true, force: true })
+  await cp(resolve('out'), join(standInCopy, 'out'), { recursive: true })
+  appMain = join(standInCopy, 'out', 'main', 'index.js')
+}
 
 const words = 'the quick brown fox jumps over a lazy dog while conductor keeps every tab alive and the composer answers each key without waiting on storage or hidden panes'.split(' ')
 let typed = ''
@@ -103,10 +147,10 @@ const initScript = () => {
 
 async function scenario(tabCount, { historyEvents = events, live = livePrompt } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'conductor-perf-input-'))
-  const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_PERF_STREAM_HISTORY: String(history) }
+  const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_PERF_STREAM_HISTORY: String(history), CONDUCTOR_BACKGROUND_PRIORITY: '0', CONDUCTOR_TEST_FIXTURE_DIR: resolve('scripts/fixtures') }
   delete env.ELECTRON_RUN_AS_NODE
   delete env.CONDUCTOR_LIVE_TESTS
-  const app = await electron.launch({ args: [resolve('out/main/index.js')], env, timeout: 30_000 })
+  const app = await electron.launch({ args: [appMain], env, timeout: 30_000 })
   const errors = []
   try {
     await app.context().addInitScript(initScript)
@@ -167,6 +211,7 @@ async function scenario(tabCount, { historyEvents = events, live = livePrompt } 
     await page.keyboard.press('Control+End')
     // Let startup work (snapshot loads, catalog probes, recovery checkpoints) settle first.
     await page.waitForTimeout(3000)
+    if (loads.length) return await loadRounds(app, page, composerBox, { tabCount, errors })
 
     const cdp = await page.context().newCDPSession(page)
     await cdp.send('Performance.enable')
@@ -399,11 +444,16 @@ const misses = (result) => {
   return missed
 }
 try {
-  if (floor) {
+  if (loads.length) {
+    results.config.load = { kinds: loads, repeat, priority: loadPriority, loadSeconds, loadIdleSeconds, boundMs, standIn: standInPriority }
+    results.load = await scenario(tabCounts[0])
+    for (const row of results.load.summary) console.log(`${row.kind}: p95 ${row.p95.join(' / ')} (median ${row.medianP95}) · p99 ${row.p99.join(' / ')} (median ${row.medianP99}) · max ${row.max.join(' / ')} ms · machine CPU ${row.cpuPercent.join(' / ')}%${row.misses.length ? ' · MISSED: ' + row.misses.join(', ') : ''}`)
+    if (assert && results.load.summary.some(row => row.misses.length)) process.exitCode = 1
+  } else if (floor) {
     results.floor = await scenario(1, { historyEvents: 4, live: '' })
     console.log(`floor: empty ${provider} conversation, 1 tab: input->paint p50 ${results.floor.inputToNextPaintMs.p50} / p95 ${results.floor.inputToNextPaintMs.p95} / p99 ${results.floor.inputToNextPaintMs.p99} ms; commits ${results.floor.reactCommits}`)
   }
-  for (const count of tabCounts) {
+  if (!loads.length) for (const count of tabCounts) {
     const result = await scenario(count)
     result.misses = misses(result)
     results.scenarios.push(result)
@@ -415,6 +465,216 @@ try {
   throw error
 } finally {
   await writeFile(join(output, label + '.json'), JSON.stringify(results, null, 2))
+  if (standInCopy) await rm(standInCopy, { recursive: true, force: true }).catch(() => {})
+}
+
+// ------------------------------------------------------------------ typing under load (--load)
+
+/** Round after round: a quiet window, then one window per load, all typed into the same composer
+ *  of the same stand-in, so the quiet p95/p99 is the floor every load row is compared with. */
+async function loadRounds(app, page, composerBox, { tabCount, errors }) {
+  const cdp = await page.context().newCDPSession(page)
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: throttle })
+  const rows = []
+  for (let round = 1; round <= repeat; round++) {
+    for (const kind of ['quiet', ...loads]) {
+      await composerBox.fill('')
+      await composerBox.click()
+      await page.waitForTimeout(1500)
+      await page.evaluate(() => {
+        const perf = window.__inputPerf = { active: true, samples: [], longtasks: [] }
+        if (!window.__inputPerfPatched) {
+          window.__inputPerfPatched = true
+          document.addEventListener('keydown', event => {
+            const current = window.__inputPerf
+            if (!current?.active) return
+            const start = event.timeStamp
+            requestAnimationFrame(() => {
+              const frame = performance.now()
+              const channel = new MessageChannel()
+              channel.port1.onmessage = () => current.samples.push({ start, frame, painted: performance.now() })
+              channel.port2.postMessage(0)
+            })
+          }, true)
+        }
+        perf.observer = new PerformanceObserver(list => { for (const entry of list.getEntries()) perf.longtasks.push(entry.duration) })
+        perf.observer.observe({ type: 'longtask' })
+      })
+      if (profileMain) await app.evaluate(() => {
+        const session = globalThis.__perfMainProfiler = new (process.getBuiltinModule('node:inspector').Session)()
+        session.connect(); session.post('Profiler.enable'); session.post('Profiler.setSamplingInterval', { interval: 500 }); session.post('Profiler.start')
+      })
+      const cpuBefore = cpus()
+      const started = Date.now()
+      const load = kind === 'quiet' ? null : LOADS[kind]({ round })
+      let typedText = ''
+      for (let word = 0; Date.now() - started < 15 * 60_000; word++) {
+        const chunk = words[word % words.length] + ' '
+        await page.keyboard.type(chunk, { delay })
+        typedText += chunk
+        if (typedText.length >= chars && (!load || load.settled)) break
+      }
+      const typingMs = Date.now() - started
+      const cpuPercent = machineCpuPercent(cpuBefore, cpus())
+      const loadResult = load ? await load.done : undefined
+      let mainHotspots
+      if (profileMain) {
+        const samples = await app.evaluate(() => new Promise((done, fail) => globalThis.__perfMainProfiler.post('Profiler.stop', (error, result) => { globalThis.__perfMainProfiler.disconnect(); error ? fail(error) : done(result.profile) })))
+        await writeFile(join(output, `${label}-${kind}-${round}-main.cpuprofile`), JSON.stringify(samples))
+        mainHotspots = selfTimeHotspots(samples, 12)
+      }
+      await page.waitForTimeout(500)
+      const collected = await page.evaluate(() => { const perf = window.__inputPerf; perf.active = false; perf.observer.disconnect(); return { samples: perf.samples, longtasks: perf.longtasks } })
+      const latencies = collected.samples.map(sample => sample.painted - sample.start).sort((a, b) => a - b)
+      const row = {
+        round, kind, typedChars: typedText.length, keystrokesMeasured: latencies.length, typingWallMs: typingMs, cpuPercent,
+        textIntact: (await composerBox.inputValue()) === typedText,
+        inputToNextPaintMs: { p50: round2(percentile(latencies, 50)), p95: round2(percentile(latencies, 95)), p99: round2(percentile(latencies, 99)), max: round2(latencies.at(-1) ?? 0), mean: round2(latencies.reduce((sum, item) => sum + item, 0) / Math.max(1, latencies.length)) },
+        over50ms: latencies.filter(value => value > 50).length,
+        over100ms: latencies.filter(value => value > 100).length,
+        longtasks: { count: collected.longtasks.length, totalMs: round2(collected.longtasks.reduce((sum, value) => sum + value, 0)), maxMs: round2(Math.max(0, ...collected.longtasks)) },
+        load: loadResult,
+        mainHotspots
+      }
+      rows.push(row)
+      console.log(`round ${round} ${kind}: ${row.keystrokesMeasured} keys over ${Math.round(typingMs / 1000)} s, input->paint p50 ${row.inputToNextPaintMs.p50} / p95 ${row.inputToNextPaintMs.p95} / p99 ${row.inputToNextPaintMs.p99} / max ${row.inputToNextPaintMs.max} ms, >100 ms ${row.over100ms}, machine CPU ${cpuPercent}%${loadResult ? ', load ' + JSON.stringify(loadResult) : ''}`)
+    }
+  }
+  await cdp.send('Emulation.setCPUThrottlingRate', { rate: 1 })
+  return { tabs: tabCount, provider, rows, summary: summarizeLoadRows(rows), errors }
+}
+
+function round2(value) { return Number(value.toFixed(2)) }
+function median(values) { const sorted = [...values].sort((a, b) => a - b); return sorted.length ? round2(sorted[Math.floor((sorted.length - 1) / 2)]) : 0 }
+
+/** Per kind: every round's p95/p99, their medians, and what --assert holds a load to: its median p95
+ *  and p99 each within --bound-ms of the quiet medians. */
+function summarizeLoadRows(rows) {
+  const kinds = [...new Set(rows.map(row => row.kind))]
+  const summary = kinds.map(kind => {
+    const mine = rows.filter(row => row.kind === kind)
+    return { kind, p95: mine.map(row => row.inputToNextPaintMs.p95), p99: mine.map(row => row.inputToNextPaintMs.p99), max: mine.map(row => row.inputToNextPaintMs.max), over100ms: mine.map(row => row.over100ms), cpuPercent: mine.map(row => row.cpuPercent), medianP95: median(mine.map(row => row.inputToNextPaintMs.p95)), medianP99: median(mine.map(row => row.inputToNextPaintMs.p99)), misses: [] }
+  })
+  const quiet = summary.find(row => row.kind === 'quiet')
+  for (const row of summary) {
+    if (!rows.filter(item => item.kind === row.kind).every(item => item.textIntact)) row.misses.push('typed text was not intact')
+    if (row === quiet || !quiet) continue
+    if (row.medianP99 > quiet.medianP99 + boundMs) row.misses.push(`median p99 ${row.medianP99} ms > quiet ${quiet.medianP99} + ${boundMs} ms`)
+    if (row.medianP95 > quiet.medianP95 + boundMs) row.misses.push(`median p95 ${row.medianP95} ms > quiet ${quiet.medianP95} + ${boundMs} ms`)
+  }
+  return summary
+}
+
+function machineCpuPercent(before, after) {
+  let idle = 0, total = 0
+  after.forEach((cpu, index) => {
+    const prior = before[index]?.times
+    if (!prior) return
+    for (const key of Object.keys(cpu.times)) total += cpu.times[key] - prior[key]
+    idle += cpu.times.idle - prior.idle
+  })
+  return total ? Math.round(100 * (1 - idle / total)) : 0
+}
+
+/** A deadline for Promise.race that never keeps the process alive once the race is decided. */
+function after(ms, value) { return new Promise(done => setTimeout(done, ms, value).unref()) }
+
+/** Starts a load command. Background (the default): through scripts/lib/background-priority.mjs,
+ *  the way smoke-lock starts a smoke now. Normal: straight at normal priority with the in-app
+ *  lowering switched off, the way test work ran before typing-lag-under-test-load. */
+function spawnLoad(command, env, logName) {
+  const log = join(output, logName)
+  const loadEnv = { ...env }
+  if (loadPriority === 'normal') loadEnv.CONDUCTOR_BACKGROUND_PRIORITY = '0'
+  else delete loadEnv.CONDUCTOR_BACKGROUND_PRIORITY
+  const argv = loadPriority === 'normal' ? command : [process.execPath, resolve('scripts/lib/background-priority.mjs'), '--', ...command]
+  const child = spawn(argv[0], argv.slice(1), { env: loadEnv, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+  const chunks = []
+  for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => chunks.push(chunk))
+  const exited = new Promise(done => { child.on('exit', code => done(code)); child.on('error', () => done(-1)) })
+  exited.then(() => writeFile(log, Buffer.concat(chunks)).catch(() => {}))
+  return { child, exited }
+}
+
+/** A smoke's own work: rebuild out/, launch a parked Conductor from it, wait until it is up (its
+ *  control-owner.json), leave it running --load-idle seconds, kill its tree. */
+function startLaunchLoad({ round }) {
+  const load = { settled: false }
+  load.done = (async () => {
+    const result = { steps: [] }
+    const env = { ...process.env }
+    delete env.ELECTRON_RUN_AS_NODE
+    let started = Date.now()
+    const build = spawnLoad([process.execPath, resolve('node_modules/electron-vite/bin/electron-vite.js'), 'build'], env, `${label}-launch-${round}-build.log`)
+    const buildCode = await Promise.race([build.exited, after(5 * 60_000, 'timeout')])
+    if (buildCode === 'timeout') killTree(build.child.pid)
+    result.steps.push({ step: 'build', ms: Date.now() - started, exitCode: buildCode })
+    const root = await mkdtemp(join(tmpdir(), 'conductor-perf-load-'))
+    const profileDir = join(root, 'profile')
+    started = Date.now()
+    const launched = spawnLoad([createRequire(import.meta.url)('electron'), resolve('out/main/index.js')], { ...env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_USER_DATA: profileDir, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_TEST_PARENT_PID: String(process.pid) }, `${label}-launch-${round}-app.log`)
+    const credential = join(profileDir, 'control-owner.json')
+    while (!existsSync(credential) && Date.now() - started < 120_000) await new Promise(done => setTimeout(done, 250))
+    result.steps.push({ step: 'launch', ms: Date.now() - started, ready: existsSync(credential) })
+    await new Promise(done => setTimeout(done, 2000))
+    result.priorities = processTreePriorities(launched.child.pid)
+    await new Promise(done => setTimeout(done, Math.max(0, loadIdleSeconds * 1000 - 2000)))
+    killTree(launched.child.pid)
+    await Promise.race([launched.exited, after(10_000)])
+    await rm(root, { recursive: true, force: true }).catch(() => {})
+    return result
+  })().finally(() => { load.settled = true })
+  return load
+}
+
+/** Agent-style test run: the whole vitest suite for --load-seconds, then its tree is killed. */
+function startVitestLoad({ round }) {
+  const load = { settled: false }
+  load.done = (async () => {
+    const started = Date.now()
+    const run = spawnLoad([process.execPath, resolve('node_modules/vitest/vitest.mjs'), 'run'], { ...process.env }, `${label}-vitest-${round}.log`)
+    await new Promise(done => setTimeout(done, 10_000))
+    const priorities = processTreePriorities(run.child.pid)
+    const code = await Promise.race([run.exited, after(Math.max(0, loadSeconds * 1000 - 10_000), 'stopped')])
+    if (code === 'stopped') { killTree(run.child.pid); await Promise.race([run.exited, after(10_000)]) }
+    return { steps: [{ step: 'vitest', ms: Date.now() - started, exitCode: code }], priorities }
+  })().finally(() => { load.settled = true })
+  return load
+}
+
+/** Four coworkers' worth at once, the way a swarm lands on this machine: one builds and launches a
+ *  parked instance, one runs vitest, one runs tsc; the machine saturates. */
+function startSwarmLoad({ round }) {
+  const load = { settled: false }
+  load.done = (async () => {
+    const started = Date.now()
+    const tsc = spawnLoad([process.execPath, resolve('node_modules/typescript/bin/tsc'), '--noEmit', '-p', 'tsconfig.json'], { ...process.env }, `${label}-swarm-${round}-tsc.log`)
+    const [launch, vitest, tscCode] = await Promise.all([startLaunchLoad({ round }).done, startVitestLoad({ round }).done, tsc.exited])
+    return { ms: Date.now() - started, launch, vitest, tsc: { exitCode: tscCode } }
+  })().finally(() => { load.settled = true })
+  return load
+}
+
+/** How many processes of each name run at which priority under `rootPid`, the evidence that a
+ *  load's GPU, renderer and worker processes really are below normal. */
+function processTreePriorities(rootPid) {
+  try {
+    let list
+    if (process.platform === 'win32') {
+      const query = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', 'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,Priority | ConvertTo-Json -Compress'], { encoding: 'utf8', windowsHide: true, timeout: 30_000 })
+      // Win32_Process.Priority is the base priority: 4 idle, 6 below normal, 8 normal, 10 above normal.
+      const names = { 4: 'low', 6: 'below_normal', 8: 'normal', 10: 'above_normal', 13: 'high' }
+      list = JSON.parse(query.stdout).map(entry => ({ pid: entry.ProcessId, ppid: entry.ParentProcessId, name: entry.Name, priority: names[entry.Priority] ?? String(entry.Priority) }))
+    } else {
+      const query = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,ni=,comm='], { encoding: 'utf8' })
+      list = query.stdout.trim().split('\n').map(line => line.trim().split(/\s+/)).map(([pid, ppid, ni, ...name]) => ({ pid: Number(pid), ppid: Number(ppid), name: name.join(' ').split('/').pop(), priority: priorityName(Number(ni)) }))
+    }
+    const tree = new Set([rootPid])
+    for (let grew = true; grew;) { grew = false; for (const entry of list) if (!tree.has(entry.pid) && tree.has(entry.ppid)) { tree.add(entry.pid); grew = true } }
+    const counts = {}
+    for (const entry of list) if (tree.has(entry.pid)) counts[`${entry.name} ${entry.priority}`] = (counts[`${entry.name} ${entry.priority}`] ?? 0) + 1
+    return counts
+  } catch (error) { return { error: String(error.message ?? error) } }
 }
 
 /** Main-thread time of the busiest renderer main thread (CrRendererMain) by trace event name: total (nested events

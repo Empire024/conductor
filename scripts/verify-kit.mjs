@@ -26,6 +26,7 @@ import { createServer } from 'node:net'
 import { cpus, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { lowerPriority } from './lib/background-priority.mjs'
 import { LOCK_DIR, parseHolderText } from './smoke-lock.mjs'
 
 export const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -329,6 +330,9 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
   if (mode !== 'playwright' && mode !== 'spawn') throw new Error(`launchParked mode must be 'playwright' or 'spawn', got ${JSON.stringify(mode)}`)
   if (!existsSync(BUILD)) throw new Error(`${BUILD} is missing: build first (npx electron-vite build)`)
   if (!process.env.CONDUCTOR_TEST_PARENT_PID) console.warn('[verify-kit] not under smoke-lock: run it as node scripts/smoke-lock.mjs -- node <smoke>')
+  // Background work even without smoke-lock: the driver below normal, and the instance lowers its own
+  // tree (src/main/background-priority.ts), so the owner's typing never waits on a verifier.
+  lowerPriority()
   const label = name ?? state.name ?? scriptName()
   const root = await mkdtemp(join(tmpdir(), `conductor-${slug(label)}-`))
   const profile = join(root, 'profile')
