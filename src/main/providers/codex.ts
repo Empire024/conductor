@@ -3,7 +3,8 @@ import { execFile } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, type RuntimeDetachment } from './adapter'
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
-import { JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
+import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
+import { relayMcpConfigs, relaysMcp } from '../runtime-host/relay-config'
 import { PROVIDER_SAFEGUARD_REFUSAL } from '../../shared/structured-agent'
 import type { ActivityStatus, AdapterEvent, ContextAttachment, FileChange, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import type { ClientRequest } from './generated/codex/ClientRequest'
@@ -299,6 +300,10 @@ export class CodexAdapter implements ProviderAdapter {
   private defaults?: ThreadStartResponse
   private models: Model[] = []
   private experimental = false
+  /** Names this conversation's MCP routes in the runtime host's relay (runtime-host/relay.ts). */
+  private relayKey = randomUUID()
+  /** The App Server reaches Conductor's MCP servers through the relay, so a reattaching app re-points them. */
+  private mcpRelayed = false
   /** Auto answers enabled MCP requests; other native approvals remain pending. */
   private unattended = false
   /** A changed payload cannot reuse its old card identity again in this runtime. */
@@ -349,9 +354,15 @@ export class CodexAdapter implements ProviderAdapter {
     return detached ? { state, transport: detached } : null
   }
 
+  private relayNotice(error: Error): void {
+    this.emit({ data: { type: 'notice', message: `Conductor's MCP servers could not be relayed through the runtime host: ${error.message}` } })
+  }
+
   private async attachRunning(detachment: RuntimeDetachment): Promise<void> {
     restoreAdapterState(this, detachment.state)
     this.disposed = false
+    // The App Server still calls the relay it was given; its routes now lead to this app's servers.
+    if (this.mcpRelayed) await relayMcpConfigs(currentRuntimeHost(), this.relayKey, [this.options.mcpConfig, this.options.localAssistMcpConfig], error => this.relayNotice(error))
     this.transport = this.createTransport(detachment.transport)
     this.transport.start()
     // The store closed this conversation's open work when it loaded (an app that stopped is
@@ -387,7 +398,14 @@ export class CodexAdapter implements ProviderAdapter {
       if (!record(initialized) || typeof initialized.userAgent !== 'string') throw new Error('Malformed Codex initialize response')
       this.transport.send({ method: 'initialized' })
       const liveEnvironment = this.options.environment ?? process.env
-      let threadConfig = mergeCodexMcpConfigs(codexBrowserMcpThreadConfig(this.options.mcpConfig), codexLocalAssistThreadConfig(this.options.localAssistMcpConfig))
+      // Conductor's MCP servers get a new port and credential every launch; an App Server kept by the
+      // runtime host calls them through the host's relay, whose address never changes. The app's own
+      // configs are validated first, then the relayed ones again below.
+      const host = currentRuntimeHost()
+      const own = [codexBrowserMcpThreadConfig(this.options.mcpConfig) ? this.options.mcpConfig : undefined, codexLocalAssistThreadConfig(this.options.localAssistMcpConfig) ? this.options.localAssistMcpConfig : undefined]
+      const mcp = this.transport.detachable && relaysMcp(host) && own.some(Boolean) ? await relayMcpConfigs(host, this.relayKey, own, error => this.relayNotice(error)) : own
+      this.mcpRelayed = mcp.some((config, index) => config !== own[index])
+      let threadConfig = mergeCodexMcpConfigs(codexBrowserMcpThreadConfig(mcp[0]), codexLocalAssistThreadConfig(mcp[1]))
       if (liveEnvironment.CONDUCTOR_LIVE_TESTS === '1') {
         if (threadConfig) throw new Error('Codex live isolation cannot enable the Conductor browser MCP')
         const requirements = await this.request<ConfigRequirementsReadResponse>('configRequirements/read')

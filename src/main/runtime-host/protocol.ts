@@ -11,6 +11,13 @@ export const RUNTIME_BUFFER_FRAMES = 50_000
 
 export interface RuntimeMeta { agentSessionId?: string; provider?: string; title?: string }
 
+/** An MCP server a provider process reaches over loopback HTTP, relayed through the host so it
+ *  keeps one address while the app behind it restarts (docs/runtime-host.md). */
+export interface RelayServer { name: string; upstream: string; authorization: string }
+export interface RelayRoute { name: string; url: string; token: string }
+/** What a host can do beyond protocol 1's process relay; an older host answers hello without it. */
+export const RUNTIME_HOST_FEATURES = ['mcp-relay'] as const
+
 export interface RuntimeSpawn { runtimeId: string; executable: string; args: string[]; cwd: string; env?: Record<string, string>; meta?: RuntimeMeta }
 
 export interface RuntimeInfo {
@@ -43,6 +50,7 @@ export type HostRequest =
   | { op: 'list'; id: number }
   | { op: 'stopAll'; id: number; onlyUnowned?: boolean }
   | { op: 'shutdown'; id: number }
+  | { op: 'relay'; id: number; key: string; servers: RelayServer[] }
 
 export type FrameStream = 'stdout' | 'stderr' | 'error'
 

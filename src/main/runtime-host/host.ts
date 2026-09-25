@@ -2,7 +2,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { timingSafeEqual } from 'node:crypto'
 import { createServer, type Server, type Socket } from 'node:net'
 import { StringDecoder } from 'node:string_decoder'
-import { LineReader, RUNTIME_BUFFER_BYTES, RUNTIME_BUFFER_FRAMES, RUNTIME_HOST_PROTOCOL, type FrameStream, type HostMessage, type HostRequest, type RuntimeInfo, type RuntimeSpawn } from './protocol'
+import { LineReader, RUNTIME_BUFFER_BYTES, RUNTIME_BUFFER_FRAMES, RUNTIME_HOST_FEATURES, RUNTIME_HOST_PROTOCOL, type FrameStream, type HostMessage, type HostRequest, type RuntimeInfo, type RuntimeSpawn } from './protocol'
+import { McpRelay } from './relay'
 
 export interface RuntimeHostOptions {
   pipe: string
@@ -13,6 +14,8 @@ export interface RuntimeHostOptions {
   unattachedMs?: number
   bufferBytes?: number
   bufferFrames?: number
+  /** How long an MCP request waits for an app to take its route over again (McpRelay). */
+  relayWaitMs?: number
   log?(message: string): void
   onIdle?(): void
 }
@@ -40,12 +43,14 @@ export class RuntimeHost {
   private readonly unattachedMs: number
   private readonly bufferBytes: number
   private readonly bufferFrames: number
+  private readonly relay: McpRelay
 
   constructor(private options: RuntimeHostOptions) {
     this.idleMs = options.idleMs ?? 5 * 60_000
     this.unattachedMs = options.unattachedMs ?? 12 * 60 * 60_000
     this.bufferBytes = options.bufferBytes ?? RUNTIME_BUFFER_BYTES
     this.bufferFrames = options.bufferFrames ?? RUNTIME_BUFFER_FRAMES
+    this.relay = new McpRelay({ waitMs: options.relayWaitMs, log: options.log })
   }
 
   listen(): Promise<void> {
@@ -64,6 +69,7 @@ export class RuntimeHost {
     if (this.idleTimer) clearTimeout(this.idleTimer)
     for (const runtime of this.runtimes.values()) this.stop(runtime)
     for (const client of this.clients) client.socket.destroy()
+    await this.relay.close()
     await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())
   }
 
@@ -91,7 +97,7 @@ export class RuntimeHost {
       if (given.length !== expected.length || !timingSafeEqual(given, expected)) { client.socket.destroy(); return }
       if (request.protocol !== RUNTIME_HOST_PROTOCOL) { this.reply(client, request.id, false, `Runtime host speaks protocol ${RUNTIME_HOST_PROTOCOL}, not ${request.protocol}`); return }
       client.authed = true
-      this.reply(client, request.id, true, { pid: process.pid, protocol: RUNTIME_HOST_PROTOCOL })
+      this.reply(client, request.id, true, { pid: process.pid, protocol: RUNTIME_HOST_PROTOCOL, features: RUNTIME_HOST_FEATURES })
       return
     }
     if (!client.authed) { client.socket.destroy(); return }
@@ -137,6 +143,11 @@ export class RuntimeHost {
           if (!runtime.info.alive) this.forget(runtime)
         }
         return this.reply(client, request.id, true, { stopped })
+      }
+      case 'relay': {
+        const id = request.id
+        this.relay.register(client, request.key, request.servers).then(routes => this.reply(client, id, true, routes), error => this.reply(client, id, false, error instanceof Error ? error.message : String(error)))
+        return
       }
       case 'shutdown':
         this.reply(client, request.id, true)
@@ -273,6 +284,7 @@ export class RuntimeHost {
    *  runtimes with it: without the adapter state it saves on detach, nobody could continue them. */
   private release(client: Client): void {
     this.clients.delete(client)
+    this.relay.release(client)
     for (const runtime of [...this.runtimes.values()]) {
       if (runtime.owner !== client) continue
       runtime.owner = undefined

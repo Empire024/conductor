@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, promises as fs, readFileSync, statSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { RuntimeHostClient } from './client'
-import { RUNTIME_HOST_PROTOCOL, type HostLock } from './protocol'
+import { RUNTIME_HOST_FEATURES, RUNTIME_HOST_PROTOCOL, type HostLock } from './protocol'
 
 export interface RuntimeHostLaunch {
   userData: string
@@ -26,7 +26,18 @@ export const readHostLock = (userData: string): HostLock | null => {
 export async function connectRuntimeHost(launch: RuntimeHostLaunch): Promise<RuntimeHostClient | null> {
   const lock = readHostLock(launch.userData)
   if (lock && lock.protocol === RUNTIME_HOST_PROTOCOL) {
-    try { return await RuntimeHostClient.connect(lock.pipe, lock.secret) } catch (error) { launch.log?.(`runtime host lock found but unreachable: ${error instanceof Error ? error.message : String(error)}`) }
+    try {
+      const client = await RuntimeHostClient.connect(lock.pipe, lock.secret)
+      // A host outlives the app, so after an update it is the previous build's. One that keeps
+      // nothing running is replaced, so this build's host features (RUNTIME_HOST_FEATURES) apply.
+      const missing = RUNTIME_HOST_FEATURES.filter(feature => !client.features.includes(feature))
+      if (!launch.start || !missing.length || (await client.list()).length) return client
+      launch.log?.(`replacing idle runtime host ${client.hostPid}: it predates ${missing.join(', ')}`)
+      await client.shutdown().catch(() => { /* it is going anyway */ })
+      client.dispose()
+      const gone = Date.now() + 5000
+      while (processAlive(client.hostPid) && Date.now() < gone) await new Promise(resolve => setTimeout(resolve, 100))
+    } catch (error) { launch.log?.(`runtime host lock found but unreachable: ${error instanceof Error ? error.message : String(error)}`) }
   }
   if (!launch.start) return null
   await fs.mkdir(hostDirectory(launch.userData), { recursive: true })
@@ -40,9 +51,7 @@ export async function connectRuntimeHost(launch: RuntimeHostLaunch): Promise<Run
   // restart. Off test mode the host is meant to survive an app restart, so this
   // is never set for a real launch.
   if (process.env.CONDUCTOR_TEST_USER_DATA) environment.CONDUCTOR_RUNTIME_HOST_WATCH_PID = process.env.CONDUCTOR_TEST_PARENT_PID || String(process.pid)
-  const child = spawn(runtime, [script, '--user-data', launch.userData], { detached: true, stdio: 'ignore', windowsHide: true, env: environment, cwd: hostDirectory(launch.userData) })
-  child.on('error', error => launch.log?.(`runtime host could not start: ${error.message}`))
-  child.unref()
+  startDetached(runtime, [script, '--user-data', launch.userData], environment, hostDirectory(launch.userData), launch.log)
   const deadline = Date.now() + 15_000
   while (Date.now() < deadline) {
     await new Promise(resolve => setTimeout(resolve, 150))
@@ -51,6 +60,45 @@ export async function connectRuntimeHost(launch: RuntimeHostLaunch): Promise<Run
     try { return await RuntimeHostClient.connect(started.pipe, started.secret) } catch { /* not listening yet */ }
   }
   throw new Error('The runtime host did not start within 15 s')
+}
+
+const processAlive = (pid: number): boolean => { try { process.kill(pid, 0); return true } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM' } }
+
+/** Windows command-line quoting (CommandLineToArgvW rules). */
+export const quoteWindowsArgument = (value: string): string =>
+  value && !/[\s"]/.test(value) ? value : `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`
+
+/**
+ * Starts the host with none of this process's handles. On Windows every child Node spawns is
+ * created with handle inheritance on, and Chromium's listening sockets (the
+ * --remote-debugging-port among them) are inheritable: a host started that way held the old app's
+ * port after the app was gone, so a relaunched app never answered on it (FX12, feature-list.md
+ * runtime-host-handle-inheritance). PowerShell's Start-Process starts it through ShellExecuteEx,
+ * which hands the new process no handles; PowerShell itself exits at once. If that route fails the
+ * host is spawned directly, as before.
+ */
+function startDetached(executable: string, args: string[], environment: NodeJS.ProcessEnv, cwd: string, log?: (message: string) => void): void {
+  const direct = (): void => {
+    const child = spawn(executable, args, { detached: true, stdio: 'ignore', windowsHide: true, env: environment, cwd })
+    child.on('error', error => log?.(`runtime host could not start: ${error.message}`))
+    child.unref()
+  }
+  if (process.platform !== 'win32') { direct(); return }
+  // Paths travel in the environment, never inside the PowerShell command text.
+  const launcher = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+    'Start-Process -FilePath $env:CONDUCTOR_RUNTIME_HOST_EXE -ArgumentList $env:CONDUCTOR_RUNTIME_HOST_ARGS -WorkingDirectory $env:CONDUCTOR_RUNTIME_HOST_CWD -WindowStyle Hidden'], {
+    stdio: 'ignore', windowsHide: true, cwd,
+    env: { ...environment, CONDUCTOR_RUNTIME_HOST_EXE: executable, CONDUCTOR_RUNTIME_HOST_ARGS: args.map(quoteWindowsArgument).join(' '), CONDUCTOR_RUNTIME_HOST_CWD: cwd }
+  })
+  let fellBack = false
+  const fallBack = (reason: string): void => {
+    if (fellBack) return
+    fellBack = true
+    log?.(`runtime host could not be started without inherited handles (${reason}); starting it directly`)
+    direct()
+  }
+  launcher.on('error', error => fallBack(error.message))
+  launcher.on('exit', code => { if (code !== 0) fallBack(`PowerShell exited with ${code}`) })
 }
 
 /** The Electron files running as plain Node needs, copied once per Electron version. */

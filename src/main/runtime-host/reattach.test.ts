@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -129,6 +130,59 @@ readline.createInterface({ input: process.stdin }).on('line', async line => {
   notify('turn/completed', { threadId, turn: { ...turn, status: 'completed' } })
 })`
 
+/** A Claude CLI stand-in that uses its tools after the app it started with is gone: once the test
+ *  writes `go` into its working directory, it sends a PreToolUse hook and calls the MCP server
+ *  named in its --mcp-config, the way the installed CLI does, and reports what came back. Like the
+ *  CLI it gives up on a hook after the timeout registered at initialize. */
+const TOOLS_CLAUDE = `
+const readline = require('node:readline')
+const { randomUUID } = require('node:crypto')
+const { existsSync, readFileSync } = require('node:fs')
+const send = message => process.stdout.write(JSON.stringify(message) + '\\n')
+const emit = message => send({ uuid: randomUUID(), session_id: 'tools-native-1', parent_tool_use_id: null, ...message })
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+const say = text => { const id = randomUUID(); emit({ type: 'assistant', message: { id, content: [{ type: 'text', text }] } }) }
+const config = process.argv[process.argv.indexOf('--mcp-config') + 1]
+const server = Object.values(JSON.parse(config.trim().startsWith('{') ? config : readFileSync(config, 'utf8')).mcpServers)[0]
+let timeout = 0
+const answers = new Map()
+const hook = tool => new Promise(resolve => {
+  const id = randomUUID()
+  const timer = setTimeout(() => resolve('timed out after ' + timeout + ' s'), timeout * 1000)
+  answers.set(id, response => { clearTimeout(timer); resolve(response.subtype) })
+  send({ type: 'control_request', request_id: id, request: { subtype: 'hook_callback', callback_id: 'conductor_before', tool_use_id: tool, input: { tool_use_id: tool, tool_name: 'Bash', tool_input: { command: 'echo hi' } } } })
+})
+readline.createInterface({ input: process.stdin }).on('line', async line => {
+  const message = JSON.parse(line)
+  if (message.type === 'control_response') { answers.get(message.response.request_id)?.(message.response); return }
+  if (message.type === 'control_request') {
+    if (message.request.subtype === 'initialize') timeout = message.request.hooks.PreToolUse[0].timeout
+    send({ type: 'control_response', response: { subtype: 'success', request_id: message.request_id, response: message.request.subtype === 'initialize' ? { models: [{ value: 'synthetic-claude', displayName: 'Synthetic' }] } : {} } })
+    return
+  }
+  if (message.type !== 'user') return
+  emit({ type: 'system', subtype: 'init', model: 'synthetic-claude' })
+  say('waiting')
+  while (!existsSync('go')) await wait(20)
+  emit({ type: 'assistant', message: { id: randomUUID(), content: [{ type: 'tool_use', id: 'tool-while-away', name: 'Bash', input: { command: 'echo hi' } }] } })
+  const [answer, reached] = await Promise.all([hook('tool-while-away'), fetch(server.url, { method: 'POST', headers: { Authorization: server.headers.Authorization, 'Content-Type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) }).then(async response => response.status + ' ' + (await response.text()), error => 'failed ' + error.message)])
+  emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-while-away', content: 'hi', is_error: false }] } })
+  say('hook timeout ' + timeout + '; hook ' + answer + '; mcp ' + reached)
+  emit({ type: 'result', subtype: 'success', is_error: false, usage: {} })
+})`
+
+/** One of the app's loopback MCP servers: a new port and token every launch, like BrowserMcpServer. */
+async function mcpServer(token: string, directory: string): Promise<{ config: string; close(): Promise<void> }> {
+  const server = createServer((request, response) => {
+    request.resume()
+    response.writeHead(request.headers.authorization === 'Bearer ' + token ? 200 : 401, { 'Content-Type': 'application/json' }).end(JSON.stringify({ served: token.slice(0, 4) }))
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const config = join(directory, `mcp-${token.slice(0, 4)}.json`)
+  writeFileSync(config, JSON.stringify({ mcpServers: { 'conductor-browser': { type: 'http', url: `http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`, headers: { Authorization: 'Bearer ' + token } } } }))
+  return { config, close: () => new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections() }) }
+}
+
 const settings: SessionSettings = { permission: 'auto', plan: false }
 const until = async (check: () => boolean, what: string, timeoutMs = 15_000): Promise<void> => {
   const deadline = Date.now() + timeoutMs
@@ -156,6 +210,7 @@ describe('reattaching a turn across an app restart', () => {
   })
   afterEach(async () => {
     setRuntimeHost(null)
+    mcpConfig = ''
     for (const step of cleanup.splice(0).reverse()) { try { step() } catch { /* best effort */ } }
     await host.close()
     await new Promise(resolve => setTimeout(resolve, 200))
@@ -166,13 +221,15 @@ describe('reattaching a turn across an app restart', () => {
     }
   })
 
-  const factory = (provider: StructuredProvider, options: AdapterOptions) => provider === 'codex' ? new CodexAdapter(options, {
+  /** The MCP configuration the current app process hands its adapters (StructuredSessions.options). */
+  let mcpConfig = ''
+  const factory = (provider: StructuredProvider, given: AdapterOptions) => { const options = mcpConfig ? { ...given, mcpConfig } : given; return provider === 'codex' ? new CodexAdapter(options, {
     version: async () => CODEX_PROTOCOL_BASELINE,
     transport: transport => new JsonLineTransport({ ...transport, executable: process.execPath, args: [fakeCodex], environment: { ...process.env } })
   }) : new ClaudeAdapter(options, {
     version: async () => CLAUDE_COMPATIBILITY,
     createTransport: transport => new JsonLineTransport({ ...transport, executable: process.execPath, args: [fake, ...transport.args], environment: { ...process.env } })
-  })
+  }) }
   /** One app process: its own database connection, runtime host client and sessions. */
   const app = async (databasePath: string): Promise<{ database: ConductorDatabase; sessions: StructuredSessions; client: RuntimeHostClient }> => {
     const database = new ConductorDatabase(databasePath)
@@ -289,6 +346,37 @@ describe('reattaching a turn across an app restart', () => {
     expect(state.items.find(item => item.data.type === 'tool')?.data).toMatchObject({ type: 'tool', status: 'completed' })
     const sequences = second.database.structured.events(spec.id).map(event => event.sequence)
     expect(sequences).toEqual(sequences.map((_, index) => sequences[0]! + index))
+  })
+
+  it('answers a kept turn\'s tool hook and MCP call made while no app ran, from the next app (FX16)', async () => {
+    writeFileSync(fake, TOOLS_CLAUDE)
+    const workspace = join(root, 'workspace-tools'); mkdirSync(workspace)
+    const databasePath = join(root, 'tools.db')
+    const before = await mcpServer('a'.repeat(64), root)
+    mcpConfig = before.config
+    const first = await app(databasePath)
+    const project = first.database.upsertProject(workspace, 'Tools project')
+    const spec: AgentSpec = { id: 'tools-agent', projectId: project.id, sessionId: first.database.listSessions(project.id)[0]!.id, provider: 'claude', title: 'Wizard', cwd: workspace }
+    first.sessions.ensure(spec)
+    await first.sessions.submit(spec.id, 'Use a tool after the restart', settings)
+    await until(() => assistantText(first.database, spec.id).includes('waiting'), 'the turn to be under way')
+    expect(await first.sessions.detachForRestart()).toEqual([spec.id])
+    first.sessions.dispose(); first.client.dispose(); first.database.close()
+    await before.close()
+
+    // No app runs: the CLI's hook and MCP call wait in the runtime host for the next one.
+    writeFileSync(join(workspace, 'go'), '')
+    await new Promise(resolve => setTimeout(resolve, 1500))
+
+    // The next app serves its MCP server on another port with another credential.
+    const after = await mcpServer('b'.repeat(64), root)
+    cleanup.push(() => { void after.close() })
+    mcpConfig = after.config
+    const second = await app(databasePath)
+    await second.sessions.reattach(spec.id)
+    await until(() => second.database.structured.snapshot(spec.id)!.phase === 'completed', 'the turn to complete', 20_000)
+    const report = assistantText(second.database, spec.id).find(text => text.startsWith('hook timeout'))
+    expect(report).toBe('hook timeout 900; hook success; mcp 200 {"served":"bbbb"}')
   })
 
   it('stops an idle conversation as before and keeps no record of it', async () => {

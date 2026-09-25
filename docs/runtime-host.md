@@ -34,14 +34,21 @@ the installer leaves them alone too.
 - Pipe: `\\.\pipe\conductor-runtime-host-<sha256(userData) prefix>`; every connection must open
   with `hello {secret, protocol}` or it is dropped.
 - Log: `<userData>/runtime-host/host.log` (bounded, rotated at 1 MiB).
-- Launch: `spawn(runtime, [host.js], { detached: true, stdio: 'ignore', windowsHide: true })`,
-  `unref()`. A second host finding a live lock with a live pid exits at once.
+- Launch: on Windows through PowerShell's `Start-Process` (ShellExecuteEx), so the host inherits
+  none of the app's handles. A plain `spawn` from Node always passes inheritable handles, and
+  Chromium's listening sockets are inheritable: a host started that way kept the old app's
+  `--remote-debugging-port` after the app was gone, so the relaunched app never answered on it
+  (FX16). If PowerShell fails, `spawn(..., { detached: true, stdio: 'ignore' })` as before. A second
+  host finding a live lock with a live pid exits at once. A running host from an older build
+  (its `hello` lacks one of `RUNTIME_HOST_FEATURES`) is replaced at launch when it keeps nothing
+  running; one that keeps a turn stays, without the newer features, until it next goes idle.
 
 ## Protocol (newline-delimited JSON over the pipe, version 1)
 
 Client to host: `hello`, `spawn {runtimeId, executable, args, cwd, env, meta}`,
 `send {runtimeId, line}`, `attach {runtimeId, afterSeq}`, `detach {runtimeId, seq}`,
-`ack {runtimeId, seq}`, `close {runtimeId}`, `list`, `stopAll`, `shutdown`.
+`ack {runtimeId, seq}`, `close {runtimeId}`, `list`, `stopAll`, `shutdown`, `relay {key, servers}`
+(a host whose `hello` lists the `mcp-relay` feature; see below).
 Requests carry an `id`; the host answers `{op: 'result', id, ok, value | error}`.
 
 Host to client: `frame {runtimeId, seq, stream: 'stdout' | 'stderr', data}` (stdout split into
@@ -108,6 +115,31 @@ one steering message with the new briefing. A reattached wizard is not resumed a
 the restart-initiator logic. Reattached conversations without an open tab appear in `agents.list`
 as orphans. After reattaching, main starts (or joins) the host for new runtimes and closes any
 host runtime nobody owns: its app crashed, so no adapter state exists to continue it.
+
+## Tools after a reattach (FX16)
+
+A kept Claude or Codex process keeps calling back into Conductor while it runs: tool hooks
+(Claude `hook_callback`) and approvals (Claude `can_use_tool`, Codex `requestApproval`) travel on
+its stdio, which the host already relays and buffers; its MCP tools (the browser view and
+`conductor-local`) are HTTP servers in the app on a new port with new bearer tokens every launch.
+
+- Hooks: a hosted Claude CLI registers its hooks with a 900 s timeout instead of 15 s, so a hook
+  sent while no app runs (an update install, then the new process's slow first minute: 45 s + 55 s
+  on 2026-09-25) waits in the host for the next app instead of failing every tool call of the turn.
+  The adapter still answers within 15 s itself, or fails the hook (the tool is not run).
+- Approvals have no provider-side timeout; the reattached adapter restates them and the answer
+  goes out through the host.
+- MCP: the host runs a loopback HTTP relay (`runtime-host/relay.ts`). An adapter whose process is
+  hosted registers its MCP servers under its own `relayKey` and gives the process the relay's
+  address and a per-route token instead of the app's. The address and token last as long as the
+  host. On reattach the adapter registers again with the new app's servers; a request that
+  arrives while no app owns the route waits for it (up to 10 min), and a server the new app no
+  longer gives the conversation is refused. The relay forwards bytes with the app's own
+  credential, so the app's server still decides every call.
+
+`scripts/smoke-fx16-restart-tools.mjs` restarts a parked app under a streaming turn whose stand-in
+CLI sends a hook and calls both MCP servers while no app runs, and checks that the relaunched app
+answers on its debugging port.
 
 ## Lifecycle
 

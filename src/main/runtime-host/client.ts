@@ -1,5 +1,5 @@
 import { connect, type Socket } from 'node:net'
-import { LineReader, RUNTIME_HOST_PROTOCOL, type FrameStream, type HostMessage, type HostRequest, type RuntimeInfo, type RuntimeMeta, type RuntimeSpawn } from './protocol'
+import { LineReader, RUNTIME_HOST_PROTOCOL, type FrameStream, type HostMessage, type HostRequest, type RelayRoute, type RelayServer, type RuntimeInfo, type RuntimeMeta, type RuntimeSpawn } from './protocol'
 
 export interface RuntimeListener {
   frame(seq: number, stream: FrameStream, data: string): void
@@ -16,6 +16,8 @@ export class RuntimeHostClient {
   private listeners = new Map<string, RuntimeListener>()
   private closed = false
   private lostHandlers = new Set<() => void>()
+  /** What this host offers beyond the process relay (RUNTIME_HOST_FEATURES); none for an older host. */
+  readonly features: readonly string[] = []
 
   private constructor(private socket: Socket, readonly hostPid: number) {}
 
@@ -29,8 +31,9 @@ export class RuntimeHostClient {
     const client = new RuntimeHostClient(socket, 0)
     client.wire()
     try {
-      const hello = await client.request({ op: 'hello', secret, protocol: RUNTIME_HOST_PROTOCOL, client: `main:${process.pid}` }, timeoutMs) as { pid: number }
+      const hello = await client.request({ op: 'hello', secret, protocol: RUNTIME_HOST_PROTOCOL, client: `main:${process.pid}` }, timeoutMs) as { pid: number; features?: unknown }
       ;(client as { hostPid: number }).hostPid = hello.pid
+      ;(client as { features: readonly string[] }).features = Array.isArray(hello.features) ? hello.features.filter((feature): feature is string => typeof feature === 'string') : []
       return client
     } catch (error) { socket.destroy(); throw error }
   }
@@ -61,6 +64,8 @@ export class RuntimeHostClient {
   list(): Promise<RuntimeInfo[]> { return this.request({ op: 'list' }) as Promise<RuntimeInfo[]> }
   stopAll(onlyUnowned = false): Promise<{ stopped: number }> { return this.request({ op: 'stopAll', onlyUnowned }) as Promise<{ stopped: number }> }
   shutdown(): Promise<unknown> { return this.request({ op: 'shutdown' }) }
+  /** Points `key`'s relayed MCP servers at where this app serves them now (McpRelay.register). */
+  relay(key: string, servers: RelayServer[]): Promise<RelayRoute[]> { return this.request({ op: 'relay', key, servers }) as Promise<RelayRoute[]> }
   /** Resolves once everything written so far has left this process. */
   flush(): Promise<void> {
     if (!this.connected) return Promise.resolve()

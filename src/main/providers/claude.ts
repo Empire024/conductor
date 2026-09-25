@@ -5,7 +5,8 @@ import { open } from 'node:fs/promises'
 import { workspacePath } from '../agent-artifacts'
 import { InteractionResponseRejectedError, SteeringUnavailableError, type AdapterOptions, type ProviderAdapter, type RuntimeDetachment } from './adapter'
 import { captureAdapterState, restoreAdapterState, settled } from './adapter-state'
-import { JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
+import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
+import { privateConfigFile, relayMcpConfigs, relaysMcp, removeConfigFiles } from '../runtime-host/relay-config'
 import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, parseAutoModeDenialReason } from '../../shared/auto-mode-denial'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
@@ -53,6 +54,13 @@ export function claudeTaskKind(taskType: string | undefined): ClaudeTaskKind {
 interface Transport { start(): void; send(message: Json): void; close(): void; closeAndWait?(): Promise<void>; readonly connected: boolean; readonly detachable?: boolean; detach?(): Promise<HostedRuntimeHandle | null> }
 /** Adapter fields that hold promises, timers or callbacks, and never travel in a detachment. */
 const CLAUDE_TRANSIENT = ['controls', 'receiving'] as const
+/** How long Conductor takes to answer a tool hook while it runs; past it the tool is not run. */
+const HOOK_ANSWER_MS = 15_000
+/** How long a CLI kept by the runtime host waits for a hook answer. An app restart (an update
+ *  install, then a slow first minute of the new process) leaves a hook unanswered for well over
+ *  15 s, and the CLI then refuses every tool call of the turn; the host holds the request until the
+ *  next app answers it (docs/runtime-host.md). A running app still answers within HOOK_ANSWER_MS. */
+const HOSTED_HOOK_TIMEOUT_SEC = 900
 interface Dependencies { createTransport?(options: TransportOptions): Transport; version?(executable: string): Promise<string> }
 interface Tool { name: string; input: Json; parentId?: string; status: 'preparing' | 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'rejected' | 'interrupted'; detached?: boolean; captured?: boolean }
 interface Block { id: string; kind: string; input: string; text: string }
@@ -118,6 +126,12 @@ export class ClaudeAdapter implements ProviderAdapter {
   private maxOutputTokens?: number
   /** Provider frames whose asynchronous handling (a host hook, an approval guard) is running. */
   private receiving = 0
+  /** Names this conversation's MCP routes in the runtime host's relay (runtime-host/relay.ts). */
+  private relayKey = randomUUID()
+  /** The CLI reaches Conductor's MCP servers through the relay, so a reattaching app re-points them. */
+  private mcpRelayed = false
+  /** Relayed MCP configs written for this CLI's command line; removed when the runtime ends. */
+  private relayFiles: string[] = []
 
   constructor(private options: AdapterOptions, private dependencies: Dependencies = {}) {
     if (options.approvalReviewer || options.reviewApprovals) this.providerCapabilities.approvalRouting = options.approvalReviewer ? 'isolated-reviewer' : 'stronger-review'
@@ -181,7 +195,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     // the owner should never have to restart one to get them. --mcp-config is additive, so the
     // owner's own MCP configuration is untouched; --strict-mcp-config is deliberately not sent.
     // One variadic flag carries both servers; a repeated flag is not something the CLI promises to merge.
-    const mcpConfigs = this.options.approvalReviewer ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig].filter((config): config is string => Boolean(config))
+    const mcpConfigs = await this.relayMcp(this.options.approvalReviewer ? [] : [this.options.mcpConfig, this.options.localAssistMcpConfig].filter((config): config is string => Boolean(config)))
     if (mcpConfigs.length) args.push('--mcp-config', ...mcpConfigs)
     if (this.nativeSessionId) args.push(this.options.newNativeSession ? '--session-id' : '--resume', this.nativeSessionId)
     // No --bare, --system-prompt, --setting-sources, or environment auth mutation:
@@ -190,10 +204,11 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.emit({ data: { type: 'session', phase: 'starting', capabilities: this.capabilities } })
     this.transport.start()
     try {
+      const timeout = this.transport.detachable ? HOSTED_HOOK_TIMEOUT_SEC : HOOK_ANSWER_MS / 1000
       const initialized = await this.control({ subtype: 'initialize', hooks: {
-        PreToolUse: [{ hookCallbackIds: ['conductor_before'], timeout: 15 }],
-        PostToolUse: [{ hookCallbackIds: ['conductor_after'], timeout: 15 }],
-        PostToolUseFailure: [{ hookCallbackIds: ['conductor_failed'], timeout: 15 }]
+        PreToolUse: [{ hookCallbackIds: ['conductor_before'], timeout }],
+        PostToolUse: [{ hookCallbackIds: ['conductor_after'], timeout }],
+        PostToolUseFailure: [{ hookCallbackIds: ['conductor_failed'], timeout }]
       }, forwardSubagentText: true, promptSuggestions: false, agentProgressSummaries: false })
       this.capabilities.models = array(initialized.models).flatMap((entry) => {
         const model = object(entry)
@@ -221,7 +236,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       onMessage: (message) => { this.receiving++; void this.receive(message).catch((error: unknown) => this.fail(error)).finally(() => { this.receiving-- }) },
       onStderr: (text) => this.emit({ data: { type: 'notice', message: 'Claude process diagnostic', payload: { stderr: text } }, native: { method: 'stderr' } }),
       onError: (error) => this.fail(error),
-      onExit: (code, signal) => this.disconnected(`Claude runtime exited${code === null ? '' : ` (${code})`}${signal ? `: ${signal}` : ''}`)
+      onExit: (code, signal) => this.exited(`Claude runtime exited${code === null ? '' : ` (${code})`}${signal ? `: ${signal}` : ''}`)
     })
   }
 
@@ -239,9 +254,33 @@ export class ClaudeAdapter implements ProviderAdapter {
     return detached ? { state, transport: detached } : null
   }
 
-  private attachRunning(detachment: RuntimeDetachment): void {
+  /** Conductor's MCP servers listen on a new port with new credentials every launch. A CLI kept by
+   *  the runtime host calls them through the host's relay, whose address never changes. */
+  private async relayMcp(configs: string[]): Promise<string[]> {
+    const host = currentRuntimeHost()
+    if (!configs.length || !relaysMcp(host)) return configs
+    const relayed = await relayMcpConfigs(host, this.relayKey, configs, error => this.relayNotice(error))
+    return relayed.map((config, index) => {
+      if (!config || config === configs[index]) return configs[index]!
+      this.mcpRelayed = true
+      const file = privateConfigFile(config, `claude-${this.relayKey}-${index}`)
+      this.relayFiles.push(file)
+      return file
+    })
+  }
+  private relayNotice(error: Error): void {
+    this.emit({ data: { type: 'notice', message: `Conductor's MCP servers could not be relayed through the runtime host: ${error.message}` } })
+  }
+  private exited(message: string): void {
+    removeConfigFiles(this.relayFiles.splice(0))
+    this.disconnected(message)
+  }
+
+  private async attachRunning(detachment: RuntimeDetachment): Promise<void> {
     restoreAdapterState(this, detachment.state)
     this.disposed = false
+    // The CLI still calls the relay it was started with; its routes now lead to this app's servers.
+    if (this.mcpRelayed) await relayMcpConfigs(currentRuntimeHost(), this.relayKey, [this.options.mcpConfig, this.options.localAssistMcpConfig], error => this.relayNotice(error))
     this.transport = this.createTransport([], detachment.transport)
     this.transport.start()
     // The store closed this conversation's open work when it loaded (an app that stopped is
@@ -419,6 +458,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    removeConfigFiles(this.relayFiles.splice(0))
     this.disconnected('Claude runtime stopped; history remains available and resume is explicit')
     this.transport?.close()
   }
@@ -920,7 +960,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.requests.has(id) || this.hookRequests.has(id)) return
     if (request.subtype === 'hook_callback') {
       this.hookRequests.add(id)
-      try { const result = await this.hook(request); if (!this.disposed && this.transport?.connected) this.reply(id, result ?? {}) }
+      try { const result = await within(this.hook(request), HOOK_ANSWER_MS, 'Conductor did not answer the tool hook in time; the tool was not run'); if (!this.disposed && this.transport?.connected) this.reply(id, result ?? {}) }
       catch (error) { if (this.transport?.connected) this.replyError(id, error instanceof Error ? error.message : 'Conductor hook failed') }
       finally { this.hookRequests.delete(id) }
       return
@@ -1038,4 +1078,10 @@ export class ClaudeAdapter implements ProviderAdapter {
     this.disconnected(message)
     this.transport?.close()
   }
+}
+
+/** `promise`, or `message` as an error once `ms` pass without it. */
+function within<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  return Promise.race([promise, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms) })]).finally(() => clearTimeout(timer))
 }
