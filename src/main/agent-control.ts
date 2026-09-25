@@ -51,6 +51,7 @@ import type { RemoteJobService } from './remote-jobs/service'
 import type { LocalMachineReadiness } from '../shared/always-on'
 import { ControlActivityRecorder, type PreparedCall } from './control-activity'
 import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERMISSION_OWNER_SIGNATURES } from './permission-grants/control'
+import { callWizardApprovals, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
 import type { PermissionGrants } from './permission-grants/service'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 
@@ -336,8 +337,9 @@ export class AgentControl {
         return entry?.models.find(model => model.id === 'opus[1m]')?.id ?? entry?.models.find(model => model.id === 'opus')?.id
       },
       open: async (spec, model) => (await this.open({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }, { provider: 'claude', model, title: 'Stronger approval review', permission: 'default', focus: false }, true)).resourceId!,
-      // One review, one tab, gone when the decision is journaled: a swarm's approvals must not
-      // leave a trail of reviewer tabs for the owner to close.
+      // One reviewer tab per worker, reused across its requests and closed once it is idle: a
+      // swarm's approvals must not leave a trail of reviewer tabs for the owner to close.
+      isOpen: (spec, reviewerId) => this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }).some(tab => tab.resourceId === reviewerId),
       close: async (spec, reviewerId) => {
         const scope = { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }
         const tab = this.tabs(scope).find(candidate => candidate.resourceId === reviewerId)
@@ -937,11 +939,12 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
       return callPermissions(this.deps.permissionGrants, { agentSessionId: scope.agentSessionId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
     }
+    if (WIZARD_APPROVAL_METHODS.includes(method)) return callWizardApprovals({ answerable: current => this.answerable(current), snapshot: id => database.structured.snapshot(id), respond: response => sessions.respond(response), persistence: database }, { agentSessionId: scope.agentSessionId, projectId: scope.projectId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -1936,6 +1939,24 @@ export class AgentControl {
       }
     }
     return [...links.values()]
+  }
+
+  /** Whose approvals agents.approve may answer (wizard-approvals.ts): the owner credential, every
+   *  agent conversation of its project; a wizard, the coworkers it controls and theirs. */
+  private answerable(scope: WizardApprovalScope): AnswerableConversation[] {
+    const describe = (id: string, title?: string): AnswerableConversation[] => {
+      const spec = this.deps.database.structured.spec<AgentSpec>(id)
+      return spec ? [{ agentSessionId: id, title, cwd: spec.cwd, projectId: spec.projectId, provider: spec.provider }] : []
+    }
+    if (scope.owner) return this.deps.database.listSessions(scope.projectId).flatMap(workspace => this.tabs({ projectId: scope.projectId, sessionId: workspace.id, agentSessionId: '' }))
+      .flatMap(tab => tab.kind === 'agent' && tab.resourceId ? describe(tab.resourceId, tab.title) : [])
+    const found = new Map<string, AnswerableConversation>()
+    let frontier = [scope.agentSessionId]
+    for (let depth = 0; depth < 4 && frontier.length; depth++) {
+      frontier = frontier.flatMap(controller => this.controlledBy(controller).map(link => link.targetAgentSessionId)).filter(id => id !== scope.agentSessionId && !found.has(id))
+      for (const id of frontier) for (const entry of describe(id)) found.set(id, entry)
+    }
+    return [...found.values()]
   }
 
   /** A main brain is a wizard tab or a controller with live coworkers: the conversation that is
