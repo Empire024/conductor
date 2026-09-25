@@ -57,8 +57,8 @@ export interface SessionSettings {
   reviewDelegatedActions?: boolean
   /** Wizard mode, the wand toggle in the composer: this conversation carries the owner's own
    *  authority over Conductor. Its coworkers' approvals are reviewed and answered for the owner,
-   *  it steers every tab, updates and restarts the app without a dialog, is brought back after a
-   *  restart Conductor started itself, and it and the coworkers it opens continue when a usage
+   *  it steers every tab, updates and restarts the app without a dialog, is brought back after any
+   *  restart that finds it working or waiting on its coworkers, and it and the coworkers it opens continue when a usage
    *  limit resets. Frontier models only (`isFrontierModel`); see `wizardActive`. */
   wizard?: boolean
   plan: boolean

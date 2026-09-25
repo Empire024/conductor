@@ -110,6 +110,16 @@ describe('installed updater source ownership — mocked transport, no installati
     await m.install()
     expect(f.instances[1].quitAndInstall).toHaveBeenCalledExactlyOnceWith(true, true)
   })
+  it('a downloaded update can be held back from installing on this quit', async () => {
+    const m = manager()
+    await m.check()
+    await m.download()
+    expect(m.getState().phase).toBe('ready')
+    expect(f.instances.every(instance => instance.autoInstallOnAppQuit)).toBe(true)
+    m.deferInstallOnQuit()
+    expect(f.instances.every(instance => instance.autoInstallOnAppQuit === false)).toBe(true)
+    expect(m.getState().phase).toBe('ready')
+  })
   it('coalesces repeated download actions from multiple windows', async () => {
     let finish!: () => void
     f.downloadGate = new Promise(resolve => { finish = resolve })

@@ -276,6 +276,11 @@ export class UpdateManager {
       throw reason
     }
   }
+  /** A downloaded update waits for the next quit instead of installing on this one: this quit
+   *  would cut running work the owner was not asked about (resume-after-any-restart). */
+  deferInstallOnQuit(): void {
+    for (const updater of [this.updater, this.remoteUpdater, this.localUpdater]) if (updater) updater.autoInstallOnAppQuit = false
+  }
   acknowledgePrepare(webContentsId: number, requestId: string): void {
     const pending = this.pendingPrepare
     if (!pending || pending.requestId !== requestId) return

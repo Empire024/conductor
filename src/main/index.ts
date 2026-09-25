@@ -1,4 +1,5 @@
-import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, wizardTabsToResume, type RestartInitiator, type RestartRequest } from './restart-initiator'
+import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, parseRestartRequest, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
+import { coworkerResumeMessage, encodeRestartIntent, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_KEY, restartLine, restartReason, resumePlan, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type RestartKind, type ResumeCandidate, type ResumePlan } from './restart-resume'
 import { StopConfirmations, type StopDecision } from './stop-confirmation'
 import { connectRuntimeHost } from './runtime-host/launcher'
 import type { RuntimeHostClient } from './runtime-host/client'
@@ -672,27 +673,101 @@ const disposeRuntimeServices = (): void => {
   }
 }
 
-/** Only the wizard tab that initiated this restart, or asked the owner for it, is brought back and
- *  told to continue. Other owner restarts restore windows without starting any conversations. */
-const resumeWizardTabs = async (initiator: RestartInitiator): Promise<void> => {
+/** Every agent tab open in a window, in every project and detached window. */
+const openAgentTabs = (): PaneTab[] => {
+  const tabs: PaneTab[] = []
+  const visit = (node: LayoutNode): void => { if (node.type === 'split') node.children.forEach(visit); else tabs.push(...node.tabs) }
+  const detachedWindows = database.listDetachedWindows()
   for (const project of database.listDeskProjects()) for (const workspace of database.listSessions(project.id)) {
-    const tabs: PaneTab[] = []
-    const visit = (node: LayoutNode): void => { if (node.type === 'split') node.children.forEach(visit); else tabs.push(...node.tabs) }
     visit(workspace.layout.root)
-    for (const detached of database.listDetachedWindows()) if (detached.sessionId === workspace.id) visit(detached.layout.root)
-    for (const tab of wizardTabsToResume(tabs, initiator)) {
-      if (tab.kind !== 'agent' || !tab.resourceId) continue
-      const state = database.structured.snapshot(tab.resourceId), spec = database.structured.spec<AgentSpec>(tab.resourceId)
-      if (!state || !spec || spec.provider === 'local' || !state.nativeSessionId || !wizardActive(state.settings, spec.provider)) continue
-      // Its turn was kept running through the restart and has been told so on reattach.
-      if (reattachedRuntimes.has(tab.resourceId)) continue
-      try {
-        await agents.structured.resume(tab.resourceId, state.settings)
-        await agents.structured.submit(tab.resourceId, `[Conductor] ${initiator.method === 'app.restart.request' ? 'The owner restarted Conductor as you requested' : 'Conductor restarted itself'} (now ${app.getVersion()}) and brought this wizard tab back. Continue your work from where you left off; check app.state and agents.list first, since your coworkers may need resuming too.`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
-        console.log(`Wizard tab ${tab.resourceId} resumed after the restart`)
-      } catch (error) { console.warn(`Wizard tab ${tab.resourceId} could not be resumed after the restart`, error) }
-    }
+    for (const detached of detachedWindows) if (detached.sessionId === workspace.id) visit(detached.layout.root)
   }
+  return tabs.filter(tab => tab.kind === 'agent' && tab.resourceId)
+}
+/** The conversation that dispatched and controls this one (the agentControlParent link). */
+const controllerOf = (agentSessionId: string): string | undefined => {
+  try { return (JSON.parse(database.getSetting('agentControlParent:' + agentSessionId) || 'null') as { controllerAgentSessionId?: string } | null)?.controllerAgentSessionId } catch { return undefined }
+}
+/** The wizards working or waiting on their coworkers right now, and those coworkers. */
+const currentWorkingSet = (): { wizards: string[]; coworkers: string[] } => {
+  const candidates = new Map<string, ResumeCandidate>()
+  for (const tab of openAgentTabs()) {
+    const id = tab.resourceId!, state = database.structured.snapshot(id)
+    if (!state || candidates.has(id)) continue
+    const working = hasSessionWork(state, agents.structured.hasRuntime(id)), controller = controllerOf(id)
+    const provider = Boolean(state.settings?.wizard) || working ? database.structured.spec<AgentSpec>(id)?.provider : undefined
+    candidates.set(id, { id, wizard: Boolean(provider && provider !== 'local' && wizardActive(state.settings, provider)), working, ...(controller ? { controller } : {}) })
+  }
+  return workingSet([...candidates.values()])
+}
+
+/* resume-after-any-restart (restart-resume.ts): while Conductor runs, RESTART_INTENT_KEY holds a
+ * `running` record of the working set, so a crash leaves it behind; every quit path replaces it
+ * once with how Conductor stopped, and the next launch reads it once and clears it. */
+let restartWatchTimer: NodeJS.Timeout | null = null
+let restartWatchRecord: RestartIntent | null = null
+let restartIntentRecorded = false
+const restartIntent = (kind: RestartKind, resume: boolean, working = currentWorkingSet(), toVersion?: string): RestartIntent =>
+  ({ kind, fromVersion: updates?.getState().currentVersion ?? app.getVersion(), ...(toVersion ? { toVersion } : {}), at: new Date().toISOString(), resume, ...working })
+const writeRestartWatch = (): void => {
+  if (restartIntentRecorded) return
+  try {
+    const next = restartIntent('running', true)
+    if (!watchChanged(restartWatchRecord, next)) return
+    database.setSetting(RESTART_INTENT_KEY, encodeRestartIntent(next))
+    restartWatchRecord = next
+  } catch (error) { console.warn('The restart watch could not be saved', error) }
+}
+const startRestartWatch = (): void => {
+  writeRestartWatch()
+  restartWatchTimer = setInterval(writeRestartWatch, 5000)
+  restartWatchTimer.unref()
+}
+/** Records how Conductor is stopping, once; `resume` is false only when the owner said "Stop work". */
+const recordRestartIntent = (kind: Exclude<RestartKind, 'running'>, resume: boolean, working?: { wizards: string[]; coworkers: string[] }): void => {
+  if (restartIntentRecorded) return
+  restartIntentRecorded = true
+  if (restartWatchTimer) clearInterval(restartWatchTimer)
+  restartWatchTimer = null
+  try {
+    const update = updates?.getState()
+    const toVersion = kind === 'update-install' || kind === 'update-on-quit' ? update?.availableVersion : undefined
+    const intent = restartIntent(kind, resume, working ?? currentWorkingSet(), toVersion)
+    database.setSetting(RESTART_INTENT_KEY, encodeRestartIntent(intent))
+    console.log(`Restart intent recorded: ${kind}, resume ${resume}, ${intent.wizards.length} wizard(s), ${intent.coworkers.length} coworker(s)`)
+  } catch (error) { console.warn('The restart intent could not be saved', error) }
+}
+/** The previous process's record, consumed by this launch. */
+const takeRestartIntent = (): RestartIntent | null => {
+  const intent = parseRestartIntent(database.getSetting(RESTART_INTENT_KEY), new Date())
+  database.setSetting(RESTART_INTENT_KEY, '')
+  return intent
+}
+
+/** Brings back the wizards and coworkers a restart left behind, and tells each why and to continue.
+ *  Coworkers go first, so a wizard's agents.list already shows them running again. A conversation
+ *  whose turn was kept running in the runtime host was told on reattach instead. */
+const resumeAfterRestart = async (plan: ResumePlan): Promise<void> => {
+  const open = new Set(openAgentTabs().map(tab => tab.resourceId))
+  const version = updates.getState().currentVersion
+  const bringBack = async (id: string, message: string, wizard: boolean): Promise<boolean> => {
+    if (!open.has(id) || reattachedRuntimes.has(id)) return false
+    const state = database.structured.snapshot(id), spec = database.structured.spec<AgentSpec>(id)
+    if (!state || !spec || spec.provider !== 'local' && !state.nativeSessionId) return false
+    if (wizard && (spec.provider === 'local' || !wizardActive(state.settings, spec.provider))) return false
+    // Something already started it again.
+    if (hasSessionWork(state, agents.structured.hasRuntime(id))) return false
+    const label = wizard ? 'Wizard tab' : 'Coworker'
+    try {
+      await agents.structured.resume(id, state.settings)
+      await agents.structured.submit(id, message, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+      console.log(`${label} ${id} resumed after the restart (${plan.reason})`)
+      return true
+    } catch (error) { console.warn(`${label} ${id} could not be resumed after the restart`, error); return false }
+  }
+  const resumed: string[] = []
+  for (const id of plan.coworkers) if (await bringBack(id, coworkerResumeMessage(plan, version), false)) resumed.push(id)
+  for (const id of plan.wizards) await bringBack(id, wizardResumeMessage(plan, version, resumed.filter(coworker => controllerOf(coworker) === id).length), true)
 }
 
 /** A wizard's request that the owner restart (app.restart.request). It is kept in the settings so
@@ -775,11 +850,11 @@ const reattachKeptRuntimes = async (): Promise<void> => {
 }
 /** A reattached turn still holds the previous process's app-control endpoint and credential, so it
  *  is told where app control lives now. */
-const briefReattachedRuntimes = (): void => {
+const briefReattachedRuntimes = (restarted: string): void => {
   for (const id of reattachedRuntimes) {
     const spec = database.structured.spec<AgentSpec>(id), state = database.structured.snapshot(id)
     if (!spec || spec.provider === 'local' || !state || !agentControlServer || !['running', 'waiting_approval', 'waiting_input'].includes(state.phase)) continue
-    void agents.structured.steer(id, `[Conductor] Conductor restarted (now ${app.getVersion()}) while this turn kept running. App control moved to a new endpoint and credential; use these from now on.\n\n${agentControlServer.briefing(spec)}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+    void agents.structured.steer(id, `[Conductor] ${restarted} while this turn kept running; continue. App control moved to a new endpoint and credential; use these from now on.\n\n${agentControlServer.briefing(spec)}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
       .catch(error => console.warn(`Reattached conversation ${id} could not be briefed`, error))
   }
 }
@@ -828,12 +903,15 @@ const takeLaunchInitiator = (): RestartInitiator | null => {
  *  stopped without the dialog, and dirty editors are flushed into their recovery drafts instead of
  *  being asked about, so nothing typed is lost and nothing on disk is overwritten. */
 const prepareForUpdateInstall = async (force = false, initiator?: Omit<RestartInitiator, 'at'>): Promise<void> => {
+  // Taken before any turn is kept or stopped: the conversations a restart has to bring back.
+  const working = currentWorkingSet(), asked = !force && stopQuestion() !== null
+  let decision: StopDecision = 'background'
   if (force) {
     try { await flushEditorWindows(editorWindows()) } catch (error) { console.warn('Editor drafts could not all be flushed before a forced restart', error) }
     // A wizard's or the owner credential's restart keeps running turns alive without asking.
     await keepRunningInBackground()
   } else {
-    const decision = await confirmApplicationStop(mainWindow, 'restart')
+    decision = await confirmApplicationStop(mainWindow, 'restart')
     if (decision === 'cancel') throw Object.assign(new Error('Update restart cancelled. Running work is unchanged.'), { code: 'UPDATE_CANCELLED' })
     if (!await resolveUnsavedEditors(mainWindow)) throw Object.assign(new Error('Update restart cancelled. Your edits are still open.'), { code: 'UPDATE_CANCELLED' })
     if (decision === 'background') await keepRunningInBackground()
@@ -841,6 +919,7 @@ const prepareForUpdateInstall = async (force = false, initiator?: Omit<RestartIn
   database.setSetting(UPDATE_WINDOW_LAYOUT_KEY, JSON.stringify(captureWindowLayout()))
   database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'true')
   database.setSetting(RESTART_INITIATOR_KEY, encodeRestartInitiator(initiator && { ...initiator, at: new Date().toISOString() }))
+  recordRestartIntent(updates?.getState().phase === 'installing' ? 'update-install' : 'restart', !(asked && decision === 'stop'), working)
   // electron-updater closes windows before Electron emits before-quit. Mark the
   // close as intentional now so detached tabs remain detached for the relaunch.
   isQuitting = true
@@ -2724,11 +2803,13 @@ app.whenReady().then(async () => {
   disposeOrchestrationIpc = registerOrchestrationIpc(orchestration)
   scheduleRunner.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
+  // How the previous process stopped, read once before anything is told about the restart.
+  const initiator = takeLaunchInitiator(), previousStop = takeRestartIntent()
+  const restartPlan = resumePlan(previousStop, initiator, updates.getState().currentVersion)
   // Turns the previous process kept running are rebound before any window asks for their tabs.
   try { await reattachKeptRuntimes() } catch (error) { console.error('Kept runtimes could not be reattached', error) }
-  briefReattachedRuntimes()
+  briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion ?? updates.getState().currentVersion, updates.getState().currentVersion))
   void startRuntimeHost()
-  const initiator = takeLaunchInitiator()
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
     ? parseSavedWindowLayout(database.getSetting(UPDATE_WINDOW_LAYOUT_KEY))
@@ -2741,8 +2822,10 @@ app.whenReady().then(async () => {
   }
   if (restoreAfterUpdate) database.setSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY, 'false')
   // The windows first, then the wizards: the panes must exist for the resumed turns to show in.
-  // A requested restart resumes its wizard however the owner restarted, even by quitting by hand.
-  if (initiator) setTimeout(() => { void resumeWizardTabs(initiator) }, 4000)
+  // Any restart brings back the wizards that were working or waiting on their coworkers, and a
+  // requested restart its wizard however the owner restarted, even by quitting by hand.
+  if (restartPlan) setTimeout(() => { void resumeAfterRestart(restartPlan) }, 4000)
+  startRestartWatch()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) mainWindow = createWindow()
   })
@@ -2759,9 +2842,11 @@ app.on('before-quit', (event) => {
   if (quitRequest) return
   const request = (async (): Promise<void> => {
     if (hostLifecycle && !await hostLifecycle.confirmStopHosting()) return
+    const asked = stopQuestion() !== null
     const decision = await confirmApplicationStop(mainWindow, 'quit')
     if (decision === 'cancel') return
     if (!await resolveUnsavedEditors(mainWindow)) return
+    recordRestartIntent(updates?.getState().phase === 'ready' ? 'update-on-quit' : 'quit', !(asked && decision === 'stop'))
     if (decision === 'background') await keepRunningInBackground()
     isQuitting = true
     app.quit()
@@ -2770,6 +2855,16 @@ app.on('before-quit', (event) => {
 })
 
 app.on('will-quit', () => {
+  if (!restartIntentRecorded && database) {
+    try {
+      const updateReady = updates?.getState().phase === 'ready'
+      if (!mayInstallOnQuit({ updateReady, unkeptWork: runningWork().length > 0, ownerAnswered: false })) {
+        updates.deferInstallOnQuit()
+        console.log('A downloaded update waits for the next quit: this one cuts running work nobody was asked about')
+      }
+      recordRestartIntent(updateReady ? 'update-on-quit' : 'quit', true)
+    } catch (error) { console.warn('The quit could not be recorded for the next launch', error) }
+  }
   hostLifecycle?.dispose()
   // Closing each job's held stdin is what tells its node to stop it.
   void remoteJobs?.shutdown(0)

@@ -187,12 +187,17 @@ try {
     // within about 10s of launch (it answers with a short SYNTHETIC-shaped continuation).
     let wizardAContinued = false, elapsedMs = null
     try {
-      await expect.poll(async () => { const s = await call('agents.status', { agentSessionId: wizardA.id }); return s.phase === 'running' || s.phase === 'completed' }, { timeout: 15_000, intervals: [300] }).toBe(true)
+      // The continue message itself, not just a settled phase: wizard A was already 'completed'
+      // before the restart, and a second restart before the launch's resume ran would pass too.
+      await expect.poll(async () => JSON.stringify(await call('agents.history', { agentSessionId: wizardA.id })).includes('This wizard tab was brought back'), { timeout: 15_000, intervals: [300] }).toBe(true)
+      await expect.poll(async () => (await call('agents.status', { agentSessionId: wizardA.id })).phase, { timeout: 15_000, intervals: [300] }).toBe('completed')
       elapsedMs = Date.now() - launchedAt
       wizardAContinued = true
     } catch (e) { observe('wizard A did not show a fresh turn within 15s', { message: e.message }) }
     summary.wizardAResumed = { wizardAContinued, elapsedMs }
     observe('wizard A resume check', summary.wizardAResumed)
+    assert.ok(wizardAContinued, 'wizard A was not brought back with the continue message')
+    assert.ok(!JSON.stringify(await call('agents.history', { agentSessionId: wizardB.id })).includes('This wizard tab was brought back'), 'idle wizard B was resumed too')
 
     const wizardBStatus = await call('agents.status', { agentSessionId: wizardB.id }).catch(e => ({ error: e.message }))
     summary.wizardBStatusAfterRelaunch = wizardBStatus
