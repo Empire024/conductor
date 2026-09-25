@@ -597,10 +597,21 @@ kbd {
 .launcher-placement-reasons li { font-size: 10px; color: #6d757e; }
 .launcher-grid button:disabled { opacity: 0.42; }
 .launcher-grid { width: min(100%, 610px); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid #242a31; border-radius: 7px; overflow: hidden; background: #11151a; }
-.launcher-grid button { min-width: 0; height: 66px; padding: 0 12px; border: 0; border-right: 1px solid #242a31; border-bottom: 1px solid #242a31; background: #11151a; display: flex; align-items: center; gap: 10px; text-align: left; position: relative; }
-.launcher-grid button:nth-child(2n) { border-right: 0; }
-.launcher-grid button:nth-last-child(-n + 2) { border-bottom: 0; }
-.launcher-grid button:hover { background: #171c22; }
+.launcher-grid > button, .launcher-grid > .launcher-tile { min-width: 0; height: 66px; border-right: 1px solid #242a31; border-bottom: 1px solid #242a31; position: relative; }
+.launcher-grid > button { padding: 0 12px; border-top: 0; border-left: 0; background: #11151a; display: flex; align-items: center; gap: 10px; text-align: left; }
+.launcher-grid > button:nth-child(2n), .launcher-grid > .launcher-tile:nth-child(2n) { border-right: 0; }
+.launcher-grid > button:nth-last-child(-n + 2), .launcher-grid > .launcher-tile:nth-last-child(-n + 2) { border-bottom: 0; }
+.launcher-grid > button:hover { background: #171c22; }
+/* A local model's tile: the same look as a plain launcher button, but split into the launch
+   button (fills the tile) and a small durable-job toggle in the corner, so "durable" is a
+   property of this one entry rather than a picker of its own. */
+.launcher-tile { display: block; }
+.launcher-tile-open { width: 100%; height: 100%; padding: 0 12px; border: 0; background: #11151a; display: flex; align-items: center; gap: 10px; text-align: left; }
+.launcher-tile-open:hover { background: #171c22; }
+.launcher-tile-open:disabled { opacity: 0.42; }
+.launcher-tile-durable-toggle { position: absolute; top: 6px; right: 6px; width: 20px; height: 20px; display: grid; place-items: center; border: 1px solid #303740; border-radius: 5px; background: #171c22; color: #6d757e; cursor: pointer; padding: 0; }
+.launcher-tile-durable-toggle:hover { color: #cfd3d8; border-color: #454e59; }
+.launcher-tile-durable-toggle.active { color: var(--accent); border-color: var(--accent-muted); background: #16211a; }
 .launch-icon { width: 32px; height: 32px; flex: 0 0 auto; display: grid; place-items: center; border: 1px solid #303740; border-radius: 6px; background: #171c22; }
 .launch-icon.amber { color: #e4b468; border-color: #5d4828; background: #2a2115; }
 .launch-icon.green { color: var(--accent); border-color: #46552e; background: #1b2314; }
@@ -616,11 +627,6 @@ kbd {
 .launcher-grid button:hover kbd { display: none; }
 .launcher-grid button:hover .launch-arrow { display: block; }
 .launcher-durable-option { width: min(100%, 610px); margin-top: 10px; padding: 10px 12px; border: 1px solid #242a31; border-radius: 7px; background: #11151a; display: grid; gap: 8px; }
-.launcher-durable-label { font-size: 9.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: #6d757e; }
-.launcher-durable-models { display: flex; flex-wrap: wrap; gap: 6px; }
-.launcher-durable-models button { height: 24px; padding: 0 10px; border: 1px solid #242a31; border-radius: 999px; background: #171c22; color: #8b939c; font-size: 10.5px; cursor: pointer; }
-.launcher-durable-models button:hover { color: #cfd3d8; background: #1c2229; }
-.launcher-durable-models button.active { color: var(--accent); border-color: var(--accent-muted); background: #16211a; }
 .launcher-tip { width: min(100%, 610px); display: flex; align-items: center; gap: 6px; margin-top: 12px; color: #4f5760; font-size: 9px; }
 .launcher-tip svg { color: #788452; }
 
@@ -971,9 +977,11 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 :root[data-theme="light"] .launcher-heading h2,
 :root[data-theme="light"] .memory-heading strong,
 :root[data-theme="light"] .process-dashboard strong { color: var(--text); }
-:root[data-theme="light"] .launcher-durable-option { background: #fffffff2; border-color: var(--border); }
-:root[data-theme="light"] .launcher-durable-models button { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
-:root[data-theme="light"] .launcher-durable-models button:hover { color: var(--text); }
+:root[data-theme="light"] .launcher-durable-option,
+:root[data-theme="light"] .launcher-tile-open { background: #fffffff2; border-color: var(--border); }
+:root[data-theme="light"] .launcher-tile-durable-toggle { background: var(--surface-2); color: var(--text-2); border-color: var(--border); }
+:root[data-theme="light"] .launcher-tile-durable-toggle:hover { color: var(--text); }
+:root[data-theme="light"] .launcher-tile-durable-toggle.active { color: var(--accent); border-color: var(--accent-muted); }
 :root[data-theme="light"] kbd { box-shadow: none; }
 :root[data-theme="light"] ::-webkit-scrollbar-thumb { background: #c4ccd8; border: 2px solid transparent; background-clip: padding-box; }
 
@@ -1036,12 +1044,15 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
  * state icon had its strokes overpainted near-black and dash-hidden, and rendered as nothing. */
 .tab-activity .tab-ring circle { fill: none; stroke: var(--text-3); stroke-width: 1.5; stroke-dasharray: 28 12; transform-origin: 9px 9px; opacity: .45; transition: stroke .35s ease, fill .35s ease, opacity .35s ease; }
 .tab-activity .tab-ring path { fill: none; stroke: #011627; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 12; stroke-dashoffset: 12; transition: stroke-dashoffset .36s cubic-bezier(.2,.8,.2,1) .08s; }
-.tab-activity.working .tab-ring circle { stroke: var(--accent); opacity: 1; animation: spin var(--spin-duration) linear infinite; }
+/* will-change promotes the spinning circle to its own compositor layer: the rotation is then a
+ * transform the compositor animates on every frame without asking the main thread to repaint the
+ * tab strip around it - the cost a streaming turn was paying per frame for every open tab. */
+.tab-activity.working .tab-ring circle { stroke: var(--accent); opacity: 1; animation: spin var(--spin-duration) linear infinite; will-change: transform; }
 /* Work the runtime backgrounded is still this conversation's work, so it keeps the turning accent
  * ring rather than the finished checkmark, dimmed because nothing is streaming into the tab while
  * it waits to be woken. The shared duration is what keeps every ring in step (see spin-sync), so
  * only the opacity differs; the churning tab background below stays with 'working' alone. */
-.tab-activity.waiting_background .tab-ring circle { stroke: var(--accent); opacity: .7; animation: spin var(--spin-duration) linear infinite; }
+.tab-activity.waiting_background .tab-ring circle { stroke: var(--accent); opacity: .7; animation: spin var(--spin-duration) linear infinite; will-change: transform; }
 .tab-activity.complete .tab-ring circle { fill: #22c57a; stroke: #22c57a; stroke-dasharray: 40; opacity: 1; animation: activity-pop .38s cubic-bezier(.16,1.4,.25,1); }
 .tab-activity.complete .tab-ring path { stroke-dashoffset: 0; }
 .tab-activity.waiting_input .tab-ring circle { stroke: #ecc48d; opacity: .8; }
@@ -1063,13 +1074,32 @@ body, .app-shell, .main-stage, .pane-workspace { background: var(--bg); color: v
 .pane-tab.needs-attention, .pane-tab:has(.tab-activity.failed) { color: var(--text); }
 .pane-tab:has(.tab-activity.failed) { box-shadow: inset 0 -1px color-mix(in srgb, var(--danger) 65%, transparent); }
 .pane-tab:has(.tab-activity.disconnected) { box-shadow: inset 0 -1px color-mix(in srgb, #ecc48d 55%, transparent); }
-.pane-tab:has(.tab-activity.working) { background: linear-gradient(105deg, transparent 10%, color-mix(in srgb, var(--accent) 13%, transparent) 43%, transparent 75%); background-size: 220% 100%; animation: tab-churning 2.4s ease-in-out infinite; }
+/* The sweep used to animate `background-position` directly on the tab, which repaints on the main
+ * thread every frame - `background-position` cannot run on the compositor. A wider `::after` with
+ * a static gradient, translated by `transform` instead, produces the same sweep as a compositor-
+ * only layer: `overflow: hidden` on the tab clips it to the tab's own bounds (the way the
+ * background itself used to clip automatically), `isolation: isolate` gives the negative z-index
+ * layer its own stacking context so it paints above the tab's fill but behind its text and icons,
+ * and the translateX keyframes below are the same 130%/-30% sweep re-expressed for an element
+ * 2.2x the tab's width instead of a background-position percentage of it. */
+.pane-tab:has(.tab-activity.working) { position: relative; overflow: hidden; isolation: isolate; }
+.pane-tab:has(.tab-activity.working)::after {
+  content: '';
+  position: absolute;
+  top: 0; bottom: 0; left: 0;
+  width: 220%;
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(105deg, transparent 10%, color-mix(in srgb, var(--accent) 13%, transparent) 43%, transparent 75%);
+  will-change: transform;
+  animation: tab-churning 2.4s ease-in-out infinite;
+}
 .session-activity-dot { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; }
 .session-activity-dot.working { background: var(--accent); box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 55%, transparent); animation: session-activity-pulse 1.2s ease-in-out infinite; }
 .session-activity-dot.done { background: #22c57a; }
 .session-activity-dot.waiting { background: #ecc48d; }
 @keyframes activity-pop { 0% { transform: scale(.55); } 70% { transform: scale(1.13); } 100% { transform: scale(1); } }
-@keyframes tab-churning { 0%, 100% { background-position: 130% 0; } 50% { background-position: -30% 0; } }
+@keyframes tab-churning { 0%, 100% { transform: translateX(-70.9%); } 50% { transform: translateX(16.4%); } }
 @keyframes session-activity-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 @media (prefers-reduced-motion: reduce) { .session-activity-dot.working { animation: none; } }
 
@@ -1437,6 +1467,8 @@ button.memory-origin-link:hover { color: var(--text); text-decoration: underline
 .launcher-heading { margin-bottom: 9px; }
 .launcher-heading h2 { margin: 0; font-size: 14px; font-weight: 600; }
 .launcher-grid button { height: 39px; padding: 0 8px; gap: 7px; }
+.launcher-grid > .launcher-tile { height: 39px; }
+.launcher-tile-open { padding: 0 8px; gap: 7px; }
 .launch-icon { width: 23px; height: 23px; border: 0; border-radius: 5px; background: transparent !important; }
 .launcher-grid strong { font-size: 9.5px; }
 .empty-content { width: auto; align-items: center; }
