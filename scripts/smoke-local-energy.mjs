@@ -49,11 +49,12 @@ try {
   console.log('local servers:', JSON.stringify(servers))
   const project = await call('projects.open', { path: projectPath, name: 'Energy smoke' })
   const open = { kind: 'agent', provider: 'local', model, permission: 'accept-edits', exactPermission: true, title: 'Energy smoke' }
-  const tab = await call('tabs.open', open, project.id).catch(async error => {
+  const opened = await call('tabs.open', open, project.id).catch(async error => {
     if (!/did not acknowledge/.test(String(error))) throw error
     await sleep(10_000)
     return call('tabs.open', open, project.id)
-  }).then(result => result.resourceId)
+  })
+  const tab = opened.resourceId
   const projection = () => {
     const db = new DatabaseSync(join(profile, 'conductor.db'), { readOnly: true })
     try { return JSON.parse(db.prepare('SELECT projection_json FROM structured_sessions WHERE id = ?').get(tab).projection_json) } finally { db.close() }
@@ -82,9 +83,21 @@ try {
     assert.ok(energy.samples > 0 && energy.averageGpuWatts > 0)
     check(`A real ${model} turn measured ${energy.totalWh.toFixed(3)} Wh (GPU ${energy.gpuWh.toFixed(3)} Wh at ${Math.round(energy.averageGpuWatts)} W avg, ${energy.samples} samples, ${(energy.durationMs / 1000).toFixed(1)} s)`)
   }
-  // The timeline shows it where the turn's other figures are.
+  // The timeline shows it where the turn's other figures are: show the project and its tab.
+  await page.locator('.project-row').filter({ hasText: 'Energy smoke' }).first().click().catch(error => console.log('project row:', error.message))
+  await call('tabs.focus', { tabId: opened.id }, project.id).catch(error => console.log('tabs.focus:', error.message))
   const card = page.locator(`.sa-local-energy[data-energy="${expectUnmeasured ? 'unmeasured' : 'measured'}"]`).first()
-  await card.waitFor({ state: 'attached', timeout: 30_000 })
+  await card.waitFor({ state: 'attached', timeout: 30_000 }).catch(async error => {
+    const seen = await page.evaluate(() => ({
+      panes: [...document.querySelectorAll('.structured-agent-pane')].map(pane => pane.getAttribute('data-structured-session')),
+      activities: document.querySelectorAll('.sa-activity').length,
+      notices: [...document.querySelectorAll('.sa-kind-notice')].map(node => node.textContent?.slice(0, 160)),
+      text: document.body.innerText.slice(0, 1500)
+    }))
+    console.log('timeline diagnostics:', JSON.stringify(seen, null, 1), 'tab', tab)
+    await page.screenshot({ path: join(output, 'missing.png') }).catch(() => {})
+    throw error
+  })
   const text = (await card.textContent()) ?? ''
   console.log('timeline:', text)
   if (!expectUnmeasured) assert.match(text, /Wh .*this turn/)

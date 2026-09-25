@@ -1,5 +1,6 @@
 import type { TimelineItem } from './structured-agent'
 import { localStopOf } from './local-stop'
+import { localEnergyOf } from './local-energy'
 import { isControlActivityNotice } from './control-activity'
 
 /** Claude's CLI keeps a long-running tool visible by re-emitting it under a synthetic
@@ -48,6 +49,8 @@ export function isConversationActivity(item: TimelineItem, _index?: number, item
   // answer: the owner must see "round limit" or "context limit" where a failure would otherwise be.
   const stop = localStopOf(data)
   if (stop) return stop.reason !== 'completed'
+  // A local turn's energy is its cost line, shown like a cloud turn's usage (local-energy.ts).
+  if (localEnergyOf(data)) return true
   // What a conversation did through app control, and who drove this one (control-activity.ts).
   if (isControlActivityNotice(data)) return true
   return data.payload === undefined

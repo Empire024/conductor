@@ -86,6 +86,8 @@ export function formatWh(wh: number): string {
 }
 
 export function formatMoney(amount: number, price: EnergyPrice): string {
+  // A short turn costs a fraction of a cent; two significant digits, never a misleading 0.0000.
+  if (amount > 0 && amount < 0.001) return `${price.currency}${Number(amount.toPrecision(2)).toFixed(Math.min(10, 1 - Math.floor(Math.log10(amount))))}`
   const digits = amount >= 1 ? 2 : amount >= 0.01 ? 3 : 4
   return `${price.currency}${amount.toFixed(digits)}`
 }
