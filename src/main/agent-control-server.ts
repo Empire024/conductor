@@ -27,7 +27,7 @@ export class AgentControlServer {
   private inFlight = new Map<string, number>()
   private mutationTails = new Map<string, Promise<void>>()
   private ownerToken?: string
-  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions) {}
+  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity' | 'prepareActivity'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions) {}
 
   async start(): Promise<void> {
     if (this.disabled || this.server) return
@@ -114,12 +114,14 @@ export class AgentControlServer {
       // Conductor side only: nothing is added to any prompt.
       const call = async (): Promise<unknown> => {
         this.control.authorize(scope)
+        // Resolved before the call: a close leaves no tab to name afterwards.
+        const prepared = this.control.prepareActivity?.(scope, input.method as string, input.args ?? {})
         try {
           const result = await this.control.call(scope, input.method as string, input.args ?? {})
-          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { result })
+          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { result, prepared })
           return result
         } catch (error) {
-          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { error: error instanceof Error ? error.message : String(error) })
+          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { error: error instanceof Error ? error.message : String(error), prepared })
           throw error
         }
       }

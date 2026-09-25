@@ -1757,14 +1757,18 @@ describe('durable jobs over app control', () => {
     await expect(f.control.call(f.owner, 'jobs.events', { jobId: job.id, limit: 0 })).rejects.toThrow(/positive whole number/)
   })
 
-  it('opens a job tab whose identity is the job id, focuses it when asked again and reopens it after a close', async () => {
+  it('opens a job tab whose identity is the job id, returns it when asked again and reopens it after a close', async () => {
     const f = jobsFixture()
     const job = await f.control.call(f.scope, 'jobs.create', create) as DurableJobSummary
     const opened = await f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: job.id }) as AgentControlTab
     expect(opened).toMatchObject({ kind: 'job', resourceId: job.id, title: job.title })
     const again = await f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: job.id }) as AgentControlTab
     expect(again.id).toBe(opened.id)
-    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', params: { tabId: opened.id } })
+    // An agent asking again gets the open tab back without moving the owner there (FX21);
+    // focus:true brings it into view once the owner pauses typing.
+    expect(f.requests.at(-1)?.action).toBe('tabs.open')
+    await f.control.call(f.scope, 'tabs.open', { kind: 'job', jobId: job.id, focus: true })
+    expect(f.requests.at(-1)).toMatchObject({ action: 'tabs.focus', params: { tabId: opened.id, whenIdle: true } })
     // Closing the tab is a layout change; the job and its id are untouched.
     const layout = f.database.getSession(f.workspace.id)!.layout
     if (layout.root.type !== 'group') throw new Error('Synthetic layout changed')
@@ -2213,5 +2217,80 @@ describe('agents.finish', () => {
   it('refuses a self-finish from the owner’s own tab', async () => {
     const f = fixture(); closer(f)
     await expect(f.control.call(f.scope, 'agents.finish', {})).rejects.toThrow(/owner’s own tab/)
+  })
+})
+
+describe('FX21: agent-opened tabs never steal the owner’s focus', () => {
+  const opens = (f: ReturnType<typeof fixture>) => f.requests.filter(request => request.action === 'tabs.open')
+  const focuses = (f: ReturnType<typeof fixture>) => f.requests.filter(request => request.action === 'tabs.focus')
+  const flush = async (): Promise<void> => { for (let i = 0; i < 5; i++) await Promise.resolve() }
+  const append = (f: ReturnType<typeof fixture>, id: string, data: AgentEventData): void => {
+    const state = f.database.structured.snapshot(id)!, spec = f.database.structured.spec<AgentSpec>(id)!
+    f.database.structured.append({ schemaVersion: 1, id: 'fx21-event-' + (state.sequence + 1), sequence: state.sequence + 1, sessionId: id, runtimeId: state.runtimeId || 'fx21-runtime', provider: spec.provider as StructuredProvider, projectId: spec.projectId, workspaceId: spec.sessionId, cwd: spec.cwd, timestamp: new Date().toISOString(), data })
+  }
+
+  it('tabs.open lands in the background unless the agent asks for focus, which then waits for a typing pause', async () => {
+    const f = fixture()
+    await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Quiet worker' })
+    await f.control.call(f.scope, 'tabs.open', { kind: 'terminal', title: 'Quiet shell' })
+    expect(opens(f).map(request => request.params.focus)).toEqual([false, false])
+    expect(focuses(f)).toHaveLength(0)
+    const wanted = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Look here', focus: true }) as { id: string }
+    await flush()
+    expect(opens(f).at(-1)?.params.focus).toBe(false)
+    expect(focuses(f)).toEqual([expect.objectContaining({ params: { tabId: wanted.id, whenIdle: true } })])
+  })
+
+  it('router.dispatch opens every coworker in the background', async () => {
+    const f = fixture()
+    await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'One', prompt: 'First task', provider: 'claude' }, { title: 'Two', prompt: 'Second task', provider: 'claude' }] })
+    expect(opens(f)).toHaveLength(2)
+    expect(opens(f).every(request => request.params.focus === false)).toBe(true)
+    expect(focuses(f)).toHaveLength(0)
+  })
+
+  it('agents.handoff opens the receiver in the background', async () => {
+    const f = fixture()
+    await f.control.call(f.scope, 'agents.handoff', { handoff: handoff() })
+    expect(opens(f)).toHaveLength(1)
+    expect(opens(f)[0]!.params.focus).toBe(false)
+    expect(focuses(f)).toHaveLength(0)
+  })
+
+  it('agents.resume reopens a tabless conversation in the background', async () => {
+    const f = fixture()
+    const orphan: AgentSpec = { id: 'fx21-orphan', projectId: f.project.id, sessionId: f.workspace.id, cwd: f.project.path, provider: 'claude', title: 'Lost coworker', model: 'claude-synthetic' }
+    f.sessions.ensure(orphan)
+    append(f, orphan.id, { type: 'session', phase: 'running' })
+    await f.control.call(f.scope, 'agents.resume', { agentSessionId: orphan.id })
+    expect(opens(f).at(-1)?.params.focus).toBe(false)
+  })
+
+  it('an agent’s tabs.focus waits for the owner to pause typing and answers deferred while it waits', async () => {
+    const f = fixture()
+    const opened = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', title: 'Worker' }) as { id: string }
+    expect(await f.control.call(f.scope, 'tabs.focus', { tabId: opened.id })).toEqual({ applied: true })
+    expect(focuses(f).at(-1)?.params).toMatchObject({ tabId: opened.id, whenIdle: true })
+    vi.useFakeTimers()
+    try {
+      let release!: (value: unknown) => void
+      f.ui.mockImplementationOnce(async request => { f.requests.push(request); return new Promise(resolve => { release = value => resolve(value as never) }) })
+      const answer = f.control.call(f.scope, 'tabs.focus', { tabId: opened.id })
+      await vi.advanceTimersByTimeAsync(3000)
+      await expect(answer).resolves.toEqual({ tabId: opened.id, closed: false, deferred: true })
+      release({ applied: true })
+    } finally { vi.useRealTimers() }
+  })
+
+  it('the owner’s own credential keeps opening and focusing tabs in front', async () => {
+    const f = fixture()
+    const owner = f.control.ownerScope({ projectId: f.project.id })
+    await f.control.call(owner, 'tabs.open', { provider: 'claude', title: 'Owner tab' })
+    expect(opens(f).at(-1)?.params).not.toHaveProperty('focus')
+    await f.control.call(owner, 'tabs.open', { provider: 'claude', title: 'Owner background', focus: false })
+    expect(opens(f).at(-1)?.params.focus).toBe(false)
+    const tab = f.control.tabs(owner).at(-1)!
+    await f.control.call(owner, 'tabs.focus', { tabId: tab.id })
+    expect(focuses(f).at(-1)?.params).not.toHaveProperty('whenIdle')
   })
 })

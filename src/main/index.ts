@@ -87,6 +87,7 @@ import type { ScheduleRunner } from './schedule-runner'
 import { createScheduledTasks, latestModelsBuiltin } from './schedule-wiring'
 import { registerScheduleIpc } from './schedule-ipc'
 import { registerIdeas, type IdeasRegistration } from './ideas/register'
+import { registerIdeaRuns, type IdeaRunsRegistration } from './idea-runs/register'
 import { normalizeNewFileExtension, normalizeThemeSettings } from './app-settings'
 import { isProjectRoot, resolveWithinProject, safeEntryName } from './project-paths'
 import { isRemoteProject, localProject, requireLocalProject } from './project-scope'
@@ -153,6 +154,9 @@ let coworkerAutoClose: CoworkerAutoClose | undefined
 /** The owner's Ideas inbox (src/main/ideas/register.ts); undefined until the app is ready. */
 let ideasRegistration: IdeasRegistration | undefined
 let disposeIdeasIpc: (() => void) | undefined
+/** The idea autopilot (src/main/idea-runs/register.ts); undefined until the app is ready. */
+let ideaRunsRegistration: IdeaRunsRegistration | undefined
+let disposeIdeaRunsIpc: (() => void) | undefined
 let disposeLogicLoopsIpc: (() => void) | undefined
 let collaboration: AgentCollaborationStore
 let disposeCollaborationIpc: (() => void) | undefined
@@ -629,6 +633,7 @@ const disposeRuntimeServices = (): void => {
     // app quit is never recorded as a failed stage. The jobs stay running and are reconciled on
     // the next launch.
     ['durable jobs', () => { durableJobs?.dispose(); disposeDurableJobsGate?.(); disposeDurableJobsIpc?.() }],
+    ['idea-runs', () => { disposeIdeaRunsIpc?.(); ideaRunsRegistration?.dispose() }],
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
     ['coworker auto-close', () => coworkerAutoClose?.dispose()],
@@ -2320,6 +2325,7 @@ const registerIpc = (): void => {
     })
   }
   if (ideasRegistration) disposeIdeasIpc = ideasRegistration.registerIpc(event => trustedStructured(event))
+  if (ideaRunsRegistration) disposeIdeaRunsIpc = ideaRunsRegistration.registerIpc(event => trustedStructured(event))
 }
 
 app.whenReady().then(async () => {
@@ -2585,6 +2591,16 @@ app.whenReady().then(async () => {
     machine: () => remoteControl!.machineName()
   })
   control.setIdeas(ideasRegistration.control)
+  // The idea autopilot (docs/idea-autopilot.md): "Run this idea", the run controller, the
+  // project's idea-run scheduled task, and checkpoint answers from the phone, plus ideas.run*.
+  ideaRunsRegistration = registerIdeaRuns({
+    databasePath, database, control, ideas: ideasRegistration.service, schedules,
+    usage: () => agents.structured.usageLimits(),
+    phone: notification => phoneAccess ? phoneAccess.announce(notification) : Promise.resolve('Phone access is not running.'),
+    publish: (channel, payload) => publish(channel, payload),
+    offline: process.env.CONDUCTOR_OFFLINE_TESTS === '1'
+  })
+  control.setIdeaRuns(ideaRunsRegistration.control)
   // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
   // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
   // one after every restart.

@@ -43,10 +43,11 @@ import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, type CreateDurableJo
 import { scheduleCall, scheduleMethods, scheduleSignatures, type ScheduleControlService } from './schedule-control'
 import { LogicLoops, type LoopRecordInput } from './logic-loops'
 import { ideaMethods, ideaSignatures, type IdeasControlCaller } from './ideas/control'
+import { ideaRunMethods, ideaRunSignatures, type IdeaRunsControlCaller } from './idea-runs/control'
 import { callNodeMethod, nodeMethods, nodeSignatures, withNodes } from './remote-jobs/control'
 import type { RemoteJobService } from './remote-jobs/service'
 import type { LocalMachineReadiness } from '../shared/always-on'
-import { ControlActivityRecorder } from './control-activity'
+import { ControlActivityRecorder, type PreparedCall } from './control-activity'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 
 type Args = Record<string, unknown>
@@ -123,8 +124,8 @@ const toolSignatures = {
   'machines.list': '() — this machine and the paired machines that can run a tab, with the projects each one accepts, plus execution nodes (kind "node", or a peer\'s node facet) that run commands through nodes.run; the local machine carries readiness (whether it comes back unattended after a reboot, with the missing steps in words)',
   'models.list': '() — available providers and model-specific effort choices; discovered runtime models take precedence',
   'tabs.list': '({projectId?,workspaceId?}) — open tabs in this workspace, including detached windows, or in a sibling project from projects.list',
-  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?}) — visible tab; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again focuses the open one',
-  'tabs.focus': '({tabId,projectId?,workspaceId?}) — any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
+  'tabs.open': '({kind?,provider?,model?,effort?,permission?,exactPermission?,title?,machineId?,projectId?,workspaceId?,repository?,research?,contract?,jobId?,focus?}) — visible tab, opened in the background with a "new" mark so the owner’s active tab, caret and window stay put; focus:true brings it into view once the owner pauses typing; agent default kind, provider/model must be available; a Claude, Codex or Grok coworker opens on Auto (the highest mode the provider offers) unless the controller is itself read-only or planning; only with exactPermission: true — for an agent that cannot be trusted at all — does it open on permission if given, else the owner’s remembered mode for that provider, else the controller’s own mode, clamped to the controller’s autonomy and to what the provider offers; a local model has no Auto and opens on accept-edits or read-only as before; runs on the controller machine unless machineId names another from machines.list; projectId hands work to a sibling project from projects.list, and only the controller that opened such a tab may steer it; repository/research open a provider-local tab with its repository-writes and deep-research grants already on, under the agents.grant rules; contract ({allowedPaths?:string[],acceptance?:{command,timeoutSec?}}) opens a provider-local tab as a bounded coding task: the runtime refuses writes outside allowedPaths, runs the acceptance command itself after edits, and when it passes with only allowed paths changed tells the model to finish; kind "job" with jobId (from jobs.list) opens the view of that durable job in this workspace, and asking again returns the open one (focus:true brings it into view)',
+  'tabs.focus': '({tabId,projectId?,workspaceId?}) — brings a tab into view once the owner pauses typing (deferred:true when it is still waiting); any tab of this workspace, or an agent tab this caller controls in a sibling project (agents.list controlled:true); the same holds for rename, split, detach and close',
   'tabs.rename': '({tabId,title,projectId?,workspaceId?})',
   'tabs.split': '({tabId,direction:"horizontal"|"vertical",projectId?,workspaceId?})',
   'tabs.detach': '({tabId,projectId?,workspaceId?})',
@@ -278,6 +279,8 @@ export interface AgentControlDependencies {
   schedules?: ScheduleControlService
   /** Ideas (src/main/ideas/register.ts); plugged in with AgentControl.setIdeas. */
   ideas?: { call(caller: IdeasControlCaller, method: string, args: unknown): Promise<unknown> }
+  /** The idea autopilot (src/main/idea-runs/register.ts); plugged in with AgentControl.setIdeaRuns. */
+  ideaRuns?: { call(caller: IdeaRunsControlCaller, method: string, args: unknown): Promise<unknown> }
   /** conductor-local MCP tools (src/main/local-assist/wiring.ts); plugged in with
    *  AgentControl.setLocalAssist, so construction order does not matter. */
   localAssist?: { savings(days?: number): SavingsSummary }
@@ -857,13 +860,28 @@ export class AgentControl {
       if (kind === 'terminal') tab.resourceId = makeId('terminal')
       tab.state = { ...tab.state, machineId }
     }
-    await this.ui(target, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
+    await this.showOpened(scope, target, tab, args)
     const opened = this.tab(target, tab.id)
     if (kind === 'agent' && !root) this.relationship(scope, target, opened, 'attached')
     // The mark of a coworker a controller opened, which agents.finish and the auto-close sweep may
     // close; the owner's own tabs, and tabs a controller only took over, never carry it.
     if (kind === 'agent' && !root && !approvalReviewer && !scope.owner && opened.resourceId) this.deps.database.setSetting(COWORKER_OPENED_PREFIX + opened.resourceId, scope.agentSessionId)
     return { ...opened, projectId: target.projectId, workspaceId: target.sessionId, ...(grants ? { grants } : {}) }
+  }
+
+  /** A tab an agent opens lands in the background with a "new" mark: the owner's active tab,
+   *  composer caret and window stay where they are (FX21). focus:true asks for it to be brought
+   *  into view, and even that waits for the owner to pause typing. The owner's own credential
+   *  opens tabs in front as it always did. */
+  private async showOpened(scope: AgentControlScope, target: AgentControlScope, tab: PaneTab, args: Args): Promise<void> {
+    if (scope.owner) { await this.ui(target, 'tabs.open', { tab, ...(typeof args.focus === 'boolean' ? { focus: args.focus } : {}) }); return }
+    await this.ui(target, 'tabs.open', { tab, focus: false })
+    if (args.focus === true) void this.focusWhenIdle(target, { tabId: tab.id }).catch(() => undefined)
+  }
+
+  /** Brings a tab into view for an agent once the owner pauses typing (AgentControlUi waits). */
+  private focusWhenIdle(target: AgentControlScope, args: Args): Promise<unknown> {
+    return this.ui(target, 'tabs.focus', { ...args, whenIdle: true })
   }
 
   /**
@@ -905,7 +923,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? ownerSignatures : {}) }
     if (ownerMethods.has(method)) {
       if (!sovereign(scope)) throw new Error(`${method} answers only the owner's own control credential (control-owner.json) or a wizard tab (the wand toggle, frontier models only), not an ordinary conversation`)
       return this.ownerCall(scope, method, args)
@@ -947,6 +965,14 @@ export class AgentControl {
       // The owner may take a while to answer; the tab and the control over it are checked again.
       this.authorize(scope); this.tabTarget(scope, args)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
+      // An agent's focus waits for the owner to pause typing; the call answers after a few seconds
+      // either way, and a focus still waiting then goes ahead on its own.
+      if (method === 'tabs.focus' && !scope.owner) {
+        const pending = this.focusWhenIdle(target, args)
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const deferred = new Promise<unknown>(resolve => { timer = setTimeout(() => resolve({ tabId: tab.id, closed: false, deferred: true }), 3000); timer.unref?.() })
+        try { return await Promise.race([pending, deferred]) } finally { clearTimeout(timer); pending.catch(() => undefined) }
+      }
       const result = await this.ui(target, method as AgentControlUiRequest['action'], args)
       if (method === 'tabs.close' && tab.kind === 'agent') this.relationship(scope, target, tab, 'detached')
       return result
@@ -1061,7 +1087,7 @@ export class AgentControl {
         if (method === 'agents.resume') {
           if (!tab.id) {
             const reopened: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: id, title: tab.title, state: tab.state }
-            await this.ui(scope, 'tabs.open', { tab: reopened })
+            await this.showOpened(scope, scope, reopened, {})
             const opened = this.tab(scope, reopened.id)
             this.relationship(scope, scope, opened, 'attached')
             return { agentSessionId: id, reopened: true, tabId: opened.id, uri: opened.uri, phase: database.structured.snapshot(id)?.phase }
@@ -1073,7 +1099,7 @@ export class AgentControl {
         }
         const forkId = await sessions.fork(id)
         const forkTab: PaneTab = { id: makeId('tab'), kind: 'agent', resourceId: forkId, title: args.title === undefined ? tab.title + ' (fork)' : text(args, 'title', 120), state: { ...tab.state, viewMode: 'visual' } }
-        await this.ui(target, 'tabs.open', { tab: forkTab })
+        await this.showOpened(scope, target, forkTab, {})
         const opened = this.tab(target, forkTab.id)
         this.relationship(scope, target, opened, 'attached')
         return { ...opened, projectId: target.projectId, workspaceId: target.sessionId }
@@ -1218,6 +1244,7 @@ export class AgentControl {
     if (nodeMethods.has(method)) return this.nodes(scope, source, method, args)
     if (scheduleMethods.has(method)) return this.scheduledTasks(scope, source, method, args)
     if (ideaMethods.has(method)) return this.ideasMethod(scope, source, method, args)
+    if (ideaRunMethods.has(method)) return this.ideaRunsMethod(scope, source, method, args)
     throw new Error('Unknown control method; use tools.list')
   }
 
@@ -1232,6 +1259,21 @@ export class AgentControl {
 
   /** Plugs in Ideas once it is constructed (src/main/index.ts). */
   setIdeas(service: AgentControlDependencies['ideas']): void { this.deps.ideas = service }
+
+  /** Plugs in the idea autopilot once it is constructed (src/main/index.ts). */
+  setIdeaRuns(service: AgentControlDependencies['ideaRuns']): void { this.deps.ideaRuns = service }
+
+  /** ideas.run* (src/main/idea-runs/control.ts): reads for everyone, changes like ideas.*, and the
+   *  owner's answers (plan approval, checkpoints) only from the owner's own credential. */
+  private ideaRunsMethod(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const service = this.deps.ideaRuns
+    if (!service) throw new Error('The idea autopilot is unavailable in this Conductor')
+    const settings = scope.owner ? undefined : this.deps.database.structured.snapshot(scope.agentSessionId)?.settings
+    return service.call({
+      projectId: scope.projectId, agentSessionId: scope.agentSessionId, title: source.title, owner: scope.owner === true,
+      sovereign: sovereign(scope), readOnly: source.provider === 'local' || restricted(settings)
+    }, method, args)
+  }
 
   /** ideas.* (src/main/ideas/control.ts): a local model or a read-only/planning conversation may
    *  only read, exactly like durable jobs and scheduled tasks; the owner and a wizard tab may
@@ -1276,11 +1318,11 @@ export class AgentControl {
     const job = this.job(scope, service, args)
     const existing = this.tabs(scope).find(tab => tab.kind === 'job' && tab.resourceId === job.id)
     if (existing) {
-      if (args.focus !== false) await this.ui(scope, 'tabs.focus', { tabId: existing.id })
+      if (scope.owner ? args.focus !== false : args.focus === true) await (scope.owner ? this.ui(scope, 'tabs.focus', { tabId: existing.id }) : this.focusWhenIdle(scope, { tabId: existing.id }).catch(() => undefined))
       return { ...existing, projectId: scope.projectId, workspaceId: scope.sessionId }
     }
     const tab: PaneTab = { id: makeId('tab'), kind: 'job', title: args.title === undefined ? job.title.slice(0, 120) : text(args, 'title', 120), resourceId: job.id }
-    await this.ui(scope, 'tabs.open', { tab, ...(args.focus === false ? { focus: false } : {}) })
+    await this.showOpened(scope, scope, tab, args)
     return { ...this.tab(scope, tab.id), projectId: scope.projectId, workspaceId: scope.sessionId }
   }
 
@@ -1777,8 +1819,14 @@ export class AgentControl {
 
   /** Shows a finished app-control call in the timelines it concerns (FX15, control-activity.ts);
    *  the control server calls it once per request. Never throws. */
-  recordActivity(scope: AgentControlScope, method: string, args: unknown, outcome: { result?: unknown; error?: string }): void {
+  recordActivity(scope: AgentControlScope, method: string, args: unknown, outcome: { result?: unknown; error?: string; prepared?: PreparedCall }): void {
     this.activityRecorder().record({ scope, method, args, ...outcome })
+  }
+
+  /** Resolves the tab a mutation names before it runs and announces a close on it (a closed
+   *  conversation takes no notice); the result goes back to `recordActivity`. Never throws. */
+  prepareActivity(scope: AgentControlScope, method: string, args: unknown): PreparedCall | undefined {
+    return this.activityRecorder().prepare({ scope, method, args })
   }
 
   /** App-wide control actions (restart, update install, rollback...), oldest first, for the status bar. */
