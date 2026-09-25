@@ -5,10 +5,10 @@ title: Deliver one batch of related tasks with the least tokens at the highest q
 trigger: [manual, after:task-triage]
 inputs: [batchId, taskIds, allowedPaths]
 budget:
-  claudeWeeklyMax: 75
+  claudeWeeklyMax: 80
   codexWeeklyMax: 95
-  opusOnlyReviewAbove: 70
-  claudeStopAt: 73
+  opusOnlyReviewAbove: 78
+  claudeStopAt: 80
 steps:
   - id: contract
     role: architect
@@ -59,8 +59,7 @@ locked: [budget, steps.review, steps.verify, steps.ship]
    real data; the brain judges VERIFIED or REOPEN. An item is ticked `[x]` only after VERIFIED.
 6. **Ship.** `git.ship({message, paths})` with the batch's files only; wait on `git.ship.status`. Do not publish;
    publish once per set of batches.
-7. Before every dispatch, read `usage.limits`. At 70% Claude weekly or more, implementation moves to Sonnet/Haiku with a
-   tighter contract. At 73%, Claude work stops; Astra plus local finish. Astra stops at 95%.
+7. Before every dispatch, read `usage.limits`. Opus implements up to 78% Claude weekly (owner 2026-09-25: no downgrade to Sonnet for budget, it lowers quality); from 78% finish in-flight work only; at 80% Claude work stops; Astra plus local finish. Astra stops at 95%.
 
 Known hazard (2026-09-24): a coworker whose tab disappears loses app control and cannot `git.ship`. Its controller
 ships for it from the coworker's handoff, which must list the exact paths and message.

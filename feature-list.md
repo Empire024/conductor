@@ -624,9 +624,6 @@ Run relevant tests and npm.cmd run build. Preserve unrelated shared work, commit
 - [x] Projects & files left-side part needs to be expandable i.e. stretchable (so we can  read filenames project names etc etc better <!-- conductor-task:fe4662b9-e2a6-4436-a753-62e7bbed9b9c agent=agent_mufva8lk_9yecftz -->
 
 - [x] Invoicing swarm: permission parity repair and durable review gate implemented locally; 329 focused tests and build pass. Automatic native execution remains blocked pending an enforceable mutation broker; live acceptance and delivery are unfinished. [Brief](docs/approval-upgrade-brief.md), [implementation evidence](docs/approval-upgrade-report.md). No deployment authorized. <!-- conductor-task:invoicing-approval-review agent=agent_mucxgir3_mmkk8m6 priority=high -->
-- [ ] Invoicing swarm: owner-scoped bounded observer recovery, preserve ownership and pending approvals, distinguish superseded failures, no implicit ancestor authority. [Brief](docs/approval-upgrade-brief.md). <!-- conductor-task:invoicing-bounded-recovery agent=agent_mucxgir3_mmkk8m6 -->
-- [ ] Invoicing swarm: native model effort parity, local remaining-round checkpoints and confirmed follow-up turn start. [Brief](docs/approval-upgrade-brief.md). <!-- conductor-task:invoicing-runtime-budget agent=agent_mucxgir3_mmkk8m6 -->
-- [ ] Invoicing swarm: compact semantic monitoring, artifact-freeze handoff, evidence-linked attribution and actual orchestration/review/retry usage metrics. No net savings claim without measurements. [Brief](docs/approval-upgrade-brief.md). <!-- conductor-task:invoicing-evidence-telemetry agent=agent_mucxgir3_mmkk8m6 -->
 
 - [x] message needs to be able to be unsent in Conductor when still queued and not actually sent easily via clicking X or some keyboard shortcut <!-- conductor-task:2ad233c6-9e4c-416c-b622-fa4bb49acadf -->
 
