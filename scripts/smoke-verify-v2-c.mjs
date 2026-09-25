@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 const root = await mkdtemp(join(tmpdir(), 'conductor-v2c-'))
 const output = resolve('artifacts/verify-v2')
 await mkdir(output, { recursive: true })
-const fixtureDir = resolve('.conductor-scratch/v2/fixtures')
+const fixtureDir = resolve('scripts/fixtures/verify-v2') // fake-claude copy with SYNTHETIC REFUSE ONCE|ALWAYS|ONCE SLOW and SYNTHETIC ERROR500
 const results = []
 
 async function runCase(label, { model, prompt, expect: expectFn }) {

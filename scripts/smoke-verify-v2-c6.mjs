@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 const root = await mkdtemp(join(tmpdir(), 'conductor-v2c6-'))
 const output = resolve('artifacts/verify-v2')
 await mkdir(output, { recursive: true })
-const fixtureDir = resolve('.conductor-scratch/v2/fixtures')
+const fixtureDir = resolve('scripts/fixtures/verify-v2') // fake-claude copy with SYNTHETIC REFUSE ONCE|ALWAYS|ONCE SLOW and SYNTHETIC ERROR500
 const refusalLog = join(root, 'refusal-c6.log')
 let lastStep = 'start'
 const step = (s) => { lastStep = s; console.log('[step] ' + s) }
