@@ -112,24 +112,55 @@ export function createProcessSummaryPoller<T>(read: () => Promise<T>, commit: (v
   }
 }
 
+interface ProcessUsageSources {
+  snapshot(id: string): Promise<SessionProjection | null | undefined>
+  caps(id: string, sessionId: string): Promise<{ effective?: { setting: UsageCapSetting } | null }>
+}
 /** Computes the same thing the tab-level warning does, per running process: the conversation's
- *  own report and whichever cap actually applies to it (tab, then workspace, then default). */
-async function loadProcessUsage(process: RuntimeProcessSummary): Promise<readonly [string, ProcessUsage | undefined]> {
-  try {
-    // This bounded projection is already required for reported usage. Its phase doubles as the
-    // connection-state join, so the mini tracker does not fetch a second or unbounded transcript.
-    const snapshot = await window.conductor.structured.snapshot(process.id)
-    if (!snapshot) return [process.id, undefined] as const
-    const report: UsageScopeReport = summarizeUsageRun(snapshot.items).conversation
-    try {
-      const caps = await window.conductor.usageCaps.read(process.id, process.sessionId)
-      const cap: UsageCapSetting | null = caps.effective?.setting ?? null
-      return [process.id, { costUsd: report.costUsd, totalTokens: report.tokens?.totalTokens, warning: evaluateUsageWarning(report, cap)?.level, snapshotPhase: snapshot.phase }] as const
-    } catch {
-      return [process.id, { costUsd: report.costUsd, totalTokens: report.tokens?.totalTokens, snapshotPhase: snapshot.phase }] as const
+ *  own report and whichever cap actually applies to it (tab, then workspace, then default).
+ *  The report is a pass over the conversation's whole projection, received over IPC: tens of
+ *  milliseconds of the renderer's main thread for a long one, and polling every tab every few
+ *  seconds made typing slower the more tabs were open. It only changes with the conversation's
+ *  own events, so it is kept per process until one arrives (`changed`). */
+export function createProcessUsageLoader(sources: ProcessUsageSources = {
+  snapshot: id => window.conductor.structured.snapshot(id),
+  caps: (id, sessionId) => window.conductor.usageCaps.read(id, sessionId)
+}) {
+  const reports = new Map<string, { report: UsageScopeReport; phase: SessionProjection['phase'] }>()
+  // Bumped by every change, so a report fetched while an event arrived is not kept as current.
+  const versions = new Map<string, number>()
+  return {
+    changed(ids: Iterable<string>): void {
+      for (const id of ids) { reports.delete(id); versions.set(id, (versions.get(id) ?? 0) + 1) }
+    },
+    retain(ids: Set<string>): void {
+      for (const id of reports.keys()) if (!ids.has(id)) reports.delete(id)
+      for (const id of versions.keys()) if (!ids.has(id)) versions.delete(id)
+    },
+    async load(process: RuntimeProcessSummary): Promise<readonly [string, ProcessUsage | undefined]> {
+      try {
+        let entry = reports.get(process.id)
+        if (!entry) {
+          const version = versions.get(process.id)
+          // This bounded projection is already required for reported usage. Its phase doubles as the
+          // connection-state join, so the mini tracker does not fetch a second or unbounded transcript.
+          const snapshot = await sources.snapshot(process.id)
+          if (!snapshot) return [process.id, undefined] as const
+          entry = { report: summarizeUsageRun(snapshot.items).conversation, phase: snapshot.phase }
+          if (versions.get(process.id) === version) reports.set(process.id, entry)
+        }
+        const { report, phase } = entry
+        try {
+          const caps = await sources.caps(process.id, process.sessionId)
+          const cap: UsageCapSetting | null = caps.effective?.setting ?? null
+          return [process.id, { costUsd: report.costUsd, totalTokens: report.tokens?.totalTokens, warning: evaluateUsageWarning(report, cap)?.level, snapshotPhase: phase }] as const
+        } catch {
+          return [process.id, { costUsd: report.costUsd, totalTokens: report.tokens?.totalTokens, snapshotPhase: phase }] as const
+        }
+      } catch {
+        return [process.id, undefined] as const
+      }
     }
-  } catch {
-    return [process.id, undefined] as const
   }
 }
 
@@ -141,15 +172,19 @@ export function ProcessStatusSummary({ projects, onOpen }: { projects: ProjectRe
   const [refreshFailed, setRefreshFailed] = useState(false)
 
   useEffect(() => {
+    const usage = createProcessUsageLoader()
+    const offEvents = window.conductor.structured.onEvents(events => usage.changed(new Set(events.map(event => event.sessionId))))
     const poller = createProcessSummaryPoller(async () => {
       const processes = await window.conductor.agents.listProcesses()
-      const entries = await Promise.all(processes.filter(item => item.kind === 'agent').map(loadProcessUsage))
+      const agents = processes.filter(item => item.kind === 'agent')
+      usage.retain(new Set(agents.map(item => item.id)))
+      const entries = await Promise.all(agents.map(usage.load))
       return { processes, usageByProcessId: new Map(entries.filter((entry): entry is [string, ProcessUsage] => Boolean(entry[1]))) }
     }, (value, observedAt) => setSnapshot({ ...value, observedAt }), setRefreshFailed)
     const refresh = (): void => { void poller.run() }
     refresh()
     const timer = window.setInterval(() => { if (!document.hidden) refresh() }, 4000)
-    return () => { poller.dispose(); window.clearInterval(timer) }
+    return () => { poller.dispose(); offEvents(); window.clearInterval(timer) }
   }, [])
 
   const perProject = useMemo(

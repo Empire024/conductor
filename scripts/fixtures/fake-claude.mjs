@@ -28,6 +28,23 @@ const text = (content) => {
 const finish = (failed = false) => emit({ type: 'result', subtype: failed ? 'error_during_execution' : 'success', is_error: failed, usage: process.env.CONDUCTOR_TEST_CLAUDE_USAGE === '1' ? { input_tokens: 100, output_tokens: 20 } : {} })
 const oldDeclarations = "  var wasOpen = el.classList.contains('is-open');\n  var wasPinned = pinned;\n"
 const editInput = { file_path: 'panel.mjs', old_string: oldDeclarations, new_string: '', description: 'Remove the two unused declarations (synthetic fixture)' }
+// Realistic conversation content shared by SYNTHETIC LONG (a replayed history) and SYNTHETIC STREAM
+// (a live turn at a real provider's pace), both for scripts/perf-input.mjs.
+const tools = ['Bash', 'Read', 'Grep', 'Edit']
+const prose = (i) => [
+  `## Step ${i}: tracing the panel state`,
+  `Paragraph ${i}: the renderer keeps **bold**, _italic_ and \`inline code\` spans, a [link](src/file-${i % 40}.ts#L${i % 300 + 1}) and a path like \`src/renderer/src/panes/file-${i % 40}.tsx:${i % 90 + 1}\` in a long explanation, the way a real reply reads after reading several files.`,
+  `- first finding about \`updatePanel${i}\` and why it re-renders\n- second finding, with a nested detail\n  - nested: the effect depends on \`items\`\n- third finding`,
+  i % 3 === 0 ? ['```ts', `export function updatePanel${i}(el: HTMLElement, pinned: boolean): void {`, "  const wasOpen = el.classList.contains('is-open')", "  el.classList.toggle('is-pinned', pinned)", `  for (let step = 0; step < ${i % 17}; step++) el.dataset[\`step\${step}\`] = String(step)`, '}', '```'].join('\n') : '',
+  i % 5 === 0 ? ['| Step | File | Status |', '| --- | --- | --- |', ...Array.from({ length: 6 }, (_, row) => `| ${row + 1} | src/file-${row + i}.ts | ok |`)].join('\n') : '',
+  `Paragraph ${i}b: a closing sentence that says what changes next and which test proves it, long enough to wrap twice in a normal pane width.`
+].filter(Boolean).join('\n\n')
+const inputFor = (tool, i) => tool === 'Bash' ? { command: `npx vitest run src/renderer/src/panes/file-${i % 40}.test.ts`, description: `Run the focused test ${i}` }
+  : tool === 'Read' ? { file_path: `src/renderer/src/panes/file-${i % 40}.tsx`, offset: i % 200, limit: 60 }
+    : tool === 'Grep' ? { pattern: `updatePanel${i % 50}`, path: 'src', output_mode: 'content' }
+      : { file_path: `src/renderer/src/panes/file-${i % 40}.tsx`, old_string: `  const wasOpen = el.classList.contains('is-open')\n  el.classList.toggle('is-pinned', pinned)\n  // step ${i}\n`, new_string: `  el.classList.toggle('is-pinned', pinned)\n  // step ${i}: wasOpen was unused\n  if (pinned) el.dataset.pinned = '${i}'\n` }
+const outputFor = (tool, i) => tool === 'Edit' ? `The file src/renderer/src/panes/file-${i % 40}.tsx has been updated.`
+  : Array.from({ length: 12 + (i % 20) }, (_, line) => tool === 'Bash' ? ` ✓ file-${i % 40}.test.ts > case ${line} (${line % 7} ms)` : `${line + 1}\tconst value${line} = compute(${i}, ${line}) // café 🧪 synthetic line`).join('\n')
 let initialized = false
 let turn = 0
 let pending
@@ -247,27 +264,50 @@ for await (const line of input) {
       text(body)
       finish(); continue
     }
+    if (prompt.startsWith('SYNTHETIC STREAM')) {
+      // A live turn at a real provider's pace for scripts/perf-input.mjs: about <rate> events a second
+      // for <seconds> s, mixing streamed text deltas, whole assistant messages with thinking and a
+      // tool call, and multi-line tool output, so typing can be measured while a turn streams.
+      const [, rate = '20', seconds = '60'] = /^SYNTHETIC STREAM (\d+) (\d+)/.exec(prompt) ?? []
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
+      const steps = function* () {
+        for (let step = 0; ; step++) {
+          const messageId = `stream-message-${turn}-${step}`, tool = tools[step % tools.length], id = `stream-tool-${turn}-${step}`
+          const words = prose(step).split(/(?<= )/)
+          yield () => emit({ type: 'stream_event', event: { type: 'message_start', message: { id: messageId } } })
+          yield () => emit({ type: 'stream_event', event: { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } } })
+          for (let word = 0; word < words.length; word += 6) yield () => emit({ type: 'stream_event', event: { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: words.slice(word, word + 6).join('') } } })
+          yield () => emit({ type: 'stream_event', event: { type: 'content_block_stop', index: 0 } })
+          yield () => emit({ type: 'stream_event', event: { type: 'message_stop' } })
+          yield () => emit({ type: 'assistant', message: { id: messageId, model: 'synthetic-claude', usage: { input_tokens: 40, cache_read_input_tokens: 20_000 + step * 60, output_tokens: 300 + (step % 400) }, content: [
+            { type: 'thinking', thinking: `Synthetic hidden reasoning ${step}: compare the two render paths before editing.`, signature: 'synthetic' },
+            { type: 'text', text: prose(step) },
+            { type: 'tool_use', id, name: tool, input: inputFor(tool, step) }
+          ] } })
+          yield () => result(id, outputFor(tool, step), false, tool === 'Bash' ? { stdout: outputFor(tool, step), stderr: '', exitCode: 0 } : undefined)
+        }
+      }()
+      const started = Date.now()
+      let emitted = 0
+      const timer = setInterval(() => {
+        // Catch up on a late tick instead of drifting below the requested rate.
+        const due = Math.floor((Date.now() - started) * Number(rate) / 1000)
+        while (emitted < due) { steps.next().value(); emitted++ }
+        if (Date.now() - started < Number(seconds) * 1000) return
+        clearInterval(timer)
+        steeringTimers.delete(timer)
+        text(`**Synthetic stream:** ${emitted} provider events at ${rate}/s; no model or tool execution.`)
+        finish()
+      }, Math.max(5, Math.floor(1000 / Number(rate))))
+      steeringTimers.add(timer)
+      continue
+    }
     if (prompt.startsWith('SYNTHETIC LONG')) {
       // A real-size conversation for scripts/perf-input.mjs: about <events> provider messages of
       // hidden thinking, long Markdown, tool calls with multi-line output and Edit diffs, each
       // assistant message carrying usage the way a 1M-context Claude session reports it.
       const total = Math.max(4, Number(/^SYNTHETIC LONG (\d+)/.exec(prompt)?.[1] ?? 3000))
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263' })
-      const tools = ['Bash', 'Read', 'Grep', 'Edit']
-      const prose = (i) => [
-        `## Step ${i}: tracing the panel state`,
-        `Paragraph ${i}: the renderer keeps **bold**, _italic_ and \`inline code\` spans, a [link](src/file-${i % 40}.ts#L${i % 300 + 1}) and a path like \`src/renderer/src/panes/file-${i % 40}.tsx:${i % 90 + 1}\` in a long explanation, the way a real reply reads after reading several files.`,
-        `- first finding about \`updatePanel${i}\` and why it re-renders\n- second finding, with a nested detail\n  - nested: the effect depends on \`items\`\n- third finding`,
-        i % 3 === 0 ? ['```ts', `export function updatePanel${i}(el: HTMLElement, pinned: boolean): void {`, "  const wasOpen = el.classList.contains('is-open')", "  el.classList.toggle('is-pinned', pinned)", `  for (let step = 0; step < ${i % 17}; step++) el.dataset[\`step\${step}\`] = String(step)`, '}', '```'].join('\n') : '',
-        i % 5 === 0 ? ['| Step | File | Status |', '| --- | --- | --- |', ...Array.from({ length: 6 }, (_, row) => `| ${row + 1} | src/file-${row + i}.ts | ok |`)].join('\n') : '',
-        `Paragraph ${i}b: a closing sentence that says what changes next and which test proves it, long enough to wrap twice in a normal pane width.`
-      ].filter(Boolean).join('\n\n')
-      const inputFor = (tool, i) => tool === 'Bash' ? { command: `npx vitest run src/renderer/src/panes/file-${i % 40}.test.ts`, description: `Run the focused test ${i}` }
-        : tool === 'Read' ? { file_path: `src/renderer/src/panes/file-${i % 40}.tsx`, offset: i % 200, limit: 60 }
-          : tool === 'Grep' ? { pattern: `updatePanel${i % 50}`, path: 'src', output_mode: 'content' }
-            : { file_path: `src/renderer/src/panes/file-${i % 40}.tsx`, old_string: `  const wasOpen = el.classList.contains('is-open')\n  el.classList.toggle('is-pinned', pinned)\n  // step ${i}\n`, new_string: `  el.classList.toggle('is-pinned', pinned)\n  // step ${i}: wasOpen was unused\n  if (pinned) el.dataset.pinned = '${i}'\n` }
-      const outputFor = (tool, i) => tool === 'Edit' ? `The file src/renderer/src/panes/file-${i % 40}.tsx has been updated.`
-        : Array.from({ length: 12 + (i % 20) }, (_, line) => tool === 'Bash' ? ` ✓ file-${i % 40}.test.ts > case ${line} (${line % 7} ms)` : `${line + 1}\tconst value${line} = compute(${i}, ${line}) // café 🧪 synthetic line`).join('\n')
       let events = 0, step = 0
       const batch = () => {
         for (let count = 0; count < 25 && events < total; count++, step++) {

@@ -1,14 +1,15 @@
 import { conversationIdentity } from './conversation-tab'
 import { PromptImageUpload, PromptImageThumbnail } from '../components/PromptImageUpload'
 import { ProviderIcon } from '../components/ProviderIcon'
-import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { startTransition, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react'
 import { Archive, ArrowDown, ArrowLeft, ClipboardCopy, FileDiff, FilePlus2, GitBranch, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, Telescope, TerminalSquare, MessagesSquare, LoaderCircle, Undo2, WandSparkles, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { isFrontierModel, MAX_PROMPT_CHARS, WIZARD_MODEL_HINT } from '../../../shared/structured-agent'
 import { permissionParity } from '../../../shared/permission-parity'
 import type { AgentEvent, ContextAttachment, ConversationSearchResult, FileChange, Json, PromptOrigin, SessionProjection, SessionSettings, TimelineItem } from '../../../shared/structured-agent'
-import { emptyProjection, projectAgentEvent } from '../../../shared/structured-agent-reducer'
+import { emptyProjection, projectAgentEvents } from '../../../shared/structured-agent-reducer'
 import { coalesceTextDeltas } from './coalesce-stream-events'
+import { createStreamIngest, lastOwnerKeyAt } from './stream-ingest'
 import type { RuntimeTerminalProps } from './RuntimeTerminal'
 import { AgentDialog, AgentFileMachineContext, ImmutableDiff, coalescedEditLabel, coalescedEditSummary, groupConversationActivities, isConversationActivity, parentLabelAnchors, safeFileTarget, StructuredActivity, toolInlinePreview, toolPresentation } from './StructuredAgentRenderers'
 import { isRemoteFileMachine } from '../remote-files'
@@ -66,6 +67,8 @@ function rememberSuspendedView(resourceId: string, view: SuspendedView): void {
 function storedExpansion(id: string): Record<string, boolean> {
   try { return JSON.parse(localStorage.getItem('conductor.structured.expansion.' + id) ?? '{}') as Record<string, boolean> } catch { return {} }
 }
+/** How far the live window may outgrow its card limit before it sheds its oldest cards (visibleItems). */
+const WINDOW_SLACK = 50
 const activePhases = new Set(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 const displayPhase = (phase: string): string => phase === 'waiting_approval' ? 'Waiting for approval' : phase === 'waiting_input' ? 'Waiting for your answer' : phase.replaceAll('_', ' ')
 const historyTime = (timestamp?: string): string => {
@@ -91,7 +94,19 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   const [fileMachineId, setFileMachineId] = useState('unresolved-remote-owner')
   const [fileCwd, setFileCwd] = useState(props.project.path)
   const [historical, setHistorical] = useState(() => restoredView.current?.historical ?? false)
-  const [projection, setProjection] = useState<SessionProjection>(() => emptyProjection(props.resourceId))
+  const [projection, setProjectionState] = useState<SessionProjection>(() => emptyProjection(props.resourceId))
+  // The newest projection, ahead of what React has rendered: a stream is reduced into it outside
+  // render (see the event subscription below), and every other writer goes through setProjection,
+  // so the two never disagree.
+  const projectionRef = useRef(projection)
+  const setProjection = useCallback((value: SetStateAction<SessionProjection>): void => {
+    projectionRef.current = typeof value === 'function' ? value(projectionRef.current) : value
+    setProjectionState(projectionRef.current)
+  }, [])
+  // The stream renders one projection at a time and waits for it to land (see stream-ingest.ts).
+  const streamIngest = useRef<{ committed(): void } | null>(null)
+  const renderedProjection = useRef(projection)
+  useLayoutEffect(() => { renderedProjection.current = projection; streamIngest.current?.committed() }, [projection])
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
   const { draft, setMessage, setAttachments, setDraft, clearSubmitted, flush: flushDraft } = useComposerDraft(props.project.id, activeId)
@@ -103,15 +118,25 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   // the timeline and shown against the message it rode with.
   const [turnRecalls, setTurnRecalls] = useState<TurnMemoryRecall[]>([])
   const loadTurnRecalls = useCallback((): void => {
-    void window.conductor.memory.turnRecalls(activeId).then(setTurnRecalls).catch(() => setTurnRecalls([]))
+    // An unchanged ledger keeps its identity, so the memoized timeline is not rebuilt for nothing.
+    const keep = (next: TurnMemoryRecall[]): void => setTurnRecalls(current => JSON.stringify(current) === JSON.stringify(next) ? current : next)
+    void window.conductor.memory.turnRecalls(activeId).then(keep).catch(() => keep([]))
   }, [activeId])
-  useEffect(loadTurnRecalls, [loadTurnRecalls, projection.sequence])
+  // A recall rides with the owner's message, so the ledger changes when a message is sent or a turn
+  // settles, not with every streamed event; refetching per event cost an IPC call and a second
+  // render of the whole pane for each frame of a stream.
+  const latestPromptId = useMemo(() => {
+    for (let index = projection.items.length - 1; index >= 0; index--) { const item = projection.items[index]!; if (item.data.type === 'text' && item.data.role === 'user') return item.id }
+    return undefined
+  }, [projection.items])
+  useEffect(loadTurnRecalls, [loadTurnRecalls, latestPromptId, projection.phase])
   const recallByItem = useMemo(() => recallsByItem(turnRecalls), [turnRecalls])
   const [workingWord, setWorkingWord] = useState(0)
   useEffect(() => { if (projection.phase !== 'running') return; const timer = window.setInterval(() => setWorkingWord((current) => (current + 1) % 4), 7000); return () => window.clearInterval(timer) }, [projection.phase])
   const [submitting, setSubmitting] = useState(false)
   const structuredProvider = props.provider === 'claude' || props.provider === 'grok' || props.provider === 'local' ? props.provider : 'codex'
-  const [settings, setSettings] = useState<SessionSettings>({ permission: initialPermission(structuredProvider), plan: false, model: concreteModel(structuredProvider, props.model), effort: props.effort === 'auto' ? undefined : props.effort })
+  // Lazy: the remembered permission is a storage read, and this pane renders on every keystroke.
+  const [settings, setSettings] = useState<SessionSettings>(() => ({ permission: initialPermission(structuredProvider), plan: false, model: concreteModel(structuredProvider, props.model), effort: props.effort === 'auto' ? undefined : props.effort }))
   const settingsRef = useRef(settings)
   settingsRef.current = settings
   useEffect(() => onAgentControlSettings(activeId, change => {
@@ -214,9 +239,6 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
 
   useEffect(() => {
     let disposed = false
-    let initialized = false
-    let queue: AgentEvent[] = []
-    let frame = 0
     setReady(false)
     setError('')
     setProjection(emptyProjection(activeId))
@@ -237,27 +259,35 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     commandLoad.current = null
     setCommandDiscovery(undefined)
     setCommandDismissed(false)
-    const flush = (): void => {
-      frame = 0
-      if (!initialized || disposed) return
-      const events = queue
-      queue = []
-      // A fast reply can queue many deltas for the same message before one frame; merging
-      // them first keeps this a single O(items) reduce instead of one per delta.
-      setProjection((current) => coalesceTextDeltas(events).reduce(projectAgentEvent, current))
-      // A permission action changes the running provider mode in every pane.
-      // Preserve any locally selected model/effort for the next message.
-      const modeUpdate = events.filter(event => event.data.type === 'session' && event.data.settings).at(-1)
-      if (modeUpdate?.data.type === 'session' && modeUpdate.data.settings) {
-        const confirmed = modeUpdate.data.settings
-        setSettings(current => ({ ...current, permission: confirmed.permission, plan: confirmed.plan, temporaryPermission: confirmed.temporaryPermission }))
+    // Streamed events are folded into the latest projection outside React, a bounded slice at a
+    // time, and the result is rendered as a transition: a keystroke interrupts that render instead
+    // of waiting behind it, and a burst of thousands of events cannot hold the keyboard.
+    const ingest = createStreamIngest<AgentEvent>({
+      lastInputAt: lastOwnerKeyAt,
+      apply(events) {
+        // A fast reply can queue many deltas for the same message before one frame; merging them
+        // first, then folding the batch with one items copy, keeps this O(items + events).
+        projectionRef.current = projectAgentEvents(projectionRef.current, coalesceTextDeltas(events))
+        // A permission action changes the running provider mode in every pane.
+        // Preserve any locally selected model/effort for the next message.
+        const modeUpdate = events.filter(event => event.data.type === 'session' && event.data.settings).at(-1)
+        if (modeUpdate?.data.type === 'session' && modeUpdate.data.settings) {
+          const confirmed = modeUpdate.data.settings
+          setSettings(current => ({ ...current, permission: confirmed.permission, plan: confirmed.plan, temporaryPermission: confirmed.temporaryPermission }))
+        }
+      },
+      render() {
+        const latest = projectionRef.current
+        // An equal state commits nothing, so there is no commit to wait for.
+        if (latest === renderedProjection.current) { ingest.committed(); return }
+        startTransition(() => setProjectionState(latest))
       }
-    }
+    })
+    streamIngest.current = ingest
     // Subscribe first, then merge events received while reading the durable snapshot.
     const off = window.conductor.structured.onEvents((events) => {
       if (disposed) return
-      queue.push(...events.filter((event) => event.sessionId === activeId))
-      if (initialized && queue.length && !frame) frame = requestAnimationFrame(flush)
+      ingest.push(events.filter((event) => event.sessionId === activeId))
     })
     const initialize = async (): Promise<void> => {
       if (activeId === propsRef.current.resourceId) {
@@ -267,10 +297,9 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       }
       const snapshot = await window.conductor.structured.snapshot(activeId)
       if (disposed) return
-      const state = queue.reduce(projectAgentEvent, snapshot ?? emptyProjection(activeId))
-      queue = []
-      initialized = true
+      const state = projectAgentEvents(snapshot ?? emptyProjection(activeId), ingest.drain())
       setProjection(state)
+      ingest.start()
       // Trusting the backend's permission outright (over the initialPermission() seed above) is
       // safe: a brand-new session is registered on the owner's remembered mode for this provider
       // (structured-sessions.ts ensure()), and an existing one carries whatever was last saved for
@@ -279,8 +308,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       setReady(true)
     }
     void initialize().catch((reason: unknown) => { if (!disposed) setError(reason instanceof Error ? reason.message : String(reason)) })
-    return () => { disposed = true; off(); if (frame) cancelAnimationFrame(frame) }
-  }, [activeId, provider])
+    return () => { disposed = true; off(); ingest.dispose(); if (streamIngest.current === ingest) streamIngest.current = null }
+  }, [activeId, provider, setProjection])
 
   // The spec only reaches main when a conversation mounts, so a workspace whose limit-continuation
   // toggle was flipped afterwards left every open conversation registered with the old answer —
@@ -622,7 +651,18 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     })
   }, [])
   const visibleItems = useMemo(() => {
-    if (!readingWindow) return conversationItems.slice(-visibleCount)
+    if (!readingWindow) {
+      // Sliding the window by one card per new item moves every card up and repaints the whole
+      // timeline on each streamed commit. The committed window keeps its first card until it has
+      // grown WINDOW_SLACK past the limit, and then sheds that many at once.
+      let start = Math.max(0, conversationItems.length - visibleCount)
+      const first = lastVisibleItems.current[0]
+      if (first && start > 0) {
+        const kept = conversationItems.findIndex(item => item.id === first.id)
+        if (kept >= 0 && kept < start && conversationItems.length - kept <= visibleCount + WINDOW_SLACK) start = kept
+      }
+      return conversationItems.slice(start)
+    }
     const latest = new Map(projection.items.map((item) => [item.id, item]))
     // Keep a bounded reading window; reconcile existing statuses without adding rows.
     return readingWindow.map((item) => latest.get(item.id) ?? item)
@@ -790,7 +830,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     }
     setFindJump(itemId)
   }
-  const earlierCount = readingWindow ? conversationItems.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).length : Math.max(0, conversationItems.length - visibleCount)
+  const earlierCount = readingWindow ? conversationItems.filter((item) => item.sequence < (readingWindow[0]?.sequence ?? 0)).length : Math.max(0, conversationItems.length - visibleItems.length)
   // Paging back keeps what the owner is reading in place: the card at the top of the view is
   // remembered, and once the earlier cards commit the scroll moves by exactly what landed above it.
   const anchorView = (): void => {

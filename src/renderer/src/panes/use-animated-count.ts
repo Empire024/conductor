@@ -1,4 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
+import { lastOwnerKeyAt } from './stream-ingest'
+
+/** Each animated step is a render and a frame of the conversation around it; while the owner is
+ *  typing, those frames would sit between their keys and their paint, so the count jumps instead. */
+const TYPING_MS = 1000
 
 /** Interpolate only between provider reports; never extrapolate token usage. */
 export function useAnimatedCount(target: number | undefined, identity: string): number | undefined {
@@ -8,7 +13,7 @@ export function useAnimatedCount(target: number | undefined, identity: string): 
     let frame = 0
     const publish = (value: number | undefined): void => { current.current = value; setShown(value) }
     const start = current.current
-    if (scope.current !== identity || target === undefined || start === undefined || target < start || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    if (scope.current !== identity || target === undefined || start === undefined || target < start || performance.now() - lastOwnerKeyAt() < TYPING_MS || window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
       scope.current = identity; publish(target); return
     }
     const began = performance.now()

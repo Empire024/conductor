@@ -30,23 +30,43 @@ import { join, resolve } from 'node:path'
 // --trace records a devtools.timeline trace while typing and adds the renderer main thread's time by
 // trace event (Paint, Layout, UpdateLayoutTree, accessibility...), which is where "(program)" in a
 // CPU profile goes: browser work outside JavaScript.
+// --profile-main samples the Electron main process (Node's inspector) from just before the live turn
+// until typing ends, writes <label>-<tabs>-main.cpuprofile and adds its top functions: every input
+// event passes through main's UI thread, so a busy main process delays keys the renderer never saw.
 // --css="<rules>" injects a stylesheet before typing, to try a rendering hypothesis without a rebuild.
+// --stream=<rate>x<seconds> (Claude only) types while a live turn streams at a real provider's pace:
+// the fixture's "SYNTHETIC STREAM" emits about <rate> events a second (text deltas, whole messages
+// with a tool call, tool output) for <seconds> s on top of the long history; typing (default 200
+// characters) is spread across the stream. Default 20x60.
+// --burst=<events> (Claude only) types while the fixture replays "SYNTHETIC LONG <events>" at its full
+// speed (about 12,000 events a second), the worst case of a reconnect or a fast tool flood.
+// --floor first measures the same typing on an empty conversation at 1 tab, the floor p95 the
+// long-conversation rows are held to.
+// --assert exits non-zero when a row misses its target: while streaming p95 < 32 ms and no key over
+// 250 ms, during a burst no key over 1,000 ms, and at rest p95 within 5 ms of the floor (--floor).
 const args = Object.fromEntries(process.argv.slice(2).filter(arg => arg.startsWith('--')).map(arg => {
   const [key, value = 'true'] = arg.slice(2).split('=')
   return [key, value]
 }))
 const label = args.label ?? 'latest'
 const tabCounts = (args.tabs ?? '1,11,26').split(',').map(Number).filter(count => Number.isSafeInteger(count) && count > 0)
-const chars = Number(args.chars ?? 300)
-const delay = Number(args.delay ?? 50)
+const [streamRate, streamSeconds] = args.stream ? (args.stream === 'true' ? '20x60' : args.stream).split('x').map(Number) : []
+const burst = args.burst ? Number(args.burst === 'true' ? 20000 : args.burst) : 0
+const floor = args.floor === 'true'
+const assert = args.assert === 'true'
+const chars = Number(args.chars ?? (streamRate ? 200 : 300))
+// Spread the keys over most of the stream, so they land throughout it rather than in its first seconds.
+const delay = Number(args.delay ?? (streamRate ? Math.floor(streamSeconds * 800 / chars) : 50))
 const throttle = Number(args.throttle ?? 4)
 const prefill = Number(args.prefill ?? 0)
 const history = Number(args.history ?? 150)
 const profile = args.profile === 'true'
 const trace = args.trace === 'true'
+const profileMain = args['profile-main'] === 'true'
 const css = args.css
-const provider = args.provider === 'claude' ? 'claude' : 'codex'
+const provider = args.provider === 'claude' || streamRate || burst ? 'claude' : 'codex'
 const events = Number(args.events ?? 3000)
+const livePrompt = streamRate ? `SYNTHETIC STREAM ${streamRate} ${streamSeconds}` : burst ? `SYNTHETIC LONG ${burst}` : ''
 const providerTitle = provider === 'claude' ? 'Claude' : 'Codex'
 const output = resolve('artifacts/perf-input')
 await mkdir(output, { recursive: true })
@@ -81,7 +101,7 @@ const initScript = () => {
   }
 }
 
-async function scenario(tabCount) {
+async function scenario(tabCount, { historyEvents = events, live = livePrompt } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'conductor-perf-input-'))
   const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_USER_DATA: join(root, 'profile'), CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_PERF_STREAM_HISTORY: String(history) }
   delete env.ELECTRON_RUN_AS_NODE
@@ -118,7 +138,7 @@ async function scenario(tabCount) {
     const phase = id => page.evaluate(agent => window.conductor.structured.snapshot(agent).then(state => state?.phase), id)
 
     // The active conversation's history, sent through the real composer.
-    await composer().fill(provider === 'claude' ? 'SYNTHETIC LONG ' + events : 'synthetic:perf-stream')
+    await composer().fill(provider === 'claude' ? 'SYNTHETIC LONG ' + historyEvents : 'synthetic:perf-stream')
     await visible.getByRole('button', { name: 'Send message', exact: true }).click()
     await expect.poll(() => phase(activeId), { timeout: 600_000, intervals: [250] }).toBe('completed')
     // Every inactive conversation gets one short exchange straight through main, the same path a
@@ -197,10 +217,62 @@ async function scenario(tabCount) {
       await cdp.send('Profiler.setSamplingInterval', { interval: 250 })
       await cdp.send('Profiler.start')
     }
+    let liveTurn
+    if (profileMain) await app.evaluate(() => {
+      const inspector = process.getBuiltinModule('node:inspector')
+      const session = globalThis.__perfMainProfiler = new inspector.Session()
+      session.connect()
+      session.post('Profiler.enable')
+      session.post('Profiler.setSamplingInterval', { interval: 500 })
+      session.post('Profiler.start')
+    })
+    if (live) {
+      // The live turn goes straight through main, like a controller's tabs.send, so the composer's
+      // draft is left alone; the pane receives its events the way it would from a real provider.
+      await page.evaluate(({ agent, prompt }) => {
+        const received = window.__inputPerfLive = { events: 0, batches: 0, first: 0, last: 0 }
+        window.__inputPerfLiveOff = window.conductor.structured.onEvents(batch => {
+          const mine = batch.filter(event => event.sessionId === agent).length
+          if (!mine) return
+          received.events += mine
+          received.batches++
+          received.first ||= performance.now()
+          received.last = performance.now()
+        })
+        return window.conductor.structured.snapshot(agent).then(state => window.conductor.structured.submit(agent, prompt, state.settings, []))
+      }, { agent: activeId, prompt: live })
+      // A burst can keep main too busy to answer a snapshot until the turn is over, so only the
+      // paced stream waits to see its turn running; a burst is typed into straight away.
+      if (streamRate) await expect.poll(() => phase(activeId), { timeout: 30_000, intervals: [100] }).toBe('running')
+    }
     const before = (await cdp.send('Performance.getMetrics')).metrics
     const wallStart = Date.now()
-    await page.keyboard.type(typed, { delay })
+    let typedText = typed
+    if (burst && live) {
+      // Main can take minutes to hand a burst to the renderer, and then hands it over at once; keep
+      // typing until it has landed and 15 s more, so keys are in flight while the pane takes it in.
+      typedText = ''
+      let arrivedAt = 0
+      for (let word = 0; Date.now() - wallStart < 15 * 60_000; word++) {
+        const chunk = words[word % words.length] + ' '
+        await page.keyboard.type(chunk, { delay })
+        typedText += chunk
+        if (!arrivedAt && await page.evaluate(() => window.__inputPerfLive.events > 0)) arrivedAt = Date.now()
+        if (arrivedAt && Date.now() - arrivedAt > 15_000 && typedText.length >= chars) break
+      }
+    } else await page.keyboard.type(typed, { delay })
     const typingMs = Date.now() - wallStart
+    if (live) {
+      liveTurn = await page.evaluate(() => { window.__inputPerfLiveOff(); const { events, batches, first, last } = window.__inputPerfLive; return { events, batches, perSecond: Number((events / Math.max(1, (last - first) / 1000)).toFixed(1)) } })
+      liveTurn.prompt = live
+      liveTurn.phaseAfterTyping = await phase(activeId)
+    }
+    let mainHotspots
+    if (profileMain) {
+      const samples = await app.evaluate(() => new Promise((resolve, reject) => globalThis.__perfMainProfiler.post('Profiler.stop', (error, result) => { globalThis.__perfMainProfiler.disconnect(); error ? reject(error) : resolve(result.profile) })))
+      await writeFile(join(output, `${label}-${tabCount}-main.cpuprofile`), JSON.stringify(samples))
+      mainHotspots = selfTimeHotspots(samples)
+    }
     // A settle window long enough for a debounced or idle-time draft write to land.
     await page.waitForTimeout(1500)
     const after = (await cdp.send('Performance.getMetrics')).metrics
@@ -227,7 +299,7 @@ async function scenario(tabCount) {
       return { timelineMutations: perf.timelineMutations, samples: perf.samples, longtasks: perf.longtasks, events: perf.events, setItem: perf.setItem, getItem: perf.getItem, removeItem: perf.removeItem, commits: (window.__inputPerfCommits ?? 0) - perf.commitsAtStart }
     })
     const value = await composerBox.inputValue()
-    const expected = (prefill > 0 ? 'x'.repeat(prefill - 1) + ' ' : '') + typed
+    const expected = (prefill > 0 ? 'x'.repeat(prefill - 1) + ' ' : '') + typedText
     const panes = await page.locator('.structured-agent-pane').count()
     // Animations running while the owner types cost a style/paint pass every frame; list them by
     // name and element so a regression names its source.
@@ -245,7 +317,7 @@ async function scenario(tabCount) {
     // What a suspended view costs: selecting another conversation and coming back to the long one,
     // timed from the click until its composer is usable and its timeline shows the latest reply.
     const switching = {}
-    if (tabCount > 1) {
+    if (tabCount > 1 && !live) {
       const select = async (id, ready) => {
         const started = Date.now()
         await page.locator(`.pane-tab[data-control-tab-id="pane-${id}"]`).click()
@@ -271,7 +343,7 @@ async function scenario(tabCount) {
       renderedActivities,
       inactiveTabs: tabCount - 1,
       mountedStructuredPanes: panes,
-      typedChars: chars,
+      typedChars: typedText.length,
       textIntact: value === expected,
       typingWallMs: typingMs,
       keystrokesMeasured: latencies.length,
@@ -301,23 +373,43 @@ async function scenario(tabCount) {
       jsEventListeners: metric(after, 'JSEventListeners'),
       jsHeapUsedMb: round((metric(after, 'JSHeapUsedSize') ?? 0) / 1024 / 1024),
       switching,
+      liveTurn,
+      mainHotspots,
       animations,
       hotspots,
       trace: traceSummary,
       errors
     }
   } finally {
-    await app.close()
+    // A close that waits on work still running must not hold the smoke lock forever.
+    const closed = await Promise.race([app.close().then(() => true), new Promise(done => setTimeout(() => done(false), 30_000))])
+    if (!closed) app.process().kill()
   }
 }
 
-const results = { label, synthetic: true, recordedAt: new Date().toISOString(), config: { chars, delay, throttle, prefill, history, provider, events, css }, scenarios: [], failures: [] }
+const results = { label, synthetic: true, recordedAt: new Date().toISOString(), config: { chars, delay, throttle, prefill, history, provider, events, css, live: livePrompt || undefined }, scenarios: [], failures: [] }
+// What each row is held to under --assert (see the header).
+const misses = (result) => {
+  const { p95, max } = result.inputToNextPaintMs
+  const missed = []
+  if (!result.textIntact) missed.push('typed text was not intact')
+  if (streamRate) { if (p95 >= 32) missed.push(`p95 ${p95} ms >= 32 ms while streaming`); if (max > 250) missed.push(`a key took ${max} ms > 250 ms while streaming`) }
+  else if (burst) { if (max > 1000) missed.push(`input froze ${max} ms > 1000 ms during the burst`) }
+  else if (results.floor && p95 > results.floor.inputToNextPaintMs.p95 + 5) missed.push(`p95 ${p95} ms > floor ${results.floor.inputToNextPaintMs.p95} + 5 ms`)
+  return missed
+}
 try {
+  if (floor) {
+    results.floor = await scenario(1, { historyEvents: 4, live: '' })
+    console.log(`floor: empty ${provider} conversation, 1 tab: input->paint p50 ${results.floor.inputToNextPaintMs.p50} / p95 ${results.floor.inputToNextPaintMs.p95} / p99 ${results.floor.inputToNextPaintMs.p99} ms; commits ${results.floor.reactCommits}`)
+  }
   for (const count of tabCounts) {
     const result = await scenario(count)
+    result.misses = misses(result)
     results.scenarios.push(result)
-    console.log(`${provider}${provider === 'claude' ? ' ' + events + ' events' : ''}, ${count} tab(s), ${result.timelineItems} items (${result.renderedActivities} rendered): input->paint p50 ${result.inputToNextPaintMs.p50} / p95 ${result.inputToNextPaintMs.p95} / p99 ${result.inputToNextPaintMs.p99} ms; longtasks ${result.longtasks.count} (${result.longtasks.totalMs} ms); commits ${result.reactCommits}; timeline mutations ${result.timelineMutations}; setItem ${result.localStorage.setItem}; getItem ${result.localStorage.getItem}; panes ${result.mountedStructuredPanes}; intact ${result.textIntact}; switch ${JSON.stringify(result.switching)}`)
+    console.log(`${provider}${provider === 'claude' ? ' ' + events + ' events' : ''}${livePrompt ? ' + ' + livePrompt + ' (' + JSON.stringify(result.liveTurn) + ')' : ''}, ${count} tab(s), ${result.timelineItems} items (${result.renderedActivities} rendered): input->paint p50 ${result.inputToNextPaintMs.p50} / p95 ${result.inputToNextPaintMs.p95} / p99 ${result.inputToNextPaintMs.p99} ms; longtasks ${result.longtasks.count} (${result.longtasks.totalMs} ms); commits ${result.reactCommits}; timeline mutations ${result.timelineMutations}; setItem ${result.localStorage.setItem}; getItem ${result.localStorage.getItem}; panes ${result.mountedStructuredPanes}; intact ${result.textIntact}; switch ${JSON.stringify(result.switching)}; max ${result.inputToNextPaintMs.max} ms${result.misses.length ? '; MISSED: ' + result.misses.join(', ') : ''}`)
   }
+  if (assert && results.scenarios.some(result => result.misses.length)) process.exitCode = 1
 } catch (error) {
   results.failures.push(error.stack ?? String(error))
   throw error

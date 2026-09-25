@@ -1,5 +1,5 @@
 import { useAnimatedCount } from './use-animated-count'
-import { memo, useEffect, useMemo, useState } from 'react'
+import { memo, startTransition, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, Flame, Search, Users } from 'lucide-react'
 import type { ContextAttachment, FileChange, SessionPhase, TimelineItem } from '../../../shared/structured-agent'
 import { AgentDialog, coalescedEditLabel, coalescedEditSummary, groupConversationActivities, isConversationActivity, StructuredActivity, StructuredMarkdown } from './StructuredAgentRenderers'
@@ -10,7 +10,26 @@ import { stripMemoryDirectives } from '../../../shared/memory-directive'
 import './StructuredAgentTelemetry.css'
 import type { SubagentSummary, UsageCapSetting } from './usage-summary'
 
-export const StructuredLiveTokens = memo(function StructuredLiveTokens({ items }: { items: TimelineItem[] }): React.JSX.Element {
+/** The timeline a summary is computed from, refreshed at most every `ms`. Each summary below is a
+ *  pass over the whole timeline, and a streaming turn changes the timeline many times a second;
+ *  recomputing on every change put tens of milliseconds of the main thread between each keystroke
+ *  and its paint. The latest timeline always arrives, at most `ms` late. */
+export function useSettledItems(items: TimelineItem[], ms = 1000): TimelineItem[] {
+  const [settled, setSettled] = useState(items)
+  const shownAt = useRef(0)
+  useEffect(() => {
+    if (settled === items) return
+    const show = (): void => { shownAt.current = Date.now(); startTransition(() => setSettled(items)) }
+    const wait = shownAt.current + ms - Date.now()
+    if (wait <= 0) { show(); return }
+    const timer = window.setTimeout(show, wait)
+    return () => window.clearTimeout(timer)
+  }, [items, ms, settled])
+  return settled
+}
+
+export const StructuredLiveTokens = memo(function StructuredLiveTokens({ items: latest }: { items: TimelineItem[] }): React.JSX.Element {
+  const items = useSettledItems(latest)
   const summary = useMemo(() => summarizeWorkingUsage(items), [items])
   const user = items.filter(item => item.data.type === 'text' && item.data.role === 'user' && !item.parentId).at(-1)
   const count = useAnimatedCount(summary.tokens?.outputTokens, JSON.stringify([items.at(-1)?.runtimeId, user?.id]))
@@ -46,7 +65,8 @@ export const StructuredAgentTelemetry = memo(function StructuredAgentTelemetry({
 })
 
 /** Usage % and the view-usage entry point live on the composer control line, beside effort/model/mode. */
-export const StructuredUsageSummary = memo(function StructuredUsageSummary({ items, runtimeId, truncated = false, modelLabel, agentSessionId, workspaceId }: { items: TimelineItem[]; runtimeId: string; truncated?: boolean; modelLabel?: string; agentSessionId?: string; workspaceId?: string }): React.JSX.Element {
+export const StructuredUsageSummary = memo(function StructuredUsageSummary({ items: latest, runtimeId, truncated = false, modelLabel, agentSessionId, workspaceId }: { items: TimelineItem[]; runtimeId: string; truncated?: boolean; modelLabel?: string; agentSessionId?: string; workspaceId?: string }): React.JSX.Element {
+  const items = useSettledItems(latest)
   const [open, setOpen] = useState(false)
   const context = useMemo(() => summarizeContext(items, runtimeId), [items, runtimeId])
   // Polled rather than read once: the cap that applies here can change from this same dialog,

@@ -60,8 +60,12 @@ function loadProjectRoots(): void {
   if (!list) return
   inFlight = true
   void window.conductor.projects.list().then((projects) => {
-    cachedRoots = projects.map((project) => ({ id: project.id, path: project.path }))
+    const roots = projects.map((project) => ({ id: project.id, path: project.path }))
     fetchedAt = Date.now()
+    // Every mounted message re-parses its Markdown when this list changes identity, and a streaming
+    // reply mounts new messages every few seconds; an unchanged list must not re-render them all.
+    if (JSON.stringify(roots) === JSON.stringify(cachedRoots)) return
+    cachedRoots = roots
     for (const notify of subscribers) notify(cachedRoots)
   }).catch(() => { /* A link still resolves inside its own workspace without the sibling list. */ })
     .finally(() => { inFlight = false })

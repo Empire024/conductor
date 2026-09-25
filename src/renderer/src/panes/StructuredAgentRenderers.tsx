@@ -1,6 +1,7 @@
 import { isConversationActivity } from '../../../shared/conversation-activity'
 import { PromptImageThumbnail } from '../components/PromptImageUpload'
-import { Children, createContext, isValidElement, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Children, createContext, isValidElement, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { markdownBlocks } from './markdown-blocks'
 import { createPortal } from 'react-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -170,6 +171,12 @@ export function safeConductorLink(href: string): boolean {
   try { const url = new URL(href); return url.protocol === 'conductor:' && Boolean(url.hostname) && !url.search && !url.hash && !url.port && !url.username && !url.password && /^\/(tab|file|workspace)\/[^/]+$/.test(url.pathname) } catch { return false }
 }
 export const AgentFileMachineContext = createContext(LOCAL_MACHINE_ID)
+type MarkdownComponents = NonNullable<React.ComponentProps<typeof ReactMarkdown>['components']>
+/** One top-level block of a message (markdown-blocks.ts), memoized on its text: while a reply
+ *  streams, only its last block changes, so only that block is parsed again. */
+const MarkdownBlock = memo(function MarkdownBlock({ text, plugins, urlTransform, components }: { text: string; plugins: React.ComponentProps<typeof ReactMarkdown>['remarkPlugins']; urlTransform(url: string): string; components: MarkdownComponents }): React.JSX.Element {
+  return <ReactMarkdown remarkPlugins={plugins} skipHtml urlTransform={urlTransform} components={components}>{text}</ReactMarkdown>
+})
 export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, projectId, machineId, onOpenFile }: { text: string; cwd: string; projectId?: string; machineId?: string; onOpenFile(path: string, line?: number): void }): React.JSX.Element {
   const contextualMachineId = useContext(AgentFileMachineContext)
   machineId ??= contextualMachineId
@@ -215,7 +222,10 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
     setMenu(null)
     runLinkAction(action, target)
   }
-  return <div className="sa-markdown"><ReactMarkdown remarkPlugins={markdownPlugins} skipHtml urlTransform={(url) => safeConductorLink(url) || safeExternalLink(url) || resolveFileLinkTarget(url, cwd, projects, machineId) ? url : ''} components={{
+  // Stable for as long as what they read is, so an unchanged block of this message is not parsed
+  // again. The link handlers read only cwd, projectId, projects, machineId, onOpenFile and setters.
+  const urlTransform = useCallback((url: string): string => safeConductorLink(url) || safeExternalLink(url) || resolveFileLinkTarget(url, cwd, projects, machineId) ? url : '', [cwd, projects, machineId])
+  const components = useMemo<MarkdownComponents>(() => ({
     a: ({ href, children }) => {
       if (!href) return <span>{children}</span>
       const internal = safeConductorLink(href)
@@ -229,7 +239,9 @@ export const StructuredMarkdown = memo(function StructuredMarkdown({ text, cwd, 
     },
     img: ({ alt }) => <span className="sa-muted">{alt ? '[Image: ' + alt + ']' : '[Image omitted]'}</span>,
     pre: ({ children }) => <MarkdownCodeBlock>{children}</MarkdownCodeBlock>
-  }}>{text}</ReactMarkdown>{linkError && <span className="sa-error" role="alert">{linkError}</span>}
+  }), [cwd, projectId, projects, machineId, onOpenFile])
+  const blocks = useMemo(() => markdownBlocks(text), [text])
+  return <div className="sa-markdown">{blocks.map((block, index) => <MarkdownBlock key={index} text={block} plugins={markdownPlugins} urlTransform={urlTransform} components={components} />)}{linkError && <span className="sa-error" role="alert">{linkError}</span>}
   {menu && createPortal(
     <div className="cursor-context-menu sa-file-link-menu" role="menu" aria-label={'Actions for ' + menu.target.path} style={{ left: menu.x, top: menu.y }} onMouseDown={(event) => event.stopPropagation()}>
       <div className="context-menu-label">{menu.target.path.split('/').pop()}</div>

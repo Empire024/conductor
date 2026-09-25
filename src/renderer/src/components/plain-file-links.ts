@@ -122,7 +122,11 @@ export function useVerifiedPlainFileLinks(text: string, cwd: string, projectId: 
   useEffect(() => { requestChecks(links) }, [links])
   // A completed message stays clickable while mounted. TTL controls its next mount/text-change
   // re-stat, not whether a once-verified local file suddenly turns into plain prose.
-  return new Set(links.filter(link => checked.get(link.key)?.exists).map(link => link.key))
+  // Every finished check anywhere re-renders every mounted message, and a new set would make each
+  // of them parse its Markdown again; the set keeps its identity until this message's links change.
+  const verified = links.filter(link => checked.get(link.key)?.exists).map(link => link.key)
+  const signature = verified.join('\n')
+  return useMemo(() => new Set(verified), [signature])
 }
 
 function splitText(value: string, links: Candidate[], verified: Set<string>): MarkdownNode[] {

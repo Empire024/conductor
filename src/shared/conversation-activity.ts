@@ -16,7 +16,20 @@ export function isRuntimeHeartbeat(item: TimelineItem): boolean {
  *  duplicate rather than new information. */
 export function isAnsweredThroughInteraction(item: TimelineItem, items: TimelineItem[]): boolean {
   if (item.data.type !== 'tool' || !item.nativeItemId) return false
-  return items.some((other) => other !== item && other.runtimeId === item.runtimeId && other.nativeItemId === item.nativeItemId && other.data.type === 'interaction' && other.data.interaction.kind === 'question')
+  return questionKeys(items).has(item.runtimeId + '\n' + item.nativeItemId)
+}
+// Filtering a timeline asks this of every tool call, so scanning the whole timeline each time made
+// a 2,000-item conversation cost millions of comparisons per streamed frame. The question
+// interactions of one timeline array are indexed once; a projection never changes an array in
+// place, and a different length rebuilds the index regardless.
+const questionIndex = new WeakMap<TimelineItem[], { length: number; keys: Set<string> }>()
+function questionKeys(items: TimelineItem[]): Set<string> {
+  const cached = questionIndex.get(items)
+  if (cached?.length === items.length) return cached.keys
+  const keys = new Set<string>()
+  for (const other of items) if (other.data.type === 'interaction' && other.data.interaction.kind === 'question' && other.nativeItemId) keys.add(other.runtimeId + '\n' + other.nativeItemId)
+  questionIndex.set(items, { length: items.length, keys })
+  return keys
 }
 /** Diagnostics remain in the event inspector, not the conversation timeline. `items` is only
  *  supplied when called through `Array.prototype.filter`, which passes it as the third argument. */

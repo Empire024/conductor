@@ -2,7 +2,13 @@ import type { TimelineItem } from '../../../shared/structured-agent'
 
 /** Ignore selections in editors and other panes when following this conversation. */
 export function hasTimelineSelection(element: HTMLElement | null, selection: Selection | null): boolean {
-  return Boolean(element && selection?.toString() && (element.contains(selection.anchorNode) || element.contains(selection.focusNode)))
+  // Reading a selection forces a style and layout pass, and this runs on every caret move in the
+  // composer (each keystroke) and on every streamed commit. While a text field has focus the
+  // document's selection is inside that field, so the timeline cannot hold one; a collapsed caret
+  // or a selection outside the timeline never needs serializing either.
+  const active = element?.ownerDocument?.activeElement
+  if (active && (active.tagName === 'TEXTAREA' || active.tagName === 'INPUT')) return false
+  return Boolean(element && selection && !selection.isCollapsed && (element.contains(selection.anchorNode) || element.contains(selection.focusNode)) && selection.toString())
 }
 
 export interface OwnerPrompt { id: string; text: string; sequence: number }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { followsBottomAfterScroll, isAtConversationBottom, latestOwnerPrompt, truncatePromptPreview, type ScrollGeometry } from './conversation-scroll'
+import { followsBottomAfterScroll, hasTimelineSelection, isAtConversationBottom, latestOwnerPrompt, truncatePromptPreview, type ScrollGeometry } from './conversation-scroll'
 import type { PromptOrigin, TimelineItem } from '../../../shared/structured-agent'
 
 const geometry = (distanceFromBottom: number, scrollHeight = 1000, clientHeight = 500): ScrollGeometry =>
@@ -105,5 +105,33 @@ describe('truncatePromptPreview', () => {
 
   it('does not leave a dangling space before the ellipsis', () => {
     expect(truncatePromptPreview('abcde fghij', 6)).toBe('abcde…')
+  })
+})
+
+describe('hasTimelineSelection', () => {
+  const inside = {} as Node, outside = {} as Node
+  const timeline = { contains: (node: Node | null) => node === inside } as HTMLElement
+  const selection = (anchorNode: Node, isCollapsed: boolean, text: string) => {
+    let serialized = 0
+    return { value: { anchorNode, focusNode: anchorNode, isCollapsed, toString: () => { serialized++; return text } } as unknown as Selection, serialized: () => serialized }
+  }
+  it('never serializes a caret or a selection outside the timeline, which would force a layout per keystroke', () => {
+    const caret = selection(inside, true, '')
+    const elsewhere = selection(outside, false, 'composer text')
+    expect(hasTimelineSelection(timeline, caret.value)).toBe(false)
+    expect(hasTimelineSelection(timeline, elsewhere.value)).toBe(false)
+    expect(caret.serialized() + elsewhere.serialized()).toBe(0)
+  })
+  it('does not read the selection at all while a text field such as the composer has focus', () => {
+    const touched: string[] = []
+    const spy = new Proxy({}, { get: (_target, key) => { touched.push(String(key)); return undefined } }) as Selection
+    const focusedComposer = { contains: () => true, ownerDocument: { activeElement: { tagName: 'TEXTAREA' } } } as unknown as HTMLElement
+    expect(hasTimelineSelection(focusedComposer, spy)).toBe(false)
+    expect(touched).toEqual([])
+  })
+  it('reports a real selection of timeline text, and not an empty one', () => {
+    expect(hasTimelineSelection(timeline, selection(inside, false, 'selected words').value)).toBe(true)
+    expect(hasTimelineSelection(timeline, selection(inside, false, '').value)).toBe(false)
+    expect(hasTimelineSelection(null, selection(inside, false, 'selected words').value)).toBe(false)
   })
 })
