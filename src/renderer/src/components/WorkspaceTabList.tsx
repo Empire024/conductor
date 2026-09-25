@@ -10,6 +10,7 @@ import { PaneTabMenu } from './PaneTabMenu'
 import { TabActivityIndicator } from './TabActivityIndicator'
 import { ProviderIcon } from './ProviderIcon'
 import { useAgentControlLinks } from './useAgentControlLinks'
+import { ControlledByBadge } from './ControlActivity'
 import './WorkspaceTabList.css'
 
 export function tabControlRole(tabId: string, links: readonly AgentControlLink[]): { controlledBy?: AgentControlLink; controlling: AgentControlLink[] } {
@@ -51,7 +52,7 @@ export function WorkspaceTabList({ session, active, expanded, activityPhases, on
         <span className="ellipsis">{tab.title}</span>
         {tab.kind === 'agent' && <TabActivityIndicator phase={tabPhase} title={tab.title} spinEpoch={spinEpoch} />}
       </button>
-      {roleLabel && <button type="button" className={`workspace-tab-role ${controlledBy && controlling.length ? 'both' : controlledBy ? 'coworker' : 'main'}`} title={controlledBy ? `${tab.title} is controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)}; show the main tab` : `${tab.title} controls ${controlling.length} coworker${controlling.length === 1 ? '' : 's'}; show one`} aria-label={controlledBy ? `${tab.title} is ${roleLabel.toLowerCase()} controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)}; show the main tab` : `${tab.title} is the main coordinating tab and controls ${controlling.length} coworkers; show its coworker`} onClick={() => focusLinkedTab(controlledBy?.controllerTabId ?? controlling[0]!.controlledTabId)}><span>{roleLabel}</span>{controlling.length > 0 && <b>{controlling.length}</b>}</button>}
+      {roleLabel && <button type="button" className={`workspace-tab-role ${controlledBy && controlling.length ? 'both' : controlledBy ? 'coworker' : 'main'}`} title={controlledBy ? `${tab.title} is controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)}; show the main tab` : `${tab.title} controls ${controlling.length} coworker${controlling.length === 1 ? '' : 's'}; show one`} aria-label={controlledBy ? `${tab.title} is ${roleLabel.toLowerCase()} controlled by ${titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)}; show the main tab` : `${tab.title} is the main coordinating tab and controls ${controlling.length} coworkers; show its coworker`} onClick={() => focusLinkedTab(controlledBy?.controllerTabId ?? controlling[0]!.controlledTabId)}>{controlledBy ? <ControlledByBadge controllerTitle={titleOf(controlledBy.controllerTabId, controlledBy.controllerTitle)} /> : <span>{roleLabel}</span>}{controlling.length > 0 && <b>{controlling.length}</b>}</button>}
       <button className="workspace-tab-more" aria-label={`${tab.title} tab actions`} onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); setMenu({ x: rect.right, y: rect.top, groupId: group.id, tab }) }}><MoreHorizontal size={12} /></button>
     </div>
   }

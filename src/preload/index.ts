@@ -35,6 +35,7 @@ const bridge: ConductorBridge = {
     focusTab: (projectId, sessionId, tabId) => ipcRenderer.invoke('agent-control:focus-tab', projectId, sessionId, tabId),
     focusOrigin: agentSessionId => ipcRenderer.invoke('agent-control:focus-origin', agentSessionId),
     links: (projectId, sessionId) => ipcRenderer.invoke('agent-control:links', projectId, sessionId),
+    appActivity: () => ipcRenderer.invoke('agent-control:app-activity'),
     release: agentSessionId => ipcRenderer.invoke('agent-control:release', agentSessionId),
     onLinksChanged: callback => subscribe('agent-control:links-changed', callback),
     onRequest: callback => subscribe('agent-control:request', callback),

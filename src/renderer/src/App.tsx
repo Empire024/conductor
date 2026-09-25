@@ -89,6 +89,7 @@ import { useAppUpdates } from './use-app-updates'
 import { TabPerformancePopover } from './components/TabPerformancePopover'
 import { playAgentSound } from './agent-sounds'
 import { AppUpdateButton } from './components/AppUpdateButton'
+import { AppControlHistory } from './components/ControlActivity'
 import { UpdatePrompt } from './components/UpdatePrompt'
 import { AgentConfirmDialog } from './components/AgentConfirmDialog'
 import { useAgentConfirm } from './use-agent-confirm'
@@ -1668,6 +1669,7 @@ export function App(): React.JSX.Element {
           ><Globe2 size={11} /> Browser</button>
         </>}
         <span className="status-spacer" />
+        <AppControlHistory />
         <AppUpdateButton state={updateState} onAction={() => void runUpdateAction()} />
         {activeProject && activeSession && <>
           <TabPerformancePopover

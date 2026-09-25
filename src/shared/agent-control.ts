@@ -1,4 +1,5 @@
 import type { PaneTab } from './models'
+import type { AppControlEntry } from './control-activity'
 
 export type AgentControlUiAction = 'tabs.list' | 'tabs.open' | 'tabs.close' | 'tabs.focus' | 'tabs.focus-origin' | 'tabs.split' | 'tabs.rename' | 'tabs.detach' | 'agents.configure' | 'agents.configure-confirmed' | 'agents.grant-confirmed' | 'files.open' | 'workspace.rename' | 'workspace.focus'
 /** `owner` marks a call made with the owner's own control credential (the `control-owner.json`
@@ -36,6 +37,8 @@ export interface AgentControlBridge {
    * never gives the calling agent control over that agent. */
   focusOrigin(agentSessionId: string): Promise<void>
   onLinksChanged(callback: (scope: { projectId: string; sessionId: string }) => void): () => void
+  /** App-wide actions agents took through app control (restart, update install, rollback), oldest first. */
+  appActivity(): Promise<AppControlEntry[]>
 }
 
 export const conductorUri = (projectId: string, kind: 'tab' | 'file' | 'workspace', id: string): string =>

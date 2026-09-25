@@ -24,6 +24,8 @@ import { autoModeDenialOf } from '../../../shared/auto-mode-denial'
 import { AutoModeDenialCard } from './AutoModeDenialCard'
 import { localStopOf } from '../../../shared/local-stop'
 import { LocalStopCard } from './LocalStopCard'
+import { controlActivityOf, controlledByOf } from '../../../shared/control-activity'
+import { ControlActivityRow, ControlledByNotice } from '../components/ControlActivity'
 import './StructuredAgentActivity.css'
 import './StructuredFileLinkMenu.css'
 
@@ -582,6 +584,8 @@ export const StructuredActivity = memo(function StructuredActivity(props: Activi
     case 'notice': {
       const denial = autoModeDenialOf(data); if (denial) { body = <AutoModeDenialCard denial={denial} onSwitchToEdit={props.onSwitchPermission ? () => props.onSwitchPermission?.('accept-edits') : undefined} />; break }
       const stop = localStopOf(data); if (stop) { body = <LocalStopCard report={stop} />; break }
+      const control = controlActivityOf(data); if (control) { body = <ControlActivityRow activity={control} onFocusAgent={props.onFocusOrigin} />; break }
+      const driven = controlledByOf(data); if (driven) { body = <ControlledByNotice driven={driven} onFocusAgent={props.onFocusOrigin} />; break }
     }
       body = <div className="sa-notice">{data.message}{data.outputArtifactId && <OutputPreview sessionId={props.sessionId} artifactId={data.outputArtifactId} value="Saved terminal output from before structured integration. Native conversation identity was not recorded." />}</div>; break
     case 'review': body = <p className="sa-muted">{data.outcome === 'kept' ? 'Edit marked reviewed.' : 'Edit reverted.'}</p>; break

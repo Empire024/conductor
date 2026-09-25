@@ -40,6 +40,7 @@ export class AgentControlUi {
   register(control: AgentControl): void {
     ipcMain.handle('agent-control:open-uri', async (event, uri: string) => { this.trusted(event); if (typeof uri !== 'string' || uri.length > 8000) throw new Error('Invalid Conductor link'); await control.openUri(uri) })
     ipcMain.handle('agent-control:links', (event, projectId: string, sessionId: string) => { this.trusted(event); return control.listLinks(projectId, sessionId) })
+    ipcMain.handle('agent-control:app-activity', event => { this.trusted(event); return control.appActivity() })
     ipcMain.handle('agent-control:release', (event, targetAgentSessionId: string) => { this.trusted(event); control.releaseByOwner(targetAgentSessionId) })
     ipcMain.handle('agent-control:focus-tab', async (event, projectId: string, sessionId: string, tabId: string) => {
       this.trusted(event)
@@ -55,7 +56,7 @@ export class AgentControlUi {
   }
   close(): void {
     ipcMain.removeListener('agent-control:response', this.response)
-    for (const channel of ['agent-control:links', 'agent-control:release', 'agent-control:focus-tab', 'agent-control:focus-origin', 'agent-control:open-uri']) ipcMain.removeHandler(channel)
+    for (const channel of ['agent-control:links', 'agent-control:app-activity', 'agent-control:release', 'agent-control:focus-tab', 'agent-control:focus-origin', 'agent-control:open-uri']) ipcMain.removeHandler(channel)
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('Conductor is shutting down')) }
     this.pending.clear()
   }

@@ -27,7 +27,7 @@ export class AgentControlServer {
   private inFlight = new Map<string, number>()
   private mutationTails = new Map<string, Promise<void>>()
   private ownerToken?: string
-  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions) {}
+  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions) {}
 
   async start(): Promise<void> {
     if (this.disabled || this.server) return
@@ -110,9 +110,18 @@ export class AgentControlServer {
       // The owner names the project and workspace per call; a conversation's scope is fixed
       // when its credential is issued and nothing in the body can move it.
       const scope = owner ? this.control.ownerScope(input.scope) : credential!.scope
+      // Every answered call is shown in the timelines it concerns (control-activity.ts), on the
+      // Conductor side only: nothing is added to any prompt.
       const call = async (): Promise<unknown> => {
         this.control.authorize(scope)
-        return this.control.call(scope, input.method as string, input.args ?? {})
+        try {
+          const result = await this.control.call(scope, input.method as string, input.args ?? {})
+          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { result })
+          return result
+        } catch (error) {
+          this.control.recordActivity?.(scope, input.method as string, input.args ?? {}, { error: error instanceof Error ? error.message : String(error) })
+          throw error
+        }
       }
       const result = controlMethodClass(input.method) === 'read'
         ? await call()

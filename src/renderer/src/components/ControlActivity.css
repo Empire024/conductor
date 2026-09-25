@@ -1,0 +1,31 @@
+.control-activity { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 5px 0; font-size: 10.5px; }
+.control-activity-lead { display: inline-flex; align-items: center; gap: 3px; margin-right: 2px; color: var(--text-3); font-size: 9.5px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.control-chip { display: inline-flex; align-items: center; gap: 4px; max-width: 260px; height: 19px; padding: 0 6px; border: 1px solid color-mix(in srgb, currentColor 22%, var(--border-soft)); border-radius: 10px; background: color-mix(in srgb, currentColor 7%, transparent); color: var(--text-2); font: inherit; white-space: nowrap; }
+.control-chip > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+button.control-chip { cursor: pointer; }
+button.control-chip:hover { color: var(--text); background: color-mix(in srgb, currentColor 13%, var(--surface-hover)); }
+button.control-chip:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.control-chip.kind-open { color: var(--blue); }
+.control-chip.kind-steer { color: var(--accent-muted); }
+.control-chip.kind-ship { color: var(--green, var(--accent)); }
+.control-chip.kind-app, .control-chip.app-wide { color: var(--orange, var(--accent)); font-weight: 600; }
+.control-chip.kind-decide { color: var(--accent); }
+.control-chip.kind-read { color: var(--text-3); border-style: dashed; }
+.control-chip.failed { color: var(--red, var(--text-2)); text-decoration: line-through; text-decoration-thickness: 1px; }
+.controlled-by-notice { display: flex; align-items: center; gap: 5px; margin: 5px 0; color: var(--text-2); font-size: 11px; }
+.controlled-by-notice > svg { color: var(--blue); flex: none; }
+.controlled-by-notice button { padding: 0; border: 0; background: none; color: var(--accent-muted); font: inherit; font-weight: 600; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; }
+.controlled-by-notice small { color: var(--text-3); font-family: var(--mono, monospace); font-size: 10px; }
+.controlled-by-badge { display: inline-flex; align-items: center; gap: 2px; min-width: 0; color: var(--blue); }
+.controlled-by-badge > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.controlled-by-badge.compact { flex: none; opacity: .85; }
+.app-control-history { position: relative; display: inline-flex; }
+.app-control-history-popover { position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 50; width: 320px; max-height: 320px; overflow: auto; padding: 8px 0; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-1, var(--surface-0)); box-shadow: 0 8px 28px rgba(0, 0, 0, .28); color: var(--text); font-size: 11px; }
+.app-control-history-popover > header { padding: 0 12px 6px; color: var(--text-3); font-size: 10px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.app-control-history-list { margin: 0; padding: 0; list-style: none; }
+.app-control-history-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1px 8px; padding: 5px 12px; }
+.app-control-history-list li + li { border-top: 1px solid var(--border-soft); }
+.app-control-history-list li.failed strong { color: var(--red, var(--text-2)); text-decoration: line-through; }
+.app-control-history-list span { grid-column: 1; color: var(--text-2); }
+.app-control-history-list time { grid-column: 2; grid-row: 1 / span 2; align-self: center; color: var(--text-3); }
+.pd-activity small.pd-control-action { color: var(--blue); }

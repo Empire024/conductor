@@ -10,6 +10,7 @@ import { createSerialPoller, currentTurnStartedAt, durationLabel, processTracker
 import { VIEWING_LABEL, viewingDescription } from '../../../shared/project-activity'
 import './ProcessDashboardPane.css'
 import { WeeklyUsage } from '../components/WeeklyUsage'
+import { latestControlAction } from '../../../shared/control-activity'
 
 interface ProcessFacts {
   snapshot?: SessionProjection
@@ -195,12 +196,13 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
         const stuck = state === 'viewing' ? stuckBackgroundTask(facts.snapshot, now, process.updatedAt) : undefined
         const canReconnect = state === 'disconnected' && Boolean(facts.snapshot?.capabilities?.resume && facts.snapshot.nativeSessionId && !facts.snapshot.archived)
         const RuntimeIcon = process.kind === 'agent' ? Bot : TerminalSquare
+        const control = facts.snapshot ? latestControlAction(facts.snapshot.items) : null
         return <article key={process.id} role="row" data-process-id={process.id} className={`pd-row state-${state}`} onDoubleClick={() => focus(process)}>
           <div className="pd-runtime" role="cell"><span className="pd-runtime-icon"><RuntimeIcon size={15} /></span><span><strong>{process.title}</strong><small>{process.kind === 'agent' ? `${process.provider ?? 'agent'} · ${model ?? 'model unavailable'}` : 'PowerShell process'}</small></span></div>
           <div className="pd-state" role="cell"><span className={`pd-state-marker ${state}`} title={`${stateLabel[state]}. ${state === 'ready' ? 'The adapter is connected but no turn is working.' : state === 'viewing' ? viewingDescription(facts.snapshot?.backgroundTasks) + '.' : state === 'disconnected' ? 'Conversation history remains available; reconnect only when you choose.' : 'Reported by the runtime.'}`} /><span><strong>{stateLabel[state]}</strong>{finishedExecution ? <small>Last execution finished</small> : turnTime && state === 'working' ? <small>Latest prompt {turnTime} ago</small> : stuck ? <small className="pd-stuck">{stuck}</small> : state === 'finished' ? <small>{relativeTime(process.updatedAt, now)}</small> : null}</span></div>
           <div className="pd-progress-cell" role="cell">{plan ? <><span>{plan.label}</span><progress max={plan.total} value={plan.completed} aria-label={`${process.title}: ${plan.label}`} /></> : <span className="pd-unreported">No plan reported</span>}</div>
           <div className={`pd-usage${facts.warning ? ` warning-${facts.warning}` : ''}`} role="cell" title={[facts.warning ? `${process.title} usage is ${facts.warning === 'high' ? 'high' : 'rising'}.` : '', tokens ? breakdownTitle(tokens, process.provider) : ''].filter(Boolean).join('\n') || undefined}><strong>{tokens?.processed === undefined ? '—' : `${tokenLabel(tokens.processed)} tok`}</strong><small>{[tokens?.output !== undefined ? `${tokenLabel(tokens.output)} out` : undefined, tokens?.cacheRead ? `${tokenLabel(tokens.cacheRead)} cache reads` : undefined, facts.usage?.costUsd ? costLabel(facts.usage.costUsd) : 'no cost reported'].filter(Boolean).join(' · ')}</small></div>
-          <div className="pd-activity" role="cell"><strong>{relativeTime(process.updatedAt, now)}</strong><small>Last runtime change</small></div>
+          <div className="pd-activity" role="cell"><strong>{relativeTime(process.updatedAt, now)}</strong><small>Last runtime change</small>{control && <small className="pd-control-action" title={`Latest app-control action, ${relativeTime(control.at, now)}`}>{control.text}</small>}</div>
           <div className="pd-actions" role="cell">
             <button type="button" title={`Open ${process.title}${facts.snapshot?.items.length ? ' history' : ' tab'}`} onClick={() => focus(process)}>{facts.snapshot?.items.length ? <History size={13} /> : <ArrowUpRight size={13} />}<span>Open</span></button>
             {canReconnect && <button type="button" className="reconnect" disabled={reconnecting === process.id} title="Reconnect this saved conversation intentionally" onClick={() => void reconnect(process, facts)}><Play size={12} /><span>{reconnecting === process.id ? 'Connecting' : 'Reconnect'}</span></button>}

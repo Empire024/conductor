@@ -43,6 +43,8 @@ import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, type CreateDurableJo
 import { scheduleCall, scheduleMethods, scheduleSignatures, type ScheduleControlService } from './schedule-control'
 import { LogicLoops, type LoopRecordInput } from './logic-loops'
 import { ideaMethods, ideaSignatures, type IdeasControlCaller } from './ideas/control'
+import { ControlActivityRecorder } from './control-activity'
+import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -991,11 +993,13 @@ export class AgentControl {
         return { agentSessionId: id, artifactId, bytes: Buffer.byteLength(content), truncated: content.length > limit, content: content.slice(0, limit) }
       }
       if (method === 'agents.snapshot') {
-        const recent = [...state.items].sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence)).slice(0, 60)
+        // Control activity rows are for the owner's eyes (control-activity.ts); a controller
+        // polling this conversation would only pay tokens for them.
+        const recent = state.items.filter(item => !isControlActivityNotice(item.data)).sort((a, b) => (b.updatedSequence ?? b.sequence) - (a.updatedSequence ?? a.sequence)).slice(0, 60)
         const activeTools = state.items.filter(item => item.data.type === 'tool' && ['preparing', 'running', 'awaiting_approval'].includes(item.data.status))
         return { ...this.observation(target, tab, state, new Date().toISOString()), ...state, activeTools, items: recent.sort((a, b) => a.sequence - b.sequence), truncated: state.truncated || state.items.length > recent.length }
       }
-      if (method === 'agents.history') return database.structured.events(id, typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0).slice(0, 100)
+      if (method === 'agents.history') return database.structured.events(id, typeof args.afterSequence === 'number' && Number.isSafeInteger(args.afterSequence) && args.afterSequence >= 0 ? args.afterSequence : 0).slice(0, 100).filter(event => !isControlActivityNotice(event.data))
       if (method === 'agents.status') return sinceCursor(this.status(target, tab, state), args.since)
       if (method === 'agents.supersede') {
         const by = text(args, 'by', 160)
@@ -1734,6 +1738,37 @@ export class AgentControl {
   }
 
   /** Every agent tab in the workspaces open in this window, as the finish rules see it. */
+  private activity?: ControlActivityRecorder
+  private activityRecorder(): ControlActivityRecorder {
+    const { database, sessions } = this.deps
+    return this.activity ??= new ControlActivityRecorder({
+      notice: (id, message, payload, itemId) => sessions.notice?.(id, message, payload, itemId) ?? false,
+      snapshot: id => database.structured.snapshot(id),
+      describe: target => this.describeTarget(target),
+      getSetting: key => database.getSetting(key),
+      setSetting: (key, value) => database.setSetting(key, value)
+    })
+  }
+
+  /** Shows a finished app-control call in the timelines it concerns (FX15, control-activity.ts);
+   *  the control server calls it once per request. Never throws. */
+  recordActivity(scope: AgentControlScope, method: string, args: unknown, outcome: { result?: unknown; error?: string }): void {
+    this.activityRecorder().record({ scope, method, args, ...outcome })
+  }
+
+  /** App-wide control actions (restart, update install, rollback...), oldest first, for the status bar. */
+  appActivity(): AppControlEntry[] { return this.activityRecorder().appHistory() }
+
+  private describeTarget(target: { agentSessionId?: string; tabId?: string }): ControlTarget | undefined {
+    for (const project of this.deps.database.listProjects()) for (const workspace of this.deps.database.listSessions(project.id)) {
+      let open: AgentControlTab[]
+      try { open = this.tabs({ projectId: project.id, sessionId: workspace.id, agentSessionId: '' }) } catch { continue }
+      const tab = open.find(candidate => target.tabId ? candidate.id === target.tabId : candidate.resourceId === target.agentSessionId)
+      if (tab) return { ...(tab.resourceId ? { agentSessionId: tab.resourceId } : {}), tabId: tab.id, title: tab.title }
+    }
+    return undefined
+  }
+
   finishTargets(): FinishTarget[] {
     const tabs: Array<{ tab: AgentControlTab; projectId: string; sessionId: string; controller: string | null }> = []
     for (const project of this.deps.database.listProjects()) for (const workspace of this.deps.database.listSessions(project.id)) {

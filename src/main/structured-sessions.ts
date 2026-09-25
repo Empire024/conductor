@@ -145,11 +145,12 @@ export class StructuredSessions {
   private mainBrain?: (spec: AgentSpec) => boolean
   setMainBrain(probe: (spec: AgentSpec) => boolean): void { this.mainBrain = probe }
   /** A Conductor notice in a conversation's own timeline from outside its runtime; false when it
-   *  has no live session in this process. */
-  notice(id: string, message: string, payload?: Json): boolean {
+   *  has no live session in this process. A notice given an itemId replaces the earlier one with
+   *  that id in place (control-activity.ts keeps one row per turn that way). */
+  notice(id: string, message: string, payload?: Json, itemId?: string): boolean {
     const live = this.live.get(id)
     if (!live || live.closed) return false
-    this.emit(live, { data: { type: 'notice', message, ...(payload === undefined ? {} : { payload }) } })
+    this.emit(live, { ...(itemId ? { itemId } : {}), data: { type: 'notice', message, ...(payload === undefined ? {} : { payload }) } })
     return true
   }
   private promptDispatchAuthorityGuard?: (authority: PromptDispatchAuthority, spec: AgentSpec) => void

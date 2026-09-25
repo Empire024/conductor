@@ -86,6 +86,7 @@ import { debugLog } from '../debug-log'
 import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
 import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
+import { ControlledByBadge } from '../components/ControlActivity'
 import './coworker-tab-groups.css'
 
 interface PaneWorkspaceProps {
@@ -587,6 +588,7 @@ function PaneGroup({
     const rawPhase = activity[tab.id] ?? 'idle'
     const correctedPhase = tab.resourceId ? workspace.correctedActivityPhases?.get(tab.resourceId) : undefined
     const tabPhase = correctedPhase ?? rawPhase
+    const controller = tab.kind === 'agent' ? controlLinks.find(link => link.controlledTabId === tab.id) : undefined
     return (
       <button
         key={tab.id}
@@ -610,6 +612,7 @@ function PaneGroup({
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
         <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
+        {controller && <ControlledByBadge compact controllerTitle={controller.controllerTitle ?? group.tabs.find(candidate => candidate.id === controller.controllerTabId)?.title ?? 'another tab'} />}
         {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (
           <span className="tab-limit-continuation" title="Limit continuation is on for this agent"><TimerReset size={12} /></span>
         )}

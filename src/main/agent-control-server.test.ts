@@ -177,3 +177,17 @@ describe('control method classes', () => {
     expect(controlMethodFamily('agents.status')).toBeUndefined()
   })
 })
+
+describe('control activity recording', () => {
+  it('records each answered call once, with its result or its error', async () => {
+    const { control, request } = await fixture(async method => { if (method === 'tabs.close') throw new Error('Tab is closed'); return { opened: method } })
+    Object.assign(control, { recordActivity: vi.fn() })
+    expect(await (await request('tabs.open')).json()).toEqual({ result: { opened: 'tabs.open' } })
+    expect(await (await request('tabs.close')).json()).toEqual({ error: 'Tab is closed' })
+    const calls = (control as unknown as { recordActivity: ReturnType<typeof vi.fn> }).recordActivity.mock.calls
+    expect(calls.map(call => [(call[0] as { agentSessionId: string }).agentSessionId, call[1], call[3]])).toEqual([
+      ['caller', 'tabs.open', { result: { opened: 'tabs.open' } }],
+      ['caller', 'tabs.close', { error: 'Tab is closed' }]
+    ])
+  })
+})
