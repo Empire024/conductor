@@ -21,6 +21,7 @@ import { LiveRuntimeBudget } from './live-runtime-budget'
 import { sanitizeDiagnostic } from './structured-store'
 import { rememberedBrowserTools, rememberBrowserTools, rememberedPermission, rememberPermission } from './app-settings'
 import { assertLocalControlAllowed } from './local-models/tools.ts'
+import { anonymousConversations } from './local-models/anonymous'
 import { normaliseContract } from './local-models/completion.ts'
 import { composeLocalPrompt } from './local-models/briefing.ts'
 import { LOCAL_MODEL_SETUP_ERROR_CODE } from '../shared/local-models.ts'
@@ -243,6 +244,12 @@ export class StructuredSessions {
     // Local is an internal adapter, not an external CLI. Its setup is validated by start(),
     // which emits the actionable local-setup-required error when config or weights are absent.
     const available = spec.provider === 'local' || Boolean(executable)
+    // Anonymous mode is chosen when the conversation opens and marks it before anything is written,
+    // so no row, setting or event of it ever reaches disk (local-models/anonymous.ts).
+    if (spec.anonymous && !previousSpec) {
+      if (spec.provider !== 'local') throw new Error('Anonymous mode is for local models only')
+      anonymousConversations.mark(spec.id)
+    }
     if (!store.snapshot(spec.id)) this.database.upsertAgent(spec, 'running', 'idle')
     const state = store.register(spec.id, spec.projectId, spec.provider as StructuredProvider, spec)
     // A brand-new conversation opens with the browser tools on — unless the owner last switched
@@ -962,7 +969,8 @@ export class StructuredSessions {
       this.reserveLive(live, settings, submitted)
       // Short and word-bounded, so history rows read the same name the tab strip auto-names
       // itself from (see conversation-tab.ts's bindConversationTab).
-      store.update(id, { settings, title: state.title || deriveConversationTitle(text) })
+      // An anonymous conversation is never named after what was said in it (local-models/anonymous.ts).
+      store.update(id, { settings, title: state.title || (anonymousConversations.has(id) ? '' : deriveConversationTitle(text)) })
       // Keep expanded file bytes and recalled context in the provider request, outside the user's message.
       if (!refusalRetry) this.emit(live, { itemId: userItemId, data: { type: 'text', role: 'user', text: text.trim(), mode: 'snapshot', ...(attachments.length ? { attachments: attachments.map(({ content: _content, ...metadata }) => metadata) } : {}), ...(origin ? { origin } : {}) } })
       this.emit(live, { data: { type: 'session', phase: 'running' } })
@@ -1575,6 +1583,8 @@ export class StructuredSessions {
   async detachForRestart(): Promise<string[]> {
     const kept: string[] = []
     for (const [id, live] of [...this.live]) {
+      // An anonymous conversation is not kept across a restart: no record of it is written.
+      if (anonymousConversations.has(id)) continue
       // A message being handed to the turn right now (a steer, a queued message, a submit)
       // finishes in moments. Waiting for it keeps the turn running instead of stopping it with
       // that message half handed over.

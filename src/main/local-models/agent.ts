@@ -17,6 +17,7 @@ import { outputBudgetLoopStop, truncatedCallResult, type OutputBudgetLoop } from
 import { newExecutionState, observeExecution, fingerprint, type ExecutionState } from './execution-state.ts'
 import { isFileProcessingTask, processingRequest, processingTool, PROCESSING_GUIDE, observedPlanHint, type ProcessingRun } from './processing-workflow.ts'
 import { mentionsConductorControl, splitLocalPrompt } from './briefing.ts'
+import { MemoryResultStore, type LocalResultStore } from './result-artifacts.ts'
 import { promptDate, templateKwargs } from './templates.ts'
 
 /** The whole agent loop for a local model. Conductor stays the orchestrator: llama.cpp only
@@ -72,6 +73,9 @@ export interface LocalAgentOptions {
   /** A bounded task's contract. Its presence narrows the tool set to the coding scope. */
   contract?: TaskContract
   control?: LocalControl
+  /** An anonymous conversation (local-models/anonymous.ts): command output and saved scripts are
+   *  held in memory, never under the runtime directory, and server refusals are logged bare. */
+  anonymous?: boolean
   beforeTool?(paths: string[]): Promise<void>
   afterTool?(paths: string[], success: boolean): Promise<void>
 }
@@ -392,8 +396,11 @@ export class LocalAgentSession {
   private get grants(): LocalGrants { return this.options.grants ?? NO_GRANTS }
   private get scope(): ToolScope { return this.options.contract ? 'coding' : 'full' }
 
+  private readonly resultStore?: LocalResultStore
+
   constructor(options: LocalAgentOptions) {
     this.options = options
+    this.resultStore = options.anonymous ? new MemoryResultStore() : undefined
     this.taskId = options.taskId ?? randomUUID()
     this.policy = this.resolvePolicy()
     this.messages = [{ role: 'system', content: this.systemPrompt() }]
@@ -529,6 +536,7 @@ export class LocalAgentSession {
       }
       try {
         return await chatCompletion({
+          ...(this.options.anonymous ? { anonymous: true } : {}),
           endpoint: this.options.endpoint,
           apiKey: this.options.apiKey,
           model: this.options.model,
@@ -993,7 +1001,7 @@ export class LocalAgentSession {
             outcome={output:`You already read ${String(parseArguments(call.arguments).url)} for this message; its text is above. Answer from it now, or read a different result.`,failed:true,paths:[]}
           } else if (call.name === 'process_files' && this.processing) {
             const args=parseArguments(call.arguments)
-            const run = await processingRequest(this.options.workspace,this.taskId,args,/payment|invoice|bank/i.test(execution.objective))
+            const run = await processingRequest(this.options.workspace,this.taskId,args,/payment|invoice|bank/i.test(execution.objective),this.resultStore)
             if(run.attempted)this.processingAttempted=true
             if(run.failed && this.processingPlanHint)run.output+=`\nUse the concise path form if these observed roles are correct:\n${this.processingPlanHint}`
             outcome = run
@@ -1019,6 +1027,7 @@ export class LocalAgentSession {
             timeoutSec: this.options.timeoutSec,
             signal,
             control: this.options.control,
+            ...(this.resultStore ? { artifacts: this.resultStore } : {}),
             beforeTool: this.options.beforeTool,
             afterTool: this.options.afterTool
             })

@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import type { AdapterOptions, ProviderAdapter, RuntimeDetachment } from './adapter'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 import { DEFAULT_LOCAL_MODEL, LOCAL_MODELS, LOCAL_MODEL_SETUP_ERROR_CODE, LOCAL_MODEL_SETUP_URL, localModelLabel } from '../../shared/local-models'
+import { anonymousConversations } from '../local-models/anonymous'
 import { LocalAgentSession, LocalTurnSuspension, type LocalAgentEvents } from '../local-models/agent.ts'
 import { normaliseContract } from '../local-models/completion.ts'
 import { localStopPayload, localStopSummary, type LocalStopReport } from '../../shared/local-stop.ts'
@@ -336,6 +337,7 @@ export class LocalAdapter implements ProviderAdapter {
         endpoint: endpointOf(model), apiKey: this.key(), model: model.id, workspace: this.options.cwd,
         sandbox, readOnly, grants, contract, timeoutSec: stack.sandbox.timeoutSec, contextTokens: model.contextTokens,
         control: this.options.localControl,
+        anonymous: anonymousConversations.has(this.options.localTaskId),
         taskId: this.options.localTaskId,
         checkpoint: this.options.localCheckpoint,
         policy: this.options.localPolicy,

@@ -5,6 +5,7 @@ import {
   controlActivityOf, controlActivitySummary, type AppControlEntry, type ControlAction, type ControlActionKind, type ControlActivity, type ControlledBy, type ControlTarget
 } from '../shared/control-activity'
 import { controlMethodClass } from './control-method-classes'
+import { anonymousConversations } from './local-models/anonymous'
 
 /**
  * Records what each conversation does through app control, Conductor-side (FX15): no prompt text,
@@ -127,7 +128,8 @@ export class ControlActivityRecorder {
   private caller(scope: AgentControlScope): { by?: ControlTarget; byTitle: string } {
     const caller = scope.owner ? undefined : scope.agentSessionId || undefined
     const by = caller ? this.deps.describe({ agentSessionId: caller }) : undefined
-    return { ...(by ? { by } : {}), byTitle: scope.owner ? 'the owner' : by?.title ?? 'another conversation' }
+    // An anonymous conversation's tab title is never written into another timeline or the app history.
+    return { ...(by ? { by } : {}), byTitle: scope.owner ? 'the owner' : anonymousConversations.has(scope.agentSessionId) ? 'an anonymous local conversation' : by?.title ?? 'another conversation' }
   }
 
   private notifyDriven(agentSessionId: string, payload: ControlledBy): void {

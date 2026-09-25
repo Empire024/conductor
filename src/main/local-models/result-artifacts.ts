@@ -42,6 +42,28 @@ export class LocalResultStore {
     } finally { closeSync(fd) }
   }
 }
+/** An anonymous conversation's command output and saved scripts (local-models/anonymous.ts):
+ *  the same handles, held in this process only and dropped with the conversation. */
+export class MemoryResultStore extends LocalResultStore {
+  private held = new Map<string, Buffer>()
+  constructor(private readonly limit = MAX_OWNER) { super() }
+  override save(owner: string, value: string): string {
+    const bytes = Buffer.from(value), id = randomUUID()
+    if (bytes.length > this.limit) throw new Error('Result exceeds artifact storage limit')
+    let total = [...this.held.values()].reduce((sum, entry) => sum + entry.length, 0)
+    for (const [key, entry] of this.held) { if (total + bytes.length <= this.limit) break; this.held.delete(key); total -= entry.length }
+    this.held.set(`${ownerKey(owner)}.${id}`, bytes)
+    return id
+  }
+  override read(owner: string, id: string, offset = 0, limit = 4096): string {
+    if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('Invalid artifact handle')
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(limit) || limit < 1) throw new Error('Artifact byte offset must be nonnegative; limit positive')
+    const bytes = this.held.get(`${ownerKey(owner)}.${id}`)
+    if (!bytes) throw new Error('Unknown, expired, or differently owned result artifact; rerun the originating command if expired')
+    const slice = bytes.subarray(offset, offset + Math.min(limit, 16384)), end = offset + slice.length
+    return `[result_artifact: id=${id}; size_bytes=${bytes.length}; byte_range=${offset}-${end}; end_exclusive=true; truncated=${offset > 0 || end < bytes.length}; next_byte_offset=${end}]\n${slice.toString('utf8')}`
+  }
+}
 export const defaultResultStore = new LocalResultStore()
 export const saveResultArtifact = (owner: string, value: string): string => defaultResultStore.save(owner, value)
 export const readResultArtifact = (owner: string, id: string, offset = 0, limit = 4096): string => defaultResultStore.read(owner, id, offset, limit)

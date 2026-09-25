@@ -24,6 +24,7 @@ import { createCertificateAuthority, issueServerCertificate, tlsIdentityUsable, 
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
 import { PhoneLock } from './phone-lock'
+import { anonymousConversations } from './local-models/anonymous'
 import type { WeeklyModelUsageReport } from '../shared/weekly-model-usage'
 
 const SETTINGS_KEY = 'phone-access.settings'
@@ -729,7 +730,8 @@ export class PhoneAccessService {
       for (const workspace of workspaces) {
         const tabs = [...layoutTabs(workspace.layout.root), ...detached.filter(window => window.sessionId === workspace.id).flatMap(window => layoutTabs(window.layout.root))]
         for (const tab of tabs) {
-          if (tab.kind !== 'agent' || !tab.resourceId || open.has(tab.resourceId)) continue
+          // An anonymous conversation never leaves this window: no phone state, push or attention entry.
+          if (tab.kind !== 'agent' || !tab.resourceId || open.has(tab.resourceId) || anonymousConversations.has(tab.resourceId)) continue
           open.add(tab.resourceId)
           const projection = this.deps.database.structured.snapshot(tab.resourceId)
           sessions.push(this.summarize(tab.resourceId, project, workspace, tab, projection, activity.get(tab.resourceId), processes.get(tab.resourceId), machines))

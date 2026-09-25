@@ -34,6 +34,8 @@ export interface RuntimeTerminalProps {
   effort?: AgentEffort
   continueOnLimit?: boolean
   viewMode?: 'visual' | 'cli'
+  /** A local conversation in anonymous mode (src/main/local-models/anonymous.ts). */
+  anonymous?: boolean
   project: ProjectRecord
   session: SessionRecord
   onOpenFile?(path: string, line?: number): void

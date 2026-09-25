@@ -3,6 +3,7 @@ import { readStoredIdentity } from '../shared/remote-control'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { StructuredAgentStore } from './structured-store'
+import { anonymousConversations, isAnonymousTab, persistableClosedTabs, persistableLayout } from './local-models/anonymous'
 import { LOCAL_MACHINE_ID } from '../shared/remote-control'
 import type { SessionArchive, SessionArchiveResult } from '../shared/session-archive'
 import { parseSessionArchive } from './session-archive'
@@ -182,6 +183,13 @@ const serializeMemoryOrigin = (origin: MemoryOrigin | undefined): string | null 
 export class ConductorDatabase {
   private readonly db: DatabaseSync
   readonly structured: StructuredAgentStore
+  /** Anonymous local conversations (local-models/anonymous.ts) never reach SQLite: their settings,
+   *  their agent row and the layouts that hold their tabs are kept here instead, and only the
+   *  layout with those tabs left out is written. Process memory, so a restart restores none of it. */
+  private volatileSettings = new Map<string, string>()
+  private volatileAgents = new Map<string, { spec: AgentSpec; status: string; activityPhase: string; updatedAt: string }>()
+  private volatileLayouts = new Map<string, WorkspaceLayout>()
+  private stopForgetting = anonymousConversations.onForget(id => this.forgetAnonymous(id))
 
   listDeskProjects(): ProjectRecord[] {
     const projects = this.listProjects()
@@ -243,7 +251,7 @@ export class ConductorDatabase {
 
   sessionArchive(name: string): SessionArchive {
     const projects = this.listDeskProjects()
-    const workspaces = projects.flatMap(project => this.listSessions(project.id))
+    const workspaces = projects.flatMap(project => this.listSessions(project.id)).map(session => ({ ...session, layout: persistableLayout(session.layout).layout }))
     const workspaceIds = new Set(workspaces.map(s => s.id))
     const detached = this.listDeskDetachedWindows().filter(d => workspaceIds.has(d.sessionId))
     const rows = this.db.prepare('SELECT * FROM agent_sessions').all() as DbRow[]
@@ -778,14 +786,19 @@ export class ConductorDatabase {
     return this.getProject(projectId)!
   }
 
-  removeSetting(key: string): void { this.db.prepare('DELETE FROM settings WHERE key = ?').run(key) }
+  removeSetting(key: string): void {
+    this.volatileSettings.delete(key)
+    this.db.prepare('DELETE FROM settings WHERE key = ?').run(key)
+  }
 
   getSetting(key: string): string | null {
+    if (anonymousConversations.ownsKey(key)) return this.volatileSettings.get(key) ?? null
     const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as DbRow | undefined
     return (row?.value as string | undefined) ?? null
   }
 
   setSetting(key: string, value: string): void {
+    if (anonymousConversations.ownsKey(key)) { this.volatileSettings.set(key, value); return }
     this.db
       .prepare(
         `INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
@@ -846,6 +859,20 @@ export class ConductorDatabase {
 
   listSessions(projectId: string): SessionRecord[] {
     return this.applyOrder('sessionOrder:' + projectId, (this.db.prepare('SELECT * FROM sessions WHERE project_id = ? AND closed_at IS NULL ORDER BY created_at ASC').all(projectId) as DbRow[]).map(this.mapSession))
+  }
+
+  /** Writes a layout with its anonymous tabs left out, keeping the full one in memory. */
+  private persistLayout(id: string, layout: WorkspaceLayout): string {
+    const stored = persistableLayout(layout)
+    if (stored.removed) this.volatileLayouts.set(id, layout)
+    else this.volatileLayouts.delete(id)
+    return JSON.stringify(stored.layout)
+  }
+
+  private forgetAnonymous(id: string): void {
+    for (const key of [...this.volatileSettings.keys()]) if (key.includes(id)) this.volatileSettings.delete(key)
+    this.volatileAgents.delete(id)
+    this.structured.forget(id)
   }
 
   getSession(id: string): SessionRecord | null {
@@ -921,7 +948,7 @@ export class ConductorDatabase {
          SET layout_json = ?, maximized_group_id = ?, closed_tabs_json = ?, updated_at = ?
          WHERE id = ? AND closed_at IS NULL`
       )
-      .run(JSON.stringify(layout), maximizedGroupId, JSON.stringify(closedTabs.slice(-20)), now(), sessionId)
+      .run(this.persistLayout(sessionId, layout), maximizedGroupId, JSON.stringify(persistableClosedTabs(closedTabs).slice(-20)), now(), sessionId)
   }
 
   getWorkspaceRecoveryState(): WorkspaceRecoveryState {
@@ -968,9 +995,9 @@ export class ConductorDatabase {
     try {
       for (const session of checkpoint.sessions) {
         saveSession.run(
-          JSON.stringify(session.layout),
+          this.persistLayout(session.id, session.layout),
           session.maximizedGroupId,
-          JSON.stringify(session.closedTabs.slice(-20)),
+          JSON.stringify(persistableClosedTabs(session.closedTabs).slice(-20)),
           timestamp,
           session.id
         )
@@ -1105,6 +1132,7 @@ export class ConductorDatabase {
     tab: PaneTab,
     sourceLayoutOverride?: WorkspaceLayout
   ): DetachedWindowRecord {
+    if (isAnonymousTab(tab)) throw new Error('An anonymous conversation stays in its window: a detached window is restored after a restart, and it must not be')
     const session = this.db
       .prepare('SELECT project_id, layout_json FROM sessions WHERE id = ?')
       .get(sessionId) as DbRow | undefined
@@ -1123,7 +1151,7 @@ export class ConductorDatabase {
         activeTabId: tab.id
       }
     }
-    const sourceLayout = sourceLayoutOverride ?? JSON.parse(session.layout_json as string) as WorkspaceLayout
+    const sourceLayout = sourceLayoutOverride ?? this.volatileLayouts.get(sessionId) ?? JSON.parse(session.layout_json as string) as WorkspaceLayout
     const nextSourceLayout = sourceLayoutOverride ?? this.removeLayoutTab(sourceLayout, tab.id)
     this.db.exec('BEGIN IMMEDIATE')
     try {
@@ -1136,7 +1164,7 @@ export class ConductorDatabase {
         .run(id, projectId, sessionId, JSON.stringify(layout), timestamp, timestamp)
       this.db
         .prepare('UPDATE sessions SET layout_json = ?, updated_at = ? WHERE id = ?')
-        .run(JSON.stringify(nextSourceLayout), timestamp, sessionId)
+        .run(this.persistLayout(sessionId, nextSourceLayout), timestamp, sessionId)
       this.db.exec('COMMIT')
     } catch (error) {
       this.db.exec('ROLLBACK')
@@ -1171,7 +1199,7 @@ export class ConductorDatabase {
          SET layout_json = ?, maximized_group_id = ?, updated_at = ?
          WHERE id = ?`
       )
-      .run(JSON.stringify(layout), maximizedGroupId, now(), id)
+      .run(this.persistLayout(id, layout), maximizedGroupId, now(), id)
   }
 
   closeDetachedWindow(id: string, restoreToWorkspace = false): { sessionId: string; tabs: PaneTab[] } | null {
@@ -1189,7 +1217,7 @@ export class ConductorDatabase {
         const returnedIds = new Set(tabs.map((tab) => tab.id))
         const retainedClosedTabs = closedTabs.filter((tab) => !returnedIds.has(tab.id))
         if (restoreToWorkspace && tabs.length) {
-          const layout = JSON.parse(source.layout_json as string) as WorkspaceLayout
+          const layout = structuredClone(this.volatileLayouts.get(record.sessionId) ?? JSON.parse(source.layout_json as string) as WorkspaceLayout)
           let group = layout.root
           while (group.type === 'split') group = group.children[0]
           const existing = new Set(this.collectLayoutTabs(layout).map(tab => tab.id))
@@ -1197,9 +1225,9 @@ export class ConductorDatabase {
           group.tabs.push(...returning)
           if (returning.length) group.activeTabId = returning.at(-1)!.id
           this.db.prepare('UPDATE sessions SET layout_json = ?, maximized_group_id = NULL, closed_tabs_json = ?, updated_at = ? WHERE id = ?')
-            .run(JSON.stringify(layout), JSON.stringify(retainedClosedTabs), now(), record.sessionId)
+            .run(this.persistLayout(record.sessionId, layout), JSON.stringify(retainedClosedTabs), now(), record.sessionId)
         } else {
-          const nextClosedTabs = [...retainedClosedTabs, ...tabs].slice(-20)
+          const nextClosedTabs = persistableClosedTabs([...retainedClosedTabs, ...tabs]).slice(-20)
           this.db.prepare('UPDATE sessions SET closed_tabs_json = ?, updated_at = ? WHERE id = ?')
             .run(JSON.stringify(nextClosedTabs), now(), record.sessionId)
         }
@@ -1259,6 +1287,7 @@ export class ConductorDatabase {
   }
 
   upsertAgent(spec: AgentSpec, status: string, activityPhase = status === 'starting' ? 'starting' : 'idle'): string {
+    if (anonymousConversations.has(spec.id)) { this.volatileAgents.set(spec.id, { spec, status, activityPhase, updatedAt: now() }); return '' }
     this.db
       .prepare(
         `INSERT INTO agent_sessions
@@ -1297,6 +1326,8 @@ export class ConductorDatabase {
   }
 
   setAgentStatus(id: string, status: string, activityPhase?: string): void {
+    const volatile = this.volatileAgents.get(id)
+    if (volatile) { this.volatileAgents.set(id, { ...volatile, status, activityPhase: activityPhase ?? volatile.activityPhase, updatedAt: now() }); return }
     if (activityPhase) {
       this.db.prepare('UPDATE agent_sessions SET status = ?, activity_phase = ?, updated_at = ? WHERE id = ?')
         .run(status, activityPhase, now(), id)
@@ -1402,7 +1433,7 @@ export class ConductorDatabase {
       projectId: row.project_id as string,
       sessionId: row.session_id as string,
       activityPhase: row.activity_phase ? readActivityPhase(row.activity_phase as string) : 'idle'
-    }))
+    })).concat([...this.volatileAgents.values()].map(({ spec, activityPhase }) => ({ id: spec.id, projectId: spec.projectId, sessionId: spec.sessionId, activityPhase: readActivityPhase(activityPhase) })))
   }
 
   listProcesses(projectId?: string): RuntimeProcessSummary[] {
@@ -1454,11 +1485,17 @@ export class ConductorDatabase {
         progress: null,
         resumeAt: (row.resume_at as string | null) ?? undefined,
         updatedAt: row.updated_at as string
+      })),
+      ...[...this.volatileAgents.values()].filter(({ spec }) => !projectId || spec.projectId === projectId).map(({ spec, status, activityPhase, updatedAt }) => ({
+        id: spec.id, projectId: spec.projectId, sessionId: spec.sessionId, kind: 'agent' as const, title: spec.title,
+        provider: spec.provider as RuntimeProcessSummary['provider'], model: spec.model, status: status as RuntimeProcessSummary['status'],
+        activityPhase: readActivityPhase(activityPhase), needsInput: status === 'waiting_input', progress: null, updatedAt
       }))
     ].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
   }
 
   remember(input: RememberMemoryInput): AgentMemory {
+    if (anonymousConversations.has(input.origin?.agentSessionId)) throw new Error('An anonymous conversation keeps no memory: nothing of it may outlive its tab')
     const gist = input.gist.replace(/\s+/g, ' ').trim().slice(0, 4000)
     if (!gist) throw new Error('Memory needs a concise gist')
     const cues = normalizeMemoryCues(input.cues?.length ? input.cues : memoryTokens(gist).slice(0, 10))
@@ -1555,7 +1592,7 @@ export class ConductorDatabase {
     prompt: string
     memoryIds: string[]
   }): void {
-    if (!entry.itemId || !entry.memoryIds.length) return
+    if (!entry.itemId || !entry.memoryIds.length || anonymousConversations.has(entry.agentSessionId)) return
     this.db.prepare(
       `INSERT INTO memory_recalls (id, project_id, agent_session_id, item_id, prompt, memory_ids_json, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)`
@@ -1667,6 +1704,7 @@ export class ConductorDatabase {
   }
 
   close(): void {
+    this.stopForgetting()
     this.structured.flush()
     this.db.close()
   }
@@ -1689,7 +1727,7 @@ export class ConductorDatabase {
     id: row.id as string,
     projectId: row.project_id as string,
     name: row.name as string,
-    layout: JSON.parse(row.layout_json as string) as WorkspaceLayout,
+    layout: this.volatileLayouts.get(row.id as string) ?? JSON.parse(row.layout_json as string) as WorkspaceLayout,
     maximizedGroupId: (row.maximized_group_id as string | null) ?? null,
     closedTabs: JSON.parse((row.closed_tabs_json as string) || '[]') as PaneTab[],
     continueOnLimit: Boolean(row.continue_on_limit),
@@ -1701,7 +1739,7 @@ export class ConductorDatabase {
     id: row.id as string,
     projectId: row.project_id as string,
     sessionId: row.session_id as string,
-    layout: JSON.parse(row.layout_json as string) as WorkspaceLayout,
+    layout: this.volatileLayouts.get(row.id as string) ?? JSON.parse(row.layout_json as string) as WorkspaceLayout,
     maximizedGroupId: (row.maximized_group_id as string | null) ?? null,
     createdAt: row.created_at as string,
     updatedAt: row.updated_at as string

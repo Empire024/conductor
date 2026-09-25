@@ -25,6 +25,7 @@ import { pinnedCliExecutable } from './cli-versions'
 import { loadConfig } from './local-models/config.ts'
 import { StructuredSessions } from './structured-sessions'
 import { TurnBriefings } from './turn-briefing'
+import { anonymousConversations } from './local-models/anonymous'
 import { baseMachineFacts, describeMachine, detectMachine } from './machine-policy'
 
 export { parseUsageLimitReset } from './usage-limit'
@@ -321,6 +322,8 @@ export class AgentManager {
       (spec, prompt, itemId, runtimeId, context) => this.briefings.compose(spec, prompt, itemId, runtimeId, context),
       (spec, event) => {
         this.briefings.observe(spec, event)
+        // An anonymous conversation banks no memory and leaves no coordination record.
+        if (anonymousConversations.has(spec.id)) return
         if (event.data.type === 'text' && event.data.role === 'assistant' && event.data.mode === 'snapshot') this.bankMemories(spec, event.itemId, event.data.text)
         if (event.data.type !== 'tool' && event.data.type !== 'changes') return
         try { collaboration?.observeEvent(spec, { id: event.id, agentSessionId: spec.id, type: event.data.type === 'changes' ? 'file_change' : 'tool_call', message: event.data.type === 'tool' ? event.data.name : event.data.changes.map(change => change.path).join(', '), metadata: { structured: true, itemId: event.itemId, input: event.data.type === 'tool' ? event.data.input : undefined }, createdAt: event.timestamp }) } catch { /* Coordination remains advisory. */ }

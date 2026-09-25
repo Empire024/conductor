@@ -102,6 +102,8 @@ export interface PlacedTabRequest {
   provider?: AgentProviderId
   /** A model the owner chose while creating the tab; only Local picks one up front. */
   model?: string
+  /** A local model opened in anonymous mode (runs on this machine only). */
+  anonymous?: boolean
   machineId: string
   projectId: string
   sessionId: string
@@ -122,7 +124,8 @@ export interface PlacedTabRequest {
  */
 export async function createPlacedTab(request: PlacedTabRequest): Promise<PaneTab> {
   const { kind, provider, model, machineId, projectId, sessionId, remoteTerminalId } = request
-  if (machineId === LOCAL_MACHINE_ID || !travels(kind)) return createPaneTab(kind, { provider, model })
+  if (machineId === LOCAL_MACHINE_ID || !travels(kind)) return createPaneTab(kind, { provider, model, ...(request.anonymous ? { anonymous: true } : {}) })
+  if (request.anonymous) throw new Error('An anonymous conversation runs on this machine only.')
 
   if (kind === 'terminal') {
     const terminals = window.conductor.remote.terminals

@@ -2,7 +2,7 @@ import { conversationIdentity } from './conversation-tab'
 import { PromptImageUpload, PromptImageThumbnail } from '../components/PromptImageUpload'
 import { ProviderIcon } from '../components/ProviderIcon'
 import { startTransition, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react'
-import { Archive, ArrowDown, ArrowLeft, ClipboardCopy, FileDiff, FilePlus2, GitBranch, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, Telescope, TerminalSquare, MessagesSquare, LoaderCircle, Undo2, WandSparkles, X } from 'lucide-react'
+import { Archive, ArrowDown, ArrowLeft, ClipboardCopy, EyeOff, FileDiff, FilePlus2, GitBranch, Globe2, History, ListTree, Pin, Play, PlugZap, Settings2, Telescope, TerminalSquare, MessagesSquare, LoaderCircle, Undo2, WandSparkles, X } from 'lucide-react'
 import type { AgentSpec, AgentActivityPhase, TurnMemoryRecall } from '../../../shared/models'
 import { isFrontierModel, MAX_PROMPT_CHARS, WIZARD_MODEL_HINT } from '../../../shared/structured-agent'
 import { permissionParity } from '../../../shared/permission-parity'
@@ -109,7 +109,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   useLayoutEffect(() => { renderedProjection.current = projection; streamIngest.current?.committed() }, [projection])
   const [ready, setReady] = useState(false)
   const [error, setError] = useState('')
-  const { draft, setMessage, setAttachments, setDraft, clearSubmitted, flush: flushDraft } = useComposerDraft(props.project.id, activeId)
+  const { draft, setMessage, setAttachments, setDraft, clearSubmitted, flush: flushDraft } = useComposerDraft(props.project.id, activeId, props.anonymous === true)
   const { message, attachments } = draft
   const draftRef = useRef(draft); draftRef.current = draft
   const composer = useRef<HTMLTextAreaElement>(null)
@@ -292,7 +292,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
     const initialize = async (): Promise<void> => {
       if (activeId === propsRef.current.resourceId) {
         const current = propsRef.current
-        const spec: AgentSpec = { id: activeId, projectId: current.project.id, sessionId: current.session.id, title: current.title, cwd: current.project.path, provider, model: current.model ?? 'default', effort: current.effort ?? 'auto', continueOnLimit: current.continueOnLimit }
+        const spec: AgentSpec = { id: activeId, projectId: current.project.id, sessionId: current.session.id, title: current.title, cwd: current.project.path, provider, model: current.model ?? 'default', effort: current.effort ?? 'auto', continueOnLimit: current.continueOnLimit, ...(current.anonymous ? { anonymous: true } : {}) }
         await window.conductor.agents.ensure(spec)
       }
       const snapshot = await window.conductor.structured.snapshot(activeId)
@@ -317,7 +317,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
   useEffect(() => {
     if (!ready || historical || activeId !== props.resourceId) return
     const current = propsRef.current
-    const spec: AgentSpec = { id: activeId, projectId: current.project.id, sessionId: current.session.id, title: current.title, cwd: current.project.path, provider, model: current.model ?? 'default', effort: current.effort ?? 'auto', continueOnLimit: current.continueOnLimit }
+    const spec: AgentSpec = { id: activeId, projectId: current.project.id, sessionId: current.session.id, title: current.title, cwd: current.project.path, provider, model: current.model ?? 'default', effort: current.effort ?? 'auto', continueOnLimit: current.continueOnLimit, ...(current.anonymous ? { anonymous: true } : {}) }
     void window.conductor.agents.ensure(spec).catch(() => { /* The next mount re-states it; a preference is never worth failing a pane over. */ })
   }, [activeId, historical, props.continueOnLimit, props.resourceId, provider, ready])
 
@@ -444,7 +444,8 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
       clearSubmitted(draft.revision)
       if (firstMessage) {
         const snapshot = await window.conductor.structured.snapshot(activeId)
-        if (snapshot && activeIdRef.current === activeId) void propsRef.current.onConversationChange?.({ ...conversationIdentity(snapshot, provider), title: text, auto: true })
+        // An anonymous tab is never named after what was said in it.
+        if (snapshot && activeIdRef.current === activeId && !propsRef.current.anonymous) void propsRef.current.onConversationChange?.({ ...conversationIdentity(snapshot, provider), title: text, auto: true })
       }
       if (activeIdRef.current === activeId) {
         setImagePreviews({})
@@ -1053,6 +1054,7 @@ export function StructuredAgentPane(props: RuntimeTerminalProps): React.JSX.Elem
             : (eligible ? 'Make this tab a wizard: the owner’s full authority over Conductor — approvals answered for its coworkers, every tab steerable, app updates and restarts without a dialog, automatic continuation after restarts and usage limits.' : `Wizard mode needs a frontier model (${WIZARD_MODEL_HINT}); this tab runs ${resolved.label}.`)
           return <button type="button" className={`wizard-toggle${settings.wizard ? ' active' : ''}`} aria-pressed={Boolean(settings.wizard)} aria-label={settings.wizard ? 'Turn wizard mode off' : 'Turn wizard mode on'} title={title} disabled={historical || (!eligible && !settings.wizard)} onClick={() => updateSettings({ wizard: !settings.wizard })}><WandSparkles size={15} /></button>
         })()}
+        {provider === 'local' && props.anonymous && <span className="sa-anonymous-mark" role="note" title="Anonymous: this conversation is kept only in this window's memory. Nothing of it is written to history, memory, logs or the phone. Closing the tab or restarting Conductor deletes it for good; files it wrote stay." aria-label="Anonymous conversation"><EyeOff size={14} /> Anonymous</span>}
         {provider === 'local' && <>
           <button type="button" className={settings.localGit ? 'active' : undefined} aria-pressed={Boolean(settings.localGit)} aria-label={settings.localGit ? 'Disable repository writes' : 'Enable repository writes'} title={settings.localGit ? 'Repository writes on: the sandbox can commit and branch locally, and a plain push of this branch to an existing remote runs on the host for it. Click to lock .git back to read-only.' : 'Let this local model commit, branch and push. Commits happen in the sandbox; the push runs on the host, because the container has no network. Applies from the next turn.'} disabled={historical} onClick={() => updateSettings({ localGit: !settings.localGit })}><GitBranch size={15} /></button>
           <button type="button" className={settings.localResearch ? 'active' : undefined} aria-pressed={Boolean(settings.localResearch)} aria-label={settings.localResearch ? 'Disable deep web research' : 'Enable deep web research'} title={settings.localResearch ? 'Deep research on: web search plus a much larger tool-round budget. Click to go back to single-page reads.' : 'Give this local model a public web search tool and the tool rounds to research at length. Only the query and URL leave this machine. Applies from the next turn.'} disabled={historical} onClick={() => updateSettings({ localResearch: !settings.localResearch })}><Telescope size={15} /></button>

@@ -116,7 +116,12 @@ export interface CompletionRequest {
    *  ends generation early with that word as the finish reason: the agent loop uses it to cut
    *  off a reply that is talking itself in circles rather than acting. */
   stopWhen?(accumulated: { content: string; reasoning: string }): string | undefined
+  /** An anonymous conversation (local-models/anonymous.ts): a refusal's body, which can echo the
+   *  prompt, is not written to the main-process log. */
+  anonymous?: boolean
   signal?: AbortSignal
+  /** Told once when this request has to wait for another conversation's request on the server. */
+  onQueued?(): void
   onText?(delta: string): void
   onReasoning?(delta: string): void
 }
@@ -140,10 +145,11 @@ export class LocalRequestError extends Error {
 /** The status alone does not say which of those two cases happened, so the body is parsed for
  *  the OpenAI-shaped error type. A prompt echoed back into a chat would be a leak, so the raw
  *  body only ever reaches the main-process log, where a diagnosis has to start. */
-async function readErrorType(response: Response): Promise<string | undefined> {
+async function readErrorType(response: Response, quiet = false): Promise<string | undefined> {
   let body = ''
   try { body = (await response.text()).slice(0, 4000) } catch { /* A body that cannot be read adds nothing. */ }
-  if (body) console.warn(`[local-models] HTTP ${response.status} from llama.cpp: ${body.slice(0, 600)}`)
+  if (body && quiet) console.warn(`[local-models] HTTP ${response.status} from llama.cpp (anonymous conversation; body not logged)`)
+  else if (body) console.warn(`[local-models] HTTP ${response.status} from llama.cpp: ${body.slice(0, 600)}`)
   try {
     const parsed = JSON.parse(body) as { error?: { type?: string; code?: string | number; message?: string } }
     const reported = parsed.error?.type ?? (parsed.error?.code != null ? String(parsed.error.code) : undefined)
@@ -187,6 +193,36 @@ export async function runtimePromptTokens(request: CompletionRequest): Promise<n
   } catch { request.signal?.throwIfAborted(); return undefined }
 }
 
+/** One completion at a time per server from this process. The machine runs one llama.cpp server
+ *  with one slot (llama.ts starts it with --parallel 1), so conversations sharing it - a local
+ *  swarm's controller and coworkers, or two owner tabs on one model - take turns request by
+ *  request. Queuing here rather than inside llama.cpp keeps a long wait from tripping the HTTP
+ *  client's header timeout, and an aborted request leaves the queue without ever being sent. */
+const serverQueues = new Map<string, Promise<void>>()
+export const localRequestsWaiting = (endpoint: string): boolean => serverQueues.has(endpoint)
+async function takeTurn<T>(endpoint: string, signal: AbortSignal | undefined, onQueued: (() => void) | undefined, run: () => Promise<T>): Promise<T> {
+  const previous = serverQueues.get(endpoint)
+  let release!: () => void
+  const mine = new Promise<void>(resolve => { release = resolve })
+  const tail = (previous ?? Promise.resolve()).then(() => mine)
+  serverQueues.set(endpoint, tail)
+  try {
+    if (previous) {
+      onQueued?.()
+      signal?.throwIfAborted()
+      await new Promise<void>((resolve, reject) => {
+        const aborted = (): void => reject(signal!.reason)
+        signal?.addEventListener('abort', aborted, { once: true })
+        void previous.then(() => { signal?.removeEventListener('abort', aborted); resolve() })
+      })
+    }
+    return await run()
+  } finally {
+    release()
+    if (serverQueues.get(endpoint) === tail) serverQueues.delete(endpoint)
+  }
+}
+
 export async function chatCompletion(request: CompletionRequest): Promise<CompletionResult> {
   if (request.contextTokens !== undefined) {
     const promptTokens=await runtimePromptTokens(request), responseTokens=request.maxTokens??4096
@@ -198,6 +234,10 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
       request.onBudget?.({promptTokens:budget.promptTokens,method:'conservative estimate'})
     }
   }
+  return takeTurn(request.endpoint, request.signal, request.onQueued, () => streamCompletion(request))
+}
+
+async function streamCompletion(request: CompletionRequest): Promise<CompletionResult> {
   // An early stop closes the stream from this side; the caller's own signal still aborts too.
   const stopper = new AbortController()
   const onCallerAbort = (): void => stopper.abort(request.signal?.reason)
@@ -222,7 +262,7 @@ export async function chatCompletion(request: CompletionRequest): Promise<Comple
     })
   })
   if (response.status === 401 || response.status === 403) throw new Error('Local model rejected the API key; regenerate it with setup and restart the servers')
-  if (!response.ok || !response.body) throw new LocalRequestError(response.status, response.ok ? undefined : await readErrorType(response))
+  if (!response.ok || !response.body) throw new LocalRequestError(response.status, response.ok ? undefined : await readErrorType(response, request.anonymous))
   const accumulator = new StreamAccumulator()
   const decoder = new TextDecoder()
   let buffer = ''

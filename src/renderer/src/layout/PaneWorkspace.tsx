@@ -26,6 +26,7 @@ import {
   Plus,
   TerminalSquare,
   TimerReset,
+  EyeOff,
   Undo2,
   X
 } from 'lucide-react'
@@ -193,7 +194,7 @@ const PaneBody = ({
   onSelectMachine(machineId: string): void
   onAttachTerminal(machineId: string, remoteTerminalId: string, title: string): void
   onOpenJob?(job: { id: string; title: string }): void
-  onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
+  onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string, options?: { anonymous?: boolean }): void
   onOpenFile(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   /** Merges `patch` into the tab's latest state. */
   onUpdateTab(tabId: string, patch: Record<string, unknown>): void
@@ -231,6 +232,7 @@ const PaneBody = ({
         effort={(tab.state?.effort as import('../../../shared/models').AgentEffort) ?? 'auto'}
         continueOnLimit={tab.state?.continueOnLimit === undefined ? session.continueOnLimit : Boolean(tab.state.continueOnLimit)}
         viewMode={(tab.state?.viewMode as 'visual' | 'cli') ?? 'visual'}
+        anonymous={tab.state?.anonymous === true}
         resourceId={tab.resourceId!}
         title={tab.title}
         project={project}
@@ -497,10 +499,10 @@ function PaneGroup({
   /** A remote project is addressed on the host by the host's own project id, never by ours. */
   const placedProjectId = workspace.project.remote?.remoteProjectId ?? workspace.project.id
 
-  const open = (kind: PaneKind, provider?: AgentProviderId, model?: string): void => {
+  const open = (kind: PaneKind, provider?: AgentProviderId, model?: string, options?: { anonymous?: boolean }): void => {
     if (kind !== 'agent' && kind !== 'terminal') return
     setPlacementError('')
-    placeTab({ kind, provider, model, machineId: placement, projectId: placedProjectId, sessionId: workspace.session.id })
+    placeTab({ kind, provider, model, ...(options?.anonymous ? { anonymous: true } : {}), machineId: placement, projectId: placedProjectId, sessionId: workspace.session.id })
   }
 
   /** Binds a tab to a shell the host is already running, rather than starting a second one. */
@@ -652,6 +654,7 @@ function PaneGroup({
       >
         {tab.kind === 'agent' ? <ProviderIcon provider={String(tab.state?.provider ?? 'codex')} model={tab.state?.model as string | undefined} size={14} /> : <Icon size={13} strokeWidth={1.8} />}
         <span className="pane-tab-title" title={tab.title}>{tab.title}</span>
+        {tab.state?.anonymous === true && <span className="pane-tab-anonymous" title="Anonymous: kept only in memory. Closing this tab deletes the conversation for good; files it wrote stay." aria-label="anonymous"><EyeOff size={12} /></span>}
         {newTabs.has(tab.id) && tab.id !== activeTab.id && <span className="pane-tab-new-mark" title="Opened by an agent; not viewed yet" aria-label="new" />}
         {controller && <ControlledByBadge compact controllerTitle={controller.controllerTitle ?? group.tabs.find(candidate => candidate.id === controller.controllerTabId)?.title ?? 'another tab'} />}
         {tab.kind === 'agent' && (tab.state?.continueOnLimit === undefined ? workspace.session.continueOnLimit : Boolean(tab.state.continueOnLimit)) && (

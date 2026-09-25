@@ -43,6 +43,8 @@ export class ComposerDraftStore {
   /** Edits storage has not seen yet: this window's latest text wins over what storage holds. */
   private unsaved = new Set<string>()
   private volatile = new Set<string>()
+  /** Drafts never written to storage (an anonymous conversation's). */
+  private memoryOnly = new Set<string>()
   private listeners = new Map<string, Set<() => void>>()
   private timer: unknown = null
   private firstUnsavedAt = 0
@@ -100,6 +102,12 @@ export class ComposerDraftStore {
     this.timer = null
   }
 
+  keepInMemory(key: string): void {
+    if (this.memoryOnly.has(key)) return
+    this.memoryOnly.add(key)
+    this.volatile.add(key)
+  }
+
   hasUnsaved(key?: string): boolean {
     return key === undefined ? this.unsaved.size > 0 : this.unsaved.has(key)
   }
@@ -113,6 +121,7 @@ export class ComposerDraftStore {
 
   private write(key: string): void {
     this.unsaved.delete(key)
+    if (this.memoryOnly.has(key)) return
     const draft = this.cache.get(key)?.draft ?? emptyDraft
     const raw = draft === emptyDraft ? null : JSON.stringify({ version: 1, ...draft })
     try {

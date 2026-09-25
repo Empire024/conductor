@@ -449,6 +449,9 @@ export interface AgentSpec {
   model?: string
   effort?: AgentEffort
   continueOnLimit?: boolean
+  /** Local models only, set when the tab opens: the conversation lives in memory and is gone for
+   *  good when its tab closes (src/main/local-models/anonymous.ts). */
+  anonymous?: boolean
 }
 
 export interface AgentProviderInfo {

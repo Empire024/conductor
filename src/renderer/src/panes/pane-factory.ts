@@ -18,6 +18,8 @@ export const createPaneTab = (
     /** For a terminal placed on a host: that host's own id for the shell, so a reopened tab
      *  re-attaches to it instead of leaving it running and starting a second one. */
     remoteTerminalId?: string
+    /** Local models only: the conversation lives in memory and is gone when this tab closes. */
+    anonymous?: boolean
   }
 ): PaneTab => {
   switch (kind) {
@@ -27,9 +29,9 @@ export const createPaneTab = (
       return {
         id: makeId('pane'),
         kind,
-        title: options?.title ?? (provider === 'local' ? localModelLabel(options?.model) : { codex: 'Codex', claude: 'Claude', grok: 'Grok', gemini: 'Gemini', qwen: 'Qwen Code', kimi: 'Kimi Code' }[provider]),
+        title: options?.title ?? (provider === 'local' ? (options?.anonymous ? 'Anonymous · ' : '') + localModelLabel(options?.model) : { codex: 'Codex', claude: 'Claude', grok: 'Grok', gemini: 'Gemini', qwen: 'Qwen Code', kimi: 'Kimi Code' }[provider]),
         resourceId: options?.resourceId ?? makeId('agent'),
-        state: { provider, resume: Boolean(options?.resume), model: options?.model ?? 'default', effort: 'auto', ...remote }
+        state: { provider, resume: Boolean(options?.resume), model: options?.model ?? 'default', effort: 'auto', ...remote, ...(options?.anonymous && provider === 'local' ? { anonymous: true } : {}) }
       }
     }
     case 'terminal': {

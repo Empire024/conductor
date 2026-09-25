@@ -8,6 +8,7 @@ import type { WeeklyUsageConversation, WeeklyUsageEvent } from '../shared/weekly
 import { emptyProjection, projectAgentEvent } from '../shared/structured-agent-reducer'
 import { emptyArchiveTail, growArchiveTail, settleArchiveTail, type ArchiveTail } from './conversation-history'
 import { liveCostLimits, liveReplacementAuthorization } from './live-test-policy'
+import { anonymousConversations } from './local-models/anonymous'
 
 /** Events beyond this many for a conversation live only in the durable transcript archive, never
  *  in the bounded journal `checkpoint` trims below it. */
@@ -68,6 +69,11 @@ export class StructuredAgentStore {
   private artifactBytes = 0
   private projections = new Map<string, SessionProjection>()
   private archiveTails = new Map<string, ArchiveTail>()
+  /** Anonymous local conversations (local-models/anonymous.ts): spec and tool output held in
+   *  memory only. Nothing keyed by one of these ids is ever written to SQLite or the artifact
+   *  directory, and `forget` drops it all when the tab closes. */
+  private volatileSpecs = new Map<string, unknown>()
+  private volatileArtifacts = new Map<string, Map<string, { kind: 'diff' | 'output'; data: string }>>()
   readonly artifactDirectory: string
   constructor(private db: DatabaseSync, dataDirectory: string) {
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
@@ -176,22 +182,38 @@ export class StructuredAgentStore {
     const existing = this.snapshot(id)
     if (existing) return existing
     const state = emptyProjection(id)
+    if (anonymousConversations.has(id)) {
+      this.volatileSpecs.set(id, spec)
+      this.projections.set(id, state)
+      return state
+    }
     this.db.prepare('INSERT INTO structured_sessions(id, project_id, provider, spec_json, projection_json) VALUES(?,?,?,?,?)').run(id, projectId, provider, JSON.stringify(spec), JSON.stringify(state))
     this.projections.set(id, state)
     return state
   }
+  /** Whether this conversation lives in memory only (an anonymous local conversation). */
+  volatile(id: string): boolean { return this.volatileSpecs.has(id) }
+  /** Drops everything an anonymous conversation left in memory; it was never anywhere else. */
+  forget(id: string): void {
+    if (!this.volatileSpecs.delete(id)) return
+    this.projections.delete(id)
+    this.archiveTails.delete(id)
+    this.volatileArtifacts.delete(id)
+  }
   spec<T>(id: string): T | null {
+    if (this.volatileSpecs.has(id)) return this.volatileSpecs.get(id) as T
     const row = this.db.prepare('SELECT spec_json FROM structured_sessions WHERE id=?').get(id) as { spec_json: string } | undefined
     return row ? JSON.parse(row.spec_json) as T : null
   }
   /** Project-scoped specs, without touching the potentially multi-GB event journal. */
   projectSpecs<T>(projectId: string): T[] {
     const rows = this.db.prepare('SELECT spec_json FROM structured_sessions WHERE project_id=?').all(projectId) as Array<{ spec_json: string }>
-    return rows.map(row => JSON.parse(row.spec_json) as T)
+    return [...rows.map(row => JSON.parse(row.spec_json) as T), ...[...this.volatileSpecs.values()].filter(spec => (spec as { projectId?: string }).projectId === projectId) as T[]]
   }
   rebindWorkspace(id: string, sessionId: string): void {
     const spec = this.spec<Record<string, unknown>>(id)
     if (!spec) throw new Error('Session not found')
+    if (this.volatileSpecs.has(id)) { this.volatileSpecs.set(id, { ...spec, sessionId }); return }
     this.db.prepare('UPDATE structured_sessions SET spec_json=? WHERE id=?').run(JSON.stringify({ ...spec, sessionId }), id)
   }
   /** The limit-continuation choice is a live workspace preference, not part of the conversation's
@@ -200,6 +222,7 @@ export class StructuredAgentStore {
   setContinueOnLimit(id: string, continueOnLimit: boolean): void {
     const spec = this.spec<Record<string, unknown>>(id)
     if (!spec) return
+    if (this.volatileSpecs.has(id)) { this.volatileSpecs.set(id, { ...spec, continueOnLimit }); return }
     this.db.prepare('UPDATE structured_sessions SET spec_json=? WHERE id=?').run(JSON.stringify({ ...spec, continueOnLimit }), id)
   }
   rebindProject(projectId: string, cwd: string): void {
@@ -234,7 +257,7 @@ export class StructuredAgentStore {
     // Read (and lazily cold-load) the archive tail before this event is inserted below, so a
     // cold load's own journal read - which would otherwise see this same event already sitting in
     // the journal - never replays it a second time when it is folded in explicitly just after.
-    const needsArchiveTail = next.sequence > JOURNAL_WINDOW || this.archiveTails.has(event.sessionId)
+    const needsArchiveTail = !this.volatileSpecs.has(event.sessionId) && (next.sequence > JOURNAL_WINDOW || this.archiveTails.has(event.sessionId))
     const tailBefore = needsArchiveTail ? this.archiveTail(event.sessionId) : null
     this.projections.set(event.sessionId, next)
     // Past the journal window, every event also grows the durable archive's live tail in memory,
@@ -244,6 +267,7 @@ export class StructuredAgentStore {
     return safe
   }
   private writeEvent(safe: AgentEvent): void {
+    if (this.volatileSpecs.has(safe.sessionId)) return
     this.db.prepare('INSERT INTO structured_events(session_id,sequence,event_json) VALUES(?,?,?)').run(safe.sessionId, safe.sequence, JSON.stringify(safe))
     // Sequence is assigned monotonically, so the first row wins and remains the runtime's start
     // even after `checkpoint` compacts the events it was read from.
@@ -283,7 +307,7 @@ export class StructuredAgentStore {
   }
   checkpoint(id: string): void {
     const state = this.snapshot(id)
-    if (!state) return
+    if (!state || this.volatileSpecs.has(id)) return
     this.db.prepare('UPDATE structured_sessions SET projection_json=?, title=?, archived=? WHERE id=?').run(JSON.stringify(state), state.title, state.archived ? 1 : 0, id)
     // Snapshot anchors older history before compacting the bounded event journal.
     if (state.sequence > JOURNAL_WINDOW) this.trimJournal(id, state.sequence - JOURNAL_WINDOW)
@@ -315,6 +339,7 @@ export class StructuredAgentStore {
    *  anything before it was already gone from the journal before this conversation's archive
    *  started covering it. */
   archive(id: string): { items: TimelineItem[]; from: number } | null {
+    if (this.volatileSpecs.has(id)) return null
     const state = this.db.prepare('SELECT archived_from FROM structured_transcript_archive_state WHERE session_id=?').get(id) as { archived_from: number } | undefined
     if (!state) return null
     const rows = this.db.prepare('SELECT item_json FROM structured_transcript_archive WHERE session_id=? ORDER BY sequence').all(id) as Array<{ item_json: string }>
@@ -329,6 +354,8 @@ export class StructuredAgentStore {
   cloneHistory(sourceId: string, targetId: string): void {
     const source = this.snapshot(sourceId), target = this.snapshot(targetId)
     if (!source || !target) throw new Error('Fork session not registered')
+    // A fork would copy an anonymous conversation into one that is kept.
+    if (this.volatileSpecs.has(sourceId)) throw new Error('An anonymous conversation cannot be forked: nothing of it may outlive its tab')
     const items = source.items.map(item => {
       if (item.data.type === 'interaction') return { ...item, data: { ...item.data, interaction: { ...item.data.interaction, status: 'expired' as const } } }
       if (item.data.type === 'changes') return { ...item, data: { ...item.data, changes: item.data.changes.map(change => change.artifactId ? { ...change, artifactId: this.putArtifact(targetId, { ...this.artifact(sourceId, change.artifactId), sessionId: targetId }).id } : change) } }
@@ -339,6 +366,7 @@ export class StructuredAgentStore {
     this.checkpoint(targetId)
   }
   events(id: string, after = 0): AgentEvent[] {
+    if (this.volatileSpecs.has(id)) return []
     return (this.db.prepare('SELECT event_json FROM structured_events WHERE session_id=? AND sequence>? ORDER BY sequence LIMIT 20001').all(id, after) as Array<{ event_json: string }>).map(row => JSON.parse(row.event_json) as AgentEvent)
   }
   /** The oldest sequence the journal still holds for a conversation; a primary-key seek. */
@@ -500,6 +528,7 @@ export class StructuredAgentStore {
   putArtifact(sessionId: string, value: Omit<DiffArtifact, 'id'>): DiffArtifact {
     const id = randomUUID()
     const artifact = { ...value, id }
+    if (this.volatileSpecs.has(sessionId)) { this.volatileArtifact(sessionId).set(id, { kind: 'diff', data: JSON.stringify(artifact) }); return artifact }
     const filename = `${id}.json`
     // Immutable original bytes are private artifacts, never sanitized diagnostic strings.
     this.writeArtifact(filename, JSON.stringify(artifact))
@@ -508,6 +537,7 @@ export class StructuredAgentStore {
   }
   putOutput(sessionId: string, output: string): string {
     const id = randomUUID(), filename = `${id}.txt`
+    if (this.volatileSpecs.has(sessionId)) { this.volatileArtifact(sessionId).set(id, { kind: 'output', data: String(sanitizeDiagnostic(output)).slice(-8 * 1024 * 1024) }); return id }
     this.writeArtifact(filename, String(sanitizeDiagnostic(output)).slice(-8 * 1024 * 1024))
     this.db.prepare('INSERT INTO structured_artifacts(id,session_id,kind,filename) VALUES(?,?,?,?)').run(id, sessionId, 'output', filename)
     return id
@@ -520,7 +550,17 @@ export class StructuredAgentStore {
     this.artifactBytes += bytes
   }
   output(sessionId: string, id: string): string { return this.readArtifact(sessionId, id, 'output') }
+  private volatileArtifact(sessionId: string): Map<string, { kind: 'diff' | 'output'; data: string }> {
+    let artifacts = this.volatileArtifacts.get(sessionId)
+    if (!artifacts) this.volatileArtifacts.set(sessionId, artifacts = new Map())
+    return artifacts
+  }
   private readArtifact(sessionId: string, id: string, kind: string): string {
+    if (this.volatileSpecs.has(sessionId)) {
+      const held = this.volatileArtifacts.get(sessionId)?.get(id)
+      if (!held || held.kind !== kind) throw new Error('Artifact not found in this session')
+      return held.data
+    }
     const row = this.db.prepare('SELECT filename FROM structured_artifacts WHERE id=? AND session_id=? AND kind=?').get(id, sessionId, kind) as { filename: string } | undefined
     if (!row || !/^[a-f0-9-]+\.(json|txt)$/.test(row.filename)) throw new Error('Artifact not found in this session')
     return readFileSync(join(this.artifactDirectory, row.filename), 'utf8')

@@ -28,8 +28,10 @@ export function hasComposerDraft(projectId: string, sessionId: string): boolean 
   return Boolean(draft.message.trim() || draft.attachments.length)
 }
 
-export function useComposerDraft(projectId: string, sessionId: string) {
+export function useComposerDraft(projectId: string, sessionId: string, memoryOnly = false) {
   const key = composerDraftKey(projectId, sessionId)
+  // An anonymous conversation's unsent words stay in this window's memory, never localStorage.
+  if (memoryOnly) drafts.keepInMemory(key)
   const subscribe = useCallback((listener: () => void) => {
     const unsubscribe = drafts.subscribe(key, listener)
     const storageChanged = (event: StorageEvent): void => {

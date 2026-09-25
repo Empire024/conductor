@@ -5,6 +5,7 @@ import {
   ChevronRight,
   Clock,
   Cloud,
+  EyeOff,
   MonitorSmartphone,
   Plug,
   RefreshCw,
@@ -31,7 +32,7 @@ interface LauncherPaneProps {
   /** A placement the other machine refused, shown where the choice was made. */
   error?: string
   onSelectMachine?(machineId: string): void
-  onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string): void
+  onOpen(kind: PaneKind, provider?: AgentProviderId, model?: string, options?: { anonymous?: boolean }): void
   workspaceId?: string
   onOpenJob?(job: { id: string; title: string }): void
   /** Binds a tab to a shell already running on that machine instead of starting another. */
@@ -108,6 +109,8 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
   const [jobError, setJobError] = useState('')
   /** The cloud session form below the grid; a cloud session always runs from this machine. */
   const [cloudForm, setCloudForm] = useState(false)
+  /** Local models open in anonymous mode (src/main/local-models/anonymous.ts) while this is on. */
+  const [anonymous, setAnonymous] = useState(false)
   const host = requiredMachineId(project)
   const selected = host ?? machineId ?? LOCAL_MACHINE_ID
 
@@ -206,6 +209,15 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
           )}
         </div>
       )}
+      {selected === LOCAL_MACHINE_ID && (
+        <label className={`launcher-anonymous${anonymous ? ' active' : ''}`}>
+          <input type="checkbox" checked={anonymous} onChange={event => setAnonymous(event.target.checked)} />
+          <EyeOff size={13} />
+          <span><strong>Anonymous local model</strong><small>{anonymous
+            ? 'On: the local model you open next keeps its conversation in memory only. Nothing of it is written to history, memory, logs or the phone; closing its tab deletes it for good and it is not restored after a restart. Files it writes stay.'
+            : 'Open a local model whose conversation is never stored and is gone for good when its tab closes.'}</small></span>
+        </label>
+      )}
       <div className="launcher-grid" aria-label="Open runtime">
         {choices.map(({ kind, provider, model, icon: Icon, title, detail, tone, key }) => {
           // Agents and terminals both travel: the host owns the process and streams it here. Only
@@ -233,7 +245,7 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
                 key={`${kind}-${provider ?? ''}-${model ?? ''}`}
                 disabled={blocked}
                 title={blocked ? (current?.reason || `${title} cannot run on another machine yet.`) : undefined}
-                onClick={() => onOpen(kind, provider, model)}
+                onClick={() => onOpen(kind, provider, model, provider === 'local' && anonymous ? { anonymous: true } : undefined)}
               >
                 {tileBody}
               </button>
@@ -247,7 +259,7 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
                 className="launcher-tile-open"
                 disabled={blocked}
                 title={blocked ? (current?.reason || `${title} cannot run on another machine yet.`) : undefined}
-                onClick={() => onOpen(kind, provider, model)}
+                onClick={() => onOpen(kind, provider, model, anonymous ? { anonymous: true } : undefined)}
               >
                 {tileBody}
               </button>

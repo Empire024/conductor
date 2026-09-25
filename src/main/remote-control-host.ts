@@ -21,6 +21,7 @@ import { readTextFile } from './text-files'
 import { REMOTE_FILE_CHUNK_BYTES, REMOTE_FILE_MAX_ASSET_BYTES } from '../shared/remote-files'
 import { MAX_PROMPT_CHARS, type ContextAttachment } from '../shared/structured-agent'
 import { isPastedText, PASTED_TEXT_MAX_CHARS } from '../shared/pasted-text'
+import { isAnonymousTab } from './local-models/anonymous'
 
 type Args = Record<string, unknown>
 
@@ -183,7 +184,8 @@ export class RemoteControlHost {
     const tabs: Array<PaneTab & { groupId: string; detachedId?: string; uri: string }> = []
     const visit = (node: LayoutNode, detachedId?: string): void => {
       if (node.type === 'split') { node.children.forEach(child => visit(child, detachedId)); return }
-      node.tabs.forEach(tab => tabs.push({ ...tab, groupId: node.id, ...(detachedId ? { detachedId } : {}), uri: conductorUri(projectId, 'tab', tab.id) }))
+      // An anonymous conversation is never mirrored to a paired machine (local-models/anonymous.ts).
+      node.tabs.filter(tab => !isAnonymousTab(tab)).forEach(tab => tabs.push({ ...tab, groupId: node.id, ...(detachedId ? { detachedId } : {}), uri: conductorUri(projectId, 'tab', tab.id) }))
     }
     visit(workspace.layout.root)
     for (const window of this.deps.database.listDetachedWindows()) {
