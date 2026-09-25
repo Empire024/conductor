@@ -24,7 +24,6 @@ import {
   Plus,
   TerminalSquare,
   TimerReset,
-  TriangleAlert,
   Undo2,
   X
 } from 'lucide-react'
@@ -87,6 +86,7 @@ import { openWorkspaceFile } from '../components/workspace-files-state'
 import { fileMachineId, isRemoteFileMachine, statMachineFile } from '../remote-files'
 import { coworkerCloseTargets, coworkerTabGroups } from './coworker-tab-groups'
 import { ControlledByBadge } from '../components/ControlActivity'
+import { guardTabClose, offerCloseUndo } from './close-work-guard'
 import './coworker-tab-groups.css'
 
 interface PaneWorkspaceProps {
@@ -107,6 +107,8 @@ interface PaneWorkspaceProps {
   onDetach(groupId: string, tab: PaneTab, options?: { alwaysOnTop?: boolean }): void
   canReopen: boolean
   onReopen(groupId: string): void
+  /** Puts these just-closed tabs back (the close undo). Without it, onReopen restores the last one. */
+  onRestoreClosed?(groupId: string, tabIds: string[]): void
   onOpenFile?(path: string, line?: number, mode?: 'editor' | 'preview', allowBinary?: boolean): void
   onMachinePlacement?(machineId: string): void
   onOpenJob?(job: { id: string; title: string }): void
@@ -314,7 +316,6 @@ function PaneGroup({
   const menuTab = group.tabs.find(tab => tab.id === menuPosition?.tabId) ?? activeTab
   const menuGroup = tabGroupsOf(group).find(item => item.id === groupMenu?.tabGroupId)
   const coworkerPresentation = coworkerTabGroups(group.tabs, controlLinks)
-  const [pendingGroupClose, setPendingGroupClose] = useState<PaneTab[] | null>(null)
   const focused = workspace.focusedGroupId === group.id
   const isSourceGroup = dragging?.sourceGroupId === group.id
   const barIndex = dropTarget?.kind === 'bar' && dropTarget.groupId === group.id ? dropTarget.index : null
@@ -435,6 +436,14 @@ function PaneGroup({
   }
 
   const runGroupAction = (action: TabGroupAction, tab: PaneTab): void => {
+    if (action.kind === 'close-group') {
+      closeTabs(group.tabs.filter(item => item.tabGroupId === action.tabGroupId), done => applyGroupAction(action, tab, done))
+      return
+    }
+    applyGroupAction(action, tab)
+  }
+
+  const applyGroupAction = (action: TabGroupAction, tab: PaneTab, onApplied?: (closed?: PaneTab) => void): void => {
     const current = workspaceRef.current
     const applied: { result?: ReturnType<typeof applyTabGroupAction>; closed: PaneTab[] } = { closed: [] }
     flushSync(() => current.onLayout(layout => {
@@ -448,6 +457,11 @@ function PaneGroup({
     for (const closed of applied.closed) {
       current.onClosed(closed)
       closePlacedTab(closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
+    }
+    if (onApplied) {
+      // closeTabs counts one answer per tab it asked about.
+      const asked = group.tabs.filter(item => action.kind === 'close-group' && item.tabGroupId === action.tabGroupId)
+      for (const item of asked) onApplied(applied.closed.find(closed => closed.id === item.id))
     }
     if (applied.result?.tabGroupId) setPendingRename(applied.result.tabGroupId)
   }
@@ -520,8 +534,8 @@ function PaneGroup({
     await latest.onPersistLayout(persisted)
   }
 
-  const close = (tab: PaneTab): void => {
-    if (closingTabIds.has(tab.id)) return
+  const close = (tab: PaneTab, onApplied?: (closed?: PaneTab) => void): void => {
+    if (closingTabIds.has(tab.id)) { onApplied?.(); return }
     const requestedSessionId = workspace.session.id
     const requestedGroupId = group.id
     debugLog('tabs', 'Tab close requested', { sessionId: requestedSessionId, groupId: requestedGroupId, tabId: tab.id, kind: tab.kind })
@@ -537,6 +551,7 @@ function PaneGroup({
           next.delete(tab.id)
           return next
         })
+        onApplied?.()
         return
       }
       const apply = (): void => {
@@ -554,6 +569,7 @@ function PaneGroup({
           closePlacedTab(applied.closed, message => window.dispatchEvent(new CustomEvent('conductor:toast', { detail: message })))
           debugLog('tabs', 'Tab closed', { sessionId: requestedSessionId, groupId: requestedGroupId, tabId: tab.id }, 'info')
         }
+        onApplied?.(applied.closed)
       }
       // The surviving neighbour must not remount when a split collapses into it, so this
       // relies on SplitView's own flex-basis transition instead of a view-transition snapshot.
@@ -562,23 +578,39 @@ function PaneGroup({
     closeTimersRef.current.set(tab.id, timer)
   }
 
-  /** A running coworker's turn is worth the same "are you sure" the app already gives active
-   *  work elsewhere (see UpdateQuitConfirm), not a silent kill. */
-  const isTabRunning = (tab: PaneTab): boolean => {
-    const phase = activity[tab.id] ?? 'idle'
-    return phase === 'working' || phase === 'waiting_background'
+  /** Every owner close in this pane. A tab that still has work (a running turn, an approval or
+   *  question, queued prompts, background tasks: the rule app-control tabs.close uses) asks first,
+   *  "Don't close" being the default; a confirmed close can be undone for a few seconds, and only
+   *  then are the closed tabs' turns stopped. Settled tabs close without a question. */
+  const closeTabs = (targets: PaneTab[], closeAll: (onApplied: (closed?: PaneTab) => void) => void = done => targets.forEach(tab => close(tab, done))): void => {
+    if (!targets.length) return
+    void guardTabClose(targets, tab => activity[tab.id]).then(working => {
+      if (!working) return
+      let remaining = targets.length
+      const closedIds: string[] = []
+      closeAll(closed => {
+        if (closed) closedIds.push(closed.id)
+        if (--remaining > 0 || !closedIds.length) return
+        const sessionId = workspaceRef.current.session.id
+        offerCloseUndo(working.filter(item => closedIds.includes(item.tab.id)), {
+          restore: () => {
+            const latest = workspaceRef.current
+            if (latest.onRestoreClosed) latest.onRestoreClosed(group.id, closedIds)
+            else latest.onReopen(group.id)
+          },
+          stop: tab => { void window.conductor.structured.interrupt(tab.resourceId!).catch(() => undefined) },
+          stillClosed: tab => workspaceRef.current.session.id !== sessionId || !listGroups(workspaceRef.current.layout.root).some(item => item.tabs.some(open => open.resourceId === tab.resourceId))
+        })
+      })
+    })
   }
 
   /** Closing a controller tab takes its whole coworker group with it by default - the group
    *  reads as one unit of work, and leaving orphaned coworker tabs behind would be confusing.
    *  "Close this tab only" (closeTabOnly) opts out and always closes just the one tab. */
-  const closeTabOnly = (tab: PaneTab): void => close(tab)
+  const closeTabOnly = (tab: PaneTab): void => closeTabs([tab])
 
-  const requestClose = (tab: PaneTab): void => {
-    const targets = coworkerCloseTargets(tab, coworkerPresentation)
-    if (targets.length > 1 && targets.some(isTabRunning)) { setPendingGroupClose(targets); return }
-    targets.forEach(close)
-  }
+  const requestClose = (tab: PaneTab): void => closeTabs(coworkerCloseTargets(tab, coworkerPresentation))
 
   /** One tab button. `gapHere` opens the drag insertion gap in front of it; for the first tab
    * of a group the gap belongs on the group wrapper instead, so the tab never detaches from
@@ -776,24 +808,6 @@ function PaneGroup({
       tabCount={group.tabs.filter(tab => tab.tabGroupId === menuGroup.id).length}
       onDismiss={() => setGroupMenu(null)}
       onAction={action => runGroupAction(action, activeTab)} />}
-    {pendingGroupClose && createPortal(
-      <div className="close-coworkers-confirm-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPendingGroupClose(null) }}>
-        <section className="close-coworkers-confirm" role="alertdialog" aria-modal="true" aria-labelledby="close-coworkers-confirm-title">
-          <header>
-            <span className="close-coworkers-confirm-icon"><TriangleAlert size={17} /></span>
-            <strong id="close-coworkers-confirm-title">Close while work is in progress?</strong>
-          </header>
-          <p>{pendingGroupClose.length === 2 ? 'This coworker is still running:' : `${pendingGroupClose.length - 1} coworkers are still running:`}</p>
-          <ul className="close-coworkers-confirm-list">{pendingGroupClose.filter(isTabRunning).map((tab) => <li key={tab.id}>{tab.title}</li>)}</ul>
-          <p>Closing this tab group now will interrupt them.</p>
-          <footer>
-            <button type="button" onClick={() => setPendingGroupClose(null)}>Keep working</button>
-            <button type="button" className="primary" onClick={() => { const targets = pendingGroupClose; setPendingGroupClose(null); targets.forEach(close) }}>Close tab group</button>
-          </footer>
-        </section>
-      </div>,
-      document.body
-    )}
 
     </>
   )

@@ -13,6 +13,8 @@ import type { AppSettings, DetachedWindowRecord, PaneKind, PaneTab, ProjectRecor
 import { makeLauncherTab } from '../../shared/models'
 import { TitleBar } from './components/TitleBar'
 import { PaneWorkspace } from './layout/PaneWorkspace'
+import { CloseWorkConfirm } from './layout/CloseWorkConfirm'
+import { guardTabClose, offerCloseUndo } from './layout/close-work-guard'
 import { activateTab, addTab, closeTab, findGroup, listGroups, stripWorkspaceUtilityTabs } from './layout/layout-operations'
 import { createPaneTab } from './panes/pane-factory'
 import { MemoryPane } from './panes/MemoryPane'
@@ -175,6 +177,19 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     }
   }, [detachedId])
 
+  /** The close undo: these just-closed tabs go back into this window and out of its reopen list. */
+  const closedTabsRef = useRef(closedTabs)
+  closedTabsRef.current = closedTabs
+  const restoreClosed = useCallback((groupId: string, tabIds: string[]): void => {
+    const tabs = closedTabsRef.current.filter(tab => tabIds.includes(tab.id))
+    if (!tabs.length) return
+    setLayout(current => {
+      const target = findGroup(current.root, groupId) ?? listGroups(current.root)[0]
+      return target ? tabs.reduce((next, tab) => addTab(next, target.id, tab), current) : current
+    })
+    setClosedTabs(existing => existing.filter(tab => !tabIds.includes(tab.id)))
+  }, [setLayout])
+
   useEffect(() => {
     const closeRequested = (): void => {
       const current = layoutRef.current
@@ -182,15 +197,24 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
       const group = findGroup(current.root, focusedGroupId) ?? listGroups(current.root)[0]
       const tab = group?.tabs.find(item => item.id === group.activeTabId) ?? group?.tabs[0]
       if (!group || !tab) return
-      const result = closeTab(current, group.id, tab.id)
-      if (!result.closed) return
-      layoutRef.current = result.layout
-      setLayout(result.layout)
-      setClosedTabs(existing => [...existing, result.closed!].slice(-20))
+      void guardTabClose([tab]).then(working => {
+        const latest = layoutRef.current
+        if (!working || !latest) return
+        const result = closeTab(latest, group.id, tab.id)
+        if (!result.closed) return
+        layoutRef.current = result.layout
+        setLayout(result.layout)
+        setClosedTabs(existing => [...existing, result.closed!].slice(-20))
+        offerCloseUndo(working, {
+          restore: () => restoreClosed(group.id, [tab.id]),
+          stop: closed => { void window.conductor.structured.interrupt(closed.resourceId!).catch(() => undefined) },
+          stillClosed: closed => { const root = layoutRef.current?.root; return !root || !listGroups(root).some(item => item.tabs.some(open => open.resourceId === closed.resourceId)) }
+        })
+      })
     }
     window.addEventListener('conductor:close-tab', closeRequested)
     return () => window.removeEventListener('conductor:close-tab', closeRequested)
-  }, [focusedGroupId])
+  }, [focusedGroupId, restoreClosed])
 
   const saveNamedSession = useCallback(async (): Promise<void> => {
     const result = await window.conductor.sessionArchive.save()
@@ -343,6 +367,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
               onDetach={detachAgain}
               onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(bundle.project.id, path, mode ?? 'auto', line, allowBinary)}
               canReopen={closedTabs.length > 0}
+              onRestoreClosed={restoreClosed}
               onReopen={(groupId) => {
                 const tab = closedTabs.at(-1)
                 const group = findGroup(layout.root, groupId) ?? listGroups(layout.root)[0]
@@ -424,6 +449,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
           {updateState.currentVersion && <AppVersionButton state={updateState} onCheck={checkForUpdates} />}
         </footer>
       )}
+      <CloseWorkConfirm />
     </div>
   )
 }

@@ -33,6 +33,8 @@ import { SettingsPanel } from './components/SettingsPanel'
 import { PaneWorkspace } from './layout/PaneWorkspace'
 import { applyTabGroupAction, applyWorkspaceTabAction, type WorkspaceTabAction } from './layout/workspace-tab-actions'
 import { closePlacedTab } from './layout/machine-placement'
+import { CloseWorkConfirm } from './layout/CloseWorkConfirm'
+import { guardTabClose, offerCloseUndo, type WorkingTab } from './layout/close-work-guard'
 import type { TabGroupAction } from './layout/tab-groups'
 import {
   activateTab,
@@ -736,6 +738,27 @@ export function App(): React.JSX.Element {
     patchActiveSession((session) => ({ ...session, closedTabs: [...session.closedTabs, tab].slice(-20) }))
   }, [patchActiveSession])
 
+  /** The close undo: these just-closed tabs go back into their workspace and out of the reopen list. */
+  const restoreClosedTabs = useCallback((sessionId: string, groupId: string, tabIds: string[]) => {
+    setSessions((current) => current.map((session) => {
+      if (session.id !== sessionId) return session
+      const tabs = session.closedTabs.filter((tab) => tabIds.includes(tab.id))
+      const target = findGroup(session.layout.root, groupId) ?? listGroups(session.layout.root)[0]
+      if (!tabs.length || !target) return session
+      return { ...session, layout: tabs.reduce((layout, tab) => addTab(layout, target.id, tab), session.layout), closedTabs: session.closedTabs.filter((tab) => !tabIds.includes(tab.id)) }
+    }))
+  }, [])
+
+  const phaseOfTab = useCallback((tab: PaneTab) => tab.resourceId ? correctedActivityPhases.get(tab.resourceId) : undefined, [correctedActivityPhases])
+  /** After an owner close outside a pane (Ctrl+W, the workspace list): undo for a few seconds, then stop. */
+  const offerUndo = useCallback((working: WorkingTab[], sessionId: string, groupId: string, tabIds: string[]) => {
+    offerCloseUndo(working, {
+      restore: () => restoreClosedTabs(sessionId, groupId, tabIds),
+      stop: (tab) => { void window.conductor.structured.interrupt(tab.resourceId!).catch(() => undefined) },
+      stillClosed: (tab) => !sessionsRef.current.some((session) => listGroups(session.layout.root).some((group) => group.tabs.some((open) => open.resourceId === tab.resourceId)))
+    })
+  }, [restoreClosedTabs])
+
   const openExistingProject = async (): Promise<void> => {
     const project = await window.conductor.projects.openFolder()
     if (!project) return
@@ -1003,17 +1026,21 @@ export function App(): React.JSX.Element {
     const group = findGroup(activeSession.layout.root, focusedGroupId) ?? listGroups(activeSession.layout.root)[0]
     const tab = group?.tabs.find((item) => item.id === group.activeTabId) ?? group?.tabs[0]
     if (!group || !tab) return false
-    const result = closeTab(activeSession.layout, group.id, tab.id)
-    const apply = (): void => patchActiveSession((session) => ({
-        ...session,
-        layout: result.layout,
-        closedTabs: result.closed ? [...session.closedTabs, result.closed].slice(-20) : session.closedTabs
+    const sessionId = activeSession.id
+    void guardTabClose([tab], phaseOfTab).then((working) => {
+      if (!working) return
+      const apply = (): void => setSessions((current) => current.map((session) => {
+        if (session.id !== sessionId) return session
+        const result = closeTab(session.layout, group.id, tab.id)
+        return result.closed ? { ...session, layout: result.layout, closedTabs: [...session.closedTabs, result.closed].slice(-20) } : session
       }))
-    const transitionDocument = document as Document & { startViewTransition?: (update: () => void) => unknown }
-    if (transitionDocument.startViewTransition) transitionDocument.startViewTransition(() => flushSync(apply))
-    else apply()
+      const transitionDocument = document as Document & { startViewTransition?: (update: () => void) => unknown }
+      if (transitionDocument.startViewTransition) transitionDocument.startViewTransition(() => flushSync(apply))
+      else apply()
+      offerUndo(working, sessionId, group.id, [tab.id])
+    })
     return true
-  }, [activeSession, focusedGroupId, patchActiveSession])
+  }, [activeSession, focusedGroupId, offerUndo, phaseOfTab])
 
   useEffect(() => {
     const closeRequested = (): void => { closeFocusedTab() }
@@ -1160,25 +1187,40 @@ export function App(): React.JSX.Element {
     void window.conductor.window.detach(activeProject.id, activeSession.id, result.closed, result.layout, options)
   }, [activeProject, activeSession, setLayout])
 
+  const closingGroupConfirmed = useRef(false)
   const sidebarTabAction = useCallback(async (sessionId: string, groupId: string, tabId: string, action: WorkspaceTabAction): Promise<void> => {
     const session = sessions.find(item => item.id === sessionId)
     if (!session) return
     const tab = findGroup(session.layout.root, groupId)?.tabs.find(item => item.id === tabId)
     if (!tab) return
+    const working = action === 'close' ? await guardTabClose([tab], phaseOfTab) : []
+    if (!working) return
     try {
-      const result = applyWorkspaceTabAction(session, groupId, tabId, action)
+      const latest = sessionsRef.current.find(item => item.id === sessionId) ?? session
+      const result = applyWorkspaceTabAction(latest, groupId, tabId, action)
       if (action === 'detach' || action === 'show') await window.conductor.window.detach(session.projectId, session.id, tab, result.session.layout, { alwaysOnTop: action === 'show' })
       // Closing from the sidebar closes a placed tab where it runs, exactly as closing its chip does.
       if (action === 'close') closePlacedTab(tab, setToast)
       setSessions(current => current.map(item => item.id === sessionId ? result.session : item))
       if (action !== 'detach' && action !== 'show') { selectSession(result.session); setFocusedGroupId(result.focusedGroupId); setUtilityPanel(null) }
       if (action === 'show') setToast(`${tab.title} is shown in a floating window. Close it to return the tab to its workspace.`)
+      if (action === 'close') offerUndo(working, sessionId, groupId, [tabId])
     } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
-  }, [sessions, selectSession])
+  }, [sessions, selectSession, offerUndo, phaseOfTab])
 
   const sidebarTabGroupAction = useCallback((sessionId: string, groupId: string, tabId: string, action: TabGroupAction): void => {
-    const session = sessions.find(item => item.id === sessionId)
+    const session = sessionsRef.current.find(item => item.id === sessionId)
     if (!session) return
+    if (action.kind === 'close-group' && !closingGroupConfirmed.current) {
+      const tabs = findGroup(session.layout.root, groupId)?.tabs.filter(item => item.tabGroupId === action.tabGroupId) ?? []
+      void guardTabClose(tabs, phaseOfTab).then((working) => {
+        if (!working) return
+        closingGroupConfirmed.current = true
+        try { sidebarTabGroupAction(sessionId, groupId, tabId, action) } finally { closingGroupConfirmed.current = false }
+        offerUndo(working, sessionId, groupId, tabs.map(item => item.id))
+      })
+      return
+    }
     try {
       const result = applyTabGroupAction(session, groupId, tabId, action)
       // Closing a group from the sidebar closes each placed tab in it where it runs, exactly as closing its chip does.
@@ -1187,7 +1229,7 @@ export function App(): React.JSX.Element {
       selectSession(result.session)
       void saveSessionLayout(result.session.id, result.session.layout, result.session.maximizedGroupId, result.session.closedTabs)
     } catch (reason) { setToast(reason instanceof Error ? reason.message : String(reason)) }
-  }, [sessions, selectSession])
+  }, [selectSession, offerUndo, phaseOfTab])
 
   useAgentControl({
     resolve: async request => {
@@ -1551,6 +1593,7 @@ export function App(): React.JSX.Element {
                           onDetach={detachTab}
                           canReopen={activeSession.closedTabs.length > 0}
                           onReopen={reopenClosed}
+                          onRestoreClosed={(groupId, tabIds) => restoreClosedTabs(activeSession.id, groupId, tabIds)}
                           onOpenFile={(path, line, mode, allowBinary) => openWorkspaceFile(activeProject.id, path, mode ?? 'auto', line, allowBinary)}
                           onOpenJob={openJobTab}
                           correctedActivityPhases={correctedActivityPhases}
@@ -1733,6 +1776,7 @@ export function App(): React.JSX.Element {
         <button className="debug-console-launcher" onClick={() => setDebugConsoleOpen(true)}>Debug</button>
       )}
       {toast && <div className="app-toast">{toast}</div>}
+      <CloseWorkConfirm />
     </div>
   )
 }
