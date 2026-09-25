@@ -1,4 +1,5 @@
 import type { AgentEvent, AgentEventData, StructuredProvider } from './structured-agent'
+import { processedTokens } from './usage-accounting'
 
 export const WEEKLY_USAGE_DAYS = 7
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -20,7 +21,11 @@ export interface WeeklyUsageEvent {
   parentId?: string
   data: AgentEventData
 }
-const tokenFields = ['inputTokens', 'outputTokens', 'cachedTokens', 'cacheCreationTokens', 'reasoningTokens', 'totalTokens'] as const
+/** `processedTokens` is derived (usage-accounting.ts): new input + cache write + output, the
+ *  figure that does not re-count cached context on every turn. It is a sum of report fields, so
+ *  a cumulative counter's delta is measured exactly like theirs. */
+const reportedFields = ['inputTokens', 'outputTokens', 'cachedTokens', 'cacheCreationTokens', 'reasoningTokens', 'totalTokens'] as const
+const tokenFields = [...reportedFields, 'processedTokens'] as const
 type TokenField = typeof tokenFields[number]
 
 export interface WeeklyUsageConversation {
@@ -77,11 +82,13 @@ const finite = (value: unknown): number | undefined => typeof value === 'number'
 
 function values(data: Extract<AgentEvent['data'], { type: 'usage' }>): Sample['values'] {
   const result: Sample['values'] = {}
-  for (const field of tokenFields) {
+  for (const field of reportedFields) {
     const value = finite(data[field])
     if (value !== undefined) result[field] = value
   }
   if (result.totalTokens === undefined && result.inputTokens !== undefined && result.outputTokens !== undefined) result.totalTokens = result.inputTokens + result.outputTokens
+  const processed = processedTokens(result)
+  if (processed !== undefined) result.processedTokens = processed
   return result
 }
 
@@ -186,7 +193,7 @@ export function summarizeWeeklyModelUsage(conversations: WeeklyUsageConversation
   }
 
   const models = [...totals.values()].map(entry => ({ ...entry.row, conversations: entry.sessions.size }))
-    .sort((a, b) => (b.totalTokens ?? 0) - (a.totalTokens ?? 0) || a.provider.localeCompare(b.provider) || (a.model ?? '').localeCompare(b.model ?? ''))
+    .sort((a, b) => (b.processedTokens ?? 0) - (a.processedTokens ?? 0) || (b.totalTokens ?? 0) - (a.totalTokens ?? 0) || a.provider.localeCompare(b.provider) || (a.model ?? '').localeCompare(b.model ?? ''))
   const truncatedConversations = conversations.filter(entry => entry.truncated).length
   const notes = [
     ...(truncatedConversations ? ['Some durable journals were compacted before the seven-day boundary.'] : []),

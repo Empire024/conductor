@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { RuntimeProcessSummary } from '../../../shared/models'
-import type { SessionProjection, TimelineItem } from '../../../shared/structured-agent'
-import { createSerialPoller, currentTurnStartedAt, durationLabel, isProcessWorking, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses } from './ProcessDashboardPane.helpers'
+import type { Json, SessionProjection, TimelineItem } from '../../../shared/structured-agent'
+import { createSerialPoller, currentTurnStartedAt, durationLabel, isProcessWorking, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses, stuckBackgroundTask } from './ProcessDashboardPane.helpers'
 
 const process = (overrides: Partial<RuntimeProcessSummary> = {}): RuntimeProcessSummary => ({
   id: 'agent-1', projectId: 'project-1', sessionId: 'workspace-1', kind: 'agent', title: 'Agent',
@@ -100,5 +100,41 @@ describe('viewing on the Processes board', () => {
     expect(processTrackerState({ ...base, status: 'complete', activityPhase: 'complete' }, { phase: 'completed', backgroundTasks: 1 })).toBe('viewing')
     expect(processTrackerState({ ...base, status: 'complete', activityPhase: 'complete' }, { phase: 'completed', backgroundTasks: 0 })).toBe('finished')
     expect(isProcessWorking({ ...base, activityPhase: 'waiting_background' })).toBe(true)
+  })
+})
+
+describe('settled conversations on the Processes board', () => {
+  // The rows the owner saw as "Working" hours after they finished: the persisted runtime row still
+  // said working (a detached subagent never reported its end), while the conversation's own
+  // snapshot had long settled with no background task left.
+  const stale = process({ status: 'running', activityPhase: 'working', updatedAt: '2026-09-24T21:10:59.177Z' })
+
+  it('trusts a settled snapshot over a persisted working phase', () => {
+    expect(processTrackerState(stale, { phase: 'completed', backgroundTasks: 0 })).toBe('finished')
+    expect(processTrackerState(stale, { phase: 'failed', backgroundTasks: 0 })).toBe('finished')
+    expect(processTrackerState(stale, { phase: 'interrupted' })).toBe('finished')
+    expect(processTrackerState(stale, { phase: 'completed', backgroundTasks: 2 })).toBe('viewing')
+    expect(isProcessWorking(stale, { phase: 'completed' })).toBe(false)
+  })
+
+  it('still reports a running snapshot as working and an unknown count from the persisted phase', () => {
+    expect(processTrackerState(process({ status: 'complete', activityPhase: 'complete' }), { phase: 'running' })).toBe('working')
+    expect(processTrackerState(process({ activityPhase: 'waiting_background' }), { phase: 'completed' })).toBe('viewing')
+    expect(processTrackerState(process({ activityPhase: 'waiting_background' }), { phase: 'completed', backgroundTasks: 0 })).toBe('finished')
+    expect(processTrackerState(process(), { phase: 'idle', backgroundTasks: 0 })).toBe('ready')
+  })
+
+  it('flags a background task that outlived its expected runtime', () => {
+    const now = Date.parse('2026-09-25T10:00:00.000Z')
+    const shell = (timestamp: string, input?: Json) =>
+      item(1, { type: 'tool', name: 'Bash', status: 'running', detached: true, ...(input ? { input } : {}) }, { timestamp })
+    const settled = (items: TimelineItem[]) => ({ ...snapshot(items, 'completed'), backgroundTasks: 1 })
+    expect(stuckBackgroundTask(settled([shell('2026-09-25T09:45:00.000Z')]), now)).toBeUndefined()
+    expect(stuckBackgroundTask(settled([shell('2026-09-25T05:00:00.000Z')]), now)).toBe('background task stuck 5h 0m')
+    // Its own declared timeout replaces the 30-minute default.
+    expect(stuckBackgroundTask(settled([shell('2026-09-25T09:45:00.000Z', { command: 'node smoke.mjs', timeout: 600_000 })]), now)).toBe('background task stuck 15m 0s')
+    // A count without a started row falls back to when the conversation last changed.
+    expect(stuckBackgroundTask(settled([]), now, '2026-09-25T08:00:00.000Z')).toBe('background task stuck 2h 0m')
+    expect(stuckBackgroundTask({ ...settled([shell('2026-09-25T05:00:00.000Z')]), backgroundTasks: 0 }, now)).toBeUndefined()
   })
 })

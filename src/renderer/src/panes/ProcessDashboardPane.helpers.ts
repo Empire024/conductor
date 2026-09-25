@@ -50,12 +50,58 @@ export function processTrackerState(process: RuntimeProcessSummary, snapshot?: (
   if (process.needsInput || process.status === 'waiting_input' || process.activityPhase === 'waiting_input') return 'attention'
   if (process.status === 'limited' || process.activityPhase === 'limited') return 'paused'
   if (process.activityPhase === 'disconnected') return 'disconnected'
+  // A conversation that has settled speaks for itself. The persisted row can keep saying
+  // 'working' for hours after its tab closed - a detached subagent that never reported its end
+  // holds it there - so it only fills in a background count the snapshot does not carry.
+  if (snapshot && settledPhases.has(snapshot.phase)) {
+    if (isViewing(snapshot.phase, snapshot.backgroundTasks) || (snapshot.backgroundTasks === undefined && process.activityPhase === 'waiting_background')) return 'viewing'
+    return snapshot.phase === 'idle' && !finishedRecord(process) ? 'ready' : 'finished'
+  }
+  if (snapshot && ['starting', 'running', 'interrupting'].includes(snapshot.phase)) return 'working'
   // Background work the runtime will wake this conversation for is neither the adapter sitting
   // idle nor a finished run: the turn ended while tasks it started still run.
   if (process.activityPhase === 'waiting_background' || isViewing(snapshot?.phase, snapshot?.backgroundTasks)) return 'viewing'
-  if (['complete', 'exited', 'error', 'unavailable'].includes(process.status) || ['complete', 'failed', 'stopped'].includes(process.activityPhase ?? '')) return 'finished'
+  if (finishedRecord(process)) return 'finished'
   if (process.status === 'starting' || process.activityPhase === 'working') return 'working'
   return 'ready'
+}
+
+const settledPhases = new Set<string>(['completed', 'failed', 'interrupted', 'idle'])
+const finishedRecord = (process: RuntimeProcessSummary): boolean =>
+  ['complete', 'exited', 'error', 'unavailable'].includes(process.status) || ['complete', 'failed', 'stopped'].includes(process.activityPhase ?? '')
+
+/** How long background work may run before the board calls it stuck, unless the task declared
+ *  its own timeout. */
+export const BACKGROUND_EXPECTED_MS = 30 * 60 * 1000
+
+/** A viewing conversation waits on work nobody watches, so a render or smoke that hung keeps it
+ *  "Viewing" indefinitely. Each running detached task is aged from its own start against its
+ *  declared timeout (a Bash `timeout`, in milliseconds) or the default; a count the runtime
+ *  reported without a started row is aged from the conversation's last change. */
+export function stuckBackgroundTask(
+  snapshot: (Pick<SessionProjection, 'phase' | 'runtimeId' | 'items'> & Partial<Pick<SessionProjection, 'backgroundTasks'>>) | null | undefined,
+  now = Date.now(),
+  lastChangeAt?: string
+): string | undefined {
+  if (!snapshot || !isViewing(snapshot.phase, snapshot.backgroundTasks)) return undefined
+  const running = snapshot.items.filter(item => item.runtimeId === snapshot.runtimeId &&
+    (item.data.type === 'tool' || item.data.type === 'subagent') && item.data.detached && item.data.status === 'running')
+  const tasks = running.length
+    ? running.map(item => ({ startedAt: item.timestamp, expected: declaredTimeout(item) ?? BACKGROUND_EXPECTED_MS }))
+    : lastChangeAt ? [{ startedAt: lastChangeAt, expected: BACKGROUND_EXPECTED_MS }] : []
+  let oldest: string | undefined, oldestAge = -1
+  for (const task of tasks) {
+    const age = now - Date.parse(task.startedAt)
+    if (Number.isFinite(age) && age > task.expected && age > oldestAge) { oldest = task.startedAt; oldestAge = age }
+  }
+  const age = durationLabel(oldest, now)
+  return age ? `background task stuck ${age}` : undefined
+}
+function declaredTimeout(item: TimelineItem): number | undefined {
+  if (item.data.type !== 'tool') return undefined
+  const input = item.data.input
+  const timeout = input && typeof input === 'object' && !Array.isArray(input) ? input.timeout : undefined
+  return typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 ? timeout : undefined
 }
 
 export const isProcessWorking = (process: RuntimeProcessSummary, snapshot?: Pick<SessionProjection, 'phase'> | null): boolean => ['working', 'viewing'].includes(processTrackerState(process, snapshot))

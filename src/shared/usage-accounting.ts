@@ -91,6 +91,45 @@ export function summarizeUsage(items: TimelineItem[]): UsageSummary {
   }
 }
 
+/** A usage report's tokens, split the way they are actually spent. Every adapter reports
+ *  `inputTokens` as the whole prompt, cache reads and cache writes included (Claude's adapter adds
+ *  them up; OpenAI, xAI and llama.cpp count cached prompt tokens inside their input), so a
+ *  long-running agent's input total re-counts its whole context on every call. The headline is
+ *  `processed`: new input + cache write + output. Cache reads stay on their own line. */
+export interface TokenBreakdown {
+  newInput?: number
+  cacheRead: number
+  cacheWrite: number
+  output?: number
+  reasoning?: number
+  /** New input + cache write + output; the reported total when the report cannot be split. */
+  processed?: number
+  /** The provider's own total, repeated context included. */
+  total?: number
+}
+export function tokenBreakdown(tokens: TokenFigures | undefined): TokenBreakdown | undefined {
+  if (!tokens || !Object.keys(tokens).length) return undefined
+  const cacheRead = tokens.cachedTokens ?? 0, cacheWrite = tokens.cacheCreationTokens ?? 0
+  const newInput = tokens.inputTokens === undefined ? undefined : Math.max(0, tokens.inputTokens - cacheRead - cacheWrite)
+  const processed = newInput !== undefined && tokens.outputTokens !== undefined ? newInput + cacheWrite + tokens.outputTokens : tokens.totalTokens
+  return {
+    ...(newInput !== undefined ? { newInput } : {}), cacheRead, cacheWrite,
+    ...(tokens.outputTokens !== undefined ? { output: tokens.outputTokens } : {}),
+    ...(tokens.reasoningTokens !== undefined ? { reasoning: tokens.reasoningTokens } : {}),
+    ...(processed !== undefined ? { processed } : {}),
+    ...(tokens.totalTokens !== undefined ? { total: tokens.totalTokens } : {})
+  }
+}
+export const processedTokens = (tokens: TokenFigures | undefined): number | undefined => tokenBreakdown(tokens)?.processed
+/** What a cache read costs relative to a fresh input token, from each provider's price list:
+ *  Anthropic and OpenAI bill cache hits at a tenth of the input price. Unknown elsewhere. */
+const CACHE_READ_PRICE_RATIO: Partial<Record<StructuredProvider, number>> = { claude: 0.1, codex: 0.1 }
+/** Cache reads expressed as fresh input tokens at the provider's cache price, for "≈ billed". */
+export function cacheReadBilledEquivalent(breakdown: TokenBreakdown | undefined, provider: StructuredProvider | undefined): number | undefined {
+  const ratio = provider ? CACHE_READ_PRICE_RATIO[provider] : undefined
+  return breakdown && ratio !== undefined ? Math.round(breakdown.cacheRead * ratio) : undefined
+}
+
 export interface ContextSummary { used: number; capacity: number; window?: number; percent: number; level: 'normal' | 'warning' | 'critical'; reserve?: number; measurement?: string }
 export function summarizeContext(items: TimelineItem[], runtimeId?: string): ContextSummary | undefined {
   const root = items.filter(item => !item.parentId)

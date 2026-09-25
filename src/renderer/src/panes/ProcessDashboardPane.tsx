@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AlertCircle, ArrowUpRight, Bot, Clock3, Gauge, History, Link2, PauseCircle, Play, TerminalSquare } from 'lucide-react'
 import type { AgentProviderInfo, ProjectRecord, RuntimeProcessSummary } from '../../../shared/models'
-import type { SessionProjection } from '../../../shared/structured-agent'
+import type { SessionProjection, StructuredProvider } from '../../../shared/structured-agent'
 import type { AgentCollaborationSnapshot } from '../../../shared/agent-collaboration'
-import { summarizeUsageRun, type UsageScopeReport } from '../../../shared/usage-accounting'
+import { cacheReadBilledEquivalent, summarizeUsageRun, tokenBreakdown, type TokenBreakdown, type UsageScopeReport } from '../../../shared/usage-accounting'
 import { evaluateUsageWarning, type UsageWarningLevel } from '../../../shared/usage-warning'
 import { processModelLabel } from '../agent-models'
-import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses, type ProcessTrackerState } from './ProcessDashboardPane.helpers'
+import { createSerialPoller, currentTurnStartedAt, durationLabel, processTrackerState, reportedPlanProgress, selectProcessBoardProcesses, stuckBackgroundTask, type ProcessTrackerState } from './ProcessDashboardPane.helpers'
 import { VIEWING_LABEL, viewingDescription } from '../../../shared/project-activity'
 import './ProcessDashboardPane.css'
 import { WeeklyUsage } from '../components/WeeklyUsage'
@@ -34,6 +34,19 @@ const relativeTime = (timestamp: string, now: number): string => {
   return `${Math.round(seconds / 86400)}d ago`
 }
 const tokenLabel = (tokens: number): string => tokens >= 1_000_000 ? `${(tokens / 1_000_000).toFixed(1)}m` : tokens >= 1000 ? `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k` : String(tokens)
+const costLabel = (cost: number): string => `$${cost < 10 ? cost.toFixed(2) : cost.toFixed(0)}`
+/** Every figure the provider reported, kept apart: the headline leaves out re-read cache. */
+const breakdownTitle = (tokens: TokenBreakdown, provider?: string): string => {
+  const billed = cacheReadBilledEquivalent(tokens, provider as StructuredProvider | undefined)
+  return [
+    'Processed = new input + cache write + output.',
+    tokens.newInput !== undefined ? `New input ${tokens.newInput.toLocaleString()}` : undefined,
+    `Cache write ${tokens.cacheWrite.toLocaleString()}`,
+    tokens.output !== undefined ? `Output ${tokens.output.toLocaleString()}${tokens.reasoning ? ` (${tokens.reasoning.toLocaleString()} reasoning)` : ''}` : undefined,
+    `Cache reads ${tokens.cacheRead.toLocaleString()}${billed !== undefined ? ` (≈ ${billed.toLocaleString()} billed-equivalent)` : ''}, the context re-read on every call`,
+    tokens.total !== undefined ? `Provider total ${tokens.total.toLocaleString()}` : undefined
+  ].filter(Boolean).join('\n')
+}
 const stateLabel: Record<ProcessTrackerState, string> = {
   attention: 'Needs input', working: 'Working', viewing: VIEWING_LABEL, paused: 'Limit pause', disconnected: 'Disconnected', ready: 'Connected · idle', finished: 'Finished'
 }
@@ -106,10 +119,15 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
     result[row.state] += 1
     return result
   }, { attention: 0, working: 0, viewing: 0, paused: 0, disconnected: 0, ready: 0, finished: 0 } as Record<ProcessTrackerState, number>), [rows])
-  const totalUsage = useMemo(() => [...dashboard.facts.values()].reduce((total, facts) => ({
-    tokens: total.tokens + (facts.usage?.tokens?.totalTokens ?? 0),
-    cost: total.cost + (facts.usage?.costUsd ?? 0)
-  }), { tokens: 0, cost: 0 }), [dashboard.facts])
+  const totalUsage = useMemo(() => [...dashboard.facts.values()].reduce((total, facts) => {
+    const tokens = tokenBreakdown(facts.usage?.tokens)
+    return {
+      processed: total.processed + (tokens?.processed ?? 0),
+      output: total.output + (tokens?.output ?? 0),
+      cacheRead: total.cacheRead + (tokens?.cacheRead ?? 0),
+      cost: total.cost + (facts.usage?.costUsd ?? 0)
+    }
+  }, { processed: 0, output: 0, cacheRead: 0, cost: 0 }), [dashboard.facts])
   const groups = useMemo(() => {
     const names = new Map(dashboard.projects.map(item => [item.id, item.name]))
     const grouped = new Map<string, typeof rows>()
@@ -153,8 +171,9 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
       <span className={counts.attention ? 'attention' : ''}><b>{counts.attention}</b><small>Need you</small></span>
       <span><b>{counts.paused}</b><small>Limit paused</small></span>
       <span><b>{counts.disconnected}</b><small>Disconnected</small></span>
-      <span><b>{tokenLabel(totalUsage.tokens)}</b><small>Reported tokens</small></span>
-      <span><b>{totalUsage.cost ? `$${totalUsage.cost < 10 ? totalUsage.cost.toFixed(2) : totalUsage.cost.toFixed(0)}` : '—'}</b><small>Estimated cost</small></span>
+      <span title={`New input + cache write + output. ${tokenLabel(totalUsage.cacheRead)} cache reads (context re-read on every call) are not in this figure.`}><b>{tokenLabel(totalUsage.processed)}</b><small>Processed tokens</small></span>
+      <span><b>{tokenLabel(totalUsage.output)}</b><small>Output tokens</small></span>
+      <span><b>{totalUsage.cost ? costLabel(totalUsage.cost) : '—'}</b><small>Estimated cost</small></span>
     </section>
 
     <WeeklyUsage />
@@ -172,14 +191,15 @@ export function ProcessDashboardPane({ project }: { project: ProjectRecord }): R
         const turnTime = durationLabel(currentTurnStartedAt(facts.snapshot), now)
         const reportedModel = facts.snapshot?.settings.model ? new Map([[process.id, facts.snapshot.settings.model]]) : new Map<string, string>()
         const model = process.kind === 'agent' ? processModelLabel(process, providers, reportedModel) : undefined
-        const usageTokens = facts.usage?.tokens?.totalTokens
+        const tokens = tokenBreakdown(facts.usage?.tokens)
+        const stuck = state === 'viewing' ? stuckBackgroundTask(facts.snapshot, now, process.updatedAt) : undefined
         const canReconnect = state === 'disconnected' && Boolean(facts.snapshot?.capabilities?.resume && facts.snapshot.nativeSessionId && !facts.snapshot.archived)
         const RuntimeIcon = process.kind === 'agent' ? Bot : TerminalSquare
         return <article key={process.id} role="row" data-process-id={process.id} className={`pd-row state-${state}`} onDoubleClick={() => focus(process)}>
           <div className="pd-runtime" role="cell"><span className="pd-runtime-icon"><RuntimeIcon size={15} /></span><span><strong>{process.title}</strong><small>{process.kind === 'agent' ? `${process.provider ?? 'agent'} · ${model ?? 'model unavailable'}` : 'PowerShell process'}</small></span></div>
-          <div className="pd-state" role="cell"><span className={`pd-state-marker ${state}`} title={`${stateLabel[state]}. ${state === 'ready' ? 'The adapter is connected but no turn is working.' : state === 'viewing' ? viewingDescription(facts.snapshot?.backgroundTasks) + '.' : state === 'disconnected' ? 'Conversation history remains available; reconnect only when you choose.' : 'Reported by the runtime.'}`} /><span><strong>{stateLabel[state]}</strong>{finishedExecution ? <small>Last execution finished</small> : turnTime && state === 'working' ? <small>Latest prompt {turnTime} ago</small> : null}</span></div>
+          <div className="pd-state" role="cell"><span className={`pd-state-marker ${state}`} title={`${stateLabel[state]}. ${state === 'ready' ? 'The adapter is connected but no turn is working.' : state === 'viewing' ? viewingDescription(facts.snapshot?.backgroundTasks) + '.' : state === 'disconnected' ? 'Conversation history remains available; reconnect only when you choose.' : 'Reported by the runtime.'}`} /><span><strong>{stateLabel[state]}</strong>{finishedExecution ? <small>Last execution finished</small> : turnTime && state === 'working' ? <small>Latest prompt {turnTime} ago</small> : stuck ? <small className="pd-stuck">{stuck}</small> : state === 'finished' ? <small>{relativeTime(process.updatedAt, now)}</small> : null}</span></div>
           <div className="pd-progress-cell" role="cell">{plan ? <><span>{plan.label}</span><progress max={plan.total} value={plan.completed} aria-label={`${process.title}: ${plan.label}`} /></> : <span className="pd-unreported">No plan reported</span>}</div>
-          <div className={`pd-usage${facts.warning ? ` warning-${facts.warning}` : ''}`} role="cell" title={facts.warning ? `${process.title} usage is ${facts.warning === 'high' ? 'high' : 'rising'}` : undefined}><strong>{usageTokens === undefined ? '—' : `${tokenLabel(usageTokens)} tok`}</strong><small>{facts.usage?.costUsd ? `$${facts.usage.costUsd.toFixed(2)}` : 'No cost reported'}</small></div>
+          <div className={`pd-usage${facts.warning ? ` warning-${facts.warning}` : ''}`} role="cell" title={[facts.warning ? `${process.title} usage is ${facts.warning === 'high' ? 'high' : 'rising'}.` : '', tokens ? breakdownTitle(tokens, process.provider) : ''].filter(Boolean).join('\n') || undefined}><strong>{tokens?.processed === undefined ? '—' : `${tokenLabel(tokens.processed)} tok`}</strong><small>{[tokens?.output !== undefined ? `${tokenLabel(tokens.output)} out` : undefined, tokens?.cacheRead ? `${tokenLabel(tokens.cacheRead)} cache reads` : undefined, facts.usage?.costUsd ? costLabel(facts.usage.costUsd) : 'no cost reported'].filter(Boolean).join(' · ')}</small></div>
           <div className="pd-activity" role="cell"><strong>{relativeTime(process.updatedAt, now)}</strong><small>Last runtime change</small></div>
           <div className="pd-actions" role="cell">
             <button type="button" title={`Open ${process.title}${facts.snapshot?.items.length ? ' history' : ' tab'}`} onClick={() => focus(process)}>{facts.snapshot?.items.length ? <History size={13} /> : <ArrowUpRight size={13} />}<span>Open</span></button>

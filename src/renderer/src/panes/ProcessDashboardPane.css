@@ -37,6 +37,7 @@
 .pd-state-marker.attention, .pd-state-marker.paused { background: #e2b872; box-shadow: 0 0 0 3px color-mix(in srgb, #e2b872 14%, transparent); }
 .pd-state-marker.disconnected { background: #c792ea; box-shadow: 0 0 0 3px color-mix(in srgb, #c792ea 14%, transparent); }
 .pd-state-marker.finished { background: #85b866; box-shadow: 0 0 0 3px color-mix(in srgb, #85b866 12%, transparent); }
+.pd-state small.pd-stuck { color: #e2b872; }
 .pd-progress-cell { min-width: 0; display: grid; gap: 4px; color: var(--text-2); font-size: 8.5px; }
 .pd-progress-cell progress { width: 100%; height: 3px; appearance: none; border: 0; border-radius: 3px; overflow: hidden; background: var(--surface-3); }
 .pd-progress-cell progress::-webkit-progress-bar { background: var(--surface-3); }.pd-progress-cell progress::-webkit-progress-value { background: var(--accent-muted); }.pd-unreported { color: var(--text-3); }

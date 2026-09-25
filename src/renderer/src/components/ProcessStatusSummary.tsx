@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Flame, Gauge } from 'lucide-react'
 import type { ProjectRecord, RuntimeProcessSummary } from '../../../shared/models'
 import type { SessionProjection } from '../../../shared/structured-agent'
-import { summarizeUsageRun, type UsageCapSetting, type UsageScopeReport } from '../../../shared/usage-accounting'
+import { processedTokens, summarizeUsageRun, type UsageCapSetting, type UsageScopeReport } from '../../../shared/usage-accounting'
 import { evaluateUsageWarning, type UsageWarningLevel } from '../../../shared/usage-warning'
 import { createSerialPoller, processTrackerState, type SerialPoller } from '../panes/ProcessDashboardPane.helpers'
 import './ProcessStatusSummary.css'
@@ -153,9 +153,9 @@ export function createProcessUsageLoader(sources: ProcessUsageSources = {
         try {
           const caps = await sources.caps(process.id, process.sessionId)
           const cap: UsageCapSetting | null = caps.effective?.setting ?? null
-          return [process.id, { costUsd: report.costUsd, totalTokens: report.tokens?.totalTokens, warning: evaluateUsageWarning(report, cap)?.level, snapshotPhase: phase }] as const
+          return [process.id, { costUsd: report.costUsd, totalTokens: processedTokens(report.tokens), warning: evaluateUsageWarning(report, cap)?.level, snapshotPhase: phase }] as const
         } catch {
-          return [process.id, { costUsd: report.costUsd, totalTokens: report.tokens?.totalTokens, snapshotPhase: phase }] as const
+          return [process.id, { costUsd: report.costUsd, totalTokens: processedTokens(report.tokens), snapshotPhase: phase }] as const
         }
       } catch {
         return [process.id, undefined] as const

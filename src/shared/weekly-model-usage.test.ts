@@ -82,4 +82,23 @@ describe('weekly model usage', () => {
     expect(truncated.coverage.complete).toBe(false)
     expect(truncated.coverage.notes.join(' ')).toMatch(/compacted/)
   })
+
+  it('heads each model with processed tokens so repeated cached context does not inflate the week', () => {
+    // Two Claude turns re-reading the same 40k cached prefix, as the adapter reports them.
+    const claude = (sequence: number, turnId: string, fresh: number, read: number, write: number, output: number) =>
+      event(sequence, `2026-09-21T00:00:0${sequence}.000Z`, { type: 'usage', scope: 'turn', source: 'provider', inputTokens: fresh + read + write, cachedTokens: read, cacheCreationTokens: write, outputTokens: output, totalTokens: fresh + read + write + output }, { provider: 'claude', turnId })
+    const report = summarizeWeeklyModelUsage([{ sessionId: 'one', provider: 'claude', model: 'opus', events: [
+      claude(1, 'turn-1', 500, 40_000, 2_000, 300),
+      claude(2, 'turn-2', 400, 42_000, 1_000, 700)
+    ] }], through)
+    expect(report.models).toEqual([expect.objectContaining({ model: 'opus', processedTokens: 900 + 3_000 + 1_000, outputTokens: 1_000, cachedTokens: 82_000, totalTokens: 86_900 })])
+  })
+
+  it('measures processed tokens of a cumulative Codex counter as a delta too', () => {
+    const report = summarizeWeeklyModelUsage([{ sessionId: 'one', provider: 'codex', model: 'gpt-6-astra', events: [
+      event(1, '2026-09-14T23:00:00.000Z', { type: 'usage', scope: 'session', source: 'provider', inputTokens: 1_000, cachedTokens: 0, outputTokens: 100, totalTokens: 1_100 }),
+      event(2, '2026-09-16T00:00:00.000Z', { type: 'usage', scope: 'session', source: 'provider', inputTokens: 3_000, cachedTokens: 1_800, outputTokens: 300, totalTokens: 3_300 })
+    ] }], through)
+    expect(report.models).toEqual([expect.objectContaining({ processedTokens: (1_200 + 300) - 1_100, outputTokens: 200, totalTokens: 2_200 })])
+  })
 })
