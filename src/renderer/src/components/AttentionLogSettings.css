@@ -1,0 +1,49 @@
+/* Settings > Notifications: the "needs you" log (AttentionLogSettings.tsx). */
+.attention-log-summary,
+.attention-log-empty { margin: 8px 0 0; color: var(--text-3); font-size: 8px; }
+.attention-log-error { color: var(--danger); }
+.attention-log-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.attention-log-entry {
+  padding: 7px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: var(--surface-0);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.attention-log-head { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.attention-log-head strong { color: var(--text); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attention-log-head small { margin-left: auto; color: var(--text-3); font-size: 7.5px; white-space: nowrap; }
+.attention-log-outcome {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 7.5px;
+}
+.attention-log-outcome.attention-notified { background: var(--accent-bg); color: var(--text); }
+.attention-log-outcome.attention-routed-around,
+.attention-log-outcome.attention-undecided { color: var(--warning); }
+.attention-log-outcome.attention-answered,
+.attention-log-outcome.attention-reviewer { color: var(--success); }
+.attention-log-detail { color: var(--text-2); font-size: 8px; overflow-wrap: anywhere; }
+.attention-log-next { color: var(--text-3); font-size: 7.5px; overflow-wrap: anywhere; }
+.attention-log-more {
+  margin-top: 8px;
+  padding: 3px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 8px;
+}

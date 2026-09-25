@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ATTENTION_GRACE_MS } from './attention-log'
 import { X509Certificate } from 'node:crypto'
 import type { AgentControlUiRequest } from '../shared/agent-control'
 import type { AgentActivityPhase, AgentProviderInfo, DetachedWindowRecord, PaneTab, ProjectRecord, SessionRecord } from '../shared/models'
@@ -507,13 +508,17 @@ describe('notifications', () => {
     await vi.advanceTimersByTimeAsync(500)
     fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 2, data: { type: 'text' } }])
     await vi.advanceTimersByTimeAsync(500)
+    // "Needs you" waits out the grace period, then goes out because the question still holds the turn.
+    expect(fix.push).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(ATTENTION_GRACE_MS)
     expect(fix.push).toHaveBeenCalledTimes(2)
+    expect(fix.service.desktopState().attentionLog).toEqual([expect.objectContaining({ sessionId: 'agent-1', kind: 'question', outcome: 'notified', detail: 'Deploy?' })])
     expect((fix.push.mock.calls[1] as [unknown, string, { urgency: string }])[2].urgency).toBe('high')
     unsubscribe()
     expect(fix.service.streamCount()).toBe(0)
   })
 
-  it('pushes once per claude auto-mode classifier denial while the turn keeps working, and never repeats it', async () => {
+  it('holds a claude auto-mode classifier denial and pushes it only once the turn stops on it, never twice', async () => {
     const fix = fixture()
     const phone = pairPhone(fix.service)
     fix.service.setSubscription(phone.id, { endpoint: 'https://push.example/sub', keys: { p256dh: 'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } })
@@ -528,17 +533,54 @@ describe('notifications', () => {
     fix.projections.set('agent-1', projection('agent-1', { phase: 'running', items: [denied] }))
     fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 2, data: { type: 'notice' } }])
     await vi.advanceTimersByTimeAsync(500)
-    expect(fix.push).toHaveBeenCalledTimes(1)
-    const [, payload, options] = fix.push.mock.calls[0] as [unknown, string, { urgency: string }]
-    expect(JSON.parse(payload) as PhoneNotification).toMatchObject({ kind: 'attention', sessionId: 'agent-1', title: 'Needs you: Tab tab-agent-1', body: 'Auto mode refused Edit: Security Weaken' })
-    expect(options.urgency).toBe('high')
     expect(fix.service.phoneState().sessions.find(session => session.id === 'agent-1')).toMatchObject({ state: 'working', autoModeDenials: [{ id: 'auto-denial:toolu_1', tool: 'Edit', reason: 'Security Weaken' }] })
-    // The result frame confirms the same item and the turn finishes: the finish is announced, the denial is not repeated.
+    // Still thinking after the grace period, with no other route taken yet: undecided, nothing sent.
+    await vi.advanceTimersByTimeAsync(ATTENTION_GRACE_MS)
+    expect(fix.push).not.toHaveBeenCalled()
+    // The result frame confirms the same item and the turn stops on the refusal: the finish is
+    // announced, and so is the refusal it stopped on, once.
     fix.projections.set('agent-1', projection('agent-1', { phase: 'completed', items: [{ ...denied, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload(denial, true) } }] }))
     fix.activity.set('agent-1', 'complete')
     fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 3, data: { type: 'notice' } }])
     await vi.advanceTimersByTimeAsync(500)
-    expect(fix.push.mock.calls.map(call => (JSON.parse(call[1] as string) as PhoneNotification).kind)).toEqual(['attention', 'done'])
+    expect(fix.push.mock.calls.map(call => (JSON.parse(call[1] as string) as PhoneNotification).kind)).toEqual(['done', 'attention'])
+    const [, payload, options] = fix.push.mock.calls[1] as [unknown, string, { urgency: string }]
+    expect(JSON.parse(payload) as PhoneNotification).toMatchObject({ kind: 'attention', sessionId: 'agent-1', title: 'Needs you: Tab tab-agent-1', body: 'Auto mode refused Edit: Security Weaken' })
+    expect(options.urgency).toBe('high')
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 3, data: { type: 'notice' } }])
+    await vi.advanceTimersByTimeAsync(ATTENTION_GRACE_MS * 2)
+    expect(fix.push).toHaveBeenCalledTimes(2)
+  })
+
+  it('logs a refusal the agent routes around and a question answered inside the grace period, and pushes neither', async () => {
+    const fix = fixture()
+    const phone = pairPhone(fix.service)
+    fix.service.setSubscription(phone.id, { endpoint: 'https://push.example/sub', keys: { p256dh: 'BP4z9KsN6nGRTbVYI_c7VJSPQTBtkgcy27mlmlMoZIIgDll6e3vCYLocInmYWAmS6TlzAC8wEqKK6PBru3jl7A8', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } })
+    openConversation(fix, 'agent-1', { phase: 'running' })
+    fix.activity.set('agent-1', 'working')
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 1, data: { type: 'session' } }])
+    await vi.advanceTimersByTimeAsync(500)
+    const denial = { tool: 'Bash', reason: 'Git Push To Default Branch', toolUseId: 'toolu_2' }
+    const denied = item(2, { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload(denial) }, { id: 'auto-denial:toolu_2', nativeItemId: 'auto-denial:toolu_2' })
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'running', items: [denied] }))
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 2, data: { type: 'notice' } }])
+    await vi.advanceTimersByTimeAsync(500)
+    // The agent goes another way: a different tool runs a few seconds later.
+    const other = item(3, { type: 'tool', name: 'mcp__conductor__git_ship', status: 'running', input: {} })
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'running', items: [denied, other] }))
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 3, data: { type: 'tool' } }])
+    await vi.advanceTimersByTimeAsync(500)
+    // A question that the owner answers on the desktop within the grace period.
+    const asked = { id: 'q-9', kind: 'question' as const, title: 'Which branch?', input: null, choices: [], status: 'pending' as const }
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'waiting_input', items: [denied, other, item(4, { type: 'interaction', interaction: asked })] }))
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 4, data: { type: 'interaction' } }])
+    await vi.advanceTimersByTimeAsync(5000)
+    fix.projections.set('agent-1', projection('agent-1', { phase: 'running', items: [denied, other, item(4, { type: 'interaction', interaction: { ...asked, status: 'resolved', outcome: 'main' } })] }))
+    fix.service.observeEvents([{ sessionId: 'agent-1', sequence: 5, data: { type: 'interaction' } }])
+    await vi.advanceTimersByTimeAsync(ATTENTION_GRACE_MS * 2)
+    expect(fix.push).not.toHaveBeenCalled()
+    expect(fix.service.attention.held()).toBe(0)
+    expect(fix.service.desktopState().attentionLog?.map(entry => [entry.kind, entry.outcome])).toEqual([['denial', 'routed-around'], ['question', 'answered']])
   })
 
   it('drops a subscription the push service says is gone and respects the master switch', async () => {

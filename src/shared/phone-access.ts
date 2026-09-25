@@ -158,6 +158,25 @@ export interface PhoneAccessState {
   pushConfigured: boolean
   /** The 6-digit phone lock (src/main/phone-lock.ts). */
   lock: PhoneLockView
+  /** Attention moments and what became of them, oldest first (src/main/attention-log.ts). */
+  attentionLog?: AttentionLogEntry[]
+}
+
+/** What became of an attention moment: sent to the phones because it still held the turn after
+ *  the grace period, or kept off them because it resolved another way. */
+export type AttentionOutcome = 'notified' | 'answered' | 'reviewer' | 'routed-around' | 'closed' | 'undecided'
+export interface AttentionLogEntry {
+  id: string
+  /** When the moment began. */
+  at: string
+  sessionId: string
+  title: string
+  kind: 'approval' | 'question' | 'denial'
+  detail: string
+  outcome: AttentionOutcome
+  /** What happened next, in words. */
+  next: string
+  waitedMs: number
 }
 
 /** The phone lock as the desktop's Settings > Phone shows it; never the code or its hash. */

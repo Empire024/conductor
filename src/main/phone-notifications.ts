@@ -59,13 +59,22 @@ export function autoModeDenials(items: readonly TimelineItem[]): PhoneAutoModeDe
  * and never for a conversation seen for the first time - the phone was not waiting on it.
  */
 export function describeDenials(previous: Pick<PhoneSessionSummary, 'autoModeDenials'> | undefined, next: PhoneSessionSummary, at: string, nextId: () => string): PhoneNotification[] {
+  return describeDenialMoments(previous, next, at, nextId).map(moment => moment.notification)
+}
+
+/** Each new denial with the notification it would raise; the attention gate (attention-log.ts)
+ *  sends it only if the turn then stops on it rather than going another way. */
+export function describeDenialMoments(previous: Pick<PhoneSessionSummary, 'autoModeDenials'> | undefined, next: PhoneSessionSummary, at: string, nextId: () => string): Array<{ denial: PhoneAutoModeDenial; notification: PhoneNotification }> {
   if (!previous) return []
   const known = new Set((previous.autoModeDenials ?? []).map(denial => denial.id))
   const url = `/#/session/${encodeURIComponent(next.id)}`
   return (next.autoModeDenials ?? []).filter(denial => !known.has(denial.id)).map(denial => ({
-    id: nextId(), kind: 'attention', sessionId: next.id, at, url,
-    title: `Needs you: ${next.title || 'Conversation'}`,
-    body: previewText(autoModeDenialSummary(denial), 160)
+    denial,
+    notification: {
+      id: nextId(), kind: 'attention', sessionId: next.id, at, url,
+      title: `Needs you: ${next.title || 'Conversation'}`,
+      body: previewText(autoModeDenialSummary(denial), 160)
+    }
   }))
 }
 

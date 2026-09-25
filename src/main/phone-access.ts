@@ -18,7 +18,8 @@ import {
 import { rememberedPermission } from './app-settings'
 import type { AgentActivityRow } from './project-activity'
 import { tabMachineId } from './machines'
-import { autoModeDenials, describeDenials, describeTransition, lastMessage, pendingInteraction, phoneSessionState, previewText, type PhoneActivity } from './phone-notifications'
+import { AttentionGate } from './attention-log'
+import { autoModeDenials, describeDenialMoments, describeTransition, lastMessage, pendingInteraction, phoneSessionState, previewText, type PhoneActivity } from './phone-notifications'
 import { createCertificateAuthority, issueServerCertificate, tlsIdentityUsable, type CertificateAuthority } from './remote-tls'
 import type { SecretKeyValueStore, SecretVault } from './secret-store'
 import { generateVapidKeys, isValidVapidKeys, sendWebPush, type VapidKeys } from './web-push'
@@ -234,6 +235,10 @@ export class PhoneAccessService {
   private listener: PhoneListenerStatus = { listening: false, endpoints: [], message: null, tailscaleCertificate: 'off', tailscaleMessage: null, tailscaleAddress: null, tailscaleDnsName: null }
   /** The last state each conversation was seen in, which is what a transition is measured from. */
   private known = new Map<string, Pick<PhoneSessionSummary, 'state' | 'pendingId' | 'autoModeDenials'>>()
+  /** The last refresh's summaries, for the attention gate's later look at a held moment. */
+  private latest = new Map<string, PhoneSessionSummary>()
+  /** "Needs you" waits out a grace period and goes out only if still blocked (attention-log.ts). */
+  readonly attention: AttentionGate
   private seeded = false
   private refreshTimer: ReturnType<typeof setTimeout> | null = null
   private touched = new Set<string>()
@@ -244,6 +249,16 @@ export class PhoneAccessService {
   readonly lock: PhoneLock
 
   constructor(private readonly deps: PhoneAccessDependencies) {
+    this.attention = new AttentionGate({
+      view: id => {
+        const summary = this.latest.get(id)
+        return { open: Boolean(summary?.tabId), ...(summary ? { state: summary.state, ...(summary.pendingId ? { pendingId: summary.pendingId } : {}) } : {}), items: this.deps.database.structured.snapshot(id)?.items ?? [] }
+      },
+      send: notification => this.deliver(notification),
+      store: deps.store,
+      changed: () => this.deps.changed?.(),
+      now: () => this.now()
+    })
     this.settings = normalizePhoneSettings(parseJson(deps.store.getSetting(SETTINGS_KEY), {}))
     this.devices = parseJson<StoredDevice[]>(deps.store.getSetting(DEVICES_KEY), []).filter(device => device && typeof device.id === 'string' && typeof device.tokenHash === 'string')
     this.lock = new PhoneLock({
@@ -315,7 +330,8 @@ export class PhoneAccessService {
       },
       recommendedEndpoint: recommendEndpoint(this.listener),
       pushConfigured: Boolean(this.deps.store.getSetting(VAPID_PUBLIC_KEY)),
-      lock: this.lock.status()
+      lock: this.lock.status(),
+      attentionLog: this.attention.entries()
     }
   }
 
@@ -562,6 +578,15 @@ export class PhoneAccessService {
     return { sent, message: problems.length ? problems.join(' ') : null }
   }
 
+  /** A feature's own notification (an idea run's checkpoint, docs/idea-autopilot.md): every open
+   *  phone hears it at once and every phone with push on gets it pushed. Says what happened. */
+  async announce(notification: PhoneNotification): Promise<string> {
+    this.broadcast('notification', notification)
+    const result = await this.sendNotification(notification)
+    const streams = this.streams.size
+    return `${result.sent ? `pushed to ${result.sent} phone${result.sent === 1 ? '' : 's'}` : result.message ?? 'not pushed'}; ${streams} open phone stream${streams === 1 ? '' : 's'}`
+  }
+
   testNotification(deviceId?: string): Promise<{ sent: number; message: string | null }> {
     if (deviceId) this.stored(deviceId)
     return this.sendNotification({ id: randomUUID(), kind: 'test', sessionId: null, title: `Conductor on ${this.deps.machineName()}`, body: 'Notifications reach this phone.', at: new Date(this.now()).toISOString(), url: '/#/' }, deviceId ? [deviceId] : undefined)
@@ -627,23 +652,39 @@ export class PhoneAccessService {
     const at = new Date(this.now()).toISOString()
     const notifications: PhoneNotification[] = []
     const seen = new Set<string>()
+    this.latest.clear()
     for (const summary of state.sessions) {
       seen.add(summary.id)
+      this.latest.set(summary.id, summary)
       // Only a conversation with an open tab is one the owner is waiting on; history stays quiet.
       if (summary.tabId) {
         const transition = this.seeded ? describeTransition(this.known.get(summary.id), summary, at, randomUUID()) : null
-        if (transition) notifications.push(transition)
-        if (this.seeded) notifications.push(...describeDenials(this.known.get(summary.id), summary, at, randomUUID))
+        // "Needs you" is held: it goes out only if the turn is still blocked after the grace period.
+        if (transition?.kind === 'attention') this.attention.offer({ sessionId: summary.id, title: summary.title, kind: summary.needs === 'question' ? 'question' : 'approval', detail: this.askedText(summary.id) ?? transition.body, ...(summary.pendingId ? { pendingId: summary.pendingId } : {}), notification: transition })
+        else if (transition) notifications.push(transition)
+        if (this.seeded) for (const { denial, notification } of describeDenialMoments(this.known.get(summary.id), summary, at, randomUUID)) {
+          this.attention.offer({ sessionId: summary.id, title: summary.title, kind: 'denial', detail: notification.body, denialItemId: denial.id, notification })
+        }
       }
       this.known.set(summary.id, { state: summary.state, pendingId: summary.pendingId, autoModeDenials: summary.autoModeDenials })
     }
     for (const id of [...this.known.keys()]) if (!seen.has(id)) this.known.delete(id)
     this.seeded = true
     if (this.streams.size) this.broadcast('state', state)
-    for (const notification of notifications) {
-      this.broadcast('notification', notification)
-      void this.sendNotification(notification).then(result => { if (result.message) this.log('Phone push: ' + result.message) }).catch(error => this.log('Phone push failed', error))
-    }
+    for (const notification of notifications) this.deliver(notification)
+    this.attention.review()
+  }
+
+  /** The question itself, for the attention log, where the interaction title is only "Claude needs your input". */
+  private askedText(id: string): string | undefined {
+    const asked = pendingInteraction(this.deps.database.structured.snapshot(id)?.items ?? [])?.questions?.map(question => question.question).filter(Boolean).join(' / ')
+    return asked ? previewText(asked, 160) : undefined
+  }
+
+  private deliver(notification: PhoneNotification): void {
+    if (this.disposed) return
+    this.broadcast('notification', notification)
+    void this.sendNotification(notification).then(result => { if (result.message) this.log('Phone push: ' + result.message) }).catch(error => this.log('Phone push failed', error))
   }
 
   /** Learns the current picture without announcing it, so a restart does not re-notify old news. */
@@ -1016,6 +1057,7 @@ export class PhoneAccessService {
     if (this.refreshTimer) { clearTimeout(this.refreshTimer); this.refreshTimer = null }
     this.streams.clear()
     this.lock.dispose()
+    this.attention.dispose()
   }
 }
 

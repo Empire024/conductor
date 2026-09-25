@@ -129,7 +129,7 @@ try {
   assert.equal(asking.summary.state, 'attention')
   assert.equal(asking.summary.needs, 'question')
   assert.ok(asking.items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.text.includes('from the phone')))
-  await until(() => events, list => list.some(entry => entry.event === 'notification' && entry.data.kind === 'attention' && entry.data.sessionId === opened.sessionId), 'the attention notification')
+  await until(() => events, list => list.some(entry => entry.event === 'notification' && entry.data.kind === 'attention' && entry.data.sessionId === opened.sessionId), 'the attention notification (sent once the question still holds the turn after the 20 s grace)', 45000)
   check('Opening a task from the phone creates a visible desktop tab, sends its first message, and a question arrives as an attention notification')
 
   const question = asking.pending[0]
