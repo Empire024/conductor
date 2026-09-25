@@ -137,4 +137,21 @@ describe('settled conversations on the Processes board', () => {
     expect(stuckBackgroundTask(settled([]), now, '2026-09-25T08:00:00.000Z')).toBe('background task stuck 2h 0m')
     expect(stuckBackgroundTask({ ...settled([shell('2026-09-25T05:00:00.000Z')]), backgroundTasks: 0 }, now)).toBeUndefined()
   })
+
+  it('ages a Claude background Bash whose row already reads completed against its declared timeout (VR1 B1-declared)', () => {
+    const now = Date.parse('2026-09-25T10:00:00.000Z')
+    const lifecycle = (sequence: number, payload: Json) => item(sequence, { type: 'notice', message: 'Claude task lifecycle', payload })
+    // The "running in background" tool_result marks the row completed; the shell runs on.
+    const bash = item(1, { type: 'tool', name: 'Bash', status: 'completed', detached: true, input: { command: 'node render.mjs', run_in_background: true, timeout: 5000 } }, { nativeItemId: 'bash-1', timestamp: '2026-09-25T09:59:50.000Z' })
+    const started = lifecycle(2, { type: 'system', subtype: 'task_started', task_id: 'task-bash-1', tool_use_id: 'bash-1', is_backgrounded: true, task_type: 'local_bash', status: 'running' })
+    const settled = (items: TimelineItem[]) => ({ ...snapshot(items, 'completed'), backgroundTasks: 1 })
+    expect(stuckBackgroundTask(settled([bash, started]), now)).toBe('background task stuck 10s')
+    expect(stuckBackgroundTask(settled([bash, started]), Date.parse('2026-09-25T09:59:54.000Z'))).toBeUndefined()
+    // Once the task reports, the row is finished work, not a stuck one.
+    const reported = lifecycle(3, { type: 'system', subtype: 'task_notification', task_id: 'task-bash-1', tool_use_id: 'bash-1', status: 'completed' })
+    expect(stuckBackgroundTask(settled([bash, started, reported]), now)).toBeUndefined()
+    // A foreground Bash that merely completed is never counted.
+    const foreground = lifecycle(2, { type: 'system', subtype: 'task_started', task_id: 'check', tool_use_id: 'bash-1', is_backgrounded: false, task_type: 'local_bash' })
+    expect(stuckBackgroundTask(settled([bash, foreground]), now)).toBeUndefined()
+  })
 })

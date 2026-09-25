@@ -143,7 +143,7 @@ try {
   // renderer's Date.now(); move it 36 min on (past the 30 min default) and let the board re-render.
   step('B1-stuck: renderer clock +36 min')
   await view.clock.setSystemTime(Date.now() + 36 * 60_000)
-  const stuckState = await poll(async () => { const text = await stateText(viewing); return /background task stuck/.test(text) ? text : null }, { timeoutMs: 20_000, intervalMs: 1000, label: 'the stuck label' }).catch(() => stateText(viewing))
+  const stuckState = await poll(async () => { const text = await stateText(viewing); return /background task stuck 3\dm/.test(text) ? text : null }, { timeoutMs: 20_000, intervalMs: 1000, label: 'the stuck label' }).catch(() => stateText(viewing))
   const stuckShot = await shot('vr1-B1-stuck')
   record('B1-stuck', /^Viewing background task stuck 3\dm/.test(stuckState) ? 'PASS' : 'FAIL', { stateP: stuckState, stateR: await stateText(streaming) }, `renderer clock moved 36 min with Playwright page.clock.setSystemTime; ${stuckShot}`)
   await call('agents.interrupt', { agentSessionId: streaming }).catch(() => {})

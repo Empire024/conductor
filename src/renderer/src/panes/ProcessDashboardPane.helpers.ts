@@ -84,8 +84,10 @@ export function stuckBackgroundTask(
   lastChangeAt?: string
 ): string | undefined {
   if (!snapshot || !isViewing(snapshot.phase, snapshot.backgroundTasks)) return undefined
+  const shells = liveBackgroundShells(snapshot)
   const running = snapshot.items.filter(item => item.runtimeId === snapshot.runtimeId &&
-    (item.data.type === 'tool' || item.data.type === 'subagent') && item.data.detached && item.data.status === 'running')
+    (item.data.type === 'tool' || item.data.type === 'subagent') && item.data.detached &&
+    (item.data.status === 'running' || item.data.type === 'tool' && item.nativeItemId !== undefined && shells.has(item.nativeItemId)))
   const tasks = running.length
     ? running.map(item => ({ startedAt: item.timestamp, expected: declaredTimeout(item) ?? BACKGROUND_EXPECTED_MS }))
     : lastChangeAt ? [{ startedAt: lastChangeAt, expected: BACKGROUND_EXPECTED_MS }] : []
@@ -96,6 +98,22 @@ export function stuckBackgroundTask(
   }
   const age = durationLabel(oldest, now)
   return age ? `background task stuck ${age}` : undefined
+}
+/** Claude answers a backgrounded Bash call at once ("running in background"), so its row reads
+ *  completed while the shell runs on. Its task lifecycle notices (task_started, then a
+ *  task_notification with a final status) say which shells, by tool_use_id, still run. */
+function liveBackgroundShells(snapshot: Pick<SessionProjection, 'runtimeId' | 'items'>): Set<string> {
+  const live = new Set<string>()
+  for (const item of snapshot.items) {
+    if (item.runtimeId !== snapshot.runtimeId || item.data.type !== 'notice' || item.data.message !== 'Claude task lifecycle') continue
+    const payload = item.data.payload
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) continue
+    const tool = payload.tool_use_id, status = payload.status
+    if (typeof tool !== 'string') continue
+    if (status === 'completed' || status === 'failed' || status === 'stopped' || payload.subtype === 'task_notification') live.delete(tool)
+    else if (payload.subtype === 'task_started' && payload.is_backgrounded === true) live.add(tool)
+  }
+  return live
 }
 function declaredTimeout(item: TimelineItem): number | undefined {
   if (item.data.type !== 'tool') return undefined
