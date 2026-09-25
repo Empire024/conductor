@@ -12,9 +12,9 @@
 
 /** 'agent' is any task an agent or the owner created. The other kinds are tasks Conductor itself
  *  seeds and keeps its scripts current for; they can be paused and edited, never deleted. */
-export const SCHEDULE_KINDS = ['agent', 'latest-models-methods', 'idea-incubator'] as const
+export const SCHEDULE_KINDS = ['agent', 'latest-models-methods', 'idea-incubator', 'idea-run'] as const
 export type ScheduleKind = (typeof SCHEDULE_KINDS)[number]
-export const BUILTIN_SCHEDULE_KINDS: ReadonlyArray<Exclude<ScheduleKind, 'agent'>> = ['latest-models-methods', 'idea-incubator']
+export const BUILTIN_SCHEDULE_KINDS: ReadonlyArray<Exclude<ScheduleKind, 'agent'>> = ['latest-models-methods', 'idea-incubator', 'idea-run']
 
 export type ScheduleOutcome = 'running' | 'unchanged' | 'changed' | 'dispatched' | 'skipped' | 'failed' | 'stale'
 

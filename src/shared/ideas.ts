@@ -51,6 +51,8 @@ export interface IdeaLink extends IdeaProvenance {
 export type IdeaEventKind =
   | 'created' | 'edited' | 'status' | 'linked' | 'unlinked' | 'worked-on'
   | 'exploration-started' | 'explored' | 'exploration-stopped' | 'section' | 'note'
+  /** A step of an idea run (docs/idea-autopilot.md): stage, agent, loop run, artifact, checkpoint, decision. */
+  | 'autopilot'
 
 export interface IdeaEvent {
   id: string

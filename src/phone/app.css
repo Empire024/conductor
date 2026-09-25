@@ -1292,6 +1292,19 @@ textarea.input { resize: none; line-height: 1.45; }
 .idea-row-status { color: var(--text-3); }
 .idea-row-status::before { content: "\00b7  "; }
 
+/* ------------------------------------------------------------------ idea runs */
+
+.tag { align-self: flex-start; flex: 0 0 auto; font-size: 10.5px; font-weight: 600; letter-spacing: .2px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-3); background: var(--surface-2); }
+.idea-run-dryrun { color: var(--amber); border-color: rgba(236, 196, 141, .35); background: rgba(236, 196, 141, .08); }
+.idea-run-checkpoint .card-head, .idea-run-row .card-head { flex-wrap: wrap; }
+.idea-run-summary { margin: 0; font-size: 13.5px; color: var(--text); }
+.idea-run-detail { margin-top: 2px; }
+.idea-run-stages { display: flex; flex-direction: column; gap: 3px; margin: 2px 0; }
+.idea-run-stage { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; }
+.idea-run-stage-title { flex: 1 1 auto; min-width: 0; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.idea-run-stage-status { flex: 0 0 auto; color: var(--text-3); }
+.idea-run-refresh { margin-left: auto; min-height: 34px; padding: 6px 12px; }
+
 /* ------------------------------------------------------------------ lock */
 
 .lock-screen { justify-content: center; }

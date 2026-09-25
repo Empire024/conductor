@@ -599,6 +599,7 @@
       if (!rest || rest === 'new') return { name: 'idea', id: null, key: 'idea:new' }
       return { name: 'idea', id: decodeURIComponent(rest), key: 'idea:' + rest }
     }
+    if (hash.indexOf('#/idea-runs') === 0) return { name: 'idea-runs', key: 'idea-runs' }
     if (hash.indexOf('#/tasks') === 0) return { name: 'tasks', key: 'tasks' }
     if (hash.indexOf('#/new') === 0) return { name: 'new', key: 'new' }
     if (hash.indexOf('#/system') === 0) return { name: 'system', key: 'system' }
@@ -668,6 +669,7 @@
     if (route.name === 'tasks') return projectTasksScreen()
     if (route.name === 'idea') return ideaEditorScreen(route.id)
     if (route.name === 'ideas') return ideasListScreen(route)
+    if (route.name === 'idea-runs') return ideaRunsScreen()
     if (route.name === 'new') return newTaskScreen()
     if (route.name === 'system') return systemScreen()
     if (route.name === 'phone') return phoneScreen()
@@ -682,6 +684,7 @@
     sessions: ['M4 7h16', 'M4 12h16', 'M4 17h11'],
     tasks: ['M9 6h11', 'M9 12h11', 'M9 18h11', 'M3.5 6h.01', 'M3.5 12h.01', 'M3.5 18h.01'],
     ideas: ['M9.5 18h5', 'M10.5 21h3', 'M12 3a6 6 0 0 0-3.6 10.8c.7.5 1.1 1.3 1.1 2.1v.1h5v-.1c0-.8.4-1.6 1.1-2.1A6 6 0 0 0 12 3Z'],
+    'idea-runs': ['M9 11l2 2 4-4', 'M12 3l7 3v5c0 5-3 8-7 9-4-1-7-4-7-9V6l7-3Z'],
     new: ['M12 5v14', 'M5 12h14'],
     system: ['M3 13h3.5l2.5-6 3.5 12 2.5-6H21'],
     phone: ['M8.5 2.75h7a1.75 1.75 0 0 1 1.75 1.75v15a1.75 1.75 0 0 1-1.75 1.75h-7A1.75 1.75 0 0 1 6.75 19.5v-15A1.75 1.75 0 0 1 8.5 2.75Z', 'M11 18.5h2']
@@ -695,6 +698,7 @@
       { id: 'tasks', label: 'Tasks', hash: '#/tasks' },
       /* Opens a new note with the keyboard up, so it renders inside the tap (goNow). */
       { id: 'ideas', label: 'Ideas', hash: '#/ideas', now: true },
+      { id: 'idea-runs', label: 'Idea runs', hash: '#/idea-runs' },
       { id: 'new', label: 'New', hash: '#/new' },
       { id: 'system', label: 'System', hash: '#/system' },
       { id: 'phone', label: 'Phone', hash: '#/phone' }
@@ -3463,6 +3467,235 @@
       },
       onVisibility: visible => { if (visible) void load() },
       destroy: () => { if (searchTimer) clearTimeout(searchTimer) }
+    }
+  }
+
+  // ------------------------------------------------------------------ idea runs
+
+  /* docs/idea-autopilot.md, server route in src/main/idea-runs/phone.ts. A checkpoint's phone
+     notification opens #/idea-runs, so this is what the owner lands on to answer it. */
+
+  const IDEA_RUN_ACTION_WORDS = {
+    'create-account': 'Create an account',
+    publish: 'Publish or upload publicly',
+    message: 'Message or reply to people',
+    purchase: 'Buy something',
+    order: 'Place an order',
+    spend: 'Spend money',
+    external: 'Other outside action'
+  }
+
+  const IDEA_RUN_STATUS_WORDS = {
+    planning: 'Planning',
+    'awaiting-approval': 'Awaiting approval',
+    running: 'Running',
+    'waiting-owner': 'Waiting on you',
+    paused: 'Paused',
+    completed: 'Completed',
+    stopped: 'Stopped',
+    failed: 'Failed'
+  }
+
+  const IDEA_RUN_FINAL_STATUSES = ['completed', 'stopped', 'failed']
+
+  const tag = (text, className) => el('span', 'tag' + (className ? ' ' + className : ''), text)
+
+  const formatEur = amount => '€' + (Math.round(amount * 100) / 100)
+
+  const ideaRunsScreen = () => {
+    const root = el('div', 'screen')
+    const header = topbar()
+    const scroll = scroller()
+    root.appendChild(header)
+    root.appendChild(scroll)
+
+    const refresh = button('ghost idea-run-refresh', 'Refresh', () => void load())
+    refresh.setAttribute('aria-label', 'Refresh idea runs')
+    header.appendChild(fill(el('div', 'topbar-main'), [el('h1', 'topbar-title', 'Idea runs'), refresh]))
+
+    let data = null
+    let problem = ''
+    let run = 0
+    let busyCheckpoint = null
+    let checkpointProblem = ''
+    let busyRun = null
+    let runProblem = ''
+
+    const decide = async (id, decision, standing) => {
+      if (busyCheckpoint) return
+      busyCheckpoint = id
+      checkpointProblem = ''
+      draw()
+      try {
+        await api('/api/idea-runs/checkpoints/' + encodeURIComponent(id), { method: 'POST', body: { decision: decision, standing: standing } })
+      } catch (error) {
+        checkpointProblem = errorMessage(error) || 'That did not work.'
+      }
+      busyCheckpoint = null
+      await load()
+    }
+
+    const runAction = async (runId, action, needsConfirm) => {
+      if (busyRun) return
+      if (needsConfirm && !window.confirm('Stop this idea run? It will not pick back up on its own.')) return
+      busyRun = runId + ':' + action
+      runProblem = ''
+      draw()
+      try {
+        await api('/api/idea-runs/' + encodeURIComponent(runId) + '/' + action, { method: 'POST', body: {} })
+      } catch (error) {
+        runProblem = errorMessage(error) || 'That did not work.'
+      }
+      busyRun = null
+      await load()
+    }
+
+    const checkpointCard = checkpoint => {
+      const action = checkpoint.action || {}
+      const card = el('section', 'card idea-run-checkpoint')
+      const head = el('div', 'card-head')
+      head.appendChild(el('h2', 'card-title', IDEA_RUN_ACTION_WORDS[action.type] || IDEA_RUN_ACTION_WORDS.external))
+      if (checkpoint.dryRun) head.appendChild(tag('Dry run', 'idea-run-dryrun'))
+      card.appendChild(head)
+      card.appendChild(el('p', 'card-note', dotRow([checkpoint.ideaTitle, checkpoint.stageTitle])))
+      if (action.summary) card.appendChild(el('p', 'idea-run-summary', action.summary))
+      const facts = []
+      if (action.target) facts.push('Target: ' + action.target)
+      if (typeof action.amountEur === 'number') facts.push('Amount: ' + formatEur(action.amountEur))
+      if (facts.length) card.appendChild(el('p', 'card-note', facts.join(' · ')))
+      card.appendChild(el('pre', 'tool-pre idea-run-detail', action.detail || ''))
+
+      const busy = busyCheckpoint === checkpoint.id
+      const row = el('div', 'idea-action-row')
+      const approve = button('primary', 'Approve', () => void decide(checkpoint.id, 'approve', false))
+      approve.dataset.decision = 'approve'
+      approve.disabled = busy
+      const deny = button('danger', 'Deny', () => void decide(checkpoint.id, 'deny', false))
+      deny.dataset.decision = 'deny'
+      deny.disabled = busy
+      row.appendChild(approve)
+      row.appendChild(deny)
+      card.appendChild(row)
+      const standing = button('ghost wide', 'Always approve this type', () => void decide(checkpoint.id, 'approve', true))
+      standing.dataset.decision = 'standing'
+      standing.disabled = busy
+      card.appendChild(standing)
+      return card
+    }
+
+    const runRow = summary => {
+      const row = el('section', 'card idea-run-row')
+      const head = el('div', 'card-head')
+      head.appendChild(el('h2', 'card-title', summary.ideaTitle || 'Idea'))
+      head.appendChild(el('span', 'card-value', IDEA_RUN_STATUS_WORDS[summary.status] || summary.status))
+      row.appendChild(head)
+      if (summary.dryRun) row.appendChild(tag('Dry run', 'idea-run-dryrun'))
+      if (summary.reason) row.appendChild(el('p', 'card-note', summary.reason))
+      if (summary.stages && summary.stages.length) {
+        const stages = el('div', 'idea-run-stages')
+        for (const stage of summary.stages) {
+          const item = el('div', 'idea-run-stage')
+          item.appendChild(el('span', 'idea-run-stage-title', stage.title))
+          item.appendChild(el('span', 'idea-run-stage-status', stage.status))
+          stages.appendChild(item)
+        }
+        row.appendChild(stages)
+      }
+      if (summary.status === 'awaiting-approval') {
+        if (summary.summary) row.appendChild(el('p', null, summary.summary))
+        if (summary.warnings && summary.warnings.length) row.appendChild(el('p', 'card-note warn', summary.warnings.join(' · ')))
+      }
+      const busy = Boolean(busyRun)
+      const actions = el('div', 'idea-action-row')
+      if (summary.status === 'awaiting-approval') {
+        const approve = button('primary', busyRun === summary.id + ':approve' ? 'Approving…' : 'Approve plan', () => void runAction(summary.id, 'approve', false))
+        approve.disabled = busy
+        actions.appendChild(approve)
+      }
+      if (summary.status === 'running' || summary.status === 'waiting-owner') {
+        const pause = button('ghost', busyRun === summary.id + ':pause' ? 'Pausing…' : 'Pause', () => void runAction(summary.id, 'pause', false))
+        pause.disabled = busy
+        actions.appendChild(pause)
+      }
+      if (summary.status === 'paused') {
+        const resume = button('ghost', busyRun === summary.id + ':resume' ? 'Resuming…' : 'Resume', () => void runAction(summary.id, 'resume', false))
+        resume.disabled = busy
+        actions.appendChild(resume)
+      }
+      if (IDEA_RUN_FINAL_STATUSES.indexOf(summary.status) < 0) {
+        const stop = button('danger', busyRun === summary.id + ':stop' ? 'Stopping…' : 'Stop', () => void runAction(summary.id, 'stop', true))
+        stop.disabled = busy
+        actions.appendChild(stop)
+      }
+      if (actions.childNodes.length) row.appendChild(actions)
+      return row
+    }
+
+    const draw = () => {
+      const top = scroll.scrollTop
+      clear(scroll)
+      if (problem && !data) {
+        scroll.appendChild(emptyNote('Could not read idea runs.', problem))
+        return
+      }
+      if (!data) {
+        scroll.appendChild(emptyNote('Loading…'))
+        return
+      }
+      const pending = data.pending || []
+      const runs = data.runs || []
+
+      const waiting = el('section', 'group')
+      waiting.appendChild(el('h2', 'group-title', 'Waiting for you'))
+      if (!pending.length) {
+        waiting.appendChild(emptyNote('Nothing is waiting for you.'))
+      } else {
+        const list = el('div', 'list')
+        for (const checkpoint of pending) list.appendChild(checkpointCard(checkpoint))
+        waiting.appendChild(list)
+      }
+      if (checkpointProblem) waiting.appendChild(el('p', 'pending-error', checkpointProblem))
+      scroll.appendChild(waiting)
+
+      const runsGroup = el('section', 'group')
+      runsGroup.appendChild(el('h2', 'group-title', 'Runs'))
+      if (!runs.length) {
+        runsGroup.appendChild(emptyNote('No idea runs yet.', 'Start one from an idea on the desktop: Run this idea.'))
+      } else {
+        const list = el('div', 'list')
+        for (const summary of runs) list.appendChild(runRow(summary))
+        runsGroup.appendChild(list)
+      }
+      if (runProblem) runsGroup.appendChild(el('p', 'pending-error', runProblem))
+      scroll.appendChild(runsGroup)
+      scroll.scrollTop = top
+    }
+
+    const load = async () => {
+      const mine = ++run
+      try {
+        const next = await api('/api/idea-runs')
+        if (mine !== run) return
+        data = next
+        problem = ''
+      } catch (error) {
+        if (mine !== run) return
+        const message = errorMessage(error)
+        if (message) problem = message
+      }
+      if (screen && screen.key === 'idea-runs') draw()
+    }
+
+    draw()
+    void load()
+    return {
+      key: 'idea-runs',
+      root: root,
+      /* The 'state' stream event re-renders the current route (onStreamEvent -> render());
+         a checkpoint appearing or a run changing status shows up here without a manual reload. */
+      update: () => { void load() },
+      onVisibility: visible => { if (visible) void load() },
+      destroy: () => {}
     }
   }
 

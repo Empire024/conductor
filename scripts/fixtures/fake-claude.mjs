@@ -134,6 +134,18 @@ for await (const line of input) {
       continue
     }
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
+    // An idea run's prompts (src/main/idea-runs/briefs.ts), answered from the scenario file a smoke
+    // names: keys are the prompt's first line ("PLAN", "STAGE research", "OCCURRENCE post 1"),
+    // matched exactly, then by its first two words, then by its first word.
+    if (prompt.startsWith('SYNTHETIC IDEA-RUN ')) {
+      const key = prompt.slice('SYNTHETIC IDEA-RUN '.length).split('\n', 1)[0].trim()
+      const scenario = process.env.CONDUCTOR_TEST_IDEA_RUN_SCENARIO ? JSON.parse(readFileSync(process.env.CONDUCTOR_TEST_IDEA_RUN_SCENARIO, 'utf8')) : {}
+      const words = key.split(/\s+/)
+      const fallback = '```idea-run-report\n{"status":"done","summary":"Synthetic idea-run step done."}\n```'
+      const answer = scenario[key] ?? scenario[words.slice(0, 2).join(' ')] ?? scenario[words[0]] ?? fallback
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      text(answer); finish(); continue
+    }
     if (prompt.startsWith('SYNTHETIC STEERING ')) {
       const scenario = prompt.split(/\s+/)[2]
       if (message.priority === 'next') {
