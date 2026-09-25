@@ -319,6 +319,8 @@ const recovery: RecoveryController | null = hasSingleInstanceLock ? createRecove
 }) : null
 /** Said to every conversation a restart brings back when recovery mode had to bring Conductor back. */
 let launchRecoveryNote = ''
+/** Settles once this launch's runtime host is up and a crash's orphaned runtimes are stopped. */
+let runtimeHostStarted: Promise<void> = Promise.resolve()
 /** A relaunch after a restart or update the owner was watching comes back in front. The installer
  *  starts it through Explorer, and Windows refuses focus to a process that is not in the
  *  foreground, so the window used to come back behind whatever was active (recovery-mode). */
@@ -764,6 +766,14 @@ const startRestartWatch = (): void => {
   writeRestartWatch()
   restartWatchTimer = setInterval(writeRestartWatch, 5000)
   restartWatchTimer.unref()
+  // A turn that starts just before a crash must already be in the record (FX27): every phase
+  // change rewrites it, coalesced, instead of waiting for the next tick.
+  let pending: NodeJS.Timeout | null = null
+  onAgentStatusChange(() => {
+    if (pending || restartIntentRecorded) return
+    pending = setTimeout(() => { pending = null; writeRestartWatch() }, 250)
+    pending.unref()
+  })
 }
 /** Records how Conductor is stopping, once; `resume` is false only when the owner said "Stop work". */
 const recordRestartIntent = (kind: Exclude<RestartKind, 'running'>, resume: boolean, working?: { wizards: string[]; coworkers: string[] }): void => {
@@ -809,8 +819,10 @@ const resumeAfterRestart = async (plan: ResumePlan): Promise<void> => {
     } catch (error) { console.warn(`${label} ${id} could not be resumed after the restart`, error); return false }
   }
   const resumed: string[] = []
-  for (const id of plan.coworkers) if (await bringBack(id, coworkerResumeMessage(plan, version) + launchRecoveryNote, false)) resumed.push(id)
-  for (const id of plan.wizards) await bringBack(id, wizardResumeMessage(plan, version, resumed.filter(coworker => controllerOf(coworker) === id).length) + launchRecoveryNote, true)
+  // A crashed process's orphaned host runtimes are stopped first, so no native resume races them.
+  await runtimeHostStarted
+  for (const id of plan.coworkers) if (await bringBack(id, coworkerResumeMessage(plan, version), false)) resumed.push(id)
+  for (const id of plan.wizards) await bringBack(id, wizardResumeMessage(plan, version, resumed.filter(coworker => controllerOf(coworker) === id).length), true)
 }
 
 /** A wizard's request that the owner restart (app.restart.request). It is kept in the settings so
@@ -909,9 +921,14 @@ const startRuntimeHost = async (): Promise<void> => {
     if (!client) return
     installRuntimeHost(client)
     // A host runtime no conversation of this app owns was left by a process that could not save
-    // how to continue it (a crash); nobody can, so it stops.
+    // how to continue it (a crash): its adapter state and frame position died with it, so it
+    // stops, and the restart plan resumes its native conversation and tells it (FX27). The host
+    // already closes a runtime whose client left without detaching; this sweeps any it kept.
     const owned = new Set([...reattachedRuntimes].map(id => database.structured.snapshot(id)?.runtimeId))
-    for (const runtime of await client.list()) if (!runtime.attached && !owned.has(runtime.runtimeId)) client.close(runtime.runtimeId)
+    for (const runtime of await client.list()) if (!runtime.attached && !owned.has(runtime.runtimeId)) {
+      client.close(runtime.runtimeId)
+      console.log(`Closed host runtime ${runtime.runtimeId} that a crashed Conductor left behind`)
+    }
   } catch (error) { console.warn('The runtime host could not start; runtimes stay inside Conductor', error) }
 }
 /** Hands every running turn to the runtime host for the next launch to continue. */
@@ -2863,13 +2880,14 @@ app.whenReady().then(async () => {
   scheduleRunner.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
   // How the previous process stopped, read once before anything is told about the restart.
-  const initiator = takeLaunchInitiator(), previousStop = takeRestartIntent()
-  const restartPlan = resumePlan(previousStop, initiator)
+  const initiator = takeLaunchInitiator(), previousStop = takeRestartIntent(), recoveryReport = recovery?.takeReport() ?? null
+  const restartPlan = resumePlan(previousStop, initiator, recoveryReport)
+  if (restartPlan) console.log(`Restart plan: ${restartPlan.reason}; ${restartPlan.wizards.length} wizard(s), ${restartPlan.coworkers.length} coworker(s) to bring back`)
   // Turns the previous process kept running are rebound before any window asks for their tabs.
   try { await reattachKeptRuntimes() } catch (error) { console.error('Kept runtimes could not be reattached', error) }
-  launchRecoveryNote = recoveryNote(recovery?.takeReport() ?? null)
+  launchRecoveryNote = recoveryNote(recoveryReport)
   briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion, updates.getState().currentVersion) + launchRecoveryNote)
-  void startRuntimeHost()
+  runtimeHostStarted = startRuntimeHost()
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
     ? parseSavedWindowLayout(database.getSetting(UPDATE_WINDOW_LAYOUT_KEY))
