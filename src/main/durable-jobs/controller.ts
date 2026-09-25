@@ -413,12 +413,20 @@ export class DurableJobController {
     }
     // Failed attempt.
     const error = describeFailure(observation, wait.interruptedFor)
+    const rolledOver = decision.contextRollover || observation.stop?.reason === 'context_limit'
+    // A rollover that made file progress in its own fresh context (new files written, or an
+    // existing one added to) continues from the handoff for free: only a rollover with nothing to
+    // show for its context spends an attempt. Otherwise a long overnight stage that needs more
+    // fresh contexts than maxStageAttempts would block for the owner every night on rollovers
+    // alone, which defeats the point of running it unattended.
+    const progressed = rolledOver && observation.filesChanged.length > 0
     const failed: DurableJobStage = { ...stage, status: 'pending', error, agentSessionId: stage.agentSessionId }
     const previousErrors = this.store.matchingEvents(job.id, { kind: 'retry', stageId: stage.id, dataType: { error: 'string' } }).map(event => String(event.data!.error))
     this.store.batch(job.id, () => {
       this.store.update(job.id, guard, { handoff: decision.handoff })
-      this.store.saveStage(job.id, guard, failed, { kind: 'retry', message: `Stage ${stage.index + 1} attempt ${stage.attempt} did not finish: ${error}`, data: { error, attempt: stage.attempt, stop: observation.stop?.reason ?? null, promptTokens: observation.report?.context.usedTokens ?? null } })
+      this.store.saveStage(job.id, guard, failed, { kind: 'retry', message: `Stage ${stage.index + 1} attempt ${stage.attempt} did not finish: ${error}${progressed ? ' (context rollover with progress; attempt not spent)' : ''}`, data: { error, attempt: stage.attempt, stop: observation.stop?.reason ?? null, promptTokens: observation.report?.context.usedTokens ?? null, ...(progressed ? { attemptCredited: true } : {}) } })
       this.store.count(job.id, guard, { retries: 1, ...(observation.stop?.reason === 'context_limit' && !decision.contextRollover ? { contextRollovers: 1 } : {}) })
+      if (progressed) this.store.creditAttempt(job.id, guard, stage.id)
     })
     // A tool call whose result was never saved has an unknown side effect. It is recorded and
     // never replayed; the owner inspects before the job continues.

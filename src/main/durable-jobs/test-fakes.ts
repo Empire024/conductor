@@ -5,7 +5,7 @@ import type { OpenStageRequest, StageObservation, StageRuntime } from './ports'
 import type { WorktreeOps } from './worktree'
 
 export type ScriptedOutcome =
-  | { kind: 'answer'; text: string; reason?: LocalStopReason; filesChanged?: string[]; pending?: { id: string; name: string; arguments: string } }
+  | { kind: 'answer'; text: string; reason?: LocalStopReason; detail?: string; filesChanged?: string[]; pending?: { id: string; name: string; arguments: string } }
   | { kind: 'hang' }
   | { kind: 'approval' }
   | { kind: 'refuse-submit'; message: string }
@@ -41,7 +41,7 @@ export class FakeRuntime implements StageRuntime {
       const phase = reason === 'completed' || (reason === 'output_limit' && outcome.text.trim()) ? 'completed' : 'failed'
       session.observation = {
         phase, stopSequence: session.observation.stopSequence + 1,
-        stop: { reason, detail: `${reason} detail`, filesChanged: outcome.filesChanged ?? [] },
+        stop: { reason, detail: outcome.detail ?? `${reason} detail`, filesChanged: outcome.filesChanged ?? [] },
         lastAnswer: outcome.text, filesChanged: outcome.filesChanged ?? [],
         ...(outcome.pending ? { execution: { lifecycle: 'blocked', nextAction: 'inspect', pending: outcome.pending } } : {})
       }

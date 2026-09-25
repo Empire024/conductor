@@ -78,6 +78,37 @@ describe('durable job controller', () => {
     expect(service.get(created.id).stages[0]!.attempt).toBe(4)
   })
 
+  it('credits back a context rollover attempt that made file progress, so a stage may roll over more times than maxStageAttempts and still complete', async () => {
+    const { service, runtime, store } = setup([
+      { kind: 'answer', text: 'progress 1', reason: 'context_limit', detail: 'rollover at line 40', filesChanged: ['INDEX.md'] },
+      { kind: 'answer', text: 'progress 2', reason: 'context_limit', detail: 'rollover at line 80', filesChanged: ['INDEX.md'] },
+      { kind: 'answer', text: 'progress 3', reason: 'context_limit', detail: 'rollover at line 120', filesChanged: ['INDEX.md'] },
+      { kind: 'answer', text: 'progress 4', reason: 'context_limit', detail: 'rollover at line 150', filesChanged: ['INDEX.md'] },
+      { kind: 'answer', text: 'Finally.\nJOB STATUS: DONE', filesChanged: ['INDEX.md'] }
+    ])
+    const created = await service.create(input({ budgets: { maxStageAttempts: 3 } }))
+    await until(() => service.status(created.id).status === 'completed')
+    const job = service.get(created.id)
+    expect(runtime.opened).toHaveLength(5)
+    // Four rollovers past a 3-attempt budget never blocked the job: each one wrote to INDEX.md,
+    // so each was credited back instead of spending one of the stage's 3 attempts.
+    expect(job.stages[0]).toMatchObject({ status: 'completed', attempt: 5 })
+    expect(job.counters).toMatchObject({ stagesCompleted: 1, contextRollovers: 4 })
+    expect(store.attemptBase(job.stages[0]!.id)).toBe(4)
+  })
+
+  it('spends the attempt on a context rollover that made no file progress, same as any other failure', async () => {
+    const { service, store } = setup([
+      { kind: 'answer', text: 'no progress', reason: 'context_limit' },
+      { kind: 'answer', text: 'Finally.\nJOB STATUS: DONE' }
+    ])
+    const created = await service.create(input({ budgets: { maxStageAttempts: 3 } }))
+    await until(() => service.status(created.id).status === 'completed')
+    const job = service.get(created.id)
+    expect(job.stages[0]).toMatchObject({ status: 'completed', attempt: 2 })
+    expect(store.attemptBase(job.stages[0]!.id)).toBe(0)
+  })
+
   it('treats an output-limit stop as unfinished even when text exists', () => {
     expect(stageSucceeded({ phase: 'completed', stopSequence: 1, stop: { reason: 'output_limit', detail: '', filesChanged: [] }, lastAnswer: 'partial', filesChanged: [] })).toBe(false)
     expect(stageSucceeded({ phase: 'completed', stopSequence: 1, stop: { reason: 'completed', detail: '', filesChanged: [] }, lastAnswer: 'ok', filesChanged: [], execution: { lifecycle: 'blocked', nextAction: 'x' } })).toBe(false)

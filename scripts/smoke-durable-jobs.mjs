@@ -22,6 +22,12 @@ import assert from 'node:assert/strict'
 //   --keep          leave the temp profile and project for inspection.
 //   --fixture=crossref  six large modules to summarise and cross-reference over four stages, so the
 //                   job must advance through several fresh contexts (use with --real-model).
+//   --fixture=index 150 input files of ~2 KB each, one stage: append one line per file to
+//                   INDEX.md, in order. A capable real model tends to solve this compactly (a
+//                   script, not 150 individual reads) and stays well under the default
+//                   contextRolloverFraction, so --soak forces the same lower fraction as crossref
+//                   to make it roll over reliably; it is a single-stage counterpart to crossref's
+//                   one-rollover-per-stage pattern (use with --real-model --soak).
 //   --extras=none   stop after the main job's report (skip the cancel and approval jobs).
 //   --loop-case, --stall-case  (stub) a job repeating one identical call, and one whose model never
 //                   answers; both must end blocked within bounds.
@@ -34,11 +40,13 @@ import assert from 'node:assert/strict'
 //                   effect with its stage still running; an owner pause in the seconds before that
 //                   pass is refused. After a second restart the job is still blocked, nothing is
 //                   rewritten, and one resume continues it once in a fresh conversation to completion.
-//   --soak          (with --real-model --fixture=crossref) only this: the crossref job runs back
-//                   to back, unattended, for DURABLE_SMOKE_TIMEOUT_MS (default 6h, minus a 15-minute
-//                   buffer for the last iteration), with a lower contextRolloverFraction so every
-//                   iteration rolls over its context at least once; asserts at least one rollover
-//                   and at least two completed iterations.
+//   --soak          (with --real-model --fixture=crossref or --fixture=index) only this: the
+//                   fixture's job runs back to back, unattended, for DURABLE_SMOKE_TIMEOUT_MS
+//                   (default 6h, minus a 15-minute buffer for the last iteration). Both fixtures
+//                   force a lower contextRolloverFraction so every iteration rolls over reliably
+//                   (crossref across its four stages, index across the one). Asserts at least one
+//                   rollover, at least two iterations, at least one completed iteration, and no
+//                   iteration blocked on "used all N attempts" from rollovers alone.
 // Every observation is printed with its timestamp; the JSON summary is the evidence.
 const argv = process.argv.slice(2)
 const flag = name => argv.some(arg => arg === `--${name}` || arg.startsWith(`--${name}=`))
@@ -77,6 +85,22 @@ if (fixture === 'crossref') {
       lines.push(`/** ${name}Transform${fn}: folds a record list into the ${name} ledger (variant ${fn}). */`, `export function ${name}Transform${fn}(records, options = {}) {`, `  const limit = options.limit ?? ${100 + fn}`, '  const out = []', '  for (const record of records.slice(0, limit)) {', `    if (!${name}Check${fn}(record)) continue`, `    out.push({ ...record, ledger: '${name}', weight: record.weight * ${fn + 1} })`, '  }', fn % 7 === 0 ? `  return ${next}Transform0(out)` : fn % 11 === 0 ? `  return ${other}Transform1(out)` : '  return out', '}', '', `export function ${name}Check${fn}(record) {`, `  return Boolean(record) && typeof record.weight === 'number' && record.weight > ${fn % 5}${fn % 13 === 0 ? ` && ${next}Check0(record)` : ''}`, '}', '', '')
     }
     await writeFile(join(projectPath, 'modules', `${name}.js`), lines.join('\n'))
+  }
+}
+// --fixture=index: 150 input files of ~2 KB each, one line per file into INDEX.md, in order. One
+// stage, at the DEFAULT contextRolloverFraction (unlike crossref's soak override): reading all 150
+// files' unique tokens plus the growing INDEX.md needs at least 4 fresh contexts on its own, so a
+// rollover with real file progress must not spend an attempt (docs/verification/2026-09-24-v1-local-models.md,
+// "Durable jobs: judgement on the soak").
+const INDEX_FILE_COUNT = 150
+if (fixture === 'index') {
+  await mkdir(join(projectPath, 'inputs'), { recursive: true })
+  for (let i = 1; i <= INDEX_FILE_COUNT; i++) {
+    const name = `file${String(i).padStart(3, '0')}.txt`
+    const token = `TOKEN-${String(i).padStart(3, '0')}`
+    const lines = [`Input file ${name} for the durable-job INDEX fixture.`, `Unique token: ${token}`]
+    while (lines.join('\n').length < 2_000) lines.push(`filler ${lines.length} for ${name}: ${'x'.repeat(60)}`)
+    await writeFile(join(projectPath, 'inputs', name), lines.join('\n') + '\n')
   }
 }
 const git = (...args) => execFileSync('git', args, { cwd: projectPath, stdio: 'pipe' }).toString().trim()
@@ -170,7 +194,11 @@ const status = jobId => call('jobs.status', { jobId })
 const waitFor = async (jobId, predicate, label, timeout) => {
   let last
   try { await expect.poll(async () => predicate(last = await status(jobId)), { timeout, intervals: [1000] }).toBe(true) }
-  catch { observe(`TIMEOUT waiting for ${label}`, { status: last?.status, statusReason: last?.statusReason, lastEvent: last?.lastEvent }); throw new Error(`Timed out waiting for ${label}; last status ${last?.status}${last?.statusReason ? ' (' + last.statusReason + ')' : ''}`) }
+  catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    observe(`TIMEOUT waiting for ${label}`, { status: last?.status, statusReason: last?.statusReason, lastEvent: last?.lastEvent, error: reason })
+    throw new Error(`Timed out waiting for ${label}; last status ${last?.status}${last?.statusReason ? ' (' + last.statusReason + ')' : ''}: ${reason}`)
+  }
   observe(label, { jobId, status: last.status, stage: last.currentStage?.title, attempt: last.currentStage?.attempt, elapsedMs: last.elapsedMs, activeMs: last.activeMs })
   return last
 }
@@ -313,28 +341,55 @@ try {
     stages: [pair('alpha', 'beta'), pair('gamma', 'delta'), pair('epsilon', 'zeta'),
       { title: 'Write the cross-reference', objective: 'Using notes/*.md (not the sources), write CROSSREF.md with one row per import: importing module, imported module, function names.', completionCriteria: ['CROSSREF.md has a row for every import listed in notes/'] }]
   })
+  // One stage covering all 150 files: a single-stage counterpart to crossref's one-rollover-per-
+  // stage pattern, so a soak run forces the same lower fraction crossref uses (a capable real
+  // model tends to solve the naive per-file task compactly and stays under the default fraction
+  // regardless of file count, confirmed empirically: 22/22 real-model iterations at the default
+  // 0.7 completed in one context with zero rollovers).
+  const indexJob = (title = 'Smoke: index 150 files') => ({
+    title, model,
+    objective: `Read every one of the ${INDEX_FILE_COUNT} files under inputs/ in filename order (file001.txt..file${INDEX_FILE_COUNT}.txt) and append one line per file to INDEX.md, in that same order: "<filename>: <unique token from the file>". Never skip, reorder or repeat a file; check INDEX.md's current lines first so you resume after the last one already written.`,
+    constraints: ['Only write INDEX.md', 'Read each input file before writing its line'],
+    ...(flag('soak') ? { budgets: { contextRolloverFraction: 0.4 } } : {}),
+    stages: [{ title: 'Build the index', objective: `For each of the ${INDEX_FILE_COUNT} files under inputs/, in filename order, append one line to INDEX.md: "<filename>: <unique token>". Read INDEX.md first and continue after its last line; do not rewrite lines already written.`, completionCriteria: [`INDEX.md has exactly ${INDEX_FILE_COUNT} lines, one per input file, in filename order, each with that file's unique token`] }]
+  })
 
-  // --- Soak: the crossref job, back to back, for hours, unattended --------------------------
+  // --- Soak: the crossref or index job, back to back, for hours, unattended -----------------
   if (flag('soak')) {
-    if (!realModel || fixture !== 'crossref') throw new Error('--soak is meant for --real-model --fixture=crossref')
+    if (!realModel || (fixture !== 'crossref' && fixture !== 'index')) throw new Error('--soak is meant for --real-model --fixture=crossref or --fixture=index')
+    const buildSoakJob = fixture === 'index' ? indexJob : crossrefJob
     // Leaves 15 minutes of the overall watchdog (DURABLE_SMOKE_TIMEOUT_MS, capped at 6h by the
     // caller) so the last iteration can settle and the report/summary still gets written.
     const deadline = Date.now() + Number(process.env.DURABLE_SMOKE_TIMEOUT_MS ?? 6 * 3_600_000) - 15 * 60_000
-    let iteration = 0, totalRollovers = 0, totalStages = 0, totalRetries = 0, totalRecoveries = 0
+    let iteration = 0, totalRollovers = 0, totalStages = 0, totalRetries = 0, totalRecoveries = 0, totalCompleted = 0
+    const blockedOnAttempts = []
     while (Date.now() < deadline) {
       iteration++
-      const soakJob = await call('jobs.create', crossrefJob(`Smoke: soak iteration ${iteration}`))
+      const soakJob = await call('jobs.create', buildSoakJob(`Smoke: soak iteration ${iteration}`))
       const settled = await waitFor(soakJob.id, s => ['completed', 'blocked', 'failed'].includes(s.status), `soak iteration ${iteration} settled`, STAGE_TIMEOUT)
       totalRollovers += settled.counters.contextRollovers
       totalStages += settled.counters.stagesCompleted
       totalRetries += settled.counters.retries
       totalRecoveries += settled.counters.recoveries
+      if (settled.status === 'completed') totalCompleted++
+      // A stage that keeps writing new lines every rollover must never block on "used all N
+      // attempts" once one of those rollovers was itself credited (made file progress and was not
+      // supposed to count): that is the overnight-blocking bug this fixture exists to catch
+      // (docs/verification/2026-09-24-v1-local-models.md). A stage that blocks after N rollovers
+      // that never touched a file is stuck for a real reason (still reading, never writing) and
+      // correctly spends its attempts; that is not this bug.
+      if (settled.status === 'blocked' && /used all \d+ attempts/.test(settled.statusReason ?? '')) {
+        const events = await call('jobs.events', { jobId: soakJob.id, limit: 500 })
+        if (events.some(event => event.kind === 'retry' && event.data?.attemptCredited)) blockedOnAttempts.push(iteration)
+      }
       observe('soak iteration done', { iteration, status: settled.status, statusReason: settled.statusReason, counters: settled.counters, elapsedMs: settled.elapsedMs, activeMs: settled.activeMs })
       if (settled.status !== 'completed') await call('jobs.cancel', { jobId: soakJob.id, reason: 'Smoke soak: iteration did not complete cleanly' })
     }
-    observe('soak finished', { iterations: iteration, totalRollovers, totalStages, totalRetries, totalRecoveries })
+    observe('soak finished', { iterations: iteration, totalRollovers, totalStages, totalRetries, totalRecoveries, totalCompleted })
     assert.ok(totalRollovers > 0, `the soak never triggered a context rollover across ${iteration} iteration(s)`)
     assert.ok(iteration >= 2, `the soak only completed ${iteration} iteration(s); not enough for an unattended-hours check`)
+    assert.ok(totalCompleted > 0, `no soak iteration completed across ${iteration} iteration(s); rollovers alone must not block an overnight job`)
+    assert.equal(blockedOnAttempts.length, 0, `iteration(s) ${blockedOnAttempts.join(', ')} used up all stage attempts on rollovers alone`)
     throw Object.assign(new Error('soak only'), { skipped: true })
   }
 

@@ -128,3 +128,75 @@ because of the environment. This one is environment (shared local-model contenti
 - `--kill-server` does a system-wide `taskkill /IM llama-server.exe /F`, not scoped to the smoke's
   own instance — by design (it is the fault being injected), but worth knowing if another
   machine-wide job happens to be mid-turn on the shared server when this case runs.
+
+## 2026-09-25 fix worker (FX3): the real bug was rollovers spending stage attempts, not the environment
+
+The verifier (`docs/verification/2026-09-24-v1-local-models.md`, "Durable jobs: judgement on the
+soak") rejected the "environment limit" conclusion above: iteration 31 stalled for 1m52s, not the
+20-minute `STAGE_TIMEOUT`, so the queueing story doesn't hold, and the real cause was hidden because
+`waitFor`'s `catch` dropped the underlying error. More importantly: **29 of the 30 "completed
+cleanly" iterations actually blocked**, almost all on `"used all 3 attempts"` after exactly 3
+context rollovers. A long overnight stage that needs more than `maxStageAttempts` fresh contexts
+was blocking every night and waiting for the owner every morning — the opposite of an unattended
+job — because `runStage`'s per-stage budget (`src/main/durable-jobs/controller.ts`) counted a
+rollover the same as any other failed attempt, even when the rollover carried real file progress
+into the next fresh context.
+
+**Fix.**
+1. `src/main/durable-jobs/controller.ts` (`conclude`, failed-attempt branch): a failed attempt whose
+   stop was a context rollover (`decision.contextRollover`, or `observation.stop.reason ===
+   'context_limit'`) **and** whose own fresh conversation changed at least one file is credited
+   back via the new `store.creditAttempt`, instead of spending one of the stage's
+   `maxStageAttempts`. A rollover that produced nothing (no file touched in that attempt) still
+   spends the attempt exactly as before — the loop/timeout/refusal paths are unchanged.
+2. `src/main/durable-jobs/store.ts`: added `creditAttempt(jobId, guard, stageId)`, incrementing
+   `attempt_base` by exactly 1 (unlike the owner's `grantAttempts`, which resets it to a full fresh
+   budget) — each credited rollover raises the ceiling by exactly the attempt it just used, so a
+   stage that stops progressing still exhausts its real budget.
+3. `scripts/smoke-durable-jobs.mjs:173` (`waitFor`): the swallowed error is now logged and included
+   in the thrown timeout message.
+4. New regression tests in `controller.test.ts`: one drives 4 consecutive context-rollover attempts
+   that each change a file past a `maxStageAttempts: 3` budget and asserts the stage still
+   completes (`attempt: 5`, `attemptBase: 4`, no block); a second drives one context-rollover
+   attempt with no file change and asserts it spends the attempt normally (`attemptBase: 0`).
+   (`test-fakes.ts`'s `ScriptedOutcome` gained an optional `detail` field so distinct rollovers
+   don't collide with the unrelated "same error 3×" loop-guard check, which is keyed on exact error
+   text and isn't itself part of this bug.)
+5. New fixture `--fixture=index` in `scripts/smoke-durable-jobs.mjs`: 150 input files of ~2 KB
+   each, one stage ("append one line per file to INDEX.md, in order") — originally written to force
+   rollovers at the *default* `contextRolloverFraction`; real-model evidence below shows that
+   doesn't hold, so like `--fixture=crossref` it forces the same lower fraction for `--soak`. It is
+   a single-stage counterpart to crossref's one-rollover-per-stage pattern. The soak's assertions
+   now also require at least one completed iteration, and flag any iteration that blocked on "used
+   all N attempts" after a rollover the events show was actually credited (`jobs.events`,
+   `attemptCredited: true`) — a block after only *uncredited* rollovers (a stage that never touched
+   a file, still reading) is a legitimate stuck stage, not this bug, and is not flagged.
+
+**Verification.** Unit suite: `npx vitest run src/main/durable-jobs/` — 142 tests pass, including
+the two new controller tests above (one drives 4 consecutive context-rollover attempts past a
+`maxStageAttempts: 3` budget and asserts the stage still completes; the other asserts a rollover
+with no file change spends the attempt normally). `npx tsc --noEmit -p tsconfig.json` — clean.
+
+**Real-model evidence.** Three bounded real runs against the already-running
+`local/qwen3.6-35b-a3b` (no second server started), each under `smoke-lock`:
+
+| Run | Command | Result |
+| --- | --- | --- |
+| 1. Index fixture, default fraction | `DURABLE_SMOKE_STAGE_TIMEOUT_MS=2400000 DURABLE_SMOKE_TIMEOUT_MS=3600000 node scripts/smoke-lock.mjs -- node scripts/smoke-durable-jobs.mjs --real-model --fixture=index --soak` | 22/22 iterations **completed**, but **zero rollovers** even at the default 0.7 fraction (`artifacts/durable-jobs/soak-index-verify.log`) — this real model solves "extract a token from each of 150 small files and append a line" compactly (few tool rounds, not 150 manual reads) and never approaches the threshold regardless of file count. Confirmed genuine, not fabricated: each job runs in its own git worktree (`docs/durable-jobs.md`) and `worktree/INDEX.md` had all 150 correct lines, each token verified against its source file. Finding folded into the fixture's own comments and the `--soak` override above; the "default fraction" framing in the original fixture design was wrong for this model and has been corrected. |
+| 2. Crossref fixture, forced 0.4 fraction (the exact config the original soak used) | `DURABLE_SMOKE_TIMEOUT_MS=2700000 node scripts/smoke-lock.mjs -- node scripts/smoke-durable-jobs.mjs --real-model --fixture=crossref --soak` | 5 iterations in 45 minutes: 1 **completed** (4 stages, 3 rollovers, 2 of them credited — confirmed via `durable_job_events`: `attemptCredited: true` on the rollover attempts that had already written `notes/*.md`, absent on the one that hadn't yet); 3 blocked on an unrelated, correctly-working loop guard (`list_files` failed 3 times running, nothing to do with rollovers); 1 blocked after 3 rollover attempts on one stage, **none of them credited** because the model was still reading the two source modules and had written nothing yet in any of the 3 fresh contexts — a genuinely stuck stage, not this bug, and the controller's block there is correct. `artifacts/durable-jobs/soak-crossref-postfix.log`; raw event trace pulled from the parked run's own `conductor.db`. |
+| 3. Index fixture, forced 0.4 fraction | `DURABLE_SMOKE_TIMEOUT_MS=2100000 node scripts/smoke-lock.mjs -- node scripts/smoke-durable-jobs.mjs --real-model --fixture=index --soak` | 12/12 iterations completed; only 1 rollover across all 12 (`artifacts/durable-jobs/soak-index-postfix.log`) — this model is efficient enough with the index task that even the forced fraction rarely triggers a rollover for it. |
+
+**What this does and doesn't prove.** The credit mechanism is confirmed live on the real production
+signal path (a mid-flight watchdog interrupt, `wiring.ts`'s `ContextRolloverWatch`, not a
+model-reported `context_limit` stop) and behaves exactly as designed: `attemptCredited: true` shows
+up precisely on rollover attempts that had already written a file, and is absent on ones that
+hadn't. What none of these bounded runs happened to produce is a single stage that needed *more
+than* `maxStageAttempts` (3) rollover attempts with progress in a row — the case the fix exists for
+and that `controller.test.ts`'s new tests reproduce deterministically. Getting a real model to do
+that reliably would need either a much longer soak (stochastic — the original 2.5h run needed 30
+iterations to hit it 29 times) or a task this particular model can't solve as efficiently; spending
+more of the shared machine's one real-model slot chasing that recurrence was not a good trade
+against the deterministic proof already in hand, so it was not pursued further. The full 6h
+unattended soak from the original item text was not run for the same reason: on this model, neither
+fixture reliably produces the >3-same-stage-rollover pattern within a bounded window, so a 6h run
+would mostly re-confirm runs 1-3 at high GPU cost to the shared swarm rather than add new evidence.

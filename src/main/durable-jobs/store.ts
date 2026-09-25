@@ -256,6 +256,18 @@ export class DurableJobStore {
     })
   }
 
+  /** A context rollover that made progress in its own fresh context credits the attempt it just
+   *  spent back, one at a time, so a stage that keeps progressing across contexts never exhausts
+   *  maxStageAttempts on rollovers alone (a rollover with nothing to show for its context is not
+   *  credited, and counts normally). */
+  creditAttempt(jobId: string, guard: WriteGuard, stageId: string): void {
+    this.transaction(jobId, () => {
+      this.check(jobId, guard)
+      const base = this.attemptBase(stageId)
+      this.db.prepare('UPDATE durable_job_stages SET attempt_base = ? WHERE id = ?').run(base + 1, stageId)
+    })
+  }
+
   checkpoints(jobId: string): DurableJobCheckpoint[] {
     return (this.db.prepare('SELECT data FROM durable_job_checkpoints WHERE job_id = ? ORDER BY created_at, rowid').all(jobId) as Row[]).map(row => json<DurableJobCheckpoint>(row.data))
   }
