@@ -15,6 +15,12 @@ const runtimeHostBundle = (): Plugin => ({
       outfile: resolve(__dirname, 'out/main/runtime-host.js'),
       bundle: true, platform: 'node', format: 'cjs', target: 'node20', logLevel: 'warning'
     })
+    // The recovery watchdog (docs/recovery-mode.md) runs the same way, from the same runtime copy.
+    await build({
+      entryPoints: [resolve(__dirname, 'src/main/recovery/watchdog-main.ts')],
+      outfile: resolve(__dirname, 'out/main/recovery-watchdog.js'),
+      bundle: true, platform: 'node', format: 'cjs', target: 'node20', logLevel: 'warning'
+    })
   }
 })
 
