@@ -2,6 +2,11 @@ import { encodeRestartInitiator, encodeRestartRequest, launchRestartInitiator, p
 import { coworkerResumeMessage, encodeRestartIntent, mayInstallOnQuit, parseRestartIntent, RESTART_INTENT_KEY, restartLine, restartReason, resumePlan, watchChanged, wizardResumeMessage, workingSet, type RestartIntent, type RestartKind, type ResumeCandidate, type ResumePlan } from './restart-resume'
 import { StopConfirmations, type StopDecision } from './stop-confirmation'
 import { connectRuntimeHost } from './runtime-host/launcher'
+import { createRecovery, findCheckout, type RecoveryController } from './recovery/controller'
+import { startWatchdogProcess, watchdogRuntime } from './recovery/detached'
+import { recoveryNote } from './recovery/protocol'
+import { importLoginShellPath } from './login-shell-path'
+import { workspaceWindowChrome } from './window-chrome'
 import type { RuntimeHostClient } from './runtime-host/client'
 import { setRuntimeHost } from './providers/transport'
 import { ConversationHistory, registerConversationHistoryIpc } from './conversation-history'
@@ -303,6 +308,34 @@ const revealWindow = (window: BrowserWindow, activate = true): void => {
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 if (!hasSingleInstanceLock) app.quit()
 
+/* Recovery mode (docs/recovery-mode.md): a watchdog outside the app brings Conductor back when a
+ * restart, an update install or a crash leaves it down. Read here, before this launch arms its own,
+ * so the first window knows how the previous process stopped. */
+const recovery: RecoveryController | null = hasSingleInstanceLock ? createRecovery({
+  userData: app.getPath('userData'), packaged: app.isPackaged, platform: process.platform, env: process.env, pid: process.pid,
+  execPath: process.execPath, argv: process.argv, cwd: process.cwd(), watchdogScript: join(__dirname, 'recovery-watchdog.js'),
+  log: message => console.log(message), copiedRuntime: userData => watchdogRuntime(userData),
+  startDetached: (executable, args, environment, cwd) => startWatchdogProcess(executable, args, environment, cwd, message => console.warn(message))
+}) : null
+/** Said to every conversation a restart brings back when recovery mode had to bring Conductor back. */
+let launchRecoveryNote = ''
+/** A relaunch after a restart or update the owner was watching comes back in front. The installer
+ *  starts it through Explorer, and Windows refuses focus to a process that is not in the
+ *  foreground, so the window used to come back behind whatever was active (recovery-mode). */
+const previousStopWasWatched = Boolean(recovery?.previousArm && recovery.previousArm.appPid !== process.pid && recovery.previousArm.foreground && recovery.previousArm.kind !== 'quit' && recovery.previousArm.kind !== 'update-on-quit')
+const bringToFront = (window: BrowserWindow): void => {
+  if (window.isDestroyed() || backgroundWindows) return
+  window.show()
+  window.focus()
+  window.setAlwaysOnTop(true)
+  window.moveTop()
+  window.setAlwaysOnTop(false)
+  if (!window.isFocused()) {
+    window.flashFrame(true)
+    window.once('focus', () => { if (!window.isDestroyed()) window.flashFrame(false) })
+  }
+}
+
 const publishWindowMaximizedState = (window: BrowserWindow): void => {
   if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
     window.webContents.send('window:maximized-changed', window.isMaximized() || window.isFullScreen())
@@ -343,13 +376,14 @@ const createWindow = (
       y: Math.min(area.y + Math.max(0, area.height - 760), Math.max(area.y, point.y - 26))
     }
   })() : {}
+  const chrome = workspaceWindowChrome(process.platform, backgroundWindows)
   const window = new BrowserWindow({
     width: detachedId ? 1120 : 1540,
     height: detachedId ? 760 : 960,
     minWidth: detachedId ? 520 : 980,
     minHeight: detachedId ? 360 : 640,
     show: false,
-    frame: false,
+    ...chrome.frame,
     backgroundColor: '#0b0d10',
     ...detachedBounds,
     ...visibleSavedPlacement?.bounds,
@@ -360,7 +394,8 @@ const createWindow = (
       sandbox: false,
       contextIsolation: true,
       nodeIntegration: false,
-      webviewTag: true
+      webviewTag: true,
+      ...chrome.webPreferences
     }
   })
   // A parked window must not take the speakers either: a smoke run completes agent after agent,
@@ -384,6 +419,8 @@ const createWindow = (
     })
   })
   installWindowStateEvents(window)
+  // Logoff or shutdown ends Conductor on purpose (Windows only): the recovery watchdog must not bring it back.
+  window.on('session-end', () => recovery?.arm('quit', { fromVersion: app.getVersion(), foreground: false }))
   hostLifecycle?.windowOpened()
   // Consume the native accelerator before Electron's default Close Window role can run.
   window.webContents.on('before-input-event', (event, input) => {
@@ -422,6 +459,7 @@ const createWindow = (
     if (!detachedId && loginItem?.startedAtLogin && !loginStartHandled && !backgroundWindows) { loginStartHandled = true; window.minimize(); return }
     if (visibleSavedPlacement?.maximized && !backgroundWindows) window.maximize()
     revealWindow(window, false)
+    if (!detachedId && previousStopWasWatched && window === mainWindow) bringToFront(window)
   })
   window.webContents.on('did-finish-load', () => {
     window.webContents.setZoomFactor(getAppSettings().zoomFactor)
@@ -738,6 +776,7 @@ const recordRestartIntent = (kind: Exclude<RestartKind, 'running'>, resume: bool
     const toVersion = kind === 'update-install' || kind === 'update-on-quit' ? update?.availableVersion : undefined
     const intent = restartIntent(kind, resume, working ?? currentWorkingSet(), toVersion)
     database.setSetting(RESTART_INTENT_KEY, encodeRestartIntent(intent))
+    recovery?.arm(kind, { fromVersion: intent.fromVersion, ...(toVersion ? { toVersion } : {}), foreground: BrowserWindow.getFocusedWindow() !== null })
     console.log(`Restart intent recorded: ${kind}, resume ${resume}, ${intent.wizards.length} wizard(s), ${intent.coworkers.length} coworker(s)`)
   } catch (error) { console.warn('The restart intent could not be saved', error) }
 }
@@ -770,8 +809,8 @@ const resumeAfterRestart = async (plan: ResumePlan): Promise<void> => {
     } catch (error) { console.warn(`${label} ${id} could not be resumed after the restart`, error); return false }
   }
   const resumed: string[] = []
-  for (const id of plan.coworkers) if (await bringBack(id, coworkerResumeMessage(plan, version), false)) resumed.push(id)
-  for (const id of plan.wizards) await bringBack(id, wizardResumeMessage(plan, version, resumed.filter(coworker => controllerOf(coworker) === id).length), true)
+  for (const id of plan.coworkers) if (await bringBack(id, coworkerResumeMessage(plan, version) + launchRecoveryNote, false)) resumed.push(id)
+  for (const id of plan.wizards) await bringBack(id, wizardResumeMessage(plan, version, resumed.filter(coworker => controllerOf(coworker) === id).length) + launchRecoveryNote, true)
 }
 
 /** A wizard's request that the owner restart (app.restart.request). It is kept in the settings so
@@ -891,7 +930,8 @@ const relaunchConductor = async (force: boolean, initiator?: Omit<RestartInitiat
   // Conductor twice.
   if (updates.getState().phase === 'ready') { await updates.install({ force }, initiator); return }
   await prepareForUpdateInstall(force, initiator)
-  app.relaunch()
+  // Test profiles only (scripts/smoke-recovery-mode.mjs): the relaunch that failed on 2026-09-25.
+  if (app.isPackaged || process.env.CONDUCTOR_RECOVERY_TEST_SKIP_RELAUNCH !== '1') app.relaunch()
   app.quit()
 }
 
@@ -2455,8 +2495,12 @@ const registerIpc = (): void => {
   })
 }
 
+// A Finder-started Mac app has a bare PATH; the CLIs it spawns need the login shell's (no-op elsewhere).
+const loginShellPath = importLoginShellPath()
+
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
+  await loginShellPath
   app.setAppUserModelId('io.conductor.desktop')
   const databasePath = join(app.getPath('userData'), 'conductor.db')
   database = new ConductorDatabase(databasePath)
@@ -2739,6 +2783,7 @@ app.whenReady().then(async () => {
   // one after every restart.
   agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '', { path: join(app.getPath('userData'), 'control-owner.json'), appVersion: app.getVersion(), packaged: app.isPackaged })
   await agentControlServer.start()
+  void recovery?.start({ fromVersion: app.getVersion(), checkout: findCheckout(database.listProjects().map(project => project.path)) })
   await browserMcp.start()
   // conductor-local MCP tools (src/main/local-assist): every Claude and Codex launch from here on.
   localAssist = await startLocalAssist({ structured: database.structured, userData: app.getPath('userData'), sessions: agents.structured })
@@ -2822,7 +2867,8 @@ app.whenReady().then(async () => {
   const restartPlan = resumePlan(previousStop, initiator)
   // Turns the previous process kept running are rebound before any window asks for their tabs.
   try { await reattachKeptRuntimes() } catch (error) { console.error('Kept runtimes could not be reattached', error) }
-  briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion, updates.getState().currentVersion))
+  launchRecoveryNote = recoveryNote(recovery?.takeReport() ?? null)
+  briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion, updates.getState().currentVersion) + launchRecoveryNote)
   void startRuntimeHost()
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
