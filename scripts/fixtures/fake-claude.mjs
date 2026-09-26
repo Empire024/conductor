@@ -81,8 +81,10 @@ let classifierCount = 0, classified, lastRefused
 // SYNTHETIC CLASSIFIER PLAN <call>: the model knows the call (a successor read it in its handoff) but
 // has not tried it; HOLD: told "approved; retry it now", it notes it and has not retried yet.
 let holdRetry = false
+// CONDUCTOR_TEST_UNIQUE_TOOL_IDS: ids unique across processes, as the real CLI's toolu_ ids are; by
+// default a successor's first denial repeats its predecessor's id (smoke-verify-vr9b-handoff.mjs).
 const classify = call => {
-  const id = `classified-${++classifierCount}`
+  const id = process.env.CONDUCTOR_TEST_UNIQUE_TOOL_IDS ? `toolu_classified_${process.pid}_${++classifierCount}` : `classified-${++classifierCount}`
   classified = { id, call }
   declare(id, call.tool, call.input)
   if (call.local || flagAllow.has(ruleFor(call))) { pending = `${id}-pre`; hook(pending, 'conductor_before', id, call.tool, call.input); return }
