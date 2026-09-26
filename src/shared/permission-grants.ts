@@ -209,6 +209,13 @@ export function describeGrantRequest(request: GrantRequestInput): Omit<Permissio
 export const grantRequestSummary = (request: Pick<PermissionGrantRequest, 'action' | 'resource' | 'class'>): string =>
   `${request.action} (${request.class}): ${request.resource.length > 140 ? request.resource.slice(0, 139) + '…' : request.resource}`
 
+/** The holder as a card names it. Every link of a successor chain is titled "<first title>
+ *  (continued)", so the title alone cannot tell B from C: the conversation id's last segment does. */
+export const grantHolderLabel = (holder: NonNullable<PermissionGrantRequest['holder']>): string => {
+  const short = holder.agentSessionId.split(/[_-]/).filter(Boolean).at(-1)?.slice(0, 8) ?? holder.agentSessionId
+  return holder.title ? `${holder.title} · ${short}` : holder.agentSessionId
+}
+
 /** What the tab is told once the owner approved. */
 export const grantApprovedMessage = (rule: string, scope: 'once' | 'session'): string =>
   `[Conductor] approved: ${rule}${scope === 'once' ? ' (once)' : ' (for this session)'}; retry it now. Run exactly the approved call, unchanged: the rule matches only that.`

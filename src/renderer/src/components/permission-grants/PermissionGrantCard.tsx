@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { GrantDecision, GrantStatus, PermissionGrant, PermissionGrantRequest, PermissionGrantsState } from '../../../../shared/permission-grants'
+import { grantHolderLabel, type GrantDecision, type GrantStatus, type PermissionGrant, type PermissionGrantRequest, type PermissionGrantsState } from '../../../../shared/permission-grants'
 import './permission-grants.css'
 
 /** The fields a card needs: a denial's request (auto-mode-denial.ts) or an agent's own request. */
@@ -74,7 +74,7 @@ export function PermissionGrantCard({ request, status, grant, busy, error, onDec
       {request.host && <><dt>Host</dt><dd><code>{request.host}</code></dd></>}
       {request.reason && <><dt>Why</dt><dd>{request.reason}</dd></>}
       {request.rollback && <><dt>Rollback</dt><dd>{request.rollback}</dd></>}
-      {request.holder && <><dt>{status === 'moved' ? 'Moved to' : 'Holder'}</dt><dd>{request.holder.title ?? request.holder.agentSessionId}</dd></>}
+      {request.holder && <><dt>{status === 'moved' ? 'Moved to' : 'Holder'}</dt><dd title={request.holder.agentSessionId}>{grantHolderLabel(request.holder)}</dd></>}
       {request.rule ? <><dt>Rule</dt><dd><code>{request.rule}</code></dd></> : <><dt>No rule</dt><dd>{request.refusal ?? 'No narrow rule can cover this call.'}</dd></>}
     </dl>
     {pending && request.rule && <p className="sa-muted">Approving hands this one conversation exactly this rule and tells it to retry the call. Nothing else is allowed, and the grant ends with this tab.</p>}

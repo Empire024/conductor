@@ -1,5 +1,6 @@
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, ProviderCapabilities, SessionSettings, StructuredProvider } from '../../shared/structured-agent'
 import type { HostedRuntimeHandle } from './transport'
+import type { DenialGrantRequest } from '../../shared/auto-mode-denial'
 
 /** What an adapter hands the next app process so it can continue a provider process the
  *  runtime host kept running (docs/runtime-host.md): its own protocol state and the process. */
@@ -32,7 +33,8 @@ export interface AdapterOptions {
   /** Native allow rules the owner granted this one conversation (src/main/permission-grants):
    *  read at launch and whenever applyPermissionRules runs; used() when an approve-once rule's
    *  call has run, refused() when the classifier refused a call a rule was granted for. */
-  permissionGrants?: { rules(): Array<{ rule: string; once: boolean }>; used(rule: string): void; refused?(rule: string): void }
+  /** denied: a classifier denial's card (its notice item) was shown, so it is a pending owner request from now on. */
+  permissionGrants?: { rules(): Array<{ rule: string; once: boolean }>; used(rule: string): void; refused?(rule: string): void; denied?(itemId: string, request: DenialGrantRequest): void }
   /** Host-only reviewer isolation; never accepted from worker settings or app-control input. */
   approvalReviewer?: boolean
   /** Delegated native approval events must pass the host reviewer gate, including Auto mode. */

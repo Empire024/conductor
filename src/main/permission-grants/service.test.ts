@@ -32,8 +32,11 @@ function harness(overrides: Partial<PermissionGrantPorts> = {}) {
     ...overrides
   }
   const grants = new PermissionGrants(ports)
-  const deny = (toolUseId: string, tool: string, input: Json, reason: string): string => {
-    denials.set(autoModeDenialItemId(toolUseId), { tool, reason, toolUseId, request: describeGrantRequest({ tool, input, cwd, category: reason, toolUseId }) })
+  const deny = (toolUseId: string, tool: string, input: Json, reason: string, shown = false): string => {
+    const denial = { tool, reason, toolUseId, request: describeGrantRequest({ tool, input, cwd, category: reason, toolUseId }) }
+    denials.set(autoModeDenialItemId(toolUseId), denial)
+    // shown: the adapter shows the card and reports it (adapterPort.denied), as the Claude adapter does.
+    if (shown) grants.adapterPort(tab).denied(autoModeDenialItemId(toolUseId), denial.request)
     return autoModeDenialItemId(toolUseId)
   }
   return { grants, ports, notices, told, deny, setPhase: (value: string) => { phase = value } }
@@ -258,6 +261,91 @@ describe('a pending owner approval survives a handoff (grant-survives-handoff)',
     await expect(h.grants.transfer(tab, 'agent_codex')).resolves.toEqual({ requests: 0, grants: 0 })
     expect(h.grants.list(tab).requests).toHaveLength(1)
     await expect(h.grants.transfer(tab, tab)).resolves.toEqual({ requests: 0, grants: 0 })
+  })
+
+  it('moves a classifier denial left unanswered at handoff: the successor holds it, the old card stops asking, the approval tells the successor', async () => {
+    const h = harness({ title: id => id === successor ? 'Wizard (continued)' : 'Wizard' })
+    const item = h.deny('toolu_ssh', 'Bash', { command: ssh }, 'External System Write', true)
+    // A pending request from the moment the card is shown, before anyone answers it.
+    expect(h.grants.list(tab).requests).toEqual([expect.objectContaining({ id: item, source: 'denial', status: 'pending', class: 'external' })])
+    const rule = h.grants.list(tab).requests[0]!.rule!
+    await expect(h.grants.transfer(tab, successor)).resolves.toEqual({ requests: 1, grants: 0 })
+    expect(h.grants.list(tab).requests).toEqual([])
+    expect(h.grants.list(successor).requests).toEqual([expect.objectContaining({ id: item, status: 'pending', holder: { agentSessionId: successor, title: 'Wizard (continued)' } })])
+    // A's denial card is restated as moved, naming the holder; B gets the same card, live, under the same id.
+    expect(h.notices.filter(entry => entry.id === tab).at(-1)).toMatchObject({ itemId: item, payload: { grantStatus: 'moved', autoModeDenial: { toolUseId: 'toolu_ssh', request: { holder: { agentSessionId: successor } } } } })
+    expect(h.notices.filter(entry => entry.id === successor).at(-1)).toMatchObject({ itemId: item, message: expect.stringContaining('Auto mode refused Bash'), payload: { grantStatus: 'pending', autoModeDenial: { toolUseId: 'toolu_ssh', request: { rule, holder: { agentSessionId: successor } } } } })
+    // The turn's result confirms the denial in A after the move: the notice it re-emits is restated as moved.
+    h.grants.adapterPort(tab).denied(item, h.grants.list(successor).requests[0]!)
+    expect(h.notices.filter(entry => entry.id === tab).at(-1)).toMatchObject({ itemId: item, payload: { grantStatus: 'moved' } })
+    // Answered on A's old id, it still reaches B: B is told and holds the rule, A never does.
+    await expect(h.grants.decide(tab, item, 'approve-once', 'owner')).resolves.toMatchObject({ status: 'approved-once', grant: { agentSessionId: successor } })
+    expect(h.told).toEqual([{ id: successor, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(ssh /) }])
+    expect(h.grants.rules(tab)).toEqual([])
+    expect(h.grants.rules(successor)).toEqual([{ rule, once: true }])
+    await expect(h.grants.decide(successor, item, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    h.grants.adapterPort(successor).used(rule)
+    expect(h.grants.rules(successor)).toEqual([])
+    expect(h.grants.list(successor).requests[0]!.status).toBe('used')
+  })
+
+  it('files a denial the superseded tab gets after the handoff as its own, even when its id repeats one its successor holds', async () => {
+    const h = harness()
+    h.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await h.grants.transfer(tab, successor)
+    // A denial id is per CLI process (the fixture's auto-denial:classified-1), so two tabs can share one.
+    const described = describeGrantRequest({ tool: 'Bash', input: { command: ssh }, cwd, category: 'External System Write', toolUseId: 'classified-1' })
+    h.grants.adapterPort(successor).denied('auto-denial:classified-1', described)
+    h.grants.adapterPort(tab).denied('auto-denial:classified-1', described)
+    expect(h.grants.list(tab).requests).toEqual([expect.objectContaining({ id: 'auto-denial:classified-1', status: 'pending' })])
+    expect(h.grants.list(successor).requests.filter(request => request.id === 'auto-denial:classified-1')).toHaveLength(1)
+    expect(h.notices.filter(entry => entry.id === tab && entry.itemId === 'auto-denial:classified-1')).toEqual([])
+  })
+
+  it('turns a denial of a call already asked about into another view of that request, in the successor and in the superseded tab', async () => {
+    const h = harness()
+    const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await h.grants.transfer(tab, successor)
+    const described = describeGrantRequest({ tool: 'Bash', input: { command: `bash ${script}` }, cwd, category: 'External System Write', toolUseId: 'classified-1' })
+    // The successor tries the moved call before the owner answered: no second request, the card shows the moved one.
+    h.grants.adapterPort(successor).denied('auto-denial:classified-1', described)
+    expect(h.grants.list(successor).requests.map(request => request.id)).toEqual([asked.id])
+    expect(h.notices.at(-1)).toMatchObject({ id: successor, itemId: 'auto-denial:classified-1', payload: { permissionGrant: { id: asked.id, status: 'pending' } } })
+    // The superseded tab tries it too: its card says where the request went, and it holds nothing.
+    h.grants.adapterPort(tab).denied('auto-denial:classified-1', described)
+    expect(h.grants.list(tab).requests).toEqual([])
+    expect(h.notices.at(-1)).toMatchObject({ id: tab, itemId: 'auto-denial:classified-1', payload: { permissionGrant: { id: asked.id, status: 'moved' } } })
+    // Answering the successor's denial card answers the one request, and both of its views show it.
+    await expect(h.grants.decide(successor, 'auto-denial:classified-1', 'approve-once', 'owner')).resolves.toMatchObject({ status: 'approved-once', grant: { agentSessionId: successor, requestId: asked.id } })
+    expect(h.told).toEqual([{ id: successor, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(bash app\/prod\/fix-pool\.sh\)/) }])
+    expect(h.notices.filter(entry => entry.id === successor && entry.itemId === 'auto-denial:classified-1').at(-1)).toMatchObject({ payload: { permissionGrant: { id: asked.id, status: 'approved-once' } } })
+    await expect(h.grants.decide(tab, 'auto-denial:classified-1', 'approve-once', 'owner')).rejects.toThrow('already answered')
+  })
+
+  it('keeps a moved denial when the predecessor tab closes, and expires a denial card of a tab closed without a successor', () => {
+    const open = new Set([tab, successor])
+    const h = harness({ tabOpen: id => open.has(id) })
+    const item = h.deny('toolu_moved', 'Bash', { command: ssh }, 'External System Write', true)
+    void h.grants.transfer(tab, successor)
+    open.delete(tab)
+    h.grants.sweep(); h.grants.sweep()
+    expect(h.grants.state().requests).toEqual([expect.objectContaining({ id: item, agentSessionId: successor, status: 'pending' })])
+    const alone = harness({ tabOpen: id => open.has(id) })
+    open.add(tab)
+    const left = alone.deny('toolu_left', 'Bash', { command: ssh }, 'External System Write', true)
+    open.delete(tab)
+    alone.grants.sweep(); alone.grants.sweep()
+    expect(alone.grants.state().requests).toEqual([])
+    expect(alone.notices.at(-1)).toMatchObject({ id: tab, itemId: left, payload: { grantStatus: 'expired' } })
+  })
+
+  it('shows an answered denial card again over the bare notice the confirmed denial re-emits', async () => {
+    const h = harness()
+    const item = h.deny('toolu_w', 'Write', { file_path: 'C:\\Users\\owner\\site\\app\\prod\\fix-pool.sh' }, 'Modify Shared Resources', true)
+    await h.grants.decide(tab, item, 'deny', 'owner')
+    h.grants.adapterPort(tab).denied(item, h.grants.list(tab).requests[0]!)
+    expect(h.notices.at(-1)).toMatchObject({ id: tab, itemId: item, payload: { grantStatus: 'denied' } })
+    expect(h.grants.list(tab).requests).toEqual([expect.objectContaining({ id: item, status: 'denied' })])
   })
 
   it('withdraws the pending card of a tab closed without a successor instead of leaving an orphan', () => {

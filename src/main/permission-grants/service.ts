@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
-import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, type AutoModeDenial } from '../../shared/auto-mode-denial'
+import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, type AutoModeDenial, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import {
-  describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantNeedsPhone, grantRequestSummary, wizardMayDecide,
+  describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary, wizardMayDecide,
   type GrantDecision, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState
 } from '../../shared/permission-grants'
 import type { Json } from '../../shared/structured-agent'
@@ -9,8 +9,9 @@ import type { Json } from '../../shared/structured-agent'
 /**
  * One narrow owner approval per sensitive action, consumed by the conversation that asked
  * (docs/permissions-classifier.md). A request comes from a classifier denial the Claude adapter
- * recorded (its notice item in the timeline is the card), or from the agent itself through
- * permissions.request before it tries. The owner answers in the card; a wizard tab may answer
+ * recorded (its notice item in the timeline is the card, a pending request from the moment the
+ * adapter shows it: denied), or from the agent itself through permissions.request before it
+ * tries. The owner answers in the card; a wizard tab may answer
  * only for local, reversible actions. An approval becomes exactly one native allow rule for that
  * one conversation, handed to the running CLI (apply_flag_settings) or, where the CLI cannot take
  * it live, through --settings on its next start. Grants live in memory only: they end with the
@@ -68,6 +69,11 @@ export class PermissionGrants {
   /** A grant a handoff moved -> the conversations that held it before, so a spend the old runtime
    *  still reports (a rule it took at launch and could not give back) spends the moved grant. */
   private readonly movedFrom = new Map<string, string[]>()
+  /** A conversation that handed itself on -> the request ids the handoff moved out of it. A denial
+   *  id is only unique within one CLI process, so a repeat is matched to these, not by id alone. */
+  private readonly movedOut = new Map<string, Set<string>>()
+  /** A conversation -> a denial card it showed for a call it had already asked about -> that request's id. */
+  private readonly aliases = new Map<string, Map<string, string>>()
   constructor(private readonly ports: PermissionGrantPorts) {}
 
   private now(): string { return this.ports.now?.() ?? new Date().toISOString() }
@@ -78,8 +84,46 @@ export class PermissionGrants {
   }
 
   /** What the Claude adapter is given (AdapterOptions.permissionGrants). */
-  adapterPort(agentSessionId: string): { rules(): GrantRule[]; used(rule: string): void; refused(rule: string): void } {
-    return { rules: () => this.rules(agentSessionId), used: rule => this.used(agentSessionId, rule), refused: rule => this.refused(agentSessionId, rule) }
+  adapterPort(agentSessionId: string): { rules(): GrantRule[]; used(rule: string): void; refused(rule: string): void; denied(itemId: string, request: DenialGrantRequest): void } {
+    return { rules: () => this.rules(agentSessionId), used: rule => this.used(agentSessionId, rule), refused: rule => this.refused(agentSessionId, rule), denied: (itemId, request) => this.denied(agentSessionId, itemId, request) }
+  }
+
+  /**
+   * The adapter showed a classifier denial's card (its notice item, itemId). From that moment it is
+   * a pending request like an agent's own, so a handoff moves it and a tab closed without a
+   * successor withdraws it; built only when the owner answered, it stayed with a superseded tab.
+   * The same card shown again (the turn's result confirms the denial) replaces the notice with
+   * its bare form, so an answer or a move already made is restated over it. A denial of a call the
+   * conversation already asked about (still waiting, or handed to its successor) is not a second
+   * request: its card becomes another view of that one (aliases), so one answer settles both.
+   */
+  denied(agentSessionId: string, itemId: string, described: DenialGrantRequest): void {
+    const known = this.requests.get(agentSessionId)?.get(itemId)
+    if (known) {
+      if (known.status !== 'pending') this.card(agentSessionId, known)
+      return
+    }
+    if (this.movedOut.get(agentSessionId)?.has(itemId)) {
+      const moved = this.lookup(agentSessionId, itemId)
+      if (moved) this.card(agentSessionId, { ...moved, status: 'moved' })
+      return
+    }
+    const aliased = this.aliases.get(agentSessionId)?.get(itemId)
+    const sameCall = (entry: PermissionGrantRequest | undefined): entry is PermissionGrantRequest => entry?.tool === described.tool && entry.resource === described.resource
+    const same = aliased ? this.lookup(agentSessionId, aliased)
+      : [...(this.requests.get(agentSessionId)?.values() ?? [])].find(entry => entry.status === 'pending' && sameCall(entry))
+        ?? [...(this.movedOut.get(agentSessionId) ?? [])].map(id => this.lookup(agentSessionId, id)).find(sameCall)
+    if (same) {
+      const views = this.aliases.get(agentSessionId) ?? new Map<string, string>()
+      this.aliases.set(agentSessionId, views.set(itemId, same.id))
+      this.aliasCard(agentSessionId, itemId, this.requests.get(agentSessionId)?.has(same.id) ? same : { ...same, status: 'moved' })
+      return
+    }
+    const request: PermissionGrantRequest = { ...described, id: itemId, source: 'denial', status: 'pending', requestedAt: this.now() }
+    const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
+    open.set(itemId, request)
+    this.requests.set(agentSessionId, open)
+    this.changed()
   }
 
   state(): PermissionGrantsState {
@@ -123,6 +167,7 @@ export class PermissionGrants {
   /** Owner (card) or wizard (app control, local actions only) answers one request. */
   async decide(agentSessionId: string, requestId: string, decision: GrantDecision, actor: GrantActor): Promise<PermissionGrantDecisionResult> {
     if (!['approve-once', 'approve-session', 'deny'].includes(decision)) throw new Error('decision must be approve-once, approve-session or deny')
+    requestId = this.aliases.get(agentSessionId)?.get(requestId) ?? requestId
     agentSessionId = this.holderOf(agentSessionId, requestId)
     const request = this.pendingRequest(agentSessionId, requestId)
     if (actor === 'wizard' && !wizardMayDecide(request)) throw new Error(`Only the owner can answer a ${request.class} request; the card is in the conversation's tab`)
@@ -207,14 +252,17 @@ export class PermissionGrants {
     const title = this.ports.title?.(toId)
     const holder = { agentSessionId: toId, ...(title ? { title } : {}) }
     const target = this.requests.get(toId) ?? new Map<string, PermissionGrantRequest>()
+    const out = this.movedOut.get(fromId) ?? new Set<string>()
     for (const id of new Set([...pending.map(request => request.id), ...granted.map(grant => grant.requestId)])) {
       const request = open?.get(id)
       if (!request) continue
       open!.delete(id)
+      out.add(id)
       request.holder = holder
       target.set(id, request)
     }
     if (target.size) this.requests.set(toId, target)
+    if (out.size) this.movedOut.set(fromId, out)
     if (open && !open.size) this.requests.delete(fromId)
     this.grants.delete(fromId)
     for (const grant of granted) {
@@ -224,7 +272,10 @@ export class PermissionGrants {
     if (granted.length) this.grants.set(toId, [...(this.grants.get(toId) ?? []).filter(entry => !granted.some(grant => grant.rule === entry.rule)), ...granted])
     this.successors.set(fromId, toId)
     for (const request of pending) {
-      if (request.source === 'agent') this.ports.notice(fromId, `Permission request moved to ${title ?? toId}: ${grantRequestSummary(request)}`, { permissionGrant: { ...request, status: 'moved' } as unknown as Json }, request.id)
+      if (request.source === 'agent') {
+        this.ports.notice(fromId, `Permission request moved to ${grantHolderLabel(holder)}: ${grantRequestSummary(request)}`, { permissionGrant: { ...request, status: 'moved' } as unknown as Json }, request.id)
+        this.aliasCards(fromId, { ...request, status: 'moved' })
+      } else this.card(fromId, { ...request, status: 'moved' })
       this.card(toId, request)
     }
     this.changed()
@@ -244,7 +295,9 @@ export class PermissionGrants {
   closed(agentSessionId: string): void {
     this.missing.delete(agentSessionId)
     this.successors.delete(agentSessionId)
+    this.movedOut.delete(agentSessionId)
     this.withdraw(agentSessionId)
+    this.aliases.delete(agentSessionId)
     if (!this.requests.delete(agentSessionId) && !this.grants.delete(agentSessionId)) return
     this.grants.delete(agentSessionId)
     this.changed()
@@ -263,6 +316,7 @@ export class PermissionGrants {
       for (const grant of granted) this.statusOf(agentSessionId, grant.requestId, 'expired')
       this.withdraw(agentSessionId)
       this.requests.delete(agentSessionId)
+      this.aliases.delete(agentSessionId)
       this.changed()
       if (granted.length) void this.ports.apply(agentSessionId).catch(error => console.warn('A grant of a closed tab could not be removed from its live runtime; it ends with the runtime', error))
     }
@@ -286,6 +340,11 @@ export class PermissionGrants {
       current = next
     }
     return agentSessionId
+  }
+
+  /** A request as its holder has it now, looked up from the conversation that asked. */
+  private lookup(agentSessionId: string, requestId: string): PermissionGrantRequest | undefined {
+    return this.requests.get(this.holderOf(agentSessionId, requestId))?.get(requestId)
   }
 
   private pendingRequest(agentSessionId: string, requestId: string): PermissionGrantRequest {
@@ -324,8 +383,10 @@ export class PermissionGrants {
   }
 
   /** The card in the tab: an agent's request is Conductor's own notice; a denial's card is the
-   *  adapter's notice, restated in place with the answer. */
+   *  adapter's notice, restated in place with the answer. A successor a handoff moved a denial to
+   *  has no such notice, so its card is built from the request under the same item id. */
   private card(agentSessionId: string, request: PermissionGrantRequest): void {
+    this.aliasCards(agentSessionId, request)
     if (request.source === 'agent') {
       const message = request.status === 'pending'
         ? `Permission requested: ${grantRequestSummary(request)}${request.rule ? `. Approving hands this conversation exactly ${request.rule}.` : `. ${request.refusal ?? ''}`}`
@@ -333,9 +394,24 @@ export class PermissionGrants {
       this.ports.notice(agentSessionId, message, { permissionGrant: request as unknown as Json }, request.id)
       return
     }
-    const denial = this.ports.denial(agentSessionId, request.id)
+    const recorded = this.ports.denial(agentSessionId, request.id)
+    const { id, source: _source, status: _status, requestedAt: _requestedAt, decidedAt: _decidedAt, decidedBy: _decidedBy, holder, ...described } = request
+    const denial: AutoModeDenial | undefined = recorded ?? (holder?.agentSessionId === agentSessionId
+      ? { tool: request.tool, reason: request.category ?? 'Permission denied', toolUseId: request.toolUseId ?? id.replace(/^auto-denial:/, ''), request: described }
+      : undefined)
     if (!denial) return
-    this.ports.notice(agentSessionId, autoModeDenialMessage(denial), { ...(autoModeDenialPayload(denial) as Record<string, Json>), grantStatus: request.status }, request.id)
+    const shown = denial.request && holder ? { ...denial, request: { ...denial.request, holder } } : denial
+    this.ports.notice(agentSessionId, autoModeDenialMessage(shown), { ...(autoModeDenialPayload(shown) as Record<string, Json>), grantStatus: request.status }, request.id)
+  }
+
+  /** Every other view of this request in the conversation shows its current answer. */
+  private aliasCards(agentSessionId: string, request: PermissionGrantRequest): void {
+    for (const [itemId, requestId] of this.aliases.get(agentSessionId) ?? []) if (requestId === request.id) this.aliasCard(agentSessionId, itemId, request)
+  }
+
+  /** A denial card that is another view of an earlier request: the same card, answered as that request. */
+  private aliasCard(agentSessionId: string, itemId: string, request: PermissionGrantRequest): void {
+    this.ports.notice(agentSessionId, `Auto mode refused this call again; it is the one already asked about: ${grantRequestSummary(request)}`, { permissionGrant: request as unknown as Json }, itemId)
   }
 
   private async restartThenTell(agentSessionId: string, text: string): Promise<void> {

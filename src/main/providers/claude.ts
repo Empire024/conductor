@@ -1000,6 +1000,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     if (this.autoModeDenials.size >= 256) this.autoModeDenials.delete(this.autoModeDenials.keys().next().value!)
     this.autoModeDenials.set(toolUseId, denial)
     this.emit({ itemId: autoModeDenialItemId(toolUseId), parentId: denial.parentId, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload({ ...denial, toolUseId }) }, native })
+    if (request) this.options.permissionGrants?.denied?.(autoModeDenialItemId(toolUseId), request)
   }
   /** The result frame's permission_denials (claude 2.1.280: [{ tool_name, tool_input, tool_use_id }])
    *  is the runtime's record of every denial in the turn, the owner's own included, so it confirms a
@@ -1013,6 +1014,7 @@ export class ClaudeAdapter implements ProviderAdapter {
       denial.confirmed = true
       denial.tool = string(record.tool_name) ?? denial.tool
       this.emit({ itemId: autoModeDenialItemId(toolUseId), parentId: denial.parentId, data: { type: 'notice', message: autoModeDenialMessage(denial), payload: autoModeDenialPayload({ ...denial, toolUseId }, true) }, native: { method: 'result/permission_denials', payload: { tool_use_id: toolUseId } } })
+      if (denial.request) this.options.permissionGrants?.denied?.(autoModeDenialItemId(toolUseId), denial.request)
     }
   }
   private requestDigests = new Map<string, string>()

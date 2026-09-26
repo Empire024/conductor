@@ -21,10 +21,11 @@ describe('permission grant card', () => {
   it('shows the holder on a card a handoff moved, and no answers on the old tab card', () => {
     const holder = { agentSessionId: 'agent_b', title: 'Wizard (continued)' }
     const live = renderToStaticMarkup(PermissionGrantCard({ request: { ...request, holder }, status: 'pending', onDecide: () => {} }))
-    expect(live).toContain('<dt>Holder</dt><dd>Wizard (continued)</dd>')
+    // Every link of a chain is "Wizard (continued)"; the id's last segment tells them apart.
+    expect(live).toContain('<dt>Holder</dt><dd title="agent_b">Wizard (continued) · b</dd>')
     expect(live).toContain('>Approve once</button>')
     const old = renderToStaticMarkup(PermissionGrantCard({ request: { ...request, holder }, status: 'moved', onDecide: () => {} }))
-    expect(old).toContain('<dt>Moved to</dt><dd>Wizard (continued)</dd>')
+    expect(old).toContain('<dt>Moved to</dt><dd title="agent_b">Wizard (continued) · b</dd>')
     expect(old).not.toContain('<button')
   })
 

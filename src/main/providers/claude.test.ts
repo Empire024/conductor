@@ -1253,7 +1253,8 @@ describe('owner permission grants (src/main/permission-grants)', () => {
     ({ type: 'control_request', request_id: requestId, request: { subtype: 'hook_callback', callback_id: 'conductor_denied', tool_use_id: toolId, input: { hook_event_name: 'PermissionDenied', tool_use_id: toolId, tool_name: name, tool_input: input, reason } } })
 
   it('registers the PermissionDenied hook and turns its record into one structured request, which the text fallback does not duplicate', async () => {
-    const f = fixture(); await f.adapter.start()
+    const denied = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), denied } }); await f.adapter.start()
     const initialize = f.transport.sent.find(message => (message as { request?: { subtype?: string } }).request?.subtype === 'initialize') as { request: { hooks: Record<string, Json> } }
     expect(initialize.request.hooks.PermissionDenied).toEqual([{ hookCallbackIds: ['conductor_denied'], timeout: expect.any(Number) }])
     await f.adapter.submit('Synthetic', settings)
@@ -1269,6 +1270,8 @@ describe('owner permission grants (src/main/permission-grants)', () => {
     expect(notices).toHaveLength(1)
     expect(autoModeDenialOf(notices[0]!.data)).toMatchObject({ tool: 'Write', reason: 'Modify Shared Resources', request: { action: 'Write a file', resource: 'C:\\Users\\owner\\site\\app\\prod\\fix-pool.sh', class: 'local', rule: 'Edit(//c/Users/owner/site/app/prod/fix-pool.sh)', category: 'Modify Shared Resources' } })
     expect(f.events.some(event => event.native?.method === 'hook/permission_denied')).toBe(true)
+    // The card is a pending owner request from the moment it is shown, so a handoff can move it.
+    expect(denied).toHaveBeenCalledExactlyOnceWith('auto-denial:toolu_w', expect.objectContaining({ rule: 'Edit(//c/Users/owner/site/app/prod/fix-pool.sh)', toolUseId: 'toolu_w' }))
   })
 
   it('launches with the granted rules in --settings, hands a running CLI the current set through apply_flag_settings, and passes no --settings without grants', async () => {
