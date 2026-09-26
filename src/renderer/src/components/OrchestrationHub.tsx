@@ -15,6 +15,7 @@ import {
   X
 } from 'lucide-react'
 import type { AgentProviderId } from '../../../shared/models'
+import { permissionLabel, rosterRole } from '../../../shared/agent-roster'
 import type {
   OrchestrationAgent,
   OrchestrationBridge,
@@ -82,6 +83,8 @@ export function OrchestrationHub({
   const [taskTitle, setTaskTitle] = useState('')
   const [taskAgentId, setTaskAgentId] = useState('')
   const [taskPriority, setTaskPriority] = useState<OrchestrationTaskPriority>('normal')
+  const [starting, setStarting] = useState<{ agentId: string; goal: string } | null>(null)
+  const [started, setStarted] = useState('')
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -131,6 +134,12 @@ export function OrchestrationHub({
       model: agentDraft.model || null
     }))
     if (saved) setAgentDraft(null)
+  }
+
+  const startAgent = async (agent: OrchestrationAgent, goal: string): Promise<void> => {
+    setStarted('')
+    const ok = await mutate(() => bridge().agents.start({ agentId: agent.id, goal }))
+    if (ok) { setStarting(null); setStarted(`${agent.name} started in a new tab`) }
   }
 
   const createTask = async (): Promise<void> => {
@@ -221,7 +230,7 @@ export function OrchestrationHub({
                   <div className="orchestration-editor-heading"><strong>{agentDraft.id ? 'Edit agent' : 'New agent'}</strong><button onClick={() => setAgentDraft(null)}><X size={15} /></button></div>
                   <div className="orchestration-form-grid">
                     <label><span>Name</span><input autoFocus value={agentDraft.name} onChange={(event) => setAgentDraft({ ...agentDraft, name: event.target.value })} placeholder="Release reviewer" /></label>
-                    <label><span>Provider</span><select value={agentDraft.provider} onChange={(event) => setAgentDraft({ ...agentDraft, provider: event.target.value as AgentProviderId })}>{['codex', 'claude', 'grok', 'gemini', 'qwen', 'kimi'].map((provider) => <option key={provider}>{provider}</option>)}</select></label>
+                    <label><span>Provider</span><select value={agentDraft.provider} onChange={(event) => setAgentDraft({ ...agentDraft, provider: event.target.value as AgentProviderId })}>{['codex', 'claude', 'grok', 'gemini', 'qwen', 'kimi', 'local'].map((provider) => <option key={provider}>{provider}</option>)}</select></label>
                     <label><span>Model (optional)</span><input value={agentDraft.model} onChange={(event) => setAgentDraft({ ...agentDraft, model: event.target.value })} placeholder="Provider default" /></label>
                     <label><span>Status</span><select value={agentDraft.status} onChange={(event) => setAgentDraft({ ...agentDraft, status: event.target.value as OrchestrationAgent['status'] })}><option value="active">Active</option><option value="paused">Paused</option><option value="archived">Archived</option></select></label>
                     <label className="wide"><span>Role</span><input value={agentDraft.role} onChange={(event) => setAgentDraft({ ...agentDraft, role: event.target.value })} placeholder="Own release readiness and regression review" /></label>
@@ -232,17 +241,30 @@ export function OrchestrationHub({
               )}
               <div className="orchestration-card-list">
                 {snapshot.agents.length === 0 && <Empty icon={<Bot size={22} />} title="No persistent agents" detail="Create a reusable agent identity, then assign it to tasks and routine steps." />}
-                {snapshot.agents.map((agent) => (
-                  <article className="orchestration-agent-card" key={agent.id}>
+                {started && <p className="orchestration-started" role="status">{started}</p>}
+                {snapshot.agents.map((agent) => {
+                  // A role Conductor's own work runs carries how it runs and where its brief lives.
+                  const role = rosterRole(agent.role)
+                  const settings = role && role.provider === agent.provider ? [role.cloud ? 'cloud' : '', role.model === agent.model ? role.effort ?? '' : '', permissionLabel(role.permission)].filter(Boolean).join(' · ') : ''
+                  const open = starting?.agentId === agent.id
+                  return (
+                  <article className="orchestration-agent-card" key={agent.id} data-role={agent.role}>
                     <div className={`orchestration-avatar ${agent.status}`}><Bot size={17} /></div>
-                    <button className="orchestration-card-main" onClick={() => setAgentDraft({ ...agent, model: agent.model ?? '' })}>
+                    <button className="orchestration-card-main" title={role ? `${role.whenToUse}\nBrief: ${role.briefs.join(', ')}` : undefined} onClick={() => setAgentDraft({ ...agent, model: agent.model ?? '' })}>
                       <strong>{agent.name}</strong>
-                      <small>{agent.provider}{agent.model ? ` · ${agent.model}` : ''} · {agent.role || 'General agent'}</small>
+                      <small>{agent.provider}{agent.model ? ` · ${agent.model}` : ''}{settings ? ` · ${settings}` : ''} · {role ? `brief ${role.briefs[0]}` : agent.role || 'General agent'}</small>
+                      {role && <small className="orchestration-when">{role.whenToUse}</small>}
                     </button>
                     <span className={`orchestration-status ${agent.status}`}>{agent.status === 'paused' && <PauseCircle size={12} />}{agent.status}</span>
+                    <button className="orchestration-run orchestration-start-agent" disabled={busy || agent.status === 'archived'} aria-expanded={open} title={`Start ${agent.name} in a new tab`} onClick={() => setStarting(open ? null : { agentId: agent.id, goal: '' })}><CirclePlay size={14} /> Start</button>
                     <button className="orchestration-danger" title={`Remove ${agent.name}`} onClick={() => void mutate(() => bridge().agents.remove(agent.id))}><Trash2 size={14} /></button>
+                    {open && <div className="orchestration-agent-start">
+                      <textarea aria-label={`Goal for ${agent.name}`} rows={2} value={starting.goal} placeholder={role?.cloud ? 'What should the cloud session do? (required)' : 'What should it work on? (optional: without one it reads its brief and asks)'} onChange={(event) => setStarting({ agentId: agent.id, goal: event.target.value })} />
+                      <button className="orchestration-primary" disabled={busy || (Boolean(role?.cloud) && !starting.goal.trim())} onClick={() => void startAgent(agent, starting.goal)}><CirclePlay size={14} /> Start {agent.name}</button>
+                    </div>}
                   </article>
-                ))}
+                  )
+                })}
               </div>
             </div>
           )}

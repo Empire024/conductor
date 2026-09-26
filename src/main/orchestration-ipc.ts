@@ -2,6 +2,8 @@ import { ipcMain } from 'electron'
 import type {
   CreateOrchestrationTaskInput,
   SaveOrchestrationAgentInput,
+  StartOrchestrationAgentInput,
+  StartOrchestrationAgentResult,
   SaveRoutineInput,
   UpdateOrchestrationTaskInput
 } from '../shared/orchestration'
@@ -11,6 +13,7 @@ export const orchestrationIpcChannels = [
   'orchestration:snapshot',
   'orchestration:agents:save',
   'orchestration:agents:remove',
+  'orchestration:agents:start',
   'orchestration:tasks:create',
   'orchestration:tasks:update',
   'orchestration:tasks:remove',
@@ -20,7 +23,7 @@ export const orchestrationIpcChannels = [
 ] as const
 
 /** Register the project orchestration API and return a hot-reload friendly disposer. */
-export const registerOrchestrationIpc = (store: OrchestrationStore): (() => void) => {
+export const registerOrchestrationIpc = (store: OrchestrationStore, deps: { startAgent?(input: StartOrchestrationAgentInput): Promise<StartOrchestrationAgentResult> } = {}): (() => void) => {
   ipcMain.handle('orchestration:snapshot', (_event, projectId: string) =>
     store.snapshot(projectId)
   )
@@ -30,6 +33,10 @@ export const registerOrchestrationIpc = (store: OrchestrationStore): (() => void
   ipcMain.handle('orchestration:agents:remove', (_event, id: string) =>
     store.removeAgent(id)
   )
+  ipcMain.handle('orchestration:agents:start', (_event, input: StartOrchestrationAgentInput) => {
+    if (!deps.startAgent) throw new Error('Starting roster agents is not available in this window')
+    return deps.startAgent(input)
+  })
   ipcMain.handle('orchestration:tasks:create', (_event, input: CreateOrchestrationTaskInput) =>
     store.createTask(input)
   )

@@ -1,4 +1,5 @@
 import type { AgentProviderId } from './models'
+import { ROSTER_ROLES } from './agent-roster'
 import type { SchedulesBridge } from './schedules'
 
 export type OrchestrationAgentStatus = 'active' | 'paused' | 'archived'
@@ -35,9 +36,12 @@ export const AUTO_FIXER_INSTRUCTIONS = [
  * Identities the Agent roster ships with. These are reusable roles, not runs: assigning work to
  * "Auto Fixer" starts a run while the roster entry stays exactly one row. The owner adds their own
  * the same way - a "Marketer", a "3D Modeling expert" - and those sit alongside these.
+ * The roles Conductor's own work runs (src/shared/agent-roster.ts) follow, each only in a project
+ * that holds its brief (`requires`, a path in the project folder).
  */
-export const BUILT_IN_AGENTS: ReadonlyArray<{ name: string; role: string; provider: AgentProviderId; instructions: string }> = [
-  { name: 'Auto Fixer', role: 'auto-fixer', provider: 'claude', instructions: AUTO_FIXER_INSTRUCTIONS }
+export const BUILT_IN_AGENTS: ReadonlyArray<{ name: string; role: string; provider: AgentProviderId; model?: string; requires?: string; instructions: string }> = [
+  { name: 'Auto Fixer', role: 'auto-fixer', provider: 'claude', instructions: AUTO_FIXER_INSTRUCTIONS },
+  ...ROSTER_ROLES.map(entry => ({ name: entry.name, role: entry.role, provider: entry.provider, model: entry.model, requires: entry.briefs[0], instructions: entry.instructions }))
 ]
 export type OrchestrationTaskStatus =
   | 'backlog'
@@ -168,11 +172,29 @@ export interface OrchestrationSnapshot {
   runs: RoutineRun[]
 }
 
+/** Start a roster entry: a tab on its provider, model, effort and permission, sent its
+ *  instructions and the owner's goal (src/main/agent-roster.ts). */
+export interface StartOrchestrationAgentInput {
+  agentId: string
+  goal?: string
+  workspaceId?: string
+}
+
+export interface StartOrchestrationAgentResult {
+  tabId: string
+  agentSessionId: string | null
+  provider: AgentProviderId
+  model: string | null
+  effort: string | null
+  permission: string | null
+}
+
 export interface OrchestrationBridge {
   snapshot(projectId: string): Promise<OrchestrationSnapshot>
   agents: {
     save(input: SaveOrchestrationAgentInput): Promise<OrchestrationAgent>
     remove(id: string): Promise<void>
+    start(input: StartOrchestrationAgentInput): Promise<StartOrchestrationAgentResult>
   }
   tasks: {
     create(input: CreateOrchestrationTaskInput): Promise<OrchestrationTask>

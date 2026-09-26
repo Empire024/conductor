@@ -1,5 +1,5 @@
-import { mkdirSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { existsSync, mkdirSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { makeId } from '../shared/models'
 import { BUILT_IN_AGENTS, DISPATCHED_COWORKER_ROLE } from '../shared/orchestration'
@@ -28,7 +28,7 @@ const taskStatuses = new Set<OrchestrationTaskStatus>([
   'backlog', 'ready', 'in_progress', 'blocked', 'done', 'cancelled'
 ])
 const taskPriorities = new Set<OrchestrationTaskPriority>(['low', 'normal', 'high', 'urgent'])
-const providers = new Set(['codex', 'claude', 'grok', 'gemini', 'qwen', 'kimi'])
+const providers = new Set(['codex', 'claude', 'grok', 'gemini', 'qwen', 'kimi', 'local'])
 
 const requiredText = (value: string, label: string, maxLength: number): string => {
   const normalized = value.replace(/\s+/g, ' ').trim().slice(0, maxLength)
@@ -141,14 +141,18 @@ export class OrchestrationStore {
   seedBuiltInAgents(projectId: string): OrchestrationAgent[] {
     this.requireProject(projectId)
     const existing = this.listAgents(projectId)
-    return BUILT_IN_AGENTS.map(builtIn => {
+    const folder = (this.db.prepare('SELECT path FROM projects WHERE id = ?').get(projectId) as { path?: string } | undefined)?.path
+    // A role whose brief this project does not hold is not this project's (the Conductor team in a
+    // website project); one the owner already has is kept either way.
+    const present = (builtIn: (typeof BUILT_IN_AGENTS)[number]): boolean => !builtIn.requires || Boolean(folder && existsSync(join(folder, builtIn.requires)))
+    return BUILT_IN_AGENTS.filter(builtIn => present(builtIn) || existing.some(agent => agent.role === builtIn.role)).map(builtIn => {
       const match = existing.find(agent => agent.role === builtIn.role)
       return this.saveAgent({
         id: match?.id,
         projectId,
         name: match?.name ?? builtIn.name,
         provider: match?.provider ?? builtIn.provider,
-        model: match?.model ?? null,
+        model: match ? match.model : builtIn.model ?? null,
         role: builtIn.role,
         instructions: builtIn.instructions,
         status: match?.status ?? 'active'
@@ -516,7 +520,7 @@ export class OrchestrationStore {
     }
   }
 
-  private getAgent(id: string): OrchestrationAgent | null {
+  getAgent(id: string): OrchestrationAgent | null {
     const row = this.db.prepare('SELECT * FROM orchestration_agents WHERE id = ?').get(id) as
       | DbRow
       | undefined

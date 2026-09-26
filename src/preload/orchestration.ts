@@ -7,7 +7,8 @@ export const orchestrationBridge: OrchestrationBridge = {
   snapshot: (projectId) => ipcRenderer.invoke('orchestration:snapshot', projectId),
   agents: {
     save: (input) => ipcRenderer.invoke('orchestration:agents:save', input),
-    remove: (id) => ipcRenderer.invoke('orchestration:agents:remove', id)
+    remove: (id) => ipcRenderer.invoke('orchestration:agents:remove', id),
+    start: (input) => ipcRenderer.invoke('orchestration:agents:start', input)
   },
   tasks: {
     create: (input) => ipcRenderer.invoke('orchestration:tasks:create', input),
