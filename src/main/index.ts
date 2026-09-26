@@ -79,6 +79,7 @@ import {
 } from './window-geometry'
 import { OrchestrationStore } from './orchestration-store'
 import { registerOrchestrationIpc } from './orchestration-ipc'
+import { startRosterAgent } from './agent-roster'
 import { ScheduleStore } from './schedule-store'
 import { createDurableJobsService, DurableJobStore, structuredStageRuntime, type DurableJobsServiceImpl } from './durable-jobs'
 import { RemoteJobService } from './remote-jobs/service'
@@ -2901,7 +2902,7 @@ app.whenReady().then(async () => {
   pruneSnapshots()
   snapshotPruneTimer = setInterval(pruneSnapshots, 24 * 60 * 60 * 1000)
   snapshotPruneTimer.unref?.()
-  disposeOrchestrationIpc = registerOrchestrationIpc(orchestration)
+  disposeOrchestrationIpc = registerOrchestrationIpc(orchestration, { startAgent: input => startRosterAgent({ agent: id => orchestration.getAgent(id), ownerScope: scope => control.ownerScope(scope), call: (scope, method, args) => control.call(scope as ReturnType<AgentControl['ownerScope']>, method, args) }, input) })
   scheduleRunner.start()
   disposeCollaborationIpc = registerAgentCollaborationIpc(collaboration)
   // How the previous process stopped, read once before anything is told about the restart.
