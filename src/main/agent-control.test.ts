@@ -498,6 +498,15 @@ locked: [budget]
     await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', exactPermission: 'yes' })).rejects.toThrow('exactPermission must be true or false')
   })
 
+  it('opens a read-only Claude coworker in plan mode, Claude having no read-only permission (the roster\'s Approval reviewer)', async () => {
+    const f = fixture(false, { claude: ['default', 'accept-edits', 'auto'] })
+    const reviewer = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'read-only', exactPermission: true }) as AgentControlTab
+    expect(f.database.structured.snapshot(reviewer.resourceId!)?.settings).toMatchObject({ permission: 'default', plan: true })
+    const worker = await f.control.call(f.scope, 'tabs.open', { provider: 'claude' }) as AgentControlTab
+    expect(f.database.structured.snapshot(worker.resourceId!)?.settings).toMatchObject({ permission: 'auto', plan: false })
+    await expect(f.control.call(f.scope, 'tabs.open', { provider: 'codex', permission: 'read-only' })).resolves.toBeTruthy()
+  })
+
   it('rejects an explicit tabs.open permission that is not a real mode, or one this provider does not offer', async () => {
     const f = fixture()
     await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', permission: 'plan' })).rejects.toThrow('Invalid permission mode')
