@@ -254,7 +254,12 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         try {
           if (forms[0] === 'combine') return { output: combineReports(args.combine), failed: false, paths: [] }
           if (forms[0] !== 'path') return { output: calculateExpressions(args.expression, args.expressions), failed: false, paths: [] }
-          const { path, relative: rel } = await resolveInWorkspace(context.workspace, text(args.path, 'path'))
+          const named = text(args.path, 'path')
+          // Said as what it is: a raw ENOENT on a path the model made up read as the owner's data missing.
+          const { path, relative: rel } = await resolveInWorkspace(context.workspace, named).catch((error: unknown) => {
+            if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') throw new CalculationError(`there is no file "${named.slice(0, 120)}" in the workspace, so nothing was computed. Use a file the owner named or list_files showed; if the task has no data file, compute nothing and answer from what you have.`)
+            throw error
+          })
           const optional = (key: string): string | undefined => args[key] === undefined || args[key] === null ? undefined : String(args[key])
           return { output: await aggregateFile(path, rel, { path: rel, column: optional('column'), groupBy: optional('group_by'), op: optional('op') }), failed: false, paths: [path] }
         } catch (error) {

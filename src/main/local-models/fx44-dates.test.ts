@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { answerDay, datedPage, datesIn, inventedReports, keyExcerpt, LocalAgentSession, pageDate, pickPages, readForYou, searchHits, stalePage } from './agent.ts'
 import { runTool, scriptIsCode } from './tools.ts'
+import { readPublicWeb } from './web.ts'
 import { PAGE_HEADER } from './web.ts'
 import { LOCAL_DOLPHIN_X1_8B } from '../../shared/local-models.ts'
 
@@ -200,6 +201,19 @@ describe('FX44: the turn ends with an answer', () => {
     expect(outcome.text).not.toContain('Could not complete the task')
   })
 
+  it('answers a web question from what it has when the model loops on failing pages (FX44 research follow-up)', async () => {
+    vi.mocked(readPublicWeb).mockRejectedValue(new Error('Research HTTP 202'))
+    try {
+      const { requests, run } = await session((sent, index) => index === 0 ? call('s', 'web_search', { query: 'pixel 10 pro reviews' })
+        : (sent.tools ?? []).length ? call(`r${index}`, 'web_read', { url: `https://reviews.example/page-${index}` }) : answer('I could not open any review; the search listed python.org.'))
+      const outcome = await run('find reviews of the pixel 10 pro online, with sources')
+      expect(outcome.stopReason).toBe('completed')
+      expect(outcome.text).toContain('I could not open any review')
+      expect(outcome.text).not.toContain('Could not complete the task')
+      expect(requests.at(-1)!.tools ?? []).toEqual([])
+    } finally { vi.mocked(readPublicWeb).mockReset() }
+  })
+
   it('gives back the key lines of a page the model asks for again, and the next round answers (VR9d gold loop)', async () => {
     const { requests, run, tools } = await session((sent, index) => [
       call('s', 'web_search', { query: 'gold price' }),
@@ -214,5 +228,32 @@ describe('FX44: the turn ends with an answer', () => {
     expect(offered(requests[3]!)).toEqual([])
     expect(outcome.stopReason).toBe('completed')
     expect(outcome.text).toContain('Python 3.14.7')
+  })
+})
+
+describe('FX44: calculate on a file that does not exist (FX44 Dolphin research run 1)', () => {
+  it('says there is no such file instead of a raw ENOENT', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'conductor-fx44-calc-'))
+    try {
+      const outcome = await runTool('calculate', JSON.stringify({ path: '/workspace/reviews.csv', column: 'rating' }), { workspace: root, readOnly: false, sandbox: null, timeoutSec: 5 })
+      expect(outcome.failed).toBe(true)
+      expect(outcome.output).toMatch(/^failed: there is no file "\/workspace\/reviews.csv" in the workspace, so nothing was computed/)
+      expect(outcome.output).not.toMatch(/ENOENT|realpath/)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+})
+
+describe('FX44: a preview date never overrides the page\'s own (FX44 Dolphin run 2)', () => {
+  it('labels a page about the day before as a day old, though its snippet was previewed on the day', () => {
+    const question = 'how much did the nasdaq go up or down yesterday?'
+    const url = 'https://www.ad-hoc-news.de/boerse/news/vorboerse/news-corp-stock-heads-into-the-open-after-september-24-close/70181578'
+    const hits = searchHits(`1. News Corp stock heads into the open after September 24 close\n   ${url}\n   2026-09-25 - News Corp stock closed on the Nasdaq.`)
+    const page = `Source: ${url}\n${PAGE_HEADER}\nNews Corp stock closed on the Nasdaq on September 24, 2026. The Nasdaq Composite finished at 26,939.37, up 0.01 percent on the same session.`
+    const labelled = datedPage(page, url, hits, question, SATURDAY)
+    expect(labelled).toContain('[Conductor: this page is dated 2026-09-24; the question is about 2026-09-25, 1 day later. Its figures are a day old.]')
+    // With nothing but the preview date, that date is still the page's.
+    expect(pageDate(hits[0], '2026-09-25', SATURDAY)).toBe('2026-09-25')
+    const investopedia = searchHits(`1. Stock market today: Dow, S&P 500, Nasdaq close higher\n   https://www.investopedia.com/stock-market-today-dow-jones-s-and-p-500-09252026-12139934\n   2026-09-25 - Stocks rose Friday.\n2. News Corp stock heads into the open after September 24 close\n   ${url}\n   2026-09-25 - News Corp stock closed on the Nasdaq on September 24, 2026.`)
+    expect(pickPages(investopedia, question, [], 1, SATURDAY)).toEqual(['https://www.investopedia.com/stock-market-today-dow-jones-s-and-p-500-09252026-12139934'])
   })
 })

@@ -358,6 +358,8 @@ interface RunLedger {
   blockedAttempts?: number
   /** A tool-free round answered with a tool call written as text, and was asked again once. */
   bareRetried?: boolean
+  /** A web turn that hit a stagnation stop was given one tool-free round to answer instead. */
+  lastWord?: boolean
   /** Successful calculate results this message, by the call's arguments. */
   computed?: Record<string, string>
   /** A calculate call succeeded this message; an answer owed a calculation had its one nudge; a
@@ -400,7 +402,10 @@ const MATH_DATA = /\d|\.(?:csv|tsv|xlsx?|json|txt)\b|\b(?:numbers?|amounts?|expe
 const MATH_CODE = /\b[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|cs|cpp|c|h)\b|\b(?:commits?|branch(?:es)?|pull requests?|PRs?|diffs?|rebase|merge conflicts?|functions?|tests?)\b/i
 /** A controller handing the numbers to coworkers is not computing them itself. */
 const DISPATCH = /\btabs\.open\b|\b(?:open|start|dispatch|spawn|create)\b[^.\n]*\b(?:coworkers?|workers?|tabs?|agents?)\b/i
-export const wantsMath = (instruction: string): boolean => MATH_CUES.test(instruction) && MATH_DATA.test(instruction) && !MATH_CODE.test(instruction) && !DISPATCH.test(instruction)
+/** "Sum it up for me" asks for a summary: with "pixel 10" as its digits, a research question was held
+ *  back for a calculation and the model averaged a reviews.csv it made up (FX44 run). */
+const SUMMARY = /\bsum(?:marize|marise)?\s+(?:it|them|this|that|these|those|everything|things|all(?: of)?(?: it| this| that| them)?)?\s*up\b|\bsumm(?:ary|ari[sz]e)\b/gi
+export const wantsMath = (instruction: string): boolean => { const text = instruction.replace(SUMMARY, ' '); return MATH_CUES.test(text) && MATH_DATA.test(text) && !MATH_CODE.test(text) && !DISPATCH.test(text) }
 /** A follow-up about reports the conversation already holds names no data of its own: "how many
  *  hours did each person work over both weeks?" was added up in the model's head (FX42 timesheet
  *  run: ben 32.75 for 32.5). With two or more reports received, these words ask for a merge. */
@@ -499,11 +504,17 @@ function dateSignals(hit: SearchHit | undefined, now: Date, page = ''): string[]
   return all.filter(date => Date.parse(date) <= now.getTime() + 86_400_000)
 }
 
-/** The date a page is about for a question about `day`: that day when any signal names it (the
- *  right day's page is never called old), else the most telling signal (dateSignals). */
+/** The date a page is about for a question about `day`: that day when its title, opening, link or
+ *  snippet text names it (the right day's page is never called old), else the most telling of
+ *  those, and the snippet's preview date only when the result carries no other. The preview date
+ *  never overrides the page's own: ad-hoc-news's "Nasdaq ... September 24 close", previewed on the
+ *  25th, was labelled "the same day" and Dolphin gave the 24th's close (FX44 run). */
 export function pageDate(hit: SearchHit | undefined, day: string | undefined, now = new Date(), page = ''): string | undefined {
   const signals = dateSignals(hit, now, page)
-  return day && signals.includes(day) ? day : signals[0]
+  const lead = hit ? /^(\d{4}-\d{2}-\d{2})/.exec(hit.snippet)?.[1] : undefined
+  const content = lead && signals.at(-1) === lead ? signals.slice(0, -1) : signals
+  if (!content.length) return signals[0]
+  return day && content.includes(day) ? day : content[0]
 }
 
 /** Markets close at weekends: "gold right now" on a Saturday is answered by Friday's close,
@@ -548,7 +559,7 @@ export function pickPages(hits: SearchHit[], instruction: string, skip: string[]
     const off = dated && day ? Math.abs(Date.parse(dated) - Date.parse(day)) / 86_400_000 : undefined
     // An undated page for a question about today is most often a live page (a price, a scoreboard);
     // one dated another day cannot answer it, however well its title matches the words.
-    const fresh = off !== undefined ? (off <= 1 ? 4 : -8)
+    const fresh = off !== undefined ? (off < 0.5 ? 4 : off <= 1 ? 2 : -8)
       : day ? 1
         : age === undefined ? 0
           : age <= 7 ? 2 : !timeBound ? 0 : age <= 31 ? 1 : age <= 60 ? 0 : -2
@@ -1224,7 +1235,9 @@ export class LocalAgentSession {
         // answered the one read nudge with another limit-1 search and then with a link, in all 10
         // current questions (VR9a). Conductor opens the best results itself instead of asking.
         const searching = completion.toolCalls.length > 0 && completion.toolCalls.every(call => call.name === 'web_search')
-        if (!forced && readDue() && ((!completion.toolCalls.length && completion.content.trim()) || (searching && (ledger.searches ?? 0) >= 2))) {
+        // A round offered no tools was told to answer now (a re-read, a turned-off tool, a stop): its
+        // answer stands, and no page is opened over it.
+        if (!forced && !bare && readDue() && ((!completion.toolCalls.length && completion.content.trim()) || (searching && (ledger.searches ?? 0) >= 2))) {
           ledger.conductorReads = (ledger.conductorReads ?? 0) + 1
           const read = ledger.webSources?.length ?? 0
           const room = this.grants.research ? 2 : WEB_CALLS_PER_MESSAGE - (ledger.webCalls ?? 0)
@@ -1648,6 +1661,15 @@ export class LocalAgentSession {
         const stop = outputBudgetLoopStop(outputBudgetLoop)
         events.notice?.(`Stopped: ${stop.detail}`)
         return this.finish(ledger, events, stop.partial, 'output_budget_loop', stop.detail)
+      }
+      // A web question ends with an answer from what was found, not with a bare stop: the research
+      // follow-up re-read failing pages six times and ended "Could not complete the task" (FX44 run).
+      if (stagnationStop && hinted && !swarmTurn() && !ledger.lastWord) {
+        ledger.lastWord = true
+        events.notice?.(`The model was repeating itself (${stagnationStop}); it was asked to answer from what it has, with no tools.`)
+        this.messages.push({ role: 'user', content: '[Conductor] Stop calling tools. Answer the owner now in plain words from the pages and results you already have, name the links you used, and say plainly what you could not find.' })
+        toolFree = true
+        stagnationStop = undefined
       }
       if (stagnationStop) {
         events.notice?.(`Stopped: ${stagnationStop}`)

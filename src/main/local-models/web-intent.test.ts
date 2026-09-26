@@ -173,9 +173,9 @@ describe('questions answered without tools (FX42)', () => {
 
 describe('whether a message asks for numbers to be worked out', () => {
   it('recognizes sums, totals and merges over data, not code or dispatch', () => {
-    for (const ask of ['Read jan.csv with read_file. Add up the amount for each category. Then call the conductor tool with method agents.report', 'Using only the two reports your coworkers sent, give the total per category for January and February together, and say which category grew the most from January to February.', 'what is the average of 12, 15 and 19', 'sum the amounts in expenses.csv by month'])
+    for (const ask of ['Read jan.csv with read_file. Add up the amount for each category. Then call the conductor tool with method agents.report', 'Using only the two reports your coworkers sent, give the total per category for January and February together, and say which category grew the most from January to February.', 'what is the average of 12, 15 and 19', 'sum the amounts in expenses.csv by month', 'sum up the hours in week1.csv per person'])
       expect(wantsMath(ask), ask).toBe(true)
-    for (const plain of ['merge the feature branch into main', 'fix the total in src/cart.ts', 'whats the difference between a mutex and a semaphore? keep it short', 'You control a small swarm of coworkers. Use the conductor tool with method tabs.open twice: 1. args {"title": "January", "prompt": "Read jan.csv. Add up the amount for each category."}', 'who got pole position for the azerbaijan grand prix this weekend?'])
+    for (const plain of ['merge the feature branch into main', 'fix the total in src/cart.ts', 'whats the difference between a mutex and a semaphore? keep it short', 'You control a small swarm of coworkers. Use the conductor tool with method tabs.open twice: 1. args {"title": "January", "prompt": "Read jan.csv. Add up the amount for each category."}', 'who got pole position for the azerbaijan grand prix this weekend?', 'find what reviewers are saying about the google pixel 10 pro online and sum it up for me, with sources', 'read the 3 reviews and summarize them'])
       expect(wantsMath(plain), plain).toBe(false)
   })
 })
