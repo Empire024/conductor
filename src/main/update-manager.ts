@@ -188,9 +188,12 @@ export class UpdateManager {
     return updater
   }
   async check(): Promise<AppUpdateState> {
-    if (!this.remoteUpdater || this.checking || busy(this.state.phase)) return this.getState()
+    if (!this.remoteUpdater || this.checking || this.state.phase === 'downloading' || this.state.phase === 'installing') return this.getState()
     const epoch = this.epoch
     const remote = this.remoteUpdater
+    // A downloaded update still looks for a newer build: otherwise a local build made after the
+    // download is never offered and the stale one installs. Nothing newer keeps it ready as it was.
+    const ready = this.state.phase === 'ready' ? { state: this.state, updater: this.updater } : null
     this.checking = true
     this.setState({ ...this.state, phase: 'checking', message: 'Checking released and local builds…', localBuildWarning: undefined })
     const problems: string[] = []
@@ -198,7 +201,10 @@ export class UpdateManager {
     const consider = (updater: BaseUpdater, info: UpdateInfo | undefined, source: 'local' | 'release'): void => {
       if (epoch !== this.epoch || busy(this.state.phase) || !info || !valid(info.version) || !gt(info.version, this.currentVersion)) return
       if (selected && this.state.availableVersion && !gt(info.version, this.state.availableVersion)) return
+      if (ready?.state.availableVersion && !gt(info.version, ready.state.availableVersion)) return
       selected = true
+      // The superseded download must not install itself when the app quits.
+      if (ready?.updater && ready.updater !== updater) ready.updater.autoInstallOnAppQuit = false
       this.updater = updater
       this.setState({ phase: 'available', currentVersion: this.currentVersion, availableVersion: info.version, source, configured: true, message: 'Update pending: Conductor ' + info.version + (source === 'local' ? ' (local test build).' : '.'), lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
     }
@@ -233,7 +239,10 @@ export class UpdateManager {
         if (this.platform === 'darwin' && /latest-mac\.yml/.test(message)) noMacBuild = true
         else problems.push(message)
       } else if (remoteResponse.result?.isUpdateAvailable) consider(remote, remoteResponse.result.updateInfo, 'release')
-      if (!selected && !busy(this.state.phase)) {
+      if (!selected && ready) {
+        this.updater = ready.updater
+        this.setState({ ...ready.state, lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
+      } else if (!selected && !busy(this.state.phase)) {
         this.updater = null
         this.setState({ phase: problems.length ? 'error' : 'idle', currentVersion: this.currentVersion, configured: true, message: problems[0] ?? (noMacBuild ? 'The latest release has no Mac build yet.' : 'Conductor is up to date.'), lastCheckedAt: new Date().toISOString(), localBuildWarning: this.state.localBuildWarning })
       }

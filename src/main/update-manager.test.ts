@@ -123,6 +123,27 @@ describe('installed updater source ownership — mocked transport, no installati
     expect(f.instances.every(instance => instance.autoInstallOnAppQuit === false)).toBe(true)
     expect(m.getState().phase).toBe('ready')
   })
+  it('offers a local build made after an update was downloaded, instead of installing the stale one', async () => {
+    const m = manager()
+    await m.check(); await m.download()
+    expect(m.getState()).toMatchObject({ phase: 'ready', availableVersion: '0.1.5-local.1' })
+    // Nothing newer: the downloaded update stays ready, untouched.
+    expect(await m.check()).toMatchObject({ phase: 'ready', availableVersion: '0.1.5-local.1', progress: 100 })
+    f.localVersion = '0.1.5-local.2'
+    expect(await m.check()).toMatchObject({ phase: 'available', source: 'local', availableVersion: '0.1.5-local.2' })
+    await m.download()
+    expect(m.getState()).toMatchObject({ phase: 'ready', availableVersion: '0.1.5-local.2' })
+    await m.install()
+    expect(f.instances.filter(instance => instance.quitAndInstall.mock.calls.length)).toHaveLength(1)
+  })
+  it('a newer release replacing a downloaded local build stops the local one installing on quit', async () => {
+    const m = manager()
+    await m.check(); await m.download()
+    const local = f.instances.find(instance => instance.provider.provider !== 'github')
+    f.remoteVersion = '0.1.6'
+    expect(await m.check()).toMatchObject({ phase: 'available', source: 'release', availableVersion: '0.1.6' })
+    expect(local.autoInstallOnAppQuit).toBe(false)
+  })
   it('coalesces repeated download actions from multiple windows', async () => {
     let finish!: () => void
     f.downloadGate = new Promise(resolve => { finish = resolve })
