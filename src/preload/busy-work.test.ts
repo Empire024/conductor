@@ -106,6 +106,55 @@ describe('BusyWork', () => {
     expect(log.at(-2)).toBe('app:idle')
     expect(work.inFlight).toBe(0)
   })
+
+  it('never lets a background poller that starts just after a click keep the cursor moving (VR7 C2b)', async () => {
+    const { work, log, advance, deferred } = rig()
+    const stamped: { at: number; entry: string }[] = []
+    let clock = 0
+    const tick = async (ms: number) => { await advance(ms); clock += ms; while (stamped.length < log.length) stamped.push({ at: clock, entry: log[stamped.length]! }) }
+    work.gesture(null)
+    await tick(200)
+    // Every 400 ms a 150 ms call, for 8 s: none of it is the click's work after the first links.
+    for (let started = 200; started < 8000; started += 400) {
+      const poll = deferred()
+      work.track(poll.promise)
+      await tick(150)
+      poll.resolve()
+      await tick(250)
+    }
+    expect(stamped.filter(entry => entry.at > 3000)).toEqual([])
+    expect(work.inFlight).toBe(0)
+  })
+
+  it('still follows a short chain whose next call starts right after the previous one settles', async () => {
+    const { work, log, advance, deferred } = rig()
+    work.gesture('project')
+    for (let link = 0; link < 4; link++) {
+      const call = deferred()
+      work.track(call.promise)
+      await advance(300)
+      call.resolve()
+      await advance(20)
+    }
+    expect(log.filter(entry => entry === 'project:busy')).toHaveLength(4)
+  })
+
+  it('does not let an old gesture\'s calls extend a newer gesture\'s chain', async () => {
+    const { work, log, advance, deferred } = rig()
+    work.gesture('a')
+    const old = deferred()
+    work.track(old.promise)
+    await advance(1000)
+    work.gesture('b')
+    await advance(700)
+    old.resolve()
+    await advance(20)
+    const background = deferred()
+    work.track(background.promise)
+    await advance(300)
+    expect(log.filter(entry => entry === 'b:busy')).toEqual([])
+    background.resolve()
+  })
 })
 
 describe('wrapBridge', () => {

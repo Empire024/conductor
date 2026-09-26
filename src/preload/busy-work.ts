@@ -7,6 +7,10 @@
  * (data-ipc-busy, aria-busy) until the work settles. Faster work never shows anything, and a state
  * that did show stays up briefly so it does not flash. Background calls (polling, subscriptions,
  * event-driven refreshes) are never attributed to a gesture, so they never move the cursor.
+ * A gesture's work may run as a chain (open a project, then load its tabs): a call that starts
+ * right after one of the gesture's calls settles still belongs to it, but only for a few links and
+ * a bounded time, so a poller that happens to fire just after a click cannot chain itself to that
+ * click for as long as it keeps polling (VR7 C2b).
  */
 
 export interface BusyEnvironment<Control> {
@@ -20,6 +24,12 @@ export interface BusyEnvironment<Control> {
 export interface BusyOptions {
   /** How long after a gesture a started call still belongs to it. */
   gestureWindowMs: number
+  /** How soon after one of a gesture's calls settles the next call must start to extend its chain. */
+  chainWindowMs: number
+  /** How many calls may join a gesture's chain after its first window. */
+  maxChainLinks: number
+  /** No call joins a gesture's chain later than this after the gesture. */
+  chainCapMs: number
   /** Work that settles sooner shows nothing. */
   showAfterMs: number
   /** Once shown, the busy state stays at least this long. */
@@ -28,13 +38,17 @@ export interface BusyOptions {
   maxMs: number
 }
 
-export const DEFAULT_BUSY_OPTIONS: BusyOptions = { gestureWindowMs: 500, showAfterMs: 100, minShowMs: 150, maxMs: 60_000 }
+export const DEFAULT_BUSY_OPTIONS: BusyOptions = { gestureWindowMs: 500, chainWindowMs: 250, maxChainLinks: 4, chainCapMs: 15_000, showAfterMs: 100, minShowMs: 150, maxMs: 60_000 }
 
-interface Call<Control> { control: Control | null; shownAt: number | null; done: boolean; timers: unknown[] }
+interface Call<Control> { control: Control | null; gesture: number; shownAt: number | null; done: boolean; timers: unknown[] }
 
 export class BusyWork<Control> {
+  private gestureId = 0
   private gestureAt = -Infinity
   private gestureControl: Control | null = null
+  /** When the current gesture's latest call settled, and how many calls joined its chain since. */
+  private chainAt = -Infinity
+  private chainLinks = 0
   private readonly visible = new Set<Call<Control>>()
   private readonly busyControls = new Set<Control>()
   private appBusy = false
@@ -44,8 +58,11 @@ export class BusyWork<Control> {
 
   /** The owner acted on `control` (null: no specific control, e.g. Enter in a text field). */
   gesture(control: Control | null): void {
+    this.gestureId++
     this.gestureAt = this.env.now()
     this.gestureControl = control
+    this.chainAt = -Infinity
+    this.chainLinks = 0
   }
 
   /** Whether any gesture's work is running (shown or not yet). */
@@ -53,14 +70,25 @@ export class BusyWork<Control> {
 
   /** Passes a bridge call's result through, tracking it when it is a gesture's pending work. */
   track<T>(result: T): T {
-    if (!isThenable(result) || this.env.now() - this.gestureAt > this.options.gestureWindowMs) return result
-    const call: Call<Control> = { control: this.gestureControl, shownAt: null, done: false, timers: [] }
+    if (!isThenable(result) || !this.attribute()) return result
+    const call: Call<Control> = { control: this.gestureControl, gesture: this.gestureId, shownAt: null, done: false, timers: [] }
     this.pending++
     call.timers.push(this.env.setTimeout(() => this.show(call), this.options.showAfterMs))
     call.timers.push(this.env.setTimeout(() => this.settle(call), this.options.maxMs))
     const settle = (): void => this.settle(call)
     ;(result as PromiseLike<unknown>).then(settle, settle)
     return result
+  }
+
+  /** Whether a call starting now is the current gesture's work: inside the gesture's own window,
+   *  or the next link of its chain (started right after one of its calls settled, within the link
+   *  and time bounds). */
+  private attribute(): boolean {
+    const now = this.env.now()
+    if (now - this.gestureAt <= this.options.gestureWindowMs) return true
+    if (now - this.chainAt > this.options.chainWindowMs || this.chainLinks >= this.options.maxChainLinks || now - this.gestureAt > this.options.chainCapMs) return false
+    this.chainLinks++
+    return true
   }
 
   private show(call: Call<Control>): void {
@@ -76,7 +104,7 @@ export class BusyWork<Control> {
     this.pending--
     for (const timer of call.timers) this.env.clearTimeout(timer)
     // A chain (open a project, then load its tabs) keeps belonging to the gesture that began it.
-    if (call.control === this.gestureControl) this.gestureAt = Math.max(this.gestureAt, this.env.now())
+    if (call.gesture === this.gestureId) this.chainAt = Math.max(this.chainAt, this.env.now())
     if (call.shownAt === null) return
     const remaining = this.options.minShowMs - (this.env.now() - call.shownAt)
     if (remaining > 0) this.env.setTimeout(() => this.hide(call), remaining)
