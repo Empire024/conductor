@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { LOCAL_KNOWLEDGE_YEAR, wantsWeb } from './web-intent.ts'
+import { closedQuestion, datedQuery, LOCAL_KNOWLEDGE_YEAR, searchDate, wantsWeb } from './web-intent.ts'
 import { searchQuery, wantsMath } from './agent.ts'
 
 /** Owner-style questions both ways (FX40). The first group must search before answering: its
@@ -41,7 +41,16 @@ const CURRENT = [
   'can you find some reviews of the steam deck oled online and sum up the pros and cons? include links',
   'who are the favourites for the election in october 2026',
   'results of the german election',
-  'what are the box office numbers for the new marvel movie'
+  'what are the box office numbers for the new marvel movie',
+  // VR9a's owner-style current questions (FX42).
+  'did the dodgers win last night?',
+  'how did the s&p 500 close yesterday?',
+  'whats bitcoin trading at right now?',
+  "who's the prime minister of japan?",
+  "what's the latest stable version of python?",
+  // A fresh appointment is news, not history.
+  'who was just elected mayor of new york',
+  'who was named ceo of intel'
 ]
 const PLAIN = [
   'whats the difference between a mutex and a semaphore? keep it short',
@@ -75,7 +84,42 @@ const PLAIN = [
   'review my changes in src/app.ts',
   'explain how the stock market works',
   'how do I deal with merge conflicts',
-  'what does the latest field in package.json do'
+  'what does the latest field in package.json do',
+  // VR9a's plain and history questions (FX42): searched 1 run in 2 on HEAD 8174e69.
+  'how many ounces are in a pound?',
+  'tcp vs udp, whats the difference in a couple of lines',
+  'who was president of the united states when the berlin wall fell?',
+  'what is 72 fahrenheit in celsius',
+  'what does a capacitor actually do in a circuit?',
+  'who were the beatles',
+  'when the titanic sank, who was the captain'
+]
+
+/** Questions with one fixed answer the model knows: answered without tools. */
+const CLOSED = [
+  'how many ounces are in a pound?',
+  'who was president of the united states when the berlin wall fell?',
+  'what is 72 fahrenheit in celsius',
+  'what does a capacitor actually do in a circuit?',
+  'convert 72 fahrenheit to celsius',
+  'who won world war 2',
+  'explain how pole vaulting works',
+  'why is the sky blue',
+  'how do vaccines work'
+]
+/** Everything else keeps its tools: current questions, workspace work, and follow-ups that point back. */
+const OPEN = [
+  'did the dodgers win last night?',
+  "who's the prime minister of japan?",
+  'summarize README.md',
+  'how do I fix it',
+  'what does this function do',
+  'explain the error in the build log',
+  'how does my script parse the csv',
+  'what is the time complexity of quicksort and can you check it against the code here',
+  'write a haiku about autumn',
+  'refactor this function to use async/await',
+  'add up the hours in week1.csv'
 ]
 
 describe('whether a message needs the web (web-intent.ts)', () => {
@@ -96,10 +140,34 @@ describe('whether a message needs the web (web-intent.ts)', () => {
   })
   it('dates a search Conductor runs itself for a time-relative question', () => {
     const now = new Date(2026, 8, 26)
-    expect(searchQuery('who got pole position for the azerbaijan grand prix this weekend?', now)).toBe('who got pole position for the azerbaijan grand prix this weekend 2026')
-    expect(searchQuery('whats the latest stable python version right now', now)).toBe('whats the latest stable python version 2026')
+    expect(searchQuery('who got pole position for the azerbaijan grand prix this weekend?', now)).toBe('who got pole position for the azerbaijan grand prix this weekend September 2026')
+    // "Right now" wants a live page, which has no date: nothing is added.
+    expect(searchQuery('whats the latest stable python version right now', now)).toBe('whats the latest stable python version')
+    // "last night" and "yesterday" are the day before (VR9a: "dodgers last night result" found 2020).
+    expect(searchQuery('did the dodgers win last night?', now)).toBe('did the dodgers win September 25 2026')
+    // The model's own query gets the date too, the relative words dropped for a named day.
+    expect(datedQuery('s&p 500 closing price yesterday', 'how did the s&p 500 close yesterday?', now)).toBe('s&p 500 closing price September 25 2026')
+    expect(datedQuery('bitcoin current price', 'whats bitcoin trading at right now?', now)).toBe('bitcoin current price')
+    expect(datedQuery('bitcoin price today', 'whats bitcoin at today?', now)).toBe('bitcoin price September 26 2026')
+    expect(datedQuery('azerbaijan gp pole this weekend', 'who got pole position this weekend?', now)).toBe('azerbaijan gp pole this weekend September 2026')
+    expect(datedQuery('japan prime minister', "who's the prime minister of japan?", now)).toBe('japan prime minister')
+    expect(datedQuery('f1 results 2026', 'who won last night', now)).toBe('f1 results 2026')
     expect(searchQuery('who won the 2025 champions league final last night', now)).not.toContain('2026')
     expect(searchQuery('any news about the eu ai act?', now)).toBe('any news about the eu ai act')
+  })
+})
+
+describe('questions answered without tools (FX42)', () => {
+  it('answers history, definitions and conversions from knowledge, and leaves everything else its tools', () => {
+    expect(CLOSED.filter(question => !closedQuestion(question))).toEqual([])
+    expect(OPEN.filter(question => closedQuestion(question))).toEqual([])
+  })
+  it('names the day a time-relative question is about', () => {
+    const now = new Date(2026, 8, 26, 5)
+    expect(searchDate('did the dodgers win last night?', now)).toBe('September 25 2026')
+    expect(searchDate('how did the s&p 500 close yesterday?', now)).toBe('September 25 2026')
+    expect(searchDate('whats bitcoin trading at right now?', now)).toBe('September 26 2026')
+    expect(searchDate('who got pole position this weekend?', now)).toBe('September 2026')
   })
 })
 

@@ -201,8 +201,11 @@ it('rejects a runtime that disagrees with a shell command, and runs the forms th
   expect(agreeing.failed).toBe(false)
   expect(exec.mock.calls[0]![0]).toContain("node match.mjs '--verbose' 'a b'")
   expect(exec.mock.calls[0]![0]).toContain('command -v node')
-  const both=await call(c,'run_command',{command:'x',code:'y'})
-  expect(both.failed).toBe(true);expect(both.output).toContain('command and code')
+  // Both command and code (VR9a: {"command":"node","code":"..."} six times): the code runs, under
+  // the interpreter the command named, and the result says which form was used.
+  const both=await call(c,'run_command',{command:'node',code:'console.log(1)'})
+  expect(both.output.startsWith('[Conductor: this call had code and command; used code and ignored command.]')).toBe(true)
+  expect(exec.mock.calls.at(-1)![0]).toContain('command -v node')
 })
 it('infers a saved script’s interpreter from its extension when the call names none',async()=>{
   const c=await fixture(),exec=vi.fn(async (command: string) => ({ ...envelope(command, 'ran\n'), exitCode: 0, timedOut: false, truncated: false, durationMs: 5 }))

@@ -73,7 +73,11 @@ describe('calculate: exact arithmetic for a local model', () => {
     const root = workspace({ 'jan.csv': jan })
     expect((await tool(root, { path: 'jan.csv', column: 'price' })).output).toBe('failed: column "price" is not a column of jan.csv; its columns are category, amount')
     expect((await tool(root, {})).output).toMatch(/^denied: Give exactly one of path, combine, expressions or expression/)
-    expect((await tool(root, { expression: '1+1', path: 'jan.csv' })).output).toMatch(/^denied: Give exactly one/)
+    // Two forms at once: the file wins and the result says what was ignored (VR9a: a coworker sent
+    // expression and combine six times, each refused).
+    const both = await tool(root, { expression: '1+1', path: 'jan.csv', column: 'amount', group_by: 'category' })
+    expect(both.output.startsWith('[Conductor: this call had path and expression; used path and ignored expression.]\n')).toBe(true)
+    expect(both.output).toContain('rent = 950')
     expect((await tool(root, { path: '../outside.csv' })).output).toMatch(/^denied: path outside workspace/)
     expect((await tool(root, { expression: '1 / 0' })).output).toBe('failed: the result is not a finite number (division by zero?)')
   })

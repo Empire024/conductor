@@ -46,6 +46,10 @@ export const NO_GRANTS: LocalGrants = { git: false, research: false }
  *  pinned credential-free broker as web_read, which every conversation has had from the start,
  *  so offering it opens no channel web_read did not. */
 export const WEB_CALLS_PER_MESSAGE = 8
+/** Fewest results one web_search returns, whatever limit the model asks for. */
+export const SEARCH_RESULTS_FLOOR = 5
+/** Characters of a page read for a current question: its opening, then the passages about it. */
+export const FOCUSED_PAGE_CHARS = 5_000
 export const LOCAL_CONTROL_METHODS = ['memory.recall', 'memory.remember', 'tasks.list', 'tasks.update', 'agents.list', 'agents.snapshot', 'agents.status', 'agents.report', 'tabs.open', 'agents.steer', 'agents.finish', 'app.update', 'app.update.status', 'usage.limits'] as const
 export type LocalControl = (method: string, args: Record<string, unknown>) => Promise<unknown>
 export type LocalToolName = (typeof LOCAL_TOOLS)[number]
@@ -73,6 +77,8 @@ export function assertLocalControlAllowed(method: string, args: Record<string, u
                 : method === 'agents.steer' ? ['agentSessionId', 'prompt']
                   : method === 'agents.finish' ? ['agentSessionId'] : []
   if (Object.keys(args).some(key => !fields.includes(key))) throw new ToolPolicyError('Conductor scope and unsupported arguments cannot be overridden')
+  // Dolphin sent memory.remember with cues and no gist eleven times, each answered "Invalid gist" (VR9a).
+  if (method === 'memory.remember' && (typeof args.gist !== 'string' || !args.gist.trim())) throw new ToolPolicyError('memory.remember needs gist: the one sentence to remember, as {"gist":"<sentence>","kind":"semantic","cues":["<word>"]}. Nothing was saved. Memory is optional: if you have nothing durable to save, carry on with the task instead.')
   if (method === 'agents.report' && (typeof args.text !== 'string' || !args.text.trim() || args.text.length > 2000)) throw new ToolPolicyError('agents.report needs a non-empty text of at most 2000 characters')
 }
 
@@ -94,7 +100,7 @@ export function toolSpecs(readOnly: boolean, control = false, grants: LocalGrant
     { type: 'function', function: { name: 'search', description: 'Search an authorized file or directory with a regular expression; reports coverage and skipped data.', parameters: { type: 'object', properties: { pattern: { type: 'string', description: 'JavaScript regular expression.' }, path: { type: 'string', description: 'Workspace-relative file or directory to search.' }, glob: { type: 'string', description: 'Only search files whose name ends with this suffix, for example .ts' } }, required: ['pattern'] } } }
   ]
   if (scope === 'coding') return readOnly ? specs : [...specs, ...writeSpecs(grants)]
-  specs.push({ type: 'function', function: { name: 'web_search', description: 'Search the public web and get back a numbered list of result titles and HTTPS links. Use it for anything current or that you are unsure of, then open the best results with web_read.' + (grants.research ? ' Search as many times as the question needs, with different wordings.' : '') + ' Only the query text leaves this machine, so never put private workspace content in it.', parameters: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer', description: 'How many results to return, 1 to 25. Defaults to 10.' } }, required: ['query'] } } })
+  specs.push({ type: 'function', function: { name: 'web_search', description: 'Search the public web and get back a numbered list of result titles and HTTPS links. Use it for anything current or that you are unsure of, then open the best results with web_read.' + (grants.research ? ' Search as many times as the question needs, with different wordings.' : '') + ' Only the query text leaves this machine, so never put private workspace content in it.', parameters: { type: 'object', properties: { query: { type: 'string' }, limit: { type: 'integer', description: `How many results to return, ${SEARCH_RESULTS_FLOOR} to 25. Defaults to 10.` } }, required: ['query'] } } })
   specs.push({ type: 'function', function: { name: 'web_read', description: 'Open a public HTTPS page (a web_search result, or a URL you were given) and get its text, without credentials or cookies. Never guess URLs or build search-engine links; use web_search to find pages. Private/local addresses are refused. The URL leaves this machine: never include private workspace content.', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } })
   specs.push(CALCULATE_SPEC)
   if (control) specs.push({ type: 'function', function: { name: 'conductor', description: 'Access durable project memory, the project task checklist, and the other visible conversations through Conductor. memory.remember accepts gist, kind (semantic, episodic, procedural), cues (string array); memory.recall accepts query; use these to save memory, never a filesystem path. tasks.list takes no arguments and returns the tasks plus the revision to quote back. tasks.update accepts revision (from the tasks.list you just read), id, and any of status (todo, doing, done), title, priority (high, normal, low). agents.list takes no arguments and returns the agentSessionId of every visible conversation; agents.snapshot requires one of those exact agentSessionId values and returns that conversation\'s state. agents.report accepts text (up to 2000 characters) and delivers it as a message to the conversation that opened this tab — no agentSessionId, never any other target; use it to tell your controller something finished or failed instead of it polling agents.status. app.update takes no arguments and builds this checkout into a local update the installed Conductor then offers as "Update pending" — use it when the owner asks to update the app via the updater; the owner confirms the build unless another coworker already authorized this conversation, and it returns immediately, so poll app.update.status (no arguments) every minute or so until it is no longer running. Nothing is installed for the owner. usage.limits takes an optional provider (claude, codex, grok) and returns the newest account allowance each provider reported, with what is unknown.' + (readOnly ? '' : ' Local swarm: tabs.open accepts title and prompt (and optionally permission, repository, research, contract, each the same as yours or narrower) and opens a coworker of this same local model with that prompt as its first message; it returns its agentSessionId. At most 3 coworkers, and a coworker cannot open its own. The coworkers share this machine\'s one model server, so their turns take turns with yours: after dispatching, end your turn and wait; each coworker sends its result with agents.report, which arrives as a new message to you. When the work is about numbers, tell each coworker to compute them with the calculate tool and report plain label = value lines, and merge their numbers with calculate yourself (combine with the text of each report): an answer is numbers, never code. agents.steer accepts agentSessionId and prompt and sends one of your coworkers a follow-up; agents.snapshot reads one; agents.finish accepts agentSessionId and closes a coworker whose turn has finished.'), parameters: { type: 'object', properties: { method: { type: 'string', enum: LOCAL_CONTROL_METHODS.filter(method => !readOnly || !MUTATING_CONTROL.has(method)) }, args: { type: 'object' } }, required: ['method', 'args'] } } })
@@ -132,11 +138,27 @@ export interface ToolContext {
   timeoutSec: number
   signal?: AbortSignal
   control?: LocalControl
+  /** A current question's words: a web_search puts dated news in front of its results, and a
+   *  web_read returns the page's opening and the passages about them. */
+  webFocus?: string[]
   beforeTool?(paths: string[]): Promise<void>
   afterTool?(paths: string[], success: boolean): Promise<void>
 }
 
 export interface ToolOutcome { output: string; failed: boolean; paths: string[]; exitCode?: number; evidence?: LocalFileEvidence }
+
+/** When a call names more than one of a tool's alternative forms, keeps the first of `order` it
+ *  named and drops the rest, and returns the note that says so; '' when it named at most one. A
+ *  small model repeats a call refused for this unchanged (VR9a: run_command with command and code
+ *  six times), so one form runs instead of none. */
+export function oneForm(args: Record<string, unknown>, order: string[]): string {
+  const sent = order.filter(key => args[key] !== undefined)
+  if (sent.length < 2) return ''
+  const [kept, ...dropped] = sent
+  for (const key of dropped) delete args[key]
+  return `[Conductor: this call had ${sent.join(' and ')}; used ${kept} and ignored ${dropped.join(' and ')}.]
+`
+}
 
 const argumentsOf = (raw: string): Record<string, unknown> => {
   if (!raw?.trim()) return {}
@@ -210,10 +232,17 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         assertLocalControlAllowed(method, input as Record<string, unknown>, context.readOnly)
         return { output: JSON.stringify(await context.control(method, input as Record<string, unknown>)).slice(0, 24_000), failed: false, paths: [] }
       }
-      case 'web_read': return { output: await readPublicWeb(text(args.url, 'url'), context.signal), failed: false, paths: [] }
-      case 'web_search': return { output: await searchPublicWeb(text(args.query, 'query'), context.signal, args.limit === undefined ? 10 : integer(args.limit, 10)), failed: false, paths: [] }
+      case 'web_read': return { output: await readPublicWeb(text(args.url, 'url'), context.signal, context.webFocus ? { terms: context.webFocus, chars: FOCUSED_PAGE_CHARS } : undefined), failed: false, paths: [] }
+      // Dolphin asks for one result (VR9a: limit 1 on every search), which leaves nothing to choose
+      // a page from; fewer than SEARCH_RESULTS_FLOOR is raised to it.
+      case 'web_search': return { output: await searchPublicWeb(text(args.query, 'query'), context.signal, Math.max(SEARCH_RESULTS_FLOOR, args.limit === undefined ? 10 : integer(args.limit, 10)), { news: Boolean(context.webFocus) }), failed: false, paths: [] }
       case 'calculate': {
+        const note = oneForm(args, ['path', 'combine', 'expressions', 'expression'])
         const forms = ['expression', 'expressions', 'path', 'combine'].filter(key => args[key] !== undefined)
+        if (note) {
+          const outcome = await runTool(name, JSON.stringify(args), context)
+          return { ...outcome, output: note + outcome.output }
+        }
         if (forms.length !== 1) throw new ToolPolicyError(`Give exactly one of path, combine, expressions or expression (this call had ${forms.length ? forms.join(' and ') : 'none of them'}). Nothing was computed. Shapes: {"path":"<file>.csv","column":"<number column>","group_by":"<category column>"}, {"combine":["<text of report 1>","<text of report 2>"]}, {"expressions":{"<label>":"<formula>"}}.`)
         try {
           if (forms[0] === 'combine') return { output: combineReports(args.combine), failed: false, paths: [] }
@@ -347,6 +376,14 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         return { output: `applied ${edits.length} edit${edits.length === 1 ? '' : 's'} to ${rel} (${status.join('; ')})${revision ? `; previous revision artifact=${revision}` : ''}`, failed: false, paths: [path] }
       }
       case 'run_command': {
+        // {"command":"node","code":"..."} names the interpreter in command: it becomes the runtime.
+        const interpreter = typeof args.command === 'string' && /^(?:node|python3?|bash)$/.test(args.command.trim()) ? args.command.trim() : undefined
+        const note = oneForm(args, ['code', 'script', 'command'])
+        if (note) {
+          if (interpreter && args.runtime === undefined) args.runtime = interpreter
+          const outcome = await runTool(name, JSON.stringify(args), context)
+          return { ...outcome, output: note + outcome.output }
+        }
         const forms = ['command', 'code', 'script'].filter(key => args[key] !== undefined)
         if (forms.length !== 1) throw new ToolPolicyError(`Provide exactly one of command, code or script (this call had ${forms.length ? forms.join(' and ') : 'none of them'}). Nothing ran. Examples: {"command":"node scratch/match.mjs"}, {"script":"scratch/match.mjs","runtime":"node"}, {"code":"console.log(1)","runtime":"node"}.`)
         const quote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"

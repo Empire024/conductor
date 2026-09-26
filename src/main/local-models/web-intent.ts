@@ -44,6 +44,7 @@ const CHANGEABLE: RegExp[] = [
   // Who holds an office, runs a company, is still alive.
   /\bwho(?:'s| is| are)\b[^?.!]*\b(?:president|prime minister|premier|chancellor|ceo|cto|cfo|coo|chair(?:man|woman|person)?|head coach|coach|manager|captain|leader|mayor|governor|king|queen|monarch|pope|minister|secretary|director|owner|champion|richest|number one|no\.? ?1)\b/i,
   /\bwho (?:runs|owns|leads|heads|coaches|manages|chairs|bought|acquired)\b/i,
+  /\bwho (?:was|were|got|has been|have been) (?:just |recently |newly )?(?:elected|named|appointed|hired|fired|chosen|picked|drafted|traded|signed|nominated|sworn in)\b/i,
   /\b(?:still (?:alive|open|in (?:office|charge|business)|available|the (?:ceo|president|champion|leader|best|fastest|cheapest))|is [\w .'-]{2,40} (?:alive|dead)|did [\w .'-]{2,40} die|has [\w .'-]{2,40} died|net worth)\b/i,
   // Prices and markets.
   /\b(?:prices?|pricing|cheapest|best deals?|on sale|stock price|stock market|stocks|share price|market cap|exchange rate|bitcoin|btc|ethereum|crypto(?:currency)?|inflation rate|mortgage rates|gas prices|fuel prices)\b/i,
@@ -57,7 +58,9 @@ const CHANGEABLE: RegExp[] = [
   /\b(?:news|headlines?|weather|forecast|temperature (?:in|at|today|tomorrow|outside)|traffic (?:in|on|at)|outage|is [\w.]+ down|breaking)\b/i
 ]
 
-const HISTORY = /\b(?:world war|civil war|cold war|revolution|dynasty|empire|ancient|medieval|centur(?:y|ies)|in history|historically|first (?:ever )?(?:president|prime minister|man|person|woman|king|queen)|who (?:was|were) the)\b/i
+// "who was president when the Berlin Wall fell" is history (VR9a: searched 1 run in 2); "who was
+// just elected" is news, so the verbs of a fresh appointment are left to the changeable patterns.
+const HISTORY = /\b(?:world war|civil war|cold war|revolution|dynasty|empire|ancient|medieval|centur(?:y|ies)|in history|historically|first (?:ever )?(?:president|prime minister|man|person|woman|king|queen)|who (?:was|were)\b(?! (?:just |recently |newly )?(?:elected|named|appointed|hired|fired|chosen|picked|drafted|traded|signed|arrested|voted|announced|sworn|nominated))|when (?:the )?[\w .'-]{2,40} (?:fell|collapsed|was (?:built|founded|invented|assassinated|signed|abolished)))/i
 
 const KNOWLEDGE_FORM = /^\s*(?:(?:hey |ok |so )?(?:can you |could you |please |pls )?(?:explain|define|describe|teach me|help me understand)\b|what(?:'s| is| are) (?:the )?(?:difference|differences|meaning|definition|purpose)\b|what does\b|how (?:does|do|to|can|would|should|is)\b|why (?:does|do|is|are|did)\b)/i
 
@@ -77,3 +80,50 @@ export function wantsWeb(instruction: string, knowledgeYear = LOCAL_KNOWLEDGE_YE
 /** Whether the message asks for something time-relative, so a search built from it needs the
  *  date: "this weekend" means nothing to a search engine without the year. */
 export const timeRelative = (instruction: string): boolean => TIME_RELATIVE.test(instruction)
+
+/** The date a time-relative question is about, as words a search engine matches: "yesterday" and
+ *  "last night" are the day before, "today" and "right now" today, anything else the month.
+ *  Dolphin searched "dodgers last night result" and got the 2020 World Series (VR9a). */
+export function searchDate(instruction: string, now = new Date()): string {
+  const month = (date: Date): string => date.toLocaleString('en-US', { month: 'long' })
+  const day = (date: Date): string => `${month(date)} ${date.getDate()} ${date.getFullYear()}`
+  if (/\b(?:yesterday|last night)\b/i.test(instruction)) return day(new Date(now.getTime() - 86_400_000))
+  if (/\b(?:today|tonight|right now|at the moment|this (?:morning|afternoon|evening))\b/i.test(instruction)) return day(now)
+  return `${month(now)} ${now.getFullYear()}`
+}
+
+/** The one day a question is about, as YYYY-MM-DD: yesterday for "yesterday" and "last night",
+ *  today for "today" and "right now"; undefined when it names no single day. */
+export function askedDay(instruction: string, now = new Date()): string | undefined {
+  const iso = (date: Date): string => `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+  if (/\b(?:yesterday|last night)\b/i.test(instruction)) return iso(new Date(now.getTime() - 86_400_000))
+  if (/\b(?:today|tonight|right now|at the moment|this (?:morning|afternoon|evening))\b/i.test(instruction)) return iso(now)
+  return undefined
+}
+
+/** A query with the date its time-relative question is about. For a named day, the relative words
+ *  go: an engine matches "yesterday" literally, and "s&p 500 close September 25 2026" finds that
+ *  day's market report. A query that already has a year is left alone. */
+export function datedQuery(query: string, instruction: string, now = new Date()): string {
+  if (!timeRelative(instruction) || /\b20\d\d\b/.test(query)) return query
+  // "Right now" is a live page (a price, a scoreboard), which carries no date; a date finds reports.
+  if (/\b(?:right now|at the moment|currently)\b/i.test(instruction) && !/\b(?:yesterday|last night|today|tonight)\b/i.test(instruction)) return query
+  const date = searchDate(instruction, now)
+  const day = /^\S+ \d/.test(date)
+  const bare = day ? query.replace(/\b(?:yesterday|last night|tonight|today|right now|at the moment|currently|current|now)\b/gi, ' ').replace(/\s+/g, ' ').trim() : query
+  return `${bare || query} ${date}`
+}
+
+const CONVERSION =/\b(?:how many [a-z]+ (?:are )?(?:in|per) (?:an? |one )?[a-z]+|\d[\d.,]*\s*(?:°\s*)?(?:degrees? )?(?:fahrenheit|celsius|kelvin|f|c|kg|kilograms?|grams?|lbs?|pounds?|oz|ounces?|km|kilomet(?:er|re)s?|mi|miles?|met(?:er|re)s?|ft|feet|foot|inch(?:es)?|cm|mm|lit(?:er|re)s?|ml|gal|gallons?|cups?|mph|kph|km\/h)\s+(?:in|to|into)\s+[a-z])/i
+// Words that point back at earlier turns or the workspace: "how do I fix it" needs what came before.
+const CONTEXTUAL = /\b(?:it|its|this|that|these|those|them|they|here|above|previous|earlier|again|same|my|our)\b/i
+
+/** A question with one fixed answer the model already knows: history, a definition or explanation,
+ *  a unit conversion. It is answered without tools: given them, Dolphin "checked" 72 °F with
+ *  calculate and the Berlin Wall with a search (VR9a). Short single questions only, never one
+ *  that refers back to the conversation or the workspace, and never one wantsWeb is true for. */
+export function closedQuestion(instruction: string, knowledgeYear = LOCAL_KNOWLEDGE_YEAR): boolean {
+  const text = instruction.replace(/\s+/g, ' ').trim()
+  if (!text || text.length > 200 || /\n\s*\S/.test(instruction.trim()) || wantsWeb(text, knowledgeYear) || WORKSPACE.test(text) || CONTEXTUAL.test(text)) return false
+  return HISTORY.test(text) || KNOWLEDGE_FORM.test(text) || CONVERSION.test(text)
+}

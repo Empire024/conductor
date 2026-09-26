@@ -3,8 +3,9 @@ import { createServer } from 'node:http'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { citeSources, LocalAgentSession, systemPrompt, wantsWeb, WEB_HINT } from './agent.ts'
-import { WEB_CALLS_PER_MESSAGE, toolSpecs } from './tools.ts'
+import { citeSources, datedPage, hitDate, inventedReports, LocalAgentSession, pickPages, READ_FOR_YOU, readForYou, searchHits, stalePage, systemPrompt, wantsWeb, WEB_HINT } from './agent.ts'
+import { SEARCH_RESULTS_FLOOR, WEB_CALLS_PER_MESSAGE, toolSpecs } from './tools.ts'
+import { focusedText, PAGE_HEADER, readPublicWeb, searchPublicWeb } from './web.ts'
 import { DOLPHIN_TEMPLATE, templateDate, templateKwargs, writeChatTemplate } from './templates.ts'
 import { llamaServerArgs } from './llama.ts'
 import { LOCAL_DOLPHIN_X1_8B, LOCAL_ORNITH_9B } from '../../shared/local-models.ts'
@@ -66,6 +67,7 @@ describe('a local model answering like any other model', () => {
     const { requests, run, tools } = await session((sent, index) => [
       call('s', 'web_search', { query: 'latest stable python version' }),
       call('r', 'web_read', { url: 'https://www.python.org/downloads/latest/' }),
+      call('r2', 'web_read', { url: 'https://devguide.python.org/versions/' }),
       answer('The latest stable Python is 3.14.7, released 2026-08-05.')
     ][index]!)
     const outcome = await run('whats the latest stable python version right now')
@@ -75,8 +77,9 @@ describe('a local model answering like any other model', () => {
     expect(requests[0]!.tools?.map(tool => tool.function.name)).toEqual(['web_search', 'web_read'])
     expect(requests[1]!.tool_choice).toBe('auto')
     expect(requests[1]!.tools?.map(tool => tool.function.name)).toContain('read_file')
-    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read'])
-    expect(outcome.text).toBe('The latest stable Python is 3.14.7, released 2026-08-05.\n\nSources: https://www.python.org/downloads/latest/')
+    // Two pages: one alone was too often an index page or a price page drawn by script (FX42).
+    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read', 'web_read'])
+    expect(outcome.text).toBe('The latest stable Python is 3.14.7, released 2026-08-05.\n\nSources: https://www.python.org/downloads/latest/ , https://devguide.python.org/versions/')
     expect(outcome.streamed).toContain('Sources: https://www.python.org/downloads/latest/')
   })
 
@@ -84,14 +87,17 @@ describe('a local model answering like any other model', () => {
     const { run, tools } = await session((sent, index) => [
       answer('Here are the results from my search: the RTX 5070 is great (made up).'),
       call('r', 'web_read', { url: 'https://www.python.org/downloads/latest/' }),
+      answer('From one page only (held back).'),
       answer('Reviewers call it decent value.')
     ][index]!)
     const outcome = await run('find reviews of the nvidia rtx 5070 online and summarize what they say, with sources')
-    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read'])
+    // Reviews want two pages: the model opened one, Conductor the next best on another site.
+    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read', 'web_read'])
     expect(tools[0]!.output).toContain('Search: reviews of the nvidia rtx 5070')
     // The made-up roundup never became part of the answer.
     expect(outcome.streamed).not.toContain('made up')
-    expect(outcome.text).toBe('Reviewers call it decent value.\n\nSources: https://www.python.org/downloads/latest/')
+    expect(outcome.streamed).not.toContain('held back')
+    expect(outcome.text).toBe('Reviewers call it decent value.\n\nSources: https://www.python.org/downloads/latest/ , https://devguide.python.org/versions/')
   })
 
   it('keeps the from-memory draft of the forced round out of the timeline, and never shows an imitated Conductor note (VR7 row 19)', async () => {
@@ -99,10 +105,11 @@ describe('a local model answering like any other model', () => {
     const { run, tools } = await session((sent, index) => [
       answer('Max Verstappen won the 2026 Japanese Grand Prix on October 2, 2026. '.repeat(120) + fake.repeat(40)),
       call('r', 'web_read', { url: 'https://www.python.org/downloads/latest/' }),
+      call('r2', 'web_read', { url: 'https://devguide.python.org/versions/' }),
       answer('Python 3.14.7 is the latest stable release.' + fake.repeat(30))
     ][index]!)
     const outcome = await run('whats the latest stable python version right now')
-    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read'])
+    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read', 'web_read'])
     // Nothing of the draft reaches the timeline, as status or as text.
     expect(outcome.status).not.toContain('Verstappen')
     expect(outcome.status.length).toBeLessThanOrEqual(500)
@@ -113,19 +120,136 @@ describe('a local model answering like any other model', () => {
     expect(outcome.text).toContain('Python 3.14.7 is the latest stable release.')
   })
 
-  it('asks once for a page when the answer rests on search results alone', async () => {
+  it('opens the best results itself when the model answers from search results alone (VR9a: 0 pages read in 10)', async () => {
     const { requests, run, tools } = await session((sent, index) => [
-      call('s', 'web_search', { query: 'rtx 5070 reviews' }),
-      answer('Reviewers call it decent value.'),
-      call('r', 'web_read', { url: 'https://www.python.org/downloads/latest/' }),
-      answer('Reviewers call it decent value (https://www.python.org/downloads/latest/).')
+      call('s', 'web_search', { query: 'latest stable python', limit: 1 }),
+      answer('The latest version is not provided in the untrusted web search results.'),
+      answer('The latest stable Python is 3.14.7, released 2026-08-05 (https://www.python.org/downloads/latest/).')
     ][index]!)
-    const outcome = await run('find reviews of the rtx 5070 online and summarize them')
-    expect(requests[2]!.messages.at(-1)!.content).toContain('[Conductor] Before answering, open the best one or two results with web_read')
-    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read'])
-    expect(outcome.text).toBe('Reviewers call it decent value (https://www.python.org/downloads/latest/).')
+    const outcome = await run("what's the latest stable version of python?")
+    // Conductor read the two best results on two sites, then asked for the answer from them.
+    expect(tools.map(tool => tool.name)).toEqual(['web_search', 'web_read', 'web_read'])
+    // The best of them is read last: an 8B model answers from the last page it read.
+    expect(vi.mocked(readPublicWeb).mock.calls.slice(-2).map(args => args[0])).toEqual(['https://devguide.python.org/versions/', 'https://www.python.org/downloads/latest/'])
+    // The page is focused on the question's words.
+    expect(vi.mocked(readPublicWeb).mock.calls.at(-1)![2]).toEqual({ terms: ['stable', 'version', 'python'], chars: 5000 })
+    const note = requests[2]!.messages.at(-1)!.content
+    expect(note.startsWith(READ_FOR_YOU)).toBe(true)
+    expect(note).toContain('Pages read: https://devguide.python.org/versions/ ; https://www.python.org/downloads/latest/ (2026-08-05).')
+    expect(note).toContain('Latest means already released and stable')
+    // A limit of 1 is raised: one result leaves nothing to choose a page from.
+    expect(vi.mocked(searchPublicWeb).mock.calls.at(-1)![2]).toBe(SEARCH_RESULTS_FLOOR)
     // The answer from snippets was held back, so the owner reads one answer, not two.
-    expect(outcome.streamed).toBe('Reviewers call it decent value (https://www.python.org/downloads/latest/).')
+    expect(outcome.streamed).toBe('The latest stable Python is 3.14.7, released 2026-08-05 (https://www.python.org/downloads/latest/).')
+  })
+
+  it('opens pages instead of a third search, and dates a time-relative search the model left undated', async () => {
+    const { run, tools } = await session((sent, index) => index < 6 ? call(`s${index}`, 'web_search', { query: `dodgers last night result ${index}`, limit: 1 }) : answer('The Dodgers lost 4-2 to the Padres.'))
+    const outcome = await run('did the dodgers win last night?')
+    // The forced search and one more ran; the third search became Conductor's reads.
+    expect(tools.slice(0, 4).map(tool => tool.name)).toEqual(['web_search', 'web_search', 'web_read', 'web_read'])
+    const yesterday = new Date(Date.now() - 86_400_000)
+    const day = `${yesterday.toLocaleString('en-US', { month: 'long' })} ${yesterday.getDate()} ${yesterday.getFullYear()}`
+    const dated = vi.mocked(searchPublicWeb).mock.calls.find(args => String(args[0]).startsWith('dodgers result 1'))!
+    expect(dated[0]).toBe(`dodgers result 1 ${day}`)
+    // A current question's searches put dated news in front of the web's pages.
+    expect(dated[3]).toEqual({ news: true })
+    expect(outcome.stopReason).toBe('completed')
+  })
+
+  it('answers history and conversions without tools, and plain questions still see them offered', async () => {
+    const { requests, run, tools } = await session(() => answer('George H. W. Bush.'))
+    await run('who was president of the united states when the berlin wall fell?')
+    expect(requests[0]!.tools).toBeUndefined()
+    expect(tools).toEqual([])
+    await run('what is 72 fahrenheit in celsius')
+    expect(requests[1]!.tools).toBeUndefined()
+  })
+
+  it('ranks results: on the question, recent, one per site, and never video pages', () => {
+    const now = new Date(2026, 8, 26)
+    const hits = searchHits([
+      'Search: dodgers last night result (via DuckDuckGo)',
+      'Results.',
+      '1. September 2008 in sports - Wikipedia', '   https://en.wikipedia.org/wiki/September_2008_in_sports',
+      '2. Dodgers win 2020 World Series', '   https://www.mlb.com/news/dodgers-win-2020-world-series', '   Dodgers beat the Rays.',
+      '3. Dodgers highlights', '   https://www.youtube.com/watch?v=abc', '   2026-09-25 - Dodgers vs Padres highlights',
+      '4. Padres beat Dodgers 4-2', '   https://www.espn.com/mlb/recap/_/gameId/1', '   2026-09-25 - The Padres beat the Dodgers 4-2 on Wednesday night.',
+      '5. Dodgers scores', '   https://www.mlb.com/dodgers/scores', '   Dodgers scores and schedule.'
+    ].join('\n'))
+    expect(hits).toHaveLength(5)
+    expect(hits[1]).toEqual({ rank: 2, title: 'Dodgers win 2020 World Series', url: 'https://www.mlb.com/news/dodgers-win-2020-world-series', snippet: 'Dodgers beat the Rays.' })
+    expect(pickPages(hits, 'did the dodgers win last night?', [], 2, now)).toEqual(['https://www.espn.com/mlb/recap/_/gameId/1', 'https://www.mlb.com/dodgers/scores'])
+    expect(pickPages(hits, 'did the dodgers win last night?', ['https://www.espn.com/mlb/recap/_/gameId/1'], 1, now)).toEqual(['https://www.mlb.com/dodgers/scores'])
+  })
+
+  it('prefers the report from the day a question is about, dated by its snippet or its link', () => {
+    const now = new Date(2026, 8, 26, 5)
+    const hits = searchHits([
+      '1. Stock Market News for Sep 23, 2026', '   https://finance.example/stock-market-news-sep-23', '   2026-09-23 - The S&P 500 declined marginally to finish at 7,764.64.',
+      '2. S&P 500 close: stocks rise Friday', '   https://news.example/2026/09/25/stocks-close', '   Stocks closed higher.',
+      '3. S&P 500 posts record close', '   https://www.cnbc.com/2026/04/15/stock-market-today.html', '   The S&P 500 closed above 7,000.'
+    ].join('\n'))
+    expect(hitDate(hits[1]!)).toBe('2026-09-25')
+    expect(hitDate(hits[2]!)).toBe('2026-04-15')
+    expect(pickPages(hits, 'how did the s&p 500 close yesterday?', [], 1, now)).toEqual(['https://news.example/2026/09/25/stocks-close'])
+    const note = readForYou(['https://finance.example/stock-market-news-sep-23', 'https://news.example/2026/09/25/stocks-close'], hits, 'how did the s&p 500 close yesterday?', now)
+    expect(note).toContain('Pages read: https://finance.example/stock-market-news-sep-23 (2026-09-23) ; https://news.example/2026/09/25/stocks-close (2026-09-25).')
+    expect(note).toContain('The question is about 2026-09-25')
+    // Each page read says how old it is against that day.
+    expect(datedPage('Source: https://finance.example/stock-market-news-sep-23\nPage text.', 'https://finance.example/stock-market-news-sep-23', hits, 'how did the s&p 500 close yesterday?', now))
+      .toBe('Source: https://finance.example/stock-market-news-sep-23\n[Conductor: this page is dated 2026-09-23; the question is about 2026-09-25, 2 days later. Its figures are 2 days old.]\nPage text.')
+    expect(datedPage('Source: x\nText.', 'https://www.cnbc.com/2026/04/15/stock-market-today.html', hits, "who's the prime minister of japan?", now)).toBe('Source: x\nText.')
+    // More than a day before the day asked about: its figures are withheld; a day before is kept.
+    expect(stalePage('https://finance.example/stock-market-news-sep-23', hits, 'how did the s&p 500 close yesterday?', now)).toMatch(/^left out: https:\/\/finance.example\/stock-market-news-sep-23 is dated 2026-09-23, 2 days before 2026-09-25/)
+    expect(stalePage('https://news.example/2026/09/25/stocks-close', hits, 'how did the s&p 500 close yesterday?', now)).toBeUndefined()
+    expect(stalePage('https://finance.example/stock-market-news-sep-23', hits, "who's the prime minister of japan?", now)).toBeUndefined()
+  })
+
+  it('does not spend the web budget on a link that already failed', async () => {
+    vi.mocked(readPublicWeb).mockRejectedValueOnce(new Error('Research HTTP 404'))
+    const { run, tools } = await session((sent, index) => index === 0 ? call('s', 'web_search', { query: 'bitcoin price' })
+      : index <= 4 ? call(`r${index}`, 'web_read', { url: 'https://coins.example/made-up' }) : answer('About $84,000 (https://www.python.org/downloads/latest/).'))
+    await run('whats bitcoin trading at right now?')
+    const made = tools.filter(tool => tool.name === 'web_read' && tool.output.includes('coins.example'))
+    expect(tools.some(tool => tool.output === 'error: Research HTTP 404')).toBe(true)
+    expect(made.map(tool => tool.output.slice(0, 8))).toEqual(['not run:', 'not run:', 'not run:'])
+    expect(vi.mocked(readPublicWeb).mock.calls.filter(args => args[0] === 'https://coins.example/made-up')).toHaveLength(1)
+  })
+
+  it('keeps only the opening of pages read for an earlier question when a new one arrives', async () => {
+    const long = 'Python 3.14.7 was released on 2026-08-05. ' + 'Older release line. '.repeat(400)
+    vi.mocked(readPublicWeb).mockResolvedValueOnce(`Source: https://www.python.org/downloads/latest/\n${PAGE_HEADER}\n${long}`)
+    const { requests, run } = await session((sent, index) => [
+      call('s', 'web_search', { query: 'latest stable python' }),
+      call('r', 'web_read', { url: 'https://www.python.org/downloads/latest/' }),
+      call('r2', 'web_read', { url: 'https://devguide.python.org/versions/' }),
+      answer('Python 3.14.7 (https://www.python.org/downloads/latest/).'),
+      answer('16 ounces.')
+    ][index]!)
+    await run("what's the latest stable version of python?")
+    const page = (sent: Sent) => sent.messages.find(message => message.role === 'tool' && message.content.startsWith('Source: https://www.python.org/downloads/latest/'))!.content
+    expect(page(requests[3]!).length).toBeGreaterThan(5000)
+    await run('how many ounces are in a pound?')
+    expect(page(requests[4]!).length).toBeLessThan(1300)
+    expect(page(requests[4]!)).toContain('Python 3.14.7 was released on 2026-08-05.')
+  })
+
+  it('keeps a long page to its opening and the passages about the question', () => {
+    const page = 'Menu Home Scores\n' + Array.from({ length: 200 }, (_, n) => `Unrelated paragraph number ${n} about nothing in particular at all, padded out to some length.`).join('\n') + '\nThe Padres beat the Dodgers 4-2 on Wednesday night in San Diego.\n' + 'More filler text here.\n'.repeat(100)
+    const focused = focusedText(page, ['dodgers', 'win'], 2000)
+    expect(focused.length).toBeLessThanOrEqual(2000)
+    expect(focused.startsWith('Menu Home Scores')).toBe(true)
+    expect(focused).toContain('The Padres beat the Dodgers 4-2')
+  })
+
+  it('refuses to merge reports nobody sent (VR9a: "Person A worked 40 hours" combined six times)', () => {
+    expect(inventedReports(['Person A worked 40 hours in week 1 and 30 hours in week 2.', 'Person B worked 35 hours in week 1 and 45 hours in week 2.'], 'I have two timesheets, week1.csv and week2.csv. Open one coworker per file.')).toBe(true)
+    expect(inventedReports(['week1: ana = 21.75, ben = 19.75', 'week2: ana = 17.25, ben = 12.75'], '[Automatic report: Week 1] ana = 21.75\nben = 19.75\n\nweek2.csv: ana = 17.25, ben = 12.75')).toBe(false)
+    expect(inventedReports('not a list', '')).toBe(false)
+    // One real report and one made up (B1, FX42 run 2: "feb.csv: rent=1050, ..." never sent).
+    const jan = 'jan.csv: rent=950, groceries=350.8, transport=86.5, utilities=118.25, fun=45, total=1550.55'
+    expect(inventedReports([jan, 'feb.csv: rent=1050, groceries=380, transport=90, utilities=125, fun=50, total=1615'], `[Automatic report: January] ${jan}\n[Automatic report: February] feb.csv: rent=950, groceries=274.8, utilities=131.75, transport=100, fun=155.5`)).toBe(true)
   })
 
   it('does not re-read a page, and holds a message to its web budget unless deep research is on', async () => {

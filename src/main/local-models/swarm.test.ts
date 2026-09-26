@@ -25,7 +25,30 @@ describe('local swarm plan', () => {
     expect(() => planLocalCoworker(opener(), { repository: true })).toThrow(/repository-write grant/)
     expect(() => planLocalCoworker(opener(), { research: true })).toThrow(/deep-research grant/)
     expect(() => planLocalCoworker(opener({ settings: { permission: 'read-only', plan: false } }), {})).toThrow(/read-only/)
-    expect(() => planLocalCoworker(opener(), { permission: 'auto' })).toThrow(/never more/)
+    // Wider than the opener, or a word that is no mode at all: the opener's own mode, never an
+    // error a small model cannot repair (VR9a: "read" refused twice, one coworker lost).
+    expect(planLocalCoworker(opener(), { permission: 'auto' }).open.permission).toBe('accept-edits')
+    expect(planLocalCoworker(opener(), { permission: 'read' }).open.permission).toBe('accept-edits')
+    expect(planLocalCoworker(opener({ settings: { permission: 'default', plan: false } }), { permission: 'full-access' }).open.permission).toBe('default')
+    expect(planLocalCoworker(opener(), { permission: 'default' }).open.permission).toBe('default')
+    expect(planLocalCoworker(opener(), {}).open).not.toHaveProperty('permission')
+  })
+
+  it('hands the controller a stalled coworker\'s last computed numbers with its automatic report', async () => {
+    const delivered: string[] = []
+    const items = [
+      { sequence: 2, data: { type: 'tool', name: 'calculate', status: 'completed', input: { path: 'week1.csv' }, output: 'ana = 21.75\nben = 19.75\ncara = 12.75' } },
+      { sequence: 3, data: { type: 'tool', name: 'calculate', status: 'failed', input: {}, output: 'denied: Give exactly one' } },
+      { sequence: 4, data: { type: 'text', role: 'assistant', text: 'Could not complete the task: the calculate approach has produced equivalent results 6 times.' } }
+    ]
+    let state: { phase: string; sequence: number; items: typeof items } = { phase: 'running', sequence: 1, items: [] }
+    const stop = watchLocalCoworker('agent_w1', 'Week 1', { snapshot: () => state as never, deliver: async text => { delivered.push(text) }, intervalMs: 5 })
+    state = { phase: 'failed', sequence: 4, items }
+    await new Promise(resolve => setTimeout(resolve, 40))
+    stop()
+    expect(delivered).toHaveLength(1)
+    expect(delivered[0]).toContain('Could not complete the task')
+    expect(delivered[0]).toContain('Its last calculate result:\nana = 21.75\nben = 19.75\ncara = 12.75')
   })
 
   it('refuses another model, another provider and anything but its own fields', () => {

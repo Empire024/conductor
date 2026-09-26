@@ -55,6 +55,16 @@ function withinContract(opener: TaskContract, coworker: TaskContract): boolean {
     : pathAllowed(opener, path))
 }
 
+/** The permission a coworker opens with. A valid mode no wider than the opener's is kept; anything
+ *  else (a wider mode, or a word like "read" or "write") becomes the opener's own mode rather than
+ *  an error: Dolphin sent permission "read" twice, was refused twice, and the swarm lost a
+ *  coworker (VR9a). Never wider than the opener, so nothing is granted that it does not hold. */
+export function coworkerPermission(requested: unknown, own: SessionSettings['permission']): SessionSettings['permission'] | undefined {
+  if (requested === undefined || requested === null || requested === '') return undefined
+  const mode = PERMISSION_RANK.find(rank => rank === requested)
+  return mode && PERMISSION_RANK.indexOf(mode) <= PERMISSION_RANK.indexOf(own) ? mode : own
+}
+
 /** What a local opener's tabs.open becomes, or the reason it is refused. */
 export function planLocalCoworker(opener: LocalOpener, args: Record<string, unknown>): LocalCoworkerPlan {
   const unknown = Object.keys(args).filter(key => !OPEN_FIELDS.includes(key))
@@ -71,9 +81,7 @@ export function planLocalCoworker(opener: LocalOpener, args: Record<string, unkn
   if (title !== undefined && (typeof title !== 'string' || !title.trim() || title.length > 120)) throw new Error('title must be 1 to 120 characters')
   const prompt = args.prompt
   if (prompt !== undefined && (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 20000)) throw new Error('prompt must be 1 to 20000 characters')
-  const permission = args.permission
-  if (permission !== undefined && (typeof permission !== 'string' || !PERMISSION_RANK.includes(permission as SessionSettings['permission']))) throw new Error('permission must be read-only, default or accept-edits')
-  if (permission !== undefined && PERMISSION_RANK.indexOf(permission as SessionSettings['permission']) > PERMISSION_RANK.indexOf(opener.settings.permission)) throw new Error(`A coworker gets the same permission as this conversation (${opener.settings.permission}) or less, never more`)
+  const permission = coworkerPermission(args.permission, opener.settings.permission)
   const repository = flag(args, 'repository'), research = flag(args, 'research')
   if (repository && !opener.settings.localGit) throw new Error('A sandboxed local conversation without the repository-write grant cannot give it to a coworker; only the same grants or fewer')
   if (research && !opener.settings.localResearch) throw new Error('A sandboxed local conversation without the deep-research grant cannot give it to a coworker; only the same grants or fewer')
@@ -135,7 +143,13 @@ export function watchLocalCoworker(id: string, title: string, deps: CoworkerWatc
     const answer = turn.filter(item => item.data.type === 'text' && item.data.role === 'assistant').map(item => item.data.type === 'text' ? item.data.text : '').join('\n').trim()
     const tools = turn.filter(item => item.data.type === 'tool').length
     if (!answer && !tools) return
-    const text = `[Automatic report: ${title} ended its turn (${state.phase}) without agents.report] ${answer ? answer.slice(-1600) : `No answer text; it made ${tools} tool call${tools === 1 ? '' : 's'}.`}`
+    // A coworker that computed its numbers and then stalled (VR9a: right per-person sums, then a
+    // stagnation stop) still hands them over: its last successful calculate result goes along.
+    const computed = turn.map(item => item.data).filter(data => data.type === 'tool' && data.name === 'calculate' && data.status === 'completed').map(data => data.type === 'tool' ? String(data.output ?? '') : '').filter(Boolean).at(-1)
+    const said = answer ? answer.slice(computed ? -900 : -1600) : `No answer text; it made ${tools} tool call${tools === 1 ? '' : 's'}.`
+    const text = `[Automatic report: ${title} ended its turn (${state.phase}) without agents.report] ${said}${computed && !answer.includes(computed.trim().slice(0, 40)) ? `
+Its last calculate result:
+${computed.slice(0, 900)}` : ''}`
     delivering = true
     void deps.deliver(text.slice(0, 2000)).catch(() => undefined).finally(() => { delivering = false })
   }

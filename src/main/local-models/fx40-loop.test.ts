@@ -145,7 +145,8 @@ describe('FX40: budgets that renew and numbers that are computed', () => {
       answer('The combined total for January and February is $3,162.60. The category with the greatest increase from January to February was entertainment, which grew by $110.50.')
     ]
     const { run } = await session((_sent, index) => steps[index]!)
-    const outcome = await run('Using only the two reports your coworkers sent, give the total per category for January and February together, and say which category grew the most from January to February.')
+    // The reports are in the conversation: a merge of numbers nobody sent is refused (inventedReports).
+    const outcome = await run(`Using only the two reports your coworkers sent (${reports.join('; ')}), give the total per category for January and February together, and say which category grew the most from January to February.`)
     expect(outcome.stopReason).toBe('completed')
     for (const line of ['rent = 1900 (950 + 950; change +0)', 'groceries = 625.6', 'transport = 186.5', 'utilities = 250', 'fun = 200.5', 'largest increase: fun (+110.5)'])
       expect(outcome.text).toContain(line)
@@ -177,11 +178,13 @@ describe('FX40: budgets that renew and numbers that are computed', () => {
     const report = (id: string) => call(id, 'conductor', { method: 'agents.report', args: { text: 'Total per category (Jan + Feb): rent = $1900, groceries = $626' } })
     const steps = [call('c', 'calculate', { combine: ['jan.csv: rent=950, groceries=350.8', 'feb.csv: rent=950, groceries=274.8'] }), ...Array.from({ length: 12 }, (_, n) => report(`r${n}`))]
     const { run } = await session((_sent, index) => steps[index] ?? answer('done'), { control })
-    const outcome = await run('Using only the two reports your coworkers sent, give the total per category for January and February together.')
+    const outcome = await run('Using only the two reports your coworkers sent (jan.csv: rent=950, groceries=350.8; feb.csv: rent=950, groceries=274.8), give the total per category for January and February together.')
     const reports = outcome.tools.filter(tool => tool.name === 'conductor')
     expect(reports[0]!.output).toMatch(/^not sent: no conversation opened this one/)
     expect(controlCalls).toBe(1)
-    expect(reports.slice(1).every(tool => tool.output.startsWith('not sent: no conversation opened this one'))).toBe(true)
+    // The same refusal twice turns the method off; two more calls to it end the turn early.
+    expect(reports[1]!.output).toContain('failed with this same error twice, so it is off for the rest of this message')
+    expect(reports.slice(2).map(tool => tool.output.slice(0, 8))).toEqual(['not run:', 'not run:'])
     // The model kept trying until the stagnation stop; the right numbers it computed survive it.
     expect(outcome.stopReason).toBe('stagnation')
     expect(outcome.text).toContain('Computed with calculate before the stop:\nrent = 1900 (950 + 950; change +0)\ngroceries = 625.6')
@@ -205,5 +208,73 @@ describe('FX40: budgets that renew and numbers that are computed', () => {
     const reply = await plain.run('whats the difference between a mutex and a semaphore? keep it short')
     expect(plain.requests).toHaveLength(1)
     expect(reply.text).toBe('A mutex has one owner; a semaphore counts permits.')
+  })
+
+  it('keeps memory writes out of a swarm task and ends a repeated invalid call early (FX42, VR9a timesheet run 1)', async () => {
+    const methods: string[] = []
+    const control = async (method: string) => { methods.push(method); return method === 'tabs.open' ? { agentSessionId: 'agent_w1' } : {} }
+    // Run 1: one coworker opened, then memory.remember without a gist, eleven times.
+    const steps = [
+      call('o', 'conductor', { method: 'tabs.open', args: { title: 'Week 1', prompt: 'Add up the hours per person in week1.csv.' } }),
+      ...Array.from({ length: 11 }, (_, n) => call(`m${n}`, 'conductor', { method: 'memory.remember', args: { kind: 'episodic', cues: ['week1.csv', `cue ${n}`] } }))
+    ]
+    const { run } = await session((_sent, index) => steps[index] ?? answer('Waiting for the reports.'), { control })
+    const outcome = await run('I have two timesheets, week1.csv and week2.csv. Open one coworker of yourself per file to add up the hours per person and report back to you. When both have reported, tell me how many hours each person worked over the two weeks together, and who worked the most.')
+    expect(methods).toEqual(['tabs.open'])
+    const memory = outcome.tools.filter(tool => tool.name === 'conductor').slice(1)
+    expect(memory[0]!.output).toMatch(/^not saved: memory is not part of this task/)
+    expect(memory[1]!.output).toContain('failed with this same error twice, so it is off for the rest of this message')
+    expect(memory).toHaveLength(4)
+    expect(outcome.stopReason).toBe('stagnation')
+  })
+
+  it('says what memory.remember needs when the gist is missing, outside a swarm', async () => {
+    const control = async () => ({ ok: true })
+    const { run } = await session((sent, index) => index === 0 ? call('m', 'conductor', { method: 'memory.remember', args: { kind: 'semantic', cues: ['node'] } }) : answer('Noted.'), { control })
+    const outcome = await run('remember that the build uses node 24')
+    expect(outcome.tools[0]!.output).toMatch(/^denied: memory.remember needs gist: the one sentence to remember/)
+  })
+
+  it('merges the reports it received when the model slips a made-up one in (FX42, B1 run)', async () => {
+    const invented = call('c', 'calculate', { combine: ['jan.csv: rent=950, groceries=350.8, transport=86.5', 'feb.csv: rent=1000, groceries=375, transport=90'] })
+    const { run } = await session((_sent, index) => index < 2 ? answer('Noted.') : index === 2 ? invented : answer('Rent 1900, groceries 625.6, transport 186.5.'))
+    await run('jan.csv: rent=950, groceries=350.8, transport=86.5')
+    await run('feb.csv: rent=950, groceries=274.8, transport=100')
+    const outcome = await run('Using only the two reports your coworkers sent, give the total per category for January and February together.')
+    expect(outcome.tools[0]!.output).toMatch(/^\[Conductor: a report in this call was not one this conversation received, so the 2 reports it did receive were merged instead\.\]\n/)
+    expect(outcome.tools[0]!.output).toContain('rent = 1900 (950 + 950; change +0)')
+    expect(outcome.tools[0]!.output).toContain('transport = 186.5')
+    expect(outcome.text).toContain('Rent 1900')
+  })
+
+  it('answers from a calculation the model repeats instead of stopping on it (FX42 timesheet run)', async () => {
+    const merge = call('c', 'calculate', { combine: ['Week 1: ana=21.75, ben=19.75, cara=12.75', 'Week 2: ana=17.25, ben=12.75, cara=17'] })
+    const { requests, run } = await session((sent, index) => (sent.tools?.length ?? 0) === 0 && index > 0 ? answer('Ana 39, Ben 32.5, Cara 29.75: Ana worked the most.') : merge)
+    const outcome = await run('Week 1: ana=21.75, ben=19.75, cara=12.75. Week 2: ana=17.25, ben=12.75, cara=17. Add up the hours per person over both weeks.')
+    expect(outcome.stopReason).toBe('completed')
+    expect(outcome.tools.map(tool => tool.name)).toEqual(['calculate', 'calculate'])
+    expect(outcome.tools[1]!.output).toMatch(/^Already computed for this message; the result is:\ncombined 2 reports/)
+    expect(requests.at(-1)!.tools).toBeUndefined()
+    expect(outcome.text).toContain('Ana 39, Ben 32.5, Cara 29.75')
+  })
+
+  it('treats a follow-up about received reports as a merge to compute (FX42 timesheet run)', async () => {
+    const { requests, run } = await session((sent, index) => index < 2 ? answer('Noted.') : index === 2 ? answer('Ana 39, Ben 32.75, Cara 29.75.') : sent.tool_choice === 'required' ? answer('still no call') : answer('Ana 39, Ben 32.5, Cara 29.75: Ana worked the most.'))
+    await run('[Automatic report: Week 1] ana = 21.75\nben = 19.75\ncara = 12.75')
+    await run('[Automatic report: Week 2] ana = 17.25\nben = 12.75\ncara = 17')
+    const outcome = await run('so, how many hours did each person work over both weeks, and who worked the most?')
+    expect(lastUser(requests[2]!)).toContain(CALC_HINT)
+    // Asked once, then held to calculate, then Conductor merged the two reports itself.
+    const merge = outcome.tools.find(tool => tool.name === 'calculate')!
+    expect(merge.output).toContain('ben = 32.5 (19.75 + 12.75')
+    expect(outcome.text).toContain('Ben 32.5')
+  })
+
+  it('merges only reports the conversation received (FX42, VR9a timesheet run 2)', async () => {
+    const invented = call('c', 'calculate', { combine: ['Person A worked 40 hours in week 1 and 30 hours in week 2.', 'Person B worked 35 hours in week 1 and 45 hours in week 2.'] })
+    const { run } = await session((_sent, index) => index === 0 ? invented : answer('No coworker has reported yet.'))
+    const outcome = await run('so, how many hours did each person work over both weeks, and who worked the most?')
+    expect(outcome.tools[0]!.output).toMatch(/^not computed: the numbers of at least one of these reports are not in this conversation/)
+    expect(outcome.text).toBe('No coworker has reported yet.')
   })
 })

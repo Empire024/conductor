@@ -17,11 +17,12 @@ import { outputBudgetLoopStop, truncatedCallResult, type OutputBudgetLoop } from
 import { newExecutionState, observeExecution, fingerprint, type ExecutionState } from './execution-state.ts'
 import { reportPairs } from './calculate.ts'
 import { isFileProcessingTask, processingRequest, processingTool, PROCESSING_GUIDE, observedPlanHint, type ProcessingRun } from './processing-workflow.ts'
-import { mentionsConductorControl, splitLocalPrompt, withoutCoworkerBrief } from './briefing.ts'
+import { LOCAL_COWORKER_BRIEF, mentionsConductorControl, splitLocalPrompt, withoutCoworkerBrief } from './briefing.ts'
 import { MemoryResultStore, type LocalResultStore } from './result-artifacts.ts'
 import { CONDUCTOR_NOTE, cappedStatus, conductorNoteGuard, stripConductorNotes } from './visible-text.ts'
 import { promptDate, templateKwargs } from './templates.ts'
-import { timeRelative, wantsWeb } from './web-intent.ts'
+import { askedDay, closedQuestion, datedQuery, timeRelative, wantsWeb } from './web-intent.ts'
+import { PAGE_HEADER, SEARCH_HEADER } from './web.ts'
 
 /** The whole agent loop for a local model. Conductor stays the orchestrator: llama.cpp only
  *  produces tokens, this loop decides what may run, and every capability it can offer is the
@@ -341,6 +342,21 @@ interface RunLedger {
   searchLinks?: string[]
   /** Whether a web answer from search results alone already had its one nudge to read a page. */
   readNudged?: boolean
+  /** Every result this message's searches listed, in order (pickPages); web_search calls made;
+   *  rounds in which Conductor opened pages for the model; pages that would not open. */
+  searchHits?: SearchHit[]
+  searches?: number
+  conductorReads?: number
+  readFailed?: string[]
+  /** Identical failures by tool and error, the tools (and conductor methods) turned off after a
+   *  second one, and calls made to them since. */
+  failures?: Record<string, number>
+  blocked?: string[]
+  blockedAttempts?: number
+  /** A tool-free round answered with a tool call written as text, and was asked again once. */
+  bareRetried?: boolean
+  /** Successful calculate results this message, by the call's arguments. */
+  computed?: Record<string, string>
   /** A calculate call succeeded this message; an answer owed a calculation had its one nudge; a
    *  report with uncomputed numbers was held back once. */
   calculated?: boolean
@@ -368,7 +384,7 @@ export function searchQuery(instruction: string, now = new Date()): string {
   const words = instruction.replace(QUERY_FILLER, ' ').replace(/[?!,;:()"]+/g, ' ').split(/\s+/).filter(Boolean)
   const query = (words.length ? words : instruction.split(/\s+/)).slice(0, 14).join(' ').slice(0, 195)
   // "this weekend" means nothing to a search engine without the year it is in.
-  return timeRelative(instruction) && !/\b20\d\d\b/.test(instruction) ? `${query} ${now.getFullYear()}` : query
+  return /\b20\d\d\b/.test(instruction) ? query : datedQuery(query, instruction, now)
 }
 /** Owner words that ask for numbers to be worked out from data: a sum, a total, a merge. An 8B
  *  model does that arithmetic in its head and gets it wrong, or writes code it never runs as its
@@ -382,6 +398,11 @@ const MATH_CODE = /\b[\w./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|cs|cpp|c|h
 /** A controller handing the numbers to coworkers is not computing them itself. */
 const DISPATCH = /\btabs\.open\b|\b(?:open|start|dispatch|spawn|create)\b[^.\n]*\b(?:coworkers?|workers?|tabs?|agents?)\b/i
 export const wantsMath = (instruction: string): boolean => MATH_CUES.test(instruction) && MATH_DATA.test(instruction) && !MATH_CODE.test(instruction) && !DISPATCH.test(instruction)
+/** A follow-up about reports the conversation already holds names no data of its own: "how many
+ *  hours did each person work over both weeks?" was added up in the model's head (FX42 timesheet
+ *  run: ben 32.75 for 32.5). With two or more reports received, these words ask for a merge. */
+const MERGE_CUES = /\b(?:over|across|for) (?:both|the two|all(?: the)?|each of the) \w+|\b(?:together|combined|in all|how many \w+ (?:did|does|do) each)\b/i
+export const wantsMerge = (instruction: string, reports: number): boolean => reports >= 2 && (MATH_CUES.test(instruction) || MERGE_CUES.test(instruction)) && !MATH_CODE.test(instruction) && !DISPATCH.test(instruction)
 export const CALC_HINT = '[Conductor: this message asks for numbers to be worked out. Compute every one of them with the calculate tool (a CSV file: path, column and group_by; results from reports: combine, with the full text of each report; other numbers: expressions) and answer with the numbers it returns, not with code or estimates.]'
 const hasNumbers = (text: string): boolean => /\d/.test(text.replace(/https?:\/\/\S+/g, ''))
 
@@ -395,6 +416,145 @@ export function citeSources(answer: string, pages: string[], results: string[]):
   if (pages.length) return `\n\nSources: ${[...new Set(pages)].slice(0, 5).join(' , ')}`
   if (results.length) return `\n\nFrom search results: ${[...new Set(results)].slice(0, 3).join(' , ')}`
   return ''
+}
+
+export interface SearchHit { url: string; title: string; snippet: string; rank: number }
+
+/** The hits of a web_search result, as searchPublicWeb lists them. */
+export function searchHits(output: string): SearchHit[] {
+  return [...output.matchAll(/^(\d+)\. (.*)\n {3}(https:\/\/\S+)(?:\n {3}(.*))?$/gm)].map(match => ({ rank: Number(match[1]), title: match[2]!, url: match[3]!, snippet: match[4] ?? '' }))
+}
+
+// Hosts whose pages carry no readable text for a plain GET: video, social feeds, sign-in walls.
+const UNREADABLE = /(^|\.)(?:youtube\.com|youtu\.be|dailymotion\.com|vimeo\.com|tiktok\.com|instagram\.com|facebook\.com|x\.com|twitter\.com|reddit\.com|linkedin\.com|pinterest\.[a-z.]+)$/i
+const QUESTION_STOP = new Set(['the', 'and', 'for', 'with', 'what', 'whats', "what's", 'how', 'who', "who's", 'whos', 'why', 'when', 'where', 'which', 'are', 'was', 'were', 'does', 'did', 'from', 'about', 'this', 'that', 'is', 'you', 'your', 'can', 'could', 'would', 'will', 'right', 'now', 'today', 'tonight', 'yesterday', 'last', 'night', 'latest', 'newest', 'current', 'currently', 'weekend', 'week', 'give', 'short', 'summary', 'sources', 'say', 'says'])
+
+/** The words of a question worth finding in a page: no question words, filler or time words. */
+export function questionTerms(instruction: string): string[] {
+  return [...new Set(instruction.toLowerCase().replace(QUERY_FILLER, ' ').split(/[^\p{L}\p{N}.+#&-]+/u).map(term => term.replace(/^[.&-]+|[.&-]+$/g, '')).filter(term => (term.length >= 3 || /\d/.test(term)) && !QUESTION_STOP.has(term)))].slice(0, 12)
+}
+
+/** The results worth opening for a question, best first and one per site: about the question
+ *  (its words in the title, snippet or link), high in their list, and for a current question
+ *  recent rather than old. Dolphin answered "did the dodgers win last night" from "Dodgers win
+ *  2020 World Series" and "September 2008 in sports" (VR9a); a page dated years back scores below
+ *  one that is undated, and one from the last week above both. */
+/** "The latest version right now": its answer is a release, which may be months old. */
+const LATEST = /\b(?:latest|newest|current)\b[^?]*\b(?:version|release|model|update)\b/i
+/** The day a question's answer belongs to (yesterday's close, the price right now), or undefined:
+ *  none named, or a latest-release question, where "right now" does not date the answer. */
+const boundDay = (instruction: string, now: Date): string | undefined => LATEST.test(instruction) ? undefined : askedDay(instruction, now)
+
+/** When a result was published: the date in front of its snippet, else one in its link
+ *  (/2026/09/25/). */
+export function hitDate(hit: SearchHit): string | undefined {
+  const dated = /^(\d{4}-\d{2}-\d{2})/.exec(hit.snippet)?.[1]
+  if (dated) return dated
+  const linked = /\/(20\d\d)[/-](\d{1,2})[/-](\d{1,2})(?:\/|-|$)/.exec(hit.url)
+  return linked ? `${linked[1]}-${linked[2]!.padStart(2, '0')}-${linked[3]!.padStart(2, '0')}` : undefined
+}
+
+export function pickPages(hits: SearchHit[], instruction: string, skip: string[], count: number, now = new Date()): string[] {
+  const terms = questionTerms(instruction)
+  const year = now.getFullYear()
+  // A question about one day (yesterday's close, the price right now) wants that day's report:
+  // Dolphin took the S&P 500's close from a report two days older than the question (FX42 run).
+  const day = boundDay(instruction, now)
+  const scored = hits.flatMap((hit, index) => {
+    let host: string, link: string
+    try { host = new URL(hit.url).hostname; link = decodeURIComponent(hit.url) } catch { return [] }
+    if (skip.includes(hit.url) || UNREADABLE.test(host) || /\.pdf$/i.test(hit.url)) return []
+    const text = `${hit.title} ${hit.snippet} ${link}`.toLowerCase()
+    const matched = terms.filter(term => text.includes(term)).length
+    const years = [...text.matchAll(/(?:^|[^\d])(20\d\d)(?!\d)/g)].map(match => Number(match[1])).filter(value => value <= year)
+    const newest = years.length ? Math.max(...years) : undefined
+    const dated = hitDate(hit)
+    const age = dated ? (now.getTime() - Date.parse(dated)) / 86_400_000 : undefined
+    const off = dated && day ? Math.abs(Date.parse(dated) - Date.parse(day)) / 86_400_000 : undefined
+    // An undated page for a question about today is most often a live page (a price, a scoreboard).
+    const fresh = off !== undefined ? (off <= 1 ? 4 : -3) : day ? 1 : age !== undefined && age <= 7 ? 2 : 0
+    const score = matched * 2 - hit.rank * 0.25 + (newest === undefined ? 0 : newest >= year ? 2 : newest === year - 1 ? 0.5 : -4) + fresh
+    return [{ url: hit.url, host: host.replace(/^www\./, ''), score, index }]
+  }).sort((a, b) => b.score - a.score || a.index - b.index)
+  const picked: typeof scored = []
+  for (const hit of scored) {
+    if (picked.length >= count) break
+    if (!picked.some(other => other.url === hit.url || other.host === hit.host)) picked.push(hit)
+  }
+  return picked.map(hit => hit.url)
+}
+
+/** Why a page read for a question about one day is left out, when it is dated more than a day
+ *  before that day; undefined when it is recent enough or has no known date. */
+export function stalePage(url: string, hits: SearchHit[], instruction: string, now = new Date()): string | undefined {
+  const day = boundDay(instruction, now)
+  const hit = hits.find(item => item.url === url)
+  const published = hit ? hitDate(hit) : undefined
+  if (!day || !published) return undefined
+  const days = Math.round((Date.parse(day) - Date.parse(published)) / 86_400_000)
+  return days > 1 ? `left out: ${url} is dated ${published}, ${days} days before ${day}, the day the question is about, so its figures do not answer it. Open a result from that day or a live page, or say that you found none.` : undefined
+}
+
+/** A page read for a question about one day, with a line after its source saying how old it is
+ *  against that day. A page with no known date, or a question about no single day, is unchanged. */
+export function datedPage(output: string, url: string, hits: SearchHit[], instruction: string, now = new Date()): string {
+  const day = boundDay(instruction, now)
+  const hit = hits.find(item => item.url === url)
+  const published = hit ? hitDate(hit) : undefined
+  if (!day || !published) return output
+  const days = Math.round((Date.parse(day) - Date.parse(published)) / 86_400_000)
+  const line = `[Conductor: this page is dated ${published}; the question is about ${day}${days > 0 ? `, ${days} day${days === 1 ? '' : 's'} later. Its figures are ${days === 1 ? 'a day' : `${days} days`} old` : days === 0 ? ', the same day' : ''}.]`
+  const end = output.indexOf('\n')
+  return end < 0 ? `${output}\n${line}` : `${output.slice(0, end)}\n${line}${output.slice(end)}`
+}
+
+/** Characters a page or result list read for an earlier message keeps. */
+export const EARLIER_WEB_CHARS = 1200
+
+/** What the model is told once Conductor has opened pages for it. */
+export const READ_FOR_YOU = '[Conductor] Conductor opened the best results above for you. Answer the owner\'s question now from these pages: state the answer itself (the result, number, name or version, with its date when the page gives one) in your first sentence, then list the https links you used. If the pages do not answer it, say what they do say and which page says it.'
+
+/** READ_FOR_YOU with what an 8B model gets wrong across pages spelled out: which day the question
+ *  is about and how old each page is (it took a figure from a page days older than the question,
+ *  and "the latest Python" from a table of planned releases, in FX42's parked runs). */
+export function readForYou(pages: string[], hits: SearchHit[], instruction: string, now = new Date()): string {
+  const day = boundDay(instruction, now)
+  const dated = pages.map(url => { const hit = hits.find(item => item.url === url); return `${url}${hit && hitDate(hit) ? ` (${hitDate(hit)})` : ''}` })
+  const latest = LATEST.test(instruction)
+  return [
+    READ_FOR_YOU,
+    `Pages read: ${dated.join(' ; ')}.`,
+    day ? `The question is about ${day}: use what a page says for that day; if none gives it, give the newest figure you have and its date.` : '',
+    latest ? 'Latest means already released and stable: not a planned, upcoming, beta or release-candidate version.' : ''
+  ].filter(Boolean).join(' ')
+}
+
+/** Whether a combine call has a made-up report: one whose numbers (two digits or more, or with
+ *  decimals) are mostly in nothing the conversation received. Dolphin, asked a follow-up after
+ *  its coworkers never reported, combined "Person A worked 40 hours ..." six times (VR9a). */
+export function inventedReports(combine: unknown, received: string): boolean {
+  if (!Array.isArray(combine) || !combine.length) return false
+  const numbers = (text: string): string[] => [...new Set((text.match(/\d+(?:\.\d+)?/g) ?? []).map(value => value.replace(/\.0+$/, '')).filter(value => value.length >= 2 || value.includes('.')))]
+  const known = new Set(numbers(received))
+  // Per report: in B1 (FX42 run) the controller merged January's real report with a February one
+  // it made up ("rent=1050"), so one invented report among real ones is refused too.
+  return combine.some(item => {
+    const claimed = numbers(typeof item === 'string' ? item : JSON.stringify(item))
+    return claimed.length > 0 && claimed.filter(value => known.has(value)).length * 2 < claimed.length
+  })
+}
+
+/** A tool, or for the conductor tool the method, as the repeat-failure rule counts it. */
+const failureKey = (call: ToolCall): string => call.name === 'conductor' ? `conductor:${String(parseArguments(call.arguments).method ?? '')}` : call.name
+const failureLabel = (call: ToolCall): string => call.name === 'conductor' ? `conductor ${String(parseArguments(call.arguments).method ?? '')}` : call.name
+
+/** A search for a time-relative question, with the date it is about when the model left it out:
+ *  "dodgers last night result" becomes "... September 25 2026". Only what runs changes; the call
+ *  shown is the model's own. */
+function datedSearch(call: ToolCall, instruction: string): string {
+  if (call.name !== 'web_search' || !timeRelative(instruction)) return call.arguments
+  const args = parseArguments(call.arguments)
+  return typeof args.query === 'string' && args.query.trim() && !/\b20\d\d\b/.test(args.query) ? JSON.stringify({ ...args, query: datedQuery(args.query.trim(), instruction) }) : call.arguments
 }
 
 /** The results of the last calculation when the answer leaves them out. An 8B model that called
@@ -444,6 +604,8 @@ export class LocalAgentSession {
   private processed?: ProcessingRun
   private processingPlanHint = ''
   private processingAttempted = false
+  /** This conversation opened a coworker: its later turns (the reports) are part of a swarm task. */
+  private openedCoworkers = false
   /** Whether the owner has asked about something the conductor tool does in this session. The
    *  tool is only offered after that: a small model offered it unprompted calls it unprompted.
    *  Sticky once set, since a follow-up ("and mark it done") need not repeat the subject. */
@@ -820,8 +982,11 @@ export class LocalAgentSession {
     const instruction = prompt === undefined ? '' : withoutCoworkerBrief(splitLocalPrompt(prompt).instruction)
     const ordinary = prompt !== undefined && this.scope === 'full' && !isFileProcessingTask(instruction)
     const hinted = ordinary && wantsWeb(instruction)
-    const mathHinted = ordinary && wantsMath(instruction)
+    const mathHinted = ordinary && (wantsMath(instruction) || wantsMerge(instruction, this.recentReports().length))
     const hints = [hinted ? WEB_HINT : '', mathHinted ? CALC_HINT : ''].filter(Boolean)
+    // A new message: the pages and result lists read for earlier ones keep only their opening, so
+    // an 8B model does not answer this question with a figure from the last one (FX42 runs).
+    if (prompt !== undefined) this.messages = this.messages.map(message => message.role === 'tool' && message.content.length > EARLIER_WEB_CHARS && (message.content.includes(PAGE_HEADER) || message.content.includes(SEARCH_HEADER)) ? { ...message, content: `${message.content.slice(0, EARLIER_WEB_CHARS)}\n[The rest of this page, read for an earlier question, is left out.]` } : message)
     if (prompt !== undefined) this.messages.push({ role: 'user', content: hints.length ? `${hints.join('\n')}\n\n${prompt}` : prompt })
     const state = prompt === undefined ? this.taskState! : this.beginTurn(prompt)
     const execution = state.execution!
@@ -852,8 +1017,19 @@ export class LocalAgentSession {
     execution.lifecycle = 'running'
     let finalText = resumed?.finalText ?? ''
     let searchFirst = hinted
-    // Searched but read nothing yet, with a nudge and web budget left to read something.
-    const readOwed = (): boolean => hinted && !ledger.readNudged && (ledger.searchLinks?.length ?? 0) > 0 && !(ledger.webSources?.length) && (this.grants.research || (ledger.webCalls ?? 0) < WEB_CALLS_PER_MESSAGE)
+    // History, a definition, a conversion: answered from what the model knows, so its first round
+    // offers no tools (VR9a: Dolphin searched the Berlin Wall and "checked" 72 °F with calculate).
+    // Not once the conversation has worked in the workspace: a follow-up there may need a file.
+    let toolFree = ordinary && !hinted && !mathHinted && closedQuestion(instruction) && !this.messages.some(message => message.role === 'assistant' && message.tool_calls?.some(call => !['web_search', 'web_read', 'calculate'].includes(call.function.name)))
+    // Two pages: the first result alone was an index page, or a price page drawn by script with no
+    // price in it (a parked run of VR9a's questions: 2 of 5 right from one page each).
+    const pagesWanted = 2
+    // Searched, and fewer pages read than the answer needs, with web budget left to open one.
+    const readDue = (): boolean => hinted && (ledger.conductorReads ?? 0) < 2 && (ledger.webSources?.length ?? 0) < pagesWanted && (ledger.searchHits?.length ?? 0) > 0 && (this.grants.research || (ledger.webCalls ?? 0) < WEB_CALLS_PER_MESSAGE)
+    // Opening coworkers, a coworker's own task, or a controller's turn once they report: memory
+    // writes are not part of it (VR9a: memory.remember without a gist, eleven times, mid-swarm).
+    const coworker = prompt !== undefined && splitLocalPrompt(prompt).instruction.startsWith(LOCAL_COWORKER_BRIEF)
+    const swarmTurn = (): boolean => coworker || this.openedCoworkers || Boolean(ledger.dispatched) || DISPATCH.test(instruction)
     // Numbers asked for and none computed yet, with the one nudge still unspent.
     const calcOwed = (): boolean => mathHinted && !ledger.calculated && !ledger.calcNudged && !ledger.dispatched && tools.some(tool => tool.function.name === 'calculate')
     // Every path through the loop below either sends a request or returns, and the stages bound
@@ -897,6 +1073,8 @@ export class LocalAgentSession {
       events.telemetry?.({ kind: 'request', round: ledger.round, promptTokens: measure.promptTokens, reserveTokens: reserve, capacityTokens: measure.capacityTokens, level: measure.level })
 
       let completion: CompletionResult
+      let readRound = false
+      let bare = false
       try {
         ledger.requests++
         // A message that asks for current or online facts starts with a web call: given the
@@ -912,7 +1090,9 @@ export class LocalAgentSession {
         ledger.forceCalc = false
         // While a page read is still owed, an answer from snippets would be followed by a second
         // one after the read: that round's text stays out of the answer too.
-        completion = await this.complete(events, forced ? tools.filter(tool => WEB_TOOLS.has(tool.function.name)) : calcForced ? tools.filter(tool => tool.function.name === 'calculate') : tools, overheadTokens, reserve, signal, forced || calcForced ? 'required' : undefined, forced || calcForced || readOwed() || calcOwed())
+        bare = toolFree && !forced && !calcForced
+        toolFree = false
+        completion = await this.complete(events, bare ? [] : forced ? tools.filter(tool => WEB_TOOLS.has(tool.function.name)) : calcForced ? tools.filter(tool => tool.function.name === 'calculate') : tools, overheadTokens, reserve, signal, forced || calcForced ? 'required' : undefined, forced || calcForced || bare || readDue() || calcOwed())
         if (calcForced && !completion.toolCalls.some(call => call.name === 'calculate' && argumentsAreObject(call.arguments))) {
           // Still no call: when the conversation holds reports to merge, Conductor merges them;
           // otherwise the model's words are shown as its answer.
@@ -925,6 +1105,22 @@ export class LocalAgentSession {
         if (forced && !completion.toolCalls.some(call => WEB_TOOLS.has(call.name) && argumentsAreObject(call.arguments))) {
           events.notice?.('The model answered from memory instead of searching; Conductor searched the web for it.')
           completion = { ...completion, content: '', finishReason: 'tool_calls', toolCalls: [{ id: `conductor-search-${ledger.requests}`, name: 'web_search', arguments: JSON.stringify({ query: searchQuery(instruction) }) }] }
+        }
+        // Searched, read nothing, and now answering from snippets or searching yet again: Dolphin
+        // answered the one read nudge with another limit-1 search and then with a link, in all 10
+        // current questions (VR9a). Conductor opens the best results itself instead of asking.
+        const searching = completion.toolCalls.length > 0 && completion.toolCalls.every(call => call.name === 'web_search')
+        if (!forced && readDue() && ((!completion.toolCalls.length && completion.content.trim()) || (searching && (ledger.searches ?? 0) >= 2))) {
+          ledger.conductorReads = (ledger.conductorReads ?? 0) + 1
+          const read = ledger.webSources?.length ?? 0
+          const room = this.grants.research ? 2 : WEB_CALLS_PER_MESSAGE - (ledger.webCalls ?? 0)
+          const pages = pickPages(ledger.searchHits ?? [], instruction, [...(ledger.webSources ?? []), ...(ledger.readFailed ?? [])], Math.min(room, read ? pagesWanted - read : 2))
+          if (pages.length) {
+            events.notice?.(`The model ${searching ? 'kept searching' : 'answered from search results'} without opening a page; Conductor opened ${pages.length === 1 ? 'the best result' : `the best ${pages.length} results`} for it.`)
+            // The best page is read last: Dolphin answers from the last page it read (FX42 runs).
+            completion = { ...completion, content: '', finishReason: 'tool_calls', toolCalls: [...pages].reverse().map((url, index) => ({ id: `conductor-read-${ledger.requests}-${index}`, name: 'web_read', arguments: JSON.stringify({ url }) })) }
+            readRound = true
+          } else if (!completion.toolCalls.length) events.text?.(completion.content)
         }
       } catch (error) {
         if (signal?.aborted) return this.finish(ledger, events, finalText, 'interrupted', 'The turn was stopped.')
@@ -951,6 +1147,20 @@ export class LocalAgentSession {
         events.telemetry?.({ kind: 'usage', round: ledger.round, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cachedTokens: result.usage.cachedTokens })
       }
       account(completion)
+      if (bare && !completion.toolCalls.length) {
+        // Offered no tools, Dolphin can still write a call as text ({"name": "calculate", ...} for
+        // 72 °F in a parked run). Not shown: asked once more to answer in words, and the time after
+        // that the round is repeated with its tools.
+        if (/^\s*\{\s*"(?:name|type|function|tool)"/.test(completion.content)) {
+          if (!ledger.bareRetried) {
+            ledger.bareRetried = true
+            toolFree = true
+            this.messages.push({ role: 'user', content: '[Conductor] No tool is needed for this question: answer it in plain words from what you know.' })
+          }
+          continue
+        }
+        if (completion.content.trim()) events.text?.(completion.content)
+      }
       let calls: ToolCall[] = completion.toolCalls
       let truncated = completion.finishReason === 'length'
       const ruminated = completion.finishReason === 'rumination'
@@ -1035,14 +1245,6 @@ export class LocalAgentSession {
             continue
           }
         }
-        // Searched but read nothing: one nudge to open a result, so the answer rests on a page
-        // rather than on a line of snippet (Dolphin summarized "reviews" from titles alone).
-        if (readOwed()) {
-          ledger.readNudged = true
-          events.notice?.('The model answered from search results alone; asking it once to open the best result first.')
-          this.messages.push({ role: 'user', content: '[Conductor] Before answering, open the best one or two results with web_read, then answer from those pages and list their https links.' })
-          continue
-        }
         // Numbers worked out in the model's head, or code in place of numbers: one nudge to compute.
         if (calcOwed()) {
           ledger.calcNudged = true
@@ -1112,6 +1314,18 @@ export class LocalAgentSession {
         // between the assistant's call and its result, and that hole is what makes every later
         // request unrenderable. The failure belongs in the transcript as the call's result.
         let outcome: ToolOutcome
+        // A merge with a made-up report, when the conversation holds two or more real ones: those
+        // are merged instead (B1, FX42 run: January's real report and a February one it invented).
+        let runArguments = hinted ? datedSearch(call, instruction) : call.arguments
+        let merged = ''
+        const invented = call.name === 'calculate' && inventedReports(parseArguments(call.arguments).combine, this.messages.filter(message => message.role === 'user' || message.role === 'tool').map(message => message.content).join('\n'))
+        if (invented) {
+          const received = this.recentReports()
+          if (received.length >= 2) {
+            runArguments = JSON.stringify({ combine: received })
+            merged = `[Conductor: a report in this call was not one this conversation received, so the ${received.length} reports it did receive were merged instead.]\n`
+          }
+        }
         const mutation = WRITE_TOOLS.has(call.name) || call.name === 'run_command'
         const priorExecution = execution.executed?.find(e=>e.id===call.id)
         execution.pending = { id: call.id, name: call.name, arguments: call.arguments }
@@ -1124,6 +1338,22 @@ export class LocalAgentSession {
             outcome={output:'The durable execution identity budget is exhausted; no further mutation was executed.',failed:true,paths:[]}
           } else if(this.processing && this.processingPlanHint && !this.processingAttempted && (call.name==='run_command'||WRITE_TOOLS.has(call.name))) {
             outcome={output:`Parser preflight required before writing or executing a replacement parser. Conductor recognized a supported header/record profile. Validate that observed interpretation with process_files first. If its full-file check fails, script tools remain available to investigate. No command executed.\n${this.processingPlanHint}`,failed:true,paths:[]}
+          } else if (ledger.blocked?.includes(failureKey(call))) {
+            // Turned off after failing the same way twice: the call costs nothing, and a second
+            // one after that ends the turn rather than spending it on the loop.
+            ledger.blockedAttempts = (ledger.blockedAttempts ?? 0) + 1
+            outcome={output:`not run: ${failureLabel(call)} failed the same way twice this message and is off until the next one. Do not call it again; carry on with the task another way, or give your answer.`,failed:true,paths:[]}
+            if (ledger.blockedAttempts >= 2) stagnationStop = `The model kept calling ${failureLabel(call)} after it was turned off for failing the same way twice.`
+          } else if (call.name === 'conductor' && parseArguments(call.arguments).method === 'memory.remember' && swarmTurn()) {
+            outcome={output:`not saved: memory is not part of this task, so nothing was written. Carry on with it: ${coworker ? 'compute your numbers with calculate and send them with agents.report.' : 'open the coworkers it needs with tabs.open, end your turn and wait for their reports, then merge them with calculate (combine).'}`,failed:true,paths:[]}
+          } else if (call.name === 'calculate' && ledger.computed?.[fingerprint(call.arguments)] !== undefined) {
+            // The same calculation again: the right merge, repeated until the stagnation stop threw
+            // it away (VR9a timesheet task, FX42 run). Its result comes back, and the next round has
+            // no tools, so the answer is written from it.
+            outcome = { output: `Already computed for this message; the result is:\n${ledger.computed[fingerprint(call.arguments)]}\nAnswer the owner now with these numbers, in plain words.`, failed: false, paths: [] }
+            toolFree = true
+          } else if (invented && !merged) {
+            outcome={output:'not computed: the numbers of at least one of these reports are not in this conversation, so no coworker sent them. Combine only the full text of reports you received. If none have arrived, open the coworkers the task needs with tabs.open, end your turn and wait: each report arrives as a new message.',failed:true,paths:[]}
           } else if ((call.name === 'web_search' || call.name === 'web_read') && !this.grants.research && (ledger.webCalls ?? 0) >= WEB_CALLS_PER_MESSAGE) {
             outcome={output:`denied: this message has used its ${WEB_CALLS_PER_MESSAGE} web calls. Answer now from the pages you already read, and name them; the owner can turn on deep research for a longer search.`,failed:true,paths:[]}
           } else if (call.name === 'conductor' && ledger.noController && reportText(call.arguments) !== undefined) {
@@ -1139,6 +1369,9 @@ export class LocalAgentSession {
           } else if (call.name === 'web_read' && (ledger.webSources ?? []).includes(String(parseArguments(call.arguments).url ?? ''))) {
             // Dolphin re-read one review six times in a row; the page is already in the transcript.
             outcome={output:`You already read ${String(parseArguments(call.arguments).url)} for this message; its text is above. Answer from it now, or read a different result.`,failed:true,paths:[]}
+          } else if (call.name === 'web_read' && (ledger.readFailed ?? []).includes(String(parseArguments(call.arguments).url ?? ''))) {
+            // Dolphin retried a made-up 404 link four times, spending the message's web budget (FX42 run).
+            outcome={output:`not run: ${String(parseArguments(call.arguments).url)} already failed for this message, and it would fail again. Open a different result from the search, or answer from the pages you read.`,failed:true,paths:[]}
           } else if (call.name === 'process_files' && this.processing) {
             const args=parseArguments(call.arguments)
             const run = await processingRequest(this.options.workspace,this.taskId,args,/payment|invoice|bank/i.test(execution.objective),this.resultStore)
@@ -1154,7 +1387,8 @@ export class LocalAgentSession {
             } else if(run.failed) execution.validation = {passed:false,artifact:'',issues:[run.output]}
           } else {
             if (call.name === 'web_search' || call.name === 'web_read') ledger.webCalls = (ledger.webCalls ?? 0) + 1
-            outcome = await runTool(call.name, call.arguments, {
+            if (call.name === 'web_search') ledger.searches = (ledger.searches ?? 0) + 1
+            outcome = await runTool(call.name, runArguments, {
             taskId: this.taskId,
             ...(this.processing ? {analysis:{taskId:this.taskId}} : {}),
             workspace: this.options.workspace,
@@ -1168,21 +1402,50 @@ export class LocalAgentSession {
             signal,
             control: this.options.control,
             ...(this.resultStore ? { artifacts: this.resultStore } : {}),
+            ...(hinted && WEB_TOOLS.has(call.name) ? { webFocus: questionTerms(instruction) } : {}),
             beforeTool: this.options.beforeTool,
             afterTool: this.options.afterTool
             })
-            if (call.name === 'calculate' && !outcome.failed) { ledger.calculated = true; ledger.calculation = outcome.output }
+            // A report from days before the day asked about is not an answer to it, and Dolphin used
+            // its figures anyway, warning line and all (FX42 runs: a 6-day-old bitcoin price as the
+            // price "right now"). Its text is withheld and it counts as unread, so another page opens.
+            const stale = hinted && call.name === 'web_read' && !outcome.failed ? stalePage(String(parseArguments(call.arguments).url ?? ''), ledger.searchHits ?? [], instruction) : undefined
+            if (stale) outcome = { output: stale, failed: true, paths: [] }
+            if (call.name === 'calculate' && !outcome.failed) { ledger.calculated = true; ledger.calculation = outcome.output; (ledger.computed ??= {})[fingerprint(call.arguments)] = outcome.output }
+            if (merged) outcome = { ...outcome, output: merged + outcome.output }
             if (call.name === 'conductor' && !outcome.failed && reportText(call.arguments) !== undefined) ledger.reported = true
             // Nobody opened this conversation. Said plainly, and not asked of app control again: a
             // controller that tried to report its own merge looped into a stagnation stop that threw
             // away its right numbers (FX40 swarm run).
             if (call.name === 'conductor' && outcome.failed && reportText(call.arguments) !== undefined && /no controlling conversation/i.test(outcome.output)) { ledger.noController = true; outcome = { ...outcome, output: NO_CONTROLLER } }
             if (call.name === 'conductor' && !outcome.failed && /"(?:tabs\.open|agents\.steer)"/.test(call.arguments)) ledger.dispatched = true
+            if (call.name === 'conductor' && !outcome.failed && /"tabs\.open"/.test(call.arguments)) this.openedCoworkers = true
+            if (call.name === 'web_read' && outcome.failed) ledger.readFailed = [...(ledger.readFailed ?? []), String(parseArguments(call.arguments).url ?? '')]
+            if (call.name === 'web_search' && !outcome.failed) ledger.searchHits = [...(ledger.searchHits ?? []), ...searchHits(outcome.output)]
             if (call.name === 'web_read' && !outcome.failed) ledger.webSources = [...(ledger.webSources ?? []), String(parseArguments(call.arguments).url ?? '')]
+            // How old the page is against the day asked about, said on the page itself: Dolphin gave a
+            // bitcoin price from a report six days old as the price "right now" (FX42 run).
+            if (hinted && call.name === 'web_read' && !outcome.failed) outcome = { ...outcome, output: datedPage(outcome.output, String(parseArguments(call.arguments).url ?? ''), ledger.searchHits ?? [], instruction) }
             if (call.name === 'web_search' && !outcome.failed) ledger.searchLinks = [...(ledger.searchLinks ?? []), ...[...outcome.output.matchAll(/^ {3}(https:\/\/\S+)$/gm)].slice(0, 3).map(match => match[1]!)]
           }
         } catch (error) {
           outcome = { output: `failed: ${error instanceof Error ? error.message : 'the tool could not run'}`, failed: true, paths: [] }
+        }
+        // The same failure twice from one tool (or conductor method) turns it off for the message,
+        // said once and plainly: Dolphin repeated memory.remember without a gist eleven times and
+        // run_command with two forms six, each answered with the same refusal (VR9a). Only calls
+        // refused as invalid count: a conductor method or calculate (whose failures are all about
+        // their arguments), a command refused before it ran. A missing file read twice is the
+        // stagnation detector's, and web calls are bounded by their own budget.
+        const invalid = call.name === 'conductor' || call.name === 'calculate' || (call.name === 'run_command' && outcome.output.startsWith('denied:'))
+        if (outcome.failed && invalid && !ledger.blocked?.includes(failureKey(call)) && !suspendedBy(signal)) {
+          const failure = `${failureKey(call)}\n${outcome.output.slice(0, 300)}`
+          const failures = ledger.failures ??= {}
+          failures[failure] = (failures[failure] ?? 0) + 1
+          if (failures[failure] >= 2) {
+            ledger.blocked = [...(ledger.blocked ?? []), failureKey(call)]
+            outcome = { ...outcome, output: `${outcome.output}\n[Conductor] ${failureLabel(call)} failed with this same error twice, so it is off for the rest of this message. Do not call it again: do what the error asks in the one call you still need, with another tool, or give your answer.` }
+          }
         }
         // Stopped by a restart's pause: reported as such, and never run again after the resume.
         if (outcome.failed && suspendedBy(signal)) outcome = { ...outcome, output: `Interrupted: Conductor restarted while this ${call.name} call was running, so it was stopped. It will not be run again; whatever it did before it stopped may be partial, so check the current state before repeating it.\n${outcome.output}` }
@@ -1259,6 +1522,7 @@ export class LocalAgentSession {
         events.notice?.(`Stopped: ${stagnationStop}`)
         return this.finish(ledger, events, finalText, 'stagnation', stagnationStop)
       }
+      if (readRound && (ledger.webSources?.length ?? 0) > 0) this.messages.push({ role: 'user', content: readForYou(ledger.webSources ?? [], ledger.searchHits ?? [], instruction) })
       if (stagnationWarning) {
         events.notice?.('The model is repeating an action without progress; it was told to change approach.')
         this.messages.push({ role: 'user', content: stagnationWarning + '\n' + execution.nextAction })
