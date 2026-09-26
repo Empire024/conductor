@@ -47,7 +47,7 @@ contents, test fixtures or dependency output, and may deliberately try to leave 
 
 - **A local model never gets a host shell.** Tool dispatch is an allowlist in code
   (`src/main/local-models/tools.ts`): `read_file`, `list_files`, `search`, `write_file`,
-  `edit_file`, `run_command`, `web_read`, `web_search`, and `conductor`. The Conductor broker
+  `edit_file`, `run_command`, `web_read`, `web_search`, `calculate`, and `conductor`. The Conductor broker
   permits only `memory.recall`, `memory.remember`, `tasks.list`, `tasks.update`, `agents.list`,
   `agents.snapshot`, `app.update` and `app.update.status`, bound to the registered
   project/session, each with its own argument allowlist. Read-only turns cannot remember, update
@@ -391,7 +391,11 @@ one typed policy (`agent-policy.ts`, defaults below) rather than by prompt text 
 - **Rounds** (`progress.ts`). Soft warning at 10, strong at 16, finish phase at 20, segment limit
   24 (research: 24 / 36 / 42 / 48). A segment with new source evidence checkpoints and continues
   automatically after compaction. The whole task remains bounded by 72 tool rounds, 96 requests,
-  three recoveries, 20 minutes and one million reported tokens. No continuation resets them.
+  three recoveries, 20 minutes and one million reported tokens. No continuation resets them. A
+  new owner message after a turn that stopped blocked (round limit, stagnation, a failed request)
+  starts a fresh budget, keeping the evidence, corrections and executed-call identities
+  (`renewBudget` in `agent.ts`, FX40): before that, VR8c saw one conversation whose three
+  stagnating turns used the 72 rounds answer its next 12 requests with the limit and no call.
 - **Stagnation.** The same call with the same result three times draws a correction; six ends the
   run with a blocker report. Six rounds without a new file change or command result draw one
   warning. File-processing script rewrites and exit zero alone do not count as progress;
@@ -468,11 +472,14 @@ A local-model tab can open coworkers of itself through its conductor tool: `tabs
 - **Its own coworkers only.** A local conversation steers and finishes only the local coworkers it opened; `provider`/`model`/`kind` may be named only as what it gets anyway.
 
 - **Reports arrive either way.** A small model forgets `agents.report`. When a local coworker's turn settles without calling it, Conductor sends its controller the end of that turn's answer as an "[Automatic report: ...]" message (`watchLocalCoworker`); a turn that did report is left alone.
+- **Numbers are computed, not guessed (FX40).** Every full-scope conversation has `calculate` (`calculate.ts`), in process, with no sandbox and no write: the totals of a CSV/TSV file in the workspace by a category column (`path`, read from every row), a merge of reports (`combine`: the total per label across label = value reports and the change from the first to the last; a report's own grand total is ignored and recomputed), several labelled formulas (`expressions`) or one (`expression`). Its descriptions carry placeholders, never numbers: Dolphin copied example values straight into its reports. A message that asks for sums, totals or a merge over data (`wantsMath`) carries a hint to use it. Without a calculation the answer is asked once to compute, the next round offers only `calculate` with the call required, and if that still brings no call Conductor combines the reports the conversation received itself. An answer that leaves out the computed numbers gets them appended ("Computed with calculate:"), and a turn that stops keeps them. A coworker's `agents.report` with numbers but no calculation is held back once, and one report per message is sent (a second one is refused, so a later made-up "failure" never replaces the right result). A conversation nobody opened is told so on its first `agents.report` and not sent to app control again. A coworker's first message starts with a swarm brief (`LOCAL_COWORKER_BRIEF`): report with `agents.report`, numbers from `calculate`. A held or failed report does not count as reported, so the automatic report still goes out.
 - **Forgiving about shape, not about limits.** A `contract` sent as a JSON string, as small models do with nested objects, is parsed and then held to the same narrowing.
 
 Because the server is shared, a controller should dispatch and end its turn, then merge when the reports arrive; polling in the same turn only takes rounds from its coworkers. `scripts/smoke-local-swarm.mjs` runs the real thing in a parked Conductor: a local controller splits writing `node:test` tests for a tiny `math.js` between two coworkers, each runs its tests in the sandbox and reports, and the controller merges; the smoke then runs `node --test` on the host and records the wall time and outcome in `artifacts/local-swarm/result.json`.
 
 Measured 2026-09-26 on Dolphin X1 8B (the server already running; nothing else started). Runs 1–2: the controller made no tool call and invented a result; llama.cpp was dropping its calls, written in the OpenAI wire shape (the empty-reply retry in section 17 fixes that). Run 3: coworkers opened in 14 s, but they wrote jest-style CommonJS tests and never reported. Run 4: the controller sent `contract` as a JSON string, which was refused (now parsed). Run 5: everything connected, and both automatic reports reached the controller in 49 s; but the coworkers pasted code instead of calling `write_file`, so no file was written. Run 6, with the coworker prompt naming `write_file`: **complete in 34 s wall time**. The controller opened both coworkers itself. Each wrote its test file, and Conductor's acceptance command passed in the sandbox. Both results reached the controller as automatic reports, since neither coworker called `agents.report`. The controller answered "Both test files passed.", and `node --test` on the host passes 5/5. That is fewer tests than asked: one each for add and subtract. After merging, the controller took two more turns trying `agents.report`/`agents.finish`, which do not apply to a tab nobody controls. A small model needs a flat, explicit dispatch prompt: one short sentence per coworker, the tool named, and a bounded contract.
+
+Measured 2026-09-26 (FX40, `scripts/smoke-fx40-swarm.mjs`, VR8c's B1: two monthly expense CSVs, one Dolphin coworker each, the controller merges; the running Dolphin server, nothing else started). VR8c before FX40: per-file sums right 2/8, merged totals 0/5 in 4/4 runs. With `calculate` alone (v2): per-file 7/8, merged right 2/4. Final (v4): **per-file 7/8** (the eighth had the right numbers under renamed labels, "entertainment" for fun), **merged totals right 4/4**, one llama-server throughout, 68-77 s per swarm and 10 s per merge. Honestly: in 2 of those 4 the model's own sentence gave only the grand total, and the per-category totals reached the answer through Conductor's appended "Computed with calculate:" block; the numbers are always a tool's, the prose is still the 8B model's. Coworkers still waste rounds on refused extra reports. Evidence: `artifacts/verification/2026-09-26-fx40/B1-v4-run*.json`.
 
 ## 17. What of a local model's output reaches the timeline (2026-09-26)
 

@@ -1,5 +1,6 @@
 import type { SessionProjection, SessionSettings, TimelineItem } from '../../shared/structured-agent'
 import { normaliseContract, pathAllowed, type TaskContract } from './completion.ts'
+import { LOCAL_COWORKER_BRIEF } from './briefing.ts'
 
 /**
  * Local swarms (local-model-swarms): a local-model conversation opens, steers, reads and finishes
@@ -96,7 +97,11 @@ export function planLocalCoworker(opener: LocalOpener, args: Record<string, unkn
       ...(opener.anonymous ? { anonymous: true } : {})
     },
     grants: { localGit: repository ?? Boolean(opener.settings.localGit), localResearch: research ?? Boolean(opener.settings.localResearch) },
-    ...(prompt !== undefined ? { prompt } : {})
+    // The brief rides in front of the controller's words: report with agents.report, and report
+    // numbers a tool computed. An 8B coworker left to itself summed in its head (VR8c: 2/8 right).
+    ...(prompt !== undefined ? { prompt: `${LOCAL_COWORKER_BRIEF}
+
+${prompt}` } : {})
   }
 }
 
@@ -108,7 +113,8 @@ export interface CoworkerWatchDeps {
 }
 
 const SETTLED: ReadonlySet<string> = new Set(['completed', 'failed', 'interrupted', 'idle'])
-const reported = (item: TimelineItem): boolean => item.data.type === 'tool' && item.data.name === 'conductor' && JSON.stringify(item.data.input ?? null).includes('agents.report')
+// A report Conductor held back (numbers not computed) or that failed never reached the controller.
+const reported = (item: TimelineItem): boolean => item.data.type === 'tool' && item.data.name === 'conductor' && item.data.status !== 'failed' && JSON.stringify(item.data.input ?? null).includes('agents.report')
 
 /**
  * A small model forgets to call agents.report, and then its controller waits for a message that

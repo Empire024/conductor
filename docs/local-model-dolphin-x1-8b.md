@@ -136,8 +136,15 @@ The causes, in order of weight:
   prompt states today's date and when to search: general knowledge answered directly with no
   tool; anything that may have changed, or that the owner asks to find online, searched and cited;
   primary sources preferred over shops and forks.
-- **A message that asks for current or online facts** (`wantsWeb`, words such as latest, current,
-  news, price, reviews, online, look up, find) carries a one-line hint and its first round offers
+- **A message that asks for current or online facts** (`wantsWeb` in `web-intent.ts`) carries a
+  one-line hint. The decision is by the kind of answer, not a word list: the owner asked for the
+  web; else a workspace question stays local; else anything time-relative (this weekend, last night,
+  latest, tomorrow) or dated from the model's training cutoff on (`LOCAL_KNOWLEDGE_YEAR`, 2024 for
+  this Llama 3.1 fine-tune) searches; else an answer that can change (results, scores, standings,
+  pole position, who holds an office or runs a company, prices, releases, news, weather) searches
+  unless the question is historical or general knowledge (explain, how does, what is the
+  difference). `web-intent.test.ts` holds 68 owner-style questions both ways. A search Conductor
+  runs itself for a time-relative question gets the current year appended. It and its first round offers
   only the web tools with `tool_choice: required`. llama.cpp b10901 does not hold Dolphin to
   `required` every time (2 of 8 probes still wrote prose until the output limit), so that round's
   text is kept out of the answer, and if no web call came back Conductor runs `web_search` itself
@@ -206,8 +213,15 @@ engine or read a 2 MB page).
   of butter where 227 g is usual); Ornith and Sonnet are tighter and better organized.
 - **It needs Conductor's scaffolding.** Before the forced first web round was made to hold, Dolphin
   answered Q6 and Q7 of an app run with an invented "review roundup" and a made-up product; with it, Conductor searches for it
-  whenever it writes prose instead. A question the cue words miss (`wantsWeb`) gets no such help,
-  and Dolphin then answers from 2023 memory; the date in the prompt is the only guard.
+  whenever it writes prose instead. A question `wantsWeb` misses gets no such help, and Dolphin
+  then answers from 2023 memory; the date in the prompt is the only guard. VR8c found one: "who got
+  pole position for the azerbaijan grand prix this weekend?" answered "Max Verstappen" from memory
+  3/4 (truth: George Russell), because the old cue list had "this week" but not "this weekend".
+  FX40 replaced the list with the classifier above. Measured 2026-09-26 on the running server
+  (`scripts/smoke-fx40-dolphin.mjs`, VR8c's C1 conversation, real web): the pole question searched,
+  read a page (planetf1.com, total-motorsport.com) and answered George Russell, 1:42.526, citing it,
+  3/3; the mutex question and two more plain ones were answered with no tool call, 5/5. Still weak:
+  the TypeScript release question twice read a third-party docs site instead of Microsoft's blog.
 - **Search reliability is the weakest link for every local model.** DuckDuckGo throttles this
   machine after a burst; Seznam's ranking favours Czech shops for product queries and knows little
   about niche topics. A keyed search API (Brave Search API, free tier) would fix both and needs a

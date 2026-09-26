@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LOCAL_SWARM_LIMITS, planLocalCoworker, watchLocalCoworker, type LocalOpener } from './swarm'
 import { agentTabIds, anonymousConversations, persistableClosedTabs, persistableLayout } from './anonymous'
 import { MemoryResultStore } from './result-artifacts'
+import { LOCAL_COWORKER_BRIEF } from './briefing'
 import type { PaneTab, WorkspaceLayout } from '../../shared/models'
 
 afterEach(() => anonymousConversations.clearForTests())
@@ -15,7 +16,8 @@ describe('local swarm plan', () => {
     const plan = planLocalCoworker(opener({ settings: { permission: 'accept-edits', plan: false, localGit: true, localResearch: false } }), { title: 'Tests for add', prompt: 'Write tests' })
     expect(plan.open).toEqual({ kind: 'agent', provider: 'local', model: 'local/dolphin', title: 'Tests for add' })
     expect(plan.grants).toEqual({ localGit: true, localResearch: false })
-    expect(plan.prompt).toBe('Write tests')
+    // The swarm brief rides in front: report with agents.report, numbers from calculate.
+    expect(plan.prompt).toBe(`${LOCAL_COWORKER_BRIEF}\n\nWrite tests`)
   })
 
   it('may narrow but never widen permission and grants', () => {

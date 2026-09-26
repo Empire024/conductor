@@ -147,7 +147,7 @@ describe('a local model answering like any other model', () => {
 
   it('offers web search to every full-scope conversation, never to a bounded coding task', () => {
     expect(toolSpecs(false).map(spec => spec.function.name)).toContain('web_search')
-    expect(toolSpecs(true).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read'])
+    expect(toolSpecs(true).map(spec => spec.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'calculate'])
     expect(toolSpecs(false, false, undefined, 'coding').map(spec => spec.function.name)).not.toContain('web_search')
     const prompt = systemPrompt('C:/w', false, undefined, 'full', new Date(2026, 8, 25))
     expect(prompt).toContain('Today is 2026-09-25')

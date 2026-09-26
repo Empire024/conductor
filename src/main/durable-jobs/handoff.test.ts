@@ -286,7 +286,7 @@ describe('stage tooling', () => {
     // A research stage carries the research grant by its kind; no other kind gets it.
     const researchByKind = stageTooling('research', 'C:/work')
     expect(researchByKind.grants.research).toBe(true)
-    expect(researchByKind.tools.map(t => t.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'conductor'])
+    expect(researchByKind.tools.map(t => t.function.name)).toEqual(['read_file', 'list_files', 'search', 'web_search', 'web_read', 'calculate', 'conductor'])
     expect(stageTooling('implement', 'C:/work', { git: false, research: true }).grants.research).toBe(false)
     // The conductor bridge every local conversation gets is budgeted with the other schemas.
     const noBridge = stageTooling('research', 'C:/work', NO_GRANTS, {}, false)
