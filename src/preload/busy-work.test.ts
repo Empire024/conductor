@@ -103,7 +103,8 @@ describe('BusyWork', () => {
     await advance(800)
     first.resolve()
     await advance(200)
-    expect(log.filter(entry => entry === 'app:busy')).toHaveLength(2)
+    // One stretch: the second call is shown before the first one's state is taken down.
+    expect(log).toEqual(['app:busy', 'project:busy'])
     await advance(60_000)
     expect(log.at(-2)).toBe('app:idle')
     expect(work.inFlight).toBe(0)
@@ -173,8 +174,23 @@ describe('BusyWork', () => {
     void calls.reduce<Promise<unknown>>((previous, call) => previous.then(() => work.track(call.promise)), Promise.resolve())
     for (const call of calls) { await advance(300); call.resolve() }
     await advance(1000)
-    expect(log.filter(entry => entry === 'project:busy')).toHaveLength(6)
+    // One busy stretch from the first call's 100 ms to the last settle: no blink between links (VR8g K4).
+    expect(log).toEqual(['app:busy', 'project:busy', 'app:idle', 'project:idle'])
     expect(work.inFlight).toBe(0)
+  })
+
+  it('keeps the cursor up across a settle when the continuation starts the next call in a posted task', async () => {
+    const { work, log, advance, deferred, post } = rig()
+    work.gesture('chain')
+    const first = deferred(), second = deferred()
+    void work.track(first.promise).then(() => post(() => { work.track(second.promise) }))
+    await advance(400)
+    first.resolve()
+    await advance(400)
+    expect(log).toEqual(['app:busy', 'chain:busy'])
+    second.resolve()
+    await advance(200)
+    expect(log).toEqual(['app:busy', 'chain:busy', 'app:idle', 'chain:idle'])
   })
 
   it('keeps an old gesture\'s continuation on its own control, never on a newer gesture\'s', async () => {
@@ -192,7 +208,9 @@ describe('BusyWork', () => {
     work.track(background.promise)
     await advance(300)
     expect(log.filter(entry => entry === 'b:busy')).toEqual([])
-    expect(log.filter(entry => entry === 'a:busy')).toHaveLength(2)
+    // a's continuation keeps a busy without a blink: one busy stretch, not yet cleared.
+    expect(log.filter(entry => entry === 'a:busy')).toHaveLength(1)
+    expect(log).not.toContain('a:idle')
     background.resolve(); next.resolve()
   })
 })

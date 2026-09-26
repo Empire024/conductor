@@ -43,7 +43,8 @@ export interface BusyOptions {
 
 export const DEFAULT_BUSY_OPTIONS: BusyOptions = { followTasks: 1, maxChainLinks: 32, chainCapMs: 15_000, showAfterMs: 100, minShowMs: 150, maxMs: 60_000 }
 
-interface Gesture<Control> { control: Control | null; at: number; links: number }
+/** `shown`: some call of this gesture was visible, so its next call shows at once, not after 100 ms. */
+interface Gesture<Control> { control: Control | null; at: number; links: number; shown: boolean }
 interface Call<Control> { gesture: Gesture<Control>; shownAt: number | null; done: boolean; timers: unknown[] }
 
 export class BusyWork<Control> {
@@ -60,7 +61,7 @@ export class BusyWork<Control> {
   /** The owner acted on `control` (null: no specific control, e.g. Enter in a text field). Call it
    *  while the gesture's event is being dispatched, before the page's own handlers. */
   gesture(control: Control | null): void {
-    this.enter({ control, at: this.env.now(), links: 0 })
+    this.enter({ control, at: this.env.now(), links: 0, shown: false })
   }
 
   /** Whether any gesture's work is running (shown or not yet). */
@@ -73,7 +74,8 @@ export class BusyWork<Control> {
     if (!gesture) return result
     const call: Call<Control> = { gesture, shownAt: null, done: false, timers: [] }
     this.pending++
-    call.timers.push(this.env.setTimeout(() => this.show(call), this.options.showAfterMs))
+    if (gesture.shown) this.show(call)
+    else call.timers.push(this.env.setTimeout(() => this.show(call), this.options.showAfterMs))
     call.timers.push(this.env.setTimeout(() => this.settle(call, false), this.options.maxMs))
     const settle = (): void => this.settle(call, true)
     ;(result as PromiseLike<unknown>).then(settle, settle)
@@ -105,6 +107,7 @@ export class BusyWork<Control> {
   private show(call: Call<Control>): void {
     if (call.done) return
     call.shownAt = this.env.now()
+    call.gesture.shown = true
     this.visible.add(call)
     this.refresh()
   }
@@ -117,9 +120,18 @@ export class BusyWork<Control> {
     // The code awaiting this call continues in this task: what it starts is the same gesture's work.
     if (settled) this.enter(call.gesture)
     if (call.shownAt === null) return
-    const remaining = this.options.minShowMs - (this.env.now() - call.shownAt)
-    if (remaining > 0) this.env.setTimeout(() => this.hide(call), remaining)
-    else this.hide(call)
+    const shownAt = call.shownAt
+    const hide = (): void => {
+      const remaining = this.options.minShowMs - (this.env.now() - shownAt)
+      if (remaining > 0) this.env.setTimeout(() => this.hide(call), remaining)
+      else this.hide(call)
+    }
+    if (!settled) { hide(); return }
+    // Hide only once the continuation's window has passed: a next call it starts is shown first,
+    // so a chain of slow calls keeps the cursor up instead of blinking once per link (VR8g K4).
+    let hops = this.options.followTasks + 1
+    const hop = (): void => { if (--hops > 0) this.env.nextTask(hop); else hide() }
+    this.env.nextTask(hop)
   }
 
   private hide(call: Call<Control>): void {
