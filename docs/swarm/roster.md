@@ -6,13 +6,20 @@ card opens a tab on the role's provider, model, effort and permission and sends 
 plus the goal you type (no goal: it reads its brief and asks). A cloud role needs a goal. The owner
 may rename an entry or change its model; the brief text is kept current by Conductor.
 
+A controller or wizard that opens a role itself with `tabs.open` uses the same settings. Open the
+Approval reviewer with `permission: 'read-only', exactPermission: true`: on Claude that is plan mode
+(it reads and searches, changes nothing). Never open it on Ask under a wizard: every tool call of an
+Ask coworker is sent to a fresh stronger-model review.
+
 | Role | Model · effort · mode | Brief | When to use |
 |---|---|---|---|
 | Swarm orchestrator | Claude opus[1m] · high · Auto (wand on = wizard) | docs/swarm/orchestrator.md, docs/swarm/worker-rules.md | A batch of owner items: plan, partition, dispatch ≤4 fixers, verify, ship, publish once |
 | Fixer | Claude opus[1m] · high · Auto | docs/swarm/worker-rules.md | One bounded item group with owned files |
 | Verifier | Claude opus[1m] · high · Auto | docs/verification/verifier-brief.md, .conductor/loops/verify.md | After delivery: adversarial check against the owner's words (verify loop v3) |
-| Verifier runner | Claude sonnet · medium · Auto | .conductor/loops/verify.md | Re-run committed smokes unchanged, collect logs; no verdicts |
-| Approval reviewer | Claude opus[1m] · high · Ask (Claude has no read-only mode; it changes nothing) | src/main/approval-review.ts, docs/approval-upgrade-brief.md | Automatic under a wizard (one review per held approval); by hand to re-review |
+| Verifier runner | Claude sonnet · low · Auto (the effort docs/verification/verifier-brief.md dispatches it at) | .conductor/loops/verify.md | Re-run committed smokes unchanged, collect logs; no verdicts |
+| Architect | Codex gpt-6-astra · high · Auto (alternate Claude opus[1m]) | .conductor/loops/batch-delivery.md | The contract step of batch delivery and task triage: failing tests, acceptance commands, allowedPaths |
+| Code reviewer | Claude opus[1m] · high · Auto, a fresh tab (alternate Codex gpt-6-astra) | .conductor/loops/batch-delivery.md | The locked review step: reads the batch’s git diff once within allowedPaths, approves or lists changes |
+| Approval reviewer | Claude opus[1m] · high · Read only (plan mode; never Ask) | src/main/approval-review.ts, docs/approval-upgrade-brief.md | Automatic under a wizard (one review per held approval); by hand to re-review |
 | Updater | local qwen3.6-35b-a3b · Edit | .conductor/loops/update-readback.md, docs/conductor-local-updates.md | Build the local update, read it back, verify after install |
 | Loop runner | Claude sonnet · medium · Auto | docs/logic-loops.md | Run a saved `.conductor/loops` procedure (loops.run / loops.record) |
 | Loop improver | Codex gpt-6-astra · high · Auto | docs/logic-loops.md | Propose loop changes from metrics (loops.propose / loops.apply) |

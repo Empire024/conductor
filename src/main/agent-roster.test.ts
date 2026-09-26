@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { describe, expect, it } from 'vitest'
@@ -36,6 +36,30 @@ describe('the Agent roster lists the roles Conductor actually runs', () => {
       expect(role.briefs.length, role.role).toBeGreaterThan(0)
       for (const brief of role.briefs) expect(role.instructions, role.role).toContain(brief)
     }
+  })
+
+  it('has an entry for every role a saved loop runs (VR8d R1b)', () => {
+    // The loop step roles map to the roster entry that plays them; a new loop role needs one.
+    const playedBy: Record<string, string> = { implementer: 'swarm-fixer', churn: 'local-helper', verifier: 'verifier', controller: 'swarm-orchestrator', architect: 'architect', reviewer: 'code-reviewer' }
+    const loops = join(resolve(__dirname, '..', '..'), '.conductor', 'loops')
+    const loopRoles = new Set(readdirSync(loops).filter(name => name.endsWith('.md')).flatMap(name => [...readFileSync(join(loops, name), 'utf8').matchAll(/^\s+role: (\w[\w-]*)/gm)].map(match => match[1]!)))
+    expect([...loopRoles]).toEqual(expect.arrayContaining(['architect', 'reviewer']))
+    for (const loopRole of loopRoles) expect(rosterRole(playedBy[loopRole] ?? loopRole), loopRole).toBeDefined()
+    expect(rosterRole('architect')).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
+    expect(rosterRole('code-reviewer')).toMatchObject({ provider: 'claude', model: 'opus[1m]', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
+    expect(rosterRole('code-reviewer')!.instructions).toMatch(/diff/)
+  })
+
+  it('never runs the Approval reviewer on Ask, where each tool call under a wizard costs a stronger-model review', () => {
+    expect(rosterRole('approval-reviewer')!.permission).toBe('read-only')
+    expect(ROSTER_ROLES.filter(role => role.permission === 'default')).toEqual([])
+  })
+
+  it('dispatches the Verifier runner at the effort the verifier brief names', () => {
+    const brief = readFileSync(join(resolve(__dirname, '..', '..'), 'docs', 'verification', 'verifier-brief.md'), 'utf8')
+    const effort = /title:'\{ROUND\} runner', model:'(\w+)', effort:'(\w+)'/.exec(brief)
+    expect(effort, 'runner dispatch line in verifier-brief.md').toBeTruthy()
+    expect(rosterRole('verifier-runner')).toMatchObject({ model: effort![1], effort: effort![2] })
   })
 
   it('points at briefs that exist in this repository', () => {
@@ -93,6 +117,14 @@ describe('starting a roster entry', () => {
     expect(calls[1]!.args.prompt).toBe(rosterStartPrompt(rosterRole('swarm-fixer')!.instructions, 'Fix the energy price editor'))
     expect(String(calls[1]!.args.prompt)).toContain('docs/swarm/worker-rules.md')
     expect(result).toMatchObject({ tabId: 'tab_1', agentSessionId: 'agent_1', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto' })
+  }))
+
+  it('starts the Approval reviewer read only, which tabs.open runs as plan mode on Claude', withProject(everyBrief, async (store, projectId) => {
+    const reviewer = store.snapshot(projectId).agents.find(agent => agent.role === 'approval-reviewer')!
+    const { calls, deps } = rig(store)
+    const result = await startRosterAgent(deps, { agentId: reviewer.id, goal: 'Re-review the held git push' })
+    expect(calls[0]!.args).toMatchObject({ provider: 'claude', model: 'opus[1m]', permission: 'read-only', exactPermission: true })
+    expect(result.permission).toBe('read-only')
   }))
 
   it('without a goal tells the role to read its brief and ask', withProject(everyBrief, async (store, projectId) => {

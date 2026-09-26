@@ -57,15 +57,29 @@ export const ROSTER_ROLES: ReadonlyArray<RosterRole> = [
     job: 'Plan, write, run and judge in this one tab; every verdict carries its evidence path.'
   }),
   role({
-    name: 'Verifier runner', role: 'verifier-runner', provider: 'claude', model: 'sonnet', effort: 'medium', permission: 'auto',
+    name: 'Verifier runner', role: 'verifier-runner', provider: 'claude', model: 'sonnet', effort: 'low', permission: 'auto',
     briefs: ['.conductor/loops/verify.md'],
     whenToUse: 'The verify loop\'s cheap fallback: re-run committed smokes unchanged and collect their logs when the verifier asks.',
     job: 'Re-run the named smokes unchanged through scripts/smoke-lock.mjs and collect their logs. Never write harness code and never give verdicts.'
   }),
   role({
-    name: 'Approval reviewer', role: 'approval-reviewer', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'default',
+    name: 'Architect', role: 'architect', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
+    briefs: ['.conductor/loops/batch-delivery.md'],
+    whenToUse: 'The contract step of batch delivery and task triage: before any fixer starts, write the failing tests, the acceptance commands and the allowedPaths. Alternate: Claude opus[1m] when Codex has no allowance.',
+    job: 'Write the contract only: failing tests, acceptance commands and allowedPaths, pointing at code by file:line. Do not implement.'
+  }),
+  role({
+    name: 'Code reviewer', role: 'code-reviewer', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto',
+    briefs: ['.conductor/loops/batch-delivery.md'],
+    whenToUse: 'The locked review step of batch delivery: a fresh tab, never the implementer, reads the batch\'s git diff once within allowedPaths. Alternate: Codex gpt-6-astra, the brain that did not write the contract.',
+    job: 'Read the git diff limited to allowedPaths once and answer approve or a specific list of changes. Change nothing yourself.'
+  }),
+  role({
+    name: 'Approval reviewer', role: 'approval-reviewer', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'read-only',
     briefs: ['src/main/approval-review.ts', 'docs/approval-upgrade-brief.md'],
-    whenToUse: 'Runs by itself under a wizard: each held coworker approval gets a fresh stronger-model review. Open one by hand only to re-review a held request.',
+    // Read only is plan mode on Claude: it reads and searches but changes nothing, so under a wizard
+    // it never asks for an approval that would cost a fresh stronger-model review (Ask would).
+    whenToUse: 'Runs by itself under a wizard: each held coworker approval gets a fresh stronger-model review. Open one by hand only to re-review a held request; it runs read only (plan mode), never on Ask.',
     job: 'Review the named approval request against the exact action, its target and the owner\'s standing rules; answer approve or deny with the reason. Change nothing.'
   }),
   role({

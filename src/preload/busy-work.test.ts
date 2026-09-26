@@ -10,6 +10,8 @@ function rig() {
     now: () => clock,
     setTimeout: (callback, ms) => { const id = nextId++; timers.push({ at: clock + ms, callback, id }); return id },
     clearTimeout: handle => { const index = timers.findIndex(timer => timer.id === handle); if (index >= 0) timers.splice(index, 1) },
+    // A posted task: after the running one and its microtasks, in posting order (a stable sort keeps it).
+    nextTask: callback => { timers.push({ at: clock, callback, id: nextId++ }) },
     setAppBusy: busy => log.push(busy ? 'app:busy' : 'app:idle'),
     setControlBusy: (control, busy) => log.push(`${control}:${busy ? 'busy' : 'idle'}`)
   }
@@ -28,7 +30,9 @@ function rig() {
     await Promise.resolve(); await Promise.resolve()
   }
   const deferred = () => { let resolve!: (value?: unknown) => void, reject!: (error: unknown) => void; const promise = new Promise((ok, fail) => { resolve = ok; reject = fail }); return { promise, resolve, reject } }
-  return { work, log, advance, deferred }
+  /** Something else posts a task now (React's scheduler after a setState). */
+  const post = (callback: () => void) => env.nextTask(callback)
+  return { work, log, advance, deferred, post }
 }
 
 describe('BusyWork', () => {
@@ -93,13 +97,11 @@ describe('BusyWork', () => {
     const { work, log, advance, deferred } = rig()
     work.gesture('project')
     const first = deferred()
-    work.track(first.promise)
+    const second = deferred()
+    // The click handler awaits its first call and then starts the next: open a project, load its tabs.
+    work.track(first.promise).then(() => work.track(second.promise))
     await advance(800)
     first.resolve()
-    await advance(10)
-    // Started after the first settled, 810 ms after the click: still the same gesture's work.
-    const second = deferred()
-    work.track(second.promise)
     await advance(200)
     expect(log.filter(entry => entry === 'app:busy')).toHaveLength(2)
     await advance(60_000)
@@ -107,26 +109,51 @@ describe('BusyWork', () => {
     expect(work.inFlight).toBe(0)
   })
 
-  it('never lets a background poller that starts just after a click keep the cursor moving (VR7 C2b)', async () => {
+  it('counts a render the handler scheduled (one posted task later), but not a timer that fires after it', async () => {
+    const { work, log, advance, deferred, post } = rig()
+    work.gesture('refresh')
+    const rendered = deferred()
+    post(() => { work.track(rendered.promise) })
+    await advance(150)
+    expect(log).toEqual(['app:busy', 'refresh:busy'])
+    rendered.resolve()
+    await advance(1)
+    const timer = deferred()
+    work.track(timer.promise)
+    await advance(400)
+    expect(log).toEqual(['app:busy', 'refresh:busy', 'app:idle', 'refresh:idle'])
+    expect(work.inFlight).toBe(0)
+    timer.resolve()
+  })
+
+  it('never lets a background poller near a click move the cursor, not even its first call (VR7 C2b, VR8d K3)', async () => {
     const { work, log, advance, deferred } = rig()
     const stamped: { at: number; entry: string }[] = []
     let clock = 0
     const tick = async (ms: number) => { await advance(ms); clock += ms; while (stamped.length < log.length) stamped.push({ at: clock, entry: log[stamped.length]! }) }
-    work.gesture(null)
-    await tick(200)
-    // Every 400 ms a 150 ms call, for 8 s: none of it is the click's work after the first links.
+    // A slow click: its own call takes 190 ms.
+    work.gesture('refresh')
+    const own = deferred()
+    work.track(own.promise)
+    await tick(190)
+    own.resolve()
+    await tick(0)
+    // Every 400 ms a 320 ms call, the first 10 ms after the click's work and 200 ms after the click.
+    await tick(10)
     for (let started = 200; started < 8000; started += 400) {
       const poll = deferred()
       work.track(poll.promise)
-      await tick(150)
+      await tick(320)
       poll.resolve()
-      await tick(250)
+      await tick(80)
     }
-    expect(stamped.filter(entry => entry.at > 3000)).toEqual([])
+    // Busy for the click's own work (100-250 ms), and nothing else.
+    expect(log).toEqual(['app:busy', 'refresh:busy', 'app:idle', 'refresh:idle'])
+    expect(stamped.filter(entry => entry.at > 600)).toEqual([])
     expect(work.inFlight).toBe(0)
   })
 
-  it('still follows a short chain whose next call starts right after the previous one settles', async () => {
+  it('never chains a poll that starts right after one of the gesture\'s calls settles, in another task', async () => {
     const { work, log, advance, deferred } = rig()
     work.gesture('project')
     for (let link = 0; link < 4; link++) {
@@ -134,16 +161,28 @@ describe('BusyWork', () => {
       work.track(call.promise)
       await advance(300)
       call.resolve()
-      await advance(20)
+      await advance(1)
     }
-    expect(log.filter(entry => entry === 'project:busy')).toHaveLength(4)
+    expect(log.filter(entry => entry === 'project:busy')).toHaveLength(1)
   })
 
-  it('does not let an old gesture\'s calls extend a newer gesture\'s chain', async () => {
+  it('follows a longer chain of awaited calls, each started as the previous one settles', async () => {
+    const { work, log, advance, deferred } = rig()
+    work.gesture('project')
+    const calls = [deferred(), deferred(), deferred(), deferred(), deferred(), deferred()]
+    void calls.reduce<Promise<unknown>>((previous, call) => previous.then(() => work.track(call.promise)), Promise.resolve())
+    for (const call of calls) { await advance(300); call.resolve() }
+    await advance(1000)
+    expect(log.filter(entry => entry === 'project:busy')).toHaveLength(6)
+    expect(work.inFlight).toBe(0)
+  })
+
+  it('keeps an old gesture\'s continuation on its own control, never on a newer gesture\'s', async () => {
     const { work, log, advance, deferred } = rig()
     work.gesture('a')
     const old = deferred()
-    work.track(old.promise)
+    const next = deferred()
+    work.track(old.promise).then(() => work.track(next.promise))
     await advance(1000)
     work.gesture('b')
     await advance(700)
@@ -153,7 +192,8 @@ describe('BusyWork', () => {
     work.track(background.promise)
     await advance(300)
     expect(log.filter(entry => entry === 'b:busy')).toEqual([])
-    background.resolve()
+    expect(log.filter(entry => entry === 'a:busy')).toHaveLength(2)
+    background.resolve(); next.resolve()
   })
 })
 
