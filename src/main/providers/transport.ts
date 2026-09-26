@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import type { Json } from '../../shared/structured-agent'
+import { lowerToBackground } from '../background-priority'
 import type { RuntimeHostClient } from '../runtime-host/client'
 import type { RuntimeMeta } from '../runtime-host/protocol'
 
@@ -86,6 +87,8 @@ export class JsonLineTransport {
       stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false
     })
     this.child = child
+    // An agent CLI and the tools it starts yield to the owner's own window (background-priority.ts).
+    if (child.pid) lowerToBackground([child.pid])
     const decoder = new JsonLineDecoder(this.options.onMessage, (error) => { this.options.onError?.(error); this.close() })
     const stderr = new StringDecoder('utf8')
     child.stdout.on('data', (chunk: Buffer) => decoder.push(chunk))

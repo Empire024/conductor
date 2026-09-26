@@ -1,8 +1,9 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { getPriority, setPriority, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { BACKGROUND_PRIORITY } from '../background-priority'
 import { RuntimeHostClient, type RuntimeListener } from './client'
 import { RuntimeHost } from './host'
 import { runtimeHostPipe, type FrameStream } from './protocol'
@@ -65,6 +66,20 @@ describe('runtime host', () => {
 
   it('refuses a client without the secret', async () => {
     await expect(RuntimeHostClient.connect(pipe, 'wrong', 1000)).rejects.toThrow()
+  })
+
+  it('runs every runtime below normal priority while the app itself stays at normal', async () => {
+    // The test process may itself run below normal (a delivery's test run does); start from normal
+    // so the runtime cannot just have inherited it.
+    const own = getPriority()
+    try { setPriority(0) } catch { /* not allowed here: the check below still holds */ }
+    try {
+      const client = await connect()
+      const { pid } = await spawnFake(client, 'runtime-priority', recorder())
+      expect(pid).toBeGreaterThan(0)
+      expect(getPriority(pid!)).toBeGreaterThanOrEqual(BACKGROUND_PRIORITY)
+      client.close('runtime-priority')
+    } finally { try { setPriority(own) } catch { /* left as it was */ } }
   })
 
   it('moves whole lines both ways with monotonic sequence numbers', async () => {

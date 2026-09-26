@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AgentControlScope } from '../shared/agent-control'
@@ -12,12 +12,38 @@ export interface OwnerCredentialOptions { path: string; appVersion: string; pack
 
 /** What `control-owner.json` holds. A process on this machine that can read the file has the
  *  owner's authority over this Conductor: it is written under the user profile with owner-only
- *  permissions, regenerated on every launch, and removed when the control server closes, so a
- *  supervisor outside the app (docs/overseer.md) finds a fresh endpoint after every restart. */
+ *  permissions on every launch and removed when the control server closes, so a supervisor
+ *  outside the app (docs/overseer.md) sees whether an app is there. With a stable endpoint
+ *  (below) it names the same endpoint and token after a restart. */
 export interface OwnerCredentialFile { version: 1; endpoint: string; token: string; pid: number; startedAt: string; appVersion: string; packaged: boolean }
+
+/** Keeps the control endpoint the same across restarts (FX33): one port and one set of
+ *  credentials per profile, so a conversation the runtime host kept running through a restart,
+ *  and every script it wrote, still reach app control with what it was given. */
+export interface StableEndpointOptions {
+  /** `control-endpoint.json` beside control-owner.json; owner-only, like it. */
+  path: string
+  /** Asks whoever holds the port for this profile (the runtime host keeps it answering while no
+   *  app is there, docs/runtime-host.md) to let go of it; true when it did. */
+  reclaim?(port: number): Promise<boolean>
+  /** How long a taken port is retried before falling back to another (default 5 s). */
+  bindWaitMs?: number
+  log?(message: string): void
+}
+
+/** What `control-endpoint.json` holds. Rotated only when the owner asks (rotate()) or when the
+ *  file is gone; a credential's scope is still checked on every call (AgentControl.authorize). */
+export interface ControlEndpointFile {
+  version: 1
+  port: number
+  ownerToken: string
+  credentials: Record<string, { token: string; projectId: string; sessionId: string; issuedAt: string }>
+}
 
 const OWNER_KEY = '\0owner'
 const MAX_IN_FLIGHT_PER_SESSION = 8
+/** Conversations whose credential is remembered across launches; the oldest go first. */
+const MAX_KEPT_CREDENTIALS = 2000
 
 /** Loopback-only internal protocol, independent of third-party MCP configuration. */
 export class AgentControlServer {
@@ -27,26 +53,118 @@ export class AgentControlServer {
   private inFlight = new Map<string, number>()
   private mutationTails = new Map<string, Promise<void>>()
   private ownerToken?: string
-  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity' | 'prepareActivity'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions) {}
+  /** What control-endpoint.json holds for this launch; absent without a stable endpoint. */
+  private kept?: ControlEndpointFile
+  private changed = true
+  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity' | 'prepareActivity'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions, private readonly stable?: StableEndpointOptions) {}
 
   async start(): Promise<void> {
     if (this.disabled || this.server) return
-    const server = createServer((request, response) => { void this.handle(request, response) })
-    server.requestTimeout = 120000
-    server.headersTimeout = 10000
-    server.maxHeadersCount = 20
+    const kept = this.stable ? this.readKept() : undefined
+    const { server, port } = await this.bind(kept?.port)
     this.server = server
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject)
-      server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve() })
-    })
     // After listen there is no promise left to reject into, and an 'error' event with no listener
     // is an uncaught exception that would take the whole app down.
     server.on('error', error => console.warn('Agent control server error', error))
-    const address = server.address()
-    if (!address || typeof address === 'string') throw new Error('Control server failed to bind')
-    this.endpoint = `http://127.0.0.1:${address.port}/control`
+    this.endpoint = `http://127.0.0.1:${port}/control`
+    if (this.stable) {
+      this.changed = !kept || kept.port !== port
+      this.kept = { version: 1, port, ownerToken: kept?.ownerToken ?? randomBytes(32).toString('hex'), credentials: kept?.credentials ?? {} }
+      for (const [id, entry] of Object.entries(this.kept.credentials)) this.credentials.set(id, { token: entry.token, scope: { projectId: entry.projectId, sessionId: entry.sessionId, agentSessionId: id } })
+      this.saveKept()
+    }
     this.writeOwnerCredential()
+  }
+
+  /** The port app control answers on. */
+  get port(): number { return this.endpoint ? Number(new URL(this.endpoint).port) : 0 }
+
+  /** Whether a conversation briefed by an earlier launch holds another endpoint or credential than
+   *  this one answers to: always without a stable endpoint, else only when control-endpoint.json
+   *  was missing or its port was taken by another process. */
+  get endpointChanged(): boolean { return this.changed }
+
+  /** A new owner token and new conversation credentials, on the owner's explicit word. Every
+   *  conversation is briefed afresh at its next turn; one in the middle of a turn loses access. */
+  rotate(): void {
+    if (!this.kept) return
+    this.kept = { ...this.kept, ownerToken: randomBytes(32).toString('hex'), credentials: {} }
+    this.credentials.clear()
+    this.saveKept()
+    this.writeOwnerCredential()
+  }
+
+  /** Listens on the port this profile always uses. A port the runtime host holds for the gap of a
+   *  restart is asked back; one another process holds is retried briefly, then given up loudly. */
+  private async bind(preferred?: number): Promise<{ server: Server; port: number }> {
+    const listen = (port: number): Promise<{ server: Server; port: number }> => new Promise((resolve, reject) => {
+      const server = createServer((request, response) => { void this.handle(request, response) })
+      // No header or request deadline: Node measures them from when a connection was accepted and
+      // checks them on a timer, which after a main-thread stall runs before the request is read,
+      // so a call that arrived in time was answered 408 or reset (FX33). A loopback server behind
+      // bearer tokens only has local callers; the connection cap bounds what a stuck one can hold.
+      server.requestTimeout = 0
+      server.headersTimeout = 0
+      server.maxConnections = 256
+      server.maxHeadersCount = 20
+      server.once('error', reject)
+      server.listen(port, '127.0.0.1', () => {
+        server.off('error', reject)
+        const address = server.address()
+        if (!address || typeof address === 'string') { server.close(); reject(new Error('Control server failed to bind')); return }
+        resolve({ server, port: address.port })
+      })
+    })
+    if (!preferred) return listen(0)
+    const deadline = Date.now() + (this.stable?.bindWaitMs ?? 5000)
+    let reclaimed = false, reason = ''
+    for (;;) {
+      try { return await listen(preferred) } catch (error) {
+        reason = (error as NodeJS.ErrnoException).code ?? (error instanceof Error ? error.message : String(error))
+        if (reason !== 'EADDRINUSE' || Date.now() >= deadline) break
+        if (!reclaimed && this.stable?.reclaim) {
+          reclaimed = true
+          try { if (await this.stable.reclaim(preferred)) continue } catch { /* nobody we know holds it */ }
+        }
+        await new Promise(resolve => setTimeout(resolve, 250))
+      }
+    }
+    const fallback = await listen(0)
+    const message = `App control could not keep port ${preferred} (${reason}): another process holds it. It answers on port ${fallback.port} from now on; conversations kept running through this restart are told the new endpoint, and every other one gets it with its next turn.`
+    console.error(`[app control] ${message}`)
+    this.stable?.log?.(message)
+    return fallback
+  }
+
+  private readKept(): ControlEndpointFile | undefined {
+    try {
+      const file = JSON.parse(readFileSync(this.stable!.path, 'utf8')) as Partial<ControlEndpointFile>
+      if (file.version !== 1 || !Number.isInteger(file.port) || file.port! <= 0 || file.port! > 65535 || typeof file.ownerToken !== 'string' || !/^[a-f0-9]{64}$/.test(file.ownerToken)) return undefined
+      const credentials: ControlEndpointFile['credentials'] = {}
+      for (const [id, entry] of Object.entries(file.credentials ?? {})) {
+        if (entry && typeof entry.token === 'string' && /^[a-f0-9]{64}$/.test(entry.token) && typeof entry.projectId === 'string' && typeof entry.sessionId === 'string') credentials[id] = { token: entry.token, projectId: entry.projectId, sessionId: entry.sessionId, issuedAt: String(entry.issuedAt ?? '') }
+      }
+      return { version: 1, port: file.port!, ownerToken: file.ownerToken, credentials }
+    } catch { return undefined }
+  }
+
+  private saveKept(): void {
+    if (!this.kept || !this.stable) return
+    const entries = Object.entries(this.kept.credentials)
+    if (entries.length > MAX_KEPT_CREDENTIALS) {
+      entries.sort((a, b) => a[1].issuedAt.localeCompare(b[1].issuedAt))
+      for (const [id] of entries.slice(0, entries.length - MAX_KEPT_CREDENTIALS)) { delete this.kept.credentials[id]; this.credentials.delete(id) }
+    }
+    const temporary = `${this.stable.path}.${process.pid}.tmp`
+    try {
+      mkdirSync(dirname(this.stable.path), { recursive: true })
+      writeFileSync(temporary, JSON.stringify(this.kept) + '\n', { encoding: 'utf8', mode: 0o600 })
+      renameSync(temporary, this.stable.path)
+    } catch (error) {
+      // App control still works for this launch; the next one mints new credentials.
+      try { rmSync(temporary, { force: true }) } catch { /* nothing written */ }
+      console.warn('App control endpoint could not be saved for the next launch', error)
+    }
   }
 
   /** The file a process outside the app reads to drive this Conductor as the owner; absent when
@@ -55,7 +173,7 @@ export class AgentControlServer {
 
   private writeOwnerCredential(): void {
     if (!this.owner) return
-    this.ownerToken = randomBytes(32).toString('hex')
+    this.ownerToken = this.kept?.ownerToken ?? randomBytes(32).toString('hex')
     const file: OwnerCredentialFile = { version: 1, endpoint: this.endpoint, token: this.ownerToken, pid: process.pid, startedAt: new Date().toISOString(), appVersion: this.owner.appVersion, packaged: this.owner.packaged }
     try {
       mkdirSync(dirname(this.owner.path), { recursive: true })
@@ -74,6 +192,10 @@ export class AgentControlServer {
     if (!credential || credential.scope.projectId !== spec.projectId || credential.scope.sessionId !== spec.sessionId) {
       credential = { token: randomBytes(32).toString('hex'), scope: { projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id } }
       this.credentials.set(spec.id, credential)
+      if (this.kept) {
+        this.kept.credentials[spec.id] = { token: credential.token, projectId: spec.projectId, sessionId: spec.sessionId, issuedAt: new Date().toISOString() }
+        this.saveKept()
+      }
     }
     return `Conductor app control: a first-party local JSON protocol is available for this project/workspace. POST ${this.endpoint} with Authorization: Bearer ${credential.token}, Content-Type: application/json, body {"method":"tools.list","args":{}} to discover methods. Use the native shell's HTTP client (PowerShell Invoke-RestMethod or curl.exe); do not expose the authorization value or copy it to another tab. app.state gives stable tab/file URIs, models.list gives actual choices, router.start({prompt}) opens a visible router; router.dispatch({tasks:[{title,prompt,provider,model}]}) opens visible coworkers. Use these visible native tabs when delegating to another provider; do not launch nested codex or claude CLI processes. Native turns and approvals remain visible in their tabs. git.ship({message,paths?}) delivers finished work on the host with the owner's Git credentials (tests, build, commit, push, release check), so never escalate the sandbox for git; files.write compares expectedContent and streams disk changes to the UI; tasks.update preserves checklist markers. Your control scope is your registered project and workspace; you cannot drive yourself or your ancestors. projects.list names the other projects the owner has open in this window: you may read one with files.list/files.read({projectId}) and hand work to it with tabs.open({projectId}) or router.dispatch, then steer that tab; you cannot write into another project's files directly. Destructive actions ask the owner; never blindly retry a mutation after a transport timeout. Use these tools only for the user's requested work.${this.machineNote?.(spec) ? ' ' + this.machineNote(spec) : ''}`
   }
@@ -81,7 +203,10 @@ export class AgentControlServer {
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
     const reply = (status: number, body: unknown): void => {
       if (response.destroyed || response.writableEnded) return
-      response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' })
+      // Connection: close once the call was read in full - a kept-alive socket is closed by a server
+      // timer that, after a main-thread stall, runs before the next call already sent on it is read
+      // (FX33). A refusal before the body was read keeps Node's default, which drains the upload.
+      response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...(request.complete ? { Connection: 'close' } : {}) })
       response.end(JSON.stringify(body))
     }
     if (request.method !== 'POST' || request.url !== '/control' || request.headers.origin || request.headers.host !== new URL(this.endpoint).host || !/^application\/json(?:\s*;|$)/i.test(request.headers['content-type'] ?? '')) { reply(403, { error: 'Only local JSON control requests are accepted' }); request.resume(); return }

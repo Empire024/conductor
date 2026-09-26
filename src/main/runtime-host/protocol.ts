@@ -15,8 +15,9 @@ export interface RuntimeMeta { agentSessionId?: string; provider?: string; title
  *  keeps one address while the app behind it restarts (docs/runtime-host.md). */
 export interface RelayServer { name: string; upstream: string; authorization: string }
 export interface RelayRoute { name: string; url: string; token: string }
-/** What a host can do beyond protocol 1's process relay; an older host answers hello without it. */
-export const RUNTIME_HOST_FEATURES = ['mcp-relay'] as const
+/** What a host can do beyond protocol 1's process relay; an older host answers hello without it.
+ *  'control-hold' keeps the app-control port answering while no app is there (control-hold.ts). */
+export const RUNTIME_HOST_FEATURES = ['mcp-relay', 'control-hold'] as const
 
 export interface RuntimeSpawn { runtimeId: string; executable: string; args: string[]; cwd: string; env?: Record<string, string>; meta?: RuntimeMeta }
 
@@ -51,6 +52,8 @@ export type HostRequest =
   | { op: 'stopAll'; id: number; onlyUnowned?: boolean }
   | { op: 'shutdown'; id: number }
   | { op: 'relay'; id: number; key: string; servers: RelayServer[] }
+  | { op: 'holdControl'; id: number; port: number }
+  | { op: 'releaseControl'; id: number; port: number }
 
 export type FrameStream = 'stdout' | 'stderr' | 'error'
 

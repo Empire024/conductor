@@ -371,7 +371,9 @@ export class ConductorDatabase {
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true })
     this.db = new DatabaseSync(path)
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000;')
+    // journal_size_limit: a write-ahead log that once grew (3.5 GB on the owner's machine,
+    // 2026-09-25) is cut back once it has been checkpointed, instead of staying that size (FX33).
+    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000; PRAGMA journal_size_limit = 67108864;')
     this.migrate()
     this.structured = new StructuredAgentStore(this.db, dirname(path))
   }
@@ -1706,6 +1708,11 @@ export class ConductorDatabase {
   close(): void {
     this.stopForgetting()
     this.structured.flush()
+    // Whatever the log still holds is copied back now, while the app quits, and the log emptied:
+    // otherwise the next launch recovers and copies it on its main thread before any window or
+    // kept turn gets a turn (FX33: 11.5 s for a 3.4 GB log). Other stores' connections may still
+    // be open, so this close is not always the last one, which would do it by itself.
+    try { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)') } catch (error) { console.warn('The database log could not be checkpointed on close', error) }
     this.db.close()
   }
 

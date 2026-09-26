@@ -3,6 +3,8 @@ import { timingSafeEqual } from 'node:crypto'
 import { createServer, type Server, type Socket } from 'node:net'
 import { StringDecoder } from 'node:string_decoder'
 import { LineReader, RUNTIME_BUFFER_BYTES, RUNTIME_BUFFER_FRAMES, RUNTIME_HOST_FEATURES, RUNTIME_HOST_PROTOCOL, type FrameStream, type HostMessage, type HostRequest, type RuntimeInfo, type RuntimeSpawn } from './protocol'
+import { lowerToBackground } from '../background-priority'
+import { ControlHold } from './control-hold'
 import { McpRelay } from './relay'
 
 export interface RuntimeHostOptions {
@@ -16,6 +18,8 @@ export interface RuntimeHostOptions {
   bufferFrames?: number
   /** How long an MCP request waits for an app to take its route over again (McpRelay). */
   relayWaitMs?: number
+  /** How long a held app-control request waits for the next app (ControlHold). */
+  controlWaitMs?: number
   log?(message: string): void
   onIdle?(): void
 }
@@ -44,6 +48,7 @@ export class RuntimeHost {
   private readonly bufferBytes: number
   private readonly bufferFrames: number
   private readonly relay: McpRelay
+  private readonly controlHold: ControlHold
 
   constructor(private options: RuntimeHostOptions) {
     this.idleMs = options.idleMs ?? 5 * 60_000
@@ -51,6 +56,7 @@ export class RuntimeHost {
     this.bufferBytes = options.bufferBytes ?? RUNTIME_BUFFER_BYTES
     this.bufferFrames = options.bufferFrames ?? RUNTIME_BUFFER_FRAMES
     this.relay = new McpRelay({ waitMs: options.relayWaitMs, log: options.log })
+    this.controlHold = new ControlHold({ waitMs: options.controlWaitMs, log: options.log })
   }
 
   listen(): Promise<void> {
@@ -69,6 +75,7 @@ export class RuntimeHost {
     if (this.idleTimer) clearTimeout(this.idleTimer)
     for (const runtime of this.runtimes.values()) this.stop(runtime)
     for (const client of this.clients) client.socket.destroy()
+    this.controlHold.close()
     await this.relay.close()
     await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve())
   }
@@ -149,6 +156,10 @@ export class RuntimeHost {
         this.relay.register(client, request.key, request.servers).then(routes => this.reply(client, id, true, routes), error => this.reply(client, id, false, error instanceof Error ? error.message : String(error)))
         return
       }
+      case 'holdControl':
+        this.controlHold.hold(request.port)
+        return this.reply(client, request.id, true)
+      case 'releaseControl': return this.reply(client, request.id, true, this.controlHold.release(request.port))
       case 'shutdown':
         this.reply(client, request.id, true)
         void this.close().then(() => this.options.onIdle?.())
@@ -176,6 +187,9 @@ export class RuntimeHost {
     }
     runtime.child = child
     runtime.info.pid = child.pid ?? null
+    // Agent CLIs and every tool they start (a tsc, a vitest, a build) yield to the owner's own
+    // Conductor window; children created from here on inherit it (background-priority.ts).
+    if (child.pid) lowerToBackground([child.pid])
     const stdout = new LineReader(line => this.push(runtime, 'stdout', line)), stderr = new StringDecoder('utf8')
     child.stdout.on('data', (chunk: Buffer) => { try { stdout.push(chunk) } catch (error) { this.push(runtime, 'error', error instanceof Error ? error.message : String(error)); this.stop(runtime) } })
     child.stdout.on('end', () => { const rest = stdout.end(); if (rest) this.push(runtime, 'stdout', rest) })

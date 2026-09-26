@@ -48,7 +48,8 @@ the installer leaves them alone too.
 Client to host: `hello`, `spawn {runtimeId, executable, args, cwd, env, meta}`,
 `send {runtimeId, line}`, `attach {runtimeId, afterSeq}`, `detach {runtimeId, seq}`,
 `ack {runtimeId, seq}`, `close {runtimeId}`, `list`, `stopAll`, `shutdown`, `relay {key, servers}`
-(a host whose `hello` lists the `mcp-relay` feature; see below).
+(a host whose `hello` lists the `mcp-relay` feature; see below), `holdControl {port}` and
+`releaseControl {port}` (the `control-hold` feature; see App control across a restart).
 Requests carry an `id`; the host answers `{op: 'result', id, ok, value | error}`.
 
 Host to client: `frame {runtimeId, seq, stream: 'stdout' | 'stderr', data}` (stdout split into
@@ -110,8 +111,9 @@ the attached adapter restates what is still live: running tools, pending interac
 phase. Buffered frames then arrive and are handled exactly as if live. A record whose runtime is
 gone is dropped and the conversation marked `disconnected` (native resume as before).
 
-A reattached turn still holds the old process's app-control endpoint and credential, so it is sent
-one steering message with the new briefing. A reattached wizard is not resumed a second time by
+A reattached turn is sent one short steering message saying the app restarted. App control keeps
+its endpoint and credential across restarts (below), so the message carries a new briefing only when
+it could not. A reattached wizard is not resumed a second time by
 the restart-initiator logic. Reattached conversations without an open tab appear in `agents.list`
 as orphans. After reattaching, main starts (or joins) the host for new runtimes and closes any
 host runtime nobody owns: its app crashed, so no adapter state exists to continue it.
@@ -140,6 +142,64 @@ its stdio, which the host already relays and buffers; its MCP tools (the browser
 `scripts/smoke-fx16-restart-tools.mjs` restarts a parked app under a streaming turn whose stand-in
 CLI sends a hook and calls both MCP servers while no app runs, and checks that the relaunched app
 answers on its debugging port.
+
+## Request timeouts and a stalled app (FX33)
+
+On 2026-09-25 the relaunched app reattached eight kept turns and then its main thread stalled for
+71 s. Seven attach requests had been queued behind a write still in flight, so they reached the host
+only when the loop ran again; the host answered at once, but the 15 s timers, armed when the
+requests were queued, fired first (a loop coming out of a stall runs its timers before it reads the
+pipe). Each attach failed with "Runtime host did not answer attach", and the conversation that
+failed closed its runtime, although the host was keeping it alive. `RuntimeHostClient` now:
+
+- counts a request's wait from when it left the process (the socket's write callback);
+- starts the wait over when its timer fires more than 1 s late (this process was stalled), and
+  gives the pipe one more turn of the loop before giving up;
+- gives `attach` 120 s instead of 15;
+- never sends `close` for a runtime whose attach it gave up on, and if the host's answer that it
+  attached comes after all, detaches it again so it stays alive in the host.
+
+`client.test.ts` (a stand-in host in its own process) and `reattach-stall.test.ts` (the real host
+bundle in its own process, three kept Claude turns, a 30 s block right after reattaching) cover it.
+
+The control server had the same flaw: Node checks an HTTP request's header and request deadlines
+(10 s and 120 s, counted from when the connection was accepted) on a timer, so a call accepted just
+before a stall was answered 408 or reset after it. The control server sets no such deadline now
+(loopback only, bearer tokens, at most 256 connections).
+
+Where the stall comes from: the owner's `conductor.db-wal` had grown to 3.49 GB (847 091 frames; the
+log was back to a few frames a day later, so the growth was an episode). A launch that finds a large
+log recovers it when it opens the database and copies it back into the database on its first
+write, on the main thread: 11.5 s with a warm cache for a 3.4 GB log in a parked launch on a copy of
+the owner's journal, against 1.8 s without the log. The workspace database now checkpoints and
+empties the log when it closes (the other stores' connections may still be open, so SQLite would
+not do it itself), and `journal_size_limit` (64 MiB) cuts a grown log back once it is
+checkpointed. What made the log grow that far is not known yet.
+
+## App control across a restart (FX33)
+
+App control keeps one port and one set of credentials per profile: `control-endpoint.json` in
+userData, beside `control-owner.json` and owner-only like it, holds the port, the owner token and
+each conversation's credential. The next launch binds the same port and accepts the same tokens, so
+a kept turn, and every script it wrote, keeps working. The file is written again whenever a
+conversation is briefed; credentials change only when the file is missing or the owner rotates them
+(`AgentControlServer.rotate()`). If another process holds the port, the app retries for 5 s and
+then binds another one, logs it as an error, and tells every reattached turn the new endpoint.
+
+Between the old app letting go of the port and the new one taking it, the runtime host answers it
+(`runtime-host/control-hold.ts`): a quit or restart that keeps turns running sends
+`holdControl {port}`, the host binds the port once it is free, and holds each request it gets. The
+new app finds the port taken, asks for it back with `releaseControl`, binds it, and the host hands
+it every held request once, headers and credential unchanged, so the app still decides every call.
+A held request no app takes within 5 minutes is answered 503 with "it was never delivered, so it is
+safe to send again". `agent-control-endpoint.test.ts` covers both;
+`scripts/smoke-fx33-restart-stall.mjs` runs the whole restart in a parked app.
+
+## Priority
+
+Provider CLIs run below normal priority, spawned directly or by the host, and so does every tool
+they start (`background-priority.ts`), so an agent's tsc, vitest or build never competes with the
+owner's own window; the app itself stays at normal.
 
 ## Lifecycle
 
