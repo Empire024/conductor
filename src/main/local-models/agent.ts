@@ -345,6 +345,9 @@ interface RunLedger {
   /** Every result this message's searches listed, in order (pickPages); web_search calls made;
    *  rounds in which Conductor opened pages for the model; pages that would not open. */
   searchHits?: SearchHit[]
+  /** The lines of each page read this message that bear on the question (keyExcerpt), given
+   *  back when the model asks for a page it already has. */
+  pageExcerpts?: Record<string, string>
   searches?: number
   conductorReads?: number
   readFailed?: string[]
@@ -445,34 +448,110 @@ const LATEST = /\b(?:latest|newest|current)\b[^?]*\b(?:version|release|model|upd
  *  none named, or a latest-release question, where "right now" does not date the answer. */
 const boundDay = (instruction: string, now: Date): string | undefined => LATEST.test(instruction) ? undefined : askedDay(instruction, now)
 
+const MONTH = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?'
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+const isoDate = (year: string | number, month: string | number, day: string | number): string | undefined => {
+  const m = typeof month === 'number' ? month : /^\d+$/.test(month) ? Number(month) : MONTHS.indexOf(month.slice(0, 3).toLowerCase()) + 1
+  const d = Number(day)
+  if (m < 1 || m > 12 || d < 1 || d > 31) return undefined
+  const iso = `${year}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`
+  return Number.isNaN(Date.parse(iso)) ? undefined : iso
+}
+/** Every full date a text names, as YYYY-MM-DD, in the order it names them: 2026-09-25,
+ *  "September 25, 2026", "Sep 11, 2026", "25 September 2026". A month or year alone is no date. */
+export function datesIn(text: string): string[] {
+  const found: Array<{ at: number; iso: string }> = []
+  const add = (at: number, iso: string | undefined): void => { if (iso) found.push({ at, iso }) }
+  for (const match of text.matchAll(/\b(20\d\d)-(\d{2})-(\d{2})\b/g)) add(match.index, isoDate(match[1]!, match[2]!, match[3]!))
+  for (const match of text.matchAll(new RegExp(`\\b${MONTH} (\\d{1,2})(?:st|nd|rd|th)?,? (20\\d\\d)\\b`, 'gi'))) add(match.index, isoDate(match[3]!, match[1]!, match[2]!))
+  for (const match of text.matchAll(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)? ${MONTH},? (20\\d\\d)\\b`, 'gi'))) add(match.index, isoDate(match[3]!, match[2]!, match[1]!))
+  return found.sort((a, b) => a.at - b.at).map(item => item.iso)
+}
+/** Dates in a link: /2026/09/25/, 2026-09-25, and a scoreboard's 9-25-2026. */
+function linkDates(url: string): string[] {
+  const dates: Array<string | undefined> = []
+  for (const match of url.matchAll(/\/(20\d\d)[/-](\d{1,2})[/-](\d{1,2})(?=\/|-|$|\.)/g)) dates.push(isoDate(match[1]!, match[2]!, match[3]!))
+  for (const match of url.matchAll(/(?:^|[/_-])(\d{1,2})-(\d{1,2})-(20\d\d)(?=[/_.-]|$)/g)) dates.push(isoDate(match[3]!, match[1]!, match[2]!))
+  return dates.filter((date): date is string => Boolean(date))
+}
+
 /** When a result was published: the date in front of its snippet, else one in its link
  *  (/2026/09/25/). */
 export function hitDate(hit: SearchHit): string | undefined {
   const dated = /^(\d{4}-\d{2}-\d{2})/.exec(hit.snippet)?.[1]
   if (dated) return dated
-  const linked = /\/(20\d\d)[/-](\d{1,2})[/-](\d{1,2})(?:\/|-|$)/.exec(hit.url)
-  return linked ? `${linked[1]}-${linked[2]!.padStart(2, '0')}-${linked[3]!.padStart(2, '0')}` : undefined
+  return linkDates(hit.url)[0]
 }
+
+/** The opening of a page web_read returned: its title and first lines, where a report names the
+ *  day it is about, without the source and notice lines Conductor puts in front. */
+function pageOpening(page: string): string {
+  return page.split('\n').filter(line => !/^Source: /.test(line) && line !== PAGE_HEADER && !line.startsWith('[Conductor')).join('\n').slice(0, 500)
+}
+
+/** Every date a result and its page carry, most telling first: the title (a box score's "Final
+ *  Score — September 25, 2026", ESPN's "(Sep 11, 2026)"), the page's own opening, the link, the
+ *  snippet's text, and last the date in front of the snippet, which is when the search engine saw
+ *  a preview (SI's box score of Sep 25 carried Sep 24, VR9d). Dates after today are plans. */
+function dateSignals(hit: SearchHit | undefined, now: Date, page = ''): string[] {
+  const lead = hit ? /^(\d{4}-\d{2}-\d{2})/.exec(hit.snippet)?.[1] : undefined
+  const all = [...(hit ? datesIn(hit.title) : []), ...(page ? datesIn(pageOpening(page)) : []), ...(hit ? linkDates(hit.url) : []), ...(hit ? datesIn(lead ? hit.snippet.slice(lead.length) : hit.snippet) : []), ...(lead ? [lead] : [])]
+  return all.filter(date => Date.parse(date) <= now.getTime() + 86_400_000)
+}
+
+/** The date a page is about for a question about `day`: that day when any signal names it (the
+ *  right day's page is never called old), else the most telling signal (dateSignals). */
+export function pageDate(hit: SearchHit | undefined, day: string | undefined, now = new Date(), page = ''): string | undefined {
+  const signals = dateSignals(hit, now, page)
+  return day && signals.includes(day) ? day : signals[0]
+}
+
+/** Markets close at weekends: "gold right now" on a Saturday is answered by Friday's close,
+ *  which VR9d's run called "a day old". Crypto trades every day. */
+const MARKET = /\b(?:stocks?|shares?|nasdaq|s&p|dow|index|indices|gold|silver|oil|crude|markets?|closed?|futures|bonds?|yields?|treasur(?:y|ies)|forex|exchange rate)\b/i
+const CRYPTO = /\b(?:bitcoin|btc|ethereum|eth|crypto(?:currency)?|solana|dogecoin)\b/i
+/** The day whose figures answer a question about `day`: the last trading day for a market
+ *  question on a weekend, else the day itself. */
+export function answerDay(day: string, instruction: string): string {
+  if (!MARKET.test(instruction) || CRYPTO.test(instruction)) return day
+  const date = new Date(`${day}T12:00:00Z`)
+  const back = date.getUTCDay() === 6 ? 1 : date.getUTCDay() === 0 ? 2 : 0
+  return back ? new Date(date.getTime() - back * 86_400_000).toISOString().slice(0, 10) : day
+}
+
+const sameLink = (a: string, b: string): boolean => a.replace(/^https?:\/\/(?:www\.)?/i, '').replace(/\/$/, '') === b.replace(/^https?:\/\/(?:www\.)?/i, '').replace(/\/$/, '')
 
 export function pickPages(hits: SearchHit[], instruction: string, skip: string[], count: number, now = new Date()): string[] {
   const terms = questionTerms(instruction)
   const year = now.getFullYear()
   // A question about one day (yesterday's close, the price right now) wants that day's report:
   // Dolphin took the S&P 500's close from a report two days older than the question (FX42 run).
-  const day = boundDay(instruction, now)
+  const asked = boundDay(instruction, now)
+  const day = asked ? answerDay(asked, instruction) : undefined
+  // "The latest version", "this weekend": no single day, but a newer page beats an older one.
+  const timeBound = Boolean(day) || LATEST.test(instruction) || timeRelative(instruction)
   const scored = hits.flatMap((hit, index) => {
     let host: string, link: string
     try { host = new URL(hit.url).hostname; link = decodeURIComponent(hit.url) } catch { return [] }
-    if (skip.includes(hit.url) || UNREADABLE.test(host) || /\.pdf$/i.test(hit.url)) return []
+    if (skip.some(url => sameLink(url, hit.url)) || UNREADABLE.test(host) || /\.pdf$/i.test(hit.url)) return []
     const text = `${hit.title} ${hit.snippet} ${link}`.toLowerCase()
     const matched = terms.filter(term => text.includes(term)).length
     const years = [...text.matchAll(/(?:^|[^\d])(20\d\d)(?!\d)/g)].map(match => Number(match[1])).filter(value => value <= year)
     const newest = years.length ? Math.max(...years) : undefined
-    const dated = hitDate(hit)
-    const age = dated ? (now.getTime() - Date.parse(dated)) / 86_400_000 : undefined
+    // Every date the result carries, not only the snippet's: ESPN's "Yankees 6-4 Mets (Sep 11,
+    // 2026)" had none in front of its snippet and was read as a live page for last night's game,
+    // and "iOS 26.5.2 ... released June 29, 2026" as the latest release in September (VR9d).
+    const signals = dateSignals(hit, now)
+    const dated = day ? pageDate(hit, day, now) : undefined
+    const latest = signals.length ? Math.max(...signals.map(date => Date.parse(date))) : undefined
+    const age = latest !== undefined ? (now.getTime() - latest) / 86_400_000 : undefined
     const off = dated && day ? Math.abs(Date.parse(dated) - Date.parse(day)) / 86_400_000 : undefined
-    // An undated page for a question about today is most often a live page (a price, a scoreboard).
-    const fresh = off !== undefined ? (off <= 1 ? 4 : -3) : day ? 1 : age !== undefined && age <= 7 ? 2 : 0
+    // An undated page for a question about today is most often a live page (a price, a scoreboard);
+    // one dated another day cannot answer it, however well its title matches the words.
+    const fresh = off !== undefined ? (off <= 1 ? 4 : -8)
+      : day ? 1
+        : age === undefined ? 0
+          : age <= 7 ? 2 : !timeBound ? 0 : age <= 31 ? 1 : age <= 60 ? 0 : -2
     const score = matched * 2 - hit.rank * 0.25 + (newest === undefined ? 0 : newest >= year ? 2 : newest === year - 1 ? 0.5 : -4) + fresh
     return [{ url: hit.url, host: host.replace(/^www\./, ''), score, index }]
   }).sort((a, b) => b.score - a.score || a.index - b.index)
@@ -484,28 +563,51 @@ export function pickPages(hits: SearchHit[], instruction: string, skip: string[]
   return picked.map(hit => hit.url)
 }
 
-/** Why a page read for a question about one day is left out, when it is dated more than a day
- *  before that day; undefined when it is recent enough or has no known date. */
-export function stalePage(url: string, hits: SearchHit[], instruction: string, now = new Date()): string | undefined {
-  const day = boundDay(instruction, now)
-  const hit = hits.find(item => item.url === url)
-  const published = hit ? hitDate(hit) : undefined
-  if (!day || !published) return undefined
+/** Why a page read for a question about one day is left out, when the page's own date (its
+ *  title or opening, else its link or snippet) is more than a day before the day whose figures
+ *  answer it; undefined when it is recent enough, names that day, or has no known date. */
+export function stalePage(url: string, hits: SearchHit[], instruction: string, now = new Date(), page = ''): string | undefined {
+  const asked = boundDay(instruction, now)
+  if (!asked) return undefined
+  const day = answerDay(asked, instruction)
+  const published = pageDate(hits.find(item => sameLink(item.url, url)), day, now, page)
+  if (!published) return undefined
   const days = Math.round((Date.parse(day) - Date.parse(published)) / 86_400_000)
   return days > 1 ? `left out: ${url} is dated ${published}, ${days} days before ${day}, the day the question is about, so its figures do not answer it. Open a result from that day or a live page, or say that you found none.` : undefined
 }
 
 /** A page read for a question about one day, with a line after its source saying how old it is
- *  against that day. A page with no known date, or a question about no single day, is unchanged. */
+ *  against that day, by the page's own date (pageDate). A page with no known date, or a question
+ *  about no single day, is unchanged. */
 export function datedPage(output: string, url: string, hits: SearchHit[], instruction: string, now = new Date()): string {
-  const day = boundDay(instruction, now)
-  const hit = hits.find(item => item.url === url)
-  const published = hit ? hitDate(hit) : undefined
-  if (!day || !published) return output
+  const asked = boundDay(instruction, now)
+  if (!asked) return output
+  const day = answerDay(asked, instruction)
+  const published = pageDate(hits.find(item => sameLink(item.url, url)), day, now, output)
+  if (!published) return output
   const days = Math.round((Date.parse(day) - Date.parse(published)) / 86_400_000)
-  const line = `[Conductor: this page is dated ${published}; the question is about ${day}${days > 0 ? `, ${days} day${days === 1 ? '' : 's'} later. Its figures are ${days === 1 ? 'a day' : `${days} days`} old` : days === 0 ? ', the same day' : ''}.]`
+  const line = day !== asked
+    ? `[Conductor: this page is dated ${published}; the question is about ${asked}, when markets are closed, so the latest figures are from ${day}${days > 0 ? `. Its figures are ${days === 1 ? 'a day' : `${days} days`} older than that` : days === 0 ? `. Its figures are that latest close` : ''}.]`
+    : `[Conductor: this page is dated ${published}; the question is about ${day}${days > 0 ? `, ${days} day${days === 1 ? '' : 's'} later. Its figures are ${days === 1 ? 'a day' : `${days} days`} old` : days === 0 ? ', the same day' : ''}.]`
   const end = output.indexOf('\n')
   return end < 0 ? `${output}\n${line}` : `${output.slice(0, end)}\n${line}${output.slice(end)}`
+}
+
+/** The lines of a page read earlier that bear on the question, for a model that asks for the page
+ *  again: Dolphin re-read the same four gold pages twelve times, each refused, and then answered
+ *  with the web limit instead of the price (VR9d). */
+export function keyExcerpt(page: string, terms: string[], chars = 600): string {
+  const lines = page.split('\n').map(line => line.trim()).filter(line => line && !/^Source: /.test(line) && line !== PAGE_HEADER && !line.startsWith('[Conductor'))
+  const scored = lines.map((line, index) => ({ line, index, score: terms.filter(term => line.toLowerCase().includes(term)).length * 2 + (/\d/.test(line) ? 1 : 0) }))
+  const kept: typeof scored = []
+  let used = 0
+  for (const item of [...scored].filter(item => item.score >= 2).sort((a, b) => b.score - a.score || a.index - b.index)) {
+    if (used + item.line.length > chars) continue
+    kept.push(item)
+    used += item.line.length + 1
+  }
+  const text = kept.length ? kept.sort((a, b) => a.index - b.index).map(item => item.line).join('\n') : lines.join('\n').slice(0, chars)
+  return text.slice(0, chars)
 }
 
 /** Characters a page or result list read for an earlier message keeps. */
@@ -519,7 +621,7 @@ export const READ_FOR_YOU = '[Conductor] Conductor opened the best results above
  *  and "the latest Python" from a table of planned releases, in FX42's parked runs). */
 export function readForYou(pages: string[], hits: SearchHit[], instruction: string, now = new Date()): string {
   const day = boundDay(instruction, now)
-  const dated = pages.map(url => { const hit = hits.find(item => item.url === url); return `${url}${hit && hitDate(hit) ? ` (${hitDate(hit)})` : ''}` })
+  const dated = pages.map(url => { const date = pageDate(hits.find(item => sameLink(item.url, url)), day ? answerDay(day, instruction) : undefined, now); return `${url}${date ? ` (${date})` : ''}` })
   const latest = LATEST.test(instruction)
   return [
     READ_FOR_YOU,
@@ -529,18 +631,30 @@ export function readForYou(pages: string[], hits: SearchHit[], instruction: stri
   ].filter(Boolean).join(' ')
 }
 
-/** Whether a combine call has a made-up report: one whose numbers (two digits or more, or with
- *  decimals) are mostly in nothing the conversation received. Dolphin, asked a follow-up after
- *  its coworkers never reported, combined "Person A worked 40 hours ..." six times (VR9a). */
+/** Whether a combine call has a made-up report: one whose figures are mostly in nothing the
+ *  conversation received. Dolphin, asked a follow-up after its coworkers never reported, combined
+ *  "Person A worked 40 hours ..." six times (VR9a). Every figure counts: a number of two digits or
+ *  more (or with decimals) is known when the conversation has it anywhere; a one-digit figure
+ *  ("sold=7") only from a line that holds both its label and the figure, since single digits are
+ *  everywhere; and a word given as a value ("item=orange") only when the conversation has it.
+ *  "sat.csv: item=orange, sold=7" was merged into "7 + 9" from files with no orange (VR9d). */
 export function inventedReports(combine: unknown, received: string): boolean {
   if (!Array.isArray(combine) || !combine.length) return false
   const numbers = (text: string): string[] => [...new Set((text.match(/\d+(?:\.\d+)?/g) ?? []).map(value => value.replace(/\.0+$/, '')).filter(value => value.length >= 2 || value.includes('.')))]
   const known = new Set(numbers(received))
+  const lines = received.toLowerCase().split('\n')
+  const lower = received.toLowerCase()
   // Per report: in B1 (FX42 run) the controller merged January's real report with a February one
   // it made up ("rent=1050"), so one invented report among real ones is refused too.
   return combine.some(item => {
-    const claimed = numbers(typeof item === 'string' ? item : JSON.stringify(item))
-    return claimed.length > 0 && claimed.filter(value => known.has(value)).length * 2 < claimed.length
+    const text = typeof item === 'string' ? item : JSON.stringify(item)
+    const claims = numbers(text).map(value => known.has(value))
+    for (const match of text.matchAll(/([a-z][\w-]*)"?\s*[=:]\s*"?(\d)(?![\d.])/gi)) {
+      const label = match[1]!.toLowerCase(), figure = new RegExp(`(?<![\\d.])${match[2]}(?![\\d.])`)
+      claims.push(lines.some(line => line.includes(label) && figure.test(line)))
+    }
+    for (const match of text.matchAll(/=\s*"?([a-z][a-z-]{2,})/gi)) claims.push(lower.includes(match[1]!.toLowerCase()))
+    return claims.length > 0 && claims.filter(Boolean).length * 2 < claims.length
   })
 }
 
@@ -1031,7 +1145,7 @@ export class LocalAgentSession {
     const coworker = prompt !== undefined && splitLocalPrompt(prompt).instruction.startsWith(LOCAL_COWORKER_BRIEF)
     const swarmTurn = (): boolean => coworker || this.openedCoworkers || Boolean(ledger.dispatched) || DISPATCH.test(instruction)
     // Numbers asked for and none computed yet, with the one nudge still unspent.
-    const calcOwed = (): boolean => mathHinted && !ledger.calculated && !ledger.calcNudged && !ledger.dispatched && tools.some(tool => tool.function.name === 'calculate')
+    const calcOwed = (): boolean => mathHinted && !ledger.calculated && !ledger.calcNudged && !ledger.dispatched && !ledger.blocked?.includes('calculate') && tools.some(tool => tool.function.name === 'calculate')
     // Every path through the loop below either sends a request or returns, and the stages bound
     // the requests; the extra allowance covers the bounded nudges that cost a request each.
     const requestCeiling = this.policy.task.maxRequests
@@ -1341,9 +1455,13 @@ export class LocalAgentSession {
           } else if (ledger.blocked?.includes(failureKey(call))) {
             // Turned off after failing the same way twice: the call costs nothing, and a second
             // one after that ends the turn rather than spending it on the loop.
+            // The next round offers no tools, so the model answers from what it has: stopping here
+            // left a research turn with two pages read and no answer (VR9d: calculate combine on
+            // prose summaries). Only a model that still calls it after that ends the turn.
             ledger.blockedAttempts = (ledger.blockedAttempts ?? 0) + 1
-            outcome={output:`not run: ${failureLabel(call)} failed the same way twice this message and is off until the next one. Do not call it again; carry on with the task another way, or give your answer.`,failed:true,paths:[]}
-            if (ledger.blockedAttempts >= 2) stagnationStop = `The model kept calling ${failureLabel(call)} after it was turned off for failing the same way twice.`
+            outcome={output:`not run: ${failureLabel(call)} failed the same way twice this message and is off until the next one. Do not call it again. Give your answer now, in plain words, from what you already have.`,failed:true,paths:[]}
+            if (ledger.blockedAttempts >= 3) stagnationStop = `The model kept calling ${failureLabel(call)} after it was turned off for failing the same way twice.`
+            else toolFree = true
           } else if (call.name === 'conductor' && parseArguments(call.arguments).method === 'memory.remember' && swarmTurn()) {
             outcome={output:`not saved: memory is not part of this task, so nothing was written. Carry on with it: ${coworker ? 'compute your numbers with calculate and send them with agents.report.' : 'open the coworkers it needs with tabs.open, end your turn and wait for their reports, then merge them with calculate (combine).'}`,failed:true,paths:[]}
           } else if (call.name === 'calculate' && ledger.computed?.[fingerprint(call.arguments)] !== undefined) {
@@ -1356,6 +1474,9 @@ export class LocalAgentSession {
             outcome={output:'not computed: the numbers of at least one of these reports are not in this conversation, so no coworker sent them. Combine only the full text of reports you received. If none have arrived, open the coworkers the task needs with tabs.open, end your turn and wait: each report arrives as a new message.',failed:true,paths:[]}
           } else if ((call.name === 'web_search' || call.name === 'web_read') && !this.grants.research && (ledger.webCalls ?? 0) >= WEB_CALLS_PER_MESSAGE) {
             outcome={output:`denied: this message has used its ${WEB_CALLS_PER_MESSAGE} web calls. Answer now from the pages you already read, and name them; the owner can turn on deep research for a longer search.`,failed:true,paths:[]}
+            // With pages read, the next round has no tools: Dolphin answered "the 8 web call limit
+            // has been reached" instead of the gold price it had read (VR9d).
+            if (ledger.webSources?.length) toolFree = true
           } else if (call.name === 'conductor' && ledger.noController && reportText(call.arguments) !== undefined) {
             outcome={output:NO_CONTROLLER,failed:true,paths:[]}
           } else if (call.name === 'conductor' && ledger.reported && reportText(call.arguments) !== undefined) {
@@ -1366,9 +1487,15 @@ export class LocalAgentSession {
             // A coworker's report is its whole result: numbers guessed there reach the controller as fact.
             ledger.reportHeld = true
             outcome={output:'not sent: this report has numbers you did not compute with a tool. Call calculate first (a CSV file: path, column and group_by), then call agents.report again with the exact numbers it returned as label = value lines.',failed:true,paths:[]}
-          } else if (call.name === 'web_read' && (ledger.webSources ?? []).includes(String(parseArguments(call.arguments).url ?? ''))) {
-            // Dolphin re-read one review six times in a row; the page is already in the transcript.
-            outcome={output:`You already read ${String(parseArguments(call.arguments).url)} for this message; its text is above. Answer from it now, or read a different result.`,failed:true,paths:[]}
+          } else if (call.name === 'web_read' && (ledger.webSources ?? []).some(url => sameLink(url, String(parseArguments(call.arguments).url ?? '')))) {
+            // Dolphin re-read one review six times in a row, and four gold pages twelve times (VR9d);
+            // the page is already in the transcript. Its key lines come back instead of a refusal,
+            // and the next round has no tools, so the answer is written from them.
+            const url = String(parseArguments(call.arguments).url)
+            const read = (ledger.webSources ?? []).find(source => sameLink(source, url))!
+            const excerpt = ledger.pageExcerpts?.[read]
+            outcome={output:`Already read above: ${read} is in this conversation for this message, so it was not opened again.${excerpt ? ` Its key lines:\n${excerpt}\n` : ' '}Answer the owner now from the pages you read, and name them.`,failed:false,paths:[]}
+            toolFree = true
           } else if (call.name === 'web_read' && (ledger.readFailed ?? []).includes(String(parseArguments(call.arguments).url ?? ''))) {
             // Dolphin retried a made-up 404 link four times, spending the message's web budget (FX42 run).
             outcome={output:`not run: ${String(parseArguments(call.arguments).url)} already failed for this message, and it would fail again. Open a different result from the search, or answer from the pages you read.`,failed:true,paths:[]}
@@ -1409,7 +1536,7 @@ export class LocalAgentSession {
             // A report from days before the day asked about is not an answer to it, and Dolphin used
             // its figures anyway, warning line and all (FX42 runs: a 6-day-old bitcoin price as the
             // price "right now"). Its text is withheld and it counts as unread, so another page opens.
-            const stale = hinted && call.name === 'web_read' && !outcome.failed ? stalePage(String(parseArguments(call.arguments).url ?? ''), ledger.searchHits ?? [], instruction) : undefined
+            const stale = hinted && call.name === 'web_read' && !outcome.failed ? stalePage(String(parseArguments(call.arguments).url ?? ''), ledger.searchHits ?? [], instruction, new Date(), outcome.output) : undefined
             if (stale) outcome = { output: stale, failed: true, paths: [] }
             if (call.name === 'calculate' && !outcome.failed) { ledger.calculated = true; ledger.calculation = outcome.output; (ledger.computed ??= {})[fingerprint(call.arguments)] = outcome.output }
             if (merged) outcome = { ...outcome, output: merged + outcome.output }
@@ -1422,7 +1549,11 @@ export class LocalAgentSession {
             if (call.name === 'conductor' && !outcome.failed && /"tabs\.open"/.test(call.arguments)) this.openedCoworkers = true
             if (call.name === 'web_read' && outcome.failed) ledger.readFailed = [...(ledger.readFailed ?? []), String(parseArguments(call.arguments).url ?? '')]
             if (call.name === 'web_search' && !outcome.failed) ledger.searchHits = [...(ledger.searchHits ?? []), ...searchHits(outcome.output)]
-            if (call.name === 'web_read' && !outcome.failed) ledger.webSources = [...(ledger.webSources ?? []), String(parseArguments(call.arguments).url ?? '')]
+            if (call.name === 'web_read' && !outcome.failed) {
+              const url = String(parseArguments(call.arguments).url ?? '')
+              ledger.webSources = [...(ledger.webSources ?? []), url]
+              ;(ledger.pageExcerpts ??= {})[url] = keyExcerpt(outcome.output, questionTerms(instruction))
+            }
             // How old the page is against the day asked about, said on the page itself: Dolphin gave a
             // bitcoin price from a report six days old as the price "right now" (FX42 run).
             if (hinted && call.name === 'web_read' && !outcome.failed) outcome = { ...outcome, output: datedPage(outcome.output, String(parseArguments(call.arguments).url ?? ''), ledger.searchHits ?? [], instruction) }

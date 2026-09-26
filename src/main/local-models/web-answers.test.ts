@@ -259,7 +259,7 @@ describe('a local model answering like any other model', () => {
           : answer('Done (https://example.com/a).')
     const limited = await session(script)
     await limited.run('look up example.com a')
-    expect(limited.tools[1]!.output).toContain('You already read https://example.com/a for this message')
+    expect(limited.tools[1]!.output).toMatch(/^Already read above: https:\/\/example\.com\/a is in this conversation/)
     const denied = limited.tools.filter(tool => tool.output.startsWith(`denied: this message has used its ${WEB_CALLS_PER_MESSAGE} web calls`))
     // One read and the searches up to the budget ran; the re-read cost nothing.
     expect(limited.tools.length - denied.length).toBe(WEB_CALLS_PER_MESSAGE + 1)

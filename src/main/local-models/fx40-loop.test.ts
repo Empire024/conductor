@@ -182,9 +182,10 @@ describe('FX40: budgets that renew and numbers that are computed', () => {
     const reports = outcome.tools.filter(tool => tool.name === 'conductor')
     expect(reports[0]!.output).toMatch(/^not sent: no conversation opened this one/)
     expect(controlCalls).toBe(1)
-    // The same refusal twice turns the method off; two more calls to it end the turn early.
+    // The same refusal twice turns the method off; each call to it after that is answered with a
+    // round offered no tools (FX44), and a model that still calls it a third time ends the turn.
     expect(reports[1]!.output).toContain('failed with this same error twice, so it is off for the rest of this message')
-    expect(reports.slice(2).map(tool => tool.output.slice(0, 8))).toEqual(['not run:', 'not run:'])
+    expect(reports.slice(2).map(tool => tool.output.slice(0, 8))).toEqual(['not run:', 'not run:', 'not run:'])
     // The model kept trying until the stagnation stop; the right numbers it computed survive it.
     expect(outcome.stopReason).toBe('stagnation')
     expect(outcome.text).toContain('Computed with calculate before the stop:\nrent = 1900 (950 + 950; change +0)\ngroceries = 625.6')
@@ -224,7 +225,7 @@ describe('FX40: budgets that renew and numbers that are computed', () => {
     const memory = outcome.tools.filter(tool => tool.name === 'conductor').slice(1)
     expect(memory[0]!.output).toMatch(/^not saved: memory is not part of this task/)
     expect(memory[1]!.output).toContain('failed with this same error twice, so it is off for the rest of this message')
-    expect(memory).toHaveLength(4)
+    expect(memory).toHaveLength(5)
     expect(outcome.stopReason).toBe('stagnation')
   })
 

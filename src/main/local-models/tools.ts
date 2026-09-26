@@ -196,6 +196,13 @@ async function walk(root: string, directory: string, visit: (path: string) => Pr
 
 export const analysisScratchPath = (workspace: string, taskId: string): string => '.conductor-scratch/' + createHash('sha256').update(workspace + '\0' + taskId).digest('hex').slice(0, 24)
 
+/** Whether a run_command `script` value is program text rather than a workspace path: a line
+ *  break, a statement, a call or a keyword no file name has. Dolphin put a whole Node program in
+ *  `script`; run as a path it failed with ENOENT on "const fs = require(...", which the model read
+ *  as its CSV files missing (VR9d timesheet run). */
+export const scriptIsCode = (value: string): boolean => value.length > 260 || /[\n;{}]|=>|\b(?:require|print|console\.log|open|readFileSync)\s*\(|^\s*(?:import|from|const|let|var|def|function|for|while|if)\b/.test(value)
+/** The interpreter inline code is written for, when the call does not name one. */
+const codeRuntime = (code: string): 'python3' | 'node' => /\b(?:require\s*\(|console\.|const |let |readFileSync)|=>/.test(code) ? 'node' : /^\s*(?:import|from|def)\b|\bprint\s*\(|\bwith open\(/m.test(code) ? 'python3' : 'node'
 /** The interpreter a saved script's extension names, for a run_command that gives none. */
 export const scriptRuntime = (path: string): 'python3' | 'node' | 'bash' | undefined => /\.py$/i.test(path) ? 'python3' : /\.(?:mjs|cjs|js)$/i.test(path) ? 'node' : /\.sh$/i.test(path) ? 'bash' : undefined
 
@@ -384,6 +391,13 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
           const outcome = await runTool(name, JSON.stringify(args), context)
           return { ...outcome, output: note + outcome.output }
         }
+        if (typeof args.script === 'string' && args.code === undefined && args.command === undefined && scriptIsCode(args.script)) {
+          const code = args.script
+          delete args.script
+          const runtime = args.runtime ?? codeRuntime(code)
+          const outcome = await runTool(name, JSON.stringify({ ...args, code, runtime }), context)
+          return { ...outcome, output: `[Conductor: script holds program text, not a workspace file path, so it ran as inline code with ${String(runtime)}. Next time send it as {"code":"...","runtime":"${String(runtime)}"}.]\n${outcome.output}` }
+        }
         const forms = ['command', 'code', 'script'].filter(key => args[key] !== undefined)
         if (forms.length !== 1) throw new ToolPolicyError(`Provide exactly one of command, code or script (this call had ${forms.length ? forms.join(' and ') : 'none of them'}). Nothing ran. Examples: {"command":"node scratch/match.mjs"}, {"script":"scratch/match.mjs","runtime":"node"}, {"code":"console.log(1)","runtime":"node"}.`)
         const quote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
@@ -427,7 +441,12 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
               setup = 'printf %s ' + quote(Buffer.from(code).toString('base64')) + ' | base64 -d > ' + quote(script) + ' && '
             }
           } else {
-            const source = await resolveInWorkspace(context.workspace, text(args.script, 'script'))
+            const named = text(args.script, 'script')
+            // A missing script is said as such: a bare ENOENT reads like the data files are missing.
+            const source = await resolveInWorkspace(context.workspace, named).catch((error: unknown) => {
+              if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') throw new ToolPolicyError(`script names a workspace file to run, and there is no file "${named.slice(0, 120)}" in the workspace, so nothing ran. This says nothing about any other file. To run inline code, send {"code":"...","runtime":"node"} (or python3).`)
+              throw error
+            })
             if ((await stat(source.path)).size > MAX_WRITE_BYTES) throw new ToolPolicyError('Saved script exceeds the 1 MiB diagnostic snapshot limit')
             scriptArtifact = (context.artifacts ?? defaultResultStore).save(artifactOwner(context), await readFile(source.path, 'utf8'))
             script = '/workspace/' + source.relative
