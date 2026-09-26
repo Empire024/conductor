@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentSpec } from '../shared/models'
@@ -190,5 +190,44 @@ describe('host approval response gate (synthetic reviewers, no inference)', () =
     await f.waitPhase('paused')
     expect(f.last().review?.rationale).toContain('Protected configuration')
     expect(f.run).not.toHaveBeenCalled()
+  })
+  it('answers routine in-workspace actions without any review and journals the automatic allow (review-cost-bounded A3)', async () => {
+    const f = fixture()
+    mkdirSync(join(f.cwd, '.git'))
+    writeFileSync(join(f.cwd, 'package.json'), JSON.stringify({ scripts: { test: 'node --test', lint: 'node scripts/check.mjs' } }))
+    writeFileSync(join(f.cwd, 'README.md'), '# repo\n')
+    const routine: Array<[string, Json, string]> = [
+      ['test', { command: 'npm test' }, 'Bash'], ['readme', { file_path: 'README.md', old_string: 'repo', new_string: 'Repo' }, 'Edit'],
+      ['diff', { command: 'git diff --stat' }, 'Bash'], ['lint', { command: 'npm run lint' }, 'Bash'], ['notes', { file_path: 'notes/todo.md', content: 'later' }, 'Write']
+    ]
+    for (const [id, args, tool] of routine) {
+      f.gate.intercept(f.spec, 'runtime', f.request(id, args, tool))
+      await vi.waitFor(() => expect(f.responses.map(response => response.requestId)).toContain(id))
+      f.gate.intercept(f.spec, 'runtime', { itemId: 'tool-' + id, data: { type: 'tool', name: tool, status: 'completed' } } as AdapterEvent)
+    }
+    expect(f.run).not.toHaveBeenCalled()
+    expect(f.responses.every(response => response.decision === 'allow')).toBe(true)
+    const records = f.gate.journal.forWorker('project', 'worker')
+    expect(records.map(record => record.coveredBy)).toEqual(['routine:npm test', 'routine:edit:workspace', 'routine:git diff', 'routine:npm run lint', 'routine:edit:workspace'])
+    expect(records.every(record => record.phase === 'executed' && !record.reviewerId && /allowed automatically/.test(record.history.find(entry => entry.phase === 'approved')!.rationale))).toBe(true)
+    expect(f.publications.map(event => event.data).filter(data => data.type === 'notice').at(-1)).toMatchObject({ payload: { approvalReviews: { reviews: 0, covered: 0, routine: 5 } } })
+    // A genuinely risky call still goes to the reviewer.
+    f.gate.intercept(f.spec, 'runtime', f.request('push', { command: 'git push origin main' }, 'Bash'))
+    await vi.waitFor(() => expect(f.run).toHaveBeenCalledOnce())
+    f.gate.intercept(f.spec, 'runtime', f.request('outside', { file_path: '../elsewhere/x.md', content: 'x' }, 'Write'))
+    await f.waitPhase('paused')
+    expect(f.last().review?.rationale).toMatch(/outside the session workspace/)
+    expect(f.run).toHaveBeenCalledOnce()
+  })
+
+  it('reviews a Write into a folder that does not exist yet instead of pausing it on realpath (A4)', async () => {
+    const f = fixture()
+    f.gate.intercept(f.spec, 'runtime', f.request('fresh', { file_path: 'docs-new/deep/plan.md', content: 'plan' }))
+    await vi.waitFor(() => expect(f.responses).toHaveLength(1))
+    expect(f.responses[0]).toMatchObject({ requestId: 'fresh', decision: 'allow' })
+    expect(f.run).toHaveBeenCalledOnce()
+    const path = f.run.mock.calls[0]![1].paths[0]!
+    expect(path.replaceAll('\\', '/')).toMatch(/docs-new\/deep\/plan\.md$/)
+    expect(f.run.mock.calls[0]![1].sideEffects).toContain('Prior file SHA-256: absent')
   })
 })

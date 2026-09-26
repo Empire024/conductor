@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
-import { relative } from 'node:path'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import type { AgentSpec } from '../shared/models'
 import type { AdapterEvent, InteractionResponse, Json, PendingInteraction, SessionSettings } from '../shared/structured-agent'
 import { workspacePath } from './agent-artifacts'
 import { ApprovalReviews, actionDigest, canonicalAction, type ReviewAction, type ReviewPersistence, type ReviewRecord, type ReviewResult } from './approval-review'
 import { commandClass, sessionRules } from './approval-review-rules'
+import { routineClass } from './approval-review-routine'
 import { ownerOnlyEscalation } from './providers/codex'
 import { sanitizeDiagnostic } from './structured-store'
 
@@ -17,6 +18,21 @@ function boundedArguments(value: Json): Json {
   const canonical = canonicalAction(value)
   if (canonical.length <= REVIEWER_ARGUMENT_CHARS) return value
   return { truncatedForReview: true, totalChars: canonical.length, preview: canonical.slice(0, REVIEWER_ARGUMENT_CHARS) }
+}
+/** The canonical workspace target of a file a tool may create, also inside folders that do not
+ *  exist yet (VR8a A4): the nearest existing ancestor gets workspacePath's realpath containment
+ *  check, and the missing rest, which cannot be a link, is appended to it. */
+export async function reviewTargetPath(cwd: string, requested: string): Promise<string> {
+  try { return await workspacePath(cwd, requested, true) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  const missing: string[] = []
+  for (let current = resolve(cwd, requested); dirname(current) !== current;) {
+    missing.unshift(basename(current))
+    current = dirname(current)
+    try { return join(await workspacePath(cwd, current), ...missing) }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error }
+  }
+  throw new Error('No existing folder holds this path')
 }
 /** The text a command-like request acts through, for the owner-only boundary check. */
 export function reachOf(input: Record<string, Json>): string {
@@ -36,7 +52,7 @@ export function attributeAnswer(response: Pick<InteractionResponse, 'sessionId' 
   return () => !attributions.delete(key)
 }
 /** The review cost line a worker's usage summary shows (a payload notice, so not a timeline row). */
-export interface ApprovalReviewUsage { reviews: number; covered: number; rules: number; tokens: number | null; elapsedMs: number | null; budget: { used: number; cap: number } | null }
+export interface ApprovalReviewUsage { reviews: number; covered: number; rules: number; routine: number; tokens: number | null; elapsedMs: number | null; budget: { used: number; cap: number } | null }
 export const APPROVAL_REVIEW_USAGE_ITEM = 'approval-review-usage'
 const tokenTotal = (usage: Json | undefined): number | undefined => {
   const report = object(usage), tokens = object(object(report.run).tokens ?? object(report.conversation).tokens)
@@ -74,7 +90,7 @@ export class ApprovalReviewGate {
     if (['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool)) {
       const args = object(input), requested = args.file_path ?? args.notebook_path
       if (typeof requested === 'string') {
-        const path = await workspacePath(spec.cwd, requested, true)
+        const path = await reviewTargetPath(spec.cwd, requested)
         const action = { projectId: spec.projectId, machineId: 'local', paths: [process.platform === 'win32' ? path.toLowerCase() : path] } as ReviewAction
         if (!this.journal.denied(action)) return undefined
       }
@@ -135,7 +151,7 @@ export class ApprovalReviewGate {
     const claudeTool = binding.spec.provider === 'claude' && binding.source.native?.method === 'can_use_tool'
     const requested = typeof input.file_path === 'string' ? input.file_path : typeof input.notebook_path === 'string' ? input.notebook_path : undefined
     if (claudeTool && ['Write', 'Edit', 'MultiEdit', 'NotebookEdit'].includes(tool) && requested) {
-      const path = await workspacePath(binding.spec.cwd, requested, true)
+      const path = await reviewTargetPath(binding.spec.cwd, requested)
       const localPath = relative(binding.spec.cwd, path).replaceAll('\\', '/')
       if (localPath.includes(':') || /(?:^|\/)(?:\.git|\.codex|\.claude|\.agents)(?:\/|$)|(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|\.mcp\.json)$/i.test(localPath)) throw new Error('Protected configuration, repository metadata or alternate-stream writes require an unsupported native boundary')
       // Existing protected-path and realpath validation stays authoritative. Bind the existing
@@ -165,9 +181,14 @@ export class ApprovalReviewGate {
     binding.action = await this.action(binding)
     // A class this worker was already allowed in this session is answered from that rule: the
     // journal still records it and every fence still applies, but no reviewer turn is paid for.
+    // A routine in-workspace action an Auto worker would simply run (approval-review-routine.ts)
+    // is allowed without any review at all, and journaled as that automatic allow.
     const scope = { workerId: binding.spec.id, runtimeId: binding.runtimeId }
-    const rule = sessionRules.covering(scope, { ...binding.action, cwd: binding.spec.cwd })
-    const covered = rule && { key: rule.key, rationale: `Covered by this conversation's session rule "${rule.key}" (${rule.source === 'wizard' ? 'allowed for the session by ' + rule.by : 'first allowed by the ' + rule.by + ' review'}); no new review` }
+    const claudeTool = binding.spec.provider === 'claude' && binding.source.native?.method === 'can_use_tool'
+    const routine = claudeTool ? await routineClass(binding.action, binding.interaction.input, binding.spec.cwd) : undefined
+    const rule = routine ? undefined : sessionRules.covering(scope, { ...binding.action, cwd: binding.spec.cwd })
+    const covered = routine ? { key: routine, rationale: `Routine in-workspace action (${routine.slice('routine:'.length)}): allowed automatically, as Auto mode would; no review` }
+      : rule && { key: rule.key, rationale: `Covered by this conversation's session rule "${rule.key}" (${rule.source === 'wizard' ? 'allowed for the session by ' + rule.by : 'first allowed by the ' + rule.by + ' review'}); no new review` }
     const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => { if (!binding.settled) this.update(binding, record) }, covered)
     if (record.phase === 'approved' && record.reviewerId && !record.coveredBy) {
       const key = commandClass({ ...binding.action, cwd: binding.spec.cwd })
@@ -194,13 +215,14 @@ export class ApprovalReviewGate {
       if (total !== undefined) { tokens += total; counted = true }
       if (typeof record.reviewerElapsedMs === 'number') { elapsed += record.reviewerElapsedMs; timed = true }
     }
-    return { reviews: reviewed.length, covered: records.filter(record => record.coveredBy).length, rules: action ? sessionRules.list({ workerId: spec.id, runtimeId: action.runtimeId }).length : 0, tokens: counted ? tokens : null, elapsedMs: timed ? elapsed : null, budget: action && this.routing?.budget ? this.routing.budget(action) : null }
+    const routine = records.filter(record => record.coveredBy?.startsWith('routine:')).length
+    return { reviews: reviewed.length, covered: records.filter(record => record.coveredBy).length - routine, routine, rules: action ? sessionRules.list({ workerId: spec.id, runtimeId: action.runtimeId }).length : 0, tokens: counted ? tokens : null, elapsedMs: timed ? elapsed : null, budget: action && this.routing?.budget ? this.routing.budget(action) : null }
   }
   private report(binding: Binding): void {
     try {
       const usage = this.usage(binding.spec, binding.action)
       const cost = [usage.tokens !== null ? `${usage.tokens.toLocaleString('en-US')} tokens` : '', usage.elapsedMs !== null ? `${Math.round(usage.elapsedMs / 1000)} s` : ''].filter(Boolean).join(', ')
-      const message = `Approval reviews: ${usage.reviews}${cost ? ` (${cost})` : ''}; ${usage.covered} answered by ${usage.rules} session rule${usage.rules === 1 ? '' : 's'}${usage.budget ? `; task budget ${usage.budget.used}/${usage.budget.cap}` : ''}`
+      const message = `Approval reviews: ${usage.reviews}${cost ? ` (${cost})` : ''}; ${usage.covered} answered by ${usage.rules} session rule${usage.rules === 1 ? '' : 's'}; ${usage.routine} routine allowed without review${usage.budget ? `; task budget ${usage.budget.used}/${usage.budget.cap}` : ''}`
       this.publish(binding.spec.id, binding.runtimeId, { itemId: APPROVAL_REVIEW_USAGE_ITEM, data: { type: 'notice', message, payload: { approvalReviews: usage as unknown as Json } } })
     } catch { /* The cost line is informational; it never holds up an answer. */ }
   }
