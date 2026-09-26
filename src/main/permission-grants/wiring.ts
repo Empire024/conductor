@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto'
-import { ipcMain } from 'electron'
+import { readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { app, ipcMain } from 'electron'
 import { autoModeDenialOf } from '../../shared/auto-mode-denial'
 import type { AgentSpec, LayoutNode, WorkspaceLayout } from '../../shared/models'
 import type { PhoneNotification } from '../../shared/phone-access'
-import type { GrantDecision, PermissionGrantsState } from '../../shared/permission-grants'
+import { permissionGrantOf, type GrantDecision, type PermissionGrantRequest, type PermissionGrantsState } from '../../shared/permission-grants'
 import type { Json, SessionSettings, SessionProjection } from '../../shared/structured-agent'
 import { ConductorMcpServer, type ControlCall } from './control-mcp'
-import { PermissionGrants } from './service'
+import { PermissionGrants, type SavedPermissionGrants } from './service'
 
 /** What the grant service needs from StructuredSessions (index.ts passes agents.structured). */
 export interface GrantSessions {
@@ -35,10 +37,19 @@ export async function startPermissionGrants(deps: {
    *  reaches the owner's phone; a classifier denial already does through phone-notifications. */
   announce?(notification: PhoneNotification): unknown
   /** The saved window layouts (index.ts passes the database): a grant ends when its tab is closed. */
-  workspaces?: { getSession(id: string): { layout: WorkspaceLayout } | null | undefined; listDetachedWindows(): Array<{ sessionId: string; layout: WorkspaceLayout }> }
+  workspaces?: {
+    getSession(id: string): { layout: WorkspaceLayout } | null | undefined
+    listDetachedWindows(): Array<{ sessionId: string; layout: WorkspaceLayout }>
+    listProjects?(): Array<{ id: string }>
+    listSessions?(projectId: string): Array<{ layout: WorkspaceLayout }>
+  }
+  /** Where waiting requests and unspent grants survive a restart; permission-grants.json in userData. */
+  file?: string
 }): Promise<{ grants: PermissionGrants; mcp: ConductorMcpServer; close(): void }> {
   const spec = (id: string): AgentSpec | undefined => deps.store.spec<AgentSpec>(id) ?? undefined
+  const file = deps.file ?? join(app.getPath('userData'), 'permission-grants.json')
   const grants = new PermissionGrants({
+    persist: saved => saveGrants(file, saved),
     notice: (id, message, payload, itemId) => deps.sessions.notice(id, message, payload, itemId),
     denial: (id, itemId) => {
       const item = deps.store.snapshot(id)?.items.find(entry => entry.nativeItemId === itemId && entry.data.type === 'notice')
@@ -59,13 +70,60 @@ export async function startPermissionGrants(deps: {
     changed: (state: PermissionGrantsState) => deps.publish('permission-grants:changed', state),
     ...(deps.workspaces ? { tabOpen: (id: string) => tabOpen(deps.workspaces!, spec(id), id) } : {})
   })
+  // Before any runtime reattaches or resumes (index.ts starts this first), so a waiting card, a
+  // grant's rule and the holder's "retry it now" work across the restart.
+  const restored = grants.restore(loadGrants(file, () => recoverFromTimelines(deps)), id => Boolean(spec(id)))
+  if (restored.requests || restored.grants || restored.dropped) console.log(`Permission grants restored: ${restored.requests} request(s), ${restored.grants} grant(s); ${restored.dropped} dropped`)
   const sweeper = setInterval(() => grants.sweep(), 1000)
   sweeper.unref?.()
   const mcp = new ConductorMcpServer(deps.control)
   await mcp.start()
   deps.sessions.setPermissionGrants(grants)
   deps.sessions.setConductorMcp(mcp)
-  return { grants, mcp, close: () => { clearInterval(sweeper); mcp.close() } }
+  // Runs before the agents are disposed on quit (index.ts disposeRuntimeServices): the runtimes
+  // stopping next end no conversation, so what is waiting stays saved for the next launch.
+  return { grants, mcp, close: () => { grants.freeze(); clearInterval(sweeper); mcp.close() } }
+}
+
+function saveGrants(file: string, saved: SavedPermissionGrants): void {
+  const temporary = `${file}.${process.pid}.tmp`
+  writeFileSync(temporary, JSON.stringify(saved) + '\n', { encoding: 'utf8', mode: 0o600 })
+  renameSync(temporary, file)
+}
+
+/** The saved state, or, the first time this build runs (no file yet), what the timelines show. */
+function loadGrants(file: string, recover: () => Pick<SavedPermissionGrants, 'requests'>): unknown {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return recover()
+    console.warn('Saved permission grants could not be read; starting without them', error)
+    return undefined
+  }
+}
+
+/** A build that kept grants in memory only left its waiting agent requests as pending cards in the
+ *  tabs' timelines (a runtime stopping at quit writes no card), so the first launch of this one
+ *  takes those back from the open tabs rather than orphaning them. */
+export function recoverFromTimelines(deps: Parameters<typeof startPermissionGrants>[0]): Pick<SavedPermissionGrants, 'requests'> {
+  const workspaces = deps.workspaces
+  if (!workspaces?.listProjects || !workspaces.listSessions) return { requests: [] }
+  const layouts = [...workspaces.listProjects().flatMap(project => workspaces.listSessions!(project.id).map(session => session.layout)), ...workspaces.listDetachedWindows().map(window => window.layout)]
+  const ids = new Set<string>()
+  const collect = (node: LayoutNode): void => { if (node.type === 'split') node.children.forEach(collect); else for (const tab of node.tabs) if (tab.resourceId) ids.add(tab.resourceId) }
+  for (const layout of layouts) collect(layout.root)
+  const requests: SavedPermissionGrants['requests'] = []
+  for (const agentSessionId of ids) {
+    if (deps.store.spec<AgentSpec>(agentSessionId)?.provider !== 'claude') continue
+    // A card restated after its runtime restarted is a later item of its own, so the last one decides.
+    const latest = new Map<string, PermissionGrantRequest>()
+    for (const item of deps.store.snapshot(agentSessionId)?.items ?? []) {
+      const request = permissionGrantOf(item.data)
+      if (request?.source === 'agent' && request.id.startsWith('grant:')) latest.set(request.id, request)
+    }
+    for (const request of latest.values()) if (request.status === 'pending') requests.push({ ...request, agentSessionId })
+  }
+  return { requests }
 }
 
 /** Whether a conversation's tab is in its workspace's layout or one of that workspace's detached windows. */

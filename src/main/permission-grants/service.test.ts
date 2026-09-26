@@ -4,7 +4,7 @@ import { describeGrantRequest } from '../../shared/permission-grants'
 import type { Json } from '../../shared/structured-agent'
 import { callPermissions } from './control'
 import { CONDUCTOR_MCP_TOOLS, ConductorMcpServer } from './control-mcp'
-import { PermissionGrants, type PermissionGrantPorts } from './service'
+import { PermissionGrants, type PermissionGrantPorts, type SavedPermissionGrants } from './service'
 
 const cwd = 'C:\\Users\\owner\\site\\theme'
 const tab = 'agent_tab'
@@ -361,5 +361,120 @@ describe('a pending owner approval survives a handoff (grant-survives-handoff)',
     closed.grants.closed(tab)
     expect(closed.notices.at(-1)).toMatchObject({ id: tab, itemId: other.id, payload: { permissionGrant: { status: 'expired' } } })
     expect(closed.grants.state().requests).toEqual([])
+  })
+})
+
+describe('a pending owner approval survives a restart (grant-survives-restart)', () => {
+  const successor = 'agent_other'
+  const script = 'app/prod/fix-pool.sh'
+  const rule = `Bash(bash ${script})`
+  /** A run whose every save is kept, as permission-grants.json keeps the last one. */
+  function saving(overrides: Partial<PermissionGrantPorts> = {}) {
+    let saved: SavedPermissionGrants | undefined
+    const h = harness({ persist: value => { saved = JSON.parse(JSON.stringify(value)) as SavedPermissionGrants }, ...overrides })
+    return { ...h, saved: () => saved }
+  }
+  const exists = (id: string): boolean => id === tab || id === successor
+
+  it('keeps a waiting request across a restart: the card, the list and one approval that tells the holder, spent once', async () => {
+    const before = saving()
+    const asked = before.grants.request(tab, { command: `bash ${script}`, reason: 'B5 lsphp pool fix', rollback: 'restore the pool file' })
+    expect(before.saved()!.requests).toEqual([expect.objectContaining({ id: asked.id, agentSessionId: tab, status: 'pending', reason: 'B5 lsphp pool fix' })])
+    const after = saving()
+    expect(after.grants.restore(before.saved(), exists)).toEqual({ requests: 1, grants: 0, dropped: 0 })
+    expect(after.grants.list(tab).requests).toEqual([expect.objectContaining({ id: asked.id, status: 'pending', rule })])
+    expect(after.ports.changed).toHaveBeenCalledWith({ requests: [expect.objectContaining({ id: asked.id, agentSessionId: tab, status: 'pending' })], grants: [] })
+    // The same identical ask after the restart is the restored request, not a second card.
+    expect(after.grants.request(tab, { command: `bash ${script}`, reason: 'again' }).id).toBe(asked.id)
+    await expect(after.grants.decide(tab, asked.id, 'approve-once', 'owner')).resolves.toMatchObject({ status: 'approved-once' })
+    expect(after.told).toEqual([{ id: tab, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(bash app\/prod\/fix-pool\.sh\) \(once\); retry it now/) }])
+    await expect(after.grants.decide(tab, asked.id, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    after.grants.adapterPort(tab).used(rule)
+    expect(after.grants.rules(tab)).toEqual([])
+    // Spent: nothing of it comes back after another restart, and it cannot be approved again.
+    const again = saving()
+    expect(again.grants.restore(after.saved(), exists)).toEqual({ requests: 0, grants: 0, dropped: 0 })
+    expect(again.grants.state()).toEqual({ requests: [], grants: [], settled: [{ agentSessionId: tab, id: asked.id, status: 'used' }] })
+    await expect(again.grants.decide(tab, asked.id, 'approve-once', 'owner')).rejects.toThrow('already answered (used)')
+  })
+
+  it('keeps an approved grant not yet used across a restart: its rule reaches the next start, and it is consumed once', async () => {
+    const before = saving()
+    const asked = before.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await before.grants.decide(tab, asked.id, 'approve-once', 'owner')
+    const after = saving()
+    expect(after.grants.restore(before.saved(), exists)).toEqual({ requests: 1, grants: 1, dropped: 0 })
+    expect(after.grants.rules(tab)).toEqual([{ rule, once: true }])
+    expect(after.grants.list(tab).grants).toEqual([expect.objectContaining({ requestId: asked.id, delivery: 'pending' })])
+    expect(after.grants.list(tab).requests).toEqual([expect.objectContaining({ id: asked.id, status: 'approved-once' })])
+    after.grants.adapterPort(tab).used(rule)
+    after.grants.adapterPort(tab).used(rule)
+    expect(after.grants.rules(tab)).toEqual([])
+    expect(after.grants.list(tab).requests[0]!.status).toBe('used')
+    const again = saving()
+    again.grants.restore(after.saved(), exists)
+    expect(again.grants.rules(tab)).toEqual([])
+  })
+
+  it('drops what a conversation that no longer exists held, and anything saved as answered or spent', () => {
+    const before = saving({ provider: () => 'claude' })
+    const gone = before.grants.request('agent_gone', { command: 'npm test', reason: 'r' })
+    const kept = before.grants.request(tab, { command: `bash ${script}`, reason: 'r' })
+    const saved = before.saved()!
+    saved.requests.push({ ...saved.requests.find(entry => entry.id === kept.id)!, id: 'grant:answered', status: 'denied' })
+    saved.requests.push({ ...saved.requests.find(entry => entry.id === kept.id)!, id: 'grant:orphan-approval', status: 'approved-once' })
+    const after = saving()
+    expect(after.grants.restore(saved, exists)).toEqual({ requests: 1, grants: 0, dropped: 2 })
+    expect(after.grants.state().requests.map(entry => entry.id)).toEqual([kept.id])
+    expect(after.saved()!.requests.map(entry => entry.id)).toEqual([kept.id])
+    expect(gone.id).not.toBe(kept.id)
+    expect(after.grants.restore('not json', exists)).toEqual({ requests: 0, grants: 0, dropped: 0 })
+  })
+
+  it('ends nothing when the app quits or an idle runtime is given back while its tab stays open', () => {
+    const open = new Set([tab])
+    const h = saving({ tabOpen: id => open.has(id) })
+    const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'r' })
+    h.grants.closed(tab)
+    expect(h.grants.list(tab).requests).toEqual([expect.objectContaining({ id: asked.id, status: 'pending' })])
+    h.grants.freeze()
+    open.clear()
+    h.grants.closed(tab)
+    h.grants.sweep(); h.grants.sweep()
+    expect(h.saved()!.requests).toEqual([expect.objectContaining({ id: asked.id, status: 'pending' })])
+    expect(h.notices.filter(entry => entry.payload && JSON.stringify(entry.payload).includes('"expired"'))).toEqual([])
+  })
+
+  it('keeps a handoff across a restart: the old id reaches the moved request, a spend the old runtime reports spends it, and its re-shown denial stays moved', async () => {
+    const before = saving()
+    const item = before.deny('toolu_moved', 'Bash', { command: ssh }, 'External System Write', true)
+    const asked = before.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await before.grants.decide(tab, asked.id, 'approve-once', 'owner')
+    await before.grants.transfer(tab, successor)
+    const after = saving({ apply: vi.fn(async () => 'offline' as const) })
+    expect(after.grants.restore(before.saved(), exists)).toEqual({ requests: 2, grants: 1, dropped: 0 })
+    expect(after.grants.list(successor).requests.map(entry => entry.id).sort()).toEqual([asked.id, item].sort())
+    expect(after.grants.rules(tab)).toEqual([])
+    // The superseded tab's runtime shows the denial again: it stays moved, not a new request there.
+    after.grants.adapterPort(tab).denied(item, describeGrantRequest({ tool: 'Bash', input: { command: ssh }, cwd }))
+    expect(after.grants.list(tab).requests).toEqual([])
+    await expect(after.grants.decide(tab, item, 'approve-once', 'owner')).resolves.toMatchObject({ status: 'approved-once', grant: { agentSessionId: successor } })
+    expect(after.told.at(-1)).toMatchObject({ id: successor })
+    // The old runtime took the moved rule at launch and ran it: the successor's grant is spent.
+    after.grants.adapterPort(tab).used(rule)
+    expect(after.grants.rules(successor).map(entry => entry.rule)).not.toContain(rule)
+  })
+
+  it('shows a denial answered before the restart as answered when the reattached runtime shows it again, and never asks it twice', async () => {
+    const before = saving()
+    const item = before.deny('toolu_w', 'Write', { file_path: 'C:\\Users\\owner\\site\\app\\prod\\fix-pool.sh' }, 'Modify Shared Resources', true)
+    await before.grants.decide(tab, item, 'deny', 'owner')
+    expect(before.saved()!.settled).toEqual([[tab, item, 'denied']])
+    const after = saving({ denial: before.ports.denial })
+    after.grants.restore(before.saved(), exists)
+    after.grants.adapterPort(tab).denied(item, describeGrantRequest({ tool: 'Write', input: { file_path: 'C:\\Users\\owner\\site\\app\\prod\\fix-pool.sh' }, cwd }))
+    expect(after.grants.list(tab).requests).toEqual([])
+    expect(after.notices.at(-1)).toMatchObject({ id: tab, itemId: item, payload: { grantStatus: 'denied' } })
+    await expect(after.grants.decide(tab, item, 'approve-once', 'owner')).rejects.toThrow('already answered (denied)')
   })
 })

@@ -90,6 +90,24 @@ export function PermissionGrantCard({ request, status, grant, busy, error, onDec
   </section>
 }
 
+/** What a card in the history shows: the main process's request if it holds one; else the answer
+ *  given before the app restarted (settled); else an agent's request it no longer holds ended with
+ *  its tab, so the card stops asking rather than offering buttons nothing answers. `loaded`: the
+ *  main process's state has arrived at least once. */
+export function liveGrantStatus(state: PermissionGrantsState, agentSessionId: string, requestId: string, recorded: GrantStatus = 'pending', loaded = true): GrantStatus {
+  const known = state.requests.find(entry => entry.agentSessionId === agentSessionId && entry.id === requestId)
+  const answered = state.settled?.find(entry => entry.agentSessionId === agentSessionId && entry.id === requestId)?.status
+  return known?.status ?? answered ?? (loaded && recorded === 'pending' && requestId.startsWith('grant:') ? 'expired' : recorded)
+}
+
+/** Whether the card offers its answers. The pane allows answers only on the current runtime's
+ *  items (interactive), but a grant is answered by the main process, not the runtime: a request it
+ *  holds pending for this conversation stays answerable on a card drawn before the CLI restarted
+ *  (an app restart, an idle CLI given back and reconnected). */
+export function grantAnswerable(state: PermissionGrantsState, agentSessionId: string, requestId: string, interactive: boolean): boolean {
+  return interactive || state.requests.some(entry => entry.agentSessionId === agentSessionId && entry.id === requestId && entry.status === 'pending')
+}
+
 /** The card wired to the main process for one conversation's request. */
 export function LivePermissionGrantCard({ agentSessionId, requestId, request, interactive, onSwitchToEdit }: {
   agentSessionId: string
@@ -101,11 +119,8 @@ export function LivePermissionGrantCard({ agentSessionId, requestId, request, in
   const state = usePermissionGrants()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
-  const known = state.requests.find(entry => entry.agentSessionId === agentSessionId && entry.id === requestId)
-  // An agent's request the main process no longer holds ended with its tab or this app: the card
-  // in the history stops asking rather than offering buttons nothing answers.
-  const recorded = request.status ?? 'pending'
-  const status = known?.status ?? (loaded && recorded === 'pending' && requestId.startsWith('grant:') ? 'expired' : recorded)
+  const status = liveGrantStatus(state, agentSessionId, requestId, request.status, loaded)
+  const answerable = grantAnswerable(state, agentSessionId, requestId, interactive)
   const grant = state.grants.find(entry => entry.agentSessionId === agentSessionId && entry.requestId === requestId)
   const act = (work: () => Promise<unknown>): void => {
     setBusy(true); setError(undefined)
@@ -113,7 +128,7 @@ export function LivePermissionGrantCard({ agentSessionId, requestId, request, in
   }
   const bridge = window.conductor?.permissionGrants
   return <PermissionGrantCard request={request} status={status} grant={grant} busy={busy} error={error}
-    onDecide={interactive && bridge ? decision => act(() => bridge.decide(agentSessionId, requestId, decision)) : undefined}
+    onDecide={answerable && bridge ? decision => act(() => bridge.decide(agentSessionId, requestId, decision)) : undefined}
     onRevoke={grant && bridge ? () => act(() => bridge.revoke(agentSessionId, grant.id)) : undefined}
     onSwitchToEdit={interactive ? onSwitchToEdit : undefined} />
 }

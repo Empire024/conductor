@@ -67,6 +67,9 @@ export interface PermissionGrant {
 export interface PermissionGrantsState {
   requests: Array<PermissionGrantRequest & { agentSessionId: string }>
   grants: PermissionGrant[]
+  /** Answers given before the app restarted, for requests no longer held: a card from before the
+   *  restart shows its answer instead of asking again or reading Expired. Absent when none. */
+  settled?: Array<{ agentSessionId: string; id: string; status: GrantStatus }>
 }
 
 export interface PermissionGrantDecisionResult {

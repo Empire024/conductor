@@ -14,8 +14,9 @@ import type { Json } from '../../shared/structured-agent'
  * tries. The owner answers in the card; a wizard tab may answer
  * only for local, reversible actions. An approval becomes exactly one native allow rule for that
  * one conversation, handed to the running CLI (apply_flag_settings) or, where the CLI cannot take
- * it live, through --settings on its next start. Grants live in memory only: they end with the
- * tab, with this app, when the owner revokes them, or (approve once) when their call has run.
+ * it live, through --settings on its next start. Waiting requests and unspent grants survive an
+ * app restart (snapshot/restore, permission-grants.json in userData); they end with the tab, when
+ * the owner revokes them, or (approve once) when their call has run.
  * A tab that hands itself on (agents.handoff successor) hands its waiting requests and unspent
  * grants to the successor (transfer), which is the same brain continued; a tab closed without one
  * withdraws its waiting cards. Nothing here lets an agent approve its own request.
@@ -47,16 +48,36 @@ export interface PermissionGrantPorts {
    *  (its runtime may run on for the undo window), so sweep() asks this rather than waiting for the
    *  runtime to stop. Absent: only closed() ends a conversation's grants. */
   tabOpen?(agentSessionId: string): boolean
+  /** Writes what must survive a restart (snapshot()), after every change. */
+  persist?(saved: SavedPermissionGrants): void
   idleWaitMs?: number
   idlePollMs?: number
 }
 
 export type GrantActor = 'owner' | 'wizard'
+
+/** What survives an app restart: the waiting requests, the unspent grants and the handoff links
+ *  they depend on. Answered, spent, withdrawn and expired requests are not kept, only their ids
+ *  and answers (settled), so a denial card a reattached runtime shows again is not asked twice. */
+export interface SavedPermissionGrants {
+  version: 1
+  requests: Array<PermissionGrantRequest & { agentSessionId: string }>
+  grants: PermissionGrant[]
+  successors: Array<[string, string]>
+  movedFrom: Array<[string, string[]]>
+  movedOut: Array<[string, string[]]>
+  aliases: Array<[string, Array<[string, string]>]>
+  settled: Array<[string, string, GrantStatus]>
+}
 export interface AgentGrantRequest { tool?: string; command?: string; path?: string; url?: string; reason?: string; rollback?: string }
 
 const ACTIVE_PHASES = new Set(['starting', 'running', 'waiting_approval', 'waiting_input', 'interrupting'])
 const AGENT_PREFIX = 'grant:'
 const DECIDED: Record<Exclude<GrantDecision, 'deny'>, GrantStatus> = { 'approve-once': 'approved-once', 'approve-session': 'approved-session' }
+/** Bounds on what a restart keeps of history that is neither waiting nor unspent. */
+const SAVED_SETTLED = 200
+const SAVED_MOVED = 200
+const LIVE_STATUSES = new Set<GrantStatus>(['pending', 'approved-once', 'approved-session'])
 
 export class PermissionGrants {
   private readonly requests = new Map<string, Map<string, PermissionGrantRequest>>()
@@ -74,10 +95,112 @@ export class PermissionGrants {
   private readonly movedOut = new Map<string, Set<string>>()
   /** A conversation -> a denial card it showed for a call it had already asked about -> that request's id. */
   private readonly aliases = new Map<string, Map<string, string>>()
+  /** Answers a previous run gave (restore): a request answered before the restart stays answered. */
+  private readonly settled = new Map<string, Map<string, GrantStatus>>()
+  /** The app is quitting (freeze): runtimes stopping now are not conversations ending. */
+  private stopping = false
   constructor(private readonly ports: PermissionGrantPorts) {}
 
   private now(): string { return this.ports.now?.() ?? new Date().toISOString() }
-  private changed(): void { this.ports.changed?.(this.state()) }
+  private changed(): void {
+    this.ports.changed?.(this.state())
+    this.save()
+  }
+  private save(): void {
+    if (!this.ports.persist) return
+    try { this.ports.persist(this.snapshot()) } catch (error) { console.warn('Permission grants could not be saved; a restart would drop them', error) }
+  }
+
+  /** What a restart must keep (SavedPermissionGrants), bounded. */
+  snapshot(): SavedPermissionGrants {
+    const grants = [...this.grants.values()].flat()
+    const granted = new Set(grants.map(grant => `${grant.agentSessionId}\n${grant.requestId}`))
+    const requests: SavedPermissionGrants['requests'] = []
+    const settled: SavedPermissionGrants['settled'] = []
+    for (const [agentSessionId, statuses] of this.settled) for (const [id, status] of statuses) settled.push([agentSessionId, id, status])
+    for (const [agentSessionId, open] of this.requests) for (const request of open.values()) {
+      if (request.status === 'pending' || granted.has(`${agentSessionId}\n${request.id}`)) requests.push({ ...request, agentSessionId })
+      else settled.push([agentSessionId, request.id, request.status])
+    }
+    const movedOut = new Map<string, string[]>()
+    for (const [from, id] of [...this.movedOut].flatMap(([from, ids]) => [...ids].map(id => [from, id] as const)).slice(-SAVED_MOVED)) movedOut.set(from, [...(movedOut.get(from) ?? []), id])
+    const ids = new Set(grants.map(grant => grant.id))
+    return {
+      version: 1,
+      requests,
+      grants: grants.map(grant => ({ ...grant })),
+      successors: [...this.successors].slice(-SAVED_MOVED),
+      movedFrom: [...this.movedFrom].filter(([id]) => ids.has(id)),
+      movedOut: [...movedOut],
+      aliases: [...this.aliases].map(([agentSessionId, views]) => [agentSessionId, [...views]]),
+      settled: settled.slice(-SAVED_SETTLED)
+    }
+  }
+
+  /**
+   * Takes back what the previous run saved (snapshot), before any runtime reattaches or resumes:
+   * the owner's card, permissions.list, an approval's "retry it now" and a grant's rules work for
+   * the holder as before the restart. An entry whose conversation no longer exists (exists) is
+   * dropped; one whose tab was closed while the app was down ends on the next sweeps, as it would
+   * have. A restored grant reaches the runtime when it next starts or reattaches.
+   */
+  restore(saved: unknown, exists: (agentSessionId: string) => boolean): { requests: number; grants: number; dropped: number } {
+    const data = saved && typeof saved === 'object' ? saved as Partial<SavedPermissionGrants> : {}
+    const list = <T>(value: T[] | undefined): T[] => Array.isArray(value) ? value : []
+    const text = (value: unknown): value is string => typeof value === 'string' && value.length > 0
+    let dropped = 0, restoredRequests = 0, restoredGrants = 0
+    for (const entry of list(data.requests)) {
+      if (!entry || !text(entry.id) || !text(entry.agentSessionId) || !LIVE_STATUSES.has(entry.status)) continue
+      const { agentSessionId, ...request } = entry
+      if (!exists(agentSessionId)) { dropped++; continue }
+      const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
+      if (open.has(request.id)) continue
+      this.requests.set(agentSessionId, open.set(request.id, request))
+      restoredRequests++
+    }
+    for (const grant of list(data.grants)) {
+      if (!grant || !text(grant.id) || !text(grant.rule) || !text(grant.agentSessionId) || (grant.scope !== 'once' && grant.scope !== 'session')) continue
+      const request = this.requests.get(grant.agentSessionId)?.get(grant.requestId)
+      if (!request || request.status === 'pending') { dropped++; continue }
+      const held = this.grants.get(grant.agentSessionId) ?? []
+      if (held.some(entry => entry.id === grant.id || entry.rule === grant.rule)) continue
+      this.grants.set(grant.agentSessionId, [...held, { ...grant, delivery: 'pending' }])
+      restoredGrants++
+    }
+    // A request saved as approved whose grant did not come back is not approved any more.
+    for (const [agentSessionId, open] of [...this.requests]) {
+      for (const request of [...open.values()]) {
+        if (request.status === 'pending' || (this.grants.get(agentSessionId) ?? []).some(grant => grant.requestId === request.id)) continue
+        open.delete(request.id)
+        this.settledAs(agentSessionId, request.id, 'expired')
+        restoredRequests--
+        dropped++
+      }
+      if (!open.size) this.requests.delete(agentSessionId)
+    }
+    const grantIds = new Set([...this.grants.values()].flat().map(grant => grant.id))
+    for (const [from, to] of list(data.successors)) if (text(from) && text(to) && exists(from) && !this.successors.has(from)) this.successors.set(from, to)
+    for (const [id, froms] of list(data.movedFrom)) if (grantIds.has(id) && Array.isArray(froms)) this.movedFrom.set(id, froms.filter(text))
+    for (const [from, ids] of list(data.movedOut)) if (text(from) && exists(from) && Array.isArray(ids)) this.movedOut.set(from, new Set([...(this.movedOut.get(from) ?? []), ...ids.filter(text)]))
+    for (const [agentSessionId, views] of list(data.aliases)) {
+      if (!text(agentSessionId) || !exists(agentSessionId) || !Array.isArray(views)) continue
+      const map = this.aliases.get(agentSessionId) ?? new Map<string, string>()
+      for (const [itemId, requestId] of views) if (text(itemId) && text(requestId)) map.set(itemId, requestId)
+      if (map.size) this.aliases.set(agentSessionId, map)
+    }
+    for (const [agentSessionId, id, status] of list(data.settled)) if (text(agentSessionId) && text(id) && text(status) && !LIVE_STATUSES.has(status) && exists(agentSessionId)) this.settledAs(agentSessionId, id, status)
+    this.changed()
+    return { requests: restoredRequests, grants: restoredGrants, dropped }
+  }
+
+  /** The app is quitting: every runtime is stopped next, which ends no conversation, so what is
+   *  waiting stays saved for the next launch instead of being withdrawn (closed, sweep). */
+  freeze(): void { this.stopping = true }
+
+  private settledAs(agentSessionId: string, id: string, status: GrantStatus): void {
+    const statuses = this.settled.get(agentSessionId) ?? new Map<string, GrantStatus>()
+    this.settled.set(agentSessionId, statuses.set(id, status))
+  }
 
   rules(agentSessionId: string): GrantRule[] {
     return (this.grants.get(agentSessionId) ?? []).map(grant => ({ rule: grant.rule, once: grant.scope === 'once' }))
@@ -103,6 +226,11 @@ export class PermissionGrants {
       if (known.status !== 'pending') this.card(agentSessionId, known)
       return
     }
+    const answered = this.settled.get(agentSessionId)?.get(itemId)
+    if (answered) {
+      this.card(agentSessionId, { ...described, id: itemId, source: 'denial', status: answered, requestedAt: this.now() })
+      return
+    }
     if (this.movedOut.get(agentSessionId)?.has(itemId)) {
       const moved = this.lookup(agentSessionId, itemId)
       if (moved) this.card(agentSessionId, { ...moved, status: 'moved' })
@@ -117,6 +245,7 @@ export class PermissionGrants {
       const views = this.aliases.get(agentSessionId) ?? new Map<string, string>()
       this.aliases.set(agentSessionId, views.set(itemId, same.id))
       this.aliasCard(agentSessionId, itemId, this.requests.get(agentSessionId)?.has(same.id) ? same : { ...same, status: 'moved' })
+      this.save()
       return
     }
     const request: PermissionGrantRequest = { ...described, id: itemId, source: 'denial', status: 'pending', requestedAt: this.now() }
@@ -127,9 +256,11 @@ export class PermissionGrants {
   }
 
   state(): PermissionGrantsState {
+    const settled = [...this.settled].flatMap(([agentSessionId, statuses]) => [...statuses].map(([id, status]) => ({ agentSessionId, id, status })))
     return {
       requests: [...this.requests].flatMap(([agentSessionId, requests]) => [...requests.values()].map(request => ({ ...request, agentSessionId }))),
-      grants: [...this.grants.values()].flat()
+      grants: [...this.grants.values()].flat(),
+      ...(settled.length ? { settled } : {})
     }
   }
 
@@ -291,13 +422,18 @@ export class PermissionGrants {
     return { requests: pending.length, grants: granted.length }
   }
 
-  /** The runtime stopped for good: its requests and grants end with it, and a waiting card says so. */
+  /** The runtime stopped for good: its requests and grants end with it, and a waiting card says so.
+   *  A runtime stopped while its tab stays open (an idle CLI given back, the app quitting) ends
+   *  nothing: the conversation reconnects on its next message, and sweep() ends them once the tab
+   *  is closed. */
   closed(agentSessionId: string): void {
+    if (this.stopping || this.ports.tabOpen?.(agentSessionId)) return
     this.missing.delete(agentSessionId)
     this.successors.delete(agentSessionId)
     this.movedOut.delete(agentSessionId)
     this.withdraw(agentSessionId)
     this.aliases.delete(agentSessionId)
+    this.settled.delete(agentSessionId)
     if (!this.requests.delete(agentSessionId) && !this.grants.delete(agentSessionId)) return
     this.grants.delete(agentSessionId)
     this.changed()
@@ -306,7 +442,7 @@ export class PermissionGrants {
   /** Ends the grants of every conversation whose tab was closed (tabOpen), and takes them back out
    *  of a runtime that is still running. Cheap when nothing is granted; wiring.ts runs it on a timer. */
   sweep(): void {
-    if (!this.ports.tabOpen) return
+    if (!this.ports.tabOpen || this.stopping) return
     for (const agentSessionId of new Set([...this.grants.keys(), ...this.requests.keys()])) {
       if (this.ports.tabOpen(agentSessionId)) { this.missing.delete(agentSessionId); continue }
       if (!this.missing.has(agentSessionId)) { this.missing.add(agentSessionId); continue }
@@ -317,6 +453,7 @@ export class PermissionGrants {
       this.withdraw(agentSessionId)
       this.requests.delete(agentSessionId)
       this.aliases.delete(agentSessionId)
+      this.settled.delete(agentSessionId)
       this.changed()
       if (granted.length) void this.ports.apply(agentSessionId).catch(error => console.warn('A grant of a closed tab could not be removed from its live runtime; it ends with the runtime', error))
     }
@@ -353,6 +490,8 @@ export class PermissionGrants {
       if (known.status !== 'pending') throw new Error(`This request was already answered (${known.status})`)
       return known
     }
+    const answered = this.settled.get(agentSessionId)?.get(requestId)
+    if (answered) throw new Error(`This request was already answered (${answered})`)
     if (requestId.startsWith(AGENT_PREFIX)) throw new Error('No such permission request in this conversation')
     const denial = this.ports.denial(agentSessionId, requestId)
     if (!denial?.request || autoModeDenialItemId(denial.toolUseId) !== requestId) throw new Error('No such permission request in this conversation')

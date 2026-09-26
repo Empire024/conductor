@@ -15,9 +15,10 @@ supports, so the tab can retry and verify the work itself.
 - A wizard tab may answer only **local** requests. Shared, destructive and external requests
   (production included) are answered only by the owner: in the card, or with the owner's own
   control credential.
-- A grant is exactly one native allow rule for one conversation. It lives in memory only, and it
-  ends when its call has run (approve once), when the owner revokes it, when its tab closes, or
-  when the app restarts.
+- A grant is exactly one native allow rule for one conversation. It ends when its call has run
+  (approve once), when the owner revokes it, or when its tab closes. Waiting requests and unspent
+  grants survive an app restart or crash (`permission-grants.json` in the app's userData, restored
+  before any runtime resumes); answered, spent and expired ones are not brought back.
 
 ## What happens
 

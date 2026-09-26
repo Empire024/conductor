@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { isValidElement, type ReactElement, type ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { PermissionGrantCard, type GrantCardRequest } from './PermissionGrantCard'
+import { grantAnswerable, liveGrantStatus, PermissionGrantCard, type GrantCardRequest } from './PermissionGrantCard'
 
 const request: GrantCardRequest = {
   tool: 'Bash', action: 'Run a command', resource: 'ssh -i key root@192.0.2.10 bash -s < app/prod/fix-pool.sh', host: '192.0.2.10', class: 'external',
@@ -16,6 +16,32 @@ const buttons = (node: ReactNode, found: Array<ReactElement<Record<string, unkno
   buttons(element.props.children as ReactNode, found)
   return found
 }
+
+describe('a card in the history after a restart (grant-survives-restart)', () => {
+  const held = { ...request, id: 'grant:w', source: 'agent' as const, status: 'pending' as const, requestedAt: '2026-09-26T04:00:00.000Z', agentSessionId: 'agent_w' }
+  it('is live while the restored request waits, shows an answer given before the restart, and stops asking once gone', () => {
+    // Restored: the card asks again.
+    expect(liveGrantStatus({ requests: [held], grants: [] }, 'agent_w', 'grant:w', 'pending')).toBe('pending')
+    // A copy of the card from before the restart, answered since: its answer, never its buttons.
+    expect(liveGrantStatus({ requests: [], grants: [], settled: [{ agentSessionId: 'agent_w', id: 'grant:w', status: 'used' }] }, 'agent_w', 'grant:w', 'pending')).toBe('used')
+    expect(liveGrantStatus({ requests: [], grants: [], settled: [{ agentSessionId: 'agent_w', id: 'auto-denial:toolu_1', status: 'denied' }] }, 'agent_w', 'auto-denial:toolu_1', 'pending')).toBe('denied')
+    // Neither held nor answered: an agent's request ended with its tab; a denial answers through its timeline.
+    expect(liveGrantStatus({ requests: [], grants: [] }, 'agent_w', 'grant:w', 'pending')).toBe('expired')
+    expect(liveGrantStatus({ requests: [], grants: [] }, 'agent_w', 'grant:w', 'pending', false)).toBe('pending')
+    expect(liveGrantStatus({ requests: [], grants: [] }, 'agent_w', 'auto-denial:toolu_2', 'pending')).toBe('pending')
+    // Another conversation's answer is not this card's.
+    expect(liveGrantStatus({ requests: [], grants: [], settled: [{ agentSessionId: 'agent_x', id: 'grant:w', status: 'used' }] }, 'agent_w', 'grant:w', 'pending')).toBe('expired')
+  })
+
+  it('keeps a held request answerable on a card an earlier runtime drew, and nothing else', () => {
+    // After the restart the holder's CLI reconnected under a new runtime: the pane calls the old card not interactive.
+    expect(grantAnswerable({ requests: [held], grants: [] }, 'agent_w', 'grant:w', false)).toBe(true)
+    expect(grantAnswerable({ requests: [{ ...held, status: 'approved-once' }], grants: [] }, 'agent_w', 'grant:w', false)).toBe(false)
+    // A card a handoff moved away (the old tab no longer holds it), or another conversation's request.
+    expect(grantAnswerable({ requests: [{ ...held, agentSessionId: 'agent_b' }], grants: [] }, 'agent_w', 'grant:w', false)).toBe(false)
+    expect(grantAnswerable({ requests: [], grants: [] }, 'agent_w', 'grant:w', true)).toBe(true)
+  })
+})
 
 describe('permission grant card', () => {
   it('shows the holder on a card a handoff moved, and no answers on the old tab card', () => {
