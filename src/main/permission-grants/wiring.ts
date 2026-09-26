@@ -45,6 +45,7 @@ export async function startPermissionGrants(deps: {
       return item ? autoModeDenialOf(item.data) : undefined
     },
     provider: id => spec(id)?.provider,
+    title: id => spec(id)?.title,
     cwd: id => spec(id)?.cwd,
     apply: id => deps.sessions.applyPermissionRules(id),
     phase: id => deps.store.snapshot(id)?.phase,

@@ -15,7 +15,9 @@ import type { Json } from '../../shared/structured-agent'
  * one conversation, handed to the running CLI (apply_flag_settings) or, where the CLI cannot take
  * it live, through --settings on its next start. Grants live in memory only: they end with the
  * tab, with this app, when the owner revokes them, or (approve once) when their call has run.
- * Nothing here lets an agent approve its own request.
+ * A tab that hands itself on (agents.handoff successor) hands its waiting requests and unspent
+ * grants to the successor (transfer), which is the same brain continued; a tab closed without one
+ * withdraws its waiting cards. Nothing here lets an agent approve its own request.
  */
 export interface PermissionGrantPorts {
   now?(): string
@@ -26,6 +28,8 @@ export interface PermissionGrantPorts {
   denial(agentSessionId: string, itemId: string): AutoModeDenial | undefined
   /** The provider of the conversation, or undefined when it is not registered. */
   provider(agentSessionId: string): string | undefined
+  /** The tab title, shown on a card that a handoff moved (holder). */
+  title?(agentSessionId: string): string | undefined
   /** The conversation's working folder, where a relative path in a request is resolved. */
   cwd(agentSessionId: string): string | undefined
   /** Hands the live runtime its current rules; 'offline' when there is none (its next start reads them). */
@@ -59,6 +63,11 @@ export class PermissionGrants {
   /** Conversations found without a tab once: a tab moving between windows is briefly in neither
    *  layout, so a grant ends only when its tab is missing on two sweeps in a row. */
   private readonly missing = new Set<string>()
+  /** A conversation that handed itself on -> its successor (transfer). */
+  private readonly successors = new Map<string, string>()
+  /** A grant a handoff moved -> the conversations that held it before, so a spend the old runtime
+   *  still reports (a rule it took at launch and could not give back) spends the moved grant. */
+  private readonly movedFrom = new Map<string, string[]>()
   constructor(private readonly ports: PermissionGrantPorts) {}
 
   private now(): string { return this.ports.now?.() ?? new Date().toISOString() }
@@ -114,6 +123,7 @@ export class PermissionGrants {
   /** Owner (card) or wizard (app control, local actions only) answers one request. */
   async decide(agentSessionId: string, requestId: string, decision: GrantDecision, actor: GrantActor): Promise<PermissionGrantDecisionResult> {
     if (!['approve-once', 'approve-session', 'deny'].includes(decision)) throw new Error('decision must be approve-once, approve-session or deny')
+    agentSessionId = this.holderOf(agentSessionId, requestId)
     const request = this.pendingRequest(agentSessionId, requestId)
     if (actor === 'wizard' && !wizardMayDecide(request)) throw new Error(`Only the owner can answer a ${request.class} request; the card is in the conversation's tab`)
     const decidedAt = this.now()
@@ -155,9 +165,15 @@ export class PermissionGrants {
   }
 
   /** An approve-once grant's call ran: it is spent and taken back out of the live settings. */
-  used(agentSessionId: string, rule: string): void {
-    const grant = (this.grants.get(agentSessionId) ?? []).find(entry => entry.rule === rule && entry.scope === 'once')
+  used(reporter: string, rule: string): void {
+    let agentSessionId = reporter
+    let grant = (this.grants.get(agentSessionId) ?? []).find(entry => entry.rule === rule && entry.scope === 'once')
+    for (let next = this.successors.get(reporter), hops = 0; !grant && next && hops < 16; next = this.successors.get(next), hops++) {
+      grant = (this.grants.get(next) ?? []).find(entry => entry.rule === rule && entry.scope === 'once' && this.movedFrom.get(entry.id)?.includes(reporter))
+      if (grant) agentSessionId = next
+    }
     if (!grant) return
+    this.movedFrom.delete(grant.id)
     this.drop(agentSessionId, grant.id)
     this.statusOf(agentSessionId, grant.requestId, 'used')
     void this.ports.apply(agentSessionId).catch(error => console.warn('A spent grant could not be removed from the live conversation; it ends with the runtime', error))
@@ -175,9 +191,60 @@ export class PermissionGrants {
     void this.ports.apply(agentSessionId).catch(() => undefined)
   }
 
-  /** The runtime stopped for good: its requests and grants end with it. */
+  /**
+   * agents.handoff({successor:true}): the successor is this conversation continued, so its
+   * waiting requests and unspent grants move to it. Synchronous up to the first await: from the
+   * moment this is called the predecessor can neither be approved for, consume nor revoke them.
+   * The predecessor's card stops asking and names the holder; the successor's tab gets the live
+   * card, and an approval (or an approval already given) tells the successor to retry. The
+   * predecessor's live runtime has the rules taken back before the successor is handed them.
+   */
+  async transfer(fromId: string, toId: string): Promise<{ requests: number; grants: number }> {
+    const open = this.requests.get(fromId)
+    const granted = this.grants.get(fromId) ?? []
+    const pending = [...(open?.values() ?? [])].filter(request => request.status === 'pending')
+    if (fromId === toId || (!pending.length && !granted.length) || this.ports.provider(toId) !== 'claude') return { requests: 0, grants: 0 }
+    const title = this.ports.title?.(toId)
+    const holder = { agentSessionId: toId, ...(title ? { title } : {}) }
+    const target = this.requests.get(toId) ?? new Map<string, PermissionGrantRequest>()
+    for (const id of new Set([...pending.map(request => request.id), ...granted.map(grant => grant.requestId)])) {
+      const request = open?.get(id)
+      if (!request) continue
+      open!.delete(id)
+      request.holder = holder
+      target.set(id, request)
+    }
+    if (target.size) this.requests.set(toId, target)
+    if (open && !open.size) this.requests.delete(fromId)
+    this.grants.delete(fromId)
+    for (const grant of granted) {
+      grant.agentSessionId = toId
+      this.movedFrom.set(grant.id, [...(this.movedFrom.get(grant.id) ?? []), fromId])
+    }
+    if (granted.length) this.grants.set(toId, [...(this.grants.get(toId) ?? []).filter(entry => !granted.some(grant => grant.rule === entry.rule)), ...granted])
+    this.successors.set(fromId, toId)
+    for (const request of pending) {
+      if (request.source === 'agent') this.ports.notice(fromId, `Permission request moved to ${title ?? toId}: ${grantRequestSummary(request)}`, { permissionGrant: { ...request, status: 'moved' } as unknown as Json }, request.id)
+      this.card(toId, request)
+    }
+    this.changed()
+    if (granted.length) {
+      await this.ports.apply(fromId).catch(error => console.warn('Moved grants could not be taken back out of the previous conversation; a spend it reports still spends them', error))
+      const applied = await this.ports.apply(toId).catch(error => { console.warn('Moved grants could not be handed to the successor live; they apply when it next starts', error); return 'offline' as const })
+      for (const grant of granted) grant.delivery = applied === 'applied' ? 'live' : applied === 'unsupported' ? 'restart' : 'pending'
+      this.changed()
+      const text = granted.map(grant => grantApprovedMessage(grant.rule, grant.scope)).join('\n')
+      if (applied === 'unsupported') void this.restartThenTell(toId, text)
+      else await this.ports.tell(toId, text).catch(error => console.warn('The successor could not be told about the grants it now holds', error))
+    }
+    return { requests: pending.length, grants: granted.length }
+  }
+
+  /** The runtime stopped for good: its requests and grants end with it, and a waiting card says so. */
   closed(agentSessionId: string): void {
     this.missing.delete(agentSessionId)
+    this.successors.delete(agentSessionId)
+    this.withdraw(agentSessionId)
     if (!this.requests.delete(agentSessionId) && !this.grants.delete(agentSessionId)) return
     this.grants.delete(agentSessionId)
     this.changed()
@@ -194,10 +261,31 @@ export class PermissionGrants {
       const granted = this.grants.get(agentSessionId) ?? []
       this.grants.delete(agentSessionId)
       for (const grant of granted) this.statusOf(agentSessionId, grant.requestId, 'expired')
+      this.withdraw(agentSessionId)
       this.requests.delete(agentSessionId)
       this.changed()
       if (granted.length) void this.ports.apply(agentSessionId).catch(error => console.warn('A grant of a closed tab could not be removed from its live runtime; it ends with the runtime', error))
     }
+  }
+
+  /** A tab that ends without a successor: its waiting cards stop asking (no orphaned card). */
+  private withdraw(agentSessionId: string): void {
+    for (const request of this.requests.get(agentSessionId)?.values() ?? []) {
+      if (request.status !== 'pending') continue
+      request.status = 'expired'
+      this.card(agentSessionId, request)
+    }
+  }
+
+  /** Who holds a request now: the named conversation, or the successor a handoff moved it to. */
+  private holderOf(agentSessionId: string, requestId: string): string {
+    for (let current = agentSessionId, hops = 0; hops < 16; hops++) {
+      if (this.requests.get(current)?.has(requestId)) return current
+      const next = this.successors.get(current)
+      if (!next) break
+      current = next
+    }
+    return agentSessionId
   }
 
   private pendingRequest(agentSessionId: string, requestId: string): PermissionGrantRequest {

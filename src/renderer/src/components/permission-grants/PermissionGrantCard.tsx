@@ -3,7 +3,7 @@ import type { GrantDecision, GrantStatus, PermissionGrant, PermissionGrantReques
 import './permission-grants.css'
 
 /** The fields a card needs: a denial's request (auto-mode-denial.ts) or an agent's own request. */
-export type GrantCardRequest = Pick<PermissionGrantRequest, 'tool' | 'action' | 'resource' | 'class'> & Partial<Pick<PermissionGrantRequest, 'host' | 'category' | 'rule' | 'refusal' | 'reason' | 'rollback' | 'status'>>
+export type GrantCardRequest = Pick<PermissionGrantRequest, 'tool' | 'action' | 'resource' | 'class'> & Partial<Pick<PermissionGrantRequest, 'host' | 'category' | 'rule' | 'refusal' | 'reason' | 'rollback' | 'status' | 'holder'>>
 
 const CLASS_WORDS: Record<PermissionGrantRequest['class'], string> = {
   local: 'Local: this machine, reversible',
@@ -19,19 +19,22 @@ const STATUS_WORDS: Record<GrantStatus, string> = {
   used: 'Approved once, and used',
   revoked: 'Revoked',
   expired: 'Expired',
-  ineffective: 'Approved, but the classifier still refused it'
+  ineffective: 'Approved, but the classifier still refused it',
+  moved: 'Moved to the tab that continued this conversation'
 }
 
 let cached: PermissionGrantsState = { requests: [], grants: [] }
 const listeners = new Set<(state: PermissionGrantsState) => void>()
 let subscribed = false
+/** Whether the main process's state has arrived at least once, so a missing request means gone. */
+let loaded = false
 function subscribe(listener: (state: PermissionGrantsState) => void): () => void {
   listeners.add(listener)
   const bridge = typeof window !== 'undefined' ? window.conductor?.permissionGrants : undefined
   if (bridge && !subscribed) {
     subscribed = true
-    bridge.onChanged(state => { cached = state; for (const entry of listeners) entry(state) })
-    void bridge.state().then(state => { cached = state; for (const entry of listeners) entry(state) }).catch(() => undefined)
+    bridge.onChanged(state => { cached = state; loaded = true; for (const entry of listeners) entry(state) })
+    void bridge.state().then(state => { cached = state; loaded = true; for (const entry of listeners) entry(state) }).catch(() => undefined)
   }
   return () => { listeners.delete(listener) }
 }
@@ -71,6 +74,7 @@ export function PermissionGrantCard({ request, status, grant, busy, error, onDec
       {request.host && <><dt>Host</dt><dd><code>{request.host}</code></dd></>}
       {request.reason && <><dt>Why</dt><dd>{request.reason}</dd></>}
       {request.rollback && <><dt>Rollback</dt><dd>{request.rollback}</dd></>}
+      {request.holder && <><dt>{status === 'moved' ? 'Moved to' : 'Holder'}</dt><dd>{request.holder.title ?? request.holder.agentSessionId}</dd></>}
       {request.rule ? <><dt>Rule</dt><dd><code>{request.rule}</code></dd></> : <><dt>No rule</dt><dd>{request.refusal ?? 'No narrow rule can cover this call.'}</dd></>}
     </dl>
     {pending && request.rule && <p className="sa-muted">Approving hands this one conversation exactly this rule and tells it to retry the call. Nothing else is allowed, and the grant ends with this tab.</p>}
@@ -98,7 +102,10 @@ export function LivePermissionGrantCard({ agentSessionId, requestId, request, in
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
   const known = state.requests.find(entry => entry.agentSessionId === agentSessionId && entry.id === requestId)
-  const status = known?.status ?? request.status ?? 'pending'
+  // An agent's request the main process no longer holds ended with its tab or this app: the card
+  // in the history stops asking rather than offering buttons nothing answers.
+  const recorded = request.status ?? 'pending'
+  const status = known?.status ?? (loaded && recorded === 'pending' && requestId.startsWith('grant:') ? 'expired' : recorded)
   const grant = state.grants.find(entry => entry.agentSessionId === agentSessionId && entry.requestId === requestId)
   const act = (work: () => Promise<unknown>): void => {
     setBusy(true); setError(undefined)

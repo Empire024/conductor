@@ -15,7 +15,7 @@
  *  destructive: deletes or overwrites. external: reaches another machine or service. */
 export type GrantClass = 'local' | 'shared' | 'destructive' | 'external'
 export type GrantDecision = 'approve-once' | 'approve-session' | 'deny'
-export type GrantStatus = 'pending' | 'approved-once' | 'approved-session' | 'denied' | 'used' | 'revoked' | 'expired' | 'ineffective'
+export type GrantStatus = 'pending' | 'approved-once' | 'approved-session' | 'denied' | 'used' | 'revoked' | 'expired' | 'ineffective' | 'moved'
 
 export interface PermissionGrantRequest {
   /** Unique per conversation: the denial's notice item id, or `grant:<uuid>` for an agent's request. */
@@ -43,6 +43,9 @@ export interface PermissionGrantRequest {
   requestedAt: string
   decidedAt?: string
   decidedBy?: 'owner' | 'wizard'
+  /** The conversation that holds the request now, set when a handoff moved it there from the tab
+   *  that asked (agents.handoff successor). On the old tab's card the status is 'moved'. */
+  holder?: { agentSessionId: string; title?: string }
 }
 
 export interface PermissionGrant {
@@ -80,7 +83,7 @@ export interface PermissionGrantsBridge {
 }
 
 const GRANT_CLASSES = new Set(['local', 'shared', 'destructive', 'external'])
-const GRANT_STATUSES = new Set(['pending', 'approved-once', 'approved-session', 'denied', 'used', 'revoked', 'expired', 'ineffective'])
+const GRANT_STATUSES = new Set(['pending', 'approved-once', 'approved-session', 'denied', 'used', 'revoked', 'expired', 'ineffective', 'moved'])
 const payloadOf = (data: { type: string; payload?: unknown }): Record<string, unknown> | undefined =>
   data.type === 'notice' && data.payload && typeof data.payload === 'object' && !Array.isArray(data.payload) ? data.payload as Record<string, unknown> : undefined
 

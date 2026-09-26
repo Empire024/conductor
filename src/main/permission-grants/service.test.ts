@@ -192,3 +192,86 @@ describe('the conductor MCP server', () => {
     } finally { server.close() }
   })
 })
+
+describe('a pending owner approval survives a handoff (grant-survives-handoff)', () => {
+  const successor = 'agent_other'
+  const script = 'app/prod/fix-pool.sh'
+
+  it('moves a pending request to the successor: its list and card show it with the holder, the approval tells the successor, and it consumes it exactly once', async () => {
+    const h = harness({ title: id => id === successor ? 'Wizard (continued)' : 'Wizard' })
+    const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'B5 lsphp pool fix' })
+    const moved = await h.grants.transfer(tab, successor)
+    expect(moved).toEqual({ requests: 1, grants: 0 })
+    expect(h.grants.list(tab).requests).toEqual([])
+    expect(h.grants.list(successor).requests).toEqual([expect.objectContaining({ id: asked.id, status: 'pending', holder: { agentSessionId: successor, title: 'Wizard (continued)' } })])
+    expect(h.grants.state().requests).toEqual([expect.objectContaining({ id: asked.id, agentSessionId: successor })])
+    // The predecessor's card stops asking and names where it went; the successor's tab gets the live card.
+    expect(h.notices.filter(entry => entry.id === tab).at(-1)).toMatchObject({ itemId: asked.id, payload: { permissionGrant: { status: 'moved', holder: { agentSessionId: successor } } } })
+    expect(h.notices.filter(entry => entry.id === successor).at(-1)).toMatchObject({ itemId: asked.id, payload: { permissionGrant: { status: 'pending', holder: { agentSessionId: successor } } } })
+    // The owner answers the card in either tab: the old conversation's id still reaches the moved request.
+    await expect(h.grants.decide(tab, asked.id, 'approve-once', 'owner')).resolves.toMatchObject({ status: 'approved-once', grant: { agentSessionId: successor } })
+    expect(h.told).toEqual([{ id: successor, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(bash app\/prod\/fix-pool\.sh\) \(once\); retry it now/) }])
+    expect(h.grants.rules(successor)).toEqual([{ rule: `Bash(bash ${script})`, once: true }])
+    expect(h.grants.rules(tab)).toEqual([])
+    await expect(h.grants.decide(successor, asked.id, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    h.grants.adapterPort(successor).used(`Bash(bash ${script})`)
+    expect(h.grants.rules(successor)).toEqual([])
+    expect(h.grants.list(successor).requests[0]!.status).toBe('used')
+  })
+
+  it('moves an approved grant not yet used: taken out of the predecessor first, handed to the successor, told to it, spent once', async () => {
+    const h = harness()
+    const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await h.grants.decide(tab, asked.id, 'approve-once', 'owner')
+    const applied = h.ports.apply as ReturnType<typeof vi.fn>
+    applied.mockClear()
+    await expect(h.grants.transfer(tab, successor)).resolves.toEqual({ requests: 0, grants: 1 })
+    expect(applied.mock.calls.map(call => call[0])).toEqual([tab, successor])
+    expect(h.grants.rules(tab)).toEqual([])
+    expect(h.grants.rules(successor)).toEqual([{ rule: `Bash(bash ${script})`, once: true }])
+    expect(h.grants.list(successor).grants).toEqual([expect.objectContaining({ agentSessionId: successor, requestId: asked.id, delivery: 'live' })])
+    expect(h.told.at(-1)).toEqual({ id: successor, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(bash app\/prod\/fix-pool\.sh\) \(once\); retry it now/) })
+    // The predecessor's runtime no longer holds the rule and it cannot revoke it; the successor spends it once.
+    expect(h.grants.adapterPort(tab).rules()).toEqual([])
+    await expect(h.grants.revoke(tab, h.grants.list(successor).grants[0]!.id)).resolves.toBe(false)
+    h.grants.adapterPort(successor).used(`Bash(bash ${script})`)
+    h.grants.adapterPort(successor).used(`Bash(bash ${script})`)
+    expect(h.grants.rules(successor)).toEqual([])
+    expect(h.grants.list(successor).requests[0]!.status).toBe('used')
+  })
+
+  it('spends a moved grant once even if the predecessor CLI still held the rule and ran it', async () => {
+    // Its runtime took the rule at launch through --settings, so taking it back live is unsupported.
+    const once = harness({ apply: vi.fn(async (id: string) => id === tab ? 'unsupported' as const : 'applied' as const), idleWaitMs: 1 })
+    const request = once.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await once.grants.decide(tab, request.id, 'approve-once', 'owner')
+    await once.grants.transfer(tab, successor)
+    once.grants.adapterPort(tab).used(`Bash(bash ${script})`)
+    expect(once.grants.rules(successor)).toEqual([])
+    expect(once.grants.list(successor).requests[0]!.status).toBe('used')
+  })
+
+  it('never hands a grant to a conversation that cannot hold one, and a handoff with nothing held is a no-op', async () => {
+    const h = harness()
+    await expect(h.grants.transfer(tab, successor)).resolves.toEqual({ requests: 0, grants: 0 })
+    h.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    await expect(h.grants.transfer(tab, 'agent_codex')).resolves.toEqual({ requests: 0, grants: 0 })
+    expect(h.grants.list(tab).requests).toHaveLength(1)
+    await expect(h.grants.transfer(tab, tab)).resolves.toEqual({ requests: 0, grants: 0 })
+  })
+
+  it('withdraws the pending card of a tab closed without a successor instead of leaving an orphan', () => {
+    let open = true
+    const h = harness({ tabOpen: id => id === tab && open })
+    const asked = h.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    open = false
+    h.grants.sweep(); h.grants.sweep()
+    expect(h.grants.state().requests).toEqual([])
+    expect(h.notices.at(-1)).toMatchObject({ id: tab, itemId: asked.id, payload: { permissionGrant: { status: 'expired' } } })
+    const closed = harness()
+    const other = closed.grants.request(tab, { command: `bash ${script}`, reason: 'fix' })
+    closed.grants.closed(tab)
+    expect(closed.notices.at(-1)).toMatchObject({ id: tab, itemId: other.id, payload: { permissionGrant: { status: 'expired' } } })
+    expect(closed.grants.state().requests).toEqual([])
+  })
+})
