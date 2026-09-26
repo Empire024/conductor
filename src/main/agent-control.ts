@@ -1,6 +1,8 @@
 import { repointRestart, RESTART_INITIATOR_KEY, RESTART_REQUEST_KEY, type RestartInitiator, type RestartRequest } from './restart-initiator'
 import type { PendingStopConfirmation } from './stop-confirmation'
 import { localModelId, LocalServerBusy, type LocalServerEntry, type LocalStopRequest } from './local-models/servers'
+import { anonymousConversations } from './local-models/anonymous'
+import { LOCAL_SWARM_LIMITS, planLocalCoworker, watchLocalCoworker } from './local-models/swarm'
 import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
@@ -394,9 +396,12 @@ export class AgentControl {
     const workspace = this.deps.database.getSession(scope.sessionId)
     if (workspace?.projectId !== scope.projectId) throw new Error('Workspace is outside the authorized project')
     const tabs: AgentControlTab[] = []
+    // What an anonymous conversation is called is part of it: only the owner and other anonymous
+    // conversations see its tab title (local-models/anonymous.ts).
+    const sealed = !scope.owner && !anonymousConversations.has(scope.agentSessionId)
     const visit = (node: LayoutNode, detachedId?: string): void => {
       if (node.type === 'split') { node.children.forEach(child => visit(child, detachedId)); return }
-      node.tabs.forEach(tab => tabs.push({ ...tab, groupId: node.id, ...(detachedId ? { detachedId } : {}), uri: conductorUri(scope.projectId, 'tab', tab.id) }))
+      node.tabs.forEach(tab => tabs.push({ ...tab, ...(sealed && anonymousConversations.has(tab.resourceId) ? { title: 'Anonymous local conversation' } : {}), groupId: node.id, ...(detachedId ? { detachedId } : {}), uri: conductorUri(scope.projectId, 'tab', tab.id) }))
     }
     visit(workspace.layout.root)
     for (const window of this.deps.database.listDetachedWindows()) if (window.projectId === scope.projectId && window.sessionId === scope.sessionId) visit(window.layout.root, window.id)
@@ -713,6 +718,7 @@ export class AgentControl {
     } else this.deps.database.removeSetting('agentControlParent:' + tab.resourceId)
     this.deps.linksChanged?.(target)
     if (!together) { this.deps.linksChanged?.(scope); return }
+    if (anonymousConversations.has(tab.resourceId) || anonymousConversations.has(scope.agentSessionId)) return
     // A collaboration message is a note between coworkers of one project; there is no shared
     // thread to post it to when the controller lives in another one.
     this.deps.collaboration.postMessage({ ...target, agentSessionId: scope.agentSessionId, toAgentSessionId: tab.resourceId, kind: 'handoff', body: state === 'attached' ? `Controlling ${tab.title}` : `Released ${tab.title}`, metadata: { control: state, controllerTabId: source?.id, controlledTabId: tab.id } })
@@ -838,6 +844,11 @@ export class AgentControl {
       // open a tab may set one; it only means something to the local runtime.
       const contract = normaliseContract(args.contract)
       if (contract && provider !== 'local') throw new Error('A task contract applies to local models only')
+      // Anonymous mode (local-models/anonymous.ts) is a local-model option chosen at opening; an
+      // anonymous conversation's coworkers are anonymous too.
+      if (args.anonymous !== undefined && typeof args.anonymous !== 'boolean') throw new Error('anonymous must be true or false')
+      const anonymous = args.anonymous === true || anonymousConversations.has(scope.agentSessionId)
+      if (anonymous && provider !== 'local') throw new Error('Anonymous mode is for local models only')
       // A local model whose server cannot start right now (another model is busy on the one
       // slot this machine has) is refused here, with the reason, rather than as the failure of the
       // first turn inside a tab that then sits there.
@@ -848,12 +859,12 @@ export class AgentControl {
       tab.resourceId = makeId('agent')
       if (approvalReviewer) this.deps.sessions.markApprovalReviewer(tab.resourceId)
       tab.title = args.title === undefined ? model.label : title
-      tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual', machineId }
+      tab.state = { provider, model: model.id, effort: effort ?? 'auto', viewMode: 'visual', machineId, ...(anonymous ? { anonymous: true } : {}) }
       // A tab handed to a sibling project belongs to that project and works in its folder, not in
       // the folder of whoever asked for it.
       const cwd = target.projectId === scope.projectId ? source.cwd : this.deps.database.getProject(target.projectId)!.path
       // A coworker of the owner or of a wizard waits out usage limits and continues, like the wizard itself.
-      const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd, ...(sovereign(scope) ? { continueOnLimit: true } : {}) }
+      const spec: AgentSpec = { id: tab.resourceId, projectId: target.projectId, sessionId: target.sessionId, provider, model: model.id, title: tab.title, cwd, ...(sovereign(scope) ? { continueOnLimit: true } : {}), ...(anonymous ? { anonymous: true } : {}) }
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || 'Provider unavailable')
       const created = this.deps.database.structured.snapshot(spec.id)!
@@ -883,6 +894,36 @@ export class AgentControl {
     // close; the owner's own tabs, and tabs a controller only took over, never carry it.
     if (kind === 'agent' && !root && !approvalReviewer && !scope.owner && opened.resourceId) this.deps.database.setSetting(COWORKER_OPENED_PREFIX + opened.resourceId, scope.agentSessionId)
     return { ...opened, projectId: target.projectId, workspaceId: target.sessionId, ...(grants ? { grants } : {}) }
+  }
+
+  /** A local conversation's tabs.open: a coworker of itself, on its model and within its limits
+   *  (local-models/swarm.ts), started on the prompt it was given. */
+  private async openLocalCoworker(scope: AgentControlScope, args: Args): Promise<unknown> {
+    const { database, sessions } = this.deps
+    const own = database.structured.snapshot(scope.agentSessionId)
+    if (!own) throw new Error('The caller no longer has an open tab')
+    const parent = this.linkFor(scope.agentSessionId)
+    const coworkers = this.tabs(scope).filter(tab => tab.kind === 'agent' && tab.resourceId && tab.state?.provider === 'local' && this.linkFor(tab.resourceId)?.controllerAgentSessionId === scope.agentSessionId)
+    const plan = planLocalCoworker({
+      model: own.settings.model, settings: settingsForRuntime(own.settings), anonymous: anonymousConversations.has(scope.agentSessionId),
+      openedByLocal: Boolean(parent && database.structured.spec<AgentSpec>(parent.controllerAgentSessionId)?.provider === 'local'),
+      liveCoworkers: coworkers.length
+    }, args)
+    const opened = await this.open(scope, plan.open)
+    const id = opened.resourceId!
+    database.structured.update(id, { settings: { ...database.structured.snapshot(id)!.settings, ...plan.grants } })
+    // A small model forgets agents.report; its controller hears when a turn ends either way.
+    const title = opened.title
+    watchLocalCoworker(id, title, {
+      snapshot: target => this.linkFor(target)?.controllerAgentSessionId === scope.agentSessionId ? database.structured.snapshot(target) : null,
+      deliver: async text => { const controller = database.structured.snapshot(scope.agentSessionId); if (controller) await sessions.steerOrStart(scope.agentSessionId, text, controller.settings, [], { agentSessionId: id, label: title }) }
+    })
+    let delivery: 'started' | 'queued' | undefined
+    if (plan.prompt) {
+      const controller = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
+      delivery = await sessions.steerOrStart(id, plan.prompt, database.structured.snapshot(id)!.settings, [], { agentSessionId: scope.agentSessionId, label: controller?.title || 'Local controller' })
+    }
+    return { ...opened, grants: { repository: plan.grants.localGit, research: plan.grants.localResearch }, ...(delivery ? { delivery } : {}), swarm: { coworkers: coworkers.length + 1, maxCoworkers: LOCAL_SWARM_LIMITS.coworkers, maxDepth: LOCAL_SWARM_LIMITS.depth, anonymous: anonymousConversations.has(id) } }
   }
 
   /** A tab an agent opens lands in the background with a "new" mark: the owner's active tab,
@@ -974,7 +1015,13 @@ export class AgentControl {
     }
     if (method === 'models.list') return this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope)
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
+    if (method === 'tabs.open' && source.provider === 'local' && !scope.owner) return this.openLocalCoworker(scope, args)
     if (method === 'tabs.open') return this.open(scope, args)
+    // A local conversation steers and finishes only the local coworkers it opened (swarm.ts).
+    if ((method === 'agents.steer' || method === 'agents.finish') && source.provider === 'local' && !scope.owner && args.agentSessionId !== undefined) {
+      const id = String(args.agentSessionId)
+      if (database.structured.spec<AgentSpec>(id)?.provider !== 'local' || this.linkFor(id)?.controllerAgentSessionId !== scope.agentSessionId) throw new Error('A sandboxed local conversation steers and finishes only the local coworkers it opened with tabs.open')
+    }
     if (['tabs.focus', 'tabs.rename', 'tabs.split', 'tabs.detach', 'tabs.close'].includes(method)) {
       const { tab, scope: target } = this.tabTarget(scope, args)
       if (method !== 'tabs.focus' && tab.kind === 'agent') this.target(scope, tab.resourceId!, true)
@@ -1031,6 +1078,7 @@ export class AgentControl {
       const link = this.linkFor(scope.agentSessionId)
       const controllerState = link ? database.structured.snapshot(link.controllerAgentSessionId) : null
       if (!link || !controllerState) throw new Error('No controlling conversation is open for this tab')
+      if (anonymousConversations.has(scope.agentSessionId) && !anonymousConversations.has(link.controllerAgentSessionId)) throw new Error('This conversation is anonymous and its controller keeps a history, so nothing of it may be reported there; the owner reads it in its tab')
       const reporter = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
       const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: reporter?.title || 'Local coworker' }
       const delivery = await sessions.steerOrStart(link.controllerAgentSessionId, reportText, controllerState.settings, [], origin)
@@ -1041,6 +1089,7 @@ export class AgentControl {
       const id = text(args, 'agentSessionId', 160), mutate = !['agents.snapshot', 'agents.history', 'agents.artifact'].includes(method)
       const reach = ['agents.snapshot', 'agents.history', 'agents.status', 'agents.artifact'].includes(method) ? 'read' : ['agents.submit', 'agents.steer', 'agents.interrupt'].includes(method) ? 'steer' : null
       const { tab, scope: target } = this.target(scope, id, mutate, reach, method === 'agents.resume'), state = database.structured.snapshot(id)!
+      if (reach === 'read' && anonymousConversations.has(id) && !scope.owner && !anonymousConversations.has(scope.agentSessionId)) throw new Error('That conversation is anonymous: only the owner and anonymous conversations may read it, because anything read here would be kept in this conversation\'s history')
       if (method === 'agents.artifact') {
         const artifactId = text(args, 'artifactId', 200)
         let content: string

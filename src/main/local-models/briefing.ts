@@ -30,10 +30,11 @@ export function splitLocalPrompt(prompt: string): { instruction: string; backgro
 /** Words that name what the scoped conductor tool does (LOCAL_CONTROL_METHODS in tools.ts):
  *  project memory (memory.recall, memory.remember), the task checklist (tasks.list,
  *  tasks.update), the visible conversations (agents.list, agents.snapshot, agents.status),
+ *  a local swarm (tabs.open, agents.steer, agents.finish, agents.report),
  *  updating the app (app.update, app.update.status) and usage limits (usage.limits).
  *  Deliberately a plain, generous word-boundary regex: a false positive only offers the tool,
  *  while a false negative hides it from an owner who asked for it. */
-const CONDUCTOR_CONTROL_WORDS = /\b(?:memory|memories|remember|recall|forget|tasks?|checklist|backlog|feature[- ]list|todo|to-do|agents?|coworkers?|conversations?|tabs?|conductor|app update|update the app|update conductor|updater|usage|limits?|rate limit)\b/i
+const CONDUCTOR_CONTROL_WORDS = /\b(?:memory|memories|remember|recall|forget|tasks?|checklist|backlog|feature[- ]list|todo|to-do|agents?|coworkers?|swarms?|subagents?|workers?|delegate|conversations?|tabs?|conductor|app update|update the app|update conductor|updater|usage|limits?|rate limit)\b/i
 
 /** Whether the owner's own words plausibly ask for the conductor tool. */
 export const mentionsConductorControl = (instruction: string): boolean => CONDUCTOR_CONTROL_WORDS.test(instruction)

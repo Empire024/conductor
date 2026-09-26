@@ -1451,7 +1451,8 @@ describe('local-model grants through app control', () => {
     const count = registered()
     await expect(f.control.call(f.scope, 'tabs.open', { provider: 'claude', repository: true })).rejects.toThrow('local models only')
     await expect(f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic', research: 'please' })).rejects.toThrow('research must be true or false')
-    await expect(f.control.call({ ...f.scope, agentSessionId: tab.resourceId! }, 'tabs.open', { provider: 'local', model: 'local-synthetic', repository: true })).rejects.toThrow('sandboxed')
+    // A local caller opens coworkers with its own grants or fewer (local-model-swarms), never one it lacks.
+    await expect(f.control.call({ ...f.scope, agentSessionId: tab.resourceId! }, 'tabs.open', { provider: 'local', model: 'local-synthetic', research: true })).rejects.toThrow('sandboxed')
     f.database.structured.update(f.spec.id, { settings: { ...f.database.structured.snapshot(f.spec.id)!.settings, permission: 'read-only' } })
     await expect(f.control.call(f.scope, 'tabs.open', { provider: 'local', model: 'local-synthetic', repository: true })).rejects.toThrow('read-only')
     expect(registered()).toBe(count)

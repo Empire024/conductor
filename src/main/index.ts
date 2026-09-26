@@ -92,6 +92,7 @@ import { createCloud, type CloudRegistration } from './cloud/register'
 import { health as llamaHealth, processAlive as llamaProcessAlive, readRunRecord, stopServer as stopLlamaServer } from './local-models/llama'
 import { runningLlamaProcesses } from './local-models/resource-guard'
 import { listLocalServers, stopLocalServer, type LocalStopRequest } from './local-models/servers'
+import { agentTabIds, anonymousConversations } from './local-models/anonymous'
 import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
 import type { ScheduleRunner } from './schedule-runner'
 import { createScheduledTasks, latestModelsBuiltin } from './schedule-wiring'
@@ -744,7 +745,8 @@ const currentWorkingSet = (): { wizards: string[]; coworkers: string[] } => {
   const candidates = new Map<string, ResumeCandidate>()
   for (const tab of openAgentTabs()) {
     const id = tab.resourceId!, state = database.structured.snapshot(id)
-    if (!state || candidates.has(id)) continue
+    // An anonymous conversation is not resumed after a restart and leaves no restart record.
+    if (!state || candidates.has(id) || anonymousConversations.has(id)) continue
     const working = hasSessionWork(state, agents.structured.hasRuntime(id)), controller = controllerOf(id)
     const provider = Boolean(state.settings?.wizard) || working ? database.structured.spec<AgentSpec>(id)?.provider : undefined
     candidates.set(id, { id, wizard: Boolean(provider && provider !== 'local' && wizardActive(state.settings, provider)), working, ...(controller ? { controller } : {}) })
@@ -1407,6 +1409,17 @@ const resolveEditorPath = async (projectId: string, requested: string): Promise<
 }
 
 /** Every renderer persistence route uses the same live-tab protection. */
+/** An anonymous local conversation whose tab is gone from every open layout is stopped and
+ *  forgotten for good (local-models/anonymous.ts); files it wrote stay in the workspace. */
+const sweepAnonymous = (): void => {
+  if (!anonymousConversations.size()) return
+  const layouts = [...database.listProjects().flatMap(project => database.listSessions(project.id).map(session => session.layout)), ...database.listDetachedWindows().map(window => window.layout)]
+  for (const id of anonymousConversations.closed(agentTabIds(layouts))) {
+    agents?.structured.killWhere(spec => spec.id === id)
+    anonymousConversations.forget(id)
+  }
+}
+
 const guardSessionLayout = (sessionId: string, layout: WorkspaceLayout, closedTabs: PaneTab[]): ReturnType<typeof guardLayoutSave> => {
   const previous = database.getSession(sessionId)?.layout ?? null
   const hasLiveWork = (id: string): boolean => {
@@ -1913,6 +1926,7 @@ const registerIpc = (): void => {
       ) => {
       const repaired = guardSessionLayout(sessionId, layout, closedTabs)
       database.saveSession(sessionId, repaired.layout, maximizedGroupId, closedTabs)
+      sweepAnonymous()
       // A paired machine showing this workspace learns its tabs changed the way it learns anything.
       const projectId = database.getSession(sessionId)?.projectId
       if (projectId) remoteControl?.transport.host.notifyTabs(projectId, sessionId)
@@ -2500,7 +2514,7 @@ const registerIpc = (): void => {
       id: string,
       layout: WorkspaceLayout,
       maximizedGroupId: string | null
-    ) => database.saveDetachedWindow(id, layout, maximizedGroupId)
+    ) => { database.saveDetachedWindow(id, layout, maximizedGroupId); sweepAnonymous() }
   )
   ipcMain.on(
     'window:flush-detached',
@@ -2605,7 +2619,7 @@ app.whenReady().then(async () => {
     if (!host) return
     if (channel === 'structured:events' && Array.isArray(payload)) {
       for (const event of payload as Array<{ projectId: string; workspaceId: string; sessionId: string; sequence: number }>) {
-        if (event?.projectId && event.workspaceId && event.sessionId) host.notifyAgents(event.projectId, event.workspaceId, event.sessionId, event.sequence)
+        if (event?.projectId && event.workspaceId && event.sessionId && !anonymousConversations.has(event.sessionId)) host.notifyAgents(event.projectId, event.workspaceId, event.sessionId, event.sequence)
       }
     } else if (channel === 'files:changed') {
       const change = payload as { projectId?: string; path?: string; machineId?: string }
