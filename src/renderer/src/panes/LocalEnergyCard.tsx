@@ -54,9 +54,14 @@ function EnergyPriceEditor({ price, onPrice }: { price: EnergyPrice; onPrice(pri
   const [perKwh, setPerKwh] = useState(String(price.perKwh))
   const [currency, setCurrency] = useState(price.currency)
   const next = parseEnergyPrice({ perKwh: Number(perKwh), currency })
-  return <form className="sa-energy-price" onSubmit={event => { event.preventDefault(); if (next) onPrice(next) }}>
-    <label>Electricity price <input aria-label="Currency" value={currency} maxLength={6} size={3} onChange={event => setCurrency(event.target.value)} /><input aria-label="Price per kWh" type="number" min={0} step={0.01} value={perKwh} onChange={event => setPerKwh(event.target.value)} /> per kWh</label>
-    <button type="submit" disabled={!next}>Save</button>
+  const save = (): void => { if (next) onPrice(next) }
+  // Not a <form>: the Usage dialog renders inside the composer's form, and a native submit of a
+  // nested form reloaded the whole window instead of saving (VR7 E2). Enter saves here and goes no
+  // further, so it cannot submit the composer either.
+  const enter = (event: React.KeyboardEvent<HTMLInputElement>): void => { if (event.key !== 'Enter') return; event.preventDefault(); event.stopPropagation(); save() }
+  return <div className="sa-energy-price" role="group" aria-label="Electricity price">
+    <label>Electricity price <input aria-label="Currency" value={currency} maxLength={6} size={3} onChange={event => setCurrency(event.target.value)} onKeyDown={enter} /><input aria-label="Price per kWh" type="number" min={0} step={0.01} value={perKwh} onChange={event => setPerKwh(event.target.value)} onKeyDown={enter} /> per kWh</label>
+    <button type="button" disabled={!next} onClick={save}>Save</button>
     <button type="button" onClick={() => { setPerKwh(String(DEFAULT_ENERGY_PRICE.perKwh)); setCurrency(DEFAULT_ENERGY_PRICE.currency); onPrice(null) }}>Default ({formatPrice(DEFAULT_ENERGY_PRICE)})</button>
-  </form>
+  </div>
 }

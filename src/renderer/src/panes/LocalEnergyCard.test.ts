@@ -42,4 +42,11 @@ describe('LocalEnergyCard', () => {
     expect(html).toContain('Default ($0.2/kWh)')
     expect(html).toContain('1 turn: the turn ended before')
   })
+
+  it('keeps the price editor out of any <form>: it sits inside the composer form, where a native submit reloaded the window (VR7 E2)', () => {
+    const html = renderToStaticMarkup(createElement(LocalEnergyTotalsView, { totals: { turns: 1, measuredTurns: 1, unmeasuredTurns: 0, gpuWh: 1, systemWh: 0.2, totalWh: 1.2, durationMs: 10_000 }, price: DEFAULT_ENERGY_PRICE, onPrice: () => {} }))
+    expect(html).not.toMatch(/<form\b/)
+    expect(html).not.toMatch(/type="submit"/)
+    expect(html).toMatch(/<button type="button"[^>]*>Save<\/button>/)
+  })
 })
