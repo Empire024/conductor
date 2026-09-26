@@ -909,15 +909,25 @@ const reattachKeptRuntimes = async (): Promise<void> => {
     } catch (error) { console.warn(`Conversation ${id} could not be reattached to its kept runtime`, error) }
   }
 }
-/** A reattached turn still holds the previous process's app-control endpoint and credential, so it
- *  is told where app control lives now. */
+/** A reattached turn is told the restart happened. App control keeps its endpoint and credential
+ *  across restarts (FX33), so only when it could not (control-endpoint.json was missing, or its
+ *  port was taken) is the turn given the new ones. */
 const briefReattachedRuntimes = (restarted: string): void => {
   for (const id of reattachedRuntimes) {
     const spec = database.structured.spec<AgentSpec>(id), state = database.structured.snapshot(id)
     if (!spec || spec.provider === 'local' || !state || !agentControlServer || !['running', 'waiting_approval', 'waiting_input'].includes(state.phase)) continue
-    void agents.structured.steer(id, `[Conductor] ${restarted} while this turn kept running; continue. App control moved to a new endpoint and credential; use these from now on.\n\n${agentControlServer.briefing(spec)}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
+    const control = agentControlServer.endpointChanged
+      ? ` App control moved to a new endpoint and credential; use these from now on.\n\n${agentControlServer.briefing(spec)}`
+      : ' App control keeps the same endpoint and credential.'
+    void agents.structured.steer(id, `[Conductor] ${restarted} while this turn kept running; continue.${control}`, state.settings, [], { agentSessionId: 'owner', label: 'Conductor' })
       .catch(error => console.warn(`Reattached conversation ${id} could not be briefed`, error))
   }
+}
+/** The new app's control server asks the runtime host for the port it held while no app ran. */
+const reclaimControlPort = async (port: number): Promise<boolean> => {
+  const client = runtimeHostClient?.connected ? runtimeHostClient : await connectRuntimeHost(runtimeHostLaunch(false)).catch(() => null)
+  if (!client) return false
+  try { return (await client.releaseControl(port)).released } finally { if (client !== runtimeHostClient) client.dispose() }
 }
 /** Starts (or joins) the runtime host for runtimes started from now on. */
 const startRuntimeHost = async (): Promise<void> => {
@@ -942,6 +952,8 @@ const keepRunningInBackground = async (): Promise<void> => {
   if (!runtimeHostClient?.connected) return
   try {
     const kept = await agents.structured.detachForRestart()
+    // A kept turn may call app control while no app runs: the host answers its port meanwhile.
+    if (kept.length && agentControlServer?.port) await runtimeHostClient.holdControl(agentControlServer.port).catch(error => console.warn('The runtime host cannot hold app control while Conductor restarts', error))
     await runtimeHostClient.flush()
     if (kept.length) console.log(`Kept ${kept.length} running turn(s) in the runtime host`)
   } catch (error) { console.warn('Running turns could not all be kept in the background', error) }
@@ -2805,7 +2817,8 @@ app.whenReady().then(async () => {
   // The owner's own credential lives beside the app's data (docs/overseer.md): a supervisor
   // outside the app reads it to drive this Conductor with the window's authority and finds a fresh
   // one after every restart.
-  agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '', { path: join(app.getPath('userData'), 'control-owner.json'), appVersion: app.getVersion(), packaged: app.isPackaged })
+  agentControlServer = new AgentControlServer(control, undefined, spec => remoteControl?.machineNote(spec) ?? '', { path: join(app.getPath('userData'), 'control-owner.json'), appVersion: app.getVersion(), packaged: app.isPackaged },
+    { path: join(app.getPath('userData'), 'control-endpoint.json'), reclaim: reclaimControlPort })
   await agentControlServer.start()
   void recovery?.start({ fromVersion: app.getVersion(), checkout: findCheckout(database.listProjects().map(project => project.path)) })
   await browserMcp.start()
@@ -2899,6 +2912,10 @@ app.whenReady().then(async () => {
   try { await reattachKeptRuntimes() } catch (error) { console.error('Kept runtimes could not be reattached', error) }
   launchRecoveryNote = recoveryNote(recoveryReport)
   briefReattachedRuntimes(restartLine(restartPlan?.reason ?? restartReason(previousStop, initiator), previousStop?.fromVersion, updates.getState().currentVersion) + launchRecoveryNote)
+  // Test profiles only (scripts/smoke-fx33-restart-stall.mjs): the relaunched main thread stalls
+  // right after reattaching, the way it did for 71 s on 2026-09-25.
+  const stallMs = Number(process.env.CONDUCTOR_TEST_STARTUP_BLOCK_MS)
+  if (process.env.CONDUCTOR_TEST_USER_DATA && stallMs > 0 && reattachedRuntimes.size) { console.log(`[test] stalling main for ${stallMs} ms`); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, stallMs) }
   runtimeHostStarted = startRuntimeHost()
   const restoreAfterUpdate = database.getSetting(RESTORE_WINDOWS_AFTER_UPDATE_KEY) === 'true'
   const savedWindowLayout = restoreAfterUpdate
