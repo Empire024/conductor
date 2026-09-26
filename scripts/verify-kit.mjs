@@ -325,10 +325,11 @@ const electronPath = () => createRequire(import.meta.url)('electron')
  *  _electron.launch; mode 'spawn' starts plain Electron (with a CDP port for the UI) and is the one
  *  to use for anything that restarts the app - Playwright loses a relaunched app (RV1 C10).
  *  env adds or overrides variables (undefined deletes one); fixtures {file: source} are written to
- *  a folder named by CONDUCTOR_TEST_FIXTURE_DIR. */
-export async function launchParked({ mode = 'playwright', name, env: extraEnv = {}, fixtures, args = [], launchTimeoutMs = 60_000 } = {}) {
+ *  a folder named by CONDUCTOR_TEST_FIXTURE_DIR. build: another out/main/index.js (a worktree's build
+ *  of an older commit, for an upgrade run); relaunchParked keeps it unless given a new one. */
+export async function launchParked({ mode = 'playwright', name, env: extraEnv = {}, fixtures, args = [], launchTimeoutMs = 60_000, build = BUILD } = {}) {
   if (mode !== 'playwright' && mode !== 'spawn') throw new Error(`launchParked mode must be 'playwright' or 'spawn', got ${JSON.stringify(mode)}`)
-  if (!existsSync(BUILD)) throw new Error(`${BUILD} is missing: build first (npx electron-vite build)`)
+  if (!existsSync(build)) throw new Error(`${build} is missing: build first (npx electron-vite build)`)
   if (!process.env.CONDUCTOR_TEST_PARENT_PID) console.warn('[verify-kit] not under smoke-lock: run it as node scripts/smoke-lock.mjs -- node <smoke>')
   // Background work even without smoke-lock: the driver below normal, and the instance lowers its own
   // tree (src/main/background-priority.ts), so the owner's typing never waits on a verifier.
@@ -345,13 +346,13 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
     env.CONDUCTOR_TEST_FIXTURE_DIR = dir
   }
   for (const [key, value] of Object.entries(extraEnv)) { if (value === undefined) delete env[key]; else env[key] = String(value) }
-  const inst = { mode, name: label, root, profile, env, pids: new Set(), credential: null, projectId: null, workspaceId: null, app: null, page: null, child: null, cdpPort: null, browser: null, errors: [], closed: false }
+  const inst = { mode, build, name: label, root, profile, env, pids: new Set(), credential: null, projectId: null, workspaceId: null, app: null, page: null, child: null, cdpPort: null, browser: null, errors: [], closed: false }
   state.instances.push(inst)
   state.current = inst
   step(`launch ${mode} (${root})`)
   if (mode === 'playwright') {
     const { _electron } = await import('@playwright/test')
-    inst.app = await _electron.launch({ args: [BUILD, ...args], env, timeout: 30_000 })
+    inst.app = await _electron.launch({ args: [build, ...args], env, timeout: 30_000 })
     const pid = inst.app.process().pid
     inst.pids.add(pid)
     const log = join(root, 'app.log')
@@ -367,7 +368,7 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
   } else {
     inst.cdpPort = await freePort()
     const log = openSync(join(root, 'app.log'), 'a')
-    inst.child = spawn(electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, BUILD, ...args], { env, stdio: ['ignore', log, log], windowsHide: true })
+    inst.child = spawn(electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, build, ...args], { env, stdio: ['ignore', log, log], windowsHide: true })
     closeSync(log)
     inst.pids.add(inst.child.pid)
     await owner(inst, { pid: inst.child.pid, timeoutMs: launchTimeoutMs })
@@ -405,16 +406,17 @@ export async function relaunched(inst = state.current, oldPid = inst.credential?
 /** Starts a spawn-mode instance again on its own profile after the scenario quit or killed it (an
  *  app.restart relaunches by itself: use relaunched() for that). `env` changes this launch and the
  *  ones after it; undefined deletes a variable. Returns the new main pid. */
-export async function relaunchParked(inst = state.current, { env: extraEnv = {}, args = [], launchTimeoutMs = 60_000 } = {}) {
+export async function relaunchParked(inst = state.current, { env: extraEnv = {}, args = [], launchTimeoutMs = 60_000, build } = {}) {
   if (inst.mode !== 'spawn') throw new Error('relaunchParked is for spawn-mode instances')
   const oldPid = inst.credential?.pid
   if (oldPid != null) await poll(() => !isAlive(oldPid), { timeoutMs: 30_000, intervalMs: 250, label: `pid ${oldPid} to exit before the relaunch` })
   for (const [key, value] of Object.entries(extraEnv)) { if (value === undefined) delete inst.env[key]; else inst.env[key] = String(value) }
   if (inst.browser) { await withDeadline(inst.browser.close(), 5000); inst.browser = null; inst.page = null }
   inst.cdpPort = await freePort()
-  step(`relaunch spawn (${inst.root})`)
+  if (build) { if (!existsSync(build)) throw new Error(`${build} is missing`); inst.build = build }
+  step(`relaunch spawn (${inst.root}${inst.build !== BUILD ? ', ' + inst.build : ''})`)
   const log = openSync(join(inst.root, 'app.log'), 'a')
-  inst.child = spawn(electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, BUILD, ...args], { env: inst.env, stdio: ['ignore', log, log], windowsHide: true })
+  inst.child = spawn(electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, inst.build ?? BUILD, ...args], { env: inst.env, stdio: ['ignore', log, log], windowsHide: true })
   closeSync(log)
   inst.pids.add(inst.child.pid)
   inst.closed = false
