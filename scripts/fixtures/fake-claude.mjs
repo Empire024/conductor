@@ -66,7 +66,7 @@ const watchLoops = new Map()
 const recordedDenial = JSON.parse(readFileSync(new URL('./haftheme-denial-2026-09-25.json', import.meta.url), 'utf8'))
 const settingsArgument = process.argv.indexOf('--settings')
 let flagAllow = new Set(settingsArgument >= 0 ? JSON.parse(readFileSync(process.argv[settingsArgument + 1], 'utf8')).permissions?.allow ?? [] : [])
-const flagLog = entry => { if (process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG) writeFileSync(process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG, JSON.stringify({ at: Date.now(), ...entry }) + '\n', { flag: 'a' }) }
+const flagLog = entry => { if (process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG) writeFileSync(process.env.CONDUCTOR_TEST_FLAG_SETTINGS_LOG, JSON.stringify({ at: Date.now(), pid: process.pid, ...entry }) + '\n', { flag: 'a' }) }
 flagLog({ launch: [...flagAllow] })
 let deniedHookRegistered = false
 const classifierCalls = {
@@ -78,6 +78,9 @@ const escapeRule = content => content.replaceAll('\\', '\\\\').replaceAll('(', '
 const posixPath = path => { const drive = /^([A-Za-z]):[/\\]/.exec(path); return drive ? '/' + drive[1].toLowerCase() + path.slice(2).replaceAll('\\', '/') : path.replaceAll('\\', '/') }
 const ruleFor = call => call.tool === 'Write' ? `Edit(${escapeRule('/' + posixPath(call.input.file_path))})` : `${call.tool}(${escapeRule(call.input.command)})`
 let classifierCount = 0, classified, lastRefused
+// SYNTHETIC CLASSIFIER PLAN <call>: the model knows the call (a successor read it in its handoff) but
+// has not tried it; HOLD: told "approved; retry it now", it notes it and has not retried yet.
+let holdRetry = false
 const classify = call => {
   const id = `classified-${++classifierCount}`
   classified = { id, call }
@@ -152,6 +155,9 @@ for await (const line of input) {
     } else if (kind === 'set_permission_mode') {
       if (permissionScenario === 'REJECT' && message.request.mode === 'auto') send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Synthetic managed policy disables auto-mode' } })
       else { permissionMode = message.request.mode; success(message.request_id) }
+    } else if (kind === 'apply_flag_settings' && process.env.CONDUCTOR_TEST_FLAG_SETTINGS_UNSUPPORTED && message.request.settings?.permissions) {
+      // A CLI that cannot take permission rules live: they reach it only through --settings at its next start.
+      send({ type: 'control_response', response: { subtype: 'error', request_id: message.request_id, error: 'Synthetic CLI: apply_flag_settings is not supported' } })
     } else if (kind === 'apply_flag_settings') {
       // A shallow merge into the flag layer, as the CLI describes it: permissions replaces permissions.
       if (message.request.settings?.permissions) flagAllow = new Set(message.request.settings.permissions.allow ?? [])
@@ -173,7 +179,7 @@ for await (const line of input) {
     if (!initialized) throw new Error('User message before initialization')
     const blocks = message.message.content
     const prompt = Array.isArray(blocks) ? blocks.filter(item => item.type === 'text').map(item => item.text).join('') : blocks
-    if (process.env.CONDUCTOR_TEST_CONTROL_CAPTURE && typeof prompt === 'string') writeFileSync(process.env.CONDUCTOR_TEST_CONTROL_CAPTURE, prompt)
+    if (process.env.CONDUCTOR_TEST_CONTROL_CAPTURE && typeof prompt === 'string') writeFileSync(process.env.CONDUCTOR_TEST_CONTROL_CAPTURE, process.env.CONDUCTOR_TEST_CONTROL_CAPTURE_APPEND ? prompt + '\n\u0000\n' : prompt, process.env.CONDUCTOR_TEST_CONTROL_CAPTURE_APPEND ? { flag: 'a' } : undefined)
     if (typeof prompt === 'string' && prompt.startsWith('SYNTHETIC IMAGES')) {
       const images = blocks.filter(item => item.type === 'image')
       if (!images.length || images.some(item => item.source.type !== 'base64' || item.source.media_type !== 'image/png' || Buffer.from(item.source.data, 'base64').subarray(0,8).toString('hex') !== '89504e470d0a1a0a')) throw new Error('Synthetic image bytes did not reach Claude')
@@ -192,7 +198,13 @@ for await (const line of input) {
     }
     // Conductor's own answer to a permission grant (src/main/permission-grants): retry exactly the
     // refused call, or stand down.
+    if (typeof prompt === 'string' && prompt.startsWith('[Conductor] approved:') && holdRetry) {
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      text('SYNTHETIC: approval noted; the retry waits.'); finish(); continue
+    }
     if (typeof prompt === 'string' && prompt.startsWith('[Conductor] approved:')) {
+      // A CLI restarted to take the rule (--settings) is a new fixture process: it retries the call the rule names.
+      lastRefused ??= Object.values(classifierCalls).map(make => make()).find(call => !call.local && prompt.includes(ruleFor(call)))
       if (!lastRefused) throw new Error('Synthetic fixture has no refused call to retry')
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
       classify(lastRefused); continue
@@ -202,6 +214,14 @@ for await (const line of input) {
       text('SYNTHETIC: understood; not retrying it.'); finish(); continue
     }
     if (typeof prompt !== 'string' || !prompt.startsWith('SYNTHETIC ')) throw new Error('Fixture accepts explicitly synthetic prompts only')
+    if (prompt.startsWith('SYNTHETIC CLASSIFIER PLAN ')) {
+      const planned = /^SYNTHETIC CLASSIFIER PLAN (WRITE|OTHER|HOLD)\b/.exec(prompt)?.[1]
+      if (!planned) throw new Error('Unknown synthetic classifier plan')
+      holdRetry = planned === 'HOLD'
+      if (!holdRetry) lastRefused = classifierCalls[planned]()
+      emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
+      text(`SYNTHETIC: planned ${planned}; nothing tried yet.`); finish(); continue
+    }
     if (prompt.startsWith('SYNTHETIC CLASSIFIER ')) {
       const scenario = /^SYNTHETIC CLASSIFIER (WRITE|OTHER|LOCAL|RETRY)\b/.exec(prompt)?.[1]
       if (!scenario) throw new Error('Unknown synthetic classifier scenario')
