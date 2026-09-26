@@ -868,7 +868,10 @@ export class AgentControl {
       const result = this.deps.sessions.ensure(spec)
       if (!result.available) throw new Error(result.message || 'Provider unavailable')
       const created = this.deps.database.structured.snapshot(spec.id)!
-      if (explicitPermission && !created.capabilities?.permissions?.includes(explicitPermission)) throw new Error('Choose a permission mode supported by this provider')
+      // Claude and Grok have no read-only permission; their read-only is plan mode, where the model
+      // reads and searches but changes nothing and asks for nothing a stronger-model review answers.
+      const planReadOnly = explicitPermission === 'read-only' && (provider === 'claude' || provider === 'grok') && !created.capabilities?.permissions?.includes('read-only')
+      if (explicitPermission && !planReadOnly && !created.capabilities?.permissions?.includes(explicitPermission)) throw new Error('Choose a permission mode supported by this provider')
       const sourceSettings: SessionSettings = sovereign(scope) ? { permission: 'auto', plan: false } : settingsForRuntime(this.deps.database.structured.snapshot(scope.agentSessionId)!.settings)
       // A native coworker opens on Auto (see dispatchPermission). Only with exactPermission does
       // an explicit ask, else the owner's remembered mode for this provider (permission-memory.ts
@@ -880,7 +883,7 @@ export class AgentControl {
       // own execution sandbox (Codex) is also told to run commands read-only. Naming a sandbox mode
       // the provider does not have fails the first turn: a local model's read-only is its permission.
       const readOnlySandbox = permission === 'read-only' && created.capabilities?.sandboxModes?.includes('read-only')
-      const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(readOnlySandbox ? { sandbox: 'read-only' as const } : {}), plan: restricted(sourceSettings) && (provider === 'claude' || provider === 'grok'), ...requestedGrants, ...(contract ? { localContract: contract } : {}) }
+      const settings: SessionSettings = { ...created.settings, model: model.id, effort, permission, ...(readOnlySandbox ? { sandbox: 'read-only' as const } : {}), plan: (planReadOnly || restricted(sourceSettings)) && (provider === 'claude' || provider === 'grok'), ...requestedGrants, ...(contract ? { localContract: contract } : {}) }
       this.deps.database.structured.update(spec.id, { settings })
       if (Object.keys(requestedGrants).length) grants = { repository: Boolean(settings.localGit), research: Boolean(settings.localResearch) }
     } else {
@@ -2065,6 +2068,9 @@ export class AgentControl {
     const parent = this.linkFor(scope.agentSessionId)
     if (parent) database.setSetting(key(agentSessionId), JSON.stringify({ ...parent, targetAgentSessionId: agentSessionId, controlledTabId: tab.id }))
     for (const [id, grant] of this.updateGrants) if (grant.controllerAgentSessionId === scope.agentSessionId) this.updateGrants.set(id, { ...grant, controllerAgentSessionId: agentSessionId })
+    // The owner's waiting approval cards and unspent grants go with it (permission-grants transfer);
+    // the move itself is synchronous, only handing the rules to the runtimes is awaited below.
+    const moving = this.deps.permissionGrants?.transfer(scope.agentSessionId, agentSessionId).catch(error => { console.warn('Permission grants could not be moved to the successor', error); return undefined })
     const restart = repointRestart(database.getSetting(RESTART_INITIATOR_KEY), database.getSetting(RESTART_REQUEST_KEY), scope.agentSessionId, { agentSessionId, title: successorTitle })
     if (restart.initiator) database.setSetting(RESTART_INITIATOR_KEY, restart.initiator)
     if (restart.request) database.setSetting(RESTART_REQUEST_KEY, restart.request)
@@ -2082,12 +2088,13 @@ export class AgentControl {
     for (const link of coworkers) touched.set(link.projectId + '\0' + link.sessionId, { projectId: link.projectId, sessionId: link.sessionId })
     for (const workspace of touched.values()) this.deps.linksChanged?.(workspace)
     this.deps.collaboration.postMessage({ projectId: scope.projectId, sessionId: scope.sessionId, agentSessionId: scope.agentSessionId, toAgentSessionId: agentSessionId, kind: 'handoff', body: `Continued in “${successorTitle}”${coworkers.length ? `, which now controls ${coworkers.length} coworker${coworkers.length === 1 ? '' : 's'}` : ''}. This conversation finishes its current step and stops.`, metadata: { handoff: 'successor', fromTabId: source?.id, toTabId: tab.id, characters: handoff.length, wizard, coworkers: coworkers.map(link => link.targetAgentSessionId) } })
+    const permissions = await moving
     const created = database.structured.snapshot(agentSessionId)
     return {
       handedOff: true, successor: true, tabId: tab.id, agentSessionId, uri: tab.uri, projectId: tab.projectId, workspaceId: tab.workspaceId,
       title: successorTitle, provider: spec.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
       wizard, continueOnLimit: wizard || Boolean(spec.continueOnLimit), coworkers: coworkers.map(link => link.targetAgentSessionId), controller: parent?.controllerAgentSessionId ?? null,
-      restart: { initiator: Boolean(restart.initiator), request: Boolean(restart.request) }, superseded: superseded.superseded,
+      restart: { initiator: Boolean(restart.initiator), request: Boolean(restart.request) }, superseded: superseded.superseded, permissions: permissions ?? { requests: 0, grants: 0 },
       note: `“${successorTitle}” is now this conversation${wizard ? ' and the wizard' : ''}. You no longer control any coworker and${wizard ? ' no longer hold the owner’s authority' : ' have no coworkers to steer'}: their reports, approvals and steering go to the successor. Finish only the step you are already in (you may still git.ship your own finished files), report it in one line, and stop.`
     }
   }
