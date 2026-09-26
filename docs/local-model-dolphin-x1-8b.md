@@ -318,3 +318,83 @@ with a made-up report merges the reports the conversation did receive instead (V
 the controller twice paired January's real report with a February it invented, "rent=1050",
 "rent=1000"), or is refused when there are none. The other run is the model: it ran code itself instead of opening
 coworkers, and then answered the follow-up with made-up totals without any tool call.
+
+## FX44: Conductor's side of VR9d, and which installed model is useful (2026-09-26)
+
+VR9d (docs/verification/2026-09-26-vr9d.md) found Dolphin reading pages for every current question but
+right 1/5 and 3/5, with 2 misses Conductor's, 1 both, and three testable gaps in research and swarms.
+Fixed in `src/main/local-models/{agent,tools}.ts` (commits 0d2bfec, 7b7fe31; unit tests in
+`fx44-dates.test.ts` on VR9d's real search results):
+
+- **Every date a result carries.** `pickPages` dated a result by the date in front of its snippet
+  only, so ESPN's "Yankees 6-4 Mets (Sep 11, 2026)" had none and scored as a live page for last
+  night's game, and "iOS 26.5.2 ... released June 29, 2026" as the latest release in September.
+  Dates now come from the title, the page's own opening, the link (also a scoreboard's
+  `9-25-2026`) and the snippet text; the snippet's leading date, which is when the search engine
+  saw a preview, counts only when there is no other. For a question about one day a page dated
+  another day scores below an undated live page; for "latest" and other time-relative questions a
+  page older than two months is demoted. `www.` and bare links are the same page.
+- **The page's own date labels it.** SI's box score "Final Score — September 25, 2026" carried a
+  Sep 24 preview date and was labelled "a day old"; ad-hoc-news's "September 24 close", previewed
+  on the 25th, was labelled "the same day" (found in this round's run 2). The staleness line and
+  the withholding rule now use the title and opening first; a page that names the asked day is
+  never called old or withheld. A market question at a weekend is answered by the last trading
+  day: Friday's gold close read on Saturday or Sunday is "the latest close", not stale (crypto
+  excluded).
+- **Answer, don't loop.** Asking for a page already read returns "Already read above" with its key
+  lines, and the next round offers no tools (VR9d's gold loop: 12 refused re-reads, then "the 8 web
+  call limit" as the answer). The same tool-free round follows the web-limit denial once pages
+  were read, a call to a turned-off tool (VR9d research run 2 ended with no answer), and a
+  stagnation stop in a web turn (this round's run 3: six failing reads, then "Could not complete
+  the task"). A round told to answer now is never overridden by Conductor opening another page.
+- **"Sum it up for me" is a summary**, not arithmetic: with "pixel 10" as its digits, the research
+  question had been held back for a calculation and Dolphin averaged a `reviews.csv` it made up
+  (this round's run 1).
+- **Errors that do not mislead.** `run_command` with program text in `script` runs it as inline code
+  and says so (VR9d timesheet run 1 read the ENOENT as missing CSVs); a missing `script` or
+  `calculate` path says "there is no file X in the workspace".
+- **Invented one-digit reports.** `inventedReports` counts one-digit figures (known only from a line
+  holding both the label and the figure) and word values, so "item=orange, sold=7" from files with
+  no oranges is refused (VR9d bakery run 2).
+
+### Which installed model (Part B)
+
+Same owner-style set as VR9d (5 current, 4 plain, 1 history questions in one conversation; a
+research question and a follow-up in a fresh one) and VR9a's timesheet swarm, 2 runs per model,
+parked, real web, `scripts/smoke-fx44-models.mjs`. Truth re-checked on the day (2026-09-26, about
+05:15Z, Saturday): Yankees-Orioles doubleheader, Orioles 10-2 then Yankees 6-3; Nasdaq Composite
++0.48 % to 27,068.72; gold about $4,284-4,299 (Friday close); Friedrich Merz; iOS 27 (27.0.1 not out).
+A score counts when it is a right final of last night's games with the right winner; a blend or a
+reversed winner does not. Only installed models; one server at a time through Conductor's
+admission path (the parked instance's idle-switch), Dolphin restarted in the owner's app afterwards.
+Evidence: `artifacts/verification/2026-09-26-fx44/`.
+
+| | Dolphin X1 8B (after FX44) | Ornith 1.5 9B | Qwen 3.6 35B-A3B |
+|---|---|---|---|
+| current questions right, run 1 / run 2 | 5/5, 4/5 (final code; the two earlier runs 5/5, 4/5) | 5/5, 3/5 | 5/5, 5/5 |
+| its misses | Nasdaq: the model gave an index level with no daily move | Yankees game 2 winner reversed; Nasdaq weekly and monthly move instead of the day's | none (run 2 swapped the doubleheader's game order, scores and winners right) |
+| answer quality | one game named; short | one or both games, exact figures | both games, exact points (AP), full sources |
+| plain and history, no tool, right | 10/10 | 10/10 (once listed source links it never read) | 10/10 |
+| research summary / follow-up | 0/2 real review summaries (spec sheets), follow-ups partial | 2/2 / 2/2 honest about what it opened | 2/2 / 2/2 honest |
+| timesheet swarm (answer right / coworkers opened) | 0/2 / 1 of 2 (then answered with Python) | 2/2 / 1 of 2 (the other computed alone) | 2/2 / 2 of 2 |
+| seconds per answer (median, range) | current 8-11 (7-29), plain 4, research 4-15 | current 9-11 (8-20), plain 4, research 20-21 | current 57-68 (45-107), plain 14, research 96-108 (to 166) |
+| seconds per swarm | 65-87 | 46-80 | 218-244 |
+| on MAIN | 4.6 GB, all layers on the GPU | 5.4 GB, all layers on the GPU | 19 GB, 10 layers on the GPU (7.9 of 12 GB VRAM in use), rest in RAM |
+
+VR9d on 557e32f, same questions, Dolphin: 1/5 and 3/5.
+
+**Recommendation (the owner decides; the default model is unchanged):**
+
+- **Web questions:** Qwen 3.6 35B-A3B is the one that answers like a frontier model here: 10/10
+  current, complete answers, real research summaries. Its price is about a minute per current
+  question and two minutes per research question. For quick questions Ornith 1.5 9B is the better
+  small model: about 10 s, 8/10, and research summaries Dolphin does not produce. Dolphin after
+  FX44 reaches the brief's ≥4/5 on current questions in 2/2 runs (5/5, 4/5), but it still reads
+  review pages as spec sheets; keep it for what it was chosen for, the uncensored conversations.
+- **Swarms:** Qwen 3.6 35B-A3B (2/2, both coworkers opened, read, computed and reported each time),
+  then Ornith (right numbers 2/2, but it opened coworkers only once). Dolphin 0/2.
+- **"Like any other model" on this machine:** reachable for current facts, research and small
+  swarms with Qwen 3.6 35B-A3B, at a speed a frontier model does not ask of the owner. Not with an
+  8B model: what Dolphin still misses is picking the right figure from a right page and summarising
+  opinions, and Conductor cannot choose the sentence for it. Two runs per model on one question
+  set and one day is a small sample; the overnight lane should repeat A, R and T ×3 per model.
