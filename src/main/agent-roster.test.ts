@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest'
 import { ConductorDatabase } from './database'
 import { OrchestrationStore } from './orchestration-store'
 import { startRosterAgent } from './agent-roster'
+import { parseLogicLoop } from './logic-loops'
 import { ROSTER_ROLES, rosterRole, rosterStartPrompt } from '../shared/agent-roster'
 
 const withProject = (briefs: string[], run: (store: OrchestrationStore, projectId: string) => void | Promise<void>) => async (): Promise<void> => {
@@ -23,6 +24,11 @@ const withProject = (briefs: string[], run: (store: OrchestrationStore, projectI
 }
 
 const everyBrief = [...new Set(ROSTER_ROLES.flatMap(role => role.briefs))]
+const loop = (id: string) => parseLogicLoop(readFileSync(join(resolve(__dirname, '..', '..'), '.conductor', 'loops', `${id}.md`), 'utf8'), `${id}.md`)
+const primary = (model: string) => {
+  const [provider, name] = model.split(':')
+  return { provider, model: name }
+}
 
 describe('the Agent roster lists the roles Conductor actually runs', () => {
   it('covers every role the owner named, each with model, permission, brief and when to use it', () => {
@@ -46,7 +52,7 @@ describe('the Agent roster lists the roles Conductor actually runs', () => {
     expect([...loopRoles]).toEqual(expect.arrayContaining(['architect', 'reviewer']))
     for (const loopRole of loopRoles) expect(rosterRole(playedBy[loopRole] ?? loopRole), loopRole).toBeDefined()
     expect(rosterRole('architect')).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
-    expect(rosterRole('code-reviewer')).toMatchObject({ provider: 'claude', model: 'opus[1m]', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
+    expect(rosterRole('code-reviewer')).toMatchObject({ provider: 'codex', model: 'gpt-6-astra', effort: 'high', briefs: ['.conductor/loops/batch-delivery.md'] })
     expect(rosterRole('code-reviewer')!.instructions).toMatch(/diff/)
   })
 
@@ -55,11 +61,29 @@ describe('the Agent roster lists the roles Conductor actually runs', () => {
     expect(ROSTER_ROLES.filter(role => role.permission === 'default')).toEqual([])
   })
 
-  it('dispatches the Verifier runner at the effort the verifier brief names', () => {
-    const brief = readFileSync(join(resolve(__dirname, '..', '..'), 'docs', 'verification', 'verifier-brief.md'), 'utf8')
-    const effort = /title:'\{ROUND\} runner', model:'(\w+)', effort:'(\w+)'/.exec(brief)
-    expect(effort, 'runner dispatch line in verifier-brief.md').toBeTruthy()
-    expect(rosterRole('verifier-runner')).toMatchObject({ model: effort![1], effort: effort![2] })
+  it('keeps loop-linked defaults, Auto mode and verifier scope aligned with the current loop steps', () => {
+    const batch = loop('batch-delivery')
+    const verify = loop('verify')
+    const step = (steps: typeof batch.steps, id: string) => {
+      const found = steps.find(item => item.id === id)
+      expect(found, id).toBeDefined()
+      expect(found!.model, id).toBeTruthy()
+      return found!
+    }
+    for (const [role, expected] of [
+      ['swarm-orchestrator', step(batch.steps, 'contract')],
+      ['swarm-fixer', step(batch.steps, 'implement')],
+      ['code-reviewer', step(batch.steps, 'review')],
+      ['verifier', step(verify.steps, 'plan')],
+      ['verifier', step(verify.steps, 'judge')],
+      ['verifier-runner', step(batch.steps, 'churn')]
+    ] as const) {
+      expect(rosterRole(role), role).toMatchObject({ ...primary(expected.model!), effort: expected.effort, permission: 'auto' })
+    }
+    expect(step(verify.steps, 'execute')).toMatchObject({ model: 'codex:gpt-6-sol', effort: 'medium' })
+    expect(rosterRole('verifier')!.instructions).toMatch(/distinct Sol tab/)
+    expect(rosterRole('verifier-runner')!.instructions).toMatch(/committed smokes unchanged/)
+    expect(rosterRole('verifier-runner')!.instructions).toMatch(/Never write harness code and never give verdicts/)
   })
 
   it('points at briefs that exist in this repository', () => {
@@ -88,8 +112,8 @@ describe('the Agent roster lists the roles Conductor actually runs', () => {
 
   it('keeps the owner\'s model choice for a seeded role', withProject(everyBrief, (store, projectId) => {
     const fixer = store.snapshot(projectId).agents.find(agent => agent.role === 'swarm-fixer')!
-    store.saveAgent({ ...fixer, model: 'sonnet' })
-    expect(store.snapshot(projectId).agents.find(agent => agent.role === 'swarm-fixer')!.model).toBe('sonnet')
+    store.saveAgent({ ...fixer, provider: 'claude', model: 'sonnet' })
+    expect(store.snapshot(projectId).agents.find(agent => agent.role === 'swarm-fixer')).toMatchObject({ provider: 'claude', model: 'sonnet' })
   }))
 })
 
@@ -111,12 +135,21 @@ describe('starting a roster entry', () => {
     const fixer = store.snapshot(projectId).agents.find(agent => agent.role === 'swarm-fixer')!
     const { calls, deps } = rig(store)
     const result = await startRosterAgent(deps, { agentId: fixer.id, goal: 'Fix the energy price editor' })
-    expect(calls[0]).toEqual({ method: 'tabs.open', args: { kind: 'agent', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto', exactPermission: true, title: 'Fixer', focus: true } })
+    expect(calls[0]).toEqual({ method: 'tabs.open', args: { kind: 'agent', provider: 'codex', model: 'gpt-6-sol', effort: 'medium', permission: 'auto', exactPermission: true, title: 'Fixer', focus: true } })
     expect(calls[1]!.method).toBe('agents.submit')
     expect(calls[1]!.args.agentSessionId).toBe('agent_1')
     expect(calls[1]!.args.prompt).toBe(rosterStartPrompt(rosterRole('swarm-fixer')!.instructions, 'Fix the energy price editor'))
     expect(String(calls[1]!.args.prompt)).toContain('docs/swarm/worker-rules.md')
-    expect(result).toMatchObject({ tabId: 'tab_1', agentSessionId: 'agent_1', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto' })
+    expect(result).toMatchObject({ tabId: 'tab_1', agentSessionId: 'agent_1', provider: 'codex', model: 'gpt-6-sol', effort: 'medium', permission: 'auto' })
+  }))
+
+  it('starts the committed-command Verifier runner on Sol low in Auto mode', withProject(everyBrief, async (store, projectId) => {
+    const runner = store.snapshot(projectId).agents.find(agent => agent.role === 'verifier-runner')!
+    const { calls, deps } = rig(store)
+    const result = await startRosterAgent(deps, { agentId: runner.id, goal: 'Rerun the named committed smoke' })
+    expect(calls[0]).toEqual({ method: 'tabs.open', args: { kind: 'agent', provider: 'codex', model: 'gpt-6-sol', effort: 'low', permission: 'auto', exactPermission: true, title: 'Verifier runner', focus: true } })
+    expect(String(calls[1]!.args.prompt)).toContain('Never write harness code and never give verdicts')
+    expect(result).toMatchObject({ provider: 'codex', model: 'gpt-6-sol', effort: 'low', permission: 'auto' })
   }))
 
   it('starts the Approval reviewer read only, which tabs.open runs as plan mode on Claude', withProject(everyBrief, async (store, projectId) => {
@@ -141,11 +174,12 @@ describe('starting a roster entry', () => {
     expect(calls[0]!.args).toMatchObject({ provider: 'local', model: 'local/qwen3.5-9b', permission: 'accept-edits', exactPermission: true })
     expect(calls[0]!.args.effort).toBeUndefined()
     const verifier = agents.find(agent => agent.role === 'verifier')!
-    store.saveAgent({ ...verifier, model: 'haiku' })
+    store.saveAgent({ ...verifier, provider: 'claude', model: 'haiku' })
     calls.length = 0
     await startRosterAgent(deps, { agentId: verifier.id })
-    expect(calls[0]!.args).toMatchObject({ provider: 'claude', model: 'haiku', permission: 'auto' })
+    expect(calls[0]!.args).toMatchObject({ provider: 'claude', model: 'haiku' })
     expect(calls[0]!.args.effort).toBeUndefined()
+    expect(calls[0]!.args.permission).toBeUndefined()
   }))
 
   it('starts the cloud coworker as a cloud session from its goal and refuses one without', withProject(everyBrief, async (store, projectId) => {

@@ -39,28 +39,28 @@ const role = (entry: Omit<RosterRole, 'instructions'> & { job: string }): Roster
 
 export const ROSTER_ROLES: ReadonlyArray<RosterRole> = [
   role({
-    name: 'Swarm orchestrator', role: 'swarm-orchestrator', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto',
+    name: 'Swarm orchestrator', role: 'swarm-orchestrator', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
     briefs: ['docs/swarm/orchestrator.md', 'docs/swarm/worker-rules.md'],
     whenToUse: 'A batch of owner items: plan it, partition files, dispatch up to four fixers, verify, ship each locally and publish once. Turn the wand on in its composer to make it the wizard controller (owner authority, approvals, restarts).',
-    job: 'You coordinate; fixers implement. Keep core wiring, verification and delivery in this tab.'
+    job: 'You coordinate the batch, dispatch Sol implementers and an independent Astra verifier, and keep delivery in this controller tab.'
   }),
   role({
-    name: 'Fixer', role: 'swarm-fixer', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto',
+    name: 'Fixer', role: 'swarm-fixer', provider: 'codex', model: 'gpt-6-sol', effort: 'medium', permission: 'auto',
     briefs: ['docs/swarm/worker-rules.md'],
     whenToUse: 'One bounded item group with the files it owns, usually dispatched by the orchestrator with the worker rules appended to its brief.',
     job: 'Own only the files your brief names, test first, prove the scenario in a parked run and deliver with git.ship.'
   }),
   role({
-    name: 'Verifier', role: 'verifier', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto',
+    name: 'Verifier', role: 'verifier', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
     briefs: ['docs/verification/verifier-brief.md', '.conductor/loops/verify.md'],
-    whenToUse: 'After a batch is delivered: one tab plans, runs and judges adversarial scenarios against the owner\'s own words (verify loop v3).',
-    job: 'Plan, write, run and judge in this one tab; every verdict carries its evidence path.'
+    whenToUse: 'After a batch is delivered: independently plan and judge adversarial scenarios against the owner\'s own words (verify loop v6); a distinct Sol executor runs them.',
+    job: 'Plan and judge independently of the implementer and executor. Dispatch bounded execution to a distinct Sol tab; every verdict carries its evidence path.'
   }),
   role({
-    name: 'Verifier runner', role: 'verifier-runner', provider: 'claude', model: 'sonnet', effort: 'low', permission: 'auto',
+    name: 'Verifier runner', role: 'verifier-runner', provider: 'codex', model: 'gpt-6-sol', effort: 'low', permission: 'auto',
     briefs: ['.conductor/loops/verify.md'],
-    whenToUse: 'The verify loop\'s cheap fallback: re-run committed smokes unchanged and collect their logs when the verifier asks.',
-    job: 'Re-run the named smokes unchanged through scripts/smoke-lock.mjs and collect their logs. Never write harness code and never give verdicts.'
+    whenToUse: 'Bounded command churn: re-run committed smokes unchanged and collect their logs when the verifier asks; scenario execution uses a distinct Sol medium tab.',
+    job: 'Re-run the named committed smokes unchanged through scripts/smoke-lock.mjs and collect their logs. Never write harness code and never give verdicts.'
   }),
   role({
     name: 'Architect', role: 'architect', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
@@ -69,9 +69,9 @@ export const ROSTER_ROLES: ReadonlyArray<RosterRole> = [
     job: 'Write the contract only: failing tests, acceptance commands and allowedPaths, pointing at code by file:line. Do not implement.'
   }),
   role({
-    name: 'Code reviewer', role: 'code-reviewer', provider: 'claude', model: 'opus[1m]', effort: 'high', permission: 'auto',
+    name: 'Code reviewer', role: 'code-reviewer', provider: 'codex', model: 'gpt-6-astra', effort: 'high', permission: 'auto',
     briefs: ['.conductor/loops/batch-delivery.md'],
-    whenToUse: 'The locked review step of batch delivery: a fresh tab, never the implementer, reads the batch\'s git diff once within allowedPaths. Alternate: Codex gpt-6-astra, the brain that did not write the contract.',
+    whenToUse: 'The locked review step of batch delivery: a fresh Astra tab, never the implementer, reads the batch\'s git diff once within allowedPaths. Alternate: Claude opus[1m] when quota permits.',
     job: 'Read the git diff limited to allowedPaths once and answer approve or a specific list of changes. Change nothing yourself.'
   }),
   role({
