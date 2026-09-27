@@ -1,6 +1,6 @@
 # Consolidated overnight execution manifest (prepared 2026-09-27)
 
-**Status: READY, NOT RUN.** This is a handoff, not authorization to start a run. The source queue is `.conductor-scratch/verify-overnight/vr9c.md`; `docs/verification/2026-09-27-durable-fault-harness.md` (01df09c) supersedes its machine-wide kill description. The exact executable queue is below; `.conductor-scratch/verify-overnight/vr10.md` is an ignored working copy. No schedules or background processes were created for this task.
+**Status: READY, NOT RUN; controller wake ARMED.** This manifest does not bypass runtime admission. The source queue is `.conductor-scratch/verify-overnight/vr9c.md`; `docs/verification/2026-09-27-durable-fault-harness.md` (01df09c) supersedes its machine-wide kill description. The exact executable queue is below; `.conductor-scratch/verify-overnight/vr10.md` is an ignored working copy. On Sep27 13:50Z the controller armed one reviewed hidden wake helper for Sep28 00:00 Budapest, deadline 00:30. Its running PID/state and candidate build are recorded in `2026-09-27-controller-wake.md`; this is not a scheduled smoke, a six-hour supervisor, or evidence of a successful midnight wake. No test has started; both Qwen-capable built-in schedules remain enabled until the exclusive phase admits.
 
 ## Admission and ownership
 
@@ -71,7 +71,7 @@ Pass: ≥2 iterations, ≥1 completion, `totalRollovers >=2`, elapsed ≥5 h 45 
 
 ## Scheduling gap
 
-Conductor's built-in `night` schedule runs 01:00–06:00 (`docs/schedules.md`), and script timeout is capped at 1,200 seconds (`src/shared/schedules.ts`). It cannot host the 6-hour soak, which needs a 00:00 start and continuous supervision. The controller must arrange a supervising overnight caller with an explicit full-window slot. This manifest does not create a schedule or imply that a 20-minute script task can continue for six hours.
+Conductor's built-in `night` schedule runs 01:00–06:00 (`docs/schedules.md`), and script timeout is capped at 1,200 seconds (`src/shared/schedules.ts`). It cannot host the 6-hour soak, which needs a 00:00 start and continuous supervision. The one-shot wake in `2026-09-27-controller-wake.md` resumes a controller for first-night admission only. A supervising caller and explicit full-window slot are still required for the separate soak night; no later-night wake has been armed. This manifest does not imply that a 20-minute script task can continue for six hours.
 
 ## Source contracts
 
