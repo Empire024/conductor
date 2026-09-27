@@ -377,8 +377,8 @@ export class LocalAdapter implements ProviderAdapter {
     this.emit({ turnId, data: { type: 'session', phase: 'running' } })
     const controller = new AbortController()
     this.controller = controller
-    // Each tool round gets its own text and reasoning items so thinking, answer text and tool
-    // calls stay in the order they happened instead of collapsing into one block.
+    // Each completion gets its own items, including retries without a tool call. A discarded
+    // draft can then be withdrawn without erasing a previous valid reply in this turn.
     const textItem = (): string => `${turn.items}:text:${turn.round}`
     const reasoningItem = (): string => `${turn.items}:reasoning:${turn.round}`
     let releaseTurn = (): void => {}
@@ -393,6 +393,8 @@ export class LocalAdapter implements ProviderAdapter {
       controller.signal.throwIfAborted()
       const session = this.ensureSession(model)
       const events: LocalAgentEvents = {
+        completionStart: () => { turn.round++ },
+        textWithdraw: () => this.emit({ turnId, itemId: textItem(), data: { type: 'text', role: 'assistant', text: '', mode: 'snapshot' } }),
         text: delta => this.emit({ turnId, itemId: textItem(), data: { type: 'text', role: 'assistant', text: delta, mode: 'delta' } }),
         // Provider-emitted reasoning is presented as a status item
         // in the timeline, never raw protocol dumped into the answer.
@@ -405,7 +407,6 @@ export class LocalAdapter implements ProviderAdapter {
         },
         toolEnd: call => {
           this.emit({ turnId, itemId: call.id, data: { type: 'tool', name: call.name, status: call.failed ? 'failed' : 'completed', output: call.output, outputMode: 'snapshot', durationMs: call.durationMs } })
-          turn.round++
         },
         // The context figures give the composer ring and "Model context window" the same data the
         // CLIs report: the window, and the room left once this round's answer reserve is held

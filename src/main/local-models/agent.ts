@@ -48,6 +48,10 @@ export type LocalTelemetryEntry =
   | { kind: 'stop'; report: LocalStopReport }
 
 export interface LocalAgentEvents {
+  /** A completion owns its streamed text, including retries without a tool call. */
+  completionStart?(): void
+  /** Withdraw only the current completion's provisional answer. */
+  textWithdraw?(): void
   text?(delta: string): void
   reasoning?(delta: string): void
   toolStart?(call: { id: string; name: string; input: string }): void
@@ -882,6 +886,7 @@ export class LocalAgentSession {
       // capped; visible text stops where the model starts imitating a Conductor note.
       const status = cappedStatus(delta => events.reasoning?.(delta))
       const visible = conductorNoteGuard(delta => events.text?.(delta))
+      events.completionStart?.()
       try {
         const result = await chatCompletion({
           ...(this.options.anonymous ? { anonymous: true } : {}),
@@ -1290,7 +1295,7 @@ export class LocalAgentSession {
       }
       let calls: ToolCall[] = completion.toolCalls
       let truncated = completion.finishReason === 'length'
-      const ruminated = completion.finishReason === 'rumination'
+      let ruminated = completion.finishReason === 'rumination'
 
       // A call whose arguments are not a JSON object, in a reply that was not cut off, is the
       // server's lazy tool parser giving up part-way (Dolphin X1, a Llama 3.1 fine-tune, writes
@@ -1319,10 +1324,14 @@ export class LocalAgentSession {
         if (repaired) account(repaired)
         const valid = Boolean(repaired?.toolCalls.length) && repaired!.toolCalls.every(call => argumentsAreObject(call.arguments))
         events.telemetry?.({ kind: 'repair', round: ledger.round, name: names, outcome: valid ? 'repaired' : 'failed' })
-        if (valid) { completion = repaired!; calls = completion.toolCalls; truncated = false }
+        if (valid) { completion = repaired!; calls = completion.toolCalls; truncated = false; ruminated = false }
+        else if (repaired?.finishReason === 'rumination') { completion = repaired; calls = completion.toolCalls; ruminated = true }
       }
 
       if (ruminated && !calls.length) {
+        // Streaming is provisional: remove this request's draft from the timeline before
+        // recovering (or stopping), while earlier completed requests keep their own items.
+        events.textWithdraw?.()
         // The monologue itself is never stored: it is exactly what would fill the next window.
         ledger.ruminations++
         const conclusion = completion.content.trim().slice(-300)
