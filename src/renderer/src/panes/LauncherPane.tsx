@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useId, useState } from 'react'
 import { ProviderIcon } from '../components/ProviderIcon'
 import {
   Bot,
@@ -111,6 +111,8 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
   const [cloudForm, setCloudForm] = useState(false)
   /** Local models open in anonymous mode (src/main/local-models/anonymous.ts) while this is on. */
   const [anonymous, setAnonymous] = useState(false)
+  const anonymousDescriptionId = useId()
+  const anonymousDescription = 'The local model you open next keeps its conversation in memory only. Nothing of it is written to history, memory, logs or the phone; closing its tab deletes it for good and it is not restored after a restart. Files it writes stay.'
   const host = requiredMachineId(project)
   const selected = host ?? machineId ?? LOCAL_MACHINE_ID
 
@@ -210,13 +212,15 @@ export function LauncherPane({ projectId, project, machineId, error, onSelectMac
         </div>
       )}
       {selected === LOCAL_MACHINE_ID && (
-        <label className={`launcher-anonymous${anonymous ? ' active' : ''}`}>
-          <input type="checkbox" checked={anonymous} onChange={event => setAnonymous(event.target.checked)} />
-          <EyeOff size={13} />
-          <span><strong>Anonymous local model</strong><small>{anonymous
-            ? 'On: the local model you open next keeps its conversation in memory only. Nothing of it is written to history, memory, logs or the phone; closing its tab deletes it for good and it is not restored after a restart. Files it writes stay.'
-            : 'Open a local model whose conversation is never stored and is gone for good when its tab closes.'}</small></span>
-        </label>
+        <div className={`launcher-anonymous${anonymous ? ' active' : ''}`}>
+          <label title={anonymousDescription}>
+            <input type="checkbox" checked={anonymous} aria-describedby={anonymousDescriptionId} onChange={event => setAnonymous(event.target.checked)} />
+            <EyeOff size={13} aria-hidden="true" />
+            <span>Anonymous local model</span>
+          </label>
+          <small aria-hidden="true">Not saved · files stay</small>
+          <span id={anonymousDescriptionId} className="launcher-anonymous-description">{anonymousDescription}</span>
+        </div>
       )}
       <div className="launcher-grid" aria-label="Open runtime">
         {choices.map(({ kind, provider, model, icon: Icon, title, detail, tone, key }) => {
