@@ -18,7 +18,25 @@ import { assertLocalControlAllowed, LOCAL_CONTROL_METHODS, toolSpecs } from './t
 
 /** local-model-swarms through the real AgentControl: what a local tab may open, steer and read. */
 const dispose: Array<() => void> = []
-afterEach(() => { for (const close of dispose.splice(0).reverse()) close(); vi.unstubAllEnvs(); anonymousConversations.clearForTests() })
+// AgentControl starts a real polling watcher for each local coworker. Keep its real behavior,
+// but own the returned stop function in this fixture so it ends before the stores close.
+vi.mock('./swarm', async importOriginal => {
+  const real = await importOriginal<typeof import('./swarm')>()
+  return { ...real, watchLocalCoworker: (...args: Parameters<typeof real.watchLocalCoworker>) => {
+    const stop = real.watchLocalCoworker(...args)
+    dispose.push(stop)
+    return stop
+  } }
+})
+const closeFixtures = () => {
+  const errors: unknown[] = []
+  for (const close of dispose.splice(0).reverse()) try { close() } catch (error) { errors.push(error) }
+  if (errors.length) throw new AggregateError(errors, 'Swarm fixture cleanup failed')
+}
+afterEach(() => {
+  try { closeFixtures() }
+  finally { vi.useRealTimers(); vi.unstubAllEnvs(); anonymousConversations.clearForTests() }
+})
 
 function fixture() {
   vi.stubEnv('CONDUCTOR_LIVE_TESTS', '0'); vi.stubEnv('CONDUCTOR_OFFLINE_TESTS', '0')
@@ -85,6 +103,20 @@ describe('local swarms through app control', () => {
     await vi.waitFor(() => expect(f.database.structured.snapshot('local-lead')!.items.some(item => item.data.type === 'text' && item.data.role === 'user' && item.data.origin?.agentSessionId === id && /Automatic report: Tests for add/.test(item.data.text))).toBe(true), { timeout: 10_000 })
     await expect(f.control.call(local, 'tabs.open', { research: true })).rejects.toThrow(/deep-research grant/)
     await expect(f.control.call(local, 'tabs.open', { provider: 'codex' })).rejects.toThrow(/only local coworkers/)
+  })
+
+  it('stops its real coworker watcher before closing the fixture database', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    const f = fixture()
+    const local = f.ownersLocalTab('local-lead')
+    await f.control.call(local, 'tabs.open', { title: 'watched coworker' })
+    const getSetting = vi.spyOn(f.database, 'getSetting')
+    vi.advanceTimersByTime(3000)
+    expect(getSetting).toHaveBeenCalled() // the watcher really ran
+    closeFixtures() // stops watcher before sessions/stores/database
+    getSetting.mockClear()
+    vi.advanceTimersByTime(6000)
+    expect(getSetting).not.toHaveBeenCalled()
   })
 
   it('bounds the swarm to three coworkers, one level deep', async () => {
