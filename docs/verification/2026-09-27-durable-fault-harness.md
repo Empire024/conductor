@@ -1,0 +1,5 @@
+# Durable fault harness repair (2026-09-27)
+
+`scripts/smoke-durable-jobs.mjs --kill-server` now asks the parked app's control endpoint for `local.servers`, requires exactly one entry for the configured model with `startedByConductor: true` and a positive PID, and checks that PID's Windows parent is the parked Electron main process. It calls `local.stop({pid,force:true})` only after those checks. It records `llama-server killed` only after the stop response confirms the same PID and model, reports process termination, and the PID disappears from `local.servers`. Missing, ambiguous, unowned, or installed-app processes fail closed.
+
+Focused verification: `node --check scripts/smoke-durable-jobs.mjs`; `node --test scripts/lib/stop-durable-smoke-server.test.mjs`. The tests mock app control and process parentage; no real server or Electron is started. The inherited real-model fault run and long soak remain **NOT RUN** for the overnight lane. The older `.conductor-scratch/verify-overnight/vr9c.md` command remains the queued run; its `taskkill /IM` description is superseded by this repair.

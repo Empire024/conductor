@@ -1,30 +1,31 @@
 ---
 id: verify
-version: 3
+version: 6
 title: Verify a delivered item against what the owner actually asked for, adversarially
 trigger: [after:batch-delivery, manual]
 inputs: [taskIds, commits]
 steps:
   - id: plan
     role: verifier
-    model: claude:opus[1m]           # one Opus tab does plan, execute and judge (v3); no Fable (owner 2026-09-24)
-    alternate: codex:gpt-6-astra
+    model: codex:gpt-6-astra
+    alternate: claude:opus[1m]
     effort: high
     output: triaged plan - day lane ≤12 scenarios (≤3 per item, owner's words first, each ≤5 min) with pass rule and control case; overnight queue; owner-gated list asked once before running
   - id: execute
     role: verifier
-    model: claude:opus[1m]           # the same tab: writes scenarios on scripts/verify-kit.mjs and runs them (owner 2026-09-25: Opus implements)
-    fallback: claude:sonnet          # runner only: re-runs committed smokes unchanged and collects logs; never writes harness, never gives verdicts
+    model: codex:gpt-6-sol
+    alternate: claude:opus[1m]
     effort: medium
     output: per-scenario PASS / FAIL / NOT RUN (reason) with evidence path, numbers, reproductions n/n and the control run
   - id: judge
     role: verifier
-    model: claude:opus[1m]
+    model: codex:gpt-6-astra
+    alternate: claude:opus[1m]
     effort: high
     output: per item VERIFIED / REOPEN (failing scenario, evidence, control) / UNVERIFIED (must-have scenario NOT RUN, and what unblocks it)
   - id: overnight
     role: verifier
-    action: overnight lane - queued long, real-model, soak and perf runs execute 00:00-06:00 on a quiet machine; a fresh Opus tab judges them in the morning
+    action: overnight lane - queued long, real-model, soak and perf runs execute 00:00-06:00 on a quiet machine; a fresh Astra tab judges them in the morning
     optional: true
 locked: [steps.plan, steps.judge]
 ---
@@ -52,7 +53,7 @@ verify smoke imports it and adds only scenario logic, about 30–80 lines each. 
 - `loadCheck()`: smoke-lock holder, CPU %, GPU %, llama-server busy, mid-turn tabs.
 - `record(id, verdict, numbers, evidence)`: appends a line to results.md at once.
 
-## 1. Plan (Opus, same tab)
+## 1. Plan (independent Astra verifier)
 
 1. Read the owner's item text and linked images, then the commits and the fixer's own smoke if there is one.
 2. **Triage every candidate scenario into one lane:**
@@ -69,7 +70,7 @@ verify smoke imports it and adds only scenario logic, about 30–80 lines each. 
 4. For each scenario, write the pass rule, the evidence to collect, and its **control**: a known-good neighbour it must
    pass, or the pre-fix commit it must fail on.
 
-## 2. Execute (same tab)
+## 2. Execute (Sol worker with bounded scenario contract)
 
 - One smoke queued per tab, and at most **two verifier rounds on the machine at once**. There is one serial smoke
   lock; `node scripts/smoke-lock.mjs --timeout-min <≤20 by day> -- node scripts/smoke-verify-<round>-<group>.mjs`.
@@ -101,7 +102,7 @@ A FAIL becomes a REOPEN only when all of these hold:
 4. **Perf numbers** only count with a quiet-machine record: no lock holder, CPU below 30 %, GPU below 40 %, no
    mid-turn tab, the same thresholds as `schedule-gate.ts`. Otherwise they are NOT RUN (load) and move overnight.
 
-## 4. Judge (same tab)
+## 4. Judge (the independent Astra verifier)
 
 - **VERIFIED**: every must-have scenario passed with evidence.
 - **REOPEN**: a guarded failure. Put the item back to `[ ]` with "Verifier YYYY-MM-DD: <scenario> failed —
@@ -118,12 +119,36 @@ A FAIL becomes a REOPEN only when all of these hold:
 - The controller or overseer starts the queue after 00:00, when the owner is idle and the machine is quiet. Runs go
   one at a time under `smoke-lock --timeout-min <run length + 10>`, the queue ends by 06:00, and a `loadCheck()` is
   recorded before each run.
-- A fresh Opus tab judges the results in the morning under the same guard.
+- A fresh Astra tab judges the results in the morning under the same guard.
 - Re-verify rounds (RV) re-run the exact failing scenario and add at most 2 new ones per item, by day. Anything
   long goes to the next night.
 
-Budget: one Opus tab per round, and a runner only when committed smokes need re-running unchanged. The caps are those
+Budget: one Astra plan/judge per round and one Sol worker for implementation and execution. Luna is never an automatic execute-step fallback. The controller may explicitly give it only exact committed commands with no write scope; it does not design scenarios or judge. The caps are those
 of `batch-delivery`.
+
+
+## Bounded continuation and token use (2026-09-27)
+
+Read docs/verification/2026-09-27-loop-retro.md for measured takeover evidence.
+The owner requested continuing the same loop with Codex after Claude's weekly limit.
+Astra handles contracts and independent judgment; Sol handles implementation and churn.
+Retain Opus as an alternate only when its quota permits.
+Keep implementation and independent verification in different conversations.
+Before dispatch refresh models.list and usage.limits; never infer general Claude
+capacity from the Fable bucket. Do not retry a capped provider in fresh tabs.
+
+Use agents.status with its cursor for routine supervision. Read a filtered snapshot
+only for a transition, recovery or missing evidence; omit configuration notices and
+full tool outputs until needed. Filter task updates to revision and affected IDs.
+Use run_and_summarize for long tests/builds and local_ask for bounded large reads
+when the existing server is available; never switch the GPU model just for a summary.
+Assign one Electron/build slot at a time; waiting workers can read and edit.
+Reuse committed smokes and passing evidence on unchanged relevant paths. Full
+suite/build is git.ship's job; additional focused runs need a change or failure.
+Briefs should fit 1,200 tokens with references; results need commit, verdict,
+evidence and NOT RUN. Record loops.run/loops.record with actual timing and measured
+tokens where available; no fabricated counters or claimed savings from estimates.
+All existing acceptance, independent-review, budget, ship and overnight gates remain.
 
 ## Run log
 - 2026-09-24 v2 (owner): plan and judge move from Fable to Opus 5.5, because Fable is too expensive. V2/V3 were switched mid-run.
@@ -135,3 +160,7 @@ of `batch-delivery`.
   Also: a day lane of ≤12 scenarios (224 were planned, ≈36 % never got a result), an overnight lane (the soak was
   cut, perf ran under load), the shared verify-kit (70 scripts, 10k lines of copies), a false-positive guard, and
   UNVERIFIED for a NOT RUN must-have.
+
+- 2026-09-27 v4 (loops.apply loopproposal_muju1qty_7hb71su): 2026-09-27 takeover: Claude general weekly 100%, Codex 0%; controller quota-failed before first action; FX45 ten reads/no edits. Snapshot payloads 45149/119806 chars versus text 6350/4047. Local assist only 14 calls/week, estimated 23956 tokens saved. Owner requests same loop improved for token savings, then explicitly cheaper workforce for churn. Sol labor, Astra judgment. docs/verification/2026-09-27-loop-retro.md; new savings unmeasured.
+- 2026-09-27 v5 (loops.apply loopproposal_muju44rc_3tu8liz): Align prose and exact model/effort with owner correction: Sol medium implementation, Sol low churn, Astra independent judgment. Preserve Unicode via UTF-8 request bytes. No acceptance gates removed. See 2026-09-27-loop-retro.md.
+- 2026-09-27 v6 (loops.apply loopproposal_mujuhku2_9y8xnk7): Independent Sol read-only review found three route inconsistencies: stale Sonnet fallback, Luna automatically eligible for full execute, and duplicate full-suite churn wording. Remove automatic fallbacks and scope churn to contract-focused checks; full suite/build belongs to ship. Gates unchanged.

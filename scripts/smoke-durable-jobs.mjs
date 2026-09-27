@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import assert from 'node:assert/strict'
+import { stopDurableSmokeServer } from './lib/stop-durable-smoke-server.mjs'
 
 // End-to-end check of durable local-model jobs in the built app (docs/durable-jobs.md). The app
 // runs parked off-screen under CONDUCTOR_TEST_USER_DATA, is driven as the owner through
@@ -17,7 +18,7 @@ import assert from 'node:assert/strict'
 //        stub on loopback, handed to the app as CONDUCTOR_DURABLE_JOBS_MODEL_ENDPOINT. The job
 //        controller must honor that variable in an unpackaged build; if it does not, the run says so.
 //   --real-model[=local/qwen3.6-35b-a3b]                 the real llama-server Conductor manages.
-//   --kill-server   (real model) kill llama-server mid-stage; expect a server event and recovery.
+//   --kill-server   (real model) stop this parked app's llama-server mid-stage; expect recovery.
 //   --restart-app   close the app mid-job and relaunch on the same profile; expect reconciliation.
 //   --keep          leave the temp profile and project for inspection.
 //   --fixture=crossref  six large modules to summarise and cross-reference over four stages, so the
@@ -439,8 +440,14 @@ try {
   // --- Optional: kill the model server mid-stage (real model only) ----------------------------
   if (flag('kill-server')) {
     await waitFor(job.id, s => s.status === 'running' && Boolean(s.currentStage), 'stage running before kill', STAGE_TIMEOUT)
-    try { execFileSync('taskkill', ['/IM', 'llama-server.exe', '/F'], { stdio: 'pipe' }) } catch (error) { observe('taskkill failed', { message: String(error.message).slice(0, 200) }) }
-    observe('llama-server killed')
+    const stopped = await stopDurableSmokeServer({
+      call, model, appPid: app.process().pid,
+      parentPidOf: pid => {
+        const result = execFileSync('powershell', ['-NoProfile', '-Command', `(Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}").ParentProcessId`], { encoding: 'utf8' }).trim()
+        return /^\d+$/.test(result) ? Number(result) : null
+      }
+    })
+    observe('llama-server killed', stopped)
     await waitFor(job.id, s => s.counters.recoveries > afterReload.counters.recoveries || s.lastEvent?.kind === 'server', 'server loss noticed', 5 * 60_000)
     await waitFor(job.id, s => s.status === 'running' || s.status === 'completed', 'job running again after server restart', STAGE_TIMEOUT)
   }
