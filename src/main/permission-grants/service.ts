@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, type AutoModeDenial, type DenialGrantRequest } from '../../shared/auto-mode-denial'
+import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, isClassifierOutage, type AutoModeDenial, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import {
   describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary, wizardMayDecide,
   type GrantDecision, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState
@@ -78,6 +78,8 @@ const DECIDED: Record<Exclude<GrantDecision, 'deny'>, GrantStatus> = { 'approve-
 const SAVED_SETTLED = 200
 const SAVED_MOVED = 200
 const LIVE_STATUSES = new Set<GrantStatus>(['pending', 'approved-once', 'approved-session'])
+/** A denial card whose only "reason" is that the server-side classifier gave no verdict. */
+const outageCard = (request: Pick<PermissionGrantRequest, 'source' | 'category'>): boolean => request.source === 'denial' && isClassifierOutage(request.category)
 
 export class PermissionGrants {
   private readonly requests = new Map<string, Map<string, PermissionGrantRequest>>()
@@ -153,6 +155,8 @@ export class PermissionGrants {
       if (!entry || !text(entry.id) || !text(entry.agentSessionId) || !LIVE_STATUSES.has(entry.status)) continue
       const { agentSessionId, ...request } = entry
       if (!exists(agentSessionId)) { dropped++; continue }
+      // A classifier outage an older build saved as a card was never a question: withdrawn, not asked again.
+      if (request.status === 'pending' && outageCard(request)) { this.settledAs(agentSessionId, request.id, 'expired'); dropped++; continue }
       const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
       if (open.has(request.id)) continue
       this.requests.set(agentSessionId, open.set(request.id, request))
@@ -221,6 +225,7 @@ export class PermissionGrants {
    * request: its card becomes another view of that one (aliases), so one answer settles both.
    */
   denied(agentSessionId: string, itemId: string, described: DenialGrantRequest): void {
+    if (isClassifierOutage(described.category)) return
     const known = this.requests.get(agentSessionId)?.get(itemId)
     if (known) {
       if (known.status !== 'pending') this.card(agentSessionId, known)
@@ -239,7 +244,7 @@ export class PermissionGrants {
     const aliased = this.aliases.get(agentSessionId)?.get(itemId)
     const sameCall = (entry: PermissionGrantRequest | undefined): entry is PermissionGrantRequest => entry?.tool === described.tool && entry.resource === described.resource
     const same = aliased ? this.lookup(agentSessionId, aliased)
-      : [...(this.requests.get(agentSessionId)?.values() ?? [])].find(entry => entry.status === 'pending' && sameCall(entry))
+      : [...(this.requests.get(agentSessionId)?.values() ?? [])].find(entry => entry.status === 'pending' && !outageCard(entry) && sameCall(entry))
         ?? [...(this.movedOut.get(agentSessionId) ?? [])].map(id => this.lookup(agentSessionId, id)).find(sameCall)
     if (same) {
       const views = this.aliases.get(agentSessionId) ?? new Map<string, string>()
@@ -442,7 +447,9 @@ export class PermissionGrants {
   /** Ends the grants of every conversation whose tab was closed (tabOpen), and takes them back out
    *  of a runtime that is still running. Cheap when nothing is granted; wiring.ts runs it on a timer. */
   sweep(): void {
-    if (!this.ports.tabOpen || this.stopping) return
+    if (this.stopping) return
+    this.expireOutages()
+    if (!this.ports.tabOpen) return
     for (const agentSessionId of new Set([...this.grants.keys(), ...this.requests.keys()])) {
       if (this.ports.tabOpen(agentSessionId)) { this.missing.delete(agentSessionId); continue }
       if (!this.missing.has(agentSessionId)) { this.missing.add(agentSessionId); continue }
@@ -457,6 +464,24 @@ export class PermissionGrants {
       this.changed()
       if (granted.length) void this.ports.apply(agentSessionId).catch(error => console.warn('A grant of a closed tab could not be removed from its live runtime; it ends with the runtime', error))
     }
+  }
+
+  /** A classifier-outage card an older build raised (the adapter no longer does) is withdrawn once
+   *  its conversation's turn has settled: expired, never answered, and restated as a plain notice
+   *  so the tab stops asking for attention. */
+  expireOutages(): void {
+    let changed = false
+    for (const [agentSessionId, open] of this.requests) {
+      if (ACTIVE_PHASES.has(this.ports.phase(agentSessionId) ?? '')) continue
+      for (const request of open.values()) {
+        if (request.status !== 'pending' || !outageCard(request)) continue
+        request.status = 'expired'
+        changed = true
+        const outage = { tool: request.tool, reason: request.category!, toolUseId: request.toolUseId ?? request.id.replace(/^auto-denial:/, '') }
+        this.ports.notice(agentSessionId, `Withdrawn: ${classifierOutageMessage(outage)}`, { ...(classifierOutagePayload(outage) as Record<string, Json>), grantStatus: 'expired' }, request.id)
+      }
+    }
+    if (changed) this.changed()
   }
 
   /** A tab that ends without a successor: its waiting cards stop asking (no orphaned card). */
@@ -495,6 +520,7 @@ export class PermissionGrants {
     if (requestId.startsWith(AGENT_PREFIX)) throw new Error('No such permission request in this conversation')
     const denial = this.ports.denial(agentSessionId, requestId)
     if (!denial?.request || autoModeDenialItemId(denial.toolUseId) !== requestId) throw new Error('No such permission request in this conversation')
+    if (isClassifierOutage(denial.reason)) throw new Error('This request was already answered (expired): the classifier was unavailable, which is not a permission question')
     const request: PermissionGrantRequest = { ...denial.request, id: requestId, source: 'denial', status: 'pending', requestedAt: this.now() }
     const open = this.requests.get(agentSessionId) ?? new Map<string, PermissionGrantRequest>()
     open.set(requestId, request)

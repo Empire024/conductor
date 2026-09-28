@@ -30,6 +30,31 @@ export function hookDenialReason(reason: string): string {
   return bracketed || parseAutoModeDenialReason(reason) || reason.trim().replace(/\s+/g, ' ').slice(0, 120) || 'Permission denied'
 }
 
+/**
+ * A denial that is an outage of the server-side classifier, not a judgment: the CLI blocks the call
+ * because the check gave no verdict. Its PermissionDenied reasons (claude 2.1.28x): "Classifier
+ * unavailable", "Classifier unavailable - blocking for safety", "Stage 2 classifier error - …",
+ * "Auto mode could not evaluate this action …", and after repeated no-verdicts the turn-ending
+ * "Auto mode unavailable — stopped after repeated responses with no safety verdict". The tool_result
+ * wording is "The server-side auto mode classifier gave no verdict (error) …". None of these is a
+ * question for the owner: an approval would not help, the same call works once the check is back.
+ */
+const CLASSIFIER_OUTAGE_PATTERN = /\bclassifier unavailable\b|\bauto mode unavailable\b|\bgave no verdict\b|\bno safety verdict\b|\bclassifier error\b|\bauto mode could not evaluate\b/i
+export const isClassifierOutage = (reason: string | undefined): boolean => Boolean(reason && CLASSIFIER_OUTAGE_PATTERN.test(reason))
+/** The CLI's circuit breaker: it stopped the turn after repeated responses without a verdict. */
+export const classifierOutageStoppedTurn = (reason: string | undefined): boolean => Boolean(reason && /\bstopped after repeated\b|\bno safety verdict\b/i.test(reason))
+
+export interface ClassifierOutage { tool: string; reason: string; toolUseId: string; stopped?: boolean; count?: number }
+/** What the conversation shows for an outage: a plain notice, never an approval card. */
+export const classifierOutageMessage = (outage: Pick<ClassifierOutage, 'tool' | 'reason' | 'stopped' | 'count'>): string => {
+  const times = outage.count && outage.count > 1 ? ` (${outage.count} calls this turn)` : ''
+  return outage.stopped
+    ? `Auto mode's safety check was unavailable for ${outage.tool}${times}, so the claude CLI stopped this turn (${outage.reason}). This is an outage of the classifier, not a refusal: nothing needs approval. Continue the conversation once the check is back.`
+    : `Auto mode's safety check was unavailable for ${outage.tool}${times} (${outage.reason}). This is a transient outage of the classifier, not a refusal: nothing needs approval. The agent was told to retry the same call after a short pause.`
+}
+export const classifierOutagePayload = (outage: ClassifierOutage): Json =>
+  ({ classifierUnavailable: { tool: outage.tool, reason: outage.reason, toolUseId: outage.toolUseId, ...(outage.stopped ? { stopped: true } : {}), ...(outage.count ? { count: outage.count } : {}) } })
+
 export const autoModeDenialItemId = (toolUseId: string): string => `auto-denial:${toolUseId}`
 
 /** What the conversation shows. Names the actual decider so the owner does not blame Conductor. */

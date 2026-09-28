@@ -478,3 +478,50 @@ describe('a pending owner approval survives a restart (grant-survives-restart)',
     await expect(after.grants.decide(tab, item, 'approve-once', 'owner')).rejects.toThrow('already answered (denied)')
   })
 })
+
+describe('classifier outages are not permission questions', () => {
+  const outageRequest = (toolUseId: string) => ({ ...describeGrantRequest({ tool: 'Bash', input: { command: 'npm test' }, cwd, category: 'Classifier unavailable', toolUseId }), id: autoModeDenialItemId(toolUseId), source: 'denial' as const, status: 'pending' as const, requestedAt: '2026-09-28T09:03:00.000Z' })
+
+  it('raises no card for an outage denial and never answers one as an approval', async () => {
+    const h = harness()
+    const item = h.deny('toolu_o', 'Bash', { command: 'npm test' }, 'Classifier unavailable', true)
+    expect(h.grants.list(tab).requests).toEqual([])
+    expect(h.ports.changed).not.toHaveBeenCalled()
+    await expect(h.grants.decide(tab, item, 'approve-once', 'owner')).rejects.toThrow('already answered (expired)')
+    expect(h.grants.rules(tab)).toEqual([])
+    // A real refusal next to it is still the owner's card.
+    const real = h.deny('toolu_r', 'Bash', { command: 'npm test' }, 'Interfere With Workloads', true)
+    expect(h.grants.list(tab).requests).toEqual([expect.objectContaining({ id: real, status: 'pending', category: 'Interfere With Workloads' })])
+  })
+
+  it('withdraws a stale outage card once its turn settles, as a plain notice, and leaves real refusals pending', async () => {
+    const h = harness()
+    // A card an older build raised in this run, held the way its denied() held it.
+    const open = new Map([[autoModeDenialItemId('toolu_live'), outageRequest('toolu_live')]])
+    ;(h.grants as unknown as { requests: Map<string, Map<string, unknown>> }).requests.set(tab, open)
+    const real = h.deny('toolu_real', 'Bash', { command: 'npm test' }, 'Interfere With Workloads', true)
+    h.grants.sweep()
+    expect(h.grants.list(tab).requests.find(request => request.id === autoModeDenialItemId('toolu_live'))?.status).toBe('pending')
+    h.setPhase('completed')
+    h.grants.sweep()
+    const requests = h.grants.list(tab).requests
+    expect(requests.find(request => request.id === autoModeDenialItemId('toolu_live'))?.status).toBe('expired')
+    expect(requests.find(request => request.id === real)?.status).toBe('pending')
+    const notice = h.notices.at(-1)!
+    expect(notice).toMatchObject({ id: tab, itemId: autoModeDenialItemId('toolu_live'), payload: { classifierUnavailable: { tool: 'Bash', toolUseId: 'toolu_live' }, grantStatus: 'expired' } })
+    expect(notice.payload).not.toHaveProperty('autoModeDenial')
+    expect(h.grants.snapshot().settled).toContainEqual([tab, autoModeDenialItemId('toolu_live'), 'expired'])
+    await expect(h.grants.decide(tab, autoModeDenialItemId('toolu_live'), 'approve-once', 'owner')).rejects.toThrow('already answered (expired)')
+  })
+
+  it('withdraws a pending outage card saved in permission-grants.json when it is loaded', async () => {
+    const h = harness()
+    const exists = (id: string) => id === tab
+    const real = { ...describeGrantRequest({ tool: 'Bash', input: { command: 'npm test' }, cwd, category: 'Interfere With Workloads', toolUseId: 'toolu_real' }), id: autoModeDenialItemId('toolu_real'), source: 'denial' as const, status: 'pending' as const, requestedAt: '2026-09-28T09:03:00.000Z' }
+    const saved: SavedPermissionGrants = { version: 1, requests: [{ ...outageRequest('toolu_old'), agentSessionId: tab }, { ...real, agentSessionId: tab }], grants: [], successors: [], movedFrom: [], movedOut: [], aliases: [], settled: [] }
+    expect(h.grants.restore(saved, exists)).toEqual({ requests: 1, grants: 0, dropped: 1 })
+    expect(h.grants.list(tab).requests).toEqual([expect.objectContaining({ id: real.id, status: 'pending' })])
+    expect(h.grants.state().settled).toContainEqual({ agentSessionId: tab, id: autoModeDenialItemId('toolu_old'), status: 'expired' })
+    await expect(h.grants.decide(tab, autoModeDenialItemId('toolu_old'), 'approve-once', 'owner')).rejects.toThrow('already answered (expired)')
+  })
+})

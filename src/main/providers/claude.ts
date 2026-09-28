@@ -8,7 +8,7 @@ import { captureAdapterState, restoreAdapterState, settled } from './adapter-sta
 import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type TransportOptions } from './transport'
 import { privateConfigFile, relayMcpConfigs, relaysMcp, removeConfigFiles } from '../runtime-host/relay-config'
 import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
-import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, hookDenialReason, parseAutoModeDenialReason, type DenialGrantRequest } from '../../shared/auto-mode-denial'
+import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, classifierOutageStoppedTurn, hookDenialReason, isClassifierOutage, parseAutoModeDenialReason, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import { callMatchesRule, describeGrantRequest } from '../../shared/permission-grants'
 import type { AdapterEvent, ContextAttachment, InteractionResponse, Json, PendingInteraction, ProviderCapabilities, SessionSettings } from '../../shared/structured-agent'
 
@@ -36,6 +36,8 @@ const object = (value: Json | undefined): ObjectValue => value && typeof value =
 const string = (value: Json | undefined): string | undefined => typeof value === 'string' ? value : undefined
 const number = (value: Json | undefined): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined
 const array = (value: Json | undefined): Json[] => Array.isArray(value) ? value : []
+/** The CLI's own tool_result wording for a classifier outage (no PermissionDenied hook ran). */
+const CLASSIFIER_OUTAGE_RESULT = /auto mode classifier gave no verdict|^Auto mode unavailable\b|^Auto mode could not evaluate this action/im
 const safeguardRefusal = (message: string): boolean => /API Error:\s*.+?s safeguards flagged this message/i.test(message)
 const display = (value: Json | undefined): string => typeof value === 'string' ? value : value === undefined ? '' : JSON.stringify(value, null, 2)
 /** A roster name is a one-line label, but a task summary can be an agent's entire final
@@ -108,6 +110,8 @@ export class ClaudeAdapter implements ProviderAdapter {
   private tools = new Map<string, Tool>()
   /** Tool calls the CLI's own auto-mode classifier refused, by tool_use_id (../../shared/auto-mode-denial.ts). */
   private autoModeDenials = new Map<string, { tool: string; reason: string; parentId?: string; confirmed?: boolean; request?: DenialGrantRequest }>()
+  /** Classifier outages of the current turn, shown as one notice item (classifier-unavailable:<turn>), never as a card. */
+  private classifierOutages?: { key: string; count: number; toolUseIds: Set<string>; stopped: boolean }
   /** The --settings file carrying owner-granted rules at launch (src/main/permission-grants). */
   private grantSettingsFile?: string
   private streams = new Map<string, { messageId: string; blocks: Map<number, Block>; textBlocks: number }>()
@@ -975,6 +979,7 @@ export class ClaudeAdapter implements ProviderAdapter {
    *  as a needs-attention card, the tab counts as attention until viewed, and the phone announces. */
   private noteAutoModeDenial(toolUseId: string, output: string): void {
     const reason = parseAutoModeDenialReason(output)
+    if (reason && isClassifierOutage(reason) || !reason && CLASSIFIER_OUTAGE_RESULT.test(output)) { this.classifierOutage(toolUseId, undefined, reason ?? 'Classifier unavailable', { method: 'tool_result/classifier_unavailable', payload: { tool_use_id: toolUseId } }); return }
     if (!reason || this.autoModeDenials.has(toolUseId)) return
     const tool = this.tools.get(toolUseId)
     const granted = tool ? (this.options.permissionGrants?.rules() ?? []).find(entry => callMatchesRule(entry.rule, tool.name, tool.input, this.options.cwd)) : undefined
@@ -985,12 +990,29 @@ export class ClaudeAdapter implements ProviderAdapter {
    *  reason. It normally arrives before the tool_result wording, which is then only a fallback for
    *  a CLI that does not run the hook. A denial of a call the owner already granted is reported as
    *  such, because that is the evidence that a grant did not take effect. */
-  private hookedAutoModeDenial(toolUseId: string, name: string, input: ObjectValue, rawReason: string): void {
+  private hookedAutoModeDenial(toolUseId: string, name: string, input: ObjectValue, rawReason: string): ObjectValue | undefined {
+    if (isClassifierOutage(rawReason)) return this.classifierOutage(toolUseId, name, hookDenialReason(rawReason), { method: 'hook/permission_denied', payload: { tool_use_id: toolUseId, tool_name: name, reason: rawReason.slice(0, 400) } })
     const reason = hookDenialReason(rawReason)
     const granted = (this.options.permissionGrants?.rules() ?? []).find(entry => callMatchesRule(entry.rule, name, input, this.options.cwd))
     if (granted) this.options.permissionGrants?.refused?.(granted.rule)
     if (this.autoModeDenials.get(toolUseId)?.request) return
     this.recordAutoModeDenial(toolUseId, reason, { name, input }, { method: 'hook/permission_denied', payload: { tool_use_id: toolUseId, tool_name: name, reason: rawReason.slice(0, 400) } })
+    return undefined
+  }
+  /** The server-side classifier gave no verdict: an outage, not a refusal, so no owner card, no
+   *  grant request and no attention. The turn gets one notice item, updated in place per call. The
+   *  hook answers retry (the CLI then tells the agent it may retry the call, on top of its own "issue
+   *  it again once" wording); after its circuit breaker has stopped the turn nothing is retried and
+   *  Conductor starts nothing, so an outage cannot become a loop. */
+  private classifierOutage(toolUseId: string, name: string | undefined, reason: string, native: { method: string; payload: Json }): ObjectValue | undefined {
+    const key = this.turnId ?? toolUseId
+    const outage = this.classifierOutages?.key === key ? this.classifierOutages : this.classifierOutages = { key, count: 0, toolUseIds: new Set<string>(), stopped: false }
+    if (!outage.toolUseIds.has(toolUseId)) { outage.toolUseIds.add(toolUseId); outage.count++ }
+    const stopped = classifierOutageStoppedTurn(reason)
+    outage.stopped ||= stopped
+    const tool = name ?? this.tools.get(toolUseId)?.name ?? 'a tool'
+    this.emit({ itemId: `classifier-unavailable:${key}`, data: { type: 'notice', message: classifierOutageMessage({ tool, reason, stopped: outage.stopped, count: outage.count }), payload: classifierOutagePayload({ tool, reason, toolUseId, stopped: outage.stopped, count: outage.count }) }, native })
+    return stopped ? undefined : { hookSpecificOutput: { hookEventName: 'PermissionDenied', retry: true } }
   }
   private recordAutoModeDenial(toolUseId: string, reason: string, call: { name: string; input: ObjectValue } | undefined, native: { method: string; payload: Json }): void {
     const tool = this.tools.get(toolUseId), name = call?.name ?? tool?.name
@@ -1091,7 +1113,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     const input = object(request.input), callback = string(request.callback_id)
     const id = string(request.tool_use_id) ?? string(input.tool_use_id)
     const name = string(input.tool_name) ?? 'Unknown tool', args = object(input.tool_input)
-    if (id && callback === 'conductor_denied') { this.hookedAutoModeDenial(id, name, args, string(input.reason) ?? ''); return }
+    if (id && callback === 'conductor_denied') return this.hookedAutoModeDenial(id, name, args, string(input.reason) ?? '')
     if (!id || !['conductor_before', 'conductor_after', 'conductor_failed'].includes(callback ?? '')) throw new Error('Unknown Claude lifecycle hook callback')
     if (!this.tools.has(id)) this.declareTool(id, name, args)
     const paths = ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'].includes(name) ? [string(args.file_path) ?? string(args.notebook_path)].filter((path): path is string => Boolean(path)) : []

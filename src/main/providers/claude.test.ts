@@ -1274,6 +1274,54 @@ describe('owner permission grants (src/main/permission-grants)', () => {
     expect(denied).toHaveBeenCalledExactlyOnceWith('auto-denial:toolu_w', expect.objectContaining({ rule: 'Edit(//c/Users/owner/site/app/prod/fix-pool.sh)', toolUseId: 'toolu_w' }))
   })
 
+  const hookReply = (f: ReturnType<typeof fixture>, requestId: string) => (f.transport.sent.find(message => (message as { response?: { request_id?: string } }).response?.request_id === requestId) as { response?: { response?: Json } } | undefined)?.response?.response
+  const outages = (f: ReturnType<typeof fixture>) => f.projection().items.filter(item => item.data.type === 'notice' && (item.data.payload as { classifierUnavailable?: unknown } | undefined)?.classifierUnavailable)
+
+  it('shows a classifier outage as one plain notice, raises no card or request, and lets the agent retry', async () => {
+    const denied = vi.fn(), refused = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [{ rule: 'Bash(npm test)', once: false }], used: vi.fn(), refused, denied } }); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    for (const id of ['toolu_o1', 'toolu_o2']) {
+      f.transport.receive(toolUse(id, 'Bash', { command: 'npm test' }))
+      f.transport.receive(deniedHook(`hook-${id}`, id, 'Bash', { command: 'npm test' }, 'Classifier unavailable'))
+      await flush()
+      f.transport.receive({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: true, content: 'The server-side auto mode classifier gave no verdict (error), so auto mode cannot determine the safety of Bash. This is a transient failure of the check, not a judgment about the action.' }] } })
+    }
+    f.transport.receive({ type: 'result', subtype: 'success', is_error: false, result: 'Done', usage: {}, modelUsage: {}, permission_denials: [{ tool_name: 'Bash', tool_input: { command: 'npm test' }, tool_use_id: 'toolu_o1' }] })
+    await flush()
+    expect(hookReply(f, 'hook-toolu_o1')).toEqual({ hookSpecificOutput: { hookEventName: 'PermissionDenied', retry: true } })
+    expect(denied).not.toHaveBeenCalled()
+    expect(refused).not.toHaveBeenCalled()
+    expect(f.projection().items.some(item => autoModeDenialOf(item.data))).toBe(false)
+    const notices = outages(f)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.data).toMatchObject({ payload: { classifierUnavailable: { tool: 'Bash', reason: 'Classifier unavailable', count: 2 } } })
+    expect(notices[0]!.data.type === 'notice' ? notices[0]!.data.message : '').toMatch(/not a refusal: nothing needs approval\. The agent was told to retry the same call/)
+  })
+
+  it('says to continue once the check is back when the CLI stopped the turn, and asks for no retry', async () => {
+    const denied = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), denied } }); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    f.transport.receive(toolUse('toolu_s', 'Bash', { command: 'npm test' }))
+    f.transport.receive(deniedHook('hook-stop', 'toolu_s', 'Bash', { command: 'npm test' }, 'Auto mode unavailable — stopped after repeated responses with no safety verdict'))
+    await flush()
+    expect(hookReply(f, 'hook-stop')).toEqual({})
+    expect(denied).not.toHaveBeenCalled()
+    expect(outages(f)).toHaveLength(1)
+    expect(outages(f)[0]!.data).toMatchObject({ payload: { classifierUnavailable: { stopped: true } }, message: expect.stringMatching(/stopped this turn.*Continue the conversation once the check is back/) })
+  })
+
+  it('keeps a real classifier refusal an owner card, as before', async () => {
+    const denied = vi.fn()
+    const f = fixture({ permissionGrants: { rules: () => [], used: vi.fn(), denied } }); await f.adapter.start(); await f.adapter.submit('Synthetic', settings)
+    f.transport.receive(toolUse('toolu_real', 'Bash', { command: 'npm test' }))
+    f.transport.receive(deniedHook('hook-real', 'toolu_real', 'Bash', { command: 'npm test' }, 'Interfere With Workloads'))
+    await flush()
+    expect(hookReply(f, 'hook-real')).toEqual({})
+    expect(outages(f)).toHaveLength(0)
+    expect(autoModeDenialOf(f.projection().items.find(item => item.nativeItemId === 'auto-denial:toolu_real')!.data)).toMatchObject({ tool: 'Bash', reason: 'Interfere With Workloads' })
+    expect(denied).toHaveBeenCalledExactlyOnceWith('auto-denial:toolu_real', expect.objectContaining({ category: 'Interfere With Workloads', toolUseId: 'toolu_real' }))
+  })
+
   it('launches with the granted rules in --settings, hands a running CLI the current set through apply_flag_settings, and passes no --settings without grants', async () => {
     let rules = [{ rule: 'Bash(ssh -i key root@192.0.2.10 bash -s < app/prod/fix-pool.sh)', once: true }]
     const f = fixture({ permissionGrants: { rules: () => rules, used: vi.fn() } })
