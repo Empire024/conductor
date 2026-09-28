@@ -15,6 +15,7 @@ import { fetchAllHistory, serverLogName, timelineLine, writeEvidence } from './o
 import { EXIT, runLoop } from './overseer/loop.mjs'
 import { countTargets } from './overseer/oracles/faktury.mjs'
 import { parseArgs } from './overseer.mjs'
+import { deliver } from './overseer/deliver.mjs'
 
 const temp = prefix => mkdtemp(resolve(tmpdir(), `conductor-overseer-${prefix}-`))
 const TOKEN = 'ab'.repeat(32)
@@ -509,6 +510,10 @@ test('CLI arguments: repeated goals, defaults and validation', () => {
   assert.throws(() => parseArgs(['run', '--target', 'cloud']), /--target/)
   assert.throws(() => parseArgs(['run', '--iterations', '0']), /--iterations/)
   assert.throws(() => parseArgs(['run', '--goal']), /needs a value/)
+  const delivery = parseArgs(['deliver', '--commit', 'abc1234', '--smoke', 'smoke-a,smoke-b', '--smoke=smoke-c', '--resume', 'agent_w', '--force'])
+  assert.deepEqual([delivery.commit, delivery.smoke, delivery.resume, delivery.force], ['abc1234', ['smoke-a', 'smoke-b', 'smoke-c'], 'agent_w', true])
+  assert.deepEqual([parseArgs(['deliver']).commit, parseArgs(['deliver']).smoke, parseArgs(['deliver']).force], [null, [], false])
+  assert.throws(() => parseArgs(['deliver', '--smoke', 'smoke-a']), /--smoke needs --commit/)
 })
 
 test('a process_files output the history only holds a tail of is fetched in full through agents.artifact before the predicate reads it', async () => {
@@ -530,4 +535,29 @@ test('a process_files output the history only holds a tail of is fetched in full
   // A fetch that fails leaves the tail, and the predicate says the artifact is missing.
   const stubborn = await resolveArtifactOutputs(projectItems(events), async () => { throw new Error('gone') }, 'agent-1')
   assert.equal(findValidatedArtifact(stubborn), null)
+})
+
+// conductor-task:b5-deliver-commit
+test('deliver --commit: builds that commit with its smokes, and stops before installing when one fails', async () => {
+  const calls = []
+  const running = { state: 'running', stage: 'smoke', commit: 'abc1234'.padEnd(40, '0'), worktree: 'C:/candidates/abc1234', smokes: [{ name: 'smoke-a', state: 'running' }] }
+  const failed = { ...running, state: 'succeeded', stage: 'done', verified: false, version: '0.1.2-local.1', smokes: [{ name: 'smoke-a', state: 'failed', exitCode: 1, tail: ['line', 'FAIL: grant card missing'], log: 'C:/candidates/abc1234/smoke-a.log' }] }
+  const client = { call: async (method, args, scope) => {
+    calls.push([method, args, scope])
+    if (method === 'projects.list') return [{ id: 'p', path: CHECKOUT, workspaces: [{ id: 'w' }] }]
+    if (method === 'app.update') return running
+    if (method === 'app.update.status') return failed
+    throw new Error(`unexpected ${method}`)
+  } }
+  const result = await deliver({ client, userData: 'unused', commit: 'abc1234', smoke: ['smoke-a'], restart: true, sleep: async () => {} })
+  assert.equal(result.ok, false)
+  assert.equal(result.stage, 'smoke')
+  assert.match(result.reason, /not verified: smoke-a failed \(exit 1\): line \| FAIL: grant card missing/)
+  assert.deepEqual(calls.find(([method]) => method === 'app.update')[1], { commit: 'abc1234', smoke: ['smoke-a'] })
+  assert.deepEqual(calls.find(([method]) => method === 'app.update.status')[1], { waitSeconds: 45 })
+  assert.ok(!calls.some(([method]) => method.startsWith('app.update.install') || method === 'app.update.check'))
+  // An installed app that predates commit builds ignores the argument: refuse rather than ship the dirty checkout.
+  const old = { call: async method => method === 'projects.list' ? [{ id: 'p', path: CHECKOUT, workspaces: [{ id: 'w' }] }] : { state: 'running', workspace: CHECKOUT } }
+  assert.match((await deliver({ client: old, userData: 'unused', commit: 'abc1234', sleep: async () => {} })).reason, /predates app\.update\(\{commit\}\)/)
+  assert.match((await deliver({ client: old, userData: 'unused', smoke: ['smoke-a'] })).reason, /--smoke needs --commit/)
 })

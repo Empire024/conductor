@@ -41,15 +41,27 @@ Before a dev launch the overseer warns when `out/main/index.js` is older than th
 ```
 node scripts/overseer.mjs run --goal <file> [--goal <file>...] [--target dev|installed] [--fixer-target auto|dev|installed]
                               [--iterations 5] [--fixers 4] [--deliver] [--restart-installed] [--no-fix] [--run-dir <dir>] [--keep-app]
+                              [--commit <sha>] [--smoke <name>[,<name>...]] [--resume <wizard agentSessionId>] [--force]
 node scripts/overseer.mjs test --goal <file> [--target ...]        one pass, no fixing
 node scripts/overseer.mjs status [--target ...]                    reachability, version, projects, working agents
 node scripts/overseer.mjs app start|stop|restart                   the parked dev instance
 node scripts/overseer.mjs call --method <m> [--args <json>] [--scope <json>] [--project <path-or-name>] [--target ...]
 node scripts/overseer.mjs build                                    npm run build in the checkout
-node scripts/overseer.mjs deliver [--restart-installed]            app.update on the installed app, then optionally install
+node scripts/overseer.mjs deliver [--commit <sha> [--smoke <name>[,<name>...]]] [--restart-installed] [--resume <agentSessionId>] [--force]
+                                                                   app.update on the installed app, then optionally install
 ```
 
 `run` and `test` stop the dev instance at the end unless `--keep-app`. `call` is for an agent driving the loop by hand: one raw owner call, JSON on stdout.
+
+## Delivering one commit
+
+`deliver --commit <sha> --smoke smoke-permission-grant --smoke smoke-workspace-clarity --restart-installed` is the whole "build exact commit, parked smoke, install" loop that wizards used to script by hand (a worktree, a robocopy of `node_modules`, `build-local-update.mjs`, a feed check, `smoke-lock`, then check/download/install):
+
+1. `app.update({commit, smoke})` on the installed app builds that commit in a clean detached worktree under `../conductor-candidates/` with a real copy of `node_modules`, and checks that the feed records the commit with `dirty=false` (docs/agent-control.md, App updates). Other agents' uncommitted edits in the shared checkout never reach the build.
+2. The named `scripts/smoke-*.mjs` run from that worktree through `smoke-lock`, one at a time and parked. `app.update.status({waitSeconds:45})` reports the stage and each smoke. A failed smoke stops the delivery before anything is installed: the result is `stage: "smoke"` with the smoke's exit code, last log lines and log path, and the update stays in the feed marked not verified.
+3. With `--restart-installed`, check and download, then `app.update.install` without `force`: Conductor refuses while any tab is mid-turn or has live background tasks, and the overseer retries every 15 s for up to 30 minutes, logging which tabs it waits for. `--force` installs over running work instead. The owner credential is no wizard, so no tab would be resumed after the restart; `--resume <agentSessionId>` names the wizard tab to bring back and tell to continue.
+
+A wizard tab can do the same through its own control tool: `app.update({commit, smoke})`, poll `app.update.status({waitSeconds:45})`, then `app.update.check`, `app.update.download` and `app.update.install({})`, which makes it the restart initiator. An installed app older than `app.update({commit})` ignores the argument; `deliver --commit` notices and refuses rather than shipping the dirty checkout. Without `--commit`, `deliver` builds the checkout as before (`dirty=true` whenever anyone has uncommitted work).
 
 Exit codes: **0** pass, **1** fail (a goal failed under `test` or `--no-fix`, a build or delivery command failed), **2** blocked (a fixer reported `blocked`, the iteration budget ran out, the app was unreachable, a goal file could not be loaded, or the run was interrupted).
 
@@ -148,5 +160,5 @@ Then follow `run.json` and the `.out.log`. Pass an explicit `--run-dir` so you k
 - Never over the owner's screen: the dev instance is always parked (`CONDUCTOR_BACKGROUND_WINDOWS=1`), worker and fixer tabs open with `focus:false`, and nothing here runs `npm run dev`.
 - One local model at a time (`docs/machine-profile.md`): goals run one after another, never in parallel, and only one overseer run with local workers at a time.
 - Builds and smokes one at a time: the overseer builds once per iteration, after all fixers finish. Do not start a smoke script or another overseer while one is running.
-- Fixers never publish. Delivering to the installed app (`--deliver`, `deliver`) is a local `app.update` into the local feed; restarting the installed app only happens with `--restart-installed`.
+- Fixers never publish. Delivering to the installed app (`--deliver`, `deliver`) is a local `app.update` into the local feed; restarting the installed app only happens with `--restart-installed`, and then only once no tab is mid-turn unless `--force`.
 - The credential is the owner's authority: keep it on this machine, in memory, out of every log and message.

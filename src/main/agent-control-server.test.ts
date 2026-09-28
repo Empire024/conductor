@@ -87,6 +87,29 @@ describe('agent-control request concurrency', () => {
     expect(calls).toEqual(['tabs.open', 'tabs.close'])
   })
 
+  it('refuses a mutation that would queue behind this session\'s own call waiting on the owner\'s dialog (409), over HTTP and the MCP path', async () => {
+    const answer = deferred()
+    const asked = deferred()
+    let waiting: string | null = null
+    const f = await fixture(async method => {
+      if (method === 'memory.forget') { waiting = 'memory.forget'; asked.resolve(); await answer.promise; waiting = null }
+      return method
+    })
+    ;(f.control as unknown as { awaitingOwner: (scope: unknown, method: string) => string | null }).awaitingOwner = vi.fn((_scope: unknown, method: string) => method === 'memory.forget' || method === 'files.write' ? waiting : null)
+    const first = f.request('memory.forget')
+    await asked.promise
+    const repeated = await f.request('memory.forget')
+    expect(repeated.status).toBe(409)
+    expect(await repeated.json()).toEqual({ error: 'A confirmation for your previous memory.forget call is still waiting for the owner; do not repeat it. That call answers with the owner\'s decision (or a timeout after two minutes); carry on with other work meanwhile' })
+    // Reads and other families are not held up by it.
+    expect((await f.request('tabs.list')).status).toBe(200)
+    expect((await f.request('tabs.open')).status).toBe(200)
+    expect(f.control.call).toHaveBeenCalledTimes(3)
+    answer.resolve()
+    expect((await first).status).toBe(200)
+    expect((await f.request('memory.forget')).status).toBe(200)
+  })
+
   /* control-concurrent-requests (V3 S20): the lock is per (session, method family). */
   it('never makes tabs.open wait behind a long git.ship from the same session', async () => {
     const ship = deferred()

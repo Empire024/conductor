@@ -122,6 +122,14 @@ describe('routing live facts and dispatch (AgentControl over model intelligence)
     await expect(f.control.evaluationTurn({ provider: 'codex', model: 'not-offered' }, { system: 's', user: 'u' }, new AbortController().signal)).rejects.toThrow(/not offered/)
   })
 
+  it('opens the evaluation tab in the workspace it is given, not the first open one', async () => {
+    const f = fixture({ vramBytes: 7 * GiB, availability: () => ({ available: true }) })
+    const second = f.database.createSession(f.scope.projectId, 'Second')
+    await f.control.evaluationTurn({ provider: 'codex', model: 'codex-synthetic' }, { system: 'Answer.', user: 'Say 42' }, new AbortController().signal, { scope: { projectId: f.scope.projectId, workspaceId: second.id } })
+    const evaluation = f.database.structured.projectSpecs<AgentSpec>(f.scope.projectId).filter(spec => spec.title.startsWith('Evaluation:'))
+    expect(evaluation.map(spec => spec.sessionId)).toEqual([second.id])
+  })
+
   // N3: spend counts cache reads and writes; a failed, stopped or usage-less turn counts at least its budget.
   const SYNTHETIC = { provider: 'codex', model: 'codex-synthetic' }
   const PROMPT = { system: 'Answer.', user: 'Say 42' }

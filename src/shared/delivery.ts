@@ -20,6 +20,14 @@ export interface DeliveryStage {
   detail: string
   /** Bounded tail of the stage's command output (at most 40 lines). */
   log: string[]
+  /** The test stage only: test files passed and failed so far, and the failing lines (at most 15). */
+  progress?: DeliveryTestProgress
+}
+
+export interface DeliveryTestProgress {
+  passedFiles: number
+  failedFiles: number
+  failing: string[]
 }
 
 export type DeliveryRequester = { kind: 'owner' } | { kind: 'agent'; agentSessionId: string; title: string }

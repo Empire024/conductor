@@ -74,7 +74,7 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   const confirm = vi.fn(async () => false), fileChanged = vi.fn()
   const providers: AgentProviderInfo[] = (['codex', 'claude'] as const).map(id => ({ id, displayName: id, available: true, installUrl: '', models: [{ id: id + '-synthetic', label: id + ' Synthetic' }], efforts: [{ id: 'low', label: 'Low' }] }))
   const backlogs = new ProjectBacklogs(database)
-  const idleUpdate = { state: 'idle' as const, workspace: null, startedAt: null, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'No local update has been built.', log: [] as string[] }
+  const idleUpdate = { state: 'idle' as const, workspace: null, startedAt: null, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'No local update has been built.', log: [] as string[], commit: null, worktree: null, stage: null, smokes: [], verified: null }
   const localUpdates = {
     unsupported: vi.fn((): string | null => null),
     status: vi.fn(() => idleUpdate),
@@ -132,7 +132,7 @@ describe('authorized native app control', () => {
     await expect(f.control.call(f.scope, 'app.update.authorize', { agentSessionId: f.spec.id })).rejects.toThrow('itself')
     expect(await f.control.call(f.scope, 'app.update.authorize', { agentSessionId: local.id })).toMatchObject({ authorized: true })
     expect(await f.control.call(localScope, 'app.update')).toMatchObject({ state: 'running', workspace: f.project.path, authorizedBy: f.spec.id })
-    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path)
+    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path, {})
     expect(f.confirm).toHaveBeenCalledTimes(1)
     // A project that cannot build Conductor says so instead of spawning anything.
     f.localUpdates.unsupported.mockReturnValueOnce('This project is not the Conductor desktop app, so it cannot build a Conductor update.')
@@ -2921,8 +2921,9 @@ describe('H15 error texts and agents.interrupt expedite', () => {
   const dropTab = (f: ReturnType<typeof fixture>, tabId: string) => {
     const current = f.database.getSession(f.workspace.id)!
     if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    const dropped = current.layout.root.tabs.filter(tab => tab.id === tabId)
     current.layout.root.tabs = current.layout.root.tabs.filter(tab => tab.id !== tabId)
-    f.database.saveSession(f.workspace.id, current.layout, null, [])
+    f.database.saveSession(f.workspace.id, current.layout, null, dropped) // what the renderer's close records
   }
   const phase = (f: ReturnType<typeof fixture>, id: string, value: SessionProjection['phase']) =>
     f.database.structured.append({ schemaVersion: 1, id: 'h15-' + value + '-' + Math.random(), sequence: f.database.structured.snapshot(id)!.sequence + 1, sessionId: id, runtimeId: 'h15-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase: value } as AgentEventData })
@@ -3036,5 +3037,223 @@ describe('G04: a conversation in another workspace of the same project', () => {
     // The route named works: a tab this caller opens there is its own to steer.
     const own = await f.control.call(f.scope, 'tabs.open', { workspaceId: room.id, title: 'My worker there' }) as AgentControlTab
     await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: own.resourceId, prompt: 'Go' })).resolves.toMatchObject({ agentSessionId: own.resourceId })
+  })
+})
+
+// conductor-task:b5-deliver-commit
+describe('B5-D: app.update builds an exact commit and an unforced install waits for working tabs', () => {
+  const ready = () => ({ phase: 'ready' as const, currentVersion: '2.0.0', availableVersion: '2.0.1', configured: true })
+  const updatingHost = () => ({ version: '2.0.0', pid: 77, relaunch: vi.fn(async () => {}), updates: { state: vi.fn(ready), check: vi.fn(async () => ready()), download: vi.fn(async () => ready()), install: vi.fn(async () => {}) } })
+  const asWizard = (f: ReturnType<typeof fixture>): void => {
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra' } })
+  }
+
+  it('hands commit and smoke to the builder, and refuses bad ones before anyone is asked', async () => {
+    const f = fixture()
+    const validate = vi.fn((_workspace: string, request: { commit?: string; smoke?: string[] }) => { if (request.smoke?.includes('rm -rf')) throw new Error('smoke names a scripts/smoke-*.mjs file') })
+    const control = new AgentControl({ ...f.deps, localUpdates: { ...f.localUpdates, validate } })
+    await expect(control.call(f.scope, 'app.update', { commit: 'HEAD', smoke: 'smoke-x' })).rejects.toThrow(/smoke must be a list/)
+    await expect(control.call(f.scope, 'app.update', { commit: 'HEAD', smoke: ['rm -rf'] })).rejects.toThrow(/scripts\/smoke-\*\.mjs/)
+    await expect(control.call(f.scope, 'app.update', { branch: 'main' })).rejects.toThrow(/branch/)
+    expect(f.confirm).not.toHaveBeenCalled()
+    f.confirm.mockResolvedValueOnce(true)
+    expect(await control.call(f.scope, 'app.update', { commit: 'abc1234', smoke: ['smoke-permission-grant'] })).toMatchObject({ state: 'running' })
+    expect(f.localUpdates.start).toHaveBeenCalledWith(f.project.path, { commit: 'abc1234', smoke: ['smoke-permission-grant'] })
+  })
+
+  it('app.update.status waits for the build to move on, within the control wait cap', async () => {
+    const f = fixture()
+    const running = { ...f.localUpdates.status(), state: 'running' as const, stage: 'build' as const }
+    let calls = 0
+    const status = vi.fn(() => ++calls < 3 ? running : { ...running, stage: 'smoke' as const })
+    const control = new AgentControl({ ...f.deps, localUpdates: { ...f.localUpdates, status } })
+    await expect(control.call(f.scope, 'app.update.status', { waitSeconds: -1 })).rejects.toThrow(/waitSeconds/)
+    calls = 0
+    expect(await control.call(f.scope, 'app.update.status', { waitSeconds: 30 })).toMatchObject({ state: 'running', stage: 'smoke' })
+    expect(await control.call(f.scope, 'app.update.status', {})).toMatchObject({ stage: 'smoke' })
+  })
+
+  it('an unforced install names every tab still mid-turn or running background tasks, and goes ahead once they settle', async () => {
+    const f = fixture()
+    const host = updatingHost()
+    const control = new AgentControl({ ...f.deps, host })
+    asWizard(f)
+    const tab = await control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic' }) as AgentControlTab
+    const id = tab.resourceId!
+    await control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Work' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('completed'))
+    const emit = (data: Omit<Extract<AgentEventData, { type: 'session' }>, 'type'>) => f.submissions.at(-1)!.options.emit({ data: { type: 'session', ...data } })
+    emit({ phase: 'running' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('running'))
+    await expect(control.call(f.scope, 'app.update.install', {})).rejects.toThrow(new RegExp(`Not installing yet: a tab is still working.*\\(${id}\\): mid-turn.*agents\\.status`))
+    emit({ phase: 'completed', backgroundTasks: 1 })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.backgroundTasks).toBe(1))
+    await expect(control.call(f.scope, 'app.update.install', {})).rejects.toThrow(/1 background task running/)
+    expect(host.updates.install).not.toHaveBeenCalled()
+    // A dead runtime's leftover count is not work the restart would cut.
+    f.sessions.killWhere(spec => spec.id === id)
+    expect(await control.call(f.scope, 'app.update.install', {})).toMatchObject({ installing: true, force: true })
+    await vi.waitFor(() => expect(host.updates.install).toHaveBeenCalledWith(true, { agentSessionId: f.spec.id, method: 'app.update.install' }))
+  })
+
+  it('force:true installs over running work; resume lets the owner credential bring a wizard back', async () => {
+    const f = fixture()
+    const host = updatingHost()
+    const control = new AgentControl({ ...f.deps, host })
+    const tab = await control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic' }) as AgentControlTab
+    await control.call(f.scope, 'agents.submit', { agentSessionId: tab.resourceId!, prompt: 'Work' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(tab.resourceId!)!.phase).toBe('completed'))
+    f.submissions.at(-1)!.options.emit({ data: { type: 'session', phase: 'running' } })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(tab.resourceId!)!.phase).toBe('running'))
+    const owner = control.ownerScope({ projectId: f.project.id })
+    await expect(control.call(owner, 'app.update.install', { resume: f.spec.id })).rejects.toThrow(/not a wizard tab/)
+    asWizard(f)
+    await expect(control.call(f.scope, 'app.update.install', { resume: f.spec.id })).rejects.toThrow(/owner credential/)
+    await expect(control.call(owner, 'app.update.install', { resume: 'agent_gone' })).rejects.toThrow(/No open conversation agent_gone/)
+    await expect(control.call(owner, 'app.update.install', { resume: f.spec.id })).rejects.toThrow(/Not installing yet/)
+    expect(await control.call(owner, 'app.update.install', { resume: f.spec.id, force: true })).toMatchObject({ installing: true, force: true, resume: f.spec.id })
+    await vi.waitFor(() => expect(host.updates.install).toHaveBeenCalledWith(true, { agentSessionId: f.spec.id, method: 'app.update.install' }))
+  })
+})
+
+// conductor-task:b5-friction
+describe('B5-F: dispatch, list, status and artifact friction', () => {
+  const phase = (f: ReturnType<typeof fixture>, id: string, value: SessionProjection['phase'], extra: Record<string, unknown> = {}) =>
+    f.database.structured.append({ schemaVersion: 1, id: 'b5f-' + value + '-' + Math.random(), sequence: f.database.structured.snapshot(id)!.sequence + 1, sessionId: id, runtimeId: 'b5f-runtime', provider: 'codex', projectId: f.project.id, workspaceId: f.workspace.id, cwd: f.project.path, timestamp: new Date().toISOString(), data: { type: 'session', phase: value, ...extra } as AgentEventData })
+  const closeTab = (f: ReturnType<typeof fixture>, tab: AgentControlTab) => {
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    current.layout.root.tabs = current.layout.root.tabs.filter(candidate => candidate.id !== tab.id)
+    f.database.saveSession(f.workspace.id, current.layout, null, [...current.closedTabs, { id: tab.id, kind: 'agent', resourceId: tab.resourceId, title: tab.title }])
+  }
+
+  it('orchestration.tasks.update answers with the task id, title, status and completedAt, never the whole description again', async () => {
+    const f = fixture()
+    const description = 'Long brief. '.repeat(220)
+    const task = await f.control.call(f.scope, 'orchestration.tasks.create', { title: 'Batch item', description }) as { id: string }
+    const done = await f.control.call(f.scope, 'orchestration.tasks.update', { id: task.id, status: 'done' }) as Record<string, unknown>
+    expect(done).toEqual({ id: task.id, title: 'Batch item', status: 'done', completedAt: expect.any(String) })
+    expect(JSON.stringify(done).length).toBeLessThan(200)
+    expect(await f.control.call(f.scope, 'orchestration.tasks.update', { id: task.id, description: 'Short brief', priority: 'high' })).toEqual({ id: task.id, title: 'Batch item', status: 'done', completedAt: expect.any(String), description: 'Short brief', priority: 'high' })
+    expect(f.orchestration.listTasks(f.project.id).find(entry => entry.id === task.id)).toMatchObject({ description: 'Short brief', status: 'done' })
+  })
+
+  it('router.dispatch deliver:"controller" tells the worker to report paths and a commit message instead of shipping or closing its task', async () => {
+    const f = fixture()
+    const [integrated] = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Integrated', prompt: 'Fix a.ts', provider: 'claude', model: 'claude-synthetic', effort: 'low', deliver: 'controller' }] }) as Array<{ taskId: string }>
+    const prompt = f.submissions.at(-1)!.prompt
+    expect(prompt).toContain('Conductor orchestration task: ' + integrated!.taskId + '. Your controller is ' + f.scope.agentSessionId + '.')
+    expect(prompt).toContain('do not commit, run git.ship or mark the orchestration task done')
+    expect(prompt).toContain('the paths you changed, a one-line commit message')
+    expect(prompt).not.toContain('Deliver with git.ship')
+    expect(prompt).not.toContain('Mark it done with orchestration.tasks.update')
+    const [own] = await f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Self', prompt: 'Fix b.ts', provider: 'claude', model: 'claude-synthetic', effort: 'low', deliver: 'self' }] }) as Array<{ taskId: string }>
+    expect(f.submissions.at(-1)!.prompt).toContain('Mark it done with orchestration.tasks.update({id:"' + own!.taskId + '",status:"done"}) only after finishing. Your controller is ' + f.scope.agentSessionId + '. Report to it with report (agents.report) when finished. Deliver with git.ship({message, paths}) as a local commit only')
+    await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [{ title: 'Bad', prompt: 'x', provider: 'claude', model: 'claude-synthetic', deliver: 'owner' }] })).rejects.toThrow(/deliver must be "self".*or "controller"/)
+    expect((await f.control.call(f.scope, 'tools.list', { prefix: 'router.dispatch' }) as Record<string, string>)['router.dispatch']).toContain('deliver?:"self"|"controller"')
+  })
+
+  it('agents.list({active:true}) keeps only tabs still at work, in both forms, and flags a dead runtime\'s count', async () => {
+    const f = fixture()
+    const busy = await f.control.call(f.scope, 'tabs.open', { title: 'Busy' }) as AgentControlTab
+    const done = await f.control.call(f.scope, 'tabs.open', { title: 'Done' }) as AgentControlTab
+    const stale = await f.control.call(f.scope, 'tabs.open', { title: 'Stale' }) as AgentControlTab
+    phase(f, busy.resourceId!, 'running')
+    phase(f, done.resourceId!, 'completed')
+    phase(f, stale.resourceId!, 'disconnected', { backgroundTasks: 2 })
+    const ids = (rows: Array<{ agentSessionId: string | null }>) => rows.map(row => row.agentSessionId)
+    const all = await f.control.call(f.scope, 'agents.list', {}) as Array<{ agentSessionId: string }>
+    expect(ids(all)).toEqual(expect.arrayContaining([busy.resourceId, done.resourceId, stale.resourceId]))
+    const active = await f.control.call(f.scope, 'agents.list', { active: true }) as Array<{ agentSessionId: string; staleBackgroundTasks?: number }>
+    expect(ids(active).sort()).toEqual([busy.resourceId, stale.resourceId].sort())
+    expect(active.find(row => row.agentSessionId === stale.resourceId)).toMatchObject({ backgroundTasks: 0, staleBackgroundTasks: 2 })
+    const load = await f.control.call(f.scope, 'agents.list', { load: true, active: true }) as Array<{ agentSessionId: string }>
+    expect(ids(load).sort()).toEqual([busy.resourceId, stale.resourceId].sort())
+    await expect(f.control.call(f.scope, 'agents.list', { active: 'yes' })).rejects.toThrow('agents.list active must be true or false')
+  })
+
+  it('a controller reads its coworker\'s report artifacts after the coworker\'s tab closed, and so does its successor', async () => {
+    const f = fixture(false, undefined, undefined, [{ id: 'gpt-6-astra', label: 'GPT-6 Astra', effort: ['high'], defaultEffort: 'high' }])
+    const child = await f.control.call(f.scope, 'tabs.open', { title: 'Reporter' }) as AgentControlTab
+    const artifactId = f.database.structured.putOutput(child.resourceId!, 'Full report. '.repeat(400))
+    closeTab(f, child)
+    expect(await f.control.call(f.scope, 'agents.artifact', { agentSessionId: child.resourceId, artifactId })).toMatchObject({ agentSessionId: child.resourceId, truncated: false })
+    // A stranger still cannot.
+    const stranger = agentIn(f, f.project.id, f.workspace.id, 'stranger')
+    await expect(f.control.call(stranger, 'agents.artifact', { agentSessionId: child.resourceId, artifactId })).rejects.toThrow(/outside this workspace|has no visible tab/)
+    // A coworker that finished (its live link dropped, the dispatch kept) and a controller that
+    // handed itself on: the successor reads it too.
+    f.control.setCoworkerAutoClose(new CoworkerAutoClose({
+      settings: f.database, snapshot: id => f.database.structured.snapshot(id),
+      targets: () => f.control.finishTargets(), close: target => f.control.closeFinished(target),
+      release: select => f.sessions.killWhere(select)
+    }))
+    const finished = await f.control.call(f.scope, 'tabs.open', { title: 'Finished' }) as AgentControlTab
+    const finishedArtifact = f.database.structured.putOutput(finished.resourceId!, 'Finished report')
+    phase(f, finished.resourceId!, 'completed')
+    await f.control.call(f.scope, 'agents.finish', { agentSessionId: finished.resourceId })
+    closeTab(f, finished)
+    expect(await f.control.call(f.scope, 'agents.artifact', { agentSessionId: finished.resourceId, artifactId: finishedArtifact })).toMatchObject({ content: 'Finished report' })
+    const state = f.database.structured.snapshot(f.spec.id)!
+    f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra', effort: 'high', permission: 'accept-edits' } })
+    const succession = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as { agentSessionId: string }
+    const successor = { ...f.scope, agentSessionId: succession.agentSessionId }
+    expect(await f.control.call(successor, 'agents.artifact', { agentSessionId: finished.resourceId, artifactId: finishedArtifact })).toMatchObject({ content: 'Finished report' })
+  })
+
+  it('does not call a freshly opened tab closed before its layout is saved; a tab the closed-tab list names stays refused', async () => {
+    const f = fixture()
+    // The owner opened this conversation seconds ago: the renderer has not written the layout yet.
+    const fresh = agentIn(f, f.project.id, f.workspace.id, 'fresh')
+    const current = f.database.getSession(f.workspace.id)!
+    if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+    current.layout.root.tabs = current.layout.root.tabs.filter(tab => tab.resourceId !== 'fresh')
+    f.database.saveSession(f.workspace.id, current.layout, null, [])
+    expect(() => f.control.authorize(fresh, 'memory.remember')).not.toThrow()
+    expect(await f.control.call(fresh, 'memory.remember', { gist: 'Fresh tab memory' })).toMatchObject({ gist: 'Fresh tab memory' })
+    f.database.saveSession(f.workspace.id, current.layout, null, [{ id: 'tab-fresh', kind: 'agent', resourceId: 'fresh', title: 'Fresh' }])
+    expect(() => f.control.authorize(fresh, 'memory.remember')).toThrow(/tab was closed while its turn was running/)
+  })
+
+  it('git.ship.status gives a running test stage its counts and failing lines instead of a tail of passing test names', async () => {
+    const f = fixture()
+    const stage = (id: string, state: string, log: string[], progress?: { passedFiles: number; failedFiles: number; failing: string[] }) => ({ id, label: id, state, startedAt: '', finishedAt: '', detail: '', log, ...(progress ? { progress } : {}) })
+    const passing = Array.from({ length: 40 }, (_, index) => ` ✓ src/main/file-${index}.test.ts (4 tests) 20ms`)
+    const run = {
+      id: 'run-t', projectId: f.project.id, state: 'running', requestedBy: { kind: 'agent', agentSessionId: f.spec.id, title: f.spec.title }, message: 'Tests', paths: null,
+      startedAt: '', finishedAt: null, commit: null, releaseTag: null, releaseUrl: null, workflowRunUrl: null, error: null,
+      stages: [stage('preflight', 'passed', ['ok']), stage('test', 'running', passing, { passedFiles: 212, failedFiles: 1, failing: ['   × agents > lists 5ms'] }), stage('build', 'running', ['> npx tsc', 'built']), stage('commit', 'pending', []), stage('push', 'skipped', []), stage('release', 'pending', [])]
+    }
+    f.delivery.find.mockReturnValueOnce(run as never)
+    const viewed = await f.control.call(f.scope, 'git.ship.status', { runId: 'run-t' }) as { stages: Array<Record<string, unknown>> }
+    const test = viewed.stages.find(entry => entry.id === 'test')!
+    expect(test).toMatchObject({ state: 'running', passedFiles: 212, failedFiles: 1, failing: ['   × agents > lists 5ms'] })
+    expect(test).not.toHaveProperty('log')
+    expect(test).not.toHaveProperty('progress')
+    expect(viewed.stages.find(entry => entry.id === 'build')).toMatchObject({ log: ['> npx tsc', 'built'] })
+    f.delivery.find.mockReturnValueOnce({ ...run, stages: [run.stages[0], stage('test', 'running', ['> npx vitest run'])] } as never)
+    const early = await f.control.call(f.scope, 'git.ship.status', { runId: 'run-t' }) as { stages: Array<Record<string, unknown>> }
+    expect(early.stages[1]).toEqual({ id: 'test', label: 'test', state: 'running', startedAt: '', finishedAt: '', detail: '', passedFiles: 0, failedFiles: 0 })
+    f.delivery.find.mockReturnValueOnce({ ...run, state: 'failed', stages: [run.stages[0], stage('test', 'failed', passing, { passedFiles: 212, failedFiles: 1, failing: [] })] } as never)
+    const failed = await f.control.call(f.scope, 'git.ship.status', { runId: 'run-t' }) as { stages: Array<Record<string, unknown>> }
+    expect(failed.stages[1]).toMatchObject({ state: 'failed', log: passing.slice(-15) })
+    expect(failed.stages[1]).not.toHaveProperty('progress')
+  })
+
+  it('knows which call of a conversation waits on the owner\'s dialog, by mutation family, until it is answered', async () => {
+    const f = fixture()
+    let answer!: (value: boolean) => void
+    f.confirm.mockImplementationOnce(() => new Promise<boolean>(resolve => { answer = resolve }))
+    const memory = await f.control.call(f.scope, 'memory.remember', { gist: 'Forget me' }) as { id: string }
+    const forgetting = f.control.call(f.scope, 'memory.forget', { id: memory.id })
+    await vi.waitFor(() => expect(f.confirm).toHaveBeenCalled())
+    expect(f.control.awaitingOwner(f.scope, 'memory.forget')).toBe('memory.forget')
+    expect(f.control.awaitingOwner(f.scope, 'files.write')).toBe('memory.forget')
+    expect(f.control.awaitingOwner(f.scope, 'tabs.open')).toBeNull()
+    expect(f.control.awaitingOwner({ ...f.scope, agentSessionId: 'someone-else' }, 'memory.forget')).toBeNull()
+    answer(true)
+    expect(await forgetting).toEqual({ removed: true })
+    expect(f.control.awaitingOwner(f.scope, 'memory.forget')).toBeNull()
   })
 })

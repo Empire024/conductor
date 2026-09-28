@@ -50,9 +50,11 @@ try {
   const first = post(auth, 'memory.forget', { id: memoryId })
   await expect(dialog).toBeVisible()
   await expect(dialog).toContainText('Confirm smoke memory')
-  // The broker refuses a second concurrent call from the same session outright.
+  // A second call from the same conversation while its first waits on the owner is refused at
+  // once instead of queuing behind it (agent-control-server.ts confirmStillWaiting).
   const repeated = await post(auth, 'memory.forget', { id: memoryId })
   assert.equal(repeated.status, 409, JSON.stringify(repeated.body))
+  assert.match(repeated.body.error, /^A confirmation for your previous memory\.forget call is still waiting for the owner; do not repeat it/)
   await expect(dialog).toHaveCount(1)
   assert.equal((await page.evaluate(() => window.conductor.agentConfirm.pending())).length, 1)
   check('The request reaches the renderer, and a repeated call while it waits does not queue a second dialog')

@@ -47,6 +47,11 @@ const BUSY = `This session already has ${MAX_IN_FLIGHT_PER_SESSION} control requ
 /** A credential the server does not know (G22). */
 export const UNAUTHORIZED_CONTROL = 'This app-control credential is not (or no longer) valid, for example because the conversation moved workspace or Conductor restarted; nothing was done. Use the conductor MCP tools if you have them; otherwise say so in your final message and the owner restarts this conversation.'
 const NO_METHOD = 'Provide a method and args object, e.g. {"method":"tools.list","args":{"brief":true}}'
+/** A mutation that would queue behind this conversation's own earlier call, which is still
+ *  waiting on the owner's confirmation dialog: refused at once (HTTP 409), since a repeat would
+ *  only wait up to two minutes and then learn the answer the first call gets anyway. */
+export class ControlConflictError extends Error { readonly status = 409 }
+export const confirmStillWaiting = (method: string): string => `A confirmation for your previous ${method} call is still waiting for the owner; do not repeat it. That call answers with the owner's decision (or a timeout after two minutes); carry on with other work meanwhile`
 /** Conversations whose credential is remembered across launches; the oldest go first. */
 const MAX_KEPT_CREDENTIALS = 2000
 
@@ -63,7 +68,7 @@ export class AgentControlServer {
   private changed = true
   /** The journal masks any of this server's tokens wherever one lands in a stored string (H17). */
   private unregisterSecretCheck?: () => void
-  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity' | 'prepareActivity'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions, private readonly stable?: StableEndpointOptions) {}
+  constructor(private readonly control: Pick<AgentControl, 'authorize' | 'call' | 'ownerScope'> & Partial<Pick<AgentControl, 'recordActivity' | 'prepareActivity' | 'awaitingOwner'>>, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly machineNote?: (spec: AgentSpec) => string, private readonly owner?: OwnerCredentialOptions, private readonly stable?: StableEndpointOptions) {}
 
   async start(): Promise<void> {
     if (this.disabled || this.server) return
@@ -245,7 +250,7 @@ export class AgentControlServer {
       // when its credential is issued and nothing in the body can move it.
       const scope = owner ? this.control.ownerScope(input.scope) : credential!.scope
       reply(200, { result: await this.run(key, scope, input.method, input.args ?? {}) })
-    } catch (error) { reply(400, { error: error instanceof Error ? error.message : 'Control request failed' }) }
+    } catch (error) { reply(error instanceof ControlConflictError ? error.status : 400, { error: error instanceof Error ? error.message : 'Control request failed' }) }
     finally { this.leave(key) }
   }
 
@@ -288,6 +293,10 @@ export class AgentControlServer {
         this.control.recordActivity?.(scope, method, args, { error: error instanceof Error ? error.message : String(error), prepared })
         throw error
       }
+    }
+    if (controlMethodClass(method) !== 'read') {
+      const waiting = this.control.awaitingOwner?.(scope, method)
+      if (waiting) throw new ControlConflictError(confirmStillWaiting(waiting))
     }
     const result = controlMethodClass(method) === 'read'
       ? await call()

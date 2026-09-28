@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
-import { DELIVERY_STAGES, type DeliveryRequester, type DeliveryRun, type DeliveryStage, type DeliveryStageId, type RepositoryFile, type RepositoryStatus } from '../shared/delivery'
+import { DELIVERY_STAGES, type DeliveryRequester, type DeliveryRun, type DeliveryStage, type DeliveryStageId, type DeliveryTestProgress, type RepositoryFile, type RepositoryStatus } from '../shared/delivery'
 
 export interface DeliveryRunOptions {
   cwd: string
@@ -264,6 +264,19 @@ export function failureLines(lines: string[], limit = 20): string[] {
   const clean = lines.map(line => line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''))
   const telling = clean.filter(line => /\bFAIL\b|error TS\d+|Error:|AssertionError|×|✗|\bnot ok\b/.test(line))
   return (telling.length ? telling : clean).slice(-limit)
+}
+
+/**
+ * Counts one test-stage line into the stage's progress: vitest's per-file lines (`✓ file (n
+ * tests)` passed, `❯ file (n tests | k failed)` failed) and the lines that say why something
+ * failed. A caller polling a running test stage reads these instead of a tail of passing names.
+ */
+export function countTestLine(progress: DeliveryTestProgress, line: string): void {
+  const testFile = /^\s*(?:✓|❯|×)\s+\S+\.(?:test|spec)\.[cm]?[jt]sx?\b/
+  if (testFile.test(line) && /^\s*✓/.test(line)) { progress.passedFiles += 1; return }
+  const failedFile = testFile.test(line) && (/^\s*×/.test(line) || /\|\s*\d+ failed\)/.test(line))
+  if (failedFile) progress.failedFiles += 1
+  if (failedFile || /\bFAIL\b|error TS\d+|Error:|AssertionError|×|✗|✖|\bnot ok\b/.test(line)) progress.failing = [...progress.failing, line].slice(-15)
 }
 
 const short = (sha: string | null): string => (sha ?? '').slice(0, 7)
@@ -1103,6 +1116,7 @@ export class DeliveryService {
     const clean = lines.map(line => line.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trimEnd().slice(0, LINE_CHARS)).filter(Boolean)
     if (!clean.length) return
     stage.log = [...stage.log, ...clean].slice(-LOG_LINES)
+    if (stage.id === 'test') for (const line of clean) countTestLine(stage.progress ??= { passedFiles: 0, failedFiles: 0, failing: [] }, line)
     this.emitSoon(active.run)
   }
 
@@ -1170,5 +1184,5 @@ export class DeliveryService {
 }
 
 function snapshot(run: DeliveryRun): DeliveryRun {
-  return { ...run, requestedBy: { ...run.requestedBy }, paths: run.paths ? [...run.paths] : null, stages: run.stages.map(stage => ({ ...stage, log: [...stage.log] })) }
+  return { ...run, requestedBy: { ...run.requestedBy }, paths: run.paths ? [...run.paths] : null, stages: run.stages.map(stage => ({ ...stage, log: [...stage.log], ...(stage.progress ? { progress: { ...stage.progress, failing: [...stage.progress.failing] } } : {}) })) }
 }

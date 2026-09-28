@@ -16,19 +16,20 @@ import { CHECKOUT, createLogger, samePath, stamp, writeJsonAtomic } from './over
 const USAGE = `Usage: node scripts/overseer.mjs <command> [options]
   run --goal <file> [--goal <file>...] [--target dev|installed] [--fixer-target auto|dev|installed]
       [--iterations N] [--fixers N] [--deliver] [--restart-installed] [--no-fix] [--run-dir <dir>] [--keep-app]
+      [--commit <sha>] [--smoke <name>[,<name>...]] [--resume <wizard agentSessionId>] [--force]
   test --goal <file> [--target dev|installed] [--run-dir <dir>] [--keep-app]
   status [--target dev|installed]
   app start|stop|restart
   call --method <m> [--args <json>] [--scope <json>] [--project <path-or-name>] [--target dev|installed]
   build
-  deliver [--restart-installed]
+  deliver [--commit <sha> [--smoke <name>[,<name>...]]] [--restart-installed] [--resume <wizard agentSessionId>] [--force]
 Exit codes: 0 pass, 1 fail, 2 blocked (fixer blocked, budget exhausted, app unreachable).`
 
-const BOOLEAN = new Set(['deliver', 'restart-installed', 'no-fix', 'keep-app', 'help'])
+const BOOLEAN = new Set(['deliver', 'restart-installed', 'no-fix', 'keep-app', 'force', 'help'])
 
 export function parseArgs(argv) {
   const positional = []
-  const options = { goal: [] }
+  const options = { goal: [], smoke: [] }
   for (let index = 0; index < argv.length; index++) {
     const token = argv[index]
     if (!token.startsWith('--')) { positional.push(token); continue }
@@ -37,6 +38,7 @@ export function parseArgs(argv) {
     const value = inline ?? argv[++index]
     if (value === undefined) throw new Error(`--${name} needs a value`)
     if (name === 'goal') options.goal.push(value)
+    else if (name === 'smoke') options.smoke.push(...value.split(',').map(entry => entry.trim()).filter(Boolean))
     else options[name] = value
   }
   const integer = (name, fallback, min) => {
@@ -49,13 +51,17 @@ export function parseArgs(argv) {
   if (!['dev', 'installed'].includes(target)) throw new Error('--target must be dev or installed')
   const fixerTarget = options['fixer-target'] ?? 'auto'
   if (!['auto', 'dev', 'installed'].includes(fixerTarget)) throw new Error('--fixer-target must be auto, dev or installed')
+  if (options.smoke.length && !options.commit) throw new Error('--smoke needs --commit: smokes run against a clean build of one commit')
   return {
     command: positional[0], sub: positional[1], goals: options.goal, target, fixerTarget,
     iterations: integer('iterations', 5, 1), fixers: integer('fixers', 4, 1),
     deliver: Boolean(options.deliver), restartInstalled: Boolean(options['restart-installed']), noFix: Boolean(options['no-fix']), keepApp: Boolean(options['keep-app']),
+    commit: options.commit ?? null, smoke: options.smoke, resume: options.resume ?? null, force: Boolean(options.force),
     runDir: options['run-dir'], method: options.method, args: options.args, scope: options.scope, project: options.project, help: Boolean(options.help)
   }
 }
+
+const deliveryOptions = args => ({ commit: args.commit, smoke: args.smoke, resume: args.resume, force: args.force })
 
 const head = () => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: CHECKOUT, encoding: 'utf8', windowsHide: true }).trim()
 
@@ -122,12 +128,12 @@ async function commandRun(args, log, { testOnly = false } = {}) {
         try { await instance.restart(); return { ok: true } } catch (error) { return { ok: false, reason: error.message } }
       }
       if (!args.restartInstalled) return { ok: false, fatal: true, reason: 'fixes are committed, but the installed target only runs them after an update; rerun with --restart-installed or use --target dev' }
-      const result = await deliver({ client: await apps.installed(), userData: installedUserData(), restart: true, log })
+      const result = await deliver({ client: await apps.installed(), userData: installedUserData(), restart: true, ...deliveryOptions(args), log })
       if (result.client) apps.forgetInstalled(result.client)
       return result.ok ? { ok: true, version: result.appVersion } : { ok: false, fatal: true, reason: result.reason }
     },
     deliver: async () => {
-      const result = await deliver({ client: await apps.installed(), userData: installedUserData(), restart: args.restartInstalled, log })
+      const result = await deliver({ client: await apps.installed(), userData: installedUserData(), restart: args.restartInstalled, ...deliveryOptions(args), log })
       if (result.client) apps.forgetInstalled(result.client)
       return result
     }
@@ -207,7 +213,7 @@ async function commandBuild(args, log) {
 async function commandDeliver(args, log) {
   const attempt = await connectInstalled()
   if (!attempt.ok) { log(`installed Conductor is not reachable: ${attempt.reason}`); return EXIT.blocked }
-  const result = await deliver({ client: attempt.client, userData: installedUserData(), restart: args.restartInstalled, log })
+  const result = await deliver({ client: attempt.client, userData: installedUserData(), restart: args.restartInstalled, ...deliveryOptions(args), log })
   const { client, ...printable } = result
   console.log(JSON.stringify(printable, null, 2))
   return result.ok ? EXIT.pass : EXIT.fail

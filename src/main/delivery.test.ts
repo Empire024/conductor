@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { DeliveryService, normalizeDeliveryPath, parseDeliveryConfig, parseGithubRemote, parsePorcelain, workflowHasMacInput, workflowRunsOnPush, type DeliveryRunOptions } from './delivery'
+import { countTestLine, DeliveryService, normalizeDeliveryPath, parseDeliveryConfig, parseGithubRemote, parsePorcelain, workflowHasMacInput, workflowRunsOnPush, type DeliveryRunOptions } from './delivery'
 import type { DeliveryRun } from '../shared/delivery'
 
 const SHA = 'a'.repeat(40)
@@ -712,5 +712,29 @@ describe('delivery helpers', () => {
     expect(() => parseDeliveryConfig('{"branch":"--force"}')).toThrow(/branch/)
     expect(() => parseDeliveryConfig('{"release":{"workflow":"../x"}}')).toThrow(/workflow/)
     expect(() => parseDeliveryConfig('nope')).toThrow(/not valid JSON/)
+  })
+})
+
+describe('countTestLine', () => {
+  it('counts vitest test files passed and failed and keeps only the failing lines', () => {
+    const progress = { passedFiles: 0, failedFiles: 0, failing: [] as string[] }
+    for (const line of [
+      '> npx vitest run',
+      ' RUN  v3.2.7 C:/repo',
+      ' ✓ src/main/a.test.ts (3 tests) 3ms',
+      ' ✓ src/renderer/src/b.test.tsx (6 tests) 8ms',
+      ' ❯ src/main/c.test.ts (5 tests | 1 failed) 20ms',
+      '   × lists the rows 5ms',
+      '   ✓ keeps the order 1ms',
+      ' FAIL  src/main/c.test.ts > lists the rows',
+      'AssertionError: expected 2 to be 3',
+      ' Test Files  1 failed | 2 passed (3)'
+    ]) countTestLine(progress, line)
+    expect(progress.passedFiles).toBe(2)
+    expect(progress.failedFiles).toBe(1)
+    expect(progress.failing).toEqual([' ❯ src/main/c.test.ts (5 tests | 1 failed) 20ms', '   × lists the rows 5ms', ' FAIL  src/main/c.test.ts > lists the rows', 'AssertionError: expected 2 to be 3'])
+    for (let index = 0; index < 30; index++) countTestLine(progress, `   × case ${index}`)
+    expect(progress.failing).toHaveLength(15)
+    expect(progress.failing.at(-1)).toBe('   × case 29')
   })
 })

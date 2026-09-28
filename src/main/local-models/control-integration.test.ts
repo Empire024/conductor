@@ -35,7 +35,7 @@ it('binds LocalAdapter control to durable project memory, live permissions and r
   cleanup.push(() => manager.dispose())
   const orchestration = new OrchestrationStore(path), collaboration = new AgentCollaborationStore(path)
   cleanup.push(() => orchestration.close(), () => collaboration.close())
-  const idleUpdate = { state: 'idle' as const, workspace: null, startedAt: null, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'idle', log: [] }
+  const idleUpdate = { state: 'idle' as const, workspace: null, startedAt: null, finishedAt: null, version: null, feedDirectory: null, exitCode: null, message: 'idle', log: [], commit: null, worktree: null, stage: null, smokes: [], verified: null }
   const localUpdates = { unsupported: () => null, status: () => idleUpdate, start: vi.fn((target: string) => ({ ...idleUpdate, state: 'running' as const, workspace: target })) }
   const control = new AgentControl({ database, sessions: manager, orchestration, collaboration, backlogs: new ProjectBacklogs(database), localUpdates, providers: () => [], ui: async () => ({}), confirm: async () => false, fileChanged: () => {} })
   manager.setLocalControl((bound, method, args) => control.call({ projectId: bound.projectId, sessionId: bound.sessionId, agentSessionId: bound.id }, method, args))

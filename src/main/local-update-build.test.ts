@@ -1,4 +1,5 @@
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -40,5 +41,81 @@ describe('local update builds', () => {
     builder.start(root)
     await vi.waitFor(() => expect(builder.status().state).toBe('succeeded'), { timeout: 20_000 })
     expect(builder.status().feedDirectory).toBe(feed)
+  })
+  // app.update({commit, smoke}): an exact commit in its own clean worktree, then its smokes.
+  const repository = (): { root: string; candidates: string; feed: string; git: (...args: string[]) => string } => {
+    const base = mkdtempSync(join(tmpdir(), 'local-update-candidate-'))
+    roots.push(base)
+    const root = join(base, 'conductor'), candidates = join(base, 'candidates'), feed = join(base, 'feed')
+    mkdirSync(join(root, 'scripts'), { recursive: true })
+    const git = (...args: string[]): string => execFileSync('git', args, { cwd: root, encoding: 'utf8', windowsHide: true }).trim()
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'conductor-desktop' }), 'utf8')
+    writeFileSync(join(root, '.gitignore'), 'node_modules/\n.conductor-scratch/\n', 'utf8')
+    // The fixture build records what the real one does: the commit it was built from and whether the tree was dirty.
+    writeFileSync(join(root, 'scripts', 'build-local-update.mjs'), [
+      "import { execFileSync } from 'node:child_process'", "import { mkdirSync, writeFileSync } from 'node:fs'",
+      "const feed = process.argv[process.argv.indexOf('--feed-dir') + 1]",
+      "const git = (...a) => execFileSync('git', a, { encoding: 'utf8' }).trim()",
+      'mkdirSync(feed, { recursive: true })',
+      "writeFileSync(feed + '/conductor-local-build.json', JSON.stringify({ version: '0.1.1-local.7', commit: git('rev-parse', 'HEAD'), dirty: Boolean(git('status', '--porcelain')) }))",
+      "console.log('Local update ready: 0.1.1-local.7'); console.log('Feed: ' + feed)"
+    ].join('\n'), 'utf8')
+    writeFileSync(join(root, 'scripts', 'smoke-lock.mjs'), "import { spawnSync } from 'node:child_process'\nconst at = process.argv.indexOf('--')\nconst [command, ...rest] = process.argv.slice(at + 1)\nprocess.exit(spawnSync(command, rest, { stdio: 'inherit' }).status ?? 1)\n", 'utf8')
+    writeFileSync(join(root, 'scripts', 'smoke-ok.mjs'), "console.log('checks 3/3 passed')\n", 'utf8')
+    writeFileSync(join(root, 'scripts', 'smoke-bad.mjs'), "for (let i = 0; i < 30; i++) console.log('line ' + i)\nconsole.error('FAIL: the grant card never appeared')\nprocess.exit(1)\n", 'utf8')
+    mkdirSync(join(root, 'node_modules', 'electron-builder'), { recursive: true })
+    writeFileSync(join(root, 'node_modules', 'electron-builder', 'cli.js'), '// fixture\n', 'utf8')
+    git('init', '-q'); git('config', 'user.email', 'fixture@example.invalid'); git('config', 'user.name', 'fixture'); git('config', 'core.autocrlf', 'false')
+    git('add', '.'); git('commit', '-q', '-m', 'fixture')
+    return { root, candidates, feed, git }
+  }
+
+  it('builds an exact commit in a clean worktree with a real node_modules, runs its smokes, and marks a failed smoke not verified', async () => {
+    if (process.platform !== 'win32') return
+    const { root, candidates, feed, git } = repository()
+    const head = git('rev-parse', 'HEAD')
+    // Another agent's unfinished edit in the checkout must not reach the build.
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ name: 'conductor-desktop', edited: true }), 'utf8')
+    const builder = new LocalUpdateBuilder({ feedDirectory: () => feed, candidatesDirectory: () => candidates })
+    expect(builder.start(root, { commit: 'HEAD', smoke: ['smoke-ok', 'scripts/smoke-bad.mjs'] })).toMatchObject({ state: 'running', commit: head, stage: 'worktree', verified: false })
+    await vi.waitFor(() => expect(builder.status().state).not.toBe('running'), { timeout: 60_000, interval: 200 })
+    const status = builder.status()
+    const worktree = join(candidates, head.slice(0, 7))
+    expect(status).toMatchObject({ state: 'succeeded', commit: head, worktree, stage: 'done', version: '0.1.1-local.7', verified: false })
+    expect(status.message).toMatch(/NOT verified: smoke-bad failed/)
+    expect(status.smokes.map(smoke => [smoke.name, smoke.state, smoke.exitCode])).toEqual([['smoke-ok', 'passed', 0], ['smoke-bad', 'failed', 1]])
+    expect(status.smokes[1]!.tail!.at(-1)).toBe('FAIL: the grant card never appeared')
+    expect(status.smokes[1]!.tail!.length).toBeLessThanOrEqual(20)
+    expect(existsSync(status.smokes[0]!.log!)).toBe(true)
+    expect(lstatSync(join(worktree, 'node_modules')).isSymbolicLink()).toBe(false)
+    expect(existsSync(join(worktree, 'node_modules', 'electron-builder', 'cli.js'))).toBe(true)
+
+    // A second build of the same commit reuses that worktree; all smokes passing verifies it.
+    builder.start(root, { commit: head, smoke: ['smoke-ok'] })
+    await vi.waitFor(() => expect(builder.status().state).not.toBe('running'), { timeout: 60_000, interval: 200 })
+    expect(builder.status()).toMatchObject({ state: 'succeeded', worktree, verified: true, stage: 'done' })
+    expect(builder.status().log.join('\n')).toMatch(/Reusing the clean worktree/)
+  }, 150_000)
+
+  it('refuses a candidate it cannot build faithfully before building anything', async () => {
+    if (process.platform !== 'win32') return
+    const { root, candidates, feed, git } = repository()
+    const builder = new LocalUpdateBuilder({ feedDirectory: () => feed, candidatesDirectory: () => candidates })
+    expect(() => builder.validate(root, { smoke: ['smoke-ok'] })).toThrow(/smoke needs commit/)
+    expect(() => builder.validate(root, { commit: 'no-such-ref' })).toThrow(/No commit no-such-ref/)
+    expect(() => builder.validate(root, { commit: '--upload-pack=x' })).toThrow(/must be a sha or ref/)
+    expect(() => builder.validate(root, { commit: 'HEAD', smoke: ['node -e 1'] })).toThrow(/scripts\/smoke-\*\.mjs/)
+    expect(() => builder.validate(root, { commit: 'HEAD', smoke: ['smoke-lock'] })).toThrow(/scripts\/smoke-\*\.mjs/)
+    expect(() => builder.validate(root, { commit: 'HEAD', smoke: ['smoke-missing'] })).toThrow(/has no scripts\/smoke-missing\.mjs/)
+    expect(builder.validate(root, {})).toBeUndefined()
+    const head = git('rev-parse', 'HEAD'), worktree = join(candidates, head.slice(0, 7))
+    git('worktree', 'add', '--detach', worktree, head)
+    writeFileSync(join(worktree, 'package.json'), '{}', 'utf8')
+    expect(() => builder.start(root, { commit: head })).toThrow(/uncommitted changes/)
+    execFileSync('git', ['checkout', '--', 'package.json'], { cwd: worktree, windowsHide: true })
+    mkdirSync(join(worktree, 'node_modules'))
+    symlinkSync(join(root, 'node_modules', 'electron-builder'), join(worktree, 'node_modules', 'electron-builder'), 'junction')
+    expect(() => builder.start(root, { commit: head })).toThrow(/junction in node_modules \(node_modules\/electron-builder\)/)
+    expect(builder.status().state).toBe('idle')
   })
 })
