@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Decider, DecisionRequest } from '../../shared/model-routing'
 import type { LocalModelRunner } from '../local-assist/contract'
 import { GO_LIVE, callModelMethod, type ModelControlCaller } from './control'
@@ -55,5 +55,40 @@ describe('decision go-live control', () => {
     expect(await f.call('decisions.live', { kind: 'approval', live: false })).toMatchObject({ live: false, previous: true })
     await expect(f.call('decisions.live', { kind: 'nope', live: true })).rejects.toThrow(/kind must be one of/)
     await expect(f.call('decisions.live', { kind: 'approval', live: 'yes' })).rejects.toThrow(/live must be true or false/)
+  })
+})
+
+describe('models.evaluate admission (B5-G)', () => {
+  const start = () => {
+    const startEvaluation = vi.fn(async (key: { provider: string; model: string }) => ({ runId: 'evaluation_x', key, suite: 'default', state: 'running', startedAt: '', notGradable: [] }))
+    const service = { store: { now: () => new Date('2026-09-28T20:00:00Z') }, startEvaluation } as unknown as ModelIntelligence
+    const call = (offered: Array<{ provider: string; model: string }>, args: Record<string, unknown>) => callModelMethod(service, {
+      projectId: 'p1', workspaceId: 'w2', agentSessionId: 'wizard', sovereign: true, readOnly: false, controls: () => false,
+      live: { offered, providerEnabled: () => true, usagePercent: () => null, loadedLocalModels: () => [] }
+    }, 'models.evaluate', args)
+    return { startEvaluation, call }
+  }
+  const OFFERED = [{ provider: 'claude', model: 'opus' }, { provider: 'claude', model: 'opus[1m]' }, { provider: 'claude', model: 'claude-fable-5-1' }, { provider: 'codex', model: 'gpt-6-astra' }]
+
+  it('evaluates the model models.list offers this caller, in the caller\'s workspace', async () => {
+    const f = start()
+    await f.call(OFFERED, { provider: 'claude', model: 'opus[1m]' })
+    expect(f.startEvaluation).toHaveBeenCalledWith({ provider: 'claude', model: 'opus[1m]' }, undefined, { scope: { projectId: 'p1', workspaceId: 'w2' } })
+  })
+  it('resolves a name as tabs.open does (H09) and says what it resolved from', async () => {
+    const f = start()
+    expect(await f.call(OFFERED, { provider: 'claude', model: 'fable' })).toMatchObject({ modelResolvedFrom: 'fable' })
+    expect(f.startEvaluation.mock.calls[0]![0]).toEqual({ provider: 'claude', model: 'claude-fable-5-1' })
+  })
+  it('refuses before any run starts or counts when the model or the provider\'s catalog is not offered', async () => {
+    const f = start()
+    await expect(f.call(OFFERED, { provider: 'claude', model: 'claude-opus-4-1' })).rejects.toThrow('claude/claude-opus-4-1 is not offered to this conversation; claude offers opus, opus[1m], claude-fable-5-1 (models.list). No evaluation was started or counted')
+    await expect(f.call(OFFERED.filter(key => key.provider !== 'claude'), { provider: 'claude', model: 'opus[1m]' })).rejects.toThrow(/claude offers no model to this conversation right now \(its catalog is not ready yet/)
+    expect(f.startEvaluation).not.toHaveBeenCalled()
+  })
+  it('leaves local keys to the local admission', async () => {
+    const f = start()
+    await f.call([], { provider: 'local', model: 'qwen' })
+    expect(f.startEvaluation).toHaveBeenCalledWith({ provider: 'local', model: 'local/qwen' }, undefined, {})
   })
 })

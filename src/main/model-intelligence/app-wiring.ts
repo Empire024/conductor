@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { AgentProviderInfo } from '../../shared/models'
 import { localStopOf } from '../../shared/local-stop'
@@ -77,11 +77,19 @@ export async function startModelIntelligence(deps: ModelIntelligenceAppDeps): Pr
       command: async () => { const image = deps.sandboxImage(); return image && await deps.sandboxReady(image) ? dockerCommandPort(image) : null },
       precheck: key => { const other = deps.runningLocalModels().filter(model => model !== key.model); return other.length ? `${other.join(', ')} holds the GPU; stop it with local.stop first, or evaluate that model` : null },
       writeReport: (name, markdown) => { const folder = join(deps.userData, 'model-evaluations'); mkdirSync(folder, { recursive: true }); writeFileSync(join(folder, name), markdown, 'utf8') },
+      readReport: runId => evaluationReport(join(deps.userData, 'model-evaluations'), runId),
       suites: bundledSuites
     }
   })
   service.start()
   return service
+}
+
+/** A run's report in the evaluation reports folder: the one file named <date>-<key>-<runId>.md. */
+export function evaluationReport(folder: string, runId: string): string | null {
+  if (!existsSync(folder)) return null
+  const name = readdirSync(folder).find(file => file.endsWith(`-${runId}.md`))
+  return name ? readFileSync(join(folder, name), 'utf8') : null
 }
 
 function localFacts(deps: ModelIntelligenceAppDeps): ConfiguredLocalModel[] | null {

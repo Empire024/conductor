@@ -9,6 +9,7 @@ import type { ReviewAction } from '../approval-review'
 import type { LocalModelRequest } from '../local-assist/contract'
 import { outcome as outcomeRow } from './capture/common'
 import { batchJobTokens, type EvaluationSuite } from './evaluation'
+import { EvaluationRefused } from './evaluation-ports'
 import { softmax } from './deciders/scorer'
 import {
   CALLER_DECIDER_ID, callerFrontier, chosenOnTop, closeCandidates, createModelIntelligence, DEFAULT_EVALUATION_CAPS, DEFAULT_EXCLUDED_MODELS, EVALUATION_CAPS_SETTING, EXCLUDED_MODELS_SETTING,
@@ -494,6 +495,49 @@ describe('the owner exclusion list (N5)', () => {
     const { service: s } = service()
     s.decisions['ports'].settings.setSetting(EXCLUDED_MODELS_SETTING, '{"not":"a list"}')
     expect(s.excludedModels()).toEqual([...DEFAULT_EXCLUDED_MODELS])
+    s.dispose()
+  })
+})
+
+describe('a cloud evaluation refused before any model call (B5-G)', () => {
+  const suite: EvaluationSuite = { name: 'mini', jobs: [{ id: 'answer', category: 'simple-coding', complexity: 1, prompt: 'Say 42', grader: { kind: 'exact', expected: '42' } }] }
+  const refusal = 'claude/opus[1m] is not offered on this machine now; models.list shows what is, or omit route and name provider and model'
+  function cloud(reports: Record<string, string> = {}) {
+    const runCloud = vi.fn(async (..._args: unknown[]): Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number }> => { throw new EvaluationRefused(refusal) })
+    const s = createModelIntelligence({ dbPath: ':memory:', settings: settings(), timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => 10, suites: () => ({ mini: suite }), readReport: runId => reports[runId] ?? null } })
+    register(s, [[OPUS, 'Opus']])
+    return { s, runCloud }
+  }
+
+  it('spends nothing, is not one of the day\'s runs, and says why; the turn gets the caller\'s scope', async () => {
+    const { s, runCloud } = cloud()
+    for (let index = 0; index < 4; index++) {
+      const handle = await s.startEvaluation(OPUS, 'mini', { scope: { projectId: 'p1', workspaceId: 'w2' } })
+      await vi.waitFor(() => expect(s.evaluation(handle.runId)!.state).toBe('done'))
+      expect(s.evaluation(handle.runId)!.result).toMatchObject({ tokens: 0, stoppedBy: 'refused', reason: refusal, outcomes: [] })
+    }
+    // Four refused runs, and the three-a-day cap still has all its runs and tokens.
+    expect(s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual({ runs: 0, tokens: 0 })
+    expect(runCloud.mock.calls[0]![4]).toEqual({ scope: { projectId: 'p1', workspaceId: 'w2' } })
+    // Nothing was measured, so the overhead is not learned from a refusal.
+    expect(s.fixedOverheadTokens('claude')).toBe(40_000)
+    s.dispose()
+  })
+  it('releases, once, a journaled run whose report shows its one turn refused, and keeps every real charge', () => {
+    const phantomReport = ['## Jobs', '', '| Job | Category | Result | Detail | Time | Cost |', '| --- | --- | --- | --- | --- | --- |',
+      `| answer | simple-coding | not-gradable | not graded: the batched turn failed: ${refusal} | 0 s | — |`, ''].join('\n')
+    const failedReport = phantomReport.replace(refusal, 'the evaluation turn ended failed')
+    const { s } = cloud({ phantom: phantomReport, failed: failedReport, graded: phantomReport })
+    const at = NOW.toISOString(), base = { key: OPUS, at, costUsd: 0, jobs: 1, gradedJobs: 0, stoppedBy: 'token-cap' as const }
+    s.store.recordEvaluationSpend({ ...base, runId: 'phantom', tokens: 60_000 })
+    s.store.recordEvaluationSpend({ ...base, runId: 'failed', tokens: 60_000 })
+    s.store.recordEvaluationSpend({ ...base, runId: 'graded', tokens: 45_000, gradedJobs: 1 })
+    s.store.recordEvaluationSpend({ ...base, runId: 'no-report', tokens: 30_000 })
+    expect(s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual({ runs: 4, tokens: 195_000 })
+    expect(s.reconcileRefusedEvaluations()).toEqual(['phantom'])
+    expect(s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual({ runs: 3, tokens: 135_000 })
+    expect(s.store.evaluationRuns('2026-09-27T12:00:00Z').find(spend => spend.runId === 'phantom')).toMatchObject({ tokens: 0, stoppedBy: 'refused', reason: refusal })
+    expect(s.reconcileRefusedEvaluations()).toEqual([])
     s.dispose()
   })
 })

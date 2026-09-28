@@ -46,7 +46,8 @@ export interface OutcomeQuery { key?: ModelKey; category?: TaskCategory; since: 
 export interface DecisionQuery { kind?: DecisionKind; since: string; until?: string; limit: number; includeDryRun?: boolean }
 /** How often the system-one verdict matched the final answer (the owner's, else the frontier's). */
 export interface Agreement { kind: DecisionKind; since: string; cases: number; agreed: number; rate: number | null }
-export interface EvaluationSpend { runId: string; key: ModelKey; at: string; tokens: number; jobs: number; gradedJobs: number; stoppedBy: string | null }
+export interface EvaluationSpend { runId: string; key: ModelKey; at: string; tokens: number; costUsd?: number; jobs: number; gradedJobs: number; stoppedBy: string | null; reason?: string }
+const spendOf = (value: unknown): EvaluationSpend | null => { try { return JSON.parse(String(value)) as EvaluationSpend } catch { return null } }
 /** The system-one verdict of a decision: DecisionService records it; older records carry it as verdicts[0] of two or more. */
 export function systemOneOf(record: DecisionRecord): NonNullable<DecisionRecord['systemOne']> | null {
   if (record.systemOne !== undefined) return record.systemOne
@@ -542,16 +543,35 @@ export class ModelIntelligenceStore {
       .run(spend.runId, modelKeyId(spend.key), iso(spend.at, 'at'), Math.max(0, Math.round(spend.tokens)), JSON.stringify(spend))
   }
 
-  /** Cloud evaluation spend since an instant: runs and tokens (local runs cost nothing and are not counted). */
+  /** Cloud evaluation spend since an instant: runs and tokens (local runs cost nothing and are not counted,
+   *  nor is a run refused before any model call). */
   evaluationSpend(since: string, provider?: string): { runs: number; tokens: number } {
     let runs = 0, tokens = 0
-    for (const row of this.db.prepare('SELECT key, tokens FROM evaluation_runs WHERE at >= ? ORDER BY at DESC LIMIT ?').all(iso(since, 'since'), MAX_QUERY_LIMIT) as Row[]) {
+    for (const row of this.db.prepare('SELECT key, tokens, record_json FROM evaluation_runs WHERE at >= ? ORDER BY at DESC LIMIT ?').all(iso(since, 'since'), MAX_QUERY_LIMIT) as Row[]) {
       const key = String(row.key)
       if (key.startsWith('local/') || provider && !key.startsWith(`${provider}/`)) continue
+      if (spendOf(row.record_json)?.stoppedBy === 'refused') continue
       runs++
       tokens += Number(row.tokens)
     }
     return { runs, tokens }
+  }
+
+  /** The journaled evaluation runs since an instant, newest first. */
+  evaluationRuns(since: string): EvaluationSpend[] {
+    return (this.db.prepare('SELECT record_json FROM evaluation_runs WHERE at >= ? ORDER BY at DESC LIMIT ?').all(iso(since, 'since'), MAX_QUERY_LIMIT) as Row[])
+      .flatMap(row => { const spend = spendOf(row.record_json); return spend ? [spend] : [] })
+  }
+
+  /** Marks a journaled run as refused before any model call: it spent nothing and leaves the day's caps.
+   *  The correction for a run charged a budget its turn never used; returns whether a row changed. */
+  releaseEvaluationSpend(runId: string, reason: string): boolean {
+    const row = this.db.prepare('SELECT record_json FROM evaluation_runs WHERE run_id = ?').get(runId) as Row | undefined
+    const spend = row ? spendOf(row.record_json) : null
+    if (!spend || spend.stoppedBy === 'refused' && spend.tokens === 0) return false
+    const released: EvaluationSpend = { ...spend, tokens: 0, costUsd: 0, stoppedBy: 'refused', reason }
+    this.db.prepare('UPDATE evaluation_runs SET tokens = 0, record_json = ? WHERE run_id = ?').run(JSON.stringify(released), runId)
+    return true
   }
 
   // -------------------------------------------------------------------------------------------

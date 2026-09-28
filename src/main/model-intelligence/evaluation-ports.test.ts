@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it, vi } from 'vitest'
 import type { LocalModelRequest } from '../local-assist/contract'
 import type { EvaluationJob } from './evaluation'
-import { answerFiles, cloudRunPort, DEFAULT_FIXED_OVERHEAD_TOKENS, dockerCommandPort, evaluationPrompt, evaluationTokens, EvaluationTurnError, fixedOverhead, localRunPort, type ExecFile } from './evaluation-ports'
+import { answerFiles, cloudRunPort, DEFAULT_FIXED_OVERHEAD_TOKENS, dockerCommandPort, evaluationPrompt, evaluationTokens, EvaluationRefused, EvaluationTurnError, fixedOverhead, isRefusal, localRunPort, type ExecFile } from './evaluation-ports'
 
 const job: EvaluationJob = { id: 'add', category: 'simple-coding', complexity: 1, prompt: 'Write src/add.js exporting add(a, b).', files: { 'package.json': '{"type":"module"}' }, grader: { kind: 'file-content', path: 'src/add.js', regex: 'export function add' } }
 
@@ -97,5 +97,26 @@ describe('evaluation ports', () => {
     const exec2 = vi.fn()
     await expect(dockerCommandPort('image:1', exec2)({ cmd: 'node', args: ['a\0b'], timeoutSec: 1, files: {} })).rejects.toThrow(/plain text/)
     expect(exec2).not.toHaveBeenCalled()
+  })
+})
+
+describe('a cloud turn refused before any model call (B5-G)', () => {
+  const key = { provider: 'claude', model: 'opus[1m]' }
+  it('reports what the turn threw before its prompt went out as a refusal that costs nothing', async () => {
+    const refused = cloudRunPort(async () => { throw new Error('claude/opus[1m] is not offered on this machine now') })(key, job, new AbortController().signal, { maxTokens: 60_000 })
+    await expect(refused).rejects.toBeInstanceOf(EvaluationRefused)
+    await expect(refused).rejects.toMatchObject({ refused: true, tokens: 0, message: 'claude/opus[1m] is not offered on this machine now' })
+    expect(isRefusal(new EvaluationRefused('x'))).toBe(true)
+    expect(isRefusal(new Error('x'))).toBe(false)
+  })
+  it('keeps a failed turn an EvaluationTurnError, charged as measured (N3)', async () => {
+    const failed = cloudRunPort(async () => { throw new EvaluationTurnError('the evaluation turn ended failed', 60_000) })(key, job, new AbortController().signal, { maxTokens: 60_000 })
+    await expect(failed).rejects.toBeInstanceOf(EvaluationTurnError)
+    await expect(failed).rejects.not.toBeInstanceOf(EvaluationRefused)
+  })
+  it('hands the turn the caller\'s scope with its budget', async () => {
+    const turn = vi.fn(async () => ({ answer: 'x', tokens: 10, costUsd: null, durationMs: 1, effort: null }))
+    await cloudRunPort(turn)(key, job, new AbortController().signal, { maxTokens: 9_000 }, { scope: { projectId: 'p1', workspaceId: 'w2' } })
+    expect((turn.mock.calls[0] as unknown[])[3]).toEqual({ maxTokens: 9_000, scope: { projectId: 'p1', workspaceId: 'w2' } })
   })
 })

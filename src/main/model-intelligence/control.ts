@@ -7,6 +7,7 @@ import type { IngestionSourceName } from './ingest'
 import { INGESTION_SOURCES } from './ingest'
 import { outcome as outcomeRow } from './capture/common'
 import { systemOneOf } from './store'
+import { resolveModel } from '../control-args'
 
 /** App control for model intelligence (docs/model-routing.md, E; docs/agent-control.md). */
 
@@ -29,6 +30,8 @@ export const modelSignatures: Record<string, string> = {
 
 export interface ModelControlCaller {
   projectId: string
+  /** The caller's workspace: a cloud evaluation opens its tab there, against the catalog models.list showed it. */
+  workspaceId?: string
   agentSessionId: string
   /** The owner credential or a wizard tab. */
   sovereign: boolean
@@ -131,16 +134,29 @@ export async function callModelMethod(service: ModelIntelligence, caller: ModelC
         return handle
       }
       only(args, method, ['provider', 'model', 'suite', 'maxJobs'])
-      const key = keyArgs(args)
-      if (key.provider !== 'local' && !caller.sovereign) throw new Error('Evaluating a cloud model spends the owner’s money: only the owner or a wizard tab may start it')
+      const requested = keyArgs(args)
+      if (requested.provider !== 'local' && !caller.sovereign) throw new Error('Evaluating a cloud model spends the owner’s money: only the owner or a wizard tab may start it')
+      const { key, resolvedFrom } = requested.provider === 'local' ? { key: requested, resolvedFrom: undefined } : offeredKey(caller, requested)
       if (caller.readOnly && !caller.sovereign) throw new Error('A sandboxed local model or a read-only conversation cannot start an evaluation')
       if (args.suite !== undefined && typeof args.suite !== 'string') throw new Error('suite must be a suite name')
       if (args.maxJobs !== undefined && (!Number.isInteger(args.maxJobs) || (args.maxJobs as number) < 1)) throw new Error('maxJobs must be a positive whole number')
-      const handle = await service.startEvaluation(key, args.suite as string | undefined, args.maxJobs ? { maxJobs: args.maxJobs as number } : {})
-      return { ...handle, note: 'Runs in the background; poll models.evaluate({runId}). Results feed reputation only.' }
+      const scope = { projectId: caller.projectId, ...(caller.workspaceId ? { workspaceId: caller.workspaceId } : {}) }
+      const handle = await service.startEvaluation(key, args.suite as string | undefined, { ...(args.maxJobs ? { maxJobs: args.maxJobs as number } : {}), ...(key.provider !== 'local' ? { scope } : {}) })
+      return { ...handle, ...(resolvedFrom ? { modelResolvedFrom: resolvedFrom } : {}), note: 'Runs in the background; poll models.evaluate({runId}). Results feed reputation only.' }
     }
   }
   throw new Error('Unknown control method; use tools.list')
+}
+
+/** A cloud key as models.list offers it to this caller, resolved as tabs.open resolves a model (H09: exact id, case,
+ *  the 1M form, label, one unique match). Refused here, before a run starts or counts, when the provider offers
+ *  nothing right now (its catalog is not ready, or the CLI is missing) or does not offer this model. */
+function offeredKey(caller: ModelControlCaller, requested: ModelKey): { key: ModelKey; resolvedFrom?: string } {
+  const offered = caller.live.offered.filter(key => key.provider === requested.provider).map(key => ({ id: key.model, label: key.model }))
+  if (!offered.length) throw new Error(`${requested.provider} offers no model to this conversation right now (its catalog is not ready yet, or the provider is unavailable); no evaluation was started or counted. Check models.list and try again`)
+  const match = resolveModel(offered, requested.model)
+  if (!match) throw new Error(`${requested.provider}/${requested.model} is not offered to this conversation; ${requested.provider} offers ${offered.map(model => model.id).join(', ')} (models.list). No evaluation was started or counted`)
+  return { key: { provider: requested.provider, model: match.model.id }, ...(match.resolvedFrom ? { resolvedFrom: match.resolvedFrom } : {}) }
 }
 
 /** models.outcome: an owner's (or controller's) verdict on a decision or an execution. It amends

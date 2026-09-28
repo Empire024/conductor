@@ -21,8 +21,8 @@ import { createFrontierDecider, type FrontierPort } from './deciders/frontier'
 import { createLocalLlmDecider } from './deciders/local-llm'
 import { createScorerDecider, defaultUsageStop, SCORER_TEMPERATURE, softmax } from './deciders/scorer'
 import defaultSuite from './suites/default.json'
-import { batchJobTokens, evaluate, validateSuite, type CommandRequest, type CommandResult, type EvaluationJob, type EvaluationOptions, type EvaluationPorts, type EvaluationResult, type EvaluationRun, type EvaluationSuite } from './evaluation'
-import { DEFAULT_FIXED_OVERHEAD_TOKENS, EvaluationTurnError, type CloudRun } from './evaluation-ports'
+import { batchJobTokens, evaluate, refusedBeforeTurn, validateSuite, type CommandRequest, type CommandResult, type EvaluationJob, type EvaluationOptions, type EvaluationPorts, type EvaluationResult, type EvaluationRun, type EvaluationSuite } from './evaluation'
+import { DEFAULT_FIXED_OVERHEAD_TOKENS, EvaluationTurnError, isRefusal, type CloudRun, type EvaluationScope } from './evaluation-ports'
 import { explainRoute } from './explain'
 import { refreshAll, type IngestionPorts, type IngestionSourceName, type RefreshResult } from './ingest'
 import { linkedBatch } from './ingest/linked'
@@ -112,7 +112,7 @@ export interface EvaluationWiring {
   /** One job on one cloud model through the native provider path, at its lowest effort. `budget` is
    *  the job's token budget (evaluation.ts): the turn is stopped past it where it can be, and a turn
    *  that fails or reports no usage counts it as spent (the error carries `tokens`). */
-  runCloud?(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<CloudRun>
+  runCloud?(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }, context?: { scope?: EvaluationScope }): Promise<CloudRun>
   /** The provider's current weekly usage percent, null when unknown (then a cloud evaluation is skipped). */
   usage?(provider: string): number | null
   /** A sandboxed grader command, or null where no sandbox is available (command jobs are then not gradable here). */
@@ -120,6 +120,8 @@ export interface EvaluationWiring {
   /** Why this key cannot be evaluated now (another model holds the GPU), or null. */
   precheck?(key: ModelKey): Promise<string | null> | string | null
   writeReport?(name: string, markdown: string): void
+  /** The report a run wrote (writeReport), by its runId; null when there is none. */
+  readReport?(runId: string): string | null
   suites(): Record<string, EvaluationSuite>
 }
 
@@ -369,6 +371,8 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
     start(): void {
       try { const pruned = store.prune(clock()); if (pruned.outcomes || pruned.decisions) log(`pruned ${pruned.outcomes} outcomes and ${pruned.decisions} decisions${pruned.complete ? '' : ' (more next start)'}`) }
       catch (error) { log('prune failed', error) }
+      try { const released = service.reconcileRefusedEvaluations(); if (released.length) log(`released the spend of ${released.length} evaluation run(s) refused before any model call: ${released.join(', ')}`) }
+      catch (error) { log('evaluation spend not reconciled', error) }
       disposers.push(timers.after(0, () => quietly(STARTUP_SOURCES)))
       disposers.push(timers.after(60_000, daily))
       disposers.push(timers.every(HOUR_MS, daily))
@@ -499,7 +503,7 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
     /** Starts an evaluation in the background. Local keys through the local runner; cloud keys through
      *  the native provider path under the owner's caps (daily count and tokens, per-run tokens, and
      *  never at or above the provider's weekly stop, where unknown usage means skip). */
-    async startEvaluation(key: ModelKey, suiteName: string | undefined, evaluationOptions: { maxJobs?: number } = {}): Promise<EvaluationHandle> {
+    async startEvaluation(key: ModelKey, suiteName: string | undefined, evaluationOptions: { maxJobs?: number; scope?: EvaluationScope } = {}): Promise<EvaluationHandle> {
       const wiring = options.evaluation
       const target = registryKey(key), cloud = target.provider !== 'local'
       const run = cloud ? wiring?.runCloud : wiring?.runLocal
@@ -557,14 +561,17 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
         try { store.recordEvaluationSpend(spend) } catch (error) { log('evaluation spend not journaled', error) }
       } }
       // A cloud job's worst case is its budget (else the run cap): a turn without usage counts it, and a
-      // failed one throws an EvaluationTurnError carrying at least it (N3).
+      // failed one throws an EvaluationTurnError carrying at least it (N3). A turn refused before any model
+      // call spent nothing: its refusal passes through uncharged.
+      const scope = evaluationOptions.scope
       const cloudJob = async (runKey: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun> => {
         const jobBudget = budget ?? (maxTokens !== undefined ? { maxTokens } : undefined)
         try {
-          const { overheadTokens, ...result }: CloudRun = await run(runKey, job, signal, jobBudget)
+          const { overheadTokens, ...result }: CloudRun = await run(runKey, job, signal, jobBudget, ...(scope ? [{ scope }] : []))
           recordOverhead(runKey.provider, overheadTokens, smallestJob ?? 0)
           return result.tokens == null && jobBudget ? { ...result, tokens: jobBudget.maxTokens } : result
         } catch (error) {
+          if (isRefusal(error)) throw error
           recordOverhead(runKey.provider, (error as { overheadTokens?: unknown } | null)?.overheadTokens, smallestJob ?? 0)
           const reported = (error as { tokens?: unknown } | null)?.tokens
           const measured = typeof reported === 'number' && Number.isFinite(reported) ? reported : null
@@ -591,6 +598,23 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
       return handle
     },
     evaluation(runId: string): EvaluationHandle | undefined { return evaluations.get(runId) },
+    /** One-off correction (B5-G): a cloud run journaled before refusals were recognised, whose report shows its
+     *  one turn refused before any model call, was charged its whole budget; it is released (0 tokens, not one of
+     *  the day's runs). Runs whose turn started keep their charge. Returns the released runIds. */
+    reconcileRefusedEvaluations(): string[] {
+      const readReport = options.evaluation?.readReport
+      if (!readReport) return []
+      const released: string[] = []
+      for (const spend of store.evaluationRuns(new Date(clock().getTime() - 2 * DAILY_MS).toISOString())) {
+        if (spend.stoppedBy === 'refused' || spend.key.provider === 'local' || spend.gradedJobs > 0 || (spend.costUsd ?? 0) > 0 || !(spend.tokens > 0)) continue
+        if ([...evaluations.values()].some(handle => handle.runId === spend.runId && handle.state === 'running')) continue
+        let markdown: string | null = null
+        try { markdown = readReport(spend.runId) } catch (error) { log('evaluation report unreadable', error) }
+        const reason = markdown ? refusedBeforeTurn(markdown) : null
+        if (reason && store.releaseEvaluationSpend(spend.runId, reason)) released.push(spend.runId)
+      }
+      return released
+    },
 
     dispose(): void {
       for (const dispose of disposers.splice(0)) dispose()

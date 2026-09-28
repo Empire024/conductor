@@ -2,9 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { REPUTATION_POLICY, type ExecutionOutcome, type ModelKey, type ModelStatus, type ReputationScore } from '../../shared/model-routing'
 import { outcome as outcomeRow } from './capture/common'
 import {
-  BATCH_JOB_ID, DEFAULT_FIXED_OVERHEAD_TOKENS, EVALUATION_AREAS, JOB_TOKEN_BUDGET, answerCode, batchJobTokens, batchPrompt, evaluate, grade, splitBatchAnswer, jobTokenBudget, minimumJobTokens, schemaViolation, validateSuite, type CommandRequest, type EvaluationJob, type EvaluationPorts,
-  type EvaluationRun, type EvaluationSuite
+  BATCH_JOB_ID, DEFAULT_FIXED_OVERHEAD_TOKENS, EVALUATION_AREAS, JOB_TOKEN_BUDGET, answerCode, batchJobTokens, batchPrompt, evaluate, grade, splitBatchAnswer, jobTokenBudget, minimumJobTokens, refusedBeforeTurn, schemaViolation, validateSuite, type CommandRequest, type EvaluationJob, type EvaluationPorts,
+  type EvaluationRun, type EvaluationSpend, type EvaluationSuite
 } from './evaluation'
+import { EvaluationRefused } from './evaluation-ports'
 import defaultSuite from './suites/default.json'
 
 const KEY: ModelKey = { provider: 'local', model: 'new-model-9b' }
@@ -348,5 +349,58 @@ describe('batched cloud evaluation (N9)', () => {
     await evaluate(KEY, suite(3), ports)
     await evaluate(CLOUD, suite(2), ports, { batch: false })
     expect(turns).toEqual(['job-1', 'job-2', 'job-3', 'job-1', 'job-2'])
+  })
+})
+
+describe('a turn refused before any model call (B5-G)', () => {
+  const CLOUD: ModelKey = { provider: 'claude', model: 'opus[1m]' }
+  const refusal = 'claude/opus[1m] is not offered on this machine now; models.list shows what is, or omit route and name provider and model'
+  const refused = () => { throw new EvaluationRefused(refusal) }
+
+  it('charges nothing, grades nothing and stops as refused with the reason, releasing the pre-charged budget', async () => {
+    const spends: EvaluationSpend[] = []
+    const { ports, recorded, reports } = harness(refused, { recordSpend: spend => { spends.push(spend) }, fixedOverheadTokens: () => 40_000 })
+    const result = await evaluate(CLOUD, suite(3), ports, { maxTokens: 60_000, runId: 'r1' })
+    expect(result).toMatchObject({ tokens: 0, costUsd: 0, stoppedBy: 'refused', reason: refusal, outcomes: [] })
+    expect(result.jobs.every(entry => entry.result === 'not-gradable' && entry.detail === `not run: the turn was refused before any model call: ${refusal}`)).toBe(true)
+    expect(recorded).toEqual([])
+    // The budget is pre-charged before the turn (N12) and released once the refusal is known.
+    expect(spends.map(spend => spend.tokens)).toEqual([0, 60_000, 0])
+    expect(spends.at(-1)).toMatchObject({ stoppedBy: 'refused', reason: refusal, gradedJobs: 0 })
+    expect(reports[0]![1]).toContain(`0 tokens, cost $0.00; stopped by refused (${refusal}); the run is not counted against the daily caps`)
+  })
+  it('stops a one-job-per-turn run at the first refusal, charging nothing', async () => {
+    const ran: string[] = []
+    const { ports, recorded } = harness(entry => { ran.push(entry.id); throw new EvaluationRefused('the tab could not open') })
+    const result = await evaluate(KEY, suite(3), ports, { maxTokens: 60_000 })
+    expect(ran).toEqual(['job-1'])
+    expect(result).toMatchObject({ tokens: 0, stoppedBy: 'refused', reason: 'the tab could not open' })
+    expect(result.jobs.map(entry => entry.result)).toEqual(['not-gradable', 'not-gradable', 'not-gradable'])
+    expect(recorded).toEqual([])
+  })
+  it('keeps charging a turn that started and failed (N3)', async () => {
+    const failed = await evaluate(CLOUD, suite(2), harness(() => { throw Object.assign(new Error('the evaluation turn ended failed'), { tokens: 60_000 }) }).ports, { maxTokens: 60_000 })
+    expect(failed).toMatchObject({ tokens: 60_000, stoppedBy: 'token-cap' })
+    expect(failed).not.toHaveProperty('reason')
+  })
+
+  // The report of evaluation_mulp6jy2_hn5iazu (2026-09-28), trimmed.
+  const phantom = [
+    '# Evaluation: claude/opus[1m]', '',
+    'Suite **default**, 2026-09-28T20:26:06.396Z. 0/0 graded jobs passed of 14; 60,000 tokens, cost $0.00; stopped by token-cap. Status now **unproven**.', '',
+    '## Jobs', '', '| Job | Category | Result | Detail | Time | Cost |', '| --- | --- | --- | --- | --- | --- |',
+    '| slugify | simple-coding | not-gradable | not run: a batched cloud run grades one-shot answers; this job\'s check needs a command runner | 0 s | — |',
+    `| predict-output | simple-coding | not-gradable | not graded: the batched turn failed: ${refusal} | 0 s | — |`,
+    '| find-definition | large-repo | not-gradable | not run: dropped from the batch; a native turn\'s 51,491 fixed tokens plus the batched jobs\' 9,018 pass the run\'s 60,000-token cap | 0 s | — |',
+    `| classify-lines | structured-output | not-gradable | not graded: the batched turn failed: ${refusal} | 0 s | — |`, '',
+    '## Reputation against alternatives', '', '| Category | claude/opus[1m] |', '| --- | --- |', '| simple-coding | 60% (low 39%, n=0) |', '',
+  ].join('\n')
+  it('recognises a journaled run whose one turn was refused, from its report, and nothing else', () => {
+    expect(refusedBeforeTurn(phantom)).toBe(refusal)
+    expect(refusedBeforeTurn(phantom.replaceAll(refusal, 'the evaluation turn ended failed'))).toBeNull()
+    expect(refusedBeforeTurn(phantom.replaceAll(refusal, 'the evaluation turn passed its 60000-token budget and was stopped'))).toBeNull()
+    expect(refusedBeforeTurn(phantom.replace('| predict-output | simple-coding | not-gradable |', '| predict-output | simple-coding | success |'))).toBeNull()
+    expect(refusedBeforeTurn(phantom.split('\n').filter(line => !line.includes('not graded')).join('\n'))).toBeNull()
+    expect(refusedBeforeTurn('# Evaluation: x\n\nno jobs')).toBeNull()
   })
 })

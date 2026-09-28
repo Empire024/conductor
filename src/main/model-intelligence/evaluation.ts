@@ -3,7 +3,7 @@ import {
   TASK_CATEGORIES, modelKeyId, type ExecutionOutcome, type ModelKey, type ModelStatus, type ReputationScore, type TaskCategory
 } from '../../shared/model-routing'
 import { outcome as outcomeRow } from './capture/common'
-import { answerFiles } from './evaluation-ports'
+import { answerFiles, isRefusal } from './evaluation-ports'
 import { isProven, type ReputationDimension } from './reputation'
 
 /**
@@ -309,7 +309,8 @@ export function splitBatchAnswer(answer: string, ids: string[]): Record<string, 
 
 export type EvaluationJobOutcome = ExecutionOutcome['result'] | 'not-gradable'
 export interface EvaluationJobResult { id: string; category: TaskCategory; result: EvaluationJobOutcome; detail: string; timedOut: boolean; durationMs: number; costUsd: number | null; tokens: number | null }
-export type EvaluationStop = 'budget' | 'token-cap' | 'aborted' | 'max-jobs'
+/** `refused`: the model's turn was refused before any model call (EvaluationRefused); the run spent nothing. */
+export type EvaluationStop = 'budget' | 'token-cap' | 'aborted' | 'max-jobs' | 'refused'
 export interface EvaluationResult {
   runId: string
   key: ModelKey
@@ -319,10 +320,12 @@ export interface EvaluationResult {
   costUsd: number
   tokens: number
   stoppedBy: EvaluationStop | null
+  /** Why the turn was refused, when stoppedBy is `refused`. */
+  reason?: string
   reportName: string
 }
-/** One run's spend, journaled so caps can be audited. */
-export interface EvaluationSpend { runId: string; key: ModelKey; at: string; tokens: number; costUsd: number; jobs: number; gradedJobs: number; stoppedBy: EvaluationStop | null }
+/** One run's spend, journaled so caps can be audited. A `refused` run spent nothing and is not one of the day's runs. */
+export interface EvaluationSpend { runId: string; key: ModelKey; at: string; tokens: number; costUsd: number; jobs: number; gradedJobs: number; stoppedBy: EvaluationStop | null; reason?: string }
 
 class JobTimeout extends Error {}
 const message = (error: unknown) => error instanceof Error ? error.message : String(error)
@@ -346,11 +349,13 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
   const jobs = suite.jobs.slice(0, options.maxJobs ?? suite.jobs.length), order = new Map(jobs.map((job, index) => [job.id, index]))
   const results: EvaluationJobResult[] = [], outcomes: ExecutionOutcome[] = []
   let spent = 0, tokens = 0, stoppedBy: EvaluationResult['stoppedBy'] = options.maxJobs !== undefined && options.maxJobs < suite.jobs.length ? 'max-jobs' : null
+  let refusal: string | undefined
   const notGradable = (job: EvaluationJob, detail: string) => results.push({ id: job.id, category: job.category, result: 'not-gradable', detail, timedOut: false, durationMs: 0, costUsd: null, tokens: null })
   const cap = options.maxTokens ?? null, capText = cap === null ? '' : `${cap.toLocaleString('en-US')}-token`
-  /** `reserved` pre-charges a turn about to start, so a restart mid-turn still leaves its budget in the journal. */
+  /** `reserved` pre-charges a turn about to start, so a restart mid-turn still leaves its budget in the journal;
+   *  the next journal replaces it with what the turn really spent (nothing, when it was refused). */
   const journal = (reserved = 0): void => {
-    try { ports.recordSpend?.({ runId, key, at: ports.now().toISOString(), tokens: tokens + reserved, costUsd: spent, jobs: results.length, gradedJobs: results.filter(result => result.result !== 'not-gradable').length, stoppedBy }) }
+    try { ports.recordSpend?.({ runId, key, at: ports.now().toISOString(), tokens: tokens + reserved, costUsd: spent, jobs: results.length, gradedJobs: results.filter(result => result.result !== 'not-gradable').length, stoppedBy, ...(refusal !== undefined ? { reason: refusal } : {}) }) }
     catch { /* The journal is the caps' audit trail; the evaluation's outcomes are already recorded. */ }
   }
   const record = (job: EvaluationJob, row: Parameters<typeof outcomeRow>[0]): void => {
@@ -391,6 +396,11 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
     let run: EvaluationRun
     try { run = await runJob(ports, key, prompt, timeoutMs * batched.length, options.signal, budget) }
     catch (error) {
+      if (isRefusal(error)) {
+        refusal = message(error); stoppedBy = 'refused'
+        for (const job of batched) notGradable(job, `not run: the turn was refused before any model call: ${refusal}`)
+        return
+      }
       const timedOut = error instanceof JobTimeout, cancelled = !timedOut && !!options.signal?.aborted
       tokens += thrownTokens(error, timedOut, budget) ?? runTokens(prompt, undefined)
       if (cancelled) stoppedBy = 'aborted'
@@ -443,6 +453,13 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
       let run: EvaluationRun | undefined, failure: string | undefined, timedOut = false, cancelled = false, failedTokens: number | null = null
       try { run = await runJob(ports, key, job, timeoutMs, options.signal, budget) }
       catch (error) {
+        // Refused before any model call: nothing spent, nothing graded, and the next job would be refused too.
+        if (isRefusal(error)) {
+          refusal = message(error); stoppedBy = 'refused'
+          for (const rest of jobs.slice(index)) notGradable(rest, `not run: the turn was refused before any model call: ${refusal}`)
+          journal()
+          break
+        }
         timedOut = error instanceof JobTimeout; cancelled = !timedOut && !!options.signal?.aborted; failure = timedOut ? message(error) : `the run failed: ${message(error)}`
         // A failed capped turn is charged what its port measured (at least its budget); a timed-out one never
         // reports back, so it is charged its whole budget. Uncapped runs keep the text estimate.
@@ -494,18 +511,36 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
     journal()
   }
   const reportName = `${ports.now().toISOString().slice(0, 10)}-${modelKeyId(key).replace(/[^\w.-]+/g, '_')}-${runId}.md`
-  ports.writeReport(reportName, report(key, suite, results, spent, tokens, stoppedBy, status, ports))
-  return { runId, key, status, jobs: results, outcomes, costUsd: spent, tokens, stoppedBy, reportName }
+  ports.writeReport(reportName, report(key, suite, results, spent, tokens, stoppedBy, status, ports, refusal))
+  return { runId, key, status, jobs: results, outcomes, costUsd: spent, tokens, stoppedBy, ...(refusal !== undefined ? { reason: refusal } : {}), reportName }
+}
+
+/** What AgentControl.evaluationTurn and tab opening refuse with before a prompt goes out. */
+const PRE_TURN_REFUSAL = /is not offered on this machine now|is unavailable here now|is not available here/
+const BATCH_FAILED = 'not graded: the batched turn failed: '
+/**
+ * The refusal of a run written before refusals were recognised (B5-G), read from its report: every job not
+ * gradable, at least one because its one batched turn failed, and every such failure a pre-turn refusal. Such a
+ * run made no model call. Null for anything else, including a turn that started and failed.
+ */
+export function refusedBeforeTurn(markdown: string): string | null {
+  const jobs = markdown.split(/^## /m).find(section => section.startsWith('Jobs')) ?? ''
+  const rows = jobs.split('\n').filter(line => /^\| [a-z0-9][a-z0-9-]* \| /.test(line) && !line.startsWith('| Job |'))
+    .map(line => line.split(/(?<!\\)\|/).map(cell => cell.trim())).filter(cells => cells.length >= 7)
+  if (!rows.length || rows.some(cells => cells[3] !== 'not-gradable')) return null
+  const failures = rows.map(cells => cells[4]!).filter(detail => detail.startsWith('not graded:'))
+  if (!failures.length || failures.some(detail => !detail.startsWith(BATCH_FAILED) || !PRE_TURN_REFUSAL.test(detail))) return null
+  return failures[0]!.slice(BATCH_FAILED.length).replace(/\\\|/g, '|')
 }
 
 const cell = (score: ReputationScore | null) => score ? `${Math.round(score.mean * 100)}% (low ${Math.round(score.lower * 100)}%, n=${Math.round(score.evidence)})` : '—'
-function report(key: ModelKey, suite: EvaluationSuite, results: EvaluationJobResult[], spent: number, tokens: number, stoppedBy: EvaluationResult['stoppedBy'], status: ModelStatus, ports: EvaluationPorts): string {
+function report(key: ModelKey, suite: EvaluationSuite, results: EvaluationJobResult[], spent: number, tokens: number, stoppedBy: EvaluationResult['stoppedBy'], status: ModelStatus, ports: EvaluationPorts, refusal?: string): string {
   const id = modelKeyId(key), alternatives = ports.alternatives(key).filter(other => modelKeyId(other) !== id)
   const categories = [...new Set(suite.jobs.map(job => job.category))], passed = results.filter(result => result.result === 'success').length, graded = results.filter(result => result.result !== 'not-gradable').length
   const escape = (text: string) => text.replace(/\|/g, '\\|').replace(/\n/g, ' ')
   return [
     `# Evaluation: ${id}`, '',
-    `Suite **${suite.name}**, ${ports.now().toISOString()}. ${passed}/${graded} graded jobs passed${graded < suite.jobs.length ? ` of ${suite.jobs.length}` : ''}; ${tokens.toLocaleString('en-US')} tokens, cost $${spent.toFixed(2)}${stoppedBy ? `; stopped by ${stoppedBy}` : ''}. Status now **${status}**.`,
+    `Suite **${suite.name}**, ${ports.now().toISOString()}. ${passed}/${graded} graded jobs passed${graded < suite.jobs.length ? ` of ${suite.jobs.length}` : ''}; ${tokens.toLocaleString('en-US')} tokens, cost $${spent.toFixed(2)}${stoppedBy ? `; stopped by ${stoppedBy}` : ''}${refusal !== undefined ? ` (${refusal}); the run is not counted against the daily caps` : ''}. Status now **${status}**.`,
     'Results feed reputation only; no default was changed.', '',
     '## Jobs', '', '| Job | Category | Result | Detail | Time | Cost |', '| --- | --- | --- | --- | --- | --- |',
     ...results.map(result => `| ${result.id} | ${result.category} | ${result.result}${result.timedOut ? ' (timed out)' : ''} | ${escape(result.detail)} | ${Math.round(result.durationMs / 1000)} s | ${result.costUsd == null ? '—' : '$' + result.costUsd.toFixed(3)} |`), '',

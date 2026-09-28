@@ -59,10 +59,16 @@ export function localRunPort(runnerFor: (modelId: string) => LocalModelRunner, b
   }
 }
 
+/** Where models.evaluate was asked from: the evaluation tab opens there, so the model is resolved against
+ *  the catalog models.list showed that caller (another workspace's runtime catalog can lack it). */
+export interface EvaluationScope { projectId: string; workspaceId?: string }
+
 /** One evaluation turn on a cloud model (AgentControl.evaluationTurn): a native tab at the lowest effort.
  *  `maxTokens` is the job's budget: the turn is interrupted once its usage passes it, and a turn that
- *  fails, times out or reports no usage counts it as spent (a failure throws an EvaluationTurnError). */
-export type CloudTurn = (key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options?: { maxTokens?: number }) => Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null; /** The input the fixed overhead is learned from (cache included): the turn's first API call where the provider reports calls, else the whole turn's; null when unreported. */ inputTokens?: number | null }>
+ *  fails, times out or reports no usage counts it as spent (a failure throws an EvaluationTurnError).
+ *  Anything else it throws was thrown before the prompt went out (the model not offered, the tab not
+ *  opened): no model call was made, so cloudRunPort reports it as an EvaluationRefused that costs nothing. */
+export type CloudTurn = (key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options?: { maxTokens?: number; scope?: EvaluationScope }) => Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null; /** The input the fixed overhead is learned from (cache included): the turn's first API call where the provider reports calls, else the whole turn's; null when unreported. */ inputTokens?: number | null }>
 
 /** A cloud job's run with the turn's fixed input overhead, when the turn reported its input. */
 export type CloudRun = EvaluationRun & { overheadTokens?: number | null }
@@ -91,17 +97,27 @@ export class EvaluationTurnError extends Error {
   constructor(message: string, readonly tokens: number | null, readonly inputTokens: number | null = null, readonly overheadTokens: number | null = null) { super(message) }
 }
 
+/** A turn refused before any model call (the model not offered, the tab not opened): it spent nothing, so the
+ *  run charges it no tokens, grades nothing and stops as `refused` (evaluation.ts), and the day does not count it. */
+export class EvaluationRefused extends Error {
+  readonly refused = true
+  readonly tokens = 0
+}
+export const isRefusal = (error: unknown): error is EvaluationRefused => error instanceof EvaluationRefused || (error as { refused?: unknown } | null)?.refused === true
+
 /** A job through the native provider path; files come from the answer's path-labelled blocks, as locally. */
 export function cloudRunPort(turn: CloudTurn) {
-  return async (key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<CloudRun> => {
+  return async (key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }, context: { scope?: EvaluationScope } = {}): Promise<CloudRun> => {
     const prompt = evaluationPrompt(job)
     let result: Awaited<ReturnType<CloudTurn>>
-    try { result = await turn(key, prompt, signal, budget ? { maxTokens: budget.maxTokens } : {}) }
+    try { result = await turn(key, prompt, signal, { ...(budget ? { maxTokens: budget.maxTokens } : {}), ...(context.scope ? { scope: context.scope } : {}) }) }
     catch (error) {
       // A failed turn still measured its overhead when it reported its input.
       if (error instanceof EvaluationTurnError && error.overheadTokens === null && error.inputTokens !== null)
         throw new EvaluationTurnError(error.message, error.tokens, error.inputTokens, fixedOverhead(error.inputTokens, prompt))
-      throw error
+      if (error instanceof EvaluationTurnError || isRefusal(error) || signal.aborted) throw error
+      // The turn contract: everything after the prompt went out fails as an EvaluationTurnError.
+      throw new EvaluationRefused(error instanceof Error ? error.message : String(error))
     }
     const files = answerFiles(result.answer), overheadTokens = fixedOverhead(result.inputTokens, prompt)
     return { answer: result.answer, ...(Object.keys(files).length ? { files } : {}), durationMs: result.durationMs, tokens: result.tokens, costUsd: result.costUsd, effort: result.effort, ...(overheadTokens !== null ? { overheadTokens } : {}) }
