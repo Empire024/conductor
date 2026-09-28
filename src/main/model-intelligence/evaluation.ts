@@ -1,0 +1,373 @@
+import { makeId } from '../../shared/models'
+import {
+  TASK_CATEGORIES, modelKeyId, type ExecutionOutcome, type ModelKey, type ModelStatus, type ReputationScore, type TaskCategory
+} from '../../shared/model-routing'
+import { outcome as outcomeRow } from './capture/common'
+import { isProven, type ReputationDimension } from './reputation'
+
+/**
+ * Evaluation (docs/model-routing.md, module D): a reusable suite of small deterministic jobs run
+ * against one model key. Results are ordinary outcomes (source `evaluation`) that feed reputation;
+ * nothing here changes a default. The key is `evaluating` while it runs, then `proven` when the
+ * evidence reaches REPUTATION_POLICY.provenSamples, else `unproven`.
+ */
+
+// ---------------------------------------------------------------------------------------------
+// Suites
+
+/** The owner's evaluation areas; each maps to the TaskCategory its outcomes are recorded under. */
+export const EVALUATION_AREAS = {
+  'simple-coding': 'simple-coding', 'difficult-coding': 'difficult-coding', 'bug-fixing': 'debugging', 'repository-navigation': 'large-repo',
+  'tool-usage': 'tool-calling', 'file-analysis': 'file-analysis', research: 'research', 'agentic-multi-step': 'terminal-use',
+  'long-running': 'long-context', 'structured-output': 'structured-output',
+} as const satisfies Record<string, TaskCategory>
+export type EvaluationArea = keyof typeof EVALUATION_AREAS
+
+export type JsonSchema = {
+  type?: JsonType | JsonType[]
+  properties?: Record<string, JsonSchema>
+  required?: string[]
+  additionalProperties?: boolean
+  items?: JsonSchema
+  enum?: unknown[]
+  const?: unknown
+  minItems?: number; maxItems?: number
+  minLength?: number; maxLength?: number; pattern?: string
+  minimum?: number; maximum?: number
+}
+type JsonType = 'string' | 'number' | 'integer' | 'boolean' | 'object' | 'array' | 'null'
+
+export type Grader =
+  | { kind: 'exact'; expected: string; caseInsensitive?: boolean }
+  | { kind: 'regex'; pattern: string; flags?: string }
+  | { kind: 'json-schema'; schema: JsonSchema }
+  /** A file the run left behind (EvaluationRun.files) must match. */
+  | { kind: 'file-content'; path: string; regex: string; flags?: string }
+  /** Runs through ports.command in a folder holding the job files, the run's files, `files` (hidden
+   *  from the model) and, when `answerFile` is set, the answer's code under that name. */
+  | { kind: 'command'; cmd: string; args: string[]; expectExit: number; timeoutSec: number; answerFile?: string; files?: Record<string, string> }
+
+export interface EvaluationJob {
+  id: string
+  area?: EvaluationArea
+  category: TaskCategory
+  complexity: 1 | 2 | 3 | 4 | 5
+  prompt: string
+  /** Fixture files the model gets (in its workspace, or inlined by a chat-only runner). */
+  files?: Record<string, string>
+  grader: Grader
+  /** Tokens (input + output) this job may spend under a capped run; defaults by complexity (JOB_TOKEN_BUDGET). */
+  maxTokens?: number
+}
+export interface EvaluationSuite { name: string; description?: string; jobs: EvaluationJob[] }
+
+const GRADER_KINDS = ['exact', 'regex', 'json-schema', 'file-content', 'command']
+const isRecord = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value)
+const isFiles = (value: unknown) => isRecord(value) && Object.values(value).every(content => typeof content === 'string')
+const validRegex = (pattern: unknown, flags: unknown) => { try { new RegExp(String(pattern), flags === undefined ? undefined : String(flags)); return typeof pattern === 'string' } catch { return false } }
+
+/** Throws naming the first problem; returns the suite typed. */
+export function validateSuite(value: unknown): EvaluationSuite {
+  if (!isRecord(value) || typeof value.name !== 'string' || !value.name.trim()) throw new Error('A suite needs a name')
+  if (!Array.isArray(value.jobs) || !value.jobs.length) throw new Error('A suite needs at least one job')
+  const ids = new Set<string>()
+  value.jobs.forEach((job: unknown, index) => {
+    const where = `Job ${index + 1}`
+    if (!isRecord(job) || typeof job.id !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(job.id)) throw new Error(`${where} needs a lowercase id`)
+    if (ids.has(job.id)) throw new Error(`Duplicate job id ${job.id}`)
+    ids.add(job.id)
+    if (!(TASK_CATEGORIES as readonly unknown[]).includes(job.category)) throw new Error(`${job.id}: unknown category ${String(job.category)}`)
+    if (job.area !== undefined && !(String(job.area) in EVALUATION_AREAS)) throw new Error(`${job.id}: unknown area ${String(job.area)}`)
+    if (![1, 2, 3, 4, 5].includes(job.complexity as number)) throw new Error(`${job.id}: complexity must be 1..5`)
+    if (typeof job.prompt !== 'string' || !job.prompt.trim()) throw new Error(`${job.id}: prompt is required`)
+    if (job.files !== undefined && !isFiles(job.files)) throw new Error(`${job.id}: files must map paths to text`)
+    if (job.maxTokens !== undefined && !(Number.isInteger(job.maxTokens) && (job.maxTokens as number) > 0)) throw new Error(`${job.id}: maxTokens must be a positive whole number`)
+    const grader = job.grader
+    if (!isRecord(grader) || !GRADER_KINDS.includes(String(grader.kind))) throw new Error(`${job.id}: unknown grader`)
+    const bad = (grader.kind === 'exact' && typeof grader.expected !== 'string')
+      || (grader.kind === 'regex' && !validRegex(grader.pattern, grader.flags))
+      || (grader.kind === 'json-schema' && !isRecord(grader.schema))
+      || (grader.kind === 'file-content' && (typeof grader.path !== 'string' || !validRegex(grader.regex, grader.flags)))
+      || (grader.kind === 'command' && (typeof grader.cmd !== 'string' || !Array.isArray(grader.args) || !grader.args.every(arg => typeof arg === 'string')
+        || !Number.isInteger(grader.expectExit) || !(typeof grader.timeoutSec === 'number' && grader.timeoutSec > 0 && grader.timeoutSec <= 600)
+        || (grader.answerFile !== undefined && typeof grader.answerFile !== 'string') || (grader.files !== undefined && !isFiles(grader.files))))
+    if (bad) throw new Error(`${job.id}: invalid ${String(grader.kind)} grader`)
+  })
+  return value as unknown as EvaluationSuite
+}
+
+// ---------------------------------------------------------------------------------------------
+// Grading
+
+/** What one run produced. Only `answer` is required; the rest is what the runner could observe. */
+export interface EvaluationRun {
+  answer: string
+  /** Files the run created or changed (workspace path -> content), for file-content and command graders. */
+  files?: Record<string, string>
+  effort?: string | null
+  durationMs?: number | null
+  tokens?: number | null
+  costUsd?: number | null
+  iterations?: number | null
+  toolFailures?: number
+  looped?: boolean
+  contextFailure?: boolean
+}
+export interface CommandRequest { cmd: string; args: string[]; timeoutSec: number; files: Record<string, string>; signal?: AbortSignal }
+export interface CommandResult { exitCode: number | null; timedOut?: boolean; output?: string }
+export interface Grade { pass: boolean; detail: string; invalidOutput?: boolean }
+
+/** The answer without reasoning blocks. */
+export const visibleAnswer = (text: string): string => {
+  const body = text.replace(/<think>[\s\S]*?<\/think>/gi, ''), close = body.toLowerCase().lastIndexOf('</think>')
+  return (close >= 0 ? body.slice(close + '</think>'.length) : body).trim()
+}
+/** The first fenced block's content, else the whole visible answer. */
+export const answerCode = (text: string): string => {
+  const visible = visibleAnswer(text), fenced = /```[\w-]*[^\S\n]*\n([\s\S]*?)```/.exec(visible)
+  return (fenced ? fenced[1]! : visible).trim() + '\n'
+}
+const clip = (text: string, max = 200) => { const line = text.replace(/\s+/g, ' ').trim(); return line.length > max ? line.slice(0, max - 1) + '…' : line }
+
+const typeOf = (value: unknown): JsonType => value === null ? 'null' : Array.isArray(value) ? 'array' : Number.isInteger(value) ? 'integer' : typeof value as JsonType
+/** A minimal JSON Schema subset; returns the first violation's path, or null. */
+export function schemaViolation(value: unknown, schema: JsonSchema, path = '$'): string | null {
+  if (schema.type) {
+    const allowed = Array.isArray(schema.type) ? schema.type : [schema.type], actual = typeOf(value)
+    if (!allowed.some(type => type === actual || (type === 'number' && actual === 'integer'))) return `${path}: expected ${allowed.join('|')}, got ${actual}`
+  }
+  if (schema.const !== undefined && JSON.stringify(value) !== JSON.stringify(schema.const)) return `${path}: expected ${JSON.stringify(schema.const)}`
+  if (schema.enum && !schema.enum.some(option => JSON.stringify(option) === JSON.stringify(value))) return `${path}: not one of ${JSON.stringify(schema.enum)}`
+  if (typeof value === 'string') {
+    if (schema.minLength !== undefined && value.length < schema.minLength) return `${path}: shorter than ${schema.minLength}`
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) return `${path}: longer than ${schema.maxLength}`
+    if (schema.pattern !== undefined && !new RegExp(schema.pattern).test(value)) return `${path}: does not match ${schema.pattern}`
+  }
+  if (typeof value === 'number') {
+    if (schema.minimum !== undefined && value < schema.minimum) return `${path}: below ${schema.minimum}`
+    if (schema.maximum !== undefined && value > schema.maximum) return `${path}: above ${schema.maximum}`
+  }
+  if (Array.isArray(value)) {
+    if (schema.minItems !== undefined && value.length < schema.minItems) return `${path}: fewer than ${schema.minItems} items`
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) return `${path}: more than ${schema.maxItems} items`
+    if (schema.items) for (const [index, item] of value.entries()) { const problem = schemaViolation(item, schema.items, `${path}[${index}]`); if (problem) return problem }
+  }
+  if (isRecord(value)) {
+    for (const key of schema.required ?? []) if (!(key in value)) return `${path}.${key}: required`
+    for (const [key, item] of Object.entries(value)) {
+      const property = schema.properties?.[key]
+      if (property) { const problem = schemaViolation(item, property, `${path}.${key}`); if (problem) return problem }
+      else if (schema.additionalProperties === false) return `${path}.${key}: not allowed`
+    }
+  }
+  return null
+}
+
+export async function grade(job: EvaluationJob, run: EvaluationRun, command?: (request: CommandRequest) => Promise<CommandResult>, signal?: AbortSignal): Promise<Grade> {
+  const grader = job.grader, answer = visibleAnswer(run.answer)
+  switch (grader.kind) {
+    case 'exact': {
+      const same = grader.caseInsensitive ? answer.toLowerCase() === grader.expected.trim().toLowerCase() : answer === grader.expected.trim()
+      return { pass: same, detail: same ? 'exact match' : `expected ${JSON.stringify(grader.expected)}, got ${JSON.stringify(clip(answer, 80))}` }
+    }
+    case 'regex': {
+      const pass = new RegExp(grader.pattern, grader.flags).test(answer)
+      return { pass, detail: pass ? `matches /${grader.pattern}/` : `no match for /${grader.pattern}/ in ${JSON.stringify(clip(answer, 80))}` }
+    }
+    case 'json-schema': {
+      let value: unknown
+      try { value = JSON.parse(answerCode(run.answer)) } catch { return { pass: false, invalidOutput: true, detail: 'the answer is not JSON' } }
+      const problem = schemaViolation(value, grader.schema)
+      return problem ? { pass: false, invalidOutput: true, detail: problem } : { pass: true, detail: 'valid against the schema' }
+    }
+    case 'file-content': {
+      const content = run.files?.[grader.path]
+      if (content === undefined) return { pass: false, detail: `${grader.path} was not written` }
+      const pass = new RegExp(grader.regex, grader.flags).test(content)
+      return { pass, detail: pass ? `${grader.path} matches` : `${grader.path} does not match /${grader.regex}/` }
+    }
+    case 'command': {
+      if (!command) return { pass: false, detail: 'no command runner is available for this grader' }
+      const files = { ...job.files, ...run.files, ...grader.files, ...(grader.answerFile ? { [grader.answerFile]: answerCode(run.answer) } : {}) }
+      let result: CommandResult
+      try { result = await command({ cmd: grader.cmd, args: grader.args, timeoutSec: grader.timeoutSec, files, ...(signal ? { signal } : {}) }) }
+      catch (error) { return { pass: false, detail: `the check could not run: ${error instanceof Error ? error.message : String(error)}` } }
+      if (result.timedOut) return { pass: false, detail: `the check timed out after ${grader.timeoutSec} s` }
+      const pass = result.exitCode === grader.expectExit
+      return { pass, detail: pass ? `${grader.cmd} exited ${result.exitCode}` : `${grader.cmd} exited ${result.exitCode ?? 'without a code'}, expected ${grader.expectExit}${result.output ? `: ${clip(result.output)}` : ''}` }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Evaluation
+
+export interface EvaluationPorts {
+  /** Runs one job on the model: a parked local agent session for local keys, a tab for cloud keys. */
+  run(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun>
+  /** Runs a command grader's check in an isolated folder holding the given files. */
+  command?(request: CommandRequest): Promise<CommandResult>
+  recordOutcome(outcome: ExecutionOutcome): void
+  outcomeRecorded?(outcome: ExecutionOutcome): void
+  setStatus(key: ModelKey, status: ModelStatus): void
+  /** The key's earlier outcomes (any source), so proven counts all its evidence. */
+  outcomes?(key: ModelKey): ExecutionOutcome[]
+  reputation(key: ModelKey, dimension: ReputationDimension): ReputationScore | null
+  /** Current alternatives to compare against in the report. */
+  alternatives(key: ModelKey): ModelKey[]
+  writeReport(name: string, markdown: string): void
+  /** Journals what the run has spent so far, cumulatively for its runId: at its start, after every job and at its end,
+   *  so a run cut short by a restart still counts against the daily cloud caps (the store upserts on runId). */
+  recordSpend?(spend: EvaluationSpend): void
+  now(): Date
+}
+export interface EvaluationOptions {
+  signal?: AbortSignal
+  /** Per job; the job is a timed-out failure after this. */
+  jobTimeoutMs?: number
+  maxJobs?: number
+  /** Stops before the next job once the recorded costUsd sum exceeds this. */
+  maxCostUsd?: number | null
+  /** A hard per-run cap on tokens (input + output): a job starts only with a budget that fits what is left, its
+   *  runner is told that budget, and the run stops, the jobs left not gradable, once none fits or a job overran. */
+  maxTokens?: number | null
+  runId?: string
+}
+export const DEFAULT_JOB_TIMEOUT_MS = 10 * 60_000
+/** A capped run's default budget for one job, by complexity 1..5. */
+export const JOB_TOKEN_BUDGET = [6_000, 10_000, 16_000, 24_000, 32_000] as const
+/** Room for an answer on top of reading the prompt and files; a smaller budget is not worth starting. */
+const MIN_ANSWER_TOKENS = 1_000
+const promptTokens = (job: EvaluationJob): number => Math.ceil((job.prompt.length + Object.values(job.files ?? {}).reduce((sum, text) => sum + text.length, 0)) / 4)
+export const jobTokenBudget = (job: EvaluationJob): number => Math.max(job.maxTokens ?? JOB_TOKEN_BUDGET[job.complexity - 1]!, minimumJobTokens(job))
+export const minimumJobTokens = (job: EvaluationJob): number => promptTokens(job) + MIN_ANSWER_TOKENS
+
+export type EvaluationJobOutcome = ExecutionOutcome['result'] | 'not-gradable'
+export interface EvaluationJobResult { id: string; category: TaskCategory; result: EvaluationJobOutcome; detail: string; timedOut: boolean; durationMs: number; costUsd: number | null; tokens: number | null }
+export type EvaluationStop = 'budget' | 'token-cap' | 'aborted' | 'max-jobs'
+export interface EvaluationResult {
+  runId: string
+  key: ModelKey
+  status: ModelStatus
+  jobs: EvaluationJobResult[]
+  outcomes: ExecutionOutcome[]
+  costUsd: number
+  tokens: number
+  stoppedBy: EvaluationStop | null
+  reportName: string
+}
+/** One run's spend, journaled so caps can be audited. */
+export interface EvaluationSpend { runId: string; key: ModelKey; at: string; tokens: number; costUsd: number; jobs: number; gradedJobs: number; stoppedBy: EvaluationStop | null }
+
+class JobTimeout extends Error {}
+const message = (error: unknown) => error instanceof Error ? error.message : String(error)
+/** Tokens a run reported, else about a quarter of the characters it read and wrote. */
+const runTokens = (job: EvaluationJob, run: EvaluationRun | undefined): number => run?.tokens ?? promptTokens(job) + Math.ceil((run?.answer.length ?? 0) / 4)
+
+/** One job under its own deadline, linked to the evaluation's signal. */
+async function runJob(ports: EvaluationPorts, key: ModelKey, job: EvaluationJob, timeoutMs: number, outer?: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun> {
+  const controller = new AbortController(), abort = () => controller.abort(outer?.reason)
+  outer?.addEventListener('abort', abort, { once: true })
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const expired = new JobTimeout(`timed out after ${timeoutMs < 1000 ? `${timeoutMs} ms` : `${Math.round(timeoutMs / 1000)} s`}`)
+  const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(expired); reject(expired) }, timeoutMs) })
+  const aborted = new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason instanceof JobTimeout ? controller.signal.reason : new Error('aborted')), { once: true }))
+  try { return await Promise.race([budget ? ports.run(key, job, controller.signal, budget) : ports.run(key, job, controller.signal), deadline, aborted]) }
+  finally { clearTimeout(timer); outer?.removeEventListener('abort', abort) }
+}
+
+export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: EvaluationPorts, options: EvaluationOptions = {}): Promise<EvaluationResult> {
+  const runId = options.runId ?? makeId('evaluation'), timeoutMs = options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS
+  const jobs = suite.jobs.slice(0, options.maxJobs ?? suite.jobs.length)
+  const results: EvaluationJobResult[] = [], outcomes: ExecutionOutcome[] = []
+  let spent = 0, tokens = 0, stoppedBy: EvaluationResult['stoppedBy'] = options.maxJobs !== undefined && options.maxJobs < suite.jobs.length ? 'max-jobs' : null
+  const notGradable = (job: EvaluationJob, detail: string) => results.push({ id: job.id, category: job.category, result: 'not-gradable', detail, timedOut: false, durationMs: 0, costUsd: null, tokens: null })
+  const cap = options.maxTokens ?? null, capText = cap === null ? '' : `${cap.toLocaleString('en-US')}-token`
+  const journal = (): void => {
+    try { ports.recordSpend?.({ runId, key, at: ports.now().toISOString(), tokens, costUsd: spent, jobs: results.length, gradedJobs: results.filter(result => result.result !== 'not-gradable').length, stoppedBy }) }
+    catch { /* The journal is the caps' audit trail; the evaluation's outcomes are already recorded. */ }
+  }
+  ports.setStatus(key, 'evaluating')
+  journal()
+  let status: ModelStatus = 'unproven'
+  try {
+    for (const [index, job] of jobs.entries()) {
+      if (options.signal?.aborted) { stoppedBy = 'aborted'; break }
+      if (options.maxCostUsd != null && spent > options.maxCostUsd) { stoppedBy = 'budget'; break }
+      // Grading it needs a sandboxed command runner; running the model first would only spend tokens.
+      if (job.grader.kind === 'command' && !ports.command) { notGradable(job, 'not run: its check needs a sandboxed command runner, which is not available here'); continue }
+      // A capped run never starts a job that could take it past the cap: the job gets what is left, or does not start.
+      let budget: { maxTokens: number } | undefined
+      if (cap !== null) {
+        const left = Math.max(0, cap - tokens), need = minimumJobTokens(job)
+        if (left < need) {
+          stoppedBy = 'token-cap'
+          for (const rest of jobs.slice(index)) notGradable(rest, `not run: ${left.toLocaleString('en-US')} tokens left of the run's ${capText} cap, below the ${minimumJobTokens(rest).toLocaleString('en-US')} this job needs`)
+          break
+        }
+        budget = { maxTokens: Math.min(jobTokenBudget(job), left) }
+      }
+      const started = ports.now().getTime()
+      let run: EvaluationRun | undefined, failure: string | undefined, timedOut = false, cancelled = false, failedTokens: number | null = null
+      try { run = await runJob(ports, key, job, timeoutMs, options.signal, budget) }
+      catch (error) {
+        timedOut = error instanceof JobTimeout; cancelled = !timedOut && !!options.signal?.aborted; failure = timedOut ? message(error) : `the run failed: ${message(error)}`
+        // A failed capped turn is charged what its port measured (at least its budget); a timed-out one never
+        // reports back, so it is charged its whole budget. Uncapped runs keep the text estimate.
+        const reported = (error as { tokens?: unknown } | null)?.tokens
+        failedTokens = !timedOut && typeof reported === 'number' && Number.isFinite(reported) ? reported : budget?.maxTokens ?? null
+      }
+      const graded: Grade = run ? await grade(job, run, ports.command?.bind(ports), options.signal) : { pass: false, detail: failure! }
+      const durationMs = run?.durationMs ?? ports.now().getTime() - started, costUsd = run?.costUsd ?? null, used = run ? runTokens(job, run) : failedTokens ?? runTokens(job, undefined)
+      const result = cancelled ? 'cancelled' : graded.pass ? 'success' : 'failure'
+      const row = outcomeRow({
+        key, source: 'evaluation', ref: `${runId}:${job.id}`, category: job.category, at: ports.now().toISOString(), result,
+        effort: run?.effort ?? null, complexity: job.complexity, verifier: cancelled ? 'none' : graded.pass ? 'pass' : 'fail', durationMs, tokens: run?.tokens ?? failedTokens, costUsd,
+        iterations: run?.iterations ?? null, toolFailures: run?.toolFailures ?? 0, looped: run?.looped ?? false, contextFailure: run?.contextFailure ?? false,
+        timedOut, invalidOutput: graded.invalidOutput ?? false, detail: `${suite.name}/${job.id}: ${graded.detail}`,
+      })
+      ports.recordOutcome(row)
+      ports.outcomeRecorded?.(row)
+      outcomes.push(row)
+      spent += costUsd ?? 0
+      tokens += used
+      results.push({ id: job.id, category: job.category, result, detail: graded.detail, timedOut, durationMs, costUsd, tokens: used })
+      // The real spend stands, even past the budget; a runner that overran is not trusted with another job.
+      const overran = budget && used > budget.maxTokens ? budget.maxTokens : null
+      if (overran !== null) {
+        stoppedBy = 'token-cap'
+        for (const rest of jobs.slice(index + 1)) notGradable(rest, `not run: ${job.id} spent ${used.toLocaleString('en-US')} tokens against its ${overran.toLocaleString('en-US')}-token budget, so the run stopped`)
+      }
+      journal()
+      if (cancelled) { stoppedBy = 'aborted'; break }
+      if (overran !== null) break
+    }
+    const ran = results.filter(result => result.result !== 'not-gradable').length
+    if (!stoppedBy && options.maxCostUsd != null && spent > options.maxCostUsd && ran < jobs.length) stoppedBy = 'budget'
+  } finally {
+    const seen = new Set(outcomes.map(row => row.id))
+    const evidence = [...(ports.outcomes?.(key) ?? []).filter(row => !seen.has(row.id)), ...outcomes]
+    status = isProven(evidence, ports.now()) ? 'proven' : 'unproven'
+    ports.setStatus(key, status)
+    journal()
+  }
+  const reportName = `${ports.now().toISOString().slice(0, 10)}-${modelKeyId(key).replace(/[^\w.-]+/g, '_')}-${runId}.md`
+  ports.writeReport(reportName, report(key, suite, results, spent, tokens, stoppedBy, status, ports))
+  return { runId, key, status, jobs: results, outcomes, costUsd: spent, tokens, stoppedBy, reportName }
+}
+
+const cell = (score: ReputationScore | null) => score ? `${Math.round(score.mean * 100)}% (low ${Math.round(score.lower * 100)}%, n=${Math.round(score.evidence)})` : '—'
+function report(key: ModelKey, suite: EvaluationSuite, results: EvaluationJobResult[], spent: number, tokens: number, stoppedBy: EvaluationResult['stoppedBy'], status: ModelStatus, ports: EvaluationPorts): string {
+  const id = modelKeyId(key), alternatives = ports.alternatives(key).filter(other => modelKeyId(other) !== id)
+  const categories = [...new Set(suite.jobs.map(job => job.category))], passed = results.filter(result => result.result === 'success').length, graded = results.filter(result => result.result !== 'not-gradable').length
+  const escape = (text: string) => text.replace(/\|/g, '\\|').replace(/\n/g, ' ')
+  return [
+    `# Evaluation: ${id}`, '',
+    `Suite **${suite.name}**, ${ports.now().toISOString()}. ${passed}/${graded} graded jobs passed${graded < suite.jobs.length ? ` of ${suite.jobs.length}` : ''}; ${tokens.toLocaleString('en-US')} tokens, cost $${spent.toFixed(2)}${stoppedBy ? `; stopped by ${stoppedBy}` : ''}. Status now **${status}**.`,
+    'Results feed reputation only; no default was changed.', '',
+    '## Jobs', '', '| Job | Category | Result | Detail | Time | Cost |', '| --- | --- | --- | --- | --- | --- |',
+    ...results.map(result => `| ${result.id} | ${result.category} | ${result.result}${result.timedOut ? ' (timed out)' : ''} | ${escape(result.detail)} | ${Math.round(result.durationMs / 1000)} s | ${result.costUsd == null ? '—' : '$' + result.costUsd.toFixed(3)} |`), '',
+    '## Reputation against alternatives', '', `| Category | ${[id, ...alternatives.map(modelKeyId)].join(' | ')} |`, `| --- |${' --- |'.repeat(alternatives.length + 1)}`,
+    ...categories.map(category => `| ${category} | ${[key, ...alternatives].map(other => cell(ports.reputation(other, category))).join(' | ')} |`), '',
+  ].join('\n')
+}

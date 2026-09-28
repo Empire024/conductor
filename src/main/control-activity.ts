@@ -84,7 +84,11 @@ const OTHER_LABELS: Record<string, { label: string; kind: ControlActionKind }> =
   'memory.remember': { label: 'Saved a memory', kind: 'write' },
   'memory.forget': { label: 'Forgot a memory', kind: 'write' },
   'orchestration.tasks.create': { label: 'Created a task', kind: 'write' },
-  'orchestration.tasks.update': { label: 'Updated its task', kind: 'write' }
+  'orchestration.tasks.update': { label: 'Updated its task', kind: 'write' },
+  'models.refresh': { label: 'Refreshed the model registry', kind: 'other' },
+  'models.outcome': { label: 'Recorded a model outcome', kind: 'write' },
+  'models.evaluate': { label: 'Started a model evaluation', kind: 'other' },
+  'decisions.live': { label: 'Switched a decision boundary live', kind: 'decide' }
 }
 
 export class ControlActivityRecorder {

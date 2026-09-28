@@ -1,0 +1,327 @@
+{
+  "name": "default",
+  "description": "Small deterministic jobs, at least one per owner evaluation area (docs/model-routing.md, D. Evaluation).",
+  "jobs": [
+    {
+      "id": "slugify",
+      "area": "simple-coding",
+      "category": "simple-coding",
+      "complexity": 1,
+      "prompt": "Write an ES module that exports `function slugify(text)`. Lowercase the text, split it on every run of characters that are not a-z or 0-9, drop empty parts, and join the parts with single hyphens. So 'Hello, World!  2026' becomes 'hello-world-2026'. Answer only with the code.",
+      "grader": {
+        "kind": "command",
+        "cmd": "node",
+        "args": [
+          "check.mjs"
+        ],
+        "expectExit": 0,
+        "timeoutSec": 30,
+        "answerFile": "solution.mjs",
+        "files": {
+          "check.mjs": "import assert from 'node:assert/strict'\nimport { slugify } from './solution.mjs'\nassert.equal(slugify('Hello, World!  2026'), 'hello-world-2026')\nassert.equal(slugify('  --Already-Slugged--  '), 'already-slugged')\nassert.equal(slugify('a_b.c'), 'a-b-c')\nassert.equal(slugify(''), '')\n"
+        }
+      }
+    },
+    {
+      "id": "predict-output",
+      "area": "simple-coding",
+      "category": "simple-coding",
+      "complexity": 1,
+      "prompt": "What does this JavaScript print?\n\nconsole.log([1, 2, 3].map(n => n * 2).filter(n => n > 2).join('+'))\n\nAnswer with the printed text only.",
+      "grader": {
+        "kind": "exact",
+        "expected": "4+6"
+      }
+    },
+    {
+      "id": "lru-cache",
+      "area": "difficult-coding",
+      "category": "difficult-coding",
+      "complexity": 4,
+      "prompt": "Write an ES module that exports `class LRUCache`. `new LRUCache(capacity)`; `get(key)` returns the value or undefined and marks the key most recently used; `put(key, value)` inserts or updates and marks it most recently used, evicting the least recently used key when the capacity is exceeded; a `size` getter returns the number of entries. get and put must be O(1). Answer only with the code.",
+      "grader": {
+        "kind": "command",
+        "cmd": "node",
+        "args": [
+          "check.mjs"
+        ],
+        "expectExit": 0,
+        "timeoutSec": 30,
+        "answerFile": "solution.mjs",
+        "files": {
+          "check.mjs": "import assert from 'node:assert/strict'\nimport { LRUCache } from './solution.mjs'\nconst cache = new LRUCache(2)\ncache.put('a', 1); cache.put('b', 2)\nassert.equal(cache.get('a'), 1)\ncache.put('c', 3)\nassert.equal(cache.get('b'), undefined)\nassert.equal(cache.get('a'), 1); assert.equal(cache.get('c'), 3)\ncache.put('a', 10); cache.put('d', 4)\nassert.equal(cache.get('c'), undefined); assert.equal(cache.get('a'), 10); assert.equal(cache.get('d'), 4)\nassert.equal(cache.size, 2)\nconst big = new LRUCache(1000)\nfor (let i = 0; i < 200000; i++) { big.put(i, i); big.get(i - 500) }\nassert.equal(big.size, 1000)\n"
+        }
+      }
+    },
+    {
+      "id": "merge-intervals",
+      "area": "difficult-coding",
+      "category": "difficult-coding",
+      "complexity": 3,
+      "prompt": "Write an ES module that exports `function mergeIntervals(intervals)`. It takes an array of [start, end] pairs in any order and returns a new array of merged, sorted, non-overlapping pairs; intervals that touch (end === next start) merge too. It must not modify its input. Answer only with the code.",
+      "grader": {
+        "kind": "command",
+        "cmd": "node",
+        "args": [
+          "check.mjs"
+        ],
+        "expectExit": 0,
+        "timeoutSec": 30,
+        "answerFile": "solution.mjs",
+        "files": {
+          "check.mjs": "import assert from 'node:assert/strict'\nimport { mergeIntervals } from './solution.mjs'\nassert.deepEqual(mergeIntervals([[1, 3], [2, 6], [8, 10], [15, 18]]), [[1, 6], [8, 10], [15, 18]])\nassert.deepEqual(mergeIntervals([[1, 4], [4, 5]]), [[1, 5]])\nassert.deepEqual(mergeIntervals([[5, 6], [1, 2]]), [[1, 2], [5, 6]])\nassert.deepEqual(mergeIntervals([[1, 10], [2, 3]]), [[1, 10]])\nassert.deepEqual(mergeIntervals([]), [])\nconst input = [[3, 4], [1, 2]]\nmergeIntervals(input)\nassert.deepEqual(input, [[3, 4], [1, 2]])\n"
+        }
+      }
+    },
+    {
+      "id": "leap-year-bug",
+      "area": "bug-fixing",
+      "category": "debugging",
+      "complexity": 2,
+      "prompt": "isLeapYear(2000) returns false, but 2000 was a leap year. Fix dates.mjs and answer with the complete corrected file only.",
+      "files": {
+        "dates.mjs": "/** month is 1..12 */\nexport function daysInMonth(year, month) {\n  return new Date(year, month, 0).getDate()\n}\nexport function isLeapYear(year) {\n  return year % 4 === 0 && year % 100 !== 0\n}\n"
+      },
+      "grader": {
+        "kind": "command",
+        "cmd": "node",
+        "args": [
+          "check.mjs"
+        ],
+        "expectExit": 0,
+        "timeoutSec": 30,
+        "answerFile": "dates.mjs",
+        "files": {
+          "check.mjs": "import assert from 'node:assert/strict'\nimport { daysInMonth, isLeapYear } from './dates.mjs'\nassert.equal(isLeapYear(2000), true); assert.equal(isLeapYear(1900), false)\nassert.equal(isLeapYear(2024), true); assert.equal(isLeapYear(2023), false)\nassert.equal(daysInMonth(2024, 2), 29); assert.equal(daysInMonth(2023, 2), 28); assert.equal(daysInMonth(2026, 12), 31)\n"
+        }
+      }
+    },
+    {
+      "id": "pagination-bug",
+      "area": "bug-fixing",
+      "category": "debugging",
+      "complexity": 3,
+      "prompt": "Two reports about paginate.mjs: page(items, 1, 10) skips the first ten items, and a last partial page is never counted by pageCount. Fix both bugs and answer with the complete corrected file only.",
+      "files": {
+        "paginate.mjs": "/** pageNumber starts at 1 */\nexport function page(items, pageNumber, pageSize) {\n  const start = pageNumber * pageSize\n  return items.slice(start, start + pageSize)\n}\nexport function pageCount(total, pageSize) {\n  return Math.floor(total / pageSize)\n}\n"
+      },
+      "grader": {
+        "kind": "command",
+        "cmd": "node",
+        "args": [
+          "check.mjs"
+        ],
+        "expectExit": 0,
+        "timeoutSec": 30,
+        "answerFile": "paginate.mjs",
+        "files": {
+          "check.mjs": "import assert from 'node:assert/strict'\nimport { page, pageCount } from './paginate.mjs'\nconst items = Array.from({ length: 25 }, (_, index) => index + 1)\nassert.deepEqual(page(items, 1, 10), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])\nassert.deepEqual(page(items, 3, 10), [21, 22, 23, 24, 25])\nassert.deepEqual(page(items, 4, 10), [])\nassert.equal(pageCount(25, 10), 3); assert.equal(pageCount(20, 10), 2); assert.equal(pageCount(0, 10), 0)\n"
+        }
+      }
+    },
+    {
+      "id": "find-definition",
+      "area": "repository-navigation",
+      "category": "large-repo",
+      "complexity": 2,
+      "prompt": "In this repository, which file defines (not re-exports) the function that computes the shipping fee used on invoices? Answer with its path relative to the repository root only.",
+      "files": {
+        "README.md": "# Shop\n\nInvoices live in src/billing/invoice.js; shipping is handled in src/billing/shipping.js.\n",
+        "src/index.js": "export { createInvoice } from './billing/invoice.js'\nexport { routes } from './api/routes.js'\n",
+        "src/api/routes.js": "import { createInvoice } from '../billing/invoice.js'\nexport const routes = { 'POST /invoices': createInvoice }\n",
+        "src/billing/invoice.js": "import { shippingFee } from './shipping.js'\nimport { cents } from '../util/money.js'\nexport function createInvoice(order) {\n  const subtotal = order.lines.reduce((sum, line) => sum + line.price * line.quantity, 0)\n  return { subtotal: cents(subtotal), shipping: cents(shippingFee(order.weightKg, order.country)) }\n}\n",
+        "src/billing/shipping.js": "// Kept for older imports; the fee table moved to rates.js.\nexport { shippingFee } from './rates.js'\n",
+        "src/billing/rates.js": "const PER_KG = { NL: 1.2, DE: 1.5 }\nexport function shippingFee(weightKg, country) {\n  return 4.95 + weightKg * (PER_KG[country] ?? 2.5)\n}\n",
+        "src/util/money.js": "export const cents = amount => Math.round(amount * 100)\nexport function legacyShipping() { return 0 }\n"
+      },
+      "grader": {
+        "kind": "regex",
+        "pattern": "^\\W*(\\./)?src/billing/rates\\.js\\W*$"
+      }
+    },
+    {
+      "id": "count-paid-rows",
+      "area": "tool-usage",
+      "category": "tool-calling",
+      "complexity": 2,
+      "prompt": "Using your tools, count the rows of data.csv whose status column is exactly `paid`, write the count as JSON `{\"paid\": <count>}` to out/summary.json, then reply \"done\".",
+      "files": {
+        "data.csv": "id,customer,status,amount\n1,Ada,paid,19.50\n2,Bram,pending,5.00\n3,Chen,paid,7.25\n4,Dara,refunded,12.00\n5,Eli,paid,3.10\n6,Fay,unpaid,8.00\n7,Gus,paid,40.00\n"
+      },
+      "grader": {
+        "kind": "file-content",
+        "path": "out/summary.json",
+        "regex": "^\\s*\\{\\s*\"paid\"\\s*:\\s*4\\s*\\}\\s*$"
+      }
+    },
+    {
+      "id": "log-timeouts",
+      "area": "file-analysis",
+      "category": "file-analysis",
+      "complexity": 2,
+      "prompt": "How many ERROR lines in service.log mention a timeout (the word \"timeout\", any letter case)? Answer with the number only.",
+      "files": {
+        "service.log": "2026-09-01T10:00:01Z INFO  started worker pool size=8\n2026-09-01T10:00:05Z ERROR upstream Timeout after 30s host=api.example\n2026-09-01T10:00:09Z WARN  slow response, near timeout (28s)\n2026-09-01T10:01:12Z ERROR database connection refused\n2026-09-01T10:02:40Z ERROR request timeout id=7781\n2026-09-01T10:03:02Z INFO  retrying id=7781\n2026-09-01T10:03:30Z ERROR TIMEOUT waiting for lock orders_2026\n2026-09-01T10:04:00Z ERROR payload too large (limit 1MB)\n2026-09-01T10:05:11Z INFO  timeout setting reloaded to 45s\n2026-09-01T10:06:00Z ERROR disk quota exceeded\n"
+      },
+      "grader": {
+        "kind": "exact",
+        "expected": "3"
+      }
+    },
+    {
+      "id": "reconcile-sources",
+      "area": "research",
+      "category": "research",
+      "complexity": 3,
+      "prompt": "Using only the files in notes/, what is Vendor A's current default API rate limit in requests per minute, and which file is outdated? Answer exactly as `<number>; <file name>`.",
+      "files": {
+        "notes/vendor-a-docs.md": "# Vendor A API\n\nLast updated 2026-03-10.\n\nDefault rate limit: 100 requests per minute per key. Enterprise plans can ask for more.\n",
+        "notes/blog-post.md": "# Integrating Vendor A (2025-06-02)\n\nKeep in mind that Vendor A allows 60 requests per minute, so batch your calls.\n",
+        "notes/changelog.md": "# Vendor A changelog\n\n- 2026-03-02: Raised the default rate limit from 60 to 100 requests per minute.\n- 2025-11-20: Added idempotency keys.\n"
+      },
+      "grader": {
+        "kind": "regex",
+        "pattern": "^\\D*100\\D*;\\s*`?(notes/)?blog-post\\.md`?\\.?\\s*$",
+        "flags": "i"
+      }
+    },
+    {
+      "id": "add-clamp-feature",
+      "area": "agentic-multi-step",
+      "category": "terminal-use",
+      "complexity": 4,
+      "prompt": "In this workspace: add `clamp(value, min, max)` to src/math.mjs, export it from src/index.mjs next to the others, add a line starting with `- clamp` under \"Unreleased\" in CHANGELOG.md, and make sure `node verify.mjs` passes. Reply \"done\" when finished.",
+      "files": {
+        "src/math.mjs": "export const add = (a, b) => a + b\nexport const sub = (a, b) => a - b\n",
+        "src/index.mjs": "export { add, sub } from './math.mjs'\n",
+        "CHANGELOG.md": "# Changelog\n\n## Unreleased\n\n## 1.0.0\n- add, sub\n",
+        "verify.mjs": "import { clamp } from './src/index.mjs'\nif (clamp(15, 0, 10) !== 10) throw new Error('clamp is wrong')\nconsole.log('ok')\n"
+      },
+      "grader": {
+        "kind": "command",
+        "cmd": "node",
+        "args": [
+          "check.mjs"
+        ],
+        "expectExit": 0,
+        "timeoutSec": 30,
+        "files": {
+          "check.mjs": "import assert from 'node:assert/strict'\nimport { readFileSync } from 'node:fs'\nimport { add, sub, clamp } from './src/index.mjs'\nassert.equal(add(2, 3), 5); assert.equal(sub(5, 3), 2)\nassert.equal(clamp(5, 0, 10), 5); assert.equal(clamp(-1, 0, 10), 0); assert.equal(clamp(11, 0, 10), 10)\nconst log = readFileSync('CHANGELOG.md', 'utf8')\nassert.match(log.slice(log.indexOf('## Unreleased'), log.indexOf('## 1.0.0')), /^- clamp/m)\n"
+        }
+      }
+    },
+    {
+      "id": "orders-report",
+      "area": "long-running",
+      "category": "long-context",
+      "complexity": 4,
+      "prompt": "orders.json lists orders. Create report.mjs exporting three functions over that array: `totalRevenue(orders)` (sum of quantity × unitPrice over orders whose status is \"paid\"), `topCustomer(orders)` (the customer with the highest paid revenue; ties go to the alphabetically first name) and `monthlyTotals(orders)` (an object from \"YYYY-MM\" to that month's paid revenue). Then run it to write out/report.json as `{\"totalRevenue\": ..., \"topCustomer\": ..., \"monthlyTotals\": {...}}`. Reply \"done\" when both files exist.",
+      "files": {
+        "orders.json": "[\n  {\n    \"id\": \"o1\",\n    \"customer\": \"Ada\",\n    \"date\": \"2026-07-03\",\n    \"quantity\": 2,\n    \"unitPrice\": 19.5,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o2\",\n    \"customer\": \"Bram\",\n    \"date\": \"2026-07-09\",\n    \"quantity\": 1,\n    \"unitPrice\": 120,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o3\",\n    \"customer\": \"Chen\",\n    \"date\": \"2026-07-15\",\n    \"quantity\": 5,\n    \"unitPrice\": 4.25,\n    \"status\": \"refunded\"\n  },\n  {\n    \"id\": \"o4\",\n    \"customer\": \"Ada\",\n    \"date\": \"2026-07-21\",\n    \"quantity\": 1,\n    \"unitPrice\": 64,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o5\",\n    \"customer\": \"Dara\",\n    \"date\": \"2026-07-30\",\n    \"quantity\": 3,\n    \"unitPrice\": 12,\n    \"status\": \"pending\"\n  },\n  {\n    \"id\": \"o6\",\n    \"customer\": \"Bram\",\n    \"date\": \"2026-08-02\",\n    \"quantity\": 2,\n    \"unitPrice\": 33.3,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o7\",\n    \"customer\": \"Chen\",\n    \"date\": \"2026-08-05\",\n    \"quantity\": 10,\n    \"unitPrice\": 7.5,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o8\",\n    \"customer\": \"Ada\",\n    \"date\": \"2026-08-11\",\n    \"quantity\": 4,\n    \"unitPrice\": 15,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o9\",\n    \"customer\": \"Eli\",\n    \"date\": \"2026-08-19\",\n    \"quantity\": 1,\n    \"unitPrice\": 250,\n    \"status\": \"refunded\"\n  },\n  {\n    \"id\": \"o10\",\n    \"customer\": \"Dara\",\n    \"date\": \"2026-08-23\",\n    \"quantity\": 6,\n    \"unitPrice\": 9.99,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o11\",\n    \"customer\": \"Chen\",\n    \"date\": \"2026-09-01\",\n    \"quantity\": 2,\n    \"unitPrice\": 48,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o12\",\n    \"customer\": \"Eli\",\n    \"date\": \"2026-09-04\",\n    \"quantity\": 3,\n    \"unitPrice\": 21,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o13\",\n    \"customer\": \"Bram\",\n    \"date\": \"2026-09-12\",\n    \"quantity\": 1,\n    \"unitPrice\": 5.5,\n    \"status\": \"pending\"\n  },\n  {\n    \"id\": \"o14\",\n    \"customer\": \"Ada\",\n    \"date\": \"2026-09-18\",\n    \"quantity\": 2,\n    \"unitPrice\": 30,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o15\",\n    \"customer\": \"Dara\",\n    \"date\": \"2026-09-25\",\n    \"quantity\": 1,\n    \"unitPrice\": 99,\n    \"status\": \"paid\"\n  },\n  {\n    \"id\": \"o16\",\n    \"customer\": \"Eli\",\n    \"date\": \"2026-09-27\",\n    \"quantity\": 2,\n    \"unitPrice\": 45,\n    \"status\": \"paid\"\n  }\n]\n"
+      },
+      "grader": {
+        "kind": "command",
+        "cmd": "node",
+        "args": [
+          "check.mjs"
+        ],
+        "expectExit": 0,
+        "timeoutSec": 30,
+        "files": {
+          "check.mjs": "import assert from 'node:assert/strict'\nimport { readFileSync } from 'node:fs'\nimport { totalRevenue, topCustomer, monthlyTotals } from './report.mjs'\nconst orders = JSON.parse(readFileSync('orders.json', 'utf8')), paid = orders.filter(order => order.status === 'paid')\nconst value = order => order.quantity * order.unitPrice, round = amount => Math.round(amount * 100)\nconst total = paid.reduce((sum, order) => sum + value(order), 0), byCustomer = {}, months = {}\nfor (const order of paid) { byCustomer[order.customer] = (byCustomer[order.customer] ?? 0) + value(order); months[order.date.slice(0, 7)] = (months[order.date.slice(0, 7)] ?? 0) + value(order) }\nconst top = Object.entries(byCustomer).sort((a, b) => round(b[1]) - round(a[1]) || a[0].localeCompare(b[0]))[0][0]\nassert.equal(round(totalRevenue(orders)), round(total))\nassert.equal(topCustomer(orders), top)\nconst got = monthlyTotals(orders)\nassert.deepEqual(Object.keys(got).sort(), Object.keys(months).sort())\nfor (const month of Object.keys(months)) assert.equal(round(got[month]), round(months[month]))\nconst written = JSON.parse(readFileSync('out/report.json', 'utf8'))\nassert.equal(round(written.totalRevenue), round(total)); assert.equal(written.topCustomer, top)\nfor (const month of Object.keys(months)) assert.equal(round(written.monthlyTotals[month]), round(months[month]))\n"
+        }
+      }
+    },
+    {
+      "id": "extract-meeting",
+      "area": "structured-output",
+      "category": "structured-output",
+      "complexity": 2,
+      "prompt": "Extract the meeting below as JSON with exactly these keys: \"title\" (string), \"date\" (YYYY-MM-DD), \"attendees\" (first names, sorted alphabetically) and \"durationMinutes\" (integer). Answer with the JSON only.\n\nQuarterly planning with Maria, Chen and Ola on 14 October 2026, from 10:00 to 11:30.",
+      "grader": {
+        "kind": "json-schema",
+        "schema": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "title",
+            "date",
+            "attendees",
+            "durationMinutes"
+          ],
+          "properties": {
+            "title": {
+              "type": "string",
+              "minLength": 1
+            },
+            "date": {
+              "const": "2026-10-14"
+            },
+            "attendees": {
+              "const": [
+                "Chen",
+                "Maria",
+                "Ola"
+              ]
+            },
+            "durationMinutes": {
+              "type": "integer",
+              "const": 90
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "classify-lines",
+      "area": "structured-output",
+      "category": "structured-output",
+      "complexity": 2,
+      "prompt": "Classify each numbered log line by severity. Answer with a JSON array only, one object per line in order: {\"line\": <number>, \"level\": \"error\" | \"warn\" | \"info\"}.\n\n1. Disk usage at 91%, cleanup recommended\n2. Service started on port 8080\n3. Unhandled exception: cannot read properties of undefined",
+      "grader": {
+        "kind": "json-schema",
+        "schema": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "line",
+              "level"
+            ],
+            "properties": {
+              "line": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 3
+              },
+              "level": {
+                "enum": [
+                  "error",
+                  "warn",
+                  "info"
+                ]
+              }
+            }
+          },
+          "const": [
+            {
+              "line": 1,
+              "level": "warn"
+            },
+            {
+              "line": 2,
+              "level": "info"
+            },
+            {
+              "line": 3,
+              "level": "error"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

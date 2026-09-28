@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 import type { AgentSpec } from '../../shared/models'
 import type { SessionSettings } from '../../shared/structured-agent'
-import type { SavingsSummary } from './contract.ts'
+import type { LocalModelRunner, SavingsSummary } from './contract.ts'
 import { LocalAssistMcpServer } from './mcp-server.ts'
 import { createLocalModelRunner, realRunnerPorts } from './model-runner.ts'
 import { FileSavingsLedger } from './savings.ts'
@@ -19,6 +19,8 @@ export interface LocalAssistWiringDeps {
 
 export interface LocalAssist {
   server: LocalAssistMcpServer
+  /** The one local-model runner of this process; model intelligence's local decider shares it. */
+  runner: LocalModelRunner
   /** Local models saved ≈ N frontier tokens over the last `days` (usage view, local.savings). */
   savings(days?: number): SavingsSummary
   close(): void
@@ -37,5 +39,5 @@ export async function startLocalAssist(deps: LocalAssistWiringDeps): Promise<Loc
   const server = new LocalAssistMcpServer(new LocalAssistTools({ session, runner, ledger }))
   await server.start()
   deps.sessions.setLocalAssist(server)
-  return { server, savings: days => ledger.summary(days), close: () => server.close() }
+  return { server, runner, savings: days => ledger.summary(days), close: () => server.close() }
 }

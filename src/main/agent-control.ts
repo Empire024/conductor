@@ -39,7 +39,7 @@ import { sinceCursor, supervise } from './agent-supervision'
 import { CoworkerRecovery } from './coworker-recovery'
 import { displaySessionPhase } from '../shared/project-activity'
 import { localStopOf } from '../shared/local-stop.ts'
-import { summarizeContext } from '../shared/usage-accounting'
+import { summarizeContext, summarizeUsage } from '../shared/usage-accounting'
 import { normaliseContract } from './local-models/completion.ts'
 import { DEFAULT_DURABLE_JOB_BUDGETS, DURABLE_JOB_STATUSES, type CreateDurableJobInput, type DurableJobsService, type DurableJobStatus, type DurableJobSummary } from '../shared/durable-jobs'
 import { scheduleCall, scheduleMethods, scheduleSignatures, type ScheduleControlService } from './schedule-control'
@@ -56,6 +56,12 @@ import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERM
 import { callWizardApprovals, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
 import type { PermissionGrants } from './permission-grants/service'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
+import type { ApprovalReviewRouting } from './approval-review-gate'
+import type { ModelKey, RegistryRecord, RouteDecision, TaskFeatures } from '../shared/model-routing'
+import { callModelMethod, modelMethods, modelSignatures, routeFeatures, type ModelControlCaller } from './model-intelligence/control'
+import { defaultUsageStop, routeConstraints, usageVerdict, weeklyUsage, type ModelIntelligence } from './model-intelligence'
+import { categorize } from './model-intelligence/categorize'
+import { EvaluationTurnError, evaluationTokens } from './model-intelligence/evaluation-ports'
 
 type Args = Record<string, unknown>
 const restricted = (settings?: SessionSettings): boolean => settings?.permission === 'read-only' || settings?.sandbox === 'read-only' || settings?.plan === true
@@ -188,7 +194,7 @@ const toolSignatures = {
   'loops.proposals': '({id?}) — proposals in this project, optionally filtered to one loop id, each with its status (pending, applied, rejected, reverted)',
   'app.update.authorize': '({agentSessionId,allowed?}) — let another visible conversation (typically a local model) run app.update without the owner dialog; only a non-local coworker may grant it, never to itself, and allowed:false revokes',
   'router.start': '({prompt,provider?,model?}) — create/reuse the project router definition, open its tab, dispatch the requested task',
-  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
+  'router.dispatch': '({tasks:[{title,prompt,provider?,model?,effort?,route?:{features?,constraints?},permission?,exactPermission?,projectTaskIds?:string[],projectId?,workspaceId?,repository?,research?,contract?}]}) - one to four visible coworkers with actual models/efforts; a task with route and no provider/model/effort lets the router choose them (features default to the prompt’s categorisation; constraints as models.route) and opens that choice exactly as if you had named it, returning decisionId and the route explanation (decisions.get, models.outcome); a native coworker opens on Auto, exactly as tabs.open does, and exactPermission: true keeps a lower mode for an agent that cannot be trusted at all; exact optional projectTaskIds transfer controller-owned or to-do claims after prompt acceptance, and cannot be combined with projectId because a claim belongs to the project that owns it; repository/research open a provider-local worker with its grants already on, as tabs.open does; a worker whose prompt was refused before any turn has its tab closed and its task dropped (tabClosed: true, with the error)'
 } as const
 
 /** The methods a caller may point at another project the owner has open in this window. Writes
@@ -298,6 +304,9 @@ export interface AgentControlDependencies {
   /** Finished coworkers closing themselves (src/main/coworker-autoclose.ts); plugged in with
    *  AgentControl.setCoworkerAutoClose. Without it agents.finish is unavailable. */
   coworkerAutoClose?: CoworkerAutoClose
+  /** Model intelligence and routing (src/main/model-intelligence); plugged in with
+   *  AgentControl.setModelIntelligence. Without it models.list is unchanged and routing is unavailable. */
+  modelIntelligence?: ModelIntelligence
   /** Whether a local model could start its server now; absent where the local runtime is not wired. */
   localModels?: {
     availability(modelId: string): Promise<{ available: boolean; reason?: string; note?: string }>
@@ -305,6 +314,8 @@ export interface AgentControlDependencies {
     servers?(): LocalServerEntry[]
     /** Stop one Conductor-started server; throws LocalServerBusy while a turn uses it unless forced. */
     stop?(request: LocalStopRequest): Promise<unknown>
+    /** The card's total VRAM in GB, for routing's fits-VRAM filter; null when unknown. */
+    vramTotalGb?(): number | null
   }
   providers(): AgentProviderInfo[]
   /** This machine plus any paired machines a tab may be placed on. */
@@ -328,7 +339,7 @@ export class AgentControl {
   constructor(private readonly deps: AgentControlDependencies) {
     // The briefing tells a main brain when to hand off to a successor; only this class knows the links.
     deps.sessions.setMainBrain?.(spec => this.mainBrain(spec))
-    deps.sessions.setApprovalReviewRouting(createApprovalRouting(deps, {
+    deps.sessions.setApprovalReviewRouting(this.approvalRouting = createApprovalRouting(deps, {
       controller: id => this.linkFor(id)?.controllerAgentSessionId,
       localAndOpen: spec => {
         const tab = this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: spec.id }).find(tab => tab.resourceId === spec.id)
@@ -348,7 +359,11 @@ export class AgentControl {
         if (tab) await this.ui(scope, 'tabs.close', { tabId: tab.id })
       }
     }))
+    this.approvalRouting.shadow = deps.modelIntelligence?.approvalShadow
   }
+
+  /** The reviewer routing handed to the approval gate; model intelligence rides on it as its shadow. */
+  private approvalRouting!: ApprovalReviewRouting
 
   /** Conversations a non-local coworker cleared to build a local update without asking the owner
    *  again. Deliberately in memory only: the clearance dies with this Conductor process. */
@@ -983,7 +998,7 @@ export class AgentControl {
     // Naming another project is only meaningful for the methods that were opened to a sibling;
     // everywhere else it is still an attempt to act outside the authorized scope.
     if (args.projectId !== undefined && args.projectId !== scope.projectId && !crossProjectMethods.includes(method)) throw new Error('This method only runs in the authorized project. Use projects.list to see what else is open, and hand work to a sibling project with tabs.open({projectId}).')
-    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }
+    if (method === 'tools.list') return { ...toolSignatures, ...(this.deps.durableJobs ? jobSignatures : {}), ...(this.deps.remoteJobs ? nodeSignatures : {}), ...(this.deps.cloud ? cloudSignatures : {}), ...(this.deps.schedules ? scheduleSignatures : {}), ...(this.deps.ideas ? ideaSignatures : {}), ...(this.deps.ideaRuns ? ideaRunSignatures : {}), ...(this.deps.modelIntelligence ? modelSignatures : {}), ...(sovereign(scope) ? { ...ownerSignatures, ...WIZARD_APPROVAL_SIGNATURES } : {}), ...(this.deps.permissionGrants ? { ...PERMISSION_METHOD_SIGNATURES, ...(sovereign(scope) ? PERMISSION_OWNER_SIGNATURES : {}) } : {}) }
     if (PERMISSION_METHODS.includes(method)) {
       if (!this.deps.permissionGrants) throw new Error('Permission grants are not available in this Conductor')
       return callPermissions(this.deps.permissionGrants, { agentSessionId: scope.agentSessionId, owner: scope.owner === true, wizard: scope.wizard === true }, method, args)
@@ -1016,7 +1031,7 @@ export class AgentControl {
         return { ...machine, current: machine.id === this.callerMachineId(scope), runsThisProject: placement.ok, projectNote: !placement.ok ? placement.message : machine.kind === 'local' ? 'Runs every project open in this Conductor; projects.list names them.' : null, ...(machine.kind === 'local' && readiness ? { readiness } : {}) }
       }), this.deps.remoteJobs?.listNodes() ?? [])
     }
-    if (method === 'models.list') return this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope)
+    if (method === 'models.list') return this.withModelFacts(this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope))
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
     if (method === 'tabs.open' && source.provider === 'local' && !scope.owner) return this.openLocalCoworker(scope, args)
     if (method === 'tabs.open') return this.open(scope, args)
@@ -1319,7 +1334,174 @@ export class AgentControl {
     if (scheduleMethods.has(method)) return this.scheduledTasks(scope, source, method, args)
     if (ideaMethods.has(method)) return this.ideasMethod(scope, source, method, args)
     if (ideaRunMethods.has(method)) return this.ideaRunsMethod(scope, source, method, args)
+    if (modelMethods.has(method)) return this.modelsMethod(scope, source, method, args)
     throw new Error('Unknown control method; use tools.list')
+  }
+
+  /** Plugs in model intelligence once it is constructed (src/main/index.ts); it also becomes the
+   *  approval gate's shadow. */
+  setModelIntelligence(service: ModelIntelligence | undefined): void {
+    this.deps.modelIntelligence = service
+    this.approvalRouting.shadow = service?.approvalShadow
+  }
+
+  /** models.list with each model's registry facts and best-evidenced reputation, when known. */
+  private withModelFacts<T extends { provider: string; models: Array<{ id: string }> }>(catalog: T[]): T[] {
+    const service = this.deps.modelIntelligence
+    if (!service) return catalog
+    return catalog.map(entry => ({ ...entry, models: entry.models.map(model => {
+      const facts = service.modelFacts({ provider: entry.provider, model: model.id })
+      return facts ? { ...model, registry: facts.registry, ...(facts.reputation ? { reputation: facts.reputation } : {}) } : model
+    }) }))
+  }
+
+  /** What the router may pick from for this caller: models this project can open now, live usage
+   *  per window (D5), loaded servers, and local admission (D4): whether the model's VRAM envelope
+   *  fits the card and whether it could be admitted right now (localModelAvailability). */
+  private async routeLive(scope: AgentControlScope): Promise<ModelControlCaller['live']> {
+    const catalog = this.catalog(scope).filter(entry => entry.available)
+    const enabled = new Set<string>(catalog.map(entry => entry.provider))
+    const labels = new Map<string, string>(catalog.flatMap(entry => entry.models.map(model => [`${entry.provider}\0${model.id}`, model.label] as const)))
+    const localIds = catalog.filter(entry => entry.provider === 'local').flatMap(entry => entry.models.map(model => model.id))
+    const availability = new Map<string, { available: boolean; reason?: string }>()
+    const check = this.deps.localModels?.availability
+    if (check) await Promise.all(localIds.map(async id => {
+      const verdict = await Promise.race([check(id).catch(error => ({ available: false, reason: error instanceof Error ? error.message : String(error) })), new Promise<null>(resolve => { setTimeout(() => resolve(null), 5_000).unref?.() })])
+      if (verdict) availability.set(id, verdict)
+    }))
+    const vramTotalGb = (() => { try { return this.deps.localModels?.vramTotalGb?.() ?? null } catch { return null } })()
+    const windows = (provider: string) => ['claude', 'codex', 'grok'].includes(provider) ? this.deps.sessions.usageLimits(provider as StructuredProvider).flatMap(report => report.windows) : []
+    const live = {
+      offered: catalog.flatMap(entry => entry.models.map(model => ({ provider: entry.provider, model: model.id }))),
+      providerEnabled: (provider: string) => enabled.has(provider),
+      usagePercent: (provider: string) => weeklyUsage(windows(provider)),
+      usage: (key: ModelKey) => usageVerdict(windows(key.provider), { id: key.model, label: labels.get(`${key.provider}\0${key.model}`) ?? key.model }, defaultUsageStop(key.provider)),
+      loadedLocalModels: () => { try { return (this.deps.localModels?.servers?.() ?? []).map(server => server.model) } catch { return [] } },
+      localAdmission: (record: RegistryRecord) => {
+        const vramGb = record.local?.vramGb ?? null
+        const fitsVram = vramGb === null || vramTotalGb === null || vramGb <= vramTotalGb
+        const verdict = availability.get(record.key.model)
+        const admissible = verdict ? verdict.available : true
+        const reason = !fitsVram ? `needs ${vramGb} GB of VRAM, the card has ${vramTotalGb} GB` : !admissible ? `cannot be admitted now: ${verdict?.reason ?? 'unavailable'}` : undefined
+        return { fitsVram, admissible, ...(reason ? { reason } : {}) }
+      }
+    }
+    return live
+  }
+
+  /** models.* and decisions.* (src/main/model-intelligence/control.ts). */
+  private async modelsMethod(scope: AgentControlScope, source: AgentSpec, method: string, args: Args): Promise<unknown> {
+    const service = this.deps.modelIntelligence
+    if (!service) throw new Error('Model intelligence is unavailable in this Conductor')
+    const settings = scope.owner ? undefined : this.deps.database.structured.snapshot(scope.agentSessionId)?.settings
+    return callModelMethod(service, {
+      projectId: scope.projectId, agentSessionId: scope.agentSessionId, sovereign: sovereign(scope),
+      readOnly: !scope.owner && (source.provider === 'local' || restricted(settings)),
+      live: await this.routeLive(scope),
+      controls: agentSessionId => this.linkFor(agentSessionId)?.controllerAgentSessionId === scope.agentSessionId
+    }, method, args)
+  }
+
+  /** The runtime catalogs open tabs discovered, across the open projects: the registry's runtime source. */
+  runtimeModelCatalog(): Array<{ provider: string; available: boolean; source: 'runtime' | 'configured'; models: Array<{ id: string; label: string; effort?: string[] }> }> {
+    const found = new Map<string, ReturnType<AgentControl['catalog']>[number]>()
+    for (const project of this.deps.database.listDeskProjects()) for (const workspace of this.deps.database.listSessions(project.id)) {
+      for (const entry of this.catalog({ projectId: project.id, sessionId: workspace.id, agentSessionId: OWNER_AGENT_ID })) if (entry.source === 'runtime' && !found.has(entry.provider)) found.set(entry.provider, entry)
+    }
+    return [...found.values()]
+  }
+
+  /** router.dispatch({route}): the router picks provider, model and effort; the task then opens
+   *  exactly as if the caller had named them. An escalated (close) route opens the most capable of
+   *  the close candidates, which the caller frontier already chose. */
+  private async routeTask(scope: AgentControlScope, request: Args): Promise<{ decisionId: string; explanation: string; features: TaskFeatures; fallback: RouteDecision['fallback'] }> {
+    const service = this.deps.modelIntelligence
+    if (!service) throw new Error('route needs model intelligence, which is unavailable in this Conductor; name provider and model instead')
+    if (request.provider !== undefined || request.model !== undefined || request.effort !== undefined) throw new Error('A routed task names no provider, model or effort: the route chooses them')
+    const route = request.route === true ? {} : object(request.route)
+    if (Object.keys(route).some(key => key !== 'features' && key !== 'constraints')) throw new Error('route accepts only features and constraints')
+    const features = routeFeatures({ prompt: request.prompt, features: route.features }, scope.projectId)
+    const { decision, explanation } = await service.route(features, routeConstraints(route.constraints), await this.routeLive(scope), { requester: 'router.dispatch', projectId: scope.projectId, agentSessionId: scope.agentSessionId })
+    delete request.route
+    Object.assign(request, { provider: decision.selected.key.provider, model: decision.selected.key.model, ...(decision.selected.effort ? { effort: decision.selected.effort } : {}) })
+    return { decisionId: decision.decisionId, explanation, features, fallback: decision.fallback }
+  }
+
+  /** Opens a routed task's tab; when that fails (a local model that cannot be admitted, a model the
+   *  CLI no longer offers), opens it once more on the route's fallback. Both attempts are journaled. */
+  private async openRouted(scope: AgentControlScope, request: Args, routed: Awaited<ReturnType<AgentControl['routeTask']>>, extra: Args): Promise<Awaited<ReturnType<AgentControl['open']>>> {
+    const service = this.deps.modelIntelligence!
+    const first: ModelKey = { provider: String(request.provider), model: String(request.model) }
+    try {
+      const tab = await this.open(scope, { ...request, kind: 'agent', ...extra })
+      service.routeAttempt(routed.decisionId, first)
+      return tab
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      service.routeAttempt(routed.decisionId, first, message)
+      if (!routed.fallback) throw error
+      delete request.effort
+      Object.assign(request, { provider: routed.fallback.key.provider, model: routed.fallback.key.model, ...(routed.fallback.effort ? { effort: routed.fallback.effort } : {}) })
+      try {
+        const tab = await this.open(scope, { ...request, kind: 'agent', ...extra })
+        service.routeAttempt(routed.decisionId, routed.fallback.key)
+        return tab
+      } catch (fallbackError) {
+        const detail = fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+        service.routeAttempt(routed.decisionId, routed.fallback.key, detail)
+        throw new Error(`${message}; the fallback ${routed.fallback.key.provider}/${routed.fallback.key.model} failed too: ${detail}`)
+      }
+    }
+  }
+
+  /**
+   * One evaluation turn on a cloud model through the native provider path (models.evaluate): a
+   * background read-only tab in the first open project at the model's lowest effort, one prompt,
+   * the answer and usage read back when the turn settles, then the tab is closed. Spend counts cache
+   * reads and writes. With a `maxTokens` budget the turn is interrupted once its usage passes it, and
+   * a turn that fails, is stopped or reports no usage counts at least that budget as spent (N3): a
+   * failure throws an EvaluationTurnError carrying those tokens.
+   */
+  async evaluationTurn(key: ModelKey, prompt: { system: string; user: string }, signal: AbortSignal, options: { maxTokens?: number } = {}): Promise<{ answer: string; tokens: number | null; costUsd: number | null; durationMs: number; effort: string | null }> {
+    const scope = this.ownerScope(undefined)
+    const model = this.catalog(scope).find(entry => entry.provider === key.provider && entry.available)?.models.find(entry => entry.id === key.model)
+    if (!model) throw new Error(`${key.provider}/${key.model} is not offered on this machine now`)
+    const effort = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'].find(level => model.effort?.includes(level)) ?? null
+    const started = Date.now()
+    const tab = await this.open(scope, { kind: 'agent', provider: key.provider, model: key.model, ...(effort ? { effort } : {}), title: `Evaluation: ${key.model}`.slice(0, 120), permission: 'read-only', focus: false })
+    const id = tab.resourceId!
+    const budget = options.maxTokens !== undefined && Number.isFinite(options.maxTokens) && options.maxTokens > 0 ? options.maxTokens : null
+    const spentOf = (items: SessionProjection['items'] | undefined): number | null => items ? evaluationTokens(summarizeUsage(items).tokens) : null
+    // What a turn that did not complete counts: its measured spend, never below the budget it was given.
+    const worstCase = (measured: number | null): number | null => measured === null ? budget : Math.max(measured, budget ?? 0)
+    try {
+      await this.deps.sessions.connectSession(id)
+      await this.call(scope, 'agents.submit', { agentSessionId: id, prompt: `${prompt.system}\n\n${prompt.user}` })
+      let overBudget = false
+      const settled = await new Promise<SessionProjection>((resolve, reject) => {
+        const poll = setInterval(() => {
+          const state = this.deps.database.structured.snapshot(id)
+          if (state && ['completed', 'failed', 'interrupted', 'disconnected'].includes(state.phase)) { clearInterval(poll); resolve(state); return }
+          if (budget !== null && !overBudget && (spentOf(state?.items) ?? 0) > budget) { overBudget = true; void this.deps.sessions.interrupt(id).catch(() => undefined) }
+        }, 250)
+        signal.addEventListener('abort', () => {
+          clearInterval(poll)
+          void this.deps.sessions.interrupt(id).catch(() => undefined)
+          reject(new EvaluationTurnError('evaluation turn aborted', worstCase(spentOf(this.deps.database.structured.snapshot(id)?.items))))
+        }, { once: true })
+      })
+      const usage = summarizeUsage(settled.items), measured = evaluationTokens(usage.tokens)
+      if (overBudget) throw new EvaluationTurnError(`the evaluation turn passed its ${budget}-token budget and was stopped`, worstCase(measured))
+      if (settled.phase !== 'completed') throw new EvaluationTurnError(`the evaluation turn ended ${settled.phase}`, worstCase(measured))
+      const answer = [...settled.items].reverse().find(item => item.data.type === 'text' && item.data.role === 'assistant')
+      return { answer: answer?.data.type === 'text' ? answer.data.text : '', tokens: measured ?? budget, costUsd: usage.costUsd ?? null, durationMs: Date.now() - started, effort }
+    } catch (error) {
+      if (error instanceof EvaluationTurnError) throw error
+      throw new EvaluationTurnError(error instanceof Error ? error.message : String(error), worstCase(spentOf(this.deps.database.structured.snapshot(id)?.items)))
+    } finally {
+      const open = this.tabs(scope).find(candidate => candidate.resourceId === id)
+      if (open) await this.ui(scope, 'tabs.close', { tabId: open.id }).catch(() => undefined)
+    }
   }
 
   /** Plugs in scheduled tasks once the scheduler is constructed (src/main/index.ts). */
@@ -1765,12 +1947,20 @@ export class AgentControl {
     const dispatcherAgentId = this.deps.orchestration.snapshot(scope.projectId).agents
       .find(agent => agent.role === 'conductor-router' || agent.role === 'auto-fixer')?.id ?? null
     for (const request of requests) {
+      const routed = request.route !== undefined ? await this.routeTask(scope, request) : undefined
+      const routing = routed ? { decisionId: routed.decisionId, route: routed.explanation } : {}
       if (request.provider === 'cloud') {
         if (request.projectTaskIds.length || request.projectId !== undefined) throw new Error('A cloud worker takes neither project task claims nor another project')
         results.push(await this.cloud(scope, this.authorize(scope), 'cloud.start', cloudStart(request)))
         continue
       }
-      const tab = await this.open(scope, { ...request, kind: 'agent', ...(request.projectTaskIds.length ? { focus: false } : {}) })
+      const extra = request.projectTaskIds.length ? { focus: false } : {}
+      const tab = routed ? await this.openRouted(scope, request, routed, extra) : await this.open(scope, { ...request, kind: 'agent', ...extra })
+      // Before the prompt goes out, so the turn it starts is captured with its decision and category.
+      if (this.deps.modelIntelligence && tab.resourceId && typeof tab.state?.provider === 'string' && typeof tab.state.model === 'string') {
+        const features = routed?.features ?? categorize({ prompt: String(request.prompt), projectId: tab.projectId })
+        this.deps.modelIntelligence.bindDispatch(tab.resourceId, { decisionId: routed?.decisionId ?? null, features, key: { provider: tab.state.provider, model: tab.state.model } as ModelKey, effort: typeof tab.state.effort === 'string' && tab.state.effort !== 'auto' ? tab.state.effort : null, projectId: tab.projectId })
+      }
       // A dispatched coworker is a run of this work, not a new identity. Minting an agent per
       // dispatch turned the roster into a task log; the task row below already records the run,
       // and it is attributed to the reusable agent that dispatched it when there is one.
@@ -1808,7 +1998,7 @@ export class AgentControl {
           }
           this.deps.fileChanged({ ...scope, path: 'feature-list.md' })
         }
-        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, provider: tab.state!.provider, model: tab.state!.model, effort: state.settings.effort, uri: tab.uri, accepted })
+        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, provider: tab.state!.provider, model: tab.state!.model, effort: state.settings.effort, uri: tab.uri, accepted, ...routing })
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         // A worker that never received its prompt has nothing to inspect: its tab and task row
@@ -1821,11 +2011,11 @@ export class AgentControl {
           this.deps.orchestration.removeTask(task.id)
           let tabClosed = true
           try { await this.ui(target, 'tabs.close', { tabId: tab.id }) } catch { tabClosed = false }
-          results.push({ tabId: tab.id, agentSessionId: tab.resourceId, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, accepted, error: message, tabClosed })
+          results.push({ tabId: tab.id, agentSessionId: tab.resourceId, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, accepted, error: message, tabClosed, ...routing })
           continue
         }
         this.deps.orchestration.updateTask(task.id, { status: 'blocked' })
-        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, accepted, error: message })
+        results.push({ tabId: tab.id, agentSessionId: tab.resourceId, taskId: task.id, projectTaskIds: request.projectTaskIds, projectId: tab.projectId, workspaceId: tab.workspaceId, accepted, error: message, ...routing })
       }
     }
     return results

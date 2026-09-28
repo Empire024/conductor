@@ -1,0 +1,535 @@
+import type { DatabaseSync } from 'node:sqlite'
+import {
+  modelKeyId, TASK_CATEGORIES, type Decider, type DeciderOutcome, type DecisionRecord, type DecisionRequest, type ExecutionOutcome, type ModelKey, type RegistryRecord,
+  type RouteConstraints, type RouteDecision, type RouteDetails, type TaskCategory, type TaskFeatures
+} from '../../shared/model-routing'
+import { makeId } from '../../shared/models'
+import type { SessionPhase, TimelineItem } from '../../shared/structured-agent'
+import type { DurableJob } from '../../shared/durable-jobs'
+import { usageWindowAppliesToModel, type AccountLimitWindow, type UsageWindow } from '../../shared/usage-accounting'
+import type { LocalModelRunner } from '../local-assist/contract'
+import type { StageResultInput } from '../durable-jobs/ports'
+import { createApprovalShadow, type ApprovalShadowService } from './approval-shadow'
+import { captureDurableStage } from './capture/durable-job'
+import { captureTurn } from './capture/turn'
+import { DecisionService, type ThresholdSettings } from './decision-service'
+import { createFrontierDecider, type FrontierPort } from './deciders/frontier'
+import { createLocalLlmDecider } from './deciders/local-llm'
+import { createScorerDecider, defaultUsageStop, SCORER_TEMPERATURE, softmax } from './deciders/scorer'
+import defaultSuite from './suites/default.json'
+import { evaluate, validateSuite, type CommandRequest, type CommandResult, type EvaluationJob, type EvaluationOptions, type EvaluationPorts, type EvaluationResult, type EvaluationRun, type EvaluationSuite } from './evaluation'
+import { EvaluationTurnError } from './evaluation-ports'
+import { explainRoute } from './explain'
+import { refreshAll, type IngestionPorts, type IngestionSourceName, type RefreshResult } from './ingest'
+import { linkedBatch } from './ingest/linked'
+import { ModelRegistry, rankOf } from './registry'
+import { ReputationService } from './reputation-service'
+import { route, type RouteLiveFacts, type RouteOptions } from './router'
+import { BINDING_TTL_DAYS, ModelIntelligenceStore, type EvaluationSpend, type StoredBinding } from './store'
+
+/**
+ * Module E's service (docs/model-routing.md): one object over the store, registry, reputation,
+ * DecisionService, router and evaluation, with the background refresh, outcome capture and the
+ * approval shadow. Nothing here throws into the app: failures are logged and the caller keeps its
+ * old behaviour.
+ */
+
+const HOUR_MS = 3_600_000
+const DAILY_MS = 24 * HOUR_MS
+const LAST_DAILY_SETTING = 'model-intelligence:last-daily-refresh'
+export const EVALUATION_CAPS_SETTING = 'model-intelligence:evaluation-caps'
+const STARTUP_SOURCES: IngestionSourceName[] = ['configured', 'runtime']
+const DAILY_SOURCES: IngestionSourceName[] = ['configured', 'runtime', 'openrouter', 'latest-models', 'benchmarks']
+const SETTLED: ReadonlySet<SessionPhase> = new Set(['completed', 'failed', 'interrupted'])
+export const CALLER_DECIDER_ID = 'caller'
+export const LOCAL_DECIDER_UNAVAILABLE = 'local decider unavailable: no local model server is running'
+
+/** Model keys routing and evaluation never use: a JSON array of glob patterns (`*`, `?`) on the key
+ *  id (`provider/model`), matched case-insensitively. The owner wants no Fable spend. */
+export const EXCLUDED_MODELS_SETTING = 'model-intelligence:excluded-models'
+export const DEFAULT_EXCLUDED_MODELS: readonly string[] = ['claude/claude-fable-5-1*', 'claude/*fable*']
+export const EXCLUDED_BY_OWNER = 'excluded by owner setting'
+const EXCLUDED_REASONS_MAX = 4
+export function excludedMatcher(patterns: readonly string[]): (key: ModelKey) => string | null {
+  const compiled = patterns.map(pattern => ({ pattern, regex: new RegExp(`^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`, 'i') }))
+  return key => compiled.find(entry => entry.regex.test(modelKeyId(registryKey(key))))?.pattern ?? null
+}
+
+/** The owner's cloud evaluation caps (owner decisions 2026-09-28), overridable in settings. */
+export interface EvaluationCaps { perRunTokens: number; perDayEvaluations: number; perDayTokens: number; /** The smallest run cap worth starting; less left of the day refuses the run. */ minRunTokens: number; weeklyStop: Record<string, number> }
+export const DEFAULT_EVALUATION_CAPS: EvaluationCaps = { perRunTokens: 60_000, perDayEvaluations: 3, perDayTokens: 150_000, minRunTokens: 20_000, weeklyStop: { claude: 85, codex: 55 } }
+
+export interface ModelIntelligenceOptions {
+  dbPath: string | DatabaseSync
+  settings: ThresholdSettings
+  /** The local-assist runner (local-assist/wiring.ts), shared: its admission rules are the local decider's. */
+  localRunner?: LocalModelRunner | null
+  /** Whether a local model server is already running. The local decider only ever uses one that
+   *  is; it never starts one. Absent: the decider may start a server as the runner allows. */
+  localServerRunning?(): boolean
+  /** A one-shot frontier call for non-approval kinds. Without one, route and fallback close calls
+   *  go to the caller (CALLER_DECIDER_ID): no model is asked. */
+  frontier?: FrontierPort | null
+  clock?: () => Date
+  log?: (message: string, error?: unknown) => void
+  sources?: Omit<IngestionPorts, 'now'>
+  evaluation?: EvaluationWiring
+  /** Test seam for the daily timer. */
+  timers?: { every(ms: number, run: () => void): () => void; after(ms: number, run: () => void): () => void }
+}
+
+export interface EvaluationWiring {
+  /** One job on one local model: a one-shot answer through the local runner. */
+  runLocal?(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun>
+  /** One job on one cloud model through the native provider path, at its lowest effort. `budget` is
+   *  the job's token budget (evaluation.ts): the turn is stopped past it where it can be, and a turn
+   *  that fails or reports no usage counts it as spent (the error carries `tokens`). */
+  runCloud?(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun>
+  /** The provider's current weekly usage percent, null when unknown (then a cloud evaluation is skipped). */
+  usage?(provider: string): number | null
+  /** A sandboxed grader command, or null where no sandbox is available (command jobs are then not gradable here). */
+  command?(): Promise<((request: CommandRequest) => Promise<CommandResult>) | null>
+  /** Why this key cannot be evaluated now (another model holds the GPU), or null. */
+  precheck?(key: ModelKey): Promise<string | null> | string | null
+  writeReport?(name: string, markdown: string): void
+  suites(): Record<string, EvaluationSuite>
+}
+
+export type DispatchBinding = StoredBinding
+export interface RouteResult { decision: RouteDecision; explanation: string }
+export interface EvaluationHandle { runId: string; key: ModelKey; suite: string; state: 'running' | 'done' | 'failed'; startedAt: string; notGradable: string[]; maxTokens?: number; result?: EvaluationResult; error?: string }
+
+/** Registry keys keep models.list ids (`local/<id>`); capture adapters may hand a bare local id. */
+export const registryKey = (key: ModelKey): ModelKey => key.provider === 'local' && !key.model.startsWith('local/') ? { provider: 'local', model: `local/${key.model}` } : key
+const normalise = (outcome: ExecutionOutcome): ExecutionOutcome => ({ ...outcome, key: registryKey(outcome.key), ...(outcome.repairedBy ? { repairedBy: registryKey(outcome.repairedBy) } : {}) })
+export const parseKeyId = (id: string): ModelKey | null => { const slash = id.indexOf('/'); return slash > 0 && slash < id.length - 1 ? registryKey({ provider: id.slice(0, slash), model: id.slice(slash + 1) }) : null }
+
+const defaultTimers = {
+  every: (ms: number, run: () => void) => { const timer = setInterval(run, ms); timer.unref?.(); return () => clearInterval(timer) },
+  after: (ms: number, run: () => void) => { const timer = setTimeout(run, ms); timer.unref?.(); return () => clearTimeout(timer) }
+}
+
+export const CLOSE_CANDIDATES_MAX = 3
+
+/** The close set of a route request: at most CLOSE_CANDIDATES_MAX options whose utility is within
+ *  `minMargin` of the top utility, best first; `probability` is each one's scorer softmax. */
+export function closeCandidates(request: Pick<DecisionRequest, 'options'>, minMargin: number, rank: (id: string) => number): Array<{ id: string; probability: number; capabilityRank: number; utility: number }> {
+  const utilities = request.options.map(option => typeof option.facts?.utility === 'number' ? option.facts.utility : NaN)
+  if (!utilities.length || utilities.some(value => !Number.isFinite(value))) return []
+  const probabilities = softmax(utilities, SCORER_TEMPERATURE), top = Math.max(...utilities)
+  return request.options.map((option, index) => ({ id: option.id, probability: probabilities[index]!, capabilityRank: rank(option.id), utility: utilities[index]! }))
+    .filter(entry => top - entry.utility <= minMargin).sort((a, b) => b.utility - a.utility).slice(0, CLOSE_CANDIDATES_MAX)
+}
+
+/** Hard or high-risk work, by the route request's features: only then does a close call go to the most capable. */
+const hardWork = (request: Pick<DecisionRequest, 'state'>): boolean => {
+  const features = request.state?.features as { complexity?: unknown; risk?: unknown } | undefined
+  return typeof features?.complexity === 'number' && features.complexity >= 4 || features?.risk === 'high'
+}
+
+/** A distribution in which `chosen` keeps its own probability and is still the top: the others share
+ *  the rest in proportion, none above it (water-filled). Where its probability is too small for that
+ *  (at or below 1/n), it leads a near-uniform split. */
+export function chosenOnTop(probabilities: Record<string, number>, chosen: string): Record<string, number> {
+  const ids = Object.keys(probabilities), own = probabilities[chosen] ?? 0, others = ids.filter(id => id !== chosen)
+  if (!others.length) return { [chosen]: 1 }
+  const cap = own * (1 - 1e-6)
+  if (own <= 1 / ids.length || cap * others.length < 1 - own) {
+    const lead = 1 / ids.length + 1e-6
+    return Object.fromEntries(ids.map(id => [id, id === chosen ? lead : (1 - lead) / others.length]))
+  }
+  const result: Record<string, number> = { [chosen]: own }
+  let open = [...others], mass = 1 - own
+  for (;;) {
+    const total = open.reduce((sum, id) => sum + (probabilities[id] ?? 0), 0)
+    const scale = (id: string) => total > 0 ? (probabilities[id] ?? 0) * mass / total : mass / open.length
+    const over = open.filter(id => scale(id) > cap)
+    if (!over.length) { for (const id of open) result[id] = scale(id); return result }
+    for (const id of over) result[id] = cap
+    mass -= cap * over.length
+    open = open.filter(id => !over.includes(id))
+  }
+}
+
+/**
+ * The frontier for route and fallback when no model is wired as one: the caller (an Opus or Astra
+ * controller, or router.dispatch) is the frontier. A close call is escalated to it with the close
+ * candidates (by utility); the default it records is the most capable of them for hard (complexity
+ * 4+) or high-risk work, else the top-utility one, so a cheaper model wins a close easy call. The
+ * verdict carries the chosen candidate's own scorer probability as its confidence. No model is asked.
+ */
+export function callerFrontier(minMargin: () => number, rank: (id: string) => number): Decider {
+  return {
+    id: CALLER_DECIDER_ID, tier: 'frontier', supports: kind => kind === 'route' || kind === 'fallback',
+    async decide(request): Promise<DeciderOutcome> {
+      const close = closeCandidates(request, minMargin(), rank)
+      if (!close.length) return { ok: false, decider: CALLER_DECIDER_ID, reason: 'no scored options to choose between' }
+      const hard = hardWork(request)
+      const chosen = hard ? [...close].sort((a, b) => b.capabilityRank - a.capabilityRank || b.utility - a.utility)[0]! : close[0]!
+      const list = close.map(entry => `${entry.id} (${entry.probability.toFixed(2)}, capability ${entry.capabilityRank})`).join(', ')
+      const softmaxOf = softmax(request.options.map(option => option.facts!.utility as number), SCORER_TEMPERATURE)
+      const probabilities = chosenOnTop(Object.fromEntries(request.options.map((option, index) => [option.id, softmaxOf[index]!])), chosen.id)
+      return { ok: true, verdict: { decider: CALLER_DECIDER_ID, probabilities,
+        rationale: `Close call between ${list}; the caller decides. Default: ${hard ? `the most capable for hard or high-risk work, ${chosen.id}` : `the top utility, ${chosen.id}, as the work is not hard or high-risk`}.`, tokens: null, elapsedMs: 0 } }
+    }
+  }
+}
+
+/** A provider's usage as routing sees it (D5): only current windows, a model-scoped window only for
+ *  the models it selects, and each window against its own threshold: a weekly window against the
+ *  weekly stop, any shorter one against 100 % (exhausted). */
+export function usageVerdict(windows: AccountLimitWindow[], model: { id: string; label?: string }, weeklyStop: number): { percent: number | null; blocked: string | null } {
+  const applicable = windows.filter(window => window.state !== 'reset' && usageWindowAppliesToModel({ scope: window.scope, ...(window.models ? { modelSelectors: window.models } : {}) } as UsageWindow, model))
+  if (!applicable.length) return { percent: null, blocked: null }
+  const over = applicable.find(window => window.usedPercent >= (window.kind === 'weekly' ? weeklyStop : 100))
+  const weekly = applicable.filter(window => window.kind === 'weekly')
+  return {
+    percent: Math.max(...(weekly.length ? weekly : applicable).map(window => window.usedPercent)),
+    blocked: over ? `${over.label} usage ${Math.round(over.usedPercent)}% at or above ${over.kind === 'weekly' ? `the ${weeklyStop}% weekly stop` : 'its limit'}` : null
+  }
+}
+
+export function createModelIntelligence(options: ModelIntelligenceOptions) {
+  const clock = options.clock ?? (() => new Date())
+  const log = options.log ?? ((message: string, error?: unknown) => console.warn(`[model-intelligence] ${message}`, error ?? ''))
+  const timers = options.timers ?? defaultTimers
+  const store = new ModelIntelligenceStore(options.dbPath, clock)
+  const registry = new ModelRegistry(store)
+  const reputation = new ReputationService(store, { now: () => clock().getTime() })
+  const localAvailable = (): boolean => { try { return options.localServerRunning ? options.localServerRunning() : true } catch { return false } }
+  // The shared runner, guarded so the decider never starts a server: only one already running is used.
+  const localRunner: LocalModelRunner | null = options.localRunner ? { ...options.localRunner, ask: request => localAvailable() ? options.localRunner!.ask(request) : Promise.resolve({ ok: false, reason: LOCAL_DECIDER_UNAVAILABLE }) } : null
+  const rank = (id: string): number => { const key = parseKeyId(id); if (!key) return 0; const record = registry.get(key); return record?.capabilityRank ?? rankOf(key, record?.family ?? null) }
+  let decisions: DecisionService
+  const deciders = [createScorerDecider(), ...(localRunner ? [createLocalLlmDecider(localRunner)] : []),
+    ...(options.frontier ? [createFrontierDecider(options.frontier, { kinds: ['route', 'retry', 'escalate', 'completion', 'fallback', 'classify'] })] : [callerFrontier(() => decisions.thresholds('route').minMargin, rank)])]
+  decisions = new DecisionService({
+    deciders, settings: options.settings, now: clock,
+    journal: { record: record => store.recordDecision(record) },
+    journalFailed: (error, record) => log(`decision ${record.id} was not journaled`, error)
+  })
+  const countersBefore = new Map<string, DurableJob['counters']>()
+  const evaluations = new Map<string, EvaluationHandle>()
+  /** Each running evaluation's journaled cumulative spend, for the rest of its reservation. */
+  const runSpend = new Map<string, number>()
+  const disposers: Array<() => void> = []
+  let refreshing: Promise<unknown> = Promise.resolve()
+
+  /** Stores the outcome (idempotent), lets reputation see it, gives its decision a first outcome,
+   *  and promotes the key once its evidence is proven (D10: not evaluation only). */
+  const recordOutcome = (raw: ExecutionOutcome | null): ExecutionOutcome | null => {
+    if (!raw) return null
+    try {
+      const { outcome, inserted } = store.recordOutcome(normalise(raw))
+      if (inserted) {
+        reputation.outcomeRecorded(outcome)
+        if (outcome.decisionId && outcome.result !== 'cancelled' && store.decision(outcome.decisionId)?.outcome === null)
+          store.updateDecisionOutcome(outcome.decisionId, { result: outcome.result, at: outcome.at, detail: `${outcome.source} ${outcome.ref}` })
+        promoteIfProven(outcome.key)
+      }
+      return outcome
+    } catch (error) { log('outcome not recorded', error); return null }
+  }
+  const promoteIfProven = (key: ModelKey): void => {
+    try {
+      const record = registry.get(key)
+      if (record && record.status === 'unproven' && reputation.proven(key)) registry.promote(key)
+    } catch (error) { log('status not promoted', error) }
+  }
+
+  /** The linked pass after every refresh: CLI keys take family, price and context from OpenRouter. */
+  const link = (): RefreshResult['changes'] => {
+    try {
+      const batch = linkedBatch(registry.list({ limit: 5_000 }), clock().toISOString())
+      return batch ? registry.applyBatch(batch).changes : []
+    } catch (error) { log('linked pass failed', error); return [] }
+  }
+  const refresh = (sources: IngestionSourceName[] = DAILY_SOURCES): Promise<RefreshResult> => {
+    const run = refreshing.then(() => refreshAll(registry, { ...options.sources, now: clock }, sources)).then(result => ({ ...result, changes: [...result.changes, ...link()] }))
+    refreshing = run.catch(() => undefined)
+    return run.then(result => {
+      for (const entry of result.results) if (entry.status === 'failed') log(`${entry.source} refresh failed: ${entry.errors.join('; ')}`)
+      return result
+    })
+  }
+  const quietly = (sources: IngestionSourceName[]): void => { void refresh(sources).catch(error => log('refresh failed', error)) }
+  const dailyDue = (): boolean => {
+    const last = Date.parse(options.settings.getSetting(LAST_DAILY_SETTING) ?? '')
+    return !Number.isFinite(last) || clock().getTime() - last >= DAILY_MS
+  }
+  const daily = (): void => {
+    if (!dailyDue()) return
+    try { options.settings.setSetting(LAST_DAILY_SETTING, clock().toISOString()) } catch (error) { log('daily refresh time not saved', error) }
+    quietly(DAILY_SOURCES)
+  }
+
+  const shadow: ApprovalShadowService = createApprovalShadow({ decisions, store, recordOutcome, log, now: clock, localAvailable: () => Boolean(localRunner) && localAvailable() })
+
+  const evaluationCaps = (): EvaluationCaps => {
+    try {
+      const stored = JSON.parse(options.settings.getSetting(EVALUATION_CAPS_SETTING) ?? '{}') as Partial<EvaluationCaps>
+      const count = (value: unknown, fallback: number): number => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback
+      return {
+        perRunTokens: count(stored.perRunTokens, DEFAULT_EVALUATION_CAPS.perRunTokens), perDayEvaluations: count(stored.perDayEvaluations, DEFAULT_EVALUATION_CAPS.perDayEvaluations),
+        perDayTokens: count(stored.perDayTokens, DEFAULT_EVALUATION_CAPS.perDayTokens), minRunTokens: count(stored.minRunTokens, DEFAULT_EVALUATION_CAPS.minRunTokens), weeklyStop: { ...DEFAULT_EVALUATION_CAPS.weeklyStop, ...stored.weeklyStop && typeof stored.weeklyStop === 'object' ? stored.weeklyStop : {} }
+      }
+    } catch { return DEFAULT_EVALUATION_CAPS }
+  }
+  /** The owner's exclusion patterns; an unreadable setting keeps the defaults, an empty array excludes nothing. */
+  const excludedModels = (): string[] => {
+    try {
+      const stored: unknown = JSON.parse(options.settings.getSetting(EXCLUDED_MODELS_SETTING) ?? 'null')
+      return Array.isArray(stored) && stored.every(pattern => typeof pattern === 'string') ? stored as string[] : [...DEFAULT_EXCLUDED_MODELS]
+    } catch { return [...DEFAULT_EXCLUDED_MODELS] }
+  }
+
+  const service = {
+    store, registry, reputation, decisions,
+    approvalShadow: shadow,
+
+    /** Prune and the startup refresh run in the background; startup never waits for either. */
+    start(): void {
+      try { const pruned = store.prune(clock()); if (pruned.outcomes || pruned.decisions) log(`pruned ${pruned.outcomes} outcomes and ${pruned.decisions} decisions${pruned.complete ? '' : ' (more next start)'}`) }
+      catch (error) { log('prune failed', error) }
+      disposers.push(timers.after(0, () => quietly(STARTUP_SOURCES)))
+      disposers.push(timers.after(60_000, daily))
+      disposers.push(timers.every(HOUR_MS, daily))
+    },
+    refresh,
+    /** The latest-models schedule ran: its script outputs are new evidence. */
+    latestModelsRan(): void { quietly(['latest-models']) },
+
+    /** Routes and stores what the router made of it (selection, fallback, escalation, reasons, and
+     *  the close candidates when the caller was escalated to) with the decision. */
+    async route(features: TaskFeatures, constraints: Partial<RouteConstraints> | undefined, live: RouteLiveFacts & { offered?: ModelKey[] }, routeOptions: RouteOptions = {}): Promise<RouteResult> {
+      const offered = live.offered && new Set(live.offered.map(key => modelKeyId(registryKey(key))))
+      // The owner's exclusion list drops keys before the router sees them; the route names each one.
+      const excludedBy = excludedMatcher(excludedModels()), excluded: string[] = []
+      const records = registry.list({ limit: 5_000 }).filter((record: RegistryRecord) => {
+        if (offered && !offered.has(modelKeyId(record.key))) return false
+        if (!live.providerEnabled(record.key.provider) || !excludedBy(record.key)) return true
+        excluded.push(modelKeyId(record.key))
+        return false
+      })
+      const exclusionReasons = [...excluded.slice(0, EXCLUDED_REASONS_MAX).map(id => `${id} ${EXCLUDED_BY_OWNER} (${EXCLUDED_MODELS_SETTING})`),
+        ...(excluded.length > EXCLUDED_REASONS_MAX ? [`${excluded.length - EXCLUDED_REASONS_MAX} more ${EXCLUDED_BY_OWNER}`] : [])]
+      let decision: RouteDecision
+      try {
+        decision = await route(features, constraints, { records: () => records, reputation: (key, dimension) => reputation.reputation(key, dimension), live, decisions }, routeOptions)
+      } catch (error) {
+        if (excluded.length && error instanceof Error) error.message = `${error.message}; ${excluded.join(', ')} ${EXCLUDED_BY_OWNER} (${EXCLUDED_MODELS_SETTING})`
+        throw error
+      }
+      if (exclusionReasons.length) decision = { ...decision, reasons: [...decision.reasons, ...exclusionReasons] }
+      const record = store.decision(decision.decisionId)
+      const close = record?.escalated && record.decidedBy === CALLER_DECIDER_ID
+        ? closeCandidates({ options: record.options }, decisions.thresholds('route').minMargin, rank).map(({ utility: _utility, ...entry }) => entry) : undefined
+      const details: RouteDetails = { selected: decision.selected, fallback: decision.fallback, escalation: decision.escalation, reasons: decision.reasons, ...(close?.length ? { closeCandidates: close } : {}) }
+      try { store.recordRouteDetails(decision.decisionId, details) } catch (error) { log('route details not stored', error) }
+      return { decision, explanation: explainRoute(decision) }
+    },
+    /** One open attempt of a routed dispatch (the choice, then its fallback), journaled with the decision. */
+    routeAttempt(decisionId: string, key: ModelKey, error?: string): void {
+      try { store.appendRouteAttempt(decisionId, { key: registryKey(key), ok: !error, ...(error ? { error: error.slice(0, 500) } : {}), at: clock().toISOString() }) } catch (failure) { log('route attempt not stored', failure) }
+    },
+
+    recordOutcome,
+    /** A routed or dispatched agent: its settled turns are captured with this decision and category,
+     *  also after a restart (the store keeps BINDINGS_MAX bindings for BINDING_TTL_DAYS). */
+    bindDispatch(agentSessionId: string, binding: Omit<DispatchBinding, 'at'>): void {
+      try { store.saveBinding(agentSessionId, { ...binding, key: registryKey(binding.key), at: clock().getTime() }) } catch (error) { log('dispatch binding not stored', error) }
+    },
+    binding(agentSessionId: string): DispatchBinding | undefined {
+      try { return store.binding(agentSessionId) ?? undefined } catch { return undefined }
+    },
+    /** A structured session reported a phase; only settled turns of bound agents are captured. */
+    turnSettled(event: { agentSessionId: string; runtimeId?: string; turnId?: string; phase: SessionPhase; limited?: boolean }, projection: () => { items: TimelineItem[] } | null | undefined): ExecutionOutcome | null {
+      if (!SETTLED.has(event.phase)) return null
+      const binding = service.binding(event.agentSessionId)
+      if (!binding) return null
+      try {
+        const items = projection()?.items ?? []
+        const turnId = event.turnId ?? [...items].reverse().find(item => item.turnId && (!event.runtimeId || item.runtimeId === event.runtimeId))?.turnId
+        if (!turnId) return null
+        return recordOutcome(captureTurn({
+          agentSessionId: event.agentSessionId, projectId: binding.projectId, turnId, ...(event.runtimeId ? { runtimeId: event.runtimeId } : {}), phase: event.phase, items,
+          provider: binding.key.provider, model: binding.key.model, effort: binding.effort, features: binding.features, decisionId: binding.decisionId, ...(event.limited ? { limited: true } : {})
+        }))
+      } catch (error) { log('turn not captured', error); return null }
+    },
+    /** A durable-job stage settled (the handoff port's afterStage); deltas are exact from the second stage on. */
+    stageSettled(input: Pick<StageResultInput, 'job' | 'stage' | 'observation' | 'succeeded'>): ExecutionOutcome | null {
+      try {
+        const before = countersBefore.get(input.job.id)
+        countersBefore.set(input.job.id, { ...input.job.counters })
+        if (countersBefore.size > 1_000) countersBefore.delete(countersBefore.keys().next().value!)
+        return recordOutcome(captureDurableStage({ job: input.job, stage: input.stage, observation: input.observation, succeeded: input.succeeded, ...(before ? { countersBefore: before } : {}) }))
+      } catch (error) { log('durable stage not captured', error); return null }
+    },
+
+    /** models.list: registry facts and the best-evidenced reputation dimensions of one catalog entry. */
+    modelFacts(key: ModelKey): { registry: { status: string; pricing: RegistryRecord['pricing']; contextTokens: number | null; stale: boolean; capabilityRank: number | null } | null; reputation: Array<{ dimension: string; mean: number; lower: number; evidence: number }> | null } | null {
+      try {
+        const record = registry.get(registryKey(key))
+        if (!record) return null
+        const profile = reputation.profile(record.key).sort((a, b) => b.evidence - a.evidence).slice(0, 3)
+        return {
+          registry: { status: record.status, pricing: record.pricing, contextTokens: record.contextTokens, stale: record.stale, capabilityRank: record.capabilityRank ?? null },
+          reputation: profile.length ? profile.map(score => ({ dimension: score.dimension, mean: round(score.mean), lower: round(score.lower), evidence: round(score.evidence) })) : null
+        }
+      } catch (error) { log('model facts unavailable', error); return null }
+    },
+
+    evaluationCaps,
+    excludedModels,
+    /** Starts an evaluation in the background. Local keys through the local runner; cloud keys through
+     *  the native provider path under the owner's caps (daily count and tokens, per-run tokens, and
+     *  never at or above the provider's weekly stop, where unknown usage means skip). */
+    async startEvaluation(key: ModelKey, suiteName: string | undefined, evaluationOptions: { maxJobs?: number } = {}): Promise<EvaluationHandle> {
+      const wiring = options.evaluation
+      const target = registryKey(key), cloud = target.provider !== 'local'
+      const run = cloud ? wiring?.runCloud : wiring?.runLocal
+      if (!wiring || !run) throw new Error(cloud ? 'Cloud model evaluation is not wired in this Conductor' : 'Model evaluation is not wired in this Conductor')
+      if (!registry.get(target)) throw new Error(`${modelKeyId(target)} is not in the model registry; run models.refresh first`)
+      const excludedPattern = excludedMatcher(excludedModels())(target)
+      if (excludedPattern) throw new Error(`${modelKeyId(target)} is ${EXCLUDED_BY_OWNER} (${EXCLUDED_MODELS_SETTING}: ${excludedPattern}); it is not evaluated`)
+      const suites = wiring.suites(), names = Object.keys(suites)
+      const name = suiteName ?? names[0]
+      const suite = name ? suites[name] : undefined
+      if (!suite) throw new Error(names.length ? `Unknown suite ${String(suiteName)}; one of ${names.join(', ')}` : 'No evaluation suite is available')
+      if (!cloud) {
+        const blocked = await wiring.precheck?.(target)
+        if (blocked) throw new Error(blocked)
+      }
+      const command = await wiring.command?.().catch(() => null) ?? null
+      // Everything from here to the handle is synchronous, so two starts cannot both pass the checks.
+      if ([...evaluations.values()].some(handle => handle.state === 'running')) throw new Error('An evaluation is already running; one at a time on this machine')
+      let maxTokens: number | undefined
+      if (cloud) {
+        const caps = evaluationCaps(), stop = caps.weeklyStop[target.provider]
+        const usage = wiring.usage?.(target.provider) ?? null
+        if (stop === undefined) throw new Error(`No weekly stop is set for ${target.provider}; set one in ${EVALUATION_CAPS_SETTING} before evaluating it`)
+        if (usage === null) throw new Error(`${target.provider}'s weekly usage is unknown, so the evaluation is skipped (owner rule: unknown usage means skip)`)
+        if (usage >= stop) throw new Error(`${target.provider} is at ${Math.round(usage)}% of its week, at or above the ${stop}% stop; no evaluation`)
+        const spent = store.evaluationSpend(new Date(clock().getTime() - DAILY_MS).toISOString())
+        if (spent.runs >= caps.perDayEvaluations) throw new Error(`${spent.runs} cloud evaluations ran in the last 24 h; the cap is ${caps.perDayEvaluations}`)
+        // A run gets what is left of the day (runs in progress keep the rest of their caps reserved), at
+        // most the per-run cap, and holds it until it ends: the day can never pass its token cap.
+        const reserved = [...evaluations.values()].reduce((sum, handle) => sum + (handle.state === 'running' && handle.maxTokens !== undefined ? Math.max(0, handle.maxTokens - (runSpend.get(handle.runId) ?? 0)) : 0), 0)
+        const remaining = caps.perDayTokens - spent.tokens - reserved, runCap = Math.min(caps.perRunTokens, remaining), floor = Math.min(caps.minRunTokens, caps.perRunTokens)
+        if (runCap < floor) throw new Error(`Cloud evaluations used ${spent.tokens} tokens in the last 24 h${reserved ? ` and ${reserved} more are reserved by a run in progress` : ''}; ${Math.max(0, remaining)} of the daily ${caps.perDayTokens} are left, below the ${floor} a run needs`)
+        maxTokens = runCap
+      }
+      const notGradable = command ? [] : suite.jobs.filter(job => job.grader.kind === 'command').map(job => `${job.id} (command: not gradable here)`)
+      const handle: EvaluationHandle = { runId: makeId('evaluation'), key: target, suite: suite.name, state: 'running', startedAt: clock().toISOString(), notGradable, ...(maxTokens !== undefined ? { maxTokens } : {}) }
+      evaluations.set(handle.runId, handle)
+      // recordSpend and maxTokens are evaluation.ts's cap contract (builder C): the run stops at the cap and journals its spend once.
+      const spendPort = { recordSpend: (spend: EvaluationSpend) => {
+        runSpend.set(spend.runId, spend.tokens)
+        try { store.recordEvaluationSpend(spend) } catch (error) { log('evaluation spend not journaled', error) }
+      } }
+      // A cloud job's worst case is its budget (else the run cap): a turn without usage counts it, and a
+      // failed one throws an EvaluationTurnError carrying at least it (N3).
+      const cloudJob = async (runKey: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }): Promise<EvaluationRun> => {
+        const jobBudget = budget ?? (maxTokens !== undefined ? { maxTokens } : undefined)
+        try {
+          const result = await run(runKey, job, signal, jobBudget)
+          return result.tokens == null && jobBudget ? { ...result, tokens: jobBudget.maxTokens } : result
+        } catch (error) {
+          const reported = (error as { tokens?: unknown } | null)?.tokens
+          const measured = typeof reported === 'number' && Number.isFinite(reported) ? reported : null
+          throw new EvaluationTurnError(error instanceof Error ? error.message : String(error), jobBudget ? Math.max(measured ?? 0, jobBudget.maxTokens) : measured)
+        }
+      }
+      const ports: EvaluationPorts = {
+        run: cloud ? cloudJob : (runKey, job, signal, budget) => run(runKey, job, signal, budget),
+        ...(command ? { command } : {}),
+        recordOutcome: outcome => { recordOutcome(outcome) },
+        setStatus: (statusKey, status) => { try { registry.setStatus(statusKey, status) } catch (error) { log('status not set', error) } },
+        outcomes: outcomeKey => store.outcomes({ key: outcomeKey, since: new Date(clock().getTime() - 180 * DAILY_MS).toISOString(), limit: 5_000 }),
+        reputation: (reputationKey, dimension) => reputation.reputation(reputationKey, dimension),
+        alternatives: altKey => registry.list({ provider: altKey.provider }).map(record => record.key).slice(0, 4),
+        writeReport: (reportName, markdown) => { try { wiring.writeReport?.(reportName, markdown) } catch (error) { log('evaluation report not written', error) } },
+        now: clock, ...spendPort
+      }
+      const tokenCap = maxTokens !== undefined ? { maxTokens } : {}
+      const runOptions: EvaluationOptions = { runId: handle.runId, ...(evaluationOptions.maxJobs ? { maxJobs: evaluationOptions.maxJobs } : {}), ...tokenCap }
+      void evaluate(target, suite, ports, runOptions)
+        .then(result => { Object.assign(handle, { state: 'done', result }) }, error => { Object.assign(handle, { state: 'failed', error: error instanceof Error ? error.message : String(error) }); log('evaluation failed', error) })
+        .finally(() => runSpend.delete(handle.runId))
+      return handle
+    },
+    evaluation(runId: string): EvaluationHandle | undefined { return evaluations.get(runId) },
+
+    dispose(): void {
+      for (const dispose of disposers.splice(0)) dispose()
+      shadow.dispose()
+      try { store.close() } catch { /* already closed */ }
+    }
+  }
+  return service
+}
+export type ModelIntelligence = ReturnType<typeof createModelIntelligence>
+export { BINDING_TTL_DAYS }
+
+/** The suites shipped with the app (suites/*.json), validated once. */
+export function bundledSuites(): Record<string, EvaluationSuite> {
+  const suite = validateSuite(defaultSuite)
+  return { [suite.name]: suite }
+}
+
+/** The current weekly usage percent of a provider's reports, null when none is current (unknown). */
+export function weeklyUsage(windows: AccountLimitWindow[]): number | null {
+  const weekly = windows.filter(window => window.state !== 'reset' && window.kind === 'weekly' && window.scope === 'provider')
+  return weekly.length ? Math.max(...weekly.map(window => window.usedPercent)) : null
+}
+export { defaultUsageStop }
+
+const round = (value: number): number => Math.round(value * 1000) / 1000
+
+/** Features for a task prompt with the caller's overrides validated on top. */
+export function taskFeatures(base: TaskFeatures, override: unknown): TaskFeatures {
+  if (override === undefined || override === null) return base
+  if (typeof override !== 'object' || Array.isArray(override)) throw new Error('route.features must be an object')
+  const input = override as Record<string, unknown>, features: TaskFeatures = { ...base }
+  const unknown = Object.keys(input).filter(key => !['category', 'complexity', 'risk', 'toolsRequired', 'contextTokens', 'summary'].includes(key))
+  if (unknown.length) throw new Error(`route.features accepts category, complexity, risk, toolsRequired, contextTokens and summary, not ${unknown.join(', ')}`)
+  if (input.category !== undefined) { if (!(TASK_CATEGORIES as readonly string[]).includes(String(input.category))) throw new Error(`route.features.category must be one of ${TASK_CATEGORIES.join(', ')}`); features.category = input.category as TaskCategory }
+  if (input.complexity !== undefined) { if (![1, 2, 3, 4, 5].includes(input.complexity as number)) throw new Error('route.features.complexity must be 1..5'); features.complexity = input.complexity as TaskFeatures['complexity'] }
+  if (input.risk !== undefined) { if (!['low', 'medium', 'high'].includes(String(input.risk))) throw new Error('route.features.risk must be low, medium or high'); features.risk = input.risk as TaskFeatures['risk'] }
+  if (input.toolsRequired !== undefined) { if (!Array.isArray(input.toolsRequired) || input.toolsRequired.length > 40 || input.toolsRequired.some(tool => typeof tool !== 'string' || tool.length > 80)) throw new Error('route.features.toolsRequired must be at most 40 tool names'); features.toolsRequired = input.toolsRequired as string[] }
+  if (input.contextTokens !== undefined) { if (input.contextTokens !== null && (!Number.isInteger(input.contextTokens) || (input.contextTokens as number) < 0)) throw new Error('route.features.contextTokens must be a whole number or null'); features.contextTokens = input.contextTokens as number | null }
+  if (input.summary !== undefined) { if (typeof input.summary !== 'string') throw new Error('route.features.summary must be text'); features.summary = input.summary.slice(0, 300) }
+  return features
+}
+
+/** Validated route constraints; unknown fields are refused rather than silently ignored. */
+export function routeConstraints(value: unknown): Partial<RouteConstraints> | undefined {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'object' || Array.isArray(value)) throw new Error('route.constraints must be an object')
+  const input = value as Record<string, unknown>, constraints: Partial<RouteConstraints> = {}
+  const unknown = Object.keys(input).filter(key => !['costWeight', 'latencyWeight', 'maxCostUsd', 'localOnly', 'excludeProviders', 'allow', 'urgency'].includes(key))
+  if (unknown.length) throw new Error(`route.constraints accepts costWeight, latencyWeight, maxCostUsd, localOnly, excludeProviders, allow and urgency, not ${unknown.join(', ')}`)
+  const unit = (key: 'costWeight' | 'latencyWeight') => { const number = input[key]; if (typeof number !== 'number' || !(number >= 0 && number <= 1)) throw new Error(`route.constraints.${key} must be 0..1`); constraints[key] = number }
+  if (input.costWeight !== undefined) unit('costWeight')
+  if (input.latencyWeight !== undefined) unit('latencyWeight')
+  if (input.maxCostUsd !== undefined) { if (input.maxCostUsd !== null && (typeof input.maxCostUsd !== 'number' || !(input.maxCostUsd >= 0))) throw new Error('route.constraints.maxCostUsd must be a non-negative number or null'); constraints.maxCostUsd = input.maxCostUsd as number | null }
+  if (input.localOnly !== undefined) { if (typeof input.localOnly !== 'boolean') throw new Error('route.constraints.localOnly must be true or false'); constraints.localOnly = input.localOnly }
+  if (input.excludeProviders !== undefined) { if (!Array.isArray(input.excludeProviders) || input.excludeProviders.some(provider => typeof provider !== 'string')) throw new Error('route.constraints.excludeProviders must be provider names'); constraints.excludeProviders = input.excludeProviders as string[] }
+  if (input.allow !== undefined) {
+    if (!Array.isArray(input.allow) || input.allow.length > 50) throw new Error('route.constraints.allow must be at most 50 {provider, model} keys')
+    constraints.allow = input.allow.map(entry => {
+      const key = typeof entry === 'string' ? parseKeyId(entry) : entry && typeof entry === 'object' && typeof (entry as ModelKey).provider === 'string' && typeof (entry as ModelKey).model === 'string' ? entry as ModelKey : null
+      if (!key) throw new Error('route.constraints.allow entries are {provider, model} or "provider/model"')
+      return registryKey({ provider: key.provider, model: key.model })
+    })
+  }
+  if (input.urgency !== undefined) { if (input.urgency !== 'normal' && input.urgency !== 'urgent') throw new Error('route.constraints.urgency must be normal or urgent'); constraints.urgency = input.urgency }
+  return constraints
+}
+
+/** The model a route decision chose, in registry form (for an owner outcome recorded against it). */
+export const decisionKey = (record: DecisionRecord): ModelKey | null => record.kind === 'route' || record.kind === 'fallback' ? record.choice ? parseKeyId(record.choice) : null : null
+
+/** A stored binding older than this is forgotten: capture stops for that agent. */
+export const BINDING_TTL_MS = BINDING_TTL_DAYS * DAILY_MS

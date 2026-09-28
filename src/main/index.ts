@@ -31,6 +31,8 @@ import { AgentControlServer } from './agent-control-server'
 import { AgentControlUi } from './agent-control-ui'
 import { BrowserMcpServer } from './browser-mcp'
 import { startLocalAssist, type LocalAssist } from './local-assist/wiring'
+import { weeklyUsage as weeklyUsagePercent, type ModelIntelligence } from './model-intelligence'
+import { latestModelsFromSchedules, latestModelsWatcher, startModelIntelligence, turnObserver, vramTotalGb, withStageCapture } from './model-intelligence/app-wiring'
 import { registerPermissionGrantsIpc, startPermissionGrants } from './permission-grants/wiring'
 import { BrowserViews } from './browser-views'
 import { RemoteControlService } from './remote-control-ipc'
@@ -90,7 +92,9 @@ import { LocalGenerationGate, createLlamaServerPorts } from './durable-jobs/serv
 import { registerDurableJobsIpc } from './durable-jobs-ipc'
 import { createCloud, type CloudRegistration } from './cloud/register'
 import { health as llamaHealth, processAlive as llamaProcessAlive, readRunRecord, stopServer as stopLlamaServer } from './local-models/llama'
-import { runningLlamaProcesses } from './local-models/resource-guard'
+import { resourceRequirements, runningLlamaProcesses } from './local-models/resource-guard'
+import { dockerAvailable, sandboxImageExists } from './local-models/sandbox'
+import { createLocalModelRunner, realRunnerPorts } from './local-assist/model-runner'
 import { listLocalServers, stopLocalServer, type LocalStopRequest } from './local-models/servers'
 import { agentTabIds, anonymousConversations } from './local-models/anonymous'
 import { loadConfig as loadLocalConfig, readApiKey as readLocalApiKey } from './local-models/config'
@@ -188,6 +192,9 @@ let disposePhoneBroadcast: (() => void) | undefined
 let agentControlUi: AgentControlUi | undefined
 let browserMcp: BrowserMcpServer | undefined
 let localAssist: LocalAssist | undefined
+/** Model intelligence and routing (docs/model-routing.md); started in the background after launch. */
+let modelIntelligence: ModelIntelligence | undefined
+let disposeModelObserver: (() => void) | undefined
 let permissionGrants: Awaited<ReturnType<typeof startPermissionGrants>> | undefined
 let browserViews: BrowserViews | undefined
 let projectFileChanges: ProjectFileChanges | undefined
@@ -701,6 +708,7 @@ const disposeRuntimeServices = (): void => {
     ['idea-runs', () => { disposeIdeaRunsIpc?.(); ideaRunsRegistration?.dispose() }],
     ['ideas', () => { disposeIdeasIpc?.(); ideasRegistration?.dispose() }],
     ['agent control', () => { agentControlServer?.close(); agentControlUi?.close(); browserMcp?.close(); localAssist?.close(); permissionGrants?.close(); browserViews?.dispose(); projectFileChanges?.close() }],
+    ['model intelligence', () => { disposeModelObserver?.(); modelIntelligence?.dispose(); modelIntelligence = undefined }],
     ['coworker auto-close', () => coworkerAutoClose?.dispose()],
     ['terminals', () => terminals?.dispose()],
     ['agents', () => agents?.dispose()],
@@ -2722,7 +2730,7 @@ app.whenReady().then(async () => {
       stopConfirmation: { pending: () => stopConfirmations.pending(), answer: stopWork => stopConfirmations.answer(stopWork), wouldAsk: stopQuestion }
     },
     delivery,
-    localModels: { availability: localModelAvailability, servers: runningLocalServers, stop: stopRunningLocalServer },
+    localModels: { availability: localModelAvailability, servers: runningLocalServers, stop: stopRunningLocalServer, vramTotalGb: () => vramTotalGb() },
     providers: () => agents.listProviders(), ui: agentControlUi.request,
     machines: () => remoteControl!.machines(),
     openRemote: (machineId, request) => remoteControl!.openRemote(machineId, request),
@@ -2752,7 +2760,7 @@ app.whenReady().then(async () => {
     projectPath: projectId => database.getProject(projectId)?.path ?? null,
     // The local adapter falls back to its default model for an unknown id; a job must not.
     validateModel: model => { if (!localModel(model)) throw new Error(`${model} is not a configured local model on this machine`) },
-    ...durableJobPorts({
+    ...withStageCapture(durableJobPorts({
       store: durableJobStore,
       gate: generationGate,
       snapshot: id => database.structured.snapshot(id),
@@ -2767,7 +2775,7 @@ app.whenReady().then(async () => {
         const result = await llamaHealth(port, apiKey, 4000)
         return { healthy: result.ok, processing: result.ok ? await slotsProcessing(port, apiKey) : false, ...(result.detail ? { detail: result.detail } : {}) }
       }
-    })
+    }), input => { modelIntelligence?.stageSettled(input) })
   })
   control.setDurableJobs(durableJobs)
   if (localMachineReadiness) control.setLocalReadiness(localMachineReadiness)
@@ -2798,6 +2806,8 @@ app.whenReady().then(async () => {
   control.setCoworkerAutoClose(coworkerAutoClose)
   delivery.onChanged(run => coworkerAutoClose?.noteDelivery(run))
   coworkerAutoClose.start()
+  // A finished latest-models run is new registry evidence (model-intelligence latest-models source).
+  const latestModelsChanged = latestModelsWatcher(() => latestModelsFromSchedules(schedules), () => modelIntelligence?.latestModelsRan())
   // Scheduled tasks (docs/schedules.md): scripts at night and in idle windows, local churn through
   // the same generation gate as durable jobs, bounded frontier reviews only on changed evidence.
   scheduledTasks = createScheduledTasks({
@@ -2808,7 +2818,7 @@ app.whenReady().then(async () => {
     localUpdateBuilding: () => localUpdateBuilder.status().state === 'running',
     durableJobsRunning: () => durableJobs?.list({ status: ['running', 'recovering'] }).length ?? 0,
     generationGate, localTurnsInFlight: () => localTurnsInFlight() > 0,
-    changed: projectId => publish('schedules:changed', projectId)
+    changed: projectId => { publish('schedules:changed', projectId); latestModelsChanged() }
   })
   scheduleRunner = scheduledTasks.runner
   control.setSchedules(scheduledTasks.control)
@@ -2851,6 +2861,29 @@ app.whenReady().then(async () => {
   permissionGrants = await startPermissionGrants({ sessions: agents.structured, store: database.structured, control: (scope, method, args) => control.call(scope, method, args), publish, announce: notification => phoneAccess?.announce(notification), workspaces: database })
     .catch(error => { console.warn('Permission grants are unavailable', error); return undefined })
   if (permissionGrants) control.setPermissionGrants(permissionGrants.grants)
+  // Model intelligence (docs/model-routing.md): registry refresh, routing, outcome capture and the
+  // approval shadow. Started in the background; until it is up, everything behaves as before.
+  disposeModelObserver = onBroadcast(turnObserver(() => modelIntelligence, id => database.structured.snapshot(id)))
+  void startModelIntelligence({
+    dbPath: databasePath, userData: app.getPath('userData'), settings: database,
+    providers: () => agents.listProviders(),
+    localModels: () => { try { return Object.values(loadLocalConfig().models) } catch { return null } },
+    vramBytes: model => resourceRequirements(model).vramBytes,
+    sandboxImage: () => { try { return loadLocalConfig().sandbox.image } catch { return null } },
+    sandboxReady: async image => (await dockerAvailable()).available && await sandboxImageExists(image),
+    runtimeCatalog: () => control.runtimeModelCatalog(),
+    latestModelsOutputs: () => latestModelsFromSchedules(schedules),
+    runningLocalModels: () => runningLocalServers().map(server => server.model),
+    network: !process.env.CONDUCTOR_TEST_USER_DATA && process.env.CONDUCTOR_OFFLINE_TESTS !== '1',
+    runner: async preferred => createLocalModelRunner(await realRunnerPorts(), { preferred: [preferred] }),
+    localRunner: localAssist?.runner ?? null,
+    cloudTurn: (key, prompt, signal, options) => control.evaluationTurn(key, prompt, signal, options),
+    weeklyUsage: provider => ['claude', 'codex', 'grok'].includes(provider) ? weeklyUsagePercent(agents.structured.usageLimits(provider as 'claude' | 'codex' | 'grok').flatMap(report => report.windows)) : null
+  }).then(service => {
+    if (servicesDisposed) { service.dispose(); return }
+    modelIntelligence = service
+    control.setModelIntelligence(service)
+  }, error => console.warn('Model intelligence is unavailable', error))
   remoteControl.registerIpc()
   await remoteControl.start()
   // Phones reach this Conductor through their own listener, built on the same stores and the

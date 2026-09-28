@@ -67,9 +67,18 @@ export interface ApprovalReviewRouting {
   budget?(action: ReviewAction): { used: number; cap: number }
   authorization(spec: AgentSpec): { text: string; id: string; ownerTaskId?: string }
   run(spec: AgentSpec, action: ReviewAction, digest: string): Promise<ReviewResult>
+  /** Model intelligence's approval shadow (docs/model-routing.md, E): told when a reviewer turn
+   *  starts, what it decided and what the owner answered. Called synchronously and guarded; it
+   *  never delays or changes a review. Absent: the gate behaves exactly as without it. */
+  shadow?: ApprovalReviewShadow
   /** @deprecated Never consulted since 18312fd: the owner accepted review without execution-time
    *  enforcement of the reviewed preconditions for their own coworkers. Kept so older fixtures type-check. */
   supportsExactExecution?(spec: AgentSpec): boolean
+}
+export interface ApprovalReviewShadow {
+  reviewing(spec: AgentSpec, action: ReviewAction): void
+  reviewed(record: ReviewRecord): void
+  answered(record: ReviewRecord): void
 }
 type Binding = { spec: AgentSpec; runtimeId: string; source: AdapterEvent; interaction: PendingInteraction; action?: ReviewAction; record?: ReviewRecord; settled?: 'owner' }
 const object = (value: unknown): Record<string, Json> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, Json> : {}
@@ -128,13 +137,18 @@ export class ApprovalReviewGate {
     queueMicrotask(() => { void this.prepare(binding).catch(error => this.pause(binding, error)) })
     return this.projection(binding)
   }
+  /** Tells the shadow, if any; its failure is never the review's. */
+  private tell(event: 'reviewed' | 'answered', record: ReviewRecord | undefined): void {
+    if (!record) return
+    try { this.routing?.shadow?.[event](record) } catch { /* the shadow only observes */ }
+  }
   private update(binding: Binding, record: ReviewRecord): void { binding.record = record; this.publish(binding.spec.id, binding.runtimeId, this.projection(binding)) }
   /** The review stopped without a decision. The request stays a normal owner approval, with the
    *  reason shown; nothing about the owner's choices changes. */
   private pause(binding: Binding, error: unknown): void {
     if (binding.settled) return
     const reason = String(sanitizeDiagnostic(error instanceof Error ? error.message : 'Review unavailable'))
-    if (binding.record) this.update(binding, this.journal.transition(this.journal.get(binding.record.projectId, binding.record.id)!, 'paused', reason))
+    if (binding.record) { this.update(binding, this.journal.transition(this.journal.get(binding.record.projectId, binding.record.id)!, 'paused', reason)); this.tell('reviewed', binding.record) }
     else this.publish(binding.spec.id, binding.runtimeId, { ...binding.source, data: { type: 'interaction', interaction: { ...binding.interaction, review: { id: '', digest: '', phase: 'paused', rationale: reason } } } })
   }
   private async action(binding: Binding): Promise<ReviewAction> {
@@ -189,11 +203,13 @@ export class ApprovalReviewGate {
     const rule = routine ? undefined : sessionRules.covering(scope, { ...binding.action, cwd: binding.spec.cwd })
     const covered = routine ? { key: routine, rationale: `Routine in-workspace action (${routine.slice('routine:'.length)}): allowed automatically, as Auto mode would; no review` }
       : rule && { key: rule.key, rationale: `Covered by this conversation's session rule "${rule.key}" (${rule.source === 'wizard' ? 'allowed for the session by ' + rule.by : 'first allowed by the ' + rule.by + ' review'}); no new review` }
+    if (!covered) try { this.routing?.shadow?.reviewing(binding.spec, binding.action) } catch { /* the shadow only observes */ }
     const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => { if (!binding.settled) this.update(binding, record) }, covered)
     if (record.phase === 'approved' && record.reviewerId && !record.coveredBy) {
       const key = commandClass({ ...binding.action, cwd: binding.spec.cwd })
       if (key) sessionRules.add(scope, { key, source: 'review', recordId: record.id, by: record.reviewerModel ?? 'stronger', at: record.updatedAt, example: binding.action.tool })
     }
+    if (!covered) this.tell('reviewed', record)
     this.report(binding)
     // An owner who answered meanwhile has already settled the record; the reviewer's late word is not used.
     if (binding.settled) return
@@ -252,11 +268,12 @@ export class ApprovalReviewGate {
     if (record?.phase === 'owner' && binding.action && (decision === 'allow' || decision === 'deny')) {
       try {
         const current = await this.action(binding)
-        if (actionDigest(current) === actionDigest(binding.action)) { binding.record = this.journal.reserve(current, decision, answeredBy); return binding.record }
+        if (actionDigest(current) === actionDigest(binding.action)) { binding.record = this.journal.reserve(current, decision, answeredBy); this.tell('answered', binding.record); return binding.record }
       } catch { /* The exact-action grant cannot be journaled; the owner's answer still goes through below. */ }
     }
     if (record && !SETTLED_PHASES.includes(record.phase)) {
       binding.record = this.journal.transition(record, 'responding', `${answeredBy ?? 'Owner'} answered while the review was ${record.phase}; the reviewer's result is not used`, { ...(decision === 'allow' || decision === 'deny' ? { ownerAnswer: decision } : {}), ...(answeredBy ? { answeredBy } : {}) })
+      this.tell('answered', binding.record)
       return binding.record
     }
     return undefined

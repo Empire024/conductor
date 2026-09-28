@@ -1,0 +1,308 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { AgentSpec } from '../../shared/models'
+import type { DecisionRequest, ModelKey, SourceRef } from '../../shared/model-routing'
+import type { AccountLimitWindow } from '../../shared/usage-accounting'
+import type { ReviewAction } from '../approval-review'
+import type { LocalModelRequest } from '../local-assist/contract'
+import { outcome as outcomeRow } from './capture/common'
+import type { EvaluationSuite } from './evaluation'
+import { softmax } from './deciders/scorer'
+import {
+  CALLER_DECIDER_ID, callerFrontier, chosenOnTop, closeCandidates, createModelIntelligence, DEFAULT_EVALUATION_CAPS, DEFAULT_EXCLUDED_MODELS, EVALUATION_CAPS_SETTING, EXCLUDED_MODELS_SETTING,
+  excludedMatcher, LOCAL_DECIDER_UNAVAILABLE, usageVerdict, weeklyUsage, type ModelIntelligenceOptions
+} from './index'
+
+const dirs: string[] = []
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true, maxRetries: 5 }) })
+const settings = () => { const values = new Map<string, string>(); return { values, getSetting: (key: string) => values.get(key) ?? null, setSetting: (key: string, value: string) => { values.set(key, value) } } }
+const noTimers = { every: () => () => {}, after: () => () => {} }
+const NOW = new Date('2026-09-28T12:00:00Z')
+const OPUS: ModelKey = { provider: 'claude', model: 'opus[1m]' }
+const SOL: ModelKey = { provider: 'codex', model: 'gpt-5.6-sol' }
+const QWEN: ModelKey = { provider: 'local', model: 'local/qwen3.6-35b-a3b' }
+const FABLE: ModelKey = { provider: 'claude', model: 'claude-fable-5-1' }
+const CONFIG: SourceRef = { kind: 'config', name: 'configured:test' }
+
+function service(extra: Partial<ModelIntelligenceOptions> = {}, dbPath = ':memory:') {
+  const clock = { now: NOW }
+  const created = createModelIntelligence({ dbPath, settings: settings(), timers: noTimers, clock: () => clock.now, log: () => {}, ...extra })
+  return { service: created, clock }
+}
+function register(s: ReturnType<typeof createModelIntelligence>, keys: Array<[ModelKey, string]>) {
+  s.registry.applyBatch({ source: CONFIG, fetchedAt: NOW.toISOString(), complete: false, benchmarks: [], observations: keys.flatMap(([key, label]) => [
+    { key, field: 'displayName' as const, value: label, source: CONFIG, observedAt: NOW.toISOString() },
+    { key, field: 'availability' as const, value: 'available', source: CONFIG, observedAt: NOW.toISOString() }]) })
+}
+const window = (patch: Partial<AccountLimitWindow>): AccountLimitWindow => ({ bucket: 'b', key: 'k', label: 'Weekly', kind: 'weekly', scope: 'provider', usedPercent: 10, windowMinutes: 10_080, resetsAt: null, state: 'current', observedAt: NOW.toISOString(), ageSeconds: 5, source: { agentSessionId: 'a', projectId: 'p' }, ...patch })
+
+describe('usage windows for routing (D5)', () => {
+  it('ignores reset windows', () => {
+    expect(usageVerdict([window({ usedPercent: 100, state: 'reset' })], { id: 'opus[1m]' }, 85)).toEqual({ percent: null, blocked: null })
+  })
+  it('applies a model-scoped window only to the models it selects', () => {
+    const fable = window({ label: 'Fable weekly', scope: 'model', models: ['fable'], usedPercent: 99 })
+    expect(usageVerdict([fable, window({ usedPercent: 40 })], { id: 'opus[1m]', label: 'Opus (1M context)' }, 85)).toEqual({ percent: 40, blocked: null })
+    expect(usageVerdict([fable, window({ usedPercent: 40 })], { id: 'claude-fable-5-1', label: 'Fable' }, 85).blocked).toBe('Fable weekly usage 99% at or above the 85% weekly stop')
+  })
+  it('compares the weekly window with the weekly stop and a short window with 100 %', () => {
+    const fiveHour = (usedPercent: number) => window({ label: '5-hour', kind: 'short', windowMinutes: 300, usedPercent })
+    expect(usageVerdict([fiveHour(92), window({ usedPercent: 50 })], { id: 'opus' }, 85)).toEqual({ percent: 50, blocked: null })
+    expect(usageVerdict([fiveHour(100), window({ usedPercent: 50 })], { id: 'opus' }, 85).blocked).toBe('5-hour usage 100% at or above its limit')
+    expect(usageVerdict([fiveHour(10), window({ usedPercent: 85 })], { id: 'opus' }, 85).blocked).toBe('Weekly usage 85% at or above the 85% weekly stop')
+    expect(usageVerdict([fiveHour(10), window({ usedPercent: 84 })], { id: 'opus' }, 85).blocked).toBeNull()
+  })
+  it('reads a current provider-wide weekly percent, or unknown', () => {
+    expect(weeklyUsage([window({ usedPercent: 30 }), window({ usedPercent: 70, state: 'reset' }), window({ usedPercent: 90, kind: 'short' })])).toBe(30)
+    expect(weeklyUsage([window({ usedPercent: 99, scope: 'model', models: ['fable'] })])).toBeNull()
+  })
+})
+
+describe('the caller as the route frontier (D2)', () => {
+  type Features = { complexity: number; risk: string }
+  const request = (utilities: number[], features: Features = { complexity: 3, risk: 'medium' }, ids = [`${SOL.provider}/${SOL.model}`, 'claude/opus[1m]', 'local/qwen']): DecisionRequest => ({ kind: 'route', question: 'q', impact: 'routine', requester: 'test',
+    state: { features: { category: 'summarization', ...features } }, options: ids.slice(0, utilities.length).map((id, index) => ({ id, label: id, facts: { utility: utilities[index]! } })) })
+  const rank = (id: string) => id.startsWith('claude') ? 3 : id.startsWith('local') ? 0 : 1
+  const decide = async (utilities: number[], features?: Features) => {
+    const outcome = await callerFrontier(() => 0.15, rank).decide(request(utilities, features))
+    if (!outcome.ok) throw new Error(outcome.reason)
+    const [choice, confidence] = Object.entries(outcome.verdict.probabilities).sort((a, b) => b[1] - a[1])[0]!
+    return { verdict: outcome.verdict, choice, confidence }
+  }
+
+  // N1: a close call keeps the top-utility (cheaper) pick unless the work is hard (complexity 4+) or high-risk.
+  it.each([
+    { cell: 'summarization, complexity 1, low risk', features: { complexity: 1, risk: 'low' }, choice: 'codex/gpt-5.6-sol' },
+    { cell: 'simple coding, complexity 2, low risk', features: { complexity: 2, risk: 'low' }, choice: 'codex/gpt-5.6-sol' },
+    { cell: 'frontend, complexity 3, medium risk', features: { complexity: 3, risk: 'medium' }, choice: 'codex/gpt-5.6-sol' },
+    { cell: 'difficult coding, complexity 4, medium risk', features: { complexity: 4, risk: 'medium' }, choice: 'claude/opus[1m]' },
+    { cell: 'complexity 5', features: { complexity: 5, risk: 'low' }, choice: 'claude/opus[1m]' },
+    { cell: 'easy but high risk', features: { complexity: 1, risk: 'high' }, choice: 'claude/opus[1m]' },
+  ])('$cell -> $choice', async ({ features, choice }) => {
+    const utilities = [0.50, 0.42, 0.20]
+    const decided = await decide(utilities, features)
+    expect(decided.choice).toBe(choice)
+    // N6: the confidence is the chosen candidate's own scorer probability, not 1 (floored at an even split,
+    // below which no distribution can keep it on top).
+    const probability = softmax(utilities)[[`${SOL.provider}/${SOL.model}`, 'claude/opus[1m]'].indexOf(choice)]!
+    expect(decided.confidence).toBeCloseTo(Math.max(probability, 1 / 3), 5)
+    expect(decided.confidence).toBeLessThan(1)
+    expect(decided.verdict.rationale).toMatch(/^Close call between codex\/gpt-5\.6-sol \(0\.\d\d, capability 1\), claude\/opus\[1m\] \(0\.\d\d, capability 3\); the caller decides\./)
+    expect(decided.verdict.rationale).not.toContain('local/qwen')
+  })
+
+  it('measures the close set in utility (not probability), best first, at most three', () => {
+    // 0.50 against 0.40: 0.10 apart in utility but about 0.55 apart in softmax probability.
+    expect(closeCandidates(request([0.50, 0.40, 0.20]), 0.15, rank).map(entry => entry.id)).toEqual(['codex/gpt-5.6-sol', 'claude/opus[1m]'])
+    const five = request([0.40, 0.50, 0.45, 0.48, 0.44], undefined, ['a/1', 'b/2', 'c/3', 'd/4', 'e/5'])
+    expect(closeCandidates(five, 0.15, rank).map(entry => entry.id)).toEqual(['b/2', 'd/4', 'c/3'])
+  })
+
+  it('keeps the chosen probability and puts it on top of a valid distribution', () => {
+    const put = chosenOnTop({ a: 0.5, b: 0.4, c: 0.1 }, 'b')
+    expect(put.b).toBeCloseTo(0.4, 9)
+    expect(put.c).toBeCloseTo(0.2, 5)
+    expect(put.a).toBeLessThan(put.b!)
+    expect(Object.values(put).reduce((sum, value) => sum + value, 0)).toBeCloseTo(1, 9)
+    const top = chosenOnTop({ a: 0.6, b: 0.3, c: 0.1 }, 'a')
+    for (const [id, value] of Object.entries({ a: 0.6, b: 0.3, c: 0.1 })) expect(top[id]).toBeCloseTo(value, 9)
+    const small = chosenOnTop({ a: 0.9, b: 0.05, c: 0.05 }, 'b')
+    expect(Object.entries(small).sort((x, y) => y[1] - x[1])[0]![0]).toBe('b')
+  })
+  it('is the app frontier when no model port is wired: a close route is escalated to the caller, with the close set stored', async () => {
+    const { service: s } = service()
+    register(s, [[OPUS, 'Opus (1M context)'], [SOL, 'GPT-5.6 Sol']])
+    const live = { offered: [OPUS, SOL], providerEnabled: () => true, usagePercent: () => null, loadedLocalModels: () => [] }
+    const { decision } = await s.route({ category: 'review', complexity: 4, risk: 'high', toolsRequired: [], contextTokens: null }, {}, live, { requester: 'router.dispatch' })
+    const record = s.store.decision(decision.decisionId)!
+    if (record.escalated) {
+      expect(record.decidedBy).toBe(CALLER_DECIDER_ID)
+      expect(record.route!.closeCandidates!.map(entry => entry.id).sort()).toEqual(['claude/opus[1m]', 'codex/gpt-5.6-sol'])
+      expect(decision.selected.key).toEqual(OPUS)
+      expect(record.confidence).toBeLessThan(1)
+    }
+    expect(record.escalationReason).not.toBe('close call, no frontier configured')
+    expect(record.route).toMatchObject({ selected: decision.selected, reasons: decision.reasons })
+    expect(record.route!.fallback).toEqual(decision.fallback)
+    s.dispose()
+  })
+})
+
+describe('decisions, bindings and status', () => {
+  it('stores route details with the decision, marks models.route runs as dry, and journals open attempts', async () => {
+    const { service: s } = service()
+    register(s, [[OPUS, 'Opus'], [SOL, 'Sol']])
+    const live = { offered: [OPUS, SOL], providerEnabled: () => true, usagePercent: () => null, loadedLocalModels: () => [] }
+    const features = { category: 'simple-coding' as const, complexity: 1 as const, risk: 'low' as const, toolsRequired: [], contextTokens: null }
+    const dry = await s.route(features, {}, live, { requester: 'models.route' })
+    const real = await s.route(features, {}, live, { requester: 'router.dispatch' })
+    expect(s.store.decision(dry.decision.decisionId)).toMatchObject({ dryRun: true })
+    expect(s.store.decisions({ since: '2020-01-01T00:00:00Z', limit: 10 }).map(record => record.id)).toEqual([real.decision.decisionId])
+    expect(s.store.decisions({ since: '2020-01-01T00:00:00Z', limit: 10, includeDryRun: true })).toHaveLength(2)
+    s.routeAttempt(real.decision.decisionId, { provider: 'local', model: 'qwen' }, 'Qwen is busy')
+    s.routeAttempt(real.decision.decisionId, SOL)
+    expect(s.store.decision(real.decision.decisionId)!.route!.attempts).toEqual([
+      { key: { provider: 'local', model: 'local/qwen' }, ok: false, error: 'Qwen is busy', at: NOW.toISOString() }, { key: SOL, ok: true, at: NOW.toISOString() }])
+    s.dispose()
+  })
+
+  it('keeps dispatch bindings across a restart, within 7 days', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'model-intel-service-')); dirs.push(dir)
+    const path = join(dir, 'conductor.db')
+    const first = service({}, path)
+    first.service.bindDispatch('worker', { decisionId: 'decision_1', features: { category: 'debugging', complexity: 3, risk: 'medium', toolsRequired: [], contextTokens: null }, key: { provider: 'local', model: 'qwen' }, effort: null, projectId: 'project' })
+    first.service.dispose()
+    const second = service({}, path)
+    expect(second.service.binding('worker')).toMatchObject({ decisionId: 'decision_1', key: { provider: 'local', model: 'local/qwen' }, projectId: 'project' })
+    second.clock.now = new Date(NOW.getTime() + 8 * 86_400_000)
+    expect(second.service.binding('worker')).toBeUndefined()
+    second.service.dispose()
+  })
+
+  it('promotes a key to proven once its recent evidence reaches the proven count (D10)', () => {
+    const { service: s } = service()
+    register(s, [[SOL, 'Sol']])
+    for (let index = 0; index < 11; index++) s.recordOutcome(outcomeRow({ key: SOL, source: 'turn', ref: `t${index}`, category: 'debugging', at: NOW.toISOString(), result: 'success' }))
+    expect(s.registry.get(SOL)!.status).toBe('unproven')
+    s.recordOutcome(outcomeRow({ key: SOL, source: 'turn', ref: 't11', category: 'debugging', at: NOW.toISOString(), result: 'failure' }))
+    expect(s.registry.get(SOL)!.status).toBe('proven')
+    s.dispose()
+  })
+})
+
+describe('the local decider never starts a model server (D6)', () => {
+  const action = { projectId: 'p', machineId: 'local', workerId: 'w', runtimeId: 'r', requestId: 'q', tool: 'Write', arguments: {}, paths: [], boundary: 'workspace-write', reason: 'x', sideEffects: [], ownerEvidence: 'o', authorizationId: 'a', native: {} } as ReviewAction
+  const spec = { id: 'w', projectId: 'p', sessionId: 's', provider: 'claude', cwd: '.', title: 'W' } as AgentSpec
+  it('skips the shadow and records the skip when no server runs, and uses a running one', async () => {
+    let running = false
+    const asked: LocalModelRequest[] = []
+    const runner = { ask: async (request: LocalModelRequest) => { asked.push(request); return { ok: true as const, answer: { text: '{"probabilities":{"allow":0.9,"deny":0.05,"escalate":0.05},"rationale":"ok"}', model: 'local/qwen', inputTokens: 1, outputTokens: 1, durationMs: 5 } } } }
+    const { service: s } = service({ localRunner: runner, localServerRunning: () => running })
+    s.approvalShadow.reviewing(spec, action)
+    expect(s.approvalShadow.stats()).toMatchObject({ skipped: 1 })
+    expect(asked).toEqual([])
+    running = true
+    s.approvalShadow.reviewing(spec, { ...action, requestId: 'q2' })
+    await vi.waitFor(() => expect(asked).toHaveLength(1))
+    s.dispose()
+  })
+  it('refuses every other local decision too while no server runs', async () => {
+    const runner = { ask: vi.fn() }
+    const { service: s } = service({ localRunner: runner, localServerRunning: () => false })
+    const record = await s.decisions.decide({ kind: 'retry', question: 'Retry?', options: [{ id: 'yes', label: 'Yes' }, { id: 'no', label: 'No' }], state: {}, impact: 'routine', requester: 'test' })
+    expect(runner.ask).not.toHaveBeenCalled()
+    expect(record.verdicts[0]).toEqual({ decider: 'local-llm', failed: LOCAL_DECIDER_UNAVAILABLE })
+    s.dispose()
+  })
+})
+
+describe('cloud evaluation under the owner caps (gap 8)', () => {
+  const suite: EvaluationSuite = { name: 'mini', jobs: [{ id: 'answer', category: 'simple-coding', complexity: 1, prompt: 'Say 42', grader: { kind: 'exact', expected: '42' } }] }
+  function cloud(usage: number | null, configure?: (values: Map<string, string>) => void) {
+    const store = settings()
+    configure?.(store.values)
+    const runCloud = vi.fn(async (..._args: unknown[]) => ({ answer: '42', tokens: 900 as number | null, costUsd: 0.01 as number | null, durationMs: 1000 }))
+    const s = createModelIntelligence({ dbPath: ':memory:', settings: store, timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => usage, suites: () => ({ mini: suite }) } })
+    register(s, [[OPUS, 'Opus'], [{ provider: 'grok', model: 'grok-4.7' }, 'Grok']])
+    return { s, runCloud }
+  }
+  it('skips when usage is unknown or at the weekly stop, and when a provider has no stop', async () => {
+    await expect(cloud(null).s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/usage is unknown/)
+    await expect(cloud(85).s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/at or above the 85% stop/)
+    await expect(cloud(10).s.startEvaluation({ provider: 'grok', model: 'grok-4.7' }, 'mini')).rejects.toThrow(/No weekly stop is set for grok/)
+  })
+  it('enforces the daily count and token caps from settings and hands the run its token budget', async () => {
+    const { s, runCloud } = cloud(10)
+    for (let index = 0; index < 2; index++) s.store.recordEvaluationSpend({ runId: `r${index}`, key: OPUS, at: NOW.toISOString(), tokens: 50_000, jobs: 1, gradedJobs: 1, stoppedBy: null })
+    s.store.recordEvaluationSpend({ runId: 'local-run', key: QWEN, at: NOW.toISOString(), tokens: 999_999, jobs: 1, gradedJobs: 1, stoppedBy: null })
+    // 100k spent: the third run gets the 50k left of the day, not the 60k run cap.
+    const handle = await s.startEvaluation(OPUS, 'mini')
+    expect(handle.maxTokens).toBe(DEFAULT_EVALUATION_CAPS.perDayTokens - 100_000)
+    await vi.waitFor(() => expect(s.evaluation(handle.runId)!.state).not.toBe('running'))
+    // The job ran with its budget (evaluation.ts hands the cloud port { maxTokens }).
+    expect(runCloud.mock.calls[0]![3]).toEqual({ maxTokens: expect.any(Number) })
+    // The run itself journaled its spend (evaluation.ts recordSpend): three today, the cap.
+    expect(s.store.evaluationSpend('2026-09-27T12:00:00Z').runs).toBe(3)
+    await expect(s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/3 cloud evaluations ran in the last 24 h; the cap is 3/)
+  })
+  it('caps a run at what is left of the day and refuses one below the 20k floor (N2)', async () => {
+    const over = cloud(10)
+    over.s.store.recordEvaluationSpend({ runId: 'x', key: OPUS, at: NOW.toISOString(), tokens: 130_001, jobs: 1, gradedJobs: 1, stoppedBy: null })
+    await expect(over.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/used 130001 tokens in the last 24 h; 19999 of the daily 150000 are left, below the 20000 a run needs/)
+    const edge = cloud(10)
+    edge.s.store.recordEvaluationSpend({ runId: 'x', key: OPUS, at: NOW.toISOString(), tokens: 130_000, jobs: 1, gradedJobs: 1, stoppedBy: null })
+    expect((await edge.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(20_000)
+    const tight = cloud(10, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perDayTokens: 1000 })))
+    await expect(tight.s.startEvaluation(OPUS, 'mini')).rejects.toThrow(/1000 of the daily 1000 are left, below the 20000 a run needs/)
+    expect(tight.s.evaluationCaps()).toMatchObject({ perDayTokens: 1000, perRunTokens: 60_000, minRunTokens: 20_000, weeklyStop: { claude: 85, codex: 55 } })
+    const small = cloud(10, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ perRunTokens: 1000, perDayTokens: 1000 })))
+    expect((await small.s.startEvaluation(OPUS, 'mini')).maxTokens).toBe(1000)
+  })
+  it('three runs that each spend their whole cap stay within the daily token cap', async () => {
+    // One job per run whose budget is the whole run cap, answered at exactly that budget.
+    const big: EvaluationSuite = { name: 'big', jobs: [{ id: 'big', category: 'simple-coding', complexity: 5, prompt: 'Say 42', maxTokens: 60_000, grader: { kind: 'exact', expected: '42' } }] }
+    const runCloud = vi.fn(async (..._args: unknown[]) => ({ answer: '42', tokens: (_args[3] as { maxTokens: number }).maxTokens, costUsd: null, durationMs: 1 }))
+    const s = createModelIntelligence({ dbPath: ':memory:', settings: settings(), timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, usage: () => 10, suites: () => ({ big }) } })
+    register(s, [[OPUS, 'Opus']])
+    const caps: number[] = []
+    for (let index = 0; index < 3; index++) {
+      const handle = await s.startEvaluation(OPUS, 'big')
+      caps.push(handle.maxTokens!)
+      await vi.waitFor(() => expect(s.evaluation(handle.runId)!.state).not.toBe('running'))
+    }
+    expect(caps).toEqual([60_000, 60_000, 30_000])
+    expect(s.store.evaluationSpend('2026-09-27T12:00:00Z')).toEqual({ runs: 3, tokens: DEFAULT_EVALUATION_CAPS.perDayTokens })
+    await expect(s.startEvaluation(OPUS, 'big')).rejects.toThrow(/3 cloud evaluations ran/)
+    s.dispose()
+  })
+  it('counts a usage-less cloud job at its budget, never an estimate (N3)', async () => {
+    const silent = cloud(10)
+    silent.runCloud.mockImplementation(async () => ({ answer: '42', tokens: null, costUsd: null, durationMs: 1 }))
+    const second = await silent.s.startEvaluation(OPUS, 'mini')
+    await vi.waitFor(() => expect(silent.s.evaluation(second.runId)!.state).not.toBe('running'))
+    expect(silent.s.evaluation(second.runId)!.result).toMatchObject({ tokens: (silent.runCloud.mock.calls[0]![3] as { maxTokens: number }).maxTokens })
+  })
+  it('never evaluates a key on the owner exclusion list (N5)', async () => {
+    const { s, runCloud } = cloud(10)
+    register(s, [[FABLE, 'Claude Fable 5.1']])
+    await expect(s.startEvaluation(FABLE, 'mini')).rejects.toThrow(/claude\/claude-fable-5-1 is excluded by owner setting \(model-intelligence:excluded-models: claude\/claude-fable-5-1\*\)/)
+    expect(runCloud).not.toHaveBeenCalled()
+  })
+})
+
+describe('the owner exclusion list (N5)', () => {
+  it('matches globs on the key id, case-insensitively', () => {
+    const excluded = excludedMatcher(DEFAULT_EXCLUDED_MODELS)
+    expect(excluded(FABLE)).toBe('claude/claude-fable-5-1*')
+    expect(excluded({ provider: 'claude', model: 'Fable-Next' })).toBe('claude/*fable*')
+    expect(excluded(OPUS)).toBeNull()
+    expect(excluded({ provider: 'openrouter', model: 'anthropic/claude-fable-5' })).toBeNull()
+    expect(excludedMatcher(['local/*'])(QWEN)).toBe('local/*')
+    expect(excludedMatcher(['codex/gpt-5.?-sol'])(SOL)).toBe('codex/gpt-5.?-sol')
+  })
+  it('drops excluded keys before routing and says so in the route, also against an allow-list; [] excludes nothing', async () => {
+    const { service: s } = service()
+    register(s, [[OPUS, 'Opus'], [FABLE, 'Claude Fable 5.1']])
+    const live = { offered: [OPUS, FABLE], providerEnabled: () => true, usagePercent: () => null, loadedLocalModels: () => [] }
+    const features = { category: 'difficult-coding' as const, complexity: 5 as const, risk: 'high' as const, toolsRequired: [], contextTokens: null }
+    const routed = await s.route(features, {}, live, { requester: 'models.route' })
+    expect(routed.decision.selected.key).toEqual(OPUS)
+    expect(routed.decision.candidates.map(candidate => candidate.key.model)).not.toContain(FABLE.model)
+    expect(routed.decision.reasons).toContain('claude/claude-fable-5-1 excluded by owner setting (model-intelligence:excluded-models)')
+    expect(routed.explanation).toContain('claude/claude-fable-5-1 excluded by owner setting')
+    await expect(s.route(features, { allow: [FABLE] }, live, { requester: 'models.route' })).rejects.toThrow(/claude\/claude-fable-5-1 excluded by owner setting/)
+    s.decisions['ports'].settings.setSetting(EXCLUDED_MODELS_SETTING, '[]')
+    expect(s.excludedModels()).toEqual([])
+    const allowed = await s.route(features, { allow: [FABLE] }, live, { requester: 'models.route' })
+    expect(allowed.decision.selected.key).toEqual(FABLE)
+    s.dispose()
+  })
+  it('falls back to the defaults when the setting is unreadable', () => {
+    const { service: s } = service()
+    s.decisions['ports'].settings.setSetting(EXCLUDED_MODELS_SETTING, '{"not":"a list"}')
+    expect(s.excludedModels()).toEqual([...DEFAULT_EXCLUDED_MODELS])
+    s.dispose()
+  })
+})
