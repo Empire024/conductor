@@ -239,7 +239,8 @@ export async function runTool(name: string, rawArguments: string, context: ToolC
         assertLocalControlAllowed(method, input as Record<string, unknown>, context.readOnly)
         return { output: JSON.stringify(await context.control(method, input as Record<string, unknown>)).slice(0, 24_000), failed: false, paths: [] }
       }
-      case 'web_read': return { output: await readPublicWeb(text(args.url, 'url'), context.signal, context.webFocus ? { terms: context.webFocus, chars: FOCUSED_PAGE_CHARS } : undefined), failed: false, paths: [] }
+      // Continuation copies of a long page are kept per conversation: taskId is the conversation's id.
+      case 'web_read': return { output: await readPublicWeb(text(args.url, 'url'), context.signal, context.webFocus ? { terms: context.webFocus, chars: FOCUSED_PAGE_CHARS } : undefined, { scope: context.taskId ?? '' }), failed: false, paths: [] }
       // Dolphin asks for one result (VR9a: limit 1 on every search), which leaves nothing to choose
       // a page from; fewer than SEARCH_RESULTS_FLOOR is raised to it.
       case 'web_search': return { output: await searchPublicWeb(text(args.query, 'query'), context.signal, Math.max(SEARCH_RESULTS_FLOOR, args.limit === undefined ? 10 : integer(args.limit, 10)), { news: Boolean(context.webFocus) }), failed: false, paths: [] }

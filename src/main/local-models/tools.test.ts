@@ -1,5 +1,39 @@
-import { describe, expect, it } from 'vitest'
-import { LOCAL_CONTROL_METHODS, ToolPolicyError, assertLocalControlAllowed, toolSpecs } from './tools'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { EventEmitter } from 'node:events'
+import { lookup } from 'node:dns/promises'
+import { request } from 'node:https'
+import { LOCAL_CONTROL_METHODS, ToolPolicyError, assertLocalControlAllowed, runTool, toolSpecs } from './tools'
+import { resetPageStore } from './web.ts'
+vi.mock('node:dns/promises', () => ({ lookup: vi.fn() }))
+vi.mock('node:https', () => ({ request: vi.fn() }))
+
+describe('web_read continuation copies stay in their own conversation', () => {
+  beforeEach(() => { resetPageStore(); vi.mocked(lookup).mockResolvedValue([{ address: '93.184.216.34', family: 4 }] as never) })
+  afterEach(() => vi.resetAllMocks())
+  const page = `<main>${Array.from({ length: 30 }, (_, index) => `<p>Section ${index}: ${'Ordinary text. '.repeat(60)}</p>`).join('')}</main>`
+  function serve(): void {
+    vi.mocked(request).mockImplementationOnce(((_url: unknown, _options: unknown, done: (res: unknown) => void) => {
+      const req = new EventEmitter() as EventEmitter & { end(): void }
+      req.end = () => {
+        const res = Object.assign(new EventEmitter(), { statusCode: 200, headers: { 'content-type': 'text/html' }, destroy() {} })
+        queueMicrotask(() => { done(res); res.emit('data', Buffer.from(page)); res.emit('end') })
+      }
+      return req
+    }) as never)
+  }
+  const read = (url: string, taskId: string) => runTool('web_read', JSON.stringify({ url }), { workspace: process.cwd(), readOnly: true, sandbox: null, timeoutSec: 10, taskId })
+  it('serves a conversation its own copy and makes another read the public page again', async () => {
+    serve()
+    const first = await read('https://docs.example/guide', 'agent_conversation_a')
+    expect(first.failed).toBe(false)
+    const next = /web_read url="([^"]+)"/.exec(first.output)![1]!
+    expect((await read(next, 'agent_conversation_a')).output).toContain('the same copy as the first page')
+    expect(request).toHaveBeenCalledTimes(1)
+    serve()
+    expect((await read(next, 'agent_conversation_b')).output).toContain('read again and unchanged')
+    expect(request).toHaveBeenCalledTimes(2)
+  })
+})
 
 describe('agents.report over the local control bridge', () => {
   it('is discoverable and allows only a bounded text field', () => {

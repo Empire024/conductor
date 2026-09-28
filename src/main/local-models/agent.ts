@@ -355,6 +355,8 @@ interface RunLedger {
   searches?: number
   conductorReads?: number
   readFailed?: string[]
+  /** Whether this message was told that the page(s) it named could not be read (namedPagesUnread). */
+  namedUnreadNoted?: boolean
   /** Identical failures by tool and error, the tools (and conductor methods) turned off after a
    *  second one, and calls made to them since. */
   failures?: Record<string, number>
@@ -535,6 +537,23 @@ export function answerDay(day: string, instruction: string): string {
 }
 
 const sameLink = (a: string, b: string): boolean => a.replace(/^https?:\/\/(?:www\.)?/i, '').replace(/\/$/, '') === b.replace(/^https?:\/\/(?:www\.)?/i, '').replace(/\/$/, '')
+
+/** A named page as host and path: what a model keeps when it reads it. The owner's Instagram
+ *  share link carried ?stkn=… and Ornith read https://www.instagram.com/wearlegohead/ (job
+ *  job_muia5ofo_6n4atg5), so scheme, www, query, fragment and a trailing slash do not count. */
+const pageKey = (url: string): string => {
+  try { const parsed = new URL(url); return parsed.hostname.toLowerCase().replace(/^www\./, '') + parsed.pathname.replace(/\/+$/, '') } catch { return url.trim().toLowerCase() }
+}
+
+/** The pages the owner's message names, when every one of them failed to open and none was read;
+ *  otherwise undefined. Then no search result is opened in their place: Conductor opened a Netflix
+ *  article for a failed Instagram profile and the brief cited it as the source (idea_mugx6gkj). */
+export function namedPagesUnread(instruction: string, readFailed: readonly string[], webSources: readonly string[]): string[] | undefined {
+  const named = [...new Set([...instruction.matchAll(/https?:\/\/[^\s"'<>()[\]]+/gi)].map(match => match[0].replace(/[.,;:!?]+$/, '')))]
+  if (!named.length) return undefined
+  const failed = new Set(readFailed.map(pageKey)), read = new Set(webSources.map(pageKey))
+  return named.every(url => failed.has(pageKey(url)) && !read.has(pageKey(url))) ? named : undefined
+}
 
 export function pickPages(hits: SearchHit[], instruction: string, skip: string[], count: number, now = new Date()): string[] {
   const terms = questionTerms(instruction)
@@ -1242,7 +1261,14 @@ export class LocalAgentSession {
         const searching = completion.toolCalls.length > 0 && completion.toolCalls.every(call => call.name === 'web_search')
         // A round offered no tools was told to answer now (a re-read, a turned-off tool, a stop): its
         // answer stands, and no page is opened over it.
-        if (!forced && !bare && readDue() && ((!completion.toolCalls.length && completion.content.trim()) || (searching && (ledger.searches ?? 0) >= 2))) {
+        const readOwed = !forced && !bare && readDue() && ((!completion.toolCalls.length && completion.content.trim()) || (searching && (ledger.searches ?? 0) >= 2))
+        const unread = readOwed ? namedPagesUnread(instruction, ledger.readFailed ?? [], ledger.webSources ?? []) : undefined
+        if (unread) {
+          // The page asked about would not open: a search result is not it, so none is opened in its place.
+          if (!ledger.namedUnreadNoted) events.notice?.(`${unread.length === 1 ? 'The page' : 'The pages'} named in the message could not be read (${unread.join(' , ')}); Conductor opened no search result in ${unread.length === 1 ? 'its' : 'their'} place.`)
+          ledger.namedUnreadNoted = true
+          if (!completion.toolCalls.length) events.text?.(completion.content)
+        } else if (readOwed) {
           ledger.conductorReads = (ledger.conductorReads ?? 0) + 1
           const read = ledger.webSources?.length ?? 0
           const room = this.grants.research ? 2 : WEB_CALLS_PER_MESSAGE - (ledger.webCalls ?? 0)

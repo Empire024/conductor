@@ -43,13 +43,14 @@ describe('a local model answering like any other model', () => {
     const endpoint = `http://127.0.0.1:${(server.address() as { port: number }).port}`
     const agent = new LocalAgentSession({ endpoint, apiKey: 'k'.repeat(64), model: LOCAL_DOLPHIN_X1_8B, workspace: root, sandbox: null, readOnly: false, grants, timeoutSec: 30, contextTokens: 32768 })
     const tools: Array<{ name: string; output: string }> = []
+    const notices: string[] = []
     const run = async (prompt: string) => {
-      tools.length = 0
+      tools.length = 0; notices.length = 0
       let streamed = '', status = ''
-      const outcome = await agent.run(prompt, { text: delta => { streamed += delta }, reasoning: delta => { status += delta }, toolEnd: result => tools.push({ name: result.name, output: result.output }) })
+      const outcome = await agent.run(prompt, { text: delta => { streamed += delta }, reasoning: delta => { status += delta }, notice: message => { notices.push(message) }, toolEnd: result => tools.push({ name: result.name, output: result.output }) })
       return { ...outcome, streamed, status }
     }
-    return { requests, run, tools }
+    return { requests, run, tools, notices }
   }
 
   it('answers a plain question in one request, offered the web but not pushed to it, with today\'s date in the template', async () => {
@@ -141,6 +142,54 @@ describe('a local model answering like any other model', () => {
     expect(vi.mocked(searchPublicWeb).mock.calls.at(-1)![2]).toBe(SEARCH_RESULTS_FLOOR)
     // The answer from snippets was held back, so the owner reads one answer, not two.
     expect(outcome.streamed).toBe('The latest stable Python is 3.14.7, released 2026-08-05 (https://www.python.org/downloads/latest/).')
+  })
+
+  describe('a page the owner named that would not open is not replaced by a search result (idea_mugx6gkj, job_muia5ofo_6n4atg5)', () => {
+    const named = 'https://www.instagram.com/wearlegohead?stkn=M2oyc2Z2NThpZjln'
+    const netflix = 'https://www.whats-on-netflix.com/news/one-piece-getting-a-lego-tv-adaptation-in-september-2026/'
+    const lego = () => vi.mocked(searchPublicWeb).mockResolvedValueOnce(`Search: lego head mask (via Seznam)\nUntrusted result titles, links and snippets.\n1. 'One Piece' Getting a LEGO TV Adaptation in September 2026\n   ${netflix}\n   The Straw Hat crew is getting a blocky makeover.`)
+    const snippets = 'I could not read the page; the search results mention a LEGO One Piece special.'
+    const reads = () => vi.mocked(readPublicWeb).mock.calls.map(args => args[0])
+
+    it('opens nothing in place of a failed named page, lets the answer stand and says why', async () => {
+      vi.mocked(readPublicWeb).mockClear()
+      // The trace: Ornith read the link without its ?stkn= query, the read failed, it searched, and answered from snippets.
+      vi.mocked(readPublicWeb).mockRejectedValueOnce(new Error('www.instagram.com sent no readable text for a plain request'))
+      lego()
+      const { run, tools, notices } = await session((sent, index) => [
+        call('r', 'web_read', { url: 'https://www.instagram.com/wearlegohead/' }),
+        call('s', 'web_search', { query: 'lego head mask' })
+      ][index] ?? answer(snippets))
+      const outcome = await run(`What is this Instagram page selling right now? ${named}`)
+      expect(tools.map(tool => tool.name)).toEqual(['web_read', 'web_search'])
+      expect(reads()).toEqual(['https://www.instagram.com/wearlegohead/'])
+      expect(notices).toContain(`The page named in the message could not be read (${named}); Conductor opened no search result in its place.`)
+      expect(notices.some(notice => notice.includes('Conductor opened the best'))).toBe(false)
+      expect(outcome.stopReason).toBe('completed')
+      expect(outcome.text).toContain(snippets)
+      expect(outcome.text).not.toContain(`Sources: ${netflix}`)
+    })
+    it('still opens the best result when the message names no page', async () => {
+      vi.mocked(readPublicWeb).mockClear()
+      lego()
+      const { run, notices } = await session((sent, index) => [call('s', 'web_search', { query: 'lego head mask' })][index] ?? answer(snippets))
+      await run('What is the wearlegohead Instagram page selling right now?')
+      expect(reads()).toEqual([netflix])
+      expect(notices.some(notice => notice.includes('Conductor opened the best result'))).toBe(true)
+    })
+    it('still opens the best result when a named page did open', async () => {
+      vi.mocked(readPublicWeb).mockClear()
+      // An undated page: the default stand-in is dated 2026-08-05, which a question about now leaves out.
+      vi.mocked(readPublicWeb).mockResolvedValueOnce(`Source: https://www.instagram.com/wearlegohead/\n${PAGE_HEADER}\nTitle: LegoHeads™ (@wearlegohead) • Instagram photos and videos\nDescription (the page's own summary): 32K Followers, 21 Posts - "The ski mask everyone asks about."`)
+      lego()
+      const { run, notices } = await session((sent, index) => [
+        call('r', 'web_read', { url: 'https://www.instagram.com/wearlegohead/' }),
+        call('s', 'web_search', { query: 'lego head mask' })
+      ][index] ?? answer(snippets))
+      await run(`What is this Instagram page selling right now? ${named}`)
+      expect(reads()).toEqual(['https://www.instagram.com/wearlegohead/', netflix])
+      expect(notices.some(notice => notice.includes('could not be read'))).toBe(false)
+    })
   })
 
   it('opens pages instead of a third search, and dates a time-relative search the model left undated', async () => {
