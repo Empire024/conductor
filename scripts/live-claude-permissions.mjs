@@ -149,7 +149,7 @@ try {
   await writeFile(join(project.path, '.claude', 'settings.local.json'), nativeSettings)
   await page.reload()
   await page.getByText(name, { exact: true }).first().click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
   const pane = page.locator('.structured-agent-pane[data-provider="claude"]')
   await pane.waitFor()
   sessionId = await pane.getAttribute('data-structured-session')

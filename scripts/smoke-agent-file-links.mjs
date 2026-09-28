@@ -70,10 +70,10 @@ try {
 
   await page.reload()
   await page.getByText('Link fixture', { exact: true }).first().click()
-  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  if (await page.locator('.launcher-grid').count()) await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
   else if (!await page.locator('.structured-agent-pane').count()) {
     await page.locator('.session-add').click()
-    await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+    await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
   }
   await page.locator('.structured-agent-pane').waitFor()
   const sessionId = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')

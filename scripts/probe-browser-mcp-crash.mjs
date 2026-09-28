@@ -44,7 +44,7 @@ try {
   await page.evaluate(() => window.conductor.projects.create('Crash target'))
   await page.reload()
   await page.locator('.project-row').filter({ hasText: 'Crash target' }).click()
-  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).click()
+  await page.locator('.launcher-grid button').filter({ hasText: 'Claude' }).filter({ hasNotText: 'Cloud' }).click()
   await expect(page.getByRole('textbox', { name: 'Message Claude Code', exact: true })).toBeEnabled()
   const id = await page.locator('.structured-agent-pane').getAttribute('data-structured-session')
   await page.evaluate(async sessionId => { await window.conductor.structured.connect(sessionId) }, id)
