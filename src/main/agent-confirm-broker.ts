@@ -93,12 +93,16 @@ export class AgentConfirmBroker {
   }
 }
 
-/** The error an agent gets back, naming what actually happened instead of calling every miss a refusal. */
+/**
+ * The error an agent gets back, naming what actually happened instead of calling every miss a
+ * refusal, who decided (only the owner answers this dialog: a wizard tab holds the owner's authority
+ * and is never asked, agent-control.ts `ask`), and what the agent can do next.
+ */
 export function agentConfirmFailure(outcome: Exclude<AgentConfirmOutcome, 'allowed'>, action: string): string {
   switch (outcome) {
-    case 'declined': return `The owner declined to ${action}`
-    case 'timeout': return `The owner did not answer the request to ${action} within two minutes, so nothing was done. The owner did not decline it; say in your tab what you need before asking again`
-    case 'undelivered': return `Conductor could not show the owner the request to ${action}: the window never acknowledged it, so nothing was done and the owner was not asked`
-    case 'unavailable': return `No Conductor main window is open to ask the owner to ${action}, so nothing was done and the owner was not asked`
+    case 'declined': return `The owner declined to ${action} in Conductor's confirmation dialog, so nothing was done. Do not ask again or route around it; carry on with other work, or report that it is blocked and why you needed it`
+    case 'timeout': return `The owner did not answer the request to ${action} within two minutes, so nothing was done. The owner did not decline it: carry on with other work, say in your tab or report what you need, and ask once more when the owner is back; your controller, if it is a wizard tab, can do it without a dialog`
+    case 'undelivered': return `Conductor could not show the owner the request to ${action}: the window never acknowledged it, so nothing was done and the owner was not asked. Ask once more; if that fails too, report it as blocked, or ask your controller if it is a wizard tab, which needs no dialog`
+    case 'unavailable': return `No Conductor main window is open to ask the owner to ${action}, so nothing was done and the owner was not asked. Report it as blocked, or ask your controller if it is a wizard tab, which needs no dialog; ask again once a window is open`
   }
 }

@@ -60,8 +60,12 @@ supports, so the tab can retry and verify the work itself.
 
 - The retry text names the conversation that made the call and when it was asked and approved.
 - A heads-up, `[Conductor] approval queued: <rule>…`, is steered once into the running turn as soon
-  as it can take one, telling the agent not to retry in this turn and to wrap up. It never carries
-  the approval itself.
+  as it can take one, telling the agent not to retry until the approval message arrives and to wrap
+  up. It never carries the approval itself. It is a confirmed steer (`steerAccepted`) that never
+  falls back to the queue, where it would sit behind the queued approval turn (Codex takes no steer
+  while a turn is dispatching, compacting or ending); a refused one is tried again on the next sweep,
+  an unconfirmed one counts as sent. An interrupt that expedites the queue can still send an unread
+  heads-up together with the retry, just ahead of it, which the wording allows for.
 - After 2 min with the turn still running, the tab says how long the turn has run and its last
   tool. An owner approval only gets that notice (Esc interrupts and sends the queue; Stop holds
   it). A wizard approval interrupts the turn with the queue expedited, so the retry runs at once.

@@ -407,7 +407,7 @@ export class PermissionGrants {
     const decidedAt = this.now()
     if (decision === 'deny') {
       this.settle(agentSessionId, request, { status: 'denied', decidedAt, decidedBy: actor })
-      await this.ports.tell(agentSessionId, grantDeniedMessage(request)).catch(error => console.warn('The denied grant could not be reported to the conversation', error))
+      await this.ports.tell(agentSessionId, grantDeniedMessage(request, actor)).catch(error => console.warn('The denied grant could not be reported to the conversation', error))
       return { status: 'denied', message: 'Denied; the conversation was told not to retry it.' }
     }
     if (!request.rule) throw new Error(request.refusal ?? 'No narrow rule can cover this request')
@@ -520,7 +520,10 @@ export class PermissionGrants {
     if (!ACTIVE_PHASES.has(phase)) return
     if (delivery.headsUp === 'no' && this.ports.headsUp && STEERABLE_PHASES.has(phase)) {
       delivery.headsUp = 'sending'
-      const note = `[Conductor] approval queued: ${delivery.rules.join(', ')}. It arrives as your next message, a turn of its own, once this turn ends; do not retry the call in this turn (it would be refused again). Finish or pause this turn soon so it can run.`
+      // Steered into the running turn or not sent at all (wiring headsUp), so it never comes after
+      // the retry. An interrupt that expedites the queue can still send an unread heads-up together
+      // with it, just ahead of it; the wording holds in that order too.
+      const note = `[Conductor] approval queued: ${delivery.rules.join(', ')}. It arrives as a message of its own, "[Conductor] approved: …; retry it now", once this turn ends. Until that message arrives, do not retry the call (it would be refused again); finish or pause this turn soon so it can run.`
       void this.ports.headsUp(agentSessionId, note).then(sent => { delivery.headsUp = sent ? 'done' : 'no' }, () => { delivery.headsUp = 'done' })
     }
     if (delivery.noticed || waited < (this.ports.retryNoticeMs ?? RETRY_NOTICE_MS)) return

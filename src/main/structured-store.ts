@@ -1,6 +1,6 @@
 import { recoverClaudeMessageDuplicates } from '../shared/claude-message-recovery'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, statSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, writeFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import type { AgentEvent, AgentEventData, ConversationHistoryEntry, ConversationSearchGroup, ConversationSearchResult, DiffArtifact, SessionProjection, SessionSettings, StructuredProvider, TimelineItem } from '../shared/structured-agent'
@@ -102,6 +102,14 @@ export function redactSecretsChunk(db: DatabaseSync, target: RedactionTarget, af
 /** structured_meta key holding the redaction cursor, then its completion. */
 const REDACTION_META = 'secret_redaction_v1'
 interface RedactionCursor { target: number; after: number; changed: number; done?: string }
+/** The same one-off pass over the command-output artifacts (agent-artifacts/*.txt), with a cursor
+ *  of its own: a store that finished the journal walk before this pass existed must still run it.
+ *  `after` is the last file name done; files are taken in name order. */
+const ARTIFACT_REDACTION_META = 'secret_redaction_artifacts_v1'
+interface ArtifactRedactionCursor { after: string; changed: number; done?: string }
+/** One step reads at most this many output files, or about this many bytes (an output is up to 8 MiB). */
+const ARTIFACT_REDACTION_FILES = 10
+const ARTIFACT_REDACTION_BYTES = 4 * 1024 * 1024
 
 /** Find only searches what the owner actually read: a message. Tool payloads, diffs, ids and
  *  provider internals are in the projection too, and matching them turns a find into noise. */
@@ -156,6 +164,8 @@ export class StructuredAgentStore {
   /** Until the one-off secret redaction has finished, events read back from the journal may
    *  predate `maskSecrets`, so what is rebuilt from them in memory is masked on the way in. */
   private redactionPending = true
+  /** The output artifacts the one-off pass walks, listed once per launch, and the next one to read. */
+  private artifactWalk?: { names: string[]; next: number }
   readonly artifactDirectory: string
   constructor(private db: DatabaseSync, dataDirectory: string) {
     this.artifactDirectory = join(dataDirectory, 'agent-artifacts')
@@ -730,15 +740,62 @@ export class StructuredAgentStore {
     }
     return chunk
   }
+  private artifactRedactionCursor(): ArtifactRedactionCursor {
+    const row = this.db.prepare('SELECT value FROM structured_meta WHERE key=?').get(ARTIFACT_REDACTION_META) as { value: string } | undefined
+    return row ? JSON.parse(row.value) as ArtifactRedactionCursor : { after: '', changed: 0 }
+  }
+  /**
+   * One bounded step of the one-off pass over command-output artifacts written before `putOutput`
+   * masked every form of the control token (H17 masked the journal; 6 of 1,343 outputs on the
+   * owner's machine still held one); false once it has finished. A file written since is masked on
+   * write. A changed file is replaced whole (temporary file, then rename), so a reader sees either
+   * version. Diff artifacts (.json) are an edit's original bytes, which undo restores, and are left
+   * alone. A file that cannot be read or replaced is skipped, not retried.
+   */
+  redactArtifactsStep(): boolean {
+    const cursor = this.artifactRedactionCursor()
+    if (cursor.done) return false
+    if (!this.artifactWalk) {
+      const names = readdirSync(this.artifactDirectory).filter(name => /^[a-f0-9-]+\.txt$/.test(name)).sort()
+      const next = names.findIndex(name => name > cursor.after)
+      this.artifactWalk = { names, next: next < 0 ? names.length : next }
+    }
+    const walk = this.artifactWalk
+    let files = 0, bytes = 0, changed = 0, after = cursor.after
+    while (walk.next < walk.names.length && files < ARTIFACT_REDACTION_FILES && bytes < ARTIFACT_REDACTION_BYTES) {
+      const name = walk.names[walk.next++]!
+      files++
+      after = name
+      const path = join(this.artifactDirectory, name)
+      try {
+        const text = readFileSync(path, 'utf8')
+        bytes += text.length
+        const masked = maskSecrets(text)
+        if (masked === text) continue
+        const temporary = `${path}.${process.pid}.tmp`
+        writeFileSync(temporary, masked, { mode: 0o600 })
+        renameSync(temporary, path)
+        this.artifactBytes += Buffer.byteLength(masked) - Buffer.byteLength(text)
+        changed++
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') console.warn(`An output artifact could not be masked and was skipped: ${name}`, error)
+      }
+    }
+    const next: ArtifactRedactionCursor = { after, changed: cursor.changed + changed, ...(walk.next >= walk.names.length ? { done: new Date().toISOString() } : {}) }
+    this.db.prepare('INSERT INTO structured_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(ARTIFACT_REDACTION_META, JSON.stringify(next))
+    if (next.done) { this.artifactWalk = undefined; console.info(`Output artifact secret redaction finished: ${next.changed} files masked`) }
+    return !next.done
+  }
   /** Runs the redaction in the background, one bounded step every `intervalMs`, until it finishes
-   *  or the returned function stops it. A failure stops it; the cursor resumes it next launch. */
+   *  or the returned function stops it: the stored rows first, then the output artifacts. A failure
+   *  stops it; the cursors resume it next launch. */
   startSecretRedaction(intervalMs = 100): () => void {
     let timer: ReturnType<typeof setTimeout> | undefined
     const schedule = (): void => { timer = setTimeout(tick, intervalMs); timer.unref?.() }
     const tick = (): void => {
-      try { if (this.redactSecretsStep()) schedule() } catch (error) { console.warn('Stored secret redaction stopped; it resumes at the next launch', error) }
+      try { if (this.redactSecretsStep() || this.redactArtifactsStep()) schedule() } catch (error) { console.warn('Stored secret redaction stopped; it resumes at the next launch', error) }
     }
-    if (!this.redactionCursor().done) schedule()
+    if (!this.redactionCursor().done || !this.artifactRedactionCursor().done) schedule()
     return () => clearTimeout(timer)
   }
 }

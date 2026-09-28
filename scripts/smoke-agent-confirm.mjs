@@ -71,7 +71,7 @@ try {
   await expect(dialog).toHaveCount(0)
   const declined = await first
   assert.equal(declined.status, 400)
-  assert.equal(declined.body.error, 'The owner declined to forget this memory')
+  assert.match(declined.body.error, /^The owner declined to forget this memory in Conductor's confirmation dialog, so nothing was done\. Do not ask again/)
   check('The owner’s Cancel reaches the agent as a real decline')
 
   const allowed = post(auth, 'memory.forget', { id: memoryId })

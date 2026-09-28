@@ -138,6 +138,8 @@ describe('one narrow owner approval per refused call', () => {
     expect(h.grants.rules(tab)).toHaveLength(3)
     const denied = h.deny('toolu_y', 'Bash', { command: 'npm run deploy:prod' }, 'Production Deploy')
     await expect(h.grants.decide(tab, denied, 'deny', 'wizard')).resolves.toMatchObject({ status: 'denied' })
+    // The tab hears who decided: a wizard answering for the owner, not the owner.
+    expect(h.told.at(-1)!.text).toMatch(/^\[Conductor\] a wizard tab, answering for the owner, denied: Run a command npm run deploy:prod\. Do not retry it/)
   })
 
   it('refuses to approve a request no narrow rule can cover, and a request that was never recorded', async () => {
@@ -689,7 +691,7 @@ describe('an approval reaches a conversation whose turn is still running (H06)',
     h.grants.sweep(); await settle()
     h.grants.sweep(); await settle()
     expect(headsUp).toHaveBeenCalledTimes(2)
-    expect(headsUp.mock.calls[1]![1]).toMatch(/^\[Conductor\] approval queued: Bash\(ssh .*do not retry the call in this turn/)
+    expect(headsUp.mock.calls[1]![1]).toMatch(/^\[Conductor\] approval queued: Bash\(ssh .*Until that message arrives, do not retry the call/)
     expect(h.retried).toHaveLength(1)
   })
 

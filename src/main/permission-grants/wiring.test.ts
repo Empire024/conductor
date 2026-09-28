@@ -4,6 +4,7 @@ import type { PermissionGrantRequest } from '../../shared/permission-grants'
 
 vi.mock('electron', () => ({ app: { getPath: () => '' }, ipcMain: { handle: vi.fn(), removeHandler: vi.fn() } }))
 const { grantDelivery, recoverFromTimelines } = await import('./wiring')
+const { SteeringUnavailableError } = await import('../providers/adapter')
 
 const request = (id: string, status: PermissionGrantRequest['status']): PermissionGrantRequest => ({
   id, source: 'agent', tool: 'Bash', action: 'Run a command', resource: 'bash app/prod/fix-pool.sh', class: 'local', rule: 'Bash(bash app/prod/fix-pool.sh)', status, requestedAt: '2026-09-26T04:00:00.000Z'
@@ -36,7 +37,7 @@ describe('delivering an approval (H06)', () => {
   function fixture(phases: string[]) {
     // Each snapshot read takes the next phase; the last one stays.
     const snapshot = vi.fn(() => ({ phase: phases.length > 1 ? phases.shift()! : phases[0]!, settings: { permission: 'auto' }, items: [], queuedPrompts: [{ id: 'q1', text: 'queued approval' }] }))
-    const sessions = { steerOrStart: vi.fn(async () => 'started'), queue: vi.fn(async () => undefined), steer: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined), cancelQueued: vi.fn(() => ({ id: 'q1' })) }
+    const sessions = { steerOrStart: vi.fn(async () => 'started'), queue: vi.fn(async () => undefined), steerAccepted: vi.fn(async () => undefined), interrupt: vi.fn(async () => undefined), cancelQueued: vi.fn(() => ({ id: 'q1' })) }
     return { sessions, delivery: grantDelivery(sessions as never, { spec: () => undefined, snapshot } as never, { settleMs: 200, pollMs: 1 }) }
   }
 
@@ -60,15 +61,56 @@ describe('delivering an approval (H06)', () => {
   it('steers a heads-up only into a turn that can take it, interrupts with the queue expedited, and takes a queued retry back', async () => {
     const starting = fixture(['starting'])
     await expect(starting.delivery.headsUp('agent_w', 'note')).resolves.toBe(false)
-    expect(starting.sessions.steer).not.toHaveBeenCalled()
+    expect(starting.sessions.steerAccepted).not.toHaveBeenCalled()
     const running = fixture(['running'])
     await expect(running.delivery.headsUp('agent_w', 'note')).resolves.toBe(true)
-    expect(running.sessions.steer).toHaveBeenCalledWith('agent_w', 'note', { permission: 'auto' })
+    expect(running.sessions.steerAccepted).toHaveBeenCalledWith('agent_w', 'note', { permission: 'auto' })
     await running.delivery.interrupt('agent_w')
     expect(running.sessions.interrupt).toHaveBeenCalledWith('agent_w', true)
     expect(running.delivery.unqueue('agent_w', 'queued approval')).toBe(true)
     expect(running.sessions.cancelQueued).toHaveBeenCalledWith('agent_w', 'q1')
     expect(running.delivery.unqueue('agent_w', 'something else')).toBe(false)
+  })
+
+  // The Codex heads-up race (H06 follow-up): a steer the runtime could not take fell back to the
+  // queue, behind the approval turn already queued there, so the heads-up came with or after it.
+  describe('the heads-up never lands after the approval turn it announces', () => {
+    function conversation(steer: (text: string) => Promise<void>) {
+      // A queue and pending steering records as StructuredSessions keeps them; the retry is queued first.
+      const state = { phase: 'running', settings: { permission: 'auto' }, items: [], queuedPrompts: [] as Array<{ id: string; text: string }>, pendingSteering: [] as Array<{ id: string; text: string; status: string }> }
+      const sessions = {
+        queue: vi.fn(async (_id: string, text: string) => { state.queuedPrompts.push({ id: `q${state.queuedPrompts.length}`, text }) }),
+        steerAccepted: vi.fn(async (_id: string, text: string) => steer(text)),
+        cancelQueued: vi.fn((_id: string, promptId: string) => { const found = state.pendingSteering.find(input => input.id === promptId); state.pendingSteering = state.pendingSteering.filter(input => input !== found); return found ?? null })
+      }
+      return { state, sessions, delivery: grantDelivery(sessions as never, { spec: () => undefined, snapshot: () => state } as never) }
+    }
+
+    it('is not queued behind the retry when the runtime takes no steer, and leaves no record to resend', async () => {
+      const c = conversation(async text => {
+        c.state.pendingSteering.push({ id: 'p1', text, status: 'uncertain' })
+        throw new SteeringUnavailableError('Codex compact turns cannot be steered')
+      })
+      await c.delivery.retry('agent_c', 'approved retry')
+      await expect(c.delivery.headsUp('agent_c', 'heads-up')).resolves.toBe(false)
+      expect(c.state.queuedPrompts.map(prompt => prompt.text)).toEqual(['approved retry'])
+      expect(c.state.pendingSteering).toEqual([])
+      expect(c.sessions.queue).toHaveBeenCalledTimes(1)
+    })
+
+    it('counts a steer the runtime may have read as sent, so it is never sent twice', async () => {
+      const c = conversation(async text => {
+        c.state.pendingSteering.push({ id: 'p1', text, status: 'uncertain' })
+        throw new Error('Native steering delivery is uncertain')
+      })
+      await c.delivery.retry('agent_c', 'approved retry')
+      await expect(c.delivery.headsUp('agent_c', 'heads-up')).resolves.toBe(true)
+      expect(c.state.queuedPrompts.map(prompt => prompt.text)).toEqual(['approved retry'])
+      // Refused before any record was made (no steerable turn at that instant): not sent, tried again later.
+      const early = conversation(async () => { throw new Error('The current turn does not support steering. Native acceptance was not confirmed') })
+      await expect(early.delivery.headsUp('agent_c', 'heads-up')).resolves.toBe(false)
+      expect(early.state.queuedPrompts).toEqual([])
+    })
   })
 
   it('names when the running turn started and its last tool', () => {

@@ -7,6 +7,7 @@ import type { AgentSpec, LayoutNode, WorkspaceLayout } from '../../shared/models
 import type { PhoneNotification } from '../../shared/phone-access'
 import { permissionGrantOf, type GrantDecision, type PermissionGrantRequest, type PermissionGrantsState } from '../../shared/permission-grants'
 import type { Json, SessionSettings, SessionProjection } from '../../shared/structured-agent'
+import { SteeringUnavailableError } from '../providers/adapter'
 import { ConductorMcpServer, type ControlCall } from './control-mcp'
 import { PermissionGrants, type SavedPermissionGrants } from './service'
 
@@ -18,7 +19,8 @@ export interface GrantSessions {
   steerOrStart(id: string, text: string, settings: SessionSettings): Promise<unknown>
   /** Queues a message as the next turn of its own, behind a turn under way (never steered). */
   queue(id: string, text: string, settings: SessionSettings): Promise<void>
-  steer(id: string, text: string, settings: SessionSettings): Promise<void>
+  /** Steers into the running turn only, confirmed by the runtime; throws instead of queueing. */
+  steerAccepted(id: string, text: string, settings: SessionSettings): Promise<void>
   /** Stops the running turn; expediteSubmittedInput sends what waits in the queue straight after (Esc). */
   interrupt(id: string, expediteSubmittedInput?: boolean): Promise<void>
   cancelQueued(id: string, promptId?: string): unknown
@@ -27,7 +29,7 @@ export interface GrantSessions {
 }
 export interface GrantStore {
   spec<T>(id: string): T | null | undefined
-  snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings' | 'queuedPrompts'> | null | undefined
+  snapshot(id: string): Pick<SessionProjection, 'items' | 'phase' | 'settings' | 'queuedPrompts' | 'pendingSteering'> | null | undefined
 }
 
 export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke', 'permission-grants:interrupt'] as const
@@ -59,13 +61,26 @@ export function grantDelivery(sessions: GrantSessions, store: GrantStore, timing
       else await sessions.steerOrStart(id, text, current.settings)
     },
     retryQueued: (id: string, text: string): boolean => Boolean(store.snapshot(id)?.queuedPrompts?.some(prompt => prompt.text === text)),
-    // Only into a turn that can take it now: a steer that fell back to the queue would ride along
-    // with the approval turn it announces.
+    // Only into a turn that takes it now, confirmed by the runtime. A plain steer the runtime
+    // cannot take falls back to the queue, behind the approval turn it announces, so the heads-up
+    // arrived with or after the retry (Codex takes no steer while a turn is dispatching, compacting
+    // or ending). steerAccepted never queues: refused, it is tried again on a later sweep.
     headsUp: async (id: string, text: string): Promise<boolean> => {
       const current = store.snapshot(id)
       if (!current || !STEERABLE.has(current.phase)) return false
-      await sessions.steer(id, text, current.settings)
-      return true
+      try {
+        await sessions.steerAccepted(id, text, current.settings)
+        return true
+      } catch (error) {
+        const left = (store.snapshot(id)?.pendingSteering ?? []).filter(input => input.text === text && ['cancelled', 'uncertain'].includes(input.status))
+        // Refused by the runtime, so never read: its leftover record goes, and nothing is resent from it.
+        if (error instanceof SteeringUnavailableError) {
+          for (const input of left) { try { sessions.cancelQueued(id, input.id) } catch { /* already gone */ } }
+          return false
+        }
+        // Sent but unconfirmed: the turn may have read it, so it counts as sent and is never sent twice.
+        return left.length > 0
+      }
     },
     interrupt: (id: string): Promise<void> => sessions.interrupt(id, true),
     turn: (id: string): { startedAt?: string; lastTool?: string } | undefined => {

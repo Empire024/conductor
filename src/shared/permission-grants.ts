@@ -225,9 +225,9 @@ export const grantHolderLabel = (holder: NonNullable<PermissionGrantRequest['hol
 export const grantApprovedMessage = (rule: string, scope: 'once' | 'session'): string =>
   `[Conductor] approved: ${rule}${scope === 'once' ? ' (once)' : ' (for this session)'}; retry it now. Run exactly the approved call, unchanged: the rule matches only that.`
 
-/** What the tab is told when the owner denied. */
-export const grantDeniedMessage = (request: Pick<PermissionGrantRequest, 'action' | 'resource'>): string =>
-  `[Conductor] the owner denied: ${request.action} ${request.resource.length > 200 ? request.resource.slice(0, 199) + '…' : request.resource}. Do not retry it or route around it; carry on with other work or report that it is blocked.`
+/** What the tab is told when the owner, or a wizard tab answering for the owner, denied. */
+export const grantDeniedMessage = (request: Pick<PermissionGrantRequest, 'action' | 'resource'>, by: 'owner' | 'wizard' = 'owner'): string =>
+  `[Conductor] ${by === 'wizard' ? 'a wizard tab, answering for the owner, denied' : 'the owner denied'}: ${request.action} ${request.resource.length > 200 ? request.resource.slice(0, 199) + '…' : request.resource}. Do not retry it or route around it; carry on with other work or report that it is blocked.`
 
 const parsedRule = (rule: string): { tool: string; content?: string } => {
   const open = rule.indexOf('(')

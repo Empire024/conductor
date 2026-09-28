@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DatabaseSync } from 'node:sqlite'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { REDACTION_TARGETS, StructuredAgentStore, maskSecrets, redactSecretsChunk, registerSecretCheck, sanitizeDiagnostic } from './structured-store'
@@ -363,5 +363,55 @@ describe('the control token is masked in every form it is stored in (H17)', () =
     expect(store.redactSecretsStep()).toBe(false)
     // Finished is durable: a reopened store neither repeats the walk nor masks events on read.
     expect(new StructuredAgentStore(db, f.root).redactSecretsStep()).toBe(false)
+  })
+
+  it('masks a command output on write, in every form the journal masks', () => {
+    const f = fixture()
+    const named = f.store.putOutput('one', `CONDUCTOR_CONTROL_TOKEN=${token} node probe.mjs\nAuthorization: Bearer ${token}`)
+    expect(f.store.output('one', named)).not.toContain(token)
+    const unregister = registerSecretCheck(candidate => candidate === token)
+    try { expect(f.store.output('one', f.store.putOutput('one', `const t = '${token}'`))).toBe("const t = '[REDACTED]'") } finally { unregister() }
+  })
+
+  it('rewrites output artifacts stored before the mask once, in bounded steps, after the journal walk, and leaves diffs alone', () => {
+    const f = fixture()
+    const outputs = Array.from({ length: 23 }, (_, index) => f.store.putOutput('one', index % 7 === 0 ? `PLACEHOLDER ${index}` : `plain output ${index}`))
+    const diff = f.store.putArtifact('one', { sessionId: 'one', path: 'probe.mjs', before: null, after: `const token = '${token}'`, patch: 'synthetic', additions: 1, deletions: 0, canUndo: true })
+    // Files as an older build wrote them: the token in clear.
+    const dir = join(f.root, 'agent-artifacts')
+    const file = (id: string): string => join(dir, `${id}.txt`)
+    for (const [index, id] of outputs.entries()) if (index % 7 === 0) writeFileSync(file(id), `$env:CONDUCTOR_CONTROL_TOKEN = "${token}"; node probe.mjs ${index}`)
+    const plain = readFileSync(file(outputs[1]!), 'utf8')
+    let steps = 0
+    while (f.store.redactSecretsStep() || f.store.redactArtifactsStep()) steps++
+    // 23 outputs at 10 a step, besides the journal phases.
+    expect(steps).toBeGreaterThanOrEqual(3)
+    for (const [index, id] of outputs.entries()) {
+      if (index % 7) continue
+      expect(f.store.output('one', id)).toBe(`$env:CONDUCTOR_CONTROL_TOKEN = "[REDACTED]"; node probe.mjs ${index}`)
+    }
+    expect(readFileSync(file(outputs[1]!), 'utf8')).toBe(plain)
+    expect(readdirSync(dir).filter(name => name.endsWith('.tmp'))).toEqual([])
+    expect(f.store.artifact('one', diff.id).after).toContain(token)
+    expect(JSON.parse((f.db.prepare('SELECT value FROM structured_meta WHERE key=?').get('secret_redaction_artifacts_v1') as { value: string }).value)).toMatchObject({ changed: 4, done: expect.any(String) })
+    // Finished is durable: a reopened store does not walk the files again.
+    writeFileSync(file(outputs[0]!), `CONDUCTOR_CONTROL_TOKEN=${token}`)
+    const reopened = new StructuredAgentStore(f.db, f.root)
+    expect(reopened.redactArtifactsStep()).toBe(false)
+    expect(readFileSync(file(outputs[0]!), 'utf8')).toContain(token)
+  })
+
+  it('resumes the output pass where an earlier launch stopped', () => {
+    const f = fixture()
+    const ids = Array.from({ length: 15 }, (_, index) => f.store.putOutput('one', `output ${index}`)).sort()
+    const dir = join(f.root, 'agent-artifacts')
+    for (const id of ids) writeFileSync(join(dir, `${id}.txt`), `CONDUCTOR_CONTROL_TOKEN=${token}`)
+    expect(f.store.redactArtifactsStep()).toBe(true)
+    const done = ids.filter(id => !readFileSync(join(dir, `${id}.txt`), 'utf8').includes(token))
+    expect(done).toEqual(ids.slice(0, 10))
+    // The next launch lists the folder again and carries on after the last file done.
+    const reopened = new StructuredAgentStore(f.db, f.root)
+    expect(reopened.redactArtifactsStep()).toBe(false)
+    for (const id of ids) expect(readFileSync(join(dir, `${id}.txt`), 'utf8')).toBe('CONDUCTOR_CONTROL_TOKEN=[REDACTED]')
   })
 })

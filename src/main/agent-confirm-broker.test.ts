@@ -78,11 +78,13 @@ describe('agent confirm broker', () => {
     await expect(new AgentConfirmBroker(() => closing.window).request('agent-a', 'Build it?')).resolves.toBe('unavailable')
   })
 
-  it('names each outcome truthfully for the agent', () => {
-    expect(agentConfirmFailure('declined', 'build a local update')).toBe('The owner declined to build a local update')
-    expect(agentConfirmFailure('timeout', 'build a local update')).toMatch(/did not answer.*did not decline/)
-    expect(agentConfirmFailure('undelivered', 'build a local update')).toMatch(/could not show the owner.*was not asked/)
-    expect(agentConfirmFailure('unavailable', 'build a local update')).toMatch(/No Conductor main window.*was not asked/)
+  it('names each outcome truthfully for the agent, who decided, and the next step it can take', () => {
+    expect(agentConfirmFailure('declined', 'build a local update')).toMatch(/^The owner declined to build a local update in Conductor's confirmation dialog, so nothing was done\. Do not ask again.*report that it is blocked/)
+    expect(agentConfirmFailure('timeout', 'build a local update')).toMatch(/did not answer.*nothing was done.*did not decline.*ask once more when the owner is back.*wizard tab/)
+    expect(agentConfirmFailure('undelivered', 'build a local update')).toMatch(/could not show the owner.*was not asked\. Ask once more.*report it as blocked/)
+    expect(agentConfirmFailure('unavailable', 'build a local update')).toMatch(/No Conductor main window.*was not asked\. Report it as blocked/)
     for (const outcome of ['timeout', 'undelivered', 'unavailable'] as const) expect(agentConfirmFailure(outcome, 'x')).not.toMatch(/declined/)
+    // Every text ends in something the agent can do, not a bare verdict.
+    for (const outcome of ['declined', 'timeout', 'undelivered', 'unavailable'] as const) expect(agentConfirmFailure(outcome, 'x')).toMatch(/nothing was done.*(carry on|report|ask)/i)
   })
 })
