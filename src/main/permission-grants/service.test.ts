@@ -124,15 +124,20 @@ describe('one narrow owner approval per refused call', () => {
     expect(h.told[0]!.text).toMatch(/owner denied: Run a command ssh .*Do not retry it or route around it/)
   })
 
-  it('lets a wizard answer only local requests; production, shared and destructive stay with the owner', async () => {
+  // H13 (owner decision 2026-09-28): the wand holds the owner's authority, so a wizard answers
+  // every class, production and destructive included.
+  it('lets a wizard answer every class of request: external, destructive and local', async () => {
     const h = harness()
     const external = h.deny('toolu_x', 'Bash', { command: ssh }, 'Modify Shared Resources')
-    await expect(h.grants.decide(tab, external, 'approve-once', 'wizard')).rejects.toThrow('Only the owner can answer a external request')
+    await expect(h.grants.decide(tab, external, 'approve-once', 'wizard')).resolves.toMatchObject({ status: 'approved-once', grant: { decidedBy: 'wizard', class: 'external' } })
     const destructive = h.deny('toolu_d', 'Bash', { command: 'rm -rf build' }, 'Irreversible Local Destruction')
-    await expect(h.grants.decide(tab, destructive, 'approve-session', 'wizard')).rejects.toThrow('Only the owner')
+    await expect(h.grants.decide(tab, destructive, 'approve-session', 'wizard')).resolves.toMatchObject({ status: 'approved-session', grant: { decidedBy: 'wizard', class: 'destructive' } })
     const local = h.deny('toolu_l', 'Write', { file_path: 'notes/plan.md' }, 'Self-Modification')
     await expect(h.grants.decide(tab, local, 'approve-session', 'wizard')).resolves.toMatchObject({ status: 'approved-session', grant: { decidedBy: 'wizard', scope: 'session' } })
-    expect(h.grants.rules(tab)).toEqual([{ rule: 'Edit(//c/Users/owner/site/theme/notes/plan.md)', once: false }])
+    expect(h.grants.rules(tab)).toContainEqual({ rule: 'Edit(//c/Users/owner/site/theme/notes/plan.md)', once: false })
+    expect(h.grants.rules(tab)).toHaveLength(3)
+    const denied = h.deny('toolu_y', 'Bash', { command: 'npm run deploy:prod' }, 'Production Deploy')
+    await expect(h.grants.decide(tab, denied, 'deny', 'wizard')).resolves.toMatchObject({ status: 'denied' })
   })
 
   it('refuses to approve a request no narrow rule can cover, and a request that was never recorded', async () => {
@@ -206,20 +211,19 @@ describe('one narrow owner approval per refused call', () => {
 })
 
 describe('permissions.* through app control', () => {
-  it('lets a conversation ask and list for itself, and only the owner credential or a wizard answer, local actions only', async () => {
+  it('lets a conversation ask and list for itself, and only the owner credential or a wizard answer, any class', async () => {
     const h = harness()
     const asked = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: ssh, reason: 'pool fix' }) as { requestId: string; rule: string; class: string }
     expect(asked).toMatchObject({ class: 'external', rule: expect.stringMatching(/^Bash\(ssh /) })
     await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: ssh, reason: 'x', allowAll: true })).rejects.toThrow('does not take allowAll')
     await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.list', { agentSessionId: 'agent_other' })).rejects.toThrow('Only the owner or a wizard')
     await expect(callPermissions(h.grants, { agentSessionId: tab }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('answers only')
-    // A wizard cannot answer its own request, and nobody answers an external one through app control.
+    // A wizard cannot answer its own request; another wizard tab answers even an external one (H13).
     await expect(callPermissions(h.grants, { agentSessionId: tab, wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('cannot answer its own')
-    await expect(callPermissions(h.grants, { agentSessionId: 'agent_wizard', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('Only the owner can answer a external request')
-    await expect(callPermissions(h.grants, { agentSessionId: '', owner: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).rejects.toThrow('Only the owner can answer a external request')
+    await expect(callPermissions(h.grants, { agentSessionId: 'agent_wizard', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: asked.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once' })
     const local = await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.request', { command: 'npm run build', reason: 'build' }) as { requestId: string }
-    await expect(callPermissions(h.grants, { agentSessionId: 'agent_wizard', wizard: true }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once' })
-    expect((await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.list', {}) as { grants: unknown[] }).grants).toHaveLength(1)
+    await expect(callPermissions(h.grants, { agentSessionId: '', owner: true }, 'permissions.decide', { agentSessionId: tab, requestId: local.requestId, decision: 'approve-once' })).resolves.toMatchObject({ status: 'approved-once' })
+    expect((await callPermissions(h.grants, { agentSessionId: tab }, 'permissions.list', {}) as { grants: unknown[] }).grants).toHaveLength(2)
   })
 })
 
@@ -637,5 +641,128 @@ describe('classifier outages are not permission questions', () => {
     expect(h.grants.list(tab).requests).toEqual([expect.objectContaining({ id: real.id, status: 'pending' })])
     expect(h.grants.state().settled).toContainEqual({ agentSessionId: tab, id: autoModeDenialItemId('toolu_old'), status: 'expired' })
     await expect(h.grants.decide(tab, autoModeDenialItemId('toolu_old'), 'approve-once', 'owner')).rejects.toThrow('already answered (expired)')
+  })
+})
+
+// H06 (docs/verification/2026-09-28-harness-gap-sweep.md): the approval turn waits behind a running
+// turn; the agent hears it is coming, the approver hears after 2 min (a wizard's approval
+// interrupts), and a retry older than 30 min is withdrawn rather than delivered.
+describe('an approval reaches a conversation whose turn is still running (H06)', () => {
+  const successor = 'agent_other'
+  function timed(overrides: Partial<PermissionGrantPorts> = {}) {
+    let clock = Date.parse('2026-09-28T15:00:00.000Z')
+    let phase = 'running'
+    // The conversation's queue: an approval turn handed over while a turn is under way waits here.
+    const waiting = new Set<string>()
+    const retried: Array<{ id: string; text: string }> = []
+    const h = harness({
+      now: () => new Date(clock).toISOString(),
+      phase: () => phase,
+      retry: vi.fn(async (id: string, text: string) => { retried.push({ id, text }); if (['running', 'starting', 'waiting_input', 'waiting_approval'].includes(phase)) waiting.add(text) }),
+      retryQueued: (_id, text) => waiting.has(text),
+      headsUp: vi.fn(async () => true),
+      interrupt: vi.fn(async () => undefined),
+      turn: () => ({ startedAt: '2026-09-28T14:50:00.000Z', lastTool: 'Bash' }),
+      unqueue: vi.fn((_id: string, text: string) => waiting.delete(text)),
+      title: id => id === successor ? 'Wizard (continued)' : 'Wizard',
+      ...overrides
+    })
+    return { ...h, retried, waiting, advance: (ms: number) => { clock += ms }, setPhase: (value: string) => { phase = value } }
+  }
+  const settle = () => new Promise(done => setTimeout(done, 0))
+  const waitingNotices = (h: ReturnType<typeof timed>) => h.notices.filter(entry => entry.itemId.startsWith('grant-waiting:'))
+
+  it('says which conversation made the call and when it was approved', async () => {
+    const h = timed()
+    await h.grants.decide(tab, h.deny('toolu_p', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'owner')
+    expect(h.retried).toEqual([{ id: tab, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(.*\(once\); retry it now\..*\(Asked in this conversation at 2026-09-28 15:00 UTC; approved by the owner at 2026-09-28 15:00 UTC\.\)$/) }])
+  })
+
+  it('steers one heads-up into the running turn once it can take one, never the approval itself', async () => {
+    const headsUp = vi.fn(async (_id: string, _text: string) => true).mockResolvedValueOnce(false)
+    const h = timed({ headsUp })
+    await h.grants.decide(tab, h.deny('toolu_h', 'Bash', { command: ssh }, 'Production Reads'), 'approve-session', 'owner')
+    await settle()
+    // Not steerable at the moment of the decision: tried again on the next sweep, then never again.
+    expect(headsUp).toHaveBeenCalledTimes(1)
+    h.grants.sweep(); await settle()
+    h.grants.sweep(); await settle()
+    h.grants.sweep(); await settle()
+    expect(headsUp).toHaveBeenCalledTimes(2)
+    expect(headsUp.mock.calls[1]![1]).toMatch(/^\[Conductor\] approval queued: Bash\(ssh .*do not retry the call in this turn/)
+    expect(h.retried).toHaveLength(1)
+  })
+
+  it('tells the owner once, after 2 min, how to interrupt the turn; it does not interrupt on its own', async () => {
+    const h = timed()
+    const result = await h.grants.decide(tab, h.deny('toolu_o', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'owner')
+    expect(result.message).toMatch(/once its current turn ends\. If that turn is still running 2 min from now, the tab says so/)
+    h.advance(119_000); h.grants.sweep()
+    expect(waitingNotices(h)).toEqual([])
+    h.advance(2000); h.grants.sweep(); h.advance(60_000); h.grants.sweep()
+    expect(waitingNotices(h)).toEqual([expect.objectContaining({ id: tab, message: expect.stringMatching(/queued behind a turn that has run 12 min \(last tool: Bash\)\. Press Esc in this tab/) })])
+    expect(h.ports.interrupt).not.toHaveBeenCalled()
+  })
+
+  it('interrupts the turn once when a wizard approved and the retry has waited 2 min', async () => {
+    const h = timed()
+    const result = await h.grants.decide(tab, h.deny('toolu_z', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'wizard')
+    expect(result.message).toMatch(/Conductor interrupts it so the retry runs/)
+    h.advance(121_000); h.grants.sweep(); h.grants.sweep()
+    expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
+    expect(h.ports.interrupt).toHaveBeenCalledWith(tab)
+    expect(waitingNotices(h)).toEqual([expect.objectContaining({ message: expect.stringMatching(/A wizard tab approved it, so Conductor interrupted that turn/) })])
+    // The retry ran after the interrupt: nothing more to follow.
+    h.waiting.clear(); h.grants.sweep(); h.advance(40 * 60_000); h.grants.sweep()
+    expect(h.ports.interrupt).toHaveBeenCalledTimes(1)
+    expect(h.ports.unqueue).not.toHaveBeenCalled()
+  })
+
+  it('never throws after the grant is applied: a conversation still stopping gets the retry once it has stopped', async () => {
+    const h = timed()
+    const retry = vi.fn(async (id: string, text: string) => {
+      if (h.ports.phase(id) === 'interrupting') throw new Error('The conversation is still stopping its last turn')
+      h.retried.push({ id, text })
+    })
+    h.ports.retry = retry
+    h.setPhase('interrupting')
+    const result = await h.grants.decide(tab, h.deny('toolu_s', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'owner')
+    expect(result).toMatchObject({ status: 'approved-once', message: expect.stringMatching(/still stopping its last turn; Conductor hands it the retry as soon as it has stopped/) })
+    expect(h.grants.rules(tab)).toHaveLength(1)
+    h.advance(5000); h.grants.sweep(); await settle()
+    expect(retry).toHaveBeenCalledTimes(1)
+    h.setPhase('completed')
+    h.advance(1000); h.grants.sweep(); await settle()
+    h.advance(5000); h.grants.sweep(); await settle()
+    h.advance(5000); h.grants.sweep(); await settle()
+    expect(retry).toHaveBeenCalledTimes(2)
+    expect(h.retried).toEqual([{ id: tab, text: expect.stringMatching(/^\[Conductor\] approved: Bash\(/) }])
+  })
+
+  it('withdraws an approval turn that waited 30 min instead of delivering it as "retry it now"', async () => {
+    const h = timed()
+    const { grant } = await h.grants.decide(tab, h.deny('toolu_w', 'Bash', { command: ssh }, 'Production Reads'), 'approve-session', 'owner')
+    h.advance(30 * 60_000 + 1000); h.grants.sweep()
+    expect(h.ports.unqueue).toHaveBeenCalledWith(tab, h.retried[0]!.text)
+    expect(h.waiting.size).toBe(0)
+    expect(h.grants.rules(tab)).toEqual([])
+    expect(h.grants.list(tab).requests.find(request => request.id === grant!.requestId)).toMatchObject({ status: 'expired' })
+    expect(waitingNotices(h).at(-1)).toMatchObject({ message: expect.stringMatching(/^Withdrawn: the approval of Bash\(.* waited 30 min .*not delivered as "retry it now"/) })
+  })
+
+  it('hands a successor only recent approvals: an older unspent grant ends with a notice and is never announced to it', async () => {
+    const h = timed()
+    const old = await h.grants.decide(tab, h.deny('toolu_old', 'Bash', { command: 'npm run deploy:staging' }, 'Production Deploy'), 'approve-session', 'owner')
+    h.advance(20 * 60_000)
+    const recent = await h.grants.decide(tab, h.deny('toolu_new', 'Bash', { command: ssh }, 'Production Reads'), 'approve-once', 'wizard')
+    h.advance(60_000)
+    expect(await h.grants.transfer(tab, successor)).toEqual({ requests: 0, grants: 1 })
+    expect(h.grants.rules(successor)).toEqual([{ rule: recent.grant!.rule, once: true }])
+    expect(h.grants.rules(tab)).toEqual([])
+    expect(h.grants.list(tab).requests.find(request => request.id === old.grant!.requestId)).toMatchObject({ status: 'expired' })
+    expect(h.notices).toContainEqual(expect.objectContaining({ id: tab, itemId: `grant-stale:${old.grant!.id}`, message: expect.stringMatching(/^Not handed on to Wizard \(continued\) · other: Bash\(npm run deploy:staging\) was approved 21 min ago/) }))
+    const told = h.retried.filter(entry => entry.id === successor)
+    expect(told).toEqual([{ id: successor, text: expect.stringMatching(/\(Asked in Wizard · tab \(which handed itself on to this one\) at 2026-09-28 15:20 UTC; approved by a wizard tab at 2026-09-28 15:20 UTC\.\)$/) }])
+    expect(told[0]!.text).not.toContain('deploy:staging')
   })
 })

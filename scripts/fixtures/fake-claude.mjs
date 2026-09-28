@@ -235,6 +235,12 @@ for await (const line of input) {
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
       classify(lastRefused); continue
     }
+    // Conductor's heads-up that an approval waits behind this turn: folded in; the turn carries on.
+    if (typeof prompt === 'string' && prompt.startsWith('[Conductor] approval queued:') && message.priority === 'next') {
+      emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'queued' })
+      emit({ type: 'command_lifecycle', command_uuid: message.uuid, state: 'started' })
+      continue
+    }
     if (typeof prompt === 'string' && prompt.startsWith('[Conductor] the owner denied:')) {
       emit({ type: 'system', subtype: 'init', model: 'synthetic-claude', claude_code_version: '2.1.263', permissionMode })
       text('SYNTHETIC: understood; not retrying it.'); finish(); continue

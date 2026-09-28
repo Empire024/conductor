@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, isClassifierOutage, type AutoModeDenial, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import {
-  describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary, wizardMayDecide,
+  describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary,
   type GrantDecision, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState
 } from '../../shared/permission-grants'
 import type { Json } from '../../shared/structured-agent'
@@ -11,8 +11,8 @@ import type { Json } from '../../shared/structured-agent'
  * (docs/permissions-classifier.md). A request comes from a classifier denial the Claude adapter
  * recorded (its notice item in the timeline is the card, a pending request from the moment the
  * adapter shows it: denied), or from the agent itself through permissions.request before it
- * tries. The owner answers in the card; a wizard tab may answer
- * only for local, reversible actions. An approval becomes exactly one native allow rule for that
+ * tries. The owner answers in the card; a wizard tab holds the owner's authority and may answer
+ * any class. An approval becomes exactly one native allow rule for that
  * one conversation, handed to the running CLI (apply_flag_settings) or, where the CLI cannot take
  * it live, through --settings on its next start, and the conversation is told to retry in a user
  * turn of its own (retry), which is what the classifier honours. Waiting requests and unspent
@@ -60,8 +60,20 @@ export interface PermissionGrantPorts {
   tabOpen?(agentSessionId: string): boolean
   /** Writes what must survive a restart (snapshot()), after every change. */
   persist?(saved: SavedPermissionGrants): void
+  /** Steers a short note into the running turn when it can take one right now; false when it
+   *  cannot. Never queues: the approval itself must stay a turn of its own. */
+  headsUp?(agentSessionId: string, text: string): Promise<boolean>
+  /** Stops the running turn and sends what waits in its queue straight after (Esc in the tab). */
+  interrupt?(agentSessionId: string): Promise<void>
+  /** When the turn under way started and the last tool it ran, for the waiting notice. */
+  turn?(agentSessionId: string): { startedAt?: string; lastTool?: string } | undefined
+  /** Takes a message that has not started yet back out of the conversation's queue; false when it
+   *  is no longer there (being sent, or already running). */
+  unqueue?(agentSessionId: string, text: string): boolean
   idleWaitMs?: number
   idlePollMs?: number
+  /** How long an approval turn waits behind a running turn before its approver hears (RETRY_NOTICE_MS). */
+  retryNoticeMs?: number
 }
 
 export type GrantActor = 'owner' | 'wizard'
@@ -88,6 +100,37 @@ const DECIDED: Record<Exclude<GrantDecision, 'deny'>, GrantStatus> = { 'approve-
 const SAVED_SETTLED = 200
 const SAVED_MOVED = 200
 const LIVE_STATUSES = new Set<GrantStatus>(['pending', 'approved-once', 'approved-session'])
+const STEERABLE_PHASES = new Set(['running', 'waiting_approval', 'waiting_input'])
+/** An approval turn queued behind a turn still running this long: the owner is told how to
+ *  interrupt it; a wizard's approval interrupts it (owner decision 2026-09-28, H06). */
+const RETRY_NOTICE_MS = 120_000
+/** An approval turn still queued after this long is withdrawn rather than delivered as "retry it
+ *  now": by then the call it names is usually no longer what the conversation is doing. */
+const RETRY_STALE_MS = 30 * 60_000
+/** A handoff hands the successor only grants approved this recently; an older unspent grant ends
+ *  with a notice instead of reaching the successor as a "retry it now" for a call it never made. */
+const HANDOFF_FRESH_MS = 10 * 60_000
+/** An approval turn a conversation could not take yet (still stopping its last turn) is handed
+ *  over again this many times, this far apart, before the owner is told. */
+const DELIVERY_ATTEMPTS = 20
+const DELIVERY_RETRY_MS = 3000
+/** An approval turn Conductor is delivering: handed to the conversation (queued or started), or
+ *  not yet, because the conversation was still stopping its last turn. */
+interface Delivery {
+  agentSessionId: string
+  text: string
+  rules: string[]
+  grantIds: string[]
+  approver: GrantActor
+  /** When it was handed over (queued), or first tried. */
+  since: number
+  handed: boolean
+  attempts: number
+  lastAttempt: number
+  sending: boolean
+  headsUp: 'no' | 'sending' | 'done'
+  noticed: boolean
+}
 /** A denial card whose only "reason" is that the server-side classifier gave no verdict. */
 const outageCard = (request: Pick<PermissionGrantRequest, 'source' | 'category'>): boolean => request.source === 'denial' && isClassifierOutage(request.category)
 
@@ -111,11 +154,14 @@ export class PermissionGrants {
   private readonly settled = new Map<string, Map<string, GrantStatus>>()
   /** A grant -> the approval turn it was announced with (retry), until the grant ends. */
   private readonly retries = new Map<string, string>()
+  /** Approval turns being delivered, by conversation and text (deliver, followDeliveries). */
+  private readonly deliveries = new Map<string, Delivery>()
   /** The app is quitting (freeze): runtimes stopping now are not conversations ending. */
   private stopping = false
   constructor(private readonly ports: PermissionGrantPorts) {}
 
   private now(): string { return this.ports.now?.() ?? new Date().toISOString() }
+  private clock(): number { return Date.parse(this.now()) }
   private changed(): void {
     this.ports.changed?.(this.state())
     this.save()
@@ -314,13 +360,14 @@ export class PermissionGrants {
     return request
   }
 
-  /** Owner (card) or wizard (app control, local actions only) answers one request. */
+  /** Owner (card) or wizard (app control; the wand holds the owner's authority, so every class)
+   *  answers one request. Once the grant is applied this never throws: an approval turn the
+   *  conversation cannot take yet is handed over again from sweep(). */
   async decide(agentSessionId: string, requestId: string, decision: GrantDecision, actor: GrantActor): Promise<PermissionGrantDecisionResult> {
     if (!['approve-once', 'approve-session', 'deny'].includes(decision)) throw new Error('decision must be approve-once, approve-session or deny')
     requestId = this.aliases.get(agentSessionId)?.get(requestId) ?? requestId
     agentSessionId = this.holderOf(agentSessionId, requestId)
     const request = this.pendingRequest(agentSessionId, requestId)
-    if (actor === 'wizard' && !wizardMayDecide(request)) throw new Error(`Only the owner can answer a ${request.class} request; the card is in the conversation's tab`)
     const decidedAt = this.now()
     if (decision === 'deny') {
       this.settle(agentSessionId, request, { status: 'denied', decidedAt, decidedBy: actor })
@@ -337,7 +384,7 @@ export class PermissionGrants {
     this.grants.set(agentSessionId, [...(this.grants.get(agentSessionId) ?? []).filter(entry => entry.rule !== grant.rule), grant])
     this.settle(agentSessionId, request, { status: DECIDED[decision], decidedAt, decidedBy: actor })
     const applied = await this.ports.apply(agentSessionId).catch(error => { this.drop(agentSessionId, grant.id); throw error })
-    const text = grantApprovedMessage(grant.rule, scope)
+    const text = this.approvalText(agentSessionId, [grant])
     this.retries.set(grant.id, text)
     if (applied === 'unsupported') {
       grant.delivery = 'restart'
@@ -348,8 +395,130 @@ export class PermissionGrants {
     grant.delivery = applied === 'applied' ? 'live' : 'pending'
     this.changed()
     const busy = ACTIVE_PHASES.has(this.ports.phase(agentSessionId) ?? '')
-    await this.ports.retry(agentSessionId, text)
-    return { status: DECIDED[decision], grant, message: `Approved: ${grant.rule}. ${busy ? 'The conversation retries it in a message of its own once its current turn ends.' : 'The conversation was told to retry it.'}` }
+    const handed = await this.deliver(agentSessionId, text, [grant], actor)
+    const later = actor === 'wizard'
+      ? 'If that turn is still running 2 min from now, Conductor interrupts it so the retry runs.'
+      : 'If that turn is still running 2 min from now, the tab says so; Esc there interrupts it and the retry runs at once.'
+    const next = !handed ? 'The conversation is still stopping its last turn; Conductor hands it the retry as soon as it has stopped.'
+      : busy ? `The conversation retries it in a message of its own once its current turn ends. ${later}` : 'The conversation was told to retry it.'
+    return { status: DECIDED[decision], grant, message: `Approved: ${grant.rule}. ${next}` }
+  }
+
+  /** "[Conductor] approved: …; retry it now", saying which conversation made the call and when it
+   *  was approved, so a successor or a late delivery can tell whose call it is. */
+  private approvalText(holder: string, granted: PermissionGrant[]): string {
+    const at = (iso: string | undefined): string => iso && !Number.isNaN(Date.parse(iso)) ? `${new Date(iso).toISOString().slice(0, 16).replace('T', ' ')} UTC` : 'an unknown time'
+    return granted.map(grant => {
+      const request = this.requests.get(holder)?.get(grant.requestId)
+      const asker = this.askedIn(holder, grant.requestId)
+      const title = this.ports.title?.(asker)
+      const where = asker === holder ? 'this conversation' : `${grantHolderLabel({ agentSessionId: asker, ...(title ? { title } : {}) })} (which handed itself on to this one)`
+      return `${grantApprovedMessage(grant.rule, grant.scope)} (Asked in ${where} at ${at(request?.requestedAt)}; approved by ${grant.decidedBy === 'wizard' ? 'a wizard tab' : 'the owner'} at ${at(grant.grantedAt)}.)`
+    }).join('\n')
+  }
+
+  /** The conversation that first asked for a request a handoff chain moved to holder. */
+  private askedIn(holder: string, requestId: string): string {
+    let current = holder
+    for (let hops = 0; hops < 16; hops++) {
+      const previous = [...this.successors].find(([from, to]) => to === current && this.movedOut.get(from)?.has(requestId))?.[0]
+      if (!previous) break
+      current = previous
+    }
+    return current
+  }
+
+  /** Hands the conversation its approval turn (retry) and follows it until it has run: a heads-up
+   *  steered into the running turn, a notice or (wizard approver) an interrupt after
+   *  RETRY_NOTICE_MS, withdrawal after RETRY_STALE_MS. False when the conversation could not take
+   *  it yet; sweep() hands it over again. */
+  private async deliver(agentSessionId: string, text: string, granted: PermissionGrant[], approver: GrantActor): Promise<boolean> {
+    const key = `${agentSessionId}\n${text}`
+    const delivery: Delivery = {
+      agentSessionId, text, rules: granted.map(grant => grant.rule), grantIds: granted.map(grant => grant.id), approver,
+      since: this.clock(), handed: false, attempts: 0, lastAttempt: 0, sending: false, headsUp: 'no', noticed: false
+    }
+    this.deliveries.set(key, delivery)
+    return this.hand(key, delivery)
+  }
+
+  private async hand(key: string, delivery: Delivery): Promise<boolean> {
+    delivery.sending = true
+    delivery.attempts++
+    delivery.lastAttempt = this.clock()
+    try {
+      await this.ports.retry(delivery.agentSessionId, delivery.text)
+      delivery.handed = true
+      delivery.since = this.clock()
+      this.follow(key, delivery)
+      return true
+    } catch (error) {
+      console.warn('An approval turn could not be handed to its conversation yet', error)
+      if (delivery.attempts >= DELIVERY_ATTEMPTS) {
+        this.deliveries.delete(key)
+        this.ports.notice(delivery.agentSessionId, `The approval of ${delivery.rules.join(', ')} could not be handed to this conversation (${error instanceof Error ? error.message : 'delivery failed'}). The rule stays in place; ask it to retry the call.`, { permissionGrantDelivery: 'failed' }, `grant-delivery:${delivery.agentSessionId}`)
+      }
+      return false
+    } finally { delivery.sending = false }
+  }
+
+  /** Every approval turn being delivered, once per sweep. */
+  private followDeliveries(): void {
+    for (const [key, delivery] of [...this.deliveries]) this.follow(key, delivery)
+  }
+
+  private follow(key: string, delivery: Delivery): void {
+    const { agentSessionId, text } = delivery
+    // Its grants ended (spent, revoked, moved on by a handoff, tab closed): nothing to deliver.
+    if (!delivery.grantIds.some(id => this.retries.get(id) === text)) { this.deliveries.delete(key); return }
+    const phase = this.ports.phase(agentSessionId) ?? ''
+    const now = this.clock()
+    if (!delivery.handed) {
+      if (!delivery.sending && phase !== 'interrupting' && now - delivery.lastAttempt >= DELIVERY_RETRY_MS) void this.hand(key, delivery)
+      return
+    }
+    // It started (or went at once to an idle conversation): the classifier judges from here.
+    if (!this.ports.retryQueued?.(agentSessionId, text)) { this.deliveries.delete(key); return }
+    const waited = now - delivery.since
+    if (waited >= RETRY_STALE_MS) { this.withdrawStale(key, delivery, waited); return }
+    if (!ACTIVE_PHASES.has(phase)) return
+    if (delivery.headsUp === 'no' && this.ports.headsUp && STEERABLE_PHASES.has(phase)) {
+      delivery.headsUp = 'sending'
+      const note = `[Conductor] approval queued: ${delivery.rules.join(', ')}. It arrives as your next message, a turn of its own, once this turn ends; do not retry the call in this turn (it would be refused again). Finish or pause this turn soon so it can run.`
+      void this.ports.headsUp(agentSessionId, note).then(sent => { delivery.headsUp = sent ? 'done' : 'no' }, () => { delivery.headsUp = 'done' })
+    }
+    if (delivery.noticed || waited < (this.ports.retryNoticeMs ?? RETRY_NOTICE_MS)) return
+    delivery.noticed = true
+    const turn = this.ports.turn?.(agentSessionId)
+    const started = turn?.startedAt ? Date.parse(turn.startedAt) : NaN
+    const running = `a turn that has run ${Number.isNaN(started) ? 'over 2' : Math.max(1, Math.round((now - started) / 60_000))} min${turn?.lastTool ? ` (last tool: ${turn.lastTool})` : ''}`
+    const rules = delivery.rules.join(', ')
+    const itemId = `grant-waiting:${delivery.grantIds[0]}`
+    if (delivery.approver === 'wizard' && this.ports.interrupt) {
+      this.ports.notice(agentSessionId, `The approved call ${rules} waited behind ${running}. A wizard tab approved it, so Conductor interrupted that turn; the retry runs now as a message of its own.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: true } }, itemId)
+      void this.ports.interrupt(agentSessionId).catch(error => {
+        this.ports.notice(agentSessionId, `The approved call ${rules} is queued behind ${running}, and Conductor could not interrupt it (${error instanceof Error ? error.message : 'interrupt failed'}). Press Esc in this tab to interrupt it; the retry then runs at once.`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: false } }, itemId)
+      })
+      return
+    }
+    this.ports.notice(agentSessionId, `The approved call ${rules} is queued behind ${running}. Press Esc in this tab to interrupt the turn: the queued retry then runs at once as a message of its own (the Stop button keeps it held above the composer instead).`, { permissionGrantWaiting: { rules: delivery.rules, interrupted: false } }, itemId)
+  }
+
+  /** An approval turn that waited RETRY_STALE_MS behind a running turn is taken back out of the
+   *  queue and its grants end: a "retry it now" that late is no longer about the current work. */
+  private withdrawStale(key: string, delivery: Delivery, waited: number): void {
+    this.deliveries.delete(key)
+    if (!this.ports.unqueue?.(delivery.agentSessionId, delivery.text)) return
+    const { agentSessionId } = delivery
+    const held = this.grants.get(agentSessionId) ?? []
+    for (const id of delivery.grantIds) {
+      const grant = held.find(entry => entry.id === id)
+      if (!grant || this.retries.get(id) !== delivery.text) continue
+      this.drop(agentSessionId, id)
+      this.statusOf(agentSessionId, grant.requestId, 'expired')
+    }
+    void this.ports.apply(agentSessionId).catch(error => console.warn('A withdrawn grant could not be removed from the live conversation; it ends with the runtime', error))
+    this.ports.notice(agentSessionId, `Withdrawn: the approval of ${delivery.rules.join(', ')} waited ${Math.round(waited / 60_000)} min behind a turn that kept running, so it was not delivered as "retry it now". Ask again if the call is still needed.`, { permissionGrantWaiting: { rules: delivery.rules, withdrawn: true } }, `grant-waiting:${delivery.grantIds[0]}`)
   }
 
   /** Revoking only narrows: the conversation's own grant, or any grant for the owner or a wizard. */
@@ -399,12 +568,19 @@ export class PermissionGrants {
    * The predecessor's card stops asking and names the holder; the successor's tab gets the live
    * card, and an approval (or an approval already given) tells the successor to retry. The
    * predecessor's live runtime has the rules taken back before the successor is handed them.
+   * Only grants approved within HANDOFF_FRESH_MS move; an older unspent one ends (expired) with a
+   * notice in the predecessor's tab rather than reaching the successor as a "retry it now".
    */
   async transfer(fromId: string, toId: string): Promise<{ requests: number; grants: number }> {
     const open = this.requests.get(fromId)
-    const granted = this.grants.get(fromId) ?? []
+    const held = this.grants.get(fromId) ?? []
     const pending = [...(open?.values() ?? [])].filter(request => request.status === 'pending')
-    if (fromId === toId || (!pending.length && !granted.length) || this.ports.provider(toId) !== 'claude') return { requests: 0, grants: 0 }
+    if (fromId === toId || (!pending.length && !held.length) || this.ports.provider(toId) !== 'claude') return { requests: 0, grants: 0 }
+    // Only a recent approval is the successor's to retry; an older unspent grant (a session grant
+    // is never spent) would reach it as "retry it now" for a call it never made.
+    const now = this.clock()
+    const granted = held.filter(grant => !(now - Date.parse(grant.grantedAt) > HANDOFF_FRESH_MS))
+    const stale = held.filter(grant => !granted.includes(grant))
     const title = this.ports.title?.(toId)
     const holder = { agentSessionId: toId, ...(title ? { title } : {}) }
     const target = this.requests.get(toId) ?? new Map<string, PermissionGrantRequest>()
@@ -434,16 +610,21 @@ export class PermissionGrants {
       } else this.card(fromId, { ...request, status: 'moved' })
       this.card(toId, request)
     }
+    for (const grant of stale) {
+      this.retries.delete(grant.id)
+      this.statusOf(fromId, grant.requestId, 'expired')
+      this.ports.notice(fromId, `Not handed on to ${grantHolderLabel(holder)}: ${grant.rule} was approved ${Math.round((now - Date.parse(grant.grantedAt)) / 60_000)} min ago and not retried in this conversation, so its successor is not told to retry a call it never made. It asks again if it needs the call.`, { permissionGrantStale: { rule: grant.rule } }, `grant-stale:${grant.id}`)
+    }
     this.changed()
+    if (held.length) await this.ports.apply(fromId).catch(error => console.warn('Moved grants could not be taken back out of the previous conversation; a spend it reports still spends them', error))
     if (granted.length) {
-      await this.ports.apply(fromId).catch(error => console.warn('Moved grants could not be taken back out of the previous conversation; a spend it reports still spends them', error))
       const applied = await this.ports.apply(toId).catch(error => { console.warn('Moved grants could not be handed to the successor live; they apply when it next starts', error); return 'offline' as const })
       for (const grant of granted) grant.delivery = applied === 'applied' ? 'live' : applied === 'unsupported' ? 'restart' : 'pending'
       this.changed()
-      const text = granted.map(grant => grantApprovedMessage(grant.rule, grant.scope)).join('\n')
+      const text = this.approvalText(toId, granted)
       for (const grant of granted) this.retries.set(grant.id, text)
       if (applied === 'unsupported') void this.restartThenRetry(toId, text)
-      else await this.ports.retry(toId, text).catch(error => console.warn('The successor could not be told about the grants it now holds', error))
+      else await this.deliver(toId, text, granted, granted.some(grant => grant.decidedBy !== 'wizard') ? 'owner' : 'wizard')
     }
     return { requests: pending.length, grants: granted.length }
   }
@@ -466,11 +647,13 @@ export class PermissionGrants {
     this.changed()
   }
 
-  /** Ends the grants of every conversation whose tab was closed (tabOpen), and takes them back out
-   *  of a runtime that is still running. Cheap when nothing is granted; wiring.ts runs it on a timer. */
+  /** Follows the approval turns being delivered (followDeliveries), ends the grants of every
+   *  conversation whose tab was closed (tabOpen), and takes them back out of a runtime that is
+   *  still running. Cheap when nothing is granted; wiring.ts runs it every second. */
   sweep(): void {
     if (this.stopping) return
     this.expireOutages()
+    this.followDeliveries()
     if (!this.ports.tabOpen) return
     for (const agentSessionId of new Set([...this.grants.keys(), ...this.requests.keys()])) {
       if (this.ports.tabOpen(agentSessionId)) { this.missing.delete(agentSessionId); continue }

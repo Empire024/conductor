@@ -18,6 +18,10 @@ export interface GrantSessions {
   steerOrStart(id: string, text: string, settings: SessionSettings): Promise<unknown>
   /** Queues a message as the next turn of its own, behind a turn under way (never steered). */
   queue(id: string, text: string, settings: SessionSettings): Promise<void>
+  steer(id: string, text: string, settings: SessionSettings): Promise<void>
+  /** Stops the running turn; expediteSubmittedInput sends what waits in the queue straight after (Esc). */
+  interrupt(id: string, expediteSubmittedInput?: boolean): Promise<void>
+  cancelQueued(id: string, promptId?: string): unknown
   setPermissionGrants(grants: PermissionGrants): void
   setConductorMcp(server: { configure(spec: AgentSpec): string; release(agentSessionId: string): void }): void
 }
@@ -29,6 +33,55 @@ export interface GrantStore {
 export const permissionGrantsIpcChannels = ['permission-grants:state', 'permission-grants:decide', 'permission-grants:revoke'] as const
 /** Phases in which a message can only follow the turn (StructuredSessions.queue) or be steered into it. */
 const TURN_UNDER_WAY = new Set(['starting', 'running', 'waiting_input', 'waiting_approval'])
+/** Phases in which a steered message reaches the running turn itself (StructuredSessions.followup). */
+const STEERABLE = new Set(['running', 'waiting_input', 'waiting_approval'])
+
+/** How an approval reaches a conversation (PermissionGrantPorts retry, headsUp, interrupt, turn,
+ *  unqueue), over the structured sessions. */
+export function grantDelivery(sessions: GrantSessions, store: GrantStore, timing: { settleMs?: number; pollMs?: number } = {}) {
+  const state = (id: string) => {
+    const current = store.snapshot(id)
+    if (!current) throw new Error('The conversation is not registered')
+    return current
+  }
+  return {
+    tell: async (id: string, text: string): Promise<void> => { await sessions.steerOrStart(id, text, state(id).settings) },
+    // A steered approval reaches the CLI as a mid-turn queued command, which its classifier did not
+    // take as the owner's approval (docs/permissions-classifier.md, Evidence 2026-09-28). A turn
+    // that is still stopping takes neither a queued nor a started message, so it is waited for
+    // (bounded); if it has not stopped by then the grant service hands the retry over again later.
+    retry: async (id: string, text: string): Promise<void> => {
+      const deadline = Date.now() + (timing.settleMs ?? 30_000)
+      while (state(id).phase === 'interrupting' && Date.now() < deadline) await new Promise(done => setTimeout(done, timing.pollMs ?? 500))
+      const current = state(id)
+      if (current.phase === 'interrupting') throw new Error('The conversation is still stopping its last turn')
+      if (TURN_UNDER_WAY.has(current.phase)) await sessions.queue(id, text, current.settings)
+      else await sessions.steerOrStart(id, text, current.settings)
+    },
+    retryQueued: (id: string, text: string): boolean => Boolean(store.snapshot(id)?.queuedPrompts?.some(prompt => prompt.text === text)),
+    // Only into a turn that can take it now: a steer that fell back to the queue would ride along
+    // with the approval turn it announces.
+    headsUp: async (id: string, text: string): Promise<boolean> => {
+      const current = store.snapshot(id)
+      if (!current || !STEERABLE.has(current.phase)) return false
+      await sessions.steer(id, text, current.settings)
+      return true
+    },
+    interrupt: (id: string): Promise<void> => sessions.interrupt(id, true),
+    turn: (id: string): { startedAt?: string; lastTool?: string } | undefined => {
+      const items = store.snapshot(id)?.items ?? []
+      let start = -1
+      for (let index = items.length - 1; index >= 0; index--) if (items[index]!.data.type === 'text' && (items[index]!.data as { role?: string }).role === 'user') { start = index; break }
+      const tool = items.slice(start + 1).reverse().find(item => item.data.type === 'tool')
+      return { ...(start >= 0 ? { startedAt: items[start]!.timestamp } : {}), ...(tool && tool.data.type === 'tool' ? { lastTool: tool.data.name } : {}) }
+    },
+    unqueue: (id: string, text: string): boolean => {
+      const prompt = store.snapshot(id)?.queuedPrompts?.find(entry => entry.text === text)
+      if (!prompt) return false
+      try { return Boolean(sessions.cancelQueued(id, prompt.id)) } catch { return false }
+    }
+  }
+}
 
 /** Starts the grant service and the `conductor` MCP server and hands both to the structured
  *  sessions. index.ts calls this once, before any conversation launches. */
@@ -65,20 +118,7 @@ export async function startPermissionGrants(deps: {
     apply: id => deps.sessions.applyPermissionRules(id),
     phase: id => deps.store.snapshot(id)?.phase,
     restart: id => deps.sessions.resume(id),
-    tell: async (id, text) => {
-      const state = deps.store.snapshot(id)
-      if (!state) throw new Error('The conversation is not registered')
-      await deps.sessions.steerOrStart(id, text, state.settings)
-    },
-    // A steered approval reaches the CLI as a mid-turn queued command, which its classifier did not
-    // take as the owner's approval (docs/permissions-classifier.md, Evidence 2026-09-28).
-    retry: async (id, text) => {
-      const state = deps.store.snapshot(id)
-      if (!state) throw new Error('The conversation is not registered')
-      if (TURN_UNDER_WAY.has(state.phase)) await deps.sessions.queue(id, text, state.settings)
-      else await deps.sessions.steerOrStart(id, text, state.settings)
-    },
-    retryQueued: (id, text) => Boolean(deps.store.snapshot(id)?.queuedPrompts?.some(prompt => prompt.text === text)),
+    ...grantDelivery(deps.sessions, deps.store),
     phone: (id, title, body) => { void deps.announce?.({ id: randomUUID(), kind: 'attention', sessionId: id, title, body, at: new Date().toISOString(), url: `/#/session/${encodeURIComponent(id)}` }) },
     changed: (state: PermissionGrantsState) => deps.publish('permission-grants:changed', state),
     ...(deps.workspaces ? { tabOpen: (id: string) => tabOpen(deps.workspaces!, spec(id), id) } : {})

@@ -7,9 +7,10 @@ export const PERMISSION_METHOD_SIGNATURES: Record<string, string> = {
   'permissions.list': '({agentSessionId?}) — your own open requests and live grants; the owner or a wizard tab may name a conversation',
   'permissions.revoke': '({grantId, agentSessionId?}) — withdraw a live grant at once; your own, or any for the owner or a wizard tab'
 }
-/** Only the owner's credential or a wizard tab sees and may call this; a wizard answers local actions only. */
+/** Only the owner's credential or a wizard tab sees and may call this; the wand holds the owner's
+ *  authority, so a wizard answers every class (never its own request). */
 export const PERMISSION_OWNER_SIGNATURES: Record<string, string> = {
-  'permissions.decide': '({agentSessionId, requestId, decision: "approve-once"|"approve-session"|"deny"}) — answer a permission request for the owner, for local, reversible actions only; shared, destructive and external requests are answered by the owner in the card'
+  'permissions.decide': '({agentSessionId, requestId, decision: "approve-once"|"approve-session"|"deny"}) — answer a permission request for the owner: any class, local, shared, destructive or external (production included), so review the exact call, reason and rollback first; never your own request. A wizard approval that waits 2 min behind a turn still running interrupts that turn so the retry runs'
 }
 export const PERMISSION_METHODS = [...Object.keys(PERMISSION_METHOD_SIGNATURES), ...Object.keys(PERMISSION_OWNER_SIGNATURES)]
 

@@ -12,9 +12,9 @@ supports, so the tab can retry and verify the work itself.
   and nothing that lets an agent grant itself permission.
 - Sensitive steps (production, shared, destructive, credentialed, external) still need an
   approval, but it is **one** approval the owner gives in Conductor.
-- A wizard tab may answer only **local** requests. Shared, destructive and external requests
-  (production included) are answered only by the owner: in the card, or with the owner's own
-  control credential.
+- The owner answers in the card or with the owner's own control credential. A wizard tab holds
+  the owner's authority (AGENTS.md) and answers **every** class, production included (owner
+  decision 2026-09-28, gap H13); it never answers its own request.
 - A grant is exactly one native allow rule for one conversation. It ends when its call has run
   (approve once), when the owner revokes it, or when its tab closes. Waiting requests and unspent
   grants survive an app restart or crash (`permission-grants.json` in the app's userData, restored
@@ -55,6 +55,24 @@ supports, so the tab can retry and verify the work itself.
    `submit_task` (agents.submit), `report`, `handoff`, `request_permission` and `list_permissions`.
    Each tool runs as the calling conversation through app control, so no bearer token appears in
    a command line.
+
+**While the approval turn waits** (gap H06, `deliver`/`follow` in `service.ts`, swept every second):
+
+- The retry text names the conversation that made the call and when it was asked and approved.
+- A heads-up, `[Conductor] approval queued: <rule>…`, is steered once into the running turn as soon
+  as it can take one, telling the agent not to retry in this turn and to wrap up. It never carries
+  the approval itself.
+- After 2 min with the turn still running, the tab says how long the turn has run and its last
+  tool. An owner approval only gets that notice (Esc interrupts and sends the queue; Stop holds
+  it). A wizard approval interrupts the turn with the queue expedited, so the retry runs at once.
+- An approval turn still queued after 30 min is taken back out of the queue and its grant expires
+  with a notice: a "retry it now" that late is no longer about the current work.
+- A conversation still stopping its last turn (`interrupting`) is waited for up to 30 s; after that
+  the approval stands and the retry is handed over again from the sweep. The decision never fails
+  once the grant is applied.
+- A handoff moves only grants approved in the last 10 min. An older unspent grant (a session
+  grant is never spent) expires with a notice in the predecessor's tab instead of reaching the
+  successor as a "retry it now" for a call it never made.
 
 If the tab retries on its own while its approval turn still waits in the queue and is refused, the
 grant stands and that denial's card joins the approved request; nothing is asked twice. If the
@@ -135,7 +153,7 @@ once in its own tab:
 1. `request_permission({ path: "app/prod/fix-lsphp-pool.sh", reason: "write the pool fix script (not run)", rollback: "delete the file" })`
    Then write the script after `[Conductor] approved: Edit(…); retry it now`.
 2. `request_permission({ command: "ssh -i <key> root@<host> bash -s < app/prod/fix-lsphp-pool.sh", reason: "apply the pool fix on production", rollback: "<the script's own revert>" })`
-   This is external, so only the owner can answer it, and it reaches the owner's phone. After the
+   This is external, so it reaches the owner's phone; the owner or a wizard tab answers it. After the
    approval, run exactly that command once and verify the result.
 
 Each approval covers only its exact call. A changed command needs a new request.
