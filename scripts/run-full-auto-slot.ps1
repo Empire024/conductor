@@ -39,9 +39,11 @@ if ($installedExecutable) {
   if ($executableInfo.ProductVersion -ne $slot.installedVersion -and $executableInfo.FileVersion -ne $slot.installedVersion) { throw 'Installed executable version differs from the grant' }
   $env:CONDUCTOR_PACKAGED_ACCEPTANCE_EXE = $installedExecutable
   $env:CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256 = $executableHash
+  $env:CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION = $slot.installedVersion
 } else {
   Remove-Item Env:CONDUCTOR_PACKAGED_ACCEPTANCE_EXE -ErrorAction SilentlyContinue
   Remove-Item Env:CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256 -ErrorAction SilentlyContinue
+  Remove-Item Env:CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION -ErrorAction SilentlyContinue
 }
 $inventory = @(Get-CimInstance Win32_Process -ErrorAction Stop)
 if ($inventory.Count -eq 0) { throw 'Host Win32_Process preflight returned no processes' }

@@ -34,6 +34,10 @@ export function testInstallProfile(options: { isPackaged: boolean; env?: NodeJS.
   if (options.isPackaged) {
     if (!directory || !isAbsolute(directory)) throw new Error('Packaged acceptance requires an absolute temporary profile')
     const canonical = realpathSync(directory)
+    const lexical = resolve(directory)
+    if ((process.platform === 'win32' ? canonical.toLowerCase() !== lexical.toLowerCase() : canonical !== lexical)) {
+      throw new Error('Packaged acceptance profile cannot use a redirected or short-path alias')
+    }
     const withinTemp = relative(realpathSync(tmpdir()), canonical).replace(/\\/g, '/')
     if (!/^conductor-packaged-acceptance-[a-z0-9_-]+\/profile$/i.test(withinTemp)) {
       throw new Error('Packaged acceptance profile must be a dedicated conductor-packaged-acceptance-* temporary directory')

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createUpdateInstallSeam, INSTALLER_STUB_FILE, INSTALLER_STUB_HISTORY, testInstallProfile } from './update-install-seam'
@@ -29,7 +29,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 
 describe('update install seam', () => {
   it('isolates explicit packaged acceptance and blocks every real installer entry point', () => {
-    const root = mkdtempSync(join(tmpdir(), 'conductor-packaged-acceptance-')); roots.push(root)
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-')); roots.push(root)
     const userData = join(root, 'profile'); mkdirSync(userData)
     const env = { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: userData }
     expect(testInstallProfile({ isPackaged: true, env })).toBe(userData)
@@ -49,14 +49,25 @@ describe('update install seam', () => {
   })
 
   it('rejects missing, ordinary, traversed and redirected packaged acceptance profiles', () => {
-    const root = mkdtempSync(join(tmpdir(), 'conductor-packaged-acceptance-')); roots.push(root)
+    const root = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-')); roots.push(root)
     const ordinary = profile()
     for (const directory of [undefined, 'relative/profile', ordinary, join(root, '..')]) {
       expect(() => testInstallProfile({ isPackaged: true, env: { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: directory } })).toThrow()
     }
     const redirected = join(root, 'profile')
     symlinkSync(ordinary, redirected, process.platform === 'win32' ? 'junction' : 'dir')
-    expect(() => testInstallProfile({ isPackaged: true, env: { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: redirected } })).toThrow(/dedicated/)
+    expect(() => testInstallProfile({ isPackaged: true, env: { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: redirected } })).toThrow(/redirected/)
+  })
+
+  it('rejects a junction or symlink alias even when its destination is another valid acceptance profile', () => {
+    const target = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-')); roots.push(target)
+    const alias = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-')); roots.push(alias)
+    const targetProfile = join(target, 'profile'); mkdirSync(targetProfile)
+    const env = { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: targetProfile }
+    expect(testInstallProfile({ isPackaged: true, env })).toBe(targetProfile)
+    const aliasProfile = join(alias, 'profile')
+    symlinkSync(targetProfile, aliasProfile, process.platform === 'win32' ? 'junction' : 'dir')
+    expect(() => testInstallProfile({ isPackaged: true, env: { ...env, CONDUCTOR_TEST_USER_DATA: aliasProfile } })).toThrow(/redirected/)
   })
 
   it('never reaches the real installer in test mode: no spawn by install, quitAndInstall or quit', () => {

@@ -2,23 +2,45 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   REPO, VERDICT, ancestorsOf, cpuPercent, descendantsOf, formatRecordLine, identityOf, ignoredTabs, judgeLoad, leavesFirst, listProcesses, loadInfo, matchProcesses, midTurnTabs, newInstance, suppliedControl,
   ownedTree, parseLlamaCommandLine, parseNvidiaSmi, parseProcessList, poll, readGateThresholds, registerRelaunch, registerRoot, retryAck, safeClose,
   sameProcesses, terminateIdentity, trackDescendants, withDeadline, commandHasArg, creationMs, startTracking, stopTracking, assertBuildHash, registerOwnChild,
-  possibleDescendants, packagedAcceptanceExecutable
+  possibleDescendants, packagedAcceptanceExecutable, assertPackagedEnvironment, assertPackagedReceipt, relaunchParked
 } from './verify-kit.mjs'
 
 test('packaged acceptance requires an explicit absolute executable and matching bytes before launch', () => {
   assert.equal(packagedAcceptanceExecutable({}), null)
   const executable = join(REPO, 'package.json')
   const hash = createHash('sha256').update(readFileSync(executable)).digest('hex')
-  assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: 'relative.exe', CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash }), /absolute/)
+  const version = '1.2.3-local.42'
+  assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: 'relative.exe', CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash, CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION: version }), /absolute/)
   assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable }), /SHA256/)
-  assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: '0'.repeat(64) }), /not the granted/)
-  assert.deepEqual(packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash }), { executable, executableSha256: hash })
+  assert.throws(() => packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: '0'.repeat(64), CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION: version }), /not the granted/)
+  assert.deepEqual(packagedAcceptanceExecutable({ CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash, CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION: version }), { executable, executableSha256: hash, expectedPackagedVersion: version })
+})
+
+test('packaged relaunch refuses missing opt-in, changed profile or project root before any spawn', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'conductor-packaged-acceptance-'))
+  const profile = join(root, 'profile'); mkdirSync(profile)
+  const executable = join(REPO, 'package.json'), hash = createHash('sha256').update(readFileSync(executable)).digest('hex')
+  const version = '1.2.3-local.42'
+  const base = { CONDUCTOR_PACKAGED_ACCEPTANCE: '1', CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects'), CONDUCTOR_PACKAGED_ACCEPTANCE_EXE: executable, CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: hash, CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION: version }
+  try {
+    for (const env of [{ CONDUCTOR_PACKAGED_ACCEPTANCE: undefined }, { CONDUCTOR_TEST_USER_DATA: REPO }, { CONDUCTOR_PROJECTS_ROOT: REPO }, { CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256: '0'.repeat(64) }]) {
+      const inst = newInstance({ mode: 'spawn', root, profile, executable, executableSha256: hash, expectedPackagedVersion: version, env: { ...base } })
+      assert.doesNotThrow(() => assertPackagedEnvironment(inst))
+      await assert.rejects(relaunchParked(inst, { env }), /pinned/)
+      assert.equal(inst.child, null)
+    }
+    const inst = { executable, expectedPackagedVersion: version }
+    assert.doesNotThrow(() => assertPackagedReceipt(inst, { packaged: true, appVersion: version }))
+    assert.throws(() => assertPackagedReceipt(inst, { packaged: false, appVersion: version }), /version/)
+    assert.throws(() => assertPackagedReceipt(inst, { packaged: true, appVersion: '1.2.4' }), /version/)
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
 // shell(100) -> agent node(200) -> smoke-lock(300) -> smoke(400) -> electron(500) -> renderer(501), fixture(502)
@@ -312,6 +334,18 @@ test('registerRelaunch accepts the app this profile\'s credential names, proven 
   const registered = await registerRelaunch(inst, 800, { list: [relaunchedApp()], credential: proofFor() })
   assert.equal(registered.source, 'relaunch')
   assert.ok(inst.roots.some(entry => entry.pid === 800))
+})
+
+test('packaged app-initiated relaunch uses exact executable, profile receipt and version without a build argument', async () => {
+  const executable = join(REPO, 'package.json'), hash = createHash('sha256').update(readFileSync(executable)).digest('hex')
+  const inst = relaunchInst()
+  Object.assign(inst, { executable, executableSha256: hash, expectedPackagedVersion: '1.2.3' })
+  inst.roots[0].executable = executable
+  const entry = relaunchedApp({ executable, commandLine: `"${executable}" --remote-debugging-port=1` })
+  await assert.rejects(registerRelaunch(inst, 800, { list: [entry], credential: proofFor({ packaged: true, appVersion: '1.2.2' }) }), /version/)
+  assert.equal(inst.roots.length, 1)
+  await registerRelaunch(inst, 800, { list: [entry], credential: proofFor({ packaged: true, appVersion: '1.2.3' }) })
+  assert.ok(inst.roots.some(item => item.pid === 800))
 })
 
 for (const [name, entry, credential, message] of [

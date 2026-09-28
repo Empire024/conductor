@@ -2784,8 +2784,8 @@ app.whenReady().then(async () => {
     },
     showWindow: () => {
       const window = liveWindow(mainWindow) ?? (mainWindow = createWindow())
-      if (window.isMinimized()) window.restore()
-      window.show(); window.focus()
+      if (!backgroundWindows && window.isMinimized()) window.restore()
+      revealWindow(window)
     },
     confirm: async message => (await showDecision(liveWindow(mainWindow), { type: 'question', buttons: ['Stop hosting and quit', 'Keep running'], defaultId: 1, cancelId: 1, message })) === 0,
     quit: () => { isQuitting = true; app.quit() },

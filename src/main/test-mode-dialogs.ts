@@ -1,6 +1,7 @@
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { app, dialog, type BrowserWindow, type MessageBoxOptions, type MessageBoxReturnValue, type OpenDialogOptions, type OpenDialogReturnValue, type SaveDialogOptions, type SaveDialogReturnValue } from 'electron'
+import { testInstallProfile } from './update-install-seam'
 
 /** A parked test window must never put a native dialog on the owner's real screen - a leaked
  *  overnight verifier left "Quit Conductor? Work is still running" and JS error boxes sitting on
@@ -12,7 +13,7 @@ import { app, dialog, type BrowserWindow, type MessageBoxOptions, type MessageBo
  *  abort signal, like the running-work confirmation) stays open until it does, so a smoke can see
  *  it pending and watch it close once the work stops. */
 export const guardingDialogs = (): boolean =>
-  !app.isPackaged && !!process.env.CONDUCTOR_TEST_USER_DATA && process.env.CONDUCTOR_TEST_DIALOGS !== '1'
+  Boolean(testInstallProfile({ isPackaged: app.isPackaged })) && (app.isPackaged || process.env.CONDUCTOR_TEST_DIALOGS !== '1')
 
 const logGuarded = (detail: string): void => {
   try { appendFileSync(join(app.getPath('userData'), 'main-errors.log'), `${new Date().toISOString()} [dialog] guarded: ${detail}\n`) }

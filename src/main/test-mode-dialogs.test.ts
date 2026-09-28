@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const { state, showMessageBoxMock, showSaveDialogMock, showOpenDialogMock } = vi.hoisted(() => ({
   state: { isPackaged: false, userData: 'C:\\test-user-data' } as { isPackaged: boolean; userData: string },
@@ -11,7 +13,7 @@ vi.mock('electron', () => ({
   app: { get isPackaged() { return state.isPackaged }, getPath: () => state.userData },
   dialog: { showMessageBox: showMessageBoxMock, showSaveDialog: showSaveDialogMock, showOpenDialog: showOpenDialogMock }
 }))
-vi.mock('node:fs', () => ({ appendFileSync: vi.fn() }))
+vi.mock('node:fs', () => ({ appendFileSync: vi.fn(), realpathSync: (path: string) => path }))
 
 import { guardingDialogs, showMessageBox, showOpenDialog, showSaveDialog } from './test-mode-dialogs'
 
@@ -20,11 +22,26 @@ beforeEach(() => {
   state.isPackaged = false
   delete process.env.CONDUCTOR_TEST_USER_DATA
   delete process.env.CONDUCTOR_TEST_DIALOGS
+  delete process.env.CONDUCTOR_PACKAGED_ACCEPTANCE
   vi.clearAllMocks()
 })
 afterEach(() => { process.env = { ...originalEnv } })
 
 describe('guardingDialogs', () => {
+  it('always guards all native dialogs in explicit packaged acceptance, even with a real-dialog override', async () => {
+    state.isPackaged = true
+    process.env.CONDUCTOR_PACKAGED_ACCEPTANCE = '1'
+    process.env.CONDUCTOR_TEST_USER_DATA = join(tmpdir(), 'conductor-packaged-acceptance-dialog', 'profile')
+    process.env.CONDUCTOR_TEST_DIALOGS = '1'
+    expect(guardingDialogs()).toBe(true)
+    expect((await showMessageBox(null, { message: 'No desktop prompt', cancelId: 2 })).response).toBe(2)
+    expect((await showOpenDialog(null, {})).canceled).toBe(true)
+    expect((await showSaveDialog(null, {})).canceled).toBe(true)
+    expect(showMessageBoxMock).not.toHaveBeenCalled()
+    expect(showOpenDialogMock).not.toHaveBeenCalled()
+    expect(showSaveDialogMock).not.toHaveBeenCalled()
+  })
+
   it('is false with no test profile', () => {
     expect(guardingDialogs()).toBe(false)
   })

@@ -22,7 +22,7 @@
 // reference ports.
 import { spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { createServer } from 'node:net'
@@ -614,9 +614,31 @@ export function packagedAcceptanceExecutable(env = process.env) {
   const executable = env.CONDUCTOR_PACKAGED_ACCEPTANCE_EXE
   if (!executable) return null
   const hash = env.CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256
-  if (!isAbsolute(executable) || !/^[a-f0-9]{64}$/i.test(hash ?? '')) throw new Error('Packaged acceptance requires an absolute executable and its exact SHA256')
+  const version = env.CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION
+  if (!isAbsolute(executable) || !/^[a-f0-9]{64}$/i.test(hash ?? '') || !/^\d+\.\d+\.\d+(?:-[a-z0-9.-]+)?$/i.test(version ?? '')) throw new Error('Packaged acceptance requires an absolute executable, its exact SHA256 and version')
   assertBuildHash(executable, hash.toLowerCase())
-  return { executable, executableSha256: hash.toLowerCase() }
+  return { executable, executableSha256: hash.toLowerCase(), expectedPackagedVersion: version }
+}
+
+/** Rechecked before every packaged spawn, including relaunch overrides. Never fall back to the
+ * real owner profile when a caller accidentally drops an opt-in or changes a profile variable. */
+export function assertPackagedEnvironment(inst) {
+  if (!inst.executable) return
+  const env = inst.env
+  const profile = realpathSync(inst.profile)
+  const root = realpathSync(inst.root)
+  const relativeProfile = relative(realpathSync(tmpdir()), profile).replace(/\\/g, '/')
+  const samePath = (a, b) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+  if (!/^conductor-packaged-acceptance-[a-z0-9_-]+\/profile$/i.test(relativeProfile) || !samePath(profile, resolve(inst.profile)) || profile !== join(root, 'profile') ||
+    env.CONDUCTOR_PACKAGED_ACCEPTANCE !== '1' || env.CONDUCTOR_TEST_USER_DATA !== inst.profile ||
+    env.CONDUCTOR_PROJECTS_ROOT !== join(inst.root, 'projects') ||
+    env.CONDUCTOR_PACKAGED_ACCEPTANCE_EXE !== inst.executable || env.CONDUCTOR_PACKAGED_ACCEPTANCE_SHA256 !== inst.executableSha256 ||
+    env.CONDUCTOR_PACKAGED_ACCEPTANCE_VERSION !== inst.expectedPackagedVersion) throw new Error('Packaged acceptance launch lost its pinned temporary profile, opt-in or executable identity')
+  assertBuildHash(inst.executable, inst.executableSha256)
+}
+
+export function assertPackagedReceipt(inst, receipt) {
+  if (inst.executable && (receipt?.packaged !== true || receipt.appVersion !== inst.expectedPackagedVersion)) throw new Error('Packaged runtime receipt does not match the granted installed version')
 }
 
 /** A parked Conductor on a fresh temp profile. mode 'playwright' drives the UI through
@@ -635,7 +657,7 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
   // tree (src/main/background-priority.ts), so the owner's typing never waits on a verifier.
   lowerPriority()
   const label = name ?? state.name ?? scriptName()
-  const root = await mkdtemp(join(tmpdir(), `${packaged ? 'conductor-packaged-acceptance-' : 'conductor-'}${slug(label)}-`))
+  const root = await mkdtemp(join(packaged ? realpathSync(tmpdir()) : tmpdir(), `${packaged ? 'conductor-packaged-acceptance-' : 'conductor-'}${slug(label)}-`))
   const profile = join(root, 'profile')
   await mkdir(profile)
   const env = { ...process.env, CONDUCTOR_OFFLINE_TESTS: '1', CONDUCTOR_TEST_NODE_EXECUTABLE: process.execPath, CONDUCTOR_TEST_USER_DATA: profile, CONDUCTOR_PROJECTS_ROOT: join(root, 'projects') }
@@ -672,6 +694,7 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
     await owner(inst, { pid: mainPid, timeoutMs: launchTimeoutMs })
   } else {
     inst.cdpPort = await freePort()
+    assertPackagedEnvironment(inst)
     const log = openSync(join(root, 'app.log'), 'a')
     const spawnedAtMs = Date.now()
     inst.child = spawn(inst.executable ?? electronPath(), [`--remote-debugging-port=${inst.cdpPort}`, ...(packaged ? [] : [build]), ...args], { env, stdio: ['ignore', log, log], windowsHide: true })
@@ -683,7 +706,7 @@ export async function launchParked({ mode = 'playwright', name, env: extraEnv = 
   startTracking(inst, { log: message => console.warn(message) })
   console.log(`[verify-kit] launched ${mode} pid ${inst.credential.pid}`)
   if (packaged) {
-    if (inst.credential.packaged !== true) throw new Error('Expected a packaged runtime receipt from the installed executable')
+    assertPackagedReceipt(inst, inst.credential)
     record('packaged-executable', 'INFO', { executable: packaged.executable, sha256: packaged.executableSha256, appVersion: inst.credential.appVersion, packaged: true, profile }, 'Actual packaged executable on a separate temporary acceptance profile; this is not a genuine owner activation')
   }
   return inst
@@ -735,6 +758,7 @@ export async function owner(inst = state.current, { pid, notPid, timeoutMs = 60_
     return found
   }, { timeoutMs, intervalMs: 500, label: `control-owner.json${pid ? ' of pid ' + pid : ''}${notPid ? ' of a pid other than ' + notPid : ''}` })
   inst.credential = credential
+  assertPackagedReceipt(inst, credential)
   inst.pids.add(credential.pid)
   return credential
 }
@@ -763,7 +787,7 @@ export function commandHasArg(commandLine, arg) {
  *  when the file was last written. The profile is unique to this instance (mkdtemp). */
 export function readCredentialProof(inst) {
   const path = join(inst.profile, 'control-owner.json')
-  try { return { path, pid: JSON.parse(readFileSync(path, 'utf8')).pid, mtimeMs: statSync(path).mtimeMs } } catch { return null }
+  try { const value = JSON.parse(readFileSync(path, 'utf8')); return { path, pid: value.pid, packaged: value.packaged, appVersion: value.appVersion, mtimeMs: statSync(path).mtimeMs } } catch { return null }
 }
 
 /**
@@ -790,7 +814,10 @@ export async function registerRelaunch(inst, pid, { list, credential } = {}) {
   const predecessor = identity && inst.roots.find(root => root.generation === inst.generation && root.executable.toLowerCase() === identity.executable.toLowerCase() && BigInt(root.creationTime) < BigInt(identity.creationTime))
   if (identity && !predecessor) problems.push('no earlier root of this generation runs its image')
   if (identity && proof && !(creationMs(identity.creationTime) <= proof.mtimeMs + 2)) problems.push('it was created after the profile credential was written (a reused pid)')
-  if (entry && !commandHasArg(entry.commandLine, inst.build ?? BUILD)) problems.push('this instance\'s build is not one of its arguments')
+  if (inst.executable) {
+    if (identity?.executable.toLowerCase() !== inst.executable.toLowerCase()) problems.push('the packaged executable identity differs')
+    try { assertPackagedReceipt(inst, proof); assertBuildHash(inst.executable, inst.executableSha256) } catch (error) { problems.push(error.message) }
+  } else if (entry && !commandHasArg(entry.commandLine, inst.build ?? BUILD)) problems.push('this instance\'s build is not one of its arguments')
   if (problems.length) throw new Error(`relaunched pid ${pid} is not provably this instance's app: ${problems.join('; ')}; it is left unregistered`)
   return registerRoot(inst, pid, { source: 'relaunch', list: snapshot })
 }
@@ -803,6 +830,7 @@ export async function relaunchParked(inst = state.current, { env: extraEnv = {},
   const oldPid = inst.credential?.pid
   if (oldPid != null) await poll(() => !isAlive(oldPid), { timeoutMs: 30_000, intervalMs: 250, label: `pid ${oldPid} to exit before the relaunch` })
   for (const [key, value] of Object.entries(extraEnv)) { if (value === undefined) delete inst.env[key]; else inst.env[key] = String(value) }
+  assertPackagedEnvironment(inst)
   if (inst.browser) { await withDeadline(inst.browser.close(), 5000); inst.browser = null; inst.page = null }
   inst.cdpPort = await freePort()
   if (build) { if (!existsSync(build)) throw new Error(`${build} is missing`); inst.build = build }

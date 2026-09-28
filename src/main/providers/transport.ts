@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { StringDecoder } from 'node:string_decoder'
 import type { Json } from '../../shared/structured-agent'
 import { lowerToBackground } from '../background-priority'
+import { providerEnvironment } from '../provider-environment'
 import type { RuntimeHostClient } from '../runtime-host/client'
 import type { RuntimeMeta } from '../runtime-host/protocol'
 
@@ -83,7 +84,7 @@ export class JsonLineTransport {
     // .cmd/.bat need a shell and unsafe quoting; callers must resolve the native exe or JS entry point.
     if (/\.(cmd|bat)$/i.test(this.options.executable)) throw new Error('A native executable is required for structured agent transport')
     const child = spawn(this.options.executable, this.options.args, {
-      cwd: this.options.cwd, env: this.options.environment ?? process.env,
+      cwd: this.options.cwd, env: providerEnvironment(this.options.environment ?? process.env),
       stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, shell: false
     })
     this.child = child
@@ -130,7 +131,7 @@ export class JsonLineTransport {
       listener.exit(0, null, null)
     }
     if (attach) { client.attach(runtimeId, attach.seq, listener).catch(failed); return }
-    const env = Object.fromEntries(Object.entries(this.options.environment ?? process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+    const env = Object.fromEntries(Object.entries(providerEnvironment(this.options.environment ?? process.env)).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
     client.spawn({ runtimeId, executable: this.options.executable, args: this.options.args, cwd: this.options.cwd, env }, listener).catch(failed)
   }
   private scheduleAck(): void {
