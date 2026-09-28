@@ -128,14 +128,14 @@ try {
     }
   }
   const observedSources = Array.isArray(settingsPayload.sources) ? settingsPayload.sources.filter(source => recognized.has(source?.name)).map(source => ({ name: source.name, ...safeScope(source) })) : []
-  record('settings-loaded-sources', sourceProof ? 'PASS' : 'NOT VERIFIED', { receiptPresent: Boolean(settingsReceipt), status: settingsPayload.status ?? 'absent', effective: safeScope(settingsPayload.effective), sources: observedSources }, sourceProof
+  record('settings-loaded-sources', sourceProof ? 'PASS' : 'NOT RUN (loaded-source receipt unavailable)', { receiptPresent: Boolean(settingsReceipt), status: settingsPayload.status ?? 'absent', effective: safeScope(settingsPayload.effective), sources: observedSources }, sourceProof
     ? 'Native get_settings/summary named loaded sources; only recognized names, counts and hook names were retained'
     : 'No available native get_settings/summary with recognized loaded source names; baseline file inventory alone does not prove loaded sources')
 
   step('foreign browser origin cannot reach the trusted owner bridge')
   const browserBridge = await view.evaluate(() => ({ mount: typeof window.conductor.browser?.mount }))
   if (browserBridge.mount !== 'function') {
-    record('J-browser', 'NOT VERIFIED', browserBridge, 'Supported browser.mount interface is unavailable in this build; no foreign-origin observation is claimed')
+    record('J-browser', 'NOT RUN (browser mount unavailable)', browserBridge, 'Supported browser.mount interface is unavailable in this build; no foreign-origin observation is claimed')
   } else {
     const url = await foreignBrowserPage()
     let unavailable = null
@@ -145,7 +145,7 @@ try {
     let receipt = null
     if (!unavailable) try { receipt = await poll(() => foreignReceipt ?? null, { timeoutMs: 15_000, label: 'foreign browser page executed and reported its bridge visibility' }) }
     catch (error) { unavailable = `browser page receipt unavailable: ${String(error?.message ?? error).slice(0, 300)}` }
-    if (unavailable) record('J-browser', 'NOT VERIFIED', { interface: 'window.conductor.browser.mount', reason: unavailable }, 'Foreign-origin page execution could not be observed through the supported browser surface')
+    if (unavailable) record('J-browser', 'NOT RUN (foreign browser receipt unavailable)', { interface: 'window.conductor.browser.mount', reason: unavailable }, 'Foreign-origin page execution could not be observed through the supported browser surface')
     else {
       assert.equal(receipt.origin, new URL(url).origin)
       assert.equal(receipt.bridge, 'undefined')
@@ -172,7 +172,7 @@ try {
   const activationTarget = item => item.data.input && typeof item.data.input === 'object' && item.data.input.method === 'claudeFullAuto.setEnabled'
   const refusalOutput = item => /(?:unknown|unsupported|unavailable|not available|not found|HTTP 400|not.*method)/i.test(item.data.output ?? '')
   const mcpRefused = mcpCalls.some(item => activationTarget(item) && ['completed', 'failed'].includes(item.data.status) && refusalOutput(item))
-  record('J-mcp', mcpRefused ? 'PASS' : 'NOT PROVEN', { phase: mcpTurn.phase, timedOut: mcpTimedOut, calls: mcpCalls.map(item => ({ name: item.data.name, status: item.data.status, activationTarget: Boolean(activationTarget(item)), refusalObserved: refusalOutput(item) })), policyEnabled: false }, mcpRefused
+  record('J-mcp', mcpRefused ? 'PASS' : 'NOT RUN (native MCP refusal unproven)', { phase: mcpTurn.phase, timedOut: mcpTimedOut, calls: mcpCalls.map(item => ({ name: item.data.name, status: item.data.status, activationTarget: Boolean(activationTarget(item)), refusalObserved: refusalOutput(item) })), policyEnabled: false }, mcpRefused
     ? 'Native Claude MCP control reached a refused activation method while owner policy stayed false'
     : 'The provider did not expose a completed MCP control refusal; policy stayed false, but native MCP boundary proof is unavailable')
 
