@@ -39,7 +39,7 @@ function fixture(aliasedRoot = false, permissionsByProvider?: Partial<Record<Str
   const submissions: Array<{ provider: StructuredProvider; prompt: string; settings: import('../shared/structured-agent').SessionSettings; options: AdapterOptions }> = []
   const broadcast = vi.fn()
   const sessions = new StructuredSessions(database, () => 'synthetic-provider', broadcast, (provider, options): ProviderAdapter => {
-    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: sandboxByProvider && provider in sandboxByProvider ? sandboxByProvider[provider] : ['inherit', 'read-only', 'workspace-write'], effort: ['low', 'high'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }, { id: provider + '-advanced', label: provider + ' Advanced', effort: ['high'], defaultEffort: 'high' }, ...extraModels], limitations: ['Zero inference fixture'] }
+    const capabilities: ProviderCapabilities = { provider, runtimeVersion: 'synthetic', adapterVersion: 1, authentication: 'cli', textStreaming: true, steering: true, toolInputStreaming: true, toolOutputStreaming: true, approvals: true, questions: true, resume: true, fork: false, plans: false, permissions: permissionsByProvider?.[provider] ?? ['default', 'read-only', 'accept-edits'], sandboxModes: sandboxByProvider && provider in sandboxByProvider ? sandboxByProvider[provider] : ['inherit', 'read-only', 'workspace-write'], effort: ['low', 'high', 'medium'], models: [{ id: provider + '-synthetic', label: provider + ' Synthetic', effort: ['low'], defaultEffort: 'low' }, { id: provider + '-advanced', label: provider + ' Advanced', effort: ['high'], defaultEffort: 'high' }, ...extraModels], limitations: ['Zero inference fixture'] }
     return { provider, capabilities, start: async () => { options.emit({ data: { type: 'session', phase: 'idle', nativeSessionId: 'native-' + options.runtimeId } }) },
       submit: async (prompt, settings) => { submissions.push({ provider, prompt, settings: structuredClone(settings), options }); options.emit({ itemId: 'result', data: { type: 'text', role: 'assistant', text: 'Native fixture result', mode: 'snapshot' } }); options.emit({ data: { type: 'session', phase: 'completed' } }) }, respond: async () => {}, interrupt: async () => {}, dispose: () => {} }
   }, briefing)
@@ -96,6 +96,20 @@ const openAgentTab = (f: ReturnType<typeof fixture>, resourceId: string, tabId: 
   const current = f.database.getSession(f.workspace.id)!
   if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
   current.layout.root.tabs.push({ id: tabId, kind: 'agent', resourceId, title: resourceId, state: { provider: 'codex', model: 'codex-synthetic' } })
+  f.database.saveSession(f.workspace.id, current.layout, null, [])
+}
+
+/** An uncontrolled Claude tab, present only so agents.handoff's cross-provider catalog lookup
+ *  sees Claude's full synthetic model list (its -advanced model and any extraModels) through the
+ *  runtime capabilities a registered session carries, rather than the bare configured fallback
+ *  (models.list) tabs.open would otherwise report for a provider nobody has opened yet. It holds
+ *  no control link, so it never counts as a coworker. */
+const seedClaudeModels = (f: ReturnType<typeof fixture>): void => {
+  const seed: AgentSpec = { ...f.spec, id: 'claude-seed', provider: 'claude', title: 'Claude seed', model: 'claude-synthetic' }
+  f.sessions.ensure(seed)
+  const current = f.database.getSession(f.workspace.id)!
+  if (current.layout.root.type !== 'group') throw new Error('Synthetic layout changed')
+  current.layout.root.tabs.push({ id: 'claude-seed-tab', kind: 'agent', resourceId: seed.id, title: seed.title, state: { provider: 'claude', model: seed.model } })
   f.database.saveSession(f.workspace.id, current.layout, null, [])
 }
 
@@ -1237,17 +1251,46 @@ describe('context handoff to a fresh tab', () => {
     // does, and the tabs.open cases above cover it.
   })
 
+  it('opens an ordinary handoff on a named provider and model, defaulting to that model’s own effort rather than the caller’s', async () => {
+    const f = fixture()
+    seedClaudeModels(f)
+    f.database.structured.update(f.spec.id, { settings: { ...f.database.structured.snapshot(f.spec.id)!.settings, model: 'codex-synthetic', effort: 'low', permission: 'accept-edits', plan: false } })
+    const result = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'claude', model: 'claude-advanced' }) as { handedOff: boolean; agentSessionId: string; provider: string; model: string; effort: string; permission: string }
+    expect(result).toMatchObject({ handedOff: true, provider: 'claude', model: 'claude-advanced', effort: 'high', permission: 'accept-edits' })
+    const opened = f.control.tabs(f.scope).find(tab => tab.resourceId === result.agentSessionId)
+    expect(opened?.state).toMatchObject({ provider: 'claude', model: 'claude-advanced', effort: 'high' })
+    expect(f.submissions.at(-1)).toMatchObject({ provider: 'claude', prompt: expect.stringContaining(handoff()) })
+  })
+
+  it('refuses a cross-provider handoff that omits the model, names an unknown one, targets cloud, or gives a non-string provider, before anything opens', async () => {
+    const f = fixture()
+    const before = f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'claude' })).rejects.toThrow(/names its model/)
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'claude', model: 'does-not-exist' })).rejects.toThrow(/not one of/)
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'cloud' })).rejects.toThrow(/cloud/)
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 42 })).rejects.toThrow(/must be a string/)
+    // 'local' is not a registered provider in this fixture at all; either way is refused.
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), provider: 'local' })).rejects.toThrow()
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(before)
+    expect(f.submissions).toHaveLength(0)
+  })
+
   it('advertises itself in tools.list with the six sections a caller has to write', async () => {
     const f = fixture()
     const tools = await f.control.call(f.scope, 'tools.list') as Record<string, string>
     expect(tools['agents.handoff']).toContain('Objective, Constraints, Owned files, Verified findings, Remaining work, Artifact references')
     expect(tools['agents.handoff']).toContain('no agentSessionId')
+    // provider, model and effort continue the caller elsewhere; all three are optional.
+    expect(tools['agents.handoff']).toContain('provider?,model?,effort?')
   })
 })
 
 // conductor-task:main-brain-succession
 describe('main-brain succession: agents.handoff successor:true', () => {
   const astra = [{ id: 'gpt-6-astra', label: 'GPT-6 Astra', effort: ['high'], defaultEffort: 'high' }]
+  // Both a Codex frontier model and a Claude one, so a successor can cross providers and still
+  // land on something able to hold the wand.
+  const extraModels = [...astra, { id: 'opus', label: 'Opus', effort: ['high', 'medium'], defaultEffort: 'high' }]
   const asWizard = (f: ReturnType<typeof fixture>) => {
     const state = f.database.structured.snapshot(f.spec.id)!
     f.database.structured.update(f.spec.id, { settings: { ...state.settings, wizard: true, model: 'gpt-6-astra', effort: 'high', permission: 'accept-edits' } })
@@ -1360,6 +1403,58 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     expect(prompts.filter(prompt => prompt.includes('Conductor: this main conversation'))).toHaveLength(1)
     expect(prompts[SUCCESSION_TURNS - 1]).toContain('Conductor: this main conversation has run ' + SUCCESSION_TURNS + ' turns')
     expect(prompts[0]).toContain('agents.handoff({handoff, successor:true})')
+  })
+
+  it('hands a wizard successor to a named model on another provider, taking coworkers, wizard mode and the pending restart with it', async () => {
+    const f = fixture(false, undefined, undefined, extraModels)
+    asWizard(f)
+    seedClaudeModels(f)
+    const first = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    const second = await f.control.call(f.scope, 'tabs.open', { title: 'W2' }) as AgentControlTab
+    f.database.setSetting(RESTART_REQUEST_KEY, encodeRestartRequest({ agentSessionId: f.spec.id, title: 'Controller', reason: 'Install the batch', at: new Date().toISOString() }))
+    f.database.setSetting(RESTART_INITIATOR_KEY, encodeRestartInitiator({ agentSessionId: f.spec.id, method: 'app.restart', at: new Date().toISOString() }))
+    const body = handoff()
+    const result = await f.control.call(f.scope, 'agents.handoff', { handoff: body, successor: true, provider: 'claude', model: 'opus', effort: 'medium' }) as Succession & { provider: string }
+    expect(result).toMatchObject({ handedOff: true, successor: true, provider: 'claude', wizard: true, continueOnLimit: true, restart: { initiator: true, request: true } })
+    expect(result.coworkers.sort()).toEqual([first.resourceId, second.resourceId].sort())
+    const successor = result.agentSessionId
+    // Every link moved to the successor, on the new provider.
+    const links = f.control.listLinks(f.project.id, f.workspace.id)
+    expect(links.filter(link => [first.resourceId, second.resourceId].includes(link.targetAgentSessionId)).map(link => link.controllerAgentSessionId)).toEqual([successor, successor])
+    // Same brain, new provider and model: wizard, model, effort and mode all carry over or apply as named.
+    expect(f.database.structured.snapshot(successor)?.settings).toMatchObject({ wizard: true, model: 'opus', effort: 'medium', permission: 'accept-edits' })
+    expect(f.database.structured.spec<AgentSpec>(successor)?.provider).toBe('claude')
+    // One owner-authority main: the caller lost the wand, the successor holds it.
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.wizard).toBe(false)
+    // The restart that would have brought the caller back brings the successor back.
+    expect(parseRestartRequest(f.database.getSetting(RESTART_REQUEST_KEY), new Date())).toMatchObject({ agentSessionId: successor })
+    expect(takeRestartInitiator(f.database.getSetting(RESTART_INITIATOR_KEY), new Date())).toMatchObject({ agentSessionId: successor })
+    // The handoff reached the successor's own (Claude) runtime, not the caller's.
+    expect(f.submissions.at(-1)).toMatchObject({ provider: 'claude', prompt: expect.stringContaining(body) })
+  })
+
+  it('refuses a wizard successor to a model that cannot hold the wand, before anything opens', async () => {
+    const f = fixture(false, undefined, undefined, extraModels)
+    asWizard(f)
+    seedClaudeModels(f)
+    const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    const before = f.control.tabs(f.scope).filter(tab => tab.kind === 'agent').length
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true, provider: 'claude', model: 'claude-advanced' })).rejects.toThrow(/hold the wand/)
+    expect(f.control.tabs(f.scope).filter(tab => tab.kind === 'agent')).toHaveLength(before)
+    expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === worker.resourceId)?.controllerAgentSessionId).toBe(f.spec.id)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.wizard).toBe(true)
+  })
+
+  it('rolls back a successor whose first prompt is refused: the coworker link stays put, the caller stays wizard, and the empty tab is closed', async () => {
+    const f = fixture(false, undefined, undefined, extraModels)
+    asWizard(f)
+    const worker = await f.control.call(f.scope, 'tabs.open', { title: 'W1' }) as AgentControlTab
+    vi.spyOn(f.sessions, 'submit').mockRejectedValueOnce(new Error('boom'))
+    await expect(f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true })).rejects.toThrow(/would not accept the handoff/)
+    const link = f.control.listLinks(f.project.id, f.workspace.id).find(candidate => candidate.targetAgentSessionId === worker.resourceId)
+    expect(link?.controllerAgentSessionId).toBe(f.spec.id)
+    expect(f.database.structured.snapshot(f.spec.id)?.settings.wizard).toBe(true)
+    expect(f.requests.some(request => request.action === 'tabs.close')).toBe(true)
   })
 })
 

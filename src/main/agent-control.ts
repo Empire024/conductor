@@ -15,7 +15,7 @@ import { agentConfirmFailure } from './agent-confirm-broker'
 import type { AgentConfirmOutcome } from '../shared/agent-confirm'
 import { isMemoryKind, MEMORY_KINDS, makeId, type AgentProviderInfo, type AgentSpec, type AppUpdateState, type LayoutNode, type PaneKind, type PaneTab, type ProjectRecord } from '../shared/models'
 import type { PromptOrigin, SessionProjection, SessionSettings, StructuredProvider } from '../shared/structured-agent'
-import { isSessionPermission, MAX_PROMPT_CHARS, settingsForRuntime, wizardActive } from '../shared/structured-agent'
+import { isFrontierModel, isSessionPermission, MAX_PROMPT_CHARS, settingsForRuntime, WIZARD_MODEL_HINT, wizardActive } from '../shared/structured-agent'
 import { rememberedPermission } from './app-settings'
 import type { CreateOrchestrationTaskInput, SaveRoutineInput, UpdateOrchestrationTaskInput } from '../shared/orchestration'
 import type { ConductorDatabase } from './database'
@@ -154,7 +154,7 @@ const toolSignatures = {
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver up to 2000 characters to the conversation that opened this tab (its controller, whoever that is), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
   'agents.finish': '({agentSessionId?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; refused, naming the reason, while it is running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn',
-  'agents.handoff': `({handoff,title?,successor?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt. Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back; you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
+  'agents.handoff': `({handoff,title?,successor?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
   'files.write': '({path,content,expectedContent}) — atomic compare-and-save in this project only; expectedContent:null creates a file; live views refresh. To change a sibling project, open a tab there with tabs.open({projectId}) and dispatch the work to it',
@@ -1853,17 +1853,15 @@ export class AgentControl {
     // The receiver is this conversation continued, so it is named after it. Kept short enough
     // that a repeated handoff cannot grow an unbounded tab title.
     const title = args.title === undefined ? (source?.title ?? spec.title).slice(0, 100).replace(/ \(continued\)$/, '') + ' (continued)' : text(args, 'title', 120)
-    if (args.successor === true) return this.succeed(scope, spec, source, { handoff, settings, title })
+    const receiver = this.handoffReceiver(scope, spec, settings, args)
+    if (args.successor === true) return this.succeed(scope, spec, source, { handoff, receiver, title })
     // Deliberately the ordinary tabs.open path: same catalog check, same machine inheritance,
-    // same permission clamping. Provider is inherited by omission; model, effort and permission
-    // are named so the receiver continues on this conversation's settings rather than on the
-    // provider default or the owner's remembered mode. A read-only or planning caller therefore
-    // hands off to a read-only or planning receiver, which is why it is allowed to hand off at all.
-    const tab = await this.open(scope, {
-      // The same agent continuing: it keeps the mode the owner set on the caller, not a dispatch default.
-      kind: 'agent', title, model: settings.model ?? spec.model, permission: settings.permission, exactPermission: true,
-      ...(settings.effort ? { effort: settings.effort } : {})
-    })
+    // same permission clamping. Provider, model and effort are this conversation's unless the
+    // caller named others; permission is always named so the receiver keeps the mode the owner set
+    // on the caller rather than the provider default or the owner's remembered mode. A read-only or
+    // planning caller therefore hands off to a read-only or planning receiver, which is why it is
+    // allowed to hand off at all.
+    const tab = await this.open(scope, { ...receiver, title })
     // A tab placed on a paired machine comes back in the remote shape, which names the session
     // differently and may not be steerable from here at all.
     const agentSessionId = tab.resourceId ?? (tab as { agentSessionId?: string }).agentSessionId
@@ -1879,7 +1877,7 @@ export class AgentControl {
     const created = database.structured.snapshot(agentSessionId)
     return {
       handedOff: true, tabId: tab.id, agentSessionId, uri: tab.uri, projectId: tab.projectId, workspaceId: tab.workspaceId,
-      title: tab.title ?? title, provider: spec.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
+      title: tab.title ?? title, provider: receiver.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
       note: 'The remaining work now belongs to that tab, which has the handoff as its first prompt. Finish only the step you are already in, report it, and stop — do not carry on with the handed-over work here in parallel. Your tab stays open and you may still steer the new one with agents.*.'
     }
   }
@@ -2031,17 +2029,38 @@ export class AgentControl {
    * workspace), is marked superseded, and its tab shows "Continued in <tab>". It is not
    * interrupted: it finishes the step it is in, exactly as with an ordinary handoff.
    */
-  private async succeed(scope: AgentControlScope, spec: AgentSpec, source: AgentControlTab | undefined, request: { handoff: string; settings: SessionSettings; title: string }): Promise<unknown> {
+  /**
+   * Who receives a handoff: this conversation's provider, model and effort unless the caller names
+   * others. Another provider must name its model, because "this model" means nothing there. Checked
+   * against the catalog here, before anything opens, so a bad choice leaves no tab behind; the mode
+   * is always the caller's own (exactPermission), so naming another provider never widens it.
+   */
+  private handoffReceiver(scope: AgentControlScope, spec: AgentSpec, settings: SessionSettings, args: Args): Args & { provider: StructuredProvider; model: string } {
+    for (const key of ['provider', 'model', 'effort'] as const) if (args[key] !== undefined && typeof args[key] !== 'string') throw new Error(`${key} must be a string from models.list`)
+    if (args.provider === 'cloud') throw new Error('A handoff continues in a native tab on this machine; cloud is not one')
+    const provider = (args.provider ?? spec.provider) as StructuredProvider
+    const entry = this.catalog(scope).find(entry => entry.provider === provider && entry.available)
+    if (!entry) throw new Error(`The provider “${provider}” is not available for a handoff; choose one from models.list`)
+    const sameProvider = provider === spec.provider
+    if (!sameProvider && args.model === undefined) throw new Error(`A handoff to another provider names its model; choose one of ${provider}'s models from models.list`)
+    const model = (args.model ?? settings.model ?? spec.model) as string
+    if (!entry.models.some(candidate => candidate.id === model)) throw new Error(`“${model}” is not one of ${provider}'s models; choose one from models.list`)
+    // The caller's effort only carries over to the same model; another model starts on its own default.
+    const effort = args.effort ?? (sameProvider && model === (settings.model ?? spec.model) ? settings.effort : undefined)
+    return { kind: 'agent', provider, model, permission: settings.permission, exactPermission: true, ...(effort ? { effort } : {}) }
+  }
+
+  private async succeed(scope: AgentControlScope, spec: AgentSpec, source: AgentControlTab | undefined, request: { handoff: string; receiver: Args & { provider: StructuredProvider; model: string }; title: string }): Promise<unknown> {
     const { database, sessions } = this.deps
     const wizard = scope.wizard === true
     const coworkers = this.controlledBy(scope.agentSessionId)
     if (!wizard && !coworkers.length) throw new Error('successor:true is for a main brain: a wizard tab, or a controller with live coworkers. This conversation is neither; call agents.handoff without successor to hand your work to a fresh tab')
     if (source?.state?.remotePeerId || this.callerMachineId(scope) !== LOCAL_MACHINE_ID) throw new Error('A successor opens on this machine, and this conversation runs on or is driven by another one; call agents.handoff without successor')
-    const { handoff, settings, title } = request
-    const tab = await this.open(scope, {
-      kind: 'agent', title, model: settings.model ?? spec.model, permission: settings.permission, exactPermission: true,
-      ...(settings.effort ? { effort: settings.effort } : {})
-    }, false, true)
+    const { handoff, receiver, title } = request
+    // Refused before anything opens: the wand, the coworkers and any restart stay with the caller.
+    if (receiver.provider === 'local') throw new Error('A successor continues a main brain on a native Claude, Codex or Grok model; a local model cannot take over coworkers or the wand')
+    if (wizard && !isFrontierModel(receiver.provider, receiver.model)) throw new Error(`A wizard's successor must be able to hold the wand (${WIZARD_MODEL_HINT}); “${receiver.model}” cannot, so nothing was handed over`)
+    const tab = await this.open(scope, { ...receiver, title }, false, true)
     const agentSessionId = tab.resourceId
     if (!agentSessionId) throw new Error(`The successor tab “${title}” opened, but this machine cannot deliver a prompt to it; nothing was handed over — keep working in this conversation`)
     const successorTitle = tab.title ?? title
@@ -2062,6 +2081,9 @@ export class AgentControl {
     catch (error) {
       for (const [id, raw] of previous) raw === null ? database.removeSetting(key(id)) : database.setSetting(key(id), raw)
       if (wizard) database.structured.update(agentSessionId, { settings: { ...database.structured.snapshot(agentSessionId)!.settings, wizard: false } })
+      // Nothing reached it, so the empty tab goes too; one that somehow started work stays visible.
+      const unused = database.structured.snapshot(agentSessionId)
+      if (unused && !hasSessionWork(unused)) await this.ui(scope, 'tabs.close', { tabId: tab.id }).catch(() => undefined)
       throw new Error(`The successor tab “${successorTitle}” opened but would not accept the handoff, so nothing was handed over and you still control your coworkers — keep working in this conversation: ${error instanceof Error ? error.message : String(error)}`)
     }
     // A sub-controller's successor stays under the same controller, so its reports still go up.
@@ -2092,7 +2114,7 @@ export class AgentControl {
     const created = database.structured.snapshot(agentSessionId)
     return {
       handedOff: true, successor: true, tabId: tab.id, agentSessionId, uri: tab.uri, projectId: tab.projectId, workspaceId: tab.workspaceId,
-      title: successorTitle, provider: spec.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
+      title: successorTitle, provider: receiver.provider, model: created?.settings.model ?? null, effort: created?.settings.effort ?? null, permission: created?.settings.permission ?? null,
       wizard, continueOnLimit: wizard || Boolean(spec.continueOnLimit), coworkers: coworkers.map(link => link.targetAgentSessionId), controller: parent?.controllerAgentSessionId ?? null,
       restart: { initiator: Boolean(restart.initiator), request: Boolean(restart.request) }, superseded: superseded.superseded, permissions: permissions ?? { requests: 0, grants: 0 },
       note: `“${successorTitle}” is now this conversation${wizard ? ' and the wizard' : ''}. You no longer control any coworker and${wizard ? ' no longer hold the owner’s authority' : ' have no coworkers to steer'}: their reports, approvals and steering go to the successor. Finish only the step you are already in (you may still git.ship your own finished files), report it in one line, and stop.`
