@@ -283,6 +283,8 @@ export interface ConductorBridge {
     isCursorOutside(): Promise<boolean>
     detach(projectId: string, sessionId: string, tab: PaneTab, sourceLayout?: WorkspaceLayout, options?: { alwaysOnTop?: boolean }): Promise<DetachedWindowRecord>
     getDetached(id: string): Promise<{ record: DetachedWindowRecord; project: ProjectRecord; session: SessionRecord } | null>
+    /** Every detached window of an open workspace, with its saved layout (the Ctrl+K tab index). */
+    listDetached(): Promise<DetachedWindowRecord[]>
     saveDetached(id: string, layout: WorkspaceLayout, maximizedGroupId: string | null): Promise<void>
     flushDetached(id: string, layout: WorkspaceLayout, maximizedGroupId: string | null): void
     /** `working`: agent sessions whose working tabs the owner agreed to close with the window. */

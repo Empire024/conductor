@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
 import { conductorUri } from '../../shared/agent-control'
-import type { LayoutNode, PaneKind, SessionRecord } from '../../shared/models'
+import type { DetachedWindowRecord, LayoutNode, PaneKind, SessionRecord } from '../../shared/models'
 
 /**
- * Every tab open in this window, across every project and workspace, keyed by the ids agents and
+ * Every open tab, across every project, workspace and window, keyed by the ids agents and
  * Conductor write into conversations: an agentSessionId (`agent_…`), a tab id (`tab_…`/`pane_…`)
  * or a `conductor://<project>/tab/<id>` uri. It is built in the renderer from state Conductor
- * already holds (the live sessions of the project on screen, `sessions.list` for the others), so
- * resolving an id in a rendered message costs no IPC and nothing reaches any model.
+ * already holds (the live sessions of the project on screen, `sessions.list` for the others and
+ * the saved layouts of the detached windows), so resolving an id in a rendered message costs no
+ * IPC and nothing reaches any model.
  */
 export interface DirectoryEntry {
   tabId: string
@@ -19,7 +20,10 @@ export interface DirectoryEntry {
   sessionId: string
   workspaceName: string
   uri: string
+  /** Set when the tab lives in a detached window rather than the main one. */
+  detachedId?: string
 }
+export type DirectoryDetachedWindow = Pick<DetachedWindowRecord, 'id' | 'sessionId' | 'layout'>
 export interface ConversationDirectory {
   entries: DirectoryEntry[]
   byAgent: ReadonlyMap<string, DirectoryEntry>
@@ -32,23 +36,25 @@ const tabsOf = (node: LayoutNode, visit: (tab: { id: string; kind: PaneKind; tit
   node.tabs.forEach(visit)
 }
 
-export function buildConversationDirectory(projects: readonly DirectoryProject[], sessions: readonly SessionRecord[]): ConversationDirectory {
+/** A detached window counts only while its workspace is one of `sessions`, so a window of a
+ *  closed workspace or of a project that is not open lists nothing. */
+export function buildConversationDirectory(projects: readonly DirectoryProject[], sessions: readonly SessionRecord[], detached: readonly DirectoryDetachedWindow[] = []): ConversationDirectory {
   const names = new Map(projects.map(project => [project.id, project.name]))
   const entries: DirectoryEntry[] = [], byAgent = new Map<string, DirectoryEntry>(), byTab = new Map<string, DirectoryEntry>()
-  for (const session of sessions) {
-    tabsOf(session.layout.root, tab => {
-      if (byTab.has(tab.id)) return
-      const agentSessionId = tab.kind === 'agent' && tab.resourceId ? tab.resourceId : undefined
-      const entry: DirectoryEntry = {
-        tabId: tab.id, kind: tab.kind, title: tab.title || 'Untitled tab', ...(agentSessionId ? { agentSessionId } : {}),
-        projectId: session.projectId, projectName: names.get(session.projectId) ?? 'another project',
-        sessionId: session.id, workspaceName: session.name, uri: conductorUri(session.projectId, 'tab', tab.id)
-      }
-      entries.push(entry)
-      byTab.set(tab.id, entry)
-      if (agentSessionId && !byAgent.has(agentSessionId)) byAgent.set(agentSessionId, entry)
-    })
-  }
+  const add = (session: SessionRecord, root: LayoutNode, detachedId?: string): void => tabsOf(root, tab => {
+    if (byTab.has(tab.id)) return
+    const agentSessionId = tab.kind === 'agent' && tab.resourceId ? tab.resourceId : undefined
+    const entry: DirectoryEntry = {
+      tabId: tab.id, kind: tab.kind, title: tab.title || 'Untitled tab', ...(agentSessionId ? { agentSessionId } : {}),
+      projectId: session.projectId, projectName: names.get(session.projectId) ?? 'another project',
+      sessionId: session.id, workspaceName: session.name, uri: conductorUri(session.projectId, 'tab', tab.id), ...(detachedId ? { detachedId } : {})
+    }
+    entries.push(entry)
+    byTab.set(tab.id, entry)
+    if (agentSessionId && !byAgent.has(agentSessionId)) byAgent.set(agentSessionId, entry)
+  })
+  for (const session of sessions) add(session, session.layout.root)
+  for (const session of sessions) for (const window of detached) if (window.sessionId === session.id) add(session, window.layout.root, window.id)
   return { entries, byAgent, byTab }
 }
 
@@ -158,6 +164,7 @@ const REFRESH_TTL_MS = 4000
 let projects: DirectoryProject[] = []
 let live: { projectId: string | null; sessions: readonly SessionRecord[] } = { projectId: null, sessions: [] }
 let stored = new Map<string, readonly SessionRecord[]>()
+let detachedWindows: readonly DirectoryDetachedWindow[] = []
 let current: ConversationDirectory = buildConversationDirectory([], [])
 let signature = ''
 let fetchedAt = 0
@@ -167,10 +174,10 @@ const subscribers = new Set<(directory: ConversationDirectory) => void>()
 
 function rebuild(): void {
   const sessions = [...(live.projectId ? live.sessions : []), ...[...stored].filter(([projectId]) => projectId !== live.projectId).flatMap(([, list]) => list)]
-  const next = buildConversationDirectory(projects, sessions)
+  const next = buildConversationDirectory(projects, sessions, detachedWindows)
   // Layout sizes, focus and tab state change constantly; only identities and titles matter here,
   // and every mounted message would re-parse its Markdown on a new directory object.
-  const nextSignature = next.entries.map(entry => `${entry.tabId}\u0001${entry.agentSessionId ?? ''}\u0001${entry.title}\u0001${entry.sessionId}\u0001${entry.workspaceName}\u0001${entry.projectName}`).join('\u0002')
+  const nextSignature = next.entries.map(entry => `${entry.tabId}\u0001${entry.agentSessionId ?? ''}\u0001${entry.title}\u0001${entry.sessionId}\u0001${entry.workspaceName}\u0001${entry.projectName}\u0001${entry.detachedId ?? ''}`).join('\u0002')
   if (nextSignature === signature) return
   signature = nextSignature
   current = next
@@ -195,10 +202,15 @@ export function refreshConversationDirectory(force = false): Promise<void> {
       const listed = await api.projects.list()
       projects = listed.map(project => ({ id: project.id, name: project.name }))
       const next = new Map<string, readonly SessionRecord[]>()
-      await Promise.all(listed.filter(project => project.id !== live.projectId).map(async project => {
-        try { next.set(project.id, await api.sessions.list(project.id)) } catch { /* A project that cannot be read has nothing to link to. */ }
-      }))
+      // Tabs popped out into their own window are in no workspace layout; main keeps their saved layouts.
+      const [windows] = await Promise.all([
+        api.window?.listDetached?.().catch(() => detachedWindows) ?? Promise.resolve(detachedWindows),
+        ...listed.filter(project => project.id !== live.projectId).map(async project => {
+          try { next.set(project.id, await api.sessions.list(project.id)) } catch { /* A project that cannot be read has nothing to link to. */ }
+        })
+      ])
       stored = next
+      detachedWindows = windows
       fetchedAt = Date.now()
       rebuild()
     } catch { /* Links fall back to plain text; the next refresh tries again. */ } finally { inFlight = null }
@@ -229,5 +241,5 @@ export function useConversationDirectory(): ConversationDirectory {
 }
 
 export const conversationDirectoryForTest = {
-  reset(): void { projects = []; live = { projectId: null, sessions: [] }; stored = new Map(); current = buildConversationDirectory([], []); signature = ''; fetchedAt = 0; inFlight = null; subscribers.clear() }
+  reset(): void { projects = []; live = { projectId: null, sessions: [] }; stored = new Map(); detachedWindows = []; current = buildConversationDirectory([], []); signature = ''; fetchedAt = 0; inFlight = null; subscribers.clear() }
 }

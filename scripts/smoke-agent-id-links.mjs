@@ -9,7 +9,9 @@ import assert from 'node:assert/strict'
 // a coworker in project B and messages it over app control; then:
 //   1. Ctrl+K finds the coworker (another project) by a fragment of its agent id and jumps to it;
 //   2. the coworker's id in the controller's conversation renders as a link that focuses it;
-//   3. the controller shows a "sent to" card and the coworker a "from" card, both collapsed.
+//   3. the controller shows a "sent to" card and the coworker a "from" card, both collapsed;
+//   4. once the coworker is detached into its own window, Ctrl+K in either window finds the tab in
+//      the other one and raises that window.
 // Real Electron and control broker; only the provider CLI is the synthetic fixture, so no inference
 // happens. CONDUCTOR_TEST_USER_DATA parks the window off every display.
 //   node scripts/smoke-lock.mjs -- node scripts/smoke-agent-id-links.mjs
@@ -163,6 +165,49 @@ try {
   await palette.locator('input').press('Enter')
   await expect(pane(controllerId)).toBeVisible()
   check('Ctrl+Shift+P finds a tab by its tab id and jumps back to project A')
+
+  // 4. b5-palette-detached: a tab popped out into its own window is in no workspace layout, yet
+  // Ctrl+K in the main window finds it and raises that window; and the detached window's own
+  // Ctrl+K finds tabs of the main window.
+  const focusedIsDetached = () => app.evaluate(({ BrowserWindow }) => new URL(BrowserWindow.getFocusedWindow()?.webContents.getURL() ?? 'file:///').searchParams.has('detached'))
+  await call(controller, 'tabs.detach', { tabId: opened.id, projectId: projectB.id })
+  await expect.poll(() => app.windows().length).toBe(2)
+  const detached = app.windows().find(candidate => candidate !== page)
+  detached.on('pageerror', error => { if (error.message !== 'Canceled') errors.push('detached: ' + error.message) })
+  const detachedPane = detached.locator(`.structured-agent-pane[data-structured-session="${coworkerId}"]`)
+  await expect(detachedPane).toBeVisible()
+  await expect(pane(controllerId)).toBeVisible()
+  await page.keyboard.press('Control+K')
+  await expect(palette).toBeVisible()
+  await palette.locator('input').fill(fragment)
+  const detachedHit = palette.locator('.palette-list button', { hasText: 'Links coworker (Links smoke B)' })
+  await expect(detachedHit).toHaveCount(1)
+  await expect(detachedHit).toContainText('separate window')
+  await expect(detachedHit).toContainText(coworkerId)
+  await palette.locator('input').fill('links cow')
+  await expect(detachedHit).toHaveCount(1)
+  await shot('palette-detached-hit.png')
+  check('Ctrl+K in the main window finds a tab in a detached window by id fragment and by title, marked "separate window"')
+  await palette.locator('input').press('Enter')
+  await expect(palette).toBeHidden()
+  await expect(detachedPane).toBeVisible()
+  await expect.poll(focusedIsDetached).toBe(true)
+  check('Choosing it raises the detached window with that tab')
+
+  await detached.keyboard.press('Control+K')
+  const detachedPalette = detached.locator('.command-palette')
+  await expect(detachedPalette).toBeVisible()
+  await detachedPalette.locator('input').fill(controllerTab.id)
+  const mainHit = detachedPalette.locator('.palette-list button', { hasText: controllerTitle + ' (Links smoke A)' })
+  await expect(mainHit).toHaveCount(1)
+  await expect(mainHit).toContainText('main window')
+  await detached.screenshot({ path: join(output, 'detached-palette-main-hit.png') }); shots.push(join(output, 'detached-palette-main-hit.png'))
+  check('Ctrl+K in the detached window finds a main-window tab of another project, marked "main window"')
+  await detachedPalette.locator('input').press('Enter')
+  await expect(detachedPalette).toBeHidden()
+  await expect(pane(controllerId)).toBeVisible()
+  await expect.poll(focusedIsDetached).toBe(false)
+  check('Choosing it raises the main window on that tab')
 
   assert.deepEqual(errors, [])
   await writeFile(join(output, 'report.json'), JSON.stringify({ checks, errors, shots, inference: 'none', controllerId, coworkerId, projectA: projectA.id, projectB: projectB.id }, null, 2))

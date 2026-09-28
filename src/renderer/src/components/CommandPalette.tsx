@@ -21,13 +21,15 @@ const icons = {
   code: Braces
 }
 
-/** A tab found by id or title, as a palette entry that jumps to it (switching project/workspace). */
-export function tabCommand(entry: DirectoryEntry, currentProjectId: string | null): PaletteCommand {
+/** A tab found by id or title, as a palette entry that jumps to it (switching project/workspace,
+ *  and raising the window it lives in). `currentDetachedId` is set in a detached window. */
+export function tabCommand(entry: DirectoryEntry, currentProjectId: string | null, currentDetachedId?: string): PaletteCommand {
   const foreign = entry.projectId !== currentProjectId
+  const place = entry.detachedId === currentDetachedId ? null : entry.detachedId ? 'separate window' : 'main window'
   return {
     id: 'tab:' + entry.tabId,
     label: foreign ? `${entry.title} (${entry.projectName})` : entry.title,
-    detail: [foreign ? entry.projectName : null, entry.workspaceName, entry.agentSessionId ?? entry.tabId].filter(Boolean).join(' · '),
+    detail: [foreign ? entry.projectName : null, entry.workspaceName, place, entry.agentSessionId ?? entry.tabId].filter(Boolean).join(' · '),
     category: 'Tabs',
     icon: entry.kind === 'agent' ? 'agent' : entry.kind === 'terminal' ? 'terminal' : entry.kind === 'browser' ? 'browser' : 'layout',
     run: () => { void focusDirectoryEntry(entry).catch((reason: unknown) => console.warn('The tab could not be shown', reason)) }
@@ -37,11 +39,14 @@ export function tabCommand(entry: DirectoryEntry, currentProjectId: string | nul
 export function CommandPalette({
   commands,
   currentProjectId,
+  currentDetachedId,
   onClose
 }: {
   commands: PaletteCommand[]
-  /** Set to search every open tab in the window by agent id, tab id or title as well. */
+  /** Set to search every open tab in every window by agent id, tab id or title as well. */
   currentProjectId?: string | null
+  /** The detached window this palette opened in; tabs elsewhere name the window they live in. */
+  currentDetachedId?: string
   onClose(): void
 }): React.JSX.Element {
   const [query, setQuery] = useState('')
@@ -52,11 +57,11 @@ export function CommandPalette({
   const filtered = useMemo(() => {
     const q = query.toLowerCase().trim()
     const matching = q ? commands.filter((item) => `${item.label} ${item.category}`.toLowerCase().includes(q)) : commands
-    return searchTabs && q ? [...matching, ...matchConversationTabs(directory, q).map(entry => tabCommand(entry, currentProjectId ?? null))] : matching
-  }, [commands, query, directory, searchTabs, currentProjectId])
+    return searchTabs && q ? [...matching, ...matchConversationTabs(directory, q).map(entry => tabCommand(entry, currentProjectId ?? null, currentDetachedId))] : matching
+  }, [commands, query, directory, searchTabs, currentProjectId, currentDetachedId])
 
   useEffect(() => inputRef.current?.focus(), [])
-  // Tabs opened in another project since the last read are found too.
+  // Tabs opened in another project or window since the last read are found too.
   useEffect(() => { if (searchTabs) void refreshConversationDirectory(true) }, [searchTabs])
   useEffect(() => setSelected(0), [query])
 
@@ -93,7 +98,7 @@ export function CommandPalette({
           <kbd>ESC</kbd>
         </div>
         <div className="palette-list">
-          {filtered.length === 0 && <div className="palette-empty">No matching commands</div>}
+          {filtered.length === 0 && <div className="palette-empty">{query.trim() || commands.length ? 'No matching commands' : 'Type a tab name or an agent id'}</div>}
           {filtered.map((item, index) => {
             const Icon = icons[item.icon]
             return (

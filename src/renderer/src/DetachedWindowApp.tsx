@@ -14,6 +14,7 @@ import { makeLauncherTab } from '../../shared/models'
 import { TitleBar } from './components/TitleBar'
 import { PaneWorkspace } from './layout/PaneWorkspace'
 import { CloseWorkConfirm } from './layout/CloseWorkConfirm'
+import { CommandPalette } from './components/CommandPalette'
 import { guardTabClose, offerCloseUndo } from './layout/close-work-guard'
 import { activateTab, addTab, closeTab, findGroup, listGroups, stripWorkspaceUtilityTabs } from './layout/layout-operations'
 import { createPaneTab } from './panes/pane-factory'
@@ -45,6 +46,18 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
     }
     window.addEventListener('keydown', restore, true)
     return () => window.removeEventListener('keydown', restore, true)
+  }, [])
+  // Ctrl+K / Ctrl+Shift+P find a tab by name or agent id in any window, as in the main one.
+  const [paletteOpen, setPaletteOpen] = useState(false)
+  useEffect(() => {
+    const toggle = (event: KeyboardEvent): void => {
+      const key = event.key.toLowerCase()
+      if (!event.ctrlKey || event.altKey || !(event.shiftKey && key === 'p' || key === 'k')) return
+      event.preventDefault()
+      setPaletteOpen(value => !value)
+    }
+    window.addEventListener('keydown', toggle)
+    return () => window.removeEventListener('keydown', toggle)
   }, [])
   const [loadedProjects, setLoadedProjects] = useState<ProjectRecord[]>([])
   const [sessionName, setSessionName] = useState('Untitled session')
@@ -461,6 +474,7 @@ export function DetachedWindowApp({ detachedId }: { detachedId: string }): React
           {updateState.currentVersion && <AppVersionButton state={updateState} onCheck={checkForUpdates} />}
         </footer>
       )}
+      {paletteOpen && <CommandPalette commands={[]} currentProjectId={bundle.project.id} currentDetachedId={detachedId} onClose={() => setPaletteOpen(false)} />}
       <CloseWorkConfirm />
     </div>
   )

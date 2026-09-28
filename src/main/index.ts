@@ -2577,6 +2577,7 @@ const registerIpc = (): void => {
     const session = database.getSession(record.sessionId)
     return project && session ? { record, project, session } : null
   })
+  ipcMain.handle('window:list-detached', () => database.listDeskDetachedWindows())
   ipcMain.handle(
     'window:save-detached',
     (

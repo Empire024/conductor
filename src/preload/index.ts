@@ -380,6 +380,7 @@ const bridge: ConductorBridge = {
     detach: (projectId, sessionId, tab, sourceLayout, options) =>
       ipcRenderer.invoke('window:detach', projectId, sessionId, tab, sourceLayout, options),
     getDetached: (id) => ipcRenderer.invoke('window:get-detached', id),
+    listDetached: () => ipcRenderer.invoke('window:list-detached'),
     saveDetached: (id, layout, maximizedGroupId) =>
       ipcRenderer.invoke('window:save-detached', id, layout, maximizedGroupId),
     flushDetached: (id, layout, maximizedGroupId) => {

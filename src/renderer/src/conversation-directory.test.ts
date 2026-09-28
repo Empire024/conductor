@@ -5,7 +5,7 @@ import type { SessionRecord } from '../../shared/models'
 import type { AgentEventData, TimelineItem } from '../../shared/structured-agent'
 import {
   buildConversationDirectory, conversationDirectoryForTest, conversationLabel, conversationRefRemarkPlugin, currentConversationDirectory, findConversationRefs,
-  matchConversationTabs, mentionsConversationId, resolveConversationRef, setLiveWorkspaces
+  matchConversationTabs, mentionsConversationId, refreshConversationDirectory, resolveConversationRef, setLiveWorkspaces
 } from './conversation-directory'
 import { mcpAgentMessageOf, receivedMessagePeer } from './panes/AgentMessageCards'
 import { StructuredActivity } from './panes/StructuredAgentRenderers'
@@ -98,6 +98,34 @@ describe('palette tab search', () => {
       expect(focusOrigin).toHaveBeenCalledWith('agent_muldox0q_y4hp2rg')
       tabCommand(directory.byTab.get('tab_mulh0000_term001')!, 'project_conductor').run()
       expect(openUri).toHaveBeenCalledWith('conductor://project_conductor/tab/tab_mulh0000_term001')
+    } finally { vi.unstubAllGlobals() }
+  })
+
+  it('finds a tab that lives in a detached window and names that window from elsewhere', async () => {
+    const popped = session('session_a', 'project_conductor', 'Main', [{ id: 'tab_muldet00_pop0001', title: 'Popped fixer', resourceId: 'agent_muldet00_fix0001' }])
+    const orphan = session('session_gone', 'project_conductor', 'Closed', [{ id: 'tab_muldet00_gone001', title: 'Gone', resourceId: 'agent_muldet00_gone001' }])
+    const withWindows = buildConversationDirectory(projects, sessions, [
+      { id: 'detached_one', sessionId: 'session_a', layout: popped.layout },
+      // A window of a workspace that is not open lists nothing.
+      { id: 'detached_two', sessionId: 'session_gone', layout: orphan.layout }
+    ])
+    expect(matchConversationTabs(withWindows, 'muldet00').map(entry => [entry.tabId, entry.detachedId])).toEqual([['tab_muldet00_pop0001', 'detached_one']])
+    expect(matchConversationTabs(withWindows, 'popped').map(entry => entry.workspaceName)).toEqual(['Main'])
+    const entry = withWindows.byAgent.get('agent_muldet00_fix0001')!
+    expect(tabCommand(entry, 'project_conductor').detail).toBe('Main · separate window · agent_muldet00_fix0001')
+    expect(tabCommand(entry, 'project_conductor', 'detached_one').detail).toBe('Main · agent_muldet00_fix0001')
+    expect(tabCommand(withWindows.byTab.get('tab_mulf9ghp_wf9a621')!, 'project_conductor', 'detached_one').detail).toBe('Main · main window · agent_mulf9gp4_awcbpcc')
+
+    // The shared directory reads the detached windows with the other projects' workspaces.
+    const listDetached = vi.fn(async () => [{ id: 'detached_one', projectId: 'project_conductor', sessionId: 'session_a', layout: popped.layout, maximizedGroupId: null, createdAt: '', updatedAt: '' }])
+    vi.stubGlobal('window', { conductor: { projects: { list: async () => projects }, sessions: { list: async (projectId: string) => sessions.filter(item => item.projectId === projectId) }, window: { listDetached } } })
+    try {
+      setLiveWorkspaces('project_conductor', [sessions[0]!], projects)
+      expect(currentConversationDirectory().byAgent.get('agent_muldet00_fix0001')).toBeUndefined()
+      await refreshConversationDirectory(true)
+      expect(listDetached).toHaveBeenCalledOnce()
+      expect(currentConversationDirectory().byAgent.get('agent_muldet00_fix0001')).toMatchObject({ detachedId: 'detached_one', projectName: 'conductor' })
+      expect(currentConversationDirectory().byAgent.get('agent_muldox0q_y4hp2rg')?.projectName).toBe('haftheme')
     } finally { vi.unstubAllGlobals() }
   })
 
