@@ -56,6 +56,7 @@ import { ControlActivityRecorder, type PreparedCall } from './control-activity'
 import { callPermissions, PERMISSION_METHOD_SIGNATURES, PERMISSION_METHODS, PERMISSION_OWNER_SIGNATURES } from './permission-grants/control'
 import { callWizardApprovals, WIZARD_APPROVAL_METHODS, WIZARD_APPROVAL_SIGNATURES, type AnswerableConversation, type WizardApprovalScope } from './wizard-approvals'
 import type { PermissionGrants } from './permission-grants/service'
+import { CONTROL_WAIT_MAX_SECONDS } from './permission-grants/control-mcp'
 import { isControlActivityNotice, type AppControlEntry, type ControlTarget } from '../shared/control-activity'
 import { ArgumentError, modelError, pickModel, resolveModel, unknownMethodError, validateArgs } from './control-args'
 import { readHistory } from './agent-history'
@@ -67,6 +68,14 @@ import { categorize } from './model-intelligence/categorize'
 import { EvaluationTurnError, evaluationTokens } from './model-intelligence/evaluation-ports'
 
 type Args = Record<string, unknown>
+/** waitSeconds caps over HTTP; the conductor MCP control tool cuts any wait to
+ *  CONTROL_WAIT_MAX_SECONDS first, inside its client's tool-call limit (control-mcp.ts). */
+const FINISH_WAIT_SECONDS = FINISH_WAIT_MAX_SECONDS
+const SHIP_WAIT_SECONDS = 100
+const MCP_WAIT_NOTE = `; ${CONTROL_WAIT_MAX_SECONDS} over the conductor MCP control tool`
+/** Said in the result when a requested wait was longer than the method waits. */
+const waitCapped = (requested: unknown, cap: number, again: string): { waitCapped: string } | Record<string, never> =>
+  typeof requested === 'number' && requested > cap ? { waitCapped: `waitSeconds ${requested} was capped at ${cap} s; ${again}` } : {}
 /** The control link of a coworker whose tab closed as finished, and each controller's list of them. */
 const FINISHED_LINK_PREFIX = 'agentControlFinished:'
 const FINISHED_BY_PREFIX = 'agentControlFinishedBy:'
@@ -210,7 +219,7 @@ const toolSignatures = {
   'agents.fork': '({agentSessionId,title?}) — fork supported idle native history into a visible linked tab, opened in the workspace that holds the original; outside this workspace only a coworker this caller controls',
   'agents.release': '({agentSessionId}) — release this controller relationship, wherever the coworker lives',
   'agents.report': '({text}) — deliver a report to the conversation that opened this tab (its controller, whoever that is; a controller that handed itself on is reached through its successor), as agents.steer does: steered into a running turn where the provider can, else queued or starting one. Never refused for length: the first 2000 characters (cut at a line break) are delivered with a pointer, and the whole text is kept as an artifact the controller reads with agents.artifact; the result says {delivered,total,artifactId}. Takes no agentSessionId: it always reports to the caller\'s own controller, never any other target. For a local model this is the way to reach its controller directly instead of the controller polling agents.status',
-  'agents.finish': '({agentSessionId?,waitSeconds?,force?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; waitSeconds (max ' + FINISH_WAIT_MAX_SECONDS + ') first waits that long for it to settle, so there is no agents.status loop; refused, naming the reason, while it is (still) running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn; background tasks of your own are waited for with waitSeconds, or stopped with your CLI with force:true',
+  'agents.finish': '({agentSessionId?,waitSeconds?,force?}) — close a finished coworker: its tab closes with history kept (reopenable from the closed tabs) and its CLI process is released. With agentSessionId, a controller finishes a coworker it controls whose turn has settled with no background tasks, at once and without an owner dialog; waitSeconds (max ' + FINISH_WAIT_SECONDS + MCP_WAIT_NOTE + '; a longer wait is capped and the result says so in waitCapped) first waits that long for it to settle, so there is no agents.status loop; refused, naming the reason, while it is (still) running, has background tasks, waits on an approval, has an unsent draft, is a wizard tab or still controls open coworkers. With {} a coworker finishes itself as its last act: Conductor closes it once this turn settles, so call it after your work is delivered and reported, then end the turn; background tasks of your own are waited for with waitSeconds, or stopped with your CLI with force:true',
   'agents.handoff': `({handoff,title?,successor?,provider?,model?,effort?}) — hand your own remaining work to a fresh tab when this conversation's context has grown expensive. Takes no agentSessionId: it always hands off the caller. handoff is ${HANDOFF_MINIMUM}-${HANDOFF_MAXIMUM} characters holding the six sections of docs/token-thrift-policy.md on their own lines, in order (${handoffSections.join(', ')}); reference long output by repository path rather than pasting it. The new tab opens in this workspace with your provider, model, effort and mode, and receives the handoff as its first prompt; provider, model and effort from models.list continue you elsewhere (another provider must name its model; your mode is kept, never widened). Your tab stays open and steerable: finish the step you are in, report it, and stop. successor:true is for a main brain (a wizard tab, or a controller with live coworkers): the new tab is you continued, not your coworker. It opens as a root (under your own controller, if you have one), inherits wizard mode and limit continuation, takes over every coworker you control (their agents.report, approvals and steering go to it) and any pending restart that would bring you back (a wizard's successor must be a model that can hold the wand, else nothing opens); you lose wizard mode, are marked superseded, and your tab shows “Continued in <tab>”`,
   'files.list': '({query?,projectId?}) — indexed project search, at most 100 matches with stable URIs',
   'files.read': '({path,projectId?}) — UTF-8 text up to 1 MiB; projectId reads a sibling project from projects.list',
@@ -229,8 +238,8 @@ const toolSignatures = {
   'app.update': '() — build this Conductor checkout and publish it to the installed app’s local update feed, the same work as `npm run update:local`; returns at once, so poll app.update.status. A native coworker in Auto builds without asking; below Auto, and for a local model, the owner confirms each build unless a non-local coworker has pre-authorized this conversation with app.update.authorize. No installer is ever run: the app offers “Update pending” and the owner (or a wizard tab) installs it',
   'app.update.status': '() — state, version, log tail and result of the local update build',
   'git.status': '() — branch, ahead/behind, head and changed files of this project’s repository, and whether a release workflow is verified after a push',
-  'git.ship': '({message,paths?,publish?,mac?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow (with the Mac build unless mac: false) and checks its Windows and Mac assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max 100) blocks until it settles or that time passes, then keep polling git.ship.status. A ship while another delivery of this project runs is queued, never refused: it returns status:"queued" with runId, behind (the run ahead of it) and position, starts by itself when that settles, and runs its own preflight then. Only a running or failed stage carries its log (last 15 lines)',
-  'git.ship.status': '({runId?,waitSeconds?}) — your own most recent delivery in this project (the project\'s latest, with a note, if you have none); runId reads any of the project\'s last 10 runs, queued, running or finished: each stage (log only for a running or failed stage, last 15 lines), commit, release tag and error, and status:"queued" with behind and position while it waits its turn; waitSeconds (max 100) long-polls until the run settles',
+  'git.ship': '({message,paths?,publish?,mac?,waitSeconds?}) — deliver finished work in one call. Conductor freezes changed paths as Git blobs, verifies that snapshot with parallel tests/build, and commits those exact blobs as a local commit on the host with the owner’s credentials; later disk edits stay uncommitted and are reported. Nothing is pushed or released unless publish: true — for the owner, a wizard tab or a controller publishing a finished batch, never a dispatched coworker — also pushes, starts the release workflow (with the Mac build unless mac: false) and checks its Windows and Mac assets. Never escalate your sandbox for git/gh or run these steps yourself. Returns the run; waitSeconds (max ' + SHIP_WAIT_SECONDS + MCP_WAIT_NOTE + ', capped with waitCapped in the result) blocks until it settles or that time passes, then keep polling git.ship.status. A ship while another delivery of this project runs is queued, never refused: it returns status:"queued" with runId, behind (the run ahead of it) and position, starts by itself when that settles, and runs its own preflight then. Only a running or failed stage carries its log (last 15 lines)',
+  'git.ship.status': '({runId?,waitSeconds?}) — your own most recent delivery in this project (the project\'s latest, with a note, if you have none); runId reads any of the project\'s last 10 runs, queued, running or finished: each stage (log only for a running or failed stage, last 15 lines), commit, release tag and error, and status:"queued" with behind and position while it waits its turn; waitSeconds (max ' + SHIP_WAIT_SECONDS + MCP_WAIT_NOTE + ', capped with waitCapped in the result) long-polls until the run settles',
   'local.servers': '() — the local model (llama.cpp) servers running on this machine: model, pid, port, start time, whether this Conductor started them, and which conversations of this project use each and whether one is mid-turn. The machine holds one at a time; this is where to look before starting or stopping one',
   'local.stop': '({model?,pid?,force?}) — stop one running local model server this Conductor started, named by model or pid (both from local.servers), in one call. Refused while a turn is using it unless force:true, which asks the owner first (a wizard tab is the owner) and fails that turn; a server Conductor did not start is never stopped. The next local turn starts its server again',
   'usage.limits': '({provider?}) — zero-turn read of the newest account allowance each provider reported: per provider and bucket (Claude five_hour, seven_day and model windows such as Fable weekly; Codex primary/secondary per limit bucket with its credits), usedPercent, resetsAt, windowMinutes, observedAt with its age and the conversation that reported it. A window whose resetsAt has passed says state "reset" (its current use is unknown until the provider reports again); a provider that reported nothing, or does not report an allowance at all (Grok), says status "unknown" and why. Figures are the provider’s own; nothing is estimated. Also carries localSavings: the conductor-local MCP tools\' (run_and_summarize, local_ask, summarize_file) measured frontier-token savings over the last 7 days — calls, modelCalls, localInputTokens/localOutputTokens and tokensSaved — or null where local assist is not wired',
@@ -257,7 +266,7 @@ type ProjectWizard = { agentSessionId: string; title: string; workspaceId: strin
 const HANDED_IN_PREFIX = 'agentControlHandedIn:'
 
 /** One agent tab in agents.list({load:true}). */
-type LoadListEntry = { tabId: string; agentSessionId: string; title: string; provider: unknown; phase: string | null; projectId: string; workspaceId: string; crossProject: boolean; backgroundTasks: number }
+type LoadListEntry = { tabId: string; agentSessionId: string; title: string; provider: unknown; phase: string | null; projectId: string; workspaceId: string; crossProject: boolean; backgroundTasks: number; staleBackgroundTasks?: number }
 
 export interface DeliveryControl {
   status(projectId: string, cwd: string): Promise<RepositoryStatus>
@@ -588,6 +597,33 @@ export class AgentControl {
     return id
   }
 
+  /** Every conversation that continued this one, oldest first (agents.handoff successor:true,
+   *  agents.supersede), open or not. */
+  private successorsOf(projectId: string, agentSessionId: string): string[] {
+    const chain: string[] = []
+    for (let id = agentSessionId; chain.length < 8;) {
+      const by = this.recovery().status(projectId, id).superseded?.by
+      if (!by || by === agentSessionId || chain.includes(by)) break
+      chain.push(by); id = by
+    }
+    return chain
+  }
+
+  /** A predecessor's message to a conversation that continues it: delivered like a report, never
+   *  taking control. Before, the old main's send_message made it its successor's controller, and
+   *  the next successor inherited that link, so the chain ended controlled by a retired tab. */
+  private async toSuccessor(scope: AgentControlScope, addressee: string, body: string): Promise<unknown> {
+    const { database, sessions } = this.deps
+    if (restricted(database.structured.snapshot(scope.agentSessionId)?.settings)) throw new Error(readOnly('send_message (agents.steer) to your successor'))
+    const toAgentSessionId = this.successorOf(scope.projectId, addressee)
+    const state = database.structured.snapshot(toAgentSessionId)
+    if (!state) throw new Error('Your successor is no longer open; put your result in your final message, where the owner reads it')
+    const sender = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)
+    const origin: PromptOrigin = { agentSessionId: scope.agentSessionId, label: sender?.title || 'Predecessor' }
+    const delivery = await sessions.steerOrStart(toAgentSessionId, body, state.settings, [], origin)
+    return { agentSessionId: toAgentSessionId, delivery, reportedTo: 'successor', controlled: false, ...(toAgentSessionId !== addressee ? { forwardedFrom: addressee, note: `${addressee} handed its work on to ${toAgentSessionId}; your message went there` } : {}) }
+  }
+
   /** A coworker's agents.steer (send_message) to its controller or an ancestor, delivered as
    *  agents.report delivers one: labelled with the coworker, into or behind the running turn.
    *  A superseded addressee's successor receives it instead (forwardedFrom names the old one). */
@@ -651,6 +687,17 @@ export class AgentControl {
     }
   }
 
+  /** A conversation's background task count as agents.list reports it. The projection keeps the
+   *  count its last lifecycle event carried, and a runtime that disconnected or was stopped never
+   *  sends another, so a dead tab would hold backgroundTasks:1 (and the install gate) for good.
+   *  Only a live, connected runtime has background tasks; a leftover count is staleBackgroundTasks. */
+  private background(id: string, state: SessionProjection | null | undefined): { phase: string | null; backgroundTasks: number; staleBackgroundTasks?: number } {
+    if (!state) return { phase: null, backgroundTasks: 0 }
+    const recorded = state.backgroundTasks ?? 0
+    const live = recorded > 0 && state.phase !== 'disconnected' && this.deps.sessions.hasRuntime(id)
+    return live ? { phase: displaySessionPhase(state.phase, recorded), backgroundTasks: recorded } : { phase: state.phase, backgroundTasks: 0, ...(recorded > 0 ? { staleBackgroundTasks: recorded } : {}) }
+  }
+
   private observation(scope: AgentControlScope, tab: AgentControlTab, state: SessionProjection | null, observedAt: string) {
     const lastEvent = state?.sequence ? this.deps.database.structured.events(tab.resourceId!, state.sequence - 1)[0] : undefined
     return {
@@ -658,7 +705,7 @@ export class AgentControl {
       tabId: tab.id, agentSessionId: tab.resourceId, groupId: tab.groupId, detachedId: tab.detachedId,
       title: tab.title, provider: tab.state?.provider, uri: tab.uri,
       // A settled turn whose background tasks still run is 'viewing', never read as finished.
-      phase: state ? displaySessionPhase(state.phase, state.backgroundTasks) : null, backgroundTasks: state?.backgroundTasks ?? 0,
+      ...this.background(tab.resourceId!, state),
       wizard: wizardActive(state?.settings, typeof tab.state?.provider === 'string' ? tab.state.provider : undefined),
       lastActivityAt: lastEvent?.timestamp ?? null, sequence: state?.sequence ?? 0,
       lastEvent: lastEvent ? {
@@ -688,11 +735,11 @@ export class AgentControl {
     const dispatched = !link && !scope.owner && this.finishedLink(id)?.controllerAgentSessionId === scope.agentSessionId
     const mine = dispatched || !scope.owner && link?.controllerAgentSessionId === scope.agentSessionId
     const sideways = elsewhere && link?.controllerAgentSessionId !== scope.agentSessionId && !dispatched
-    if (sideways && spec.projectId === scope.projectId) throw missing
+    if (sideways && spec.projectId === scope.projectId) throw this.inAnotherWorkspace(scope, id, link)
     // Even a tab it controls: a link made before a paired machine took this conversation over
     // does not carry that machine past the project it was granted.
     if (spec.projectId !== scope.projectId && this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
-    if (sideways && !reach) throw link ? missing : new Error('That tab is outside this workspace and this agent does not control it. agents.submit or agents.steer takes control of an uncontrolled tab in a sibling project; after that it answers every agents.* and tabs.* method')
+    if (sideways && !reach) throw link ? new Error(`Another agent controls that tab in ${this.deps.database.getProject(spec.projectId)?.name ?? 'the other project'}: ${this.agentLabel(link.controllerAgentSessionId)}; only it can act on that tab, so send_message it instead`) : new Error('That tab is outside this workspace and this agent does not control it. agents.submit or agents.steer takes control of an uncontrolled tab in a sibling project; after that it answers every agents.* and tabs.* method')
     if (sideways) {
       if (link) throw new Error(`Another agent controls that tab in ${this.deps.database.getProject(spec.projectId)?.name ?? 'the other project'}: ${this.agentLabel(link.controllerAgentSessionId)}; only it can read or steer that tab, so send_message it instead`)
       if (reach === 'steer' && this.deps.database.structured.spec<AgentSpec>(scope.agentSessionId)?.provider === 'local') throw new Error('A sandboxed local conversation cannot steer a tab in another project; a non-local coworker or the owner can')
@@ -721,6 +768,27 @@ export class AgentControl {
       if (link && link.controllerAgentSessionId !== scope.agentSessionId && !sovereign(scope)) throw new Error(`Another agent already controls this tab: "${tab.title}" is controlled by ${this.agentLabel(link.controllerAgentSessionId)}; send_message that controller, or ask it to agents.release the tab`)
     }
     return { tab, scope: target }
+  }
+
+  /** The refusal for a conversation of this project that lives in another workspace (G04): where
+   *  it is open, who controls it and the route that does work, instead of pointing at
+   *  agents.resume, which only reopens a closed tab of the caller's own workspace. */
+  private inAnotherWorkspace(scope: AgentControlScope, id: string, link: AgentControlLink | null): Error {
+    const { database } = this.deps
+    const label = this.agentLabel(id)
+    const workspaces = database.listSessions(scope.projectId).filter(workspace => workspace.id !== scope.sessionId)
+    const open = workspaces.find(workspace => this.tabs({ projectId: scope.projectId, sessionId: workspace.id, agentSessionId: '' }).some(tab => tab.kind === 'agent' && tab.resourceId === id))
+    const home = open ?? workspaces.find(workspace => workspace.id === database.structured.spec<AgentSpec>(id)?.sessionId)
+    const where = home ? `workspace "${home.name}" (${home.id})` : 'another workspace'
+    if (!open) return new Error(`${label} belongs to ${where} of this project and has no open tab; agents in one workspace do not reach another's conversations, and agents.resume reopens only a tab of yours. Open your own tab for the work with tabs.open${home ? `({workspaceId:"${home.id}",prompt})` : ''}, or report to your controller`)
+    const controller = link ? link.controllerAgentSessionId : null
+    const reachable = controller && (this.tabs(scope).some(tab => tab.resourceId === controller) || this.ancestorsOf(scope.agentSessionId).includes(controller))
+    const route = !controller
+      ? `nobody controls it, and agents in one workspace do not steer another's tabs: open your own tab there with tabs.open({workspaceId:"${open.id}",prompt}), or report to your controller`
+      : reachable
+        ? `it is controlled by ${this.agentLabel(controller)}: send_message that controller instead`
+        : `it is controlled by ${this.agentLabel(controller)}, which is not in your workspace either: open your own tab there with tabs.open({workspaceId:"${open.id}",prompt}), or report to your controller`
+    return new Error(`${label} is open in ${where} of this project, not in yours; ${route}`)
   }
 
   /** Settings are more durable than a prompt: changing an unclaimed neighbour would leave it
@@ -825,7 +893,10 @@ export class AgentControl {
     if (link.targetAgentSessionId !== agentSessionId) return null
     const projectId = link.controllerProjectId ?? link.projectId, sessionId = link.controllerSessionId ?? link.sessionId
     if (this.deps.database.getSession(sessionId)?.projectId !== projectId) return null
-    return this.tabs({ projectId, sessionId, agentSessionId: '' }).some(tab => tab.resourceId === link.controllerAgentSessionId) ? link : null
+    if (!this.tabs({ projectId, sessionId, agentSessionId: '' }).some(tab => tab.resourceId === link.controllerAgentSessionId)) return null
+    // A link from a conversation this one continues is void: a successor is its predecessor
+    // continued, never its coworker (a link recorded before this rule steered a chain of wizards).
+    return this.successorsOf(projectId, link.controllerAgentSessionId).includes(agentSessionId) ? null : link
   }
 
   /** A finished coworker's tab is closed and its live link dropped (closeFinished), but the
@@ -941,7 +1012,7 @@ export class AgentControl {
         const state = database.structured.snapshot(tab.resourceId)
         if (!state || !wizardActive(state.settings, typeof tab.state?.provider === 'string' ? tab.state.provider : undefined)) continue
         const lastActivityAt = state.sequence ? database.structured.events(tab.resourceId, state.sequence - 1)[0]?.timestamp ?? '' : ''
-        found.push({ agentSessionId: tab.resourceId, title: tab.title, workspaceId: workspace.id, workspaceName: workspace.name, phase: displaySessionPhase(state.phase, state.backgroundTasks), lastActivityAt, remote: Boolean(tab.state?.remotePeerId) })
+        found.push({ agentSessionId: tab.resourceId, title: tab.title, workspaceId: workspace.id, workspaceName: workspace.name, phase: this.background(tab.resourceId, state).phase, lastActivityAt, remote: Boolean(tab.state?.remotePeerId) })
       }
     }
     return found.sort((a, b) => b.lastActivityAt.localeCompare(a.lastActivityAt))
@@ -1025,22 +1096,32 @@ export class AgentControl {
   private messagesAcross(scope: AgentControlScope, id: string): boolean {
     const spec = this.deps.database.structured.spec<AgentSpec>(id)
     if (!spec || scope.owner || spec.projectId === scope.projectId || this.linkFor(id)?.controllerAgentSessionId === scope.agentSessionId) return false
-    return this.senders(scope.agentSessionId).includes(id) || this.wizardsOf(spec.projectId).some(wizard => wizard.agentSessionId === id && !wizard.remote)
+    // A wizard that handed itself on is reached through its successor, which is the wizard now.
+    const to = this.successorOf(spec.projectId, id)
+    return this.mayReplyTo(scope.agentSessionId, id) || this.wizardsOf(spec.projectId).some(wizard => (wizard.agentSessionId === id || wizard.agentSessionId === to) && !wizard.remote)
+  }
+  /** Whether a wizard may answer this conversation across projects: it handed the wizard work,
+   *  or it continues (successor:true) one that did. */
+  private mayReplyTo(wizardId: string, id: string): boolean {
+    return this.senders(wizardId).some(sender => sender === id || this.successorsOf(this.deps.database.structured.spec<AgentSpec>(sender)?.projectId ?? '', sender).includes(id))
   }
 
   private async messageAcross(scope: AgentControlScope, method: string, args: Args): Promise<unknown> {
     const { database, sessions } = this.deps
-    const id = text(args, 'agentSessionId', 160), prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
+    const named = text(args, 'agentSessionId', 160), prompt = text(args, 'prompt', MAX_PROMPT_CHARS)
+    // Addressed to a conversation that handed itself on: its successor receives it.
+    const id = this.successorOf(database.structured.spec<AgentSpec>(named)!.projectId, named)
+    const forwarded = id !== named ? { forwardedFrom: named } : {}
     const spec = database.structured.spec<AgentSpec>(id)!, state = database.structured.snapshot(id)
     if (this.tabs(scope).find(tab => tab.resourceId === scope.agentSessionId)?.state?.remotePeerId) throw new Error('This conversation is driven by a paired machine and stays inside the project shared with it')
     const tab = this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId }).find(candidate => candidate.kind === 'agent' && candidate.resourceId === id)
     if (!tab || !state) throw new Error('That conversation has no open tab in its project any more; send to the project instead with send_message({projectId,text}), and its wizard gets it')
     if (tab.state?.remotePeerId) throw new Error('That conversation is driven by a paired machine; only that machine steers it')
     const wizard = this.wizardsOf(spec.projectId).find(candidate => candidate.agentSessionId === id)
-    if (wizard) return { ...await this.deliverToWizard(scope, wizard, prompt), agentSessionId: id, projectId: spec.projectId, workspaceId: spec.sessionId }
+    if (wizard) return { ...await this.deliverToWizard(scope, wizard, prompt), agentSessionId: id, projectId: spec.projectId, workspaceId: spec.sessionId, ...forwarded }
     const title = this.tabs(scope).find(candidate => candidate.resourceId === scope.agentSessionId)?.title || 'Another Conductor tab'
     const delivery = await sessions.steerOrStart(id, prompt, state.settings, [], { agentSessionId: scope.agentSessionId, label: `${title} (${database.getProject(scope.projectId)?.name ?? 'another project'})` })
-    return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: spec.projectId, workspaceId: spec.sessionId, phase: database.structured.snapshot(id)?.phase, delivery, reply: true, controlled: false, ...(method === 'agents.submit' ? { note: 'A reply across projects is steered like agents.steer and takes no control' } : {}) }
+    return { agentSessionId: id, tabId: tab.id, uri: tab.uri, projectId: spec.projectId, workspaceId: spec.sessionId, phase: database.structured.snapshot(id)?.phase, delivery, reply: true, controlled: false, ...forwarded, ...(method === 'agents.submit' ? { note: 'A reply across projects is steered like agents.steer and takes no control' } : {}) }
   }
 
   /** agents.steer/submit({projectId,prompt}) with no agentSessionId: a message to a project
@@ -1091,7 +1172,8 @@ export class AgentControl {
         for (const tab of this.tabs({ projectId: project.id, sessionId: workspace.id, agentSessionId: scope.agentSessionId })) {
           if (tab.kind !== 'agent' || !tab.resourceId) continue
           const state = this.deps.database.structured.snapshot(tab.resourceId)
-          found.push({ tabId: tab.id, agentSessionId: tab.resourceId, title: tab.title, provider: tab.state?.provider, phase: state ? displaySessionPhase(state.phase, state.backgroundTasks) : null, projectId: project.id, workspaceId: workspace.id, crossProject: project.id !== scope.projectId, backgroundTasks: state?.backgroundTasks ?? 0 })
+          const { phase, backgroundTasks, staleBackgroundTasks } = this.background(tab.resourceId, state)
+          found.push({ tabId: tab.id, agentSessionId: tab.resourceId, title: tab.title, provider: tab.state?.provider, phase, projectId: project.id, workspaceId: workspace.id, crossProject: project.id !== scope.projectId, backgroundTasks, ...(staleBackgroundTasks ? { staleBackgroundTasks } : {}) })
         }
       }
     }
@@ -1437,6 +1519,8 @@ export class AgentControl {
     if (method === 'models.list') return this.withModelFacts(this.deps.cloud ? [...this.catalog(scope), cloudCatalogEntry(this.deps.cloud.available())] : this.catalog(scope))
     if (method === 'tabs.list') return this.tabs(this.sibling(scope, args))
     if (method === 'tabs.open') return this.callOpen(scope, source, args)
+    // A superseded main's message to the conversation that continues it takes no control either.
+    if ((method === 'agents.steer' || method === 'agents.submit') && !scope.owner && typeof args.agentSessionId === 'string' && this.successorsOf(scope.projectId, scope.agentSessionId).includes(args.agentSessionId)) return this.toSuccessor(scope, args.agentSessionId, text(args, 'prompt', MAX_PROMPT_CHARS))
     // A coworker's message to its controller, or to any ancestor, is a report and takes no
     // control: send_message is agents.steer, and coworkers reach for it first.
     // A superseded controller named from an old briefing counts through its successor.
@@ -1490,7 +1574,7 @@ export class AgentControl {
         if (spec.sessionId !== scope.sessionId || visible.has(spec.id)) return []
         const state = database.structured.snapshot(spec.id)
         if (!state || !hasSessionWork(state)) return []
-        return [{ observedAt, source: 'native-session', projectId: scope.projectId, workspaceId: scope.sessionId, tabId: null, agentSessionId: spec.id, title: state.title || spec.title, provider: spec.provider, phase: displaySessionPhase(state.phase, state.backgroundTasks), backgroundTasks: state.backgroundTasks ?? 0, orphaned: true }]
+        return [{ observedAt, source: 'native-session', projectId: scope.projectId, workspaceId: scope.sessionId, tabId: null, agentSessionId: spec.id, title: state.title || spec.title, provider: spec.provider, ...this.background(spec.id, state), orphaned: true }]
       })
       // A coworker this caller dispatched that finished and closed its tab, in any project: still
       // its own to follow up, and agents.steer brings it back.
@@ -1499,7 +1583,7 @@ export class AgentControl {
         const spec = database.structured.spec<AgentSpec>(id), state = database.structured.snapshot(id)
         if (!spec || !state || listed.has(id) || this.finishedLink(id)?.controllerAgentSessionId !== scope.agentSessionId || this.linkFor(id)) return []
         if (this.tabs({ projectId: spec.projectId, sessionId: spec.sessionId, agentSessionId: scope.agentSessionId }).some(tab => tab.resourceId === id)) return []
-        return [{ observedAt, source: 'native-session', projectId: spec.projectId, workspaceId: spec.sessionId, tabId: null, agentSessionId: id, title: state.title || spec.title, provider: spec.provider, phase: displaySessionPhase(state.phase, state.backgroundTasks), backgroundTasks: state.backgroundTasks ?? 0, finished: true, controlled: true, ...(spec.projectId !== scope.projectId ? { crossProject: true } : {}), note: 'Finished and its tab closed; agents.steer reopens it and starts a turn' }]
+        return [{ observedAt, source: 'native-session', projectId: spec.projectId, workspaceId: spec.sessionId, tabId: null, agentSessionId: id, title: state.title || spec.title, provider: spec.provider, ...this.background(id, state), finished: true, controlled: true, ...(spec.projectId !== scope.projectId ? { crossProject: true } : {}), note: 'Finished and its tab closed; agents.steer reopens it and starts a turn' }]
       })
       // A tab this caller handed to another open project is still its own work to follow, and it
       // would otherwise be unfindable after the id that came back from tabs.open is forgotten.
@@ -2190,15 +2274,16 @@ export class AgentControl {
     const wait = (): number => {
       if (args.waitSeconds === undefined) return 0
       if (typeof args.waitSeconds !== 'number' || !Number.isFinite(args.waitSeconds) || args.waitSeconds < 0) throw new Error('waitSeconds must be a number of seconds')
-      return Math.min(args.waitSeconds, 100) * 1000
+      return Math.min(args.waitSeconds, SHIP_WAIT_SECONDS) * 1000
     }
+    const capped = (): Record<string, unknown> => waitCapped(args.waitSeconds, SHIP_WAIT_SECONDS, 'poll git.ship.status again to keep waiting')
     const settle = async (run: DeliveryRun | null): Promise<DeliveryRun | null> => run && run.state === 'running' && wait() ? delivery.wait(scope.projectId, run.id, wait()) : run
     // The panel keeps every stage's full log; a caller gets only what it can act on: the last
     // lines of a running or failed stage, never a passed build's asset list.
     const view = (run: DeliveryRun, note?: string): Record<string, unknown> => {
       const queued = delivery.queuePosition(scope.projectId, run.id)
       const stages = run.stages.map(({ log, ...stage }) => stage.state === 'running' || stage.state === 'failed' ? { ...stage, log: log.slice(-15) } : stage)
-      const queueNote = queued ? `Queued behind ${queued.behind} (position ${queued.position}); it starts by itself when that delivery settles and verifies the tree as it is then. Poll git.ship.status({runId:"${run.id}",waitSeconds:100}).` : undefined
+      const queueNote = queued ? `Queued behind ${queued.behind} (position ${queued.position}); it starts by itself when that delivery settles and verifies the tree as it is then. Poll git.ship.status({runId:"${run.id}",waitSeconds:${CONTROL_WAIT_MAX_SECONDS}}).` : undefined
       const notes = [note, queueNote].filter(Boolean).join(' ')
       return { ...run, stages, ...(queued ? { runId: run.id, status: 'queued', behind: queued.behind, position: queued.position } : {}), ...(notes ? { note: notes } : {}) }
     }
@@ -2219,7 +2304,7 @@ export class AgentControl {
         }
       }
       const settled = await settle(run)
-      return settled ? view(settled, note) : { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
+      return settled ? { ...view(settled, note), ...capped() } : { state: 'idle', note: 'No delivery has run for this project since Conductor started.' }
     }
     if (method !== 'git.ship') throw new Error(this.unknownMethod(method))
     args = validateArgs(method, args, ['message', 'paths', 'publish', 'mac', 'waitSeconds'], { aliases: { commitMessage: 'message', files: 'paths', wait: 'waitSeconds' } })
@@ -2239,7 +2324,7 @@ export class AgentControl {
     this.authorize(scope)
     // A second ship while another delivery of this project runs is queued behind it, never refused.
     const run = delivery.ship(scope.projectId, source.cwd, { message, ...(paths ? { paths } : {}), ...(publish ? { publish } : {}), ...(publish && args.mac === false ? { mac: false } : {}) }, scope.owner ? { kind: 'owner' } : { kind: 'agent', agentSessionId: scope.agentSessionId, title: source.title }, { queue: true })
-    return view((await settle(run))!)
+    return { ...view((await settle(run))!), ...capped() }
   }
 
   /**
@@ -2602,14 +2687,15 @@ export class AgentControl {
     const service = this.deps.coworkerAutoClose
     if (!service) throw new Error('agents.finish is unavailable in this window')
     validateArgs('agents.finish', args, ['agentSessionId', 'waitSeconds', 'force'], { aliases: { wait: 'waitSeconds' } })
-    if (args.waitSeconds !== undefined && (typeof args.waitSeconds !== 'number' || !Number.isFinite(args.waitSeconds) || args.waitSeconds < 0)) throw new ArgumentError(`waitSeconds must be a number of seconds from 0 to ${FINISH_WAIT_MAX_SECONDS}`)
+    if (args.waitSeconds !== undefined && (typeof args.waitSeconds !== 'number' || !Number.isFinite(args.waitSeconds) || args.waitSeconds < 0)) throw new ArgumentError(`waitSeconds must be a number of seconds from 0 to ${FINISH_WAIT_SECONDS}`)
     if (args.force !== undefined && typeof args.force !== 'boolean') throw new ArgumentError('force must be true or false')
-    const waitMs = Math.min(FINISH_WAIT_MAX_SECONDS, (args.waitSeconds as number | undefined) ?? 0) * 1000
+    const waitMs = Math.min(FINISH_WAIT_SECONDS, (args.waitSeconds as number | undefined) ?? 0) * 1000
+    const capped = waitCapped(args.waitSeconds, FINISH_WAIT_SECONDS, 'call agents.finish again to keep waiting')
     if (args.agentSessionId === undefined) {
       if (scope.owner) throw new Error('The owner credential has no tab of its own to finish; name the coworker with agentSessionId')
       const self = this.finishTargets().find(target => target.agentSessionId === scope.agentSessionId)
       if (!self) throw new Error(TAB_CLOSED)
-      return service.requestSelfFinish(self, { waitMs, force: args.force === true })
+      return { ...await service.requestSelfFinish(self, { waitMs, force: args.force === true }), ...capped }
     }
     // A controller's finish closes a settled coworker; force only cuts off a caller's own tasks.
     if (args.force !== undefined) throw new ArgumentError('force applies only to agents.finish({}) on your own tab, whose background tasks stop with its CLI; a coworker is finished once it settles: pass waitSeconds, or agents.interrupt it first')
@@ -2618,7 +2704,7 @@ export class AgentControl {
     const target = this.finishTargets().find(candidate => candidate.agentSessionId === id)
     if (!target) throw new Error('Agent is outside this workspace or has no visible tab; agents.list returns every agentSessionId this caller may name')
     if (target.controller !== scope.agentSessionId && !sovereign(scope)) throw new Error('Finish only a coworker this agent controls; agents.list shows them as its coworkers')
-    return service.finish(target, { waitMs })
+    return { ...await service.finish(target, { waitMs }), ...capped }
   }
 
   /** Every agent tab in the workspaces open in this window, as the finish rules see it. */
@@ -2806,8 +2892,16 @@ export class AgentControl {
       throw new Error(`The successor tab “${successorTitle}” opened but would not accept the handoff, so nothing was handed over and you still control your coworkers — keep working in this conversation: ${error instanceof Error ? error.message : String(error)}`)
     }
     // A sub-controller's successor stays under the same controller, so its reports still go up.
-    const parent = this.linkFor(scope.agentSessionId)
+    // A wizard's never does: it holds the owner's authority and opens as a root on every hop.
+    const parent = wizard ? null : this.linkFor(scope.agentSessionId)
     if (parent) database.setSetting(key(agentSessionId), JSON.stringify({ ...parent, targetAgentSessionId: agentSessionId, controlledTabId: tab.id }))
+    // Conversations in other projects that handed the caller work may still be answered, now by
+    // the successor (messagesAcross).
+    const handedIn = this.senders(scope.agentSessionId)
+    if (handedIn.length) {
+      for (const sender of handedIn) this.rememberSender(agentSessionId, sender)
+      database.removeSetting(HANDED_IN_PREFIX + scope.agentSessionId)
+    }
     for (const [id, grant] of this.updateGrants) if (grant.controllerAgentSessionId === scope.agentSessionId) this.updateGrants.set(id, { ...grant, controllerAgentSessionId: agentSessionId })
     // The owner's waiting approval cards and unspent grants go with it (permission-grants transfer);
     // the move itself is synchronous, only handing the rules to the runtimes is awaited below.

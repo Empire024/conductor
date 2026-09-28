@@ -1467,7 +1467,10 @@ export class StructuredSessions {
     // Restated on every lifecycle event for the same reason: the renderer derives the tab's own
     // phase from the projection, so a conversation whose turn settled while a render runs on has
     // to carry that fact forward rather than depend on the one event that announced it.
-    if (data.type === 'session' && data.backgroundTasks === undefined) data = { ...data, backgroundTasks: live.adapter?.backgroundWork?.() ?? 0 }
+    // A lost runtime has no background task left that can report into it, whatever its inventory
+    // last counted; restating that count kept a dead tab 'viewing' (and the install gate held) for good.
+    if (data.type === 'session' && data.phase === 'disconnected') data = { ...data, backgroundTasks: 0 }
+    else if (data.type === 'session' && data.backgroundTasks === undefined) data = { ...data, backgroundTasks: live.adapter?.backgroundWork?.() ?? 0 }
     if (data.type === 'changes') data = { ...data, changes: data.changes.map(change => this.artifacts.fromPatch(live.spec.id, change, live.spec.cwd)) }
     if (data.type === 'tool' && data.output && data.output.length > 32_000) {
       const output = data.output
@@ -1533,7 +1536,7 @@ export class StructuredSessions {
       store.addLiveCost(process.env.CONDUCTOR_LIVE_SUITE_ID!, live.spec.provider as StructuredProvider, data.costUsd)
       for (const session of this.live.values()) if (store.liveCostExceeded(process.env.CONDUCTOR_LIVE_SUITE_ID!, session.spec.provider as StructuredProvider)) this.stopLive(session, 'Live suite observed cost threshold reached')
     }
-    if (data.type !== 'session' && live.adapter && !live.closed) {
+    if (data.type !== 'session' && live.adapter && !live.closed && store.snapshot(live.spec.id)!.phase !== 'disconnected') {
       const outstanding = live.adapter.backgroundWork?.() ?? 0
       if (outstanding !== (live.backgroundTasks ?? 0)) this.emit(live, { data: { type: 'session', phase: state.phase, backgroundTasks: outstanding } })
     }

@@ -147,6 +147,9 @@ describe('AgentCollaborationStore', () => {
       expect(leased).toContain('expires in ~2 min unless renewed')
       expect(leased).not.toContain('heartbeat=')
       expect(leased).toContain('another workspace=' + first.sessionId + '; agent=' + first.id + '; tab=coworker-tab')
+      // Those ids identify who holds what; the briefing says how to reach them (G04).
+      expect(leased).toContain("Another workspace's agent and tab ids are for coordination: agents.list lists the ones there you control")
+      expect(store.buildBriefing(second.id, 1800, { guidance: false })).not.toContain('are for coordination')
       expect(leased).toContain('Recorded intent at 2026-09-08T10:00:00.000Z')
       expect(leased).toContain('not live execution evidence')
       expect(leased).toContain('agents.snapshot')

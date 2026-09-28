@@ -344,8 +344,11 @@ export class AgentCollaborationStore {
     if (added.length === 0 && released.length === 0 && messages.length === 0) return ''
 
     const agents = this.agentLabels(scope.projectId), tabs = this.agentTabs(scope.projectId)
-    const location = (workspaceId: string, id: string): string =>
-      `${workspaceId === scope.sessionId ? 'this workspace' : 'another workspace'}=${workspaceId}; agent=${id}; tab=${tabs.get(workspaceId + ':' + id)?.join(',') ?? 'none'}`
+    let elsewhere = false
+    const location = (workspaceId: string, id: string): string => {
+      if (workspaceId !== scope.sessionId) elsewhere = true
+      return `${workspaceId === scope.sessionId ? 'this workspace' : 'another workspace'}=${workspaceId}; agent=${id}; tab=${tabs.get(workspaceId + ':' + id)?.join(',') ?? 'none'}`
+    }
     const lines: Array<{ text: string; lease?: () => void }> = [{ text: `[Conductor coworker briefing — project-wide; generated ${now()}; other workspaces are included]` }]
     if (options.guidance !== false) lines.push(
       { text: '- Recorded coordination, not live execution evidence. Refresh app.state, agents.list and agents.snapshot for current phase and results; old intents may be stale.' },
@@ -366,6 +369,9 @@ export class AgentCollaborationStore {
       lines.push({ text: `- Recorded ${message.kind} at ${message.createdAt} from ${agents.get(message.agentSessionId) ?? message.agentSessionId} (${location(message.sessionId, message.agentSessionId)}): ${message.body}${paths}` })
     }
 
+    // The ids of another workspace identify who holds what; they are not a route. App control
+    // steers only this workspace's tabs and the coworkers a caller opened elsewhere (agents.list).
+    if (elsewhere && options.guidance !== false) lines.push({ text: '- Another workspace\'s agent and tab ids are for coordination: agents.list lists the ones there you control. To reach any other, send_message its controller when that one is in your workspace, or open your own tab there with tabs.open({workspaceId}).' })
     // Only a lease line that fits is recorded as told; one cut off here is offered again next time.
     let result = ''
     for (const line of lines) {

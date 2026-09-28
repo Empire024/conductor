@@ -1533,6 +1533,51 @@ describe('main-brain succession: agents.handoff successor:true', () => {
     expect(links.find(link => link.targetAgentSessionId === worker.resourceId)?.controllerAgentSessionId).toBe(result.agentSessionId)
     expect(await f.control.call({ ...f.scope, agentSessionId: result.agentSessionId }, 'agents.report', { text: 'Lead handed on' })).toMatchObject({ agentSessionId: f.spec.id })
   })
+
+  it('opens every successor of a two-hop chain as a root, and each predecessor messages it without taking control', async () => {
+    const f = fixture(false, undefined, undefined, astra)
+    asWizard(f)
+    const first = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    const firstScope = { ...f.scope, agentSessionId: first.agentSessionId }
+    // The old main reports its last step to the one that continues it: delivered, no control taken.
+    expect(await f.control.call(f.scope, 'agents.steer', { agentSessionId: first.agentSessionId, prompt: 'Step done' })).toMatchObject({ agentSessionId: first.agentSessionId, reportedTo: 'successor', controlled: false })
+    expect(f.submissions.at(-1)!.prompt).toBe('Step done')
+    expect(f.database.getSetting('agentControlParent:' + first.agentSessionId)).toBeNull()
+    // The link an older build recorded when the old main messaged its successor is void.
+    f.database.setSetting('agentControlParent:' + first.agentSessionId, JSON.stringify({ projectId: f.project.id, sessionId: f.workspace.id, controllerAgentSessionId: f.spec.id, targetAgentSessionId: first.agentSessionId, controllerTabId: f.rootTab.id, controlledTabId: first.tabId }))
+    expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === first.agentSessionId)).toBeUndefined()
+    // Second hop: the successor hands itself on in turn, and the new wizard is a root too.
+    const second = await f.control.call(firstScope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    expect(second).toMatchObject({ successor: true, wizard: true, controller: null })
+    expect(f.database.getSetting('agentControlParent:' + second.agentSessionId)).toBeNull()
+    expect(f.control.listLinks(f.project.id, f.workspace.id).find(link => link.targetAgentSessionId === second.agentSessionId)).toBeUndefined()
+    // Both predecessors reach the newest wizard, as a message, and neither becomes its controller.
+    expect(await f.control.call(firstScope, 'agents.steer', { agentSessionId: second.agentSessionId, prompt: 'Handed over' })).toMatchObject({ agentSessionId: second.agentSessionId, reportedTo: 'successor', controlled: false })
+    expect(await f.control.call(f.scope, 'agents.submit', { agentSessionId: second.agentSessionId, prompt: 'Also from the first' })).toMatchObject({ agentSessionId: second.agentSessionId, reportedTo: 'successor' })
+    // Naming the middle one reaches the newest, which now holds the work.
+    expect(await f.control.call(f.scope, 'agents.steer', { agentSessionId: first.agentSessionId, prompt: 'Late note' })).toMatchObject({ agentSessionId: second.agentSessionId, forwardedFrom: first.agentSessionId })
+    expect(f.database.getSetting('agentControlParent:' + second.agentSessionId)).toBeNull()
+    const secondScope = { ...f.scope, agentSessionId: second.agentSessionId }
+    expect((await f.control.call(secondScope, 'agents.list', {}) as Array<{ agentSessionId: string; wizard: boolean }>).filter(entry => entry.wizard).map(entry => entry.agentSessionId)).toEqual([second.agentSessionId])
+  })
+
+  it('passes the cross-project reply allowance to the successor, and forwards a message to the old wizard', async () => {
+    const f = fixture(false, undefined, undefined, astra)
+    asWizard(f)
+    const other = sibling(f, 'Haftheme'), asker = agentIn(f, other.project.id, other.workspace.id, 'theme-asker')
+    await f.control.call(asker, 'agents.steer', { projectId: f.project.id, prompt: 'Can you fix the shared build?' })
+    expect(f.submissions.at(-1)!.prompt).toContain('Can you fix the shared build?')
+    const next = await f.control.call(f.scope, 'agents.handoff', { handoff: handoff(), successor: true }) as Succession
+    const nextScope = { ...f.scope, agentSessionId: next.agentSessionId }
+    // The successor answers across projects as a reply: no control taken over the asker.
+    expect(await f.control.call(nextScope, 'agents.steer', { agentSessionId: asker.agentSessionId, prompt: 'Fixed in 1a2b3c' })).toMatchObject({ agentSessionId: asker.agentSessionId, reply: true, controlled: false })
+    expect(f.database.getSetting('agentControlParent:' + asker.agentSessionId)).toBeNull()
+    expect(f.database.getSetting('agentControlHandedIn:' + f.spec.id)).toBeNull()
+    // The asker's follow-up to the old wizard reaches the successor.
+    expect(await f.control.call(asker, 'agents.steer', { agentSessionId: f.spec.id, prompt: 'Thanks' })).toMatchObject({ agentSessionId: next.agentSessionId, forwardedFrom: f.spec.id })
+    expect(f.submissions.at(-1)!.prompt).toContain('Thanks')
+    expect(f.database.getSetting('agentControlParent:' + f.spec.id)).toBeNull()
+  })
   it('nudges a wizard once, as a Conductor notice in its tab, when it passes the succession threshold', async () => {
     let briefings: TurnBriefings | undefined
     const f = fixture(false, undefined, undefined, astra, (spec, prompt, itemId, runtimeId, context) => briefings!.compose(spec, prompt, itemId, runtimeId, context))
@@ -2090,7 +2135,7 @@ describe('control catalog and dispatch repairs', () => {
     f.delivery.queuePosition.mockReturnValueOnce({ position: 1, behind: 'run-1' })
     const queued = await f.control.call(f.scope, 'git.ship', { message: 'Second' }) as Viewed
     expect(queued).toMatchObject({ id: 'run-2', runId: 'run-2', status: 'queued', behind: 'run-1', position: 1 })
-    expect(queued.note).toMatch(/^Queued behind run-1 \(position 1\); it starts by itself.*git\.ship\.status\(\{runId:"run-2",waitSeconds:100\}\)/)
+    expect(queued.note).toMatch(/^Queued behind run-1 \(position 1\); it starts by itself.*git\.ship\.status\(\{runId:"run-2",waitSeconds:50\}\)/)
     const logs = Object.fromEntries(queued.stages.map(entry => [entry.id, entry.log]))
     expect(logs).toEqual({ preflight: undefined, test: lines(30).slice(-15), build: undefined, commit: lines(20).slice(-15), push: undefined, release: undefined })
     expect(queued.stages.find(entry => entry.id === 'build')).not.toHaveProperty('log')
@@ -2428,6 +2473,36 @@ describe('viewing through app control', () => {
     await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.backgroundTasks ?? 0).toBe(0))
     expect(await f.control.call(f.scope, 'agents.status', { agentSessionId: id })).toMatchObject({ phase: 'completed', backgroundTasks: 0 })
   })
+
+  it('never reports a disconnected or runtime-less conversation’s leftover count as live background work', async () => {
+    const f = fixture()
+    const tab = await f.control.call(f.scope, 'tabs.open', { provider: 'claude', model: 'claude-synthetic' }) as AgentControlTab
+    const id = tab.resourceId!
+    await f.control.call(f.scope, 'agents.submit', { agentSessionId: id, prompt: 'Start a watcher' })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('completed'))
+    const entry = async () => (await f.control.call(f.scope, 'agents.list', {}) as Array<Record<string, unknown>>).find(listed => listed.agentSessionId === id)
+    const loaded = async () => (await f.control.call(f.scope, 'agents.list', { load: true }) as Array<Record<string, unknown>>).find(listed => listed.agentSessionId === id)
+    // The runtime's connection drops while it counted a task: the lost runtime records none.
+    f.submissions.at(-1)!.options.emit({ data: { type: 'session', phase: 'completed', backgroundTasks: 1 } })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.backgroundTasks).toBe(1))
+    f.submissions.at(-1)!.options.emit({ data: { type: 'session', phase: 'disconnected', backgroundTasks: 1 } })
+    await vi.waitFor(() => expect(f.database.structured.snapshot(id)!.phase).toBe('disconnected'))
+    expect(f.database.structured.snapshot(id)!.backgroundTasks).toBe(0)
+    expect(await entry()).toMatchObject({ phase: 'disconnected', backgroundTasks: 0 })
+    expect(await entry()).not.toHaveProperty('staleBackgroundTasks')
+    // A disconnected record an older build left with its count is reported stale, never live.
+    // (Written straight into the projection: no event of this build produces such a record.)
+    const persist = (patch: Partial<SessionProjection>) => f.database.structured.update(id, patch as Parameters<typeof f.database.structured.update>[1])
+    persist({ backgroundTasks: 1 })
+    expect(await entry()).toMatchObject({ phase: 'disconnected', backgroundTasks: 0, staleBackgroundTasks: 1 })
+    expect(await loaded()).toMatchObject({ phase: 'disconnected', backgroundTasks: 0, staleBackgroundTasks: 1 })
+    // A count persisted before the runtime went away (a restart) is stale too, whatever the phase.
+    f.sessions.killWhere(spec => spec.id === id)
+    expect(f.sessions.hasRuntime(id)).toBe(false)
+    persist({ phase: 'completed', backgroundTasks: 1 })
+    expect(await entry()).toMatchObject({ phase: 'completed', backgroundTasks: 0, staleBackgroundTasks: 1 })
+    expect(await f.control.call(f.scope, 'agents.status', { agentSessionId: id })).toMatchObject({ phase: 'completed', backgroundTasks: 0, staleBackgroundTasks: 1 })
+  })
 })
 
 describe('agents.finish', () => {
@@ -2575,6 +2650,11 @@ describe('agents.finish', () => {
     settle(f, stuck.resourceId!, 'running')
     await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: stuck.resourceId, waitSeconds: 0.5 })).rejects.toThrow(/its turn is still running after 1 s of waiting\. Retry with agents.finish\(\{agentSessionId:"[^"]+",waitSeconds:60\}\).*or agents.interrupt it first/)
     await expect(f.control.call(f.scope, 'agents.finish', { agentSessionId: stuck.resourceId, waitSeconds: 'soon' })).rejects.toThrow(/waitSeconds must be a number of seconds from 0 to 150/)
+    // A longer wait is capped, and the result says so (the MCP control tool caps at 50 s before that).
+    const done = await f.control.call(f.scope, 'tabs.open', {}) as AgentControlTab
+    settle(f, done.resourceId!, 'completed')
+    expect(await f.control.call(f.scope, 'agents.finish', { agentSessionId: done.resourceId, waitSeconds: 600 })).toMatchObject({ finished: true, waitCapped: 'waitSeconds 600 was capped at 150 s; call agents.finish again to keep waiting' })
+    expect(await f.control.call(f.scope, 'tools.list', { prefix: 'agents.finish' })).toMatchObject({ 'agents.finish': expect.stringContaining('waitSeconds (max 150; 50 over the conductor MCP control tool;') })
   })
 
   it('lets a coworker with background tasks finish itself with force:true, and says how otherwise', async () => {
@@ -2930,5 +3010,31 @@ describe('H15 error texts and agents.interrupt expedite', () => {
     await expect(f.control.call(f.scope, 'router.dispatch', { tasks: [] })).rejects.toThrow(/tasks must hold one to four bounded tasks; split a larger batch/)
     await expect(f.control.call(f.scope, 'app.state', { sessionId: 'elsewhere' })).rejects.toThrow(/omit sessionId: a conversation's scope is fixed/)
     await expect(f.control.call(f.scope, 'tools.list', [] as never)).rejects.toThrow(/args must be a JSON object/)
+  })
+})
+
+describe('G04: a conversation in another workspace of the same project', () => {
+  it('is refused naming its workspace, its controller and the route that works, never agents.resume', async () => {
+    const f = fixture()
+    const room = f.database.createSession(f.project.id, 'Review room')
+    const loose = agentIn(f, f.project.id, room.id, 'loose-agent')
+    const refused = (id: string, method = 'agents.steer') => f.control.call(f.scope, method, { agentSessionId: id, ...(method === 'agents.steer' ? { prompt: 'x' } : {}) })
+    // Nobody controls it: open a tab there.
+    await expect(refused(loose.agentSessionId)).rejects.toThrow(`"loose-agent" (loose-agent) is open in workspace "Review room" (${room.id}) of this project, not in yours; nobody controls it`)
+    await expect(refused(loose.agentSessionId, 'agents.status')).rejects.toThrow(`tabs.open({workspaceId:"${room.id}",prompt})`)
+    await expect(refused(loose.agentSessionId)).rejects.not.toThrow(/agents\.resume/)
+    // Controlled from this workspace: send_message that controller.
+    const lead = agentIn(f, f.project.id, f.workspace.id, 'lead')
+    const worker = await f.control.call(lead, 'tabs.open', { workspaceId: room.id, title: 'Room worker' }) as AgentControlTab
+    await expect(refused(worker.resourceId!, 'agents.status')).rejects.toThrow(`is open in workspace "Review room" (${room.id}) of this project, not in yours; it is controlled by "lead" (lead): send_message that controller instead`)
+    // Controlled from the other workspace: the controller is out of reach too.
+    const theirs = await f.control.call(loose, 'tabs.open', { title: 'Their worker' }) as AgentControlTab
+    await expect(refused(theirs.resourceId!)).rejects.toThrow(/controlled by "loose-agent" \(loose-agent\), which is not in your workspace either: open your own tab there/)
+    // No open tab at all: where it belongs, and no promise that agents.resume reopens it.
+    f.sessions.ensure({ id: 'tabless', projectId: f.project.id, sessionId: room.id, cwd: f.project.path, provider: 'codex', title: 'Tabless', model: 'codex-synthetic' })
+    await expect(refused('tabless')).rejects.toThrow(`"Tabless" (tabless) belongs to workspace "Review room" (${room.id}) of this project and has no open tab`)
+    // The route named works: a tab this caller opens there is its own to steer.
+    const own = await f.control.call(f.scope, 'tabs.open', { workspaceId: room.id, title: 'My worker there' }) as AgentControlTab
+    await expect(f.control.call(f.scope, 'agents.steer', { agentSessionId: own.resourceId, prompt: 'Go' })).resolves.toMatchObject({ agentSessionId: own.resourceId })
   })
 })

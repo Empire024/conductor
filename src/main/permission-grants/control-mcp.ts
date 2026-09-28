@@ -12,6 +12,25 @@ const MAX_BODY = 256 * 1024
 /** Codex stops waiting for an MCP tool after 60 s by default; git.ship.status({waitSeconds:100})
  *  and agents.finish({waitSeconds}) legitimately take longer, so it gets the server's own limit. */
 export const CONDUCTOR_TOOL_TIMEOUT_SEC = 180
+/** The Claude CLI aborts an HTTP MCP request after 60 s unless the server entry sets its own
+ *  `timeout` (measured 2026-09-28: git.ship.status({waitSeconds:90}) over this tool failed with
+ *  "The operation timed out."; the 2.1.28x binary defaults the request timeout to 60000 ms). The
+ *  control tool therefore lives inside the shorter of the two clients' limits. */
+export const MCP_CLIENT_LIMIT_SEC = Math.min(60, CONDUCTOR_TOOL_TIMEOUT_SEC)
+/** The longest waitSeconds a method is asked for over the control tool (agents.finish,
+ *  git.ship(.status), nodes.job, ...); over HTTP each method keeps its own maximum. The margin
+ *  covers a call queued behind the caller's previous mutation and the work after the wait. */
+export const CONTROL_WAIT_MAX_SECONDS = MCP_CLIENT_LIMIT_SEC - 10
+/** A tool call still running this long is answered "still running" rather than left to the
+ *  client's timeout, which would read as a failure and invite a blind retry of a mutation. */
+export const CONDUCTOR_TOOL_ANSWER_MS = (MCP_CLIENT_LIMIT_SEC - 5) * 1000
+const WAIT_KEYS = ['waitSeconds', 'wait', 'timeoutSeconds']
+/** The control tool's args with any wait cut to CONTROL_WAIT_MAX_SECONDS, and what to say if it was. */
+const capWait = (args: Record<string, unknown>): { args: Record<string, unknown>; waitCapped?: string } => {
+  const key = WAIT_KEYS.find(candidate => typeof args[candidate] === 'number' && (args[candidate] as number) > CONTROL_WAIT_MAX_SECONDS)
+  if (!key) return { args }
+  return { args: { ...args, [key]: CONTROL_WAIT_MAX_SECONDS }, waitCapped: `${key} ${String(args[key])} was capped at ${CONTROL_WAIT_MAX_SECONDS} s, inside this MCP client's ${MCP_CLIENT_LIMIT_SEC} s tool-call limit; call again to keep waiting` }
+}
 
 export interface ControlScope { projectId: string; sessionId: string; agentSessionId: string }
 /** AgentControl.call with the conversation's own scope: the same authority rules as over HTTP.
@@ -89,7 +108,7 @@ export class ConductorMcpServer {
   private authority = ''
   private configDirectory = ''
   private credentials = new Map<string, Credential>()
-  constructor(private readonly call: ControlCall, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1') {}
+  constructor(private readonly call: ControlCall, private readonly disabled = process.env.CONDUCTOR_LIVE_TESTS === '1', private readonly answerWithinMs = CONDUCTOR_TOOL_ANSWER_MS) {}
 
   get url(): string { return this.endpoint }
 
@@ -201,10 +220,21 @@ export class ConductorMcpServer {
       if (!tool) return { ...envelope, error: { code: -32602, message: `Unknown Conductor tool "${name || '(none)'}"; the tools here are ${offered(credential.provider).map(candidate => candidate.name).join(', ')}. control({method,args}) calls any app-control method.` } }
       if (tool.claudeOnly && credential.provider !== 'claude') return { ...envelope, result: { isError: true, content: [{ type: 'text', text: `${name} is for Claude conversations, whose auto-mode classifier refuses calls; a ${credential.provider} command that needs the owner raises its own approval card in this tab, so run the call itself. Tools here: ${offered(credential.provider).map(candidate => candidate.name).join(', ')}.` }] } }
       const input = params.arguments && typeof params.arguments === 'object' && !Array.isArray(params.arguments) ? params.arguments as Record<string, unknown> : {}
+      let timer: ReturnType<typeof setTimeout> | undefined
       try {
-        const result = tool.generic
-          ? await this.call(credential.scope, controlMethod(input), tool.args(input), { generic: true })
-          : await this.call(credential.scope, tool.method, tool.args(input))
+        const method = tool.generic ? controlMethod(input) : tool.method
+        const { args, waitCapped } = capWait(tool.args(input))
+        const running = tool.generic
+          ? this.call(credential.scope, method, args, { generic: true })
+          : this.call(credential.scope, method, args)
+        const late = Symbol('late')
+        const answered = await Promise.race([running, new Promise<typeof late>(resolve => { timer = setTimeout(() => resolve(late), this.answerWithinMs); timer.unref?.() })])
+        if (answered === late) {
+          running.catch(() => undefined)
+          return { ...envelope, result: { isError: true, content: [{ type: 'text', text: `${method} is still running after ${Math.round(this.answerWithinMs / 1000)} s, so it is answered now, before your MCP client gives up at ${MCP_CLIENT_LIMIT_SEC} s. It was not cancelled and may still take effect: do not repeat it; check its outcome (agents.status, agents.list, git.ship.status or list_permissions). Keep waitSeconds at ${CONTROL_WAIT_MAX_SECONDS} or less.` }] } }
+        }
+        const plain = answered !== null && typeof answered === 'object' && !Array.isArray(answered)
+        const result = waitCapped ? plain ? { ...answered as Record<string, unknown>, waitCapped } : { result: answered, waitCapped } : answered
         if (this.credentials.get(credential.scope.agentSessionId) !== credential) throw new Error('Conductor access was revoked while the tool was running; the call may already have taken effect, so check (agents.list, git.ship.status or list_permissions) before repeating it')
         // Any method's result as its JSON text alone: a tools.list is tens of KB, so it is not
         // sent a second time as structuredContent.
@@ -212,6 +242,7 @@ export class ConductorMcpServer {
         const structured = result && typeof result === 'object' && !Array.isArray(result) ? result as Record<string, unknown> : { result }
         return { ...envelope, result: { content: [{ type: 'text', text: JSON.stringify(structured) }], structuredContent: structured } }
       } catch (error) { return { ...envelope, result: { isError: true, content: [{ type: 'text', text: error instanceof Error ? error.message : 'Conductor tool failed; the call may not have run: check with agents.list or list_permissions before repeating it' }] } } }
+      finally { clearTimeout(timer) }
     }
     return { ...envelope, error: { code: -32601, message: `Method not found: ${message.method ?? '(none)'}` } }
   }

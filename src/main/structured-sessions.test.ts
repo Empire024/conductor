@@ -1749,6 +1749,11 @@ describe('activity reported while background work outlives its turn', () => {
     expect(activityPhase(f)).toBe('waiting_background')
     f.current.emit({ data: { type: 'session', phase: 'disconnected' } })
     expect(activityPhase(f)).toBe('disconnected')
+    // The lost runtime's count does not outlive it, even though its stale inventory still says 1.
+    expect(f.database.structured.snapshot(f.spec.id)?.backgroundTasks).toBe(0)
+    tick(f)
+    expect(f.database.structured.snapshot(f.spec.id)?.backgroundTasks).toBe(0)
+    expect(activityPhase(f)).toBe('disconnected')
   })
 
   it('leaves a conversation whose inventory was empty all along exactly as it was', async () => {

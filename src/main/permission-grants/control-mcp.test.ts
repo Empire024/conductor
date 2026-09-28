@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
 import { afterEach, describe, expect, it } from 'vitest'
-import { CONDUCTOR_MCP_TOOLS, CONDUCTOR_TOOL_TIMEOUT_SEC, ConductorMcpServer } from './control-mcp'
+import { CONDUCTOR_MCP_TOOLS, CONDUCTOR_TOOL_ANSWER_MS, CONDUCTOR_TOOL_TIMEOUT_SEC, CONTROL_WAIT_MAX_SECONDS, ConductorMcpServer, MCP_CLIENT_LIMIT_SEC } from './control-mcp'
 import { codexConductorThreadConfig, codexLocalAssistThreadConfig, mergeCodexMcpConfigs } from '../local-assist/mcp-config'
 
 const servers: ConductorMcpServer[] = []
@@ -82,6 +82,41 @@ describe('the report tool (H08)', () => {
     const reply = await (await fetch(entry.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: entry.http_headers.Authorization }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'report', arguments: { text } } }) })).json() as Rpc
     expect(reply.result!.isError).toBeUndefined()
     expect(calls).toEqual([{ scope: { projectId: 'project', sessionId: 'workspace', agentSessionId: 'agent_codex' }, method: 'agents.report', args: { text }, generic: false }])
+  })
+})
+
+describe('long waits over the conductor MCP tool (b5)', () => {
+  it('keeps the wait cap and the early answer inside the Claude CLI 60 s HTTP request limit', () => {
+    expect(MCP_CLIENT_LIMIT_SEC).toBe(60)
+    expect(CONTROL_WAIT_MAX_SECONDS).toBe(50)
+    expect(CONDUCTOR_TOOL_ANSWER_MS).toBeGreaterThan(CONTROL_WAIT_MAX_SECONDS * 1000)
+    expect(CONDUCTOR_TOOL_ANSWER_MS).toBeLessThan(MCP_CLIENT_LIMIT_SEC * 1000)
+    expect(CONDUCTOR_TOOL_TIMEOUT_SEC).toBeGreaterThan(MCP_CLIENT_LIMIT_SEC)
+  })
+
+  it('caps any wait passed through the control tool, and says so in the result', async () => {
+    const { server, calls } = await serve()
+    const entry = JSON.parse(readFileSync(server.configure(spec('claude')), 'utf8')).mcpServers.conductor
+    const call = async (args: Record<string, unknown>) => JSON.parse((await (await fetch(entry.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: entry.headers.Authorization }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'control', arguments: { method: 'git.ship.status', args } } }) })).json() as Rpc).result!.content![0]!.text)
+    expect(await call({ waitSeconds: 90 })).toEqual({ ok: true, waitCapped: "waitSeconds 90 was capped at 50 s, inside this MCP client's 60 s tool-call limit; call again to keep waiting" })
+    expect(await call({ wait: 100 })).toMatchObject({ waitCapped: expect.stringMatching(/^wait 100 was capped at 50 s/) })
+    expect(await call({ waitSeconds: 30 })).toEqual({ ok: true })
+    expect(calls.map(entry => entry.args)).toEqual([{ waitSeconds: 50 }, { wait: 50 }, { waitSeconds: 30 }])
+  })
+
+  it('answers a call still running at the deadline as still running, without cancelling it', async () => {
+    let finish!: (value: unknown) => void
+    const settled: unknown[] = []
+    const server = new ConductorMcpServer((_scope, method) => new Promise(resolve => { finish = resolve }).then(value => { settled.push([method, value]); return value }), false, 50)
+    servers.push(server)
+    await server.start()
+    const entry = JSON.parse(readFileSync(server.configure(spec('codex')), 'utf8')).mcp_servers.conductor
+    const reply = await (await fetch(entry.url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: entry.http_headers.Authorization }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'control', arguments: { method: 'agents.finish', args: { agentSessionId: 'agent_x', waitSeconds: 120 } } } }) })).json() as Rpc
+    expect(reply.result).toMatchObject({ isError: true })
+    expect(reply.result!.content![0]!.text).toMatch(/^agents\.finish is still running after 0 s.*It was not cancelled and may still take effect: do not repeat it/)
+    finish({ finished: true })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    expect(settled).toEqual([['agents.finish', { finished: true }]])
   })
 })
 
