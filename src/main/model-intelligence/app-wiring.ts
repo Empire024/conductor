@@ -8,7 +8,7 @@ import type { HandoffPort, StageResultInput } from '../durable-jobs/ports'
 import type { LocalModelRunner } from '../local-assist/contract'
 import type { LocalModelConfig } from '../local-models/config'
 import type { ThresholdSettings } from './decision-service'
-import { cloudRunPort, dockerCommandPort, localRunPort, type CloudTurn } from './evaluation-ports'
+import { cloudRunPort, dockerCommandPort, hostCommandPort, localRunPort, type CloudTurn } from './evaluation-ports'
 import { bundledSuites, createModelIntelligence, type ModelIntelligence } from './index'
 import type { ConfiguredLocalModel } from './ingest/configured'
 import type { LatestModelsOutputs } from './ingest/latest-models'
@@ -57,6 +57,7 @@ const NO_BENCHMARKS = JSON.stringify({ source: { name: 'none' }, observedAt: '19
 
 export async function startModelIntelligence(deps: ModelIntelligenceAppDeps): Promise<ModelIntelligence> {
   const runners = new Map<string, Promise<LocalModelRunner>>()
+  let hostCommand: ReturnType<typeof hostCommandPort> | undefined
   const runnerFor = (model: string): Promise<LocalModelRunner> => { if (!runners.has(model)) runners.set(model, deps.runner(model)); return runners.get(model)! }
   const run = localRunPort(model => ({ ask: async request => (await runnerFor(model)).ask(request) }))
   const service = createModelIntelligence({
@@ -74,7 +75,8 @@ export async function startModelIntelligence(deps: ModelIntelligenceAppDeps): Pr
       runLocal: run,
       ...(deps.cloudTurn ? { runCloud: cloudRunPort(deps.cloudTurn) } : {}),
       usage: provider => deps.weeklyUsage(provider),
-      command: async () => { const image = deps.sandboxImage(); return image && await deps.sandboxReady(image) ? dockerCommandPort(image) : null },
+      // The docker sandbox where it is built, else a confined host node check (probed once per app run).
+      command: async () => { const image = deps.sandboxImage(); return image && await deps.sandboxReady(image) ? dockerCommandPort(image) : await (hostCommand ??= hostCommandPort().catch(() => null)) },
       precheck: key => { const other = deps.runningLocalModels().filter(model => model !== key.model); return other.length ? `${other.join(', ')} holds the GPU; stop it with local.stop first, or evaluate that model` : null },
       writeReport: (name, markdown) => { const folder = join(deps.userData, 'model-evaluations'); mkdirSync(folder, { recursive: true }); writeFileSync(join(folder, name), markdown, 'utf8') },
       readReport: runId => evaluationReport(join(deps.userData, 'model-evaluations'), runId),

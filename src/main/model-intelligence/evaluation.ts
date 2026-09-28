@@ -115,17 +115,20 @@ export interface EvaluationRun {
   contextFailure?: boolean
 }
 export interface CommandRequest { cmd: string; args: string[]; timeoutSec: number; files: Record<string, string>; signal?: AbortSignal }
-export interface CommandResult { exitCode: number | null; timedOut?: boolean; output?: string }
-export interface Grade { pass: boolean; detail: string; invalidOutput?: boolean }
+/** `spawnFailed`: the check's runtime never started, which says nothing about the answer. */
+export interface CommandResult { exitCode: number | null; timedOut?: boolean; output?: string; spawnFailed?: boolean }
+/** `notGradable`: the check itself could not run (no runner, a refused command, a runtime that did not start);
+ *  the job records no outcome rather than a failure the model did not cause. */
+export interface Grade { pass: boolean; detail: string; invalidOutput?: boolean; notGradable?: boolean }
 
 /** The answer without reasoning blocks. */
 export const visibleAnswer = (text: string): string => {
   const body = text.replace(/<think>[\s\S]*?<\/think>/gi, ''), close = body.toLowerCase().lastIndexOf('</think>')
   return (close >= 0 ? body.slice(close + '</think>'.length) : body).trim()
 }
-/** The first fenced block's content, else the whole visible answer. */
+/** The first fenced block's content (any info string, a file path too), else the whole visible answer. */
 export const answerCode = (text: string): string => {
-  const visible = visibleAnswer(text), fenced = /```[\w-]*[^\S\n]*\n([\s\S]*?)```/.exec(visible)
+  const visible = visibleAnswer(text), fenced = /```[^\s`]*[^\S\n]*\n([\s\S]*?)```/.exec(visible)
   return (fenced ? fenced[1]! : visible).trim() + '\n'
 }
 const clip = (text: string, max = 200) => { const line = text.replace(/\s+/g, ' ').trim(); return line.length > max ? line.slice(0, max - 1) + '…' : line }
@@ -188,11 +191,15 @@ export async function grade(job: EvaluationJob, run: EvaluationRun, command?: (r
       return { pass, detail: pass ? `${grader.path} matches` : `${grader.path} does not match /${grader.regex}/` }
     }
     case 'command': {
-      if (!command) return { pass: false, detail: 'no command runner is available for this grader' }
-      const files = { ...job.files, ...run.files, ...grader.files, ...(grader.answerFile ? { [grader.answerFile]: answerCode(run.answer) } : {}) }
+      if (!command) return { pass: false, notGradable: true, detail: 'no command runner is available for this grader' }
+      // The answer file is the block the answer named after it, else its first fenced block.
+      const answered = grader.answerFile ? run.files?.[grader.answerFile] ?? answerCode(run.answer) : undefined
+      const files = { ...job.files, ...run.files, ...grader.files, ...(grader.answerFile ? { [grader.answerFile]: answered! } : {}) }
       let result: CommandResult
       try { result = await command({ cmd: grader.cmd, args: grader.args, timeoutSec: grader.timeoutSec, files, ...(signal ? { signal } : {}) }) }
-      catch (error) { return { pass: false, detail: `the check could not run: ${error instanceof Error ? error.message : String(error)}` } }
+      catch (error) { return { pass: false, notGradable: true, detail: `the check could not run: ${error instanceof Error ? error.message : String(error)}` } }
+      if (result.spawnFailed) return { pass: false, notGradable: true, detail: `the check could not start: ${clip(result.output ?? 'no output')}` }
+      if (signal?.aborted) return { pass: false, notGradable: true, detail: 'the check was aborted' }
       if (result.timedOut) return { pass: false, detail: `the check timed out after ${grader.timeoutSec} s` }
       const pass = result.exitCode === grader.expectExit
       return { pass, detail: pass ? `${grader.cmd} exited ${result.exitCode}` : `${grader.cmd} exited ${result.exitCode ?? 'without a code'}, expected ${grader.expectExit}${result.output ? `: ${clip(result.output)}` : ''}` }
@@ -265,6 +272,9 @@ export function batchPrompt(jobs: EvaluationJob[]): EvaluationJob {
     `You are evaluated on ${jobs.length} independent tasks in one reply. Do not use tools. Answer every task, in order.`,
     'Start each answer with a line that is exactly "### JOB <task id>" (for example "### JOB ' + (jobs[0]?.id ?? 'x') + '") and put nothing before the first such line.',
     'Under each header follow that task\'s own instructions: when it asks for code or JSON only, give one fenced block; when it asks for a file, give it as a fenced block whose info string is its relative path.',
+    // A command-graded job is checked by running its check over the files the answer gives; nothing runs during the turn.
+    ...(jobs.some(job => job.grader.kind === 'command' || job.grader.kind === 'file-content')
+      ? ['You cannot run anything. Where a task asks you to change, create or run files, give the complete content of every file it asks for, and of every file that run would write, each as a fenced block whose info string is its relative path; the files are checked afterwards.'] : []),
     '', ...sections,
   ].join('\n')
   return { id: BATCH_JOB_ID, category: 'general', complexity: Math.max(1, ...jobs.map(job => job.complexity)) as EvaluationJob['complexity'], prompt, grader: { kind: 'regex', pattern: '.' } }
@@ -375,8 +385,9 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
   // gradable and writes no outcome. Only a wrong answer is a failure.
   const runBatched = async (): Promise<void> => {
     const batched: EvaluationJob[] = []
+    // A command job rides in the same turn: its answer's files are checked afterwards by the command runner.
     for (const job of jobs) {
-      if (needsCommand(job)) notGradable(job, 'not run: a batched cloud run grades one-shot answers; this job\'s check needs a command runner')
+      if (needsCommand(job) && !ports.command) notGradable(job, 'not run: its check needs a command runner, which is not available here')
       else batched.push(job)
     }
     const overhead = ports.fixedOverheadTokens?.(key.provider) ?? DEFAULT_FIXED_OVERHEAD_TOKENS
@@ -421,7 +432,9 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
     for (const job of batched) {
       const section = sections[job.id]
       const graded: Grade = section === undefined ? { pass: false, invalidOutput: true, detail: `no "### JOB ${job.id}" section in the batched answer` }
-        : await grade(job, { answer: section, files: { ...run.files, ...answerFiles(section) } }, ports.command?.bind(ports), options.signal)
+        // A check runs over this job's own files only, never another section's.
+        : await grade(job, { answer: section, files: needsCommand(job) ? answerFiles(section) : { ...run.files, ...answerFiles(section) } }, ports.command?.bind(ports), options.signal)
+      if (graded.notGradable) { notGradable(job, `not graded: ${graded.detail}`); continue }
       record(job, {
         key, source: 'evaluation', ref: `${runId}:${job.id}`, category: job.category, at: ports.now().toISOString(), result: graded.pass ? 'success' : 'failure',
         effort: run.effort ?? null, complexity: job.complexity, verifier: graded.pass ? 'pass' : 'fail', durationMs: null, tokens: null, costUsd: null,
@@ -469,9 +482,14 @@ export async function evaluate(key: ModelKey, suite: EvaluationSuite, ports: Eva
       // A turn stopped at its budget ran out of tokens; it says nothing about the model.
       const cutOff = !run && !timedOut && !cancelled && budget !== undefined && used >= budget.maxTokens
       tokens += used
-      if (cutOff) notGradable(job, `not graded: the turn was stopped at its ${budget!.maxTokens.toLocaleString('en-US')}-token budget (${failure})`)
-      else {
-        const graded: Grade = run ? await grade(job, run, ports.command?.bind(ports), options.signal) : { pass: false, detail: failure! }
+      const graded: Grade | null = cutOff ? null : run ? await grade(job, run, ports.command?.bind(ports), options.signal) : { pass: false, detail: failure! }
+      if (!graded) notGradable(job, `not graded: the turn was stopped at its ${budget!.maxTokens.toLocaleString('en-US')}-token budget (${failure})`)
+      else if (graded.notGradable && !cancelled) {
+        // The model answered, but its check could not run: the spend stands, the answer is not judged.
+        notGradable(job, `not graded: ${graded.detail}`)
+        results[results.length - 1]!.tokens = used
+        spent += run?.costUsd ?? 0
+      } else {
         const durationMs = run?.durationMs ?? ports.now().getTime() - started, costUsd = run?.costUsd ?? null
         const result = cancelled ? 'cancelled' : graded.pass ? 'success' : 'failure'
         record(job, {

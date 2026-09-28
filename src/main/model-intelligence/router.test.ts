@@ -201,3 +201,22 @@ describe('router explanation', () => {
     expect(lines.at(-1)).toMatch(/^Confidence [01]\.\d\d \(margin [01]\.\d\d\), decided by scorer$/)
   })
 })
+
+describe('router: hard-work floor and unpriced models (N10, N18)', () => {
+  it('keeps hard work off a rank-1 model at cost weight 1, says why, and lifts the floor only when nothing stronger is eligible', async () => {
+    const luna = record('codex', 'gpt-6-luna', { capabilityRank: 1, pricing: price(0.05, 0.4) }), opus = { ...STRONG, capabilityRank: 3 as const }
+    const { ports } = setup({ records: [luna, opus], table: {} })
+    const decision = await route(hard, { costWeight: 1 }, ports)
+    expect(chosen(decision)).toBe('claude/opus[1m]')
+    expect(decision.reasons.join('\n')).toMatch(/codex\/gpt-6-luna excluded: capability rank 1 below the rank-2 floor/)
+    const lifted = await route(hard, { costWeight: 1, excludeProviders: ['claude'] }, ports)
+    expect(chosen(lifted)).toBe('codex/gpt-6-luna')
+    expect(lifted.reasons).toContain('no model of capability rank 2+ is eligible, so the floor for hard work is lifted')
+  })
+  it('explains the price an unpriced model was scored at', async () => {
+    const fast = record('grok', 'grok-4.7-build-fast', { capabilityRank: 2 }), heavy = record('grok', 'grok-4.7-heavy', { capabilityRank: 2, pricing: price(3, 15) })
+    const { ports } = setup({ records: [fast, heavy], table: {}, live: { usagePercent: () => null } })
+    const decision = await route(simple, { allow: [fast.key] }, ports)
+    expect(decision.reasons.join('\n')).toMatch(/no per-token price known; scored at \$\d+\.\d\d, the price of grok\/grok-4\.7-heavy, so it never undercuts a priced model beside it/)
+  })
+})

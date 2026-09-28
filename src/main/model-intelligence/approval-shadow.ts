@@ -2,28 +2,39 @@ import type { AgentSpec } from '../../shared/models'
 import type { Decider, DeciderOutcome, DecisionRecord, DecisionRequest, ExecutionOutcome } from '../../shared/model-routing'
 import type { ReviewAction, ReviewRecord } from '../approval-review'
 import { captureApprovalReview } from './capture/approval-review'
-import type { DecisionService } from './decision-service'
-import type { ModelIntelligenceStore } from './store'
+import { topChoice, type DecisionService } from './decision-service'
+import { LIVE_AUDIT_EVERY, type LiveBoundaries } from './live-boundaries'
+import { boundaryOf, type ModelIntelligenceStore } from './store'
 
 /**
  * The approval gate's shadow (docs/model-routing.md, E): when a reviewer turn is about to run, the
  * local decider is asked the same question in the background; the reviewer's own answer is the
  * frontier verdict of that DecisionRecord, and the owner's later answer is its outcome, so
- * agreement can be counted before `live` is ever considered. The gate calls these synchronously and
- * never waits: nothing here can delay or change a review. Mode `live` is not wired: it behaves as
- * shadow.
+ * agreement is counted per boundary (live-boundaries.ts). reviewing, reviewed and answered are called
+ * synchronously and never wait: they cannot delay or change a review.
+ *
+ * decideLive is the one step the gate waits for, and only on a boundary the owner or a wizard switched
+ * live (decisions.live, at 95% over 30 cases): a confident local allow of a workspace-write action then
+ * answers it without a reviewer turn. Anything else (a deny, an escalation, an unsure verdict, native-owner,
+ * no local server, a slow or failed decider) returns null and the reviewer runs as before. Every
+ * LIVE_AUDIT_EVERY-th confident allow is still reviewed, so agreement keeps being measured; a boundary whose
+ * agreement falls below the rule is reverted to shadow as soon as a reviewer's or owner's answer shows it.
  */
 
 export interface ApprovalShadowService {
+  /** A live boundary's answer for this action, or null: the reviewer decides as before. Never throws. */
+  decideLive(spec: AgentSpec, action: ReviewAction): Promise<{ key: string; rationale: string } | null>
   reviewing(spec: AgentSpec, action: ReviewAction): void
   reviewed(record: ReviewRecord): void
   answered(record: ReviewRecord): void
   /** Settles in tests once every background step of this request has finished. */
   settled(record: Pick<ReviewRecord, 'workerId' | 'runtimeId' | 'requestId'>): Promise<DecisionRecord | null>
-  /** Reviews the shadow skipped because no local model server was running (it never starts one). */
-  stats(): { skipped: number; lastSkip: string | null }
+  /** Reviews the shadow skipped because no local model server was running (it never starts one); live answers and audits. */
+  stats(): { skipped: number; lastSkip: string | null; liveAllowed: number; audited: number }
   dispose(): void
 }
+/** How long a live boundary waits for the local verdict before the reviewer takes the action as usual. */
+export const LIVE_WAIT_MS = 30_000
 
 interface Pending { resolve(outcome: DeciderOutcome): void; decision: Promise<DecisionRecord | null>; work: Promise<unknown>; expires: ReturnType<typeof setTimeout>; reviewer?: string }
 
@@ -64,34 +75,74 @@ export function reviewVerdict(record: ReviewRecord): DeciderOutcome {
 }
 
 export function createApprovalShadow(deps: {
-  decisions: Pick<DecisionService, 'decide' | 'thresholds'>
+  decisions: Pick<DecisionService, 'decide' | 'thresholds' | 'askSystemOne'>
   store: Pick<ModelIntelligenceStore, 'updateDecisionOutcome'>
   recordOutcome(outcome: ExecutionOutcome | null): ExecutionOutcome | null
   log(message: string, error?: unknown): void
   now(): Date
   /** A local decider exists and a model server is already running; otherwise the shadow only records the skip. */
   localAvailable?(): boolean
+  /** Which boundaries are live, and the automatic revert once a decision's final answer is known. */
+  boundaries?: Pick<LiveBoundaries, 'isLive' | 'status' | 'check'>
+  liveWaitMs?: number
 }): ApprovalShadowService {
   const pending = new Map<string, Pending>()
-  let skipped = 0, lastSkip: string | null = null
+  /** The local verdict decideLive already asked for an action it left to the reviewer, for reviewing to journal. */
+  const asked = new Map<string, { verdict: DeciderOutcome; audit: boolean }>()
+  let skipped = 0, lastSkip: string | null = null, confidentAllows = 0, liveAllowed = 0, audited = 0
   const drop = (key: string): void => { const entry = pending.get(key); if (entry) { clearTimeout(entry.expires); pending.delete(key) } }
   const guard = (what: string, work: () => void): void => { try { work() } catch (error) { deps.log(`approval shadow: ${what}`, error) } }
+  /** A decision with a reviewer's or owner's answer may show a live boundary's agreement falling: revert it then. */
+  const checkLive = (journaled: DecisionRecord | null): void => {
+    if (!journaled || !deps.boundaries) return
+    try { deps.boundaries.check('approval', boundaryOf(journaled)) } catch (error) { deps.log('approval shadow: live boundary not checked', error) }
+  }
   const capture = (entry: Pending | undefined, record: ReviewRecord): void => {
     const decision = entry?.decision ?? Promise.resolve(null)
-    const work = decision.then(journaled => { deps.recordOutcome(captureApprovalReview({ record, decisionId: journaled?.id ?? null })) }).catch(error => deps.log('approval shadow: review outcome not recorded', error))
+    const work = decision.then(journaled => { deps.recordOutcome(captureApprovalReview({ record, decisionId: journaled?.id ?? null })); checkLive(journaled) }).catch(error => deps.log('approval shadow: review outcome not recorded', error))
     if (entry) entry.work = Promise.all([entry.work, work])
   }
+  const skip = (): void => {
+    // D6: the shadow never loads a model onto the GPU; it notes the skip and does nothing else.
+    if (!skipped || Date.parse(lastSkip ?? '') < deps.now().getTime() - 3_600_000) deps.log('approval shadow: local decider unavailable (no local model server is running); reviews are not shadowed')
+    skipped++; lastSkip = deps.now().toISOString()
+  }
   return {
+    async decideLive(spec, action) {
+      try {
+        if (action.boundary !== 'workspace-write' || !deps.boundaries?.isLive('approval', action.boundary) || deps.decisions.thresholds('approval').mode === 'off') return null
+        if (deps.localAvailable && !deps.localAvailable()) return null
+        const key = keyOf(action), request = approvalRequest(spec, action)
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const controller = new AbortController()
+        const verdict = await Promise.race([
+          deps.decisions.askSystemOne(request, controller.signal),
+          new Promise<null>(done => { timer = setTimeout(() => { controller.abort(); done(null) }, deps.liveWaitMs ?? LIVE_WAIT_MS); timer.unref?.() })
+        ]).finally(() => clearTimeout(timer))
+        if (!verdict) return null
+        const thresholds = deps.decisions.thresholds('approval'), top = verdict.ok ? topChoice(verdict.verdict.probabilities, request.options.map(option => option.id)) : null
+        const confident = !!top && top.choice === 'allow' && !thresholds.frontierOnly.includes('allow') && top.confidence >= thresholds.minConfidence && top.margin >= thresholds.minMargin
+        const audit = confident && ++confidentAllows % LIVE_AUDIT_EVERY === 0
+        if (!confident || audit) {
+          // The reviewer decides; reviewing journals this verdict beside its answer instead of asking again.
+          if (asked.size >= PENDING_MAX) asked.delete(asked.keys().next().value!)
+          asked.set(key, { verdict, audit })
+          if (audit) audited++
+          return null
+        }
+        const record = await deps.decisions.decide({ ...request, state: { ...request.state, live: true } }, { systemOne: verdict, mode: 'live' })
+        if (record.choice !== 'allow' || record.escalated) return null
+        liveAllowed++
+        const status = deps.boundaries.status('approval', action.boundary)
+        return { key: `live:${record.decidedBy}`, rationale: `Allowed by the local decision model ${record.decidedBy} (confidence ${record.confidence.toFixed(2)}): workspace-write approvals are live (decisions.live) at ${status.agreement === null ? '?' : Math.round(status.agreement * 1000) / 10}% agreement over ${status.cases} reviewed cases; decision ${record.id}` }
+      } catch (error) { deps.log('approval shadow: live decision failed; the reviewer decides', error); return null }
+    },
     reviewing(spec, action) {
       guard('not started', () => {
+        const key = keyOf(action), early = asked.get(key)
+        asked.delete(key)
         if (deps.decisions.thresholds('approval').mode === 'off') return
-        if (deps.localAvailable && !deps.localAvailable()) {
-          // D6: the shadow never loads a model onto the GPU; it notes the skip and does nothing else.
-          if (!skipped || Date.parse(lastSkip ?? '') < deps.now().getTime() - 3_600_000) deps.log('approval shadow: local decider unavailable (no local model server is running); reviews are not shadowed')
-          skipped++; lastSkip = deps.now().toISOString()
-          return
-        }
-        const key = keyOf(action)
+        if (!early && deps.localAvailable && !deps.localAvailable()) { skip(); return }
         if (pending.has(key)) return
         if (pending.size >= PENDING_MAX) { const oldest = pending.keys().next().value!; pending.get(oldest)!.resolve({ ok: false, decider: 'approval-reviewer', reason: 'shadow queue full' }); drop(oldest) }
         let resolve!: (outcome: DeciderOutcome) => void
@@ -99,7 +150,9 @@ export function createApprovalShadow(deps: {
         const frontier: Decider = { id: 'approval-reviewer', tier: 'frontier', supports: kind => kind === 'approval', decide: () => review }
         const expires = setTimeout(() => { resolve({ ok: false, decider: 'approval-reviewer', reason: 'the review never reported back' }); drop(key) }, REVIEW_WAIT_MS)
         expires.unref?.()
-        const decision = deps.decisions.decide(approvalRequest(spec, action), { frontier }).catch(error => { deps.log('approval shadow decision failed', error); return null })
+        // Always measured as shadow: the reviewer's verdict is journaled beside the local one, whatever the kind's mode.
+        const request = approvalRequest(spec, action), state = early?.audit ? { ...request.state, liveAudit: true } : request.state
+        const decision = deps.decisions.decide({ ...request, state }, { frontier, mode: 'shadow', ...(early ? { systemOne: early.verdict } : {}) }).catch(error => { deps.log('approval shadow decision failed', error); return null })
         pending.set(key, { resolve, decision, work: decision, expires })
       })
     },
@@ -124,6 +177,7 @@ export function createApprovalShadow(deps: {
           // The decision was right when the owner's answer matches it, or when it left the answer to the owner.
           const agreed = journaled.choice === 'escalate' || journaled.choice === owner
           deps.store.updateDecisionOutcome(journaled.id, { result: agreed ? 'success' : 'failure', at: deps.now().toISOString(), detail: `${record.answeredBy ?? 'owner'} answered ${owner}`, answer: owner })
+          checkLive(journaled)
         }).catch(error => deps.log('approval shadow: owner outcome not recorded', error))
         entry.work = Promise.all([entry.work, work])
         void entry.work.finally(() => { if (pending.get(key) === entry) drop(key) })
@@ -135,7 +189,7 @@ export function createApprovalShadow(deps: {
       await entry.work.catch(() => undefined)
       return entry.decision
     },
-    stats: () => ({ skipped, lastSkip }),
-    dispose() { for (const key of [...pending.keys()]) { pending.get(key)!.resolve({ ok: false, decider: 'approval-reviewer', reason: 'shutting down' }); drop(key) } }
+    stats: () => ({ skipped, lastSkip, liveAllowed, audited }),
+    dispose() { asked.clear(); for (const key of [...pending.keys()]) { pending.get(key)!.resolve({ ok: false, decider: 'approval-reviewer', reason: 'shutting down' }); drop(key) } }
   }
 }

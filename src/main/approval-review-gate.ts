@@ -76,6 +76,9 @@ export interface ApprovalReviewRouting {
   supportsExactExecution?(spec: AgentSpec): boolean
 }
 export interface ApprovalReviewShadow {
+  /** Only on a boundary the owner switched live (decisions.list/decisions.live): a confident local allow of a
+   *  workspace-write action, answered as covered without a reviewer turn. Null, or a throw: the reviewer runs. */
+  decideLive?(spec: AgentSpec, action: ReviewAction): Promise<{ key: string; rationale: string } | null>
   reviewing(spec: AgentSpec, action: ReviewAction): void
   reviewed(record: ReviewRecord): void
   answered(record: ReviewRecord): void
@@ -202,7 +205,8 @@ export class ApprovalReviewGate {
     const routine = claudeTool ? await routineClass(binding.action, binding.interaction.input, binding.spec.cwd) : undefined
     const rule = routine ? undefined : sessionRules.covering(scope, { ...binding.action, cwd: binding.spec.cwd })
     const covered = routine ? { key: routine, rationale: `Routine in-workspace action (${routine.slice('routine:'.length)}): allowed automatically, as Auto mode would; no review` }
-      : rule && { key: rule.key, rationale: `Covered by this conversation's session rule "${rule.key}" (${rule.source === 'wizard' ? 'allowed for the session by ' + rule.by : 'first allowed by the ' + rule.by + ' review'}); no new review` }
+      : rule ? { key: rule.key, rationale: `Covered by this conversation's session rule "${rule.key}" (${rule.source === 'wizard' ? 'allowed for the session by ' + rule.by : 'first allowed by the ' + rule.by + ' review'}); no new review` }
+      : await this.liveVerdict(binding.spec, binding.action)
     if (!covered) try { this.routing?.shadow?.reviewing(binding.spec, binding.action) } catch { /* the shadow only observes */ }
     const record = await this.journal.review(binding.action, digest => this.routing!.run(binding.spec, binding.action!, digest), record => { if (!binding.settled) this.update(binding, record) }, covered)
     if (record.phase === 'approved' && record.reviewerId && !record.coveredBy) {
@@ -220,6 +224,10 @@ export class ApprovalReviewGate {
       if (!binding.interaction.choices.some(choice => choice.id === decision && !choice.disabled)) { this.update(binding, this.journal.transition(record, 'blocked', 'Native provider did not offer the exact one-action response')); return }
       await this.respond({ sessionId: binding.spec.id, runtimeId: binding.runtimeId, requestId: binding.interaction.id, decision })
     }
+  }
+  /** A live boundary's local allow (model intelligence, decisions.live), else undefined and the reviewer decides. */
+  private async liveVerdict(spec: AgentSpec, action: ReviewAction): Promise<{ key: string; rationale: string } | undefined> {
+    try { return await this.routing?.shadow?.decideLive?.(spec, action) ?? undefined } catch { return undefined }
   }
   /** What the worker's reviews cost so far, for its usage line (StructuredUsageSummary). */
   usage(spec: AgentSpec, action?: ReviewAction): ApprovalReviewUsage {

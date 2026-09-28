@@ -35,6 +35,11 @@ export interface DecideOptions {
   signal?: AbortSignal
   /** A frontier decider bound to this one request (the approval gate's reviewer for one action). */
   frontier?: Decider
+  /** The system-one verdict already asked for this request (askSystemOne), so it is not asked twice. */
+  systemOne?: DeciderOutcome
+  /** This request's mode instead of its kind's: the approval shadow keeps measuring in 'shadow', and a boundary
+   *  the owner switched live decides in 'live'. */
+  mode?: DecisionThresholds['mode']
 }
 
 type Overrides = Partial<Record<DecisionKind, Partial<DecisionThresholds>>>
@@ -107,24 +112,33 @@ export class DecisionService {
     } catch { return {} }
   }
 
+  /** Only the system-one verdict (probabilities normalised over the options), journaling nothing; null when no
+   *  system-one decider takes this kind. decide({systemOne}) then records it without asking again. */
+  async askSystemOne(request: DecisionRequest, signal?: AbortSignal): Promise<DeciderOutcome | null> {
+    validateDecisionRequest(request)
+    const systemOne = this.ports.deciders.find(decider => decider.tier === 'system-one' && decider.supports(request.kind))
+    return systemOne ? this.ask(systemOne, request, signal) : null
+  }
+  private async ask(decider: Decider, request: DecisionRequest, signal?: AbortSignal): Promise<DeciderOutcome> {
+    try {
+      const outcome = await decider.decide(request, signal)
+      if (!outcome.ok) return outcome
+      const probabilities = normaliseProbabilities(outcome.verdict.probabilities, request.options.map(option => option.id))
+      return probabilities ? { ok: true, verdict: { ...outcome.verdict, probabilities } } : { ok: false, decider: decider.id, reason: 'No probability for any offered option' }
+    } catch (error) { return { ok: false, decider: decider.id, reason: error instanceof Error ? error.message : String(error) } }
+  }
+
   async decide(request: DecisionRequest, options: DecideOptions = {}): Promise<DecisionRecord> {
     validateDecisionRequest(request)
-    const thresholds = this.thresholds(request.kind), ids = request.options.map(option => option.id)
+    const thresholds = { ...this.thresholds(request.kind), ...(options.mode ? { mode: options.mode } : {}) }, ids = request.options.map(option => option.id)
     const systemOne = thresholds.mode === 'off' ? undefined : this.ports.deciders.find(decider => decider.tier === 'system-one' && decider.supports(request.kind))
     const frontier = options.frontier ?? this.ports.deciders.find(decider => decider.tier === 'frontier' && decider.supports(request.kind))
-    const ask = async (decider: Decider): Promise<DeciderOutcome> => {
-      try {
-        const outcome = await decider.decide(request, options.signal)
-        if (!outcome.ok) return outcome
-        const probabilities = normaliseProbabilities(outcome.verdict.probabilities, ids)
-        return probabilities ? { ok: true, verdict: { ...outcome.verdict, probabilities } } : { ok: false, decider: decider.id, reason: 'No probability for any offered option' }
-      } catch (error) { return { ok: false, decider: decider.id, reason: error instanceof Error ? error.message : String(error) } }
-    }
+    const ask = (decider: Decider): Promise<DeciderOutcome> => this.ask(decider, request, options.signal)
     // Escalation that is certain before system-one answers runs the frontier alongside it, so a
     // shadow verdict never delays the decision the frontier makes anyway.
     const certain = thresholds.mode !== 'live' ? `mode ${thresholds.mode}` : request.impact === 'high' && thresholds.highImpact === 'always-escalate' ? 'high-impact decision' : null
     const early = certain && frontier ? ask(frontier) : undefined
-    const first: DeciderOutcome | undefined = systemOne ? await ask(systemOne) : undefined
+    const first: DeciderOutcome | undefined = thresholds.mode === 'off' ? undefined : options.systemOne ?? (systemOne ? await ask(systemOne) : undefined)
     const verdicts: DecisionRecord['verdicts'] = []
     if (first) verdicts.push(first.ok ? first.verdict : failure(first))
 

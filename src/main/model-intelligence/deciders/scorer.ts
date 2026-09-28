@@ -107,6 +107,32 @@ export function expectedLatency(record: RegistryRecord, features: TaskFeatures):
   const tokens = estimateTokens(features)
   return (record.latencyMs ?? 0) * TURNS_BY_COMPLEXITY[features.complexity - 1]! + (record.tokensPerSecond ? tokens.output / record.tokensPerSecond * 1000 : 0)
 }
+/**
+ * The cost a candidate is scored at. A priced one (or a local one) at its own expected cost. An unpriced
+ * cloud model is never scored as cheaper than what it is known to sit beside (N18): it takes the
+ * priciest priced model of its provider and capability rank, else of its provider, else of its rank
+ * anywhere; with none of those it stays unknown (the neutral middle of the scale). `basis` names the model
+ * the price was taken from. Siblings come from every candidate, eligible or not, so filtering never reprices.
+ */
+export function scoredCosts(all: CandidateFacts[], features: TaskFeatures): Array<{ cost: number | null; basis: string | null }> {
+  const known = all.map(facts => expectedCost(facts.record, features))
+  const priciest = (match: (index: number) => boolean): { cost: number; basis: string } | null => known.reduce<{ cost: number; basis: string } | null>((best, cost, index) =>
+    cost !== null && !isLocal(all[index]!.record) && match(index) && (!best || cost > best.cost) ? { cost, basis: modelKeyId(all[index]!.record.key) } : best, null)
+  return all.map((facts, index) => {
+    if (known[index] !== null || isLocal(facts.record)) return { cost: known[index]!, basis: null }
+    const provider = facts.record.key.provider, rank = rankOf(facts.record)
+    const sibling = priciest(other => all[other]!.record.key.provider === provider && rankOf(all[other]!.record) === rank)
+      ?? priciest(other => all[other]!.record.key.provider === provider) ?? priciest(other => rankOf(all[other]!.record) === rank)
+    return sibling ?? { cost: null, basis: null }
+  })
+}
+
+/** Hard or high-risk work goes to a model of at least this capability rank while one is eligible (N10): cost
+ *  and latency weights trade between strong models, never down to a weak one. A weaker model takes such work
+ *  only with a proven record on its category (the same Wilson test a local model needs), or when no model of
+ *  the floor's rank is eligible at all. */
+export const HARD_WORK_RANK_FLOOR = 2
+
 /** How much success is worth against cost: trivial low-risk work lets cost win, hard high-risk work does not. */
 export function stakes(features: TaskFeatures): number {
   const value = 1 + (features.complexity - 3) * 0.25 + (features.risk === 'high' ? 0.5 : features.risk === 'low' ? -0.25 : 0)
@@ -149,15 +175,26 @@ export function hardFilter(facts: CandidateFacts, features: TaskFeatures, constr
 /** Every candidate with its filter verdict and utility; eligible ones first, by utility. */
 export function scoreCandidates(all: CandidateFacts[], features: TaskFeatures, constraints: RouteConstraints): RouteCandidate[] {
   const costs = all.map(facts => expectedCost(facts.record, features)), latencies = all.map(facts => expectedLatency(facts.record, features))
+  const scored = scoredCosts(all, features)
   const excluded = all.map((facts, index) => hardFilter(facts, features, constraints, costs[index]!))
+  // The rank floor for hard or high-risk work applies while a model of that rank passes every other filter.
+  if (conservative(features) && all.some((facts, index) => !excluded[index] && rankOf(facts.record) >= HARD_WORK_RANK_FLOOR)) {
+    all.forEach((facts, index) => {
+      if (excluded[index] || isLocal(facts.record) || rankOf(facts.record) >= HARD_WORK_RANK_FLOOR) return
+      const record = localRecord(facts.reputation, facts.record, features)
+      if (record.evidence >= LOCAL_EXCLUSION.provenEvidence && record.lower >= LOCAL_EXCLUSION.threshold) return
+      excluded[index] = `capability rank ${rankOf(facts.record)} below the rank-${HARD_WORK_RANK_FLOOR} floor for complexity ${features.complexity}, ${features.risk}-risk work, and no proven record on ${features.category} (${Math.round(record.successes)} of ${Math.round(record.evidence)} outcomes)`
+    })
+  }
   const latencyWeight = Math.min(1, constraints.latencyWeight * (constraints.urgency === 'urgent' ? 2 : 1)), weight = stakes(features)
   const candidates = all.map((facts, index): RouteCandidate => {
     const cost = costs[index]!, latency = latencies[index]!, success = expectedSuccess(effectiveReputation(facts.reputation, facts.record, features), features)
-    const normCost = logScale(cost, COST_SCALE_USD), normLatency = logScale(latency, LATENCY_SCALE_MS)
+    const normCost = logScale(scored[index]!.cost, COST_SCALE_USD), normLatency = logScale(latency, LATENCY_SCALE_MS)
     const load = facts.local && !facts.local.loaded ? LOAD_PENALTY : 0
     const utility = weight * success - constraints.costWeight * normCost - latencyWeight * normLatency - load - behaviourPenalty(facts.loopTendency) - behaviourPenalty(facts.falseCompletion)
     const live: RouteCandidate['live'] = { usagePercent: facts.usagePercent, usageStopPercent: facts.usageStopPercent, availability: facts.record.availability, status: facts.record.status, capabilityRank: rankOf(facts.record) }
     if (facts.local) Object.assign(live, { loaded: facts.local.loaded, fitsVram: facts.local.fitsVram, admissible: facts.local.admissible })
+    if (scored[index]!.basis) Object.assign(live, { scoredCostUsd: scored[index]!.cost, costBasis: scored[index]!.basis })
     return { key: facts.record.key, effort: facts.effort, eligible: !excluded[index], excluded: excluded[index]!, expectedSuccess: success, expectedCostUsd: cost, expectedLatencyMs: latency, utility, reputation: facts.reputation, live }
   })
   return candidates.map((candidate, index) => ({ candidate, index }))

@@ -72,11 +72,25 @@ describe('graders', () => {
     expect(seen[0]).toMatchObject({ cmd: 'node', args: ['check.mjs'], timeoutSec: 5, files: { 'data.txt': 'fixture', 'made.txt': 'x', 'check.mjs': 'hidden', 'solution.mjs': 'export const good = 1\n' } })
     expect(await grade(command, { answer: 'export const bad = 1' }, port)).toEqual({ pass: false, detail: 'node exited 1, expected 0: AssertionError: nope' })
     expect(await grade(command, { answer: 'x' }, async () => ({ exitCode: null, timedOut: true }))).toEqual({ pass: false, detail: 'the check timed out after 5 s' })
-    expect(await grade(command, { answer: 'x' })).toEqual({ pass: false, detail: 'no command runner is available for this grader' })
+    // A check that cannot run says nothing about the answer: not gradable, never a failure.
+    expect(await grade(command, { answer: 'x' })).toEqual({ pass: false, notGradable: true, detail: 'no command runner is available for this grader' })
+    expect(await grade(command, { answer: 'x' }, async () => { throw new Error('Only node checks run on the host') })).toEqual({ pass: false, notGradable: true, detail: 'the check could not run: Only node checks run on the host' })
+    expect(await grade(command, { answer: 'x' }, async () => ({ exitCode: null, spawnFailed: true, output: 'spawn ENOENT' }))).toEqual({ pass: false, notGradable: true, detail: 'the check could not start: spawn ENOENT' })
+  })
+  it('takes the answer file from the block named after it, else the first fenced block', async () => {
+    const seen: CommandRequest[] = []
+    const command = job('c', { kind: 'command', cmd: 'node', args: ['check.mjs'], expectExit: 0, timeoutSec: 5, answerFile: 'dates.mjs', files: { 'check.mjs': 'hidden' } })
+    const port = async (request: CommandRequest) => { seen.push(request); return { exitCode: 0 } }
+    // A path info string is a fenced block too: its content is the code, not the fence lines.
+    await grade(command, { answer: '```dates.mjs\nexport const fixed = 1\n```' }, port)
+    expect(seen[0]!.files['dates.mjs']).toBe('export const fixed = 1\n')
+    await grade(command, { answer: 'notes\n```js\nconst other = 1\n```\n```dates.mjs\nexport const named = 1\n```', files: { 'dates.mjs': 'export const named = 1\n' } }, port)
+    expect(seen[1]!.files['dates.mjs']).toBe('export const named = 1\n')
   })
   it('extracts code from a fenced answer and strips reasoning', () => {
     expect(answerCode('<think>hmm</think>Sure:\n```javascript\nconst a = 1\n```\nDone')).toBe('const a = 1\n')
     expect(answerCode('const b = 2')).toBe('const b = 2\n')
+    expect(answerCode('```src/a.mjs\nexport const a = 1\n```')).toBe('export const a = 1\n')
   })
 })
 
@@ -318,6 +332,37 @@ describe('batched cloud evaluation (N9)', () => {
     expect(result).toMatchObject({ tokens: 43_000, stoppedBy: null })
     // N12: the batch's budget is pre-charged before its turn, then reconciled.
     expect(spends.map(spend => spend.tokens)).toEqual([0, 60_000, 43_000])
+  })
+  it('with a command runner, a command job rides in the same one turn and is graded by running its check over its own section\'s files', async () => {
+    const withCheck: EvaluationSuite = { name: 'checked', jobs: [
+      job('first', { kind: 'exact', expected: '4+6' }, { complexity: 1 }),
+      job('slug', { kind: 'command', cmd: 'node', args: ['check.mjs'], expectExit: 0, timeoutSec: 5, answerFile: 'solution.mjs', files: { 'check.mjs': 'hidden check' } }),
+      job('clamp', { kind: 'command', cmd: 'node', args: ['check.mjs'], expectExit: 0, timeoutSec: 5, files: { 'check.mjs': 'hidden check' } }, { files: { 'src/math.mjs': 'old' } }),
+      job('broken', { kind: 'command', cmd: 'node', args: ['check.mjs'], expectExit: 0, timeoutSec: 5, answerFile: 'solution.mjs' }),
+    ] }
+    const reply = ['### JOB first', '4+6', '### JOB slug', '```js', 'export const slugify = good', '```', '### JOB clamp', '```src/math.mjs', 'export const clamp = good', '```', 'done',
+      '### JOB broken', '```solution.mjs', 'export const x = bad', '```'].join('\n')
+    const turns: EvaluationJob[] = [], checks: CommandRequest[] = []
+    const { ports, recorded } = harness(() => ({ answer: 'unused' }), {
+      run: async (_key, batch) => { turns.push(batch); return { answer: reply, tokens: 30_000, files: { 'src/math.mjs': 'export const clamp = good', 'solution.mjs': 'export const x = bad' } } },
+      command: async request => { checks.push(request); return { exitCode: Object.values(request.files).some(text => text.includes('bad')) ? 1 : 0, output: 'AssertionError' } },
+      fixedOverheadTokens: () => 7_000,
+    })
+    const result = await evaluate(CLOUD, withCheck, ports, { maxTokens: 60_000, runId: 'c1' })
+    expect(turns).toHaveLength(1)
+    expect(turns[0]!.prompt).toContain('TASK 2 of 4: slug')
+    expect(turns[0]!.prompt).toContain('You cannot run anything.')
+    expect(result.jobs.map(entry => [entry.id, entry.result])).toEqual([['first', 'success'], ['slug', 'success'], ['clamp', 'success'], ['broken', 'failure']])
+    expect(recorded.map(row => [row.ref, row.result])).toEqual([['c1:first', 'success'], ['c1:slug', 'success'], ['c1:clamp', 'success'], ['c1:broken', 'failure']])
+    // Each check sees its fixtures, its hidden check and its own section's files, never another section's.
+    expect(checks[0]!.files).toEqual({ 'check.mjs': 'hidden check', 'solution.mjs': 'export const slugify = good\n' })
+    expect(checks[1]!.files).toEqual({ 'src/math.mjs': 'export const clamp = good\n', 'check.mjs': 'hidden check' })
+    expect(checks[2]!.files).toEqual({ 'solution.mjs': 'export const x = bad\n' })
+    // A check that cannot run leaves that job not gradable; the others still count.
+    const refused = await evaluate(CLOUD, withCheck, harness(() => ({ answer: reply, tokens: 30_000 }), { command: async () => { throw new Error('Only node checks run on the host') }, fixedOverheadTokens: () => 7_000 }).ports, { maxTokens: 60_000 })
+    expect(refused.jobs.map(entry => entry.result)).toEqual(['success', 'not-gradable', 'not-gradable', 'not-gradable'])
+    expect(refused.jobs[1]!.detail).toBe('not graded: the check could not run: Only node checks run on the host')
+    expect(refused.outcomes).toHaveLength(1)
   })
   it('drops the largest jobs when the fixed overhead plus the batch would pass the cap, and takes the overhead from the port', async () => {
     const sizes = mixed.jobs.filter(entry => entry.grader.kind !== 'command').map(batchJobTokens)

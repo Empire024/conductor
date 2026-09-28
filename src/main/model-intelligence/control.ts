@@ -6,7 +6,8 @@ import type { RouteLiveFacts } from './router'
 import type { IngestionSourceName } from './ingest'
 import { INGESTION_SOURCES } from './ingest'
 import { outcome as outcomeRow } from './capture/common'
-import { systemOneOf } from './store'
+import { GO_LIVE } from './live-boundaries'
+import { boundaryOf, systemOneOf } from './store'
 import { resolveModel } from '../control-args'
 
 /** App control for model intelligence (docs/model-routing.md, E; docs/agent-control.md). */
@@ -14,14 +15,14 @@ import { resolveModel } from '../control-args'
 export const MODEL_READ_METHODS = ['models.registry', 'models.route', 'decisions.list', 'decisions.get'] as const
 export const MODEL_MUTATION_METHODS = ['models.refresh', 'models.outcome', 'models.evaluate', 'decisions.live'] as const
 /** The owner's go-live rule (2026-09-28): a boundary may act on its local verdict only at this agreement over this many cases. */
-export const GO_LIVE = { agreement: 0.95, cases: 30, windowDays: 90 } as const
+export { GO_LIVE }
 export const modelMethods = new Set<string>([...MODEL_READ_METHODS, ...MODEL_MUTATION_METHODS])
 
 export const modelSignatures: Record<string, string> = {
   'models.registry': '({provider?,model?,status?,changesSince?,limit?}) — the model registry: each model+provider key with its status (unproven, evaluating, proven, retired), pricing per million tokens, context, capabilities, availability, which source said so (provenance) and stale; changesSince (ISO) adds what changed since then (new models, prices, context, removals). limit defaults to 100, at most 2000',
   'models.route': '({prompt?,features?,constraints?}) — a dry run of the router: which model+provider (and effort) it would pick for a task, with fallback, escalation, confidence and the reasons, as {decision, explanation}. features default to the categorisation of prompt (category, complexity 1-5, risk, toolsRequired, contextTokens); constraints: costWeight and latencyWeight 0..1, maxCostUsd, localOnly, excludeProviders, allow ["provider/model"], urgency. Only models this project can open are candidates. The decision is journaled (decisions.get)',
-  'decisions.list': '({kind?,since?,limit?}) — {decisions, boundaries}. decisions: journaled routing and approval decisions, newest first: id, kind, requester, choice, confidence, who decided, whether it escalated, the system-one (local) verdict next to the final choice, and its outcome once known; since defaults to 30 days ago, limit to 50, at most 200. boundaries: per decision kind, cases, agreement (how often the local verdict matched the reviewer or owner answer over the last 90 days) and live (whether that kind acts on its local verdict)',
-  'decisions.live': '({kind, live}) — owner or wizard only: let one decision kind act on its local (system-one) verdict (live true) or keep it in shadow, where the stronger model decides and the local verdict is only journaled (live false). Going live is refused below 95% agreement over at least 30 cases (see decisions.list boundaries); low-confidence and frontier-only choices still escalate',
+  'decisions.list': '({kind?,since?,limit?}) — {decisions, boundaries, rule, switches}. decisions: journaled routing and approval decisions, newest first: id, kind, requester, choice, confidence, who decided, whether it escalated, the approval boundary, the system-one (local) verdict next to the final choice, and its outcome once known; since defaults to 30 days ago, limit to 50, at most 200. boundaries: per decision kind (approval per boundary: workspace-write, native-owner), cases, agreed, agreement (how often the local verdict matched the reviewer or owner answer over the last 90 days), meetsRule (at least 95% over 30 or more), live and liveable. switches: the last live/shadow switches, including automatic reverts',
+  'decisions.live': '({kind, boundary?, live}) — owner or wizard only: let one decision boundary act on its local (system-one) verdict (live true) or keep it in shadow, where the stronger model decides and the local verdict is only journaled (live false). approval is switched per boundary (default and only liveable one: workspace-write; there a confident local allow answers the card without a reviewer turn, every 5th is still reviewed, deny and native-owner always go to the reviewer); other kinds have one boundary. Going live is refused below 95% agreement over at least 30 cases for that kind and boundary (decisions.list boundaries), naming the numbers. Nothing goes live by itself; a live boundary whose agreement falls below 95% goes back to shadow automatically. Every switch is journaled',
   'decisions.get': '({decisionId}) — one decision in full: options, every decider verdict (the shadow one too), the choice and why, plus a readable explanation and the execution outcomes linked to it',
   'models.refresh': '({sources?}) — refresh the model registry now from sources (configured, runtime, openrouter, latest-models, benchmarks; default all) and return per-source results and the changes found. A failing source changes nothing and never blocks the others',
   'models.outcome': '({decisionId|outcomeId, result, ownerCorrected?, falseCompletion?, detail?}) — say how a routed decision or a recorded execution actually turned out (result success, partial, failure or cancelled; ownerCorrected when the owner had to fix it, falseCompletion when it claimed done and was not). The outcome feeds the model’s reputation, so the next route sees it. The owner, a wizard tab, or the conversation that asked for the decision (or controls the agent that ran it)',
@@ -97,19 +98,16 @@ export async function callModelMethod(service: ModelIntelligence, caller: ModelC
       if (args.kind !== undefined && !KINDS.includes(args.kind as DecisionKind)) throw new Error(`kind must be one of ${KINDS.join(', ')}`)
       const decisions = service.store.decisions({ ...(args.kind ? { kind: args.kind as DecisionKind } : {}), since: since(args.since, 30, now), limit: limitOf(args.limit, 50, 200) })
         .filter(record => record.projectId === null || record.projectId === caller.projectId || caller.sovereign)
-        .map(record => ({ id: record.id, kind: record.kind, requester: record.requester, at: record.at, question: record.question, choice: record.choice, confidence: record.confidence, decidedBy: record.decidedBy, escalated: record.escalated, escalationReason: record.escalationReason, systemOne: systemOneOf(record), outcome: record.outcome }))
-      return { decisions, boundaries: (args.kind ? [args.kind as DecisionKind] : KINDS).map(kind => boundary(service, kind, now)) }
+        .map(record => ({ id: record.id, kind: record.kind, requester: record.requester, at: record.at, question: record.question, choice: record.choice, confidence: record.confidence, decidedBy: record.decidedBy, escalated: record.escalated, escalationReason: record.escalationReason, ...(boundaryOf(record) ? { boundary: boundaryOf(record) } : {}), systemOne: systemOneOf(record), outcome: record.outcome }))
+      return { decisions, boundaries: service.liveBoundaries.all(args.kind ? [args.kind as DecisionKind] : KINDS), rule: GO_LIVE, switches: service.liveBoundaries.flips(10) }
     }
     case 'decisions.live': {
-      only(args, method, ['kind', 'live'])
+      only(args, method, ['kind', 'boundary', 'live'])
       if (!caller.sovereign) throw new Error('Only the owner or a wizard tab may switch a decision boundary live or back to shadow')
       if (!KINDS.includes(args.kind as DecisionKind)) throw new Error(`kind must be one of ${KINDS.join(', ')}`)
+      if (args.boundary !== undefined && typeof args.boundary !== 'string') throw new Error('boundary must be a boundary name (decisions.list boundaries)')
       if (typeof args.live !== 'boolean') throw new Error('live must be true or false')
-      const kind = args.kind as DecisionKind, current = boundary(service, kind, now)
-      if (args.live && (current.cases < GO_LIVE.cases || current.agreement === null || current.agreement < GO_LIVE.agreement))
-        throw new Error(`${kind} stays in shadow: its local verdict agreed on ${current.agreement === null ? 'no' : `${Math.round(current.agreement * 1000) / 10}% of`} ${current.cases} case${current.cases === 1 ? '' : 's'} in ${GO_LIVE.windowDays} days; going live needs at least ${GO_LIVE.agreement * 100}% over ${GO_LIVE.cases} or more`)
-      service.decisions.setThresholds(kind, { mode: args.live ? 'live' : 'shadow' })
-      return { ...boundary(service, kind, now), previous: current.live }
+      return service.liveBoundaries.set(args.kind as DecisionKind, args.boundary as string | undefined, args.live, caller.agentSessionId)
     }
     case 'decisions.get': {
       only(args, method, ['decisionId'])
@@ -198,12 +196,6 @@ function recordOwnerOutcome(service: ModelIntelligence, caller: ModelControlCall
     ...(patch.detail ? { detail: patch.detail } : {})
   })) : null
   return { decision: updated, amended: amended.map(row => row.id), recorded: own?.id ?? null, ...(!linked.length && !key ? { note: 'This decision chose no model, so only the decision records the outcome' } : {}) }
-}
-
-/** Go-live evidence for one decision kind: how often its local verdict matched the reviewer or owner. */
-function boundary(service: ModelIntelligence, kind: DecisionKind, now: Date): { kind: DecisionKind; cases: number; agreement: number | null; live: boolean } {
-  const measured = service.store.approvalAgreement({ kind, since: new Date(now.getTime() - GO_LIVE.windowDays * DAY_MS).toISOString() })
-  return { kind, cases: measured.cases, agreement: measured.cases ? measured.rate : null, live: service.decisions.thresholds(kind).mode === 'live' }
 }
 
 const categoryOf = (decision: { state: Record<string, unknown> }): ReturnType<typeof categorize>['category'] => {

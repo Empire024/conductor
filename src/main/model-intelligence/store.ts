@@ -45,7 +45,9 @@ export interface SourceListing { source: string; kind: SourceKind; key: ModelKey
 export interface OutcomeQuery { key?: ModelKey; category?: TaskCategory; since: string; until?: string; limit: number }
 export interface DecisionQuery { kind?: DecisionKind; since: string; until?: string; limit: number; includeDryRun?: boolean }
 /** How often the system-one verdict matched the final answer (the owner's, else the frontier's). */
-export interface Agreement { kind: DecisionKind; since: string; cases: number; agreed: number; rate: number | null }
+export interface Agreement { kind: DecisionKind; boundary?: string; since: string; cases: number; agreed: number; rate: number | null }
+/** A decision's boundary: its request state's `boundary` (the approval gate's workspace-write or native-owner), else null. */
+export const boundaryOf = (record: Pick<DecisionRecord, 'state'>): string | null => typeof record.state?.boundary === 'string' ? record.state.boundary : null
 export interface EvaluationSpend { runId: string; key: ModelKey; at: string; tokens: number; costUsd?: number; jobs: number; gradedJobs: number; stoppedBy: string | null; reason?: string }
 const spendOf = (value: unknown): EvaluationSpend | null => { try { return JSON.parse(String(value)) as EvaluationSpend } catch { return null } }
 /** The system-one verdict of a decision: DecisionService records it; older records carry it as verdicts[0] of two or more. */
@@ -521,9 +523,10 @@ export class ModelIntelligenceStore {
    * owner's (an outcome detail "... answered <choice>"), else the frontier or reviewer choice.
    * Dry runs are not cases. Bounded by `limit` newest decisions.
    */
-  approvalAgreement(query: { kind: DecisionKind; since: string; limit?: number }): Agreement {
+  approvalAgreement(query: { kind: DecisionKind; since: string; limit?: number; boundary?: string }): Agreement {
     let cases = 0, agreed = 0
     for (const record of this.decisions({ kind: query.kind, since: query.since, limit: query.limit ?? 2_000 })) {
+      if (query.boundary !== undefined && boundaryOf(record) !== query.boundary) continue
       const systemOne = systemOneOf(record)
       if (!systemOne || systemOne.failed || !systemOne.choice) continue
       // The owner's own answer settles it; else the frontier's choice when the frontier decided.
@@ -532,7 +535,7 @@ export class ModelIntelligenceStore {
       cases++
       if (systemOne.choice === final) agreed++
     }
-    return { kind: query.kind, since: iso(query.since, 'since'), cases, agreed, rate: cases ? agreed / cases : null }
+    return { kind: query.kind, ...(query.boundary !== undefined ? { boundary: query.boundary } : {}), since: iso(query.since, 'since'), cases, agreed, rate: cases ? agreed / cases : null }
   }
 
   /** One evaluation run's spend, journaled once per run (evaluation.ts recordSpend), so the owner's

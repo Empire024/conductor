@@ -26,6 +26,7 @@ import { DEFAULT_FIXED_OVERHEAD_TOKENS, EvaluationTurnError, isRefusal, type Clo
 import { explainRoute } from './explain'
 import { refreshAll, type IngestionPorts, type IngestionSourceName, type RefreshResult } from './ingest'
 import { linkedBatch } from './ingest/linked'
+import { createLiveBoundaries } from './live-boundaries'
 import { ModelRegistry, rankOf } from './registry'
 import { ReputationService } from './reputation-service'
 import { route, type RouteLiveFacts, type RouteOptions } from './router'
@@ -84,10 +85,10 @@ export const OVERHEAD_MIN_TOKENS = 5_000
  *  runs, so within this window a run the measurement says cannot hold a job is refused instead of cut off;
  *  after it, one run is admitted on the banded value and measures the preamble again. */
 export const OVERHEAD_TRUST_MS = DAILY_MS
-/** What the smallest job a cloud run can grade adds to its batched turn (command-graded jobs are not
- *  gradable in the cloud); null when the suite has none. */
-export function smallestCloudJob(jobs: EvaluationJob[]): number | null {
-  const sizes = jobs.filter(job => job.grader.kind !== 'command').map(batchJobTokens)
+/** What the smallest job a cloud run can grade adds to its batched turn (a command-graded job only where a
+ *  command runner checks its answer); null when the suite has none. */
+export function smallestCloudJob(jobs: EvaluationJob[], commands = false): number | null {
+  const sizes = jobs.filter(job => commands || job.grader.kind !== 'command').map(batchJobTokens)
   return sizes.length ? Math.min(...sizes) : null
 }
 
@@ -119,7 +120,8 @@ export interface EvaluationWiring {
   runCloud?(key: ModelKey, job: EvaluationJob, signal: AbortSignal, budget?: { maxTokens: number }, context?: { scope?: EvaluationScope }): Promise<CloudRun>
   /** The provider's current weekly usage percent, null when unknown (then a cloud evaluation is skipped). */
   usage?(provider: string): number | null
-  /** A sandboxed grader command, or null where no sandbox is available (command jobs are then not gradable here). */
+  /** A grader command with no network (the docker sandbox, else a confined host `node` check), or null where
+   *  neither is available (command jobs are then not gradable here). */
   command?(): Promise<((request: CommandRequest) => Promise<CommandResult>) | null>
   /** Why this key cannot be evaluated now (another model holds the GPU), or null. */
   precheck?(key: ModelKey): Promise<string | null> | string | null
@@ -311,7 +313,8 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
     quietly(DAILY_SOURCES)
   }
 
-  const shadow: ApprovalShadowService = createApprovalShadow({ decisions, store, recordOutcome, log, now: clock, localAvailable: () => Boolean(localRunner) && localAvailable() })
+  const liveBoundaries = createLiveBoundaries({ store, decisions, settings: options.settings, now: clock, log })
+  const shadow: ApprovalShadowService = createApprovalShadow({ decisions, store, recordOutcome, log, now: clock, localAvailable: () => Boolean(localRunner) && localAvailable(), boundaries: liveBoundaries })
 
   /** The weekly stops, defaults overlaid with the setting's valid percents; an unreadable setting keeps the defaults. */
   const weeklyStops = (): Record<string, number> => {
@@ -373,6 +376,8 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
   const service = {
     store, registry, reputation, decisions,
     approvalShadow: shadow,
+    /** Which decision boundaries act on their local verdict (decisions.live, decisions.list). */
+    liveBoundaries,
 
     /** Prune and the startup refresh run in the background; startup never waits for either. */
     start(): void {
@@ -530,7 +535,7 @@ export function createModelIntelligence(options: ModelIntelligenceOptions) {
       // Everything from here to the handle is synchronous, so two starts cannot both pass the checks.
       if ([...evaluations.values()].some(handle => handle.state === 'running')) throw new Error('An evaluation is already running; one at a time on this machine')
       let maxTokens: number | undefined
-      const jobs = suite.jobs.slice(0, evaluationOptions.maxJobs ?? suite.jobs.length), smallestJob = cloud ? smallestCloudJob(jobs) : null
+      const jobs = suite.jobs.slice(0, evaluationOptions.maxJobs ?? suite.jobs.length), smallestJob = cloud ? smallestCloudJob(jobs, command !== null) : null
       if (cloud) {
         const caps = evaluationCaps(), stop = caps.weeklyStop[target.provider]
         const usage = wiring.usage?.(target.provider) ?? null

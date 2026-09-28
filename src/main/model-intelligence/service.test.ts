@@ -334,6 +334,23 @@ describe('cloud evaluation under the owner caps (gap 8)', () => {
     await expect(s.startEvaluation(OPUS, 'commands')).rejects.toThrow(/No job of commands can be graded in a cloud run/)
     expect(s.store.evaluationSpend('2026-09-27T12:00:00Z').runs).toBe(0)
   })
+  it('with a command runner, a cloud run takes the command jobs into its one batched turn and grades them by their checks', async () => {
+    const mixed: EvaluationSuite = { name: 'mixed', jobs: [
+      { id: 'check', category: 'simple-coding', complexity: 1, prompt: 'Write add.js', grader: { kind: 'command', cmd: 'node', args: ['test.mjs'], expectExit: 0, timeoutSec: 10, answerFile: 'add.mjs' } },
+      { id: 'plain', category: 'general', complexity: 1, prompt: 'Say 42', grader: { kind: 'exact', expected: '42' } },
+    ] }
+    const runCloud = vi.fn(async () => ({ answer: '### JOB check\n```js\nexport const add = 1\n```\n### JOB plain\n42', tokens: 9_000, costUsd: null, durationMs: 1 }))
+    const checks: string[] = []
+    const command = vi.fn(async () => async (request: { files: Record<string, string> }) => { checks.push(request.files['add.mjs']!); return { exitCode: 0 } })
+    const s = createModelIntelligence({ dbPath: ':memory:', settings: settings(), timers: noTimers, clock: () => NOW, log: () => {}, evaluation: { runCloud, command, usage: () => 10, suites: () => ({ mixed }) } })
+    register(s, [[OPUS, 'Opus']])
+    const run = await s.startEvaluation(OPUS, 'mixed')
+    expect(run.notGradable).toEqual([])
+    await vi.waitFor(() => expect(s.evaluation(run.runId)!.state).toBe('done'))
+    expect(runCloud).toHaveBeenCalledTimes(1)
+    expect(s.evaluation(run.runId)!.result!.jobs.map(job => [job.id, job.result])).toEqual([['check', 'success'], ['plain', 'success']])
+    expect(checks).toEqual(['export const add = 1\n'])
+  })
   it('validates an evaluation-caps weeklyStop override: a malformed value never disables the stop (N17)', async () => {
     const bad = cloud(86, values => values.set(EVALUATION_CAPS_SETTING, JSON.stringify({ weeklyStop: { codex: 'x', claude: 150, grok: -1 } })))
     expect(bad.s.evaluationCaps().weeklyStop).toEqual({ claude: 85, codex: 55 })

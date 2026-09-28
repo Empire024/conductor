@@ -1,6 +1,6 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, normalize, sep } from 'node:path'
 import type { ModelKey } from '../../shared/model-routing'
@@ -9,9 +9,9 @@ import type { LocalModelRunner } from '../local-assist/contract'
 import type { CommandRequest, CommandResult, EvaluationJob, EvaluationRun } from './evaluation'
 
 /**
- * The ports models.evaluate hands module D (evaluation.ts): a one-shot local answer, and a grader
- * command that runs only inside the local-models docker sandbox image with no network. Where that
- * sandbox is missing there is no command port and command-graded jobs are not gradable here.
+ * The ports models.evaluate hands module D (evaluation.ts): a one-shot local answer, a cloud turn, and a
+ * grader command with no network: inside the local-models docker sandbox image where it is built, else a
+ * confined `node` check on the host (hostCommandPort). Without either, command-graded jobs are not gradable.
  */
 
 const FIXTURE_CHARS = 40_000
@@ -124,6 +124,103 @@ export function cloudRunPort(turn: CloudTurn) {
   }
 }
 
+/** A grader command's files in a fresh temp folder (paths checked to stay inside it); the folder's real path. */
+async function writeJobFolder(prefix: string, files: Record<string, string>): Promise<string> {
+  const entries = Object.entries(files).map(([path, content]) => [safePath(path), content] as const)
+  if (entries.some(([path]) => !path)) throw new Error('A grader file path leaves the job folder')
+  if (entries.reduce((total, [, content]) => total + Buffer.byteLength(content), 0) > FILES_MAX_BYTES) throw new Error('Grader files exceed 2 MB')
+  const folder = await realpath(await mkdtemp(join(tmpdir(), prefix)))
+  try {
+    for (const [path, content] of entries) {
+      const target = join(folder, ...path!.split('/'))
+      if (!target.startsWith(folder + sep)) throw new Error('A grader file path leaves the job folder')
+      await mkdir(dirname(target), { recursive: true })
+      await writeFile(target, content, 'utf8')
+    }
+  } catch (error) { await rm(folder, { recursive: true, force: true }).catch(() => undefined); throw error }
+  return folder
+}
+
+/**
+ * Loaded with --require before a host check: every network route a check could take (sockets, TLS, UDP,
+ * DNS, HTTP/HTTP2 clients, listening, the inspector, fetch/WebSocket/EventSource) throws ERR_ACCESS_DENIED,
+ * and the replacements cannot be redefined. With the permission model (no child processes, workers, addons
+ * or process.binding) nothing below them is reachable from JavaScript.
+ */
+export const NO_NETWORK_PRELOAD = `'use strict'
+;(() => {
+  const denied = name => function () { const error = new Error('Network access is disabled in an evaluation check (' + name + ')'); error.code = 'ERR_ACCESS_DENIED'; throw error }
+  const lock = (target, key, name) => { if (target && key in target) Object.defineProperty(target, key, { value: denied(name), writable: false, configurable: false, enumerable: true }) }
+  const net = require('net'), tls = require('tls'), dgram = require('dgram'), dns = require('dns'), http = require('http'), https = require('https'), http2 = require('http2')
+  for (const key of ['connect', 'createConnection']) lock(net, key, 'net.' + key)
+  lock(net.Socket.prototype, 'connect', 'socket.connect')
+  lock(net.Server.prototype, 'listen', 'server.listen')
+  lock(tls, 'connect', 'tls.connect')
+  lock(dgram, 'createSocket', 'dgram.createSocket')
+  for (const key of ['bind', 'send', 'connect']) lock(dgram.Socket.prototype, key, 'dgram.' + key)
+  for (const module of [http, https]) for (const key of ['request', 'get']) lock(module, key, 'http.' + key)
+  for (const agent of [http.Agent.prototype, https.Agent.prototype]) lock(agent, 'createConnection', 'agent.createConnection')
+  lock(http2, 'connect', 'http2.connect')
+  const lookups = ['lookup', 'lookupService', 'resolve', 'resolve4', 'resolve6', 'resolveAny', 'resolveCaa', 'resolveCname', 'resolveMx', 'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa', 'resolveSrv', 'resolveTxt', 'reverse']
+  for (const target of [dns, dns.promises, dns.Resolver.prototype, dns.promises.Resolver.prototype]) for (const key of lookups) lock(target, key, 'dns.' + key)
+  try { lock(require('inspector'), 'open', 'inspector.open') } catch {}
+  for (const key of ['fetch', 'WebSocket', 'EventSource']) Object.defineProperty(globalThis, key, { value: denied(key), writable: false, configurable: false, enumerable: false })
+  require('module').syncBuiltinESMExports()
+})()
+`
+
+/** The Node runtime host checks run on: this process's own (Electron told to act as Node). */
+export interface NodeRuntime { command: string; env: Record<string, string> }
+export const ownNodeRuntime = (): NodeRuntime => ({ command: process.execPath, env: process.versions.electron ? { ELECTRON_RUN_AS_NODE: '1' } : {} })
+export type SpawnChild = (command: string, args: string[], options: { cwd: string; env: Record<string, string>; windowsHide: boolean; stdio: ['ignore', 'pipe', 'pipe'] }) => ChildProcess
+
+/**
+ * A grader check on the host, where no docker sandbox is: `node <script>` (the only command it runs) in a
+ * throwaway temp folder, with Node's permission model (reads only that folder, writes nothing, no child
+ * processes, workers or addons), the NO_NETWORK_PRELOAD, a minimal environment (no PATH, tokens or
+ * NODE_OPTIONS), a heap cap, killed at its timeout, and the folder removed afterwards. Returns null when this
+ * runtime has no permission model (a check that cannot be confined is not run).
+ */
+export async function hostCommandPort(runtime: NodeRuntime = ownNodeRuntime(), spawnChild: SpawnChild = spawn as unknown as SpawnChild): Promise<((request: CommandRequest) => Promise<CommandResult>) | null> {
+  // PATH is set empty rather than left out: on Windows libuv copies a missing PATH from this process.
+  const env = (folder: string): Record<string, string> => ({ ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}), PATH: '', TEMP: folder, TMP: folder, TMPDIR: folder, ...runtime.env })
+  const exec = (folder: string, args: string[], timeoutMs: number, signal?: AbortSignal) => new Promise<CommandResult>(resolve => {
+    let output = '', timedOut = false, done = false
+    const finish = (result: CommandResult) => { if (!done) { done = true; clearTimeout(timer); signal?.removeEventListener('abort', stop); resolve(result) } }
+    let child: ChildProcess
+    try { child = spawnChild(runtime.command, args, { cwd: folder, env: env(folder), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }) }
+    catch (error) { finish({ exitCode: null, output: String(error instanceof Error ? error.message : error).slice(0, OUTPUT_TAIL), spawnFailed: true }); return }
+    const keep = (chunk: Buffer | string) => { output = (output + chunk.toString()).slice(-OUTPUT_TAIL) }
+    child.stdout?.on('data', keep); child.stderr?.on('data', keep)
+    const stop = () => { child.kill('SIGKILL') }
+    const timer = setTimeout(() => { timedOut = true; stop() }, timeoutMs)
+    signal?.addEventListener('abort', stop, { once: true })
+    child.on('error', error => finish({ exitCode: null, output: error.message.slice(0, OUTPUT_TAIL), spawnFailed: true }))
+    child.on('close', code => finish({ exitCode: timedOut ? null : code, timedOut, output }))
+  })
+  const confined = (folder: string, preload: string) => ['--permission', `--allow-fs-read=${folder}`, '--max-old-space-size=512', '--require', preload]
+  // The runtime must honour the permission model, or nothing is run on the host.
+  const probe = await writeJobFolder('conductor-eval-probe-', { 'probe.cjs': "try { require('fs').readFileSync(process.execPath); process.exit(3) } catch (error) { process.exit(error.code === 'ERR_ACCESS_DENIED' ? 0 : 4) }" })
+  try {
+    const result = await exec(probe, ['--permission', `--allow-fs-read=${probe}`, 'probe.cjs'], 20_000).catch(() => null)
+    if (result?.exitCode !== 0) return null
+  } finally { await rm(probe, { recursive: true, force: true }).catch(() => undefined) }
+
+  return async (request: CommandRequest): Promise<CommandResult> => {
+    if (request.cmd !== 'node') throw new Error(`Only node checks run on the host; ${JSON.stringify(request.cmd)} needs the docker sandbox`)
+    const script = request.args[0]
+    // Every argument after the script is the script's own; the script itself may not pass a Node option.
+    if (!script || script.startsWith('-') || !safePath(script)) throw new Error('A host check starts with the relative path of its script')
+    if (request.args.some(arg => typeof arg !== 'string' || arg.includes('\0') || arg.length > 4_000)) throw new Error('Grader arguments must be plain text')
+    const preloadName = `.conductor-no-network-${randomBytes(6).toString('hex')}.cjs`
+    const folder = await writeJobFolder('conductor-eval-', { ...request.files, [preloadName]: NO_NETWORK_PRELOAD })
+    try {
+      if (request.signal?.aborted) return { exitCode: null, output: 'aborted' }
+      return await exec(folder, [...confined(folder, join(folder, preloadName)), ...request.args], request.timeoutSec * 1000, request.signal)
+    } finally { await rm(folder, { recursive: true, force: true }).catch(() => undefined) }
+  }
+}
+
 export type ExecFile = (file: string, args: string[], options: { timeout: number; maxBuffer: number; windowsHide: boolean }, done: (error: (Error & { code?: number | string; killed?: boolean }) | null, stdout: string, stderr: string) => void) => void
 
 /** docker run --rm --network none over a temp folder holding only the job files; the folder is
@@ -139,20 +236,11 @@ export function dockerCommandPort(image: string, exec: ExecFile = execFile as un
   return async (request: CommandRequest): Promise<CommandResult> => {
     if (!/^[A-Za-z0-9._+-]{1,40}$/.test(request.cmd)) throw new Error(`Grader command ${JSON.stringify(request.cmd)} is not a plain program name`)
     if (request.args.some(arg => typeof arg !== 'string' || arg.includes('\0') || arg.length > 4_000)) throw new Error('Grader arguments must be plain text')
-    const entries = Object.entries(request.files).map(([path, content]) => [safePath(path), content] as const)
-    if (entries.some(([path]) => !path)) throw new Error('A grader file path leaves the job folder')
-    if (entries.reduce((total, [, content]) => total + Buffer.byteLength(content), 0) > FILES_MAX_BYTES) throw new Error('Grader files exceed 2 MB')
-    const folder = await mkdtemp(join(tmpdir(), 'conductor-eval-'))
+    const folder = await writeJobFolder('conductor-eval-', request.files)
     const name = `conductor-eval-${randomBytes(6).toString('hex')}`
     const abort = () => { void docker(['rm', '-f', name], 30_000) }
     request.signal?.addEventListener('abort', abort, { once: true })
     try {
-      for (const [path, content] of entries) {
-        const target = join(folder, ...path!.split('/'))
-        if (!target.startsWith(folder + sep)) throw new Error('A grader file path leaves the job folder')
-        await mkdir(dirname(target), { recursive: true })
-        await writeFile(target, content, 'utf8')
-      }
       const run = await docker(['run', '--rm', '--name', name, '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', '128',
         '--memory', '1g', '--cpus', '2', '--read-only', '--tmpfs', '/tmp:rw,size=64m', '-v', `${folder}:/work`, '-w', '/work', image, request.cmd, ...request.args],
       request.timeoutSec * 1000 + 15_000)

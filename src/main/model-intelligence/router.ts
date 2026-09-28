@@ -3,7 +3,7 @@ import {
   type RegistryRecord, type ReputationScore, type RouteCandidate, type RouteConstraints, type RouteDecision, type RoutingProvider, type TaskCategory, type TaskFeatures
 } from '../../shared/model-routing'
 import type { DecideOptions } from './decision-service'
-import { SCORER_ID, capabilityPrior, conservative, defaultUsageStop, isLocal, percent, scoreCandidates, softmax, type CandidateFacts } from './deciders/scorer'
+import { HARD_WORK_RANK_FLOOR, SCORER_ID, capabilityPrior, conservative, defaultUsageStop, isLocal, percent, scoreCandidates, softmax, type CandidateFacts } from './deciders/scorer'
 
 /**
  * route(features, constraints, ports): candidates from the registry and live state, the scorer's
@@ -111,6 +111,8 @@ function successReason(candidate: RouteCandidate, features: TaskFeatures): strin
 }
 function costReason(candidate: RouteCandidate, constraints: RouteConstraints): string {
   if (candidate.key.provider === 'local') return `local model: no per-token cost${candidate.live.loaded === true ? ', already loaded' : candidate.live.loaded === false ? ', needs a server start' : ''}`
+  if (candidate.expectedCostUsd == null && typeof candidate.live.costBasis === 'string' && typeof candidate.live.scoredCostUsd === 'number')
+    return `no per-token price known; scored at ${money(candidate.live.scoredCostUsd)}, the price of ${candidate.live.costBasis}, so it never undercuts a priced model beside it`
   if (candidate.expectedCostUsd == null) return 'no per-token price known (subscription or unpriced); usage limits apply instead'
   return `expected cost ${money(candidate.expectedCostUsd)}${constraints.maxCostUsd != null ? ` within the ${money(constraints.maxCostUsd)} cap` : ''}`
 }
@@ -187,6 +189,8 @@ export async function route(features: TaskFeatures, constraints: Partial<RouteCo
     capabilityReason(selected, records.get(modelKeyId(selected.key)), features),
     ...providerReasons(selected, candidates, records),
     selected.effort ? `effort ${selected.effort} for complexity ${features.complexity}, ${features.risk} risk` : null,
+    conservative(features) && !isLocal(records.get(modelKeyId(selected.key))!) && rank(selected) < HARD_WORK_RANK_FLOOR && !eligible.some(candidate => rank(candidate) >= HARD_WORK_RANK_FLOOR)
+      ? `no model of capability rank ${HARD_WORK_RANK_FLOOR}+ is eligible, so the floor for hard work is lifted` : null,
     !chosen ? `no decider settled it (${record.rationale}); the scorer's top candidate is used` : record.escalated ? `close call escalated (${record.escalationReason}); ${record.decidedBy} chose` : record.escalationReason ? `${record.escalationReason}: the scorer's top candidate stands` : null,
   ].filter((reason): reason is string => !!reason)
 

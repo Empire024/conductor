@@ -94,6 +94,43 @@ describe('scorer', () => {
     expect(ranked[3]).toMatchObject({ eligible: false, excluded: 'availability unavailable' })
     expect(ranked[0]!.utility - ranked[1]!.utility).toBeCloseTo(0.05, 9)
   })
+  it('keeps hard or high-risk work on rank 2+ whatever the weights, unless the weaker model has a proven record or nothing of rank 2+ is eligible (N10)', () => {
+    const priced = (input: number, output: number) => ({ pricing: { inputPerMTok: input, outputPerMTok: output, cachedInputPerMTok: null, currency: 'USD' as const } })
+    const opus = record('claude', 'opus', { capabilityRank: 3, ...priced(5, 25) }), luna = record('codex', 'gpt-6-luna', { capabilityRank: 1, ...priced(0.05, 0.4) })
+    const costliest = { ...DEFAULT_ROUTE_CONSTRAINTS, costWeight: 1, latencyWeight: 1, urgency: 'urgent' as const }
+    for (const hard of [{ ...features, category: 'difficult-coding', complexity: 5, risk: 'low' }, { ...features, category: 'debugging', complexity: 3, risk: 'high' }, { ...features, complexity: 1, risk: 'high' }] as TaskFeatures[]) {
+      const ranked = scoreCandidates([facts(luna), facts(opus)], hard, costliest)
+      expect(ranked[0]!.key.model, JSON.stringify(hard)).toBe('opus')
+      expect(ranked[1]).toMatchObject({ eligible: false, excluded: expect.stringMatching(/^capability rank 1 below the rank-2 floor for complexity \d, \w+-risk work, and no proven record on/) })
+    }
+    // Easy work is left to the weights: the cheap model wins at cost weight 1.
+    expect(scoreCandidates([facts(luna), facts(opus)], { ...features, complexity: 2, risk: 'low' }, costliest)[0]!.key.model).toBe('gpt-6-luna')
+    // Evidence earns the exception; with nothing of rank 2+ eligible the floor is lifted.
+    const hard: TaskFeatures = { ...features, category: 'difficult-coding', complexity: 5, risk: 'high' }
+    expect(scoreCandidates([facts(luna, { reputation: outcomes(12, 12) }), facts(opus)], hard, costliest).find(candidate => candidate.key.model === 'gpt-6-luna')!.eligible).toBe(true)
+    expect(scoreCandidates([facts(luna), facts(opus)], hard, { ...costliest, excludeProviders: ['claude'] })[0]).toMatchObject({ key: { model: 'gpt-6-luna' }, eligible: true })
+    // Failing strong models are not replaced by an unproven weak one (the Claude-only case with Opus and Sonnet failing).
+    const haiku = record('claude', 'haiku', { capabilityRank: 1 }), sonnet = record('claude', 'sonnet', { capabilityRank: 2 })
+    const claudeOnly = scoreCandidates([facts(opus, { reputation: outcomes(0, 8) }), facts(sonnet, { reputation: outcomes(0, 8) }), facts(haiku)], hard, DEFAULT_ROUTE_CONSTRAINTS)
+    expect(claudeOnly.filter(candidate => candidate.eligible).map(candidate => candidate.key.model).sort()).toEqual(['opus', 'sonnet'])
+  })
+  it('never scores an unpriced cloud model as cheaper than the priced models beside it (N18)', () => {
+    const priced = (input: number, output: number) => ({ pricing: { inputPerMTok: input, outputPerMTok: output, cachedInputPerMTok: null, currency: 'USD' as const } })
+    const fast = record('grok', 'grok-4.7-build-fast', { capabilityRank: 2 }), code = record('grok', 'grok-4.7-code', { capabilityRank: 2, ...priced(0.2, 1.5) }), heavy = record('grok', 'grok-4.7-heavy', { capabilityRank: 2, ...priced(3, 15) })
+    const all = [facts(fast), facts(code), facts(heavy)]
+    const ranked = scoreCandidates(all, features, { ...DEFAULT_ROUTE_CONSTRAINTS, costWeight: 1 })
+    expect(ranked[0]!.key.model).toBe('grok-4.7-code')
+    const unpriced = ranked.find(candidate => candidate.key.model === 'grok-4.7-build-fast')!
+    // Scored at its priciest same-rank sibling; its own price stays unknown in the record.
+    expect(unpriced).toMatchObject({ expectedCostUsd: null, live: { costBasis: 'grok/grok-4.7-heavy', scoredCostUsd: expectedCost(heavy, features) } })
+    expect(unpriced.utility).toBeCloseTo(ranked.find(candidate => candidate.key.model === 'grok-4.7-heavy')!.utility, 9)
+    // An excluded sibling still prices it, so filtering never reprices; with no priced model anywhere it stays neutral.
+    expect(scoreCandidates(all, features, { ...DEFAULT_ROUTE_CONSTRAINTS, allow: [fast.key, code.key] }).find(candidate => candidate.key.model === 'grok-4.7-build-fast')!.live.costBasis).toBe('grok/grok-4.7-heavy')
+    expect(scoreCandidates([facts(fast), facts(record('claude', 'opus', { capabilityRank: 3 }))], features, DEFAULT_ROUTE_CONSTRAINTS)[0]!.live).not.toHaveProperty('costBasis')
+    // Another provider's same-rank price is the last resort; a local model is never a price basis.
+    expect(scoreCandidates([facts(fast), facts(record('codex', 'terra', { capabilityRank: 2, ...priced(1, 8) })), facts(record('local', 'q'))], features, DEFAULT_ROUTE_CONSTRAINTS)
+      .find(candidate => candidate.key.model === 'grok-4.7-build-fast')!.live.costBasis).toBe('codex/terra')
+  })
   it('decides from the utilities on the options', async () => {
     const decider = createScorerDecider()
     expect(decider.supports('route') && decider.supports('fallback') && !decider.supports('approval')).toBe(true)
