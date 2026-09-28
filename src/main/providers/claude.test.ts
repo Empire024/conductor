@@ -1347,6 +1347,10 @@ describe('owner permission grants (src/main/permission-grants)', () => {
     await f.adapter.start()
     const args = f.transport.options.args
     expect(JSON.parse(readFileSync(args[args.indexOf('--settings') + 1]!, 'utf8'))).toEqual({ permissions: { allow: [rules[0]!.rule] } })
+    // A pipeline is checked part by part natively, so each part gets its own exact rule as well.
+    rules = [{ rule: "Bash(ssh -o BatchMode=yes root@192.0.2.10 'bash -s -- --check' < app/prod/fix-pool.sh 2>&1 | tail -40)", once: false }]
+    await expect(f.adapter.applyPermissionRules()).resolves.toBe('applied')
+    expect(f.transport.sent.at(-1)).toMatchObject({ type: 'control_request', request: { subtype: 'apply_flag_settings', settings: { permissions: { allow: [rules[0]!.rule, "Bash(ssh -o BatchMode=yes root@192.0.2.10 'bash -s -- --check' < app/prod/fix-pool.sh 2>&1)", 'Bash(tail -40)'] } } } })
     rules = []
     await expect(f.adapter.applyPermissionRules()).resolves.toBe('applied')
     expect(f.transport.sent.at(-1)).toMatchObject({ type: 'control_request', request: { subtype: 'apply_flag_settings', settings: { permissions: { allow: [] } } } })

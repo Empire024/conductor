@@ -61,6 +61,10 @@ export interface PermissionGrant {
   decidedBy: 'owner' | 'wizard'
   /** How the rule reached the conversation: applied live, or waiting for its restart. */
   delivery: 'live' | 'restart' | 'pending'
+  /** permissions.list only: the exact native allow rules installed for it (nativeGrantRules) and
+   *  where; one conversation's session permissions, never a settings file other tabs read. */
+  nativeRules?: string[]
+  installedIn?: string
 }
 
 /** What the renderer holds: every open request and live grant, per conversation. */
@@ -190,6 +194,7 @@ export function describeGrantRequest(request: GrantRequestInput): Omit<Permissio
     const shaped = { ...base, action: 'Run a command', resource: command, ...(host ? { host } : {}), class: kind }
     if (command.length > 4000) return { ...shaped, refusal: 'The command is too long to show as one exact rule; put it in a script file and ask for that script.' }
     if (command.includes('*') || /:\s*$/.test(command)) return { ...shaped, refusal: 'The command holds * (or ends in :), which the CLI reads as a wildcard, so a rule for it would allow other commands too. Ask for a command without it.' }
+    if (tool === 'Bash' && changesDirectoryBeforeInput(command)) return { ...shaped, refusal: 'The command changes directory (cd) and then reads a file with <. Claude Code always asks for such a redirect itself, so no allow rule can ever let it through, and in Auto its classifier decides. Ask again without the cd, naming the file from the project root (for example ssh … < app/prod/fix.sh instead of cd app && ssh … < prod/fix.sh).' }
     return { ...shaped, rule: `${tool}(${escapeRuleContent(command)})` }
   }
   if (tool === 'Skill') {
@@ -238,6 +243,60 @@ const parsedRule = (rule: string): { tool: string; content?: string } => {
 
 /** Whether a tool call is the very call a granted rule was minted for (same tool, same exact
  *  resource), which is how an approve-once grant knows it was used. */
+/** Splits a command at its top-level operators, outside quotes, `$( )`, `( )` and backslash
+ *  escapes: `|` (not `||`) when `pipes`, else `&&`, `||` and `;`. */
+function topLevelParts(command: string, pipes: boolean): string[] {
+  const parts: string[] = []
+  let quote: '"' | "'" | null = null, depth = 0, start = 0
+  for (let index = 0; index < command.length; index++) {
+    const char = command[index]!
+    if (quote) {
+      if (char === '\\' && quote === '"') index++
+      else if (char === quote) quote = null
+      continue
+    }
+    if (char === '\\') { index++; continue }
+    if (char === '"' || char === "'") { quote = char; continue }
+    if (char === '(') { depth++; continue }
+    if (char === ')') { depth = Math.max(0, depth - 1); continue }
+    if (depth) continue
+    let width = 0
+    if (pipes) width = char === '|' && command[index + 1] !== '|' && command[index - 1] !== '|' && command[index - 1] !== '>' ? 1 : 0
+    else if ((char === '&' || char === '|') && command[index + 1] === char) width = 2
+    else if (char === ';') width = 1
+    if (!width) continue
+    parts.push(command.slice(start, index).trim())
+    start = index + width
+    index += width - 1
+  }
+  parts.push(command.slice(start).trim())
+  return parts.filter(Boolean)
+}
+
+/** claude 2.1.282 always asks for an input redirect from a file after a `cd` in the same command
+ *  ("the file it names depends on … a directory change"), whatever allow rules say. */
+export function changesDirectoryBeforeInput(command: string): boolean {
+  const chain = topLevelParts(command, false)
+  const changes = chain.findIndex(part => /^(cd|pushd)(\s|$)/.test(part))
+  if (changes < 0) return false
+  return chain.slice(changes + 1).some(part => topLevelParts(part, true).some(segment => /(^|[^<\d&])<(?![<(&>])/.test(segment.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, '""'))))
+}
+
+/**
+ * The exact native allow rules one grant installs. claude 2.1.282 checks a piped Bash command
+ * part by part, and an exact rule for the whole pipeline never matches it (probed 2026-09-28,
+ * docs/permissions-classifier.md), so a pipeline also gets one exact rule per `|` part. Every
+ * rule is a literal part of the approved command: nothing is widened and no wildcard is added.
+ * `&&` and `;` chains match the whole rule and need nothing more.
+ */
+export function nativeGrantRules(rule: string): string[] {
+  const parsed = parsedRule(rule)
+  if (parsed.tool !== 'Bash' || parsed.content === undefined) return [rule]
+  const parts = topLevelParts(parsed.content, true)
+  if (parts.length < 2) return [rule]
+  return [...new Set([rule, ...parts.map(part => `Bash(${escapeRuleContent(part)})`)])]
+}
+
 export function callMatchesRule(rule: string, tool: string, input: unknown, cwd: string): boolean {
   const described = describeGrantRequest({ tool, input, cwd })
   if (described.rule) return described.rule === rule

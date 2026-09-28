@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, isClassifierOutage, type AutoModeDenial, type DenialGrantRequest } from '../../shared/auto-mode-denial'
 import {
-  describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary,
+  describeGrantRequest, grantApprovedMessage, grantDeniedMessage, grantHolderLabel, grantNeedsPhone, grantRequestSummary, nativeGrantRules,
   type GrantDecision, type GrantRule, type GrantStatus, type PermissionGrant, type PermissionGrantDecisionResult, type PermissionGrantRequest, type PermissionGrantsState
 } from '../../shared/permission-grants'
 import type { Json } from '../../shared/structured-agent'
@@ -366,7 +366,11 @@ export class PermissionGrants {
   }
 
   list(agentSessionId: string): { requests: PermissionGrantRequest[]; grants: PermissionGrant[] } {
-    return { requests: [...(this.requests.get(agentSessionId)?.values() ?? [])], grants: [...(this.grants.get(agentSessionId) ?? [])] }
+    // Where each grant lives natively: this conversation's session permissions (the claude CLI's
+    // flag-settings layer, apply_flag_settings live or --settings at launch), never a settings
+    // file that every Claude tab of the project would also read.
+    const installed = (grant: PermissionGrant): PermissionGrant => ({ ...grant, nativeRules: nativeGrantRules(grant.rule), installedIn: grant.delivery === 'live' ? 'this conversation\'s Claude Code session permissions (live)' : 'this conversation\'s Claude Code session permissions (--settings when its runtime next starts)' })
+    return { requests: [...(this.requests.get(agentSessionId)?.values() ?? [])], grants: (this.grants.get(agentSessionId) ?? []).map(installed) }
   }
 
   /**

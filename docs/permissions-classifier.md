@@ -131,17 +131,52 @@ attempt raises an ordinary Allow card.
     approval as a turn of its own (`retry` in `src/main/permission-grants/service.ts`), and the
     synthetic CLI encodes this precedence under `CONDUCTOR_TEST_CLASSIFIER=approval-turn`
     (`smoke-permission-grant.mjs`, step 3b).
+  - **Corrected the same day (rule matching, below):** that rule could never have matched. The
+    command was piped (`… | tail -40`) and read a file after a `cd` (`cd …/app && ssh … <
+    prod/fix-lsphp-pool.sh`). The CLI checks a pipeline part by part and never lets a rule allow an
+    input redirect after a `cd`. So every attempt went to the classifier, and the approval turn only
+    changed what the classifier saw. The user turn is still how Conductor delivers an approval.
+- **Rule matching, probed (2026-09-28, claude 2.1.282, owner-ordered).** Probing it through the
+  classifier gave no clean signal. A call the user's own prompt dictates passes with or without a
+  rule. The model itself declined a root ssh taken from a runbook before the classifier was asked.
+  And the classifier's verdict on a nested `claude` run changed with the conversation's context.
+  Rule matching was therefore probed where it is deterministic: headless `claude -p
+  --permission-mode manual`, where a Bash call no rule allows is refused outright.
+  `scripts/probe-permission-rule-matching.mjs` reruns it (10 cases, exit 1 on any difference):
+  - An exact rule for a whole pipeline never matches it ("contains multiple operations. The
+    following part requires approval: …"). An exact rule for each non-read-only `|` part does;
+    `tail -5` needs none. `--settings` and `.claude/settings.local.json` behave identically, so
+    writing the rule to a settings file would change nothing.
+  - `&&` and `;` chains, `cd … &&` included, match the exact whole rule.
+  - An input redirect matches the exact rule for that file only (`< input.txt` does not allow `<
+    other.txt`).
+  - An input redirect after a `cd` in the same command is never allowed by any rule: "Input
+    redirection from 'input.txt' requires manual approval: the file it names depends on glob
+    expansion or a directory change in the same command." In Auto that means the classifier decides.
+  - Conductor therefore installs, for every grant, the exact rule the owner saw plus one exact rule
+    per `|` part (`nativeGrantRules` in `src/shared/permission-grants.ts`). Each is a literal piece
+    of the approved command, with no wildcard. A `cd … && … < file` command gets no card rule at all
+    (`changesDirectoryBeforeInput`); its refusal tells the agent to ask again naming the file from
+    the project root. `permissions.list` shows each grant's `nativeRules` and `installedIn`.
+  - The rules stay in the conversation's session permissions (the flag-settings layer: live through
+    `apply_flag_settings`, or `--settings` at launch). Revoking a grant, spending an approve-once
+    grant or closing the tab takes them out again. A project's `.claude/settings.local.json` would
+    also hand the rule to every other Claude tab of that project and outlive the grant, which the
+    boundary above rules out. The SDK-style answer (`canUseTool` with `updatedPermissions`) does not
+    apply either: a classifier refusal in Auto leaves no pending permission request to answer.
+  - Whether a matching allow rule then also beats the classifier in Auto was not settled by a clean
+    A/B. The classifier would not refuse on demand. One observation leans yes: this Conductor tab's
+    own approved call, a simple `node … | tail` pipeline, ran mid-turn before its "retry it now"
+    turn arrived. But its whole-command rule did not match (see the first point), so the classifier
+    let it through in context, and that observation says nothing about rule precedence.
 
 ## UNCONFIRMED
 
-- **Precedence, what is still open:** the 2026-09-28 case is one observation. It shows that a live
-  flag-settings rule does not beat the classifier, and that an approval arriving as a user turn got
-  the call through. It does not show whether the rule contributes at all, whether a rule given at
-  launch (`--settings`) behaves differently (no restart happened), or whether the classifier would
-  refuse again in a context that weighs more heavily against the call. The owner ruled out a probe
-  that deliberately provokes the classifier. Conductor keeps handing over the rule, which is
-  harmless and is how an approve-once grant is spent, and still detects a grant that does not take
-  effect.
+- **Precedence, what is still open:** whether an allow rule that does match (see Rule matching)
+  is honoured before the Auto classifier judges the call. The haftheme case never had a matching
+  rule, so it does not answer this. A clean A/B needs a call the classifier refuses reliably in a
+  fresh context, and none was found. Conductor still detects a grant that does not take effect
+  (`ineffective`) and still delivers the approval as a user turn of its own.
 - Whether the classifier also judges `conductor` MCP tool calls (`send_message` and the rest), and
   with which reasons. A message is no longer a `curl` command line, which removes the shape that
   was refused as `[Auto-Mode Bypass]`. The topic of a message may still be judged.

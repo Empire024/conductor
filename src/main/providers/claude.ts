@@ -9,7 +9,7 @@ import { currentRuntimeHost, JsonLineTransport, type HostedRuntimeHandle, type T
 import { privateConfigFile, relayMcpConfigs, relaysMcp, removeConfigFiles } from '../runtime-host/relay-config'
 import { PROVIDER_SAFEGUARD_REFUSAL, settingsForRuntime } from '../../shared/structured-agent'
 import { autoModeDenialItemId, autoModeDenialMessage, autoModeDenialPayload, classifierOutageMessage, classifierOutagePayload, classifierOutageStoppedTurn, hookDenialReason, isClassifierOutage, parseAutoModeDenialReason, type DenialGrantRequest } from '../../shared/auto-mode-denial'
-import { callMatchesRule, describeGrantRequest } from '../../shared/permission-grants'
+import { callMatchesRule, describeGrantRequest, nativeGrantRules } from '../../shared/permission-grants'
 import { BROWSER_MCP_SERVER_NAME, BROWSER_TOOLS } from '../../shared/browser-mcp'
 import { LOCAL_ASSIST_MCP_SERVER_NAME } from '../local-assist/contract'
 import { LOCAL_ASSIST_TOOLS } from '../local-assist/tools'
@@ -293,7 +293,7 @@ export class ClaudeAdapter implements ProviderAdapter {
     // ever put there, so a launch without grants passes no --settings at all.
     const grantRules = this.options.approvalReviewer || this.options.profile === 'evaluation' ? [] : this.options.permissionGrants?.rules() ?? []
     if (grantRules.length) {
-      this.grantSettingsFile = privateConfigFile(JSON.stringify({ permissions: { allow: grantRules.map(entry => entry.rule) } }), `claude-grants-${this.options.runtimeId}`)
+      this.grantSettingsFile = privateConfigFile(JSON.stringify({ permissions: { allow: grantRules.flatMap(entry => nativeGrantRules(entry.rule)) } }), `claude-grants-${this.options.runtimeId}`)
       this.relayFiles.push(this.grantSettingsFile)
       args.push('--settings', this.grantSettingsFile)
     }
@@ -565,7 +565,7 @@ export class ClaudeAdapter implements ProviderAdapter {
   async applyPermissionRules(): Promise<'applied' | 'unsupported'> {
     if (this.options.approvalReviewer || !this.ready || this.disposed || !this.transport?.connected) return 'unsupported'
     const rules = this.options.permissionGrants?.rules() ?? []
-    try { await this.control({ subtype: 'apply_flag_settings', settings: { permissions: { allow: rules.map(entry => entry.rule) } } }) }
+    try { await this.control({ subtype: 'apply_flag_settings', settings: { permissions: { allow: rules.flatMap(entry => nativeGrantRules(entry.rule)) } } }) }
     catch (error) {
       if (/not supported|not implemented|unknown|unsupported/i.test(error instanceof Error ? error.message : '')) return 'unsupported'
       throw error

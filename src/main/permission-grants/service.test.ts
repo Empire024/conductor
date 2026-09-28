@@ -60,6 +60,8 @@ describe('one narrow owner approval per refused call', () => {
     // The denial's own card is restated in place with the answer.
     expect(h.notices.at(-1)).toMatchObject({ itemId: item, payload: { grantStatus: 'approved-once', autoModeDenial: { toolUseId: 'toolu_w' } } })
     await expect(h.grants.decide(tab, item, 'approve-once', 'owner')).rejects.toThrow('already answered')
+    // permissions.list says which native rules were installed, and where.
+    expect(h.grants.list(tab).grants).toEqual([expect.objectContaining({ rule: 'Edit(//c/Users/owner/site/app/prod/fix-pool.sh)', nativeRules: ['Edit(//c/Users/owner/site/app/prod/fix-pool.sh)'], installedIn: expect.stringMatching(/this conversation's Claude Code session permissions/) })])
     h.grants.adapterPort(tab).used('Edit(//c/Users/owner/site/app/prod/fix-pool.sh)')
     expect(h.grants.rules(tab)).toEqual([])
     expect(h.grants.list(tab).requests[0]!.status).toBe('used')
